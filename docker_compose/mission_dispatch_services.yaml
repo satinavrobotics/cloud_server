@@ -15,7 +15,6 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-version: "3.3"
 services:
   # Create an MQTT broker
   mosquitto: 
@@ -39,36 +38,189 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DATABASE_NAME}
       - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256
-    ports:
-      - '${POSTGRES_DATABASE_PORT}:${POSTGRES_DATABASE_PORT}'
     network_mode: "host"
     healthcheck:
-      test: pg_isready -U ${POSTGRES_DATABASE_USERNAME}
-      interval: 3s
-      timeout: 10s
-      retries: 5
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_DATABASE_USERNAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
-  # Create an instance of mission database
-  mission-database: 
-    image: ${MISSION_DATABASE_IMAGE}
-    command: ["--port", "${DATABASE_API_PORT}", 
-              "--controller_port", "${DATABASE_CONTROLLER_PORT}", 
-              "--db_port", "${POSTGRES_DATABASE_PORT}", 
-              "--db_name", "${POSTGRES_DATABASE_NAME}", 
-              "--db_username", "${POSTGRES_DATABASE_USERNAME}", 
-              "--db_password", "${POSTGRES_DATABASE_PASSWORD}"]
-    network_mode: "host"
-    depends_on: 
-      postgres:
-        condition: service_healthy
 
-  # Create an instance of mission dispatch  
+
+  # Create an instance of mission dispatch
   mission-dispatch:
-    image: ${MISSION_DISPATCH_IMAGE}
-    command: ["--mqtt_port", "${MQTT_PORT_WEBSOCKET}", 
-              "--mqtt_transport", "${MQTT_TRANSPORT}", 
-              "--database_url", "http://localhost:${DATABASE_CONTROLLER_PORT}"]
+    build:
+      context: ..
+      dockerfile: packages/controllers/mission/Dockerfile
+    image: ${MISSION_DISPATCH_IMAGE:-mission_dispatch:latest}
+    command: ["--mqtt_port", "${MQTT_PORT_WEBSOCKET}",
+              "--mqtt_transport", "${MQTT_TRANSPORT}",
+              "--postgres_port", "${POSTGRES_DATABASE_PORT}",
+              "--postgres_db", "${POSTGRES_DATABASE_NAME}",
+              "--postgres_user", "${POSTGRES_DATABASE_USERNAME}",
+              "--postgres_password", "${POSTGRES_DATABASE_PASSWORD}"]
     network_mode: "host"
+    depends_on:
+      mosquitto:
+        condition: service_started
+
+  # Create ArangoDB for topological map
+  arangodb:
+    image: arangodb/arangodb:latest
+    environment:
+      - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
+    network_mode: "host"
+    volumes:
+      - arango_data:/var/lib/arangodb3
+
+  # Create MinIO for image storage
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":${MINIO_CONSOLE_PORT:-9001}"
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+    network_mode: "host"
+    volumes:
+      - minio_data:/data
+
+  # Create Graph Builder Service
+  graph-builder-service:
+    build:
+      context: ..
+      dockerfile: packages/services/graph_builder/Dockerfile
+    image: ${GRAPH_BUILDER_SERVICE_IMAGE:-graph_builder_service:latest}
+    command: ["python", "-m", "packages.services.graph_builder.main",
+              "--port", "${GRAPH_BUILDER_PORT:-8004}",
+              "--host", "0.0.0.0"]
+    environment:
+      - MQTT_HOST=localhost
+      - MQTT_PORT=${MQTT_PORT_TCP:-1883}
+      - MQTT_TOPIC=${GRAPH_BUILDER_MQTT_TOPIC:-robot/node_update}
+      - MQTT_IMAGE_TOPIC=${GRAPH_BUILDER_MQTT_IMAGE_TOPIC:-robot/image_upload}
+      - ARANGO_HOST=localhost
+      - ARANGO_PORT=${ARANGO_PORT:-8529}
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
+      - DATABASE_NAME=${GRAPH_DB_NAME:-topomap_db}
+      - MINIO_HOST=localhost
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - MINIO_SECURE=false
+      - DISTANCE_THRESHOLD=${SIMILARITY_DISTANCE_THRESHOLD:-5.0}
+      - MISSION_DISPATCH_URL=http://localhost:${API_DELEGATION_PORT:-8000}
+      - RADIUS_THRESHOLD=${GRAPH_BUILDER_RADIUS_THRESHOLD:-2.0}
+      - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
+    network_mode: "host"
+    restart: on-failure
+    depends_on:
+      - mosquitto
+      - arangodb
+      - minio
+
+  # Create Mission Planner Service
+  mission-planner-service:
+    build:
+      context: ..
+      dockerfile: packages/services/mission_planner/Dockerfile
+    image: ${MISSION_PLANNER_SERVICE_IMAGE:-mission_planner_service:latest}
+    command: ["python", "-m", "packages.services.mission_planner.main",
+              "--port", "${MISSION_PLANNER_PORT:-8005}",
+              "--host", "0.0.0.0"]
+    environment:
+      - ARANGO_HOST=localhost
+      - ARANGO_PORT=${ARANGO_PORT:-8529}
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
+      - DATABASE_NAME=${GRAPH_DB_NAME:-topomap_db}
+      - MINIO_HOST=localhost
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - MINIO_SECURE=false
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DATABASE_PORT=${POSTGRES_DATABASE_PORT}
+      - POSTGRES_DATABASE_NAME=${POSTGRES_DATABASE_NAME}
+      - POSTGRES_DATABASE_USERNAME=${POSTGRES_DATABASE_USERNAME}
+      - POSTGRES_DATABASE_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
+      - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
+      - KNN_K=${MISSION_PLANNER_KNN_K:-1}
+      - RANGE_SEARCH_RADIUS=${MISSION_PLANNER_RANGE_SEARCH_RADIUS:-2.0}
+      - MQTT_ENABLED=${MQTT_ENABLED:-true}
+      - MQTT_BROKER=${MQTT_BROKER:-localhost}
+      - MQTT_PORT=${MQTT_PORT_TCP:-1883}
+      - MQTT_KEEPALIVE=${MQTT_KEEPALIVE:-60}
+    network_mode: "host"
+    restart: on-failure
+    depends_on:
+      - mosquitto
+      - arangodb
+
+  # Create LiveKit Service
+  livekit-service:
+    build:
+      context: ..
+      dockerfile: packages/services/livekit/Dockerfile
+    image: ${LIVEKIT_SERVICE_IMAGE:-livekit_service:latest}
+    command: ["python", "-m", "packages.services.livekit.main",
+              "--port", "${LIVEKIT_PORT:-8006}",
+              "--host", "0.0.0.0"]
+    environment:
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - LIVEKIT_SERVER_URL=${LIVEKIT_SERVER_URL}
+      - LIVEKIT_TTL=${LIVEKIT_TTL:-36000}
+      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    network_mode: "host"
+    restart: on-failure
 
 
+  # Create API Delegation Service
+  api-delegation-service:
+    build:
+      context: ..
+      dockerfile: packages/api/Dockerfile
+    image: ${API_DELEGATION_SERVICE_IMAGE:-api_delegation_service:latest}
+    command: ["python", "-m", "packages.api.main",
+              "--port", "${API_DELEGATION_PORT:-8000}",
+              "--host", "0.0.0.0"]
+    environment:
+      - ARANGO_HOST=localhost
+      - ARANGO_PORT=${ARANGO_PORT:-8529}
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
+      - DATABASE_NAME=${GRAPH_DB_NAME:-topomap_db}
+      - MINIO_HOST=localhost
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - MINIO_SECURE=false
+      - MISSION_PLANNER_URL=http://localhost:${MISSION_PLANNER_PORT:-8005}
+      - LIVEKIT_URL=http://localhost:${LIVEKIT_PORT:-8006}
+      - POSTGRES_DATABASE_PORT=${POSTGRES_DATABASE_PORT}
+      - POSTGRES_DATABASE_NAME=${POSTGRES_DATABASE_NAME}
+      - POSTGRES_DATABASE_USERNAME=${POSTGRES_DATABASE_USERNAME}
+      - POSTGRES_DATABASE_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
+      - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
+      - ROSBAG_PRESIGN_EXPIRY=${ROSBAG_PRESIGN_EXPIRY:-3600}
+      - GRAPH_BUILDER_WS_URL=ws://localhost:${GRAPH_BUILDER_PORT:-8004}
+      - MISSION_DISPATCHER_WS_URL=ws://localhost:${DATABASE_API_PORT:-5000}
+    network_mode: "host"
+    restart: on-failure
+    depends_on:
+      - arangodb
+      - minio
+      - mission-planner-service
+      - livekit-service
+      - graph-builder-service
 
+volumes:
+  arango_data:
+  minio_data:

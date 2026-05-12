@@ -1,0 +1,11 @@
+# Mission Dispatch Service Requirements
+# Pinned to pydantic v1 to match Isaac Mission Dispatch upstream
+
+pydantic==1.9.0
+psycopg[binary,pool]==3.0.15
+paho-mqtt==1.6.1
+pyyaml==6.0
+py_trees==2.1.6
+requests==2.32.3
+fastapi==0.111.0
+uvicorn==0.30.1

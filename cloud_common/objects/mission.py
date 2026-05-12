@@ -35,6 +35,11 @@ class MissionNodeType(str, enum.Enum):
     CONSTANT = "constant"
 
 
+class MissionMode(str, enum.Enum):
+    MAPLESS = "mapless"
+    MAPPED = "mapped"
+
+
 class MissionStateV1(str, enum.Enum):
     """Enum defining the state of the mission."""
     # The mission has not yet been started
@@ -146,7 +151,7 @@ class MissionMoveNodeV1(pydantic.BaseModel):
     rotation: Optional[float] = pydantic.Field(
         description="The relative rotation that robot needs to move in radians")
 
-    @pydantic.root_validator
+    @pydantic.root_validator(skip_on_failure=True)
     def validate_mission_move_node_type(cls, values):
         types = ["distance", "rotation"]
         set_types = [type for type in types if values.get(type) is not None]
@@ -184,13 +189,13 @@ class MissionNodeV1(pydantic.BaseModel):
     parent: str = pydantic.Field(
         "root", description="A parent for the node")
     route: Optional[MissionRouteNodeV1] = pydantic.Field(
-        description="A list of poses for the robot to complete.")
+        None, description="A list of poses for the robot to complete.")
     move: Optional[MissionMoveNodeV1] = pydantic.Field(
-        description="A distance or relative rotation for the robot to complete.")
+        None, description="A distance or relative rotation for the robot to complete.")
     action: Optional[MissionActionNodeV1] = pydantic.Field(
-        description="An action for the robot to complete.")
+        None, description="An action for the robot to complete.")
     notify: Optional[MissionNotifyNodeV1] = pydantic.Field(
-        description="An API for Dispatch to call.")
+        None, description="An API for Dispatch to call.")
     selector: Optional[Dict] = pydantic.Field(
         None, description="When started, this node will start its first child. If the child \
             currently running returns FAILED, start the next child. If all children fail, \
@@ -201,10 +206,10 @@ class MissionNodeV1(pydantic.BaseModel):
             currently running returns SUCCESS, start the next child. If all children succeed, \
             this node returns SUCCESS. If any child fails, this node immediately returns FAILURE.")
     constant: Optional[MissionConstantNodeV1] = pydantic.Field(
-        description="A boolean describing the whether the node status should be a success \
+        None, description="A boolean describing the whether the node status should be a success \
             or failure when started")
 
-    @pydantic.root_validator
+    @pydantic.root_validator(skip_on_failure=True)
     def validate_mission_node_type(cls, values):
         types = [e.value for e in MissionNodeType]
         set_types = [type for type in types if values.get(type) is not None]
@@ -256,12 +261,24 @@ class MissionSpecV1(pydantic.BaseModel):
         datetime.timedelta(seconds=300),
         description="How long the mission is allowed to run before giving up.")
     deadline: Optional[datetime.datetime] = pydantic.Field(
-        description="When the mission must complete by before it is canceled.")
+        None, description="When the mission must complete by before it is canceled.")
     needs_canceled: bool = pydantic.Field(
         False, description="Marker for whether the mission is requested to be canceled"
     )
     update_nodes: Optional[Dict[str, MissionRouteNodeV1]] = pydantic.Field(
         None, description="Nodes need to be updated")
+    planned_path: Optional[List[str]] = pydantic.Field(
+        None, description="The sequence of topological node IDs for this mission"
+    )
+    mode: MissionMode = pydantic.Field(
+        MissionMode.MAPPED,
+        description="Whether this mission uses graph-based planning (mapped) or direct waypoints (mapless)."
+    )
+    register_map: bool = pydantic.Field(
+        True,
+        description="Whether the graph builder should record topology while this mission is running. "
+                    "Set to False for logging-only missions where no map should be built."
+    )
 
     @pydantic.validator("mission_tree")
     def _validate_at_least_one_node(cls, value):

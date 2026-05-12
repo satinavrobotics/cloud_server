@@ -21,16 +21,17 @@ import datetime
 import logging
 import sys
 import time
-from typing import Any, AsyncGenerator, Optional, Union
+from typing import Any, AsyncGenerator, Optional
 import uuid
 import enum
+import asyncio
 
 import fastapi
 import pydantic
 import psycopg
 from psycopg import sql
+from psycopg_pool import AsyncConnectionPool
 
-from packages.database import common
 import traceback
 
 from cloud_common import objects
@@ -60,11 +61,34 @@ async def initialize_database(connection: psycopg.AsyncConnection):
     await cursor.execute("CREATE INDEX IF NOT EXISTS mission_time_index " + \
                          f"ON {MissionObjectV1.table_name()} " + \
                          "((status->>'start_timestamp'));")
+    await cursor.execute("""CREATE TABLE IF NOT EXISTS mission_trajectory (
+        id         SERIAL PRIMARY KEY,
+        mission_id TEXT NOT NULL,
+        robot_name TEXT NOT NULL,
+        node_id    TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        x          FLOAT NOT NULL,
+        y          FLOAT NOT NULL,
+        yaw        FLOAT NOT NULL,
+        map_id     TEXT NOT NULL,
+        ts         TIMESTAMPTZ NOT NULL DEFAULT now()
+    );""")
+    await cursor.execute(
+        "CREATE INDEX IF NOT EXISTS trajectory_mission_idx "
+        "ON mission_trajectory (mission_id, seq);"
+    )
     await connection.commit()
 
 
-class PostgresWatcher(common.Watcher):
+class PostgresWatcher:
     """ Watches for updates to objects in a postgres database """
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
 
     def __init__(self, auth: str, object_class: objects.ApiObjectType,
                  publisher_id: uuid.UUID):
@@ -149,32 +173,39 @@ class PostgresWatcher(common.Watcher):
         pass
 
 
-class PostgresDatabase(common.Database):
+class PostgresDatabase:
     """ Stores and retrieves api objects in a postgres database """
 
-    def __init__(self, dbname: str, user: str, password: str, host: str, port: int):
+    def __init__(self, dbname: str, user: str, password: str, host: str, port: int, max_retries: Optional[int] = None):
         self._logger = logging.getLogger("Isaac Mission Database")
         self._auth = f"dbname={dbname} user={user} host={host} password={password} port={port}"
         self._host = host
-        self._connection: Optional[psycopg.AsyncConnection] = None
+        self._pool: Optional[AsyncConnectionPool] = None
+        self._max_retries = max_retries
+
+    def is_running(self) -> bool:
+        return self._pool is not None and not self._pool.closed
 
     async def async_init(self):
-        await self._get_connection()
+        await self._open_pool()
 
-    async def _get_connection(self) -> Union[psycopg.AsyncConnection, Any]:
-        # pylint: disable=return-value
-        if self._connection is None:
-            connected = False
-            while not connected:
-                try:
-                    self._connection = await psycopg.AsyncConnection.connect(self._auth)
-                    await initialize_database(self._connection)
-                    connected = True
-                except psycopg.OperationalError:
-                    self._logger.warning(
-                        "Could not connect to Postgres, retry in %ss", POSTGRES_RECONNECT_PERIOD)
-                    time.sleep(POSTGRES_RECONNECT_PERIOD)
-        return self._connection # pylint: disable=return-value
+    async def _open_pool(self):
+        retries = 0
+        while True:
+            try:
+                pool = AsyncConnectionPool(self._auth, min_size=2, max_size=10, open=False)
+                await pool.open(wait=True)
+                async with pool.connection() as conn:
+                    await initialize_database(conn)
+                self._pool = pool
+                return
+            except psycopg.OperationalError:
+                retries += 1
+                if self._max_retries is not None and retries >= self._max_retries:
+                    raise
+                self._logger.warning(
+                    "Could not connect to Postgres, retry in %ss", POSTGRES_RECONNECT_PERIOD)
+                await asyncio.sleep(POSTGRES_RECONNECT_PERIOD)
 
     async def _notify(self, cursor, table_name: str, name: str,
                       lifecycle: str, publisher_id: uuid.UUID):
@@ -184,7 +215,15 @@ class PostgresDatabase(common.Database):
 
     async def _commit_update(self, cursor, table_name: str, name: str,
                              publisher_id: uuid.UUID):
-        values = await cursor.fetchone()
+        if cursor.rowcount == 0:
+            raise fastapi.HTTPException(404,
+                                        f"Could not find object {name}")
+        try:
+            values = await cursor.fetchone()
+        except psycopg.ProgrammingError:
+            # Result set has no data (e.g. after a DELETE operation)
+            return
+
         if values is None:
             raise fastapi.HTTPException(400,
                                         f"Could not find object {name}")
@@ -203,7 +242,15 @@ class PostgresDatabase(common.Database):
                     extra_clause = query_map[param].format(str(value))
                 elif value is not None:
                     if isinstance(value, list):
-                        value_str = "('" + "', '".join(value) + "')"
+                        if not value:
+                            continue
+                        # If the value is a list, we format it as a SQL list (v1, v2, ...)
+                        # We also check if the query map uses '=' and convert it to 'IN' for lists
+                        value_str = "(" + ", ".join([f"'{v}'" for v in value]) + ")"
+                        clause = query_map[param]
+                        if " = " in clause and "{}" in clause:
+                            clause = clause.replace(" = ", " IN ")
+                        params_list.append(clause.format(value_str))
                     elif isinstance(value, enum.Enum):
                         value_str = str(value.value)
                     elif isinstance(value, bool):
@@ -212,158 +259,148 @@ class PostgresDatabase(common.Database):
                         value_str = value.isoformat()
                     else:
                         value_str = str(value)
-                    params_list.append(query_map[param].format(value_str))
+                    
+                    if not isinstance(value, list):
+                        params_list.append(query_map[param].format(value_str))
             if params_list:
                 query += " WHERE " + " AND ".join(params_list)
             query += extra_clause
         query += ";"
 
-        connection = await self._get_connection()
         try:
-            async with connection.cursor() as cursor:
-                await cursor.execute(query)
-                values = await cursor.fetchall()
-                return [object_class(name=name,
-                                     lifecycle=objects.ObjectLifecycleV1[lifecycle],
-                                     status=status, **spec)
-                        for name, lifecycle, spec, status in values]
-        except psycopg.OperationalError as err:
-            self._logger.error("Exit: %s", err)
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(query)
+                    values = await cursor.fetchall()
+                    return [object_class(name=name,
+                                         lifecycle=objects.ObjectLifecycleV1[lifecycle],
+                                         status=status, **spec)
+                            for name, lifecycle, spec, status in values]
+        except Exception as err:
+            self._logger.error("Error in list_objects: %s", err)
             traceback.print_exc()
-            sys.exit(1)
+            raise
 
     async def get_object(self, object_class: objects.ApiObjectType, name: str):
-        connection = await self._get_connection()
         try:
-            async with connection.cursor() as cursor:
-                query = f"SELECT * FROM {object_class.table_name()} WHERE name = %s;"
-                await cursor.execute(query, [name])
-                values = await cursor.fetchone()
-                if values is None:
-                    raise fastapi.HTTPException(
-                        status_code=400,
-                        detail=f"Did not find \"{object_class.get_alias()}\" with name \"{name}\"")
-                obj_name, lifecycle, spec, status = values
-                return object_class(name=obj_name,
-                                    lifecycle=objects.ObjectLifecycleV1[lifecycle],
-                                    status=status, **spec)
-        except psycopg.OperationalError as err:
-            self._logger.error("Exit: %s", err)
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    query = f"SELECT * FROM {object_class.table_name()} WHERE name = %s;"
+                    await cursor.execute(query, [name])
+                    values = await cursor.fetchone()
+                    if values is None:
+                        raise fastapi.HTTPException(
+                            status_code=404,
+                            detail=f"Did not find \"{object_class.get_alias()}\" with name \"{name}\"")
+                    obj_name, lifecycle, spec, status = values
+                    return object_class(name=obj_name,
+                                        lifecycle=objects.ObjectLifecycleV1[lifecycle],
+                                        status=status, **spec)
+        except fastapi.HTTPException:
+            raise
+        except Exception as err:
+            self._logger.error("Error in get_object: %s", err)
             traceback.print_exc()
-            sys.exit(1)
+            raise
 
     async def create_object(self, obj: objects.ApiObject, publisher_id: uuid.UUID):
-        connection = await self._get_connection()
         try:
-            async with connection.cursor() as cursor:
-                self._logger.info("Create object: %s:%s",
-                                  obj.table_name(), obj.name)
-                self._logger.info("   %s:%s:%s", obj.lifecycle.name,
-                                  obj.spec.json(), obj.status.json())
-                query = f"INSERT INTO {obj.table_name()} (name, lifecycle, spec, status) " \
-                        f"VALUES (%s, %s, %s, %s);"
-                await cursor.execute(query, [obj.name, obj.lifecycle.name,
-                                             obj.spec.json(), obj.status.json()])
-                await self._notify(cursor, obj.table_name(), obj.name,
-                                   obj.lifecycle.name, publisher_id)
-                await connection.commit()
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    self._logger.info("Create object: %s:%s",
+                                      obj.table_name(), obj.name)
+                    self._logger.info("   %s:%s:%s", obj.lifecycle.name,
+                                      obj.spec.json(), obj.status.json())
+                    query = f"INSERT INTO {obj.table_name()} (name, lifecycle, spec, status) " \
+                            f"VALUES (%s, %s, %s, %s);"
+                    await cursor.execute(query, [obj.name, obj.lifecycle.name,
+                                                 obj.spec.json(), obj.status.json()])
+                    await self._notify(cursor, obj.table_name(), obj.name,
+                                       obj.lifecycle.name, publisher_id)
                 return obj
         except psycopg.errors.UniqueViolation:
-            await connection.rollback()
             raise fastapi.HTTPException(
                 400,
                 f"Object {obj.get_alias()} with name {obj.name} already exists") # pylint: disable=raise-missing-from
+        except fastapi.HTTPException:
+            raise
         except Exception as err:  # pylint: disable=broad-except
-            self._logger.error("Exit: %s", err)
+            self._logger.error("Error in create_object: %s", err)
             traceback.print_exc()
-            sys.exit(1)
+            raise
 
     async def update_spec(self, object_class: objects.ApiObjectType, name: str, spec: Any,
                           publisher_id: uuid.UUID):
-        connection = await self._get_connection()
         try:
-            async with connection.cursor() as cursor:
-                query = f"UPDATE {object_class.table_name()} " \
-                        f"SET spec = %s WHERE name = %s RETURNING *;"
-                await cursor.execute(query, [spec.json(), name])
-                await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
-                await connection.commit()
-        except psycopg.OperationalError as err:
-            self._logger.error("Exit: %s", err)
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    query = f"UPDATE {object_class.table_name()} " \
+                            f"SET spec = %s WHERE name = %s RETURNING *;"
+                    await cursor.execute(query, [spec.json(), name])
+                    await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+        except Exception as err:
+            self._logger.error("Database error: %s", err)
             traceback.print_exc()
-            sys.exit(1)
+            raise
 
     async def update_status(self, object_class: objects.ApiObjectType, name: str, status: Any,
                             publisher_id: uuid.UUID):
-        connection = await self._get_connection()
         try:
-            async with connection.cursor() as cursor:
-                query = f"UPDATE {object_class.table_name()} " \
-                        "SET status = %s WHERE name = %s RETURNING *;"
-                await cursor.execute(query, [status.json(), name])
-                await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
-                await connection.commit()
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    query = f"UPDATE {object_class.table_name()} " \
+                            "SET status = %s WHERE name = %s RETURNING *;"
+                    await cursor.execute(query, [status.json(), name])
+                    await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+        except Exception as err:
+            self._logger.error("Database error: %s", err)
+            traceback.print_exc()
+            raise
+
+    async def set_lifecycle(self, object_class: objects.ApiObjectType, name: str,
+                            lifecycle: objects.ObjectLifecycleV1, publisher_id: uuid.UUID):
+        try:
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    query = f"UPDATE {object_class.table_name()} " \
+                        "SET lifecycle = %s WHERE name = %s RETURNING *;"
+                    await cursor.execute(query, [lifecycle.value, name])
+                    if lifecycle == objects.ObjectLifecycleV1.DELETED:
+                        await cursor.fetchone()
+                        query = f"DELETE FROM {object_class.table_name()} \
+                                  WHERE name = %s RETURNING *;"
+                        await cursor.execute(query, [name])
+                    await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
         except psycopg.OperationalError as err:
             self._logger.error("Exit: %s", err)
             traceback.print_exc()
             sys.exit(1)
 
-    async def set_lifecycle(self, object_class: objects.ApiObjectType, name: str,
-                            lifecycle: objects.ObjectLifecycleV1, publisher_id: uuid.UUID):
-        connection = await self._get_connection()
+    async def log_mission_waypoint(
+        self,
+        mission_id: str,
+        robot_name: str,
+        node_id: str,
+        seq: int,
+        x: float,
+        y: float,
+        yaw: float,
+        map_id: str,
+    ):
         try:
-            async with connection.cursor() as cursor:
-                query = f"UPDATE {object_class.table_name()} " \
-                    "SET lifecycle = %s WHERE name = %s RETURNING *;"
-                await cursor.execute(query, [lifecycle.value, name])
-                if lifecycle == objects.ObjectLifecycleV1.DELETED:
-                    await cursor.fetchone()
-                    query = f"DELETE FROM {object_class.table_name()} \
-                              WHERE name = %s RETURNING *;"
-                    await cursor.execute(query, [name])
-                await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
-                await connection.commit()
-        except psycopg.OperationalError as err:
-            self._logger.error("Exit: %s", err)
-            traceback.print_exc()
-            sys.exit(1)
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        "INSERT INTO mission_trajectory "
+                        "(mission_id, robot_name, node_id, seq, x, y, yaw, map_id) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s);",
+                        [mission_id, robot_name, node_id, seq, x, y, yaw, map_id]
+                    )
+        except Exception as err:
+            self._logger.error("Error in log_mission_waypoint: %s", err)
 
     async def get_watcher(self, object_class: objects.ApiObjectType,
                           publisher_id: uuid.UUID) -> PostgresWatcher:
         return PostgresWatcher(self._auth, object_class, publisher_id)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    common.WebServer.add_parser_args(parser)
-    parser.add_argument("--db_name", default="mission",
-                        help="The name of database to connect to in postgres")
-    parser.add_argument("--db_username", default="postgres",
-                        help="The postgres username to use")
-    parser.add_argument("--db_host", default="localhost",
-                        help="The hostname of the postgres server")
-    parser.add_argument("--db_port", default=5432, type=int,
-                        help="The port to connect to on the postgres server")
-    parser.add_argument("--access_log", action="store_true",
-                        help="This controls whether Uvicorn access logs are emitted")
-    db_password_group = parser.add_mutually_exclusive_group()
-    db_password_group.add_argument("--db_password", default="postgres",
-                                   help="The postgres password to use")
-    db_password_group.add_argument("--db_password_file",
-                                   help="A file to read the postgres password from")
-    args = parser.parse_args()
-
-    if args.db_password_file is not None:
-        with open(args.db_password_file, encoding="utf-8") as file:
-            db_password = file.read()
-    else:
-        db_password = args.db_password
-
-    database = PostgresDatabase(args.db_name, args.db_username, db_password, args.db_host,
-                                args.db_port)
-    server = common.WebServer(database, args)
-    server.run()
-
-
-if __name__ == "__main__":
-    main()

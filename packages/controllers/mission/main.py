@@ -41,8 +41,16 @@ if __name__ == "__main__":
                         help="The Username to authenticate to MQTT broker")
     parser.add_argument("--mqtt_password", default=None,
                         help="The password to authenticate to MQTT broker")
-    parser.add_argument("--database_url", default="http://localhost:5001",
-                        help="The url where the database REST API is hosted")
+    parser.add_argument("--postgres-db", default="mission",
+                        help="The name of the postgres database")
+    parser.add_argument("--postgres-user", default="postgres",
+                        help="The username for the postgres database")
+    parser.add_argument("--postgres-password", default="postgres",
+                        help="The password for the postgres database")
+    parser.add_argument("--postgres-host", default="localhost",
+                        help="The hostname of the postgres database")
+    parser.add_argument("--postgres-port", default=5432, type=int,
+                        help="The port of the postgres database")
     parser.add_argument("--mission_ctrl_url", default=None,
                         help="The url where the mission control REST API is hosted")
     parser.add_argument("--log_level", default="INFO", choices=LOGGING_LEVELS,

@@ -1,0 +1,16 @@
+# Test reports and artifacts
+reports/
+*.coverage
+.coverage
+htmlcov/
+.pytest_cache/
+__pycache__/
+
+# Test databases
+*.db
+*.sqlite
+
+# Temporary test files
+*.tmp
+*.log
+

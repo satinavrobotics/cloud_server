@@ -517,6 +517,7 @@ class VDA5050State(pydantic.BaseModel):
     safetyState: VDA5050SafetyStatus
     velocity: Optional[VDA5050Velocity]
     zoneSetId: Optional[str] = ""
+    recordingState: Optional[str] = None
 
     @pydantic.validator("operatingMode", pre=True)
     def default_operating_mode(cls, v):
@@ -527,25 +528,25 @@ class VDA5050State(pydantic.BaseModel):
 
 class VDA5050TypeSpecification(pydantic.BaseModel):
     """Describes general properties of a robot"""
-    seriesName: Optional[str]
-    seriesDescription: Optional[str]
-    agvKinematic: Optional[str]
+    seriesName: Optional[str] = None
+    seriesDescription: Optional[str] = None
+    agvKinematic: Optional[str] = None
     agvClass: str = "CARRIER"
-    maxLoadMass: Optional[float]
-    localizationTypes: Optional[List[str]]
-    navigationTypes: Optional[List[str]]
+    maxLoadMass: Optional[float] = None
+    localizationTypes: Optional[List[str]] = None
+    navigationTypes: Optional[List[str]] = None
 
 
 class VDA5050PhysicalParameters(pydantic.BaseModel):
     """Describes physical properties of a robot"""
-    speedMin: Optional[float]
+    speedMin: Optional[float] = None
     speedMax: float = 1
-    accelerationMax: Optional[float]
-    decelerationMax: Optional[float]
-    heightMin: Optional[float]
-    heightMax: Optional[float]
-    width: Optional[float]
-    length: Optional[float]
+    accelerationMax: Optional[float] = None
+    decelerationMax: Optional[float] = None
+    heightMin: Optional[float] = None
+    heightMax: Optional[float] = None
+    width: Optional[float] = None
+    length: Optional[float] = None
 
 
 # # # # # # # # # # # # # # # # # # # #
@@ -573,6 +574,18 @@ class VDA5050LocalizationParameters(pydantic.BaseModel):
     temporary: int
 
 
+class VDA5050ActionDefinition(pydantic.BaseModel):
+    """Definition of a custom action available on a robot"""
+    actionType: str = pydantic.Field(..., description="Unique identifier for the action type")
+    actionDescription: str = pydantic.Field("", description="Human-readable description of the action")
+    actionParameters: List[VDA5050ActionParameter] = pydantic.Field(
+        [], description="List of parameters this action accepts")
+    blockingType: VDA5050ActionBlockingType = pydantic.Field(
+        VDA5050ActionBlockingType.HARD, description="Default blocking type for this action")
+    iconHint: Optional[str] = pydantic.Field(
+        None, description="Icon hint for UI display")
+
+
 class VDA5050Factsheet(pydantic.BaseModel):
     """Specification information specific to each robot type"""
     headerId: int = 0
@@ -587,6 +600,8 @@ class VDA5050Factsheet(pydantic.BaseModel):
     agvGeometry: Optional[VDA5050AGVGeometry]
     loadSpecification: Optional[VDA5050LoadSpecification]
     localizationParameters: Optional[VDA5050LocalizationParameters]
+    actions: Optional[List[VDA5050ActionDefinition]] = pydantic.Field(
+        None, description="List of custom actions available on this robot")
 
 
 class VDA5050Visualization(pydantic.BaseModel):

@@ -22,9 +22,10 @@ from cloud_common.objects.mission import MissionObjectV1
 from cloud_common.objects.object import ApiObject, ApiObjectMethod, ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
+from cloud_common.objects.map import MapObjectV1
 
 ALL_OBJECTS: List[Type[ApiObject]] = [
-    RobotObjectV1, MissionObjectV1, DetectionResultsObjectV1]
+    RobotObjectV1, MissionObjectV1, DetectionResultsObjectV1, MapObjectV1]
 OBJECT_DICT: Dict[str, Type[ApiObject]] = {
     obj.get_alias(): obj for obj in ALL_OBJECTS}
 

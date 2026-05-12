@@ -1,0 +1,34 @@
+services:
+  # Dev overrides build specific services from local source instead of relying on pre-built images.
+  livekit-service:
+    build:
+      context: ..
+      dockerfile: packages/services/livekit/Dockerfile
+
+  api-delegation-service:
+    build:
+      context: ..
+      dockerfile: packages/api/Dockerfile
+
+  # Dummy Robot for Testing
+  dummy-robot:
+    build:
+      context: ..
+      dockerfile: tests/dummy_robot/Dockerfile
+    image: ${DUMMY_ROBOT_IMAGE:-dummy_robot:latest}
+    command: ["python", "tests/dummy_robot/dummy_robot.py",
+              "--robot_name", "${DUMMY_ROBOT_NAME:-dummy_robot_01}",
+              "--mqtt_host", "localhost",
+              "--mqtt_port", "${MQTT_PORT_TCP:-1883}",
+              "--mqtt_prefix", "uagv/v2/RobotCompany",
+              "--node_topic", "${GRAPH_BUILDER_MQTT_TOPIC:-robot/node_update}",
+              "--map_id", "${IMAGE_DB_DEFAULT_MAP:-default}",
+              "--loop_radius", "${DUMMY_ROBOT_LOOP_RADIUS:-10.0}",
+              "--speed", "${DUMMY_ROBOT_SPEED:-1.0}",
+              "--tick_period", "${DUMMY_ROBOT_TICK_PERIOD:-1.0}"]
+    network_mode: "host"
+    restart: on-failure
+    depends_on:
+      - mosquitto
+      - mission-dispatch
+      - graph-builder-service

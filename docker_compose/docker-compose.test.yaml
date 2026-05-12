@@ -1,0 +1,458 @@
+# Docker Compose for Testing
+# Runs tests in isolated containers with all dependencies
+
+services:
+  # ==================== Test Runner ====================
+
+  test-runner:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: cloud_server_test_runner
+    volumes:
+      # Mount source code for live updates
+      - ../packages:/app/packages:ro
+      - ../cloud_common:/app/cloud_common:ro
+      - ../tests:/app/tests:ro
+      # Mount output directories for reports
+      - ../tests/reports:/app/tests/reports
+    environment:
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - PYTHONPATH=/app
+      - PYTEST_ADDOPTS=--color=yes
+    command: pytest tests/unit -v --cov=packages --cov-report=html --cov-report=term-missing
+    networks:
+      - test-network
+
+  # ==================== Unit Tests Only ====================
+
+  test-unit:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: cloud_server_test_unit
+    volumes:
+      - ../packages:/app/packages:ro
+      - ../cloud_common:/app/cloud_common:ro
+      - ../tests:/app/tests:ro
+      - ../tests/reports:/app/tests/reports
+    environment:
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - PYTHONPATH=/app
+    command: pytest tests/unit -v -m unit --cov=packages --cov-report=html --cov-report=term-missing
+    networks:
+      - test-network
+
+  # ==================== Integration Tests with Dependencies ====================
+
+  test-integration:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: cloud_server_test_integration
+    volumes:
+      - ../packages:/app/packages:ro
+      - ../cloud_common:/app/cloud_common:ro
+      - ../tests:/app/tests:ro
+      - ../tests/reports:/app/tests/reports
+    environment:
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - PYTHONPATH=/app
+      # Database containers
+      - ARANGODB_HOST=arangodb-test
+      - ARANGODB_PORT=8529
+      - MINIO_HOST=minio-test
+      - MINIO_PORT=9000
+      - POSTGRES_HOST=postgres-test
+      - POSTGRES_PORT=5432
+      # Microservice URLs
+      - GRAPH_BUILDER_URL=http://graph-builder-service-test:8004
+      - MISSION_PLANNER_URL=http://mission-planner-service-test:8005
+      - MISSION_DISPATCH_URL=http://mission-dispatch-test:8080
+      - API_DELEGATION_URL=http://api-delegation-service-test:8000
+      - MISSION_DATABASE_URL=http://api-delegation-service-test:8000
+      - MQTT_HOST=mosquitto-test
+      - MQTT_PORT=1883
+    command: pytest tests/integration -v -m integration --cov=packages --cov-report=html --cov-report=term-missing
+    depends_on:
+      mosquitto-test:
+        condition: service_healthy
+      arangodb-test:
+        condition: service_started
+      graph-builder-service-test:
+        condition: service_healthy
+      mission-planner-service-test:
+        condition: service_healthy
+      api-delegation-service-test:
+        condition: service_healthy
+    networks:
+      - test-network
+
+  # ==================== Scenario Tests with All Services ====================
+
+  test-scenario:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    container_name: cloud_server_test_scenario
+    volumes:
+      - ../packages:/app/packages:ro
+    environment:
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - PYTHONPATH=/app
+    command: pytest tests/scenarios -v -m scenario --cov=packages --cov-report=html --cov-report=term-missing
+    depends_on:
+      mosquitto-test:
+        condition: service_healthy
+      arangodb-test:
+        condition: service_started
+      graph-builder-service-test:
+        condition: service_healthy
+      mission-planner-service-test:
+        condition: service_healthy
+      api-delegation-service-test:
+        condition: service_healthy
+    networks:
+      - test-network
+
+  # ==================== E2E Tests with All Services ====================
+
+  test-e2e:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    environment:
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - PYTHONPATH=/app
+      - ../cloud_common:/app/cloud_common:ro
+      - ../tests:/app/tests:ro
+      - ../tests/reports:/app/tests/reports
+    command: pytest tests/e2e -v -m e2e --cov=packages --cov-report=html --cov-report=term-missing
+    depends_on:
+      mosquitto-test:
+        condition: service_healthy
+      arangodb-test:
+        condition: service_started
+      graph-builder-service-test:
+        condition: service_healthy
+      mission-planner-service-test:
+        condition: service_healthy
+      api-delegation-service-test:
+        condition: service_healthy
+      mission-dispatch-test:
+        condition: service_healthy
+    networks:
+      - test-network
+
+  # ==================== Test Dependencies ====================
+
+  # ArangoDB for integration tests
+  arangodb-test:
+    image: arangodb:3.11
+    container_name: cloud_server_arangodb_test
+    environment:
+      ARANGO_NO_AUTH: 1
+    ports:
+      - "8529:8529"
+    networks:
+      - test-network
+    tmpfs:
+      - /var/lib/arangodb3
+
+  # MinIO for integration tests
+  minio-test:
+    image: minio/minio:latest
+    container_name: cloud_server_minio_test
+    command: server /data --console-address ":9091"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9090:9000"
+      - "9091:9091"
+    networks:
+      - test-network
+    tmpfs:
+      - /data
+
+  # PostgreSQL for integration tests
+  postgres-test:
+    image: postgres:15
+    container_name: cloud_server_postgres_test
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: test_db
+    ports:
+      - "5432:5432"
+    networks:
+      - test-network
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U test_user" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # MQTT Broker for integration tests
+  mosquitto-test:
+    image: eclipse-mosquitto:latest
+    container_name: cloud_server_mosquitto_test
+    ports:
+      - "1893:1883"
+      - "9011:9001"
+    networks:
+      - test-network
+    volumes:
+      - ../packages/utils/test_utils/mosquitto.sh:/mosquitto.sh
+    command:
+      - /bin/sh
+      - -c
+      - |
+        sh /mosquitto.sh "1883" "9001"
+    healthcheck:
+      test: [ "CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -W 1 || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # ==================== Microservice Containers for Integration Tests ====================
+
+  # Mission Dispatch Service (built from source)
+  mission-dispatch-test:
+    build:
+      context: ..
+      dockerfile: packages/controllers/mission/Dockerfile
+    container_name: cloud_server_mission_dispatch_test
+    environment:
+      - MQTT_HOST=mosquitto-test
+      - MQTT_PORT=1883
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+    command: [ "python", "packages/controllers/mission/main.py", "--mqtt_host", "mosquitto-test", "--mqtt_port", "1883", "--mqtt_transport", "tcp", "--postgres-db", "test_db", "--postgres-user", "test_user", "--postgres-password", "test_password", "--postgres-host", "postgres-test", "--postgres-port", "5432" ]
+    ports:
+      - "8080:8080"
+    networks:
+      - test-network
+    depends_on:
+      mosquitto-test:
+        condition: service_healthy
+      postgres-test:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "ps aux | grep -i 'mission.*main.py' | grep -v grep || exit 1" ]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Graph Builder Service
+  graph-builder-service-test:
+    build:
+      context: ..
+      dockerfile: packages/services/graph_builder/Dockerfile
+    container_name: cloud_server_graph_builder_test
+    environment:
+      - MQTT_HOST=mosquitto-test
+      - MQTT_PORT=1883
+      - MQTT_TOPIC=robot/node_update
+      - ARANGO_HOST=arangodb-test
+      - ARANGO_PORT=8529
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=test
+      - DATABASE_NAME=test_topomap_db
+      - MINIO_HOST=minio-test
+      - MINIO_PORT=9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - DISTANCE_THRESHOLD=5.0
+      - RADIUS_THRESHOLD=5.0
+      - DEFAULT_MAP_ID=test_map
+      - ARANGO_PASSWORD=test
+      - POSTGRES_DATABASE_NAME=test_db
+      - POSTGRES_DATABASE_USERNAME=test_user
+      - POSTGRES_DATABASE_PASSWORD=test_password
+      - POSTGRES_DATABASE_HOST=postgres-test
+      - POSTGRES_DATABASE_PORT=5432
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+    ports:
+      - "8004:8004"
+    networks:
+      - test-network
+    depends_on:
+      mosquitto-test:
+        condition: service_healthy
+      arangodb-test:
+        condition: service_started
+      minio-test:
+        condition: service_started
+      postgres-test:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8004/health" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Mission Planner Service
+  mission-planner-service-test:
+    build:
+      context: ..
+      dockerfile: packages/services/mission_planner/Dockerfile
+    container_name: cloud_server_mission_planner_test
+    environment:
+      - ARANGO_HOST=arangodb-test
+      - ARANGO_PORT=8529
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=test
+      - DATABASE_NAME=test_topomap_db
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - POSTGRES_DATABASE_NAME=test_db
+      - POSTGRES_DATABASE_USERNAME=test_user
+      - POSTGRES_DATABASE_PASSWORD=test_password
+      - POSTGRES_DATABASE_HOST=postgres-test
+      - POSTGRES_DATABASE_PORT=5432
+      - DEFAULT_MAP_ID=test_map
+      - KNN_K=1
+      - RANGE_SEARCH_RADIUS=5.0
+    ports:
+      - "8005:8005"
+    networks:
+      - test-network
+    depends_on:
+      arangodb-test:
+        condition: service_started
+      postgres-test:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8005/health" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # API Delegation Service
+  api-delegation-service-test:
+    build:
+      context: ..
+      dockerfile: packages/api/Dockerfile
+    container_name: cloud_server_api_delegation_test
+    environment:
+      - ARANGO_HOST=arangodb-test
+      - ARANGO_PORT=8529
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=test
+      - DATABASE_NAME=test_topomap_db
+      - MINIO_HOST=minio-test
+      - MINIO_PORT=9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MISSION_PLANNER_URL=http://mission-planner-service-test:8005
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - POSTGRES_DATABASE_NAME=test_db
+      - POSTGRES_DATABASE_USERNAME=test_user
+      - POSTGRES_DATABASE_PASSWORD=test_password
+      - POSTGRES_DATABASE_HOST=postgres-test
+      - POSTGRES_DATABASE_PORT=5432
+      - DEFAULT_MAP_ID=test_map
+      - GRAPH_BUILDER_WS_URL=ws://graph-builder-service-test:8004
+      - MISSION_DISPATCHER_WS_URL=ws://mission-dispatch-test:8080
+    ports:
+      - "8000:8000"
+    networks:
+      - test-network
+    depends_on:
+      arangodb-test:
+        condition: service_started
+      minio-test:
+        condition: service_started
+      mission-planner-service-test:
+        condition: service_healthy
+      postgres-test:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ==================== Parallel Test Execution ====================
+
+  test-parallel:
+    environment:
+      - ARANGO_PASSWORD=test
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_db
+      - PYTHONPATH=/app
+    container_name: cloud_server_test_parallel
+    volumes:
+      - ../packages:/app/packages:ro
+      - ../cloud_common:/app/cloud_common:ro
+      - ../tests:/app/tests:ro
+      - ../tests/reports:/app/tests/reports
+    command: pytest tests/unit -v -n auto --cov=packages --cov-report=html --cov-report=term-missing
+    networks:
+      - test-network
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    depends_on:
+      mosquitto-test:
+        condition: service_healthy
+      arangodb-test:
+        condition: service_started
+      graph-builder-service-test:
+        condition: service_healthy
+      mission-planner-service-test:
+        condition: service_healthy
+      api-delegation-service-test:
+        condition: service_healthy
+      mission-dispatch-test:
+        condition: service_healthy
+networks:
+  test-network:
+    driver: bridge

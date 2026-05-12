@@ -1,0 +1,8 @@
+fastapi==0.109.1
+uvicorn==0.17.6
+pydantic==1.9.0
+psycopg[binary,pool]==3.0.15
+httpx>=0.27.0
+paho-mqtt>=1.6.1
+python-arango>=7.9.0
+minio>=7.2.0

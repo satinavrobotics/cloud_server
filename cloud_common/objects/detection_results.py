@@ -68,7 +68,7 @@ class DetectedObject(pydantic.BaseModel):
     object_id: int = 0
     class_id: str = ''
 
-    @pydantic.root_validator
+    @pydantic.root_validator(skip_on_failure=True)
     def check_f1_f2(cls, values):
         bbox_2d = values.get('bbox2d')
         bbox_3d = values.get('bbox3d')

@@ -30,11 +30,4 @@ class TelemetrySender:
 
     def send_telemetry(self, metrics: Dict,
                        service_name: str = "DISPATCH"):
-        """
-        Send telemetry data
-
-        Args:
-            metrics: metric dictionary to send
-            index: the index to send the info to
-        """
-        self.logger.debug("Send telemetry data.")
+        pass

@@ -26,8 +26,8 @@ from typing import Dict, List, NamedTuple, Tuple, Optional
 from cloud_common import objects as api_objects
 from cloud_common.objects import robot as robot_object
 from packages.controllers.mission.tests import client as simulator
-from packages.database import client as db_client
-from packages.utils import test_utils
+from tests.sync_db_client import SyncDatabaseClient as db_client
+from tests.utils import test_utils
 import requests
 import logging
 
@@ -153,9 +153,9 @@ class TestContext:
 
         # Create db client
         self.md_url = f"http://{self.database_address}:{DATABASE_PORT}"
-        self.db_client = db_client.DatabaseClient(self.md_url)
+        self.db_client = db_client()
         self.md_ctrl_url = f"http://{self.database_address}:{DATABASE_CONTROLLER_PORT}"
-        self.db_controller_client = db_client.DatabaseClient(self.md_ctrl_url)
+        self.db_controller_client = db_client()
 
     def wait_for_database(self):
         test_utils.wait_for_port(

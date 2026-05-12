@@ -18,7 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 """
 import datetime
 import enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import pydantic
 from fastapi import Query
@@ -71,9 +71,27 @@ class RobotHardwareVersionV1(pydantic.BaseModel):
     serial_number: str = ""
 
 
+class CustomActionParameterV1(pydantic.BaseModel):
+    """Parameter definition for a custom action"""
+    key: str = ""
+    value: str = ""
+
+
+class CustomActionV1(pydantic.BaseModel):
+    """Definition of a custom VDA5050 action available on a robot"""
+    action_type: str = ""
+    action_id: str = ""
+    action_description: str = ""
+    action_parameters: List[CustomActionParameterV1] = []
+    blocking_type: str = "HARD"
+    icon_hint: Optional[str] = None
+
+
 class RobotTypeIdentifierV1(pydantic.BaseModel):
     agv_class: str = ""
     speed_max: float = -1
+    custom_actions: List[CustomActionV1] = pydantic.Field(
+        [], description="List of custom VDA5050 actions available on this robot")
 
 
 class RobotBatterySpecV1(pydantic.BaseModel):
@@ -96,6 +114,9 @@ class RobotStatusV1(pydantic.BaseModel):
         None, description="Data collected from the mission client.")
     errors: Dict = pydantic.Field(
         {}, description="Key value pairs to describe if something is wrong with the robot.")
+    recording_state: Optional[str] = pydantic.Field(
+        None, description="Recording state reported by the robot: 'idle' or 'running'. "
+                          "None if recording is not available on this robot.")
 
 
 class RobotSpecV1(pydantic.BaseModel):
@@ -111,6 +132,19 @@ class RobotSpecV1(pydantic.BaseModel):
     switch_teleop: bool = pydantic.Field(
         False, description="Toggle the mode of the robot to TELEOP."
     )
+    current_map: Optional[str] = pydantic.Field(
+        None, description="The map ID that this robot is currently operating on. "
+                          "Set via PUT /api/v1/robots/{robot_name}/map."
+    )
+    position_mode: Literal['local', 'gps'] = pydantic.Field(
+        'local',
+        description="'local' = robot publishes odometry in local Cartesian (x, y, theta); "
+                    "'gps' = robot publishes GPS coordinates (x=lat, y=lon)."
+    )
+    ip_address: Optional[str] = pydantic.Field(
+        None, description="IPv4 address of the robot, updated on each startup.")
+    entrypoint_port: Optional[int] = pydantic.Field(
+        None, description="Port for accessing robot APIs, updated on each startup.")
 
 
 class RobotQueryParamsV1(pydantic.BaseModel):
@@ -152,10 +186,10 @@ class RobotObjectV1(RobotSpecV1, object.ApiObject):
         return {
             "min_battery": "(status->'battery_level')::float >= {}",
             "max_battery": "(status->'battery_level')::float <= {}",
-            "names": "name in {}",
+            "names": "name IN {}",
             "state": "status->>'state' = '{}'",
             "online": "status->>'online' = '{}'",
-            "robot_type": "(status->'factsheet'->>'agv_class')::text = '{}'"
+            "robot_type": "(status->'factsheet'->>'agv_class')::text IN {}"
         }
 
     @classmethod

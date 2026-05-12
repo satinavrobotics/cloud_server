@@ -1,0 +1,86 @@
+E2E Test Fixes for Mission Planner - Get Mission Plan Feature
+================================================================
+
+ISSUE:
+------
+E2E test `test_create_and_retrieve_mission_plan` was failing with:
+  AssertionError: Mission ID should be returned
+  assert None is not None
+
+ROOT CAUSE:
+-----------
+The test was trying to create a navigation mission without first creating
+a robot in the database. The mission_planner service's `plan_and_execute_mission`
+method calls `find_closest_node_to_robot()` which queries the robot from the
+database to get its current position. Without a robot in the database, the
+mission creation fails.
+
+FIX APPLIED:
+------------
+1. Added `mission_database_service` fixture to test parameters
+2. Created a robot in the database BEFORE creating the navigation mission
+3. Added proper cleanup to delete both mission and robot after test
+
+CHANGES:
+--------
+File: tests/e2e/mission_planner/test_get_mission_plan_e2e.py
+
+Test: test_create_and_retrieve_mission_plan
+  - Added robot creation step with proper status/pose data
+  - Added 1 second wait for robot registration
+  - Added cleanup for both mission and robot
+  - Improved error messages
+
+Test: test_get_mission_plan_multiple_missions
+  - Added robot creation for each mission
+  - Added cleanup for all missions and robots
+  - Added 0.5 second wait between robot registrations
+
+ROBOT DATA FORMAT:
+------------------
+Robots must be created in TWO steps:
+
+1. CREATE robot (POST /robot) - Only spec fields allowed:
+{
+  "name": "robot_name",
+  "labels": ["test", "e2e"]
+}
+
+2. UPDATE robot status (PATCH /robot/{name}) - Set pose for mission planner:
+{
+  "status": {
+    "pose": {
+      "x": 0.0,
+      "y": 0.0,
+      "theta": 0.0,
+      "map_id": "map_id"
+    }
+  }
+}
+
+NOTE: The Mission Database API does NOT allow "status" in the CREATE request.
+Status is managed by the system and can only be updated via PATCH after creation.
+
+UNRELATED FAILURE:
+------------------
+The test `test_mission_dispatcher_orders_e2e.py::test_order_dispatch_on_mission_creation`
+is also failing, but this is UNRELATED to our changes. This test is for the
+Mission Dispatcher service and tests VDA5050 order dispatch via MQTT. The failure
+indicates that the Mission Dispatcher service may not be running or not properly
+dispatching orders. This is a pre-existing issue in the Mission Dispatcher service,
+not caused by the get_mission_plan feature implementation.
+
+RUNNING E2E TESTS:
+------------------
+E2E tests require all services to be running:
+  - Graph DB (port 6001)
+  - Mission Database (port 5000)
+  - Mission Planner (port 8080)
+  - Mission Dispatcher (port 8081) - for dispatcher tests only
+
+To run only the mission planner E2E tests:
+  python3 -m pytest tests/e2e/mission_planner/test_get_mission_plan_e2e.py -v
+
+To skip the unrelated dispatcher test:
+  python3 -m pytest tests/e2e/mission_planner/ -v
+

@@ -1,0 +1,44 @@
+CLIENT:
+ - calls goTo on REST BRIDGE via REST, waits for status on WebSocket
+ - calls loadMap on REST BRIDGE via REST, waits for status on WebSocket
+ - waits for map updates on WebSocket
+ - queries REST BRIDGE via REST for images
+ - queries REST BRIDGE via REST for mission status
+
+ROBOT:
+ - publishes new node via MQTT
+ - publishes telemetry via MQTT
+ - asks for help via MQTT (include in telemetry?)
+ - receives missions via MQTT
+
+REST BRIDGE:
+ - serves loadMap requests over REST, queries graph db, opens websocket for graph builder for this map
+ - serves loadImage requests over REST, queries image db
+ - proxy for goTo requests for mission planner microservice
+ - proxy for mission planner microservice
+ - proxy for Mission Dispatch status getters
+ - proxy for graph builder map updates
+
+MISSION PLANNER MICROSERVICE:
+ - serves goTo requests
+    - check closest node to robot (query this from mission dispatch robot status, run knn on graph service)
+    - check closest node to target (range search) -
+    - find path between node (graph db query)
+    - send mission to Mission Dispatcher in the right format
+    - return with success (with planned path) or failure (where it went wrong)
+
+GRAPH BUILDER MICROSERVICE:
+ - serves new node updates on MQTT
+    - save image + features to image db
+    - make connections to existing nodes (range search + similarity)
+    - save to graph db
+    - publish map updates to websocket
+
+SIMILARITY MICROSERVICE
+- queried to tell distance/traversability between two nodes in graph db
+
+GRAPH DATABASE
+ - arango db
+
+IMAGE DATABASE
+ - minio

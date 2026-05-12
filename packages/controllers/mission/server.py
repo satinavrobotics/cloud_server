@@ -24,19 +24,19 @@ import datetime
 import json
 import logging
 import re
-import requests  # type: ignore
-import socket
-import time
-import threading
+import requests
+import sys
 from typing import Any, Dict, List, Optional, Union, cast
 from collections import OrderedDict
 
-import paho.mqtt.client as mqtt_client
 import pydantic
 
+from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import behavior_tree
 import packages.controllers.mission.vda5050_types as types
-import packages.database.client as db_client
+from packages.database.postgres import PostgresDatabase
+from packages.config import GPS_MAP_SENTINEL
+from packages.utils.geo import gps_to_local
 from packages.utils import metrics
 import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
@@ -85,7 +85,7 @@ class ClientFactsheetMessage(ClientMessage):
 class Robot:
     """Manages the mission state of a particular robot"""
 
-    def __init__(self, name: str, db: db_client.DatabaseClient, client: mqtt_client.Client,
+    def __init__(self, name: str, db: PostgresDatabase, client: MQTTClient,
                  prefix: str, server: "RobotServer"):
         self._logger = logging.getLogger("Isaac Mission Dispatch")
         self._name = name
@@ -95,14 +95,10 @@ class Robot:
         self._robot_object: Optional[api_objects.RobotObjectV1] = None
         self._detection_results_object: Optional[api_objects.DetectionResultsObjectV1] = None
         # Try to get existing detected objects.
-        try:
-            self._detection_results_object = cast(
-                api_objects.DetectionResultsObjectV1,
-                self._database.get(
-                    api_objects.DetectionResultsObjectV1, self._name)
-            )
-        except api_objects.common.ICSError:
-            pass
+        # This will be awaited later or handled directly. In this legacy block, it was synchronous.
+        # Since PostgresDatabase methods are async, we can't await in __init__.
+        # For now, we initialize to None and will handle it appropriately.
+        self._detection_results_object = None
         self._missions: OrderedDict[str,
                                     api_objects.MissionObjectV1] = OrderedDict()
         self._current_mission: Optional[api_objects.MissionObjectV1] = None
@@ -299,7 +295,8 @@ class Robot:
             self._robot_online_task = \
                 asyncio.get_event_loop().create_task(self._check_robot_online())
 
-            if not self._robot_server.disable_request_factsheet:
+            if (not self._robot_server.disable_request_factsheet
+                    and self._robot_object.status.factsheet.agv_class == ""):
                 action_id = f"instantaction-n{self._header_id}"
                 factsheet_action_type = types.VDA5050InstantActionType.FACTSHEET_REQUEST
                 instant_action = types.VDA5050Action(
@@ -322,6 +319,18 @@ class Robot:
                 self.debug(
                     "Robot is idle and delete request received, deleting robot.")
                 await self._delete_robot_object()
+
+            # Re-request factsheet if not yet received (robot may have restarted MQTT)
+            if (not self._robot_server.disable_request_factsheet and
+                    self._robot_object.status.factsheet.agv_class == ""):
+                action_id = f"instantaction-n{self._header_id}"
+                factsheet_action_type = types.VDA5050InstantActionType.FACTSHEET_REQUEST
+                instant_action = types.VDA5050Action(
+                    actionType=factsheet_action_type, actionId=action_id)
+                self.info(
+                    f"FACTSHEET INFO: Re-sending {factsheet_action_type.value} action.")
+                await self._send_instant_action(instant_action)
+                self._current_instant_actions[action_id] = instant_action
 
             # Teleop update
             if (message.switch_teleop and
@@ -379,7 +388,39 @@ class Robot:
                 await self._send_instant_action(instant_action)
                 self.mission_info(
                     f"Resend {instant_action.actionType} instant action.")
-        return finished_instant_actions
+    async def _apply_gps_position(self, lat: float, lon: float, theta: float) -> None:
+        """Store GPS position. latitude/longitude hold raw WGS84 degrees; x/y hold local-frame metres.
+
+        If no datum is registered for the robot's current map, x/y are not updated
+        (remain 0.0). Mission planning will fail with a clear datum-missing error.
+        """
+        self._robot_object.status.pose.latitude = lat
+        self._robot_object.status.pose.longitude = lon
+        self._robot_object.status.pose.theta = theta
+
+        current_map = self._robot_object.current_map
+        self._robot_object.status.pose.map_id = current_map if current_map else GPS_MAP_SENTINEL
+
+        if current_map and current_map != GPS_MAP_SENTINEL:
+            try:
+                map_obj = await self._database.get_object(api_objects.MapObjectV1, current_map)
+                if (map_obj and map_obj.datum_latitude is not None
+                        and map_obj.datum_longitude is not None):
+                    x, y = gps_to_local(
+                        lat, lon,
+                        map_obj.datum_latitude,
+                        map_obj.datum_longitude,
+                        map_obj.datum_bearing_deg,
+                    )
+                    self._robot_object.status.pose.x = x
+                    self._robot_object.status.pose.y = y
+                    return
+            except Exception as e:
+                self.warning(f"Datum lookup failed for map '{current_map}': {e}")
+
+        self.warning(
+            f"No datum for map '{current_map}'; GPS pose stored in latitude/longitude only"
+        )
 
     async def _on_client_message(self, message: types.VDA5050State):
         self.debug(f"[{message.orderId}] Got feedback")
@@ -392,10 +433,14 @@ class Robot:
             self._robot_online_task = \
                 asyncio.get_event_loop().create_task(self._check_robot_online())
             if message.agvPosition:
-                self._robot_object.status.pose.x = message.agvPosition.x
-                self._robot_object.status.pose.y = message.agvPosition.y
-                self._robot_object.status.pose.theta = message.agvPosition.theta
-                self._robot_object.status.pose.map_id = message.agvPosition.mapId
+                if self._robot_object.position_mode == 'gps':
+                    await self._apply_gps_position(
+                        message.agvPosition.x, message.agvPosition.y, message.agvPosition.theta)
+                else:
+                    self._robot_object.status.pose.x = message.agvPosition.x
+                    self._robot_object.status.pose.y = message.agvPosition.y
+                    self._robot_object.status.pose.theta = message.agvPosition.theta
+                    self._robot_object.status.pose.map_id = message.agvPosition.mapId
             if message.batteryState:
                 self._robot_object.status.battery_level = message.batteryState.batteryCharge
                 if message.batteryState.charging and not self._robot_object.status.state.running:
@@ -467,6 +512,9 @@ class Robot:
                         self._robot_object.status.info_messages = \
                             json.loads(information.infoDescription)
                         break
+            # Update recording state if present in the message
+            if message.recordingState is not None:
+                self._robot_object.status.recording_state = message.recordingState
             # Update robot unique ID
             self._robot_object.status.hardware_version = \
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,
@@ -535,6 +583,23 @@ class Robot:
         if self._robot_object is not None:
             self._robot_object.status.factsheet.agv_class = message.typeSpecification.agvClass
             self._robot_object.status.factsheet.speed_max = message.physicalParameters.speedMax
+
+            # Store custom actions from factsheet
+            if message.actions:
+                self._robot_object.status.factsheet.custom_actions = [
+                    robot_object.CustomActionV1(
+                        action_type=action.actionType,
+                        action_description=action.actionDescription,
+                        action_parameters=[
+                            robot_object.CustomActionParameterV1(key=param.key, value=param.value)
+                            for param in action.actionParameters
+                        ],
+                        blocking_type=action.blockingType.value,
+                        icon_hint=action.iconHint
+                    )
+                    for action in message.actions
+                ]
+                self.info(f"Stored {len(message.actions)} custom actions from factsheet")
 
             self._database.update_status(self._robot_object)
 
@@ -729,6 +794,31 @@ class Robot:
                 (self._current_behavior_tree is None):
             return
 
+        # Check for missionStatus published inside the VDA5050 informations array.
+        # The robot firmware embeds lifecycle events here instead of a separate topic.
+        mission_status = next(
+            (i.infoDescription for i in (message.information or [])
+             if i.infoType == "missionStatus"),
+            None
+        )
+
+        if mission_status == "completed":
+            self._set_mission_state(mission_object.MissionStateV1.COMPLETED)
+            return
+        if mission_status == "failed":
+            # Populate failure_reason from the errors array before transitioning.
+            self.get_mission_errors(message)
+            self._set_mission_state(mission_object.MissionStateV1.FAILED)
+            return
+        if mission_status == "canceled":
+            if self._current_mission.needs_canceled:
+                self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+            else:
+                self._updating_mission_from_api = True
+            return
+
+        # For "reached" (intermediate waypoint) and the no-info case, fall through
+        # to the existing behavior-tree path so node-level tracking stays intact.
         node_state = self.update_mission_node_state(
             message, finished_instant_actions)
         if node_state == mission_object.MissionStateV1.CANCELED:
@@ -897,7 +987,11 @@ class RobotServer:
                  mqtt_prefix: str = "uagv/v2/RobotCompany",
                  mqtt_username: Optional[str] = None,
                  mqtt_password: Optional[str] = None,
-                 database_url: str = "http://localhost:5000",
+                 postgres_db: str = "mission",
+                 postgres_user: str = "postgres",
+                 postgres_password: str = "postgres",
+                 postgres_host: str = "localhost",
+                 postgres_port: int = 5432,
                  mission_ctrl_url: Optional[str] = None, push_telemetry: bool = False,
                  telemetry_env: str = "DEV", disable_request_factsheet: bool = False):
         """Initializes a RobotServer object by starting threads for mqtt and for the robot/mission
@@ -914,32 +1008,27 @@ class RobotServer:
         self._mqtt_prefix = mqtt_prefix
 
         # Connect to the db
-        self._database = db_client.DatabaseClient(database_url)
+        from packages.database.postgres import PostgresDatabase
+        import uuid
+        self._database = PostgresDatabase(
+            dbname=postgres_db,
+            user=postgres_user,
+            password=postgres_password,
+            host=postgres_host,
+            port=postgres_port
+        )
 
         # Create queues to propogate changes to the main thread
         self._event_loop = asyncio.get_event_loop()
-        self._mission_changes: asyncio.Queue[api_objects.MissionObjectV1] = asyncio.Queue(
-        )
-        self._robot_changes: asyncio.Queue[api_objects.RobotObjectV1] = asyncio.Queue(
-        )
-        self._mqtt_messages: asyncio.Queue[ClientMessage] = asyncio.Queue()
-
-        # Launch threads to listen for updates to robot / mission objects
-        mission_update_args = (
-            api_objects.MissionObjectV1, self._mission_changes)
-        self._mission_update_thread = threading.Thread(group=None, target=self._watch_changes,
-                                                       args=mission_update_args)
-        self._mission_update_thread.daemon = True
-        robot_update_args = (api_objects.RobotObjectV1, self._robot_changes)
-        self._robot_update_thread = threading.Thread(group=None, target=self._watch_changes,
-                                                     args=robot_update_args)
-        self._robot_update_thread.daemon = True
+        self._mission_changes: asyncio.Queue[api_objects.MissionObjectV1] = asyncio.Queue()
+        self._robot_changes: asyncio.Queue[api_objects.RobotObjectV1] = asyncio.Queue()
+        self._mqtt_messages: asyncio.Queue = asyncio.Queue()
 
         # Connect to MQTT
-        self._mqtt_client = \
-            self._connect_to_mqtt(mqtt_host, mqtt_port,
-                                  mqtt_transport, mqtt_ws_path,
-                                  mqtt_username, mqtt_password)
+        self._mqtt_client = self._connect_to_mqtt(
+            mqtt_host, mqtt_port, mqtt_transport, mqtt_ws_path,
+            mqtt_username, mqtt_password
+        )
 
         # The robot objects
         self._robots: Dict[str, Robot] = {}
@@ -978,50 +1067,50 @@ class RobotServer:
                 return
         except pydantic.ValidationError as e:
             self.warning(f"Validation error from client message:\n{e.errors()}")
+        except Exception as e:
+            self.warning(f"Error processing MQTT message: {e}")
 
     def _connect_to_mqtt(self, host: str, port: int, transport: str, ws_path: Optional[str],
-                         username: Optional[str], password: Optional[str]) -> mqtt_client.Client:
-        client = mqtt_client.Client(transport=transport)
-        if transport == "websockets" and ws_path is not None:
-            client.ws_set_options(path=ws_path)
-        if username and password:
-            client.username_pw_set(username=username, password=password)
-        client.on_connect = self._mqtt_on_connect
-        client.on_message = self._mqtt_on_message
-        connected = False
-        while not connected:
-            try:
-                client.connect(host, port)
-                connected = True
-            except (ConnectionRefusedError, ConnectionResetError):
-                self.warning("Failed to connect to mqtt broker, retrying in "
-                             f"{MQTT_RECONNECT_PERIOD}s")
-                time.sleep(MQTT_RECONNECT_PERIOD)
-            except socket.gaierror:
-                self.warning(f"Could not resolve mqtt hostname {host}, retrying in "
-                             f"{MQTT_RECONNECT_PERIOD}s")
-                time.sleep(MQTT_RECONNECT_PERIOD)
+                         username: Optional[str], password: Optional[str]) -> MQTTClient:
+        client = MQTTClient(
+            client_id="mission_dispatcher_backend",
+            broker=host,
+            port=port,
+            transport=transport,
+            ws_path=ws_path,
+            username=username,
+            password=password
+        )
+        
+        # Register wildcard callbacks
+        client.register_callback(f"{self._mqtt_prefix}/+/state", self._mqtt_on_message)
+        client.register_callback(f"{self._mqtt_prefix}/+/factsheet", self._mqtt_on_message)
+        
+        client.connect()
         return client
 
     async def stop(self):
         loop = asyncio.get_event_loop()
         loop.stop()
 
-    def _watch_changes(self, obj: Any, queue: asyncio.Queue):
+    async def _watch_changes(self, object_class: Any, queue: asyncio.Queue):
         while True:
             try:
-                for update in self._database.watch(obj):
-                    self.debug(f"Watch object update: {obj.get_alias()}")
-                    self._enqueue(queue, update)
-            except requests.exceptions.ConnectionError:
-                self.warning("Failed to connect to mission-database, retrying in "
-                             f"{DATABASE_RECONNECT_PERIOD}")
-                time.sleep(DATABASE_RECONNECT_PERIOD)
-            # Force the whole program to exit if a database crashes
-            except Exception as err:  # pylint: disable=broad-except
+                import uuid
+                publisher_id = uuid.uuid4()
+                watcher_instance = await self._database.get_watcher(object_class, publisher_id)
+                with watcher_instance:
+                    async for update in watcher_instance.watch():
+                        self.debug(f"Watch object update: {object_class.get_alias()}")
+                        await queue.put(update)
+            except Exception as err:
                 self.warning(f"Exit: {err}")
-                self._mqtt_client.loop_stop()
+                if hasattr(self._mqtt_client, 'disconnect'):
+                    self._mqtt_client.disconnect()
+                elif hasattr(self._mqtt_client, 'loop_stop'):
+                    self._mqtt_client.loop_stop()
                 asyncio.run_coroutine_threadsafe(self.stop(), self._event_loop)
+                break
 
     async def _handle_robot_changes(self):
         while True:
@@ -1064,40 +1153,51 @@ class RobotServer:
         while True:
             message = await self._mqtt_messages.get()
             if message.name not in self._robots:
-                self.warning(
-                    f"Ignoring MQTT message from unknown robot \"{message.name}\"")
-                continue
+                # Try to get the robot from the database
+                try:
+                    robot = await self._database.get_object(api_objects.RobotObjectV1, message.name)
+                    self.debug(f"Got robot from database on MQTT message: {message.name}")
+                    self._robots[message.name] = Robot(message.name, self._database,
+                                                       self._mqtt_client, self._mqtt_prefix, self)
+                    # Send the robot object to the robot handler
+                    await self._robots[message.name].send_message(robot)
+                except Exception as e:
+                    self.warning(
+                        f"Ignoring MQTT message from unknown robot \"{message.name}\": {e}")
+                    continue
             await self._robots[message.name].send_message(message.payload)
 
     async def _run(self):
+        await self._database.async_init()
         await asyncio.gather(
+            self._watch_changes(api_objects.MissionObjectV1, self._mission_changes),
+            self._watch_changes(api_objects.RobotObjectV1, self._robot_changes),
             self._handle_robot_changes(),
             self._handle_mission_changes(),
-            self._handle_mqtt_messages())
+            self._handle_mqtt_messages()
+        )
 
     async def delete_robot(self, robot_name: str):
         robot = self._robots[robot_name]
         if robot is not None:
             properties = robot.robot_object
             if properties is not None:
-                self._database.delete(
-                    api_objects.RobotObjectV1, properties.name)
+                import uuid
+                await self._database.set_lifecycle(api_objects.RobotObjectV1, properties.name, api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
                 del self._robots[properties.name]
 
     async def delete_pending_mission(self, mission: api_objects.MissionObjectV1) -> bool:
         if mission.lifecycle == \
                 api_objects.object.ObjectLifecycleV1.PENDING_DELETE:
-            self._database.delete(
-                api_objects.MissionObjectV1, mission.name)
+            import uuid
+            await self._database.set_lifecycle(api_objects.MissionObjectV1, mission.name, api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
             self.info(f"Deleted mission {mission.name}")
             return True
         return False
 
     def run(self):
         # Start threads and corroutines
-        self._mission_update_thread.start()
-        self._robot_update_thread.start()
-        self._mqtt_client.loop_start()
+        # self._mqtt_client.loop_start() handles loop internally now
         self._event_loop.run_until_complete(self._run())
 
     def info(self, message: str):

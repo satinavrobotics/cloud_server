@@ -1,0 +1,16 @@
+# Graph Database Service Dependencies
+
+# FastAPI and web server
+fastapi==0.109.1
+uvicorn[standard]==0.17.6
+pydantic==1.9.0
+
+# ArangoDB client
+python-arango>=8.0.0
+
+# R-tree spatial index
+rtree>=1.1.0
+
+# HTTP client (for client library)
+requests>=2.31.0
+

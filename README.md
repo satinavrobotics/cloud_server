@@ -7,13 +7,46 @@ Isaac Mission Dispatch is a cloud service that enables the communication between
 <div><i align = "center">Diagram highlighting this package. Mission Dispatch and Client in green. This simplified diagram of a fleet management system on the left is connected to a robot running ROS 2 on the right. References are provided to database and MQTT services. Mission Dispatch needs to be integrated with the fleet management system of preference. A matching ROS 2 <a href="https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_mission_client">Mission Client</a> is available for ROS 2 Humble; or use the <a href="https://github.com/inorbit-ai/ros_amr_interop/tree/galactic-devel/vda5050_connector">VDA5050 connector</a> from OTTO Motors & InOrbit AI on ROS 2 Galactic with Mission Dispatch.</i></div>
 <br>
 
-The Mission Dispatch system is composed of two main components:
-1. The mission database microservice 
+The Mission Dispatch system is composed of multiple microservices:
 
-    This component hosts REST APIs used to create, update, and get the state of API mission/robot objects. It also manages persistence for objects, allowing them to rebuild their internal state if they crash or are restarted.
-2. The mission dispatch microservice
+### Core Mission Dispatch Components
+1. **Mission Database Microservice**
+   - Hosts REST APIs to create, update, and get the state of mission/robot objects
+   - Manages persistence for objects, allowing them to rebuild their internal state if they crash or are restarted
 
-    This component handles the communication with robots and manages mission state transitions. A mission is defined as a series of tasks needed to be completed by a specific robot. See the [Mission](#mission) section for more details of how a mission maps to VDA5050 orders. 
+2. **Mission Dispatch Microservice**
+   - Handles communication with robots and manages mission state transitions
+   - A mission is defined as a series of tasks needed to be completed by a specific robot
+   - See the [Mission](#mission) section for more details of how a mission maps to VDA5050 orders
+
+### Additional Microservices
+3. **Graph Database Service** (Port 6001)
+   - Manages topological map nodes and edges using ArangoDB
+   - Provides spatial indexing with R-tree for fast proximity queries
+   - Supports graph operations like shortest path finding
+
+4. **Image Database Service** (Port 6002)
+   - Stores robot camera images using MinIO object storage
+   - Organizes images by map and node for topological mapping
+
+5. **Similarity Service** (Port 8003)
+   - Computes similarity between nodes based on spatial proximity
+   - Determines traversability based on distance thresholds
+
+6. **Graph Builder Service** (Port 8004)
+   - Processes MQTT node updates from robots to build topological maps
+   - Automatically creates edges between nearby traversable nodes
+   - Publishes real-time map updates via WebSocket
+
+7. **Mission Planner Service** (Port 8005)
+   - Plans navigation missions using topological maps
+   - Finds shortest paths between robot position and target
+   - Integrates with Mission Dispatch to submit missions
+
+8. **API Delegation Service** (Port 8000)
+   - Unified REST and WebSocket gateway for all services
+   - Proxies requests to appropriate microservices
+   - Provides real-time updates for map changes and mission status
 
 There are several types of communication between a control service and the fleet of robots, including large data transfers such as map updates to the robot, events recordings from the robot, and high throughput, low latency teleoperation of the robot. Each type is better serviced by other side-channel communication protocols. When a side channel for communication is needed, Mission Dispatch should establish and provide the connection details as it maintains a database for the current state of the system and available robots.
 
@@ -709,6 +742,55 @@ We aim to provide robot control adhering to VDA5050.  There are aspects of the p
 
 Yes!
 
+## Testing
+
+The project includes comprehensive test suites with Docker-based isolated testing.
+
+### Quick Start
+
+**Run unit tests (fast, isolated):**
+```bash
+./scripts/test_docker.sh unit
+```
+
+**Run integration tests (with real services):**
+```bash
+./scripts/test_docker.sh integration
+```
+
+**Run all tests with coverage:**
+```bash
+./scripts/test_docker.sh coverage
+```
+
+For more details, see [tests/README.md](tests/README.md).
+
+### Available Scripts
+
+- `./scripts/build_all.sh` - Build all Docker images
+- `./scripts/check_health.sh` - Check health of all services
+- `./scripts/run_all_tests.sh` - Run all tests locally
+- `./scripts/run_unit_tests.sh` - Run unit tests only
+- `./scripts/run_integration_tests.sh` - Run integration tests
+- `./scripts/test_docker.sh` - Docker-based testing (recommended)
+- `./scripts/verify_integration_setup.sh` - Verify integration test setup
+
+## Configuration
+
+All default configuration values are centralized in `packages/config.py`:
+- Service ports and URLs
+- Timeout values
+- Distance and spatial thresholds
+- Database connection settings
+- MQTT configuration
+
+This ensures consistency across all microservices.
+
+## Documentation
+
+- [Docker Setup Guide](docs/DOCKER_SETUP_GUIDE.md) - Comprehensive guide for Docker deployment
+- [Test Suite Documentation](tests/README.md) - Testing infrastructure and guidelines
+- [Architecture Plan](docs/ARCHITECTURE_PLAN.txt) - System architecture overview
 
 ## License
 Isaac Mission Dispatch is under [Apache 2.0 license](https://github.com/NVIDIA-ISAAC/isaac_mission_dispatch/blob/main/LICENSE).
