@@ -17,7 +17,6 @@ limitations under the License.
 SPDX-License-Identifier: Apache-2.0
 """
 import enum
-from typing import Optional
 
 import pydantic
 
@@ -61,12 +60,10 @@ class TaskType(enum.Enum):
 class Pose2D(pydantic.BaseModel):
     """Specifies a pose to be traveled to by the robot"""
     x: float = pydantic.Field(
-        description="Local-frame x coordinate in metres. Always holds metres, never GPS degrees. "
-                    "For GPS robots, computed from latitude/longitude via gps_to_local().",
+        description="Local-frame x coordinate in metres.",
         default=0.0)
     y: float = pydantic.Field(
-        description="Local-frame y coordinate in metres. Always holds metres, never GPS degrees. "
-                    "For GPS robots, computed from latitude/longitude via gps_to_local().",
+        description="Local-frame y coordinate in metres.",
         default=0.0)
     theta: float = pydantic.Field(
         description="The rotation of the pose in radians", default=0.0)
@@ -78,10 +75,6 @@ class Pose2D(pydantic.BaseModel):
     allowedDeviationTheta: float = pydantic.Field(
         description="Allowed theta deviation radians",
         default=0.0)
-    latitude: Optional[float] = pydantic.Field(
-        None, description="Raw WGS84 latitude in degrees. Set for GPS robots only; null for local-mode robots.")
-    longitude: Optional[float] = pydantic.Field(
-        None, description="Raw WGS84 longitude in degrees. Set for GPS robots only; null for local-mode robots.")
 
 
 def handle_response(response):

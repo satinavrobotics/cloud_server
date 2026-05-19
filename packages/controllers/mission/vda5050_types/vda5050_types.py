@@ -50,7 +50,7 @@ class VDA5050EdgeState(pydantic.BaseModel):
 class VDA5050ActionParameter(pydantic.BaseModel):
     """Action parameters"""
     key: str
-    value: str
+    value: Optional[str] = None
 
 
 class VDA5050ActionBlockingType(str, enum.Enum):
@@ -508,16 +508,19 @@ class VDA5050State(pydantic.BaseModel):
     driving: bool = False
     agvPosition: Optional[VDA5050AgvPosition]
     errors: List[VDA5050Error] = []
-    information: Optional[List[VDA5050Info]] = []
+    information: Optional[List[VDA5050Info]] = pydantic.Field([], alias="informations")
     distanceSinceLastNode: Optional[float] = 0.0
     loads: Optional[List[VDA5050Load]] = []
     newBaseRequest: Optional[bool] = False
     operatingMode: VDA5050OperatingMode = VDA5050OperatingMode.AUTOMATIC
     paused: Optional[bool] = False
-    safetyState: VDA5050SafetyStatus
+    safetyState: Optional[VDA5050SafetyStatus] = None
     velocity: Optional[VDA5050Velocity]
     zoneSetId: Optional[str] = ""
     recordingState: Optional[str] = None
+
+    class Config:
+        allow_population_by_field_name = True
 
     @pydantic.validator("operatingMode", pre=True)
     def default_operating_mode(cls, v):
@@ -639,3 +642,10 @@ class VDA5050Connection(pydantic.BaseModel):
     manufacturer: str = ""
     serialNumber: str = ""
     connectionState: VDA5050ConnectionState = VDA5050ConnectionState.OFFLINE
+
+
+class RobotDatum(pydantic.BaseModel):
+    """GPS origin published by the robot on its /{robot_name}/datum MQTT topic."""
+    latitude: float
+    longitude: float
+    bearing_deg: float = 0.0

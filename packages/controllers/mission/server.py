@@ -25,6 +25,7 @@ import json
 import logging
 import re
 import requests
+import uuid
 import sys
 from typing import Any, Dict, List, Optional, Union, cast
 from collections import OrderedDict
@@ -35,8 +36,6 @@ from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import behavior_tree
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
-from packages.config import GPS_MAP_SENTINEL
-from packages.utils.geo import gps_to_local
 from packages.utils import metrics
 import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
@@ -62,7 +61,8 @@ DATABASE_RECONNECT_PERIOD = 0.5
 RobotMessage = Union[api_objects.RobotObjectV1,
                      api_objects.MissionObjectV1,
                      types.VDA5050State,
-                     types.VDA5050Factsheet]
+                     types.VDA5050Factsheet,
+                     types.RobotDatum]
 
 
 class ClientMessage(pydantic.BaseModel):
@@ -80,6 +80,11 @@ class ClientStatusMessage(ClientMessage):
 class ClientFactsheetMessage(ClientMessage):
     name: str
     payload: types.VDA5050Factsheet
+
+
+class ClientDatumMessage(ClientMessage):
+    name: str
+    payload: types.RobotDatum
 
 
 class Robot:
@@ -282,7 +287,7 @@ class Robot:
             # Cancel a queued mission
             elif message.needs_canceled:
                 self._missions[message.name].status.state = mission_object.MissionStateV1.CANCELED
-                self._database.update_status(self._missions[message.name])
+                await self._database.update_status(api_objects.MissionObjectV1, self._missions[message.name].name, self._missions[message.name].status, uuid.uuid4())
                 del self._missions[message.name]
 
     async def _on_robot_change(self, message: api_objects.RobotObjectV1):
@@ -355,11 +360,13 @@ class Robot:
         try:
             await asyncio.sleep(self._robot_object.heartbeat_timeout.total_seconds())
             self.info("Robot Offline")
+            self._robot_object.status.recording_state = None
             if not self._robot_object.status.online:
+                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
                 return
             self._robot_object.status.online = False
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
-                self._database.update_status(self._robot_object)
+                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
         except asyncio.CancelledError:
             self.debug("Cancelled robot online check.")
 
@@ -388,39 +395,30 @@ class Robot:
                 await self._send_instant_action(instant_action)
                 self.mission_info(
                     f"Resend {instant_action.actionType} instant action.")
-    async def _apply_gps_position(self, lat: float, lon: float, theta: float) -> None:
-        """Store GPS position. latitude/longitude hold raw WGS84 degrees; x/y hold local-frame metres.
-
-        If no datum is registered for the robot's current map, x/y are not updated
-        (remain 0.0). Mission planning will fail with a clear datum-missing error.
-        """
-        self._robot_object.status.pose.latitude = lat
-        self._robot_object.status.pose.longitude = lon
-        self._robot_object.status.pose.theta = theta
-
+        return finished_instant_actions
+    async def _process_datum_message(self, msg: types.RobotDatum) -> None:
+        """Persist robot datum and auto-seed the current map's datum if it has none."""
+        import uuid
+        self._robot_object.datum.latitude = msg.latitude
+        self._robot_object.datum.longitude = msg.longitude
+        self._robot_object.datum.bearing_deg = msg.bearing_deg
+        await self._database.update_spec(
+            api_objects.RobotObjectV1, self._name, self._robot_object.spec, uuid.uuid4()
+        )
         current_map = self._robot_object.current_map
-        self._robot_object.status.pose.map_id = current_map if current_map else GPS_MAP_SENTINEL
-
-        if current_map and current_map != GPS_MAP_SENTINEL:
+        if current_map:
             try:
                 map_obj = await self._database.get_object(api_objects.MapObjectV1, current_map)
-                if (map_obj and map_obj.datum_latitude is not None
-                        and map_obj.datum_longitude is not None):
-                    x, y = gps_to_local(
-                        lat, lon,
-                        map_obj.datum_latitude,
-                        map_obj.datum_longitude,
-                        map_obj.datum_bearing_deg,
+                if map_obj and map_obj.datum_latitude is None:
+                    map_obj.datum_latitude = msg.latitude
+                    map_obj.datum_longitude = msg.longitude
+                    map_obj.datum_bearing_deg = msg.bearing_deg
+                    await self._database.update_spec(
+                        api_objects.MapObjectV1, current_map, map_obj.spec, uuid.uuid4()
                     )
-                    self._robot_object.status.pose.x = x
-                    self._robot_object.status.pose.y = y
-                    return
+                    self.info(f"Auto-seeded datum for map '{current_map}' from robot datum.")
             except Exception as e:
-                self.warning(f"Datum lookup failed for map '{current_map}': {e}")
-
-        self.warning(
-            f"No datum for map '{current_map}'; GPS pose stored in latitude/longitude only"
-        )
+                self.warning(f"Failed to auto-seed datum for map '{current_map}': {e}")
 
     async def _on_client_message(self, message: types.VDA5050State):
         self.debug(f"[{message.orderId}] Got feedback")
@@ -433,14 +431,10 @@ class Robot:
             self._robot_online_task = \
                 asyncio.get_event_loop().create_task(self._check_robot_online())
             if message.agvPosition:
-                if self._robot_object.position_mode == 'gps':
-                    await self._apply_gps_position(
-                        message.agvPosition.x, message.agvPosition.y, message.agvPosition.theta)
-                else:
-                    self._robot_object.status.pose.x = message.agvPosition.x
-                    self._robot_object.status.pose.y = message.agvPosition.y
-                    self._robot_object.status.pose.theta = message.agvPosition.theta
-                    self._robot_object.status.pose.map_id = message.agvPosition.mapId
+                self._robot_object.status.pose.x = message.agvPosition.x
+                self._robot_object.status.pose.y = message.agvPosition.y
+                self._robot_object.status.pose.theta = message.agvPosition.theta
+                self._robot_object.status.pose.map_id = message.agvPosition.mapId
             if message.batteryState:
                 self._robot_object.status.battery_level = message.batteryState.batteryCharge
                 if message.batteryState.charging and not self._robot_object.status.state.running:
@@ -512,15 +506,20 @@ class Robot:
                         self._robot_object.status.info_messages = \
                             json.loads(information.infoDescription)
                         break
-            # Update recording state if present in the message
-            if message.recordingState is not None:
-                self._robot_object.status.recording_state = message.recordingState
+            # Update recording state from the informations array
+            recording_info = next(
+                (i.infoDescription for i in (message.information or [])
+                 if i.infoType == "recordingState"),
+                message.recordingState,
+            )
+            if recording_info is not None:
+                self._robot_object.status.recording_state = recording_info
             # Update robot unique ID
             self._robot_object.status.hardware_version = \
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,
                                                     serial_number=message.serialNumber)
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
-                self._database.update_status(self._robot_object)
+                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
 
             # Update object detection results if necessary
             for action_state in message.actionStates:
@@ -535,8 +534,8 @@ class Robot:
                         [DetectedObject(**item) for item in json.loads(
                             action_state.resultDescription)]
 
-                    self._database.update_status(
-                        self._detection_results_object)
+                    await self._database.update_status(
+                        api_objects.DetectionResultsObjectV1, self._detection_results_object.name, self._detection_results_object.status, uuid.uuid4())
                     self.info(
                         "Updated object detector information in mission database.")
 
@@ -591,7 +590,7 @@ class Robot:
                         action_type=action.actionType,
                         action_description=action.actionDescription,
                         action_parameters=[
-                            robot_object.CustomActionParameterV1(key=param.key, value=param.value)
+                            robot_object.CustomActionParameterV1(key=param.key, value=param.value or "")
                             for param in action.actionParameters
                         ],
                         blocking_type=action.blockingType.value,
@@ -601,7 +600,7 @@ class Robot:
                 ]
                 self.info(f"Stored {len(message.actions)} custom actions from factsheet")
 
-            self._database.update_status(self._robot_object)
+            await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
 
     async def post_mission_completion(self):
         # Delete a completed/failure mission
@@ -685,7 +684,7 @@ class Robot:
                     task_status[str(current_mission_node.name)] = 0
                 else:
                     task_status[str(current_mission_node.name)] += 1
-                self._database.update_status(self._current_mission)
+                asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
 
             if current_order_node_id == current_mission_node.route.size * 2 + 2:
                 node_state = mission_object.MissionStateV1.COMPLETED
@@ -766,7 +765,7 @@ class Robot:
         if not mission_state_updated and previous_mission_status != self._current_mission.status:
             self.info(
                 f"update mission node: {self._current_mission.status.current_node}")
-            self._database.update_status(self._current_mission)
+            asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
 
     def update_robot_state(self, finished_instant_actions: List[types.VDA5050Action]):
         """ Update robot states after teleop is finished
@@ -842,6 +841,8 @@ class Robot:
                 await self._on_client_message(message)
             elif isinstance(message, types.VDA5050Factsheet):
                 await self._on_client_factsheet(message)
+            elif isinstance(message, types.RobotDatum):
+                await self._process_datum_message(message)
 
     async def send_message(self, message):
         await self._messages.put(message)
@@ -882,7 +883,7 @@ class Robot:
             self._telemetry_client.send_telemetry(self._telemetry.get_kpis_by_frequency(
                 metrics.Timeframe.ROBOT))
         self._robot_object.status.state = state
-        self._database.update_status(self._robot_object)
+        asyncio.ensure_future(self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4()))
 
     def _set_mission_state(self, state: mission_object.MissionStateV1):
         if self._current_mission is None or state == self._current_mission.status.state:
@@ -934,7 +935,7 @@ class Robot:
             self.mission_info("Mission duration: "
                               f"""{self._current_mission.status.end_timestamp -
                                    self._current_mission.status.start_timestamp}""")
-        self._database.update_status(self._current_mission)
+        asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
         return True
 
     def set_mission_node_state(self, node_name: str, state: mission_object.MissionStateV1):
@@ -1045,11 +1046,13 @@ class RobotServer:
     def _mqtt_on_connect(self, client, userdata, flags, rc):
         client.subscribe(f"{self._mqtt_prefix}/+/state")
         client.subscribe(f"{self._mqtt_prefix}/+/factsheet")
+        client.subscribe(f"{self._mqtt_prefix}/+/datum")
 
     def _mqtt_on_message(self, client, userdata, msg):
         state_match = re.match(f"{self._mqtt_prefix}/(.*)/state", msg.topic)
         factsheet_match = re.match(
             f"{self._mqtt_prefix}/(.*)/factsheet", msg.topic)
+        datum_match = re.match(f"{self._mqtt_prefix}/(.*)/datum", msg.topic)
         try:
             if state_match:
                 robot = state_match.groups()[0]
@@ -1061,6 +1064,11 @@ class RobotServer:
                 pl = msg.payload
                 self._enqueue(self._mqtt_messages, ClientFactsheetMessage(name=robot,
                                                                           payload=json.loads(pl)))
+            elif datum_match:
+                robot = datum_match.groups()[0]
+                pl = msg.payload
+                self._enqueue(self._mqtt_messages, ClientDatumMessage(name=robot,
+                                                                      payload=json.loads(pl)))
             else:
                 self.warning(
                     f"Got message from unrecognized topic \"{msg.topic}\"")
@@ -1085,6 +1093,7 @@ class RobotServer:
         # Register wildcard callbacks
         client.register_callback(f"{self._mqtt_prefix}/+/state", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/factsheet", self._mqtt_on_message)
+        client.register_callback(f"{self._mqtt_prefix}/+/datum", self._mqtt_on_message)
         
         client.connect()
         return client

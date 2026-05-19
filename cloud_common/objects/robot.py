@@ -101,6 +101,16 @@ class RobotBatterySpecV1(pydantic.BaseModel):
     recommended_maximum: Optional[float] = None
 
 
+class RobotDatumV1(pydantic.BaseModel):
+    """GPS origin reported by the robot via its MQTT datum topic."""
+    latitude: Optional[float] = pydantic.Field(
+        None, description="WGS84 latitude of the robot's local-frame origin.")
+    longitude: Optional[float] = pydantic.Field(
+        None, description="WGS84 longitude of the robot's local-frame origin.")
+    bearing_deg: float = pydantic.Field(
+        0.0, description="Angle from robot local +X axis to true north, in degrees.")
+
+
 class RobotStatusV1(pydantic.BaseModel):
     """Represents the status of the robot."""
     pose: common.Pose2D = common.Pose2D()
@@ -138,8 +148,12 @@ class RobotSpecV1(pydantic.BaseModel):
     )
     position_mode: Literal['local', 'gps'] = pydantic.Field(
         'local',
-        description="'local' = robot publishes odometry in local Cartesian (x, y, theta); "
-                    "'gps' = robot publishes GPS coordinates (x=lat, y=lon)."
+        description="'local' = local-only robot; 'gps' = robot publishes a datum via MQTT and "
+                    "sends local Cartesian coordinates derived from GPS."
+    )
+    datum: RobotDatumV1 = pydantic.Field(
+        default_factory=RobotDatumV1,
+        description="GPS origin last reported by the robot via its MQTT datum topic."
     )
     ip_address: Optional[str] = pydantic.Field(
         None, description="IPv4 address of the robot, updated on each startup.")

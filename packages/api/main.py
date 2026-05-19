@@ -59,6 +59,7 @@ class LoadMapResponse(BaseModel):
     error: Optional[str] = None
     nodes: Optional[List[Dict[str, Any]]] = None
     edges: Optional[List[Dict[str, Any]]] = None
+    transform: Optional[Dict[str, Any]] = None
 
 
 class NavigationRequest(BaseModel):
@@ -140,7 +141,6 @@ class CreateTokenResponse(BaseModel):
 
 class CreateBagEntryRequest(BaseModel):
     """Request model for creating a ROS bag upload entry."""
-    map_id: str = Field(..., description="Map ID this recording belongs to")
     robot_name: str = Field(..., description="Name of the robot that produced the bag")
     description: Optional[str] = Field(None, description="Human-readable description of the recording")
     recorded_at: Optional[str] = Field(None, description="ISO-8601 timestamp when recording started")
@@ -151,30 +151,47 @@ class CreateBagEntryResponse(BaseModel):
     bag_id: str
     upload_url: str = Field(..., description="Presigned PUT URL — upload directly with rclone or curl")
     expires_in: int = Field(..., description="URL expiry in seconds")
-    map_id: str
+    map_id: Optional[str] = Field(None, description="Map the robot was on at upload time, or null")
     robot_name: str
+    datum_latitude: Optional[float] = None
+    datum_longitude: Optional[float] = None
+    datum_bearing_deg: Optional[float] = None
 
 
 class BagMetadataResponse(BaseModel):
     """Response model for ROS bag metadata."""
     bag_id: str
     robot_name: str
-    map_id: str
+    map_id: Optional[str] = None
+    datum_latitude: Optional[float] = None
+    datum_longitude: Optional[float] = None
+    datum_bearing_deg: Optional[float] = None
+    description: Optional[str] = None
+    recorded_at: Optional[str] = None
     size: Optional[int] = None
-    content_type: Optional[str] = None
     last_modified: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
     download_url: Optional[str] = Field(None, description="Presigned GET URL for direct download")
+
+
+class BagSummary(BaseModel):
+    """Single bag entry in a list response."""
+    bag_id: str
+    robot_name: str
+    map_id: Optional[str] = None
+    datum_latitude: Optional[float] = None
+    datum_longitude: Optional[float] = None
+    datum_bearing_deg: Optional[float] = None
+    description: Optional[str] = None
+    recorded_at: Optional[str] = None
+    size: Optional[int] = None
 
 
 class BagListResponse(BaseModel):
     """Response model for listing ROS bags."""
-    bags: List[Dict[str, str]]
+    bags: List[BagSummary]
     count: int
-    map_id: str
     robot_name: Optional[str] = None
-    participant_name: str = Field(..., description="Participant identifier")
-    room_name: str = Field(..., description="Room name")
+    map_id: Optional[str] = None
 
 
 class CreateModelUploadUrlRequest(BaseModel):
@@ -345,11 +362,12 @@ async def root():
             "get_image": "GET /api/v1/images/{map_id}/{node_id}",
             "rosbags": {
                 "upload_url": "POST /api/v1/rosbags/upload-url",
-                "list_by_map": "GET /api/v1/rosbags/{map_id}/list",
-                "list_by_robot": "GET /api/v1/rosbags/{map_id}/{robot_name}/list",
-                "metadata": "GET /api/v1/rosbags/{map_id}/{robot_name}/{bag_id}",
-                "delete_one": "DELETE /api/v1/rosbags/{map_id}/{robot_name}/{bag_id}",
-                "delete_robot": "DELETE /api/v1/rosbags/{map_id}/{robot_name}",
+                "list_all": "GET /api/v1/rosbags",
+                "list_by_robot": "GET /api/v1/rosbags/{robot_name}/list",
+                "list_by_map": "GET /api/v1/rosbags/map/{map_id}/list",
+                "metadata": "GET /api/v1/rosbags/{robot_name}/{bag_id}",
+                "delete_one": "DELETE /api/v1/rosbags/{robot_name}/{bag_id}",
+                "delete_robot": "DELETE /api/v1/rosbags/{robot_name}",
             },
             "base_models": {
                 "upload_url": "POST /api/v1/base_models/upload-url",
@@ -612,28 +630,25 @@ async def get_image(map_id: str, node_id: str, image_id: Optional[str] = None):
 
 
 # ==================== ROS Bag Operations ====================
-# NOTE: Routes ordered most-specific first to avoid FastAPI path conflicts.
-# /upload-url and /{map_id}/list must come before /{map_id}/{robot_name}/{bag_id}.
+# Route ordering: fixed-segment paths (/upload-url, /map/) before parameterised ones.
 
 @app.post("/api/v1/rosbags/upload-url", response_model=CreateBagEntryResponse)
 async def create_bag_upload_url(request: CreateBagEntryRequest):
     """
     Create a ROS bag entry and return a presigned PUT URL.
 
-    The robot should upload the bag file directly to MinIO using the returned URL
-    (via rclone or curl). The API server is NOT in the data path for the actual bytes.
+    map_id and GPS datum are resolved automatically from the robot's current state
+    and stored as sidecar metadata. Both may be null if the robot has no active map
+    or has not reported a datum.
 
-    Example (curl):
+    Upload the binary directly to MinIO using the returned URL:
         curl --upload-file bag.bag "{upload_url}"
-
-    Example (rclone):
-        rclone copyto bag.bag :s3,provider=Minio,...:{bucket}/{object_name}
+        rclone copyto bag.bag "{upload_url}"
     """
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     result = await service.create_bag_upload_url(
-        map_id=request.map_id,
         robot_name=request.robot_name,
         description=request.description,
         recorded_at=request.recorded_at,
@@ -644,64 +659,73 @@ async def create_bag_upload_url(request: CreateBagEntryRequest):
     return CreateBagEntryResponse(**result)
 
 
-@app.get("/api/v1/rosbags/{map_id}/list", response_model=BagListResponse)
+@app.get("/api/v1/rosbags", response_model=BagListResponse)
+async def list_all_bags():
+    """List all ROS bags across all robots."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    bags = await service.list_bags()
+    return BagListResponse(bags=[BagSummary(**b) for b in bags], count=len(bags))
+
+
+@app.get("/api/v1/rosbags/map/{map_id}/list", response_model=BagListResponse)
 async def list_bags_for_map(map_id: str):
-    """List all ROS bags stored for a map (across all robots)."""
+    """List all ROS bags whose sidecar metadata records the given map_id."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     bags = await service.list_bags(map_id=map_id)
-    return BagListResponse(bags=bags, count=len(bags), map_id=map_id)
+    return BagListResponse(bags=[BagSummary(**b) for b in bags], count=len(bags), map_id=map_id)
 
 
-@app.get("/api/v1/rosbags/{map_id}/{robot_name}/list", response_model=BagListResponse)
-async def list_bags_for_robot(map_id: str, robot_name: str):
-    """List all ROS bags stored for a specific robot and map."""
+@app.get("/api/v1/rosbags/{robot_name}/list", response_model=BagListResponse)
+async def list_bags_for_robot(robot_name: str):
+    """List all ROS bags for a specific robot."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    bags = await service.list_bags(map_id=map_id, robot_name=robot_name)
-    return BagListResponse(bags=bags, count=len(bags), map_id=map_id, robot_name=robot_name)
+    bags = await service.list_bags(robot_name=robot_name)
+    return BagListResponse(bags=[BagSummary(**b) for b in bags], count=len(bags), robot_name=robot_name)
 
 
-@app.get("/api/v1/rosbags/{map_id}/{robot_name}/{bag_id}", response_model=BagMetadataResponse)
-async def get_bag_metadata(map_id: str, robot_name: str, bag_id: str):
+@app.get("/api/v1/rosbags/{robot_name}/{bag_id}", response_model=BagMetadataResponse)
+async def get_bag_metadata(robot_name: str, bag_id: str):
     """
     Get metadata for a ROS bag, including a presigned download URL.
 
-    The download_url in the response can be used directly with rclone or curl
-    to retrieve the bag file without going through the API server.
+    Use the download_url to retrieve the binary directly with curl or rclone.
     """
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    meta = await service.get_bag_metadata(map_id=map_id, robot_name=robot_name, bag_id=bag_id)
+    meta = await service.get_bag_metadata(robot_name=robot_name, bag_id=bag_id)
     if meta is None:
         raise HTTPException(status_code=404, detail="Bag not found")
 
     return BagMetadataResponse(**meta)
 
 
-@app.delete("/api/v1/rosbags/{map_id}/{robot_name}/{bag_id}")
-async def delete_bag(map_id: str, robot_name: str, bag_id: str):
-    """Delete a single ROS bag."""
+@app.delete("/api/v1/rosbags/{robot_name}/{bag_id}")
+async def delete_bag(robot_name: str, bag_id: str):
+    """Delete a single ROS bag and its metadata sidecar."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    result = await service.delete_bag(map_id=map_id, robot_name=robot_name, bag_id=bag_id)
+    result = await service.delete_bag(robot_name=robot_name, bag_id=bag_id)
     if not result.get("success"):
         raise HTTPException(status_code=404, detail="Bag not found or could not be deleted")
 
     return result
 
 
-@app.delete("/api/v1/rosbags/{map_id}/{robot_name}")
-async def delete_robot_bags(map_id: str, robot_name: str):
-    """Delete all ROS bags for a specific robot and map."""
+@app.delete("/api/v1/rosbags/{robot_name}")
+async def delete_robot_bags(robot_name: str):
+    """Delete all ROS bags for a specific robot."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    return await service.delete_robot_bags(map_id=map_id, robot_name=robot_name)
+    return await service.delete_robot_bags(robot_name=robot_name)
 
 
 # ==================== Base Model Operations ====================

@@ -142,11 +142,11 @@ class ModelDatabaseService(MinIOService):
             return None
 
         try:
-            url = self.client.presigned_put_object(
+            url = self._rewrite_presigned_url(self.client.presigned_put_object(
                 BUCKET,
                 self._model_object(model_id),
                 expires=timedelta(seconds=self.presign_expiry_seconds),
-            )
+            ))
             return {
                 "model_id": model_id,
                 "upload_url": url,
@@ -183,11 +183,11 @@ class ModelDatabaseService(MinIOService):
         """Return a presigned GET URL. Returns None if binary not yet uploaded."""
         try:
             self.client.stat_object(BUCKET, self._model_object(model_id))
-            return self.client.presigned_get_object(
+            return self._rewrite_presigned_url(self.client.presigned_get_object(
                 BUCKET,
                 self._model_object(model_id),
                 expires=timedelta(seconds=self.presign_expiry_seconds),
-            )
+            ))
         except S3Error as e:
             if e.code == "NoSuchKey":
                 return None

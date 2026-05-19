@@ -2,7 +2,7 @@
 """Shared MinIO connection and bucket management base class."""
 
 import logging
-from typing import List, Optional
+from typing import List
 
 try:
     from minio import Minio
@@ -41,6 +41,9 @@ class MinIOService:
         self.client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
         self.client.list_buckets()  # raises immediately if credentials are wrong
         self.logger.info(f"Connected to MinIO: {endpoint}")
+
+    def _rewrite_presigned_url(self, url: str) -> str:
+        return url
 
     def is_healthy(self) -> bool:
         """Return True if MinIO is reachable."""

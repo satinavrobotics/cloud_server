@@ -536,23 +536,6 @@ class MissionPlannerService:
 
         result["target"] = {"x": target_x, "y": target_y}
 
-        # Guard: GPS-mode robots need a datum so that _apply_gps_position() can convert
-        # lat/lon to metres. Without a datum, pose.x/y remain 0.0 and the spatial
-        # lookup would silently find the wrong start node.
-        # Reuse datum fetched in Step 0 if available; only query DB when Step 0 didn't run.
-        robot_for_guard = await self.get_robot_status(robot_name)
-        if robot_for_guard and robot_for_guard.position_mode == 'gps':
-            if datum is None:
-                datum = await self._get_map_datum(effective_map_id)
-            if datum is None:
-                result["error"] = (
-                    f"GPS-mode robot '{robot_name}' requires map '{effective_map_id}' "
-                    "to have a GPS datum registered before navigation. "
-                    "Register one via PUT /api/v1/maps/{map_id}/datum."
-                )
-                result["failed_at"] = "gps_position_validation"
-                return result
-
         # Step 1: Find closest node to robot
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")
         start_node, error = await self.find_closest_node_to_robot(robot_name, map_id)

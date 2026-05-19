@@ -753,11 +753,27 @@ class ApiDelegationService:
                 await self.database.create_object(map_obj, _uuid.uuid4())
                 self.logger.info(f"Registered map '{actual_map_id}' in Postgres")
             except Exception:
-                # Map already registered — update spec to pick up any datum changes
-                await self.database.update_spec(
-                    MapObjectV1, actual_map_id, map_obj.spec, _uuid.uuid4()
-                )
-                self.logger.info(f"Updated existing map '{actual_map_id}' in Postgres")
+                if datum_latitude is not None and datum_longitude is not None:
+                    # Explicit datum provided — update the full spec including datum.
+                    await self.database.update_spec(
+                        MapObjectV1, actual_map_id, map_obj.spec, _uuid.uuid4()
+                    )
+                    self.logger.info(f"Updated existing map '{actual_map_id}' in Postgres")
+                else:
+                    # No datum in request — preserve whatever datum is already stored.
+                    self.logger.info(f"Map '{actual_map_id}' already registered; preserving stored datum")
+
+            # Fetch the stored map to obtain the current datum (may differ from request).
+            stored_datum_lat = datum_latitude
+            stored_datum_lon = datum_longitude
+            stored_datum_bearing = datum_bearing_deg or 0.0
+            try:
+                stored_map = await self.database.get_object(MapObjectV1, actual_map_id)
+                stored_datum_lat = stored_map.spec.datum_latitude
+                stored_datum_lon = stored_map.spec.datum_longitude
+                stored_datum_bearing = stored_map.spec.datum_bearing_deg or 0.0
+            except Exception:
+                pass  # fall back to request values if fetch fails
 
             # Fetch existing nodes and edges from the database
             try:
@@ -798,6 +814,16 @@ class ApiDelegationService:
             # Notify graph builder
             self._notify_graph_builder(actual_map_id, "map_loaded")
 
+            import math as _math
+            transform = None
+            if stored_datum_lat is not None and stored_datum_lon is not None:
+                transform = {
+                    "origin_lat": stored_datum_lat,
+                    "origin_lon": stored_datum_lon,
+                    "rotation_rad": _math.radians(stored_datum_bearing),
+                    "scale": 1.0,
+                }
+
             return {
                 "success": True,
                 "map_id": actual_map_id,
@@ -805,6 +831,7 @@ class ApiDelegationService:
                 "stats": stats,
                 "nodes": nodes_data,
                 "edges": edges_data,
+                "transform": transform,
             }
         except Exception as e:
             self.logger.error(f"Failed to load map {actual_map_id}: {e}")
@@ -1149,7 +1176,6 @@ class ApiDelegationService:
 
     async def create_bag_upload_url(
         self,
-        map_id: str,
         robot_name: str,
         description: Optional[str] = None,
         recorded_at: Optional[str] = None,
@@ -1157,23 +1183,41 @@ class ApiDelegationService:
         """
         Generate a presigned PUT URL for direct robot upload.
 
-        Returns dict with bag_id, upload_url, expires_in, map_id, robot_name
-        or None on error.
+        Resolves map_id and GPS datum from the robot's current state.
+        Both are stored as sidecar metadata and may be None.
+
+        Returns dict with bag_id, upload_url, expires_in, map_id, robot_name,
+        datum fields, or None on error.
         """
         import uuid as _uuid
         bag_id = str(_uuid.uuid4())
 
-        metadata: Dict[str, str] = {}
-        if description:
-            metadata["description"] = description
-        if recorded_at:
-            metadata["recorded_at"] = recorded_at
+        # Resolve map and datum from robot state; neither is required.
+        map_id = None
+        datum_latitude = None
+        datum_longitude = None
+        datum_bearing_deg = None
+        try:
+            robot = await self.database.get_object(RobotObjectV1, robot_name)
+            map_id = robot.current_map
+            if robot.datum:
+                datum_latitude = robot.datum.latitude
+                datum_longitude = robot.datum.longitude
+                datum_bearing_deg = robot.datum.bearing_deg
+        except Exception as e:
+            self.logger.warning(
+                f"Could not fetch robot '{robot_name}' for bag upload metadata: {e}"
+            )
 
         result = self.rosbag_db.create_upload_url(
-            map_id=map_id,
             robot_name=robot_name,
             bag_id=bag_id,
-            metadata=metadata or None,
+            map_id=map_id,
+            datum_latitude=datum_latitude,
+            datum_longitude=datum_longitude,
+            datum_bearing_deg=datum_bearing_deg,
+            description=description,
+            recorded_at=recorded_at,
         )
         if result is None:
             return None
@@ -1184,60 +1228,43 @@ class ApiDelegationService:
             "expires_in": result["expires_in"],
             "map_id": map_id,
             "robot_name": robot_name,
+            "datum_latitude": datum_latitude,
+            "datum_longitude": datum_longitude,
+            "datum_bearing_deg": datum_bearing_deg,
         }
 
     async def get_bag_metadata(
         self,
-        map_id: str,
         robot_name: str,
         bag_id: str,
     ) -> Optional[Dict[str, Any]]:
         """Get metadata and a presigned download URL for a bag."""
         try:
-            meta = self.rosbag_db.get_bag_metadata(
-                map_id=map_id,
-                robot_name=robot_name,
-                bag_id=bag_id,
-            )
-            if meta is None:
-                return None
-
-            download_url = self.rosbag_db.get_download_url(
-                map_id=map_id,
-                robot_name=robot_name,
-                bag_id=bag_id,
-            )
-            meta["download_url"] = download_url
-            return meta
+            return self.rosbag_db.get_bag_metadata(robot_name=robot_name, bag_id=bag_id)
         except Exception as e:
             self.logger.error(f"Error getting metadata for bag {bag_id}: {e}", exc_info=True)
             return None
 
     async def list_bags(
         self,
-        map_id: str,
         robot_name: Optional[str] = None,
-    ) -> List[Dict[str, str]]:
-        """List bags for a map, optionally filtered by robot."""
+        map_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List bags, optionally filtered by robot_name and/or map_id."""
         try:
-            return self.rosbag_db.list_bags(map_id=map_id, robot_name=robot_name)
+            return self.rosbag_db.list_bags(robot_name=robot_name, map_id=map_id)
         except Exception as e:
-            self.logger.error(f"Error listing bags in map {map_id}: {e}", exc_info=True)
+            self.logger.error(f"Error listing bags: {e}", exc_info=True)
             return []
 
     async def delete_bag(
         self,
-        map_id: str,
         robot_name: str,
         bag_id: str,
     ) -> Dict[str, Any]:
-        """Delete a single bag."""
+        """Delete a single bag and its sidecar."""
         try:
-            success = self.rosbag_db.delete_bag(
-                map_id=map_id,
-                robot_name=robot_name,
-                bag_id=bag_id,
-            )
+            success = self.rosbag_db.delete_bag(robot_name=robot_name, bag_id=bag_id)
             return {"success": success}
         except Exception as e:
             self.logger.error(f"Error deleting bag {bag_id}: {e}", exc_info=True)
@@ -1245,19 +1272,17 @@ class ApiDelegationService:
 
     async def delete_robot_bags(
         self,
-        map_id: str,
         robot_name: str,
     ) -> Dict[str, Any]:
-        """Delete all bags for a robot+map combination."""
+        """Delete all bags for a robot."""
         try:
-            bags_before = self.rosbag_db.list_bags(map_id=map_id, robot_name=robot_name)
+            bags_before = self.rosbag_db.list_bags(robot_name=robot_name)
             count = len(bags_before)
-            success = self.rosbag_db.delete_robot_bags(map_id=map_id, robot_name=robot_name)
+            success = self.rosbag_db.delete_robot_bags(robot_name=robot_name)
             return {"success": success, "count_deleted": count if success else 0}
         except Exception as e:
             self.logger.error(
-                f"Error deleting bags for robot {robot_name} in map {map_id}: {e}",
-                exc_info=True,
+                f"Error deleting bags for robot {robot_name}: {e}", exc_info=True
             )
             return {"success": False, "count_deleted": 0}
 

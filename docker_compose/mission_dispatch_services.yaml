@@ -27,7 +27,7 @@ services:
     network_mode: "host"
     volumes:
     - type: bind
-      source: ../packages/utils/test_utils/mosquitto.sh
+      source: ../packages/utils/mosquitto.sh
       target: /mosquitto.sh
 
   # Create Postgres database
@@ -196,7 +196,7 @@ services:
       - ARANGO_USERNAME=root
       - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
       - DATABASE_NAME=${GRAPH_DB_NAME:-topomap_db}
-      - MINIO_HOST=localhost
+      - MINIO_HOST=${MINIO_HOST:-localhost}
       - MINIO_PORT=${MINIO_PORT:-9000}
       - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
       - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
