@@ -181,6 +181,36 @@ services:
     restart: on-failure
 
 
+  # Create Agent Orchestrator Service (LLM triage of VDA5050 state)
+  agent-orchestrator-service:
+    build:
+      context: ..
+      dockerfile: packages/services/agent_orchestrator/Dockerfile
+    image: ${AGENT_ORCHESTRATOR_SERVICE_IMAGE:-agent_orchestrator_service:latest}
+    command: ["python", "-m", "packages.services.agent_orchestrator.main",
+              "--port", "${AGENT_ORCHESTRATOR_PORT:-8007}",
+              "--host", "0.0.0.0"]
+    environment:
+      - MQTT_HOST=localhost
+      - MQTT_PORT=${MQTT_PORT_TCP:-1883}
+      - MQTT_VDA5050_PREFIX=${MQTT_VDA5050_PREFIX:-uagv/v2/RobotCompany}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Optional: point the Anthropic client at a local LiteLLM proxy (Gemini etc.)
+      # for free dev LLM. See docker_compose/llm_proxy.yaml. Unset == real API.
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - AGENT_MODEL=${AGENT_MODEL:-claude-haiku-4-5}
+      - AGENT_BATTERY_LOW_THRESHOLD=${AGENT_BATTERY_LOW_THRESHOLD:-20.0}
+      # Required by packages/config.py at import time:
+      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    network_mode: "host"
+    restart: on-failure
+    depends_on:
+      - mosquitto
+
+
   # Create API Delegation Service
   api-delegation-service:
     build:

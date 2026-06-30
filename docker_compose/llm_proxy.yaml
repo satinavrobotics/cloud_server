@@ -1,0 +1,39 @@
+# Optional dev-only LLM proxy: a free model behind an Anthropic-compatible API.
+#
+# Lets the agent-orchestrator run real (non-degraded) LLM triage without
+# Anthropic credits. LiteLLM exposes /v1/messages (Anthropic format) on :4000
+# and translates to the configured provider (Gemini by default).
+#
+# Usage:
+#   1. Put GEMINI_API_KEY (+ optionally LITELLM_MASTER_KEY) in cloud_server/.env
+#   2. docker compose -f docker_compose/llm_proxy.yaml up -d
+#   3. In .env set:
+#        ANTHROPIC_BASE_URL=http://localhost:4000
+#        ANTHROPIC_API_KEY=${LITELLM_MASTER_KEY}   # same value
+#        AGENT_MODEL=gemini-3.5-flash
+#      then rebuild the agent service so it picks up the env + base_url seam:
+#        docker compose -f docker_compose/mission_dispatch_services.yaml \
+#          up -d --build agent-orchestrator-service
+#
+# host networking: the agent (also host-networked) reaches it at localhost:4000,
+# and the proxy gets outbound internet to call the provider.
+
+# Distinct project name so this file doesn't treat the main stack's containers
+# as orphans (and a stray --remove-orphans can't delete them).
+name: sati-llm-proxy
+
+services:
+  litellm-proxy:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: sati_litellm_proxy
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    # Load the project's real .env into the container (GEMINI_API_KEY,
+    # LITELLM_MASTER_KEY). env_file is resolved relative to THIS file, so ../.env
+    # is cloud_server/.env regardless of the working directory compose runs from.
+    env_file:
+      - path: ../.env
+        required: false
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
+    network_mode: "host"
+    restart: on-failure

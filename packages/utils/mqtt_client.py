@@ -66,6 +66,13 @@ class MQTTClient:
         except Exception as e:
             self.logger.error(f"Failed to initiate MQTT connection: {e}")
 
+    def publish(self, topic: str, payload: str, qos: int = 0, retain: bool = False):
+        """Publish a message to a topic."""
+        result = self.client.publish(topic, payload, qos=qos, retain=retain)
+        if result.rc != mqtt_client.MQTT_ERR_SUCCESS:
+            self.logger.warning(f"Publish to {topic} returned rc={result.rc}")
+        return result
+
     def disconnect(self):
         """Disconnect and stop the background loop."""
         self.client.loop_stop()

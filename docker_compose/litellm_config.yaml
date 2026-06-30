@@ -1,0 +1,32 @@
+# LiteLLM proxy config — presents an Anthropic-compatible /v1/messages endpoint
+# backed by a free model, so the agent-orchestrator's Anthropic SDK code is
+# unchanged (it just points ANTHROPIC_BASE_URL at this proxy).
+#
+# The agent requests model=${AGENT_MODEL}; that must match a model_name below.
+# To swap providers (Groq, NVIDIA NIM, local Ollama, real Claude) change the
+# litellm_params.model here and AGENT_MODEL — no application code changes.
+
+model_list:
+  # Free Google AI Studio tier — get a key at https://aistudio.google.com/apikey
+  # NOTE: gemini-2.0-flash was retired 2026-06-01; use a current model.
+  # Alternatives: gemini-flash-latest, gemini-flash-lite-latest.
+  # Flash-Lite — higher free-tier RPM than Flash (Flash is only ~5 req/min free),
+  # so it survives bursts of events better in dev. Quota is per-model.
+  - model_name: gemini-flash-lite-latest
+    litellm_params:
+      model: gemini/gemini-flash-lite-latest
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini-3.5-flash
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+litellm_settings:
+  # Silently drop request params a given provider doesn't support (e.g. the
+  # Anthropic prompt-cache `cache_control` block has no Gemini equivalent).
+  drop_params: true
+
+general_settings:
+  # Shared secret the agent sends as its Anthropic x-api-key. Must equal the
+  # ANTHROPIC_API_KEY the agent uses. Defaulted in llm_proxy.yaml.
+  master_key: os.environ/LITELLM_MASTER_KEY

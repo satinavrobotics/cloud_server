@@ -17,6 +17,7 @@ import os
 PORT_GRAPH_BUILDER = 8004
 PORT_MISSION_PLANNER = 8005
 PORT_LIVEKIT = 8006
+PORT_AGENT_ORCHESTRATOR = 8007
 PORT_API_DELEGATION = 8000
 
 # ==================== Infrastructure Ports ====================
@@ -30,6 +31,7 @@ PORT_MQTT = 1883
 URL_GRAPH_BUILDER = f"http://localhost:{PORT_GRAPH_BUILDER}"
 URL_MISSION_PLANNER = f"http://localhost:{PORT_MISSION_PLANNER}"
 URL_LIVEKIT = f"http://localhost:{PORT_LIVEKIT}"
+URL_AGENT_ORCHESTRATOR = f"http://localhost:{PORT_AGENT_ORCHESTRATOR}"
 URL_API_DELEGATION = f"http://localhost:{PORT_API_DELEGATION}"
 URL_MISSION_DISPATCH = f"http://localhost:5000"
 
@@ -90,6 +92,9 @@ MQTT_TOPIC_NODE_UPDATE = "robot/node_update"
 # Some services use MQTT_BROKER; normalise to MQTT_HOST as fallback
 MQTT_BROKER    = os.getenv("MQTT_BROKER", MQTT_HOST)
 MQTT_IMAGE_TOPIC = os.getenv("MQTT_IMAGE_TOPIC", "robot/image_upload")
+# VDA5050 topic prefix — must match the mission controller's prefix so the agent
+# orchestrator subscribes to the same robot state stream (`{prefix}/+/state`).
+MQTT_VDA5050_PREFIX = os.getenv("MQTT_VDA5050_PREFIX", "uagv/v2/RobotCompany")
 
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
@@ -124,6 +129,19 @@ LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 LIVEKIT_SERVER_URL = os.getenv("LIVEKIT_SERVER_URL", "ws://localhost:7880")
 LIVEKIT_TTL = int(os.getenv("LIVEKIT_TTL", "36000"))
+
+# ==================== Agent Orchestrator ====================
+# LLM-based fleet triage service. ANTHROPIC_API_KEY is intentionally optional:
+# when unset the orchestrator runs in degraded (non-LLM) mode and emits
+# deterministic summaries, so the service still boots in dev without a key.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
+# Optional: point the Anthropic client at an Anthropic-compatible proxy (e.g. a
+# local LiteLLM proxy in front of a free model like Gemini) for development.
+# Leave unset to talk to the real Anthropic API. See docker_compose/llm_proxy.yaml.
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL") or None
+# Battery state-of-charge (%) at or below which a low-battery event fires.
+AGENT_BATTERY_LOW_THRESHOLD = float(os.getenv("AGENT_BATTERY_LOW_THRESHOLD", "20.0"))
 
 # Validate required credentials at import time
 for _required_secret in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):

@@ -1,0 +1,20 @@
+# Dev override: run the agent-orchestrator's LLM triage through the local
+# LiteLLM proxy (free Gemini) instead of the real Anthropic API.
+#
+# Sets ONLY the agent's three seam vars as explicit literals, so it does not
+# touch the shared secrets .env. The proxy (docker_compose/llm_proxy.yaml) must
+# be up, and its LITELLM_MASTER_KEY must equal ANTHROPIC_API_KEY below.
+#
+# Usage:
+#   docker compose -f docker_compose/mission_dispatch_services.yaml \
+#                  -f docker_compose/agent_gemini_override.yaml \
+#                  up -d --build agent-orchestrator-service
+#
+# Remove the second -f to go back to real Anthropic / degraded mode.
+
+services:
+  agent-orchestrator-service:
+    environment:
+      - ANTHROPIC_BASE_URL=http://localhost:4000
+      - ANTHROPIC_API_KEY=sk-litellm-local
+      - AGENT_MODEL=gemini-flash-lite-latest
