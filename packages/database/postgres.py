@@ -231,12 +231,14 @@ class PostgresDatabase:
         await self._notify(cursor, table_name, name, lifecycle, publisher_id)
 
     async def list_objects(self, object_class: objects.ApiObjectType,
-                           query_params: Optional[pydantic.BaseModel] = None):
+                           query_params: Optional[pydantic.BaseModel] = None,
+                           include_deleted: bool = False):
+        base_filter = "" if include_deleted else "lifecycle != 'DELETED'"
         query = f"SELECT * FROM {object_class.table_name()}"
+        all_clauses = [base_filter] if base_filter else []
+        extra_clause = ""
         if query_params and object_class.get_query_map():
             query_map = object_class.get_query_map()
-            params_list = []
-            extra_clause = ""
             for param, value in query_params:
                 if param == "most_recent" and value is not None:
                     extra_clause = query_map[param].format(str(value))
@@ -250,7 +252,7 @@ class PostgresDatabase:
                         clause = query_map[param]
                         if " = " in clause and "{}" in clause:
                             clause = clause.replace(" = ", " IN ")
-                        params_list.append(clause.format(value_str))
+                        all_clauses.append(clause.format(value_str))
                     elif isinstance(value, enum.Enum):
                         value_str = str(value.value)
                     elif isinstance(value, bool):
@@ -259,13 +261,12 @@ class PostgresDatabase:
                         value_str = value.isoformat()
                     else:
                         value_str = str(value)
-                    
+
                     if not isinstance(value, list):
-                        params_list.append(query_map[param].format(value_str))
-            if params_list:
-                query += " WHERE " + " AND ".join(params_list)
-            query += extra_clause
-        query += ";"
+                        all_clauses.append(query_map[param].format(value_str))
+        if all_clauses:
+            query += " WHERE " + " AND ".join(all_clauses)
+        query += extra_clause + ";"
 
         try:
             async with self._pool.connection() as conn:
