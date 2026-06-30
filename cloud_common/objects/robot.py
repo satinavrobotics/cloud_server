@@ -146,6 +146,10 @@ class RobotSpecV1(pydantic.BaseModel):
         None, description="The map ID that this robot is currently operating on. "
                           "Set via PUT /api/v1/robots/{robot_name}/map."
     )
+    current_model: Optional[str] = pydantic.Field(
+        None, description="The model the robot currently has loaded/active. "
+                          "Reported by the orchestrator at registration and on change."
+    )
     position_mode: Literal['local', 'gps'] = pydantic.Field(
         'local',
         description="'local' = local-only robot; 'gps' = robot publishes a datum via MQTT and "

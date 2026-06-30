@@ -373,6 +373,7 @@ async def root():
                 "upload_url": "POST /api/v1/base_models/upload-url",
                 "list": "GET /api/v1/base_models",
                 "get": "GET /api/v1/base_models/{model_id}",
+                "download_url": "GET /api/v1/base_models/{model_id}/download-url",
                 "delete": "DELETE /api/v1/base_models/{model_id}",
             },
             "navigate": "POST /api/v1/navigate",
@@ -806,6 +807,25 @@ async def delete_model(model_id: str):
     return result
 
 
+@app.get("/api/v1/base_models/{model_id}/download-url")
+async def get_base_model_download_url(model_id: str):
+    """
+    Get only the presigned download URL for a base model's binary.
+
+    Returns 404 if the model does not exist or its binary has not yet been
+    uploaded. Used by the robot orchestrator to fetch a model directly from
+    object storage.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    url = service.model_db.get_download_url(model_id)
+    if url is None:
+        raise HTTPException(status_code=404, detail="Model not found or not yet uploaded")
+
+    return {"download_url": url, "model_id": model_id}
+
+
 # ==================== Navigation Operations ====================
 
 @app.post("/api/v1/navigate", response_model=NavigationResponse)
@@ -996,6 +1016,7 @@ async def create_robot(robot_data: dict):
         entrypoint_port = robot_data.pop("entrypoint_port", None)
         position_mode = robot_data.pop("position_mode", None)
         factsheet_data = robot_data.pop("factsheet", None)
+        current_model = robot_data.pop("current_model", None)
 
         # Try to fetch existing robot; any exception (including 404 HTTPException) means not found
         try:
@@ -1014,6 +1035,9 @@ async def create_robot(robot_data: dict):
                 spec_changed = True
             if position_mode is not None and robot.position_mode != position_mode:
                 robot.position_mode = position_mode
+                spec_changed = True
+            if current_model is not None and robot.current_model != current_model:
+                robot.current_model = current_model
                 spec_changed = True
             if spec_changed:
                 await service.database.update_spec(RobotObjectV1, robot.name, robot.spec, publisher_id)
@@ -1041,6 +1065,8 @@ async def create_robot(robot_data: dict):
                 robot_data_with_defaults["entrypoint_port"] = entrypoint_port
             if position_mode is not None:
                 robot_data_with_defaults["position_mode"] = position_mode
+            if current_model is not None:
+                robot_data_with_defaults["current_model"] = current_model
             robot = RobotObjectV1(**robot_data_with_defaults)
             await service.database.create_object(robot, publisher_id)
             return robot.dict()
