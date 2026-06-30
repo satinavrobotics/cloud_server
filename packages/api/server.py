@@ -1835,9 +1835,14 @@ class ApiDelegationService:
                         "pose": {
                             "x": robot.status.pose.x if hasattr(robot.status, 'pose') else 0,
                             "y": robot.status.pose.y if hasattr(robot.status, 'pose') else 0,
-                            "theta": robot.status.pose.theta if hasattr(robot.status, 'pose') else 0
+                            "theta": robot.status.pose.theta if hasattr(robot.status, 'pose') else 0,
+                            "deviationRange": (
+                                (robot.status.info_messages or {}).get("deviation_range", 0.0)
+                                if hasattr(robot.status, 'info_messages') else 0.0
+                            ),
                         } if hasattr(robot.status, 'pose') else None,
                         "recording_state": robot.status.recording_state if hasattr(robot.status, 'recording_state') else None,
+                        "nav_reasoning": robot.status.nav_reasoning if hasattr(robot.status, 'nav_reasoning') else None,
                     }
                 }
 

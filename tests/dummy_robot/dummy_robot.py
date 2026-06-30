@@ -252,6 +252,11 @@ class DummyRobot:
                 localizationTypes=["NATURAL"],
                 navigationTypes=["AUTONOMOUS"]
             ),
+            protocolLimits=None,
+            protocolFeatures=None,
+            agvGeometry=None,
+            loadSpecification=None,
+            localizationParameters=None,
             actions=custom_actions
         )
 
@@ -276,6 +281,13 @@ class DummyRobot:
             )
             information.append(camera_info)
 
+        # Navigation reasoning narration: level-triggered, re-sent every state.
+        information.append(types.VDA5050Info(
+            infoType="navReasoning",
+            infoLevel="INFO",
+            infoDescription=f"Heading to waypoint {self.header_id % 5}",
+        ))
+
         state = types.VDA5050State(
             headerId=self.header_id,
             timestamp=datetime.datetime.now().isoformat(),
@@ -292,7 +304,9 @@ class DummyRobot:
             batteryState=types.VDA5050BatteryState(
                 batteryCharge=self.battery,
                 batteryVoltage=48.0,
-                charging=False
+                batteryHealth=None,
+                charging=False,
+                reach=None,
             ),
             driving=True,
             agvPosition=types.VDA5050AgvPosition(

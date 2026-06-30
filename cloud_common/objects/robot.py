@@ -127,6 +127,11 @@ class RobotStatusV1(pydantic.BaseModel):
     recording_state: Optional[str] = pydantic.Field(
         None, description="Recording state reported by the robot: 'idle' or 'running'. "
                           "None if recording is not available on this robot.")
+    nav_reasoning: Optional[str] = pydantic.Field(
+        None, description="Latest human-readable navigation reasoning line the robot "
+                          "narrates via the VDA5050 state information[] array "
+                          "(infoType='navReasoning'). Level-triggered: holds the most "
+                          "recent line until the robot replaces it. None if never reported.")
 
 
 class RobotSpecV1(pydantic.BaseModel):

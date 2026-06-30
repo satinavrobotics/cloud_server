@@ -366,6 +366,7 @@ class Robot:
             await asyncio.sleep(self._robot_object.heartbeat_timeout.total_seconds())
             self.info("Robot Offline")
             self._robot_object.status.recording_state = None
+            self._robot_object.status.nav_reasoning = None
             if not self._robot_object.status.online:
                 await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
                 return
@@ -505,20 +506,44 @@ class Robot:
             if not self._robot_object.status.online:
                 self.info("Robot Online")
             self._robot_object.status.online = True
-            if message.information and len(message.information) > 0:
-                for information in message.information:
-                    if information.infoType == "user_info":
-                        self._robot_object.status.info_messages = \
-                            json.loads(information.infoDescription)
-                        break
-            # Update recording state from the informations array
-            recording_info = next(
-                (i.infoDescription for i in (message.information or [])
-                 if i.infoType == "recordingState"),
-                message.recordingState,
-            )
+            # Single pass over the VDA5050 information[] array. Each infoType is an
+            # independent slot keyed by type (last entry wins on the rare duplicate),
+            # so we collect them once instead of re-scanning the list per field.
+            info_by_type: Dict[str, str] = {
+                i.infoType: i.infoDescription for i in (message.information or [])}
+
+            if "user_info" in info_by_type:
+                self._robot_object.status.info_messages = \
+                    json.loads(info_by_type["user_info"])
+
+            # deviation_range is a server-tracked value kept alongside the user_info
+            # payload. Write it *after* the user_info replacement above so it is not
+            # clobbered when a robot reports agvPosition and user_info in the same
+            # state message.
+            if message.agvPosition is not None:
+                if self._robot_object.status.info_messages is None:
+                    self._robot_object.status.info_messages = {}
+                self._robot_object.status.info_messages["deviation_range"] = \
+                    message.agvPosition.deviationRange
+
+            # Recording state: prefer the information[] entry, else the legacy
+            # top-level recordingState field.
+            recording_info = info_by_type.get(
+                "recordingState", message.recordingState)
             if recording_info is not None:
                 self._robot_object.status.recording_state = recording_info
+
+            # Navigation reasoning narration (infoType="navReasoning"): the robot
+            # re-sends its latest operator-facing line in every ~1Hz state message.
+            # It is level-triggered, so we keep the last known line and treat only a
+            # *changed* description as a new event (log it once); an unchanged line is
+            # a heartbeat. An absent entry leaves the last line in place — MQTT is
+            # QoS 0, so a single message missing it must not erase the narration.
+            nav_reasoning = info_by_type.get("navReasoning")
+            if nav_reasoning is not None:
+                if nav_reasoning != self._robot_object.status.nav_reasoning:
+                    self.info(f"Nav reasoning: {nav_reasoning}")
+                self._robot_object.status.nav_reasoning = nav_reasoning
             # Update robot unique ID
             self._robot_object.status.hardware_version = \
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,
