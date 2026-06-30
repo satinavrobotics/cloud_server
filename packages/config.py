@@ -93,7 +93,8 @@ MQTT_IMAGE_TOPIC = os.getenv("MQTT_IMAGE_TOPIC", "robot/image_upload")
 
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
-GPS_MAP_SENTINEL = 'GEO'  # map_id sentinel for GPS-mode robots with no assigned map
+GPS_MAP_SENTINEL = 'GEO'    # map_id sentinel for GPS-mode robots with no assigned map
+LOCAL_MAP_SENTINEL = 'LOCAL'  # map_id sentinel for local-odometry robots with no assigned map
 
 # ==================== Camera Configuration ====================
 # Camera yaw offsets in radians relative to robot's forward direction (0 radians)

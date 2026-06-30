@@ -28,6 +28,7 @@ from packages.config import (
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
     DEFAULT_MAP_ID,
     GPS_MAP_SENTINEL,
+    LOCAL_MAP_SENTINEL,
 )
 
 
@@ -303,7 +304,8 @@ class GraphBuilderService:
         """
         Look up the robot's current_map from its database record.
 
-        Returns None when the robot is in GEO mode (current_map == GPS_MAP_SENTINEL), which
+        Returns None when the robot is in GEO or LOCAL mode
+        (current_map == GPS_MAP_SENTINEL or LOCAL_MAP_SENTINEL), which
         signals _handle_node_update to skip topology recording entirely.
 
         Falls back to self.default_map_id if the robot is not found, has no
@@ -313,12 +315,12 @@ class GraphBuilderService:
             robot_name: Name of the robot to look up
 
         Returns:
-            The map ID to use, or None if the robot is in GEO mode.
+            The map ID to use, or None if the robot is in GEO or LOCAL mode.
         """
         try:
             robot = await self.database.get_object(RobotObjectV1, robot_name)
             if robot is not None and robot.current_map:
-                if robot.current_map == GPS_MAP_SENTINEL:
+                if robot.current_map in (GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL):
                     return None
                 return robot.current_map
         except Exception as e:
@@ -335,8 +337,8 @@ class GraphBuilderService:
         Looks up the robot's active mission once to read the register_map flag.
         When register_map=True (or no mission is active): builds topology and logs.
         When register_map=False: skips topology entirely, logs position only.
-        When map_id is None (robot in GEO mode): skips topology, logs position only
-          (register_map is not available in GEO mode regardless of mission settings).
+        When map_id is None (robot in GEO or LOCAL mode): skips topology, logs position only
+          (register_map is not available in GEO/LOCAL mode regardless of mission settings).
 
         The map_id is always resolved from the robot's database record
         (robot.current_map), falling back to self.default_map_id. Any map_id
@@ -345,7 +347,7 @@ class GraphBuilderService:
         robot_name = payload.get('robot_name')
 
         # Resolve map_id from the robot's DB record, not from the payload.
-        # None means GEO mode — topology recording is not available.
+        # None means GEO/LOCAL mode — topology recording is not available.
         map_id: Optional[str] = self.default_map_id
         if robot_name:
             map_id = await self._get_robot_map_id(robot_name)
@@ -370,7 +372,7 @@ class GraphBuilderService:
             except Exception as e:
                 self.logger.error(f"Failed to look up active mission for '{robot_name}': {e}")
 
-        # GEO mode: no map assigned, skip topology regardless of register_map
+        # GEO/LOCAL mode: no map assigned, skip topology regardless of register_map
         if map_id is None:
             register_map = False
 

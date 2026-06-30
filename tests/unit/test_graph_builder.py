@@ -1613,6 +1613,19 @@ class TestGraphBuilderGetRobotMapIdGeo:
 
     @patch('packages.services.graph_builder.server.PostgresDatabase')
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
+    async def test_local_sentinel_returns_none(self, mock_topomap, mock_postgres):
+        """current_map == 'LOCAL' must return None, not the string 'LOCAL'."""
+        robot = Mock()
+        robot.current_map = 'LOCAL'
+        mock_postgres.return_value.get_object = AsyncMock(return_value=robot)
+
+        service = self._make_service(mock_topomap)
+        result = await service._get_robot_map_id('sati-gamma')
+
+        assert result is None
+
+    @patch('packages.services.graph_builder.server.PostgresDatabase')
+    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     async def test_real_map_id_returned_unchanged(self, mock_topomap, mock_postgres):
         """A real map ID passes through unmodified."""
         robot = Mock()
