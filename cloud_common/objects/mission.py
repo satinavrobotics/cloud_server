@@ -334,6 +334,20 @@ class MissionStatusV1(pydantic.BaseModel):
                            readable reason why.")
     failure_category: Optional[MissionFailureCategoryV1] = pydantic.Field(
         None, description="A enum describing the cause of the mission failure.")
+    blocked: bool = pydantic.Field(
+        False, description="True when the robot reported an impassable edge and is waiting \
+                           (IDLE) for the server/operator to send a new route. The mission \
+                           remains RUNNING; this is a non-terminal condition.")
+    blocked_node: Optional[str] = pydantic.Field(
+        None, description="Name of the mission_tree route node whose edge is blocked.")
+    blocked_edge: Optional[str] = pydantic.Field(
+        None, description="VDA5050 edge id of the blocked edge, if the robot could resolve it \
+                           (may be null).")
+    blocked_waypoint_index: Optional[int] = pydantic.Field(
+        None, description="Index of the unreachable waypoint within the blocked route node, if \
+                           resolvable.")
+    block_reason: Optional[str] = pydantic.Field(
+        None, description="Human readable description of why the edge is blocked.")
 
     class Config:
         use_enum_value = True

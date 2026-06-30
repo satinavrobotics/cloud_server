@@ -1864,16 +1864,34 @@ class ApiDelegationService:
                 if mission.lifecycle == ObjectLifecycleV1.DELETED:
                     continue
 
-                # Build WebSocket message
+                # Build WebSocket message — include full status plus needs_canceled so
+                # clients can show the "(Canceling...)" indicator without a round-trip.
+                st = mission.status
                 message = {
                     "type": "mission_update",
                     "mission_name": mission.name,
                     "robot_name": mission.robot,
+                    "needs_canceled": mission.needs_canceled,
                     "timestamp": datetime.now().isoformat(),
                     "status": {
-                        "state": mission.status.state.value if hasattr(mission.status, 'state') else "PENDING",
-                        "current_node": mission.status.current_node if hasattr(mission.status, 'current_node') else 0,
-                        "failure_reason": mission.status.failure_reason if hasattr(mission.status, 'failure_reason') else None
+                        "state": st.state.value if hasattr(st, 'state') else "PENDING",
+                        "current_node": st.current_node if hasattr(st, 'current_node') else 0,
+                        "failure_reason": st.failure_reason if hasattr(st, 'failure_reason') else None,
+                        "failure_category": st.failure_category.value if (
+                            hasattr(st, 'failure_category') and st.failure_category is not None
+                        ) else None,
+                        "start_timestamp": st.start_timestamp.isoformat() if (
+                            hasattr(st, 'start_timestamp') and st.start_timestamp is not None
+                        ) else None,
+                        "end_timestamp": st.end_timestamp.isoformat() if (
+                            hasattr(st, 'end_timestamp') and st.end_timestamp is not None
+                        ) else None,
+                        "blocked": st.blocked if hasattr(st, 'blocked') else False,
+                        "blocked_node": st.blocked_node if hasattr(st, 'blocked_node') else None,
+                        "blocked_edge": st.blocked_edge if hasattr(st, 'blocked_edge') else None,
+                        "blocked_waypoint_index": st.blocked_waypoint_index if hasattr(
+                            st, 'blocked_waypoint_index') else None,
+                        "block_reason": st.block_reason if hasattr(st, 'block_reason') else None,
                     }
                 }
 

@@ -286,6 +286,7 @@ class VDA5050ErrorLevel(str, enum.Enum):
 
 
 class VDA5050Error(pydantic.BaseModel):
+    errorType: Optional[str] = None
     errorReferences: List[VDA5050ErrorReference] = []
     errorDescription: str
     errorLevel: VDA5050ErrorLevel = VDA5050ErrorLevel.WARNING

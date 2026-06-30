@@ -111,6 +111,7 @@ class Robot:
                                                    types.VDA5050Action] = OrderedDict()
         self._mqtt_client = client
         self._robot_online_task: Optional[asyncio.Task[Any]] = None
+        self._mission_timeout_task: Optional[asyncio.Task[Any]] = None
         self._robot_server = server
         self._alive = True
         self._header_id = 0
@@ -140,6 +141,12 @@ class Robot:
         if self._robot_object is None or \
                 self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.ALIVE:
             return
+        # Skip missions that were already canceled before they started
+        if self._current_mission.needs_canceled:
+            self.mission_info("Mission already flagged for cancel before dispatch — canceling immediately")
+            self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+            await self.get_next_mission()
+            return
         # Initialize behavior tree
         self._current_behavior_tree = behavior_tree.MissionBehaviorTree(
             self._current_mission)
@@ -152,9 +159,7 @@ class Robot:
             return
 
         self.update_mission_from_behavior_tree()
-        asyncio.get_event_loop().create_task(self._wait_mission_timeout(
-            self._current_mission.timeout.total_seconds(),
-            self._current_mission.name))
+        self._arm_mission_timeout()
         await self._send_order()
 
     async def _send_instant_action(self, instant_action: types.VDA5050Action):
@@ -624,6 +629,26 @@ class Robot:
         else:
             await self._try_start_mission()
 
+    def _arm_mission_timeout(self):
+        """(Re)start the mission timeout watchdog for the current mission.
+
+        Any previously scheduled timeout is cancelled first. Used both on initial
+        dispatch and when resuming after an edgeBlocked condition clears."""
+        self._cancel_mission_timeout()
+        if self._current_mission is None:
+            return
+        self._mission_timeout_task = asyncio.get_event_loop().create_task(
+            self._wait_mission_timeout(
+                self._current_mission.timeout.total_seconds(),
+                self._current_mission.name))
+
+    def _cancel_mission_timeout(self):
+        """Cancel the mission timeout watchdog (e.g. while the mission is blocked and
+        legitimately waiting for an operator reroute, so it is not failed as TIMEOUT)."""
+        if self._mission_timeout_task is not None:
+            self._mission_timeout_task.cancel()
+            self._mission_timeout_task = None
+
     async def _wait_mission_timeout(self, timeout: float, name: str):
         await asyncio.sleep(timeout)
         # Check to see if the mission that launched this thread is still running
@@ -632,11 +657,19 @@ class Robot:
 
         if name == self._current_mission.name and \
                 self._current_mission.status.state == mission_object.MissionStateV1.RUNNING:
+            # A mission blocked on an impassable edge is legitimately waiting for an
+            # operator reroute — never fail it as a timeout. (The timeout task is also
+            # cancelled on block; this guards the rare cancel/fire race.)
+            if self._current_mission.status.blocked:
+                return
             # In case there is no response from the client
             if await self._robot_server.delete_pending_mission(self._current_mission):
                 return
-            self._current_mission.status.failure_reason = "Mission timed out"
-            self._set_mission_state(mission_object.MissionStateV1.FAILED)
+            if self._current_mission.needs_canceled:
+                self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+            else:
+                self._current_mission.status.failure_reason = "Mission timed out"
+                self._set_mission_state(mission_object.MissionStateV1.FAILED)
             self._set_robot_state(robot_object.RobotStateV1.IDLE)
 
     async def _delete_robot_object(self):
@@ -679,6 +712,7 @@ class Robot:
             # that node, so we enforce that idx >= 0.
             if self.last_node_seq_id < message.lastNodeSequenceId and \
                     idx >= 0 and \
+                    idx < len(current_mission_node.route.waypoints) and \
                     current_mission_node.route.waypoints[idx].allowedDeviationXY == 0:
                 if current_mission_node.name not in task_status:
                     task_status[str(current_mission_node.name)] = 0
@@ -720,6 +754,108 @@ class Robot:
         # Set mission node state based on update from robot client message
         self.set_mission_node_state(str(current_mission_node.name), node_state)
         return node_state
+
+    def _handle_edge_blocked(self, message: types.VDA5050State) -> bool:
+        """Detect a robot-reported ``edgeBlocked`` WARNING and record it as a
+        non-terminal block on the current mission.
+
+        The robot emits this on ``state.errors[]`` when a topological edge is
+        impassable after its local retries. It then stops, goes IDLE, and waits for
+        the server/operator to send a new route. The mission deliberately stays
+        RUNNING (the error is a WARNING, not FATAL); we only annotate it so an
+        operator can see it and issue a reroute.
+
+        Returns True while the mission is blocked, signalling the caller to skip
+        further state/behavior-tree processing for this tick. When the robot stops
+        reporting the block (the new order has been ingested and navigation resumed),
+        any recorded block is cleared and False is returned.
+        """
+        if self._current_mission is None:
+            return False
+        status = self._current_mission.status
+        blocked_error = next(
+            (e for e in message.errors if e.errorType == "edgeBlocked"), None)
+
+        if blocked_error is None:
+            # No active block reported. If we had one recorded, the robot has
+            # resumed (a new order cleared its error) — clear the server-side block.
+            if status.blocked:
+                self._clear_block(self._current_mission)
+            return False
+
+        # Resolve references. The nodeId encodes the mission_tree node and the
+        # waypoint sequence as "{mission}-n{node_idx}-s{sequence}". edgeId may be
+        # absent if the robot could not resolve it — tolerate that.
+        blocked_edge = None
+        blocked_node_name = None
+        blocked_waypoint_index = None
+        for ref in blocked_error.errorReferences:
+            if ref.referenceKey in ("edgeId", "edge_id"):
+                blocked_edge = ref.referenceValue
+            elif ref.referenceKey in ("nodeId", "node_id"):
+                try:
+                    node_idx = int(
+                        ref.referenceValue.rsplit("-n", 1)[1].rsplit("-s", 1)[0])
+                    if node_idx < len(self._current_mission.mission_tree):
+                        blocked_node_name = str(
+                            self._current_mission.mission_tree[node_idx].name)
+                except (ValueError, IndexError):
+                    pass
+                try:
+                    seq = int(ref.referenceValue.rsplit("-s", 1)[1])
+                    blocked_waypoint_index = seq // 2 - 1
+                except (ValueError, IndexError):
+                    pass
+
+        # Idempotency: the idle robot re-emits this WARNING in every state message,
+        # so only act (log + persist) when the block is new or its target changed.
+        if (status.blocked and status.blocked_node == blocked_node_name and
+                status.blocked_edge == blocked_edge):
+            return True
+
+        status.blocked = True
+        status.blocked_node = blocked_node_name
+        status.blocked_edge = blocked_edge
+        status.blocked_waypoint_index = blocked_waypoint_index
+        status.block_reason = blocked_error.errorDescription
+        if blocked_node_name is not None and blocked_node_name in status.node_status:
+            status.node_status[blocked_node_name].error_msg = \
+                blocked_error.errorDescription
+
+        self.warning(
+            f"Edge blocked: node={blocked_node_name} edge={blocked_edge} "
+            f"reason={blocked_error.errorDescription!r}; mission stays RUNNING, "
+            "awaiting reroute")
+
+        # The robot has stopped and is IDLE; reflect that and stop the timeout from
+        # failing a mission that is legitimately waiting for an operator reroute.
+        self._set_robot_state(robot_object.RobotStateV1.IDLE)
+        self._cancel_mission_timeout()
+
+        asyncio.ensure_future(self._database.update_status(
+            api_objects.MissionObjectV1, self._current_mission.name,
+            status, uuid.uuid4()))
+        return True
+
+    def _clear_block(self, mission: api_objects.MissionObjectV1):
+        """Clear a recorded edgeBlocked condition once the robot has resumed."""
+        if not mission.status.blocked:
+            return
+        blocked_node = mission.status.blocked_node
+        mission.status.blocked = False
+        mission.status.blocked_node = None
+        mission.status.blocked_edge = None
+        mission.status.blocked_waypoint_index = None
+        mission.status.block_reason = None
+        if blocked_node is not None and blocked_node in mission.status.node_status:
+            mission.status.node_status[blocked_node].error_msg = None
+        self.mission_info("Edge block cleared; mission resuming")
+        # Robot is moving again; restore ON_TASK and re-arm the mission timeout.
+        self._set_robot_state(robot_object.RobotStateV1.ON_TASK)
+        if mission is self._current_mission:
+            self._arm_mission_timeout()
+        asyncio.ensure_future(self._database.update_status(
+            api_objects.MissionObjectV1, mission.name, mission.status, uuid.uuid4()))
 
     def get_mission_errors(self, message: types.VDA5050State):
         fatal_errors = False
@@ -816,6 +952,13 @@ class Robot:
                 self._updating_mission_from_api = True
             return
 
+        # A robot that has hit an impassable edge reports an edgeBlocked WARNING and
+        # waits IDLE (it does not emit missionStatus="failed"). Record the block and
+        # stop here so a waiting mission is not churned or advanced; it resumes once
+        # an operator reroute clears the block.
+        if self._handle_edge_blocked(message):
+            return
+
         # For "reached" (intermediate waypoint) and the no-info case, fall through
         # to the existing behavior-tree path so node-level tracking stays intact.
         node_state = self.update_mission_node_state(
@@ -831,18 +974,23 @@ class Robot:
 
     async def run(self):
         while self._alive:
-            message = await self._messages.get()
-            # If this is a robot object
-            if isinstance(message, api_objects.RobotObjectV1):
-                await self._on_robot_change(message)
-            elif isinstance(message, api_objects.MissionObjectV1):
-                await self._on_mission_change(message)
-            elif isinstance(message, types.VDA5050State):
-                await self._on_client_message(message)
-            elif isinstance(message, types.VDA5050Factsheet):
-                await self._on_client_factsheet(message)
-            elif isinstance(message, types.RobotDatum):
-                await self._process_datum_message(message)
+            try:
+                message = await self._messages.get()
+                # If this is a robot object
+                if isinstance(message, api_objects.RobotObjectV1):
+                    await self._on_robot_change(message)
+                elif isinstance(message, api_objects.MissionObjectV1):
+                    await self._on_mission_change(message)
+                elif isinstance(message, types.VDA5050State):
+                    await self._on_client_message(message)
+                elif isinstance(message, types.VDA5050Factsheet):
+                    await self._on_client_factsheet(message)
+                elif isinstance(message, types.RobotDatum):
+                    await self._process_datum_message(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.warning(f"Unhandled exception in robot message loop: {e}")
 
     async def send_message(self, message):
         await self._messages.put(message)

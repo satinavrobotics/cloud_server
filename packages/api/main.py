@@ -1422,9 +1422,45 @@ async def websocket_mission_status(websocket: WebSocket, mission_name: str):
     if service is None:
         await websocket.close(code=1011, reason="Service not initialized")
         return
-    
+
     await service.ws_manager.connect(websocket, "mission_status", mission_name)
-    
+
+    # Send current state immediately so clients that connect after state changes
+    # (e.g. fast-completing missions) don't get stuck on stale PENDING state.
+    try:
+        mission = await service.database.get_object(MissionObjectV1, mission_name)
+        st = mission.status
+        snapshot = {
+            "type": "mission_update",
+            "mission_name": mission.name,
+            "robot_name": mission.robot,
+            "needs_canceled": mission.needs_canceled,
+            "timestamp": datetime.now().isoformat(),
+            "status": {
+                "state": st.state.value if hasattr(st, "state") else "PENDING",
+                "current_node": st.current_node if hasattr(st, "current_node") else 0,
+                "failure_reason": st.failure_reason if hasattr(st, "failure_reason") else None,
+                "failure_category": st.failure_category.value if (
+                    hasattr(st, "failure_category") and st.failure_category is not None
+                ) else None,
+                "start_timestamp": st.start_timestamp.isoformat() if (
+                    hasattr(st, "start_timestamp") and st.start_timestamp is not None
+                ) else None,
+                "end_timestamp": st.end_timestamp.isoformat() if (
+                    hasattr(st, "end_timestamp") and st.end_timestamp is not None
+                ) else None,
+                "blocked": st.blocked if hasattr(st, "blocked") else False,
+                "blocked_node": st.blocked_node if hasattr(st, "blocked_node") else None,
+                "blocked_edge": st.blocked_edge if hasattr(st, "blocked_edge") else None,
+                "blocked_waypoint_index": st.blocked_waypoint_index if hasattr(
+                    st, "blocked_waypoint_index") else None,
+                "block_reason": st.block_reason if hasattr(st, "block_reason") else None,
+            },
+        }
+        await websocket.send_json(snapshot)
+    except Exception:
+        pass  # Mission may not exist yet; client will receive updates via watcher
+
     try:
         while True:
             await websocket.receive_text()
