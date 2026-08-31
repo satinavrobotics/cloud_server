@@ -61,9 +61,12 @@ services:
               "--postgres_user", "${POSTGRES_DATABASE_USERNAME}",
               "--postgres_password", "${POSTGRES_DATABASE_PASSWORD}"]
     network_mode: "host"
+    restart: on-failure
     depends_on:
       mosquitto:
         condition: service_started
+      postgres:
+        condition: service_healthy
 
   # Create ArangoDB for topological map
   arangodb:
@@ -83,7 +86,7 @@ services:
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
     network_mode: "host"
     volumes:
-      - minio_data:/data
+      - /media/satiadmin/data0/minio_data:/data
 
   # Create Graph Builder Service
   graph-builder-service:
@@ -253,4 +256,3 @@ services:
 
 volumes:
   arango_data:
-  minio_data:

@@ -1,9 +1,16 @@
 import logging
 import asyncio
 import threading
+import time
 import json
 from typing import Callable, Dict, Any, Optional
 import paho.mqtt.client as mqtt_client
+
+# How long the client can go without a broker connection before the watchdog
+# forces a reconnect attempt. Covers cases where paho's built-in automatic
+# reconnection silently stalls (observed with the websockets transport).
+_RECONNECT_WATCHDOG_INTERVAL_SEC = 15
+_RECONNECT_STALL_THRESHOLD_SEC = 30
 
 class MQTTClient:
     """
@@ -29,9 +36,13 @@ class MQTTClient:
         self.keepalive = keepalive
 
         self._connected = False
+        self._disconnected_since: Optional[float] = None
         self._callbacks: Dict[str, Callable[[Any, Any, mqtt_client.MQTTMessage], None]] = {}
 
         self.client = mqtt_client.Client(client_id=client_id, transport=transport, protocol=mqtt_client.MQTTv311)
+        # Surface paho's own connection/reconnection logging, which is otherwise
+        # silent and was the reason a stalled reconnect went unnoticed.
+        self.client.enable_logger(self.logger)
 
         if username and password:
             self.client.username_pw_set(username=username, password=password)
@@ -42,6 +53,9 @@ class MQTTClient:
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
+
+        self._watchdog_thread = threading.Thread(
+            target=self._reconnect_watchdog, daemon=True)
 
     @property
     def connected(self) -> bool:
@@ -63,8 +77,31 @@ class MQTTClient:
             self.client.connect(self.broker, self.port, self.keepalive)
             # loop_start() spins up a background thread that automatically handles reconnects
             self.client.loop_start()
+            if not self._watchdog_thread.is_alive():
+                self._watchdog_thread.start()
         except Exception as e:
             self.logger.error(f"Failed to initiate MQTT connection: {e}")
+
+    def _reconnect_watchdog(self):
+        """
+        Backstop for paho's automatic reconnection, which has been observed to
+        silently stall (e.g. over the websockets transport) leaving the client
+        disconnected indefinitely with no further log output. Forces an explicit
+        reconnect attempt if the client has been down too long.
+        """
+        while True:
+            time.sleep(_RECONNECT_WATCHDOG_INTERVAL_SEC)
+            if self._connected:
+                continue
+            since = self._disconnected_since
+            if since is not None and (time.monotonic() - since) >= _RECONNECT_STALL_THRESHOLD_SEC:
+                self.logger.warning(
+                    f"MQTT client has been disconnected from {self.broker}:{self.port} for "
+                    f"over {_RECONNECT_STALL_THRESHOLD_SEC}s; forcing reconnect attempt.")
+                try:
+                    self.client.reconnect()
+                except Exception as e:
+                    self.logger.error(f"Forced MQTT reconnect attempt failed: {e}")
 
     def publish(self, topic: str, payload: str, qos: int = 0, retain: bool = False):
         """Publish a message to a topic."""
@@ -81,6 +118,7 @@ class MQTTClient:
     def _on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self._connected = True
+            self._disconnected_since = None
             self.logger.info(f"Successfully connected to MQTT broker at {self.broker}:{self.port}")
             # Re-subscribe to all registered topics upon connection/reconnection
             for topic in self._callbacks.keys():
@@ -88,10 +126,12 @@ class MQTTClient:
                 self.logger.info(f"Subscribed to topic: {topic}")
         else:
             self._connected = False
+            self._disconnected_since = self._disconnected_since or time.monotonic()
             self.logger.error(f"MQTT connection failed with code {rc}")
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected = False
+        self._disconnected_since = time.monotonic()
         if rc != 0:
             self.logger.warning(f"Unexpected disconnect from MQTT broker (code: {rc})")
         else:

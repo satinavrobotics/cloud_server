@@ -42,9 +42,21 @@ from cloud_common.objects.mission import MissionObjectV1
 POSTGRES_RECONNECT_PERIOD = 0.5
 WATCHER_POSTGRES_RECONNECT_PERIOD = 0.1
 
+# Fixed application-wide key for the advisory lock that serializes schema creation
+# across services (see initialize_database). Any constant works as long as every
+# service agrees on it; this one is arbitrary ("SATIDB" in hex).
+DB_INIT_LOCK_KEY = 0x5A71DB
+
 
 async def initialize_database(connection: psycopg.AsyncConnection):
     cursor = connection.cursor()
+    # Serialize schema creation across services. Every service (api, mission-dispatch,
+    # mission-planner, graph-builder) runs this on startup, and CREATE TABLE IF NOT
+    # EXISTS is *not* atomic w.r.t. the implicit pg_type row it inserts: two concurrent
+    # creators both pass the existence check, then collide on pg_type_typname_nsp_index
+    # (a UniqueViolation that IF NOT EXISTS does not swallow). A shared transaction-scoped
+    # advisory lock makes init single-file; it releases automatically on commit below.
+    await cursor.execute("SELECT pg_advisory_xact_lock(%s);", (DB_INIT_LOCK_KEY,))
     for obj in objects.ALL_OBJECTS:
         await cursor.execute(f"""CREATE TABLE IF NOT EXISTS {obj.table_name()} (
             name VARCHAR(100) PRIMARY KEY NOT NULL,
@@ -199,7 +211,13 @@ class PostgresDatabase:
                     await initialize_database(conn)
                 self._pool = pool
                 return
-            except psycopg.OperationalError:
+            except (psycopg.OperationalError, psycopg.errors.UniqueViolation):
+                # OperationalError: Postgres not accepting connections yet.
+                # UniqueViolation: lost a concurrent CREATE TABLE race on
+                # pg_type_typname_nsp_index (belt-and-suspenders alongside the advisory
+                # lock in initialize_database). A retry succeeds because the table now
+                # exists, so CREATE TABLE IF NOT EXISTS cleanly no-ops. Note this is not
+                # an OperationalError, so it must be caught explicitly.
                 retries += 1
                 if self._max_retries is not None and retries >= self._max_retries:
                     raise

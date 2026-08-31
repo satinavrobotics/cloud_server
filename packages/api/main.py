@@ -997,6 +997,84 @@ async def get_robot_status(robot_name: str):
         raise HTTPException(status_code=404, detail=f"Robot not found: {str(e)}")
 
 
+@app.get("/api/v1/robots/{robot_name}/diagnostics")
+async def get_robot_diagnostics(robot_name: str):
+    """
+    Get the latest cached system diagnostics (jtop/host_stats/ros_health) for a robot.
+
+    Served from an in-memory cache populated by MQTT `<robot_name>/diagnostics`
+    messages, not from the database — used to warm the client on load/reconnect
+    before the next WebSocket push arrives. Not having received diagnostics yet is
+    a normal, expected state (same as an offline robot having no pose) rather than
+    an error, so this returns 200 with a null `diagnostics` field instead of a 404.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    cached = service.diagnostics.get_cached(robot_name)
+    if cached is None:
+        return {
+            "type": "diagnostics_update",
+            "robot_name": robot_name,
+            "timestamp": None,
+            "robot_timestamp": None,
+            "diagnostics": None,
+        }
+    return cached
+
+
+@app.get("/api/v1/robots/{robot_name}/nav2_bt_tree")
+async def get_robot_nav2_bt_tree(robot_name: str):
+    """
+    Get the latest cached behavior tree XML(s) for a robot.
+
+    Served from an in-memory cache populated by MQTT `<robot_name>/nav2_bt_tree`
+    messages (retained, published once at startup then only on an XML change), not
+    from the database. Not having received a tree yet is a normal, expected state
+    rather than an error, so this returns 200 with a null `trees` field instead of
+    a 404.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    cached = service.diagnostics.get_cached_bt_tree(robot_name)
+    if cached is None:
+        return {
+            "type": "nav2_bt_tree_update",
+            "robot_name": robot_name,
+            "timestamp": None,
+            "trees": None,
+        }
+    return cached
+
+
+@app.get("/api/v1/robots/{robot_name}/nav2_bt_state")
+async def get_robot_nav2_bt_state(robot_name: str):
+    """
+    Get the latest cached behavior tree node states for a robot.
+
+    Served from an in-memory cache populated by MQTT `<robot_name>/nav2_bt_state`
+    messages (live, coalesced to 5Hz by the publisher), not from the database —
+    used to warm the client on load/reconnect before the next WebSocket push
+    arrives. Not having received a state update yet is a normal, expected state
+    rather than an error, so this returns 200 with a null `nodes` field instead of
+    a 404.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    cached = service.diagnostics.get_cached_bt_state(robot_name)
+    if cached is None:
+        return {
+            "type": "nav2_bt_state_update",
+            "robot_name": robot_name,
+            "timestamp": None,
+            "robot_stamp": None,
+            "nodes": None,
+        }
+    return cached
+
+
 @app.post("/api/v1/robots", response_model=dict)
 async def create_robot(robot_data: dict):
     """

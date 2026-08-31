@@ -20,6 +20,7 @@ from packages.topomap_dbs.client import TopomapDatabaseClient
 from packages.services.mission_planner.client import MissionPlannerClient
 from packages.services.livekit.client import LiveKitClient
 from packages.database.postgres import PostgresDatabase
+from packages.api.diagnostics import DiagnosticsService
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1
@@ -572,6 +573,16 @@ class ApiDelegationService:
         self.default_map_id = default_map_id
 
         self.ws_manager = WebSocketManager()
+
+        # Diagnostics: own MQTT subscription to `<robot_name>/diagnostics`, cache-only,
+        # broadcasts onto the existing "robot_status" bucket. Independent lifecycle from
+        # the mission-progress mqtt_client below.
+        self.diagnostics = DiagnosticsService(
+            mqtt_host=mqtt_broker,
+            mqtt_port=mqtt_port,
+            mqtt_keepalive=mqtt_keepalive,
+            ws_manager=self.ws_manager,
+        )
 
         # WebSocket proxy manager (new implementation)
         self.ws_proxy = WebSocketProxyManager(
@@ -1748,6 +1759,9 @@ class ApiDelegationService:
             event_loop.create_task(self._handle_mission_progress_updates())
         ]
 
+        self.diagnostics.set_event_loop(event_loop)
+        self.diagnostics.connect_mqtt()
+
         self.logger.info("✅ Database watchers started for WebSocket broadcasting")
 
     def stop_watchers(self):
@@ -1763,6 +1777,8 @@ class ApiDelegationService:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
             self.logger.info("[MQTT] Disconnected from broker")
+
+        self.diagnostics.disconnect_mqtt()
 
         self.logger.info("Database watchers stopped")
 

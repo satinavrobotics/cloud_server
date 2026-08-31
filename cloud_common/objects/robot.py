@@ -125,7 +125,7 @@ class RobotStatusV1(pydantic.BaseModel):
     errors: Dict = pydantic.Field(
         {}, description="Key value pairs to describe if something is wrong with the robot.")
     recording_state: Optional[str] = pydantic.Field(
-        None, description="Recording state reported by the robot: 'idle' or 'running'. "
+        None, description="Recording state reported by the robot: 'idle' or 'recording'. "
                           "None if recording is not available on this robot.")
     nav_reasoning: Optional[str] = pydantic.Field(
         None, description="Latest human-readable navigation reasoning line the robot "
