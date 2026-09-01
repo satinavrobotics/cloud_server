@@ -1,8 +1,8 @@
 """Robot system diagnostics ingestion for the API Delegation Service.
 
 Subscribes directly to `<robot_name>/diagnostics` MQTT messages (JSON mirror of a
-ROS DiagnosticArray covering jtop/host_stats/ros_health/topic_availability
-collectors), keeps an in-memory latest-value cache per robot, and rebroadcasts
+ROS DiagnosticArray covering jtop/host_stats/ros_health/topic_availability/
+topic_listing collectors), keeps an in-memory latest-value cache per robot, and rebroadcasts
 to WebSocket clients
 already connected to `/ws/robot/{robot_name}` (bucket "robot_status"). Cache-only:
 this is live telemetry, not persisted to Postgres.
@@ -34,7 +34,7 @@ _BT_TREE_TOPIC_RE = re.compile(r"^(.+)/nav2_bt_tree$")
 BT_STATE_TOPIC = "+/nav2_bt_state"
 _BT_STATE_TOPIC_RE = re.compile(r"^(.+)/nav2_bt_state$")
 
-COLLECTOR_NAMES = ("jtop", "host_stats", "ros_health", "topic_availability")
+COLLECTOR_NAMES = ("jtop", "host_stats", "ros_health", "topic_availability", "topic_listing")
 STALE_SOURCES = ("esp32", "gps", "sati_pose")
 
 LEVEL_OK = 0
@@ -172,7 +172,10 @@ class DiagnosticsService:
         is keyed by topic name; per the sati_system_diagnostics contract it's
         WARN if any monitored topic is missing or not publishing, OK otherwise,
         and deliberately never ERROR (that's reserved for the collector itself
-        throwing, not a topic being slow to start).
+        throwing, not a topic being slow to start). topic_listing carries no
+        health signal at all -- it's a point-in-time graph snapshot ({topic_count,
+        topics}), not a liveness check, so it falls through to the same "block
+        present means OK" default as jtop/host_stats.
         """
         if name == "topic_availability":
             unhealthy = any(

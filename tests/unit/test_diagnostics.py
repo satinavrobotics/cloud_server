@@ -1,6 +1,7 @@
 """
 Unit tests for DiagnosticsService — MQTT topic parsing, tolerant payload
-parsing of the 4 fixed collectors (jtop/host_stats/ros_health/topic_availability),
+parsing of the 5 fixed collectors (jtop/host_stats/ros_health/topic_availability/
+topic_listing),
 the in-memory cache, and broadcasting onto the existing "robot_status" WebSocket
 bucket.
 """
@@ -75,6 +76,14 @@ HEALTHY_TOPIC_AVAILABILITY_BLOCK = {
     "/odom": {"exists": True, "publisher_count": 1, "publishing": True, "age_sec": 0.1},
 }
 
+TOPIC_LISTING_BLOCK = {
+    "topic_count": 2,
+    "topics": {
+        "/odom": ["nav_msgs/msg/Odometry"],
+        "/scan": ["sensor_msgs/msg/LaserScan"],
+    },
+}
+
 FULL_PAYLOAD = {
     "timestamp": 1751364000.123456,
     "robot_name": "Pincer01",
@@ -82,6 +91,7 @@ FULL_PAYLOAD = {
     "host_stats": HOST_STATS_BLOCK,
     "ros_health": HEALTHY_ROS_HEALTH_BLOCK,
     "topic_availability": HEALTHY_TOPIC_AVAILABILITY_BLOCK,
+    "topic_listing": TOPIC_LISTING_BLOCK,
 }
 
 
@@ -109,11 +119,14 @@ class TestTopicRegex:
 class TestParseDiagnostics:
     def test_full_payload_all_collectors_present(self):
         result = DiagnosticsService._parse_diagnostics(FULL_PAYLOAD)
-        assert set(result.keys()) == {"jtop", "host_stats", "ros_health", "topic_availability"}
+        assert set(result.keys()) == {
+            "jtop", "host_stats", "ros_health", "topic_availability", "topic_listing",
+        }
         assert result["jtop"] == {"level": LEVEL_OK, "values": JTOP_BLOCK}
         assert result["host_stats"] == {"level": LEVEL_OK, "values": HOST_STATS_BLOCK}
         assert result["ros_health"]["level"] == LEVEL_OK
         assert result["topic_availability"] == {"level": LEVEL_OK, "values": HEALTHY_TOPIC_AVAILABILITY_BLOCK}
+        assert result["topic_listing"] == {"level": LEVEL_OK, "values": TOPIC_LISTING_BLOCK}
 
     def test_missing_collector_is_absent_not_defaulted_ok(self):
         payload = {k: v for k, v in FULL_PAYLOAD.items() if k != "host_stats"}
@@ -125,6 +138,13 @@ class TestParseDiagnostics:
         payload = {k: v for k, v in FULL_PAYLOAD.items() if k != "topic_availability"}
         result = DiagnosticsService._parse_diagnostics(payload)
         assert "topic_availability" not in result
+
+    def test_topic_listing_absent_when_missing_from_payload(self):
+        # Missing entirely -- e.g. a robot on a sati_system_diagnostics build older than
+        # topic_listing, not necessarily a failed read (see _derive_level's docstring).
+        payload = {k: v for k, v in FULL_PAYLOAD.items() if k != "topic_listing"}
+        result = DiagnosticsService._parse_diagnostics(payload)
+        assert "topic_listing" not in result
 
     def test_non_dict_collector_block_ignored(self):
         payload = {**FULL_PAYLOAD, "jtop": None}
@@ -177,6 +197,9 @@ class TestDeriveLevel:
     def test_topic_availability_never_errors(self):
         block = {"/scan": {"exists": False, "publisher_count": 0, "publishing": False, "age_sec": None}}
         assert DiagnosticsService._derive_level("topic_availability", block) == LEVEL_WARN
+
+    def test_topic_listing_always_ok_when_present(self):
+        assert DiagnosticsService._derive_level("topic_listing", TOPIC_LISTING_BLOCK) == LEVEL_OK
 
     def test_topic_availability_ok_when_empty(self):
         assert DiagnosticsService._derive_level("topic_availability", {}) == LEVEL_OK
