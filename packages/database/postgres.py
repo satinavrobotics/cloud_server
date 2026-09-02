@@ -42,6 +42,16 @@ from cloud_common.objects.mission import MissionObjectV1
 POSTGRES_RECONNECT_PERIOD = 0.5
 WATCHER_POSTGRES_RECONNECT_PERIOD = 0.1
 
+# How long PostgresWatcher.watch() will wait for a NOTIFY before treating the LISTEN
+# channel as silently stalled. Observed in practice: Postgres can stop delivering
+# notifications on an otherwise-healthy connection without ever raising an exception,
+# so a bare `async for ... in notifies()` can hang forever and never reach the
+# except-and-reconnect path below it — a watcher going silently dead with nothing in
+# the logs to point at. A bounded timeout turns that into a visible, self-healing
+# event instead: on timeout we log a warning and force a fresh connection + full
+# resync, exactly like the exception path already does.
+WATCHER_NOTIFY_TIMEOUT_S = 60
+
 # Fixed application-wide key for the advisory lock that serializes schema creation
 # across services (see initialize_database). Any constant works as long as every
 # service agrees on it; this one is arbitrary ("SATIDB" in hex).
@@ -143,8 +153,11 @@ class PostgresWatcher:
                         self._logger.warning("Object from DB: %s", obj.name)
                         yield obj
 
-                    # Now handle all notifications
-                    async for notification in self._connection.notifies():
+                    # Now handle all notifications. timeout bounds how long we'll wait
+                    # for one before treating the channel as stalled — see
+                    # WATCHER_NOTIFY_TIMEOUT_S above.
+                    async for notification in self._connection.notifies(
+                            timeout=WATCHER_NOTIFY_TIMEOUT_S):
                         publisher, obj_name, lifecycle = notification.payload.split(
                             " ", 2)
 
@@ -176,6 +189,18 @@ class PostgresWatcher:
                         self._logger.debug(
                             "Object from notification: %s", pop_obj.name)
                         yield pop_obj
+
+                    # notifies() only exits its loop on timeout (an exception would
+                    # skip straight to the except block below) — no notification
+                    # arrived for WATCHER_NOTIFY_TIMEOUT_S seconds. Reconnect and let
+                    # the while loop's next iteration re-LISTEN and fully resync, so a
+                    # stalled channel recovers within one timeout window instead of
+                    # hanging indefinitely with nothing logged.
+                    self._logger.warning(
+                        "Watcher for %s received no notification in %ss; "
+                        "reconnecting and resyncing.",
+                        self._object_class.table_name(), WATCHER_NOTIFY_TIMEOUT_S)
+                    self._connection = await self._get_connection()
 
             except Exception:  # pylint: disable=broad-except
                 self._connection = await self._get_connection()
