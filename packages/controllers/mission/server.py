@@ -87,6 +87,22 @@ class ClientDatumMessage(ClientMessage):
     payload: types.RobotDatum
 
 
+def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str, str]:
+    """Mirror a VDA5050 state message's errors[] onto the RobotStatusV1.errors dict.
+
+    Keyed by errorType (falling back to a positional key for the rare untyped
+    error) so distinct errors don't collide under a single value. A plain
+    snapshot, not an accumulating log: the robot re-sends its currently-active
+    errors every state message, so the caller should overwrite status.errors
+    with this each time rather than merge it — an error absent from a new
+    message has genuinely cleared.
+    """
+    return {
+        (error.errorType or f"error_{idx}"): error.errorDescription
+        for idx, error in enumerate(errors)
+    }
+
+
 class Robot:
     """Manages the mission state of a particular robot"""
 
@@ -544,6 +560,8 @@ class Robot:
                 if nav_reasoning != self._robot_object.status.nav_reasoning:
                     self.info(f"Nav reasoning: {nav_reasoning}")
                 self._robot_object.status.nav_reasoning = nav_reasoning
+
+            self._robot_object.status.errors = vda5050_errors_to_status_dict(message.errors)
             # Update robot unique ID
             self._robot_object.status.hardware_version = \
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,
@@ -696,6 +714,7 @@ class Robot:
                 self._current_mission.status.failure_reason = "Mission timed out"
                 self._set_mission_state(mission_object.MissionStateV1.FAILED)
             self._set_robot_state(robot_object.RobotStateV1.IDLE)
+            await self.get_next_mission()
 
     async def _delete_robot_object(self):
         if self._robot_object is not None:
@@ -1065,6 +1084,15 @@ class Robot:
             f"Mission state: {self._current_mission.status.state} -> {state}")
         self._current_mission.status.state = state
         self._current_mission.status.node_status["root"].state = state
+        if state.done:
+            # Terminal mission states are set here directly (e.g. on timeout or
+            # cancel-before-ack), bypassing the leaf-node updates that normally
+            # come from robot feedback (see update_mission_node_state). Propagate
+            # to any node still RUNNING/PENDING so node_status doesn't disagree
+            # with the mission-level state forever.
+            for node_state in self._current_mission.status.node_status.values():
+                if not node_state.state.done:
+                    node_state.state = state
         if state == mission_object.MissionStateV1.RUNNING:
             # If the mission just moved to RUNNING, set the start timestamp
             if self._current_mission.status.start_timestamp is None:

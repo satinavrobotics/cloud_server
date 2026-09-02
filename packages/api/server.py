@@ -1859,6 +1859,7 @@ class ApiDelegationService:
                         } if hasattr(robot.status, 'pose') else None,
                         "recording_state": robot.status.recording_state if hasattr(robot.status, 'recording_state') else None,
                         "nav_reasoning": robot.status.nav_reasoning if hasattr(robot.status, 'nav_reasoning') else None,
+                        "errors": robot.status.errors if hasattr(robot.status, 'errors') else {},
                     }
                 }
 
