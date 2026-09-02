@@ -12,6 +12,7 @@
    - [Image Operations](#image-operations)
    - [Navigation Operations](#navigation-operations)
    - [Robot Management](#robot-management)
+   - [Fleet Settings](#fleet-settings)
    - [Mission Management](#mission-management)
    - [Detection Results](#detection-results)
 4. [WebSocket Endpoints](#websocket-endpoints)
@@ -481,6 +482,58 @@ Delete a robot.
 
 **Error Response:**
 - `404 Not Found`: Robot not found
+
+---
+
+### Fleet Settings
+
+A single, fleet-wide, operator-editable settings object — not tied to any
+one robot/mission/map. Always stored under the fixed name `"global"`
+(`SettingsObjectV1`, `cloud_common/objects/settings.py`): a singleton
+simulated by convention on top of the normal name-keyed Postgres storage,
+since there's no separate keyless/singleton storage mode. Auto-created
+with defaults on first `GET` or `PUT` if it doesn't exist yet.
+
+#### `GET /api/v1/settings`
+
+Fetch the fleet-wide settings.
+
+**Response:**
+```json
+{
+  "name": "global",
+  "lifecycle": "ALIVE",
+  "fault_error_types": [],
+  "status": {}
+}
+```
+
+**Backend Service:** Mission Dispatcher Database (Postgres)
+
+---
+
+#### `PUT /api/v1/settings`
+
+Update the fleet-wide settings. Unknown fields are ignored; `name`,
+`status`, and `lifecycle` in the request body are ignored too (this is a
+spec-only update, same convention as `PUT /api/v1/robots/{robot_name}`).
+
+**Request Body:**
+```json
+{
+  "fault_error_types": ["motorStalledError"]
+}
+```
+
+**`fault_error_types`:** VDA5050 `errorType` strings severe enough that a
+robot reporting one should be badged FAULT by clients (see
+`sati-client`'s `utils/robotStatus.ts`). Any other `errorType` a robot
+reports is treated as a non-fault warning by clients. Empty by default —
+nothing is FAULT until an operator opts specific error types in here.
+
+**Response:** Same shape as `GET /api/v1/settings`, reflecting the update.
+
+**Backend Service:** Mission Dispatcher Database (Postgres)
 
 ---
 

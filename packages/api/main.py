@@ -36,6 +36,7 @@ from cloud_common.objects.robot import RobotObjectV1, RobotStatusV1, CustomActio
 from cloud_common.objects.mission import MissionObjectV1, MissionStatusV1
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects.map import MapObjectV1
+from cloud_common.objects.settings import SettingsObjectV1, SettingsSpecV1, GLOBAL_SETTINGS_NAME
 from cloud_common.objects.object import ObjectLifecycleV1
 
 
@@ -501,6 +502,66 @@ async def delete_map(map_id: str):
     except Exception as e:
         logging.error(f"Failed to delete map {map_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete map: {str(e)}")
+
+
+# ==================== Fleet Settings ====================
+# A single operator-editable settings object, always stored under
+# GLOBAL_SETTINGS_NAME — see cloud_common/objects/settings.py for why this is
+# a singleton simulated by convention rather than a distinct storage mode.
+
+async def _get_or_create_settings() -> SettingsObjectV1:
+    try:
+        return await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
+    except Exception:
+        import uuid
+        settings = SettingsObjectV1(name=GLOBAL_SETTINGS_NAME, lifecycle=ObjectLifecycleV1.ALIVE)
+        try:
+            await service.database.create_object(settings, uuid.uuid4())
+            return settings
+        except HTTPException as exc:
+            # Another concurrent request already created the row between our
+            # get_object miss and this create_object call (UniqueViolation,
+            # surfaced as a 400 by the database layer) — that request's copy is
+            # just as valid as the one we would have created, so fetch and use
+            # it instead of failing this request over a benign race.
+            if exc.status_code == 400:
+                return await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
+            raise
+
+
+@app.get("/api/v1/settings")
+async def get_settings():
+    """Fetch the fleet-wide settings object, creating it with defaults on first read."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        settings = await _get_or_create_settings()
+        return settings.dict()
+    except Exception as e:
+        logging.error(f"Failed to get settings: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get settings: {str(e)}")
+
+
+@app.put("/api/v1/settings")
+async def update_settings(settings_data: dict):
+    """Update the fleet-wide settings object (creates it first if it doesn't exist yet)."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        settings = await _get_or_create_settings()
+
+        import uuid
+        publisher_id = uuid.uuid4()
+        for key, value in settings_data.items():
+            if key not in ("status", "name", "lifecycle") and key in SettingsSpecV1.__fields__:
+                setattr(settings, key, value)
+        await service.database.update_spec(SettingsObjectV1, settings.name, settings.spec, publisher_id)
+
+        updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
+        return updated_settings.dict()
+    except Exception as e:
+        logging.error(f"Failed to update settings: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to update settings: {str(e)}")
 
 
 @app.websocket("/ws/map/{map_id}")
