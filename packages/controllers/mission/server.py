@@ -103,6 +103,12 @@ def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str,
     }
 
 
+# VDA5050 error types that mean "this robot's mission can't make forward progress
+# right now" — mirrors sati-client's utils/robotStatus.ts NAVIGATION_READINESS_ERROR_TYPES
+# so client and server agree on the same definition of "nav ready".
+NAVIGATION_READINESS_ERROR_TYPES = {"navigationNotReadyError", "poseHealthNotReadyError"}
+
+
 class Robot:
     """Manages the mission state of a particular robot"""
 
@@ -163,6 +169,27 @@ class Robot:
             self._set_mission_state(mission_object.MissionStateV1.CANCELED)
             await self.get_next_mission()
             return
+        # Withhold dispatch while the robot can't actually receive an order — offline
+        # or not navigation-ready. The mission stays PENDING; _on_client_message()
+        # retries this once the robot's online/error status changes.
+        hold_reason = self._dispatch_hold_reason()
+        if hold_reason is not None:
+            if not self._current_mission.status.held or \
+                    self._current_mission.status.held_reason != hold_reason:
+                self._current_mission.status.held = True
+                self._current_mission.status.held_reason = hold_reason
+                self.mission_info(f"Holding mission dispatch: {hold_reason}")
+                asyncio.ensure_future(self._database.update_status(
+                    api_objects.MissionObjectV1, self._current_mission.name,
+                    self._current_mission.status, uuid.uuid4()))
+            return
+        if self._current_mission.status.held:
+            self._current_mission.status.held = False
+            self._current_mission.status.held_reason = None
+            self.mission_info("Robot ready — releasing held mission")
+            asyncio.ensure_future(self._database.update_status(
+                api_objects.MissionObjectV1, self._current_mission.name,
+                self._current_mission.status, uuid.uuid4()))
         # Initialize behavior tree
         self._current_behavior_tree = behavior_tree.MissionBehaviorTree(
             self._current_mission)
@@ -177,6 +204,15 @@ class Robot:
         self.update_mission_from_behavior_tree()
         self._arm_mission_timeout()
         await self._send_order()
+
+    def _dispatch_hold_reason(self) -> Optional[str]:
+        """None if the robot can receive a dispatched order right now; otherwise a
+        human-readable reason dispatch should be withheld."""
+        if self._robot_object is None or not self._robot_object.status.online:
+            return "Robot is offline"
+        if NAVIGATION_READINESS_ERROR_TYPES & self._robot_object.status.errors.keys():
+            return "Robot navigation is not ready"
+        return None
 
     async def _send_instant_action(self, instant_action: types.VDA5050Action):
         instant_actions = types.VDA5050InstantActions(
@@ -562,6 +598,12 @@ class Robot:
                 self._robot_object.status.nav_reasoning = nav_reasoning
 
             self._robot_object.status.errors = vda5050_errors_to_status_dict(message.errors)
+            # Robot's online/error status just changed — retry dispatch of a mission
+            # that was being withheld for that reason. No-op if still not ready, and
+            # never touches an already-dispatched mission (held is only ever set on a
+            # not-yet-dispatched PENDING mission).
+            if self._current_mission is not None and self._current_mission.status.held:
+                await self._try_start_mission()
             # Update robot unique ID
             self._robot_object.status.hardware_version = \
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,

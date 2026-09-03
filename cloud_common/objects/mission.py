@@ -348,6 +348,14 @@ class MissionStatusV1(pydantic.BaseModel):
                            resolvable.")
     block_reason: Optional[str] = pydantic.Field(
         None, description="Human readable description of why the edge is blocked.")
+    held: bool = pydantic.Field(
+        False, description="True when this PENDING mission's dispatch is being withheld \
+                           because the robot is offline or not navigation-ready. Distinct \
+                           from `blocked`, which applies to an already-RUNNING mission \
+                           waiting on an edgeBlocked reroute.")
+    held_reason: Optional[str] = pydantic.Field(
+        None, description="Human readable reason dispatch is being withheld, e.g. \
+                           'Robot is offline' or 'Robot navigation is not ready'.")
 
     class Config:
         use_enum_value = True
