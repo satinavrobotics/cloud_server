@@ -124,7 +124,19 @@ pushes on state changes. Parsed on the cloud side into `types.VDA5050State`
 
 Key fields (robot → cloud):
 - Identity/order bookkeeping: `headerId`, `timestamp`, `orderId`,
-  `orderUpdateId`, `lastNodeId`, `lastNodeSequenceId`
+  `orderUpdateId`, `lastNodeId`, `lastNodeSequenceId`. **`lastNodeId`/
+  `lastNodeSequenceId` lag `orderId`**: they describe the last node the robot
+  physically *reached*, so right after a new order is dispatched the robot echoes
+  the new `orderId` while still reporting the previous order's final node. Node
+  ids are named for their mission (`{mission}-n{node}-s{seq}`, plus
+  `{mission}-s0-n0` for the initial node at the robot's own pose — see
+  `VDA5050Order.from_mission`), so `update_mission_node_state()` reads them as
+  progress only when `lastNodeId` carries the current mission's name, and treats
+  a foreign one as "this mission has reached nothing yet" (the same as the empty
+  `lastNodeId` before the robot's first order). Reading them unconditionally
+  completes a brand-new mission on its very first `/state` message, because the
+  previous route's terminal sequence id already satisfies the route-complete test
+  (`current_order_node_id == route.size * 2 + 2`).
 - Motion: `driving`, `paused`, `newBaseRequest`, `distanceSinceLastNode`,
   `velocity` (vx, vy, omega), `agvPosition` (x, y, theta, mapId,
   positionInitialized, deviationRange/localizationScore)
@@ -141,6 +153,17 @@ Key fields (robot → cloud):
   warning) is now an operator-editable fleet policy, not implied by this
   protocol layer — see `SettingsObjectV1` in §7 and `GET/PUT /api/v1/settings`
   in `docs/API_REFERENCE.md`.
+
+  `errors[]` is a **snapshot of the robot's current error state, not a log of
+  events**: `vda5050_errors_to_status_dict()` overwrites `robot.status.errors`
+  wholesale on every message, so whatever the robot keeps republishing is what
+  operators keep seeing. The robot side owns both halves of that contract —
+  deduplicating a repeated condition instead of appending it, and dropping an
+  error once it no longer holds (`NavigationHandler::AddError` /
+  `ClearErrorsOfType`). A robot that appends instead will pin a stale fault on
+  itself indefinitely: a rejected order (`orderUpdateError`, "An order is
+  running") was observed republished 40 times per `/state` message, one per
+  server resend, long after the orders involved had finished.
 
 ## 6. Custom SATI topics (`robot/...`)
 
@@ -188,6 +211,55 @@ Mission-planner tracks mission progress purely from these MQTT messages
 `mission-dispatch` publishes `/order` → robot's `sati_vda5050_client`
 executes it, reports progress via `/state` → `mission-dispatch` updates
 Postgres → `api-delegation-service` reflects it back over REST/WebSocket.
+
+One robot runs one order at a time: `Robot._missions` is a per-robot FIFO and
+`_try_start_mission()` dispatches only while `_current_mission is None`, so a
+second queued mission stays `PENDING` until the first reaches a terminal state.
+
+That serialization depends on a finished mission actually leaving the queue, and
+the last leg of the loop above makes it circular — `mission-dispatch` writes the
+terminal status to Postgres, and its own write comes back through the database
+watcher as a mission change. `_on_mission_change()` therefore has to recognise
+its own echo. Checking the echoed object's `status.state.done` is *not* enough:
+the watcher can deliver a snapshot taken before the terminal write landed, still
+reading `RUNNING`. `Robot._finished_missions` (bounded by
+`MAX_FINISHED_MISSIONS_TRACKED`, forgotten when the object is deleted so a name
+can be reused) records what this controller actually ran, and is the check that
+does not depend on winning that race.
+
+Losing it re-queues a completed mission, which then dispatches on top of the one
+that legitimately followed it. The robot refuses the duplicate — correctly, with
+`orderUpdateError` "An order is running" — and the duplicate fails after
+`MAX_ORDER_MISMATCHES` state messages with "Robot did not accept the dispatched
+order", overwriting the `COMPLETED` status the mission had already earned.
+
+**Mission cancel (VDA5050 `cancelOrder` instant action):**
+`POST /api/v1/missions/{name}/cancel` sets `needs_canceled` on the mission →
+`mission-dispatch` publishes a `cancelOrder` on `/instantActions` (action id
+`{mission}-instantaction-n{headerId}`) → the robot cancels its Nav2 goal,
+reports the action `FINISHED` in `actionStates[]` and stops republishing the
+order's progress → `mission-dispatch` marks the mission `CANCELED`.
+
+Two rules keep this to *one* cancel per user click. First, the same database
+echo problem as above applies: the cancel write comes back as a mission change
+with `needs_canceled` still set, so `_on_mission_change()` only mints a new
+`cancelOrder` when `_has_outstanding_cancel()` is false — otherwise every echo
+created a fresh action id (observed: 31 cancels for one click, each of which the
+robot then had to reject). Second, the robot fails a `cancelOrder` that arrives
+while another is in progress ("A cancelOrder is already in progress"), and
+`handle_instant_action()` treats a `FAILED` `cancelOrder` as terminal and
+cancelled — the earlier one is what actually stopped the robot, so the mission
+is cancelled either way. Any other instant action reported `FAILED` is dropped
+from the outstanding set without being counted as finished.
+
+On the robot side, `cancelOrder` with no running order answers with a single
+`noOrderToCancel` WARNING that *replaces* the previous one (snapshot semantics
+per §5) and is cleared once a later cancel completes; a `cancelOrder` that finds
+the client `IDLE` but a navigation goal still active stops that goal rather than
+reporting `noOrderToCancel`. `driving` is true only while Nav2 is being driven
+toward a node of the current order — it is forced false on cancel, on every
+terminal navigation result, and while stopped at a node, and re-asserted for
+each subsequent leg of the route.
 
 **Visual-navigation mission images (custom path, parallel to the above):**
 `mission-planner-service` fetches waypoint images from `image-db-service`
