@@ -156,8 +156,27 @@ class PostgresWatcher:
                     # Now handle all notifications. timeout bounds how long we'll wait
                     # for one before treating the channel as stalled — see
                     # WATCHER_NOTIFY_TIMEOUT_S above.
-                    async for notification in self._connection.notifies(
-                            timeout=WATCHER_NOTIFY_TIMEOUT_S):
+                    #
+                    # psycopg 3.0.15 (pinned repo-wide, see requirements.txt) has no
+                    # `timeout` parameter on notifies() at all -- passing one raised
+                    # TypeError on every call, immediately, which the broad `except
+                    # Exception` below silently swallowed as if it were a stalled
+                    # channel: reconnect + continue, forever, as fast as a fresh
+                    # LISTEN + full-table SELECT could run (observed live: ~200
+                    # iterations/second, one CPU core pinned at 100%, Postgres hammered
+                    # with the same full resync nonstop, and every one of those bogus
+                    # "resync" yields propagating as if it were a real change to
+                    # everything watching this table). Timing this out for a version
+                    # that has no timeout param of its own means driving the
+                    # notifies() generator's own __anext__() through asyncio.wait_for()
+                    # instead.
+                    notify_iter = aiter(self._connection.notifies())
+                    while True:
+                        try:
+                            notification = await asyncio.wait_for(
+                                anext(notify_iter), timeout=WATCHER_NOTIFY_TIMEOUT_S)
+                        except (asyncio.TimeoutError, StopAsyncIteration):
+                            break
                         publisher, obj_name, lifecycle = notification.payload.split(
                             " ", 2)
 
@@ -190,10 +209,11 @@ class PostgresWatcher:
                             "Object from notification: %s", pop_obj.name)
                         yield pop_obj
 
-                    # notifies() only exits its loop on timeout (an exception would
-                    # skip straight to the except block below) — no notification
-                    # arrived for WATCHER_NOTIFY_TIMEOUT_S seconds. Reconnect and let
-                    # the while loop's next iteration re-LISTEN and fully resync, so a
+                    # The inner loop only breaks on timeout or exhaustion (an
+                    # exception from the body above would skip straight to the except
+                    # block below) — no notification arrived for
+                    # WATCHER_NOTIFY_TIMEOUT_S seconds. Reconnect and let the outer
+                    # while loop's next iteration re-LISTEN and fully resync, so a
                     # stalled channel recovers within one timeout window instead of
                     # hanging indefinitely with nothing logged.
                     self._logger.warning(
