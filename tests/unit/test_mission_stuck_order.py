@@ -378,6 +378,34 @@ async def test_own_last_node_still_completes_the_mission():
 
 
 @pytest.mark.unit
+async def test_stale_sequence_id_under_own_node_id_does_not_complete_mission():
+    """The robot reset lastNodeId to the new order's node 0 but left
+    lastNodeSequenceId at the previous route's terminal value (2026-09-14:
+    lastNodeId=Test2-n1-s0, lastNodeSequenceId=6). The prefix guard passes, so
+    the id's own "-s0" suffix must override the stale sequence id.
+    """
+    r, _ = _make_robot()
+    mission = _arm_running_mission(r)
+
+    node_state = r.update_mission_node_state(
+        _build_state(order_id="m1-n0",
+                     last_node_id="m1-n0-s0", last_node_seq=_TERMINAL_SEQ_ID),
+        [])
+
+    assert node_state != mission_object.MissionStateV1.COMPLETED
+    assert mission.status.state == mission_object.MissionStateV1.RUNNING
+    assert r.last_node_seq_id == 0
+
+
+@pytest.mark.unit
+def test_sequence_id_from_node_id():
+    assert Robot._sequence_id_from_node_id("m1-n0-s4") == 4
+    assert Robot._sequence_id_from_node_id("Test2-n1-s0") == 0
+    assert Robot._sequence_id_from_node_id("") is None
+    assert Robot._sequence_id_from_node_id("free-form") is None
+
+
+@pytest.mark.unit
 async def test_stale_last_node_does_not_advance_the_waypoint_counter():
     r, _ = _make_robot()
     mission = _arm_running_mission(r)

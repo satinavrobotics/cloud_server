@@ -910,6 +910,14 @@ class Robot:
                 self._robot_online_task.cancel()
             await self._robot_server.delete_robot(self._name)
 
+    @staticmethod
+    def _sequence_id_from_node_id(node_id: str) -> Optional[int]:
+        """Sequence id encoded in a node id we generated ("...-s{seq}"), else None."""
+        _, sep, suffix = node_id.rpartition("-s")
+        if not sep or not suffix.isdigit():
+            return None
+        return int(suffix)
+
     def update_mission_node_state(self, message: types.VDA5050State,
                                   finished_instant_actions: List[types.VDA5050Action])\
             -> mission_object.MissionStateV1:
@@ -941,6 +949,21 @@ class Robot:
         # order, since that matches no mission's prefix either.
         last_node_seq_id = \
             message.lastNodeSequenceId if reached_node_in_current_mission else 0
+        # lastNodeId and lastNodeSequenceId must describe the same node. Every node
+        # id we generate ends in "-s{sequenceId}", so cross-check the two: a robot
+        # that reset only the id on accepting a new order (observed 2026-09-14:
+        # lastNodeId=Test2-n1-s0 with lastNodeSequenceId=6 left over from the
+        # previous route) passes the prefix guard above and would complete a route
+        # of three waypoints on its first state message. The id is the field the
+        # robot set for *this* order, so it wins.
+        seq_from_node_id = self._sequence_id_from_node_id(message.lastNodeId)
+        if reached_node_in_current_mission and seq_from_node_id is not None and \
+                seq_from_node_id != last_node_seq_id:
+            self.warning(
+                f"[{self._current_mission.name}] lastNodeSequenceId "
+                f"{last_node_seq_id} disagrees with lastNodeId "
+                f"'{message.lastNodeId}'; using {seq_from_node_id} from the id")
+            last_node_seq_id = seq_from_node_id
         current_order_node_id = \
             last_node_seq_id + 2 if reached_node_in_current_mission else 0
 
