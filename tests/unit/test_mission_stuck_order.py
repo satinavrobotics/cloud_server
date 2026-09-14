@@ -247,6 +247,40 @@ async def test_finished_mission_is_not_requeued_by_a_stale_echo():
 
 
 @pytest.mark.unit
+async def test_freshly_created_mission_is_queued_even_before_the_delete_echo_arrives():
+    """A name reused via delete-then-recreate must not depend on watcher ordering.
+
+    The 2026-09-15 field incident: an operator deleted a completed mission named
+    "Test" and immediately re-created a new one under the same name. The delete's
+    own lifecycle-change event (which clears _finished_missions -- see the
+    recycled-name test below) and the re-create's PENDING echo are two
+    independent writes with no ordering guarantee between them; the re-create's
+    echo arrived first here, got silently swallowed by _finished_missions, and
+    the mission sat PENDING forever with no error surfaced anywhere. Deleting it
+    again was the only fix, and only by luck of timing.
+
+    A message this fresh -- PENDING, never dispatched (no start_timestamp) -- is
+    unambiguously a new mission, not the stale echo _finished_missions exists to
+    catch (see test_finished_mission_is_not_requeued_by_a_stale_echo above: that
+    echo always carries a start_timestamp, since the mission had to reach
+    RUNNING to ever become "finished"), so it must be queued immediately
+    regardless of whether the delete's own event has arrived yet.
+    """
+    r, _ = _make_robot()
+    r._try_start_mission = AsyncMock()
+    r._remember_finished("Test")
+
+    # The re-create's echo, arriving BEFORE any delete/lifecycle event for the
+    # old "Test" -- deliberately no PENDING_DELETE step in this test.
+    recreated = _make_mission(name="Test")
+    await r._on_mission_change(recreated)
+
+    assert "Test" in r._missions
+    assert "Test" not in r._finished_missions
+    r._try_start_mission.assert_awaited_once()
+
+
+@pytest.mark.unit
 async def test_deleted_mission_is_forgotten_so_its_name_can_be_reused():
     """Otherwise a mission later created under a reused name looks like an echo."""
     r, _ = _make_robot()

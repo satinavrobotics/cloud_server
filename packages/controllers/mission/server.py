@@ -360,11 +360,34 @@ class Robot:
 
         # If this is a new mission, add it to the queue
         if message.name not in self._missions:
-            # Neither check is redundant. _finished_missions covers what *this*
-            # controller ran, without trusting the echoed status (see the field's
-            # declaration for why that status can lie); state.done covers missions
-            # already terminal in the database that we never ran ourselves, e.g.
-            # after a restart.
+            # A mission name reused after its previous run finished (deleted and
+            # re-created, rather than left alone) must not be blocked by
+            # _finished_missions below just because the delete's own lifecycle
+            # change event hasn't reached us yet -- delete and re-create are two
+            # independent writes the watcher delivers with no ordering guarantee
+            # against each other (2026-09-15 field incident: an operator deleted
+            # a completed mission and immediately re-created it under the same
+            # name; the re-create's PENDING echo arrived first, got swallowed
+            # here, and the mission sat PENDING forever with no error anywhere
+            # -- deleting it *again* was the only fix, and only by luck of
+            # timing). A message this fresh -- PENDING, never dispatched -- is
+            # unambiguously a new mission, never the stale echo _finished_missions
+            # exists to catch (that echo is always of a mission that reached
+            # RUNNING at some point, so it always carries a start_timestamp; see
+            # the true stale-echo case below, which this does not weaken).
+            looks_freshly_created = (
+                message.status.state == mission_object.MissionStateV1.PENDING and
+                message.status.start_timestamp is None)
+            if looks_freshly_created:
+                self._finished_missions.pop(message.name, None)
+            # Neither check below is redundant. _finished_missions covers what
+            # *this* controller ran, without trusting the echoed status (see the
+            # field's own declaration for why that status can lie -- this is the
+            # true stale-echo case: our own completion write hasn't propagated
+            # yet, so the echo still reports the mission RUNNING, not PENDING,
+            # and so is never "freshly created" above); state.done covers
+            # missions already terminal in the database that we never ran
+            # ourselves, e.g. after a restart.
             if message.name in self._finished_missions:
                 self.debug(f"Ignoring already-finished mission [{message.name}] "
                            f"(echo reports {message.status.state}) -- not re-queueing")
