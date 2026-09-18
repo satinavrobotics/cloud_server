@@ -6,6 +6,7 @@ FastAPI application that provides REST and WebSocket endpoints for clients.
 """
 
 import logging
+import uuid
 import argparse
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
@@ -422,6 +423,8 @@ async def list_maps():
     try:
         maps = await service.database.list_objects(MapObjectV1)
         return {"maps": [m.dict() for m in maps], "count": len(maps)}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Failed to list maps: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list maps: {str(e)}")
@@ -513,7 +516,6 @@ async def _get_or_create_settings() -> SettingsObjectV1:
     try:
         return await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
     except Exception:
-        import uuid
         settings = SettingsObjectV1(name=GLOBAL_SETTINGS_NAME, lifecycle=ObjectLifecycleV1.ALIVE)
         try:
             await service.database.create_object(settings, uuid.uuid4())
@@ -537,6 +539,8 @@ async def get_settings():
     try:
         settings = await _get_or_create_settings()
         return settings.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Failed to get settings: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get settings: {str(e)}")
@@ -550,7 +554,6 @@ async def update_settings(settings_data: dict):
     try:
         settings = await _get_or_create_settings()
 
-        import uuid
         publisher_id = uuid.uuid4()
         for key, value in settings_data.items():
             if key not in ("status", "name", "lifecycle") and key in SettingsSpecV1.__fields__:
@@ -559,6 +562,8 @@ async def update_settings(settings_data: dict):
 
         updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
         return updated_settings.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Failed to update settings: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to update settings: {str(e)}")
@@ -607,6 +612,8 @@ async def list_node_images(map_id: str, node_id: str):
         )
 
         return {"image_ids": image_ids}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error listing images for node {node_id} in map {map_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error listing images: {str(e)}")
@@ -686,6 +693,8 @@ async def get_image(map_id: str, node_id: str, image_id: Optional[str] = None):
                 "Content-Length": str(len(image_data))
             }
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error retrieving image for node {node_id} in map {map_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving image: {str(e)}")
@@ -1020,6 +1029,8 @@ async def list_robots(
 
         robots = await service.database.list_objects(RobotObjectV1, query_params=params.items() if params else None)
         return [robot.dict() for robot in robots]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list robots: {str(e)}")
 
@@ -1037,6 +1048,8 @@ async def get_robot(robot_name: str):
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)
         return robot.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Robot not found: {str(e)}")
 
@@ -1053,7 +1066,9 @@ async def get_robot_status(robot_name: str):
 
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return robot.dict()
+        return robot.status.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Robot not found: {str(e)}")
 
@@ -1149,7 +1164,6 @@ async def create_robot(robot_data: dict):
         if "name" not in robot_data:
             raise HTTPException(status_code=400, detail="Missing required field: name")
 
-        import uuid
         publisher_id = uuid.uuid4()
         ip_address = robot_data.pop("ip_address", None)
         entrypoint_port = robot_data.pop("entrypoint_port", None)
@@ -1212,7 +1226,7 @@ async def create_robot(robot_data: dict):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Failed to register robot: {str(e)}")
+        logging.exception(f"Failed to register robot: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to register robot: {str(e)}")
 
 
@@ -1230,7 +1244,6 @@ async def update_robot(robot_name: str, robot_data: dict):
         # Get existing robot
         robot = await service.database.get_object(RobotObjectV1, robot_name)
 
-        import uuid
         publisher_id = uuid.uuid4()
 
         # Update spec if provided
@@ -1249,6 +1262,8 @@ async def update_robot(robot_name: str, robot_data: dict):
         # Return updated robot
         updated_robot = await service.database.get_object(RobotObjectV1, robot_name)
         return updated_robot.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update robot: {str(e)}")
 
@@ -1264,9 +1279,10 @@ async def delete_robot(robot_name: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        import uuid
         await service.database.set_lifecycle(RobotObjectV1, robot_name, ObjectLifecycleV1.DELETED, uuid.uuid4())
         return {"success": True, "message": f"Robot {robot_name} deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Failed to delete robot: {str(e)}")
 
@@ -1289,15 +1305,45 @@ async def update_robot_map(robot_name: str, request: UpdateRobotMapRequest):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        import uuid
         publisher_id = uuid.uuid4()
         robot = await service.database.get_object(RobotObjectV1, robot_name)
         robot.current_map = request.map_id
         await service.database.update_spec(RobotObjectV1, robot_name, robot.spec, publisher_id)
         updated_robot = await service.database.get_object(RobotObjectV1, robot_name)
         return {"success": True, "robot_name": robot_name, "current_map": updated_robot.current_map}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Failed to update robot map: {str(e)}")
+
+
+@app.post("/api/v1/robots/{robot_name}/cancel-order")
+async def force_cancel_robot_order(robot_name: str):
+    """
+    Force the robot to abandon whatever VDA5050 order it currently holds, independent
+    of mission tracking.
+
+    An operator escape hatch: a robot can end up holding an order nothing tracks
+    anymore (the mission that dispatched it hit a client-side error, was force-failed
+    by a timeout, or was otherwise abandoned server-side) and keep reporting that
+    stale orderId forever, rejecting every subsequently dispatched order as "An order
+    is running". Unlike POST /missions/{name}/cancel, this doesn't require (or touch)
+    any tracked mission -- it just asks the dispatcher to send a cancelOrder to the
+    robot the next time it processes a robot-object change. See
+    RobotSpecV1.needs_order_cancel's doc comment for the full mechanism.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        robot = await service.database.get_object(RobotObjectV1, robot_name)
+        robot.needs_order_cancel = True
+        await service.database.update_spec(RobotObjectV1, robot_name, robot.spec, uuid.uuid4())
+        return {"success": True, "message": f"cancelOrder requested for {robot_name}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to request cancel-order: {str(e)}")
 
 
 @app.post("/api/v1/robots/{robot_name}/actions", response_model=InvokeActionResponse)
@@ -1336,6 +1382,8 @@ async def list_missions():
     try:
         missions = await service.database.list_objects(MissionObjectV1)
         return [mission.dict() for mission in missions]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list missions: {str(e)}")
 
@@ -1353,6 +1401,8 @@ async def get_mission(mission_name: str):
     try:
         mission = await service.database.get_object(MissionObjectV1, mission_name)
         return mission.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Mission not found: {str(e)}")
 
@@ -1366,6 +1416,8 @@ async def get_mission_status(mission_name: str):
     try:
         mission = await service.database.get_object(MissionObjectV1, mission_name)
         return mission.status.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Mission not found: {str(e)}")
 
@@ -1393,7 +1445,6 @@ async def create_mission(mission_data: dict):
         # Note: status and lifecycle must be set before **mission_data to avoid being overridden
         mission_data_with_defaults = {"status": MissionStatusV1(), "lifecycle": ObjectLifecycleV1.ALIVE, **mission_data}
         mission = MissionObjectV1(**mission_data_with_defaults)
-        import uuid
         publisher_id = uuid.uuid4()
         await service.database.create_object(mission, publisher_id)
         return mission.dict()
@@ -1417,7 +1468,6 @@ async def update_mission(mission_name: str, mission_data: dict):
         # Get existing mission
         mission = await service.database.get_object(MissionObjectV1, mission_name)
 
-        import uuid
         publisher_id = uuid.uuid4()
 
         # Update spec if provided
@@ -1436,6 +1486,8 @@ async def update_mission(mission_name: str, mission_data: dict):
         # Return updated mission
         updated_mission = await service.database.get_object(MissionObjectV1, mission_name)
         return updated_mission.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update mission: {str(e)}")
 
@@ -1451,9 +1503,10 @@ async def delete_mission(mission_name: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        import uuid
         await service.database.set_lifecycle(MissionObjectV1, mission_name, ObjectLifecycleV1.DELETED, uuid.uuid4())
         return {"success": True, "message": f"Mission {mission_name} deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Failed to delete mission: {str(e)}")
 
@@ -1475,6 +1528,8 @@ async def get_mission_plan(mission_name: str, map_id: Optional[str] = None):
     try:
         result = await service.get_mission_plan(mission_name, map_id=map_id)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Failed to get mission plan: {str(e)}")
 
@@ -1492,9 +1547,10 @@ async def cancel_mission(mission_name: str):
     try:
         mission = await service.database.get_object(MissionObjectV1, mission_name)
         await mission.cancel()
-        import uuid
         await service.database.update_spec(MissionObjectV1, mission_name, mission.spec, uuid.uuid4())
         return {"success": True, "message": f"Mission {mission_name} cancelled"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to cancel mission: {str(e)}")
 
@@ -1514,6 +1570,8 @@ async def list_detection_results():
     try:
         results = await service.database.list_objects(DetectionResultsObjectV1)
         return [result.dict() for result in results]
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list detection results: {str(e)}")
 
@@ -1531,6 +1589,8 @@ async def get_detection_result(name: str):
     try:
         result = await service.database.get_object(DetectionResultsObjectV1, name)
         return result.dict()
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Detection results not found: {str(e)}")
 
@@ -1546,9 +1606,10 @@ async def delete_detection_result(name: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        import uuid
         await service.database.set_lifecycle(DetectionResultsObjectV1, name, ObjectLifecycleV1.DELETED, uuid.uuid4())
         return {"success": True, "message": f"Detection results {name} deleted"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Failed to delete detection results: {str(e)}")
 

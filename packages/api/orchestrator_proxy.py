@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/orchestration", tags=["orchestration-proxy"])
 
 
-@router.api_route("/{robot_name}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+@router.api_route("/{robot_name}/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
     """Forward the request to the orchestrator running on the named robot."""
     service = getattr(request.app.state, "service", None)

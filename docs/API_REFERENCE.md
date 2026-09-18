@@ -392,9 +392,11 @@ Get detailed information about a specific robot.
 
 #### `GET /api/v1/robots/{robot_name}/status`
 
-Get current status of a robot (alias for GET /api/v1/robots/{robot_name}).
+Get the current status of a robot.
 
-**Response:** Same as `GET /api/v1/robots/{robot_name}`
+**Response:** the robot's `status` object only (the `status` field of
+`GET /api/v1/robots/{robot_name}`), mirroring `GET /api/v1/missions/{name}/status`.
+It can be PUT back as `{"status": ...}` without clobbering anything.
 
 ---
 

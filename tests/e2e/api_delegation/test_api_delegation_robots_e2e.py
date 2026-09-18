@@ -127,8 +127,10 @@ class TestApiDelegationRobotsE2E:
         )
         assert response.status_code == 200
 
-        robot = response.json()
-        assert "status" in robot  # Status should exist (will be empty initially)
+        # The status object itself (like /missions/{name}/status), not the whole robot
+        status = response.json()
+        assert "state" in status
+        assert "status" not in status
 
         # Cleanup
         requests.delete(f"{mission_database_service['url']}/robot/{robot_name}")
