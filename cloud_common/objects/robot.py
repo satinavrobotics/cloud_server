@@ -147,6 +147,19 @@ class RobotSpecV1(pydantic.BaseModel):
     switch_teleop: bool = pydantic.Field(
         False, description="Toggle the mode of the robot to TELEOP."
     )
+    needs_order_cancel: bool = pydantic.Field(
+        False, description="One-shot request (set via POST /api/v1/robots/{name}/"
+                           "cancel-order, cleared by the dispatcher once sent) to send "
+                           "the robot a VDA5050 cancelOrder unconditionally -- i.e. "
+                           "independent of whether any mission is currently tracked for "
+                           "it. A robot can end up holding an order nothing tracks "
+                           "anymore (e.g. the mission that dispatched it hit a client-side "
+                           "error, or was force-timed-out) and silently keep reporting "
+                           "that stale orderId forever, rejecting every subsequent order "
+                           "as 'An order is running'; this is the operator escape hatch "
+                           "for that state, previously only reachable by hand-publishing "
+                           "MQTT."
+    )
     current_map: Optional[str] = pydantic.Field(
         None, description="The map ID that this robot is currently operating on. "
                           "Set via PUT /api/v1/robots/{robot_name}/map."

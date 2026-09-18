@@ -453,3 +453,29 @@ async def test_stale_last_node_does_not_advance_the_waypoint_counter():
     # The saved sequence id tracks this mission, so the next genuine reading of
     # sequence 2 still registers as forward progress rather than being swallowed.
     assert r.last_node_seq_id == 0
+
+
+@pytest.mark.unit
+def test_task_status_reflects_the_reached_index_even_on_a_non_zero_first_reach():
+    """Regression test: task_status is assigned directly from the computed `idx`
+    rather than a separate 0-then-increment counter. The old counter form was wrong
+    whenever the very *first* update_mission_node_state call for a mission reported
+    reaching a waypoint other than index 0 (e.g. a resumed/rerouted order) -- it
+    always initialized to 0 regardless of the real idx. sati-client's
+    utils/missionRouteProgress.ts now reads this value as the authoritative
+    "which waypoint" signal, so it must be correct on the very first reach, not
+    just in steady-state increments."""
+    r, _ = _make_robot()
+    mission = _arm_running_mission(r)  # mission_tree[0], node name "0", 2 waypoints
+    # task_status only updates for "user-defined" waypoints (allowedDeviationXY == 0,
+    # per update_mission_node_state's own comment) -- _make_mission's default (0.1)
+    # would skip that branch entirely, so set it explicitly for this test.
+    for wp in mission.mission_tree[0].route.waypoints:
+        wp.allowedDeviationXY = 0.0
+
+    # last_node_seq_id=4 -> idx = 4 // 2 - 1 = 1, the *second* waypoint, reported as
+    # the very first progress this mission has ever registered.
+    r.update_mission_node_state(
+        _build_state(order_id="m1-n0", last_node_id="m1-n0-s4", last_node_seq=4), [])
+
+    assert mission.status.task_status == {"0": 1}

@@ -253,6 +253,41 @@ class Robot:
         return any(a.actionType == types.VDA5050InstantActionType.CANCEL_ORDER
                    for a in self._current_instant_actions.values())
 
+    async def _send_cancel_order(self, action_id: str):
+        """Send a VDA5050 cancelOrder and track it in _current_instant_actions, so
+        _has_outstanding_cancel() sees it and handle_instant_action() resends it
+        until the robot reports it FINISHED (or it is abandoned)."""
+        instant_action = types.VDA5050Action(
+            actionType=types.VDA5050InstantActionType.CANCEL_ORDER,
+            actionId=action_id)
+        await self._send_instant_action(instant_action)
+        self._current_instant_actions[action_id] = instant_action
+
+    async def _handle_force_cancel(self, message: api_objects.RobotObjectV1):
+        """Operator escape hatch, independent of mission tracking (see
+        RobotSpecV1.needs_order_cancel's doc comment).
+
+        Level-triggered on the flag rather than on its rising edge: the request may
+        already be True the first time this dispatcher sees the robot (it was down
+        or restarting when the operator asked -- exactly when the hatch is needed),
+        and an edge check against _robot_object would then never fire nor clear it.
+        The clear is persisted *before* sending so a stale still-True echo of the
+        API's write can at worst cost a redundant clear, and one cancel at a time
+        (same rule as the explicit-cancel path) keeps such echoes from minting a
+        second cancelOrder while the first is outstanding."""
+        if not message.needs_order_cancel:
+            return
+        message.needs_order_cancel = False
+        await self._database.update_spec(
+            api_objects.RobotObjectV1, message.name, message.spec, uuid.uuid4())
+        if self._has_outstanding_cancel():
+            self.info("Force-cancel requested, but a cancelOrder is already "
+                      "outstanding; not sending another")
+            return
+        action_id = f"force-cancel-instantaction-n{self._header_id}"
+        self.info(f"Force-cancel requested: sending {action_id}")
+        await self._send_cancel_order(action_id)
+
     async def _send_instant_action(self, instant_action: types.VDA5050Action):
         instant_actions = types.VDA5050InstantActions(
             headerId=self._header_id,
@@ -424,12 +459,8 @@ class Robot:
                         return
                     self.info("Cancelling current node...")
                     action_id = f"{self._current_mission.name}-instantaction-n{self._header_id}"
-                    instant_action = types.VDA5050Action(
-                        actionType=types.VDA5050InstantActionType.CANCEL_ORDER,
-                        actionId=action_id)
                     self.mission_info(f"Send cancel order action {action_id}")
-                    await self._send_instant_action(instant_action)
-                    self._current_instant_actions[action_id] = instant_action
+                    await self._send_cancel_order(action_id)
                 return
 
             self.info(f"Update a PENDING mission [{message.name}]")
@@ -465,6 +496,7 @@ class Robot:
                 await self._send_instant_action(instant_action)
                 self._current_instant_actions[action_id] = instant_action
 
+            await self._handle_force_cancel(message)
             await self._try_start_mission()
         else:
             # Delete robot update
@@ -504,6 +536,8 @@ class Robot:
                 self.mission_info(f"Sending {action_type.value} action.")
                 await self._send_instant_action(instant_action)
                 self._current_instant_actions[action_id] = instant_action
+
+            await self._handle_force_cancel(message)
 
             # Robot object update
             self._robot_object = message
@@ -592,7 +626,6 @@ class Robot:
         return finished_instant_actions
     async def _process_datum_message(self, msg: types.RobotDatum) -> None:
         """Persist robot datum and auto-seed the current map's datum if it has none."""
-        import uuid
         self._robot_object.datum.latitude = msg.latitude
         self._robot_object.datum.longitude = msg.longitude
         self._robot_object.datum.bearing_deg = msg.bearing_deg
@@ -755,7 +788,8 @@ class Robot:
                     if self._detection_results_object is None:
                         self._detection_results_object = api_objects.DetectionResultsObjectV1(
                             name=self.robot_object.name)
-                        self._database.create(self._detection_results_object)
+                        await self._database.create_object(
+                            self._detection_results_object, uuid.uuid4())
                     self._detection_results_object.status.detected_objects = \
                         [DetectedObject(**item) for item in json.loads(
                             action_state.resultDescription)]
@@ -922,6 +956,28 @@ class Robot:
             else:
                 self._current_mission.status.failure_reason = "Mission timed out"
                 self._set_mission_state(mission_object.MissionStateV1.FAILED)
+            # Tell the robot to actually abandon its order before moving on — without
+            # this, a robot that never finished the order (e.g. stuck retrying/stalled
+            # navigation, exactly what triggers this timeout in the first place) keeps
+            # reporting the old orderId indefinitely. Nothing else here ever notices;
+            # the mission object is already gone from _missions/_current_mission below,
+            # so the normal needs_canceled-driven cancelOrder path (see the "Update a
+            # RUNNING mission" branch above) never runs for it. The next dispatched
+            # mission then gets rejected by the robot ("An order is running") and fails
+            # the same way after MAX_ORDER_MISMATCHES — observed in practice as a
+            # "zombie order" a rerun could not recover from short of manually
+            # publishing a cancelOrder or restarting the robot's VDA5050 client.
+            # One cancel at a time, same as the explicit-cancel path: on the
+            # needs_canceled route a cancelOrder is usually already outstanding, and
+            # handle_instant_action() keeps resending that one regardless of which
+            # mission is current, so a second one here would only be a duplicate.
+            if not self._has_outstanding_cancel():
+                timeout_cancel_id = \
+                    f"{self._current_mission.name}-timeout-cancel-n{self._header_id}"
+                self.mission_info(
+                    f"Sending cancelOrder {timeout_cancel_id} so the robot "
+                    "abandons the timed-out order")
+                await self._send_cancel_order(timeout_cancel_id)
             self._set_robot_state(robot_object.RobotStateV1.IDLE)
             await self.get_next_mission()
 
@@ -1005,14 +1061,20 @@ class Robot:
             # We assume that user-defined nodes will allowedDeviationXY = 0
             # Because we pad by an additional node in the beginning, we want to ignore
             # that node, so we enforce that idx >= 0.
+            #
+            # Assign `idx` directly rather than incrementing a separate counter (as this
+            # used to: `0` on first reach, `+= 1` after) -- `idx` is already the exact,
+            # correctly-computed waypoint index, so incrementing a shadow counter was both
+            # redundant and, on the very first reach, wrong whenever idx happened to be
+            # anything other than 0 (e.g. a mission resumed or rerouted partway through its
+            # route). sati-client's utils/missionRouteProgress.ts now reads this value as
+            # the authoritative "which waypoint" signal (see AUDIT_BACKLOG Z9 item 5), so it
+            # needs to be correct on every reach, not just steady-state increments.
             if self.last_node_seq_id < last_node_seq_id and \
                     idx >= 0 and \
                     idx < len(current_mission_node.route.waypoints) and \
                     current_mission_node.route.waypoints[idx].allowedDeviationXY == 0:
-                if current_mission_node.name not in task_status:
-                    task_status[str(current_mission_node.name)] = 0
-                else:
-                    task_status[str(current_mission_node.name)] += 1
+                task_status[str(current_mission_node.name)] = idx
                 asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
 
             if current_order_node_id == current_mission_node.route.size * 2 + 2:
@@ -1464,7 +1526,6 @@ class RobotServer:
 
         # Connect to the db
         from packages.database.postgres import PostgresDatabase
-        import uuid
         self._database = PostgresDatabase(
             dbname=postgres_db,
             user=postgres_user,
@@ -1559,7 +1620,6 @@ class RobotServer:
     async def _watch_changes(self, object_class: Any, queue: asyncio.Queue):
         while True:
             try:
-                import uuid
                 publisher_id = uuid.uuid4()
                 watcher_instance = await self._database.get_watcher(object_class, publisher_id)
                 with watcher_instance:
@@ -1645,14 +1705,12 @@ class RobotServer:
         if robot is not None:
             properties = robot.robot_object
             if properties is not None:
-                import uuid
                 await self._database.set_lifecycle(api_objects.RobotObjectV1, properties.name, api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
                 del self._robots[properties.name]
 
     async def delete_pending_mission(self, mission: api_objects.MissionObjectV1) -> bool:
         if mission.lifecycle == \
                 api_objects.object.ObjectLifecycleV1.PENDING_DELETE:
-            import uuid
             await self._database.set_lifecycle(api_objects.MissionObjectV1, mission.name, api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
             self.info(f"Deleted mission {mission.name}")
             return True
