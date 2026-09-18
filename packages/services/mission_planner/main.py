@@ -128,12 +128,12 @@ async def lifespan(app: FastAPI):
     health_checker = DependencyHealthChecker(timeout=TIMEOUT_HTTP_REQUEST_SHORT)
     health_checker.add_dependency(
         "graph_db",
-        lambda: service.graph_db.is_healthy(timeout=TIMEOUT_HTTP_REQUEST_SHORT),
+        lambda: service.graph_db.is_healthy(),
         critical=True
     )
     health_checker.add_dependency(
         "mission_database",
-        lambda: service.database.is_running(timeout=TIMEOUT_HTTP_REQUEST_SHORT),
+        lambda: service.database.is_running(),
         critical=True
     )
 

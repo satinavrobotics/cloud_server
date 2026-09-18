@@ -806,10 +806,10 @@ class MissionPlannerService:
         """Check if service is healthy."""
         try:
             # Check graph database
-            graph_healthy = self.graph_db.is_healthy(timeout=2)
+            graph_healthy = self.graph_db.is_healthy()
 
             # Check mission database
-            db_healthy = self.database.is_running(timeout=2)
+            db_healthy = self.database.is_running()
 
             return graph_healthy and db_healthy
         except Exception as e:

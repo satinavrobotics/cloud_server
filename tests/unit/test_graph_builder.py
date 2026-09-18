@@ -1533,6 +1533,23 @@ class TestGraphBuilderHandleNodeUpdate:
 
     @patch('packages.services.graph_builder.server.PostgresDatabase')
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
+    async def test_robot_registration_is_actually_awaited(self, mock_topomap, mock_postgres):
+        """Regression: _ensure_robot_exists (a coroutine) was called un-awaited from the
+        sync, worker-thread _process_topology, so it never ran and its always-truthy
+        coroutine object made the failure branch unreachable."""
+        mock_postgres.return_value.list_objects = AsyncMock(
+            return_value=[self._make_mission(register_map=True)])
+        mock_postgres.return_value.log_mission_waypoint = AsyncMock()
+
+        service = self._make_service(mock_topomap)
+        service._ensure_robot_exists = AsyncMock(return_value=True)
+
+        await service._handle_node_update(self._valid_payload())
+
+        service._ensure_robot_exists.assert_awaited_once_with("robot1")
+
+    @patch('packages.services.graph_builder.server.PostgresDatabase')
+    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     async def test_register_map_false_skips_process_topology(self, mock_topomap, mock_postgres):
         """When register_map=False _process_topology must NOT be called."""
         running_mission = self._make_mission(register_map=False)

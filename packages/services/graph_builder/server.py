@@ -377,6 +377,11 @@ class GraphBuilderService:
             register_map = False
 
         if register_map:
+            # Awaited here rather than inside _process_topology: that one runs in a
+            # worker thread, where calling this coroutine only built (and dropped) a
+            # coroutine object -- always truthy, so registration silently never ran.
+            if robot_name and not await self._ensure_robot_exists(robot_name):
+                self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
             result = await asyncio.to_thread(self._process_topology, payload, map_id=map_id)
             if result is None:
                 return
@@ -442,9 +447,6 @@ class GraphBuilderService:
         self.logger.info(f"📨 Received node update from {robot_name}, session_node_id={session_node_id}")
 
         self._detect_and_clear_session_reset(robot_name, session_node_id)
-
-        if not self._ensure_robot_exists(robot_name):
-            self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
 
         global_node_id = self._generate_global_node_id()
 

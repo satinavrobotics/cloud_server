@@ -192,10 +192,13 @@ async def process_node(node: NodeUpdate):
             "metadata": node.metadata or {}
         }
         
-        success = service.process_node_update(node_data)
-        
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to process node")
+        # process_node_update returns a result dict (always truthy) and does blocking
+        # ArangoDB/MinIO I/O, so check its "success" key and keep it off the event loop.
+        result = await asyncio.to_thread(service.process_node_update, node_data)
+
+        if not result.get("success"):
+            raise HTTPException(status_code=500,
+                                detail=result.get("error") or "Failed to process node")
         
         return {
             "success": True,
