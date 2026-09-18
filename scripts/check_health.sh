@@ -5,11 +5,10 @@ echo "========================================"
 echo ""
 
 services=(
-  "Graph Database:http://localhost:6001/health"
-  "Image Database:http://localhost:6002/health"
-  "Similarity Service:http://localhost:8003/health"
   "Graph Builder:http://localhost:8004/health"
   "Mission Planner:http://localhost:8005/health"
+  "LiveKit Service:http://localhost:8006/health"
+  "Agent Orchestrator:http://localhost:8007/health"
   "API Delegation:http://localhost:8000/health"
 )
 
@@ -65,5 +64,5 @@ fi
 echo ""
 echo "Docker Containers:"
 echo "=================="
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "NAME|arangodb|minio|mosquitto|postgres|graph-db|image-db|similarity|graph-builder|mission-planner|api-delegation"
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "NAME|arangodb|minio|mosquitto|postgres|mission-dispatch|graph-builder|mission-planner|livekit|agent-orchestrator|api-delegation"
 

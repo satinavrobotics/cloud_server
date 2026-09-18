@@ -19,6 +19,7 @@ docker compose -f $COMPOSE_FILE build \
     graph-builder-service \
     mission-planner-service \
     livekit-service \
+    agent-orchestrator-service \
     api-delegation-service
 
 # Start all services
