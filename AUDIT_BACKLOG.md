@@ -174,15 +174,15 @@ compose sets env vars nothing reads (`DISTANCE_THRESHOLD=5.0` in compose vs the
 with mosquitto's websocket default :9001 under host networking.
 
 ### C3. Stale docs and tests — **medium**
-- **`CLAUDE.md`** (not edited in this pass — it is the instruction file, flagged
-  for the owner): says `packages/api/server.py` is the main FastAPI app (all ~60
-  routes live in `packages/api/main.py`; `server.py` holds `ApiDelegationService`
-  + WS managers); lists `packages/utils/base_client.py` (does not exist); the port
-  table lists similarity:8003, graph-db:6001, image-db:6002, mission-dispatch:5000
-  — none exist as HTTP services (the API talks to Arango/MinIO directly through
-  `TopomapDatabaseClient`) — and omits agent-orchestrator:8007; says clients use
-  bare `requests` (they use `httpx.AsyncClient`); says copy `.env.example` to the
-  repo root (compose reads `docker_compose/.env`).
+- ✅ DONE — **`CLAUDE.md`** rewritten to match the code (on the owner's request):
+  `packages/api/main.py` holds the app + all routes and `server.py` the
+  `ApiDelegationService`; the port table now lists the services that exist
+  (no graph-db:6001 / image-db:6002 / similarity:8003; mission-dispatch has no HTTP
+  port; agent-orchestrator:8007 added); `topomap_dbs/*` are in-process libraries;
+  PostgreSQL LISTEN/NOTIFY — not HTTP — is the API↔mission-dispatch interface; the
+  nonexistent `utils/base_client.py` is gone; service clients are `httpx`; and the
+  two env files (`docker_compose/.env` vs the process env `config.py` validates) and
+  their different variable names are spelled out.
 - **`docs/API_REFERENCE.md`**: documents a nonexistent `POST /api/v1/explore`; has
   nothing on `/maps*`, `/rosbags*` (8), `/base_models*` (5), `/createToken`,
   `/robots/{name}/map|cancel-order|actions|diagnostics`, `nav2_bt_*`,
