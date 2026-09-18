@@ -12,6 +12,13 @@ punch list.
 > Status: unit suite **555 passed / 0 failed** (was 537 passed / **18 failed** at the
 > start of the pass). Integration/e2e suites were not run (they need the Docker
 > stack). Line numbers are as of the commits named in each item.
+>
+> Session log (2026-09-18), oldest first: `68f41af` mission-dispatch · `2201e0b` API ·
+> `c5562fd` services · `e387736` stale tests · `17d7f5b` ops scripts · `b62dcc5` this
+> file · `f4a44b4` `CLAUDE.md`. Nothing pushed. The client half, its commits, and the
+> one item left open (UI bugs after starting a mission, which the client's mock
+> backend cannot reproduce) are in `../sati-client/AUDIT_BACKLOG.md` AA14 and its
+> session summary.
 
 ---
 
