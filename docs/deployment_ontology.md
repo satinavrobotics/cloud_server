@@ -63,10 +63,18 @@ Two independent MQTT "vocabularies" coexist on the same broker:
 | similarity-service | 8003 | Distance/traversability metric computation |
 | graph-db-service | 6001 | ArangoDB wrapper — topological graph CRUD + spatial index |
 | image-db-service | 6002 | MinIO wrapper — node image storage/retrieval |
-| livekit-service | 8006 | Teleoperation video token service |
+| livekit-service | 8006 | Teleoperation video token service for LiveKit Cloud (pre-existing; caller-chosen grants) |
 | mosquitto | 1883 (TCP) / 9001 (WS) | MQTT broker — the shared bus for everything below |
 | postgres | 5432 | Mission/robot persistent state |
 | arangodb | 8529 | Graph database backend |
+
+Self-hosted LiveKit, in the same compose file (`docker_compose/mission_dispatch_services.yaml`, Tailscale-only; see `docs/livekit_sfu/README.md`):
+
+| Service | Port | Role |
+|---|---|---|
+| livekit-sfu | 7880/7881 TCP, 50000-60000 UDP | Self-hosted LiveKit server (SFU) |
+| livekit-sfu-tokens | 8008 | Role-scoped tokens for the self-hosted SFU (`robot` / `operator`); the self-hosted counterpart of `livekit-service` |
+| (host: `tailscale serve`) | 443 (tailnet) | `wss://admin-satinav-pc.tail055f44.ts.net` → SFU `127.0.0.1:7880`, for the https dashboard; not a container, `tailscale serve status` |
 
 ## 3. VDA5050 topic ontology (`uagv/v2/<manufacturer>/<serial>/...`)
 

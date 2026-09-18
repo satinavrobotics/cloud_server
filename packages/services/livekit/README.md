@@ -4,7 +4,7 @@ A microservice for generating LiveKit access tokens to enable video conferencing
 
 ## Overview
 
-The LiveKit service provides JWT token generation for LiveKit video conferencing. It allows participants to join LiveKit rooms with configurable permissions for publishing/subscribing to video, audio, and data tracks.
+The LiveKit service provides JWT token generation for **LiveKit Cloud** video conferencing. (The self-hosted SFU has its own role-scoped token service, `livekit-sfu-tokens`; see `docs/livekit_sfu/README.md`. Both sign tokens through `packages/utils/livekit_tokens.py`.) It allows participants to join LiveKit rooms with configurable permissions for publishing/subscribing to video, audio, and data tracks.
 
 ## Features
 

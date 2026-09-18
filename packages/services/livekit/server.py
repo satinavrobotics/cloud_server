@@ -3,15 +3,16 @@
 LiveKit Service - Core Logic
 
 This service handles LiveKit token generation for video conferencing.
-It creates JWT tokens that allow clients to connect to LiveKit rooms.
+It creates JWT tokens that allow clients to connect to LiveKit Cloud rooms.
+The self-hosted SFU's role-scoped counterpart is packages/services/livekit_sfu_tokens;
+both build the JWT with packages/utils/livekit_tokens.py.
 """
 
 import logging
 from typing import Optional, Dict, Any
-from datetime import timedelta
 
 try:
-    from livekit import api
+    from packages.utils.livekit_tokens import mint_room_token
 except ImportError:
     raise ImportError(
         "livekit-api package is required. Install with: pip install livekit-api"
@@ -93,31 +94,18 @@ class LiveKitService:
             
             self.logger.info(f"Creating token for participant '{participant_name}' in room '{room_name}'")
             
-            # Create access token
-            token = api.AccessToken(self.api_key, self.api_secret)
-            token.with_identity(participant_name)
-            token.with_name(participant_name)
-            
-            # Set token lifetime
-            token.with_ttl(timedelta(seconds=ttl))
-            
-            # Add metadata if provided
-            if metadata:
-                token.with_metadata(metadata)
-            
-            # Add video grants (permissions)
-            video_grants = api.VideoGrants(
-                room_join=True,
-                room=room_name,
+            jwt_token = mint_room_token(
+                self.api_key, self.api_secret,
+                identity=participant_name,
+                room_name=room_name,
+                ttl=ttl,
                 can_publish=can_publish,
                 can_subscribe=can_subscribe,
-                can_publish_data=can_publish_data
+                can_publish_data=can_publish_data,
+                display_name=participant_name,
+                metadata=metadata,
             )
-            token.with_grants(video_grants)
-            
-            # Generate JWT
-            jwt_token = token.to_jwt()
-            
+
             self.logger.info(f"✅ Token created successfully for '{participant_name}'")
             
             return {

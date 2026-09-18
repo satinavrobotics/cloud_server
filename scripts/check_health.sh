@@ -62,6 +62,24 @@ else
 fi
 
 echo ""
+echo "Self-hosted LiveKit (livekit-sfu services, main compose file):"
+echo "==========================================================================="
+
+printf "%-20s " "LiveKit SFU:"
+if curl -s -f "http://localhost:7880/" > /dev/null 2>&1; then
+  echo "✅ RUNNING"
+else
+  echo "❌ DOWN"
+fi
+
+printf "%-20s " "LiveKit SFU tokens:"
+if curl -s -f "http://localhost:8008/health" > /dev/null 2>&1; then
+  echo "✅ HEALTHY"
+else
+  echo "❌ UNHEALTHY"
+fi
+
+echo ""
 echo "Docker Containers:"
 echo "=================="
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "NAME|arangodb|minio|mosquitto|postgres|mission-dispatch|graph-builder|mission-planner|livekit|agent-orchestrator|api-delegation"

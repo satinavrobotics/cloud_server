@@ -6,3 +6,5 @@ __pycache__
 .claude
 htmlcov/*
 
+# Self-hosted LiveKit key pair (livekit-sfu services in docker_compose/mission_dispatch_services.yaml)
+docker_compose/livekit_sfu.env

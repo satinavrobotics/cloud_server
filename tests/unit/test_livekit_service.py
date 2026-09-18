@@ -8,9 +8,14 @@ import pytest
 import sys
 from unittest.mock import Mock, patch, MagicMock
 
-# Mock the livekit module before importing LiveKitService
-sys.modules['livekit'] = MagicMock()
-sys.modules['livekit.api'] = MagicMock()
+# Only stub the livekit SDK when it isn't installed. Replacing it unconditionally
+# leaks the mock into every other test in the session (the SFU token tests sign
+# real JWTs with it).
+try:
+    import livekit.api  # noqa: F401
+except ImportError:
+    sys.modules['livekit'] = MagicMock()
+    sys.modules['livekit.api'] = MagicMock()
 
 from packages.services.livekit.server import LiveKitService
 
@@ -48,7 +53,7 @@ class TestLiveKitServiceInit:
 class TestLiveKitServiceCreateToken:
     """Test LiveKitService token creation."""
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_with_defaults(self, mock_access_token):
         """Test token creation with default permissions."""
         mock_token_instance = Mock()
@@ -74,7 +79,7 @@ class TestLiveKitServiceCreateToken:
         mock_access_token.assert_called_once_with("test_api_key", "test_api_secret")
         mock_token_instance.to_jwt.assert_called_once()
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_with_custom_ttl(self, mock_access_token):
         """Test token creation with custom TTL."""
         mock_token_instance = Mock()
@@ -96,7 +101,7 @@ class TestLiveKitServiceCreateToken:
         assert result["token"] == "mock_jwt_token"
         assert result["ttl"] == 7200
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_with_metadata(self, mock_access_token):
         """Test token creation with metadata."""
         mock_token_instance = Mock()
@@ -119,7 +124,7 @@ class TestLiveKitServiceCreateToken:
         assert result["token"] == "mock_jwt_token"
         mock_token_instance.with_metadata.assert_called_once()
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_publish_only(self, mock_access_token):
         """Test token creation with publish-only permissions."""
         mock_token_instance = Mock()
@@ -141,7 +146,7 @@ class TestLiveKitServiceCreateToken:
 
         assert result["token"] == "mock_jwt_token"
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_subscribe_only(self, mock_access_token):
         """Test token creation with subscribe-only permissions."""
         mock_token_instance = Mock()
@@ -163,7 +168,7 @@ class TestLiveKitServiceCreateToken:
 
         assert result["token"] == "mock_jwt_token"
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_no_permissions(self, mock_access_token):
         """Test token creation with no publish/subscribe permissions."""
         mock_token_instance = Mock()
@@ -185,7 +190,7 @@ class TestLiveKitServiceCreateToken:
 
         assert result["token"] == "mock_jwt_token"
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_with_data_publish(self, mock_access_token):
         """Test token creation with data publish permission."""
         mock_token_instance = Mock()
@@ -206,7 +211,7 @@ class TestLiveKitServiceCreateToken:
 
         assert result["token"] == "mock_jwt_token"
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_all_permissions(self, mock_access_token):
         """Test token creation with all permissions enabled."""
         mock_token_instance = Mock()
@@ -229,7 +234,7 @@ class TestLiveKitServiceCreateToken:
 
         assert result["token"] == "mock_jwt_token"
 
-    @patch('packages.services.livekit.server.api.AccessToken')
+    @patch('packages.utils.livekit_tokens.api.AccessToken')
     def test_create_token_multiple_rooms(self, mock_access_token):
         """Test creating tokens for different rooms."""
         mock_token_instance = Mock()

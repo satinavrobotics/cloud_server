@@ -184,6 +184,58 @@ services:
     restart: on-failure
 
 
+  # Self-hosted LiveKit SFU (Tailscale-only): live robot video for the dashboard.
+  # Independent of livekit-service above (LiveKit Cloud tokens); its token
+  # counterpart is livekit-sfu-tokens below. Design and ops:
+  # docs/livekit_sfu/. Host networking: the SFU needs the wide UDP port range
+  # and must see the tailscale0 interface; exposure is limited by the host
+  # firewall and the Tailscale ACL, not by binding.
+  # NOTE: `restart_services.sh` stops and starts this with everything else, so
+  # live video drops for a few seconds and clients reconnect.
+  livekit-sfu:
+    image: livekit/livekit-server:v1.9.1   # pinned to the version validated in docs/livekit_sfu/TESTING.md
+    # Fixed name: tests/performance/livekit/*.sh select this exact container.
+    container_name: sati_livekit_sfu
+    # LiveKit reads its key pair from LIVEKIT_KEYS ("key: secret"); build it from
+    # the same env file the token service reads, so the pair lives in one place.
+    # $$ escapes compose interpolation -- the shell in the container expands these.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        [ -n "$${LIVEKIT_SFU_API_KEY}" ] && [ -n "$${LIVEKIT_SFU_API_SECRET}" ] || {
+          echo "LIVEKIT_SFU_API_KEY/SECRET not set: create docker_compose/livekit_sfu.env from livekit_sfu.env.example" >&2
+          exit 1
+        }
+        LIVEKIT_KEYS="$${LIVEKIT_SFU_API_KEY}: $${LIVEKIT_SFU_API_SECRET}" exec /livekit-server --config /etc/livekit.yaml
+    # Gitignored (holds the key pair). Optional here so a checkout without it can
+    # still build/start/stop every other service; these two then exit with the
+    # message above / the token service's own missing-variable error.
+    env_file:
+      - path: livekit_sfu.env
+        required: false
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    network_mode: "host"
+    restart: unless-stopped
+
+  # Role-scoped token service for the SFU above (robots: publish; operators, i.e.
+  # the sati-client dashboard: subscribe + data). Tailnet-only, no auth of its own;
+  # sati-client's gateway nginx only exposes /api/operator/createToken.
+  livekit-sfu-tokens:
+    build:
+      context: ..
+      dockerfile: packages/services/livekit_sfu_tokens/Dockerfile
+    image: ${LIVEKIT_SFU_TOKENS_IMAGE:-livekit_sfu_tokens:latest}
+    command: ["python", "-m", "packages.services.livekit_sfu_tokens.main",
+              "--port", "${LIVEKIT_SFU_TOKENS_PORT:-8008}",
+              "--host", "0.0.0.0"]
+    env_file:
+      - path: livekit_sfu.env
+        required: false
+    network_mode: "host"
+    restart: unless-stopped
+
   # Create Agent Orchestrator Service (LLM triage of VDA5050 state)
   agent-orchestrator-service:
     build:

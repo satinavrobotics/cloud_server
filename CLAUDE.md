@@ -67,7 +67,8 @@ All services use `network_mode: host` and communicate over localhost. Port assig
 | mission-dispatch | — (no HTTP) | VDA5050 mission controller (MQTT↔PostgreSQL); a worker, not a web service |
 | graph-builder-service | 8004 | Subscribes to `robot/node_update` MQTT, builds the topomap |
 | mission-planner-service | 8005 | Path planning on the topological graph |
-| livekit-service | 8006 | Teleoperation video token service |
+| livekit-service | 8006 | Teleoperation video token service for **LiveKit Cloud** (caller-chosen grants; the pre-existing one) |
+| livekit-sfu-tokens | 8008 | Role-scoped tokens for the **self-hosted** Tailscale-only LiveKit SFU (`livekit-sfu`, below); shares only `packages/utils/livekit_tokens.py` with `livekit-service` |
 | agent-orchestrator-service | 8007 | LLM agent: watches fleet events, produces insights (`/api/agent/*`, `/ws/agent/*` via the client's nginx) |
 | mosquitto | 1883/9001 | MQTT broker (TCP/WebSocket) |
 | postgres | 5432 | Mission/robot/map/settings objects (mission-dispatch, mission-planner, api, graph-builder) |
@@ -75,6 +76,8 @@ All services use `network_mode: host` and communicate over localhost. Port assig
 | minio | 9000 | Object storage: node images, rosbags, base models |
 
 There is **no** standalone graph-db, image-db or similarity service. `packages/topomap_dbs/{graph_db,image_db,model_db,rosbag_db}/server.py` are in-process libraries: services reach ArangoDB and MinIO directly through `TopomapDatabaseClient` (`packages/topomap_dbs/client.py`).
+
+Self-hosted LiveKit is part of the main compose file (`docker_compose/mission_dispatch_services.yaml`), so `restart_services.sh` rebuilds/restarts it with everything else (note: that restarts the SFU, dropping live video for a few seconds; reconnects are automatic): `livekit-sfu` (7880/7881 TCP, 50000-60000 UDP, Prometheus 6789, container `sati_livekit_sfu`) and `livekit-sfu-tokens` (8008, role-scoped tokens, `packages/services/livekit_sfu_tokens/`; operators get a `wss://` name from `tailscale serve` on 443 so the https dashboard works, via the operator-only `/api/operator/createToken`). Tailscale-only, settings in the gitignored `docker_compose/livekit_sfu.env` (optional for compose; without it just these two fail to start). See `docs/livekit_sfu/README.md`.
 
 ### Data Flow
 

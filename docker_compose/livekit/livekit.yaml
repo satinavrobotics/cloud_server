@@ -1,0 +1,31 @@
+# Self-hosted, Tailscale-only. No public exposure, no TURN, no Redis (single node).
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 60000
+  node_ip: "100.85.3.47"   # this box's Tailscale IPv4 (`tailscale ip -4`).
+                            # Confirmed-working knob per github.com/livekit/livekit#2088 —
+                            # the rtc.interfaces/ips filter was tried first and found unreliable.
+  use_external_ip: false
+  enable_loopback_candidate: false
+  interfaces:
+    excludes: ["eno1", "wlp132s0", "docker0"]
+      # REQUIRED, not cosmetic: this box has real public, globally-routable
+      # IPv6 addresses on eno1 (SLAAC/ISP-assigned). Without this exclude,
+      # a same-box test connection actually SELECTED that public IPv6 as its
+      # media path -- node_ip/use_external_ip:false do not stop ICE from
+      # gathering (and choosing) host candidates on other local interfaces;
+      # they only set what's advertised as external/STUN-discovered. See
+      # TESTING.md phase 1 notes for the full verification (checked the
+      # complete candidate list this time, not just one log line).
+# Deliberately left at default bind (0.0.0.0) for the HTTP/WS port so `tailscale serve`
+# (which proxies via 127.0.0.1) keeps working. Exposure is controlled by the Tailscale
+# ACL and host firewall, not by binding — see docs/livekit_sfu/TAILSCALE_ADMIN_STEPS.md and README.md §5.
+prometheus:
+  port: 6789                  # scrape for CPU/bandwidth/packet metrics during benchmarking,
+                               # see tests/performance/livekit/monitor.sh. Only reachable on this host / tailnet.
+                               # (top-level prometheus_port is deprecated as of v1.9.1 — confirmed
+                               # via the running server's own startup warning)
+logging:
+  level: info                 # bump to debug only while running tests/performance/livekit/verify_candidates.sh

@@ -2,7 +2,8 @@
 """
 LiveKit Service - FastAPI Application
 
-Exposes the LiveKit Service via REST API for token generation.
+Token generation for LiveKit Cloud (grants chosen by the caller). The self-hosted
+SFU has its own role-scoped counterpart, packages/services/livekit_sfu_tokens.
 """
 
 import argparse

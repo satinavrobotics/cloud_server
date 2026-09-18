@@ -19,6 +19,7 @@ docker compose -f $COMPOSE_FILE build \
     graph-builder-service \
     mission-planner-service \
     livekit-service \
+    livekit-sfu-tokens \
     agent-orchestrator-service \
     api-delegation-service
 
@@ -34,6 +35,7 @@ echo "📋 To view logs:"
 echo "   docker compose -f $COMPOSE_FILE logs -f mission-planner-service"
 echo "   docker compose -f $COMPOSE_FILE logs -f api-delegation-service"
 echo "   docker compose -f $COMPOSE_FILE logs -f graph-builder-service"
+echo "   docker compose -f $COMPOSE_FILE logs -f livekit-sfu-tokens"
 echo ""
 echo "📊 To check service status:"
 echo "   docker compose -f $COMPOSE_FILE ps"
