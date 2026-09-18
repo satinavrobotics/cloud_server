@@ -200,10 +200,11 @@ class TestApiDelegationLoadMapPostgres:
     @patch('packages.api.server.PostgresDatabase')
     @patch('packages.api.server.MissionPlannerClient')
     @patch('packages.api.server.LiveKitClient')
-    async def test_load_map_updates_existing_postgres_record(
+    async def test_load_map_on_existing_record_only_updates_when_given_a_datum(
         self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
     ):
-        """If map already exists in Postgres, update_spec is called instead of create_object."""
+        """If the map already exists in Postgres, a load that carries no datum must
+        leave the stored record (and its datum) alone rather than overwrite it."""
         from packages.api.server import ApiDelegationService
 
         mock_db_inst = AsyncMock()
@@ -220,6 +221,13 @@ class TestApiDelegationLoadMapPostgres:
 
         service = ApiDelegationService(arango_password="x", postgres_password="x")
         result = await service.load_map(map_id="existing")
+
+        assert result["success"] is True
+        mock_db_inst.update_spec.assert_not_called()
+
+        # ...whereas a load that does supply a datum updates the existing record.
+        result = await service.load_map(
+            map_id="existing", datum_latitude=47.37, datum_longitude=8.54)
 
         assert result["success"] is True
         mock_db_inst.update_spec.assert_called_once()
