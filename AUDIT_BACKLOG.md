@@ -119,7 +119,7 @@ against the live signatures; no code regressed. The same stale calls remain in
 `UnboundLocalError` for any earlier use. (`packages/api/server.py` still has ~12
 inline `import uuid as _uuid` / `base64` / `math` — same cleanup, not done.)
 
-### A15. ✅ DONE (uncommitted) — VDA5050 order/node ids repeated across runs and revisions — **high**
+### A15. ✅ DONE (`6da917c`) — VDA5050 order/node ids repeated across runs and revisions — **high**
 `orderId` was `{mission}-n{idx}` with `orderUpdateId` always 0, so a mission
 re-created under a name that was used before (the 2026-09-15 incident: delete +
 re-create) sent the *same* ids as the earlier run — which a robot that ignores
@@ -138,6 +138,25 @@ replay guard, or our legitimate retries (mismatch resend, restart resume) are
 dropped; (2) `sati-client`'s `MissionStatus` type does not list `run_id` /
 `order_rev` (harmless — extra JSON is ignored); (3) the Docker e2e test
 `test_state_updates_mission_progress` was adapted but not run.
+
+### A16. ✅ DONE (uncommitted) — a cancel released a teleoperated robot in the dispatcher only — **high**
+The dispatcher sends `stopTeleop` only while it believes the robot is `TELEOP` and
+`switch_teleop` is false. But `update_robot_state()` treated *any* acknowledged instant
+action other than `startTeleop` (a finished `cancelOrder`, `factsheetRequest`, …) as
+"stop teleop", and every mission-end path reset the robot to `IDLE`, so after a cancel
+the dispatcher believed the robot was free and an operator's stop sent nothing. That
+was invisible while a robot's `cancelOrder` also ended its pause; once a robot stays
+`paused` after a cancel (robot change R1) it would have been stuck until someone
+started and stopped teleop again. Now only `startTeleop`/`stopTeleop` acks move the
+state, and mission end (`_set_robot_idle_after_mission`) and mission start leave
+`TELEOP` alone. Tests: `tests/unit/test_mission_teleop_state.py`.
+Left open: (1) for a robot whose cancel *does* end its pause, the dispatcher now stays
+`TELEOP` until a `stopTeleop` is acknowledged (the operator's stop, or any robot-object
+update while `switch_teleop` is false), where it used to fall back to `IDLE`; using the
+robot's reported `paused` to clear it would remove that dependency (`paused` is not read
+anywhere today); (2) a `pause_order` action sets `TELEOP` without touching
+`switch_teleop`, so the next robot-object event sends `stopTeleop` at once — whether
+that is intended (auto-release) was not checked; (3) not run against a simulator.
 
 ---
 
@@ -286,6 +305,35 @@ dispatcher restart in the window resumes with the new route depends on whether t
 copy already holds it (not checked). Bumping at update time instead moves the resend
 onto the order-mismatch path (budget `MAX_ORDER_MISMATCHES` = 40 state messages) and
 skips the explicit "canceled" branch — a flow change, not a tweak.
+
+### C14. `bearing_deg` is documented one way and implemented another — **medium**
+`utils/geo.py` and `RobotDatumV1` / `MapObjectV1.datum_bearing_deg` describe it as the
+"angle from +X to true north", but `gps_to_local` computes `x = east·cos b + north·sin b`,
+i.e. with b = 0 the local +X axis points *east* (the doc's wording would give 90°). The
+code behaves as "local +X rotated b° counter-clockwise from true east". The datum is
+also assumed *true*-north: nothing accounts for grid north / meridian convergence
+(≈ −1.44° at the reporting site, ≈ 2.5 m lateral error per 100 m). The robot publishes
+a constant 0.0 today. Decide the convention, fix the docstrings (or the maths), and pin
+it with a round-trip test against a known bearing before any robot sends a non-zero
+value. Note the planner converts GPS goals with the *map's* datum, not the robot's; the
+robot's is only used to seed a map that has none (`_process_datum_message`).
+
+### C15. An unknown `operatingMode` drops the whole state message — **medium**
+`VDA5050OperatingMode` accepts only AUTOMATIC / MANUAL / SEMIAUTOMATIC / SERVICE /
+TEACHIN (and `""`). Any other value (e.g. a robot reporting `TELEOPERATION`) fails
+`VDA5050State` validation, and `_on_mqtt_message` logs a warning and discards the *entire*
+message — including the heartbeat, so the robot goes offline after `heartbeat_timeout`
+and its mission stalls. Nothing in the dispatcher reads `operatingMode` (only the agent
+orchestrator forwards it). Make the field tolerant (unknown → keep the message, log
+once) rather than fatal, and agree the value a teleoperated robot reports.
+
+### C16. `pause_order` detection reads only `actionStates[0]` — **low/medium**
+`update_mission_node_state` (`controllers/mission/server.py`, `# TODO(Nico): fix the
+action states index`) looks at the first action state only: a pause action that is not
+first is missed, and an ACTION node whose `actionStates` is empty raises `IndexError`
+(no guard). Instant-action states are appended to the same list, so "first" is only
+right by convention. Match the state whose `actionId` belongs to the current node
+(`…-n{idx}-s{seq}`), or scan all entries; `paused` is available too and unused.
 
 ---
 

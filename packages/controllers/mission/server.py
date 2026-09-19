@@ -874,7 +874,7 @@ class Robot:
 
         # In case mission failed due to timeout
         if self._current_mission.status.state.done:
-            self._set_robot_state(robot_object.RobotStateV1.IDLE)
+            self._set_robot_idle_after_mission()
             await self.get_next_mission()
             return
 
@@ -900,7 +900,7 @@ class Robot:
                      f"(still reporting {message.orderId})")
                 self._set_mission_state(mission_object.MissionStateV1.FAILED)
                 self._order_mismatch_count = 0
-                self._set_robot_state(robot_object.RobotStateV1.IDLE)
+                self._set_robot_idle_after_mission()
                 await self.get_next_mission()
                 return
             await self._send_order()
@@ -962,7 +962,7 @@ class Robot:
             return
         await self._robot_server.delete_pending_mission(self._current_mission)
         # Set robot to idle
-        self._set_robot_state(robot_object.RobotStateV1.IDLE)
+        self._set_robot_idle_after_mission()
         await self.get_next_mission()
 
     def _remember_finished(self, name: str) -> None:
@@ -1050,7 +1050,7 @@ class Robot:
                     f"Sending cancelOrder {timeout_cancel_id} so the robot "
                     "abandons the timed-out order")
                 await self._send_cancel_order(timeout_cancel_id)
-            self._set_robot_state(robot_object.RobotStateV1.IDLE)
+            self._set_robot_idle_after_mission()
             await self.get_next_mission()
 
     async def _delete_robot_object(self):
@@ -1330,20 +1330,23 @@ class Robot:
     def update_robot_state(self, finished_instant_actions: List[types.VDA5050Action]):
         """ Update robot states after teleop is finished
 
+        Only the teleop instant actions matter here. Any other acknowledged instant
+        action (cancelOrder, factsheetRequest, ...) says nothing about teleop and must
+        not move the robot out of TELEOP: a robot that is still paused only leaves it
+        through stopTeleop, and the dispatcher only sends that while it is in TELEOP.
+
         Args:
             finished_instant_actions (List[types.VDA5050Action]): All the completed instant actions
         """
-        # Check if there is an instant teleop feedback
         for finished_instant_action in finished_instant_actions:
             if finished_instant_action.actionType == types.NVInstantActionType.START_TELEOP:
                 self._set_robot_state(robot_object.RobotStateV1.TELEOP)
                 self.mission_info("Switch to teleop")
-            else:
+            elif finished_instant_action.actionType == types.NVInstantActionType.STOP_TELEOP:
                 resume_robot_state = robot_object.RobotStateV1.ON_TASK \
                     if self._current_mission else robot_object.RobotStateV1.IDLE
                 self._set_robot_state(resume_robot_state)
                 self.mission_info("Stop teleop")
-            return
 
     def update_mission_state(self, message: types.VDA5050State,
                              finished_instant_actions: List):
@@ -1457,6 +1460,18 @@ class Robot:
         self._robot_object.status.state = state
         asyncio.ensure_future(self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4()))
 
+    def _set_robot_idle_after_mission(self):
+        """The robot's state once a mission has ended -- unless it is teleoperated.
+
+        A mission ending (completed, failed, cancelled, timed out) says nothing about
+        teleop: the robot may still be paused by a pause_order or startTeleop, and only
+        stopTeleop releases it. Dropping TELEOP here would make the dispatcher believe
+        the robot is free, so it would never send that stopTeleop."""
+        if self._robot_object is not None and \
+                self._robot_object.status.state == robot_object.RobotStateV1.TELEOP:
+            return
+        self._set_robot_state(robot_object.RobotStateV1.IDLE)
+
     def _set_mission_state(self, state: mission_object.MissionStateV1):
         if self._current_mission is None or state == self._current_mission.status.state:
             return False
@@ -1477,7 +1492,10 @@ class Robot:
             # If the mission just moved to RUNNING, set the start timestamp
             if self._current_mission.status.start_timestamp is None:
                 self._current_mission.status.start_timestamp = datetime.datetime.now()
-                self._set_robot_state(robot_object.RobotStateV1.ON_TASK)
+                # A teleoperated (paused) robot stays TELEOP until stopTeleop.
+                if self._robot_object is None or \
+                        self._robot_object.status.state != robot_object.RobotStateV1.TELEOP:
+                    self._set_robot_state(robot_object.RobotStateV1.ON_TASK)
                 self.mission_info(
                     f"Mission started at {self._current_mission.status.start_timestamp}")
         elif state.done:
