@@ -1445,6 +1445,10 @@ async def create_mission(mission_data: dict):
         # Note: status and lifecycle must be set before **mission_data to avoid being overridden
         mission_data_with_defaults = {"status": MissionStatusV1(), "lifecycle": ObjectLifecycleV1.ALIVE, **mission_data}
         mission = MissionObjectV1(**mission_data_with_defaults)
+        # Dispatcher-owned (see PUT below): a new mission is never dispatched yet, so a
+        # caller-supplied run_id could only make its order ids collide with another run's.
+        mission.status.run_id = None
+        mission.status.order_rev = 0
         publisher_id = uuid.uuid4()
         await service.database.create_object(mission, publisher_id)
         return mission.dict()
@@ -1480,7 +1484,13 @@ async def update_mission(mission_name: str, mission_data: dict):
 
         # Update status if provided
         if "status" in mission_data:
-            mission.status = mission.get_status_class()(**mission_data["status"])
+            new_status = mission.get_status_class()(**mission_data["status"])
+            # run_id / order_rev belong to the dispatcher: they name the VDA5050
+            # orders it has already sent, so a caller's copy of the status (stale, or
+            # simply without them) must not blank or change them.
+            new_status.run_id = mission.status.run_id
+            new_status.order_rev = mission.status.order_rev
+            mission.status = new_status
             await service.database.update_status(MissionObjectV1, mission.name, mission.status, publisher_id)
 
         # Return updated mission

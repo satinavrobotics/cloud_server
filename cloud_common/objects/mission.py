@@ -356,6 +356,20 @@ class MissionStatusV1(pydantic.BaseModel):
     held_reason: Optional[str] = pydantic.Field(
         None, description="Human readable reason dispatch is being withheld, e.g. \
                            'Robot is offline' or 'Robot navigation is not ready'.")
+    run_id: Optional[str] = pydantic.Field(
+        None, description="Dispatcher-owned token that makes the VDA5050 order/node ids of \
+                           this run unique, so a mission re-created under a name that was \
+                           used before never reuses an earlier run's ids. Assigned once, \
+                           just before the first order is sent; null on a mission that has \
+                           not been dispatched yet, and on one that was already running \
+                           before this field existed (which keeps the legacy id format). \
+                           Never set it from the API.")
+    order_rev: int = pydantic.Field(
+        0, description="Dispatcher-owned revision of this run's orders. Bumped when a \
+                        cancelled node is resent with new content (an operator route \
+                        update or edge-blocked reroute), so the resend carries a new \
+                        orderId instead of reusing the cancelled order's. Never set it \
+                        from the API.")
 
     class Config:
         use_enum_value = True

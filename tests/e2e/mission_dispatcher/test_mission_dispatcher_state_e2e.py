@@ -289,12 +289,23 @@ class TestMissionDispatcherStateE2E:
         # Wait for mission to be dispatched
         time.sleep(2)
         
+        # The dispatcher names its orders "{mission}-r{run_id}-n{idx}" (just
+        # "{mission}-n{idx}" for a mission dispatched before run ids existed); echo the
+        # id it actually used, as a robot that adopted the order would.
+        order_prefix = mission_name
+        mission_response = requests.get(
+            f"{mission_database_service['url']}/mission/{mission_name}")
+        if mission_response.status_code == 200:
+            run_id = (mission_response.json().get("status") or {}).get("run_id")
+            if run_id:
+                order_prefix = f"{mission_name}-r{run_id}"
+
         # Send state indicating progress
         state_message = {
             "headerId": 1,
             "timestamp": "2024-01-01T00:00:00Z",
             "version": "2.0.0",
-            "orderId": f"{mission_name}-n0",
+            "orderId": f"{order_prefix}-n0",
             "orderUpdateId": 0,
             "lastNodeId": "node_0",
             "lastNodeSequenceId": 0,

@@ -34,6 +34,7 @@ import pydantic
 
 from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import behavior_tree
+from packages.controllers.mission import order_ids
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
 from packages.utils import metrics
@@ -223,6 +224,9 @@ class Robot:
             asyncio.ensure_future(self._database.update_status(
                 api_objects.MissionObjectV1, self._current_mission.name,
                 self._current_mission.status, uuid.uuid4()))
+        # The run id must exist (and be persisted) before the first order goes out.
+        if not await self._assign_run_id():
+            return
         # Initialize behavior tree
         self._current_behavior_tree = behavior_tree.MissionBehaviorTree(
             self._current_mission)
@@ -297,6 +301,68 @@ class Robot:
                                   instant_actions.json())
         self._header_id += 1
 
+    def _order_prefix(self) -> str:
+        """Prefix of every order/node id generated for the current mission's run and
+        revision (see order_ids)."""
+        status = self._current_mission.status
+        return order_ids.run_prefix(str(self._current_mission.name),
+                                    status.run_id, status.order_rev)
+
+    async def _persist_current_mission_status(self):
+        await self._database.update_status(
+            api_objects.MissionObjectV1, self._current_mission.name,
+            self._current_mission.status, uuid.uuid4())
+
+    async def _assign_run_id(self) -> bool:
+        """Give a mission that is about to be dispatched for the first time its run
+        id, and persist it *before* any order carrying it is sent.
+
+        Awaited rather than fire-and-forget: if the dispatcher restarted between
+        publishing the first order and the write landing, the mission would resume
+        with no run_id and come back under different ids than the robot holds.
+
+        A mission that already has a start_timestamp but no run_id was running before
+        run_id existed; it keeps its legacy ids (see order_ids.run_prefix).
+
+        Returns False if the id could not be persisted; nothing has been sent and
+        the mission stays PENDING for the next attempt.
+        """
+        status = self._current_mission.status
+        if status.run_id is not None or status.start_timestamp is not None:
+            return True
+        status.run_id = uuid.uuid4().hex[:8]
+        try:
+            await self._persist_current_mission_status()
+        except Exception as err:  # pylint: disable=broad-except
+            status.run_id = None
+            self.warning(f"[{self._current_mission.name}] Could not persist run id "
+                         f"({err}); not dispatching yet")
+            return False
+        self.mission_info(f"Run id {status.run_id}")
+        return True
+
+    async def _bump_order_rev(self) -> bool:
+        """Move the current run to a new order revision, and persist it *before* the
+        resend, so a cancelled node that is resent with new content goes out under a
+        new orderId (the robot still holds the cancelled order's id in its state).
+
+        A legacy mission (no run_id) keeps its ids. Returns False if the revision
+        could not be persisted; the caller must not resend and should retry.
+        """
+        status = self._current_mission.status
+        if status.run_id is None:
+            return True
+        status.order_rev += 1
+        try:
+            await self._persist_current_mission_status()
+        except Exception as err:  # pylint: disable=broad-except
+            status.order_rev -= 1
+            self.warning(f"[{self._current_mission.name}] Could not persist order "
+                         f"revision ({err}); not resending yet")
+            return False
+        self.mission_info(f"Order revision {status.order_rev}")
+        return True
+
     async def _send_order(self):
         if self._robot_object is None or self._robot_object.lifecycle \
             not in [api_objects.object.ObjectLifecycleV1.ALIVE,
@@ -322,21 +388,21 @@ class Robot:
             if mission_node.type == mission_object.MissionNodeType.ROUTE and \
                     mission_node.route is not None:
                 order = types.VDA5050Order.from_route(mission_node.route, self._robot_object,
-                                                      self._current_mission.name, idx)
+                                                      self._order_prefix(), idx)
                 self.mission_info("Sending mission route node "
                                   f"{mission_node.name}")
 
             elif mission_node.type == mission_object.MissionNodeType.MOVE and \
                     mission_node.move is not None:
                 order = types.VDA5050Order.from_move(mission_node.move, self._robot_object,
-                                                     self._current_mission.name, idx)
+                                                     self._order_prefix(), idx)
                 self.mission_info("Sending mission move node "
                                   f"{mission_node.name}")
 
             elif mission_node.type == mission_object.MissionNodeType.ACTION and \
                     mission_node.action is not None:
                 order = types.VDA5050Order.from_action(mission_node.action, self._robot_object,
-                                                       self._current_mission.name, idx)
+                                                       self._order_prefix(), idx)
                 self.mission_info("Sending mission action node "
                                   f"{mission_node.name}")
 
@@ -458,7 +524,7 @@ class Robot:
                         self.debug("cancelOrder already outstanding; not sending another")
                         return
                     self.info("Cancelling current node...")
-                    action_id = f"{self._current_mission.name}-instantaction-n{self._header_id}"
+                    action_id = f"{self._order_prefix()}-instantaction-n{self._header_id}"
                     self.mission_info(f"Send cancel order action {action_id}")
                     await self._send_cancel_order(action_id)
                 return
@@ -813,7 +879,7 @@ class Robot:
             return
 
         # If the order doesn't match, ignore it
-        if message.orderId.rsplit("-n", 1)[0] != str(self._current_mission.name):
+        if not order_ids.is_order_of(self._order_prefix(), message.orderId):
             self._order_mismatch_count += 1
             self.info(f"[{self._current_mission.name}] Got message from another mission order: "
                       f"{message.orderId} "
@@ -846,6 +912,12 @@ class Robot:
 
         # Resend node requested by the user
         if self._updating_mission_from_api:
+            # The robot cancelled this node's order to take the new content, and still
+            # holds its orderId; resending under the same id would be a different
+            # order with an id the robot has already seen. If the revision can't be
+            # persisted, leave the flag set and retry on the next state message.
+            if not await self._bump_order_rev():
+                return
             self.mission_info(f"Resend the updated mission node {prev_child_node}: "
                               f"{self._current_behavior_tree.current_node.name}")
             await self._send_order()
@@ -973,7 +1045,7 @@ class Robot:
             # mission is current, so a second one here would only be a duplicate.
             if not self._has_outstanding_cancel():
                 timeout_cancel_id = \
-                    f"{self._current_mission.name}-timeout-cancel-n{self._header_id}"
+                    f"{self._order_prefix()}-timeout-cancel-n{self._header_id}"
                 self.mission_info(
                     f"Sending cancelOrder {timeout_cancel_id} so the robot "
                     "abandons the timed-out order")
@@ -992,10 +1064,7 @@ class Robot:
     @staticmethod
     def _sequence_id_from_node_id(node_id: str) -> Optional[int]:
         """Sequence id encoded in a node id we generated ("...-s{seq}"), else None."""
-        _, sep, suffix = node_id.rpartition("-s")
-        if not sep or not suffix.isdigit():
-            return None
-        return int(suffix)
+        return order_ids.node_sequence(node_id)
 
     def update_mission_node_state(self, message: types.VDA5050State,
                                   finished_instant_actions: List[types.VDA5050Action])\
@@ -1003,26 +1072,27 @@ class Robot:
         # Update mission state from robot client
         if self._current_mission is None:
             return mission_object.MissionStateV1.PENDING
-        mission_node_index = int(message.orderId.rsplit("-n", 1)[1])
+        mission_node_index = order_ids.order_node_index(message.orderId)
         current_mission_node = self._current_mission.mission_tree[mission_node_index]
         task_status = self._current_mission.status.task_status
         # lastNodeId/lastNodeSequenceId describe the last node the robot *reached*,
         # which lags the order it has accepted: right after we dispatch a new
         # mission's order the robot echoes the new orderId while still reporting the
         # previous mission's final node. Every node this mission generates is named
-        # for it ("{mission}-n{node}-s{seq}", or "{mission}-s0-n0" for the initial
-        # node at the robot's own pose -- see VDA5050Order.from_mission), so a
-        # lastNodeId not carrying this mission's name is a leftover from the previous
-        # one and must not be read as progress: its terminal sequence id satisfies the
-        # route-complete test below and completes a brand-new mission on its very
-        # first state message (observed: a mission COMPLETED 55ms after dispatch with
-        # the robot still parked at the previous route's endpoint).
+        # for its run ("{prefix}-n{node}-s{seq}", see order_ids -- the prefix carries
+        # the mission name, run id and order revision, so a same-named earlier run or
+        # a cancelled revision doesn't match either), so a lastNodeId not carrying
+        # the current prefix is a leftover from the previous one and must not be
+        # read as progress: its terminal sequence id satisfies the route-complete
+        # test below and completes a brand-new mission on its very first state
+        # message (observed: a mission COMPLETED 55ms after dispatch with the robot
+        # still parked at the previous route's endpoint).
         #
-        # Keyed on the mission name rather than the node id, so that advancing
+        # Keyed on the run prefix rather than the node id, so that advancing
         # between mission_tree nodes *within* one mission still reads the previous
         # node's sequence id exactly as before.
         reached_node_in_current_mission = \
-            message.lastNodeId.startswith(f"{self._current_mission.name}-")
+            order_ids.is_node_of(self._order_prefix(), message.lastNodeId)
         # A foreign lastNodeId means "this mission has reached nothing yet" -- which
         # also covers the empty lastNodeId the robot reports before its very first
         # order, since that matches no mission's prefix either.
@@ -1152,19 +1222,14 @@ class Robot:
             if ref.referenceKey in ("edgeId", "edge_id"):
                 blocked_edge = ref.referenceValue
             elif ref.referenceKey in ("nodeId", "node_id"):
-                try:
-                    node_idx = int(
-                        ref.referenceValue.rsplit("-n", 1)[1].rsplit("-s", 1)[0])
-                    if node_idx < len(self._current_mission.mission_tree):
-                        blocked_node_name = str(
-                            self._current_mission.mission_tree[node_idx].name)
-                except (ValueError, IndexError):
-                    pass
-                try:
-                    seq = int(ref.referenceValue.rsplit("-s", 1)[1])
+                node_idx = order_ids.node_index(ref.referenceValue)
+                if node_idx is not None and \
+                        node_idx < len(self._current_mission.mission_tree):
+                    blocked_node_name = str(
+                        self._current_mission.mission_tree[node_idx].name)
+                seq = order_ids.node_sequence(ref.referenceValue)
+                if seq is not None:
                     blocked_waypoint_index = seq // 2 - 1
-                except (ValueError, IndexError):
-                    pass
 
         # Idempotency: the idle robot re-emits this WARNING in every state message,
         # so only act (log + persist) when the block is new or its target changed.

@@ -119,6 +119,26 @@ against the live signatures; no code regressed. The same stale calls remain in
 `UnboundLocalError` for any earlier use. (`packages/api/server.py` still has ~12
 inline `import uuid as _uuid` / `base64` / `math` — same cleanup, not done.)
 
+### A15. ✅ DONE (uncommitted) — VDA5050 order/node ids repeated across runs and revisions — **high**
+`orderId` was `{mission}-n{idx}` with `orderUpdateId` always 0, so a mission
+re-created under a name that was used before (the 2026-09-15 incident: delete +
+re-create) sent the *same* ids as the earlier run — which a robot that ignores
+already-seen ids drops, and which also let the previous run's leftover `lastNodeId`
+read as progress here. The same id was also reused within a run when a cancelled node
+was resent with new content (operator route update / edge-blocked reroute). Ids are now
+`{mission}-r{run_id}[v{order_rev}]-n{idx}[-s{seq}]`: `MissionStatusV1.run_id` is
+assigned once and persisted *before* the first order, `order_rev` is bumped and
+persisted before a cancel-and-resend; both are dispatcher-owned (the API ignores them
+on create, preserves them on a status write). A mission already running before this
+keeps its legacy ids, so no deploy ordering is needed. All id building/matching/parsing
+is in `packages/controllers/mission/order_ids.py` (`docs/deployment_ontology.md`
+describes the scheme). Tests: `tests/unit/test_mission_order_ids.py`.
+Left for others: (1) the robot client must record only *completed* orders in a
+replay guard, or our legitimate retries (mismatch resend, restart resume) are
+dropped; (2) `sati-client`'s `MissionStatus` type does not list `run_id` /
+`order_rev` (harmless — extra JSON is ignored); (3) the Docker e2e test
+`test_state_updates_mission_progress` was adapted but not run.
+
 ---
 
 ## B. Security — needs an owner decision, not a code-only fix
@@ -241,6 +261,32 @@ Still open: a lingering FATAL from an unrelated order can fail a fresh mission.
 fields with no `validate_assignment`. `UpdateRobotMapRequest.map_id` is required,
 so the client's `assignRobotMap(name, null)` can only ever 422.
 
+### C11. FATAL-error references parsed as node indexes, action ids included — **medium**
+`get_mission_errors()` (`controllers/mission/server.py`, see also C9) parses
+`rsplit("-n")[-1].rsplit("-s")[0]` for `referenceKey in node_id/nodeId/action_id/
+actionId`, which reads the suffix of an *action* id as a `mission_tree` index. Instant-action
+ids are `…-instantaction-n{headerId}`, so a failed instant action is attributed to
+`mission_tree[headerId]` whenever that index exists. Pre-existing; found while doing A15.
+Fix: only parse `nodeId` references (`order_ids.node_index`), and match `actionId`
+references against the tracked actions instead.
+
+### C12. Instant-action ids are inconsistently scoped — **low/medium**
+The mission cancel / timeout-cancel ids carry the run prefix (A15), but the bare
+`instantaction-n{headerId}` ids (`_on_robot_change` custom actions and the like) and
+`force-cancel-instantaction-n{headerId}` carry no mission or run, and `_header_id`
+restarts at 0 on every dispatcher start — so they repeat across restarts. Harmless
+unless a robot dedupes on `actionId`; if it does (unverified), give them a per-process
+token like the run id.
+
+### C13. Order revision is bumped after the robot confirms the cancel — **low, design**
+A15 bumps `order_rev` when the robot reports the node cancelled, but the route change
+is applied when the API update arrives. Anything that sends an order inside that window
+(none found in normal operation) would put new content under the old id. Whether a
+dispatcher restart in the window resumes with the new route depends on whether the DB
+copy already holds it (not checked). Bumping at update time instead moves the resend
+onto the order-mismatch path (budget `MAX_ORDER_MISMATCHES` = 40 state messages) and
+skips the explicit "canceled" branch — a flow change, not a tweak.
+
 ---
 
 ## D. Performance / reliability — deferred
@@ -261,6 +307,8 @@ surface only as "Task exception was never retrieved", and ordering across pool
 connections is not guaranteed (the `_finished_missions` comments already work
 around this). One `_persist_status()` with a done-callback logger, ideally a
 per-object serial write queue.
+`Robot._persist_current_mission_status()` (awaited, added in A15 for the writes that
+must land *before* an order goes out) is a starting point for the shared helper.
 
 ### D3. Path planning minimises hops, not distance — **medium**
 `graph_db/server.py` `SHORTEST_PATH` has no `weightAttribute`, and the edge weight
@@ -305,7 +353,8 @@ on any other receive error.
   `GraphDatabaseService.update_node` / `delete_node` / `remove_node` / `find_path`
   (the latter fakes "10 m per hop"; `delete_node` would leave dangling edges);
   `MQTT_RECONNECT_PERIOD`, `DATABASE_RECONNECT_PERIOD`,
-  `RobotServer._mqtt_on_connect`, unused `sys`/`cast` imports and a double
+  `RobotServer._mqtt_on_connect`, `VDA5050Order.from_mission` (no callers; emits a
+  bare-name `orderId` outside the A15 scheme), unused `sys`/`cast` imports and a double
   `_detection_results_object` init in the mission controller;
   `scripts/update_robot_custom_actions.py` targets a nonexistent :5001.
 - **API surface with no client caller:** `GET /maps/{id}`, `PUT /maps/{id}/datum`,

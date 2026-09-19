@@ -136,10 +136,9 @@ Key fields (robot → cloud):
   `lastNodeSequenceId` lag `orderId`**: they describe the last node the robot
   physically *reached*, so right after a new order is dispatched the robot echoes
   the new `orderId` while still reporting the previous order's final node. Node
-  ids are named for their mission (`{mission}-n{node}-s{seq}`, plus
-  `{mission}-s0-n0` for the initial node at the robot's own pose — see
-  `VDA5050Order.from_mission`), so `update_mission_node_state()` reads them as
-  progress only when `lastNodeId` carries the current mission's name, and treats
+  ids are named for their mission *run* (`{prefix}-n{node}-s{seq}`; the order id
+  is `{prefix}-n{node}`), so `update_mission_node_state()` reads them as progress
+  only when `lastNodeId` carries the current prefix, and treats
   a foreign one as "this mission has reached nothing yet" (the same as the empty
   `lastNodeId` before the robot's first order). Reading them unconditionally
   completes a brand-new mission on its very first `/state` message, because the
@@ -241,10 +240,25 @@ that legitimately followed it. The robot refuses the duplicate — correctly, wi
 `MAX_ORDER_MISMATCHES` state messages with "Robot did not accept the dispatched
 order", overwriting the `COMPLETED` status the mission had already earned.
 
+**Order / node id scheme** (`packages/controllers/mission/order_ids.py`): a
+VDA5050 `orderId` names one order, and a robot may treat a repeated id as a replay
+or a continuation, so the dispatcher never sends two different orders under one id.
+`prefix` is `{mission}-r{run_id}` (`{mission}-r{run_id}v{order_rev}` after a
+revision), where `run_id` (`MissionStatusV1.run_id`) is assigned once per run just
+before the first order and persisted first, and `order_rev` is bumped, and persisted
+first, when a cancelled node is resent with new content (operator route update,
+edge-blocked reroute). Both are dispatcher-owned: the API ignores them on create and
+preserves them on a status write. A mission that was already running before run ids
+existed keeps the legacy `{mission}-n{node}` ids. `orderUpdateId` is always `0`: a
+new run or revision is a new order, never an update. Plain resends (a robot that
+hasn't adopted the order yet, a dispatcher restart) keep the same id. A robot that
+ignores repeated ids should record only orders it *completed* -- not ones it merely
+received or rejected -- or those legitimate retries would be dropped.
+
 **Mission cancel (VDA5050 `cancelOrder` instant action):**
 `POST /api/v1/missions/{name}/cancel` sets `needs_canceled` on the mission →
 `mission-dispatch` publishes a `cancelOrder` on `/instantActions` (action id
-`{mission}-instantaction-n{headerId}`) → the robot cancels its Nav2 goal,
+`{prefix}-instantaction-n{headerId}`) → the robot cancels its Nav2 goal,
 reports the action `FINISHED` in `actionStates[]` and stops republishing the
 order's progress → `mission-dispatch` marks the mission `CANCELED`.
 
