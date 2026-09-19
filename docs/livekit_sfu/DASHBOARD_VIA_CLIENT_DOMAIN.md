@@ -134,7 +134,7 @@ Files: `packages/services/livekit_sfu_tokens/{server.py,main.py}`,
       a spare port (e.g. 8018, host network) with the env file and `curl` both
       routes; confirm URLs and grants.
 
-      Result: operator route -> `wss://` URL, canPublish=false/canSubscribe=true; a smuggled `role: robot` is ignored; `/api/createToken` robot -> `ws://100.85.3.47:7880`. Test image tag `livekit_sfu_tokens:operator-url-test`; live `:latest` untouched.
+      Result: operator route -> `wss://` URL, canPublish=false/canSubscribe=true (at the time; both roles are now true/true); a smuggled `role: robot` is ignored; `/api/createToken` robot -> `ws://100.85.3.47:7880`. Test image tag `livekit_sfu_tokens:operator-url-test`; live `:latest` untouched.
 ### Phase 2: sati-client (worktree `~/satinavrobotics/sati-client-livekit-sfu-tokens`)  [me]
 - [x] `constants/LiveKit.ts`: `buildTokenRequest` selfhost branch drops `role`
       (body identical to cloud; only the path differs). Update

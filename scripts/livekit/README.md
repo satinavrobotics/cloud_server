@@ -22,18 +22,14 @@ python robot_client.py --role operator    # room defaults to admin@satinavroboti
 - **Auth**: fetches a short-lived, *role-scoped* token from the `livekit-sfu-tokens`
   service (`packages/services/livekit_sfu_tokens/`; `--token-server`, default `http://100.85.3.47:8008`) — the device never
   holds the raw `LIVEKIT_API_KEY`/`SECRET`, only that service does.
-  `--role robot` (default) gets a token that publishes tracks + data and
-  subscribes to nothing; `--role operator` gets one that subscribes and
-  publishes data (teleop, RPC) but **cannot publish tracks**. This is
-  enforced server-side, not just by the script choosing not to try —
-  verified directly: an operator-scoped token attempting `publish_track` is
-  refused by the SFU (`NOT_ALLOWED`; client-side it times out) rather than
-  accepted.
+  Both roles get bidirectional tokens (publish tracks + data, subscribe);
+  `--role robot` (default) and `--role operator` differ only in server URL,
+  TTL and identity rules. What the script itself does per role is below.
 - **Video** (`--role robot` only): real camera (index 0 by default) if one's
   available, a synthetic color-cycle frame if not (auto-detected;
   `--force-synthetic` to skip the camera deliberately). Same I420/RGBA
   publish path LiveKit's own SDK examples use.
-- **Viewing** (`--role operator`): publishes nothing, just connects,
+- **Viewing** (`--role operator`): the script publishes nothing (its token could), just connects,
   auto-subscribes (LiveKit's default), and logs `track_subscribed`/
   `participant_connected` events — a minimal headless viewer, useful for
   confirming a robot's stream is actually reachable before wiring up a real
@@ -58,8 +54,8 @@ CLI, no real media) — this is the real thing, one participant at a time.
 
 ## Least-privilege on the network layer too
 
-Token scoping (above) closes the *application-layer* gap — an operator
-token can't publish. The matching *network-layer* piece is giving operator
+Token scoping (above) no longer limits what an operator token can do — both
+roles are bidirectional — so the network layer is the real control. The matching *network-layer* piece is giving operator
 devices their own Tailscale ACL scoping instead of relying on account
 ownership (which is all `cimbi` has today) — see Human task 4 in
 `docs/livekit_sfu/TAILSCALE_ADMIN_STEPS.md`.

@@ -9,12 +9,11 @@ script and command line run unmodified anywhere.
 Two roles, same script:
   --role robot     (default) publish real camera video, or a synthetic
                     color-cycle frame if no camera's available (auto-
-                    detected). Gets a publish-only token.
+                    detected). Gets a bidirectional token.
   --role operator  viewer: connects, subscribes to whatever's being
-                    published, logs track/participant events. Its token can
-                    also send data (teleop cmd_vel, RPC) but can't publish
-                    tracks -- an operator's laptop can watch and drive the
-                    fleet, it can't inject video into a room.
+                    published, logs track/participant events. Its token is
+                    bidirectional too (teleop cmd_vel, RPC, tracks); this
+                    script just doesn't publish anything.
 
 Unlike tests/performance/livekit/'s synthetic load tool, this uses the real
 LiveKit Python SDK.
@@ -86,8 +85,8 @@ def resolve_identity() -> tuple[str, str]:
 
 def fetch_token(token_server: str, identity: str, room: str, role: str) -> dict:
     """One attempt; raises on failure. `role` controls what the token can
-    actually do server-side (robot: publish tracks + data, no subscribe;
-    operator: subscribe + data, no tracks) -- not just a label. Blocking, so
+    actually do server-side (currently both roles: publish tracks + data and
+    subscribe; they differ in server URL and TTL) -- not just a label. Blocking, so
     callers run it in a thread (see connect_and_publish)."""
     body = json.dumps({"participantName": identity, "roomName": room, "role": role}).encode()
     req = request.Request(

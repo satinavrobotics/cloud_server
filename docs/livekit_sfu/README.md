@@ -152,15 +152,18 @@ required. The caller names a role; it cannot request raw permissions:
 
 | role | publish tracks | subscribe | publish data |
 |---|---|---|---|
-| `robot` | yes | no | yes |
-| `operator` | no | yes | yes |
+| `robot` | yes | yes | yes |
+| `operator` | yes | yes | yes |
 
-Operators publish data because sati-client drives robots over it (teleop
-`cmd_vel/<robot>` topics and RPC); they still cannot publish tracks. This is
-a deliberate change from the original Node token-server, whose operator
-tokens were subscribe-only. Robots receive data despite `canSubscribe: false`
-(verified 2026-09-18: `cmd_vel`, reliable data and RPC all reach a robot-role
-participant, and the SFU still refuses an operator's video publish).
+Communication is bidirectional for both roles: robots publish video and
+subscribe to what operators send (tracks, and teleop `cmd_vel/<robot>` topics
+and RPC over data); operators publish teleop data and tracks and subscribe to
+the robots' video. The roles differ only in server URL, token TTL and identity
+rules (below), not in grants. Earlier revisions were asymmetric (robot
+subscribe-only-nothing, operator publish-nothing-but-data); the original Node
+token-server's operator tokens were subscribe-only. Trade-off of the current
+setup: a leaked operator token can publish tracks into a room, so the network
+ACL and the short operator TTL are the controls that matter.
 
 `can_publish_data` is set explicitly per role: LiveKit resolves an omitted
 `canPublishData` to the `canPublish` value, and the Python SDK otherwise always
@@ -183,7 +186,7 @@ Two limits keep the unauthenticated dashboard route from being abused:
   cannot take over a robot's identity. Both routes require 1-128 character names.
 - **Lifetime.** Operator tokens live `LIVEKIT_SFU_OPERATOR_TTL` seconds
   (default 3600), robot tokens `LIVEKIT_SFU_TTL` (36000). They carry
-  data-publish (teleop) rights and are minted on the public route, so a leaked
+  publish (teleop, tracks) rights and are minted on the public route, so a leaked
   one should expire soon. Expiry does not drop a connected participant (verified:
   a 15 s token stayed connected for 45 s); it only bounds joins and reconnects,
   and the client refetches when its cached token has expired.

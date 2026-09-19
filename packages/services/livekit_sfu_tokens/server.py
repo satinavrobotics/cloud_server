@@ -15,17 +15,18 @@ from typing import Any, Dict, Optional
 
 from packages.utils.livekit_tokens import mint_room_token
 
-# role -> grants. robot: publishes video + data, subscribes to nothing.
-# operator: watches video and sends data (teleop cmd_vel, RPC), but can't
-# publish tracks, so it can't inject video into a room.
+# role -> grants. Both roles are fully bidirectional: robots publish video and
+# subscribe to the operator's tracks and teleop commands; operators publish
+# teleop commands (data) and any tracks, and subscribe to the robots'. The roles
+# differ only in server URL, token TTL and identity rules, not in grants.
 #
 # can_publish_data is always set explicitly: the Python SDK's VideoGrants
 # writes canPublishData=true unless told otherwise, and LiveKit resolves an
 # omitted canPublishData to the canPublish value (GetCanPublishData in
 # livekit/protocol auth/grants.go), so relying on either default is fragile.
 ROLE_GRANTS: Dict[str, Dict[str, bool]] = {
-    "robot": {"can_publish": True, "can_subscribe": False, "can_publish_data": True},
-    "operator": {"can_publish": False, "can_subscribe": True, "can_publish_data": True},
+    "robot": {"can_publish": True, "can_subscribe": True, "can_publish_data": True},
+    "operator": {"can_publish": True, "can_subscribe": True, "can_publish_data": True},
 }
 
 # LiveKit disconnects an existing participant when another joins its room under

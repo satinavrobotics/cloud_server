@@ -121,10 +121,9 @@ tagged from your existing fleet provisioning, that part isn't changing).
 
 **Why:** `cimbi` currently reaches `admin-satinav-pc` only because both are
 owned by `admin@` — broad, implicit, account-based access, not a scoped
-grant. `scripts/livekit/robot_client.py --role operator` already closes the
-*application-layer* gap (operator tokens can't publish tracks, enforced
-server-side — see `scripts/livekit/README.md`). This closes the matching
-*network-layer* gap.
+grant. Operator tokens are bidirectional (they can publish tracks and data),
+so the token no longer limits an operator device; this network-layer scoping is
+the real control (see `scripts/livekit/README.md`).
 
 **Same reasoning as task 3: not tagging.** Tagging `cimbi` would strip its
 own owner-based access to whatever else it currently reaches (SSH to other

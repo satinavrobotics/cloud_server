@@ -51,15 +51,17 @@ def service():
 class TestRoleGrants:
     """The effective permissions each role gets."""
 
-    def test_robot_is_publish_only(self, service):
+    def test_robot_is_bidirectional(self, service):
+        """Robots publish video and subscribe to the operator's tracks and
+        teleop commands."""
         video = _decode(service.create_token("jetson-golya", "fleet", "robot")["token"])["video"]
-        assert _effective(video) == (True, False, True)
+        assert _effective(video) == (True, True, True)
 
-    def test_operator_subscribes_and_publishes_data_but_not_tracks(self, service):
-        """Operators watch video and send teleop commands / RPC over data,
-        but must never publish tracks into a room."""
+    def test_operator_is_bidirectional(self, service):
+        """Operators watch video, send teleop commands / RPC over data, and
+        can publish their own tracks."""
         video = _decode(service.create_token("cimbi", "fleet", "operator")["token"])["video"]
-        assert _effective(video) == (False, True, True)
+        assert _effective(video) == (True, True, True)
 
     def test_every_role_sets_publish_data_explicitly(self, service):
         """Neither the SDK default (true) nor LiveKit's fallback (canPublish)
@@ -172,7 +174,7 @@ class TestEndpoints:
         body = resp.json()
         assert set(body) == {"token", "ttl", "server_url"}
         assert body["ttl"] == 120  # operator role -> LIVEKIT_SFU_OPERATOR_TTL
-        assert _effective(_decode(body["token"])["video"]) == (False, True, True)
+        assert _effective(_decode(body["token"])["video"]) == (True, True, True)
 
     def test_robot_ttl_over_http(self, client):
         resp = client.post("/api/createToken",
@@ -192,14 +194,18 @@ class TestEndpoints:
         body = resp.json()
         assert set(body) == {"token", "ttl", "server_url"}
         assert body["server_url"] == OPERATOR_URL
-        assert _effective(_decode(body["token"])["video"]) == (False, True, True)
+        assert _effective(_decode(body["token"])["video"]) == (True, True, True)
 
     def test_operator_route_cannot_mint_a_robot_token(self, client):
         """The route exposed on the public gateway ignores any role in the body."""
         resp = client.post("/api/operator/createToken",
                            json={"participantName": "WEB-p", "roomName": "fleet", "role": "robot"})
         assert resp.status_code == 200
-        assert _effective(_decode(resp.json()["token"])["video"]) == (False, True, True)
+        # grants are identical for both roles now, so the operator URL and TTL
+        # are what show the body's `role: robot` was ignored
+        assert resp.json()["server_url"] == OPERATOR_URL
+        assert resp.json()["ttl"] == 120
+        assert _effective(_decode(resp.json()["token"])["video"]) == (True, True, True)
 
     @pytest.mark.parametrize("name", ["jetson-golya", "web-lower", "", "XWEB-abc"])
     def test_operator_route_rejects_identities_without_the_dashboard_prefix(self, client, name):
