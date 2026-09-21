@@ -72,6 +72,16 @@ class MissionFailureCategoryV1(str, enum.Enum):
     CANCELED = "CANCELED"
 
 
+# Spec fields of a still-PENDING mission that an operator may edit (PUT /missions/{name});
+# the API validates them and the dispatcher copies them onto the mission it has loaded.
+EDITABLE_SPEC_FIELDS = ("robot", "mission_tree", "timeout", "deadline", "repeat", "then_run",
+                        "register_map", "mode", "planned_path")
+
+# Action type the dispatcher executes itself as a timer instead of sending it to the robot.
+WAIT_ACTION_TYPE = "wait"
+MAX_WAIT_SECONDS = 3600
+
+
 class MissionActionNodeV1(pydantic.BaseModel):
     """
     This action leaf node defines the structure of an action behavior node, including the type of
@@ -91,6 +101,22 @@ class MissionActionNodeV1(pydantic.BaseModel):
         description="Describes an action that the robot can perform")
     action_parameters: Dict = pydantic.Field(
         {}, description="Dictionary of parameters for the specified action.")
+
+    @pydantic.root_validator(skip_on_failure=True)
+    def _validate_wait_action(cls, values):
+        # "wait" is run by the dispatcher itself (a timer, no robot order), so its
+        # duration has to be sane here rather than discovered mid-mission.
+        if values.get("action_type") != WAIT_ACTION_TYPE:
+            return values
+        seconds = values.get("action_parameters", {}).get("seconds")
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+            raise common.ICSUsageError(
+                f"A \"{WAIT_ACTION_TYPE}\" action needs a numeric action_parameters.seconds")
+        if not 0 < seconds <= MAX_WAIT_SECONDS:
+            raise common.ICSUsageError(
+                f"A \"{WAIT_ACTION_TYPE}\" action must wait between 0 and "
+                f"{MAX_WAIT_SECONDS} seconds, got {seconds}")
+        return values
 
 
 class MissionConstantNodeV1(pydantic.BaseModel):
@@ -280,6 +306,21 @@ class MissionSpecV1(pydantic.BaseModel):
                     "Set to False for logging-only missions where no map should be built."
     )
 
+    repeat: int = pydantic.Field(
+        1, description="How many times in total the mission runs: 1 runs it once, N runs "
+                       "it N times, 0 repeats it until it is cancelled. Every pass runs the "
+                       "whole mission_tree again from its first node.")
+    then_run: Optional[str] = pydantic.Field(
+        None, description="Name of another mission to start when this one has completed, "
+                          "including all of its repeats. The named mission is copied into a "
+                          "new mission, so it can be one that has already run.")
+
+    @pydantic.validator("repeat")
+    def _validate_repeat(cls, value):
+        if value < 0:
+            raise common.ICSUsageError("repeat must be >= 0 (0 repeats until cancelled)")
+        return value
+
     @pydantic.validator("mission_tree")
     def _validate_at_least_one_node(cls, value):
         if len(value) < 1:
@@ -364,6 +405,9 @@ class MissionStatusV1(pydantic.BaseModel):
                            not been dispatched yet, and on one that was already running \
                            before this field existed (which keeps the legacy id format). \
                            Never set it from the API.")
+    passes_completed: int = pydantic.Field(
+        0, description="Dispatcher-owned count of the passes of a repeating mission that have \
+                        finished so far (see the spec's repeat). Never set it from the API.")
     order_rev: int = pydantic.Field(
         0, description="Dispatcher-owned revision of this run's orders. Bumped when a \
                         cancelled node is resent with new content (an operator route \

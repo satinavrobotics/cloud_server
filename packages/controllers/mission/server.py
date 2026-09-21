@@ -25,9 +25,10 @@ import json
 import logging
 import re
 import requests
+import time
 import uuid
 import sys
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 from collections import OrderedDict
 
 import pydantic
@@ -42,6 +43,7 @@ import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
 import cloud_common.objects.robot as robot_object
 from cloud_common.objects.detection_results import DetectedObject
+from cloud_common.objects.mission import EDITABLE_SPEC_FIELDS
 
 import importlib
 
@@ -59,11 +61,22 @@ MQTT_RECONNECT_PERIOD = 0.5
 # How long to wait in seconds before trying to reconnect to the mission database
 DATABASE_RECONNECT_PERIOD = 0.5
 
+class WaitElapsed(pydantic.BaseModel):
+    """Posted to a robot's own message queue when a "wait" action node's timer runs out.
+
+    Going through the queue (rather than letting the timer task touch the mission
+    itself) keeps every mission mutation on the one message loop, in order with the
+    robot's state messages. `key` ties it to the wait that started the timer, so a
+    timer that outlived its mission (or its pass) is recognised and dropped."""
+    key: Tuple[str, str, Optional[str], int, int]
+
+
 RobotMessage = Union[api_objects.RobotObjectV1,
                      api_objects.MissionObjectV1,
                      types.VDA5050State,
                      types.VDA5050Factsheet,
-                     types.RobotDatum]
+                     types.RobotDatum,
+                     WaitElapsed]
 
 
 class ClientMessage(pydantic.BaseModel):
@@ -169,6 +182,16 @@ class Robot:
         self._alive = True
         self._header_id = 0
         self._current_behavior_tree: Optional[behavior_tree.MissionBehaviorTree] = None
+        # The timer of the "wait" action node that is currently running, and the
+        # key that its WaitElapsed message will carry (see WaitElapsed).
+        self._wait_task: Optional[asyncio.Task[Any]] = None
+        self._wait_key: Optional[Tuple[str, str, Optional[str], int, int]] = None
+        # Completion (mission name + run id + pass) whose then_run mission has been
+        # created already, so a completion seen twice chains only once.
+        self._chained_completion: Optional[str] = None
+        # Missions whose spec edit was refused because they were already dispatched,
+        # so the log says so once rather than on every status echo.
+        self._ignored_spec_edits: Set[str] = set()
         self._updating_mission_from_api: bool = False
         self._charging_mission_received: bool = False
         self.last_node_seq_id: int = -1
@@ -385,6 +408,13 @@ class Robot:
                 self._process_notify_node(mission_node)
                 return
 
+            # A wait is a timer the dispatcher runs itself; the robot has no order for it.
+            if mission_node.type == mission_object.MissionNodeType.ACTION and \
+                    mission_node.action is not None and \
+                    mission_node.action.action_type == mission_object.WAIT_ACTION_TYPE:
+                self._start_wait(mission_node)
+                return
+
             if mission_node.type == mission_object.MissionNodeType.ROUTE and \
                     mission_node.route is not None:
                 order = types.VDA5050Order.from_route(mission_node.route, self._robot_object,
@@ -502,7 +532,25 @@ class Robot:
             if self._current_mission is None:
                 await self._try_start_mission()
         else:  # If we've seen this mission, update it
+            # An edit that moved a mission that has not been dispatched to another robot:
+            # that robot's dispatcher queues it (the server routes by `robot`), so this one
+            # lets go of it.
+            dispatched = self._current_mission is not None and \
+                self._current_mission.name == message.name and \
+                self._current_behavior_tree is not None
+            if message.robot != self._name and not dispatched:
+                self.info(f"Mission [{message.name}] was moved to robot {message.robot}")
+                del self._missions[message.name]
+                if self._current_mission is not None and self._current_mission.name == message.name:
+                    self._current_mission = None
+                    await self._try_start_mission()
+                return
             if self._current_mission is not None and self._current_mission.name == message.name:
+                # A held mission has not been dispatched, so an operator's spec edit can
+                # still take effect; once the behavior tree exists the orders are on
+                # their way and the edit can only be ignored.
+                self._apply_spec_edit(self._current_mission, message,
+                                      dispatched=self._current_behavior_tree is not None)
                 self.info(f"Update a RUNNING mission [{message.name}]")
                 cancel_node_from_api = self._update_mission_from_api(
                     self._current_mission, message)
@@ -510,6 +558,15 @@ class Robot:
                 if self._current_mission.lifecycle == \
                         api_objects.object.ObjectLifecycleV1.PENDING_DELETE:
                     self._current_mission.needs_canceled = True
+
+                if self._wait_task is not None and self._current_mission.needs_canceled:
+                    # Nothing is running on the robot during a wait, so there is no
+                    # order to cancel: end the mission here.
+                    self.mission_info("Cancelled during a wait")
+                    self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+                    self._set_robot_idle_after_mission()
+                    await self.get_next_mission()
+                    return
 
                 if self._current_mission.needs_canceled or cancel_node_from_api:
                     # One cancel at a time. This branch runs on *every* change event
@@ -530,6 +587,7 @@ class Robot:
                 return
 
             self.info(f"Update a PENDING mission [{message.name}]")
+            self._apply_spec_edit(self._missions[message.name], message, dispatched=False)
             self._update_mission_from_api(
                 self._missions[message.name], message)
             # Delete a queued mission
@@ -874,8 +932,16 @@ class Robot:
 
         # In case mission failed due to timeout
         if self._current_mission.status.state.done:
-            self._set_robot_idle_after_mission()
+            if not self._will_run_another_pass():
+                self._set_robot_idle_after_mission()
             await self.get_next_mission()
+            return
+
+        # During a wait the robot has no order of ours to report (a mission or pass that
+        # starts with one still has the previous order's id on its state), so a
+        # mismatch is expected and must neither be counted nor trigger a resend.
+        if self._wait_key is not None and \
+                not order_ids.is_order_of(self._order_prefix(), message.orderId):
             return
 
         # If the order doesn't match, ignore it
@@ -961,8 +1027,10 @@ class Robot:
         if self._current_mission is None:
             return
         await self._robot_server.delete_pending_mission(self._current_mission)
-        # Set robot to idle
-        self._set_robot_idle_after_mission()
+        # Set robot to idle -- unless the mission is about to run its next pass, in
+        # which case the robot never stops being on task.
+        if not self._will_run_another_pass():
+            self._set_robot_idle_after_mission()
         await self.get_next_mission()
 
     def _remember_finished(self, name: str) -> None:
@@ -973,9 +1041,131 @@ class Robot:
         while len(self._finished_missions) > self.MAX_FINISHED_MISSIONS_TRACKED:
             self._finished_missions.popitem(last=False)
 
+    def _will_run_another_pass(self) -> bool:
+        """Whether the current mission has just completed a pass and has more to run.
+
+        A cancelled (or deleted) mission never does: cancelling during any pass ends
+        the whole repeat."""
+        mission = self._current_mission
+        if mission is None or mission.status.state != mission_object.MissionStateV1.COMPLETED:
+            return False
+        if mission.needs_canceled or \
+                mission.lifecycle is not api_objects.object.ObjectLifecycleV1.ALIVE:
+            return False
+        return mission.repeat == 0 or mission.status.passes_completed + 1 < mission.repeat
+
+    async def _start_next_pass(self) -> bool:
+        """Run the current (just completed) mission again, in place, as its next pass.
+
+        The mission object stays the same, so the operator sees one mission with a lap
+        counter rather than a pile of copies; what changes is the run id, so the new
+        pass's VDA5050 order/node ids can never collide with the previous pass's (the
+        robot may still hold those). The reset is persisted before anything is sent
+        (the same rule as _assign_run_id). Returns False if the pass could not be
+        started; the mission then simply finishes as COMPLETED.
+        """
+        mission = self._current_mission
+        assert mission is not None
+        self._cancel_mission_timeout()
+        self._cancel_wait()
+        status = mission.status.copy(deep=True)
+        status.passes_completed += 1
+        status.state = mission_object.MissionStateV1.PENDING
+        status.node_status = {name: mission_object.MissionNodeStatusV1()
+                              for name in status.node_status}
+        status.current_node = 0
+        status.task_status = {}
+        status.end_timestamp = None
+        status.failure_reason = None
+        status.failure_category = None
+        status.blocked = False
+        status.blocked_node = None
+        status.blocked_edge = None
+        status.blocked_waypoint_index = None
+        status.block_reason = None
+        status.held = False
+        status.held_reason = None
+        status.run_id = uuid.uuid4().hex[:8]
+        status.order_rev = 0
+        try:
+            await self._database.update_status(
+                api_objects.MissionObjectV1, mission.name, status, uuid.uuid4())
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not persist the next pass ({err}); "
+                         "finishing the mission instead")
+            return False
+        mission.status = status
+        self._order_mismatch_count = 0
+        self.last_node_seq_id = -1
+        self.mission_info(f"Starting pass {status.passes_completed + 1}"
+                          f"{'' if mission.repeat == 0 else f' of {mission.repeat}'}"
+                          f", run id {status.run_id}")
+        self._current_behavior_tree = behavior_tree.MissionBehaviorTree(mission)
+        if not self._current_behavior_tree.create_behavior_tree():
+            mission.status.failure_reason = self._current_behavior_tree.failure_reason
+            self._set_mission_state(mission_object.MissionStateV1.FAILED)
+            return False
+        self.update_mission_from_behavior_tree()
+        self._arm_mission_timeout()
+        await self._send_order()
+        return True
+
+    async def _chain_then_run(self, finished: api_objects.MissionObjectV1):
+        """Start the mission named by `finished.then_run`, as a copy of it.
+
+        A copy rather than the template itself, because the template is usually a
+        mission that has already run. Never fails the finished mission: a template that
+        is missing or belongs to another robot is logged and skipped."""
+        if not finished.then_run:
+            return
+        key = f"{finished.name}:{finished.status.run_id}"
+        if key == self._chained_completion:
+            return
+        self._chained_completion = key
+        try:
+            template = await self._database.get_object(
+                api_objects.MissionObjectV1, finished.then_run)
+            if template.robot != finished.robot:
+                self.warning(f"[{finished.name}] then_run mission {finished.then_run} is for "
+                             f"robot {template.robot}, not {finished.robot}; not chaining")
+                return
+            chained = api_objects.MissionObjectV1(
+                name=f"{template.name}-run-{int(time.time() * 1000)}",
+                robot=template.robot,
+                mission_tree=[node.copy(deep=True) for node in template.mission_tree],
+                timeout=template.timeout,
+                mode=template.mode,
+                register_map=template.register_map,
+                repeat=template.repeat,
+                then_run=template.then_run,
+                status=mission_object.MissionStatusV1(),
+                lifecycle=api_objects.object.ObjectLifecycleV1.ALIVE)
+            await self._database.create_object(chained, uuid.uuid4())
+            self.mission_info(f"Chained mission {chained.name} from {template.name}")
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{finished.name}] Could not chain then_run mission "
+                         f"{finished.then_run}: {err}")
+
     async def get_next_mission(self):
         if self._current_mission is None:
             return
+        if self._current_mission.status.state == mission_object.MissionStateV1.COMPLETED and \
+                not self._current_mission.needs_canceled and \
+                self._current_mission.lifecycle is api_objects.object.ObjectLifecycleV1.ALIVE:
+            if self._will_run_another_pass() and await self._start_next_pass():
+                return
+            if self._current_mission.status.state == mission_object.MissionStateV1.COMPLETED:
+                # The last pass is a finished pass too: "lap 3 / 3" reads passes_completed.
+                final = self._current_mission
+                final.status.passes_completed += 1
+                try:
+                    await self._database.update_status(
+                        api_objects.MissionObjectV1, final.name, final.status, uuid.uuid4())
+                except Exception as err:  # pylint: disable=broad-except
+                    self.warning(f"[{final.name}] Could not persist the pass count ({err})")
+                await self._chain_then_run(final)
+        self._cancel_wait()
+        self._ignored_spec_edits.discard(self._current_mission.name)
         self._remember_finished(self._current_mission.name)
         del self._missions[self._current_mission.name]
         self._current_mission = None
@@ -1365,7 +1555,12 @@ class Robot:
         )
 
         if mission_status == "completed":
-            self._set_mission_state(mission_object.MissionStateV1.COMPLETED)
+            # The robot reports this per order, and each mission_tree node gets its own
+            # order, so it completes the node the order belongs to; the behavior tree
+            # then decides whether that was the last one (a single-node mission ends
+            # right here, as it always did).
+            if self._complete_order_node(message):
+                self.update_mission_from_behavior_tree()
             return
         if mission_status == "failed":
             # Populate failure_reason from the errors array before transitioning.
@@ -1399,6 +1594,111 @@ class Robot:
 
         self.update_mission_from_behavior_tree()
 
+    def _leaf_node_count(self) -> int:
+        """How many leaf (order) nodes the current mission has."""
+        assert self._current_mission is not None
+        return sum(1 for node in self._current_mission.mission_tree
+                   if node.type in (mission_object.MissionNodeType.ROUTE,
+                                    mission_object.MissionNodeType.MOVE,
+                                    mission_object.MissionNodeType.ACTION,
+                                    mission_object.MissionNodeType.NOTIFY,
+                                    mission_object.MissionNodeType.CONSTANT))
+
+    def _complete_order_node(self, message: types.VDA5050State) -> bool:
+        """Mark the node the message's order belongs to COMPLETED, for the robot's
+        missionStatus "completed". Returns whether the behavior tree should be updated."""
+        assert self._current_mission is not None
+        try:
+            node = self._current_mission.mission_tree[order_ids.order_node_index(message.orderId)]
+        except (ValueError, IndexError):
+            return False
+        # In a mission with several nodes the previous order's "completed" can still be
+        # on the robot's state right after the next order is accepted, and must not
+        # complete that new node: a route only counts once the robot says it reached a
+        # node of this run. A single-node mission has no earlier order to be stale.
+        if self._leaf_node_count() > 1 and \
+                node.type in (mission_object.MissionNodeType.ROUTE,
+                              mission_object.MissionNodeType.MOVE) and \
+                not order_ids.is_node_of(self._order_prefix(), message.lastNodeId):
+            return False
+        self.set_mission_node_state(str(node.name), mission_object.MissionStateV1.COMPLETED)
+        return True
+
+    def _apply_spec_edit(self, target: api_objects.MissionObjectV1,
+                         message: api_objects.MissionObjectV1, dispatched: bool):
+        """Copy an operator's spec edit (PUT /missions/{name}) onto the mission this
+        dispatcher already loaded. Only a mission that has not been dispatched yet can
+        take one: a dispatched mission's orders are already with the robot."""
+        # A reroute rewrites a route of the dispatcher's copy of the tree only (the
+        # database keeps the original and the request in update_nodes), so on a
+        # dispatched mission a differing tree is expected and not an edit.
+        changed = [field for field in EDITABLE_SPEC_FIELDS
+                   if getattr(target, field) != getattr(message, field) and
+                   not (dispatched and field == "mission_tree" and message.update_nodes)]
+        if not changed:
+            return
+        if dispatched:
+            if target.name not in self._ignored_spec_edits:
+                self._ignored_spec_edits.add(target.name)
+                self.warning(f"[{target.name}] Ignoring an edit of {changed}: the mission "
+                             "has already been dispatched")
+            return
+        for field in changed:
+            setattr(target, field, getattr(message, field))
+        if "mission_tree" in changed:
+            names = ["root"] + [str(node.name) for node in target.mission_tree]
+            target.status.node_status = {
+                name: target.status.node_status.get(name, mission_object.MissionNodeStatusV1())
+                for name in names}
+        self.info(f"Applied an edit of {changed} to mission [{target.name}]")
+
+    def _start_wait(self, mission_node: mission_object.MissionNodeV1):
+        """Start the timer of a "wait" action node. No order goes to the robot."""
+        assert self._current_mission is not None and mission_node.action is not None
+        status = self._current_mission.status
+        seconds = float(mission_node.action.action_parameters["seconds"])
+        key = (str(self._current_mission.name), str(mission_node.name),
+               status.run_id, status.order_rev, status.passes_completed)
+        # _send_order() runs again for a node whenever the robot's state does not match
+        # yet; the timer already running for this node must not be restarted by that.
+        if self._wait_key == key:
+            return
+        self._cancel_wait()
+        self._wait_key = key
+        self.mission_info(f"Waiting {seconds:g}s at node {mission_node.name}")
+        self.set_mission_node_state(str(mission_node.name),
+                                    mission_object.MissionStateV1.RUNNING)
+        asyncio.ensure_future(self._persist_current_mission_status())
+        self._wait_task = asyncio.get_event_loop().create_task(
+            self._run_wait_timer(seconds, self._wait_key))
+
+    async def _run_wait_timer(self, seconds: float,
+                              key: Tuple[str, str, Optional[str], int, int]):
+        await asyncio.sleep(seconds)
+        await self._messages.put(WaitElapsed(key=key))
+
+    def _cancel_wait(self):
+        """Drop the running wait, if any. Safe from any path that leaves the mission."""
+        if self._wait_task is not None and self._wait_task is not asyncio.current_task():
+            self._wait_task.cancel()
+        self._wait_task = None
+        self._wait_key = None
+
+    async def _on_wait_elapsed(self, message: WaitElapsed):
+        if self._current_mission is None or self._wait_key != message.key or \
+                self._current_behavior_tree is None:
+            return
+        self._wait_task = None
+        self._wait_key = None
+        node_name = message.key[1]
+        self.set_mission_node_state(node_name, mission_object.MissionStateV1.COMPLETED)
+        prev_child_node = self._current_behavior_tree.current_node.name
+        self.update_mission_from_behavior_tree()
+        if self._current_mission.status.state.done:
+            await self.post_mission_completion()
+        elif prev_child_node != self._current_behavior_tree.current_node.name:
+            await self._send_order()
+
     async def run(self):
         while self._alive:
             try:
@@ -1414,6 +1714,8 @@ class Robot:
                     await self._on_client_factsheet(message)
                 elif isinstance(message, types.RobotDatum):
                     await self._process_datum_message(message)
+                elif isinstance(message, WaitElapsed):
+                    await self._on_wait_elapsed(message)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

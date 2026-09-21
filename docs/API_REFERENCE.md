@@ -688,10 +688,22 @@ Create a new mission.
 
 Update a mission.
 
+Editing the spec (`robot`, `mission_tree`, `timeout`, `deadline`, `repeat`, `then_run`,
+`register_map`, `mode`, `planned_path`) is only allowed while the mission is `PENDING`;
+any other state answers `409`, and an invalid spec answers `400` with the validation
+message. `name` cannot be changed (it is the mission's identity), so a rename or an edit
+of a mission that has already run is a new mission. A new `mission_tree` gets its
+`status.node_status` entries created and the dropped ones removed. The dispatcher applies
+the edit to a queued (or held, not yet dispatched) mission; once the mission has been
+dispatched a late edit is ignored. `update_nodes` (a reroute of a running mission) is not
+an edit and is not restricted this way.
+
 **Request Body:**
 ```json
 {
-  "timeout": 600
+  "timeout": 600,
+  "repeat": 3,
+  "then_run": "dock_check"
 }
 ```
 
@@ -1066,8 +1078,11 @@ interface MissionObject {
   mission_tree: MissionNode[];
   timeout: number;  // seconds
   deadline?: string;  // ISO 8601 timestamp
+  repeat: number;  // total runs of the whole mission_tree; 1 = once (default), 0 = until cancelled
+  then_run?: string | null;  // mission to start (as a copy) after this one and all repeats complete
   needs_canceled: boolean;
   status: {
+    passes_completed: number;  // finished passes so far (dispatcher-owned): "lap 2 of 3"
     state: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELED';
     progress: number;  // 0.0 - 1.0
     start_time?: string;  // ISO 8601 timestamp
@@ -1086,6 +1101,29 @@ interface MissionObject {
 ```
 
 ---
+
+### Repeating, chaining and waiting
+
+- **`repeat`**: `N` runs the mission N times in total, `0` until it is cancelled. When a
+  pass completes and more remain, the dispatcher runs the *same* mission object again
+  in place: node statuses reset to `PENDING`, `status.run_id` renewed (so the VDA5050
+  order/node ids of each pass are unique), `status.passes_completed` incremented, and
+  the timeout re-armed per pass. The robot is not idled between passes. A cancel, a
+  failure or a timeout in any pass ends the whole repeat.
+- **`then_run`**: when the mission has completed (last pass included) the dispatcher
+  creates a new mission named `{then_run}-run-{unix_ms}` as a copy of the named mission
+  (same `robot`, `mission_tree`, `timeout`, `mode`, `register_map`, `repeat` and
+  `then_run`) and it is queued behind whatever is already waiting. A missing mission or
+  one for another robot is logged and skipped; the finished mission is never failed by
+  it. Cycles (A then B then A) are allowed; cancelling the running mission breaks them.
+- **`wait` action**: `{"action": {"action_type": "wait", "action_parameters":
+  {"seconds": 5}}}` (`0 < seconds <= 3600`). The dispatcher runs it as a timer between
+  the surrounding nodes; nothing is sent to the robot. Cancelling during a wait cancels
+  the mission at once (there is no robot order to cancel). The mission timeout keeps
+  running through it.
+- **Several route nodes in one mission** (needed to put a wait mid-route: route, wait,
+  route). The robot's `missionStatus: "completed"` now completes only the node of the
+  order it came with, and the mission completes when the whole tree does.
 
 ### Mission Node Types
 

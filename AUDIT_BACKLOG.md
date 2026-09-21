@@ -335,6 +335,19 @@ first is missed, and an ACTION node whose `actionStates` is empty raises `IndexE
 right by convention. Match the state whose `actionId` belongs to the current node
 (`…-n{idx}-s{seq}`), or scan all entries; `paused` is available too and unused.
 
+### C17. Repeat, then-run, `wait` and multi-node completion are untested on a real robot — **medium**
+`repeat`/`then_run`/`wait` and the per-node reading of `missionStatus: "completed"` were
+built and unit-tested against the dispatcher only (`tests/unit/test_mission_repeat_chain_wait.py`).
+Unverified against the robot client (`sati_vda5050_client/src/vda5050_client_node.cpp`):
+(a) that a second order under a new `orderId` right after a completed one is accepted and
+clears the old `missionStatus` before the next `/state` (the dispatcher ignores a
+`completed` whose `lastNodeId` is not of the current run, for multi-node route/move nodes
+only); (b) that a route that starts at the point the previous one ended is accepted (a
+route split by a wait is `route, wait, route`, the second starting at the next waypoint);
+(c) how a chained mission created by `then_run` orders against other queued missions (it is
+queued last). Also open: an endless `then_run` cycle leaves one finished mission object
+per lap in the database; nothing prunes them.
+
 ---
 
 ## D. Performance / reliability — deferred

@@ -34,7 +34,9 @@ from packages.config import (
     DEFAULT_MAP_ID, PORT_API_DELEGATION, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
 )
 from cloud_common.objects.robot import RobotObjectV1, RobotStatusV1, CustomActionV1
-from cloud_common.objects.mission import MissionObjectV1, MissionStatusV1
+from cloud_common.objects.mission import (
+    EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
+    MissionStatusV1)
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects.map import MapObjectV1
 from cloud_common.objects.settings import SettingsObjectV1, SettingsSpecV1, GLOBAL_SETTINGS_NAME
@@ -1477,10 +1479,41 @@ async def update_mission(mission_name: str, mission_data: dict):
         # Update spec if provided
         if "status" not in mission_data or len(mission_data) > 1:
             # This is a spec update
+            edits = {}
             for key, value in mission_data.items():
-                if key != "status" and key != "name" and key != "lifecycle":
+                if key in ("status", "name", "lifecycle"):
+                    continue
+                if key in EDITABLE_SPEC_FIELDS:
+                    edits[key] = value
+                else:
+                    # e.g. update_nodes (a reroute), which is meant for a running mission
                     setattr(mission, key, value)
+            if edits:
+                # Only a mission that has not started can be edited: once its orders are
+                # with the robot the operator has to start a new mission instead.
+                if mission.status.state != MissionStateV1.PENDING:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Mission {mission_name} is {mission.status.state.value}; "
+                               "only a PENDING mission can be edited")
+                try:
+                    edited = MissionSpecV1(**{**mission.spec.dict(), **edits})
+                except Exception as e:
+                    raise HTTPException(status_code=400,
+                                        detail=f"Invalid mission spec: {str(e)}")
+                for key in edits:
+                    setattr(mission, key, getattr(edited, key))
+                # Every node of the tree has a status entry (the dispatcher reads them
+                # by name), so a new tree needs its entries made and old ones dropped.
+                if "mission_tree" in edits:
+                    node_names = ["root"] + [str(node.name) for node in mission.mission_tree]
+                    mission.status.node_status = {
+                        name: mission.status.node_status.get(name, MissionNodeStatusV1())
+                        for name in node_names}
             await service.database.update_spec(MissionObjectV1, mission.name, mission.spec, publisher_id)
+            if "mission_tree" in edits:
+                await service.database.update_status(
+                    MissionObjectV1, mission.name, mission.status, publisher_id)
 
         # Update status if provided
         if "status" in mission_data:
