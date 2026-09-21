@@ -422,3 +422,9 @@ on any other receive error.
   `POST /navigate/waypoints`, `GET /rosbags`, `GET /base_models/{id}`,
   `/detection_results*`, `/stats`.
 - Third-party images pinned to `:latest` (mosquitto, arangodb, minio).
+
+### C18. No robot publishes `heightMax` — **low**
+mission-dispatch now keeps VDA5050 `physicalParameters.heightMax` as `factsheet.height` (`da91987`,
+-1 until sent) and the client raises the robot by it (2.5D map view), but the ROS client only
+sends length and width, so every robot is drawn 0.35 m tall. Add `heightMax` to the factsheet the
+robot publishes (and to the `factsheet_data` of its registration in `create_robot`).
