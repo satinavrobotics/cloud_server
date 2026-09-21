@@ -1056,6 +1056,8 @@ interface RobotObject {
     factsheet: {
       agv_class: string;
       speed_max: number;
+      length: number;   // footprint, metres (physicalParameters.length); -1 until reported
+      width: number;    // footprint, metres (physicalParameters.width); -1 until reported
     };
     online: boolean;
     battery_level: number;  // 0-100

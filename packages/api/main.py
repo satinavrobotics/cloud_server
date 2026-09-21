@@ -1199,6 +1199,8 @@ async def create_robot(robot_data: dict):
             if factsheet_data:
                 robot.status.factsheet.agv_class = factsheet_data.get("agv_class", robot.status.factsheet.agv_class)
                 robot.status.factsheet.speed_max = factsheet_data.get("speed_max", robot.status.factsheet.speed_max)
+                robot.status.factsheet.length = factsheet_data.get("length", robot.status.factsheet.length)
+                robot.status.factsheet.width = factsheet_data.get("width", robot.status.factsheet.width)
                 robot.status.factsheet.custom_actions = [
                     CustomActionV1(**a) for a in factsheet_data.get("actions", [])
                 ]
@@ -1210,6 +1212,8 @@ async def create_robot(robot_data: dict):
             if factsheet_data:
                 status.factsheet.agv_class = factsheet_data.get("agv_class", "")
                 status.factsheet.speed_max = factsheet_data.get("speed_max", -1)
+                status.factsheet.length = factsheet_data.get("length", -1)
+                status.factsheet.width = factsheet_data.get("width", -1)
                 status.factsheet.custom_actions = [
                     CustomActionV1(**a) for a in factsheet_data.get("actions", [])
                 ]

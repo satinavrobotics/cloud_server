@@ -1002,6 +1002,12 @@ class Robot:
         if self._robot_object is not None:
             self._robot_object.status.factsheet.agv_class = message.typeSpecification.agvClass
             self._robot_object.status.factsheet.speed_max = message.physicalParameters.speedMax
+            # Footprint in metres, both optional in VDA5050; a missing value stays "unknown" (-1).
+            physical = message.physicalParameters
+            if physical.length is not None and physical.length > 0:
+                self._robot_object.status.factsheet.length = physical.length
+            if physical.width is not None and physical.width > 0:
+                self._robot_object.status.factsheet.width = physical.width
 
             # Store custom actions from factsheet
             if message.actions:

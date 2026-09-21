@@ -90,6 +90,12 @@ class CustomActionV1(pydantic.BaseModel):
 class RobotTypeIdentifierV1(pydantic.BaseModel):
     agv_class: str = ""
     speed_max: float = -1
+    length: float = pydantic.Field(
+        -1, description="Footprint length in metres along the direction of travel "
+        "(VDA5050 physicalParameters.length); -1 until the robot has sent its factsheet.")
+    width: float = pydantic.Field(
+        -1, description="Footprint width in metres (VDA5050 physicalParameters.width); "
+        "-1 until the robot has sent its factsheet.")
     custom_actions: List[CustomActionV1] = pydantic.Field(
         [], description="List of custom VDA5050 actions available on this robot")
 

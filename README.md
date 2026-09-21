@@ -708,7 +708,7 @@ If the user intends to integrate teleoperation within a specific mission node, t
 Currently, Mission Dispatch collects data on robot status durations and records the outcomes of missions, such as COMPLETED or FAILED. We provide a `TelemetrySender` dummy class for transmitting telemetry data. Users can replace this class with their custom telemetry client provider. This allows for the submission of personalized telemetry to your systems, which can then be viewed in tools like Grafana and similar platforms.
 
 ### Retrieving Robot Factsheet
-As per the VDA5050 protocol, Mission Dispatch fetches a robot's factsheet upon creation. In Mission Dispatch, the only fields that are stored are "agv_class" and "speed_max," which allow users to determine robot type (e.g. "arm" or "amr"). This functionality can be disabled by adding "--disable_request_factsheet" when running Mission Dispatch through CLI.
+As per the VDA5050 protocol, Mission Dispatch fetches a robot's factsheet upon creation. In Mission Dispatch, the only fields that are stored are "agv_class", "speed_max", the footprint "length" and "width" (metres, used to draw the robot at its real size on the map) and the custom actions, which allow users to determine robot type (e.g. "arm" or "amr"). This functionality can be disabled by adding "--disable_request_factsheet" when running Mission Dispatch through CLI.
 
 ## Additional Resources
 ### Isaac ROS Mission Client
