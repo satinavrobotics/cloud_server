@@ -34,6 +34,7 @@ def _factsheet(**physical):
 def test_size_is_unknown_until_the_robot_reports_one():
     assert api_objects.RobotObjectV1(name="r1", status={}).status.factsheet.length == -1
     assert api_objects.RobotObjectV1(name="r1", status={}).status.factsheet.width == -1
+    assert api_objects.RobotObjectV1(name="r1", status={}).status.factsheet.height == -1
 
 
 async def test_factsheet_stores_length_and_width_in_metres():
@@ -57,3 +58,11 @@ async def test_factsheet_ignores_a_nonsense_size_and_keeps_the_previous_one():
     await r._on_client_factsheet(_factsheet(length=0.0, width=-3.0))
     fs = r._robot_object.status.factsheet
     assert (fs.length, fs.width) == (0.8, 0.6)
+
+
+async def test_factsheet_stores_the_height_and_ignores_a_nonsense_one():
+    r, _ = _robot()
+    await r._on_client_factsheet(_factsheet(length=0.8, width=0.6, heightMax=0.4))
+    assert r._robot_object.status.factsheet.height == 0.4
+    await r._on_client_factsheet(_factsheet(heightMax=-1.0))
+    assert r._robot_object.status.factsheet.height == 0.4

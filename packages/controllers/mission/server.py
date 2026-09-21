@@ -1008,6 +1008,8 @@ class Robot:
                 self._robot_object.status.factsheet.length = physical.length
             if physical.width is not None and physical.width > 0:
                 self._robot_object.status.factsheet.width = physical.width
+            if physical.heightMax is not None and physical.heightMax > 0:
+                self._robot_object.status.factsheet.height = physical.heightMax
 
             # Store custom actions from factsheet
             if message.actions:

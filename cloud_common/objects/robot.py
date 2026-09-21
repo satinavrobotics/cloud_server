@@ -96,6 +96,9 @@ class RobotTypeIdentifierV1(pydantic.BaseModel):
     width: float = pydantic.Field(
         -1, description="Footprint width in metres (VDA5050 physicalParameters.width); "
         "-1 until the robot has sent its factsheet.")
+    height: float = pydantic.Field(
+        -1, description="Height in metres (VDA5050 physicalParameters.heightMax); "
+        "-1 until the robot has sent its factsheet.")
     custom_actions: List[CustomActionV1] = pydantic.Field(
         [], description="List of custom VDA5050 actions available on this robot")
 
