@@ -7,6 +7,7 @@ bucket.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,6 +19,7 @@ from packages.api.diagnostics import (
     LEVEL_WARN,
     _BT_STATE_TOPIC_RE,
     _BT_TREE_TOPIC_RE,
+    _NAV_SUPERVISOR_TOPIC_RE,
     _TOPIC_RE,
 )
 
@@ -31,6 +33,24 @@ BT_TREE_PAYLOAD = {
 BT_STATE_PAYLOAD = {
     "nodes": [{"name": "NavigateRecovery", "status": "RUNNING"}],
     "stamp": {"sec": 123, "nanosec": 456},
+}
+
+NAV_SUPERVISOR_PAYLOAD = {
+    "state": "DRIVE",
+    "attempts": 2,
+    "unrefunded": 1,
+    "max_unrefunded_attempts": 6,
+    "elapsed_s": 12.3,
+    "max_duration_s": 600.0,
+    "record_low_m": 0.42,
+    "last_drive_cause": "UNATTRIBUTED",
+    "blocked_pending": False,
+    "blocked_elapsed_s": 0.0,
+    "blocked_hold_s": 20.0,
+    "goal_frame": "map",
+    "goal_x": 1.5,
+    "goal_y": -2.0,
+    "stamp": {"sec": 789, "nanosec": 12},
 }
 
 JTOP_BLOCK = {
@@ -442,3 +462,93 @@ class TestOnBtStateMessage:
 
         service._on_bt_state_message(None, None, msg)  # must not raise
         assert service.get_cached_bt_state("Pincer01") is None
+
+
+@pytest.mark.unit
+class TestNavSupervisorTopicRegex:
+    def test_extracts_robot_name(self):
+        assert _NAV_SUPERVISOR_TOPIC_RE.match("Pincer01/nav_supervisor").group(1) == "Pincer01"
+
+    def test_rejects_non_nav_supervisor_topic(self):
+        assert _NAV_SUPERVISOR_TOPIC_RE.match("Pincer01/nav2_bt_state") is None
+
+
+@pytest.mark.unit
+class TestHandleNavSupervisor:
+    @pytest.mark.asyncio
+    async def test_caches_and_broadcasts_envelope(self):
+        service, ws_manager = make_service()
+
+        await service._handle_nav_supervisor("Pincer01", NAV_SUPERVISOR_PAYLOAD)
+
+        cached = service.get_cached_nav_supervisor("Pincer01")
+        assert cached is not None
+        assert cached["type"] == "nav_supervisor_update"
+        assert cached["robot_name"] == "Pincer01"
+        assert cached["supervisor"] == NAV_SUPERVISOR_PAYLOAD
+        assert cached["robot_stamp"] == NAV_SUPERVISOR_PAYLOAD["stamp"]
+
+        ws_manager.broadcast.assert_awaited_once_with("robot_status", "Pincer01", cached)
+
+    @pytest.mark.asyncio
+    async def test_get_cached_nav_supervisor_returns_none_before_first_message(self):
+        service, _ = make_service()
+        assert service.get_cached_nav_supervisor("NeverSeenRobot") is None
+
+    @pytest.mark.asyncio
+    async def test_handles_none_supervisor_payload(self):
+        service, ws_manager = make_service()
+
+        await service._handle_nav_supervisor("Pincer01", None)
+
+        cached = service.get_cached_nav_supervisor("Pincer01")
+        assert cached is not None
+        assert cached["supervisor"] is None
+        assert cached["robot_stamp"] is None
+
+
+@pytest.mark.unit
+class TestOnNavSupervisorMessage:
+    @pytest.fixture
+    def loop(self):
+        loop = asyncio.new_event_loop()
+        yield loop
+        loop.close()
+
+    def test_dispatches_parsed_message_to_event_loop(self, loop):
+        service, _ = make_service()
+        service.set_event_loop(loop)
+
+        msg = MagicMock()
+        msg.topic = "Pincer01/nav_supervisor"
+        msg.payload = json.dumps(NAV_SUPERVISOR_PAYLOAD).encode("utf-8")
+
+        service._on_nav_supervisor_message(None, None, msg)
+        loop.run_until_complete(asyncio.sleep(0.05))
+
+        cached = service.get_cached_nav_supervisor("Pincer01")
+        assert cached is not None
+        assert cached["supervisor"]["state"] == "DRIVE"
+        assert cached["robot_stamp"] == NAV_SUPERVISOR_PAYLOAD["stamp"]
+
+    def test_ignores_non_nav_supervisor_topic(self, loop):
+        service, _ = make_service()
+        service.set_event_loop(loop)
+
+        msg = MagicMock()
+        msg.topic = "Pincer01/nav2_bt_state"
+        msg.payload = b"{}"
+
+        service._on_nav_supervisor_message(None, None, msg)
+        assert service.get_cached_nav_supervisor("Pincer01") is None
+
+    def test_malformed_json_does_not_raise(self, loop):
+        service, _ = make_service()
+        service.set_event_loop(loop)
+
+        msg = MagicMock()
+        msg.topic = "Pincer01/nav_supervisor"
+        msg.payload = b"not json"
+
+        service._on_nav_supervisor_message(None, None, msg)  # must not raise
+        assert service.get_cached_nav_supervisor("Pincer01") is None

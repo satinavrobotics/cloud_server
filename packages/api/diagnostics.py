@@ -7,11 +7,14 @@ to WebSocket clients
 already connected to `/ws/robot/{robot_name}` (bucket "robot_status"). Cache-only:
 this is live telemetry, not persisted to Postgres.
 
-Also covers the two nav2 behavior-tree topics published by the same robot-side
-diagnostics_reporter node, on the same MQTT client and cache/broadcast pattern:
-`<robot_name>/nav2_bt_tree` (retained, published once at startup then only on an
-XML change) and `<robot_name>/nav2_bt_state` (live, coalesced to 5Hz by the
-publisher).
+Also covers three more topics published by the same robot-side diagnostics_reporter
+node, on the same MQTT client and cache/broadcast pattern: `<robot_name>/nav2_bt_tree`
+(retained, published once at startup then only on an XML change), `<robot_name>/nav2_bt_state`
+(live, coalesced to 5Hz by the publisher), and `<robot_name>/nav_supervisor` (live,
+event-driven on goal-window state transitions, coalesced to 5Hz by the publisher --
+NavSupervisor's DRIVE/RECOVER state, attempt budget, blocked-goal hold and last abort
+cause; not published by every robot -- absent on any robot whose nav stack predates
+the NavSupervisor node).
 """
 
 import asyncio
@@ -34,6 +37,9 @@ _BT_TREE_TOPIC_RE = re.compile(r"^(.+)/nav2_bt_tree$")
 BT_STATE_TOPIC = "+/nav2_bt_state"
 _BT_STATE_TOPIC_RE = re.compile(r"^(.+)/nav2_bt_state$")
 
+NAV_SUPERVISOR_TOPIC = "+/nav_supervisor"
+_NAV_SUPERVISOR_TOPIC_RE = re.compile(r"^(.+)/nav_supervisor$")
+
 COLLECTOR_NAMES = ("jtop", "host_stats", "ros_health", "topic_availability", "topic_listing")
 STALE_SOURCES = ("esp32", "gps", "sati_pose")
 
@@ -55,6 +61,7 @@ class DiagnosticsService:
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._bt_tree_cache: Dict[str, Dict[str, Any]] = {}
         self._bt_state_cache: Dict[str, Dict[str, Any]] = {}
+        self._nav_supervisor_cache: Dict[str, Dict[str, Any]] = {}
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._event_loop = loop
@@ -71,10 +78,11 @@ class DiagnosticsService:
             self.mqtt_client.register_callback(DIAGNOSTICS_TOPIC, self._on_diagnostics_message)
             self.mqtt_client.register_callback(BT_TREE_TOPIC, self._on_bt_tree_message)
             self.mqtt_client.register_callback(BT_STATE_TOPIC, self._on_bt_state_message)
+            self.mqtt_client.register_callback(NAV_SUPERVISOR_TOPIC, self._on_nav_supervisor_message)
             self.mqtt_client.connect()
             self.logger.info(
                 f"[Diagnostics] Subscribed to diagnostics streams: "
-                f"{DIAGNOSTICS_TOPIC}, {BT_TREE_TOPIC}, {BT_STATE_TOPIC}"
+                f"{DIAGNOSTICS_TOPIC}, {BT_TREE_TOPIC}, {BT_STATE_TOPIC}, {NAV_SUPERVISOR_TOPIC}"
             )
             return True
         except Exception as e:
@@ -94,6 +102,9 @@ class DiagnosticsService:
 
     def get_cached_bt_state(self, robot_name: str) -> Optional[Dict[str, Any]]:
         return self._bt_state_cache.get(robot_name)
+
+    def get_cached_nav_supervisor(self, robot_name: str) -> Optional[Dict[str, Any]]:
+        return self._nav_supervisor_cache.get(robot_name)
 
     def _decode_mqtt_json(self, msg, topic_re: "re.Pattern"):
         """
@@ -141,6 +152,13 @@ class DiagnosticsService:
             return
         robot_name, payload = decoded
         self._schedule(self._handle_bt_state, robot_name, payload.get("nodes"), payload.get("stamp"))
+
+    def _on_nav_supervisor_message(self, client, userdata, msg):
+        decoded = self._decode_mqtt_json(msg, _NAV_SUPERVISOR_TOPIC_RE)
+        if decoded is None:
+            return
+        robot_name, payload = decoded
+        self._schedule(self._handle_nav_supervisor, robot_name, payload)
 
     @staticmethod
     def _parse_diagnostics(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -233,3 +251,15 @@ class DiagnosticsService:
             "nodes": nodes,
         }
         await self._cache_and_broadcast(self._bt_state_cache, robot_name, envelope, "BT state")
+
+    async def _handle_nav_supervisor(self, robot_name: str, supervisor: Optional[Dict[str, Any]]):
+        envelope = {
+            "type": "nav_supervisor_update",
+            "robot_name": robot_name,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "robot_stamp": (supervisor or {}).get("stamp"),
+            "supervisor": supervisor,
+        }
+        await self._cache_and_broadcast(
+            self._nav_supervisor_cache, robot_name, envelope, "nav supervisor"
+        )

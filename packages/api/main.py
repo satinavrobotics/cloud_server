@@ -1153,6 +1153,34 @@ async def get_robot_nav2_bt_state(robot_name: str):
     return cached
 
 
+@app.get("/api/v1/robots/{robot_name}/nav_supervisor")
+async def get_robot_nav_supervisor(robot_name: str):
+    """
+    Get the latest cached NavSupervisor goal-window state for a robot.
+
+    Served from an in-memory cache populated by MQTT `<robot_name>/nav_supervisor`
+    messages (live, event-driven on goal-window state transitions), not from the
+    database — used to warm the client on load/reconnect before the next WebSocket
+    push arrives. Not having received one yet is a normal, expected state (either the
+    robot hasn't reported since startup yet, or its nav stack predates the
+    NavSupervisor node) rather than an error, so this returns 200 with a null
+    `supervisor` field instead of a 404.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    cached = service.diagnostics.get_cached_nav_supervisor(robot_name)
+    if cached is None:
+        return {
+            "type": "nav_supervisor_update",
+            "robot_name": robot_name,
+            "timestamp": None,
+            "robot_stamp": None,
+            "supervisor": None,
+        }
+    return cached
+
+
 @app.post("/api/v1/robots", response_model=dict)
 async def create_robot(robot_data: dict):
     """
