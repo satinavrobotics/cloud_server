@@ -613,6 +613,7 @@ class ApiDelegationService:
         self._mission_watcher_thread = None
         self._watcher_tasks = []
         self._running = False
+        self.telemetry = None  # packages/api/telemetry.ApiTelemetry, set in start_watchers()
 
         self.logger.info("✅ API Delegation Service initialized")
         self.logger.info(f"   ArangoDB: {arango_host}:{arango_port}")
@@ -1760,9 +1761,34 @@ class ApiDelegationService:
         ]
 
         self.diagnostics.set_event_loop(event_loop)
+        self._start_telemetry()
         self.diagnostics.connect_mqtt()
 
         self.logger.info("✅ Database watchers started for WebSocket broadcasting")
+
+    def _start_telemetry(self):
+        """Phase 0 ingest (packages/api/telemetry.py): start the writer election. Any failure
+        is logged and leaves the API running exactly as without it."""
+        try:
+            from packages.api.telemetry import build_from_config
+            self.telemetry = build_from_config()
+            if self.telemetry is not None:
+                self.telemetry.start()
+                self.diagnostics.telemetry = self.telemetry
+        except Exception as e:
+            self.logger.error(f"Telemetry ingest not started: {e}")
+            self.telemetry = None
+            self.diagnostics.telemetry = None
+
+    async def stop_telemetry(self):
+        """Final flush and lock release, bounded in time. Never raises."""
+        telemetry, self.telemetry = getattr(self, "telemetry", None), None
+        self.diagnostics.telemetry = None
+        if telemetry is not None:
+            try:
+                await telemetry.stop()
+            except Exception as e:
+                self.logger.error(f"Telemetry ingest stop failed: {e}")
 
     def stop_watchers(self):
         """Stop all background watchers."""
