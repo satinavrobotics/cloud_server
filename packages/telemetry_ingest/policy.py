@@ -138,6 +138,12 @@ class RecordingPolicy:
     def allows(self, table: str, robot_name: Optional[str], code: Optional[str] = None) -> bool:
         return allows(self.level_for(robot_name), table, code)
 
+    def site_for(self, robot_name: Optional[str]) -> Optional[str]:
+        """The robot's current site as of the last refresh (None if unassigned/unknown)."""
+        if robot_name is None:
+            return None
+        return self._sources.robot_sites.get(robot_name)
+
     def snapshot(self) -> Dict[str, Any]:
         """Current sources and cached levels, for debugging/health output."""
         return {

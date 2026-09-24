@@ -98,6 +98,14 @@ class TestRecordingPolicy:
         assert policy.level_for("r-full") is EVENTS
         assert policy.snapshot()["resolved"]["r-full"] == "events_only"
 
+    def test_site_for(self):
+        policy = RecordingPolicy(sources=self.sources())
+        assert policy.site_for("r-site") == "s-off"
+        assert policy.site_for("r-full") is None
+        assert policy.site_for(None) is None
+        policy.set_robot_site("r-full", "s-none")
+        assert policy.site_for("r-full") == "s-none"
+
     async def test_invalidate_and_refresh(self, pool):
         loads = []
 

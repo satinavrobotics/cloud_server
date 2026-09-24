@@ -18,8 +18,10 @@ SPDX-License-Identifier: Apache-2.0
 """
 import argparse
 import logging
+import os
 import sys
 
+from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import server as mission_server
 
 LOGGING_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -60,6 +62,15 @@ if __name__ == "__main__":
                         help="Environment to push telemetry to (DEV | TEST | PROD)")
     parser.add_argument("--disable_request_factsheet", action="store_true",
                         help="Disable factsheet pulling")
+    parser.add_argument("--disable_fleet_recording", action="store_true",
+                        default=os.getenv("DISABLE_FLEET_RECORDING", "").lower()
+                        in ("1", "true", "yes"),
+                        help="Do not write Phase 0 runs/events/telemetry (kill switch; "
+                             "also $DISABLE_FLEET_RECORDING)")
+    parser.add_argument("--fleet_spill_path",
+                        default=os.getenv("FLEET_SPILL_PATH", fleet_recorder.DEFAULT_SPILL_PATH),
+                        help="JSONL file for events the database could not take yet "
+                             "(also $FLEET_SPILL_PATH)")
 
     args = parser.parse_known_args()[0]
     logger = logging.getLogger("Isaac Mission Dispatch")
