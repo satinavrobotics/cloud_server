@@ -36,10 +36,10 @@ right order, not to save minutes.
 > - **Nobody prunes Docker volumes** (permanent — see §0 "Leftover risk") (`docker volume prune`, `docker system prune --volumes`).
 >   On Docker 29, `docker volume prune` removes unused *anonymous* volumes by default. That is
 >   exactly the class of volume that holds production data today, plus the orphaned ones below.
-> - **Do not delete the ~190 orphaned PG14 data volumes** (anonymous, dated 2025-10 → 2026-09).
->   They are very likely earlier production databases that were stranded by full restarts. A few
->   may be test leftovers. The owner has to decide whether any of them hold data worth recovering
->   before anything is removed.
+> - ~~Do not delete the ~190 orphaned PG14 data volumes.~~ **Resolved 2026-09-24**: the owner
+>   confirmed none held data worth keeping; 189 were removed by name (`docker volume rm`, not a
+>   prune), freeing ~10 GB. Kept: `pgdata14` (`b323568f…`, rollback until 2026-10-08) and
+>   `sati_pgdata17` (live).
 
 ## Shell setup (used by every section below)
 
@@ -573,9 +573,8 @@ This is separate from the 1-hour decision window. Following v2 WP1.8, **keep the
 (`pgdata14` / `b323568f…0fa52`) and `cutover-inwindow.dump` for 2 weeks** after the cutover.
 The safety dump stays with them, off-host. Then remove them deliberately: a named person, on a
 named date, runs `docker volume rm b323568ff9d35df1ea2dfd6916624635ca53953379106159029ca3dd0830fa52`
-and removes `pgdata14` from the compose file in a reviewed commit. Never do it via a prune. The
-~190 orphaned volumes from the standing warning are a separate decision and are not part of this
-cleanup. (`cutover-inwindow.dump` and the safety dump are pg14 dumps: plain restore, §7.7. Window 2
+and removes `pgdata14` from the compose file in a reviewed commit. Never do it via a prune. (The
+~190 orphaned PG14 volumes were already removed on 2026-09-24; see the standing warning.) (`cutover-inwindow.dump` and the safety dump are pg14 dumps: plain restore, §7.7. Window 2
 keeps its own artifacts on its own 2-week clock: §10.7.)
 
 ## 9. Explicitly out of scope for this window
