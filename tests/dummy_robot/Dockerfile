@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY cloud_common /app/cloud_common
 COPY packages/config.py /app/packages/config.py
 COPY packages/controllers/mission/vda5050_types /app/packages/controllers/mission/vda5050_types
-COPY tests/dummy_robot/dummy_robot.py /app/tests/dummy_robot/dummy_robot.py
+COPY tests/dummy_robot/dummy_robot.py tests/dummy_robot/goal_follower.py /app/tests/dummy_robot/
 
 # Create __init__.py files for proper imports
 RUN touch /app/cloud_common/__init__.py && \

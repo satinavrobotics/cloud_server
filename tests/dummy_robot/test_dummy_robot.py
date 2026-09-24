@@ -243,6 +243,74 @@ class TestDummyRobotIntegration(unittest.TestCase):
             self.skipTest(f"MQTT broker not available: {e}")
 
 
+class TestDummyRobotGoalMode(unittest.TestCase):
+    """MQTT wiring of --mode goal (the logic itself is in test_goal_follower.py)."""
+
+    @patch('paho.mqtt.client.Client')
+    def setUp(self, mock_mqtt_client):
+        self.mock_client = MagicMock()
+        mock_mqtt_client.return_value = self.mock_client
+        self.robot = DummyRobot(robot_name="goal_robot", mode="goal", speed=1.0,
+                                publish_nodes=False, publish_images=False)
+
+    def _last_state(self):
+        topic, payload = self.mock_client.publish.call_args[0][:2]
+        self.assertEqual(topic, "uagv/v2/RobotCompany/goal_robot/state")
+        return json.loads(payload)
+
+    def test_invalid_mode_rejected(self):
+        with patch('paho.mqtt.client.Client'):
+            with self.assertRaises(ValueError):
+                DummyRobot(mode="teleport")
+
+    def test_order_is_followed_and_reported(self):
+        order = {
+            "orderId": "m1-n0", "orderUpdateId": 0,
+            "nodes": [
+                {"nodeId": "m1-n0-s0", "sequenceId": 0,
+                 "nodePosition": {"x": 0.0, "y": 0.0}},
+                {"nodeId": "m1-n0-s2", "sequenceId": 2,
+                 "nodePosition": {"x": 2.0, "y": 0.0}},
+            ],
+            "edges": [{"edgeId": "m1-e1", "sequenceId": 1,
+                       "startNodeId": "m1-n0-s0", "endNodeId": "m1-n0-s2"}],
+        }
+        self.robot._handle_order(order)
+        self.robot._step_goal(1.0)
+        self.robot._publish_state()
+        state = self._last_state()
+        self.assertEqual(state["orderId"], "m1-n0")
+        self.assertTrue(state["driving"])
+        self.assertEqual(state["lastNodeId"], "m1-n0-s0")
+        self.assertEqual([n["nodeId"] for n in state["nodeStates"]], ["m1-n0-s2"])
+        self.assertEqual(self.robot.x, 1.0)
+
+        self.robot._step_goal(1.0)
+        self.robot._publish_state()
+        state = self._last_state()
+        self.assertEqual((state["lastNodeId"], state["lastNodeSequenceId"]), ("m1-n0-s2", 2))
+        self.assertEqual(state["nodeStates"], [])
+        self.assertEqual(state["edgeStates"], [])
+        self.assertFalse(state["driving"])
+
+    def test_cancel_order_instant_action(self):
+        self.robot._handle_instant_actions({
+            "headerId": 1, "timestamp": "",
+            "instantActions": [{"actionType": "cancelOrder", "actionId": "c1"}]})
+        self.robot._publish_state()
+        [action_state] = self._last_state()["actionStates"]
+        self.assertEqual((action_state["actionId"], action_state["actionStatus"]),
+                         ("c1", "FAILED"))  # no order to cancel
+
+    def test_factsheet_request_publishes_factsheet(self):
+        self.mock_client.publish.reset_mock()
+        self.robot._handle_instant_actions({
+            "headerId": 1, "timestamp": "",
+            "instantActions": [{"actionType": "factsheetRequest", "actionId": "f1"}]})
+        topics = [c[0][0] for c in self.mock_client.publish.call_args_list]
+        self.assertIn("uagv/v2/RobotCompany/goal_robot/factsheet", topics)
+
+
 if __name__ == "__main__":
     unittest.main()
 

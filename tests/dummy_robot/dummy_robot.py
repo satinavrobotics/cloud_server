@@ -26,6 +26,7 @@ import time
 import random
 import base64
 import io
+import threading
 from typing import Optional, List
 import sys
 import os
@@ -37,6 +38,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from packages.controllers.mission.vda5050_types import vda5050_types as types
 from packages.config import CAMERA_YAW_OFFSETS
+from tests.dummy_robot.goal_follower import GoalFollower
+
+MODES = ("patrol", "goal")
 
 
 # Try to import PIL for image generation, fall back to simple placeholder
@@ -59,6 +63,9 @@ class DummyRobot:
     2. Listens for VDA5050 orders from mission dispatch
     3. Publishes node updates for graph building
     4. Simulates robot movement in a loop
+
+    mode="patrol" (default) free-runs a circle and ignores orders beyond logging them.
+    mode="goal" follows the received VDA5050 orders instead (see goal_follower.py).
     """
 
     def __init__(
@@ -77,7 +84,12 @@ class DummyRobot:
         tick_period: float = 1.0,
         publish_nodes: bool = True,
         publish_images: bool = True,
+        mode: str = "patrol",
+        action_duration: float = 1.0,
+        goal_tolerance: float = 0.05,
     ):
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
         self.logger = logging.getLogger(f"DummyRobot[{robot_name}]")
         self.robot_name = robot_name
         self.manufacturer = manufacturer
@@ -91,6 +103,7 @@ class DummyRobot:
         self.tick_period = tick_period
         self.publish_nodes = publish_nodes
         self.publish_images = publish_images
+        self.mode = mode
 
         # Available cameras on this robot
         self.available_cameras = ["front_camera", "back_camera", "left_camera", "right_camera"]
@@ -112,6 +125,15 @@ class DummyRobot:
         self.angle = 0.0  # For circular movement
         self.running = True
 
+        # Goal-following mode: orders arrive on the MQTT thread, ticks on the main one.
+        self._lock = threading.Lock()
+        self.follower: Optional[GoalFollower] = None
+        if self.mode == "goal":
+            self.follower = GoalFollower(
+                x=self.x, y=self.y, theta=self.theta, speed=speed,
+                action_duration=action_duration, goal_tolerance=goal_tolerance,
+                map_id=map_id)
+
         # MQTT client
         self.client = mqtt_client.Client(client_id=f"{robot_name}_client")
         self.client.on_connect = self._on_connect
@@ -119,7 +141,7 @@ class DummyRobot:
         self.client.connect(mqtt_host, mqtt_port, 60)
         self.client.loop_start()
 
-        self.logger.info(f"Dummy robot initialized: {robot_name}")
+        self.logger.info(f"Dummy robot initialized: {robot_name} (mode={mode})")
         self.logger.info(f"MQTT: {mqtt_host}:{mqtt_port}")
         self.logger.info(f"VDA5050 prefix: {mqtt_prefix}")
         self.logger.info(f"Node topic: {node_topic}")
@@ -167,6 +189,12 @@ class DummyRobot:
         """Handle incoming VDA5050 order."""
         try:
             order = types.VDA5050Order(**payload)
+            if self.follower is not None:
+                with self._lock:
+                    result = self.follower.handle_order(order)
+                self.logger.info(f"Order {order.orderId} (update {order.orderUpdateId}): "
+                                 f"{result}, {len(order.nodes)} nodes")
+                return
             self.current_order = order
             self.order_id = order.orderId
             self.order_update_id = order.orderUpdateId
@@ -182,6 +210,16 @@ class DummyRobot:
         """Handle incoming VDA5050 instant actions."""
         try:
             instant_actions = types.VDA5050InstantActions(**payload)
+            if self.follower is not None:
+                with self._lock:
+                    self.follower.handle_instant_actions(instant_actions.instantActions)
+                    publish_factsheet = self.follower.factsheet_requested
+                    self.follower.factsheet_requested = False
+                for action in instant_actions.instantActions:
+                    self.logger.info(f"  Instant action: {action.actionType} {action.actionId}")
+                if publish_factsheet:
+                    self._publish_factsheet()
+                return
             self.logger.info(f"Instant actions: {len(instant_actions.instantActions)}")
             for action in instant_actions.instantActions:
                 self.logger.info(f"  Action: {action.actionType}")
@@ -281,6 +319,35 @@ class DummyRobot:
             )
             information.append(camera_info)
 
+        battery_state = types.VDA5050BatteryState(
+            batteryCharge=self.battery,
+            batteryVoltage=48.0,
+            batteryHealth=None,
+            charging=False,
+            reach=None,
+        )
+
+        if self.follower is not None:
+            with self._lock:
+                information.append(types.VDA5050Info(
+                    infoType="navReasoning", infoLevel="INFO",
+                    infoDescription=self.follower.nav_reasoning))
+                state = self.follower.to_state(
+                    header_id=self.header_id,
+                    timestamp=datetime.datetime.now().isoformat(),
+                    version="2.0.0",
+                    manufacturer=self.manufacturer,
+                    serialNumber=self.serial_number,
+                    batteryState=battery_state,
+                    errors=[],
+                    information=information,
+                    safetyState=types.VDA5050SafetyStatus(
+                        eStop=types.VDA5050EStop.NONE, fieldViolation=False))
+            topic = f"{self.mqtt_prefix}/{self.robot_name}/state"
+            self.client.publish(topic, state.json())
+            self.header_id += 1
+            return
+
         # Navigation reasoning narration: level-triggered, re-sent every state.
         information.append(types.VDA5050Info(
             infoType="navReasoning",
@@ -301,13 +368,7 @@ class DummyRobot:
             nodeStates=[],
             edgeStates=[],
             actionStates=[],
-            batteryState=types.VDA5050BatteryState(
-                batteryCharge=self.battery,
-                batteryVoltage=48.0,
-                batteryHealth=None,
-                charging=False,
-                reach=None,
-            ),
+            batteryState=battery_state,
             driving=True,
             agvPosition=types.VDA5050AgvPosition(
                 positionInitialized=True,
@@ -524,8 +585,17 @@ class DummyRobot:
         self.x = self.loop_radius * math.cos(self.angle)
         self.y = self.loop_radius * math.sin(self.angle)
         self.theta = self.angle + math.pi / 2  # Tangent to circle
-        
-        # Simulate battery drain
+        self._drain_battery()
+
+    def _step_goal(self, dt: float):
+        """Advance the goal-following simulation and mirror its pose."""
+        with self._lock:
+            self.follower.step(dt)
+            self.x, self.y, self.theta = self.follower.x, self.follower.y, self.follower.theta
+        self._drain_battery()
+
+    def _drain_battery(self):
+        """Simulate battery drain"""
         self.battery = max(0.0, self.battery - 0.01)
         if self.battery < 20.0:
             self.battery = 100.0  # "Recharge"
@@ -535,10 +605,16 @@ class DummyRobot:
         self.logger.info("🤖 Starting dummy robot main loop...")
 
         iteration = 0
+        last_tick = time.monotonic()
         try:
             while self.running:
                 # Update position
-                self._update_position()
+                if self.follower is not None:
+                    now = time.monotonic()
+                    self._step_goal(now - last_tick)
+                    last_tick = now
+                else:
+                    self._update_position()
 
                 # Publish state every tick
                 self._publish_state()
@@ -592,6 +668,15 @@ def main():
                         help="Disable node publishing")
     parser.add_argument("--no_images", action="store_true",
                         help="Disable image publishing")
+    parser.add_argument("--mode", choices=MODES,
+                        default=os.environ.get("DUMMY_ROBOT_MODE", "patrol"),
+                        help="patrol: free-running circle, orders ignored (default). "
+                             "goal: follow received VDA5050 orders and report progress. "
+                             "Default from $DUMMY_ROBOT_MODE.")
+    parser.add_argument("--action_duration", type=float, default=1.0,
+                        help="goal mode: seconds each node action stays RUNNING")
+    parser.add_argument("--goal_tolerance", type=float, default=0.05,
+                        help="goal mode: distance (m) at which a node counts as reached")
 
     args = parser.parse_args()
 
@@ -610,6 +695,9 @@ def main():
         tick_period=args.tick_period,
         publish_nodes=not args.no_nodes,
         publish_images=not args.no_images,
+        mode=args.mode,
+        action_duration=args.action_duration,
+        goal_tolerance=args.goal_tolerance,
     )
 
     robot.run()
