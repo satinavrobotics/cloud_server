@@ -148,6 +148,66 @@ class TestRecordingPolicy:
         assert policy.stale                              # the next refresh will reload
         assert policy.level_for("x") is OFF
 
+    def test_setters_report_changes_and_skip_no_ops(self):
+        policy = RecordingPolicy(sources=self.sources())
+        assert policy.level_for("r-full") is FULL
+        generation = policy._generation
+        assert not policy.set_robot_level("r-full", "full")
+        assert not policy.set_robot_site("r-site", "s-off")
+        assert not policy.set_site_level("s-off", "off")
+        assert not policy.set_global_level("full")
+        assert not policy.forget_robot("never-seen")
+        assert policy._generation == generation
+        assert policy.set_robot_level("new-robot", None)          # first sighting counts
+        assert policy.set_global_level("off")
+        assert policy.forget_robot("r-full")
+        assert policy._generation == generation + 3
+        assert not policy.stale                                   # pushes need no reload
+
+    async def test_push_during_refresh_keeps_it_stale(self, pool):
+        """A NOTIFY pushed while a reload is in flight must not be lost when the (older)
+        loaded snapshot replaces the sources."""
+        gate = asyncio.Event()
+
+        async def loader(conn, now):
+            await gate.wait()
+            return PolicySources(global_level="events_only")
+
+        policy = RecordingPolicy(loader=loader, sources=PolicySources(global_level="full"))
+        policy.invalidate()
+        refresh = asyncio.ensure_future(policy.refresh(pool))
+        await asyncio.sleep(0)
+        policy.set_global_level("off")                  # pushed from a settings NOTIFY
+        gate.set()
+        assert await refresh
+        assert policy.stale                              # the writer reloads on its next tick
+
+    def test_apply_objects_from_watchers(self):
+        class Obj:
+            def __init__(self, name, level=None, lifecycle="ALIVE"):
+                self.name, self.telemetry_recording, self.lifecycle = name, level, lifecycle
+
+        policy = RecordingPolicy(sources=self.sources())
+        assert policy.apply_robot_object(Obj("r-site", "full"))
+        assert policy.level_for("r-site") is FULL
+        assert not policy.apply_robot_object(Obj("r-site", "full"))
+        assert policy.apply_robot_object(Obj("r-site", "full", lifecycle="DELETED"))
+        assert policy.level_for("r-site") is FULL        # forgotten: no site -> global
+        assert policy.apply_settings_object(Obj("global", "off"))
+        assert policy.level_for("r-site") is OFF
+        assert not policy.apply_settings_object(Obj("other", "full"))
+        assert policy.apply_settings_object(Obj("global", "off", lifecycle="DELETED"))
+        assert policy.level_for("r-site") is DEFAULT_LEVEL
+
+    def test_no_site_resolves_to_global(self):
+        """Before WP9 no robot has a site: robot level, else global, else default."""
+        policy = RecordingPolicy(sources=PolicySources(robot_levels={"r1": None},
+                                                       global_level="off"))
+        assert policy.site_for("r1") is None
+        assert policy.level_for("r1") is OFF
+        policy.set_robot_level("r1", "full")
+        assert policy.level_for("r1") is FULL
+
     async def test_writer_loop_refreshes_stale_policy(self, pool, db, clock, spill_path):
         results = [RuntimeError("down"), PolicySources(global_level="full")]
 

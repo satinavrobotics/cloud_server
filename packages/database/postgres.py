@@ -18,10 +18,11 @@ SPDX-License-Identifier: Apache-2.0
 """
 import argparse
 import datetime
+import json
 import logging
 import sys
 import time
-from typing import Any, AsyncGenerator, Optional, Sequence
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Optional, Sequence
 import uuid
 import enum
 import asyncio
@@ -58,6 +59,14 @@ WATCHER_NOTIFY_TIMEOUT_S = 60
 # across services (see initialize_database). Any constant works as long as every
 # service agrees on it; this one is arbitrary ("SATIDB" in hex).
 DB_INIT_LOCK_KEY = 0x5A71DB
+
+# Optional hook for create_object/update_spec: `hook(conn, old_spec, new_spec)` runs on the
+# same connection after the write and before the commit, so whatever it writes commits (or
+# not) together with the object change. old_spec is the stored spec (read FOR UPDATE; None on
+# create), new_spec the written one, both as JSON dicts. The hook must not raise and must not
+# leave the transaction aborted: it isolates its own statements in a savepoint.
+# Used for TELEMETRY.RECORDING_CHANGED (packages/api/recording.py).
+SpecHook = Callable[[Any, Optional[Dict[str, Any]], Dict[str, Any]], Awaitable[Any]]
 
 
 async def initialize_database(connection: psycopg.AsyncConnection):
@@ -388,20 +397,24 @@ class PostgresDatabase:
             traceback.print_exc()
             raise
 
-    async def create_object(self, obj: objects.ApiObject, publisher_id: uuid.UUID):
+    async def create_object(self, obj: objects.ApiObject, publisher_id: uuid.UUID,
+                            before_commit: Optional[SpecHook] = None):
         try:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cursor:
                     self._logger.info("Create object: %s:%s",
                                       obj.table_name(), obj.name)
+                    spec_json = obj.spec.json()
                     self._logger.info("   %s:%s:%s", obj.lifecycle.name,
-                                      obj.spec.json(), obj.status.json())
+                                      spec_json, obj.status.json())
                     query = f"INSERT INTO {obj.table_name()} (name, lifecycle, spec, status) " \
                             f"VALUES (%s, %s, %s, %s);"
                     await cursor.execute(query, [obj.name, obj.lifecycle.name,
-                                                 obj.spec.json(), obj.status.json()])
+                                                 spec_json, obj.status.json()])
                     await self._notify(cursor, obj.table_name(), obj.name,
                                        obj.lifecycle.name, publisher_id)
+                if before_commit is not None:
+                    await self._run_hook(before_commit, conn, None, spec_json)
                 return obj
         except psycopg.errors.UniqueViolation:
             raise fastapi.HTTPException(
@@ -415,18 +428,38 @@ class PostgresDatabase:
             raise
 
     async def update_spec(self, object_class: objects.ApiObjectType, name: str, spec: Any,
-                          publisher_id: uuid.UUID):
+                          publisher_id: uuid.UUID, before_commit: Optional[SpecHook] = None):
         try:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cursor:
+                    old_spec = None
+                    if before_commit is not None:
+                        # Lock the row so the hook sees exactly the spec this write replaces.
+                        await cursor.execute(
+                            f"SELECT spec FROM {object_class.table_name()} "
+                            "WHERE name = %s FOR UPDATE;", [name])
+                        row = await cursor.fetchone()
+                        old_spec = row[0] if row is not None else None
+                    spec_json = spec.json()
                     query = f"UPDATE {object_class.table_name()} " \
                             f"SET spec = %s WHERE name = %s RETURNING *;"
-                    await cursor.execute(query, [spec.json(), name])
+                    await cursor.execute(query, [spec_json, name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+                if before_commit is not None:
+                    await self._run_hook(before_commit, conn, old_spec, spec_json)
         except Exception as err:
             self._logger.error("Database error: %s", err)
             traceback.print_exc()
             raise
+
+    async def _run_hook(self, hook: SpecHook, conn: Any, old_spec: Optional[Dict[str, Any]],
+                        new_spec_json: str) -> None:
+        """Run a before-commit hook; its failure is logged and never fails the write."""
+        try:
+            await hook(conn, old_spec, json.loads(new_spec_json))
+        except Exception as err:  # pylint: disable=broad-except
+            self._logger.error("before-commit hook failed (the object change still "
+                               "commits): %s", err)
 
     async def update_status(self, object_class: objects.ApiObjectType, name: str, status: Any,
                             publisher_id: uuid.UUID):

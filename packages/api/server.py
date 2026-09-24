@@ -25,6 +25,7 @@ from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1
 from cloud_common.objects.mission import MissionObjectV1
+from cloud_common.objects.settings import SettingsObjectV1
 from cloud_common.objects.object import ObjectLifecycleV1
 from packages.config import (
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
@@ -1757,7 +1758,9 @@ class ApiDelegationService:
             event_loop.create_task(self._watch_mission_changes()),
             event_loop.create_task(self._handle_robot_updates()),
             event_loop.create_task(self._handle_mission_updates()),
-            event_loop.create_task(self._handle_mission_progress_updates())
+            event_loop.create_task(self._handle_mission_progress_updates()),
+            # Recording policy only (WP8): the global level lives in settings.
+            event_loop.create_task(self._watch_settings_changes()),
         ]
 
         self.diagnostics.set_event_loop(event_loop)
@@ -1852,6 +1855,35 @@ class ApiDelegationService:
                     self.logger.error(f"Mission watcher error: {e}, reconnecting in {reconnect_delay}s...")
                     await asyncio.sleep(reconnect_delay)
 
+    async def _watch_settings_changes(self):
+        """Feed settings NOTIFYs to the telemetry writer's recording policy (§4.3). Never
+        raises: a failure here only delays a level change until the periodic reload."""
+        reconnect_delay = 5  # seconds
+        while self._running:
+            try:
+                watcher = await self.database.get_watcher(SettingsObjectV1, self._publisher_id)
+                async for settings in watcher.watch():
+                    if not self._running:
+                        break
+                    self._feed_policy("on_settings_object", settings)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._running:
+                    self.logger.error(f"Settings watcher error: {e}, "
+                                      f"reconnecting in {reconnect_delay}s...")
+                    await asyncio.sleep(reconnect_delay)
+
+    def _feed_policy(self, method: str, obj: Any) -> None:
+        """Hand a watched object to the Phase 0 recording policy. Never raises."""
+        telemetry = self.telemetry
+        if telemetry is None:
+            return
+        try:
+            getattr(telemetry, method)(obj)
+        except Exception as e:  # pylint: disable=broad-except
+            self.logger.error(f"Recording policy update failed: {e}")
+
     async def _handle_robot_updates(self):
         """
         Async task that processes robot updates from the queue and broadcasts them
@@ -1860,6 +1892,8 @@ class ApiDelegationService:
         while self._running:
             try:
                 robot = await self._robot_changes.get()
+                # Recording level (WP8), deleted robots included (they are forgotten).
+                self._feed_policy("on_robot_object", robot)
 
                 # Ignore deleted robots
                 if robot.lifecycle == ObjectLifecycleV1.DELETED:

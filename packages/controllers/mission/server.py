@@ -67,6 +67,9 @@ DISPATCH_REQUIRED_TABLES = ("mission_runs", "fleet_events", "robot_state_ts", "r
 # How long to wait in seconds before trying to reconnect to the mission database
 DATABASE_RECONNECT_PERIOD = 0.5
 
+# How long the recording-only settings watcher waits before re-watching after a failure
+SETTINGS_WATCH_RETRY_S = 5.0
+
 class WaitElapsed(pydantic.BaseModel):
     """Posted to a robot's own message queue when a "wait" action node's timer runs out.
 
@@ -2116,6 +2119,8 @@ class RobotServer:
             # Ignore deleted robot object
             if robot.lifecycle == \
                     api_objects.object.ObjectLifecycleV1.DELETED:
+                if self.fleet_recorder is not None:
+                    self.fleet_recorder.on_robot_deleted(robot)
                 continue
             # Robots being deleted may not have a name
             if hasattr(robot, "name"):
@@ -2126,6 +2131,24 @@ class RobotServer:
                 if self.fleet_recorder is not None:
                     self.fleet_recorder.on_robot_object(robot)
                 await self._robots[robot.name].send_message(robot)
+
+    async def _watch_settings(self):
+        """Recording only (WP8): feed settings NOTIFYs (the global recording level) to the
+        fleet recorder. Unlike _watch_changes, a failure here never stops the dispatcher:
+        it is logged and retried, and meanwhile the periodic policy reload still applies."""
+        while True:
+            try:
+                watcher = await self._database.get_watcher(api_objects.SettingsObjectV1,
+                                                            uuid.uuid4())
+                with watcher:
+                    async for settings in watcher.watch():
+                        self.fleet_recorder.on_settings_object(settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Settings watcher failed, retrying in "
+                             f"{SETTINGS_WATCH_RETRY_S}s: {err}")
+            await asyncio.sleep(SETTINGS_WATCH_RETRY_S)
 
     async def _handle_mission_changes(self):
         while True:
@@ -2183,13 +2206,16 @@ class RobotServer:
                 await self.fleet_recorder.start()
             except Exception as err:  # pylint: disable=broad-except
                 self.warning(f"Fleet recording failed to start: {err}")
-        await asyncio.gather(
+        tasks = [
             self._watch_changes(api_objects.MissionObjectV1, self._mission_changes),
             self._watch_changes(api_objects.RobotObjectV1, self._robot_changes),
             self._handle_robot_changes(),
             self._handle_mission_changes(),
             self._handle_mqtt_messages()
-        )
+        ]
+        if self.fleet_recorder is not None:
+            tasks.append(self._watch_settings())
+        await asyncio.gather(*tasks)
 
     async def delete_robot(self, robot_name: str):
         robot = self._robots[robot_name]
