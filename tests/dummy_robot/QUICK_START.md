@@ -199,6 +199,18 @@ export DUMMY_ROBOT_TICK_PERIOD=0.5
 docker-compose -f mission_dispatch_services_dev.yaml up dummy-robot
 ```
 
+### Goal-following mode
+
+By default the robot patrols a circle and ignores orders, so missions never
+complete. To have it drive the ordered waypoints and finish missions
+(`COMPLETED`), add `--mode goal` (or set `DUMMY_ROBOT_MODE=goal`):
+
+```bash
+python tests/dummy_robot/dummy_robot.py --robot_name dummy_robot_01 --mode goal --speed 1.0
+```
+
+See README.md, "Goal-following mode", for what it reports.
+
 ## Multiple Robots
 
 Run multiple dummy robots:

@@ -90,6 +90,54 @@ docker-compose -f mission_dispatch_services_dev.yaml up dummy-robot
 | `--speed` | `1.0` | Movement speed (m/s) |
 | `--tick_period` | `1.0` | Update period (seconds) |
 | `--no_nodes` | `false` | Disable node publishing |
+| `--mode` | `patrol` (or `$DUMMY_ROBOT_MODE`) | `patrol`: circle, orders ignored. `goal`: follow VDA5050 orders |
+| `--action_duration` | `1.0` | `goal` mode: seconds a node action stays RUNNING |
+| `--goal_tolerance` | `0.05` | `goal` mode: distance (m) at which a node counts as reached |
+
+## Goal-following mode (`--mode goal`)
+
+The default `patrol` mode free-runs a circle and never reports progress on an
+order. `--mode goal` (or `DUMMY_ROBOT_MODE=goal`) makes the robot execute the
+orders mission-dispatch sends, so missions can reach `COMPLETED`:
+
+- The first node of a new order is taken as reached on acceptance; the robot then
+  drives to each released node's `nodePosition` in sequence at `--speed`, one node
+  per tick at most, and stops at the end of the released base.
+- State reports `orderId`/`orderUpdateId`, `lastNodeId`/`lastNodeSequenceId`,
+  shrinking `nodeStates`/`edgeStates`, `driving`, `agvPosition`. When the order is
+  done: empty `nodeStates`/`edgeStates`, `driving: false`, same `orderId`.
+- Order update (same `orderId`, higher `orderUpdateId`): nodes/edges after the last
+  reached node replace the rest of the order. A resend with the same update id is
+  ignored; a lower one is rejected. A new `orderId` replaces the current order.
+- Node actions run one at a time and block driving: `WAITING` (node not reached)
+  -> `RUNNING` (for `--action_duration`) -> `FINISHED`. Order actions come first in
+  `actionStates` (dispatch reads `actionStates[0]` for an action node).
+- Instant actions: `cancelOrder` stops the robot and drops the order, reported
+  `FINISHED` (or `FAILED` / `noOrderToCancel` when idle); `factsheetRequest`
+  republishes the factsheet; `startTeleop`/`stopTeleop` are acknowledged.
+  Unknown instant actions are ignored.
+
+```bash
+python tests/dummy_robot/dummy_robot.py --mode goal --robot_name dummy_robot_01 \
+    --speed 1.0 --tick_period 0.5 --action_duration 2
+```
+
+The logic lives in `goal_follower.py` (no MQTT) and is tested without a broker:
+
+```bash
+docker build -t dummy-robot-test -f - . <<'DOCKERFILE'
+FROM python:3.10-slim
+COPY tests/dummy_robot/requirements.txt /r.txt
+RUN pip install -r /r.txt pytest pytest-asyncio requests
+DOCKERFILE
+docker run --rm --network none -v "$PWD":/src:ro -w /src \
+    -e ARANGO_PASSWORD=x -e MINIO_ACCESS_KEY=x -e MINIO_SECRET_KEY=x -e POSTGRES_PASSWORD=x \
+    dummy-robot-test python -m pytest -p no:cacheprovider tests/dummy_robot/test_goal_follower.py
+```
+
+`test_goal_follower_dispatch.py` runs the real dispatcher `Robot` against the
+follower (MQTT/Postgres mocked) and needs the dispatcher's dependencies
+(`packages/controllers/mission/requirements.txt`); it skips without them.
 
 ## Testing
 
