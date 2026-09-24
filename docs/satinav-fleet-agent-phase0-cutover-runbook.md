@@ -7,8 +7,10 @@ Those come in separate, later windows (see `docs/satinav-fleet-agent-phase0-v2.m
 **Target:** `postgres:14.5` → `timescale/timescaledb-ha:pg17.11-ts2.30.1`. This is a deliberate
 major upgrade. We do it once, together with the dump/restore that is happening anyway.
 
-**Status: draft, timings not yet rehearsed.** The compatibility rehearsal on the bridge-network
-staging stack (commit c5dbb4d) showed that the migration itself is clean:
+**Status: timed rehearsal done 2026-09-24 (§1–§7, including a real rollback) on a fresh staging
+stack; see "Rehearsal log" at the end for what it changed.** Timings below are from that run.
+The earlier compatibility rehearsal on the bridge-network staging stack (commit c5dbb4d) showed
+that the migration itself is clean:
 
 - the schema catalog diff against a pg14 baseline was empty and row counts matched;
 - LISTEN/NOTIFY dispatch went `PENDING -> RUNNING` end to end;
@@ -47,7 +49,7 @@ PW=$(grep -E "^POSTGRES_DATABASE_PASSWORD=" docker_compose/.env | cut -d= -f2)
 USR=$(grep -E "^POSTGRES_DATABASE_USERNAME=" docker_compose/.env | cut -d= -f2)
 DB=$(grep -E "^POSTGRES_DATABASE_NAME=" docker_compose/.env | cut -d= -f2)
 CUTOVER_DIR=$HOME/pg-cutover/YYYYMMDD        # fill in the window's date. Explicit, no globs
-mkdir -p "$CUTOVER_DIR"
+mkdir -p "$CUTOVER_DIR"; chmod 700 "$CUTOVER_DIR"   # holds data dumps and rendered configs with credentials
 psqlq() { docker exec -e PGPASSWORD="$PW" "$PG" psql -X -At -v ON_ERROR_STOP=1 -U "$USR" -d "$DB" "$@"; }
 ```
 
@@ -152,10 +154,13 @@ Once this is verified, lift the `restart_services.sh` part of the standing warni
 
 - [ ] **§0 has been deployed and verified.** The cutover and its rollback depend on `pgdata14`.
 - [ ] **No robot `ON_TASK`.** Pull live state, not a cached view:
-  `curl -s http://localhost:8000/api/v1/robots | python3 -c "import json,sys; [print(r['name'], r['status']['state']) for r in json.load(sys.stdin)]"`
-  and cross-check `curl -s http://localhost:8000/api/v1/missions` for any `RUNNING` mission.
+  `curl -s http://localhost:8000/api/v1/robots | python3 -c "import json,sys; [print(r['name'], r['status']['state'], 'online' if r['status']['online'] else 'OFFLINE') for r in json.load(sys.stdin)]"`
+  and cross-check for any `RUNNING` mission:
+  `curl -s http://localhost:8000/api/v1/missions | python3 -c "import json,sys; print('RUNNING:', [m['name'] for m in json.load(sys.stdin) if m['status']['state']=='RUNNING'])"`
   Both must be clear. Run this check again immediately before §2. Don't rely on a check done
-  earlier in the day.
+  earlier in the day. Note: the robot state in the DB is the last state the robot reported. A robot
+  that went offline mid-order stays `ON_TASK` with `OFFLINE` indefinitely (seen in rehearsal). That
+  is stale, not a moving robot; confirm with the robot's owner, then treat it as clear.
 - [ ] **Safety dump taken.** This is an extra copy taken before anything is touched. It is *not*
   the dump that gets restored (that one is taken inside the window, in §2):
   ```bash
@@ -190,13 +195,19 @@ Once this is verified, lift the `restart_services.sh` part of the standing warni
   superuser/owner, and PGDATA is `/home/postgres/pgdata/data`. Don't move off this pin without a
   specific reason.
 - [ ] Create the new data volume ahead of time, so the window doesn't depend on it:
-  `docker volume create sati_pgdata17`
+  `docker volume create sati_pgdata17`. It must be **empty**: the image only runs initdb, the
+  timescaledb-tune step (§3.1) and the extension setup on an empty data directory. Rehearsal
+  confirmed an empty external volume gets the right ownership on first boot.
+- [ ] **The memory/CPU sizing values for §3.1 are agreed** with the host owner (`TS_TUNE_MEMORY`,
+  `TS_TUNE_NUM_CPUS`). The runbook uses the rehearsed 4GB / 2 CPUs.
+
+`[TIMING: rehearsal 2026-09-24: §1 commands < 1 s; announce/volume/image steps are manual]`
 - [ ] Announce the window. Confirm that nobody else is about to run `restart_services.sh` or edit
   `docker_compose/mission_dispatch_services.yaml` at the same time.
 
 ## 2. Stop apps, in-window dump and pg14 baseline, stop Postgres
 
-`[TIMING: window start]`
+`[TIMING: window start — rehearsal 2026-09-24: T+0]`
 
 Re-run the `ON_TASK` / `RUNNING` check from §1 first.
 
@@ -212,7 +223,9 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
    ```
    Confirm that no app connections remain:
    `psqlq -c "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()"` → `0`.
-   `[TIMING: apps stopped]`
+   `mission-dispatch` does not handle SIGTERM: its `stop` always waits the full 10 s grace and
+   ends with exit code 137 (SIGKILL). That is expected and is most of this step's time.
+   `[TIMING: apps stopped — rehearsal 2026-09-24: 12 s]`
 2. **In-window dump.** This is the one §3 restores. Nothing writes after this point:
    ```bash
    docker exec -e PGPASSWORD="$PW" "$PG" pg_dump -Fc -U "$USR" "$DB" \
@@ -220,7 +233,7 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
    ls -la "$CUTOVER_DIR/cutover-inwindow.dump"
    sha256sum "$CUTOVER_DIR/cutover-inwindow.dump" > "$CUTOVER_DIR/cutover-inwindow.dump.sha256"
    ```
-   `[TIMING: in-window dump complete]`
+   `[TIMING: in-window dump complete — rehearsal 2026-09-24: < 1 s (15 KB dump)]`
 3. **pg14 catalog baseline.** Save this function once, run it now against pg14, and run it again
    in §4 against pg17:
    ```bash
@@ -271,12 +284,13 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
    ```
    As of 2026-09-24, `public` held 6 tables (`robotobjectv1`, `missionobjectv1`, `mapobjectv1`,
    `settingsobjectv1`, `detectionresultsobjectv1`, `mission_trajectory`).
-   `[TIMING: baseline captured]`
+   In rehearsal `triggers.txt` and `functions.txt` were empty (0 lines); the others were not.
+   `[TIMING: baseline captured — rehearsal 2026-09-24: 1 s]`
 4. **Stop Postgres:**
    ```bash
    $COMPOSE stop postgres
    ```
-   `[TIMING: postgres stopped]`
+   `[TIMING: postgres stopped — rehearsal 2026-09-24: < 1 s]`
 
 ## 3. Image swap, config, restore
 
@@ -285,13 +299,23 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
       postgres:
    -    image: postgres:14.5
    +    image: timescale/timescaledb-ha:pg17.11-ts2.30.1
-   +    # v2 WP1.2 settings. Do NOT override shared_preload_libraries here unless §4.1 shows
-   +    # timescaledb missing from it: a -c override replaces the image's whole list.
+   +    # v2 WP1.2 settings. Do NOT override shared_preload_libraries here: the image already
+   +    # ships 'timescaledb,pg_textsearch', and a -c override replaces the whole list.
    +    command: ["postgres",
    +              "-c", "timescaledb.telemetry_level=off",
    +              "-c", "timezone=UTC"]
-        environment:   # unchanged
-        ...
+        environment:
+          - POSTGRES_USER=${POSTGRES_DATABASE_USERNAME}                # these four unchanged
+          - POSTGRES_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
+          - POSTGRES_DB=${POSTGRES_DATABASE_NAME}
+          - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256
+   +      # timescaledb-tune runs once, at initdb, and sizes from the container's cgroup limits.
+   +      # Production has no limits, so without these it sizes from the whole shared host
+   +      # (187 GB / 24 CPUs => shared_buffers ~47 GB). Pin it to the rehearsed values.
+   +      - TS_TUNE_MEMORY=4GB
+   +      - TS_TUNE_NUM_CPUS=2
+   +      - TS_TUNE_MAX_CONNS=100        # pg14 had 100; tune would otherwise pick 50 at 4GB
+   +      - TIMESCALEDB_TELEMETRY=off    # also written to postgresql.conf + telemetry job unscheduled
         volumes:
    -      - pgdata14:/var/lib/postgresql/data
    +      - pgdata17:/home/postgres/pgdata      # PGDATA is /home/postgres/pgdata/data
@@ -309,20 +333,34 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
    ```
    The volume must be mounted at the parent `/home/postgres/pgdata`, not at `…/data`. The
    rehearsal used exactly this.
-   **Verify during rehearsal:** that `command:` with `-c` flags works with the ha image's
-   `/docker-entrypoint.sh`, and that an empty external volume gets the right ownership on first
-   boot. The rehearsal used a compose-managed volume, not an external one.
+   **Verified in the 2026-09-24 rehearsal:** `command:` with `-c` flags works with the ha image's
+   `/docker-entrypoint.sh` (the settings show `source = command line`), and an empty external
+   volume gets the right ownership on first boot (`fixing permissions on existing directory
+   /home/postgres/pgdata/data ... ok`). The `TS_TUNE_*` values were verified in a separate
+   throwaway container with **no** cgroup limit, like production: `shared_buffers=1GB`,
+   `effective_cache_size=3GB`, `max_connections=100`. Production uses ~16 client connections.
+   Before `up`, check the rendered config:
+   `$COMPOSE config | grep -A30 '^  postgres:' | grep -E 'image|TS_TUNE|TIMESCALEDB|pgdata|telemetry|timezone'`
+   (don't paste the full output anywhere: it contains the password).
+   `[TIMING: compose edit — rehearsal 2026-09-24: a prepared file was swapped in; allow ~2 min to edit by hand]`
 2. **Bring up the new Postgres:**
    ```bash
    $COMPOSE up -d postgres
    $COMPOSE ps postgres        # wait for (healthy); healthcheck is pg_isready, unchanged
-   docker logs "$PG" 2>&1 | tail -50
+   docker logs "$PG" 2>&1 | grep -E "Recommendations based on|init process complete|ready to accept"
    ```
-   `[TIMING: new postgres healthy]`
+   The first boot runs initdb, `001_timescaledb_tune.sh` and the extension scripts, then restarts
+   the server. The log must say `Recommendations based on 4.00 GB of available memory and 2 CPUs`.
+   If it names the host's full memory, `TS_TUNE_*` did not apply: stop, fix §3.1, remove and
+   re-create the **empty** `sati_pgdata17`, and `up` again (tune only runs on an empty volume).
+   `[TIMING: new postgres healthy — rehearsal 2026-09-24: 6 s after up]`
 3. **Record whether the image pre-created the extension** (this decides what §4.2 expects):
    ```bash
    psqlq -c "SELECT extname, extversion FROM pg_extension ORDER BY 1"
    ```
+   Rehearsal: `plpgsql 1.0`, `timescaledb 2.30.1`, `timescaledb_toolkit 1.26.0`. The image's
+   `000_install_timescaledb.sh` creates `timescaledb` in `postgres`, `template1` and `$POSTGRES_DB`.
+   The restore on top of that is clean.
 4. **Restore the in-window dump from §2.2, as the app role.** This makes the app role the owner of
    everything the restore creates, which resolves the pg15+ `public`-schema privilege change. The
    rehearsal confirmed this.
@@ -333,7 +371,7 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
      pg_restore --no-owner --role="$USR" -U "$USR" -d "$DB" --exit-on-error \
      /tmp/cutover-inwindow.dump
    ```
-   `[TIMING: restore complete]`
+   `[TIMING: restore complete — rehearsal 2026-09-24: < 1 s]`
 
 ## 4. Verification, then extension
 
@@ -343,24 +381,27 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
    psqlq -c "SHOW shared_preload_libraries"         # must contain timescaledb
    psqlq -c "SHOW timescaledb.telemetry_level"      # off
    psqlq -c "SHOW timezone"                         # UTC
-   psqlq -c "SHOW shared_buffers"                   # see timescaledb-tune note below
-   psqlq -c "SHOW effective_cache_size"
-   psqlq -c "SHOW max_worker_processes"
-   psqlq -c "SHOW timescaledb.max_background_workers"
+   psqlq -c "SHOW shared_buffers"                   # 1GB   (tune, from TS_TUNE_MEMORY=4GB)
+   psqlq -c "SHOW effective_cache_size"             # 3GB
+   psqlq -c "SHOW max_worker_processes"             # 21
+   psqlq -c "SHOW timescaledb.max_background_workers"   # 16
+   psqlq -c "SHOW max_connections"                  # 100  (TS_TUNE_MAX_CONNS)
    ```
-   - `shared_preload_libraries`: we could not confirm from the host how the ha image sets this
-     (its layers aren't readable without root, and we didn't want to start a container for it).
-     **Verify during rehearsal.** If `timescaledb` is missing, add
-     `"-c", "shared_preload_libraries=<existing list>,timescaledb"` to `command:`. Keep the
-     existing list.
-   - `timescaledb-tune`: **verify during rehearsal** whether the ha image runs it at initdb.
-     Look for tune output in `docker logs`, and compare `shared_buffers` against the stock
-     `128MB`. Note that staging ran under a 4 GB / 2 CPU limit, but production has no container
-     limit on a shared host. If tune runs, it sizes itself from the whole host, so the values
-     will differ from staging. Decide during rehearsal whether to cap memory/CPUs for tune, or
-     pin `shared_buffers` and friends via `-c`.
+   All passed in the 2026-09-24 rehearsal (`server_version` = `17.11 (Ubuntu 17.11-1.pgdg22.04+2)`).
+   - `shared_preload_libraries` = `timescaledb,pg_textsearch`. The ha image ships it in
+     `/usr/share/postgresql/17/postgresql.conf.sample` (line 773), and initdb copies it into
+     `$PGDATA/postgresql.conf`. It is not set by tune or by the entrypoint. Leave it alone.
+   - `timescaledb-tune` **does** run at initdb (`/docker-entrypoint-initdb.d/001_timescaledb_tune.sh`,
+     disable with `NO_TS_TUNE`). It reads the container's cgroup memory/CPU limits and, when
+     there are none, the whole host. §3.1 pins it with `TS_TUNE_*`; tune writes its values into
+     `postgresql.conf`, so they persist but can be changed later with `-c` if needed.
+   - The image's `000_install_timescaledb.sh` appends `timescaledb.telemetry_level=basic` to
+     `postgresql.conf` unless `TIMESCALEDB_TELEMETRY=off` is set. The `-c` flag wins either way
+     (it shows `source = command line`); the env var makes the file agree and unschedules the
+     telemetry job.
    - If the telemetry setting shows `unrecognized configuration parameter`, timescaledb is not
-     preloaded. Fix `shared_preload_libraries` first.
+     preloaded. Something overrode `shared_preload_libraries`; remove that override.
+   `[TIMING: settings checks — rehearsal 2026-09-24: < 1 s]`
 2. **Catalog and row-count diff. Run this *before* `CREATE EXTENSION`**, as the rehearsal did:
    ```bash
    snapshot "$CUTOVER_DIR/after-restore-pg17"
@@ -372,15 +413,22 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
    shows only a *textual* difference in `pg_get_*def` output (a deparse format change between
    14 and 17, not a semantic one), stop and have a second person confirm it's cosmetic before
    continuing. The rehearsal saw none.
-   `[TIMING: verification complete]`
+   `[TIMING: verification complete — rehearsal 2026-09-24: 1 s, CATALOG + COUNTS IDENTICAL]`
 3. **Extension.** This is idempotent, because the image may already have created it:
    ```bash
    psqlq -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
    psqlq -c "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"   # 2.30.1
    ```
-   Re-run only `counts.txt`, and confirm the `public` table set is unchanged. The extension adds
-   objects in its own schemas, plus extension-member functions in `public`. It does not touch
-   user tables.
+   The `CREATE EXTENSION` prints `NOTICE: extension "timescaledb" already exists, skipping`
+   (§3.3), which is expected. Then confirm the `public` table set and row counts are unchanged.
+   The extension adds objects in its own schemas, plus extension-member functions in `public`.
+   It does not touch user tables:
+   ```bash
+   snapshot "$CUTOVER_DIR/after-extension-pg17"
+   diff "$CUTOVER_DIR/baseline-pg14/counts.txt" "$CUTOVER_DIR/after-extension-pg17/counts.txt" \
+     && echo "COUNTS IDENTICAL"
+   ```
+   `[TIMING: extension step — rehearsal 2026-09-24: < 1 s]`
 
 If anything in §4 fails to verify: **stop. Do not start the application services. Go to §7.**
 
@@ -398,21 +446,53 @@ MinIO and MQTT all connect, and there are no tracebacks. This is the same bar as
 production verification. A live process is not enough evidence on its own; check the actual
 connection log lines. (`up -d api-delegation-service` also ensures its `depends_on` services are
 up. They are already running and unchanged, so nothing should be recreated. Check the
-`up` output for any unexpected `Recreate`.)
+`up` output for any unexpected `Recreate`. Those dependencies include `livekit-service`: fine on
+production, where it's running, but on the bridge staging stack use
+`up -d --no-deps api-delegation-service`, or compose starts a staging `livekit-service` on the host
+network next to production's.)
 
-`[TIMING: all services up]`
+What the clean-startup evidence looks like (rehearsal): planner and graph-builder log
+`Connected to ArangoDB`, `Connected to MinIO` and `Successfully connected to MQTT broker`, then
+`Application startup complete`. The API logs `Database watchers started`. `mission-dispatch` prints
+no explicit Postgres connect line; the evidence is one `Object from DB: <name>` per mission/robot
+followed by `[<robot>] Created robot` for each robot. Then check
+`docker inspect -f '{{.RestartCount}}'` is `0` for all four.
+
+`[TIMING: all services up — rehearsal 2026-09-24: 18 s (4 services, ~4 s log check each)]`
 
 ## 6. End-to-end check
 
 **On staging (rehearsal only, never against production robots):**
 1. Run the dummy robot simulator (`tests/dummy_robot/dummy_robot.py`) against the staging broker,
-   targeting a registered test robot.
+   targeting a registered test robot. Rehearsal commands (the `register_robot.sh` /
+   `send_test_mission.sh` helpers are stale: they target port 5000 and old routes):
+   ```bash
+   API=http://127.0.0.1:18000/api/v1
+   curl -s -X POST $API/robots -H 'Content-Type: application/json' -d '{"name":"stg-dummy-01"}'
+   docker build -t satinav-staging-dummy-robot:rehearsal -f tests/dummy_robot/Dockerfile .
+   docker run -d --rm --name satinav-staging-dummy-robot --network satinav-staging_staging \
+     satinav-staging-dummy-robot:rehearsal python tests/dummy_robot/dummy_robot.py \
+     --robot_name stg-dummy-01 --mqtt_host mosquitto --mqtt_port 1883 \
+     --mqtt_prefix staging/uagv/v2/RobotCompany --no_images
+   ```
+   The `--mqtt_prefix` must match staging `mission-dispatch`'s `staging/...` prefix, or the robot
+   never sees the order.
 2. Create a mission through the staging API, and confirm `PENDING -> RUNNING`. This proves
-   LISTEN/NOTIFY dispatch on the new Postgres.
+   LISTEN/NOTIFY dispatch on the new Postgres:
+   ```bash
+   curl -s -X POST $API/missions -H 'Content-Type: application/json' -d '{"name":"post-cutover-check",
+     "robot":"stg-dummy-01","mission_tree":[{"name":"root_sequence","parent":"root","sequence":{}},
+     {"name":"goto","parent":"root_sequence","route":{"waypoints":[{"x":5.0,"y":5.0,"theta":0.0,"map_id":""}]}}]}'
+   curl -s $API/missions/post-cutover-check | python3 -c "import json,sys; print(json.load(sys.stdin)['status']['state'])"
+   docker logs satinav-staging-dummy-robot 2>&1 | grep "Order accepted"
+   ```
 3. Note: the dummy robot currently runs its own patrol loop instead of following the ordered
    waypoints, so it won't reach `COMPLETED`. That's expected until the week-2 goal-following
    mode is added (see `docs/satinav-fleet-agent-phase0-v2.md`). `RUNNING` with a dispatched
-   VDA5050 order is enough evidence for this check.
+   VDA5050 order is enough evidence for this check. It also never acknowledges `cancelOrder`
+   (dispatch gives up after 20 resends) and always reports `ON_TASK` while connected, so stop the
+   dummy robot before the §1 / §2 `ON_TASK` check, and delete its missions rather than cancelling
+   them.
 
 **On production (the actual cutover, after the staging rehearsal above has passed clean):**
 1. The same WAIT-only-mission check used to verify commits A/B: create a mission whose only node
@@ -424,7 +504,7 @@ up. They are already running and unchanged, so nothing should be recreated. Chec
    safe, already-mapped waypoint, and watch it complete (`RUNNING -> COMPLETED`) before calling
    the cutover done.
 
-`[TIMING: e2e check complete]`
+`[TIMING: e2e check complete — rehearsal 2026-09-24 (staging): PENDING -> RUNNING in 0.6 s; 22 s including dummy-robot start]`
 
 ## 7. Rollback
 
@@ -436,16 +516,30 @@ prerequisite.
 
 1. Stop the Postgres-using apps, in the §2.1 order, then `$COMPOSE stop postgres`.
 2. Edit `docker_compose/mission_dispatch_services.yaml` back to the §0 state of the `postgres`
-   service. That means `image: postgres:14.5`, no `command:`, and
-   `volumes: [pgdata14:/var/lib/postgresql/data]`. The simplest way is to restore the file from
-   the commit that landed §0. Leave the top-level `pgdata17` declaration in place, or remove it;
-   either way the volume itself is **not** deleted. Keep it for forensics.
-3. `$COMPOSE up -d postgres`, and wait for healthy.
+   service. That means `image: postgres:14.5`, no `command:`, no `TS_TUNE_*`/`TIMESCALEDB_*`
+   env, and `volumes: [pgdata14:/var/lib/postgresql/data]`. The §3.1 edit is not committed
+   during the window, so the simplest way is to discard it:
+   ```bash
+   git diff --stat docker_compose/mission_dispatch_services.yaml   # must show only the §3.1 edit
+   git checkout -- docker_compose/mission_dispatch_services.yaml
+   ```
+   Don't restore from commit 8fe98d5 (the §0 commit) blindly: that also reverts any later,
+   unrelated compose changes. Dropping the §3.1 edit also drops the top-level `pgdata17`
+   declaration; the volume itself is **not** deleted. Keep it for forensics.
+3. `$COMPOSE up -d postgres`, and wait for healthy (`$COMPOSE ps postgres`).
 4. Verify it's the old data: `docker inspect "$PG" --format '{{json .Mounts}}'` shows
    `b323568f…0fa52`, `psqlq -c "SHOW server_version"` shows 14.5, and running
    `snapshot "$CUTOVER_DIR/rollback-pg14"` then
    `diff -r "$CUTOVER_DIR/baseline-pg14" "$CUTOVER_DIR/rollback-pg14"` is empty.
-5. Start the apps, in the §5 order.
+5. Start the apps, in the §5 order, with the same log checks. Then re-run the §6 check that
+   applies (WAIT-only mission on production) to confirm dispatch works on pg14 again.
+   Rehearsal 2026-09-24: mounts showed the old volume, `14.5 (Debian 14.5-2.pgdg110+2)`, the
+   snapshot diff was empty, all four apps came back with 0 restarts and no tracebacks, the
+   mission created on pg17 was gone (as expected, see 6), and a new mission went
+   `PENDING -> RUNNING` in 0.6 s.
+   `[TIMING: rollback — rehearsal 2026-09-24: 38 s wall from first stop to apps back (stop apps +
+   postgres 12 s, pg14 healthy 6 s, verify < 1 s, apps up 5 s, plus a 15 s pause); budget 5 min
+   including the compose revert and log reading]`
 6. **The one real caveat:** anything written *after* the cutover (new missions, robot state
    updates, node updates) is lost on rollback, because it only exists in `sati_pgdata17`. That's
    why the decision window is short.
@@ -459,7 +553,11 @@ error class not seen in rehearsal, or anything that doesn't match what staging s
 window closes, fix forward instead. A rollback after real production writes have landed on pg17
 means losing that data.
 
-`[TIMING: window end]`
+`[TIMING: window end — rehearsal 2026-09-24: first app stop -> all apps back 118 s wall, of which
+~80 s were deliberate investigation pauses; commands alone ~38 s (12 s stop,
+~1 s dump + baseline, 6 s new postgres, ~2 s restore + verification, 18 s start). Budget
+15 min for production: hand edit of the compose file, careful log reading, and the §6 production
+checks (which were not rehearsed and depend on the robot owner).]`
 
 ## 8. Retention of rollback artifacts
 
@@ -480,3 +578,56 @@ cleanup.
 - `packages/events` is independent. It is safe to merge any time and is unrelated to this window.
 - The mechanical test-debt backlog (`sync_db_client`, `list_bags` signature, etc.) is unrelated.
   Do it whenever there's a gap.
+
+## Rehearsal log
+
+**2026-09-24, timed rehearsal of §1–§7 on a fresh staging stack.** Project `satinav-staging`
+(bridge network, own mosquitto, `staging/` MQTT prefix, API only on `127.0.0.1:18000`). Staging
+Postgres started on `postgres:14.5` with an external named volume (mirroring §0), loaded from a
+fresh read-only `pg_dump -Fc` of production (17 missions, 3 robots, 2 maps, 1 settings), restored
+as the staging app role. The §3.1 edit was mirrored by a third `-f` override file. The rollback
+(§7) was rehearsed for real, back onto the untouched pg14 volume. The staging stack and its
+volumes were removed afterwards. Production was only read (`pg_dump`, `SELECT`).
+
+Results: every §4.1 `SHOW` passed; the §4.2 catalog + count diff was empty; `PENDING -> RUNNING`
+on pg17 and again after rollback on pg14. No step needed a retry.
+
+Changes made to this runbook:
+
+1. **§3.1: added `TS_TUNE_MEMORY=4GB`, `TS_TUNE_NUM_CPUS=2`, `TS_TUNE_MAX_CONNS=100`,
+   `TIMESCALEDB_TELEMETRY=off`.** The ha image runs `timescaledb-tune` at initdb and sizes from
+   cgroup limits, falling back to the whole host. Staging only looked sane because of its 4 GB /
+   2 CPU limit. Uncapped on this host (187 GB, 24 CPUs) a dry run gives `shared_buffers=47872MB`,
+   `effective_cache_size=143616MB`, `max_parallel_workers_per_gather=12`. Also, at 4 GB tune picks
+   `max_connections=50` versus pg14's 100, so it is pinned to 100. Verified in a limit-free
+   throwaway container. Added a §1 pre-check to agree the sizing, a §3.2 log check that tune used
+   4 GB, and the recovery if it didn't.
+2. **§4.1: answered the open questions.** `shared_preload_libraries` comes from the image's
+   `postgresql.conf.sample` (`timescaledb,pg_textsearch`), so it must not be overridden. Filled in
+   the expected values, and added `SHOW max_connections`.
+3. **§3.3: recorded that the image pre-creates `timescaledb` 2.30.1 and `timescaledb_toolkit`
+   1.26.0**, so §4.3's `CREATE EXTENSION` prints an "already exists" notice.
+4. **§4.3: "re-run only counts.txt" had no command.** Added one.
+5. **§7.2: "restore the file from the commit that landed §0" was ambiguous and would revert
+   unrelated later changes.** It now says to discard the uncommitted §3.1 edit with
+   `git checkout --`, after a `git diff --stat` check. Also added a post-rollback dispatch check
+   and the rollback timing.
+6. **§1: the `ON_TASK` check now prints `online`.** A robot that disconnects mid-order stays
+   `ON_TASK` in the DB. Also added a runnable `RUNNING`-mission one-liner in place of the bare
+   `curl`.
+7. **§5: documented the start-up evidence per service.** `mission-dispatch` has no Postgres
+   connect line. Also noted that `up -d api-delegation-service` pulls in the host-network
+   `livekit-service` dependency: harmless on production, but staging must use `--no-deps`.
+8. **§2.1: noted that `mission-dispatch` ignores SIGTERM**, so its stop always takes 10 s and
+   exits 137.
+9. **§6 staging: replaced the vague dummy-robot steps with the commands that worked.** The
+   `tests/dummy_robot/*.sh` helpers target port 5000 and are stale. Documented that the dummy
+   robot must use the `staging/` prefix, never acks `cancelOrder`, and always reports `ON_TASK`.
+10. **Shell setup: `chmod 700 "$CUTOVER_DIR"`**, since it holds data dumps and rendered configs
+    that contain credentials.
+
+Not runbook bugs, but seen in staging and worth knowing: on a fresh ArangoDB,
+`mission-planner-service` crashed once on start (`GraphCreateError 409`, racing graph-builder to
+create `topological_map`) and recovered through `restart: on-failure`. The staging API's
+`+/diagnostics` MQTT client connects to `localhost` (the staging override doesn't set its MQTT
+host), so it logs `Connection refused`. Neither applies to production.
