@@ -8,6 +8,8 @@ to test the SpatialIndexManager with real ArangoDB geo indexes.
 Tests the actual index management functionality, not mocked data.
 """
 
+import os
+
 import pytest
 from arango import ArangoClient
 from packages.topomap_dbs.graph_db.spatial_index_manager import SpatialIndexManager
@@ -25,14 +27,14 @@ def spatial_index_manager(arangodb_container):
     """
     # Connect to ArangoDB
     client = ArangoClient(hosts=f"http://{arangodb_container['host']}:{arangodb_container['port']}")
-    sys_db = client.db("_system", username="root", password="openSesame")
+    sys_db = client.db("_system", username="root", password=os.getenv("ARANGO_PASSWORD", "test"))
     
     # Create test database
     db_name = "test_spatial_index_db"
     if not sys_db.has_database(db_name):
         sys_db.create_database(db_name)
     
-    db = client.db(db_name, username="root", password="openSesame")
+    db = client.db(db_name, username="root", password=os.getenv("ARANGO_PASSWORD", "test"))
     
     # Create test collection
     collection_name = "test_nodes"
@@ -73,7 +75,7 @@ class TestSpatialIndexManagerInitialization:
     def test_initialization_with_disabled_indexes(self, arangodb_container):
         """Test initialization with indexes disabled."""
         client = ArangoClient(hosts=f"http://{arangodb_container['host']}:{arangodb_container['port']}")
-        db = client.db("_system", username="root", password="openSesame")
+        db = client.db("_system", username="root", password=os.getenv("ARANGO_PASSWORD", "test"))
         
         config = {
             "spatial": {

@@ -8,6 +8,8 @@ to test the GraphDatabaseService with both ArangoDB and R-tree spatial index.
 Tests the SERVER directly (not via REST API).
 """
 
+import os
+
 import pytest
 import math
 import time
@@ -29,7 +31,7 @@ def graph_db_server(arangodb_container):
         arango_host=arangodb_container["host"],
         arango_port=arangodb_container["port"],
         arango_username="root",
-        arango_password="openSesame",
+        arango_password=os.getenv("ARANGO_PASSWORD", "test"),
         database_name="test_topomap_db",
     )
     
@@ -55,6 +57,7 @@ class TestGraphDatabaseServerInitialization:
         server = GraphDatabaseService(
             arango_host=arangodb_container["host"],
             arango_port=arangodb_container["port"],
+            arango_password=os.getenv("ARANGO_PASSWORD", "test"),
             database_name="test_init_db"
         )
         
