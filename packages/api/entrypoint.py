@@ -23,6 +23,8 @@ import psycopg
 from psycopg.conninfo import make_conninfo
 
 logger = logging.getLogger("api.entrypoint")
+# Explicit: alembic.ini's fileConfig sets the root logger to WARNING mid-run.
+logger.setLevel(logging.INFO)
 
 ALEMBIC_INI = Path(__file__).resolve().parent / "alembic.ini"
 MIGRATION_LOCK_NAME = "migrations"
