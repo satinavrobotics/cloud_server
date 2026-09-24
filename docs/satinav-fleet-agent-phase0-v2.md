@@ -18,7 +18,7 @@
 
 | Container | Status | Phase 0 responsibility |
 |---|---|---|
-| **postgres** | image swapped | TimescaleDB image, same Postgres major version |
+| **postgres** | image swapped | TimescaleDB image `timescale/timescaledb-ha:pg17.11-ts2.30.1`. The 14 → 17 major upgrade is deliberate: we do it once, together with the dump/restore that happens anyway |
 | **mission-dispatch** | existing | `mission_runs`, mission events (transactional); from `state`/`connection`/`factsheet` it writes `robot_state_ts` and `robot_latest`, and emits robot, battery, error, heartbeat and version events |
 | **api** | existing | Runs migrations in its entrypoint; from `diagnostics` (incl. GNSS) it writes `diagnostics_ts` and emits GNSS, thermal, recovery and node events; adds endpoints for sites, runs, events and timeline; applies the fixes |
 | graph-builder, mission-planner, livekit | existing | unchanged |
@@ -332,10 +332,10 @@ The recording level is set through the existing robot and settings routes and th
 
 **WP1: TimescaleDB and Alembic (days 1–3)**
 
-1. Pin `timescale/timescaledb-ha:pg<same-major>-<exact-tag>`. It includes PostGIS, which you'll want later for geofences.
+1. Pin `timescale/timescaledb-ha:pg17.11-ts2.30.1`. This deliberately upgrades Postgres from 14.5 to 17: we do the major upgrade once, together with the dump/restore that happens anyway. The image includes PostGIS, which you'll want later for geofences.
 2. Configure it: `shared_preload_libraries='timescaledb'`, `timescaledb.telemetry_level=off`, run `timescaledb-tune`, and set the server timezone to UTC.
-3. On staging, run `pg_dumpall`, start the new image, restore, run `CREATE EXTENSION timescaledb`, and diff row counts and schema.
-4. Run the existing API, dispatch and graph-builder tests on staging.
+3. **Done on staging** (bridge-network rehearsal, commit c5dbb4d). On staging, dump, start the new image, restore, run `CREATE EXTENSION timescaledb`, and diff row counts and schema. The result: the catalog diff was empty and row counts matched. The dump is `pg_dump` of the app database, not `pg_dumpall`, because production has only the app role, which the image creates from `POSTGRES_USER`. The restore runs as the app role (`--no-owner --role=<app role>`), which resolves the pg15+ `public`-schema privilege change.
+4. **Done on staging** (same rehearsal). LISTEN/NOTIFY dispatch went `PENDING -> RUNNING`, and the test suite ran. Its 82 pre-existing failures are marked xfail in `tests/conftest.py` and are unrelated to Postgres.
 5. Add Alembic to the API package:
    - an empty baseline revision, applied with `alembic stamp`;
    - autogenerate **disabled**;
@@ -344,13 +344,18 @@ The recording level is set through the existing robot and settings routes and th
    - date-prefixed revision IDs.
 6. Write migration `…_01_phase0_core` containing all §3 tables, hypertables, compression and retention policies, continuous aggregates, the `cause_codes` seed and the `mission_runs` immutability trigger.
 7. Add the migration step to the API entrypoint under an advisory lock, and make dispatch retry its DB init until the tables exist.
-8. Migrate production in a maintenance window:
+8. Migrate production in a maintenance window. The full procedure is in `docs/satinav-fleet-agent-phase0-cutover-runbook.md`. In outline:
    - wait until no robot is `ON_TASK`;
-   - stop dispatch, then the API, then graph-builder;
+   - stop dispatch, then the API, then graph-builder, then mission-planner;
    - dump, restore and verify;
    - start the services again.
 
    Keep the old volume for 2 weeks as a rollback.
+
+   **Prerequisite:** the pre-window volume fix (runbook §0) is deployed first. It pins production's current Postgres volume as a named external volume. Without it there is nothing stable to roll back to (see the known issue below).
+   **Ordering rule:** Alembic / `phase0_core` (steps 5–7) must **not** merge before this cutover. The API entrypoint runs `alembic upgrade head`, which would fail against pg14 without TimescaleDB and keep the API from starting.
+
+> **Known issue: Postgres data resets on full restart.** The production `postgres` service declares no volume, so it only gets the image's anonymous volume. `restart_services.sh` (`down` then `up -d`) therefore starts a fresh, empty volume each time. The host has ~190 orphaned PG14 data volumes (2025-10 → 2026-09), so production has very likely been reset to an empty database on each full restart. A few of those volumes may be test leftovers. Until the runbook §0 fix lands, don't run `restart_services.sh` and don't prune volumes. The owner has to decide whether any orphaned volume holds data worth recovering.
 
 **WP2: `packages/events` (days 1–5, in parallel)**
 
