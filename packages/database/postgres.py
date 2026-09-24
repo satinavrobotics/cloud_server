@@ -241,6 +241,56 @@ class PostgresWatcher:
         pass
 
 
+class PostgresChannelWatcher:
+    """LISTENs on a plain NOTIFY channel (not an object table) and yields the payloads.
+
+    Yields None first and after every reconnect: notifications sent while not listening are
+    lost, so the consumer must resynchronise (e.g. reload) when it sees None. Reconnects on
+    any error and, like PostgresWatcher, after WATCHER_NOTIFY_TIMEOUT_S without a
+    notification. Never raises (except cancellation); runs until the consumer stops."""
+
+    def __init__(self, auth: str, channel: str,
+                 notify_timeout_s: float = WATCHER_NOTIFY_TIMEOUT_S,
+                 retry_s: float = WATCHER_POSTGRES_RECONNECT_PERIOD * 10,
+                 connect: Optional[Callable[[], Awaitable[Any]]] = None):
+        self._logger = logging.getLogger("Isaac Mission Dispatch")
+        self._auth = auth
+        self.channel = channel
+        self._notify_timeout_s = notify_timeout_s
+        self._retry_s = retry_s
+        self._connect = connect or (
+            lambda: psycopg.AsyncConnection.connect(self._auth, autocommit=True))
+
+    async def watch(self) -> AsyncGenerator[Optional[str], None]:
+        while True:
+            connection = None
+            try:
+                connection = await self._connect()
+                await connection.execute(
+                    sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+                yield None
+                notify_iter = aiter(connection.notifies())
+                while True:
+                    try:
+                        notification = await asyncio.wait_for(
+                            anext(notify_iter), timeout=self._notify_timeout_s)
+                    except (asyncio.TimeoutError, StopAsyncIteration):
+                        break
+                    yield notification.payload
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                self._logger.warning("LISTEN %s failed (%s); retrying in %ss",
+                                     self.channel, err, self._retry_s)
+                await asyncio.sleep(self._retry_s)
+            finally:
+                if connection is not None:
+                    try:
+                        await connection.close()
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+
+
 class PostgresDatabase:
     """ Stores and retrieves api objects in a postgres database """
 
@@ -547,5 +597,14 @@ class PostgresDatabase:
     async def get_watcher(self, object_class: objects.ApiObjectType,
                           publisher_id: uuid.UUID) -> PostgresWatcher:
         return PostgresWatcher(self._auth, object_class, publisher_id)
+
+    def get_channel_watcher(self, channel: str) -> PostgresChannelWatcher:
+        return PostgresChannelWatcher(self._auth, channel)
+
+    def connection(self):
+        """A pooled connection as an async context manager: one transaction that commits on
+        a clean exit and rolls back on an exception (psycopg_pool semantics). For callers
+        that need several statements in one transaction (packages/api/sites.py)."""
+        return self._pool.connection()
 
 

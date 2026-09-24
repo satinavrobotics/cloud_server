@@ -1,12 +1,18 @@
 """Recording-level changes made through the API (docs/satinav-fleet-agent-phase0-v2.md §4, WP8).
 
-The level lives in the `telemetry_recording` field of the robot spec and of the global
-settings (the site layer arrives with siteobjectv1 in WP9). The robot and settings routes:
+The level lives in the `telemetry_recording` field of the robot spec, the site spec
+(siteobjectv1, WP9) and the global settings. The robot, site and settings routes:
 
 - validate the field with `check_level()` (422 on an unknown value);
 - pass `change_hook(...)` to `create_object`/`update_spec`. It runs on the route's own
   connection after the object write and before the commit, so `TELEMETRY.RECORDING_CHANGED`
   commits together with the change it describes.
+
+Scopes: `robot` (robot_name set), `site` (robot_name NULL, site_id set; old/new_level are what
+the site's robots without their own level get) and `global` (both NULL). A site (re)assignment
+(PUT /api/v1/robots/{name}/site) that changes a robot's effective level writes a `robot`-scope
+event from `record_assignment_change()` in the assignment's transaction (discriminator
+`robot:<name>:site:<old>-><new>`); one that changes nothing effective writes none.
 
 The event is written straight to `fleet_events` (not through the telemetry queue), so the
 §4.1 level gate never applies to it: it is written even at level `off`.
@@ -85,6 +91,11 @@ async def record_change(conn: Any, scope: RecordingScope, scope_id: Optional[str
             robot_name = site_id = None
             if scope is RecordingScope.GLOBAL:
                 old_level, new_level = resolve(None, None, old), resolve(None, None, new)
+            elif scope is RecordingScope.SITE:
+                # What the site's robots without an override get: the site level, else global.
+                site_id = scope_id
+                old_level = resolve(None, old, sources.global_level)
+                new_level = resolve(None, new, sources.global_level)
             else:
                 robot_name = scope_id
                 site_id = sources.robot_sites.get(robot_name)
@@ -112,6 +123,49 @@ async def record_change(conn: Any, scope: RecordingScope, scope_id: Optional[str
     return True
 
 
+async def record_assignment_change(conn: Any, robot_name: str, old_site: Optional[str],
+                                   new_site: Optional[str], actor: Optional[str],
+                                   ts: Optional[datetime.datetime] = None) -> bool:
+    """TELEMETRY.RECORDING_CHANGED (scope robot) when moving `robot_name` from `old_site` to
+    `new_site` changes its effective level (robot -> site -> global). Nothing is written when
+    the robot has its own level or both sites resolve the same, since then nothing recorded
+    changes. Written on `conn` in a savepoint (the assignment's transaction). Never raises."""
+    if old_site == new_site:
+        return False
+    ts = ts or _utcnow()
+    try:
+        async with conn.transaction():
+            sources = await load_sources(conn, ts)
+            robot_level = sources.robot_levels.get(robot_name)
+
+            def effective(site: Optional[str]) -> RecordingLevel:
+                site_level = sources.site_levels.get(site) if site is not None else None
+                return resolve(robot_level, site_level, sources.global_level)
+
+            old_level, new_level = effective(old_site), effective(new_site)
+            if old_level == new_level:
+                return False
+            event = Event(
+                EventCode.TELEMETRY_RECORDING_CHANGED, ts, robot_name=robot_name,
+                site_id=new_site, source=Source.API,
+                discriminator=f"{RecordingScope.ROBOT.value}:{robot_name}:"
+                              f"site:{old_site or 'none'}->{new_site or 'none'}",
+                payload={"old_level": old_level.value, "new_level": new_level.value,
+                         "scope": RecordingScope.ROBOT.value, "scope_id": robot_name,
+                         "actor": actor})
+            await emit(conn, event)
+    except Exception:  # noqa: BLE001 - the assignment must commit regardless
+        stats["failed"] += 1
+        logger.exception("Could not write TELEMETRY.RECORDING_CHANGED for robot %s moving "
+                         "from site %s to %s; the assignment itself is saved",
+                         robot_name, old_site, new_site)
+        return False
+    stats["written"] += 1
+    logger.info("Recording level robot %s: effective %s -> %s (site %s -> %s, actor %s)",
+                robot_name, old_level.value, new_level.value, old_site, new_site, actor)
+    return True
+
+
 def change_hook(scope: RecordingScope, scope_id: Optional[str], actor: Optional[str] = None,
                 ) -> Callable[[Any, Optional[Mapping[str, Any]], Mapping[str, Any]],
                               Awaitable[bool]]:
@@ -126,4 +180,4 @@ def change_hook(scope: RecordingScope, scope_id: Optional[str], actor: Optional[
 
 
 __all__ = ["RecordingLevel", "RecordingScope", "change_hook", "check_level", "record_change",
-           "request_actor", "stats"]
+           "record_assignment_change", "request_actor", "stats"]

@@ -54,9 +54,10 @@ CONNECT_TIMEOUT_S = 5.0
 QUERY_TIMEOUT_S = 5.0
 WRITER_STOP_TIMEOUT_S = 3.0
 # While writing: reload the dispatch-owned robot_latest columns used as event context, and
-# mark the recording policy stale so the writer reloads it. The policy follows robot and
-# settings NOTIFYs (on_robot_object / on_settings_object, WP8); this reload is only the
-# safety net for a missed NOTIFY and for layers nothing watches yet (sites, WP9).
+# mark the recording policy stale so the writer reloads it. The policy follows the robot,
+# settings and site NOTIFYs and the assignment channel (on_robot_object, on_settings_object,
+# on_site_object, on_site_assignment; WP8/WP9); this reload is only the safety net for a
+# missed NOTIFY.
 CONTEXT_REFRESH_S = 10.0
 POLICY_REFRESH_S = 60.0
 
@@ -238,11 +239,16 @@ class WriterElection:
 # --- event context -------------------------------------------------------------------------
 
 class LatestContext:
-    """events.EventContext from the dispatch-owned robot_latest columns (refreshed every
-    CONTEXT_REFRESH_S). It returns the robot's current run/site/version, not the ones at `ts`."""
+    """events.EventContext. The run and version come from the dispatch-owned robot_latest
+    columns (refreshed every CONTEXT_REFRESH_S). The site comes from the recording policy,
+    which follows the assignment NOTIFYs (WP9), i.e. the robot's current assignment at write
+    time; robot_latest.site_id is only the fallback until the policy has loaded. All of them
+    are the robot's current values, not the ones at `ts`."""
 
-    def __init__(self, rows: Optional[Mapping[str, LatestRow]] = None):
+    def __init__(self, rows: Optional[Mapping[str, LatestRow]] = None,
+                 policy: Optional[RecordingPolicy] = None):
         self._rows: Dict[str, LatestRow] = dict(rows or {})
+        self._policy = policy
 
     def update(self, rows: Mapping[str, LatestRow]) -> None:
         self._rows = dict(rows)
@@ -252,6 +258,8 @@ class LatestContext:
         return row.active_run_id if row is not None else None
 
     def site_for(self, robot_name: str, ts: datetime.datetime) -> Optional[str]:
+        if self._policy is not None and self._policy.loaded:
+            return self._policy.site_for(robot_name)
         row = self._rows.get(robot_name)
         return row.site_id if row is not None else None
 
@@ -441,7 +449,7 @@ class ApiTelemetry:
         try:
             writer = TelemetryWriter(pool, queue, policy=policy, metrics=self.metrics,
                                      **self._writer_kwargs)
-            term = _Term(queue, writer, pool, policy, LatestContext(latest), latest,
+            term = _Term(queue, writer, pool, policy, LatestContext(latest, policy), latest,
                          self._high_c, self._ok_c)
             writer.start()
         except BaseException:
@@ -498,6 +506,35 @@ class ApiTelemetry:
         except Exception:  # noqa: BLE001
             self.handler_errors.log("Recording policy update failed for settings %s",
                                     getattr(settings, "name", "?"))
+
+    def on_site_object(self, site: Any) -> None:
+        """A site object from the site watcher: its recording level (WP9)."""
+        term = self._term
+        if term is None:
+            return
+        try:
+            term.policy.apply_site_object(site)
+        except Exception:  # noqa: BLE001
+            self.handler_errors.log("Recording policy update failed for site %s",
+                                    getattr(site, "name", "?"))
+
+    def on_site_assignment(self, payload: str) -> None:
+        """An assignment NOTIFY payload (policy.ASSIGNMENTS_CHANNEL): the robot's site from
+        now on, which also selects its site recording level (WP9)."""
+        term = self._term
+        if term is None:
+            return
+        try:
+            term.policy.apply_assignment_payload(payload)
+        except Exception:  # noqa: BLE001
+            self.handler_errors.log("Recording policy update failed for assignment %r",
+                                    payload)
+
+    def on_site_assignments_resync(self, _: Any = None) -> None:
+        """The assignment watcher (re)subscribed and may have missed changes: reload."""
+        term = self._term
+        if term is not None:
+            term.policy.invalidate()
 
     # --- MQTT handlers (event-loop thread) -----------------------------------------------
     def on_diagnostics(self, robot_name: str, robot_timestamp: Any,

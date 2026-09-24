@@ -52,6 +52,7 @@ from packages.telemetry_ingest import (
     IngestQueue, RecordingPolicy, SpillFile, TelemetryWriter, create_pool, load_latest,
 )
 from packages.telemetry_ingest import tables
+from packages.telemetry_ingest.policy import ASSIGNMENTS_CHANNEL, parse_assignment_payload
 from packages.telemetry_ingest.rehydrate import LatestRow
 
 logger = logging.getLogger("Isaac Mission Dispatch.fleet_recorder")
@@ -69,9 +70,10 @@ STATE_ROW_INTERVAL_S = 5.0
 BATTERY_LOW_PCT = 20.0
 BATTERY_OK_PCT = 25.0
 SWEEP_PERIOD_S = 1.0
-# The recording policy follows the robot and settings NOTIFYs directly (on_robot_object,
-# on_settings_object: the level is pushed, no reload). On top of that it is reloaded this
-# often as a safety net for a missed NOTIFY and for layers nothing watches yet (sites, WP9).
+# The recording policy follows the robot, settings and site NOTIFYs and the assignment channel
+# directly (on_robot_object, on_settings_object, on_site_object, on_site_assignment: the value
+# is pushed, no reload). On top of that it is reloaded this often as a safety net for a
+# missed NOTIFY.
 POLICY_REFRESH_MAX_S = 60.0
 REHYDRATE_TIMEOUT_S = 10.0
 REHYDRATE_RETRY_S = 10.0
@@ -569,6 +571,25 @@ class FleetRecorder:
         self.policy.apply_settings_object(settings)
 
     @_guarded
+    def on_site_object(self, site: Any) -> None:
+        """A site object from the watcher: that site's recording level (WP9)."""
+        self.policy.apply_site_object(site)
+
+    @_guarded
+    def on_site_assignment(self, payload: str) -> None:
+        """An assignment NOTIFY payload (policy.ASSIGNMENTS_CHANNEL): the robot's site from
+        now on. Runs, events and robot_latest written after this carry the new site; a run
+        already in progress keeps the site it started with."""
+        if self.policy.apply_assignment_payload(payload):
+            robot_name, _ = parse_assignment_payload(payload)
+            self._latest_changed(robot_name)
+
+    @_guarded
+    def on_site_assignments_resync(self, _: Any = None) -> None:
+        """The assignment watcher (re)subscribed and may have missed changes: reload."""
+        self.policy.invalidate()
+
+    @_guarded
     def on_state(self, robot_name: str, message: Any, robot_object: Any = None,
                  received_at: Optional[datetime.datetime] = None) -> None:
         """A VDA5050 state message, after the dispatcher has processed it."""
@@ -693,7 +714,8 @@ class FleetRecorder:
         if track.sw.value is not None:
             fields.setdefault("sw_version", track.sw.value)
         site = self.policy.site_for(track.robot_name)
-        if site is not None:
+        if site is not None or self.policy.loaded:
+            # Once the policy has loaded, None means "unassigned" and clears a stale value.
             fields.setdefault("site_id", site)
         self.queue.put_latest(track.robot_name, state_msg=state_msg, **fields)
 
