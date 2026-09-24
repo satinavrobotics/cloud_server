@@ -449,7 +449,7 @@ The recording level is set through the existing robot and settings routes and th
 
 ### Week 3 — API surface, fixes, verification
 
-**WP9: Sites (day 1)**
+**WP9: Sites (day 1)** — **Done, in production since 2026-09-24 22:34** (merged a1d5f2d; rollback images `:pre-wp9`). Verified live with a throwaway `test-site` (created, assigned, recording switched to `full` via the site, delete refused while assigned, unassigned, deleted); one closed assignment row for formidable-peacock remains as history.
 
 - CRUD routes and the assign route (close the previous range and open a new one in one transaction).
 - Site resolution in the events `EventContext` and in run start.
