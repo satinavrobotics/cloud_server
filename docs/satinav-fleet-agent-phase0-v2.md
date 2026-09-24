@@ -431,7 +431,7 @@ The recording level is set through the existing robot and settings routes and th
 3. `nav_supervisor` handler: recovery and blocked-goal events only.
 4. Integration test with 2 API workers: exactly one writes, and when it's killed the other takes over.
 
-**WP8: Recording policy (day 5)**
+**WP8: Recording policy (day 5)** — **Done, in production since 2026-09-24 21:51** (merged b584514; rollback images `:pre-wp8`). Robot and global levels only; site levels wait for WP9 (site spec field, `siteobjectv1` watcher → `policy.set_site_level`, assignments → `set_robot_site`). `RECORDING_CHANGED` is written in the same transaction as the object change; `actor` is null until F4/F5. Level changes apply via NOTIFY within ~0.1–0.4 s (60 s reload as safety net). Also: mission-dispatch now writes only the robot-spec keys it owns (`update_spec_fields`: datum, needs_order_cancel), so it can no longer revert an operator's change from its cached copy. Verified live: formidable-peacock → `full` wrote `robot_state_ts` rows and survived datum messages; reset to inherit stopped them; invalid value → 422.
 
 1. Add the `telemetry_recording` field to settings (F2 model), robot spec and site spec.
 2. Emit `TELEMETRY.RECORDING_CHANGED` on every change.
