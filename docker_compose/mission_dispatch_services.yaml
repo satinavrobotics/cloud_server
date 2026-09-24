@@ -39,6 +39,8 @@ services:
       - POSTGRES_DB=${POSTGRES_DATABASE_NAME}
       - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256
     network_mode: "host"
+    volumes:
+      - pgdata14:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_DATABASE_USERNAME}"]
       interval: 5s
@@ -314,3 +316,9 @@ services:
 
 volumes:
   arango_data:
+  pgdata14:
+    # Production PG14 data. This was the container's anonymous volume, pinned by name so that
+    # `down`/`up` reattaches it instead of creating a fresh, empty one. external: compose never
+    # creates or deletes it, not even with `down -v`.
+    external: true
+    name: b323568ff9d35df1ea2dfd6916624635ca53953379106159029ca3dd0830fa52
