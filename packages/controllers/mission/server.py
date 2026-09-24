@@ -335,8 +335,11 @@ class Robot:
         if not message.needs_order_cancel:
             return
         message.needs_order_cancel = False
-        await self._database.update_spec(
-            api_objects.RobotObjectV1, message.name, message.spec, uuid.uuid4())
+        # Only this key: writing the cached full spec back could revert a spec change
+        # another service committed meanwhile (e.g. telemetry_recording).
+        await self._database.update_spec_fields(
+            api_objects.RobotObjectV1, message.name, {"needs_order_cancel": False},
+            uuid.uuid4())
         if self._has_outstanding_cancel():
             self.info("Force-cancel requested, but a cancelOrder is already "
                       "outstanding; not sending another")
@@ -786,8 +789,11 @@ class Robot:
         self._robot_object.datum.latitude = msg.latitude
         self._robot_object.datum.longitude = msg.longitude
         self._robot_object.datum.bearing_deg = msg.bearing_deg
-        await self._database.update_spec(
-            api_objects.RobotObjectV1, self._name, self._robot_object.spec, uuid.uuid4()
+        # Only the datum (robots send it every few seconds): writing the cached full spec
+        # back would revert any spec change committed since the cache was filled.
+        await self._database.update_spec_fields(
+            api_objects.RobotObjectV1, self._name,
+            {"datum": json.loads(self._robot_object.datum.json())}, uuid.uuid4()
         )
         current_map = self._robot_object.current_map
         if current_map:

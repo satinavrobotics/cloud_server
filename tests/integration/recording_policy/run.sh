@@ -30,7 +30,7 @@ cleanup() {
   if [ $status -ne 0 ]; then
     echo "--- dispatcher log (tail) ---"; docker logs --tail 60 "$ID-dispatch" 2>&1 || true
   fi
-  docker rm -f "$ID-db" "$ID-mqtt" "$ID-dispatch" "$ID-alembic" "$ID-init" "$ID-scenario" \
+  docker rm -f "$ID-db" "$ID-mqtt" "$ID-dispatch" "$ID-alembic" "$ID-init" "$ID-partial" "$ID-scenario" \
     >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
@@ -77,6 +77,9 @@ run_py "$DISPATCH_IMAGE" alembic alembic -c packages/api/alembic.ini upgrade hea
 
 step "init: object tables and the robot (no level set anywhere)"
 run_py "$API_IMAGE" init python tests/integration/recording_policy/checks.py init
+
+step "partial robot-spec updates (dispatch datum / flag clear) on real Postgres"
+run_py "$DISPATCH_IMAGE" partial python tests/integration/recording_policy/checks.py partial
 
 step "start mission-dispatch"
 docker run -d --name "$ID-dispatch" --network "$NET" "${PY_LIMITS[@]}" -v "$REPO":/src:ro \

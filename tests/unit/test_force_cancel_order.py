@@ -26,6 +26,7 @@ def _make_robot():
     db = AsyncMock(spec=PostgresDatabase)
     db.update_status = AsyncMock()
     db.update_spec = AsyncMock()
+    db.update_spec_fields = AsyncMock()
     client = MagicMock()
     server = MagicMock()
     server.disable_request_factsheet = True
@@ -73,7 +74,8 @@ async def test_needs_order_cancel_is_cleared_after_sending():
     await r._on_robot_change(update)
 
     assert r._robot_object.needs_order_cancel is False
-    db.update_spec.assert_awaited_once()
+    db.update_spec_fields.assert_awaited_once()
+    db.update_spec.assert_not_awaited()  # never the whole cached spec
 
 
 @pytest.mark.unit
@@ -123,8 +125,8 @@ async def test_cleared_spec_is_what_gets_persisted_and_cancel_is_tracked():
 
     await r._on_robot_change(_cancel_request())
 
-    persisted_spec = db.update_spec.await_args.args[2]
-    assert persisted_spec.needs_order_cancel is False
+    persisted_fields = db.update_spec_fields.await_args.args[2]
+    assert persisted_fields == {"needs_order_cancel": False}
     assert r._has_outstanding_cancel()
 
 
@@ -146,4 +148,5 @@ async def test_request_already_pending_when_the_robot_is_first_seen_still_fires(
     assert r._send_instant_action.await_args.args[0].actionType == \
         types.VDA5050InstantActionType.CANCEL_ORDER
     assert r._robot_object.needs_order_cancel is False
-    db.update_spec.assert_awaited_once()
+    db.update_spec_fields.assert_awaited_once()
+    db.update_spec.assert_not_awaited()  # never the whole cached spec

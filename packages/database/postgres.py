@@ -452,6 +452,33 @@ class PostgresDatabase:
             traceback.print_exc()
             raise
 
+    async def update_spec_fields(self, object_class: objects.ApiObjectType, name: str,
+                                 fields: Dict[str, Any], publisher_id: uuid.UUID):
+        """Set only the given top-level spec keys, leaving every other key as stored.
+
+        For writers that hold a cached copy of the object (mission-dispatch): writing their
+        whole cached spec back with update_spec() would revert any change another service
+        committed since the cache was filled (e.g. an operator's PUT of telemetry_recording
+        just before a datum message). One statement (`spec || patch`), so it is atomic and
+        takes the same row lock as update_spec; NOTIFY and 404 behave like update_spec.
+        `fields` must be JSON-serialisable (use json.loads(model.json()) for sub-models)."""
+        if not fields:
+            return
+        unknown = set(fields) - set(object_class.get_spec_class().__fields__)
+        if unknown:
+            raise ValueError(f"unknown {object_class.get_alias()} spec fields: {sorted(unknown)}")
+        try:
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    query = f"UPDATE {object_class.table_name()} " \
+                            "SET spec = spec || %s::jsonb WHERE name = %s RETURNING *;"
+                    await cursor.execute(query, [json.dumps(fields), name])
+                    await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+        except Exception as err:
+            self._logger.error("Database error: %s", err)
+            traceback.print_exc()
+            raise
+
     async def _run_hook(self, hook: SpecHook, conn: Any, old_spec: Optional[Dict[str, Any]],
                         new_spec_json: str) -> None:
         """Run a before-commit hook; its failure is logged and never fails the write."""

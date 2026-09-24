@@ -2,6 +2,8 @@
 container on the test's private network).
 
     checks.py init        object tables and the robot (no level anywhere: events_only)
+    checks.py partial     PostgresDatabase.update_spec_fields on real Postgres (dispatch's
+                          datum handler with a stale cached robot)
     checks.py scenario    switch levels through the real routes while mission-dispatch (its
                           own container) and an in-process API writer record; check what each
                           level writes, RECORDING_CHANGED (same transaction as the change), and
@@ -71,6 +73,80 @@ async def init():
     await db.async_init()
     await db.create_object(api_objects.RobotObjectV1(name=ROBOT, status={}), uuid.uuid4())
     print("init done")
+
+
+async def partial():
+    """update_spec_fields on real Postgres: only the given keys change, the rest (including a
+    level committed after dispatch cached the robot) survive, and the NOTIFY the watchers
+    rely on still fires. Uses dispatch's real datum handler with a stale cached robot."""
+    from unittest.mock import MagicMock
+    import packages.controllers.mission.vda5050_types as vtypes
+    from packages.controllers.mission.server import Robot
+
+    name = "partial_bot"
+    db = database()
+    await db.async_init()
+    listener = await psycopg.AsyncConnection.connect(conninfo(), autocommit=True)
+    await listener.execute("LISTEN robotobjectv1")
+
+    async def notifications(timeout=3.0):
+        got = []
+        gen = listener.notifies()
+        try:
+            while True:
+                n = await asyncio.wait_for(gen.__anext__(), timeout)
+                got.append(n.payload)
+                timeout = 0.5
+        except (asyncio.TimeoutError, StopAsyncIteration):
+            pass
+        return got
+
+    cached = api_objects.RobotObjectV1(name=name, status={}, labels=["a"])
+    await db.create_object(cached, uuid.uuid4())
+    await notifications()
+    # another service changes the spec after dispatch cached the robot
+    fresh = await db.get_object(api_objects.RobotObjectV1, name)
+    fresh.telemetry_recording = "full"
+    fresh.labels = ["ops"]
+    fresh.needs_order_cancel = True
+    await db.update_spec(api_objects.RobotObjectV1, name, fresh.spec, uuid.uuid4())
+    await notifications()
+
+    server = MagicMock()
+    server.disable_request_factsheet = True
+    server.push_telemetry = False
+    server.mission_ctrl_url = None
+    robot = Robot(name, db, MagicMock(), "prefix", server)
+    robot._robot_object = cached                      # stale: no level, labels ["a"]
+    await robot._process_datum_message(vtypes.RobotDatum(latitude=47.5, longitude=19.1,
+                                                         bearing_deg=3.0))
+    got = await notifications()
+    check(len(got) == 1 and got[0].split(" ")[1:] == [name, "ALIVE"],
+          f"datum write fired the robot NOTIFY: {got}")
+    spec = query("SELECT spec FROM robotobjectv1 WHERE name = %s", (name,))[0][0]
+    check(spec["telemetry_recording"] == "full" and spec["labels"] == ["ops"]
+          and spec["needs_order_cancel"] is True,
+          "datum write kept the newer keys (telemetry_recording, labels, flag)")
+    check(spec["datum"] == {"latitude": 47.5, "longitude": 19.1, "bearing_deg": 3.0},
+          "datum written")
+    await db.update_spec_fields(api_objects.RobotObjectV1, name,
+                                {"needs_order_cancel": False}, uuid.uuid4())
+    got = await notifications()
+    spec2 = query("SELECT spec FROM robotobjectv1 WHERE name = %s", (name,))[0][0]
+    check(len(got) == 1 and spec2 == {**spec, "needs_order_cancel": False},
+          "flag clear touched only needs_order_cancel and fired the NOTIFY")
+    loaded = await db.get_object(api_objects.RobotObjectV1, name)
+    check(loaded.telemetry_recording == "full", "object still loads")
+    try:
+        await db.update_spec_fields(api_objects.RobotObjectV1, "nobody", {"labels": []},
+                                    uuid.uuid4())
+        raise AssertionError("missing robot accepted")
+    except Exception as exc:  # fastapi.HTTPException(404)
+        check(getattr(exc, "status_code", None) == 404, "missing robot -> 404 like update_spec")
+    await db.set_lifecycle(api_objects.RobotObjectV1, name,
+                           api_objects.ObjectLifecycleV1.DELETED, uuid.uuid4())
+    await listener.close()
+    print("partial done")
 
 
 # --- synthetic sources ---------------------------------------------------------------------
@@ -364,6 +440,8 @@ def main_(argv):
     step = argv[1]
     if step == "init":
         asyncio.run(init())
+    elif step == "partial":
+        asyncio.run(partial())
     elif step == "scenario":
         asyncio.run(scenario())
     else:
