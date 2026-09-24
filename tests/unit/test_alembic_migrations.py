@@ -51,3 +51,29 @@ def test_migrations_are_raw_sql(script):
         assert "sqlalchemy" not in src, rev.path
         assert not re.search(r"op\.(create|drop|add|alter)_", src), rev.path
 
+
+def _load_revision(script, rev_id):
+    import importlib.util
+    path = script.get_revision(rev_id).path
+    spec = importlib.util.spec_from_file_location(rev_id, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_phase0_core_constants(script):
+    from cloud_common.objects.mission import MissionStateV1
+    from packages.database.postgres import DB_INIT_LOCK_KEY
+    core = _load_revision(script, "20260924_01_phase0_core")
+    # Serializes with initialize_database's mission_trajectory CREATE.
+    assert core.DB_INIT_LOCK_KEY == DB_INIT_LOCK_KEY
+    # Decided 2026-09-24: COMPLETED (MissionStateV1), not v2's SUCCEEDED.
+    assert "COMPLETED" in core.RUN_TERMINAL_STATES and "SUCCEEDED" not in core.RUN_STATES
+    assert core.RUN_ACTIVE_STATE == MissionStateV1.RUNNING.value
+    codes = [row[0] for row in core.CAUSE_CODES]
+    assert len(codes) == len(set(codes)) == 20
+    assert "UNKNOWN" in codes
+    for code, category, _title, _desc in core.CAUSE_CODES:
+        assert category == code.split(".", 1)[0]
+    assert core.EVENT_SEVERITIES == ("info", "warning", "error", "critical")
+    assert core.EVENT_SOURCES == ("dispatch", "api")
