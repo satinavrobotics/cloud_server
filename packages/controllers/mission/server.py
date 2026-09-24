@@ -58,6 +58,11 @@ TelemetrySender = getattr(module, "TelemetrySender")
 
 # How long to wait in seconds before trying to reconnect to the mqtt broker
 MQTT_RECONNECT_PERIOD = 0.5
+
+# Phase 0 tables dispatch will write (v2 §5.3). They come from the API's Alembic migration
+# (20260924_01_phase0_core), so on startup dispatch waits until they exist.
+DISPATCH_REQUIRED_TABLES = ("mission_runs", "fleet_events", "robot_state_ts", "robot_latest")
+
 # How long to wait in seconds before trying to reconnect to the mission database
 DATABASE_RECONNECT_PERIOD = 0.5
 
@@ -1924,7 +1929,8 @@ class RobotServer:
             user=postgres_user,
             password=postgres_password,
             host=postgres_host,
-            port=postgres_port
+            port=postgres_port,
+            required_tables=DISPATCH_REQUIRED_TABLES,
         )
 
         # Create queues to propogate changes to the main thread

@@ -21,7 +21,7 @@ import datetime
 import logging
 import sys
 import time
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, Sequence
 import uuid
 import enum
 import asyncio
@@ -41,6 +41,8 @@ from cloud_common.objects.mission import MissionObjectV1
 # How long to wait in seconds before trying to reconnect to the Postgres database
 POSTGRES_RECONNECT_PERIOD = 0.5
 WATCHER_POSTGRES_RECONNECT_PERIOD = 0.1
+# How long to wait before re-checking for tables that another service's migrations create
+REQUIRED_TABLES_RETRY_PERIOD = 5
 
 # How long PostgresWatcher.watch() will wait for a NOTIFY before treating the LISTEN
 # channel as silently stalled. Observed in practice: Postgres can stop delivering
@@ -233,12 +235,16 @@ class PostgresWatcher:
 class PostgresDatabase:
     """ Stores and retrieves api objects in a postgres database """
 
-    def __init__(self, dbname: str, user: str, password: str, host: str, port: int, max_retries: Optional[int] = None):
+    def __init__(self, dbname: str, user: str, password: str, host: str, port: int, max_retries: Optional[int] = None,
+                 required_tables: Sequence[str] = ()):
+        """required_tables: tables this service needs but does not create itself (they come
+        from the API's Alembic migrations). async_init() waits until they all exist."""
         self._logger = logging.getLogger("Isaac Mission Database")
         self._auth = f"dbname={dbname} user={user} host={host} password={password} port={port}"
         self._host = host
         self._pool: Optional[AsyncConnectionPool] = None
         self._max_retries = max_retries
+        self._required_tables = list(required_tables)
 
     def is_running(self) -> bool:
         return self._pool is not None and not self._pool.closed
@@ -254,6 +260,7 @@ class PostgresDatabase:
                 await pool.open(wait=True)
                 async with pool.connection() as conn:
                     await initialize_database(conn)
+                await self._wait_for_required_tables(pool)
                 self._pool = pool
                 return
             except (psycopg.OperationalError, psycopg.errors.UniqueViolation):
@@ -269,6 +276,20 @@ class PostgresDatabase:
                 self._logger.warning(
                     "Could not connect to Postgres, retry in %ss", POSTGRES_RECONNECT_PERIOD)
                 await asyncio.sleep(POSTGRES_RECONNECT_PERIOD)
+
+    async def _wait_for_required_tables(self, pool: AsyncConnectionPool):
+        while self._required_tables:
+            async with pool.connection() as conn:
+                cursor = await conn.execute(
+                    "SELECT t FROM unnest(%s::text[]) AS t WHERE to_regclass(t) IS NULL",
+                    (self._required_tables,))
+                missing = [row[0] for row in await cursor.fetchall()]
+            if not missing:
+                return
+            self._logger.warning(
+                "Waiting for tables %s (created by the API's migrations), retry in %ss",
+                ", ".join(missing), REQUIRED_TABLES_RETRY_PERIOD)
+            await asyncio.sleep(REQUIRED_TABLES_RETRY_PERIOD)
 
     async def _notify(self, cursor, table_name: str, name: str,
                       lifecycle: str, publisher_id: uuid.UUID):
