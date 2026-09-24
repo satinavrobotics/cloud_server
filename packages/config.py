@@ -96,6 +96,21 @@ MQTT_IMAGE_TOPIC = os.getenv("MQTT_IMAGE_TOPIC", "robot/image_upload")
 # orchestrator subscribes to the same robot state stream (`{prefix}/+/state`).
 MQTT_VDA5050_PREFIX = os.getenv("MQTT_VDA5050_PREFIX", "uagv/v2/RobotCompany")
 
+# ==================== Phase 0 telemetry ingest (API) ====================
+# docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).
+# Kill switch: "false" leaves the API exactly as before (in-memory caches only).
+TELEMETRY_INGEST_ENABLED = os.getenv("TELEMETRY_INGEST_ENABLED", "true").lower() in ("true", "1", "yes")
+# Directory of the per-worker event spill files (api-<pid>.jsonl). Mount a volume here to keep
+# spilled events across container restarts; the default is lost with the container.
+TELEMETRY_SPILL_DIR = os.getenv("TELEMETRY_SPILL_DIR", "/tmp/satinav_telemetry_spill")
+# How often a non-writer worker retries pg_try_advisory_lock('telemetry_writer'), and how often
+# the writer re-checks its lock connection (seconds).
+TELEMETRY_ELECTION_RETRY_S = float(os.getenv("TELEMETRY_ELECTION_RETRY_S", "5.0"))
+TELEMETRY_ELECTION_CHECK_S = float(os.getenv("TELEMETRY_ELECTION_CHECK_S", "2.0"))
+# SYSTEM.THERMAL_HIGH / THERMAL_OK hysteresis (°C, max of the jtop cpu/gpu/soc temperatures).
+THERMAL_HIGH_C = float(os.getenv("THERMAL_HIGH_C", "85.0"))
+THERMAL_OK_C = float(os.getenv("THERMAL_OK_C", "78.0"))
+
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
 GPS_MAP_SENTINEL = 'GEO'    # map_id sentinel for GPS-mode robots with no assigned map

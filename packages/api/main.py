@@ -309,6 +309,7 @@ async def lifespan(app: FastAPI):
 
     if service:
         service.stop_watchers()
+        await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
 

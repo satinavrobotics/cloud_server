@@ -4,8 +4,9 @@ Subscribes directly to `<robot_name>/diagnostics` MQTT messages (JSON mirror of 
 ROS DiagnosticArray covering jtop/host_stats/ros_health/topic_availability/
 topic_listing collectors), keeps an in-memory latest-value cache per robot, and rebroadcasts
 to WebSocket clients
-already connected to `/ws/robot/{robot_name}` (bucket "robot_status"). Cache-only:
-this is live telemetry, not persisted to Postgres.
+already connected to `/ws/robot/{robot_name}` (bucket "robot_status"). The cache itself is
+in-memory only; Phase 0 persistence (diagnostics_ts, robot_latest, fleet_events) is done by
+`self.telemetry` (packages/api/telemetry.py), and only in the elected writer worker.
 
 Also covers three more topics published by the same robot-side diagnostics_reporter
 node, on the same MQTT client and cache/broadcast pattern: `<robot_name>/nav2_bt_tree`
@@ -62,6 +63,10 @@ class DiagnosticsService:
         self._bt_tree_cache: Dict[str, Dict[str, Any]] = {}
         self._bt_state_cache: Dict[str, Dict[str, Any]] = {}
         self._nav_supervisor_cache: Dict[str, Dict[str, Any]] = {}
+        # Phase 0 ingest (packages/api/telemetry.ApiTelemetry), set by ApiDelegationService.
+        # Fed before the first await of each handler, so messages reach its detectors in arrival
+        # order; synchronous and exception-proof. Only the elected writer worker writes.
+        self.telemetry: Optional[Any] = None
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._event_loop = loop
@@ -231,6 +236,7 @@ class DiagnosticsService:
             "robot_timestamp": robot_timestamp,
             "diagnostics": diagnostics,
         }
+        self._feed_telemetry("on_diagnostics", robot_name, robot_timestamp, diagnostics)
         await self._cache_and_broadcast(self._cache, robot_name, envelope, "diagnostics")
 
     async def _handle_bt_tree(self, robot_name: str, trees: Optional[Dict[str, Any]]):
@@ -260,6 +266,17 @@ class DiagnosticsService:
             "robot_stamp": (supervisor or {}).get("stamp"),
             "supervisor": supervisor,
         }
+        self._feed_telemetry("on_nav_supervisor", robot_name, supervisor)
         await self._cache_and_broadcast(
             self._nav_supervisor_cache, robot_name, envelope, "nav supervisor"
         )
+
+    def _feed_telemetry(self, method: str, *args):
+        """Hand a message to the Phase 0 ingest. Runs on the event loop; never raises, so the
+        cache and broadcast above behave exactly as without it."""
+        if self.telemetry is None:
+            return
+        try:
+            getattr(self.telemetry, method)(*args)
+        except Exception as e:
+            self.logger.error(f"[Diagnostics] Telemetry ingest {method} failed: {e}")

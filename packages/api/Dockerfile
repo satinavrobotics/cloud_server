@@ -37,6 +37,10 @@ COPY packages/database/__init__.py /app/packages/database/
 # Copy utils
 COPY packages/utils/ /app/packages/utils/
 
+# Phase 0 libraries (fleet events + telemetry ingest, used by packages/api/telemetry.py)
+COPY packages/events/ /app/packages/events/
+COPY packages/telemetry_ingest/ /app/packages/telemetry_ingest/
+
 # Copy config
 COPY packages/config.py /app/packages/config.py
 
