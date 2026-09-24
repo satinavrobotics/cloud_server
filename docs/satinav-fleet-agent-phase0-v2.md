@@ -404,7 +404,7 @@ The recording level is set through the existing robot and settings routes and th
 
 ### Week 2 — Ingest inside existing services
 
-**WP5: `packages/telemetry_ingest` (days 1–2)**
+**WP5: `packages/telemetry_ingest` (days 1–2)** — **Done** (merged e3b728b; refresh backoff 6ba0ee4).
 
 1. Queue, writer (COPY, events upsert, separate pool, catch-all), spill file and replay-on-flush.
 2. Policy resolver with the NOTIFY-refreshed cache.
@@ -412,7 +412,7 @@ The recording level is set through the existing robot and settings routes and th
 4. Metrics.
 5. Unit tests with a fake clock and a fake database; one test kills the writer mid-batch and checks that events are not lost.
 
-**WP6: Dispatch integration (days 2–4)**
+**WP6: Dispatch integration (days 2–4)** — **Done, in production since 2026-09-24 21:00** (merged 5433b3a; `mission-dispatch:pre-wp6` is the rollback image; kill switch `DISABLE_FLEET_RECORDING=1`). As built: run rows are written by an ordered background worker on the telemetry pool, never in the mission-object transaction; `mission_trajectory.run_id` is back-filled at run finish (graph-builder owns that table); orphan reconciliation leaves runs the dispatcher will resume alone. Also fixed a pre-existing hot loop in `Robot.run` that made 8 dispatcher test files spin unbounded.
 
 1. Transactional `mission_runs` insert and finish with their events.
 2. Node, reroute and blocked events.
@@ -422,9 +422,9 @@ The recording level is set through the existing robot and settings routes and th
 6. Orphan reconciliation.
 7. Integration test: replay a recording (or a synthetic sequence) twice and check that the event set is identical; restart dispatch mid-stream and check there are no spurious events.
 
-**Dummy robot needs a goal-following mode.** `tests/dummy_robot/dummy_robot.py` currently free-runs its own circular patrol regardless of the VDA5050 order it receives — it never reports reaching an ordered waypoint or finishing an order. `MISSION.RUN_FINISHED` (item 1 above) and orphan reconciliation (item 6) both need a robot that actually completes an order to test the success path, not just the timeout/failure paths. Add a mode where it follows the ordered waypoints and reports FINISHED when done, before relying on it for WP6's integration tests.
+**Dummy robot needs a goal-following mode.** — **Done** (merged f06b6c9: `--mode goal` / `DUMMY_ROBOT_MODE=goal`). `tests/dummy_robot/dummy_robot.py` currently free-runs its own circular patrol regardless of the VDA5050 order it receives — it never reports reaching an ordered waypoint or finishing an order. `MISSION.RUN_FINISHED` (item 1 above) and orphan reconciliation (item 6) both need a robot that actually completes an order to test the success path, not just the timeout/failure paths. Add a mode where it follows the ordered waypoints and reports FINISHED when done, before relying on it for WP6's integration tests.
 
-**WP7: API integration (days 3–5)**
+**WP7: API integration (days 3–5)** — **Done, in production since 2026-09-24 21:00** (merged 7f1b573; `api_delegation_service:pre-wp6` rollback; kill switch `TELEMETRY_INGEST_ENABLED=false`). GNSS detection deferred (columns stay NULL). Production runs 1 uvicorn worker, which always holds the writer lock. "Node down" = stale ros_health source or missing monitored topic; `NAV.GOAL_BLOCKED` cause = `last_drive_cause`.
 
 1. The advisory-lock writer election.
 2. `diagnostics` handler: `diagnostics_ts` with GNSS columns, GNSS/thermal/node detectors, `robot_latest`.
