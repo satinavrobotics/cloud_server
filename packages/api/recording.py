@@ -45,6 +45,29 @@ def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+# --- event discriminators -----------------------------------------------------------------
+# The discriminator is part of the deterministic event_id (packages/events/ids.py), so these
+# formats are stored data: never change them. The configured values (not the effective levels
+# in the payload) are only recoverable from event_id, which packages/api/fleet_reads.py does
+# to rebuild a robot's level history.
+UNSET = "unset"
+NO_SITE = "none"
+
+
+def change_discriminator(scope: RecordingScope, scope_id: Optional[str],
+                         old: Optional[RecordingLevel], new: Optional[RecordingLevel]) -> str:
+    """A configured-value change at `scope` (None = unset)."""
+    return (f"{scope.value}:{scope_id or ''}:"
+            f"{old.value if old else UNSET}->{new.value if new else UNSET}")
+
+
+def assignment_discriminator(robot_name: str, old_site: Optional[str],
+                             new_site: Optional[str]) -> str:
+    """A site (re)assignment that changed the robot's effective level."""
+    return (f"{RecordingScope.ROBOT.value}:{robot_name}:"
+            f"site:{old_site or NO_SITE}->{new_site or NO_SITE}")
+
+
 def check_level(data: Mapping[str, Any]) -> None:
     """Raise 422 if `data` sets `telemetry_recording` to anything but a level or None.
 
@@ -105,8 +128,7 @@ async def record_change(conn: Any, scope: RecordingScope, scope_id: Optional[str
             event = Event(
                 EventCode.TELEMETRY_RECORDING_CHANGED, ts, robot_name=robot_name,
                 site_id=site_id, source=Source.API,
-                discriminator=f"{scope.value}:{scope_id or ''}:"
-                              f"{old.value if old else 'unset'}->{new.value if new else 'unset'}",
+                discriminator=change_discriminator(scope, scope_id, old, new),
                 payload={"old_level": old_level.value, "new_level": new_level.value,
                          "scope": scope.value, "scope_id": scope_id, "actor": actor})
             await emit(conn, event)
@@ -148,8 +170,7 @@ async def record_assignment_change(conn: Any, robot_name: str, old_site: Optiona
             event = Event(
                 EventCode.TELEMETRY_RECORDING_CHANGED, ts, robot_name=robot_name,
                 site_id=new_site, source=Source.API,
-                discriminator=f"{RecordingScope.ROBOT.value}:{robot_name}:"
-                              f"site:{old_site or 'none'}->{new_site or 'none'}",
+                discriminator=assignment_discriminator(robot_name, old_site, new_site),
                 payload={"old_level": old_level.value, "new_level": new_level.value,
                          "scope": RecordingScope.ROBOT.value, "scope_id": robot_name,
                          "actor": actor})
@@ -179,5 +200,6 @@ def change_hook(scope: RecordingScope, scope_id: Optional[str], actor: Optional[
     return hook
 
 
-__all__ = ["RecordingLevel", "RecordingScope", "change_hook", "check_level", "record_change",
+__all__ = ["RecordingLevel", "RecordingScope", "assignment_discriminator", "change_discriminator",
+           "change_hook", "check_level", "record_change",
            "record_assignment_change", "request_actor", "stats"]
