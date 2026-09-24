@@ -21,6 +21,10 @@ COPY packages/controllers/ /app/packages/controllers/
 # Copy utils package
 COPY packages/utils/ /app/packages/utils/
 
+# Phase 0 recording libraries (fleet events, telemetry ingest)
+COPY packages/events/ /app/packages/events/
+COPY packages/telemetry_ingest/ /app/packages/telemetry_ingest/
+
 # Create __init__.py files for packages
 RUN touch /app/packages/__init__.py
 

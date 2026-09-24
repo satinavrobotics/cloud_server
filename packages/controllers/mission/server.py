@@ -35,6 +35,7 @@ import pydantic
 
 from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import behavior_tree
+from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
@@ -104,6 +105,11 @@ class ClientFactsheetMessage(ClientMessage):
 class ClientDatumMessage(ClientMessage):
     name: str
     payload: types.RobotDatum
+
+
+class ClientConnectionMessage(ClientMessage):
+    name: str
+    payload: types.VDA5050Connection
 
 
 def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str, str]:
@@ -200,6 +206,9 @@ class Robot:
         self._updating_mission_from_api: bool = False
         self._charging_mission_received: bool = False
         self.last_node_seq_id: int = -1
+        # Timestamp of the robot state message being handled, for the events it causes
+        # (see _record); None outside that.
+        self._event_ts: Optional[datetime.datetime] = None
 
         if self._robot_server.push_telemetry:
             self._telemetry = metrics.Telemetry()
@@ -266,9 +275,22 @@ class Robot:
             await self.get_next_mission()
             return
 
+        self._record("run_started", self._name, self._current_mission, self._robot_object)
         self.update_mission_from_behavior_tree()
         self._arm_mission_timeout()
         await self._send_order()
+
+    def _record(self, hook: str, *args: Any, **kwargs: Any) -> None:
+        """Phase 0 recording (fleet_recorder.FleetRecorder). The hooks only enqueue work and
+        never raise, and this guard makes sure of it: recording must never change what the
+        dispatcher does."""
+        recorder = getattr(self._robot_server, "fleet_recorder", None)
+        if recorder is None:
+            return
+        try:
+            getattr(recorder, hook)(*args, **kwargs)
+        except Exception:  # pylint: disable=broad-except
+            self._logger.exception("Fleet recording hook %s failed (ignored)", hook)
 
     def _dispatch_hold_reason(self) -> Optional[str]:
         """None if the robot can receive a dispatched order right now; otherwise a
@@ -634,6 +656,9 @@ class Robot:
                     # Set mission to failure
                     self._set_mission_state(
                         mission_object.MissionStateV1.FAILED)
+                    if self._current_mission is not None:
+                        self._record("run_finished", self._name, self._current_mission,
+                                     self._robot_object)
                 # Set the state of the robot to DELETE for RobotServer to delete
                 # on the server and database side.
                 self.debug(
@@ -1177,6 +1202,7 @@ class Robot:
                 except Exception as err:  # pylint: disable=broad-except
                     self.warning(f"[{final.name}] Could not persist the pass count ({err})")
                 await self._chain_then_run(final)
+        self._record("run_finished", self._name, self._current_mission, self._robot_object)
         self._cancel_wait()
         self._ignored_spec_edits.discard(self._current_mission.name)
         self._remember_finished(self._current_mission.name)
@@ -1229,7 +1255,8 @@ class Robot:
             if self._current_mission.needs_canceled:
                 self._set_mission_state(mission_object.MissionStateV1.CANCELED)
             else:
-                self._current_mission.status.failure_reason = "Mission timed out"
+                self._current_mission.status.failure_reason = \
+                    fleet_recorder.MISSION_TIMEOUT_REASON
                 self._set_mission_state(mission_object.MissionStateV1.FAILED)
             # Tell the robot to actually abandon its order before moving on — without
             # this, a robot that never finished the order (e.g. stuck retrying/stalled
@@ -1448,6 +1475,7 @@ class Robot:
         if blocked_node_name is not None and blocked_node_name in status.node_status:
             status.node_status[blocked_node_name].error_msg = \
                 blocked_error.errorDescription
+        self._record("edge_blocked", self._name, self._current_mission, self._event_ts)
 
         self.warning(
             f"Edge blocked: node={blocked_node_name} edge={blocked_edge} "
@@ -1469,6 +1497,8 @@ class Robot:
         if not mission.status.blocked:
             return
         blocked_node = mission.status.blocked_node
+        self._record("rerouted", self._name, mission, blocked_node,
+                     mission.status.blocked_edge, self._event_ts)
         mission.status.blocked = False
         mission.status.blocked_node = None
         mission.status.blocked_edge = None
@@ -1714,17 +1744,23 @@ class Robot:
 
     async def run(self):
         while self._alive:
+            # Outside the try on purpose: only a failing *handler* is survivable. If the
+            # queue itself fails (e.g. "bound to a different event loop"), it fails on every
+            # call, and swallowing that turned this loop into a hot spin that logged millions
+            # of warnings a second (seen in the unit tests: 55+ GB of captured log records
+            # before the host's OOM killer stepped in). Let the task end instead.
+            message = await self._messages.get()
             try:
-                message = await self._messages.get()
                 # If this is a robot object
                 if isinstance(message, api_objects.RobotObjectV1):
                     await self._on_robot_change(message)
                 elif isinstance(message, api_objects.MissionObjectV1):
                     await self._on_mission_change(message)
                 elif isinstance(message, types.VDA5050State):
-                    await self._on_client_message(message)
+                    await self._on_state_message(message)
                 elif isinstance(message, types.VDA5050Factsheet):
                     await self._on_client_factsheet(message)
+                    self._record("on_factsheet", self._name, message)
                 elif isinstance(message, types.RobotDatum):
                     await self._process_datum_message(message)
                 elif isinstance(message, WaitElapsed):
@@ -1733,6 +1769,17 @@ class Robot:
                 raise
             except Exception as e:
                 self.warning(f"Unhandled exception in robot message loop: {e}")
+
+    async def _on_state_message(self, message: types.VDA5050State):
+        """A robot state message: dispatch handles it, then it is recorded -- afterwards, so
+        the recorded robot state and run are the ones this message led to. Events the
+        dispatcher raises meanwhile carry the message's timestamp."""
+        self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
+        try:
+            await self._on_client_message(message)
+        finally:
+            self._event_ts = None
+            self._record("on_state", self._name, message, self._robot_object)
 
     async def send_message(self, message):
         await self._messages.put(message)
@@ -1772,6 +1819,8 @@ class Robot:
                 self._robot_object.name, robot_metrics, metrics.Timeframe.ROBOT)
             self._telemetry_client.send_telemetry(self._telemetry.get_kpis_by_frequency(
                 metrics.Timeframe.ROBOT))
+        self._record("on_robot_state", self._name, self._robot_object.status.state, state,
+                     self._event_ts)
         self._robot_object.status.state = state
         asyncio.ensure_future(self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4()))
 
@@ -1860,6 +1909,9 @@ class Robot:
             return
         self.mission_info(f"Node {node_name}: {previous_state} -> {state}")
         self._current_mission.status.node_status[node_name].state = state
+        if state == mission_object.MissionStateV1.FAILED:
+            self._record("node_failed", self._name, self._current_mission, node_name,
+                         self._event_ts)
 
     def _process_notify_node(self, mission_node):
         self.set_mission_node_state(f"{mission_node.name}",
@@ -1908,7 +1960,9 @@ class RobotServer:
                  postgres_host: str = "localhost",
                  postgres_port: int = 5432,
                  mission_ctrl_url: Optional[str] = None, push_telemetry: bool = False,
-                 telemetry_env: str = "DEV", disable_request_factsheet: bool = False):
+                 telemetry_env: str = "DEV", disable_request_factsheet: bool = False,
+                 disable_fleet_recording: bool = False,
+                 fleet_spill_path: str = fleet_recorder.DEFAULT_SPILL_PATH):
         """Initializes a RobotServer object by starting threads for mqtt and for the robot/mission
         database watchers
         Args:
@@ -1932,6 +1986,19 @@ class RobotServer:
             port=postgres_port,
             required_tables=DISPATCH_REQUIRED_TABLES,
         )
+
+        # Phase 0 recording (mission_runs, fleet_events, robot_state_ts, robot_latest) on
+        # its own small pool; see fleet_recorder for why it can never hold missions up.
+        # Set before MQTT connects: the message callback looks at it.
+        self.fleet_recorder: Optional[fleet_recorder.FleetRecorder] = None
+        if not disable_fleet_recording:
+            try:
+                self.fleet_recorder = fleet_recorder.FleetRecorder(
+                    conninfo=f"dbname={postgres_db} user={postgres_user} host={postgres_host} "
+                             f"password={postgres_password} port={postgres_port}",
+                    spill_path=fleet_spill_path)
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Fleet recording disabled: {err}")
 
         # Create queues to propogate changes to the main thread
         self._event_loop = asyncio.get_event_loop()
@@ -1961,12 +2028,14 @@ class RobotServer:
         client.subscribe(f"{self._mqtt_prefix}/+/state")
         client.subscribe(f"{self._mqtt_prefix}/+/factsheet")
         client.subscribe(f"{self._mqtt_prefix}/+/datum")
+        client.subscribe(f"{self._mqtt_prefix}/+/connection")
 
     def _mqtt_on_message(self, client, userdata, msg):
         state_match = re.match(f"{self._mqtt_prefix}/(.*)/state", msg.topic)
         factsheet_match = re.match(
             f"{self._mqtt_prefix}/(.*)/factsheet", msg.topic)
         datum_match = re.match(f"{self._mqtt_prefix}/(.*)/datum", msg.topic)
+        connection_match = re.match(f"{self._mqtt_prefix}/(.*)/connection", msg.topic)
         try:
             if state_match:
                 robot = state_match.groups()[0]
@@ -1983,6 +2052,12 @@ class RobotServer:
                 pl = msg.payload
                 self._enqueue(self._mqtt_messages, ClientDatumMessage(name=robot,
                                                                       payload=json.loads(pl)))
+            elif connection_match:
+                if self.fleet_recorder is None:
+                    return
+                robot = connection_match.groups()[0]
+                self._enqueue(self._mqtt_messages, ClientConnectionMessage(
+                    name=robot, payload=json.loads(msg.payload)))
             else:
                 self.warning(
                     f"Got message from unrecognized topic \"{msg.topic}\"")
@@ -2008,7 +2083,8 @@ class RobotServer:
         client.register_callback(f"{self._mqtt_prefix}/+/state", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/factsheet", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/datum", self._mqtt_on_message)
-        
+        client.register_callback(f"{self._mqtt_prefix}/+/connection", self._mqtt_on_message)
+
         client.connect()
         return client
 
@@ -2047,6 +2123,8 @@ class RobotServer:
                     self.debug(f"Got robot from database {robot.name}")
                     self._robots[robot.name] = Robot(robot.name, self._database,
                                                      self._mqtt_client, self._mqtt_prefix, self)
+                if self.fleet_recorder is not None:
+                    self.fleet_recorder.on_robot_object(robot)
                 await self._robots[robot.name].send_message(robot)
 
     async def _handle_mission_changes(self):
@@ -2074,6 +2152,12 @@ class RobotServer:
     async def _handle_mqtt_messages(self):
         while True:
             message = await self._mqtt_messages.get()
+            if isinstance(message, ClientConnectionMessage):
+                # Recording only (ROBOT.ONLINE/OFFLINE); mission handling ignores it.
+                if self.fleet_recorder is not None and (
+                        message.name in self._robots or self.fleet_recorder.knows(message.name)):
+                    self.fleet_recorder.on_connection(message.name, message.payload)
+                continue
             if message.name not in self._robots:
                 # Try to get the robot from the database
                 try:
@@ -2091,6 +2175,14 @@ class RobotServer:
 
     async def _run(self):
         await self._database.async_init()
+        if self.fleet_recorder is not None:
+            # Before the watchers start, so detectors are rehydrated and the orphan
+            # reconciliation is queued ahead of any run this process starts. Bounded and
+            # never raises: missions dispatch whether or not recording works.
+            try:
+                await self.fleet_recorder.start()
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Fleet recording failed to start: {err}")
         await asyncio.gather(
             self._watch_changes(api_objects.MissionObjectV1, self._mission_changes),
             self._watch_changes(api_objects.RobotObjectV1, self._robot_changes),
