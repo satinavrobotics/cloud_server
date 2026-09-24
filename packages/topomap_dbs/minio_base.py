@@ -7,8 +7,15 @@ from typing import List
 try:
     from minio import Minio
     from minio.deleteobjects import DeleteObject
+    from minio.error import S3Error
 except ImportError:
     raise ImportError("minio required. Install: pip install minio")
+
+# bucket_exists-then-make_bucket is TOCTOU: two concurrent callers can both see
+# "doesn't exist" and both call make_bucket. The loser gets one of these codes
+# from MinIO's single-owner bucket model -- the bucket exists either way, so
+# it's not a real error.
+_BUCKET_RACE_CODES = frozenset({"BucketAlreadyOwnedByYou", "BucketAlreadyExists"})
 
 
 class MinIOService:
@@ -65,6 +72,11 @@ class MinIOService:
                 self.client.make_bucket(bucket_name)
                 self.logger.info(f"Created bucket: {bucket_name}")
             return True
+        except S3Error as e:
+            if e.code in _BUCKET_RACE_CODES:
+                return True
+            self.logger.error(f"Failed to ensure bucket '{bucket_name}': {e}")
+            return False
         except Exception as e:
             self.logger.error(f"Failed to ensure bucket '{bucket_name}': {e}")
             return False
