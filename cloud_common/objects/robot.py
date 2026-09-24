@@ -190,6 +190,8 @@ class RobotSpecV1(pydantic.BaseModel):
         None, description="IPv4 address of the robot, updated on each startup.")
     entrypoint_port: Optional[int] = pydantic.Field(
         None, description="Port for accessing robot APIs, updated on each startup.")
+    telemetry_recording: Optional[common.TelemetryRecordingV1] = \
+        common.telemetry_recording_field("robot")
 
 
 class RobotQueryParamsV1(pydantic.BaseModel):

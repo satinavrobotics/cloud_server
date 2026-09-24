@@ -69,9 +69,9 @@ STATE_ROW_INTERVAL_S = 5.0
 BATTERY_LOW_PCT = 20.0
 BATTERY_OK_PCT = 25.0
 SWEEP_PERIOD_S = 1.0
-# Robot NOTIFYs arrive with every status write, so the policy is reloaded at most this
-# often after one, and at least this often regardless (sites/settings are not watched).
-POLICY_REFRESH_MIN_S = 5.0
+# The recording policy follows the robot and settings NOTIFYs directly (on_robot_object,
+# on_settings_object: the level is pushed, no reload). On top of that it is reloaded this
+# often as a safety net for a missed NOTIFY and for layers nothing watches yet (sites, WP9).
 POLICY_REFRESH_MAX_S = 60.0
 REHYDRATE_TIMEOUT_S = 10.0
 REHYDRATE_RETRY_S = 10.0
@@ -455,7 +455,6 @@ class FleetRecorder:
         self._ops_lock = asyncio.Lock()
         self._tasks: List[asyncio.Task] = []
         self._started_at: Optional[datetime.datetime] = None
-        self._policy_dirty = False
         self._policy_invalidated_at: Optional[datetime.datetime] = None
         self.hook_errors = 0
         self.op_failures = 0
@@ -557,7 +556,17 @@ class FleetRecorder:
     def on_robot_object(self, robot_object: Any) -> None:
         """A robot object from the watcher (spec/status change)."""
         self._track(robot_object.name, robot_object)
-        self._policy_dirty = True
+        self.policy.apply_robot_object(robot_object)
+
+    @_guarded
+    def on_robot_deleted(self, robot_object: Any) -> None:
+        """A DELETED robot object from the watcher: drop its recording level."""
+        self.policy.apply_robot_object(robot_object)
+
+    @_guarded
+    def on_settings_object(self, settings: Any) -> None:
+        """A settings object from the watcher: the global recording level."""
+        self.policy.apply_settings_object(settings)
 
     @_guarded
     def on_state(self, robot_name: str, message: Any, robot_object: Any = None,
@@ -722,13 +731,10 @@ class FleetRecorder:
 
     def _maybe_invalidate_policy(self, now: datetime.datetime) -> None:
         last = self._policy_invalidated_at
-        elapsed = None if last is None else (now - last).total_seconds()
-        if (self._policy_dirty and (elapsed is None or elapsed >= POLICY_REFRESH_MIN_S)) or \
-                (elapsed is not None and elapsed >= POLICY_REFRESH_MAX_S):
-            self.policy.invalidate()
-            self._policy_dirty = False
+        if last is None:
             self._policy_invalidated_at = now
-        elif last is None:
+        elif (now - last).total_seconds() >= POLICY_REFRESH_MAX_S:
+            self.policy.invalidate()
             self._policy_invalidated_at = now
 
     async def _sweep_loop(self) -> None:

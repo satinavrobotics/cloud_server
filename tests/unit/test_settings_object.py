@@ -62,7 +62,9 @@ class TestSettingsObjectV1:
         assert SettingsObjectV1.supports_spec_update() is True
 
     def test_default_spec(self):
-        assert SettingsObjectV1.default_spec() == {"fault_error_types": []}
+        # telemetry_recording: WP8, None = unset (the policy then uses events_only)
+        assert SettingsObjectV1.default_spec() == {"fault_error_types": [],
+                                                   "telemetry_recording": None}
 
     def test_construct_with_global_name(self):
         settings = SettingsObjectV1(name=GLOBAL_SETTINGS_NAME, lifecycle=ObjectLifecycleV1.ALIVE)

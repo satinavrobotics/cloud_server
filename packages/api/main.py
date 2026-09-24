@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from packages.api.server import ApiDelegationService
+from packages.api import recording
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
     configure_service_logging, DependencyHealthChecker
@@ -534,6 +535,11 @@ async def _get_or_create_settings() -> SettingsObjectV1:
             raise
 
 
+def _hook_kwargs(hook) -> Dict[str, Any]:
+    """`before_commit` only when there is a hook, so calls without one are unchanged."""
+    return {"before_commit": hook} if hook is not None else {}
+
+
 @app.get("/api/v1/settings")
 async def get_settings():
     """Fetch the fleet-wide settings object, creating it with defaults on first read."""
@@ -555,13 +561,20 @@ async def update_settings(settings_data: dict):
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
+        recording.check_level(settings_data)
         settings = await _get_or_create_settings()
 
         publisher_id = uuid.uuid4()
         for key, value in settings_data.items():
             if key not in ("status", "name", "lifecycle") and key in SettingsSpecV1.__fields__:
                 setattr(settings, key, value)
-        await service.database.update_spec(SettingsObjectV1, settings.name, settings.spec, publisher_id)
+        hook = None
+        if recording.SPEC_FIELD in settings_data:
+            # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
+            hook = recording.change_hook(recording.RecordingScope.GLOBAL, None,
+                                         recording.request_actor())
+        await service.database.update_spec(SettingsObjectV1, settings.name, settings.spec,
+                                           publisher_id, **_hook_kwargs(hook))
 
         updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
         return updated_settings.dict()
@@ -1194,6 +1207,9 @@ async def create_robot(robot_data: dict):
     try:
         if "name" not in robot_data:
             raise HTTPException(status_code=400, detail="Missing required field: name")
+        # Validated on registration too; like the other spec fields it only applies when the
+        # robot is created (an existing robot's level is changed with PUT).
+        recording.check_level(robot_data)
 
         publisher_id = uuid.uuid4()
         ip_address = robot_data.pop("ip_address", None)
@@ -1258,7 +1274,11 @@ async def create_robot(robot_data: dict):
             if current_model is not None:
                 robot_data_with_defaults["current_model"] = current_model
             robot = RobotObjectV1(**robot_data_with_defaults)
-            await service.database.create_object(robot, publisher_id)
+            hook = None
+            if robot.telemetry_recording is not None:
+                hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
+                                             recording.request_actor())
+            await service.database.create_object(robot, publisher_id, **_hook_kwargs(hook))
             return robot.dict()
     except HTTPException:
         raise
@@ -1278,6 +1298,7 @@ async def update_robot(robot_name: str, robot_data: dict):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
+        recording.check_level(robot_data)
         # Get existing robot
         robot = await service.database.get_object(RobotObjectV1, robot_name)
 
@@ -1289,7 +1310,13 @@ async def update_robot(robot_name: str, robot_data: dict):
             for key, value in robot_data.items():
                 if key != "status" and key != "name" and key != "lifecycle":
                     setattr(robot, key, value)
-            await service.database.update_spec(RobotObjectV1, robot.name, robot.spec, publisher_id)
+            hook = None
+            if recording.SPEC_FIELD in robot_data:
+                # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
+                hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
+                                             recording.request_actor())
+            await service.database.update_spec(RobotObjectV1, robot.name, robot.spec,
+                                               publisher_id, **_hook_kwargs(hook))
 
         # Update status if provided
         if "status" in robot_data:

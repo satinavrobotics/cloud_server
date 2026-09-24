@@ -54,9 +54,11 @@ CONNECT_TIMEOUT_S = 5.0
 QUERY_TIMEOUT_S = 5.0
 WRITER_STOP_TIMEOUT_S = 3.0
 # While writing: reload the dispatch-owned robot_latest columns used as event context, and
-# mark the recording policy stale so the writer reloads it (until WP8 wires NOTIFYs to it).
+# mark the recording policy stale so the writer reloads it. The policy follows robot and
+# settings NOTIFYs (on_robot_object / on_settings_object, WP8); this reload is only the
+# safety net for a missed NOTIFY and for layers nothing watches yet (sites, WP9).
 CONTEXT_REFRESH_S = 10.0
-POLICY_REFRESH_S = 30.0
+POLICY_REFRESH_S = 60.0
 
 SPILL_PREFIX = "api-"
 SPILL_SUFFIX = ".jsonl"
@@ -448,6 +450,9 @@ class ApiTelemetry:
         now = self._monotonic()
         self._last_context_refresh = self._last_policy_refresh = now
         self._term = term
+        # A NOTIFY that arrived between the load above and now went nowhere (no term yet):
+        # have the writer reload once more on its next tick.
+        policy.invalidate()
         logger.info("Telemetry writer started (%d robot_latest rows rehydrated)", len(latest))
 
     async def _stop_term(self) -> None:
@@ -469,6 +474,30 @@ class ApiTelemetry:
             rows = await load_latest(conn)
             if rows:
                 term.ctx.update(rows)
+
+    # --- recording policy from NOTIFYs (event-loop thread) --------------------------------
+    def on_robot_object(self, robot: Any) -> None:
+        """A robot object from the API's robot watcher: push its recording level into the
+        writer's policy (no database round trip). Never raises; a no-op in non-writers."""
+        term = self._term
+        if term is None:
+            return
+        try:
+            term.policy.apply_robot_object(robot)
+        except Exception:  # noqa: BLE001
+            self.handler_errors.log("Recording policy update failed for robot %s",
+                                    getattr(robot, "name", "?"))
+
+    def on_settings_object(self, settings: Any) -> None:
+        """A settings object from the settings watcher (see on_robot_object)."""
+        term = self._term
+        if term is None:
+            return
+        try:
+            term.policy.apply_settings_object(settings)
+        except Exception:  # noqa: BLE001
+            self.handler_errors.log("Recording policy update failed for settings %s",
+                                    getattr(settings, "name", "?"))
 
     # --- MQTT handlers (event-loop thread) -----------------------------------------------
     def on_diagnostics(self, robot_name: str, robot_timestamp: Any,

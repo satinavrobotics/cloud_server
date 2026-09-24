@@ -17,10 +17,10 @@ limitations under the License.
 SPDX-License-Identifier: Apache-2.0
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import pydantic
 
-from cloud_common.objects import object
+from cloud_common.objects import common, object
 
 # There is exactly one settings row, always addressed by this fixed name — a
 # singleton simulated by convention on top of the normal name-keyed object
@@ -39,6 +39,8 @@ class SettingsSpecV1(pydantic.BaseModel):
             "non-fault warning. Empty by default: nothing is FAULT until an operator opts "
             "specific error types in here."
         ))
+    telemetry_recording: Optional[common.TelemetryRecordingV1] = \
+        common.telemetry_recording_field("fleet (global default)")
 
 
 class SettingsStatusV1(pydantic.BaseModel):

@@ -165,26 +165,62 @@ class RecordingPolicy:
         self._stale = True
         self._generation += 1
 
-    def set_robot_level(self, robot_name: str, value: Optional[str]) -> None:
-        self._sources.robot_levels[robot_name] = value
+    # The set_* helpers push one value straight from a NOTIFY (no database round trip).
+    # They return True if the value changed. A change also bumps the generation, so a
+    # refresh() already in flight (whose snapshot may predate the change) leaves the policy
+    # stale and the next refresh picks the change up again; an unchanged value (e.g. a
+    # status-only robot write) does not.
+    def _set(self, changed: bool) -> bool:
         self._cache.clear()
+        if changed:
+            self._generation += 1
+        return changed
 
-    def forget_robot(self, robot_name: str) -> None:
+    def set_robot_level(self, robot_name: str, value: Optional[str]) -> bool:
+        levels = self._sources.robot_levels
+        changed = robot_name not in levels or levels[robot_name] != value
+        levels[robot_name] = value
+        return self._set(changed)
+
+    def forget_robot(self, robot_name: str) -> bool:
+        changed = (robot_name in self._sources.robot_levels
+                   or robot_name in self._sources.robot_sites)
         self._sources.robot_levels.pop(robot_name, None)
         self._sources.robot_sites.pop(robot_name, None)
-        self._cache.clear()
+        return self._set(changed)
 
-    def set_robot_site(self, robot_name: str, site_id: Optional[str]) -> None:
-        self._sources.robot_sites[robot_name] = site_id
-        self._cache.clear()
+    def set_robot_site(self, robot_name: str, site_id: Optional[str]) -> bool:
+        sites = self._sources.robot_sites
+        changed = robot_name not in sites or sites[robot_name] != site_id
+        sites[robot_name] = site_id
+        return self._set(changed)
 
-    def set_site_level(self, site_id: str, value: Optional[str]) -> None:
-        self._sources.site_levels[site_id] = value
-        self._cache.clear()
+    def set_site_level(self, site_id: str, value: Optional[str]) -> bool:
+        levels = self._sources.site_levels
+        changed = site_id not in levels or levels[site_id] != value
+        levels[site_id] = value
+        return self._set(changed)
 
-    def set_global_level(self, value: Optional[str]) -> None:
+    def set_global_level(self, value: Optional[str]) -> bool:
+        changed = self._sources.global_level != value
         self._sources.global_level = value
-        self._cache.clear()
+        return self._set(changed)
+
+    # --- whole objects, as the hosts' NOTIFY watchers deliver them ------------------------
+    def apply_robot_object(self, robot: Any) -> bool:
+        """A robotobjectv1 object (spec fields flattened, as cloud_common builds it); a
+        DELETED one is forgotten. Returns True if the robot's configured level changed."""
+        if _is_deleted(robot):
+            return self.forget_robot(robot.name)
+        return self.set_robot_level(robot.name, getattr(robot, SPEC_FIELD, None))
+
+    def apply_settings_object(self, settings: Any) -> bool:
+        """A settingsobjectv1 object. Only the global row counts; a DELETED one unsets the
+        global level (as load_sources would). Returns True if the global level changed."""
+        if getattr(settings, "name", None) != GLOBAL_SETTINGS_NAME:
+            return False
+        value = None if _is_deleted(settings) else getattr(settings, SPEC_FIELD, None)
+        return self.set_global_level(value)
 
     def replace_sources(self, sources: PolicySources) -> None:
         self._sources = sources
@@ -208,6 +244,11 @@ class RecordingPolicy:
         self.replace_sources(sources)
         self._stale = generation != self._generation
         return True
+
+
+def _is_deleted(obj: Any) -> bool:
+    lifecycle = getattr(obj, "lifecycle", None)
+    return getattr(lifecycle, "value", lifecycle) == "DELETED"
 
 
 async def _table_exists(cursor: Any, table: str) -> bool:

@@ -17,12 +17,29 @@ limitations under the License.
 SPDX-License-Identifier: Apache-2.0
 """
 import enum
+from typing import Any, Literal
 
 import pydantic
 
 # Tell pylint to ignore the invalid names. We must use fields that are specified
 # by VDA5050.
 # pylint: disable=invalid-name
+
+
+# Phase 0 recording level (docs/satinav-fleet-agent-phase0-v2.md §4.1). The same values as
+# packages/events/schemas.py RecordingLevel, spelled out here because cloud_common is also
+# shipped to services without packages/events (graph-builder, mission-planner).
+TELEMETRY_RECORDING_LEVELS = ("full", "events_only", "off")
+TelemetryRecordingV1 = Literal["full", "events_only", "off"]
+
+
+def telemetry_recording_field(scope: str) -> Any:
+    """The optional `telemetry_recording` spec field; None means "not set here"."""
+    return pydantic.Field(
+        None, description=(
+            f"Phase 0 live-data recording level for this {scope}: 'full', 'events_only' or "
+            "'off'. None (the default) means not set here: the level is inherited, resolved "
+            "robot -> site -> global settings, and 'events_only' when none is set."))
 
 
 class ICSError(Exception):
