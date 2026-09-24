@@ -49,6 +49,8 @@ ENV PYTHONPATH=/app
 # Expose port
 EXPOSE 8000
 
-# Run the service
+# The entrypoint runs `alembic upgrade head` under pg_advisory_lock('migrations'), then execs
+# the command (compose `command:` or the CMD below). See packages/api/entrypoint.py.
+ENTRYPOINT ["python", "-m", "packages.api.entrypoint"]
 CMD ["python", "-m", "packages.api.main", "--host", "0.0.0.0", "--port", "8000"]
 
