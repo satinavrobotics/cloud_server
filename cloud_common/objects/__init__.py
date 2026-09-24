@@ -24,9 +24,14 @@ from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects.map import MapObjectV1
 from cloud_common.objects.settings import SettingsObjectV1
+from cloud_common.objects.site import SiteObjectV1
 
+# Every service creates the tables of these classes at startup (initialize_database), so a
+# class added here only needs the new code deployed; services still on the old list simply
+# never touch the new table.
 ALL_OBJECTS: List[Type[ApiObject]] = [
-    RobotObjectV1, MissionObjectV1, DetectionResultsObjectV1, MapObjectV1, SettingsObjectV1]
+    RobotObjectV1, MissionObjectV1, DetectionResultsObjectV1, MapObjectV1, SettingsObjectV1,
+    SiteObjectV1]
 OBJECT_DICT: Dict[str, Type[ApiObject]] = {
     obj.get_alias(): obj for obj in ALL_OBJECTS}
 

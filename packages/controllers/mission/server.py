@@ -2156,6 +2156,42 @@ class RobotServer:
                              f"{SETTINGS_WATCH_RETRY_S}s: {err}")
             await asyncio.sleep(SETTINGS_WATCH_RETRY_S)
 
+    async def _watch_sites(self):
+        """Recording only (WP9): site NOTIFYs (site recording levels) to the fleet recorder.
+        Never stops the dispatcher (see _watch_settings)."""
+        while True:
+            try:
+                watcher = await self._database.get_watcher(api_objects.SiteObjectV1,
+                                                            uuid.uuid4())
+                with watcher:
+                    async for site in watcher.watch():
+                        self.fleet_recorder.on_site_object(site)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Site watcher failed, retrying in "
+                             f"{SETTINGS_WATCH_RETRY_S}s: {err}")
+            await asyncio.sleep(SETTINGS_WATCH_RETRY_S)
+
+    async def _watch_site_assignments(self):
+        """Recording only (WP9): robot site assignment changes (NOTIFY channel written by the
+        API's PUT /api/v1/robots/{name}/site) to the fleet recorder. A None from the watcher
+        means it (re)subscribed: reload. Never stops the dispatcher."""
+        while True:
+            try:
+                watcher = self._database.get_channel_watcher(fleet_recorder.ASSIGNMENTS_CHANNEL)
+                async for payload in watcher.watch():
+                    if payload is None:
+                        self.fleet_recorder.on_site_assignments_resync()
+                    else:
+                        self.fleet_recorder.on_site_assignment(payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Site assignment watcher failed, retrying in "
+                             f"{SETTINGS_WATCH_RETRY_S}s: {err}")
+            await asyncio.sleep(SETTINGS_WATCH_RETRY_S)
+
     async def _handle_mission_changes(self):
         while True:
             mission = await self._mission_changes.get()
@@ -2221,6 +2257,8 @@ class RobotServer:
         ]
         if self.fleet_recorder is not None:
             tasks.append(self._watch_settings())
+            tasks.append(self._watch_sites())
+            tasks.append(self._watch_site_assignments())
         await asyncio.gather(*tasks)
 
     async def delete_robot(self, robot_name: str):

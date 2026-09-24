@@ -356,8 +356,13 @@ class TestWriterTerm:
     async def test_event_context_from_dispatch_columns(self, tmp_path):
         server = LockServer()
         set_level(server.db, "events_only")
+        # WP9: the site is the robot's current assignment (via the recording policy), not
+        # the robot_latest copy, which may lag behind an assignment change.
+        server.db.query_results[r"to_regclass"] = lambda sql, params: [
+            (params[0] in ("settingsobjectv1", "robot_site_assignments"),)]
+        server.db.query_results[r"FROM robot_site_assignments"] = [("r1", "site-a")]
         run_id = uuid.uuid4()
-        server.db.latest["r1"] = {"active_run_id": run_id, "site_id": "site-a",
+        server.db.latest["r1"] = {"active_run_id": run_id, "site_id": "site-old",
                                   "sw_version": "jetson-2026.09+gabc"}
         tel = make_telemetry(server, tmp_path)
         await tel.election.step()

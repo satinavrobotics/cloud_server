@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import recording
+from packages.api import recording, sites
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
     configure_service_logging, DependencyHealthChecker
@@ -41,6 +41,7 @@ from cloud_common.objects.mission import (
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects.map import MapObjectV1
 from cloud_common.objects.settings import SettingsObjectV1, SettingsSpecV1, GLOBAL_SETTINGS_NAME
+from cloud_common.objects.site import SiteObjectV1
 from cloud_common.objects.object import ObjectLifecycleV1
 
 
@@ -1429,6 +1430,99 @@ async def invoke_custom_action(robot_name: str, request: InvokeActionRequest):
     )
 
     return InvokeActionResponse(**result)
+
+
+# ==================== Sites (Phase 0 WP9) ====================
+# Transactions, NOTIFYs and RECORDING_CHANGED: packages/api/sites.py.
+
+def _require_service():
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+
+async def _site_call(what: str, coro):
+    """Run a packages/api/sites.py call: HTTPExceptions pass through, anything else is a
+    logged 500."""
+    try:
+        return await coro
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception(f"Failed to {what}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to {what}: {str(e)}")
+
+
+@app.get("/api/v1/sites", response_model=List[dict])
+async def list_sites():
+    """List all sites."""
+    _require_service()
+    found = await _site_call("list sites", service.database.list_objects(SiteObjectV1))
+    return [site.dict() for site in found]
+
+
+@app.get("/api/v1/sites/{site_id}")
+async def get_site(site_id: str):
+    """Get one site (404 if unknown)."""
+    _require_service()
+    return (await _site_call("get site", service.database.get_object(SiteObjectV1,
+                                                                     site_id))).dict()
+
+
+@app.post("/api/v1/sites", status_code=201)
+async def create_site(site_data: dict):
+    """Create a site. Body: `name` (the site_id) plus any spec field (customer, display_name,
+    sector, geofence, gps_datum, rtk_base, timezone, telemetry_recording). 409 if the id is
+    taken, 422 on unknown fields or invalid values."""
+    _require_service()
+    site = await _site_call("create site", sites.create_site(
+        service.database, site_data, uuid.uuid4(), recording.request_actor()))
+    return site.dict()
+
+
+@app.put("/api/v1/sites/{site_id}")
+async def update_site(site_id: str, site_data: dict):
+    """Partial update: only the spec fields in the body change (null clears one). 404 if
+    unknown, 422 on unknown fields or invalid values."""
+    _require_service()
+    site = await _site_call("update site", sites.update_site(
+        service.database, site_id, site_data, uuid.uuid4(), recording.request_actor()))
+    return site.dict()
+
+
+@app.delete("/api/v1/sites/{site_id}")
+async def delete_site(site_id: str):
+    """Delete a site. 409 while robots are assigned to it; its assignment history stays."""
+    _require_service()
+    await _site_call("delete site", sites.delete_site(
+        service.database, site_id, uuid.uuid4(), recording.request_actor()))
+    return {"success": True, "message": f"Site {site_id} deleted"}
+
+
+class AssignRobotSiteRequest(BaseModel):
+    """Body of PUT /api/v1/robots/{robot_name}/site."""
+    site_id: Optional[str] = Field(..., description="Site to assign the robot to from now "
+                                                    "on; null unassigns it")
+
+    class Config:
+        extra = "forbid"
+
+
+@app.put("/api/v1/robots/{robot_name}/site")
+async def assign_robot_site(robot_name: str, request: AssignRobotSiteRequest):
+    """Assign a robot to a site from now on: closes its current assignment and opens a new
+    one in one transaction (a no-op if it is already there). `{"site_id": null}` unassigns.
+    404 for an unknown robot or site."""
+    _require_service()
+    return await _site_call("assign site", sites.assign_robot(
+        service.database, robot_name, request.site_id, recording.request_actor()))
+
+
+@app.get("/api/v1/robots/{robot_name}/site-assignments", response_model=List[dict])
+async def list_robot_site_assignments(robot_name: str):
+    """The robot's site assignment history, newest first."""
+    _require_service()
+    return await _site_call("list site assignments",
+                            sites.list_assignments(service.database, robot_name))
 
 
 # ==================== Mission Operations ====================

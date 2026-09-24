@@ -26,6 +26,7 @@ from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1
 from cloud_common.objects.mission import MissionObjectV1
 from cloud_common.objects.settings import SettingsObjectV1
+from cloud_common.objects.site import SiteObjectV1
 from cloud_common.objects.object import ObjectLifecycleV1
 from packages.config import (
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
@@ -1761,6 +1762,9 @@ class ApiDelegationService:
             event_loop.create_task(self._handle_mission_progress_updates()),
             # Recording policy only (WP8): the global level lives in settings.
             event_loop.create_task(self._watch_settings_changes()),
+            # Recording policy only (WP9): site levels and robot site assignments.
+            event_loop.create_task(self._watch_site_changes()),
+            event_loop.create_task(self._watch_site_assignments()),
         ]
 
         self.diagnostics.set_event_loop(event_loop)
@@ -1871,6 +1875,49 @@ class ApiDelegationService:
             except Exception as e:
                 if self._running:
                     self.logger.error(f"Settings watcher error: {e}, "
+                                      f"reconnecting in {reconnect_delay}s...")
+                    await asyncio.sleep(reconnect_delay)
+
+    async def _watch_site_changes(self):
+        """Feed site NOTIFYs (site recording levels) to the recording policy. Never raises
+        (see _watch_settings_changes)."""
+        reconnect_delay = 5  # seconds
+        while self._running:
+            try:
+                watcher = await self.database.get_watcher(SiteObjectV1, self._publisher_id)
+                async for site in watcher.watch():
+                    if not self._running:
+                        break
+                    self._feed_policy("on_site_object", site)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._running:
+                    self.logger.error(f"Site watcher error: {e}, "
+                                      f"reconnecting in {reconnect_delay}s...")
+                    await asyncio.sleep(reconnect_delay)
+
+    async def _watch_site_assignments(self):
+        """Feed robot site assignment changes (NOTIFY on policy.ASSIGNMENTS_CHANNEL, sent by
+        packages/api/sites.py) to the recording policy. None from the watcher means it
+        (re)subscribed and may have missed some: the policy reloads. Never raises."""
+        from packages.telemetry_ingest.policy import ASSIGNMENTS_CHANNEL
+        reconnect_delay = 5  # seconds
+        while self._running:
+            try:
+                watcher = self.database.get_channel_watcher(ASSIGNMENTS_CHANNEL)
+                async for payload in watcher.watch():
+                    if not self._running:
+                        break
+                    if payload is None:
+                        self._feed_policy("on_site_assignments_resync", None)
+                    else:
+                        self._feed_policy("on_site_assignment", payload)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._running:
+                    self.logger.error(f"Site assignment watcher error: {e}, "
                                       f"reconnecting in {reconnect_delay}s...")
                     await asyncio.sleep(reconnect_delay)
 

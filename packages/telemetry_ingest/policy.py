@@ -17,8 +17,9 @@ Until the first refresh every robot resolves to the default.
 
 import dataclasses
 import datetime
+import json
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 from packages.events.codes import EventCode
 from packages.events.schemas import RecordingLevel  # the one definition of the levels
@@ -33,6 +34,11 @@ ROBOT_TABLE = "robotobjectv1"
 SITE_TABLE = "siteobjectv1"
 SETTINGS_TABLE = "settingsobjectv1"
 ASSIGNMENTS_TABLE = "robot_site_assignments"
+# NOTIFY channel for assignment changes (WP9). The API's PUT /api/v1/robots/{name}/site sends
+# pg_notify(ASSIGNMENTS_CHANNEL, assignment_payload(robot, site)) in the transaction that
+# changes the assignment, so it is delivered on commit only. robot_site_assignments is not an
+# object table and has no object NOTIFY of its own, hence the dedicated channel.
+ASSIGNMENTS_CHANNEL = "robot_site_assignments"
 
 
 DEFAULT_LEVEL = RecordingLevel.EVENTS_ONLY
@@ -201,6 +207,11 @@ class RecordingPolicy:
         levels[site_id] = value
         return self._set(changed)
 
+    def forget_site(self, site_id: str) -> bool:
+        changed = site_id in self._sources.site_levels
+        self._sources.site_levels.pop(site_id, None)
+        return self._set(changed)
+
     def set_global_level(self, value: Optional[str]) -> bool:
         changed = self._sources.global_level != value
         self._sources.global_level = value
@@ -221,6 +232,24 @@ class RecordingPolicy:
             return False
         value = None if _is_deleted(settings) else getattr(settings, SPEC_FIELD, None)
         return self.set_global_level(value)
+
+    def apply_site_object(self, site: Any) -> bool:
+        """A siteobjectv1 object; a DELETED one is forgotten (its robots then resolve to the
+        global level, as load_sources would). Returns True if the site's level changed."""
+        if _is_deleted(site):
+            return self.forget_site(site.name)
+        return self.set_site_level(site.name, getattr(site, SPEC_FIELD, None))
+
+    def apply_assignment_payload(self, payload: str) -> bool:
+        """A NOTIFY payload from ASSIGNMENTS_CHANNEL. An unreadable one marks the policy
+        stale (full reload) instead of raising. Returns True if the robot's site changed."""
+        try:
+            robot_name, site_id = parse_assignment_payload(payload)
+        except ValueError:
+            logger.warning("Unreadable %s payload %r; reloading", ASSIGNMENTS_CHANNEL, payload)
+            self.invalidate()
+            return False
+        return self.set_robot_site(robot_name, site_id)
 
     def replace_sources(self, sources: PolicySources) -> None:
         self._sources = sources
@@ -244,6 +273,24 @@ class RecordingPolicy:
         self.replace_sources(sources)
         self._stale = generation != self._generation
         return True
+
+
+def assignment_payload(robot_name: str, site_id: Optional[str]) -> str:
+    """The ASSIGNMENTS_CHANNEL payload: the robot's site from now on (None = unassigned)."""
+    return json.dumps({"robot_name": robot_name, "site_id": site_id}, separators=(",", ":"))
+
+
+def parse_assignment_payload(payload: str) -> Tuple[str, Optional[str]]:
+    """(robot_name, site_id) from assignment_payload(); ValueError if malformed."""
+    try:
+        data = json.loads(payload)
+        robot_name, site_id = data["robot_name"], data["site_id"]
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError(f"bad assignment payload {payload!r}") from exc
+    if not isinstance(robot_name, str) or not robot_name or \
+            (site_id is not None and not isinstance(site_id, str)):
+        raise ValueError(f"bad assignment payload {payload!r}")
+    return robot_name, site_id
 
 
 def _is_deleted(obj: Any) -> bool:

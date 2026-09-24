@@ -454,6 +454,31 @@ The recording level is set through the existing robot and settings routes and th
 - CRUD routes and the assign route (close the previous range and open a new one in one transaction).
 - Site resolution in the events `EventContext` and in run start.
 
+As built (branch `phase0/sites`, not yet merged):
+
+- `SiteObjectV1` (`cloud_common/objects/site.py`) is in `ALL_OBJECTS`, so every service creates
+  `siteobjectv1` at startup; services still on the old object list simply never touch it. The site id
+  is the object name (`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}$`). Spec fields are all optional; `geofence`
+  must be a GeoJSON object, `timezone` an IANA name.
+- Routes (`packages/api/main.py`, logic in `packages/api/sites.py`): `GET/POST /api/v1/sites`,
+  `GET/PUT/DELETE /api/v1/sites/{site_id}` (PUT is partial; unknown fields 422; duplicate 409; delete
+  409 while an existing robot is assigned), `PUT /api/v1/robots/{name}/site` (`{"site_id": "s1" | null}`),
+  `GET /api/v1/robots/{name}/site-assignments` (newest first).
+- The assign route serialises per robot (transaction-scoped advisory lock), takes the timestamp
+  *after* the lock (`clock_timestamp()`), closes the open range at that instant and opens `[ts, ∞)`,
+  all in one transaction; the same site again is a no-op.
+- NOTIFY: site writes use the object convention (channel `siteobjectv1`); assignment changes send
+  `pg_notify('robot_site_assignments', {"robot_name", "site_id"})` from the same transaction.
+  Dispatch and the API writer push both into the recording policy (measured 0.05–0.3 s); on every
+  (re)subscribe the policy reloads, and the 60 s reload stays as a safety net.
+- `RECORDING_CHANGED`: scope `site` (robot_name NULL, site_id set) when a site's level changes;
+  scope `robot` when an assignment changes the robot's *effective* level (nothing if the robot has
+  its own level or both sites resolve the same).
+- Site on runs/events: dispatch resolves it from the policy at run start and per event; the API's
+  event context now also takes it from the policy (the robot's current assignment), falling back to
+  `robot_latest.site_id` only until the policy has loaded. Dispatch clears `robot_latest.site_id`
+  on unassign. A run keeps the site it started at.
+
 **WP10: Read endpoints (days 1–3)**
 
 - `/runs`, `/runs/{id}`, `/events` with cursor pagination.
