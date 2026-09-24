@@ -1,0 +1,174 @@
+# Staging rehearsal override for the TimescaleDB/pg17 migration (Phase 0, WP1).
+#
+# Runs as its OWN compose project on a bridge network, isolated from production (which stays
+# on network_mode: host). This is deliberate: bridge networking fails closed -- an unconfigured
+# "localhost" inside a bridge container means "this container," never the real MQTT broker or
+# Postgres, so a missed override can't make staging talk to production or send orders to real
+# robots. LiveKit and the agent orchestrator are intentionally not included -- not needed for
+# Phase 0, and `up`/`run` are invoked with an explicit service list rather than trying to
+# disable them here.
+#
+# Usage (see docker_compose/.env.staging for credentials, gitignored):
+#   docker compose -p satinav-staging --env-file docker_compose/.env.staging \
+#     -f docker_compose/mission_dispatch_services.yaml \
+#     -f docker_compose/mission_dispatch_services_staging_override.yaml \
+#     up -d postgres mosquitto arangodb minio          # infra first -- see runbook below
+#   ... pg_dump/pg_restore, catalog diff, CREATE EXTENSION ...
+#   docker compose -p satinav-staging --env-file docker_compose/.env.staging \
+#     -f docker_compose/mission_dispatch_services.yaml \
+#     -f docker_compose/mission_dispatch_services_staging_override.yaml \
+#     up -d mission-dispatch graph-builder-service mission-planner-service api-delegation-service
+#   docker compose -p satinav-staging ... run --rm test-runner pytest tests/integration -v -m integration
+#   docker compose -p satinav-staging down -v            # full teardown; re-dump before the next rehearsal
+
+x-staging-limits: &staging-limits
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 1g
+
+services:
+  mosquitto:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+
+  postgres:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    # Pinned: same tag validated against a plain (non-Patroni) single-node boot before writing
+    # this file -- POSTGRES_USER/PASSWORD/DB work exactly like the official postgres image, and
+    # PGDATA ends up at /home/postgres/pgdata/data, so the volume mounts at the parent dir.
+    image: timescale/timescaledb-ha:pg17.11-ts2.30.1
+    volumes: !override
+      - stg-pg:/home/postgres/pgdata
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+
+  arangodb:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    volumes: !override
+      - stg-arango:/var/lib/arangodb3
+
+  minio:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    volumes: !override
+      - stg-minio:/data
+
+  mission-dispatch:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    # Full replacement (compose does not merge `command` across files): same flags as the base
+    # file plus an explicit staging MQTT prefix. This only namespaces the VDA5050 topics
+    # mission-dispatch itself publishes under -- the API's `+/diagnostics` and graph-builder's
+    # `robot/node_update` are NOT prefixed, so real isolation comes from the separate broker
+    # container, not this prefix. No robots connect to staging, so that gap doesn't matter here.
+    command: ["--mqtt_host", "mosquitto",
+              "--mqtt_port", "${MQTT_PORT_WEBSOCKET}",
+              "--mqtt_transport", "${MQTT_TRANSPORT}",
+              "--mqtt_prefix", "staging/uagv/v2/RobotCompany",
+              "--postgres-host", "postgres",
+              "--postgres-port", "${POSTGRES_DATABASE_PORT}",
+              "--postgres-db", "${POSTGRES_DATABASE_NAME}",
+              "--postgres-user", "${POSTGRES_DATABASE_USERNAME}",
+              "--postgres-password", "${POSTGRES_DATABASE_PASSWORD}"]
+
+  graph-builder-service:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    environment:
+      - MQTT_HOST=mosquitto
+      - ARANGO_HOST=arangodb
+      - MINIO_HOST=minio
+      - POSTGRES_HOST=postgres
+      # graph_builder/main.py reads POSTGRES_DATABASE_* (not POSTGRES_HOST/PASSWORD directly);
+      # POSTGRES_DATABASE_HOST isn't set here on purpose -- it falls back to POSTGRES_HOST
+      # above (packages/config.py:81). Username/db aren't in the base environment block at
+      # all, so they need to be explicit here.
+      - POSTGRES_DATABASE_USERNAME=${POSTGRES_DATABASE_USERNAME}
+      - POSTGRES_DATABASE_NAME=${POSTGRES_DATABASE_NAME}
+      - MISSION_DISPATCH_URL=http://api-delegation-service:${API_DELEGATION_PORT:-8000}
+
+  mission-planner-service:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    environment:
+      - ARANGO_HOST=arangodb
+      - MINIO_HOST=minio
+      - POSTGRES_HOST=postgres
+      - MQTT_BROKER=mosquitto
+
+  api-delegation-service:
+    <<: *staging-limits
+    network_mode: !reset null
+    networks: [staging]
+    environment:
+      - ARANGO_HOST=arangodb
+      - MINIO_HOST=minio
+      - POSTGRES_HOST=postgres
+      - MISSION_PLANNER_URL=http://mission-planner-service:${MISSION_PLANNER_PORT:-8005}
+      - GRAPH_BUILDER_WS_URL=ws://graph-builder-service:${GRAPH_BUILDER_PORT:-8004}
+      # LIVEKIT_URL deliberately left pointing at localhost -- livekit isn't started in
+      # staging, and packages/config.py doesn't currently read a LIVEKIT_URL override anyway
+      # (a pre-existing gap unrelated to this rehearsal). Fine to leave unreachable.
+    ports:
+      - "127.0.0.1:18000:8000"
+
+  # Attaches to the staging network to run the existing pytest suites against the staging
+  # stack (tests/conftest.py's env-var contract, not packages/config.py's), without publishing
+  # any new host port -- avoids the port collisions docker-compose.test.yaml would hit if run
+  # while production is up (its postgres-test/arangodb-test publish :5432/:8529 directly).
+  test-runner:
+    build:
+      context: ..
+      dockerfile: tests/Dockerfile
+    networks: [staging]
+    environment:
+      - PYTHONPATH=/app
+      - ARANGODB_HOST=arangodb
+      - ARANGODB_PORT=8529
+      - ARANGO_HOST=arangodb
+      - ARANGO_USERNAME=root
+      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD}
+      - MINIO_HOST=minio
+      - MINIO_PORT=9000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=${POSTGRES_DATABASE_NAME}
+      - POSTGRES_USER=${POSTGRES_DATABASE_USERNAME}
+      - POSTGRES_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
+      - GRAPH_BUILDER_URL=http://graph-builder-service:${GRAPH_BUILDER_PORT:-8004}
+      - MISSION_PLANNER_URL=http://mission-planner-service:${MISSION_PLANNER_PORT:-8005}
+      - API_DELEGATION_URL=http://api-delegation-service:${API_DELEGATION_PORT:-8000}
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+    command: ["true"]  # no default run -- invoke with `... run --rm test-runner pytest ...`
+    depends_on:
+      - postgres
+      - mosquitto
+      - arangodb
+      - minio
+
+networks:
+  staging: {}
+
+volumes:
+  stg-pg: {}
+  stg-arango: {}
+  stg-minio: {}

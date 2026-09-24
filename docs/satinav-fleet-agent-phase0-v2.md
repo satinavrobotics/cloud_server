@@ -400,6 +400,8 @@ The recording level is set through the existing robot and settings routes and th
 6. Orphan reconciliation.
 7. Integration test: replay a recording (or a synthetic sequence) twice and check that the event set is identical; restart dispatch mid-stream and check there are no spurious events.
 
+**Dummy robot needs a goal-following mode.** `tests/dummy_robot/dummy_robot.py` currently free-runs its own circular patrol regardless of the VDA5050 order it receives — it never reports reaching an ordered waypoint or finishing an order. `MISSION.RUN_FINISHED` (item 1 above) and orphan reconciliation (item 6) both need a robot that actually completes an order to test the success path, not just the timeout/failure paths. Add a mode where it follows the ordered waypoints and reports FINISHED when done, before relying on it for WP6's integration tests.
+
 **WP7: API integration (days 3–5)**
 
 1. The advisory-lock writer election.

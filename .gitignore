@@ -8,3 +8,6 @@ htmlcov/*
 
 # Self-hosted LiveKit key pair (livekit-sfu services in docker_compose/mission_dispatch_services.yaml)
 docker_compose/livekit_sfu.env
+
+# Staging rehearsal credentials (docker_compose/mission_dispatch_services_staging_override.yaml)
+docker_compose/.env.staging
