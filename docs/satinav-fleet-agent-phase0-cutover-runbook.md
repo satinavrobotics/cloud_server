@@ -4,6 +4,10 @@
 Those come in separate, later windows (see `docs/satinav-fleet-agent-phase0-v2.md` §7, WP1, and
 §9 below). One change and one cause, if something breaks.
 
+**Status 2026-09-24: cutover done (16:45), window 1 (Alembic baseline) done (18:14); see
+"Post-cutover log" at the end. Window 2 (`phase0_core`) is ready: §10.** Any dump of the pg17
+database is restored with §11, not with a plain `pg_restore`.
+
 **Target:** `postgres:14.5` → `timescale/timescaledb-ha:pg17.11-ts2.30.1`. This is a deliberate
 major upgrade. We do it once, together with the dump/restore that is happening anyway.
 
@@ -372,6 +376,9 @@ Re-run the `ON_TASK` / `RUNNING` check from §1 first.
      /tmp/cutover-inwindow.dump
    ```
    `[TIMING: restore complete — rehearsal 2026-09-24: < 1 s]`
+   This plain restore is right only for this pg14 dump (no TimescaleDB objects in it). A dump
+   taken from the pg17 database, and especially one taken after window 2 (hypertables,
+   continuous aggregates), must be restored with §11.
 
 ## 4. Verification, then extension
 
@@ -545,7 +552,8 @@ prerequisite.
    why the decision window is short.
 7. If `pgdata14` is somehow unusable, the fallback is to restore
    `$CUTOVER_DIR/cutover-inwindow.dump` into a fresh `postgres:14.5` container on a new named
-   volume.
+   volume. That dump is from pg14 and has no TimescaleDB objects, so the plain §3.4 `pg_restore`
+   is correct for it. A dump taken from pg17 cannot go back to pg14 at all; for pg17 dumps use §11.
 
 **Rollback decision window: 1 hour from §5 completing.** Within that hour, roll back rather than
 debug live if anything looks wrong: verification queries clean but application behavior off, an
@@ -567,17 +575,288 @@ The safety dump stays with them, off-host. Then remove them deliberately: a name
 named date, runs `docker volume rm b323568ff9d35df1ea2dfd6916624635ca53953379106159029ca3dd0830fa52`
 and removes `pgdata14` from the compose file in a reviewed commit. Never do it via a prune. The
 ~190 orphaned volumes from the standing warning are a separate decision and are not part of this
-cleanup.
+cleanup. (`cutover-inwindow.dump` and the safety dump are pg14 dumps: plain restore, §7.7. Window 2
+keeps its own artifacts on its own 2-week clock: §10.7.)
 
 ## 9. Explicitly out of scope for this window
 
 - Alembic (baseline stamp and the `phase0_core` migration) comes in separate, later windows, only
   after this cutover is confirmed stable. **Do not merge Alembic/`phase0_core` before this
   cutover.** Per v2 §5.3 the API entrypoint will run `alembic upgrade head`. Against pg14 without
-  TimescaleDB, that fails, and the API does not start.
+  TimescaleDB, that fails, and the API does not start. (Window 1, the baseline stamp, was done
+  2026-09-24 18:14. Window 2, `phase0_core`, is §10.)
 - `packages/events` is independent. It is safe to merge any time and is unrelated to this window.
 - The mechanical test-debt backlog (`sync_db_client`, `list_bags` signature, etc.) is unrelated.
   Do it whenever there's a gap.
+
+## 10. Window 2: the `phase0_core` migration
+
+**What changes:** the API applies Alembic revision `20260924_01_phase0_core` (on branch
+`phase0/alembic`: 600c1ae + cba5f18) on its next start. That revision creates 9 tables
+(`cause_codes` + 20 seed rows, `mission_runs` + its immutability trigger, `fleet_events`,
+`robot_state_ts`, `diagnostics_ts`, `robot_latest`, `robot_site_assignments`, `audit_log`,
+`idempotency_keys`), 3 hypertables, 2 continuous aggregates (`robot_state_1m`, `diagnostics_1m`),
+9 TimescaleDB policy jobs, the `btree_gist` extension, and `mission_trajectory.run_id` plus the
+index `trajectory_run_idx`. The revision runs in one transaction: it applies completely or not at
+all. `mission-dispatch` also changes: at start it now waits until `mission_runs`, `fleet_events`,
+`robot_state_ts` and `robot_latest` exist. Nothing writes to the new tables yet (that is WP6/WP7).
+The `*objectv1` tables are not touched.
+
+**Status: ready. Verified 2026-09-24 on a throwaway stack** (own compose project, staging
+override, restored from a fresh read-only `pg_dump` of production, baseline stamped as in
+window 1): the steps below twice, the full rollback twice, and §11 on the migrated database. See
+"Window 2 verification" in the Post-cutover log. `window2.sh` is the same procedure as a script
+(each check gates the next step, it prints the exact rollback on failure, `--dry-run` runs only
+W2.1). Copy it into `$CUTOVER_DIR` before the window.
+
+Shell setup as at the top, with `CUTOVER_DIR=$HOME/pg-cutover/YYYYMMDD-window2`, plus the
+`snapshot` function from §2.3.
+
+### 10.1 Pre-checks (read-only)
+
+- [ ] **No robot `ON_TASK`, no mission `RUNNING`.** Same commands and the same stale-`OFFLINE`
+  caveat as §1. Re-run immediately before §10.4.
+- [ ] **All services are running cleanly on the window 1 images:**
+  ```bash
+  docker inspect -f '{{.Name}} {{.RestartCount}} {{.State.Status}}' \
+    docker_compose-api-delegation-service-1 docker_compose-mission-dispatch-1   # 0 running, both
+  docker inspect -f '{{.Image}}' docker_compose-api-delegation-service-1
+  docker image inspect -f '{{.Id}}' api_delegation_service:latest               # same ID as above
+  docker inspect -f '{{.Image}}' docker_compose-mission-dispatch-1
+  docker image inspect -f '{{.Id}}' mission_dispatch:latest                     # same ID as above
+  ```
+  If `:latest` is not what the container runs, someone has already built. Stop: the `:pre-phase0`
+  tag in §10.3 would then not point at the running code.
+- [ ] **Database is at the baseline and has none of the new objects:**
+  ```bash
+  psqlq -c "SELECT version_num FROM alembic_version"                                 # 20260924_00_baseline
+  psqlq -c "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"       # 2.30.1
+  psqlq -c "SELECT count(*) FROM pg_extension WHERE extname = 'btree_gist'"          # 0
+  psqlq -c "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"              # 7 (6 app tables + alembic_version)
+  psqlq -c "SELECT count(*) FROM timescaledb_information.jobs WHERE job_id >= 1000"  # 0
+  ```
+  If `btree_gist` already exists, stop and ask: the downgrade drops it.
+- [ ] Nobody runs `restart_services.sh` or `$COMPOSE build` between the merge (§10.3) and the
+  end of the window. After the merge, any rebuild deploys window 2 without these checks.
+- [ ] Announce the window.
+
+`[TIMING: pre-checks — verification 2026-09-24: 1 s]`
+
+### 10.2 Safety dump and baseline snapshot
+
+```bash
+docker exec -e PGPASSWORD="$PW" "$PG" pg_dump -Fc -U "$USR" "$DB" \
+  > "$CUTOVER_DIR/safety-pre-phase0.dump"
+docker exec -i "$PG" pg_restore -l < "$CUTOVER_DIR/safety-pre-phase0.dump" | grep -c "TABLE DATA"
+sha256sum "$CUTOVER_DIR/safety-pre-phase0.dump" > "$CUTOVER_DIR/safety-pre-phase0.dump.sha256"
+snapshot "$CUTOVER_DIR/before"
+```
+`pg_dump` warns `there are circular foreign-key constraints on this table: continuous_agg`. That
+comes from TimescaleDB's own catalog (it appears on production already, since §4.3) and is
+harmless. Copy the dump off the host. It restores with §11.
+
+`[TIMING: < 1 s (25 KB dump)]`
+
+### 10.3 Merge, tag, build
+
+The merge is inert: nothing changes until §10.5 recreates a container. Tag **before** building,
+because the build moves `:latest`.
+```bash
+git checkout main && git pull --ff-only
+git merge --no-ff phase0/alembic          # clean merge onto cb29036 (checked 2026-09-24)
+test -f packages/api/migrations/versions/20260924_01_phase0_core.py && echo MIGRATION PRESENT
+docker tag api_delegation_service:latest api_delegation_service:pre-phase0
+docker tag mission_dispatch:latest mission_dispatch:pre-phase0
+$COMPOSE build api-delegation-service mission-dispatch
+docker image ls --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep -E 'api_delegation_service|mission_dispatch'
+```
+Now `:latest` and `:pre-phase0` must differ for both images, and `:pre-phase0` must equal the IDs
+from §10.1. The running containers are not touched by `build`: they keep their image IDs.
+
+`[TIMING: build 2–6 s with a warm cache in verification; allow minutes if the cache is cold. Not downtime.]`
+
+### 10.4 Deploy order
+
+Re-run the `ON_TASK` / `RUNNING` check. Then:
+```bash
+$COMPOSE stop mission-dispatch                        # ~10 s, exit 137 is expected (§2.1)
+$COMPOSE up -d --no-deps api-delegation-service       # recreates on the new image; migrates on start
+docker logs --since 1m docker_compose-api-delegation-service-1 2>&1 \
+  | grep -E "api.entrypoint|Running upgrade|startup complete|Traceback"
+```
+The API log must show, in this order: `Holding migration lock; running alembic upgrade head`,
+`Running upgrade 20260924_00_baseline -> 20260924_01_phase0_core, phase0_core: ...`,
+`Migrations done`, `Application startup complete`. Then:
+```bash
+curl -s http://localhost:8000/api/v1/robots | python3 -c "import json,sys; print(len(json.load(sys.stdin)), 'robots')"
+psqlq -c "SELECT version_num FROM alembic_version"    # 20260924_01_phase0_core
+$COMPOSE up -d --no-deps mission-dispatch
+docker logs --since 1m docker_compose-mission-dispatch-1 2>&1 | grep -E "Waiting for tables|Created robot|Traceback"
+```
+Dispatch must log one `[<robot>] Created robot` per robot and **no** `Waiting for tables`. Then
+`docker inspect -f '{{.RestartCount}}'` is `0` for both.
+
+Why dispatch is stopped first: the migration's `ALTER TABLE mission_trajectory` needs a brief
+exclusive lock (it gives up after `lock_timeout = 10s`), and the new dispatch image waits for the
+new tables, so it must not start before the API has migrated. Why `--no-deps`: nothing else is
+recreated. If the migration fails, the transaction rolls back completely, the API exits, and
+`restart: on-failure` retries it. Go to §10.6.
+
+`[TIMING: verification 2026-09-24: API down 1–2 s (recreate + migration ~0.4 s + startup);
+dispatch down 13–14 s (10 s of it is the SIGTERM grace).]`
+
+### 10.5 Verification
+
+```bash
+psqlq -c "SELECT string_agg(hypertable_name, ',' ORDER BY hypertable_name) FROM timescaledb_information.hypertables WHERE hypertable_schema = 'public'"
+                                                    # diagnostics_ts,fleet_events,robot_state_ts
+psqlq -c "SELECT count(*) FROM timescaledb_information.jobs WHERE job_id >= 1000"   # 9
+psqlq -c "SELECT string_agg(view_name, ',' ORDER BY view_name) FROM timescaledb_information.continuous_aggregates"
+                                                    # diagnostics_1m,robot_state_1m
+psqlq -c "SELECT count(*) FROM cause_codes"         # 20
+psqlq -c "SELECT string_agg(t.tgname, ',') FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+          WHERE c.relnamespace = 'public'::regnamespace AND NOT t.tgisinternal"
+                                                    # mission_runs_immutable_when_terminal
+psqlq -c "SELECT count(*) FROM pg_extension WHERE extname = 'btree_gist'"           # 1
+psqlq -c "SELECT data_type FROM information_schema.columns WHERE table_schema = 'public'
+          AND table_name = 'mission_trajectory' AND column_name = 'run_id'"        # uuid
+$COMPOSE exec -T api-delegation-service alembic -c packages/api/alembic.ini current 2>&1 | tail -1
+                                                    # 20260924_01_phase0_core (head)
+```
+The 9 jobs are 3 compression policies (`fleet_events`, `robot_state_ts`, `diagnostics_ts`),
+4 retention policies (both raw tables, both aggregates) and 2 aggregate refresh policies. The two
+jobs below 1000 (`policy_telemetry`, `policy_job_stat_history_retention`) already existed.
+
+**Pre-existing tables unchanged, exactly the expected new tables.** Do **not** `diff -r` the
+whole snapshot: it differs by design (window 1's check aborted on exactly that). Compare only the
+tables that existed before, dropping the two expected additions on `mission_trajectory`, and
+check the new-table set separately:
+```bash
+snapshot "$CUTOVER_DIR/after"
+OLD=$(cut -d'|' -f1 "$CUTOVER_DIR/before/counts.txt" | sort -u | tr '\n' ' ')
+keep() { awk -F'|' -v T="$OLD" 'BEGIN{split(T,a," "); for(i in a) k[a[i]]=1} k[$1]' "$1" \
+         | grep -vE '^mission_trajectory\|[0-9]+\|run_id\||^mission_trajectory\|trajectory_run_idx\|'; }
+for f in columns indexes constraints triggers counts; do
+  diff <(keep "$CUTOVER_DIR/before/$f.txt") <(keep "$CUTOVER_DIR/after/$f.txt") && echo "$f: IDENTICAL"
+done
+comm -13 <(cut -d'|' -f1 "$CUTOVER_DIR/before/counts.txt" | sort -u) \
+         <(cut -d'|' -f1 "$CUTOVER_DIR/after/counts.txt" | sort -u) | tr '\n' ' '; echo
+# audit_log cause_codes diagnostics_ts fleet_events idempotency_keys mission_runs robot_latest robot_site_assignments robot_state_ts
+diff "$CUTOVER_DIR/before/functions.txt" <(grep -v '^mission_runs_block_terminal_update|' "$CUTOVER_DIR/after/functions.txt") \
+  && echo "functions: only mission_runs_block_terminal_update added"
+```
+The pre-existing set is `alembic_version` plus the 5 `*objectv1` tables and `mission_trajectory`.
+Row counts are compared exactly, so nobody should create missions during the window.
+
+Then the production WAIT-only mission check from §6 (dispatch picks it up via NOTIFY; delete it
+afterwards).
+
+`[TIMING: verification < 1 s]`
+
+### 10.6 Rollback
+
+**Order matters.** Only the new API image knows revision `20260924_01_phase0_core`. The old
+(`:pre-phase0`) API runs `alembic upgrade head` at start and aborts with
+`Can't locate revision identified by '20260924_01_phase0_core'` (verified) while the database is
+still at that revision. So downgrade first, with the new image, and only then swap the images
+back. And stop dispatch first: once the tables are gone, a restarting new dispatch waits forever.
+```bash
+$COMPOSE stop mission-dispatch
+psqlq -c "SELECT version_num FROM alembic_version"     # if already 20260924_00_baseline, skip the downgrade
+$COMPOSE run --rm --no-deps --entrypoint alembic api-delegation-service \
+  -c packages/api/alembic.ini downgrade 20260924_00_baseline
+psqlq -c "SELECT version_num FROM alembic_version"     # 20260924_00_baseline
+docker tag api_delegation_service:pre-phase0 api_delegation_service:latest
+docker tag mission_dispatch:pre-phase0 mission_dispatch:latest
+$COMPOSE up -d --no-deps api-delegation-service       # logs: Migrations done, Application startup complete
+$COMPOSE up -d --no-deps mission-dispatch             # logs: Created robot per robot
+snapshot "$CUTOVER_DIR/rollback"
+diff -r "$CUTOVER_DIR/before" "$CUTOVER_DIR/rollback" && echo "IDENTICAL TO BEFORE"
+```
+- `run --rm` instead of `exec`: it works even when the API container is crash-looping.
+- If the migration failed in §10.4, `alembic_version` is still the baseline and nothing was
+  created: skip the downgrade and just swap the images back.
+- The downgrade drops everything the revision created, **including its data**. Until WP6/WP7 code
+  that writes these tables ships, that is only the seed rows, so rolling back loses nothing.
+  After that it loses real data; fix forward instead.
+- If the downgrade itself fails (for example on `lock_timeout`), retry it once dispatch is
+  stopped. Last resort: restore `safety-pre-phase0.dump` into a fresh database with §11.
+- Undo the merge on `main` with `git revert -m 1 <merge commit>` so the next rebuild does not
+  redeploy it.
+
+After the rollback the database is identical to `before` (catalog and counts). The timescale
+jobs `>= 1000` and `btree_gist` are gone.
+
+`[TIMING: verification 2026-09-24, twice: 14 s wall from stop to dispatch back (10 s dispatch stop,
+< 1 s downgrade, API recreate ~2 s, dispatch ~1 s). Budget 5 min including log reading.]`
+
+### 10.7 Retention
+
+Keep `api_delegation_service:pre-phase0`, `mission_dispatch:pre-phase0` and
+`$CUTOVER_DIR/safety-pre-phase0.dump` (plus a copy off the host) for **2 weeks** after window 2.
+Then a named person, on a named date, removes them deliberately:
+`docker image rm api_delegation_service:pre-phase0 mission_dispatch:pre-phase0`. Never via a prune.
+The same applies to window 1's `api_delegation_service:pre-alembic`.
+
+## 11. Restoring a dump of the pg17 database (TimescaleDB)
+
+A plain `pg_restore` of a database with hypertables **fails**. Verified 2026-09-24:
+`COPY failed for table "_hyper_7_3_chunk": ERROR: could not find hypertable with id 7`. It needs
+`timescaledb_pre_restore()` before and `timescaledb_post_restore()` after. This applies to every
+dump taken from the pg17 database (`safety-pre-phase0.dump` included) and to every future
+dump/restore fallback. The target must run the same TimescaleDB version as the source (2.30.1,
+image `timescale/timescaledb-ha:pg17.11-ts2.30.1`), in a database that has no user objects yet
+(the image creates the app database with the extension already in it).
+```bash
+sha256sum -c "$CUTOVER_DIR/<dump>.sha256"
+docker cp "$CUTOVER_DIR/<dump>" "$PG":/tmp/restore.dump
+psqlq -c "SELECT timescaledb_pre_restore();"          # t. Stops background jobs for this database
+docker exec -e PGPASSWORD="$PW" "$PG" \
+  pg_restore --no-owner --role="$USR" -U "$USR" -d "$DB" --exit-on-error /tmp/restore.dump
+psqlq -c "SELECT timescaledb_post_restore();"         # t. ALWAYS run it, even after a failed restore
+psqlq -c "SHOW timescaledb.restoring"                 # off
+```
+Then verify with the §10.5 queries and a `snapshot` diff against the source. After
+`post_restore` all jobs are scheduled again; check
+`SELECT job_id, last_run_status FROM timescaledb_information.job_stats`. If a failed restore left
+the database half-filled, drop and recreate it (then `CREATE EXTENSION timescaledb`) before trying
+again.
+
+Verified 2026-09-24 on a migrated throwaway database with data in all three hypertables, one
+compressed chunk and both aggregates refreshed, restored into a fresh pg17 container in 0.6 s:
+catalog and row counts identical to the source; 3 hypertables, 9 jobs, 2 aggregates, the
+compressed chunk, `alembic_version` intact; inserts into hypertables and an aggregate refresh
+worked afterwards. Two things to expect:
+- On a small test container (`max_worker_processes = 8`) one of the 9 jobs logged
+  `failed to start a background worker` right after `post_restore`, then succeeded on its
+  scheduled retry. Production has `max_worker_processes = 21`.
+- If a column was ever dropped from a table (for example `mission_trajectory.run_id` after a
+  §10.6 rollback and re-upgrade), the restored `ordinal_position` closes the gap. That shows up as a
+  position-only line in `columns.txt`. It is not a data difference.
+
+## Post-cutover log
+
+- **2026-09-24 16:45, cutover (§1–§6).** About 38 s downtime. Every §4 check passed (settings,
+  catalog + count diff empty). The production WAIT-only mission went through to `COMPLETED`.
+  Artifacts are in `~/pg-cutover/20260924/`. The pg14 volume `pgdata14` (`b323568f…0fa52`) is kept
+  until 2026-10-08 (§8).
+- **2026-09-24 18:14, window 1: Alembic baseline.** Merged in cb29036. The baseline
+  `20260924_00_baseline` was stamped, and the API was recreated on the image whose entrypoint runs
+  `alembic upgrade head` under `pg_advisory_lock`. About 1 s API downtime. The only schema change
+  was the new `alembic_version` table (1 row). The window script's whole-snapshot diff then aborted
+  on exactly that expected table (after the deploy, with nothing to roll back). Window 2 therefore
+  compares only the pre-existing tables. The old image is tagged `api_delegation_service:pre-alembic`.
+  Artifacts are in `~/pg-cutover/20260924-window1/`.
+- **2026-09-24, window 2 verification (throwaway, not production).** Compose project
+  `p0w2-7d50d7`, staging override, `.env.staging`, own image tags. Postgres on its own volume
+  (checked with `compose config` and `docker inspect`). Loaded from a fresh read-only `pg_dump` of
+  production (19 missions, 3 robots, 2 maps, 1 settings), restored as the app role, baseline
+  stamped. Then `main` + `phase0/alembic` (merged, not committed) went through §10.1–§10.5, the full
+  §10.6 rollback, §10.3–§10.5 again, §11 on the migrated database, and §10.6 again. Everything
+  passed. API down 1–2 s, dispatch down 13–14 s, rollback 14 s. Two script bugs were found and
+  fixed on the way (`compose ps -q` hides stopped containers; `string_agg(… ORDER BY 1)` orders by
+  a constant). Both were in checks, and both were caught by the gates. The stack, volumes, images
+  and worktree were removed by name afterwards. Production was only read (`pg_dump`).
 
 ## Rehearsal log
 

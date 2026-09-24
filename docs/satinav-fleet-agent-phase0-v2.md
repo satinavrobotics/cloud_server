@@ -56,7 +56,9 @@ flowchart LR
 
 ## 3. Schema
 
-All DDL is managed by Alembic.
+All DDL is managed by Alembic. **As built:** everything in §3 is created by one revision,
+`packages/api/migrations/versions/20260924_01_phase0_core.py`; where it differs from the sketches
+below, the migration wins. The differences are noted in each subsection.
 
 ### 3.1 `mission_runs`
 
@@ -69,7 +71,7 @@ CREATE TABLE mission_runs (
   map_id           text,
   sw_version       text,                    -- build id snapshot at start
   recording_level  text NOT NULL,           -- full | events_only | off (at start)
-  state            text NOT NULL,           -- RUNNING | SUCCEEDED | FAILED | CANCELED | ABORTED | TIMEOUT
+  state            text NOT NULL,           -- RUNNING | COMPLETED | FAILED | CANCELED | ABORTED | TIMEOUT
   abort_cause      text REFERENCES cause_codes(code),
   abort_detail     jsonb,                   -- raw errors / navReasoning at termination
   passes_completed int NOT NULL DEFAULT 0,
@@ -88,6 +90,10 @@ CREATE INDEX ON mission_runs (sw_version);
 - One run is one dispatcher `run_id`. Repeat passes are counted inside the run.
 - A trigger blocks updates once the state is terminal, except to `summary_metrics`.
 - `mission_trajectory` gets an `ADD COLUMN run_id uuid`, and dispatch fills it from now on.
+- As built: the success state is `COMPLETED`, not `SUCCEEDED` (decided 2026-09-24, to match
+  `MissionStateV1`). `state` and `recording_level` are enforced by named `CHECK` constraints. The
+  trigger (`mission_runs_immutable_when_terminal`) raises `restrict_violation`. The migration also
+  adds a partial index `trajectory_run_idx` on `mission_trajectory (run_id) WHERE run_id IS NOT NULL`.
 
 ### 3.2 `fleet_events` (hypertable)
 
@@ -113,6 +119,8 @@ CREATE INDEX ON fleet_events (run_id) WHERE run_id IS NOT NULL;
 
 - The ID is `event_id = uuid5(NS, f"{code}|{robot}|{ts_utc_µs}|{discriminator}")` and inserts use `ON CONFLICT DO NOTHING`, so replays and duplicate messages can never create duplicate events.
 - Events are kept indefinitely, and chunks older than 14 days are compressed.
+- As built: `severity` and `source` are enforced by `CHECK` constraints; compression is segmented
+  by `robot_name`, ordered by `ts DESC`. There is no foreign key from `code` or `run_id`.
 
 ### 3.3 Event codes (v1)
 
@@ -142,10 +150,17 @@ Codes are append-only: they are never renamed or reused, only deprecated.
 
 | Table | Writer | Rate | Columns |
 |---|---|---|---|
-| `robot_state_ts` | dispatch | every 5 s + immediately on state/order/error change | ts, robot, run_id, x, y, yaw, map_id, battery, state, order_id, last_node, driving |
-| `diagnostics_ts` | api | the existing diagnostics rate | ts, robot, cpu, gpu, ram, temp_max, power_w, nodes_down, **gnss_fix, gnss_sats, gnss_h_acc_m, gnss_corr_age_s** |
+| `robot_state_ts` | dispatch | every 5 s + immediately on state/order/error change | ts, robot_name, run_id, x, y, yaw, map_id, battery, state, order_id, last_node, driving |
+| `diagnostics_ts` | api | the existing diagnostics rate | ts, robot_name, cpu, gpu, ram, temp_max, power_w, nodes_down, **gnss_fix, gnss_sats, gnss_h_acc_m, gnss_corr_age_s** |
 
 - **Retention:** 30 days of raw data. Rollups (`robot_state_1m`, `diagnostics_1m`) are kept for 2 years, and raw chunks older than 3 days are compressed.
+- As built: 1-day chunks, compression segmented by `robot_name`. The rollups are continuous
+  aggregates on 1-minute buckets, keyed `(bucket, robot_name)`, refreshed every 5 min over the last
+  2 days (end offset 2 min). Their columns were designed during implementation; see the migration.
+  `robot_state_1m`: `samples`, last-value `run_id`/`x`/`y`/`yaw`/`map_id`/`state`/`order_id`/`last_node`,
+  `battery_avg`, `battery_min`, `driving` (`bool_or`). `diagnostics_1m`: `samples`, avg and max of
+  `cpu`/`gpu`/`ram`, `temp_max`, `power_w_avg`, `nodes_down_max`, last `gnss_fix`, `gnss_sats_min`,
+  `gnss_h_acc_m_max`, `gnss_corr_age_s_max`.
 - **Not stored as time series:** BT state, nav_supervisor samples and full jtop payloads. The events above cover what the agent needs.
 
 ### 3.5 `robot_latest`
@@ -197,6 +212,8 @@ CREATE TABLE idempotency_keys (
 ```
 
 `cause_codes` is seeded with about 20 codes: `NAV.GOAL_UNREACHABLE`, `NAV.RECOVERY_EXHAUSTED`, `GNSS.RTK_LOST`, `POWER.LOW_BATTERY`, `COMMS.HEARTBEAT_LOST`, `OPERATOR.CANCELED`, `DISPATCH.TIMEOUT`, `DISPATCH.ORPHANED`, `HW.FAULT`, `UNKNOWN`, and so on.
+As built: exactly 20 rows, copied verbatim from `packages/events/causes.py` `CAUSE_CODES`.
+`siteobjectv1` (§3.6) is not in the migration: it follows the runtime object-class convention.
 
 ---
 
@@ -336,15 +353,15 @@ The recording level is set through the existing robot and settings routes and th
 2. Configure it: `shared_preload_libraries='timescaledb'`, `timescaledb.telemetry_level=off`, run `timescaledb-tune`, and set the server timezone to UTC.
 3. **Done on staging** (bridge-network rehearsal, commit c5dbb4d). On staging, dump, start the new image, restore, run `CREATE EXTENSION timescaledb`, and diff row counts and schema. The result: the catalog diff was empty and row counts matched. The dump is `pg_dump` of the app database, not `pg_dumpall`, because production has only the app role, which the image creates from `POSTGRES_USER`. The restore runs as the app role (`--no-owner --role=<app role>`), which resolves the pg15+ `public`-schema privilege change.
 4. **Done on staging** (same rehearsal). LISTEN/NOTIFY dispatch went `PENDING -> RUNNING`, and the test suite ran. Its 82 pre-existing failures are marked xfail in `tests/conftest.py` and are unrelated to Postgres.
-5. Add Alembic to the API package:
+5. **Done, in production since 2026-09-24 18:14 (window 1, merged in cb29036).** Add Alembic to the API package:
    - an empty baseline revision, applied with `alembic stamp`;
    - autogenerate **disabled**;
    - an `include_object` filter that excludes the `*objectv1` tables;
    - raw-SQL migrations only;
    - date-prefixed revision IDs.
-6. Write migration `…_01_phase0_core` containing all §3 tables, hypertables, compression and retention policies, continuous aggregates, the `cause_codes` seed and the `mission_runs` immutability trigger.
-7. Add the migration step to the API entrypoint under an advisory lock, and make dispatch retry its DB init until the tables exist.
-8. Migrate production in a maintenance window. The full procedure is in `docs/satinav-fleet-agent-phase0-cutover-runbook.md`. In outline:
+6. **Written; window 2 ready** (branch `phase0/alembic`; procedure, verified on a throwaway copy of production, in the runbook's "Window 2" section). Write migration `…_01_phase0_core` containing all §3 tables, hypertables, compression and retention policies, continuous aggregates, the `cause_codes` seed and the `mission_runs` immutability trigger.
+7. **Entrypoint: done (window 1). Dispatch table wait: on `phase0/alembic`, ships in window 2.** Add the migration step to the API entrypoint under an advisory lock, and make dispatch retry its DB init until the tables exist.
+8. **Done: production cut over 2026-09-24 16:45** (~38 s downtime; see the runbook's "Post-cutover log"). Migrate production in a maintenance window. The full procedure is in `docs/satinav-fleet-agent-phase0-cutover-runbook.md`. In outline:
    - wait until no robot is `ON_TASK`;
    - stop dispatch, then the API, then graph-builder, then mission-planner;
    - dump, restore and verify;
@@ -355,9 +372,9 @@ The recording level is set through the existing robot and settings routes and th
    **Prerequisite:** the pre-window volume fix (runbook §0) is deployed first. It pins production's current Postgres volume as a named external volume. Without it there is nothing stable to roll back to (see the known issue below).
    **Ordering rule:** Alembic / `phase0_core` (steps 5–7) must **not** merge before this cutover. The API entrypoint runs `alembic upgrade head`, which would fail against pg14 without TimescaleDB and keep the API from starting.
 
-> **Known issue: Postgres data resets on full restart.** The production `postgres` service declares no volume, so it only gets the image's anonymous volume. `restart_services.sh` (`down` then `up -d`) therefore starts a fresh, empty volume each time. The host has ~190 orphaned PG14 data volumes (2025-10 → 2026-09), so production has very likely been reset to an empty database on each full restart. A few of those volumes may be test leftovers. Until the runbook §0 fix lands, don't run `restart_services.sh` and don't prune volumes. The owner has to decide whether any orphaned volume holds data worth recovering.
+> **Known issue (fixed 2026-09-24: runbook §0 deployed): Postgres data resets on full restart.** The production `postgres` service declares no volume, so it only gets the image's anonymous volume. `restart_services.sh` (`down` then `up -d`) therefore starts a fresh, empty volume each time. The host has ~190 orphaned PG14 data volumes (2025-10 → 2026-09), so production has very likely been reset to an empty database on each full restart. A few of those volumes may be test leftovers. Until the runbook §0 fix lands, don't run `restart_services.sh` and don't prune volumes. The owner has to decide whether any orphaned volume holds data worth recovering.
 
-**WP2: `packages/events` (days 1–5, in parallel)**
+**WP2: `packages/events` (days 1–5, in parallel)** — **Done** (on `main` since 30a6388).
 
 1. Codes registry and payload models for every code in §3.3.
 2. Deterministic IDs, with a test that the same input gives the same ID across processes.
