@@ -111,6 +111,17 @@ TELEMETRY_ELECTION_CHECK_S = float(os.getenv("TELEMETRY_ELECTION_CHECK_S", "2.0"
 THERMAL_HIGH_C = float(os.getenv("THERMAL_HIGH_C", "85.0"))
 THERMAL_OK_C = float(os.getenv("THERMAL_OK_C", "78.0"))
 
+# ==================== Phase 0 read endpoints (API) ====================
+# docs/satinav-fleet-agent-phase0-v2.md §5.5, WP10 (packages/api/fleet_reads.py): /runs,
+# /runs/{id}, /runs/{id}/timeline, /events. Each request runs in one READ ONLY transaction whose
+# statements are cancelled after this many milliseconds (503), so a heavy query can't hold a
+# pooled connection for long.
+FLEET_READ_STATEMENT_TIMEOUT_MS = int(os.getenv("FLEET_READ_STATEMENT_TIMEOUT_MS", "5000"))
+# Timeline caps: points per track (robot_state / diagnostics / trajectory; longer series are
+# downsampled) and events per run (the rest is cut, with a `*_truncated` flag).
+FLEET_TIMELINE_MAX_POINTS = int(os.getenv("FLEET_TIMELINE_MAX_POINTS", "2000"))
+FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
+
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
 GPS_MAP_SENTINEL = 'GEO'    # map_id sentinel for GPS-mode robots with no assigned map

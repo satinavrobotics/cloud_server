@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import recording, sites
+from packages.api import fleet_reads, recording, sites
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
     configure_service_logging, DependencyHealthChecker
@@ -1523,6 +1523,91 @@ async def list_robot_site_assignments(robot_name: str):
     _require_service()
     return await _site_call("list site assignments",
                             sites.list_assignments(service.database, robot_name))
+
+
+# ==================== Runs, events, timeline (Phase 0 WP10) ====================
+# Read-only; response shapes, pagination and `not_recorded`: packages/api/fleet_reads.py.
+
+@app.get("/api/v1/runs")
+async def list_runs(
+    robot: Optional[str] = Query(None, description="Robot name"),
+    site: Optional[str] = Query(None, description="Site id (the site the run started at)"),
+    state: Optional[str] = Query(None, description="RUNNING, COMPLETED, FAILED, CANCELED, "
+                                                   "ABORTED or TIMEOUT"),
+    sw_version: Optional[str] = Query(None, description="Robot build id at run start"),
+    from_: Optional[str] = Query(None, alias="from",
+                                 description="started_at >= this (ISO-8601 with time zone)"),
+    to: Optional[str] = Query(None, description="started_at < this (ISO-8601 with time zone)"),
+    cursor: Optional[str] = Query(None, description="`next_cursor` of the previous page"),
+    limit: int = Query(fleet_reads.DEFAULT_LIMIT, ge=1, le=fleet_reads.MAX_LIMIT),
+):
+    """Mission runs, newest first: `{"items": [run...], "next_cursor": str | null}`."""
+    _require_service()
+    start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
+    return await _site_call("list runs", fleet_reads.list_runs(
+        service.database, robot=robot, site=site, state=state, sw_version=sw_version,
+        start=start, end=end, cursor=cursor, limit=limit))
+
+
+@app.get("/api/v1/runs/{run_id}")
+async def get_run(run_id: uuid.UUID):
+    """One run (with mission_tree) and its events, oldest first. 404 if unknown."""
+    _require_service()
+    return await _site_call("get run", fleet_reads.get_run(service.database, run_id))
+
+
+@app.get("/api/v1/runs/{run_id}/timeline")
+async def get_run_timeline(run_id: uuid.UUID):
+    """Events, coarse robot_state/diagnostics tracks, trajectory and the recording level
+    history (`recording.not_recorded` intervals) over the run's window. 404 if unknown."""
+    _require_service()
+    return await _site_call("get run timeline",
+                            fleet_reads.run_timeline(service.database, run_id))
+
+
+@app.get("/api/v1/events")
+async def list_events(
+    robot: Optional[str] = Query(None, description="Robot name"),
+    site: Optional[str] = Query(None, description="Site id"),
+    code: Optional[List[str]] = Query(None, description="Event code or category prefix "
+                                                        "(NAV.*); may be repeated"),
+    severity: Optional[List[str]] = Query(None, description="info, warning, error or "
+                                                            "critical; may be repeated"),
+    run: Optional[str] = Query(None, description="Run id"),
+    from_: Optional[str] = Query(None, alias="from",
+                                 description="ts >= this (ISO-8601 with time zone)"),
+    to: Optional[str] = Query(None, description="ts < this (ISO-8601 with time zone)"),
+    cursor: Optional[str] = Query(None, description="`next_cursor` of the previous page"),
+    limit: int = Query(fleet_reads.DEFAULT_LIMIT, ge=1, le=fleet_reads.MAX_LIMIT),
+):
+    """Fleet events, newest first: `{"items": [event...], "next_cursor": str | null}`."""
+    _require_service()
+    start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
+    return await _site_call("list events", fleet_reads.list_events(
+        service.database, robot=robot, site=site, codes=fleet_reads.expand_codes(code),
+        severities=severity, run=fleet_reads.parse_uuid(run, "run"), start=start, end=end,
+        cursor=cursor, limit=limit))
+
+
+@app.get("/api/v1/robots/{robot_name}/recording")
+async def get_robot_recording(robot_name: str):
+    """The robot's effective telemetry recording level now and where it comes from:
+    `{"level", "source": "robot"|"site"|"global"|"default", "site_id", "configured": {...}}`."""
+    _require_service()
+    return await _site_call("get recording level",
+                            fleet_reads.effective_recording(service.database, robot_name))
+
+
+# Not /api/v1/robots/recording: GET /api/v1/robots/{robot_name} (declared earlier) would take
+# "recording" as a robot name.
+@app.get("/api/v1/recording", response_model=List[dict])
+async def list_recording_levels():
+    """Every robot's effective recording level (the same rule as
+    /api/v1/robots/{name}/recording), by name: `[{"robot_name", "level", "source", "site_id",
+    "site_name"}]`."""
+    _require_service()
+    return await _site_call("list recording levels",
+                            fleet_reads.effective_recording_all(service.database))
 
 
 # ==================== Mission Operations ====================

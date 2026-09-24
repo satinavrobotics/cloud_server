@@ -484,6 +484,29 @@ As built (branch `phase0/sites`, not yet merged):
 - `/runs`, `/runs/{id}`, `/events` with cursor pagination.
 - `/runs/{id}/timeline`: events, rollup or raw tracks depending on window length, the trajectory, and `not_recorded` intervals derived from the recording level and `RECORDING_CHANGED` events.
 
+As built (branch `phase0/read-endpoints`, not yet merged; logic and response shapes in
+`packages/api/fleet_reads.py`, routes in `packages/api/main.py`):
+
+- Routes: `GET /api/v1/runs`, `/api/v1/runs/{run_id}`, `/api/v1/runs/{run_id}/timeline`,
+  `/api/v1/events`, plus `GET /api/v1/robots/{name}/recording` (effective level + source) and
+  `GET /api/v1/recording` (the same for every robot, for the UI). No migration: the existing
+  indexes cover the filters at current table sizes.
+- Lists are `{"items": [...], "next_cursor": str | null}`, newest first, keyset on
+  `(started_at, run_id)` / `(ts, event_id)`; `limit` 1–500 (default 50); `from`/`to` are
+  ISO-8601 with a zone, `[from, to)`; `code` repeats or takes a category (`NAV.*`), expanded
+  to the known codes. 422 on bad parameters, 404 on an unknown run.
+- Every request is one `READ ONLY` transaction with `statement_timeout`
+  (`FLEET_READ_STATEMENT_TIMEOUT_MS`, 5 s): cancelled → 503.
+- Timeline: the run's events plus the robot's events in `[started_at, ended_at|now]`;
+  `robot_state_ts`/`diagnostics_ts` raw, or the 1-minute rollups once raw rows are gone, each
+  downsampled to `FLEET_TIMELINE_MAX_POINTS` (2000; last sample per equal bucket);
+  `mission_trajectory` by `run_id`, or the mission's untagged rows in the window while running.
+- `not_recorded`: the level is rebuilt over the window from the robot/site/global
+  `RECORDING_CHANGED` events and `robot_site_assignments`. The configured values are decoded
+  from each event's deterministic `event_id`, because the payload holds effective levels. The
+  first segment uses `mission_runs.recording_level`. `events_only` → missing `time_series`;
+  `off` → missing `events` and `time_series`.
+
 **WP11: Fixes F1–F5 (days 2–4)**
 
 Tests for each fix: the map delete saga under an injected Arango or MinIO failure, settings returning 422, idempotent replay of the same request, audit rows written, and `created_by` not spoofable.
