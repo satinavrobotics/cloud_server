@@ -32,15 +32,26 @@ services:
 
   # Create Postgres database
   postgres:
-    image: postgres:14.5
+    image: timescale/timescaledb-ha:pg17.11-ts2.30.1
+    # v2 WP1.2 settings. Do NOT override shared_preload_libraries here: the image already
+    # ships 'timescaledb,pg_textsearch', and a -c override replaces the whole list.
+    command: ["postgres",
+              "-c", "timescaledb.telemetry_level=off",
+              "-c", "timezone=UTC"]
     environment:
       - POSTGRES_USER=${POSTGRES_DATABASE_USERNAME}
       - POSTGRES_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
       - POSTGRES_DB=${POSTGRES_DATABASE_NAME}
       - POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256
+      # timescaledb-tune runs once, at initdb, and sizes from the container's cgroup limits.
+      # There are none here, so without these it would size from the whole shared host.
+      - TS_TUNE_MEMORY=4GB
+      - TS_TUNE_NUM_CPUS=2
+      - TS_TUNE_MAX_CONNS=100
+      - TIMESCALEDB_TELEMETRY=off
     network_mode: "host"
     volumes:
-      - pgdata14:/var/lib/postgresql/data
+      - pgdata17:/home/postgres/pgdata      # PGDATA is /home/postgres/pgdata/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_DATABASE_USERNAME}"]
       interval: 5s
@@ -322,3 +333,8 @@ volumes:
     # creates or deletes it, not even with `down -v`.
     external: true
     name: b323568ff9d35df1ea2dfd6916624635ca53953379106159029ca3dd0830fa52
+  pgdata17:
+    # Production PG17 + TimescaleDB data (cutover 2026-09-24). pgdata14 above is kept
+    # for rollback and 2-week retention (runbook §7-§8).
+    external: true
+    name: sati_pgdata17
