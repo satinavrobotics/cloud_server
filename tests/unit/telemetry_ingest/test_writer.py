@@ -286,6 +286,39 @@ class TestFailures:
         assert len(db.events) == 1
         await writer.stop()
 
+    async def test_policy_refresh_backs_off_while_failing(self, pool, db, clock, spill_path):
+        class FailingPolicy:
+            stale = True
+            calls = 0
+            ok = False
+
+            async def refresh(self, _pool):
+                FailingPolicy.calls += 1
+                if self.ok:
+                    self.stale = False
+                return self.ok
+
+        policy = FailingPolicy()
+        _, writer = make(pool, clock, spill_path, policy=policy)
+        writer.start()
+        await spin(50)                      # many ticks, clock frozen: one attempt only
+        assert FailingPolicy.calls == 1
+        clock.advance(0.9)
+        await spin(50)
+        assert FailingPolicy.calls == 1     # still inside the 1 s backoff
+        clock.advance(0.2)
+        await spin(50)
+        assert FailingPolicy.calls == 2     # then 2 s
+        clock.advance(1.9)
+        await spin(50)
+        assert FailingPolicy.calls == 2
+        policy.ok = True
+        clock.advance(0.2)
+        await spin(50)
+        assert FailingPolicy.calls == 3 and not policy.stale
+        assert writer.metrics.policy_refresh_failures == 2
+        await writer.stop()
+
 
 class TestKillMidBatch:
     """Required by WP5: kill the writer mid-batch and lose no events."""

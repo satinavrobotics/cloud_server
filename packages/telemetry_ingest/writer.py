@@ -43,6 +43,7 @@ DEFAULT_BATCH_SIZE = 500
 DEFAULT_REPLAY_LIMIT = 5000
 DEFAULT_CONNECT_TIMEOUT_S = 5.0
 DEFAULT_TICK_S = 0.1
+POLICY_RETRY_BACKOFF_S = (1.0, 2.0, 5.0, 10.0, 30.0)
 
 
 async def create_pool(conninfo: str, *, name: str = "telemetry_ingest") -> Any:
@@ -104,6 +105,8 @@ class TelemetryWriter:
         self._clock = clock
         self._sleep = sleep
         self._last_flush: Optional[float] = None
+        self._policy_failures = 0
+        self._policy_retry_at = float("-inf")
         self._task: Optional[asyncio.Task] = None
 
     # --- lifecycle -----------------------------------------------------------------------
@@ -151,9 +154,18 @@ class TelemetryWriter:
     async def _run(self) -> None:
         while True:
             try:
-                if self._policy is not None and self._policy.stale:
-                    if not await self._policy.refresh(self._pool):
+                if (self._policy is not None and self._policy.stale
+                        and self._clock() >= self._policy_retry_at):
+                    if await self._policy.refresh(self._pool):
+                        self._policy_failures = 0
+                    else:
                         self.metrics.policy_refresh_failures += 1
+                        # Back off while the database is down instead of retrying (and
+                        # logging a traceback) every tick.
+                        delay = POLICY_RETRY_BACKOFF_S[
+                            min(self._policy_failures, len(POLICY_RETRY_BACKOFF_S) - 1)]
+                        self._policy_failures += 1
+                        self._policy_retry_at = self._clock() + delay
                 if self.due():
                     await self.flush_once()
             except asyncio.CancelledError:

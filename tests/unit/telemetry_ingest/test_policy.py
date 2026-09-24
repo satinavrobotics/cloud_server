@@ -166,6 +166,9 @@ class TestRecordingPolicy:
         writer.start()
         for _ in range(10):
             await asyncio.sleep(0)
+        clock.advance(1.0)                  # past the first retry backoff
+        for _ in range(10):
+            await asyncio.sleep(0)
         await writer.stop()
         assert writer.metrics.policy_refresh_failures == 1
         assert not policy.stale and policy.level_for("r1") is FULL
