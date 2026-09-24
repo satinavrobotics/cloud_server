@@ -54,12 +54,18 @@ services:
       context: ..
       dockerfile: packages/controllers/mission/Dockerfile
     image: ${MISSION_DISPATCH_IMAGE:-mission_dispatch:latest}
-    command: ["--mqtt_port", "${MQTT_PORT_WEBSOCKET}",
+    # NOTE: packages/controllers/mission/main.py's argparse defines the postgres flags with
+    # HYPHENS (--postgres-host, --postgres-port, ...) while the mqtt flags use underscores.
+    # parse_known_args() silently drops unrecognized flags, so underscored postgres_* flags
+    # here would be (and, before this comment, always were) no-ops -- see AUDIT_BACKLOG.md.
+    command: ["--mqtt_host", "${MQTT_HOST:-localhost}",
+              "--mqtt_port", "${MQTT_PORT_WEBSOCKET}",
               "--mqtt_transport", "${MQTT_TRANSPORT}",
-              "--postgres_port", "${POSTGRES_DATABASE_PORT}",
-              "--postgres_db", "${POSTGRES_DATABASE_NAME}",
-              "--postgres_user", "${POSTGRES_DATABASE_USERNAME}",
-              "--postgres_password", "${POSTGRES_DATABASE_PASSWORD}"]
+              "--postgres-host", "${POSTGRES_HOST:-localhost}",
+              "--postgres-port", "${POSTGRES_DATABASE_PORT}",
+              "--postgres-db", "${POSTGRES_DATABASE_NAME}",
+              "--postgres-user", "${POSTGRES_DATABASE_USERNAME}",
+              "--postgres-password", "${POSTGRES_DATABASE_PASSWORD}"]
     network_mode: "host"
     restart: on-failure
     depends_on:

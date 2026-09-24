@@ -29,7 +29,7 @@ PORT_MQTT = 1883
 # ==================== Service URLs ====================
 # Default URLs for service-to-service communication
 URL_GRAPH_BUILDER = f"http://localhost:{PORT_GRAPH_BUILDER}"
-URL_MISSION_PLANNER = f"http://localhost:{PORT_MISSION_PLANNER}"
+URL_MISSION_PLANNER = os.getenv("MISSION_PLANNER_URL", f"http://localhost:{PORT_MISSION_PLANNER}")
 URL_LIVEKIT = f"http://localhost:{PORT_LIVEKIT}"
 URL_AGENT_ORCHESTRATOR = f"http://localhost:{PORT_AGENT_ORCHESTRATOR}"
 URL_API_DELEGATION = f"http://localhost:{PORT_API_DELEGATION}"
