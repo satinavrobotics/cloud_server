@@ -1074,7 +1074,8 @@ class TestApiDelegationServiceUpdateNode:
 
 @pytest.mark.unit
 class TestApiDelegationServiceDeleteMap:
-    """Test ApiDelegationService.delete_map() method."""
+    """ApiDelegationService.delete_map() hands off to the background MapDeleter (WP11 F1); these
+    check the store results one cleanup attempt sees (the saga: tests/unit/test_map_delete.py)."""
 
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')
@@ -1082,7 +1083,7 @@ class TestApiDelegationServiceDeleteMap:
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
     @patch('packages.topomap_dbs.client.GraphDatabaseService')
     async def test_delete_map_success(self, mock_graph, mock_image, mock_planner, mock_db):
-        """Test deleting map successfully."""
+        """Both stores clean: the attempt succeeds, and delete_map returns the 202 body."""
         mock_graph_instance = Mock()
         mock_graph_instance.delete_map.return_value = {"success": True}
         mock_graph.return_value = mock_graph_instance
@@ -1092,12 +1093,16 @@ class TestApiDelegationServiceDeleteMap:
         mock_image.return_value = mock_image_instance
 
         service = ApiDelegationService()
-        result = await service.delete_map("test_map")
-
-        assert result["success"] is True
-        assert result["map_id"] == "test_map"
+        assert await service.map_deleter._attempt("test_map") is None
         mock_graph_instance.delete_map.assert_called_once_with("test_map")
         mock_image_instance.delete_map.assert_called_once_with("test_map")
+
+        service.map_deleter.request = AsyncMock(
+            return_value={"success": True, "map_id": "test_map", "lifecycle": "DELETING"})
+        result = await service.delete_map("test_map")
+        assert result["success"] is True
+        assert result["map_id"] == "test_map"
+        service.map_deleter.request.assert_awaited_once_with("test_map")
 
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')
@@ -1105,7 +1110,7 @@ class TestApiDelegationServiceDeleteMap:
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
     @patch('packages.topomap_dbs.client.GraphDatabaseService')
     async def test_delete_map_graph_db_fails(self, mock_graph, mock_image, mock_planner, mock_db):
-        """Test deleting map when graph DB deletion fails."""
+        """Graph DB deletion fails: the attempt reports it."""
         mock_graph_instance = Mock()
         mock_graph_instance.delete_map.return_value = {"success": False}
         mock_graph.return_value = mock_graph_instance
@@ -1115,10 +1120,7 @@ class TestApiDelegationServiceDeleteMap:
         mock_image.return_value = mock_image_instance
 
         service = ApiDelegationService()
-        result = await service.delete_map("test_map")
-
-        assert result["success"] is False
-        assert "error" in result
+        assert await service.map_deleter._attempt("test_map") == "graph_db: delete failed"
 
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')
@@ -1126,19 +1128,17 @@ class TestApiDelegationServiceDeleteMap:
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
     @patch('packages.topomap_dbs.client.GraphDatabaseService')
     async def test_delete_map_image_db_fails(self, mock_graph, mock_image, mock_planner, mock_db):
-        """Test deleting map when image DB deletion fails."""
+        """Image DB deletion fails: the attempt reports it."""
         mock_graph_instance = Mock()
         mock_graph_instance.delete_map.return_value = {"success": True}
         mock_graph.return_value = mock_graph_instance
 
         mock_image_instance = Mock()
-        mock_image_instance.delete_map.return_value = {"success": False}
+        mock_image_instance.delete_map.return_value = False
         mock_image.return_value = mock_image_instance
 
         service = ApiDelegationService()
-        result = await service.delete_map("test_map")
-
-        assert result["success"] is False
+        assert await service.map_deleter._attempt("test_map") == "image_db: delete failed"
 
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')
@@ -1146,7 +1146,7 @@ class TestApiDelegationServiceDeleteMap:
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
     @patch('packages.topomap_dbs.client.GraphDatabaseService')
     async def test_delete_map_returns_boolean(self, mock_graph, mock_image, mock_planner, mock_db):
-        """Test deleting map when services return boolean instead of dict."""
+        """Services returning booleans (their real return type)."""
         mock_graph_instance = Mock()
         mock_graph_instance.delete_map.return_value = True
         mock_graph.return_value = mock_graph_instance
@@ -1156,9 +1156,7 @@ class TestApiDelegationServiceDeleteMap:
         mock_image.return_value = mock_image_instance
 
         service = ApiDelegationService()
-        result = await service.delete_map("test_map")
-
-        assert result["success"] is True
+        assert await service.map_deleter._attempt("test_map") is None
 
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')
@@ -1166,14 +1164,14 @@ class TestApiDelegationServiceDeleteMap:
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
     @patch('packages.topomap_dbs.client.GraphDatabaseService')
     async def test_delete_map_exception(self, mock_graph, mock_image, mock_planner, mock_db):
-        """Test deleting map when exception occurs."""
+        """An exception from a store is a failed attempt (retried), not a crash."""
         mock_graph_instance = Mock()
         mock_graph_instance.delete_map.side_effect = Exception("Delete failed")
         mock_graph.return_value = mock_graph_instance
+        mock_image.return_value.delete_map.return_value = True
 
         service = ApiDelegationService()
-        with pytest.raises(Exception, match="Delete failed"):
-            await service.delete_map("test_map")
+        assert await service.map_deleter._attempt("test_map") == "graph_db: Delete failed"
 
 
 @pytest.mark.unit

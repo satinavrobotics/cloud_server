@@ -118,17 +118,85 @@ class TestUpdateSettingsRoute:
         svc.database.update_spec.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_ignores_unknown_fields(self):
+    async def test_unknown_fields_are_422_listing_them(self):
+        # WP11 F2: no longer silently dropped. Nothing is read or written.
         svc = MagicMock()
-        svc.database.get_object = AsyncMock(
-            side_effect=[_existing_settings([]), _existing_settings([])]
-        )
+        svc.database.get_object = AsyncMock()
         svc.database.update_spec = AsyncMock()
         with patch.object(main, "service", svc):
-            result = await main.update_settings({"not_a_real_field": "whatever"})
-        assert result["fault_error_types"] == []
+            with pytest.raises(HTTPException) as exc:
+                await main.update_settings({"not_a_real_field": "whatever",
+                                            "fault_error_types": ["e"], "another": 1})
+        assert exc.value.status_code == 422
+        assert [err["loc"] for err in exc.value.detail] == [
+            ["body", "another"], ["body", "not_a_real_field"]]
+        assert all(err["type"] == "value_error.extra" for err in exc.value.detail)
+        svc.database.update_spec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_field_422_even_with_a_valid_recording_level(self):
+        svc = MagicMock()
+        svc.database.update_spec = AsyncMock()
+        with patch.object(main, "service", svc):
+            with pytest.raises(HTTPException) as exc:
+                await main.update_settings({"telemetry_recording": "full", "typo": True})
+        assert exc.value.status_code == 422
+        assert exc.value.detail[0]["loc"] == ["body", "typo"]
+        svc.database.update_spec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bad_value_is_422(self):
+        svc = MagicMock()
+        svc.database.get_object = AsyncMock(return_value=_existing_settings([]))
+        svc.database.update_spec = AsyncMock()
+        with patch.object(main, "service", svc):
+            with pytest.raises(HTTPException) as exc:
+                await main.update_settings({"fault_error_types": "not-a-list"})
+        assert exc.value.status_code == 422
+        assert exc.value.detail[0]["loc"][:2] == ["body", "fault_error_types"]
+        svc.database.update_spec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_is_partial(self):
+        # Only the keys sent change: a stored telemetry_recording survives a
+        # fault_error_types update, and no RECORDING_CHANGED hook is attached.
+        stored = _existing_settings(["old"])
+        stored.telemetry_recording = "full"
+        svc = MagicMock()
+        svc.database.get_object = AsyncMock(side_effect=[stored, stored])
+        svc.database.update_spec = AsyncMock()
+        with patch.object(main, "service", svc):
+            await main.update_settings({"fault_error_types": ["new"]})
         spec_arg = svc.database.update_spec.call_args.args[2]
-        assert not hasattr(spec_arg, "not_a_real_field")
+        assert spec_arg.fault_error_types == ["new"]
+        assert spec_arg.telemetry_recording == "full"
+        assert "before_commit" not in svc.database.update_spec.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_telemetry_recording_update_keeps_its_hook(self):
+        svc = MagicMock()
+        svc.database.get_object = AsyncMock(
+            side_effect=[_existing_settings(["keep"]), _existing_settings(["keep"])])
+        svc.database.update_spec = AsyncMock()
+        with patch.object(main, "service", svc):
+            await main.update_settings({"telemetry_recording": "off"})
+        spec_arg = svc.database.update_spec.call_args.args[2]
+        assert spec_arg.telemetry_recording == "off"
+        assert spec_arg.fault_error_types == ["keep"]
+        assert callable(svc.database.update_spec.call_args.kwargs["before_commit"])
+
+    @pytest.mark.asyncio
+    async def test_accepts_the_get_body_back(self):
+        # A client may PUT what GET returned: name/status/lifecycle are accepted and ignored.
+        svc = MagicMock()
+        svc.database.get_object = AsyncMock(
+            side_effect=[_existing_settings([]), _existing_settings(["x"])])
+        svc.database.update_spec = AsyncMock()
+        body = {**_existing_settings(["x"]).dict(), "lifecycle": "ALIVE"}
+        with patch.object(main, "service", svc):
+            result = await main.update_settings(body)
+        assert result["fault_error_types"] == ["x"]
+        assert svc.database.update_spec.call_args.args[2].fault_error_types == ["x"]
 
     @pytest.mark.asyncio
     async def test_ignores_name_status_lifecycle_even_if_provided(self):

@@ -15,11 +15,12 @@ from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, recording, sites
+from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
     configure_service_logging, DependencyHealthChecker
@@ -33,6 +34,7 @@ from packages.config import (
     POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, POSTGRES_DATABASE_PASSWORD,
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
     DEFAULT_MAP_ID, PORT_API_DELEGATION, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
+    IDEMPOTENCY_TTL_S, IDEMPOTENCY_LEASE_S, IDEMPOTENCY_PURGE_INTERVAL_S,
 )
 from cloud_common.objects.robot import RobotObjectV1, RobotStatusV1, CustomActionV1
 from cloud_common.objects.mission import (
@@ -296,6 +298,8 @@ async def lifespan(app: FastAPI):
 
     await service.database.async_init()
     service.start_watchers(asyncio.get_event_loop())
+    # Map deletes left DELETING by a previous run (WP11 F1); one runner per map across workers.
+    service.map_deleter.start_resume()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -311,6 +315,7 @@ async def lifespan(app: FastAPI):
 
     if service:
         service.stop_watchers()
+        await service.map_deleter.stop()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
@@ -324,6 +329,19 @@ app = FastAPI(
 
 # Add standardized error handlers
 add_error_handlers(app)
+
+
+def _idempotency_store() -> Optional[IdempotencyStore]:
+    if service is None or not service.database.is_running():
+        return None
+    return IdempotencyStore(service.database.connection, ttl_s=IDEMPOTENCY_TTL_S,
+                            lease_s=IDEMPOTENCY_LEASE_S)
+
+
+# WP11 F3: Idempotency-Key on the side-effecting routes (packages/api/idempotency.py). Without
+# the header every request behaves exactly as before.
+app.add_middleware(IdempotencyMiddleware, store=_idempotency_store,
+                   purge_interval_s=IDEMPOTENCY_PURGE_INTERVAL_S)
 
 from packages.api.orchestrator_proxy import router as orchestrator_proxy_router
 app.include_router(orchestrator_proxy_router)
@@ -427,6 +445,8 @@ async def list_maps():
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
         maps = await service.database.list_objects(MapObjectV1)
+        # A DELETING map is on its way out (packages/api/map_delete.py): hidden.
+        maps = [m for m in maps if m.lifecycle != ObjectLifecycleV1.DELETING]
         return {"maps": [m.dict() for m in maps], "count": len(maps)}
     except HTTPException:
         raise
@@ -441,6 +461,8 @@ async def load_map(request: LoadMapRequest):
     """Load a map: creates ArangoDB graph collections and registers in Postgres."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    # Loading would recreate the graph the background delete is removing.
+    await service.ensure_map_not_deleting(request.map_id or service.default_map_id)
 
     result = await service.load_map(
         map_id=request.map_id,
@@ -476,6 +498,7 @@ async def update_map_datum(map_id: str, request: UpdateDatumRequest):
     """Register or update the GPS datum for an existing map."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    await service.ensure_map_not_deleting(map_id)
     result = await service.update_map_datum(
         map_id,
         request.datum_latitude,
@@ -487,10 +510,15 @@ async def update_map_datum(map_id: str, request: UpdateDatumRequest):
     return result
 
 
-@app.delete("/api/v1/maps/{map_id}")
+@app.delete("/api/v1/maps/{map_id}", status_code=202)
 async def delete_map(map_id: str):
     """
-    Delete a map and all its data from both graph and image databases.
+    Delete a map and all its data from the graph and image databases.
+
+    Returns 202 at once: the map is marked DELETING (hidden from GET /api/v1/maps, 409 on
+    assign/load/datum) and a background task deletes it from ArangoDB and MinIO, retrying
+    with backoff, then removes it from Postgres (packages/api/map_delete.py). Repeating the
+    request is harmless; for a map stuck in DELETING it starts a new round of attempts.
 
     WARNING: This will permanently delete all map data including nodes, edges, and images!
     """
@@ -498,13 +526,7 @@ async def delete_map(map_id: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        result = await service.delete_map(map_id)
-
-        if not result.get("success", False):
-            error_msg = result.get("error", "Unknown error")
-            raise HTTPException(status_code=500, detail=f"Failed to delete map: {error_msg}")
-
-        return result
+        return await service.delete_map(map_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -556,25 +578,49 @@ async def get_settings():
         raise HTTPException(status_code=500, detail=f"Failed to get settings: {str(e)}")
 
 
+# Keys of the settings object accepted in a PUT body but never written from it, so a client can
+# send back what GET returned.
+SETTINGS_IGNORED_KEYS = frozenset({"status", "name", "lifecycle"})
+
+
+def _settings_changes(settings_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The spec fields in a PUT body (WP11 F2): 422 listing every unknown key instead of
+    silently dropping them, and 422 on a bad `telemetry_recording`."""
+    unknown = sorted(k for k in settings_data
+                     if k not in SettingsSpecV1.__fields__ and k not in SETTINGS_IGNORED_KEYS)
+    if unknown:
+        raise HTTPException(status_code=422, detail=[
+            {"loc": ["body", k], "msg": "extra fields not permitted", "type": "value_error.extra"}
+            for k in unknown])
+    recording.check_level(settings_data)
+    return {k: v for k, v in settings_data.items() if k in SettingsSpecV1.__fields__}
+
+
 @app.put("/api/v1/settings")
 async def update_settings(settings_data: dict):
-    """Update the fleet-wide settings object (creates it first if it doesn't exist yet)."""
+    """Update the fleet-wide settings object (creates it first if it doesn't exist yet).
+
+    Partial: only the keys sent change. Unknown keys are a 422 that lists them; name, status
+    and lifecycle are accepted and ignored."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
-        recording.check_level(settings_data)
+        changes = _settings_changes(settings_data)
         settings = await _get_or_create_settings()
 
         publisher_id = uuid.uuid4()
-        for key, value in settings_data.items():
-            if key not in ("status", "name", "lifecycle") and key in SettingsSpecV1.__fields__:
-                setattr(settings, key, value)
+        try:
+            spec = SettingsSpecV1(**{**settings.spec.dict(), **changes})
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=[
+                {"loc": ["body", *err["loc"]], "msg": err["msg"], "type": err["type"]}
+                for err in e.errors()])
         hook = None
-        if recording.SPEC_FIELD in settings_data:
+        if recording.SPEC_FIELD in changes:
             # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
             hook = recording.change_hook(recording.RecordingScope.GLOBAL, None,
                                          recording.request_actor())
-        await service.database.update_spec(SettingsObjectV1, settings.name, settings.spec,
+        await service.database.update_spec(SettingsObjectV1, settings.name, spec,
                                            publisher_id, **_hook_kwargs(hook))
 
         updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
@@ -1255,6 +1301,8 @@ async def create_robot(robot_data: dict):
             return (await service.database.get_object(RobotObjectV1, robot_data["name"])).dict()
         else:
             # Robot doesn't exist — create it
+            if robot_data.get("current_map"):
+                await service.ensure_map_not_deleting(robot_data["current_map"])
             status = RobotStatusV1()
             if factsheet_data:
                 status.factsheet.agv_class = factsheet_data.get("agv_class", "")
@@ -1302,6 +1350,8 @@ async def update_robot(robot_name: str, robot_data: dict):
         recording.check_level(robot_data)
         # Get existing robot
         robot = await service.database.get_object(RobotObjectV1, robot_name)
+        if robot_data.get("current_map") and robot_data["current_map"] != robot.current_map:
+            await service.ensure_map_not_deleting(robot_data["current_map"])
 
         publisher_id = uuid.uuid4()
 
@@ -1372,6 +1422,7 @@ async def update_robot_map(robot_name: str, request: UpdateRobotMapRequest):
     try:
         publisher_id = uuid.uuid4()
         robot = await service.database.get_object(RobotObjectV1, robot_name)
+        await service.ensure_map_not_deleting(request.map_id)
         robot.current_map = request.map_id
         await service.database.update_spec(RobotObjectV1, robot_name, robot.spec, publisher_id)
         updated_robot = await service.database.get_object(RobotObjectV1, robot_name)

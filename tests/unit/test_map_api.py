@@ -234,7 +234,8 @@ class TestApiDelegationLoadMapPostgres:
 
 
 # ---------------------------------------------------------------------------
-# ApiDelegationService.delete_map — Postgres cleanup
+# ApiDelegationService.delete_map — hands off to the background saga (WP11 F1;
+# the saga itself: tests/unit/test_map_delete.py)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -248,29 +249,27 @@ class TestApiDelegationDeleteMapPostgres:
     @patch('packages.api.server.PostgresDatabase')
     @patch('packages.api.server.MissionPlannerClient')
     @patch('packages.api.server.LiveKitClient')
-    async def test_delete_map_removes_postgres_record(
+    async def test_delete_map_marks_deleting_and_does_not_delete_inline(
         self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
     ):
         from packages.api.server import ApiDelegationService
 
         mock_db_inst = AsyncMock()
-        mock_db_inst.set_lifecycle = AsyncMock()
         mock_db.return_value = mock_db_inst
-
         mock_graph_inst = Mock()
-        mock_graph_inst.delete_map.return_value = {"success": True}
         mock_graph.return_value = mock_graph_inst
-        mock_image.return_value.delete_map = Mock(return_value={"success": True})
 
         service = ApiDelegationService(arango_password="x", postgres_password="x")
+        body = {"success": True, "map_id": "site_a", "lifecycle": "DELETING"}
+        service.map_deleter.request = AsyncMock(return_value=body)
         result = await service.delete_map("site_a")
 
-        assert result["success"] is True
-        mock_db_inst.set_lifecycle.assert_called_once()
-        call_args = mock_db_inst.set_lifecycle.call_args[0]
-        assert call_args[0] is MapObjectV1
-        assert call_args[1] == "site_a"
-        assert call_args[2] == ObjectLifecycleV1.DELETED
+        assert result == body
+        service.map_deleter.request.assert_awaited_once_with("site_a")
+        # Nothing is deleted in the request path any more.
+        mock_graph_inst.delete_map.assert_not_called()
+        mock_image.return_value.delete_map.assert_not_called()
+        mock_db_inst.set_lifecycle.assert_not_called()
 
     @pytest.mark.asyncio
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
@@ -280,26 +279,18 @@ class TestApiDelegationDeleteMapPostgres:
     @patch('packages.api.server.PostgresDatabase')
     @patch('packages.api.server.MissionPlannerClient')
     @patch('packages.api.server.LiveKitClient')
-    async def test_delete_map_postgres_failure_does_not_block(
+    async def test_deleter_uses_the_graph_and_image_stores(
         self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
     ):
-        """A Postgres failure on delete should be logged but not cause an error response."""
         from packages.api.server import ApiDelegationService
 
-        mock_db_inst = AsyncMock()
-        mock_db_inst.set_lifecycle = AsyncMock(side_effect=Exception("Postgres down"))
-        mock_db.return_value = mock_db_inst
-
-        mock_graph_inst = Mock()
-        mock_graph_inst.delete_map.return_value = {"success": True}
-        mock_graph.return_value = mock_graph_inst
-        mock_image.return_value.delete_map = Mock(return_value={"success": True})
-
+        mock_graph.return_value.delete_map.return_value = True
+        mock_image.return_value.delete_map.return_value = True
         service = ApiDelegationService(arango_password="x", postgres_password="x")
-        result = await service.delete_map("site_a")
-
-        # ArangoDB + MinIO succeeded, so overall success even if Postgres had an error
-        assert result["success"] is True
+        assert await service.map_deleter._attempt("site_a") is None
+        mock_graph.return_value.delete_map.assert_called_once_with("site_a")
+        mock_image.return_value.delete_map.assert_called_once_with("site_a")
+        mock_rosbag.return_value.delete_map_bags.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

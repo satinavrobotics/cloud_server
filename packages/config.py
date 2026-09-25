@@ -122,6 +122,20 @@ FLEET_READ_STATEMENT_TIMEOUT_MS = int(os.getenv("FLEET_READ_STATEMENT_TIMEOUT_MS
 FLEET_TIMELINE_MAX_POINTS = int(os.getenv("FLEET_TIMELINE_MAX_POINTS", "2000"))
 FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
 
+# ==================== Phase 0 fixes (API, WP11) ====================
+# F1 map delete (packages/api/map_delete.py): cleanup attempts per round before
+# MAP.DELETE_FAILED, and the backoff between them (base * 2^(n-1), capped), in seconds.
+# A map that exhausts its round stays DELETING until the next API start or another DELETE.
+MAP_DELETE_MAX_ATTEMPTS = int(os.getenv("MAP_DELETE_MAX_ATTEMPTS", "5"))
+MAP_DELETE_BACKOFF_S = float(os.getenv("MAP_DELETE_BACKOFF_S", "2.0"))
+MAP_DELETE_BACKOFF_MAX_S = float(os.getenv("MAP_DELETE_BACKOFF_MAX_S", "60.0"))
+# F3 Idempotency-Key (packages/api/idempotency.py): how long a key is remembered, how long an
+# unfinished request holds its key before a retry may take it over (longer than any guarded
+# route can take), and how often a worker purges expired keys (seconds).
+IDEMPOTENCY_TTL_S = int(os.getenv("IDEMPOTENCY_TTL_S", str(24 * 3600)))
+IDEMPOTENCY_LEASE_S = int(os.getenv("IDEMPOTENCY_LEASE_S", "120"))
+IDEMPOTENCY_PURGE_INTERVAL_S = float(os.getenv("IDEMPOTENCY_PURGE_INTERVAL_S", "600"))
+
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
 GPS_MAP_SENTINEL = 'GEO'    # map_id sentinel for GPS-mode robots with no assigned map

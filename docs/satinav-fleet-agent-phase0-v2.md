@@ -511,6 +511,30 @@ As built (logic and response shapes in
 
 Tests for each fix: the map delete saga under an injected Arango or MinIO failure, settings returning 422, idempotent replay of the same request, audit rows written, and `created_by` not spoofable.
 
+As built (branch `phase0/wp11-fixes`, not yet deployed; API only):
+
+- F1 (`packages/api/map_delete.py`): `ObjectLifecycleV1.DELETING` (maps only). DELETE marks the
+  row DELETING in one upsert (a map with no row gets one, so Arango/MinIO-only leftovers can
+  still be deleted) and returns 202. The cleanup runs under the per-map session advisory lock
+  `map_delete:<map_id>`: graph (ArangoDB) + image bucket (MinIO), both idempotent, then the row
+  is deleted. Failures: `MAP_DELETE_MAX_ATTEMPTS` (5) per round, backoff `MAP_DELETE_BACKOFF_S`
+  (2 s) doubling up to `MAP_DELETE_BACKOFF_MAX_S` (60 s); the exhausted round writes
+  MAP.DELETE_FAILED (ts = `delete_requested_at`, discriminator `map:<id>:attempts:<total>`) with
+  the status in one transaction and stops; the map stays DELETING until the next API start
+  (every worker resumes; the lock picks one) or another DELETE. ROS bags and base models are not
+  per-map and are kept. DELETING maps: hidden from `GET /maps`, 409 on `PUT /robots/{name}/map`,
+  `current_map` in robot PUT/create, `POST /map/load` and the datum PUT; `GET /maps/{id}` shows
+  `lifecycle` and the delete progress.
+- F2: unknown keys 422 (one entry per key, `value_error.extra`); name/status/lifecycle still
+  accepted and ignored; bad values 422 (were 400); partial updates and the RECORDING_CHANGED
+  hook unchanged.
+- F3 (`packages/api/idempotency.py`, migration `20260925_01_idempotency`): ASGI middleware on the
+  8 guarded routes, only when `Idempotency-Key` is sent. It reuses phase0_core's
+  `idempotency_keys` (the migration adds `completed_at` as the in-progress marker and `actor`
+  default ''). A concurrent duplicate gets 409 + `Retry-After: 1`; 5xx responses are not stored;
+  a stale in-progress key (`IDEMPOTENCY_LEASE_S`, 120 s) can be taken over; expired keys
+  (`IDEMPOTENCY_TTL_S`, 24 h) are ignored and purged every `IDEMPOTENCY_PURGE_INTERVAL_S`.
+
 **WP12: Backfill (day 4)** — dropped 2026-09-25 (not needed).
 
 - One `mission_runs` row per terminal `missionobjectv1` that has a `run_id`, with `created_by='backfill'`, `sw_version` NULL and the cause mapped.
