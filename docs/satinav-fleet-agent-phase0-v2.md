@@ -454,7 +454,7 @@ The recording level is set through the existing robot and settings routes and th
 - CRUD routes and the assign route (close the previous range and open a new one in one transaction).
 - Site resolution in the events `EventContext` and in run start.
 
-As built (branch `phase0/sites`, not yet merged):
+As built:
 
 - `SiteObjectV1` (`cloud_common/objects/site.py`) is in `ALL_OBJECTS`, so every service creates
   `siteobjectv1` at startup; services still on the old object list simply never touch it. The site id
@@ -479,12 +479,12 @@ As built (branch `phase0/sites`, not yet merged):
   `robot_latest.site_id` only until the policy has loaded. Dispatch clears `robot_latest.site_id`
   on unassign. A run keeps the site it started at.
 
-**WP10: Read endpoints (days 1–3)**
+**WP10: Read endpoints (days 1–3)** — **Done, in production since 2026-09-25 12:46** (merged 55f3ca1; rollback image `:pre-wp10`; API only). The sati-client UI uses it for run history and run timeline charts.
 
 - `/runs`, `/runs/{id}`, `/events` with cursor pagination.
 - `/runs/{id}/timeline`: events, rollup or raw tracks depending on window length, the trajectory, and `not_recorded` intervals derived from the recording level and `RECORDING_CHANGED` events.
 
-As built (branch `phase0/read-endpoints`, not yet merged; logic and response shapes in
+As built (logic and response shapes in
 `packages/api/fleet_reads.py`, routes in `packages/api/main.py`):
 
 - Routes: `GET /api/v1/runs`, `/api/v1/runs/{run_id}`, `/api/v1/runs/{run_id}/timeline`,
@@ -533,9 +533,9 @@ Tests for each fix: the map delete saga under an injected Arango or MinIO failur
 - [ ] Coarse telemetry is written only where the level is `full`; level changes are events, and timelines show `not_recorded` gaps.
 - [ ] The multi-worker API writes exactly once.
 - [ ] Robots report GNSS fix data in diagnostics, a stable build ID, and a synced clock.
-- [ ] Sites and assignment history are in place.
+- [x] Sites and assignment history are in place.
 - [ ] Fixes F1–F5 are shipped.
-- [ ] The `/runs`, `/runs/{id}`, `/runs/{id}/timeline` and `/events` endpoints are live.
+- [x] The `/runs`, `/runs/{id}`, `/runs/{id}/timeline` and `/events` endpoints are live.
 - [ ] The exit test passes.
 
 ## 9. What this unlocks for Phase 1
