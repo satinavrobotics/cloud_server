@@ -145,6 +145,30 @@ async def test_cancelled_mission_run_is_canceled(tmp_path):
     assert (run["state"], run["abort_cause"]) == ("CANCELED", "OPERATOR.CANCELED")
 
 
+async def test_resumed_mission_cancelled_before_redispatch_closes_its_run(tmp_path):
+    """Regression 2026-09-25: a RUNNING mission flagged for cancel, picked up again after
+    a dispatcher restart, was cancelled on the pre-dispatch path without closing its run
+    row, which then stayed RUNNING."""
+    recorder, fdb, _ = make_recorder(tmp_path)
+    robot, _ = _make_robot(recorder)
+    mission = _mission(far=50.0)
+    await _start(robot, mission)
+    await recorder.run_pending_ops()
+    [run] = fdb.runs.values()
+    assert run["state"] == "RUNNING"
+
+    recorder._runs.clear()                      # the restarted dispatcher's recorder
+    restarted, _ = _make_robot(recorder)
+    mission.needs_canceled = True
+    restarted._missions[mission.name] = mission
+    await restarted._try_start_mission()
+    await recorder.run_pending_ops()
+
+    assert mission.status.state == State.CANCELED
+    [run] = fdb.runs.values()
+    assert (run["state"], run["abort_cause"]) == ("CANCELED", "OPERATOR.CANCELED")
+
+
 async def test_timeout_run_is_timeout(tmp_path):
     recorder, fdb, _ = make_recorder(tmp_path)
     robot, _ = _make_robot(recorder)

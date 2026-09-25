@@ -240,7 +240,17 @@ class Robot:
         # Skip missions that were already canceled before they started
         if self._current_mission.needs_canceled:
             self.mission_info("Mission already flagged for cancel before dispatch — canceling immediately")
+            # A mission that was already running before a dispatcher restart still has a
+            # RUNNING run row (startup reconciliation leaves it for us to resume): adopt it
+            # so it is closed too, instead of staying RUNNING forever (observed 2026-09-25).
+            resumed = self._current_mission.status.start_timestamp is not None
+            if resumed:
+                self._record("run_started", self._name, self._current_mission,
+                             self._robot_object)
             self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+            if resumed:
+                self._record("run_finished", self._name, self._current_mission,
+                             self._robot_object)
             await self.get_next_mission()
             return
         # Withhold dispatch while the robot can't actually receive an order — offline
