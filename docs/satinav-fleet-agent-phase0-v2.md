@@ -507,7 +507,7 @@ As built (logic and response shapes in
   first segment uses `mission_runs.recording_level`. `events_only` → missing `time_series`;
   `off` → missing `events` and `time_series`.
 
-**WP11: Fixes F1–F5 (days 2–4)** — scope cut 2026-09-25: only F1–F3. F4 (audit) and F5 (`created_by` from auth) are dropped until the API has authentication, which is not planned for a long time.
+**WP11: Fixes F1–F5 (days 2–4)** — scope cut 2026-09-25: only F1–F3. **F1–F3 done, in production since 2026-09-25 15:42** (merged cad2ffe; migration `20260925_01_idempotency`; rollback image `:pre-wp11`). F4 (audit) and F5 (`created_by` from auth) are dropped until the API has authentication, which is not planned for a long time.
 
 Tests for each fix: the map delete saga under an injected Arango or MinIO failure, settings returning 422, idempotent replay of the same request, audit rows written, and `created_by` not spoofable.
 
@@ -558,7 +558,7 @@ As built (branch `phase0/wp11-fixes`, not yet deployed; API only):
 - [ ] The multi-worker API writes exactly once.
 - [ ] Robots report GNSS fix data in diagnostics, a stable build ID, and a synced clock.
 - [x] Sites and assignment history are in place.
-- [ ] Fixes F1–F3 are shipped (F4/F5 dropped until there is authentication).
+- [x] Fixes F1–F3 are shipped (F4/F5 dropped until there is authentication).
 - [x] The `/runs`, `/runs/{id}`, `/runs/{id}/timeline` and `/events` endpoints are live.
 - [ ] The exit test passes.
 
