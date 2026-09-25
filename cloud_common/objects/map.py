@@ -17,6 +17,7 @@ limitations under the License.
 SPDX-License-Identifier: Apache-2.0
 """
 
+import datetime
 from typing import Any, Dict, Optional
 import pydantic
 
@@ -47,6 +48,11 @@ class MapStatusV1(pydantic.BaseModel):
     "always fetched from ArangoDB on GET /maps/{map_id}."""
     node_count: int = 0
     edge_count: int = 0
+    # Set while lifecycle is DELETING (packages/api/map_delete.py): when the delete was
+    # requested, failed cleanup attempts so far, and the last attempt's error.
+    delete_requested_at: Optional[datetime.datetime] = None
+    delete_attempts: int = 0
+    delete_error: Optional[str] = None
 
 
 class MapQueryParamsV1(pydantic.BaseModel):

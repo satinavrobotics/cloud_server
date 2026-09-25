@@ -607,4 +607,9 @@ class PostgresDatabase:
         that need several statements in one transaction (packages/api/sites.py)."""
         return self._pool.connection()
 
+    async def dedicated_connection(self, **kwargs) -> psycopg.AsyncConnection:
+        """A new autocommit connection outside the pool, for holding a session-level advisory
+        lock while a long task runs (packages/api/map_delete.py). The caller closes it."""
+        return await psycopg.AsyncConnection.connect(self._auth, autocommit=True, **kwargs)
+
 

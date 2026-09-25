@@ -33,7 +33,9 @@ from packages.config import (
     URL_MISSION_PLANNER, URL_LIVEKIT, URL_MISSION_DISPATCH,
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
     MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE, DEFAULT_MAP_ID,
+    MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
 )
+from packages.api.map_delete import MapDeleter
 
 try:
     import websockets
@@ -571,6 +573,14 @@ class ApiDelegationService:
         import uuid
         self._publisher_id = uuid.uuid4()
 
+        # WP11 F1: DELETE /maps/{id} marks the map DELETING; this cleans up in the background.
+        self.map_deleter = MapDeleter(
+            self.database,
+            lambda map_id: self.graph_db.delete_map(map_id),
+            lambda map_id: self.image_db.delete_map(map_id),
+            max_attempts=MAP_DELETE_MAX_ATTEMPTS, backoff_s=MAP_DELETE_BACKOFF_S,
+            backoff_max_s=MAP_DELETE_BACKOFF_MAX_S)
+
         # Configuration
         self.default_map_id = default_map_id
 
@@ -911,13 +921,20 @@ class ApiDelegationService:
         except Exception:
             return {"success": False, "error": f"Map '{map_id}' not found"}
         stats = self.graph_db.get_map_stats(map_id)
-        return {
+        result = {
             "success": True,
             "map_id": map_id,
             **map_obj.spec.dict(),
             "node_count": stats.get("node_count", 0),
             "edge_count": stats.get("edge_count", 0),
+            "lifecycle": map_obj.lifecycle.value,
         }
+        if map_obj.lifecycle == ObjectLifecycleV1.DELETING:
+            # Progress of the background delete (packages/api/map_delete.py).
+            result["delete_requested_at"] = map_obj.status.delete_requested_at
+            result["delete_attempts"] = map_obj.status.delete_attempts
+            result["delete_error"] = map_obj.status.delete_error
+        return result
 
     async def update_map_datum(
         self,
@@ -999,31 +1016,25 @@ class ApiDelegationService:
             }
 
     async def delete_map(self, map_id: str) -> Dict[str, Any]:
-        """Delete a map from ArangoDB, MinIO, and Postgres."""
-        import uuid as _uuid
-
+        """Mark the map DELETING and start its ArangoDB/MinIO cleanup in the background
+        (packages/api/map_delete.py). The Postgres row goes only once both stores are clean."""
         self.logger.info(f"Deleting map: {map_id}")
-        graph_result = self.graph_db.delete_map(map_id)
-        image_result = self.image_db.delete_map(map_id)
-        graph_ok = graph_result.get("success", False) if isinstance(graph_result, dict) else bool(graph_result)
-        image_ok = image_result.get("success", False) if isinstance(image_result, dict) else bool(image_result)
+        return await self.map_deleter.request(map_id)
 
-        # Remove Postgres record regardless of ArangoDB/MinIO outcome
+    async def map_lifecycle(self, map_id: str) -> Optional[ObjectLifecycleV1]:
+        """The map's lifecycle, or None if it has no Postgres row."""
         try:
-            await self.database.set_lifecycle(
-                MapObjectV1, map_id, ObjectLifecycleV1.DELETED, _uuid.uuid4()
-            )
-        except Exception as e:
-            self.logger.warning(f"Could not delete Postgres map record for '{map_id}': {e}")
+            return (await self.database.get_object(MapObjectV1, map_id)).lifecycle
+        except HTTPException as e:
+            if e.status_code == 404:
+                return None
+            raise
 
-        if graph_ok and image_ok:
-            return {"success": True, "map_id": map_id, "message": f"Map {map_id} deleted successfully"}
-        errors = []
-        if not graph_ok:
-            errors.append(f"graph_db: {graph_result.get('error', 'unknown') if isinstance(graph_result, dict) else 'failed'}")
-        if not image_ok:
-            errors.append(f"image_db: {image_result.get('error', 'unknown') if isinstance(image_result, dict) else 'failed'}")
-        return {"success": False, "map_id": map_id, "error": "; ".join(errors)}
+    async def ensure_map_not_deleting(self, map_id: Optional[str]) -> None:
+        """409 if `map_id` is being deleted. Unregistered ids (sentinels, maps that exist only
+        in ArangoDB) pass, as before."""
+        if map_id and await self.map_lifecycle(map_id) == ObjectLifecycleV1.DELETING:
+            raise HTTPException(status_code=409, detail=f"Map '{map_id}' is being deleted")
 
     def _notify_graph_builder(self, map_id: str, event_type: str = "map_updated") -> None:
         """

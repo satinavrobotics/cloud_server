@@ -32,6 +32,9 @@ class ObjectLifecycleV1(str, enum.Enum):
     ALIVE = "ALIVE"
     PENDING_DELETE = "PENDING_DELETE"
     DELETED = "DELETED"
+    # Maps only (WP11 F1): the Arango/MinIO cleanup is running in the background
+    # (packages/api/map_delete.py). The row is hidden from lists and removed when it succeeds.
+    DELETING = "DELETING"
 
 
 class ApiObjectMethod(NamedTuple):
