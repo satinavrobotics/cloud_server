@@ -1630,7 +1630,15 @@ class Robot:
         # waits IDLE (it does not emit missionStatus="failed"). Record the block and
         # stop here so a waiting mission is not churned or advanced; it resumes once
         # an operator reroute clears the block.
-        if self._handle_edge_blocked(message):
+        #
+        # A cancelOrder the robot just finished (or answered with "no order to cancel")
+        # must still end the mission: a blocked robot keeps reporting the edgeBlocked
+        # warning, and returning here swallowed the cancel, so the mission stayed
+        # RUNNING however often the operator pressed cancel (observed 2026-09-25).
+        cancel_finished = any(
+            a.actionType == types.VDA5050InstantActionType.CANCEL_ORDER
+            for a in finished_instant_actions)
+        if not cancel_finished and self._handle_edge_blocked(message):
             return
 
         # For "reached" (intermediate waypoint) and the no-info case, fall through

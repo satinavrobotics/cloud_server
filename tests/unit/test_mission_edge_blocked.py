@@ -196,3 +196,44 @@ async def test_no_block_when_no_current_mission():
     r, _ = _make_robot()
     r._current_mission = None
     assert r._handle_edge_blocked(_build_state([_edge_blocked_error()])) is False
+
+
+def _blocked_cancel_setup():
+    """A RUNNING, edge-blocked, cancel-requested mission whose robot keeps reporting
+    edgeBlocked on the mission's own order."""
+    r, db = _make_robot()
+    mission = _make_mission()
+    mission.status.state = mission_object.MissionStateV1.RUNNING
+    for node in ("root", "0"):
+        mission.status.node_status.setdefault(node, mission_object.MissionNodeStatusV1())
+        mission.status.node_status[node].state = mission_object.MissionStateV1.RUNNING
+    mission.needs_canceled = True
+    r._current_mission = mission
+    r._current_behavior_tree = MagicMock()
+    state = _build_state([_edge_blocked_error()])
+    state.orderId = f"{r._order_prefix()}-n0"
+    assert r._handle_edge_blocked(state) is True        # the mission is blocked
+    return r, mission, state
+
+
+@pytest.mark.unit
+async def test_finished_cancel_ends_blocked_mission():
+    """Regression 2026-09-25: the edgeBlocked early return swallowed a finished
+    cancelOrder, so a blocked mission could never be cancelled."""
+    r, mission, state = _blocked_cancel_setup()
+    cancel = types.VDA5050Action(
+        actionType=types.VDA5050InstantActionType.CANCEL_ORDER, actionId="a1")
+
+    r.update_mission_state(state, [cancel])
+
+    assert mission.status.state == mission_object.MissionStateV1.CANCELED
+
+
+@pytest.mark.unit
+async def test_blocked_mission_without_cancel_stays_running():
+    r, mission, state = _blocked_cancel_setup()
+
+    r.update_mission_state(state, [])
+
+    assert mission.status.state == mission_object.MissionStateV1.RUNNING
+    assert mission.status.blocked is True
