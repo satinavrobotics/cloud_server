@@ -18,6 +18,7 @@ import random
 import sys
 import types
 import uuid
+from urllib.parse import urlencode
 
 import httpx
 
@@ -56,6 +57,27 @@ def insert_run(conn, run_id, robot, started, ended, state, level, site=None, sw=
         "sw_version, recording_level, state, passes_completed, mission_tree, started_at, "
         "ended_at) VALUES (%s, %s, %s, %s, 'map1', %s, %s, %s, 0, '[]', %s, %s)",
         (run_id, mission, robot, site, sw, level, state, started, ended))
+
+
+MISSION_NAMES = [
+    "x", "x-rerun-1", "x-rerun-1-rerun-2", "x-rerun-1727179200000", "x", "x-rerun-3",
+    "x-rerun-abc", "xy-rerun-1", "xy", "x-rerun-", "x-rerun-1-", "x-Rerun-1", " x",
+    "x.", "xa", "xa-rerun-1", "x.-rerun-3", "a+b (1)", "aab (1)", "a+b (1)-rerun-9",
+    ".*", ".*-rerun-1", "anything", "x\\d", "x\\d-rerun-1", "x7", "Ünï 名", "Ünï 名-rerun-5",
+    "100%_done", "100%_done-rerun-2", "1000_done", "x-rerun-1\n",
+]
+MISSION_CASES = {  # base -> the names above it must return (each as often as seeded)
+    "x": ["x", "x", "x-rerun-1", "x-rerun-1-rerun-2", "x-rerun-1727179200000", "x-rerun-3"],
+    "x-rerun-1": ["x-rerun-1", "x-rerun-1-rerun-2"],
+    "x.": ["x.", "x.-rerun-3"],
+    "a+b (1)": ["a+b (1)", "a+b (1)-rerun-9"],
+    ".*": [".*", ".*-rerun-1"],
+    "x\\d": ["x\\d", "x\\d-rerun-1"],
+    "Ünï 名": ["Ünï 名", "Ünï 名-rerun-5"],
+    "100%_done": ["100%_done", "100%_done-rerun-2"],
+    "xy": ["xy", "xy-rerun-1"],
+    "nope": [],
+}
 
 
 def insert_event(conn, ts, robot, code, severity="info", run=None, site=None, payload="{}"):
@@ -194,6 +216,12 @@ async def scenario():
                                   "ROBOT.ERROR_RAISED", "error")
         insert_event(conn, t[3], OTHER, "ROBOT.ONLINE")          # another robot: not shown
         seed_lists(conn, start - datetime.timedelta(days=1))
+        # `mission` filter: reruns (chained), lookalikes and regex metacharacters
+        mbase = start - datetime.timedelta(days=5)
+        for i, name in enumerate(MISSION_NAMES):
+            insert_run(conn, uuid.uuid4(), OTHER, mbase + datetime.timedelta(minutes=i // 2),
+                       mbase + datetime.timedelta(minutes=i // 2, seconds=30), "COMPLETED",
+                       "events_only", mission=name)
 
         # an old run whose raw telemetry is gone (retention), only the 1-minute rollup left
         old_run = uuid.uuid4()
@@ -256,6 +284,21 @@ async def scenario():
             got, pages = await all_pages(http, "/api/v1/runs?" + url, 5)
             check([g["run_id"] for g in got] == want and want,
                   f"runs {url}: {len(want)} rows in {pages} pages")
+        for base, names in MISSION_CASES.items():
+            url = "/api/v1/runs?" + urlencode({"mission": base})
+            got, pages = await all_pages(http, url, 2)
+            want = [r[0] for r in query(
+                "SELECT run_id::text FROM mission_runs WHERE mission_name = ANY(%s) "
+                "ORDER BY started_at DESC, run_id DESC", (names,))]
+            check([g["run_id"] for g in got] == want
+                  and sorted(g["mission_name"] for g in got) == sorted(names),
+                  f"runs mission={base!r}: {len(want)} rows in {pages} pages")
+        got, _ = await all_pages(http, "/api/v1/runs?mission=x&robot=" + OTHER
+                                 + "&state=COMPLETED", 4)
+        check(sorted(g["mission_name"] for g in got) == sorted(MISSION_CASES["x"]),
+              "runs mission=x combined with robot and state")
+        await get(http, "/api/v1/runs?mission=x&robot=" + ROBOT, 200)
+        await get(http, "/api/v1/runs?mission=", 422)
         await get(http, "/api/v1/runs?state=SUCCEEDED", 422)
         await get(http, "/api/v1/runs?from=2026-09-24T12:00:00", 422)
         await get(http, "/api/v1/runs?limit=501", 422)
