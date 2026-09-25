@@ -1586,6 +1586,9 @@ async def list_runs(
     state: Optional[str] = Query(None, description="RUNNING, COMPLETED, FAILED, CANCELED, "
                                                    "ABORTED or TIMEOUT"),
     sw_version: Optional[str] = Query(None, description="Robot build id at run start"),
+    mission: Optional[str] = Query(None, description="Mission name: runs whose mission_name "
+                                                     "is exactly this, or this followed by "
+                                                     "one or more `-rerun-<digits>` (reruns)"),
     from_: Optional[str] = Query(None, alias="from",
                                  description="started_at >= this (ISO-8601 with time zone)"),
     to: Optional[str] = Query(None, description="started_at < this (ISO-8601 with time zone)"),
@@ -1597,7 +1600,7 @@ async def list_runs(
     start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
     return await _site_call("list runs", fleet_reads.list_runs(
         service.database, robot=robot, site=site, state=state, sw_version=sw_version,
-        start=start, end=end, cursor=cursor, limit=limit))
+        mission=mission, start=start, end=end, cursor=cursor, limit=limit))
 
 
 @app.get("/api/v1/runs/{run_id}")

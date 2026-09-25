@@ -305,7 +305,8 @@ mqtt-recorder:          # optional, remove freely
 GET  /api/v1/sites                       CRUD
 PUT  /api/v1/robots/{name}/site          closes the previous assignment, opens a new one
 GET  /api/v1/robots/{name}/site-assignments
-GET  /api/v1/runs?robot=&site=&state=&sw_version=&from=&to=&cursor=
+GET  /api/v1/runs?robot=&site=&state=&sw_version=&mission=&from=&to=&cursor=
+                                         mission= base name + its `-rerun-<n>` reruns
 GET  /api/v1/runs/{run_id}               run + events
 GET  /api/v1/runs/{run_id}/timeline      events + coarse tracks + trajectory + not_recorded gaps
 GET  /api/v1/events?robot=&site=&code=&severity=&from=&to=&cursor=

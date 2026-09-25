@@ -270,13 +270,31 @@ def _page(rows: List[Sequence[Any]], limit: int, kind: str, ts_idx: int, key_idx
     return {"items": [convert(r) for r in rows], "next_cursor": cursor}
 
 
+# `mission` filter: the base name, or the base followed by one or more `-rerun-<digits>`
+# (the client names a rerun `${name}-rerun-${Date.now()}`; reruns of reruns chain). The base
+# is free text, so it never goes into a regex: it is compared as a plain string (equality /
+# starts_with) and only the remainder is matched against this constant pattern.
+RERUN_SUFFIX_RE = "^(-rerun-[0-9]+)+$"
+_MISSION_FILTER = ("(mission_name = %s::text OR (starts_with(mission_name, %s::text) AND "
+                   f"substr(mission_name, char_length(%s::text) + 1) ~ '{RERUN_SUFFIX_RE}'))")
+
+
+def check_mission(value: Optional[str]) -> Optional[str]:
+    if value is not None and (value == "" or "\x00" in value):
+        raise _invalid("mission", "mission must be a non-empty mission name")
+    return value
+
+
 async def list_runs(db: Any, *, robot: Optional[str] = None, site: Optional[str] = None,
                     state: Optional[str] = None, sw_version: Optional[str] = None,
+                    mission: Optional[str] = None,
                     start: Optional[datetime.datetime] = None,
                     end: Optional[datetime.datetime] = None, cursor: Optional[str] = None,
                     limit: int = DEFAULT_LIMIT) -> Dict[str, Any]:
-    """Runs newest first (by started_at); `from`/`to` bound started_at: [from, to)."""
+    """Runs newest first (by started_at); `from`/`to` bound started_at: [from, to).
+    `mission`: runs of that mission and of its reruns (`<mission>-rerun-<n>[-rerun-<n>...]`)."""
     check_choice(state, "state", RUN_STATES)
+    check_mission(mission)
     check_window(start, end)
     after = decode_cursor("runs", cursor)
     where, params = [], []
@@ -285,6 +303,9 @@ async def list_runs(db: Any, *, robot: Optional[str] = None, site: Optional[str]
         if value is not None:
             where.append(f"{column} = %s")
             params.append(value)
+    if mission is not None:
+        where.append(_MISSION_FILTER)
+        params.extend((mission, mission, mission))
     if start is not None:
         where.append("started_at >= %s")
         params.append(start)

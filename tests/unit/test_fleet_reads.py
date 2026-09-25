@@ -12,7 +12,9 @@ The real SQL against TimescaleDB is covered by tests/integration/fleet_reads.
 """
 import datetime
 import os
+import re
 import uuid
+from urllib.parse import urlencode
 
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
     os.environ.setdefault(_k, "test")
@@ -165,6 +167,9 @@ class TestValidation:
         "/api/v1/runs?limit=0",
         "/api/v1/runs?limit=501",
         "/api/v1/runs?cursor=garbage",
+        "/api/v1/runs?mission=",
+        "/api/v1/runs?mission=x%00y",
+        "/api/v1/runs?robot=r1&mission=&limit=5",
         "/api/v1/events?code=NAV",
         "/api/v1/events?code=NAV.*&code=FOO.BAR",
         "/api/v1/events?severity=fatal",
@@ -234,6 +239,91 @@ class TestLists:
         body = (await get(db, "/api/v1/runs")).json()
         assert body["next_cursor"] is None and len(body["items"]) == 1
         assert db.executed[-1][1] == (fr.DEFAULT_LIMIT + 1,)
+
+    @staticmethod
+    def mission_db(names):
+        """A fake mission_runs that applies the `mission` predicate (a Python transcription of
+        fleet_reads._MISSION_FILTER: equality, or starts_with + the constant suffix regex on the
+        remainder), the keyset condition and the LIMIT. The same cases run against real
+        PostgreSQL in tests/integration/fleet_reads."""
+        rows = [run_row(uuid.UUID(int=i + 1), t(i), t(i + 0.5)) for i in range(len(names))]
+        rows = [(r[0], name) + r[2:] for r, name in zip(rows, names)]
+        rows.sort(key=lambda r: (r[12], r[0]), reverse=True)
+        suffix = re.compile(fr.RERUN_SUFFIX_RE)
+
+        def respond(sql, params):
+            if "mission_runs" not in sql:
+                return []
+            params = list(params)
+            limit = params.pop()
+            out = rows
+            if "starts_with(mission_name" in sql:
+                base, again, third = params[:3]
+                assert base == again == third
+                params = params[3:]
+                out = [r for r in out if r[1] == base or (
+                    r[1].startswith(base) and suffix.search(r[1][len(base):]))]
+            if "(started_at, run_id) < (%s, %s)" in sql:
+                key = tuple(params[-2:])
+                out = [r for r in out if (r[12], r[0]) < key]
+            return out[:limit]
+        return FakeDb(respond)
+
+    @pytest.mark.parametrize("base, names, want", [
+        ("x", ["x", "x-rerun-1", "x-rerun-1-rerun-2", "x-rerun-1727179200000"],
+         ["x", "x-rerun-1", "x-rerun-1-rerun-2", "x-rerun-1727179200000"]),
+        ("x", ["x-rerun-abc", "xy-rerun-1", "xy", "x-rerun-", "x-rerun-1-", "x-rerun-1x",
+               "x-rerun--1", "x-Rerun-1", "x-rerun-1-rerun-", "prefix-x", " x", "x "], []),
+        ("x.", ["xa", "xa-rerun-1", "x.", "x.-rerun-3"], ["x.", "x.-rerun-3"]),
+        ("a+b (1)", ["a+b (1)", "aab (1)", "a+b (1)-rerun-9", "ab (1)"],
+         ["a+b (1)", "a+b (1)-rerun-9"]),
+        ("x-rerun-1", ["x", "x-rerun-1", "x-rerun-1-rerun-2", "x-rerun-2"],
+         ["x-rerun-1", "x-rerun-1-rerun-2"]),
+        (".*", ["anything", ".*", ".*-rerun-1"], [".*", ".*-rerun-1"]),
+    ])
+    async def test_runs_mission_filter(self, base, names, want):
+        db = self.mission_db(names)
+        response = await get(db, "/api/v1/runs?" + urlencode({"mission": base}))
+        assert response.status_code == 200, response.text
+        assert sorted(r["mission_name"] for r in response.json()["items"]) == sorted(want)
+        sql, params = db.executed[-1]
+        # the base is only ever a bind parameter, never spliced into the SQL or a regex
+        assert fr._MISSION_FILTER in sql and sql.count("%s") == len(params)
+        assert params == (base, base, base, fr.DEFAULT_LIMIT + 1)
+
+    async def test_runs_mission_filter_sql_and_other_filters(self):
+        db = FakeDb()
+        response = await get(db, "/api/v1/runs?robot=r1&mission=m%201&state=FAILED"
+                                 "&from=2026-09-24T12:00:00Z&limit=3")
+        assert response.status_code == 200, response.text
+        sql, params = db.executed[-1]
+        assert ("(mission_name = %s::text OR (starts_with(mission_name, %s::text) AND "
+                "substr(mission_name, char_length(%s::text) + 1) ~ '^(-rerun-[0-9]+)+$'))"
+                in sql)
+        assert sql.endswith("ORDER BY started_at DESC, run_id DESC LIMIT %s")
+        assert params == ("r1", "FAILED", "m 1", "m 1", "m 1", T0, 4)
+
+    async def test_runs_mission_filter_pagination(self):
+        names = [n for i in range(5) for n in (f"x-rerun-{i}", f"xy-rerun-{i}", "x")]
+        names += ["x-rerun-1-rerun-2", "x-rerun-abc"]
+        db = self.mission_db(names)
+        want = [r[0] for r in db.respond("SELECT mission_runs", (10 ** 6,))
+                if r[1] in ("x", "x-rerun-1-rerun-2") or re.fullmatch(r"x-rerun-\d", r[1])]
+        assert len(want) == 11
+        got, url, pages = [], "/api/v1/runs?mission=x&limit=4", 0
+        while True:
+            body = (await get(db, url)).json()
+            pages += 1
+            got.extend(r["run_id"] for r in body["items"])
+            assert all(r["mission_name"].startswith("x") and not r["mission_name"].startswith(
+                "xy") for r in body["items"])
+            if body["next_cursor"] is None:
+                break
+            assert len(body["items"]) == 4
+            url = "/api/v1/runs?mission=x&limit=4&cursor=" + body["next_cursor"]
+        assert got == [str(r) for r in want] and pages == 3
+        sql, params = db.executed[-1]
+        assert "(started_at, run_id) < (%s, %s)" in sql and params[:3] == ("x", "x", "x")
 
     async def test_events_filters(self):
         e1, e2 = uuid.UUID(int=1), uuid.UUID(int=2)
