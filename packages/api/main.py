@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import fleet_reads, recording, run_admin, sites
+from packages.api import fleet_reads, recorder_health, recording, run_admin, sites
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -1676,6 +1676,19 @@ async def list_recording_levels():
     _require_service()
     return await _site_call("list recording levels",
                             fleet_reads.effective_recording_all(service.database))
+
+
+@app.get("/api/v1/health/recording")
+async def get_recording_health():
+    """Recorder health (Phase 0 WP13), read-only, always 200: per recording process
+    (`dispatch` = mission-dispatch's fleet_recorder, `api` = the elected telemetry writer)
+    queue depth/capacity/%, dropped rows, spilled events pending + oldest age, last flush
+    ages, heartbeat sweep lag (dispatch) and election role (api), plus the active `alerts`
+    (writer_queue_high, spill_pending, heartbeat_sweep_lag, report_stale). `status` is "ok"
+    when there is no alert. Details: packages/api/recorder_health.py."""
+    _require_service()
+    return await _site_call("read recorder health", recorder_health.recording_health(
+        service.database, getattr(service, "telemetry", None)))
 
 
 # ==================== Mission Operations ====================

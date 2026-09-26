@@ -87,9 +87,12 @@ class TelemetryWriter:
                  connect_timeout_s: float = DEFAULT_CONNECT_TIMEOUT_S,
                  tick_s: float = DEFAULT_TICK_S,
                  clock: Callable[[], float] = time.monotonic,
-                 sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep):
+                 sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+                 wall: Callable[[], float] = time.time):
         """`policy` (optional RecordingPolicy) is refreshed by the loop whenever it is
-        stale, e.g. after the host's NOTIFY handler called `policy.invalidate()`."""
+        stale, e.g. after the host's NOTIFY handler called `policy.invalidate()`.
+        `wall` (epoch seconds) only stamps metrics.last_flush_at / last_flush_ok_at /
+        writer_tick_at for the recorder health report (packages/telemetry_ingest/health.py)."""
         if batch_size <= 0 or flush_interval_s <= 0:
             raise ValueError("batch_size and flush_interval_s must be positive")
         self._pool = pool
@@ -104,6 +107,7 @@ class TelemetryWriter:
         self._tick = tick_s
         self._clock = clock
         self._sleep = sleep
+        self._wall = wall
         self._last_flush: Optional[float] = None
         self._policy_failures = 0
         self._policy_retry_at = float("-inf")
@@ -153,6 +157,7 @@ class TelemetryWriter:
 
     async def _run(self) -> None:
         while True:
+            self.metrics.writer_tick_at = self._wall()
             try:
                 if (self._policy is not None and self._policy.stale
                         and self._clock() >= self._policy_retry_at):
@@ -213,7 +218,7 @@ class TelemetryWriter:
             logger.exception("Telemetry flush failed")
         finally:
             self._settle(batch)
-            self.metrics.flush_finished(self._clock() - started, batch.failed)
+            self.metrics.flush_finished(self._clock() - started, batch.failed, at=self._wall())
         return not batch.failed
 
     async def _write_events(self, conn: Any, batch: _Batch) -> None:

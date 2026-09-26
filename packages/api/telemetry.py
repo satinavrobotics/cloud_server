@@ -32,6 +32,7 @@ import uuid
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 from packages.api.entrypoint import advisory_lock_key
+from packages.api.recorder_health import ROLE_STANDBY, ROLE_WRITER, RecorderHealthMonitor
 from packages.api.telemetry_detectors import (
     DEFAULT_THERMAL_HIGH_C, DEFAULT_THERMAL_OK_C, DiagnosticsDetector, NavSupervisorDetector,
     robot_ts, stamp_ts,
@@ -41,7 +42,8 @@ from packages.telemetry_ingest import (
     IngestQueue, LatestRow, Metrics, RecordingPolicy, SpillFile, TelemetryWriter, create_pool,
     load_latest,
 )
-from packages.telemetry_ingest.queue import decode_event
+from packages.telemetry_ingest import health as ingest_health
+from packages.telemetry_ingest.queue import DEFAULT_MAXSIZE, decode_event
 
 logger = logging.getLogger("ApiDelegationService.telemetry")
 
@@ -376,7 +378,8 @@ class ApiTelemetry:
                  now: Callable[[], datetime.datetime] = _utcnow,
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
-                 writer_kwargs: Optional[Dict[str, Any]] = None):
+                 writer_kwargs: Optional[Dict[str, Any]] = None,
+                 health_monitor: Optional[RecorderHealthMonitor] = None):
         self._conninfo = conninfo
         self._spill_dir = spill_dir
         self._high_c = high_c
@@ -388,6 +391,10 @@ class ApiTelemetry:
         self.metrics = Metrics()
         self._spill: Optional[SpillFile] = None
         self._term: Optional[_Term] = None
+        self._started_at = now()
+        # WP13: recorder health row + alert rules, run by the elected writer on its lock
+        # connection (packages/api/recorder_health.py).
+        self.health = health_monitor or RecorderHealthMonitor(now=now, monotonic=monotonic)
         self._last_context_refresh = 0.0
         self._last_policy_refresh = 0.0
         self.handler_errors = _Throttled()
@@ -432,6 +439,38 @@ class ApiTelemetry:
             "ingest": self.metrics.snapshot(),
         }
 
+    # --- recorder health (WP13) ----------------------------------------------------------
+    @property
+    def role(self) -> str:
+        return ROLE_WRITER if self.is_writer else ROLE_STANDBY
+
+    def health_report(self) -> Dict[str, Any]:
+        """This worker's recorder_health report (the `api` row while it is the writer)."""
+        term = self._term
+        report = ingest_health.ingest_report(
+            self.metrics,
+            queue_depth=term.queue.qsize() if term is not None else 0,
+            queue_capacity=term.queue.capacity if term is not None else DEFAULT_MAXSIZE,
+            spill=self._spill,
+            writer_running=term is not None and term.writer.running)
+        report["election"] = {
+            "role": self.role, "pid": os.getpid(), "lock_key": self.election.key,
+            "acquisitions": self.election.acquisitions, "losses": self.election.losses,
+            "errors": self.election.errors,
+        }
+        report["handler_errors"] = self.handler_errors.count
+        report["alert_events"] = {"pending": self.health.pending_events,
+                                  "emitted": self.health.events_emitted,
+                                  "write_failures": self.health.write_failures}
+        return report
+
+    def health_row(self) -> Dict[str, Any]:
+        """health_report() as a recorder_health row (for the endpoint, from memory)."""
+        return {"process": ingest_health.PROCESS_API, "pid": os.getpid(),
+                "hostname": ingest_health.hostname(), "role": self.role,
+                "started_at": self._started_at, "reported_at": self._now(),
+                "report": self.health_report(), "alerts": self.health.active_alerts()}
+
     def _spill_file(self) -> SpillFile:
         if self._spill is None:
             path = os.path.join(self._spill_dir, f"{SPILL_PREFIX}{os.getpid()}{SPILL_SUFFIX}")
@@ -461,11 +500,19 @@ class ApiTelemetry:
         # A NOTIFY that arrived between the load above and now went nowhere (no term yet):
         # have the writer reload once more on its next tick.
         policy.invalidate()
+        # Alerts a previous writer left active stay active (not raised a second time).
+        await self.health.restore(conn)
         logger.info("Telemetry writer started (%d robot_latest rows rehydrated)", len(latest))
 
     async def _stop_term(self) -> None:
         term, self._term = self._term, None
         if term is not None:
+            # Alert events the lock connection could not write: to the spill file, which the
+            # next writer (this worker or another) replays.
+            pending = self.health.take_pending()
+            if pending:
+                term.queue.spill_events(pending)
+                logger.warning("Spilled %d unwritten recorder alert events", len(pending))
             await term.stop()
             logger.info("Telemetry writer stopped")
 
@@ -482,6 +529,9 @@ class ApiTelemetry:
             rows = await load_latest(conn)
             if rows:
                 term.ctx.update(rows)
+        await asyncio.wait_for(
+            self.health.maybe_tick(conn, self.health_report(), role=self.role,
+                                   started_at=self._started_at), QUERY_TIMEOUT_S)
 
     # --- recording policy from NOTIFYs (event-loop thread) --------------------------------
     def on_robot_object(self, robot: Any) -> None:

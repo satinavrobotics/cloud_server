@@ -145,6 +145,7 @@ CREATE INDEX ON fleet_events (run_id) WHERE run_id IS NOT NULL;
 | `MISSION.DELETED` | api | mission delete (payload: names, deleted run/event/trajectory counts) |
 | `RUN.ARCHIVED` / `RUN.UNARCHIVED` | api | `POST /api/v1/runs/archive` changed runs (payload: count, run_ids) |
 | `TELEMETRY.RECORDING_CHANGED` | api | policy change (**always written, even at level `off`**) |
+| `SYSTEM.RECORDER_ALERT_RAISED` / `RECORDER_ALERT_CLEARED` | api | WP13 recorder health alert starts / ends (payload: alert, process, value, threshold; robot null; not gated by the level) |
 
 Codes are append-only: they are never renamed or reused, only deprecated.
 
@@ -266,6 +267,9 @@ The level is resolved per robot, in this order of precedence:
 - `policy.py`: resolves the recording level (§4.2) with a NOTIFY-refreshed cache.
 - `rehydrate.py`: loads `robot_latest` into the detectors at startup.
 - `metrics.py`: counters for rows written, rows dropped, events spilled, flush duration and queue depth.
+- `health.py` (WP13): the per-process report behind `GET /api/v1/health/recording`: queue
+  depth/capacity/%, dropped rows, spilled events pending and since when, and flush ages. It also
+  holds the `recorder_health` upserts.
 
 ### 5.3 Host integrations
 
@@ -317,6 +321,7 @@ POST /api/v1/runs/archive                {"run_ids": [...1..500] | "mission": "<
                                          -> {"updated": n, "skipped_running": m}
 DELETE /api/v1/missions/{name}[?with_reruns=true]
                                          also deletes the runs, their events and trajectory
+GET  /api/v1/health/recording            WP13 recorder health + active alerts (read-only)
 ```
 
 Every run in the responses carries `archived_at` (ISO-8601 or null).
@@ -576,10 +581,89 @@ As built (branch `phase0/wp11-fixes`, not yet deployed; API only):
 - `mission_trajectory.run_id` filled where the time window matches exactly one run.
 - Current sites created, with each robot's assignment valid from its `created_at` onwards.
 
-**WP13: Observability and exit test (day 5)**
+**WP13: Observability and exit test (day 5)** — **Built, not deployed** (deploy with
+`~/pg-cutover/scripts/wp13.sh`: API + dispatch, migration `20260926_02_recorder_health`, rollback
+images `:pre-wp13`). The exit test itself has not been run yet; the runbook is
+`docs/satinav-fleet-agent-phase0-exit-test.md`.
 
 - Metrics exposed. Alert on writer queue > 80 %, spilled events > 0 for 5 min, and heartbeat sweep lag.
 - Run the exit test (5 runs, including one failure and one disconnect) and record the share of `UNKNOWN` causes as a baseline.
+
+As built:
+
+- **No Grafana, no exporter, no new container or port.** The numbers are one read-only JSON
+  route, `GET /api/v1/health/recording`. Charts and alert display belong in the sati-client UI
+  later.
+- **How dispatch reports** (it has no HTTP port). Every recording process upserts one row, keyed
+  by process, into the new two-row table `recorder_health`:
+  - `dispatch`: fleet_recorder, every 10 s;
+  - `api`: the elected telemetry writer, every `RECORDER_HEALTH_EVAL_S` (5 s).
+
+  Postgres is already the only interface between dispatch and the API. A keyed row is readable by
+  every API worker, survives API restarts and costs one small upsert per period. NOTIFY would be
+  lost while no worker listens, and it has no last value. If dispatch cannot reach the database,
+  its row goes stale, which is itself an alert.
+
+  `reported_at` is the database's `now()`, and every other age is measured by the reporter, so
+  host clock skew does not matter. Code: `packages/telemetry_ingest/health.py` for the report,
+  `packages/api/recorder_health.py` for the rules, monitor and route.
+- **Endpoint.** `{status: ok|alerting, generated_at, served_by, database, thresholds,
+  processes: {dispatch, api}, alerts: [...]}`. Each process carries:
+  - `present`, `reported_at`, `report_age_s`, `stale`, `role`;
+  - `queue {depth, capacity, pct, depth_max}` and `dropped {total, by_table}`;
+  - `events_spilled/replayed/rejected/lost` and `spill {pending, pending_age_s}`;
+  - `writer {running, last_flush_ok_age_s, last_flush_age_s, flush_failures, ...}`.
+
+  Dispatch adds `heartbeat_sweep {period_s, lag_s, last_completed_age_s, gap_max_s,
+  lag_threshold_s}` and `runs {ops_pending, ...}`; the API adds `election {role:
+  writer|standby, ...}`. The answer is always 200. The writer worker answers for itself and the
+  alerts from memory, so it works even with the database down. Other workers read the stored row.
+  Staleness is also checked at read time, so a dead evaluator shows as well.
+- **Alert rules.** Thresholds are in `packages/config.py` and can be overridden by env:
+
+  | Alert | Process | Raised when | Cleared when |
+  |---|---|---|---|
+  | `writer_queue_high` | api, dispatch | queue > 80 % of capacity | < 60 % |
+  | `spill_pending` | api, dispatch | spilled events waiting continuously > 300 s | spill empty |
+  | `heartbeat_sweep_lag` | dispatch | lag > 3 × period (1 s → 3 s) | ≤ 1.5 × period |
+  | `report_stale` | dispatch | no report for > 60 s (a missing row gets 60 s of grace after the evaluator starts) | a fresh report |
+
+  - **Sweep lag.** It is the larger of the time since the last pass and the longest gap between
+    passes since the previous report, so a stall that recovered still shows. The sweep sleeps 1 s
+    per pass, so a healthy lag is about 1 s. 3 s means at least two passes in a row were missed (a
+    blocked event loop or a dead task), which is beyond jitter and GC pauses and still well under
+    the 30 s heartbeat timeouts.
+  - **Anti-flap.** A raise condition must hold for 10 s, and a clear condition for 30 s. The
+    spill and stale rules measure a duration already and raise at once. Between the two
+    thresholds the state holds. For dispatch the windows run on its reports' `reported_at`, so
+    re-reading one bad report is not "10 s of evidence". A stale process's other rules hold.
+- **Emission.** Only the elected writer evaluates, so each transition is seen once. Each start
+  and end writes one `SYSTEM.RECORDER_ALERT_RAISED` / `_CLEARED` event (robot null; always
+  written, whatever the recording level) and one WARNING log line.
+  - The events do not go through the ingest queue, which may be the thing that is failing. They
+    are written with `emit()` on the writer's lock connection, in one transaction with the `api`
+    row, whose `alerts` column carries the active alerts.
+  - If that write fails, the log line and the in-memory state remain and the endpoint still shows
+    the alert. The events retry on the next evaluation; their ids are deterministic, so a retry
+    cannot duplicate them. If the writer term ends first, they go to its spill file.
+  - A restarted or failed-over writer restores the active alerts from the row, so an ongoing alert
+    is not raised twice.
+- **Tests.**
+  - Unit: `test_recorder_health.py` (every rule: raise, clear, hysteresis, minimum durations, stale,
+    report-time windows, DB failure and retry, restore, the endpoint), `test_fleet_recorder_health.py`
+    and `telemetry_ingest/test_health.py`.
+  - Integration: `tests/integration/recorder_health/run.sh`. On TimescaleDB it runs migration
+    up/down/up and the real dispatch → table → API path, covering stale, sweep lag and spill
+    alerts, one event per transition, an API restart and a non-writer reader.
+- **Exit-test tooling.** `tools/phase0_exit_check.py` (shipped in the API image; run it with
+  `docker exec <api> python -m tools.phase0_exit_check --from ...`) makes read-only checks of §8 +
+  WP13 over a time window. It prints a PASS/FAIL table and JSON, including the `UNKNOWN` baseline.
+  - Unit tests: `test_phase0_exit_check.py`.
+  - Integration: `tests/integration/phase0_exit_check/run.sh` seeds the five-run scenario through
+    the real recording code. The checker must PASS without changing a row, and FAIL exactly the
+    checks whose data is then tampered.
+- **Robot side.** The robot-side items of §8 (GNSS, build ID, clock) are not part of this exit test
+  (see the note under §8). The checker allows `sw_version` null and reports how many runs have it.
 
 ---
 
@@ -587,15 +671,23 @@ As built (branch `phase0/wp11-fixes`, not yet deployed; API only):
 
 - [ ] Postgres is on TimescaleDB, and all new DDL is managed by Alembic from the API entrypoint.
 - [ ] There are **no new long-running containers**; the recorder is optional under a compose profile.
-- [ ] Every run after rollout has exactly one `mission_runs` row with version, site, cause and recording level, and it is immutable once terminal.
+- [ ] Every run after rollout has exactly one `mission_runs` row with site, cause and recording level (version: see the deferred note below), and it is immutable once terminal.
 - [ ] `fleet_events` is populated for all v1 codes, idempotent under replay and restarts, with no spurious events after a restart.
 - [ ] Coarse telemetry is written only where the level is `full`; level changes are events, and timelines show `not_recorded` gaps.
 - [ ] The multi-worker API writes exactly once.
-- [ ] Robots report GNSS fix data in diagnostics, a stable build ID, and a synced clock.
 - [x] Sites and assignment history are in place.
 - [x] Fixes F1–F3 are shipped (F4/F5 dropped until there is authentication).
 - [x] The `/runs`, `/runs/{id}`, `/runs/{id}/timeline` and `/events` endpoints are live.
-- [ ] The exit test passes.
+- [ ] Recorder health is exposed (`GET /api/v1/health/recording`) and alerts on queue, spill, sweep lag and stale reports (WP13: built, not yet deployed).
+- [ ] The exit test passes (`docs/satinav-fleet-agent-phase0-exit-test.md`; `tools/phase0_exit_check.py` checks the first four items above plus WP13; record the date, `OVERALL` and the `UNKNOWN` baseline here).
+
+> **Deferred to the robot-side step (WP3), not part of the Phase 0 exit test (decided
+> 2026-09-26):**
+> - Robots report GNSS fix data in diagnostics, a stable build ID (`sw_version` on runs and
+>   events), and a synced clock.
+>
+> Until then `mission_runs.sw_version` may be null, the GNSS columns stay NULL, and the exit
+> checker neither requires nor depends on any of them.
 
 ## 9. What this unlocks for Phase 1
 

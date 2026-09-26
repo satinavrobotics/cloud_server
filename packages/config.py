@@ -111,6 +111,30 @@ TELEMETRY_ELECTION_CHECK_S = float(os.getenv("TELEMETRY_ELECTION_CHECK_S", "2.0"
 THERMAL_HIGH_C = float(os.getenv("THERMAL_HIGH_C", "85.0"))
 THERMAL_OK_C = float(os.getenv("THERMAL_OK_C", "78.0"))
 
+# ==================== Phase 0 recorder health + alerts (API, WP13) ====================
+# packages/api/recorder_health.py: GET /api/v1/health/recording and the alert rules. The API's
+# elected telemetry writer evaluates them every RECORDER_HEALTH_EVAL_S, writes its own
+# `recorder_health` row, and emits SYSTEM.RECORDER_ALERT_RAISED / _CLEARED once per transition.
+# mission-dispatch reports every fleet_recorder.HEALTH_REPORT_PERIOD_S (10 s; its image has no
+# config.py).
+RECORDER_HEALTH_EVAL_S = float(os.getenv("RECORDER_HEALTH_EVAL_S", "5.0"))
+# report_stale: a process's row is older than this (seconds). Also applied when reading.
+RECORDER_HEALTH_STALE_S = float(os.getenv("RECORDER_HEALTH_STALE_S", "60.0"))
+# writer_queue_high: queue depth above this % of capacity; clears below the clear %.
+RECORDER_ALERT_QUEUE_PCT = float(os.getenv("RECORDER_ALERT_QUEUE_PCT", "80.0"))
+RECORDER_ALERT_QUEUE_CLEAR_PCT = float(os.getenv("RECORDER_ALERT_QUEUE_CLEAR_PCT", "60.0"))
+# spill_pending: spilled events have been waiting continuously for longer than this (seconds).
+RECORDER_ALERT_SPILL_S = float(os.getenv("RECORDER_ALERT_SPILL_S", "300.0"))
+# heartbeat_sweep_lag: dispatch's sweep lag above FACTOR x its period (1 s -> 3 s); clears at
+# or below CLEAR_FACTOR x period.
+RECORDER_ALERT_SWEEP_LAG_FACTOR = float(os.getenv("RECORDER_ALERT_SWEEP_LAG_FACTOR", "3.0"))
+RECORDER_ALERT_SWEEP_LAG_CLEAR_FACTOR = float(
+    os.getenv("RECORDER_ALERT_SWEEP_LAG_CLEAR_FACTOR", "1.5"))
+# Anti-flap: a raise condition must hold this long before the alert starts, and the clear
+# condition this long before it ends (seconds).
+RECORDER_ALERT_RAISE_S = float(os.getenv("RECORDER_ALERT_RAISE_S", "10.0"))
+RECORDER_ALERT_CLEAR_S = float(os.getenv("RECORDER_ALERT_CLEAR_S", "30.0"))
+
 # ==================== Phase 0 read endpoints (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.5, WP10 (packages/api/fleet_reads.py): /runs,
 # /runs/{id}, /runs/{id}/timeline, /events. Each request runs in one READ ONLY transaction whose

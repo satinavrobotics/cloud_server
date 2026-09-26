@@ -21,8 +21,9 @@ import datetime
 import json
 import logging
 import os
+import time
 import uuid
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 from packages.events import ids
 from packages.events.emit import COLUMNS as EVENT_COLUMNS, Event, build_row
@@ -78,15 +79,24 @@ class SpillFile:
     can read a prefix, await the database, and then drop exactly that prefix even if
     more lines were appended meanwhile. Writes are flushed to the OS (they survive a
     process crash) but not fsync'ed.
+
+    For the recorder health report (WP13) it also tracks `pending_lines` (lines waiting,
+    blank/corrupt ones included) and `pending_since` (wall clock, epoch s: when the file last
+    went from empty to non-empty, i.e. how long spilled events have been waiting
+    continuously). A file found at startup counts from its modification time, a lower bound.
     """
 
-    def __init__(self, path: Union[str, os.PathLike], metrics: Optional[Metrics] = None):
+    def __init__(self, path: Union[str, os.PathLike], metrics: Optional[Metrics] = None, *,
+                 wall: Callable[[], float] = time.time):
         self.path = os.fspath(path)
         self.metrics = metrics or Metrics()
+        self._wall = wall
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         self._has_data = False
+        self.pending_lines = 0
+        self.pending_since: Optional[float] = None
         self._repair()
 
     def _repair(self) -> None:
@@ -102,10 +112,21 @@ class SpillFile:
             f.seek(-1, os.SEEK_END)
             if f.read(1) != b"\n":
                 f.write(b"\n")
+        try:
+            with open(self.path, "rb") as f:
+                self.pending_lines = sum(1 for _ in f)
+            self.pending_since = os.path.getmtime(self.path)
+        except OSError:
+            self.pending_since = self._wall()
 
     @property
     def pending(self) -> bool:
         return self._has_data
+
+    def _set_empty(self) -> None:
+        self._has_data = False
+        self.pending_lines = 0
+        self.pending_since = None
 
     def append(self, rows: Iterable[Mapping[str, Any]]) -> int:
         """Append rows; returns how many were written. Raises OSError on I/O failure."""
@@ -115,7 +136,10 @@ class SpillFile:
         with open(self.path, "a", encoding="utf-8") as f:
             f.writelines(lines)
             f.flush()
+        if not self._has_data or self.pending_since is None:
+            self.pending_since = self._wall()
         self._has_data = True
+        self.pending_lines += len(lines)
         self.metrics.events_spilled += len(lines)
         return len(lines)
 
@@ -153,7 +177,7 @@ class SpillFile:
                         self.metrics.spill_corrupt_lines += 1
                         logger.error("Skipping corrupt spill line in %s: %r", self.path, line[:200])
         except FileNotFoundError:
-            self._has_data = False
+            self._set_empty()
         return rows, consumed
 
     def consume(self, n_lines: int) -> None:
@@ -164,11 +188,11 @@ class SpillFile:
             with open(self.path, "r", encoding="utf-8") as f:
                 remaining = f.readlines()[n_lines:]
         except FileNotFoundError:
-            self._has_data = False
+            self._set_empty()
             return
         if not any(line.strip() for line in remaining):
             os.unlink(self.path)
-            self._has_data = False
+            self._set_empty()
             return
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -176,6 +200,7 @@ class SpillFile:
             f.flush()
         os.replace(tmp, self.path)
         self._has_data = True
+        self.pending_lines = len(remaining)
 
 
 # --- queue ---------------------------------------------------------------------------------
@@ -195,6 +220,7 @@ class IngestQueue:
         self.metrics = metrics or spill.metrics
         spill.metrics = self.metrics
         self.policy = policy
+        self.capacity = maxsize
         self._queue: "asyncio.Queue[Item]" = asyncio.Queue(maxsize=maxsize)
         self._latest: Dict[str, Dict[str, Any]] = {}
         self._owned = tables.LATEST_OWNED_COLUMNS[self.source]
