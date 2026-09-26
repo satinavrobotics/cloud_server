@@ -1,5 +1,7 @@
 # SatiNav Fleet Agent — Phase 1: Explain with Evidence
 
+> **Status (2026-09-26): parked.** The owner will not use a paid model API at first: the agent must run on a free API tier or a self-hosted model. This plan assumes Anthropic models, per-token budgets and a model bake-off (§7, §9, §15), so it needs rework for that before it starts. Phase 1 waits until Phase 0 is done and the owner picks it up again; the §15 questions are withdrawn.
+
 **Goal:** the agent answers **"why did run X fail"**, **"what's going wrong on robot Y / at site Z"** and **"what changed since version V"**, and every claim cites a stable `run_id`, `event_id` or timeline range that an operator can open in sati-client. It also raises these explanations **proactively** when a run ends badly. It explains; it does not act.
 
 **Constraints**
