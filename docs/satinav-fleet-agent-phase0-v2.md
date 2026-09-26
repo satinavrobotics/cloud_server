@@ -142,6 +142,8 @@ CREATE INDEX ON fleet_events (run_id) WHERE run_id IS NOT NULL;
 | `SYSTEM.THERMAL_HIGH` / `THERMAL_OK` | api | 85 °C / 78 °C hysteresis |
 | `SYSTEM.NODE_DOWN` / `NODE_UP` | api | ROS node health in diagnostics |
 | `MAP.DELETE_FAILED` | api | delete saga exhausted retries |
+| `MISSION.DELETED` | api | mission delete (payload: names, deleted run/event/trajectory counts) |
+| `RUN.ARCHIVED` / `RUN.UNARCHIVED` | api | `POST /api/v1/runs/archive` changed runs (payload: count, run_ids) |
 | `TELEMETRY.RECORDING_CHANGED` | api | policy change (**always written, even at level `off`**) |
 
 Codes are append-only: they are never renamed or reused, only deprecated.
@@ -305,12 +307,44 @@ mqtt-recorder:          # optional, remove freely
 GET  /api/v1/sites                       CRUD
 PUT  /api/v1/robots/{name}/site          closes the previous assignment, opens a new one
 GET  /api/v1/robots/{name}/site-assignments
-GET  /api/v1/runs?robot=&site=&state=&sw_version=&mission=&from=&to=&cursor=
+GET  /api/v1/runs?robot=&site=&state=&sw_version=&mission=&archived=&from=&to=&cursor=
                                          mission= base name + its `-rerun-<n>` reruns
-GET  /api/v1/runs/{run_id}               run + events
+                                         archived= exclude (default) | include | only
+GET  /api/v1/runs/{run_id}               run + events (archived or not)
 GET  /api/v1/runs/{run_id}/timeline      events + coarse tracks + trajectory + not_recorded gaps
 GET  /api/v1/events?robot=&site=&code=&severity=&from=&to=&cursor=
+POST /api/v1/runs/archive                {"run_ids": [...1..500] | "mission": "<base>", "archived": true}
+                                         -> {"updated": n, "skipped_running": m}
+DELETE /api/v1/missions/{name}[?with_reruns=true]
+                                         also deletes the runs, their events and trajectory
 ```
+
+Every run in the responses carries `archived_at` (ISO-8601 or null).
+
+**Archive** (reversible, nothing is lost). `POST /api/v1/runs/archive` selects runs by exactly one
+of `run_ids` (1–500 ids) or `mission` (the same family rule as the `mission` filter) and sets
+`mission_runs.archived_at` to now (`archived: true`, the default) or back to null (`false`).
+Open runs (`ended_at` null) are never archived; they are counted in `skipped_running` (0 when
+restoring). `updated` counts only runs whose state changed. A bad body (both or neither
+selector, an empty or oversized list, a bad uuid, an unknown field) is a 422. Archived runs are
+hidden from `GET /runs` unless `archived=include|only`; the detail and timeline routes return
+them as usual. One `RUN.ARCHIVED` / `RUN.UNARCHIVED` event per request that changed something.
+Migration `20260926_01_run_archive` adds the column and lets the terminal-run trigger accept
+changes to `archived_at` (dispatch never writes it).
+
+**Mission delete** (irreversible). `DELETE /api/v1/missions/{name}` deletes the mission object as
+before and, in the same transaction, its runs for good: the `mission_runs` rows with
+`mission_name = name`, the `fleet_events` rows tagged with those `run_id`s (also in compressed
+chunks), and the `mission_trajectory` rows tagged with them or untagged rows of that mission name.
+Robot telemetry (`robot_state_ts`, `diagnostics_ts`, rollups, `robot_latest`) and robot events
+without a `run_id` stay. The response adds `deleted_runs`, `deleted_events` and
+`deleted_trajectory`. With `with_reruns=true` it covers the whole family (every matching
+mission object and every matching run, even when the objects are already gone) and adds
+`deleted_missions: [names]`; it is a 404 only if neither a mission nor a run matches (without
+it, a missing mission object is a 404 as before). It is refused with 409, and nothing is
+deleted, while a targeted mission is `RUNNING` or a targeted run is still open; a `PENDING`
+mission is deleted as before. One `MISSION.DELETED` event (robot and run null) records the
+names and counts. Both write routes honour `Idempotency-Key`.
 
 The recording level is set through the existing robot and settings routes and the new site route; the fields are validated.
 

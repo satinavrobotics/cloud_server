@@ -933,7 +933,10 @@ class FleetRecorder:
     async def _close_run(self, conn: Any, info: RunInfo, finish: _Finish,
                          with_events: bool) -> None:
         """UPDATE the run to its terminal state + RUN_FINISHED, on `conn` inside the caller's
-        transaction. A run whose start was never written is inserted whole."""
+        transaction. A run whose start was never written is inserted whole, unless its
+        mission object no longer exists (deleted, with its runs, by the API).
+
+        Neither statement touches mission_runs.archived_at (API-owned, run_admin.py)."""
         async with conn.cursor() as cursor:
             await cursor.execute(FINISH_RUN_SQL, (
                 finish.outcome.value, finish.ended_at, finish.cause,
@@ -945,6 +948,15 @@ class FleetRecorder:
                 if existing is not None:
                     logger.info("Run %s is already %s; not finishing it again",
                                 info.run_id, existing[0])
+                    return
+                # The run was never written. If its mission object is gone too, the mission
+                # was deleted in the meantime (DELETE /api/v1/missions deletes its runs, and
+                # refuses open ones, so this late finish is the only way back): don't
+                # re-create the run the operator just deleted.
+                await cursor.execute(MISSION_SQL, (info.mission_name,))
+                if await cursor.fetchone() is None:
+                    logger.warning("Run %s: mission %s no longer exists; not recording its "
+                                   "finish", info.run_id, info.mission_name)
                     return
         if not updated:
             await self._insert_run(conn, info, finish)

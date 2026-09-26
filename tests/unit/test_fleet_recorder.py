@@ -159,6 +159,7 @@ async def test_transient_failures_retry_in_order(tmp_path):
 async def test_finish_writes_whole_run_when_start_was_lost(tmp_path):
     rec, db, clock = make_recorder(tmp_path)
     mission, robot = _mission(), _robot()
+    db.missions["m1"] = ("ALIVE", "r1", {"state": "FAILED"})
     db.unavailable = True
     rec.run_started("r1", mission, robot)
     await rec.run_pending_ops()                   # gives up after every retry
@@ -173,6 +174,35 @@ async def test_finish_writes_whole_run_when_start_was_lost(tmp_path):
     row = _run_row(db)
     assert row["state"] == "FAILED" and row["started_at"] == T0
     assert codes(db.events_by_code()) == ["MISSION.RUN_STARTED", "MISSION.RUN_FINISHED"]
+
+
+async def test_late_finish_does_not_recreate_a_deleted_missions_run(tmp_path):
+    """DELETE /api/v1/missions removed the mission and its runs while the finish of a run whose
+    start was never written was still queued: the finish must not bring the run back."""
+    rec, db, clock = make_recorder(tmp_path)
+    mission, robot = _mission(), _robot()
+    db.unavailable = True
+    rec.run_started("r1", mission, robot)
+    await rec.run_pending_ops()
+    assert db.runs == {}
+
+    db.unavailable = False
+    clock.advance(10)
+    mission.status.state = State.COMPLETED
+    rec.run_finished("r1", mission, robot)       # no missionobjectv1 row: deleted
+    await rec.run_pending_ops()
+    assert db.runs == {} and db.events == {} and rec.op_failures == 1
+
+
+def test_run_writes_never_touch_archived_at():
+    """archived_at belongs to the API (POST /api/v1/runs/archive): dispatch's run upserts must
+    neither set nor clear it."""
+    for sql in (fr.INSERT_RUN_SQL, fr.FINISH_RUN_SQL, fr.TRAJECTORY_SQL):
+        assert "archived_at" not in sql
+    set_list = fr.FINISH_RUN_SQL.split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+    assert [c.split("=")[0].strip() for c in set_list.split(",")] == [
+        "state", "ended_at", "abort_cause", "abort_detail", "passes_completed"]
+    assert fr.INSERT_RUN_SQL.endswith("ON CONFLICT (run_id) DO NOTHING")
 
 
 async def test_terminal_run_is_not_finished_twice(tmp_path):

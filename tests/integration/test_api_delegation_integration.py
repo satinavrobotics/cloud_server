@@ -298,9 +298,9 @@ class TestAPIDelegationIntegration:
         response = requests.post(f"{api_url}/api/v1/missions/{mission_name}/cancel", timeout=10)
         assert response.status_code in [200, 404, 400]
 
-        # 6. Delete mission
+        # 6. Delete mission (409 while it is still RUNNING: packages/api/run_admin.py)
         response = requests.delete(f"{api_url}/api/v1/missions/{mission_name}", timeout=10)
-        assert response.status_code in [200, 404]
+        assert response.status_code in [200, 404, 409]
 
     def test_detection_results_crud_workflow(self, mission_database_service, api_delegation_service):
         """Test Detection Results CRUD workflow through API delegation."""
@@ -451,9 +451,9 @@ class TestAPIDelegationIntegration:
             assert response.status_code in [200, 404, 503]
 
         finally:
-            # 6. Cleanup - delete mission
+            # 6. Cleanup - delete mission (409 while it is still RUNNING)
             response = requests.delete(f"{api_url}/api/v1/missions/{mission_name}", timeout=10)
-            assert response.status_code in [200, 404]
+            assert response.status_code in [200, 404, 409]
     
     @pytest.mark.asyncio
     async def test_update_map_node(self, graph_db_client, sample_map_simple):

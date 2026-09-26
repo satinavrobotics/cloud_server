@@ -40,6 +40,13 @@ VALID_PAYLOADS = {
     EventCode.SYSTEM_NODE_DOWN: {"node": "/nav2/controller"},
     EventCode.SYSTEM_NODE_UP: {"node": "/nav2/controller"},
     EventCode.MAP_DELETE_FAILED: {"map_name": "site-a", "attempts": 5, "error": "minio timeout"},
+    EventCode.MISSION_DELETED: {"mission_name": "m1", "with_reruns": True,
+                                "deleted_missions": ["m1", "m1-rerun-1"], "deleted_runs": 2,
+                                "deleted_events": 7, "deleted_trajectory": 40,
+                                "run_ids": ["6f1c0c2e-0000-4000-8000-000000000001"],
+                                "robots": ["r1"]},
+    EventCode.RUN_ARCHIVED: {"count": 1, "run_ids": ["6f1c0c2e-0000-4000-8000-000000000001"]},
+    EventCode.RUN_UNARCHIVED: {"count": 2, "run_ids": [], "mission": "m1"},
     EventCode.TELEMETRY_RECORDING_CHANGED: {"old_level": "events_only", "new_level": "off",
                                             "scope": "site", "scope_id": "site-a", "actor": "bob"},
 }

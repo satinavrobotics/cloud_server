@@ -169,6 +169,28 @@ class MapDeleteFailed(Payload):
     error: Optional[str] = None
 
 
+class MissionDeleted(Payload):
+    """DELETE /api/v1/missions/{name} (packages/api/run_admin.py). `run_ids` lists at most
+    run_admin.EVENT_MAX_RUN_IDS of the deleted runs (`run_ids_truncated` says if more)."""
+    mission_name: str
+    with_reruns: bool = False
+    deleted_missions: List[str] = []
+    deleted_runs: int
+    deleted_events: int
+    deleted_trajectory: int
+    run_ids: List[str] = []
+    run_ids_truncated: bool = False
+    robots: List[str] = []
+
+
+class RunsArchived(Payload):
+    """POST /api/v1/runs/archive: the runs whose archive state changed."""
+    count: int
+    run_ids: List[str] = []
+    run_ids_truncated: bool = False
+    mission: Optional[str] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel

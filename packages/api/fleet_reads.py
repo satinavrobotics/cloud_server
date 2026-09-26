@@ -7,7 +7,8 @@
     GET /api/v1/robots/{name}/recording     effective_recording()
     GET /api/v1/recording                   effective_recording_all() (every robot)
 
-Read-only by construction: every request is ONE pooled connection in a `READ ONLY`
+Read-only by construction (the writes on these tables, archive and delete, live in
+packages/api/run_admin.py): every request is ONE pooled connection in a `READ ONLY`
 transaction with `statement_timeout` (config.FLEET_READ_STATEMENT_TIMEOUT_MS); a cancelled
 statement is a 503, missing Phase 0 tables are a 503. Timestamps in responses are ISO-8601 UTC.
 
@@ -219,7 +220,7 @@ def _row(columns: Sequence[str], values: Sequence[Any]) -> Dict[str, Any]:
 
 RUN_COLUMNS = ("run_id", "mission_name", "robot_name", "site_id", "map_id", "sw_version",
                "recording_level", "state", "abort_cause", "abort_detail", "passes_completed",
-               "created_by", "started_at", "ended_at", "summary_metrics")
+               "created_by", "started_at", "ended_at", "summary_metrics", "archived_at")
 EVENT_COLUMNS = ("event_id", "ts", "robot_name", "run_id", "site_id", "code", "severity",
                  "sw_version", "source", "payload")
 _RUN_SELECT = ", ".join(RUN_COLUMNS)
@@ -275,8 +276,22 @@ def _page(rows: List[Sequence[Any]], limit: int, kind: str, ts_idx: int, key_idx
 # is free text, so it never goes into a regex: it is compared as a plain string (equality /
 # starts_with) and only the remainder is matched against this constant pattern.
 RERUN_SUFFIX_RE = "^(-rerun-[0-9]+)+$"
-_MISSION_FILTER = ("(mission_name = %s::text OR (starts_with(mission_name, %s::text) AND "
-                   f"substr(mission_name, char_length(%s::text) + 1) ~ '{RERUN_SUFFIX_RE}'))")
+
+
+def family_filter(column: str) -> str:
+    """The `mission` family predicate on `column` (a constant column name); takes the base
+    name three times as bind parameters. Also used by the mission delete (run_admin.py)."""
+    return (f"({column} = %s::text OR (starts_with({column}, %s::text) AND "
+            f"substr({column}, char_length(%s::text) + 1) ~ '{RERUN_SUFFIX_RE}'))")
+
+
+_MISSION_FILTER = family_filter("mission_name")
+
+# `archived` filter on the run list: archived runs (mission_runs.archived_at set) are hidden
+# unless asked for. The run detail and timeline routes return a run whatever its archive state.
+ARCHIVED_CHOICES: Tuple[str, ...] = ("exclude", "include", "only")
+_ARCHIVED_WHERE = {"exclude": "archived_at IS NULL", "include": None,
+                   "only": "archived_at IS NOT NULL"}
 
 
 def check_mission(value: Optional[str]) -> Optional[str]:
@@ -287,13 +302,15 @@ def check_mission(value: Optional[str]) -> Optional[str]:
 
 async def list_runs(db: Any, *, robot: Optional[str] = None, site: Optional[str] = None,
                     state: Optional[str] = None, sw_version: Optional[str] = None,
-                    mission: Optional[str] = None,
+                    mission: Optional[str] = None, archived: Optional[str] = "exclude",
                     start: Optional[datetime.datetime] = None,
                     end: Optional[datetime.datetime] = None, cursor: Optional[str] = None,
                     limit: int = DEFAULT_LIMIT) -> Dict[str, Any]:
     """Runs newest first (by started_at); `from`/`to` bound started_at: [from, to).
-    `mission`: runs of that mission and of its reruns (`<mission>-rerun-<n>[-rerun-<n>...]`)."""
+    `mission`: runs of that mission and of its reruns (`<mission>-rerun-<n>[-rerun-<n>...]`).
+    `archived`: exclude (default) | include | only."""
     check_choice(state, "state", RUN_STATES)
+    check_choice(archived, "archived", ARCHIVED_CHOICES)
     check_mission(mission)
     check_window(start, end)
     after = decode_cursor("runs", cursor)
@@ -306,6 +323,9 @@ async def list_runs(db: Any, *, robot: Optional[str] = None, site: Optional[str]
     if mission is not None:
         where.append(_MISSION_FILTER)
         params.extend((mission, mission, mission))
+    archived_where = _ARCHIVED_WHERE[archived or "exclude"]
+    if archived_where is not None:
+        where.append(archived_where)
     if start is not None:
         where.append("started_at >= %s")
         params.append(start)
