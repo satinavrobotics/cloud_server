@@ -49,6 +49,11 @@ VALID_PAYLOADS = {
     EventCode.RUN_UNARCHIVED: {"count": 2, "run_ids": [], "mission": "m1"},
     EventCode.TELEMETRY_RECORDING_CHANGED: {"old_level": "events_only", "new_level": "off",
                                             "scope": "site", "scope_id": "site-a", "actor": "bob"},
+    EventCode.SYSTEM_RECORDER_ALERT_RAISED: {"alert": "writer_queue_high", "process": "api",
+                                             "value": 85.0, "threshold": 80.0},
+    EventCode.SYSTEM_RECORDER_ALERT_CLEARED: {"alert": "report_stale", "process": "dispatch",
+                                              "value": 4.2, "threshold": 60.0, "raised_at": TS,
+                                              "duration_s": 120.0},
 }
 
 

@@ -13,7 +13,7 @@ import uuid
 from packages.controllers.mission import fleet_recorder as fr
 from packages.controllers.mission.vda5050_types import vda5050_types as types
 from packages.events.emit import COLUMNS as EVENT_COLUMNS, INSERT_SQL as EVENT_INSERT_SQL
-from packages.telemetry_ingest import IngestQueue, RecordingPolicy, SpillFile, tables
+from packages.telemetry_ingest import IngestQueue, RecordingPolicy, SpillFile, health, tables
 from packages.telemetry_ingest.policy import PolicySources
 from packages.telemetry_ingest.rehydrate import SELECT_SQL as LATEST_SELECT_SQL
 
@@ -44,6 +44,7 @@ class FakeDB:
         self.trajectory = []    # dicts: mission_id, robot_name, ts, run_id
         self.missions = {}      # name -> (lifecycle, robot, status dict)
         self.latest = []        # tuples in rehydrate SELECT_SQL column order
+        self.health = {}        # recorder_health: process -> row dict
         self.unavailable = False
         self.fail = None        # fail(sql, params) -> exception or None
         self.statements = []
@@ -134,6 +135,11 @@ class FakeDB:
                 cursor.rowcount = 1
         elif sql.startswith(LATEST_SELECT_SQL):
             cursor.results = list(self.latest)
+        elif sql == health.UPSERT_SQL:
+            process, pid, host, role, started_at, report = params
+            self.health[process] = {"pid": pid, "hostname": host, "role": role,
+                                    "started_at": started_at, "report": json.loads(report)}
+            cursor.rowcount = 1
         else:
             raise AssertionError(f"unexpected SQL: {sql}")
 

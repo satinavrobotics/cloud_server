@@ -12,6 +12,9 @@ What dispatch records, on top of what it already does:
   (every 5 s per robot and at once on a state/order/error change) and `robot_latest`.
 - A 1 Hz sweep for HEARTBEAT_LOST / HEARTBEAT_RESTORED.
 - Orphan reconciliation of RUNNING runs at startup.
+- A health report (WP13) every HEALTH_REPORT_PERIOD_S: the `dispatch` row of
+  `recorder_health` (queue, spill, flush ages, heartbeat sweep lag), which the API serves at
+  GET /api/v1/health/recording and alerts on (packages/api/recorder_health.py).
 
 Failure isolation: the command path never waits on, or fails because of, anything here.
 
@@ -51,7 +54,7 @@ from packages.events.schemas import RecordingLevel, RunOutcome
 from packages.telemetry_ingest import (
     IngestQueue, RecordingPolicy, SpillFile, TelemetryWriter, create_pool, load_latest,
 )
-from packages.telemetry_ingest import tables
+from packages.telemetry_ingest import health, tables
 from packages.telemetry_ingest.policy import ASSIGNMENTS_CHANNEL, parse_assignment_payload
 from packages.telemetry_ingest.rehydrate import LatestRow
 
@@ -70,6 +73,13 @@ STATE_ROW_INTERVAL_S = 5.0
 BATTERY_LOW_PCT = 20.0
 BATTERY_OK_PCT = 25.0
 SWEEP_PERIOD_S = 1.0
+# Health report (WP13): how often dispatch upserts its recorder_health row. Well inside the
+# API's staleness threshold (config.RECORDER_HEALTH_STALE_S, 60 s). This image has no
+# packages/config.py, hence a constant here.
+HEALTH_REPORT_PERIOD_S = 10.0
+HEALTH_CONNECT_TIMEOUT_S = 2.0
+HEALTH_WRITE_TIMEOUT_S = 5.0
+HEALTH_ROLE = "recorder"
 # The recording policy follows the robot, settings and site NOTIFYs and the assignment channel
 # directly (on_robot_object, on_settings_object, on_site_object, on_site_assignment: the value
 # is pushed, no reload). On top of that it is reloaded this often as a safety net for a
@@ -461,6 +471,9 @@ class FleetRecorder:
         self.hook_errors = 0
         self.op_failures = 0
         self.ops_dropped = 0
+        self.health_failures = 0
+        self._sweep_done_at: Optional[datetime.datetime] = None
+        self._sweep_gap_max_s = 0.0
 
     # --- lifecycle -----------------------------------------------------------------------
     async def start(self) -> None:
@@ -488,6 +501,7 @@ class FleetRecorder:
             self._writer.start()
         self._spawn(self._run_worker(), "runs")
         self._spawn(self._sweep_loop(), "heartbeat_sweep")
+        self._spawn(self._health_loop(), "health_report")
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -508,6 +522,7 @@ class FleetRecorder:
     def snapshot(self) -> Dict[str, Any]:
         return {"hook_errors": self.hook_errors, "op_failures": self.op_failures,
                 "ops_dropped": self.ops_dropped, "ops_pending": len(self._ops),
+                "health_failures": self.health_failures,
                 "robots": len(self._tracks), "active_runs": len(self._runs),
                 "ingest": self.queue.metrics.snapshot()}
 
@@ -762,7 +777,79 @@ class FleetRecorder:
     async def _sweep_loop(self) -> None:
         while True:
             self.sweep()
+            self.sweep_completed()
             await self._sleep(SWEEP_PERIOD_S)
+
+    def sweep_completed(self, now: Optional[datetime.datetime] = None) -> None:
+        """Note that a sweep pass finished (for the health report's sweep lag)."""
+        now = now or self._clock()
+        last = self._sweep_done_at
+        if last is not None:
+            gap = (now - last).total_seconds()
+            if gap > self._sweep_gap_max_s:
+                self._sweep_gap_max_s = gap
+        self._sweep_done_at = now
+
+    # --- health report (WP13) ------------------------------------------------------------
+    def health_report(self, now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+        """This process's recorder_health report. Starts a new sweep-gap window.
+
+        heartbeat_sweep.lag_s is the larger of the time since the last completed pass and
+        the longest interval between two passes since the previous report, so a sweep that
+        stalled and recovered between two reports still shows. Healthy: about
+        SWEEP_PERIOD_S."""
+        now = now or self._clock()
+        writer = self._writer
+        report = health.ingest_report(
+            self.queue.metrics, queue_depth=self.queue.qsize(),
+            queue_capacity=self.queue.capacity, spill=self.queue.spill,
+            writer_running=writer is not None and writer.running, now=now.timestamp())
+        reference = self._sweep_done_at or self._started_at
+        age = max(0.0, (now - reference).total_seconds()) if reference is not None else None
+        gap, self._sweep_gap_max_s = self._sweep_gap_max_s, 0.0
+        report["heartbeat_sweep"] = {
+            "period_s": SWEEP_PERIOD_S,
+            "last_completed_age_s": None if age is None else round(age, 3),
+            "gap_max_s": round(gap, 3),
+            "lag_s": None if age is None else round(max(age, gap), 3),
+        }
+        report["runs"] = {"ops_pending": len(self._ops), "op_failures": self.op_failures,
+                          "ops_dropped": self.ops_dropped, "active_runs": len(self._runs)}
+        report["hook_errors"] = self.hook_errors
+        report["robots"] = len(self._tracks)
+        report["report_period_s"] = HEALTH_REPORT_PERIOD_S
+        return report
+
+    async def write_health(self) -> bool:
+        """Upsert the `dispatch` recorder_health row on the recorder pool. False (logged,
+        counted) on any failure: the API then sees the row go stale, which is the alert."""
+        if self._pool is None:
+            return False
+        report = self.health_report()
+        params = health.row_params(health.PROCESS_DISPATCH, HEALTH_ROLE, self._started_at,
+                                   report)
+
+        async def write() -> None:
+            async with self._pool.connection(timeout=HEALTH_CONNECT_TIMEOUT_S) as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(health.UPSERT_SQL, params)
+        try:
+            await asyncio.wait_for(write(), HEALTH_WRITE_TIMEOUT_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.health_failures += 1
+            if self.health_failures <= 3 or self.health_failures % 60 == 0:
+                logger.warning("Recorder health report failed (#%d): %s", self.health_failures,
+                               str(exc).strip() or type(exc).__name__)
+            return False
+        return True
+
+    async def _health_loop(self) -> None:
+        while True:
+            await self.write_health()
+            await self._sleep(HEALTH_REPORT_PERIOD_S)
 
     # --- mission hooks -------------------------------------------------------------------
     @_guarded

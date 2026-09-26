@@ -51,7 +51,14 @@ def schema(which):
         check(cols == ["archived_at"], "mission_runs.archived_at exists")
         check("'archived_at'" in src and "'summary_metrics'" in src,
               "trigger ignores summary_metrics and archived_at")
-        check(version == HEAD, f"alembic_version at {HEAD}")
+        # at head, which is HEAD or a later revision on top of it
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+        from packages.api.entrypoint import ALEMBIC_INI
+        script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+        applied = {rev.revision for rev in script.walk_revisions()}
+        check(version == script.get_current_head() and HEAD in applied,
+              f"alembic_version at head ({version}), which includes {HEAD}")
     else:
         check(cols == [], "downgrade dropped archived_at")
         check("'archived_at'" not in src and "'summary_metrics'" in src,

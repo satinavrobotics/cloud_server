@@ -41,6 +41,8 @@ class EventCode(str, enum.Enum):
     RUN_ARCHIVED = "RUN.ARCHIVED"
     RUN_UNARCHIVED = "RUN.UNARCHIVED"
     TELEMETRY_RECORDING_CHANGED = "TELEMETRY.RECORDING_CHANGED"
+    SYSTEM_RECORDER_ALERT_RAISED = "SYSTEM.RECORDER_ALERT_RAISED"
+    SYSTEM_RECORDER_ALERT_CLEARED = "SYSTEM.RECORDER_ALERT_CLEARED"
 
 
 class Severity(str, enum.Enum):
@@ -102,6 +104,8 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.RUN_ARCHIVED: CodeMeta(_S.INFO, True, schemas.RunsArchived, _A),
     _C.RUN_UNARCHIVED: CodeMeta(_S.INFO, True, schemas.RunsArchived, _A),
     _C.TELEMETRY_RECORDING_CHANGED: CodeMeta(_S.INFO, True, schemas.RecordingChanged, _A),
+    _C.SYSTEM_RECORDER_ALERT_RAISED: CodeMeta(_S.WARNING, True, schemas.RecorderAlert, _A),
+    _C.SYSTEM_RECORDER_ALERT_CLEARED: CodeMeta(_S.INFO, True, schemas.RecorderAlert, _A),
 }
 
 

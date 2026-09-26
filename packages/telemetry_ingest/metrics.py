@@ -5,7 +5,7 @@ route, periodic log line). Everything here is touched only from the event loop t
 """
 
 import collections
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 class Metrics:
@@ -25,6 +25,10 @@ class Metrics:
     flushes / flush_failures       flush attempts / attempts with at least one failed step
     flush_duration_*_s             wall time of flushes, from the writer's clock
     queue_depth / queue_depth_max  current and high-water queue size
+    last_flush_at / last_flush_ok_at   wall-clock time (epoch s) of the last flush and of the
+                                   last one that fully succeeded (None: none yet)
+    writer_tick_at                 wall-clock time of the writer loop's last iteration
+                                   (liveness; the writer only flushes when there is work)
     """
 
     def __init__(self):
@@ -45,6 +49,9 @@ class Metrics:
         self.flush_duration_total_s = 0.0
         self.queue_depth = 0
         self.queue_depth_max = 0
+        self.last_flush_at: Optional[float] = None
+        self.last_flush_ok_at: Optional[float] = None
+        self.writer_tick_at: Optional[float] = None
 
     def written(self, table: str, n: int) -> None:
         if n:
@@ -63,10 +70,15 @@ class Metrics:
         if depth > self.queue_depth_max:
             self.queue_depth_max = depth
 
-    def flush_finished(self, duration_s: float, failed: bool) -> None:
+    def flush_finished(self, duration_s: float, failed: bool, at: Optional[float] = None) -> None:
+        """`at`: wall-clock time (epoch s) the flush finished, if the caller tracks it."""
         self.flushes += 1
         if failed:
             self.flush_failures += 1
+        if at is not None:
+            self.last_flush_at = at
+            if not failed:
+                self.last_flush_ok_at = at
         self.flush_duration_last_s = duration_s
         self.flush_duration_total_s += duration_s
         if duration_s > self.flush_duration_max_s:
@@ -92,4 +104,7 @@ class Metrics:
             "flush_duration_total_s": self.flush_duration_total_s,
             "queue_depth": self.queue_depth,
             "queue_depth_max": self.queue_depth_max,
+            "last_flush_at": self.last_flush_at,
+            "last_flush_ok_at": self.last_flush_ok_at,
+            "writer_tick_at": self.writer_tick_at,
         }

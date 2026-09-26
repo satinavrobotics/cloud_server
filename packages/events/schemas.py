@@ -191,6 +191,18 @@ class RunsArchived(Payload):
     mission: Optional[str] = None
 
 
+class RecorderAlert(Payload):
+    """A recorder health alert started or ended (packages/api/recorder_health.py, WP13).
+    `value` is the measurement that crossed `threshold` (null when there is none, e.g. a
+    process that never reported); `raised_at` / `duration_s` are set on CLEARED."""
+    alert: str
+    process: str
+    value: Optional[float] = None
+    threshold: float
+    raised_at: Optional[datetime.datetime] = None
+    duration_s: Optional[float] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel
