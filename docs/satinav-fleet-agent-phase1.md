@@ -101,6 +101,8 @@ The views are owned by the migration role and are **not** `security_invoker`, so
 | `agent.cause_codes` | `cause_codes` | |
 | `agent.insights` | `agent_insights` | So the agent can find prior insights about the same robot, run or cause |
 
+**Archived and deleted runs.** Archived runs (`mission_runs.archived_at` set) are still data: `agent.runs` keeps them (with `archived_at`), and `list_runs` passes `archived=include` so the agent sees them. Runs deleted together with their mission are gone for good (rows, events, trajectory); only a `MISSION.DELETED` event with the counts remains.
+
 **Not exposed:** `idempotency_keys` (holds response bodies), `audit_log` (empty; F4 dropped), `*objectv1` specs, `mission_trajectory` (read through the timeline endpoint instead).
 
 ### 4.2 Roles

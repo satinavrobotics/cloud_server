@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import fleet_reads, recording, sites
+from packages.api import fleet_reads, recording, run_admin, sites
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -1589,6 +1589,8 @@ async def list_runs(
     mission: Optional[str] = Query(None, description="Mission name: runs whose mission_name "
                                                      "is exactly this, or this followed by "
                                                      "one or more `-rerun-<digits>` (reruns)"),
+    archived: str = Query("exclude", description="Archived runs: exclude (default), include "
+                                                 "or only"),
     from_: Optional[str] = Query(None, alias="from",
                                  description="started_at >= this (ISO-8601 with time zone)"),
     to: Optional[str] = Query(None, description="started_at < this (ISO-8601 with time zone)"),
@@ -1600,7 +1602,19 @@ async def list_runs(
     start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
     return await _site_call("list runs", fleet_reads.list_runs(
         service.database, robot=robot, site=site, state=state, sw_version=sw_version,
-        mission=mission, start=start, end=end, cursor=cursor, limit=limit))
+        mission=mission, archived=archived, start=start, end=end, cursor=cursor,
+        limit=limit))
+
+
+@app.post("/api/v1/runs/archive")
+async def archive_runs(request: run_admin.ArchiveRequest):
+    """Archive (`archived`: true, the default) or restore (false) runs, selected by exactly one
+    of `run_ids` (1-500 run ids) or `mission` (the mission and its reruns, the same rule as
+    GET /api/v1/runs?mission=). Open runs are never archived (`skipped_running`). Returns
+    `{"updated": n, "skipped_running": m}`, n = runs whose archive state changed."""
+    _require_service()
+    run_admin.check_archive_request(request)   # 422 before any database work
+    return await _site_call("archive runs", run_admin.archive_runs(service.database, request))
 
 
 @app.get("/api/v1/runs/{run_id}")
@@ -1831,21 +1845,29 @@ async def update_mission(mission_name: str, mission_data: dict):
 
 
 @app.delete("/api/v1/missions/{mission_name}")
-async def delete_mission(mission_name: str):
+async def delete_mission(mission_name: str,
+                         with_reruns: bool = Query(False, description="Also delete every "
+                                                   "rerun (`<name>-rerun-<digits>...`) and "
+                                                   "all their runs")):
     """
-    Delete a mission (proxy to Mission Dispatcher database).
+    Delete a mission and, for good, its recorded runs (mission_runs rows, their events and
+    trajectory rows; robot telemetry is kept). With `with_reruns=true`, the whole family
+    (mission objects that are already gone are fine: their runs are still deleted).
 
-    Removes the mission from the database.
+    409 (nothing deleted) while a targeted mission is RUNNING or one of its runs is still open.
+    404 if the mission does not exist (with_reruns: if neither a mission nor a run matches).
+    Returns `{"success", "message", "deleted_runs", "deleted_events", "deleted_trajectory"}`,
+    plus `"deleted_missions": [names]` with with_reruns. Rules: packages/api/run_admin.py.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
+    _require_service()
     try:
-        await service.database.set_lifecycle(MissionObjectV1, mission_name, ObjectLifecycleV1.DELETED, uuid.uuid4())
-        return {"success": True, "message": f"Mission {mission_name} deleted"}
+        return await run_admin.delete_mission(service.database, mission_name,
+                                              with_reruns=with_reruns,
+                                              publisher_id=uuid.uuid4())
     except HTTPException:
         raise
     except Exception as e:
+        logging.exception(f"Failed to delete mission {mission_name}: {e}")
         raise HTTPException(status_code=404, detail=f"Failed to delete mission: {str(e)}")
 
 

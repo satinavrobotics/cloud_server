@@ -93,10 +93,11 @@ class FakeDb:
         yield self.conn
 
 
-def run_row(run_id, started, ended=None, state=None, robot="r1", level="full"):
+def run_row(run_id, started, ended=None, state=None, robot="r1", level="full",
+            archived=None):
     return (run_id, "m1", robot, "site-a", "map1", "v1", level,
             state or ("RUNNING" if ended is None else "COMPLETED"), None, None, 0, None,
-            started, ended, None)
+            started, ended, None, archived)
 
 
 def event_row(event_id, ts, code="ROBOT.ONLINE", robot="r1", run=None):
@@ -325,6 +326,51 @@ class TestLists:
         sql, params = db.executed[-1]
         assert "(started_at, run_id) < (%s, %s)" in sql and params[:3] == ("x", "x", "x")
 
+    @pytest.mark.parametrize("query, clause", [
+        ("", "archived_at IS NULL"),
+        ("&archived=exclude", "archived_at IS NULL"),
+        ("&archived=include", None),
+        ("&archived=only", "archived_at IS NOT NULL"),
+    ])
+    async def test_runs_archived_filter(self, query, clause):
+        db = FakeDb()
+        response = await get(db, "/api/v1/runs?robot=r1&mission=m&limit=3" + query)
+        assert response.status_code == 200, response.text
+        sql, params = db.executed[-1]
+        assert ("archived_at IS" in sql) == (clause is not None)
+        if clause is not None:
+            where = sql.split(" WHERE ", 1)[1].split(" ORDER BY ")[0].split(" AND ")
+            assert clause in where
+        assert params == ("r1", "m", "m", "m", 4)   # no bind parameter for the filter
+
+    async def test_runs_archived_filter_with_cursor(self):
+        cursor = fr.encode_cursor("runs", t(2), uuid.UUID(int=2))
+        db = FakeDb()
+        response = await get(db, f"/api/v1/runs?archived=only&cursor={cursor}")
+        assert response.status_code == 200, response.text
+        sql, params = db.executed[-1]
+        assert "archived_at IS NOT NULL AND (started_at, run_id) < (%s, %s)" in sql
+        assert params == (t(2), uuid.UUID(int=2), fr.DEFAULT_LIMIT + 1)
+
+    @pytest.mark.parametrize("value", ["bogus", "", "EXCLUDE", "true"])
+    async def test_runs_archived_bad_value_is_422(self, value):
+        db = FakeDb()
+        response = await get(db, "/api/v1/runs?" + urlencode({"archived": value}))
+        assert response.status_code == 422
+        detail = response.json()["detail"][0]
+        assert detail["loc"] == ["query", "archived"] and detail["type"] == "type_error.enum"
+        assert "exclude, include, only" in detail["msg"]
+        assert not [s for s, _ in db.executed if "mission_runs" in s]
+
+    async def test_run_json_has_archived_at(self):
+        archived = t(9)
+        rows = [run_row(uuid.UUID(int=2), t(1), t(2), archived=archived),
+                run_row(uuid.UUID(int=1), t(0), t(0.5))]
+        db = FakeDb(lambda sql, params: rows if "mission_runs" in sql else [])
+        items = (await get(db, "/api/v1/runs?archived=include")).json()["items"]
+        assert [i["archived_at"] for i in items] == ["2026-09-24T12:09:00+00:00", None]
+        assert fr.RUN_COLUMNS[-1] == "archived_at"
+
     async def test_events_filters(self):
         e1, e2 = uuid.UUID(int=1), uuid.UUID(int=2)
         run = uuid.uuid4()
@@ -352,12 +398,14 @@ class TestLists:
 
         def respond(sql, params):
             if "FROM mission_runs" in sql:
-                return [run_row(run_id, t(0), t(1)) + (tree,)]
+                return [run_row(run_id, t(0), t(1), archived=t(5)) + (tree,)]
             if "FROM fleet_events" in sql:
                 return ev
             return []
         body = (await get(FakeDb(respond), f"/api/v1/runs/{run_id}")).json()
         assert body["run"]["run_id"] == str(run_id) and body["run"]["mission_tree"] == tree
+        # archived runs are returned like any other (only the list hides them)
+        assert body["run"]["archived_at"] == "2026-09-24T12:05:00+00:00"
         assert [e["code"] for e in body["events"]] == ["MISSION.RUN_STARTED"]
         assert body["events_truncated"] is False
 

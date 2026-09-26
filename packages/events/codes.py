@@ -37,6 +37,9 @@ class EventCode(str, enum.Enum):
     SYSTEM_NODE_DOWN = "SYSTEM.NODE_DOWN"
     SYSTEM_NODE_UP = "SYSTEM.NODE_UP"
     MAP_DELETE_FAILED = "MAP.DELETE_FAILED"
+    MISSION_DELETED = "MISSION.DELETED"
+    RUN_ARCHIVED = "RUN.ARCHIVED"
+    RUN_UNARCHIVED = "RUN.UNARCHIVED"
     TELEMETRY_RECORDING_CHANGED = "TELEMETRY.RECORDING_CHANGED"
 
 
@@ -95,6 +98,9 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.SYSTEM_NODE_DOWN: CodeMeta(_S.ERROR, True, schemas.RosNode, _A),
     _C.SYSTEM_NODE_UP: CodeMeta(_S.INFO, True, schemas.RosNode, _A),
     _C.MAP_DELETE_FAILED: CodeMeta(_S.ERROR, True, schemas.MapDeleteFailed, _A),
+    _C.MISSION_DELETED: CodeMeta(_S.INFO, True, schemas.MissionDeleted, _A),
+    _C.RUN_ARCHIVED: CodeMeta(_S.INFO, True, schemas.RunsArchived, _A),
+    _C.RUN_UNARCHIVED: CodeMeta(_S.INFO, True, schemas.RunsArchived, _A),
     _C.TELEMETRY_RECORDING_CHANGED: CodeMeta(_S.INFO, True, schemas.RecordingChanged, _A),
 }
 

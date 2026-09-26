@@ -33,8 +33,16 @@ def schema():
     check(cols["actor"] == "''::text", f"actor defaults to '' ({cols['actor']})")
     check(query("SELECT 1 FROM pg_constraint WHERE conname = 'idempotency_keys_completed_check'"),
           "completed CHECK constraint exists")
-    check(query("SELECT version_num FROM alembic_version")[0][0] == "20260925_01_idempotency",
-          "alembic_version at 20260925_01_idempotency")
+    # at head, which is 20260925_01_idempotency or a later revision on top of it
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from packages.api.entrypoint import ALEMBIC_INI
+    script = ScriptDirectory.from_config(Config(str(ALEMBIC_INI)))
+    head = script.get_current_head()
+    applied = {rev.revision for rev in script.walk_revisions()}
+    version = query("SELECT version_num FROM alembic_version")[0][0]
+    check(version == head and "20260925_01_idempotency" in applied,
+          f"alembic_version at head ({version}), which includes 20260925_01_idempotency")
 
 
 async def init():
