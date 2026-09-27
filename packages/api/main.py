@@ -1921,6 +1921,8 @@ async def cancel_mission(mission_name: str):
         mission = await service.database.get_object(MissionObjectV1, mission_name)
         await mission.cancel()
         await service.database.update_spec(MissionObjectV1, mission_name, mission.spec, uuid.uuid4())
+        await run_admin.record_cancel_requested(service.database, mission_name,
+                                                getattr(mission.spec, "robot", None))
         return {"success": True, "message": f"Mission {mission_name} cancelled"}
     except HTTPException:
         raise

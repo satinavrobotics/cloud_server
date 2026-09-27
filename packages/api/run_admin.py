@@ -1,7 +1,9 @@
-"""Writes on the Phase 0 run tables: archiving runs and deleting a mission's runs.
+"""Writes on the Phase 0 run tables: archiving runs and deleting a mission's runs, plus the
+MISSION.CANCEL_REQUESTED event of the cancel route.
 
     POST   /api/v1/runs/archive                    archive_runs()
     DELETE /api/v1/missions/{name}[?with_reruns=]   delete_mission()
+    POST   /api/v1/missions/{name}/cancel          record_cancel_requested() (after the cancel)
 
 The read routes (packages/api/fleet_reads.py) stay read-only; everything here is one pooled
 connection = one transaction (PostgresDatabase.connection: commits on a clean exit, rolls back
@@ -61,9 +63,11 @@ from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 
-from packages.api.fleet_reads import family_filter
+from packages.api.fleet_reads import effective_level, family_filter
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
+from packages.telemetry_ingest import tables
+from packages.telemetry_ingest.policy import RecordingLevel, allows, load_sources
 
 logger = logging.getLogger("ApiDelegationService.run_admin")
 
@@ -264,3 +268,35 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
     if with_reruns:
         result["deleted_missions"] = names
     return result
+
+
+# --- cancel requested ------------------------------------------------------------------------
+
+async def record_cancel_requested(db: Any, mission_name: str, robot_name: Optional[str],
+                                  actor: str = "operator") -> bool:
+    """MISSION.CANCEL_REQUESTED for a cancel the route has just written, tagged with the
+    mission's open run (if any). Gated by the robot's recording level like every robot event
+    (level `off` stores none). Never raises: the cancel itself has already happened, so a
+    failed trace write is only logged. Returns True if an event row was inserted."""
+    try:
+        async with db.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT now()")
+                now = (await cur.fetchone())[0]
+                if robot_name:
+                    level = effective_level(robot_name, await load_sources(conn, now))["level"]
+                    if not allows(RecordingLevel(level), tables.EVENTS_TABLE,
+                                  EventCode.MISSION_CANCEL_REQUESTED.value):
+                        return False
+                await cur.execute(
+                    "SELECT run_id FROM mission_runs WHERE mission_name = %s "
+                    "AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1", (mission_name,))
+                row = await cur.fetchone()
+            return await emit(conn, Event(
+                EventCode.MISSION_CANCEL_REQUESTED, now, robot_name=robot_name or None,
+                source=Source.API, run_id=row[0] if row else None,
+                discriminator=f"mission:{mission_name}",
+                payload={"mission_name": mission_name, "actor": actor}))
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not record MISSION.CANCEL_REQUESTED for %s", mission_name)
+        return False
