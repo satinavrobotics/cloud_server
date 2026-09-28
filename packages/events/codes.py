@@ -43,6 +43,13 @@ class EventCode(str, enum.Enum):
     TELEMETRY_RECORDING_CHANGED = "TELEMETRY.RECORDING_CHANGED"
     SYSTEM_RECORDER_ALERT_RAISED = "SYSTEM.RECORDER_ALERT_RAISED"
     SYSTEM_RECORDER_ALERT_CLEARED = "SYSTEM.RECORDER_ALERT_CLEARED"
+    MAP_CREATED = "MAP.CREATED"
+    MAP_ARCHIVED = "MAP.ARCHIVED"
+    MAP_RESTORED = "MAP.RESTORED"
+    MAP_SESSION_STARTED = "MAP.SESSION_STARTED"
+    MAP_SESSION_PAUSED = "MAP.SESSION_PAUSED"
+    MAP_SESSION_RESUMED = "MAP.SESSION_RESUMED"
+    MAP_SESSION_FINISHED = "MAP.SESSION_FINISHED"
 
 
 class Severity(str, enum.Enum):
@@ -106,6 +113,15 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.TELEMETRY_RECORDING_CHANGED: CodeMeta(_S.INFO, True, schemas.RecordingChanged, _A),
     _C.SYSTEM_RECORDER_ALERT_RAISED: CodeMeta(_S.WARNING, True, schemas.RecorderAlert, _A),
     _C.SYSTEM_RECORDER_ALERT_CLEARED: CodeMeta(_S.INFO, True, schemas.RecorderAlert, _A),
+    # Maps redesign M1 (packages/api/maps.py). Discriminators: `map:<name>:<state>` for the
+    # map codes (no robot), `session:<session_id>:<action>` for the session codes.
+    _C.MAP_CREATED: CodeMeta(_S.INFO, True, schemas.MapLifecycle, _A),
+    _C.MAP_ARCHIVED: CodeMeta(_S.INFO, True, schemas.MapLifecycle, _A),
+    _C.MAP_RESTORED: CodeMeta(_S.INFO, True, schemas.MapLifecycle, _A),
+    _C.MAP_SESSION_STARTED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
+    _C.MAP_SESSION_PAUSED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
+    _C.MAP_SESSION_RESUMED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
+    _C.MAP_SESSION_FINISHED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
 }
 
 

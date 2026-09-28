@@ -54,6 +54,17 @@ VALID_PAYLOADS = {
     EventCode.SYSTEM_RECORDER_ALERT_CLEARED: {"alert": "report_stale", "process": "dispatch",
                                               "value": 4.2, "threshold": 60.0, "raised_at": TS,
                                               "duration_s": 120.0},
+    EventCode.MAP_CREATED: {"map_name": "yard", "map_type": "geo", "state": "draft"},
+    EventCode.MAP_ARCHIVED: {"map_name": "yard", "map_type": "local", "state": "archived"},
+    EventCode.MAP_RESTORED: {"map_name": "yard", "state": "ready", "actor": None},
+    EventCode.MAP_SESSION_STARTED: {"map_name": "yard", "session_id": "s1",
+                                    "map_state": "mapping", "aligned": True,
+                                    "map_T_session": {"tx": 1.5, "ty": -2.0, "yaw": 0.01}},
+    EventCode.MAP_SESSION_PAUSED: {"map_name": "yard", "session_id": "s1", "map_state": "paused"},
+    EventCode.MAP_SESSION_RESUMED: {"map_name": "yard", "session_id": "s1",
+                                    "map_state": "mapping"},
+    EventCode.MAP_SESSION_FINISHED: {"map_name": "yard", "session_id": "s1",
+                                     "map_state": "ready", "aligned": False},
 }
 
 

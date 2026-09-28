@@ -203,6 +203,25 @@ class RecorderAlert(Payload):
     duration_s: Optional[float] = None
 
 
+class MapLifecycle(Payload):
+    """MAP.CREATED / MAP.ARCHIVED / MAP.RESTORED (packages/api/maps.py): the map's state after
+    the change."""
+    map_name: str
+    map_type: Optional[str] = None
+    state: str
+    actor: Optional[str] = None
+
+
+class MapSession(Payload):
+    """MAP.SESSION_STARTED / _PAUSED / _RESUMED / _FINISHED (packages/api/maps.py)."""
+    map_name: str
+    session_id: str
+    map_state: str
+    aligned: Optional[bool] = None
+    map_T_session: Optional[Dict[str, float]] = None
+    actor: Optional[str] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel
