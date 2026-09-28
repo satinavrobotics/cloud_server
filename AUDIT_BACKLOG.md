@@ -318,6 +318,14 @@ it with a round-trip test against a known bearing before any robot sends a non-z
 value. Note the planner converts GPS goals with the *map's* datum, not the robot's; the
 robot's is only used to seed a map that has none (`_process_datum_message`).
 
+**Update 2026-09-28:** convention decided and documented (angle of +X from east, CCW, as the
+code always did) and pinned by tests. The grid-north part is solved by the datum `frame`:
+the robot's VDA5050 client sends `"frame": "utm"` (+ zone, hemisphere, datum E/N), and
+`geo.py` / the client's `mapTransform.ts` convert UTM-frame x/y with the exact UTM
+projection, ENU-frame x/y (sim, orchestrator anchor) in the tangent plane. Left: maps whose
+datum was auto-seeded before the frame existed are stored as `enu`; one from a real robot
+needs `PUT /api/v1/maps/{id}/datum` with `datum_frame: "utm"`.
+
 ### C15. An unknown `operatingMode` drops the whole state message — **medium**
 `VDA5050OperatingMode` accepts only AUTOMATIC / MANUAL / SEMIAUTOMATIC / SERVICE /
 TEACHIN (and `""`). Any other value (e.g. a robot reporting `TELEOPERATION`) fails

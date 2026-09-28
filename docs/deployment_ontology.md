@@ -89,7 +89,7 @@ uses the same prefix scheme with a `+` wildcard for the serial segment).
 | `/order` | mission-dispatch → Robot | — | Assigns a VDA5050 order (nodes/edges/actions) |
 | `/instantActions` | mission-dispatch → Robot | — | Out-of-band commands (e.g. `factsheetRequest`) |
 | `/factsheet` | Robot → mission-dispatch | retained | Static capability description (published on connect + on `factsheetRequest`) |
-| `/datum` | Robot → mission-dispatch | — | `RobotDatum {latitude, longitude, bearing_deg}` — GPS origin, used to auto-seed a map's datum |
+| `/datum` | Robot → mission-dispatch | retained | `RobotDatum {latitude, longitude, bearing_deg, frame, utm_zone, utm_north, utm_easting, utm_northing}` — GPS origin, used to auto-seed a map's datum. `frame`: `utm` (VDA5050 client; x/y are UTM grid offsets) or `enu` (orchestrator anchor; missing = `enu`), see `packages/utils/geo.py` |
 
 Cloud subscriptions are registered in
 `packages/controllers/mission/server.py:1220-1222` (`_mqtt_on_connect`):
