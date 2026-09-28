@@ -222,6 +222,30 @@ class MapSession(Payload):
     actor: Optional[str] = None
 
 
+class MapDeleted(Payload):
+    """MAP.DELETED (packages/api/map_delete.py): the background delete finished; the map's
+    Postgres row, sessions, ArangoDB graph and MinIO bucket are gone."""
+    map_name: str
+    requested_at: Optional[datetime.datetime] = None
+    attempts: int = 0
+
+
+class MapIngestRejected(Payload):
+    """MAP.INGEST_REJECTED (packages/services/graph_builder/ingest.py): robot data dropped by
+    graph-builder because it had no session to go to. Rate-limited per robot and reason:
+    `dropped_nodes` / `dropped_images` count every drop since `since` (the first drop not yet
+    reported). `reason`: no_session, session_paused, map_not_mapping, map_deleting,
+    map_missing, session_mismatch, datum_changed, lookup_failed."""
+    reason: str
+    dropped_nodes: int = 0
+    dropped_images: int = 0
+    since: datetime.datetime
+    map_name: Optional[str] = None
+    map_state: Optional[str] = None
+    session_id: Optional[str] = None
+    payload_session_id: Optional[str] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel

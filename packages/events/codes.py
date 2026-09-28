@@ -50,6 +50,8 @@ class EventCode(str, enum.Enum):
     MAP_SESSION_PAUSED = "MAP.SESSION_PAUSED"
     MAP_SESSION_RESUMED = "MAP.SESSION_RESUMED"
     MAP_SESSION_FINISHED = "MAP.SESSION_FINISHED"
+    MAP_DELETED = "MAP.DELETED"
+    MAP_INGEST_REJECTED = "MAP.INGEST_REJECTED"
 
 
 class Severity(str, enum.Enum):
@@ -62,6 +64,9 @@ class Severity(str, enum.Enum):
 class Source(str, enum.Enum):
     DISPATCH = "dispatch"
     API = "api"
+    # Maps redesign M2: MAP.INGEST_REJECTED (packages/services/graph_builder/ingest.py).
+    # fleet_events_source_check allows it from migration 20260929_01_maps_m2 on.
+    GRAPH_BUILDER = "graph_builder"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,6 +81,7 @@ _C = EventCode
 _S = Severity
 _D = Source.DISPATCH
 _A = Source.API
+_G = Source.GRAPH_BUILDER
 
 # The discriminator is required wherever two events with the same code, robot and
 # timestamp can legitimately differ (several errors or nodes in one message), and
@@ -122,6 +128,11 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MAP_SESSION_PAUSED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
     _C.MAP_SESSION_RESUMED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
     _C.MAP_SESSION_FINISHED: CodeMeta(_S.INFO, True, schemas.MapSession, _A),
+    # Maps redesign M2. MAP.DELETED: discriminator `map:<name>:deleted:<requested_at>`
+    # (packages/api/map_delete.py); MAP.INGEST_REJECTED: `ingest:<reason>`, rate-limited per
+    # robot and reason (packages/services/graph_builder/ingest.py).
+    _C.MAP_DELETED: CodeMeta(_S.INFO, True, schemas.MapDeleted, _A),
+    _C.MAP_INGEST_REJECTED: CodeMeta(_S.WARNING, True, schemas.MapIngestRejected, _G),
 }
 
 

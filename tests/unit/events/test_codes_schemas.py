@@ -65,6 +65,12 @@ VALID_PAYLOADS = {
                                     "map_state": "mapping"},
     EventCode.MAP_SESSION_FINISHED: {"map_name": "yard", "session_id": "s1",
                                      "map_state": "ready", "aligned": False},
+    EventCode.MAP_DELETED: {"map_name": "yard", "requested_at": "2026-09-29T08:00:00+00:00",
+                            "attempts": 1},
+    EventCode.MAP_INGEST_REJECTED: {"reason": "session_paused", "dropped_nodes": 3,
+                                    "dropped_images": 6, "since": "2026-09-29T08:00:00+00:00",
+                                    "map_name": "yard", "map_state": "paused",
+                                    "session_id": "s1"},
 }
 
 
@@ -80,7 +86,8 @@ def test_codes_are_str_enums_with_spec_values():
 
 def test_severity_and_source_values_match_schema():
     assert [s.value for s in Severity] == ["info", "warning", "error", "critical"]
-    assert [s.value for s in Source] == ["dispatch", "api"]
+    # graph_builder: migration 20260929_01_maps_m2 widens fleet_events_source_check.
+    assert [s.value for s in Source] == ["dispatch", "api", "graph_builder"]
 
 
 def test_meta_for_accepts_plain_string():
