@@ -64,7 +64,7 @@ draft ──start session──▶ mapping ◀──▶ paused
 
 - `draft`: created, no data yet.
 - `mapping` / `paused`: a session is open. Paused keeps the session but the robot records nothing (the topomap `~/set_enabled` switch, commit 62fd26a5).
-- `ready`: no open session. Usable for missions. **No data is accepted.** Extending means explicitly starting a new session.
+- `ready`: no open session. Usable for missions. **No robot data is accepted.** Extending means explicitly starting a new session. Small hand edits in the map view are allowed (Q2).
 - `archived`: hidden from normal lists, kept. Deleting stays a separate, explicit action (existing background delete).
 
 ---
@@ -151,7 +151,9 @@ The cloud and client treat everything as ENU (spherical, 111 320 m/°). For UTM 
 
 This redesign builds on it: geo maps store UTM directly, so converting for display is one exact UTM → lat/lon step.
 
-**Known conflict, not fixed yet:** the orchestrator and the VDA5050 client both publish the retained datum on the same MQTT topic. On a real robot the orchestrator's UM982 point (the robot's position at orchestrator start, **not** the map origin) can overwrite the pose module's datum. Proposal: the orchestrator publishes only when the robot has no pose module (sim, or GNSS-less robots), or on its own topic.
+**Status:** built on 2026-09-28 across all four repos (not yet deployed): the datum carries `frame`; cloud `ff5268b..6174c3d`, client `eb31164..2b2d727`, robot `d5b6785c`, orchestrator `11da006`.
+
+**Datum topic conflict: fixed** (Q6): the real robot's orchestrator no longer publishes a datum, so the VDA5050 client is the only source wherever the pose module runs.
 
 ---
 
@@ -181,7 +183,10 @@ This redesign builds on it: geo maps store UTM directly, so converting for displ
 | DELETE | `/api/v1/maps/{id}` | Existing background delete; refused while a session is open |
 | GET | `/api/v1/maps/{id}/grid[/{version}]` | Grid metadata and images (later) |
 
-Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.ARCHIVED`, `MAP.DELETED`, `MAP.INGEST_REJECTED`.
+| DELETE | `/api/v1/maps/{id}/nodes/{node}` | Hand edit on a `ready` map (Q2): remove a node and its edges |
+| POST · DELETE | `/api/v1/maps/{id}/edges` | Hand edit: add or remove an edge `{from, to}` |
+
+Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.EDITED`, `MAP.ARCHIVED`, `MAP.DELETED`, `MAP.INGEST_REJECTED`.
 
 `PUT /robots/{r}/map`, the `GEO`/`LOCAL` sentinels and `POST /map/load` stay for one release as deprecated shims, then go away.
 
@@ -270,8 +275,6 @@ Decided 2026-09-28:
 - **Q3.** When a session starts and the mapping service isn't running, the client **only tells the user**; nothing is started automatically. A map can have both a topo and a grid layer at the same time.
 - **Q5.** The grid map is **uploaded once, at session end**.
 
-Still open:
-
-- **Q2.** Should small edits to a `ready` map (delete a bad node, add or remove an edge, re-align a session) be allowed directly in the map view, or only by starting a new session?
-- **Q4.** Should a map belong to a site (required, optional, or not at all)?
-- **Q6.** The datum topic conflict (§5): both publishers write the identical retained topic `uagv/v2/RobotCompany/<robot>/datum`, so the last one wins. On the real robot the orchestrator publishes a UM982 startup fix at boot (and again on every orchestrator restart); the VDA5050 client publishes the pose module's datum once anchored, and again on MQTT reconnect. Proposal: the VDA5050 client is the only datum source wherever the pose module runs; the orchestrator's datum publishing is kept only for robots without a pose module (the sim's `gps_anchor`).
+- **Q2.** Small hand edits to a `ready` map are **allowed directly in the map view**, with no robot and no session: delete a node, add or remove an edge, re-align a session. Each edit emits a `MAP.EDITED` event (who, what, before/after). Extending the map with new robot data still needs a new session.
+- **Q4.** A map **may** belong to a site (`site_id` optional). It is used for filtering the Maps page and linking runs to maps; a map works fine without one.
+- **Q6.** Both publishers wrote the identical retained topic `uagv/v2/RobotCompany/<robot>/datum`, so the last one won. On the real robot the orchestrator published a UM982 startup fix at every orchestrator (re)start, overwriting the pose module's map origin, and its UM982 read competed with the navstack's own `um982_driver` for the serial port. **Fixed** (satibot_orchestrator `6587a6a`): the real robot's config no longer has `um982_gps`, so the VDA5050 client is the only datum source wherever the pose module runs. The orchestrator's `gps_anchor` publishing stays for robots without a pose module (the sim).
