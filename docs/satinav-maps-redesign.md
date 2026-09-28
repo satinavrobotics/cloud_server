@@ -41,7 +41,6 @@ Live data on 2026-09-28: map `map` has datum (0, 0); map `GEO` exists as a real 
 
 - `type: local`: its own metric frame, no link to the Earth. Shown on a metric grid, no street tiles.
 - `type: geo`: anchored to the Earth. Positions are stored in one **UTM zone** fixed per map (`utm_zone`, `utm_north`), as metres relative to a map origin (`origin_e`, `origin_n`). Shown over street tiles, which can be switched off.
-- Optional `site_id`, linking to the Phase 0 sites table.
 
 **Mapping session:** one continuous period in which one robot adds data to one map. It records who, when, and the transform from the robot's frame for that run into the map frame (`map_T_session`). Every node, image and grid upload belongs to exactly one session.
 
@@ -64,7 +63,7 @@ draft ──start session──▶ mapping ◀──▶ paused
 
 - `draft`: created, no data yet.
 - `mapping` / `paused`: a session is open. Paused keeps the session but the robot records nothing (the topomap `~/set_enabled` switch, commit 62fd26a5).
-- `ready`: no open session. Usable for missions. **No robot data is accepted.** Extending means explicitly starting a new session. Small hand edits in the map view are allowed (Q2).
+- `ready`: no open session. Usable for missions. **No robot data is accepted.** Extending means explicitly starting a new session.
 - `archived`: hidden from normal lists, kept. Deleting stays a separate, explicit action (existing background delete).
 
 ---
@@ -90,7 +89,7 @@ A geo map needs a geo-capable robot run (a datum present). A local map ignores a
 **Postgres (`mapobjectv1`, existing object convention; spec fields added, all optional):**
 
 ```
-spec:   display_name, description, type ('local'|'geo'), site_id?,
+spec:   display_name, description, type ('local'|'geo'),
         geo?: { utm_zone, utm_north, origin_e, origin_n }
 status: state ('draft'|'mapping'|'paused'|'ready'|'archived'), node_count, edge_count,
         grid_version?, open_session_id?, (existing delete bookkeeping)
@@ -171,10 +170,10 @@ This redesign builds on it: geo maps store UTM directly, so converting for displ
 
 | Method | Path | Does |
 |---|---|---|
-| POST | `/api/v1/maps` | Create `{name, type, description?, site_id?}` → `draft` |
-| GET | `/api/v1/maps?type=&state=&site=` | List, archived excluded by default |
+| POST | `/api/v1/maps` | Create `{name, type, description?}` → `draft` |
+| GET | `/api/v1/maps?type=&state=` | List, archived excluded by default |
 | GET | `/api/v1/maps/{id}` | Spec, status, sessions summary, grid version |
-| PATCH | `/api/v1/maps/{id}` | Rename, description, site |
+| PATCH | `/api/v1/maps/{id}` | Rename, description |
 | GET | `/api/v1/maps/{id}/graph` | Nodes and edges (replaces `POST /map/load` as the read path) |
 | POST | `/api/v1/maps/{id}/sessions` | Start a session `{robot}`: robot must be online, geo needs a datum; turns robot-side mapping on |
 | POST | `/api/v1/maps/{id}/sessions/{sid}/pause` · `/resume` · `/finish` | Session control; finishing with no other open session → `ready` |
@@ -183,10 +182,8 @@ This redesign builds on it: geo maps store UTM directly, so converting for displ
 | DELETE | `/api/v1/maps/{id}` | Existing background delete; refused while a session is open |
 | GET | `/api/v1/maps/{id}/grid[/{version}]` | Grid metadata and images (later) |
 
-| DELETE | `/api/v1/maps/{id}/nodes/{node}` | Hand edit on a `ready` map (Q2): remove a node and its edges |
-| POST · DELETE | `/api/v1/maps/{id}/edges` | Hand edit: add or remove an edge `{from, to}` |
 
-Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.EDITED`, `MAP.ARCHIVED`, `MAP.DELETED`, `MAP.INGEST_REJECTED`.
+Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.ARCHIVED`, `MAP.DELETED`, `MAP.INGEST_REJECTED`.
 
 `PUT /robots/{r}/map`, the `GEO`/`LOCAL` sentinels and `POST /map/load` stay for one release as deprecated shims, then go away.
 
@@ -208,7 +205,7 @@ Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.EDITE
   - `local`: metric grid plus the map's grid layer (when there is one).
   - `geo`: OpenFreeMap tiles (toggle) plus the grid layer placed exactly (4-corner bounds, since UTM is rotated against lat/lon).
 - **Overlays through the existing layer toggles:** Costmap (the robot's live costmap), Mission, Travelled path, Topo nodes, and later Grid.
-- **Maps page:** the list with type and state badges; "New map" (name, type, site); archive/restore/delete.
+- **Maps page:** the list with type and state badges; "New map" (name, type); archive/restore/delete.
 - **Mapping bar** on the map view while the map is `mapping`/`paused`: robot, elapsed time, node count, **Pause / Resume / Finish**. This is where the mapping on/off switch lives. "Start mapping" is on a `draft`/`ready` map (pick a robot) and on the robot panel (pick or create a map).
 - **Unaligned sessions** show in a different colour with an "Align" tool: drag and rotate, then save.
 - Viewing a map no longer needs a selected robot, or changes one.
@@ -275,6 +272,6 @@ Decided 2026-09-28:
 - **Q3.** When a session starts and the mapping service isn't running, the client **only tells the user**; nothing is started automatically. A map can have both a topo and a grid layer at the same time.
 - **Q5.** The grid map is **uploaded once, at session end**.
 
-- **Q2.** Small hand edits to a `ready` map are **allowed directly in the map view**, with no robot and no session: delete a node, add or remove an edge, re-align a session. Each edit emits a `MAP.EDITED` event (who, what, before/after). Extending the map with new robot data still needs a new session.
-- **Q4.** A map **may** belong to a site (`site_id` optional). It is used for filtering the Maps page and linking runs to maps; a map works fine without one.
+- **Q2.** Hand-editing a finished map (deleting nodes, editing edges): **out of scope** for now; revisit later.
+- **Q4.** Maps are **not linked to sites**. Whether the Phase 0 sites concept stays at all is under review.
 - **Q6.** Both publishers wrote the identical retained topic `uagv/v2/RobotCompany/<robot>/datum`, so the last one won. On the real robot the orchestrator published a UM982 startup fix at every orchestrator (re)start, overwriting the pose module's map origin, and its UM982 read competed with the navstack's own `um982_driver` for the serial port. **Fixed** (satibot_orchestrator `6587a6a`): the real robot's config no longer has `um982_gps`, so the VDA5050 client is the only datum source wherever the pose module runs. The orchestrator's `gps_anchor` publishing stays for robots without a pose module (the sim).
