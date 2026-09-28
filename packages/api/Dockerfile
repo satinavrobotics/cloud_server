@@ -44,9 +44,10 @@ COPY packages/telemetry_ingest/ /app/packages/telemetry_ingest/
 # Copy config
 COPY packages/config.py /app/packages/config.py
 
-# Operator tools run inside this container (read-only), e.g.
-#   docker exec <api> python -m tools.phase0_exit_check --from ... (docs/satinav-fleet-agent-phase0-exit-test.md)
-COPY tools/__init__.py tools/phase0_exit_check.py /app/tools/
+# Operator tools run inside this container, e.g.
+#   docker exec <api> python -m tools.phase0_exit_check --from ... (read-only; docs/satinav-fleet-agent-phase0-exit-test.md)
+#   docker exec <api> python -m tools.maps_m2_legacy_nodes [--apply]  (dry run by default; maps M2)
+COPY tools/__init__.py tools/phase0_exit_check.py tools/maps_m2_legacy_nodes.py /app/tools/
 
 # Copy cloud_common
 COPY cloud_common/ /app/cloud_common/
