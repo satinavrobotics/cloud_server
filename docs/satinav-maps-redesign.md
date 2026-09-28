@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** draft for discussion, 2026-09-28. Nothing here is built yet, except the coordinate-conversion fix in §5 (in progress separately).
+**Status:** 2026-09-28. M0 (coordinate conversion, §5) deployed. **M1 built, not deployed** (branch off `d4296cd`; deploy script `~/pg-cutover/scripts/mapsm1.sh`): map type/geo/state, `map_sessions`, migration of today's maps, the new map routes next to the old ones (§4, §7, §12, §13.1). M2 onwards: not started.
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -31,7 +31,7 @@ Found in the 2026-09-28 survey; file references are to that date.
 | Client | DeckGLMap, MapLibreMap, GeoMap (Google + MapLibre), FleetGlobe: separate views, the same layers wired 4 times | Every feature is built 4 times; the background depends on a datum guess |
 | Background | The robot's live costmap; street tiles for anything with a datum | A stored map has no image of its own |
 
-Live data on 2026-09-28: map `map` has datum (0, 0); map `GEO` exists as a real map.
+Live data on 2026-09-28 (survey): map `map` had datum (0, 0); map `GEO` existed as a real map. At the M1 build (same day, later): one Postgres map, `map`, datum 47.4979, 19.0402 (frame `enu`); no `GEO`/`LOCAL` rows. ArangoDB also holds map collections without a Postgres row: `default` (624 nodes), `example trajectory` (441), `Test` (0), and the empty `map_nodes`/`map_edges`.
 
 ---
 
@@ -114,7 +114,9 @@ CREATE TABLE map_sessions (
 CREATE UNIQUE INDEX ON map_sessions (robot_name) WHERE ended_at IS NULL;
 ```
 
-The one-open-session-per-*map* rule is **not** a DB constraint. That keeps multi-robot mapping (§10) open.
+The one-open-session-per-*map* rule is **not** a DB constraint. That keeps multi-robot mapping (§10) open. (The M1 API still refuses a second open session on a map; lifting that is an API change only.)
+
+As built in M1 (migration `20260928_01_map_sessions`): the column is `map_t_session` (Postgres folds unquoted names; the API shows `map_T_session`), `started_at` defaults to `now()`, and there is a `kind` column (`live` | `legacy`) with a second partial unique index, one `legacy` session per map. No foreign key to `mapobjectv1` (that table is created at runtime, not by Alembic); the map delete removes a map's sessions in the same transaction as its row.
 
 **ArangoDB (unchanged layout, `nodes_{map}` / `edges_{map}`):** node documents add `session_id` and `robot_pose` (the robot-frame pose). `pose` is the map-frame pose.
 
@@ -236,24 +238,26 @@ At that point a mapping session can start *localized* in an existing map, and `m
 
 ## 12. Migration of today's data
 
-1. Every existing Postgres map:
-   - → `type = geo` if it has a real datum, i.e. not null and not (0, 0). The UTM zone comes from the datum longitude; the origin is the datum's UTM point.
-   - → otherwise `type = local`.
-   - `state = ready`.
-2. Its existing nodes get one synthetic `legacy` session (`aligned = true`, identity transform).
-3. Maps named `GEO`, `LOCAL`, `default`, and Arango-only maps with no Postgres row: listed for the user to archive or delete. Nothing is removed automatically.
-4. `robot.current_map` is cleared; no session is opened automatically.
-5. Map `map` with datum (0, 0) becomes `local`, unless the user gives it a real datum.
+Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are skipped, the legacy session is `ON CONFLICT DO NOTHING`):
 
----
+1. Every existing Postgres map (any lifecycle except `DELETED`):
+   - → `type = geo` if it has a real datum, i.e. not null and not (0, 0). `geo` = the datum's UTM point in its own zone: a `utm` datum's reported zone/hemisphere/easting/northing when present, else the lat/lon projected in its longitude's zone (`packages/utils/map_geo.py`).
+   - → otherwise `type = local`.
+   - `state = ready`. The `datum_*` fields stay: they describe the frame the existing nodes are stored in.
+2. Every map gets one synthetic `legacy` session: robot `legacy`, ended, `aligned = true`, identity transform, `datum` = the map's datum, `node_count` = the row's stored count (not the live ArangoDB count).
+3. Maps named `GEO`, `LOCAL`, `default`, and ArangoDB-only maps with no Postgres row: **nothing is created or deleted**. The deploy script prints them (read-only) for the user to archive or delete.
+4. ~~`robot.current_map` is cleared~~ **Moved to M2**: M1 leaves `current_map` and the dispatcher's datum auto-seed alone, because graph-builder still ingests by `current_map` until M2.
+5. The live map `map` (datum 47.4979, 19.0402, frame `enu`) becomes `geo`, zone 34 N, origin E 352 397.33 / N 5 262 357.80.
+
+**Left for M2 — legacy node poses.** Nodes in ArangoDB are **not** rewritten in M1. A geo map's frame is UTM grid metres from the origin, but a migrated map's legacy nodes are in its old datum frame. For a `utm` datum with bearing 0 the two are the same. For an `enu` datum they differ by the grid convergence at the datum (−1.445° for `map`, i.e. about 2.5 cm per metre from the origin) and by the UTM scale factor. M2 must either rewrite those nodes into the map frame (rotate by the convergence; also store `robot_pose`), or give the legacy session the real transform (`map_geo.session_transform(geo, datum)`) instead of identity. Until then the old display path (`POST /map/load` `transform`, from the `datum_*` fields) places them exactly as before.
 
 ## 13. Plan
 
 | Step | Content | Repos |
 |---|---|---|
 | M0 | Coordinate conversion fix (§5) | all four; in progress |
-| M1 | Map spec + `map_sessions` + migration of today's data (§4, §12); new map endpoints (§7) behind the old ones | cloud_server |
-| M2 | graph-builder ingest by session (§6); `MAP.*` events | cloud_server |
+| M1 | Map spec + `map_sessions` + migration of today's data (§4, §12); new map endpoints (§7) behind the old ones | cloud_server; **built, not deployed** (§13.1) |
+| M2 | graph-builder ingest by session (§6); `MAP.INGEST_REJECTED`; clear `robot.current_map` (§12 step 4); legacy node poses (§12) | cloud_server |
 | M3 | Robot mapping switch over MQTT, session tagging (§8) | sati_ros_navstack |
 | M4 | Client: Maps page, mapping bar, session start (§9, first half) | sati-client |
 | M5 | Client: one `MapView` replacing the three map views (§9, second half) | sati-client |
@@ -261,6 +265,19 @@ At that point a mapping session can start *localized* in an existing map, and `m
 | M7 | Grid layer storage and display, once `sati_grid_mapping` produces output | all |
 
 M1–M2 and M3 can run in parallel. M5 is the largest client change and doesn't depend on M1, but it's simpler once map types exist.
+
+### 13.1 M1 as built
+
+Code: `cloud_common/objects/map.py` (fields), `packages/utils/map_geo.py` (classification, origin, `map_T_session`), `packages/api/maps.py` (routes' logic), migration `20260928_01_map_sessions`. Route reference: `packages/api/README.md`. Tests: `tests/unit/test_maps_m1.py`, `tests/integration/maps/run.sh` (also rehearses the migration on a production dump: `--dump FILE`).
+
+- **Model:** `spec.type`, `spec.geo`, `status.state`, `status.open_session_id`, `status.grid_version`, all optional. Rows without them read as the migration would type them (`effective_type()`: geo iff a real datum; `effective_state()`: ready). Responses only gained keys.
+- **Routes (§7):** `POST /maps` (draft), `GET /maps?type=&state=&include_archived=`, `GET /maps/{id}` (+ type/geo/state and a sessions summary), `PATCH /maps/{id}` (description only: the name keys Postgres, ArangoDB and MinIO, so rename is not in M1), `GET /maps/{id}/graph`, `POST /maps/{id}/sessions`, `.../sessions/{sid}/pause|resume|finish`, `/archive`, `/restore`; `DELETE /maps/{id}` refused while a session is open. Old routes unchanged.
+- **Events:** `MAP.CREATED`, `MAP.ARCHIVED`, `MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, written in the change's transaction (savepoint: a failed event write never fails the change). `MAP.DELETED` and `MAP.INGEST_REJECTED` are not in M1.
+- **Session start:** robot must exist and be online; a robot has at most one open session (index); **one open session per map** (API rule, not a constraint); geo needs the robot's current datum (`robot.datum`, not (0, 0)). The first session of a geo map without an origin sets `geo` from that datum (Q1) **and fills the map's `datum_*` fields (when unset) with the origin as a `utm` datum, bearing 0**, which is exactly the map frame, so the old client, planner and `POST /map/load` `transform` show a new geo map correctly. Local map: identity, `aligned` only for the map's first session (a migrated local map has its legacy session, so a new one starts unaligned).
+- **Not wired yet:** a session does not route robot data (graph-builder ingests by `current_map` until M2), so `session.node_count` stays 0 and pausing does not stop ingest; no MQTT to the robot (M3); no orchestrator check of the mapping service (M3/M4).
+- **Legacy routes:** `POST /map/load` types the maps it registers (same rule as the migration) and never retypes an existing one. `PUT /maps/{id}/datum` updates the datum only (it does not retype a local map; revisit in M2). An archived map can still be assigned with `PUT /robots/{r}/map` (legacy path; goes away with the shims).
+- **Deploy:** API (routes + migration) and mission-dispatch. Dispatch because its datum auto-seed writes the whole map spec back and the old model would drop `type`/`geo`; the planner only reads maps and ignores unknown keys; graph-builder never reads map objects. Checked on the running images.
+- **Client (sati-client):** nothing to change for M1; all response changes are additive.
 
 ---
 

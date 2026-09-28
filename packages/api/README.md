@@ -146,6 +146,43 @@ Load a map from the graph database.
 }
 ```
 
+A map this route registers is typed like the M1 migration types old maps: `geo` if the datum is
+real (not null, not (0, 0)), else `local`; state `ready`. It never retypes an existing map.
+
+#### Typed maps and mapping sessions (maps redesign M1)
+
+See `docs/satinav-maps-redesign.md` §2-§4, §7. Code: `packages/api/maps.py`. The routes above
+and `PUT /api/v1/maps/{id}/datum`, `PUT /api/v1/robots/{r}/map` are unchanged.
+
+Every map has `type` (`local` | `geo`), `geo` (`{utm_zone, utm_north, origin_e, origin_n}` for a
+geo map once its origin is known, else null) and `status.state` (`draft` | `mapping` | `paused`
+| `ready` | `archived`). The object `lifecycle` (`ALIVE` / `DELETING`) is still the delete
+bookkeeping. All additions are new keys; nothing was removed or renamed.
+
+| Method | Path | Does |
+|---|---|---|
+| POST | `/api/v1/maps` | `{name, type, description?}` → 201, a `draft` map. 409 if the name exists, collides with another map's image bucket (case/`_` vs `-`), or ArangoDB already has nodes under it. 422 on a bad name (1-59 of `A-Za-z0-9_-`, alphanumeric at both ends; not `GEO`/`LOCAL`) or type. |
+| GET | `/api/v1/maps?type=&state=&include_archived=` | Same `{maps, count}` body as before. Archived maps only with `include_archived=true` or `state=archived`. |
+| GET | `/api/v1/maps/{id}` | As before plus `type`, `geo`, `state`, `open_session_id`, `grid_version` and `sessions: {count, open, unaligned, items}` (newest first, at most 50). |
+| PATCH | `/api/v1/maps/{id}` | `{description}`. Renaming is not supported (422): the name keys the map in Postgres, ArangoDB and MinIO. |
+| GET | `/api/v1/maps/{id}/graph` | `{map_id, type, geo, state, node_count, edge_count, nodes, edges, transform}`; nodes/edges as in `POST /map/load`, without its side effects. |
+| POST | `/api/v1/maps/{id}/sessions` | `{robot}` → 201 `{map_id, map_state, changed, session}`. The robot must exist (404) and be online (409), and have no other open session (409). One open session per map for now (409). A geo map needs the robot's datum (409); its first session sets the map origin from it. The map goes to `mapping`. |
+| POST | `/api/v1/maps/{id}/sessions/{sid}/pause` · `resume` · `finish` | Map → `paused` / `mapping` / `ready`. Repeating an action already in effect returns `changed: false`; pause/resume of a finished session is 409. |
+| POST | `/api/v1/maps/{id}/archive` · `restore` | `archived` (409 while a session is open) / back to `ready` (`draft` if it never had a session). |
+| DELETE | `/api/v1/maps/{id}` | As before (202, background delete); now 409 while a session is open. The map's sessions go with it. |
+
+A session: `{session_id, map_name, robot_name, kind ('live' | 'legacy'), state ('mapping' |
+'paused' | 'finished'), started_at, paused_at, ended_at, datum, map_T_session: {tx, ty, yaw},
+aligned, node_count}`. `map_T_session` takes a robot-frame point into the map frame
+(`packages/utils/map_geo.py`): a pure translation for a UTM datum in the map's zone, with the
+grid-convergence yaw for an ENU datum; identity for a local map (aligned only for its first
+session). Every pre-M1 map has one ended `legacy` session (robot `legacy`, identity).
+
+Not in M1: sessions do not route robot data yet (graph-builder still ingests by the robot's
+`current_map` until M2), no MQTT to the robot (M3), no alignment (M6), no grid (M7). Events:
+`MAP.CREATED`, `MAP.ARCHIVED`, `MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`
+in `fleet_events`. `POST /api/v1/maps` and `POST .../sessions` accept `Idempotency-Key`.
+
 #### `WS /ws/map/{map_id}`
 WebSocket endpoint for real-time map updates.
 
