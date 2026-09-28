@@ -2,7 +2,7 @@
 
 Golden values were computed with pyproj 3.7 (PROJ etmerc for UTM, EPSG:4979->4978 ECEF for the
 tangent plane, Geod(WGS84) for geodesics) in a throwaway python:3.12-slim container; pyproj is
-not a dependency. The same tables are in sati-client utils/__tests__/mapTransform.test.ts, so
+not a dependency. The same tables are in sati-client __tests__/utils/mapTransform.test.ts, so
 client and server provably agree.
 """
 
