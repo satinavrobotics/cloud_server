@@ -9,7 +9,7 @@ import logging
 import uuid
 import argparse
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 import os
 from datetime import datetime
 
@@ -55,7 +55,19 @@ class LoadMapRequest(BaseModel):
     description: Optional[str] = Field(None, description="Human-readable map name or label")
     datum_latitude: Optional[float] = Field(None, description="WGS84 origin latitude in degrees")
     datum_longitude: Optional[float] = Field(None, description="WGS84 origin longitude in degrees")
-    datum_bearing_deg: float = Field(0.0, description="Angle from map +X axis to true north in degrees")
+    datum_bearing_deg: float = Field(0.0, description="Angle of the map +X axis from east (grid east for utm), CCW, in degrees")
+    datum_frame: Optional[Literal["enu", "utm"]] = Field(
+        None, description="Frame of the map's local x/y: 'utm' = UTM grid offsets from the "
+                          "datum (robot with GNSS), 'enu' = tangent-plane east/north (sim). "
+                          "Default 'enu'.")
+    datum_utm_zone: Optional[int] = Field(
+        None, ge=1, le=60, description="UTM zone of a 'utm' datum (default: the datum's own)")
+    datum_utm_north: Optional[bool] = Field(
+        None, description="UTM hemisphere of a 'utm' datum (default: the datum's own)")
+    datum_utm_easting: Optional[float] = Field(
+        None, description="Exact UTM easting of a 'utm' datum (default: projected)")
+    datum_utm_northing: Optional[float] = Field(
+        None, description="Exact UTM northing of a 'utm' datum (default: projected)")
 
 
 class LoadMapResponse(BaseModel):
@@ -470,6 +482,11 @@ async def load_map(request: LoadMapRequest):
         datum_latitude=request.datum_latitude,
         datum_longitude=request.datum_longitude,
         datum_bearing_deg=request.datum_bearing_deg,
+        datum_frame=request.datum_frame,
+        datum_utm_zone=request.datum_utm_zone,
+        datum_utm_north=request.datum_utm_north,
+        datum_utm_easting=request.datum_utm_easting,
+        datum_utm_northing=request.datum_utm_northing,
     )
     return LoadMapResponse(**result)
 
@@ -489,7 +506,19 @@ class UpdateDatumRequest(BaseModel):
     """Request model for registering or updating a map's GPS datum."""
     datum_latitude: float = Field(..., description="WGS84 origin latitude in degrees")
     datum_longitude: float = Field(..., description="WGS84 origin longitude in degrees")
-    datum_bearing_deg: float = Field(0.0, description="Angle from map +X axis to true north in degrees")
+    datum_bearing_deg: float = Field(0.0, description="Angle of the map +X axis from east (grid east for utm), CCW, in degrees")
+    datum_frame: Optional[Literal["enu", "utm"]] = Field(
+        None, description="Frame of the map's local x/y: 'utm' = UTM grid offsets from the "
+                          "datum (robot with GNSS), 'enu' = tangent-plane east/north (sim). "
+                          "Default 'enu'.")
+    datum_utm_zone: Optional[int] = Field(
+        None, ge=1, le=60, description="UTM zone of a 'utm' datum (default: the datum's own)")
+    datum_utm_north: Optional[bool] = Field(
+        None, description="UTM hemisphere of a 'utm' datum (default: the datum's own)")
+    datum_utm_easting: Optional[float] = Field(
+        None, description="Exact UTM easting of a 'utm' datum (default: projected)")
+    datum_utm_northing: Optional[float] = Field(
+        None, description="Exact UTM northing of a 'utm' datum (default: projected)")
 
 
 
@@ -504,6 +533,11 @@ async def update_map_datum(map_id: str, request: UpdateDatumRequest):
         request.datum_latitude,
         request.datum_longitude,
         request.datum_bearing_deg,
+        datum_frame=request.datum_frame,
+        datum_utm_zone=request.datum_utm_zone,
+        datum_utm_north=request.datum_utm_north,
+        datum_utm_easting=request.datum_utm_easting,
+        datum_utm_northing=request.datum_utm_northing,
     )
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error"))

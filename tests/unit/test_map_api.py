@@ -143,6 +143,72 @@ class TestApiDelegationUpdateDatum:
 
         assert result["success"] is False
 
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_update_datum_with_utm_frame(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        from packages.api.server import ApiDelegationService
+
+        map_obj = _make_map_obj()
+        mock_db_inst = AsyncMock()
+        mock_db_inst.get_object = AsyncMock(return_value=map_obj)
+        mock_db_inst.update_spec = AsyncMock()
+        mock_db.return_value = mock_db_inst
+        mock_graph.return_value = Mock()
+
+        service = ApiDelegationService(arango_password="x", postgres_password="x")
+        result = await service.update_map_datum(
+            "site_a", 47.47946, 19.03238, 0.0, datum_frame="utm", datum_utm_zone=34,
+            datum_utm_north=True)
+
+        assert result["datum_frame"] == "utm"
+        assert result["datum_utm_zone"] == 34
+        spec = mock_db_inst.update_spec.call_args[0][2]
+        assert spec.datum_frame == "utm"
+        assert spec.datum_utm_zone == 34 and spec.datum_utm_north is True
+        assert spec.datum_utm_easting is None
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_update_datum_without_frame_resets_to_enu(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        """A datum PUT replaces the whole datum: the old UTM fields must not survive."""
+        from packages.api.server import ApiDelegationService
+
+        map_obj = _make_map_obj()
+        map_obj.datum_frame = "utm"
+        map_obj.datum_utm_zone = 32
+        map_obj.datum_utm_easting = 465270.4231
+        map_obj.description = "yard"
+        mock_db_inst = AsyncMock()
+        mock_db_inst.get_object = AsyncMock(return_value=map_obj)
+        mock_db_inst.update_spec = AsyncMock()
+        mock_db.return_value = mock_db_inst
+        mock_graph.return_value = Mock()
+
+        service = ApiDelegationService(arango_password="x", postgres_password="x")
+        result = await service.update_map_datum("site_a", 47.0, 8.0)
+
+        assert result["datum_frame"] == "enu"
+        spec = mock_db_inst.update_spec.call_args[0][2]
+        assert spec.datum_frame == "enu"
+        assert spec.datum_utm_zone is None and spec.datum_utm_easting is None
+        assert spec.description == "yard"
+
 
 # ---------------------------------------------------------------------------
 # ApiDelegationService.load_map — Postgres registration
@@ -231,6 +297,84 @@ class TestApiDelegationLoadMapPostgres:
 
         assert result["success"] is True
         mock_db_inst.update_spec.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_load_map_transform_carries_the_stored_frame(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        """The transform comes from the stored map (e.g. auto-seeded from a UTM robot),
+        not from the request."""
+        from packages.api.server import ApiDelegationService
+
+        stored = MapObjectV1(
+            name="yard", datum_latitude=47.47946, datum_longitude=19.03238,
+            datum_frame="utm", datum_utm_zone=34, datum_utm_north=True,
+            datum_utm_easting=351756.484938, datum_utm_northing=5260323.440888)
+        mock_db_inst = AsyncMock()
+        mock_db_inst.create_object = AsyncMock(side_effect=Exception("duplicate"))
+        mock_db_inst.get_object = AsyncMock(return_value=stored)
+        mock_db.return_value = mock_db_inst
+
+        mock_graph_inst = Mock()
+        mock_graph_inst.create_map.return_value = True
+        mock_graph_inst.get_map_stats.return_value = {"node_count": 0, "edge_count": 0}
+        mock_graph_inst.get_all_nodes.return_value = []
+        mock_graph_inst.get_edges.return_value = []
+        mock_graph.return_value = mock_graph_inst
+
+        service = ApiDelegationService(arango_password="x", postgres_password="x")
+        result = await service.load_map(map_id="yard")
+
+        t = result["transform"]
+        assert t["frame"] == "utm"
+        assert t["utm_zone"] == 34 and t["utm_north"] is True
+        assert t["utm_easting"] == 351756.484938
+        assert t["origin_lat"] == 47.47946
+        assert t["rotation_rad"] == 0.0
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_load_map_accepts_a_frame(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        from packages.api.server import ApiDelegationService
+
+        mock_db_inst = AsyncMock()
+        mock_db_inst.create_object = AsyncMock()
+        mock_db_inst.get_object = AsyncMock(side_effect=Exception("not reachable"))
+        mock_db.return_value = mock_db_inst
+
+        mock_graph_inst = Mock()
+        mock_graph_inst.create_map.return_value = True
+        mock_graph_inst.get_map_stats.return_value = {"node_count": 0, "edge_count": 0}
+        mock_graph_inst.get_all_nodes.return_value = []
+        mock_graph_inst.get_edges.return_value = []
+        mock_graph.return_value = mock_graph_inst
+
+        service = ApiDelegationService(arango_password="x", postgres_password="x")
+        result = await service.load_map(
+            map_id="new", datum_latitude=-33.8688, datum_longitude=151.2093,
+            datum_frame="utm", datum_utm_zone=56, datum_utm_north=False)
+
+        created = mock_db_inst.create_object.call_args[0][0]
+        assert created.datum_frame == "utm"
+        assert created.datum_utm_zone == 56 and created.datum_utm_north is False
+        # stored map not readable -> transform from the request's values
+        assert result["transform"]["frame"] == "utm"
+        assert result["transform"]["utm_zone"] == 56
 
 
 # ---------------------------------------------------------------------------
@@ -552,3 +696,23 @@ class TestMissionPlannerGpsNavigation:
 
         assert result["target"]["x"] == 50.0
         assert result["target"]["y"] == 60.0
+
+    @pytest.mark.asyncio
+    @patch('packages.services.mission_planner.server.GraphDatabaseService')
+    @patch('packages.services.mission_planner.server.PostgresDatabase')
+    async def test_gps_target_with_utm_datum_is_exact(self, mock_db, mock_graph):
+        """A UTM robot's map: the GPS target lands on the grid offset, not ~27 m off at 1 km.
+        Golden point from pyproj (tests/unit/test_geo.py BUDAPEST_GRID_CASES)."""
+        service = self._make_planner_with_mocks(
+            mock_db, mock_graph, datum={"lat": 47.47946, "lon": 19.03238})
+        stored = await service.database.get_object(MapObjectV1, "site_a")
+        stored.datum_frame = "utm"
+        stored.datum_utm_zone = 34
+        stored.datum_utm_north = True
+
+        result = await service.plan_and_execute_mission(
+            robot_name="robot_1", target_lat=47.4796869358, target_lon=19.0456449132,
+            map_id="site_a")
+
+        assert abs(result["target"]["x"] - 1000.0) < 0.01
+        assert abs(result["target"]["y"]) < 0.01

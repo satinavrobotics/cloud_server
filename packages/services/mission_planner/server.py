@@ -114,6 +114,11 @@ class MissionPlannerService:
                 "lat": map_obj.datum_latitude,
                 "lon": map_obj.datum_longitude,
                 "bearing_deg": map_obj.datum_bearing_deg,
+                "frame": map_obj.datum_frame,
+                "utm_zone": map_obj.datum_utm_zone,
+                "utm_north": map_obj.datum_utm_north,
+                "utm_easting": map_obj.datum_utm_easting,
+                "utm_northing": map_obj.datum_utm_northing,
             }
         except Exception:
             return None
@@ -524,9 +529,15 @@ class MissionPlannerService:
             target_x, target_y = gps_to_local(
                 target_lat, target_lon,
                 datum["lat"], datum["lon"], datum["bearing_deg"],
+                frame=datum.get("frame"),
+                utm_zone=datum.get("utm_zone"),
+                utm_north=datum.get("utm_north"),
+                utm_easting=datum.get("utm_easting"),
+                utm_northing=datum.get("utm_northing"),
             )
             self.logger.info(
-                f"GPS ({target_lat}, {target_lon}) → local ({target_x:.2f}, {target_y:.2f})"
+                f"GPS ({target_lat}, {target_lon}) → local ({target_x:.2f}, {target_y:.2f}) "
+                f"[{datum.get('frame') or 'enu'} datum]"
             )
 
         if target_x is None or target_y is None:

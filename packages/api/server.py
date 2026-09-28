@@ -37,6 +37,26 @@ from packages.config import (
 )
 from packages.api.map_delete import MapDeleter
 
+
+def map_datum_transform(spec: MapSpecV1) -> Optional[Dict[str, Any]]:
+    """The `transform` of POST /map/load: what the client needs to place local x/y on the
+    globe (sati-client types/MapTransform.ts; conversions in packages/utils/geo.py and
+    sati-client utils/mapTransform.ts). None without a datum."""
+    import math as _math
+    if spec.datum_latitude is None or spec.datum_longitude is None:
+        return None
+    return {
+        "origin_lat": spec.datum_latitude,
+        "origin_lon": spec.datum_longitude,
+        "rotation_rad": _math.radians(spec.datum_bearing_deg or 0.0),
+        "scale": 1.0,
+        "frame": spec.datum_frame,
+        "utm_zone": spec.datum_utm_zone,
+        "utm_north": spec.datum_utm_north,
+        "utm_easting": spec.datum_utm_easting,
+        "utm_northing": spec.datum_utm_northing,
+    }
+
 try:
     import websockets
     WEBSOCKETS_AVAILABLE = True
@@ -688,6 +708,11 @@ class ApiDelegationService:
         datum_latitude: Optional[float] = None,
         datum_longitude: Optional[float] = None,
         datum_bearing_deg: float = 0.0,
+        datum_frame: Optional[str] = None,
+        datum_utm_zone: Optional[int] = None,
+        datum_utm_north: Optional[bool] = None,
+        datum_utm_easting: Optional[float] = None,
+        datum_utm_northing: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Load a map into the graph and image databases and register it in Postgres.
@@ -768,6 +793,11 @@ class ApiDelegationService:
                 datum_latitude=datum_latitude,
                 datum_longitude=datum_longitude,
                 datum_bearing_deg=datum_bearing_deg,
+                datum_frame=datum_frame,
+                datum_utm_zone=datum_utm_zone,
+                datum_utm_north=datum_utm_north,
+                datum_utm_easting=datum_utm_easting,
+                datum_utm_northing=datum_utm_northing,
                 status=MapStatusV1(
                     node_count=stats.get("node_count", len(nodes)),
                     edge_count=stats.get("edge_count", len(edges)),
@@ -788,14 +818,10 @@ class ApiDelegationService:
                     self.logger.info(f"Map '{actual_map_id}' already registered; preserving stored datum")
 
             # Fetch the stored map to obtain the current datum (may differ from request).
-            stored_datum_lat = datum_latitude
-            stored_datum_lon = datum_longitude
-            stored_datum_bearing = datum_bearing_deg or 0.0
+            stored_spec = map_obj.spec
             try:
                 stored_map = await self.database.get_object(MapObjectV1, actual_map_id)
-                stored_datum_lat = stored_map.spec.datum_latitude
-                stored_datum_lon = stored_map.spec.datum_longitude
-                stored_datum_bearing = stored_map.spec.datum_bearing_deg or 0.0
+                stored_spec = stored_map.spec
             except Exception:
                 pass  # fall back to request values if fetch fails
 
@@ -838,15 +864,7 @@ class ApiDelegationService:
             # Notify graph builder
             self._notify_graph_builder(actual_map_id, "map_loaded")
 
-            import math as _math
-            transform = None
-            if stored_datum_lat is not None and stored_datum_lon is not None:
-                transform = {
-                    "origin_lat": stored_datum_lat,
-                    "origin_lon": stored_datum_lon,
-                    "rotation_rad": _math.radians(stored_datum_bearing),
-                    "scale": 1.0,
-                }
+            transform = map_datum_transform(stored_spec)
 
             return {
                 "success": True,
@@ -942,27 +960,51 @@ class ApiDelegationService:
         datum_latitude: float,
         datum_longitude: float,
         datum_bearing_deg: float = 0.0,
+        datum_frame: Optional[str] = None,
+        datum_utm_zone: Optional[int] = None,
+        datum_utm_north: Optional[bool] = None,
+        datum_utm_easting: Optional[float] = None,
+        datum_utm_northing: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Register or update the GPS datum for an existing map."""
+        """Register or update the GPS datum for an existing map.
+
+        The whole datum is replaced: a frame left out is 'enu', and UTM zone/hemisphere/
+        easting/northing left out are cleared (they belonged to the previous datum).
+        """
         import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
         except Exception:
             return {"success": False, "error": f"Map '{map_id}' not found"}
-        map_obj.datum_latitude = datum_latitude
-        map_obj.datum_longitude = datum_longitude
-        map_obj.datum_bearing_deg = datum_bearing_deg
-        await self.database.update_spec(MapObjectV1, map_id, map_obj.spec, _uuid.uuid4())
+        spec = map_obj.spec.dict()
+        spec.update(
+            datum_latitude=datum_latitude,
+            datum_longitude=datum_longitude,
+            datum_bearing_deg=datum_bearing_deg,
+            datum_frame=datum_frame,
+            datum_utm_zone=datum_utm_zone,
+            datum_utm_north=datum_utm_north,
+            datum_utm_easting=datum_utm_easting,
+            datum_utm_northing=datum_utm_northing,
+        )
+        new_spec = MapSpecV1(**spec)
+        await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
         self.logger.info(
             f"Updated datum for map '{map_id}': "
-            f"({datum_latitude}, {datum_longitude}, bearing={datum_bearing_deg}°)"
+            f"({datum_latitude}, {datum_longitude}, bearing={datum_bearing_deg}°, "
+            f"frame={new_spec.datum_frame})"
         )
         return {
             "success": True,
             "map_id": map_id,
-            "datum_latitude": datum_latitude,
-            "datum_longitude": datum_longitude,
-            "datum_bearing_deg": datum_bearing_deg,
+            "datum_latitude": new_spec.datum_latitude,
+            "datum_longitude": new_spec.datum_longitude,
+            "datum_bearing_deg": new_spec.datum_bearing_deg,
+            "datum_frame": new_spec.datum_frame,
+            "datum_utm_zone": new_spec.datum_utm_zone,
+            "datum_utm_north": new_spec.datum_utm_north,
+            "datum_utm_easting": new_spec.datum_utm_easting,
+            "datum_utm_northing": new_spec.datum_utm_northing,
         }
 
     async def update_node(
