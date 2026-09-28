@@ -21,6 +21,9 @@ IMAGE="${1:-wp6-test:py310}"
 DB_IMAGE="timescale/timescaledb-ha:pg17.11-ts2.30.1"
 PREV=20260926_02_recorder_health
 NEW=20260928_01_map_sessions
+# Head since maps M2 (20260929_01_maps_m2, fleet_events source graph_builder): the API
+# entrypoint upgrades to it. M2's own rehearsal (legacy nodes, ingest) is run_m2.sh.
+HEAD=20260929_01_maps_m2
 ID="m1it-$$-$(date +%s)"
 NET="$ID-net"
 PW="m1-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -85,7 +88,7 @@ run_py python tests/integration/maps/checks.py show
 
 step "upgrade: the API entrypoint (advisory lock + alembic upgrade head), as production does"
 run_py python -m packages.api.entrypoint true
-[ "$(version)" = "$NEW" ] || { echo "not at $NEW"; exit 1; }
+[ "$(version)" = "$HEAD" ] || { echo "not at $HEAD"; exit 1; }
 
 step "AFTER"
 run_py python tests/integration/maps/checks.py show
@@ -94,15 +97,15 @@ run_py python tests/integration/maps/checks.py upgraded
 step "scenario: maps routes' logic on real Postgres"
 run_py python tests/integration/maps/checks.py scenario
 
-step "downgrade -1 (-> $PREV)"
-alembic downgrade -1
+step "downgrade to $PREV (M2, then M1)"
+alembic downgrade "$PREV"
 [ "$(version)" = "$PREV" ] || { echo "not at $PREV"; exit 1; }
 run_py python tests/integration/maps/checks.py downgraded
 run_py python tests/integration/maps/checks.py show
 
 step "re-upgrade (idempotent data step)"
 alembic upgrade head
-[ "$(version)" = "$NEW" ] || { echo "not at $NEW"; exit 1; }
+[ "$(version)" = "$HEAD" ] || { echo "not at $HEAD"; exit 1; }
 run_py python tests/integration/maps/checks.py upgraded
 
 step "PASSED"
