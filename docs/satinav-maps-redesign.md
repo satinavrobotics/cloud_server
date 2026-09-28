@@ -75,7 +75,7 @@ This is the hard part, and it is why sessions exist.
 
 The robot does **not** relocalize in a stored map (decided). So each robot run has its own origin:
 
-- **Geo map, robot with GNSS (UTM frame):** every run publishes its datum. The session stores it, `map_T_session` is a pure translation (the datum's UTM minus the map origin, same zone), and all sessions line up automatically. The first session's datum becomes the map origin.
+- **Geo map, robot with GNSS (UTM frame):** every run publishes its datum. The session stores it, `map_T_session` is a pure translation (the datum's UTM minus the map origin, same zone), and all sessions line up automatically. The first session's datum becomes the map origin (Q1, decided).
 - **Geo map, robot without a UTM datum (ENU anchor, e.g. the sim's fixed `gps_anchor`):** the datum is converted to the map's UTM zone. `map_T_session` then includes the grid-convergence rotation at that point (§5).
 - **Local map:** there is no shared reference between runs. The first session defines the map frame (`map_T_session` = identity). A later session starts with identity **and is flagged `unaligned`**. The user aligns it in the map view (drag/rotate the session's nodes onto the existing ones) before the map is used for missions. Automatic alignment (matching node images) is a later improvement.
 
@@ -122,7 +122,7 @@ The one-open-session-per-*map* rule is **not** a DB constraint. That keeps multi
 **MinIO bucket `map-{id}`:**
 
 - `{node_id}/images/...` (unchanged)
-- `grid/{version}/{layer}.png` plus `grid/{version}/meta.yaml` (resolution, origin in the map frame, source session(s)). ROS `map_server`-style, so a later robot-sync phase can hand it to the robot as is.
+- `grid/{version}/{layer}.png` plus `grid/{version}/meta.yaml` (resolution, origin in the map frame, source session(s)). ROS `map_server`-style, so a later robot-sync phase can hand it to the robot as is. The robot uploads the grid **once, at session end** (Q5); each upload is a new version. A map can hold topo and grid layers at the same time.
 
 **Robot object:** `current_map` is replaced by `mapping_session` (read-only; the open session, if any). The `'GEO'` / `'LOCAL'` sentinels go away: "no map" is simply no session. Whether a mission is mapped or mapless stays on the mission (`Mission.mode`).
 
@@ -190,7 +190,7 @@ Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.ARCHI
 ## 8. Robot side (this phase only)
 
 - **Mapping switch over MQTT.** `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to `{prefix}/{robot}/mapping/set` (`{enabled, session_id}`) and publishes `{prefix}/{robot}/mapping/state` (retained: `enabled`, `session_id`, node counter). It already has an MQTT connection, so no orchestrator or VDA5050 change is needed. It tags every node and image with `session_id`.
-- **Starting the topomap service itself:** the session-start call checks the service is running through the existing orchestrator proxy, and offers to start it (open question Q3).
+- **Starting the topomap service itself:** the session-start call checks, through the existing orchestrator proxy, whether the mapping service is running. If it isn't, the client tells the user to start it; nothing is started automatically (Q3, decided).
 - **No map download, no relocalization.**
 
 ---
@@ -262,11 +262,16 @@ M1–M2 and M3 can run in parallel. M5 is the largest client change and doesn't 
 
 ---
 
-## 14. Open questions
+## 14. Questions
 
-- **Q1.** A geo map's origin: the first session's datum (proposed), or a surveyed point entered by the user?
-- **Q2.** Should `ready` maps be editable (delete a bad node, re-run alignment) without reopening a session?
-- **Q3.** When a session starts and the topomap service isn't running: start it automatically through the orchestrator, or only tell the user?
+Decided 2026-09-28:
+
+- **Q1.** A geo map's origin is **the first session's datum**.
+- **Q3.** When a session starts and the mapping service isn't running, the client **only tells the user**; nothing is started automatically. A map can have both a topo and a grid layer at the same time.
+- **Q5.** The grid map is **uploaded once, at session end**.
+
+Still open:
+
+- **Q2.** Should small edits to a `ready` map (delete a bad node, add or remove an edge, re-align a session) be allowed directly in the map view, or only by starting a new session?
 - **Q4.** Should a map belong to a site (required, optional, or not at all)?
-- **Q5.** Grid map format and update rhythm: one upload per session end, or periodic uploads during mapping?
-- **Q6.** The datum topic conflict (§5): which option?
+- **Q6.** The datum topic conflict (§5): both publishers write the identical retained topic `uagv/v2/RobotCompany/<robot>/datum`, so the last one wins. On the real robot the orchestrator publishes a UM982 startup fix at boot (and again on every orchestrator restart); the VDA5050 client publishes the pose module's datum once anchored, and again on MQTT reconnect. Proposal: the VDA5050 client is the only datum source wherever the pose module runs; the orchestrator's datum publishing is kept only for robots without a pose module (the sim's `gps_anchor`).
