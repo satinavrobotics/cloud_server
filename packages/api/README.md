@@ -221,6 +221,7 @@ Topic and payload contract: `packages/api/mapping_control.py` (docstring); robot
 | `POST .../sessions/{sid}/pause\|resume\|finish` | `robot_notified`, `mapping_state` |
 | `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service` (of the open session's robot; null without an open session) |
 | `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state` per robot |
+| `POST /api/v1/robots/{r}/mapping/off` | new: force a robot's capture off when it has **no** open session (404 unknown robot; 409 `finish or pause the session on map X` otherwise). Publishes the retained `{enabled: false, session_id: null, map: null, force: true, issued_at}`; `force` makes the robot apply it even if unchanged (it also ends a local `~/set_enabled` override). Returns `robot_notified`, `mapping_state` |
 | `WS /ws/robot/{r}` | `{type: "mapping_state_update", robot_name, timestamp, mapping_state}` on every state message |
 
 `mapping_state`: null (nothing received since the API started: the topomap never connected, or

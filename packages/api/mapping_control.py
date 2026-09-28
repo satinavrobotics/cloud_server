@@ -11,6 +11,8 @@ sati_ros_navstack). `{prefix}` is the VDA5050 prefix (config MQTT_VDA5050_PREFIX
       no open session -> disabled, nulls. Retained, so a topomap that (re)starts picks up the
       current state. Also re-published for every robot whenever the API (re)connects to the
       broker (the broker keeps no retained messages across its own restart).
+      Optional `"force": true` (only POST /robots/{r}/mapping/off sets it): the robot applies
+      the message even if unchanged, so it also ends a local `~/set_enabled` override.
 
   {prefix}/{robot}/mapping/state    robot -> API, RETAINED, QoS 1
       {"online": true, "enabled": bool, "session_id": str|null, "map": str|null,
@@ -66,6 +68,14 @@ def set_payload(open_session: Optional[Mapping[str, Any]],
     return {"enabled": open_session.get("paused_at") is None,
             "session_id": str(open_session["session_id"]),
             "map": open_session["map_name"], "issued_at": issued_at}
+
+
+def force_off_payload(now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+    """The operator's "force off" for a robot capturing without a session: the no-session
+    payload plus `force: true`, which the robot applies even if unchanged (so it also ends a
+    local `~/set_enabled true` override). Retained like every set message; the next ordinary
+    set message (a session change or an API reconnect) replaces it."""
+    return {**set_payload(None, now), "force": True}
 
 
 def state_view(state: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:

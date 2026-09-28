@@ -1578,6 +1578,19 @@ async def update_robot_map(robot_name: str, request: UpdateRobotMapRequest):
         recording.request_actor(), arango_nodes, control=service.mapping_control))
 
 
+@app.post("/api/v1/robots/{robot_name}/mapping/off")
+async def robot_mapping_off(robot_name: str):
+    """Force a robot's mapping capture off when it has no open mapping session (maps M3; e.g.
+    a local `~/set_enabled true` on the robot, whose nodes graph-builder ignores). Publishes
+    the retained `{prefix}/{robot}/mapping/set` `{enabled: false, session_id: null, map: null,
+    force: true, issued_at}`. 404 unknown robot, 409 while the robot has an open session
+    (finish or pause it instead). Returns `robot_notified` (the broker acknowledged it) and
+    `mapping_state`."""
+    _require_service()
+    return await _site_call("turn robot mapping off", maps.robot_mapping_off(
+        service.database, robot_name, service.mapping_control))
+
+
 @app.post("/api/v1/robots/{robot_name}/cancel-order")
 async def force_cancel_robot_order(robot_name: str):
     """

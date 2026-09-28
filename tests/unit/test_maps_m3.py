@@ -435,3 +435,59 @@ class TestSummaryAndRoutes:
         assert one["mapping_state"]["status"] == "on" and one["name"] == "r1"
         assert many[0]["mapping_state"]["status"] == "on"
         json.dumps(one, default=str)
+
+
+class TestForceOff:
+    """POST /robots/{r}/mapping/off: a forced no-session set message, only without a session."""
+
+    def test_payload(self):
+        p = mc.force_off_payload()
+        assert p["force"] is True and p["enabled"] is False
+        assert p["session_id"] is None and p["map"] is None and p["issued_at"]
+        assert "force" not in mc.set_payload(None)
+
+    async def test_publishes_forced_off_without_a_session(self, db):
+        db.add_robot("r1")
+        db.add_map("old", type="local")
+        db.add_session("old", "r1", "live", ended=True)
+        ctl = control()
+        _robot_state(ctl, online=True, enabled=True, session_id=None, map=None, source="local")
+        out = await maps.robot_mapping_off(None, "r1", ctl)
+        assert out["robot_notified"] is True
+        assert out["mapping_state"]["status"] == "on"  # until the robot answers
+        topic, payload, qos, retain = ctl.client.published[-1]
+        assert topic == f"{PREFIX}/r1/mapping/set" and qos == 1 and retain is True
+        assert {k: payload[k] for k in ("enabled", "session_id", "map", "force")} == {
+            "enabled": False, "session_id": None, "map": None, "force": True}
+
+    async def test_open_session_is_409_and_publishes_nothing(self, db):
+        db.add_robot("r1")
+        db.add_map("yard", type="local", status={"state": "paused"})
+        db.add_session("yard", "r1", "live", ended=False, paused_at=m1.T0)
+        ctl = control()
+        with pytest.raises(HTTPException) as err:
+            await maps.robot_mapping_off(None, "r1", ctl)
+        assert err.value.status_code == 409
+        assert "finish or pause the session on map yard" in err.value.detail
+        assert ctl.client.published == []
+
+    async def test_unknown_robot_is_404(self, db):
+        ctl = control()
+        with pytest.raises(HTTPException) as err:
+            await maps.robot_mapping_off(None, "ghost", ctl)
+        assert err.value.status_code == 404 and ctl.client.published == []
+
+    async def test_broker_down_is_robot_notified_false(self, db):
+        db.add_robot("r1")
+        out = await maps.robot_mapping_off(None, "r1", control(connected=False))
+        assert out["robot_notified"] is False
+
+    async def test_route(self, db):
+        db.add_robot("r1")
+        svc = MagicMock()
+        svc.database = None
+        svc.mapping_control = control()
+        with patch.object(main, "service", svc):
+            out = await main.robot_mapping_off("r1")
+        assert out["robot_notified"] is True
+        assert svc.mapping_control.client.sets()[-1]["force"] is True

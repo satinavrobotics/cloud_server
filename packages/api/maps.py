@@ -66,7 +66,7 @@ from cloud_common.objects.map import (
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
-from packages.api.mapping_control import set_payload
+from packages.api.mapping_control import force_off_payload, set_payload
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.utils import map_geo
@@ -652,6 +652,28 @@ async def notify_robot(control: Optional[Any], db: Any, robot_name: str,
     if with_service:
         out["mapping_service"] = control.mapping_service(robot_name)
     return out
+
+
+async def robot_mapping_off(db: Any, robot_name: str, control: Any) -> Dict[str, Any]:
+    """POST /robots/{r}/mapping/off: turn off a robot's capture when it has NO open session
+    (e.g. a local `~/set_enabled true` left on: its nodes are ignored). Publishes the retained
+    no-session set message with `force: true` (mapping_control.force_off_payload), which the
+    robot applies even if unchanged. 404 unknown robot; 409 while the robot has an open
+    session (that session's pause / finish is the way to stop it). Checked under the robot's
+    publish lock, so a session started concurrently is not overwritten by this message."""
+    async with control.lock(robot_name):
+        async with open_store(db, uuid.uuid4()) as store:
+            robot = await store.robot(robot_name)
+            mine = await store.open_sessions_of_robot(robot_name)
+        if robot is None:
+            raise HTTPException(status_code=404, detail=f"Robot {robot_name} not found")
+        if mine:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Robot {robot_name} has an open mapping session: finish or pause the "
+                       f"session on map {mine[0]['map_name']}")
+        ok = await control.publish_set(robot_name, force_off_payload())
+    return {"robot_notified": ok, "mapping_state": control.state(robot_name)}
 
 
 async def sync_all_robots(control: Any, db: Any) -> Dict[str, bool]:
