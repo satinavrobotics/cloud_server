@@ -10,7 +10,8 @@ ArangoDB/MinIO can still be deleted) and the route returns 202. A background tas
 2. deletes the map's graph from ArangoDB and its image bucket from MinIO. Both deletes are
    idempotent and treat "not there" as success, so a re-run after a partial success is safe;
 3. on success deletes the row (only while it is still DELETING) and its `map_sessions` rows,
-   and NOTIFYs `DELETED`;
+   NOTIFYs `DELETED` and writes MAP.DELETED, all in one transaction (the event in a savepoint:
+   a failing event write never keeps the map);
 4. on failure records the attempt in the map's status (`delete_attempts`, `delete_error`) and
    retries with exponential backoff. After MAP_DELETE_MAX_ATTEMPTS attempts in one round it
    writes MAP.DELETE_FAILED in the same transaction as the status and stops. The map stays
@@ -18,6 +19,9 @@ ArangoDB/MinIO can still be deleted) and the route returns 202. A background tas
 
 MAP.DELETE_FAILED: ts = `delete_requested_at`, discriminator `map:<map_id>:attempts:<total>`,
 so the event_id is deterministic and each exhausted round writes exactly one event.
+MAP.DELETED (maps redesign M2): ts = when the row was removed, discriminator
+`map:<map_id>:deleted:<delete_requested_at>`; written only by the runner whose DELETE removed
+the row, so once per delete.
 
 Not deleted: ROS bags (a robot's recordings; they only name the map in a sidecar) and base
 models (not per map). Robots whose `current_map` is the deleted map keep it; the assign routes
@@ -70,6 +74,11 @@ def lock_key(map_id: str) -> int:
 def failed_discriminator(map_id: str, attempts: int) -> str:
     """Part of MAP.DELETE_FAILED's event_id (stored data: never change the format)."""
     return f"map:{map_id}:attempts:{attempts}"
+
+
+def deleted_discriminator(map_id: str, requested_at: Optional[str]) -> str:
+    """Part of MAP.DELETED's event_id (stored data: never change the format)."""
+    return f"map:{map_id}:deleted:{requested_at or '-'}"
 
 
 def _utcnow() -> datetime.datetime:
@@ -233,7 +242,7 @@ class MapDeleter:
             status = row[1] or {}
             error = await self._attempt(map_id)
             if error is None:
-                await self._finish(map_id)
+                await self._finish(map_id, status)
                 return
             total = int(status.get("delete_attempts") or 0) + 1
             requested_at = _parse_ts(status.get("delete_requested_at")) or self._now()
@@ -268,15 +277,32 @@ class MapDeleter:
                 await cursor.execute(LOAD_SQL, (map_id,))
                 return await cursor.fetchone()
 
-    async def _finish(self, map_id: str) -> None:
+    async def _finish(self, map_id: str, status: Optional[Dict[str, Any]] = None) -> None:
+        status = status or {}
         async with self._db.connection() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(FINISH_SQL, (map_id,))
-                if cursor.rowcount:
+                removed = bool(cursor.rowcount)
+                if removed:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
+            if removed:
+                await self._emit_deleted(conn, map_id, status)
         logger.info("Map %s deleted", map_id)
+
+    async def _emit_deleted(self, conn: Any, map_id: str, status: Dict[str, Any]) -> None:
+        """MAP.DELETED in the finishing transaction, in a savepoint (never fails the delete)."""
+        requested_at = status.get("delete_requested_at")
+        try:
+            async with conn.transaction():
+                await emit(conn, Event(
+                    EventCode.MAP_DELETED, self._now(), source=Source.API,
+                    discriminator=deleted_discriminator(map_id, requested_at),
+                    payload={"map_name": map_id, "requested_at": requested_at,
+                             "attempts": int(status.get("delete_attempts") or 0) + 1}))
+        except Exception:  # noqa: BLE001
+            logger.exception("Map %s: could not write MAP.DELETED (the map is deleted)", map_id)
 
     async def _record_failure(self, map_id: str, total: int, error: str,
                               requested_at: datetime.datetime, exhausted: bool) -> None:

@@ -221,8 +221,18 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     assert db.sessions_deleted == ["site_a"]  # its mapping sessions go with the row
     assert graph.calls == ["site_a"] and images.calls == ["site_a"]
     assert [p[1].split(" ", 1)[1] for p in db.notifies] == ["site_a DELETING", "site_a DELETED"]
-    assert db.events == [] and sleeps == []
+    assert sleeps == []
     assert db.locks == {}  # released with the connection
+    # MAP.DELETED (maps M2), in the transaction that removed the row
+    assert len(db.events) == 1
+    event = db.events[0]
+    assert event["code"] == EventCode.MAP_DELETED.value
+    assert event["severity"] == "info" and event["source"] == "api"
+    assert event["robot_name"] is None and event["ts"] == T0
+    assert event["event_id"] == event_id(EventCode.MAP_DELETED, None, T0,
+                                         f"map:site_a:deleted:{T0.isoformat()}")
+    assert json.loads(event["payload"]) == {"map_name": "site_a", "attempts": 1,
+                                            "requested_at": T0.isoformat()}
 
 
 async def test_arango_failure_retries_with_backoff_then_emits_delete_failed():
@@ -274,7 +284,9 @@ async def test_transient_failure_recovers_without_an_event():
 
     assert "site_a" not in db.rows
     assert len(graph.calls) == 3 and sleeps == [2.0, 4.0]
-    assert db.events == []
+    # no MAP.DELETE_FAILED; MAP.DELETED counts every attempt of the delete
+    assert [e["code"] for e in db.events] == [EventCode.MAP_DELETED.value]
+    assert json.loads(db.events[0]["payload"])["attempts"] == 3
 
 
 async def test_backoff_is_capped():
