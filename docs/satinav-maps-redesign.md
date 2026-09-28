@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** 2026-09-28. M0 (coordinate conversion, §5) deployed. **M1 built, not deployed** (branch off `d4296cd`; deploy script `~/pg-cutover/scripts/mapsm1.sh`): map type/geo/state, `map_sessions`, migration of today's maps, the new map routes next to the old ones (§4, §7, §12, §13.1). M2 onwards: not started.
+**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 built, not deployed** (branch off `2e0b63a`; deploy script `~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). M3 onwards: not started.
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -246,10 +246,10 @@ Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are
    - `state = ready`. The `datum_*` fields stay: they describe the frame the existing nodes are stored in.
 2. Every map gets one synthetic `legacy` session: robot `legacy`, ended, `aligned = true`, identity transform, `datum` = the map's datum, `node_count` = the row's stored count (not the live ArangoDB count).
 3. Maps named `GEO`, `LOCAL`, `default`, and ArangoDB-only maps with no Postgres row: **nothing is created or deleted**. The deploy script prints them (read-only) for the user to archive or delete.
-4. ~~`robot.current_map` is cleared~~ **Moved to M2**: M1 leaves `current_map` and the dispatcher's datum auto-seed alone, because graph-builder still ingests by `current_map` until M2.
+4. ~~`robot.current_map` is cleared~~ **Moved to M2**: M1 leaves `current_map` and the dispatcher's datum auto-seed alone, because graph-builder still ingests by `current_map` until M2. M2 removed the auto-seed but keeps `current_map` (written by the deprecated shim) for its remaining readers; see §13.2.
 5. The live map `map` (datum 47.4979, 19.0402, frame `enu`) becomes `geo`, zone 34 N, origin E 352 397.33 / N 5 262 357.80.
 
-**Left for M2 — legacy node poses.** Nodes in ArangoDB are **not** rewritten in M1. A geo map's frame is UTM grid metres from the origin, but a migrated map's legacy nodes are in its old datum frame. For a `utm` datum with bearing 0 the two are the same. For an `enu` datum they differ by the grid convergence at the datum (−1.445° for `map`, i.e. about 2.5 cm per metre from the origin) and by the UTM scale factor. M2 must either rewrite those nodes into the map frame (rotate by the convergence; also store `robot_pose`), or give the legacy session the real transform (`map_geo.session_transform(geo, datum)`) instead of identity. Until then the old display path (`POST /map/load` `transform`, from the `datum_*` fields) places them exactly as before.
+**Legacy node poses (done in M2, `tools/maps_m2_legacy_nodes.py`, §13.2).** Nodes in ArangoDB are **not** rewritten in M1. A geo map's frame is UTM grid metres from the origin, but a migrated map's legacy nodes are in its old datum frame. For a `utm` datum with bearing 0 the two are the same. For an `enu` datum they differ by the grid convergence at the datum (−1.445° for `map`, i.e. about 2.5 cm per metre from the origin) and by the UTM scale factor. M2 must either rewrite those nodes into the map frame (rotate by the convergence; also store `robot_pose`), or give the legacy session the real transform (`map_geo.session_transform(geo, datum)`) instead of identity. Until then the old display path (`POST /map/load` `transform`, from the `datum_*` fields) places them exactly as before.
 
 ## 13. Plan
 
@@ -257,7 +257,7 @@ Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are
 |---|---|---|
 | M0 | Coordinate conversion fix (§5) | all four; in progress |
 | M1 | Map spec + `map_sessions` + migration of today's data (§4, §12); new map endpoints (§7) behind the old ones | cloud_server; **built, not deployed** (§13.1) |
-| M2 | graph-builder ingest by session (§6); `MAP.INGEST_REJECTED`; clear `robot.current_map` (§12 step 4); legacy node poses (§12) | cloud_server |
+| M2 | graph-builder ingest by session (§6); `MAP.INGEST_REJECTED`; clear `robot.current_map` (§12 step 4); legacy node poses (§12) | cloud_server; **built, not deployed** (§13.2) |
 | M3 | Robot mapping switch over MQTT, session tagging (§8) | sati_ros_navstack |
 | M4 | Client: Maps page, mapping bar, session start (§9, first half) | sati-client |
 | M5 | Client: one `MapView` replacing the three map views (§9, second half) | sati-client |
@@ -280,6 +280,84 @@ Code: `cloud_common/objects/map.py` (fields), `packages/utils/map_geo.py` (class
 - **Client (sati-client):** nothing to change for M1; all response changes are additive.
 
 ---
+
+### 13.2 M2 as built
+
+Code: `packages/services/graph_builder/ingest.py` (+ `server.py`), `packages/api/maps.py`
+(`assign_robot_map`), `packages/utils/map_geo.py` (`robot_frame_in_map`, `invert_transform`,
+`apply_pose`), `packages/services/mission_planner/server.py`, `packages/controllers/mission/server.py`
+(`_route_in_robot_frame`), `packages/api/map_delete.py`, `tools/maps_m2_legacy_nodes.py`, migration
+`20260929_01_maps_m2`. Tests: `tests/unit/test_maps_m2.py`, `tests/integration/maps/run_m2.sh`
+(Postgres, ArangoDB, MinIO, mosquitto and graph-builder on a private network; `--dump` /
+`--arango-dump` rehearse on production dumps). Deploy: `~/pg-cutover/scripts/mapsm2.sh` (API,
+graph-builder, dispatch, planner; with 2e0b63a).
+
+- **Ingest (§6).** graph-builder resolves the robot (payload `robot_name`) to its open session in
+  one query (`map_sessions` ⋈ `mapobjectv1` ⋈ `robotobjectv1`), cached 1 s per robot, so a
+  pause/finish takes effect within ~1 s without a second LISTEN connection. Nodes **and** images
+  go to the session's map; the payload `map_id` is ignored (images used to land in `default`).
+  Dropped, with a reason: `no_session`, `session_paused`, `map_not_mapping`, `map_deleting`,
+  `map_missing`, `session_mismatch` (a payload `session_id` that is not the open one; untagged
+  payloads are accepted until M3), `datum_changed` (a geo session whose robot datum changed since
+  it started: a new robot run, so `map_T_session` would be stale; finish and start again),
+  `lookup_failed`. The images buffered for a dropped node are dropped with it. The silent
+  `default` map is gone (`POST /node`, a test hook, needs a map in `mapping`). Stored: `pose` =
+  `map_T_session` applied (rigid, as in M1: no UTM scale factor, ≤1.3 cm per 100 m), `robot_pose`,
+  `session_id`; `map_sessions.node_count` += 1 per node (inline; the map's status counts stay
+  "fresh from ArangoDB on read", as in M1).
+- **`MAP.INGEST_REJECTED`**: source `graph_builder` (new; the migration widens
+  `fleet_events_source_check`), per robot and reason: the first drop at once, then at most one a
+  minute with `dropped_nodes` / `dropped_images` since `since`; a 10 s flush reports the tail.
+- **Missions unchanged:** a RUNNING mission with `register_map = false` still suppresses ingest
+  (the node goes only to the waypoint log, robot frame). With `register_map = true` (or no
+  mission) the session decides; a running mission's waypoint log gets the map-frame pose when the
+  node is stored, the robot-frame pose otherwise.
+- **Map frame vs robot frame** (not in the M2 plan; needed once nodes are map-frame). The robot's
+  pose and VDA5050 orders are in the robot's current run frame. `map_geo.robot_frame_in_map(map,
+  robot.datum)` = map_T_robot: a geo map with an origin → `session_transform` of the robot's
+  current datum; a local map (or no origin yet) → identity; a geo map and a robot without a datum
+  → unknown (no conversion, as before). The **planner** compares the robot's position in the map
+  frame (closest start node, nearby nodes) and converts GPS goals with the map's UTM origin (the
+  legacy datum only for maps without `geo`). The **dispatcher** sends route waypoints whose
+  `map_id` names a real map through robot_T_map at order time (stored missions stay map-frame, so
+  the client's display and reroute stay consistent); mapless / GEO / LOCAL waypoints are sent as
+  they are. For every map live today this is identity except `map` with the sim robot (a
+  −1.445° rotation about the origin).
+- **Shim** (`PUT /api/v1/robots/{r}/map`, deprecated): a real map → finish the robot's session on
+  another map, create the map if missing (typed from the robot's datum), start a session (the
+  errors of `POST .../sessions`); `GEO` / `LOCAL` / null → finish. One transaction. It still
+  writes `current_map`. `POST /map/load` no longer registers `GEO`/`LOCAL` as maps.
+- **Datum auto-seed removed** (dispatcher). A geo map's origin and legacy `datum_*` come from its
+  first session (Q1, M1). Nothing else needed it: the seeded `GEO` row was what the old client's
+  mapless GEO view loaded; without it `POST /map/load GEO` returns `transform: null` and the
+  client falls back to the robot's own datum (the right frame for mapless waypoints).
+- **Legacy nodes** (`python -m tools.maps_m2_legacy_nodes [--apply]`, in the API image; dry run
+  by default, idempotent, `--revert [--include-live]` from `robot_pose`): per geo map with a
+  legacy session, the legacy session gets the real transform (`map`: yaw −1.4451°, no
+  translation), nodes without `robot_pose` are rewritten (`robot_pose` = old pose, `pose` =
+  transformed, `session_id` = legacy), `datum_*` become the origin as a `utm` datum with bearing 0
+  (so `POST /map/load`'s `transform`, `GET /maps/{id}/graph` and the client's
+  `utils/mapTransform.ts`, which handles `utm` exactly since eb31164, describe the map frame), and
+  the legacy session's `node_count` and the map's status counts come from ArangoDB. Local maps:
+  identity, tags only. On production: `map`, 5 nodes, each moved by < 7 cm.
+- **`MAP.DELETED`**: when the background delete removes the row, in the same transaction
+  (savepoint), once per delete.
+- **`robot.current_map` — remaining readers (for M4/M5):** the old client (mission mode
+  unassigned/geo/local/mapped and `register_map` in `CreateMissionOverlay`, per-waypoint `map_id`
+  in `missionApi.toMissionWaypoint`, `RerouteMissionOverlay`, `MissionBuilder` map load, the map
+  the UI opens on robot select in `useRobotSelection`, `MapSelectionPanel`, `MapPickerDropdown`,
+  header labels, robot cards); the run recorder (`mission_runs.map_id` = `current_map` or the
+  pose's map id; `GEO`/`LOCAL` land there); the bag upload metadata (`map_id`); the API's generic
+  robot create/update (`current_map` in the body, no session effect). graph-builder and the
+  dispatcher no longer read it. It goes when the client stops sending/reading it (M4: sessions;
+  M5: one map view), replaced by the robot's open session (`mapping_session`, §4).
+- **Deferred / known:** the client draws the live robot marker through the **map's** transform:
+  on `map` with the sim robot it is now off by the −1.445° rotation about the origin (2.5 cm per
+  m) until M5 projects `robot.status.pose` with the robot's own datum (or `map_T_robot`).
+  Client-built mission waypoints are map-frame and converted by the dispatcher, so missions are
+  right. A robot restart mid-session on a geo map is rejected (`datum_changed`), not re-anchored:
+  M3 should end the session when the robot's run ends. graph-builder's `GET /health`
+  `mqtt_connected` is always false (pre-existing flag, never set).
 
 ## 14. Questions
 

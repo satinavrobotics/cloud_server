@@ -12,6 +12,21 @@ The Graph Builder Service is a critical component of the topological mapping sys
 - Creates bidirectional edges between traversable nodes
 - Saves nodes and edges to the Graph Database
 
+## Which map (maps redesign M2)
+
+Nodes and images go to the robot's **open mapping session** (`map_sessions`, resolved by the
+payload's `robot_name`; `ingest.py`), never to `robot.current_map` or a `default` map; a
+`map_id` in the payload is ignored. The node's `pose` is stored in the map frame (the session's
+`map_T_session` applied), with `robot_pose` (as received) and `session_id`. No open session, a
+paused one, a map that is not `mapping` or is being deleted, a payload `session_id` that is not
+the open session, or a geo session whose robot datum changed since it started (a new robot run):
+the data is dropped, counted (`GET /stats`: `nodes_rejected`, `images_rejected`) and reported as
+`MAP.INGEST_REJECTED` in `fleet_events` (at most one per robot and reason a minute). The session
+lookup is cached for 1 s, so a pause or finish takes effect within about a second. A RUNNING
+mission with `register_map = false` still suppresses ingest, as before. `POST /node` (a test
+hook) needs `map_id` naming a map in the `mapping` state. See
+`docs/satinav-maps-redesign.md` §6, §13.2.
+
 ## Architecture
 
 ```
@@ -66,7 +81,6 @@ IMAGE_DB_URL=http://localhost:6002
 GRAPH_DB_URL=http://localhost:6001
 SIMILARITY_SERVICE_URL=http://localhost:8003
 RADIUS_THRESHOLD=5.0
-DEFAULT_MAP_ID=default
 ```
 
 ## Usage
@@ -100,7 +114,7 @@ python -m packages.services.graph_builder.main \
 - `--graph-db-url`: Graph DB service URL (default: http://localhost:6001)
 - `--distance-threshold`: Distance threshold in meters for edge creation (default: 3.0)
 - `--radius-threshold`: Radius threshold in meters (default: 5.0)
-- `--default-map-id`: Default map ID (default: default)
+- (no default map since maps M2: see "Which map")
 - `--log-level`: Logging level (DEBUG, INFO, WARNING, ERROR)
 
 ## API Endpoints

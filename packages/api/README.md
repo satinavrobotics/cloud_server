@@ -148,11 +148,14 @@ Load a map from the graph database.
 
 A map this route registers is typed like the M1 migration types old maps: `geo` if the datum is
 real (not null, not (0, 0)), else `local`; state `ready`. It never retypes an existing map.
+Since M2 `POST /map/load` with `GEO` / `LOCAL` (the old client's mapless views) registers
+nothing: it returns no nodes and `transform: null` (the client then uses the robot's datum).
 
 #### Typed maps and mapping sessions (maps redesign M1)
 
-See `docs/satinav-maps-redesign.md` §2-§4, §7. Code: `packages/api/maps.py`. The routes above
-and `PUT /api/v1/maps/{id}/datum`, `PUT /api/v1/robots/{r}/map` are unchanged.
+See `docs/satinav-maps-redesign.md` §2-§4, §7, §13.1-§13.2. Code: `packages/api/maps.py`. The
+routes above and `PUT /api/v1/maps/{id}/datum` are unchanged; `PUT /api/v1/robots/{r}/map` is a
+deprecated shim over sessions since M2 (below).
 
 Every map has `type` (`local` | `geo`), `geo` (`{utm_zone, utm_north, origin_e, origin_n}` for a
 geo map once its origin is known, else null) and `status.state` (`draft` | `mapping` | `paused`
@@ -178,10 +181,30 @@ aligned, node_count}`. `map_T_session` takes a robot-frame point into the map fr
 grid-convergence yaw for an ENU datum; identity for a local map (aligned only for its first
 session). Every pre-M1 map has one ended `legacy` session (robot `legacy`, identity).
 
-Not in M1: sessions do not route robot data yet (graph-builder still ingests by the robot's
-`current_map` until M2), no MQTT to the robot (M3), no alignment (M6), no grid (M7). Events:
-`MAP.CREATED`, `MAP.ARCHIVED`, `MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`
-in `fleet_events`. `POST /api/v1/maps` and `POST .../sessions` accept `Idempotency-Key`.
+Since M2 a session is what routes robot data: graph-builder stores a robot's nodes and images
+in the map of its open, unpaused session (node `pose` in the map frame, plus `robot_pose` and
+`session_id`) and drops everything else, reported as `MAP.INGEST_REJECTED` (at most one per robot
+and reason a minute, with the drop counts). A pause or finish takes effect within ~1 s. Not yet:
+MQTT to the robot (M3), alignment (M6), grid (M7). Events: `MAP.CREATED`, `MAP.ARCHIVED`,
+`MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.DELETED` (background delete
+finished), `MAP.INGEST_REJECTED` (source `graph_builder`) in `fleet_events`. `POST /api/v1/maps`
+and `POST .../sessions` accept `Idempotency-Key`.
+
+#### `PUT /api/v1/robots/{robot}/map` — DEPRECATED (maps M2; removed with the client's Maps page, M4)
+
+The old client's "assign map", kept working on top of sessions (`maps.assign_robot_map`), in
+one transaction:
+
+| `map_id` | Does |
+|---|---|
+| a real map name | Finishes the robot's open session if it is on another map; creates the map if it does not exist (`draft`, typed from the robot's datum: `geo` with a real datum, else `local`; `MAP.CREATED`; the name rules and 409s of `POST /api/v1/maps`); starts a session on it with the rules and errors of `POST /api/v1/maps/{id}/sessions` (404 robot, 409 offline / geo map without a robot datum / map busy / archived / being deleted). The map the robot already maps: nothing changes. |
+| `GEO`, `LOCAL`, null, `""` | Finishes the robot's open session, if any. |
+
+`robot.current_map` is still written (the value sent; null to clear): the old client's mission
+modes and map selection, the run recorder's `map_id` and the bag metadata read it
+(`docs/satinav-maps-redesign.md` §13.2). A refused call changes nothing. Body:
+`{success, robot_name, current_map, deprecated, map_created, finished_session, session}`.
+`POST /api/v1/maps/{id}/sessions` does not write `current_map`.
 
 #### `WS /ws/map/{map_id}`
 WebSocket endpoint for real-time map updates.
