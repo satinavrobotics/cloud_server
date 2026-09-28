@@ -5,6 +5,8 @@ These tests mock the service dependencies to test the API delegation logic.
 """
 
 import pytest
+
+from packages.api import maps
 import asyncio
 from unittest.mock import Mock, MagicMock, patch, AsyncMock
 from packages.api.server import ApiDelegationService, WebSocketManager
@@ -1102,7 +1104,8 @@ class TestApiDelegationServiceDeleteMap:
         result = await service.delete_map("test_map")
         assert result["success"] is True
         assert result["map_id"] == "test_map"
-        service.map_deleter.request.assert_awaited_once_with("test_map")
+        service.map_deleter.request.assert_awaited_once_with(
+            "test_map", guard=maps.refuse_open_session)
 
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')

@@ -83,6 +83,8 @@ class FakeCursor:
             if row is not None and row["lifecycle"] == "DELETING":
                 del db.rows[params[0]]
                 self.rowcount = 1
+        elif sql == map_delete.SESSIONS_SQL:
+            db.sessions_deleted.append(params[0])
         elif sql == emit_mod.INSERT_SQL:
             if db.fail_events:
                 raise RuntimeError("fleet_events unavailable")
@@ -143,6 +145,7 @@ class FakeDb:
         self.events = []
         self.notifies = []
         self.statements = []
+        self.sessions_deleted = []
         self.locks = {} if locks is None else locks
         self.fail_events = False
 
@@ -215,6 +218,7 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     await deleter.task_for("site_a")
 
     assert "site_a" not in db.rows
+    assert db.sessions_deleted == ["site_a"]  # its mapping sessions go with the row
     assert graph.calls == ["site_a"] and images.calls == ["site_a"]
     assert [p[1].split(" ", 1)[1] for p in db.notifies] == ["site_a DELETING", "site_a DELETED"]
     assert db.events == [] and sleeps == []

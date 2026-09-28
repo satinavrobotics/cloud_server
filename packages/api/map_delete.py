@@ -9,7 +9,8 @@ ArangoDB/MinIO can still be deleted) and the route returns 202. A background tas
    else skips the map. The lock goes with the connection, so a crashed worker never keeps it;
 2. deletes the map's graph from ArangoDB and its image bucket from MinIO. Both deletes are
    idempotent and treat "not there" as success, so a re-run after a partial success is safe;
-3. on success deletes the row (only while it is still DELETING) and NOTIFYs `DELETED`;
+3. on success deletes the row (only while it is still DELETING) and its `map_sessions` rows,
+   and NOTIFYs `DELETED`;
 4. on failure records the attempt in the map's status (`delete_attempts`, `delete_error`) and
    retries with exponential backoff. After MAP_DELETE_MAX_ATTEMPTS attempts in one round it
    writes MAP.DELETE_FAILED in the same transaction as the status and stops. The map stays
@@ -57,6 +58,8 @@ LIST_SQL = f"SELECT name FROM {MAP_TABLE} WHERE lifecycle = '{DELETING}' ORDER B
 RECORD_SQL = (f"UPDATE {MAP_TABLE} SET status = status || %s::jsonb "
               f"WHERE name = %s AND lifecycle = '{DELETING}'")
 FINISH_SQL = f"DELETE FROM {MAP_TABLE} WHERE name = %s AND lifecycle = '{DELETING}'"
+# The map's mapping sessions (maps redesign M1) go with its row, in the same transaction.
+SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
 
 
@@ -110,8 +113,13 @@ class MapDeleter:
         return min(self._backoff_max_s, self._backoff_s * (2 ** max(0, attempt - 1)))
 
     # --- entry points ------------------------------------------------------------------------
-    async def request(self, map_id: str) -> Dict[str, Any]:
-        """Mark `map_id` DELETING (idempotent) and start its cleanup; the 202 body."""
+    async def request(self, map_id: str,
+                      guard: Optional[Callable[[Any, str], Awaitable[Any]]] = None
+                      ) -> Dict[str, Any]:
+        """Mark `map_id` DELETING (idempotent) and start its cleanup; the 202 body.
+
+        `guard(cursor, map_id)` runs first in the same transaction and may refuse the delete
+        by raising (packages/api/maps.py::refuse_open_session: 409 while a session is open)."""
         now = self._now()
         patch = {"delete_requested_at": now.isoformat(), "delete_attempts": 0,
                  "delete_error": None}
@@ -119,6 +127,8 @@ class MapDeleter:
         status.update(patch)
         async with self._db.connection() as conn:
             async with conn.cursor() as cursor:
+                if guard is not None:
+                    await guard(cursor, map_id)
                 await cursor.execute(MARK_SQL, (map_id, MapSpecV1().json(), json.dumps(status),
                                                 json.dumps(patch)))
                 marked = await cursor.fetchone() is not None
@@ -263,6 +273,7 @@ class MapDeleter:
             async with conn.cursor() as cursor:
                 await cursor.execute(FINISH_SQL, (map_id,))
                 if cursor.rowcount:
+                    await cursor.execute(SESSIONS_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
         logger.info("Map %s deleted", map_id)

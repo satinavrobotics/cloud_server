@@ -23,7 +23,8 @@ from packages.database.postgres import PostgresDatabase
 from packages.api.diagnostics import DiagnosticsService
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from cloud_common.objects.robot import RobotObjectV1
-from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1
+from cloud_common.objects.map import (
+    MapObjectV1, MapSpecV1, MapStatusV1, effective_state, effective_type)
 from cloud_common.objects.mission import MissionObjectV1
 from cloud_common.objects.settings import SettingsObjectV1
 from cloud_common.objects.site import SiteObjectV1
@@ -36,6 +37,8 @@ from packages.config import (
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
 )
 from packages.api.map_delete import MapDeleter
+from packages.api import maps
+from packages.utils import map_geo
 
 
 def map_datum_transform(spec: MapSpecV1) -> Optional[Dict[str, Any]]:
@@ -786,9 +789,7 @@ class ApiDelegationService:
             except Exception:
                 stats = {"node_count": len(nodes), "edge_count": len(edges)}
 
-            map_obj = MapObjectV1(
-                name=actual_map_id,
-                lifecycle=ObjectLifecycleV1.ALIVE,
+            legacy_spec = dict(
                 description=description,
                 datum_latitude=datum_latitude,
                 datum_longitude=datum_longitude,
@@ -798,9 +799,20 @@ class ApiDelegationService:
                 datum_utm_north=datum_utm_north,
                 datum_utm_easting=datum_utm_easting,
                 datum_utm_northing=datum_utm_northing,
+            )
+            # A map registered through this legacy route is typed like the M1 migration
+            # types pre-M1 maps (docs/satinav-maps-redesign.md §12): geo iff a real datum.
+            map_type, map_geo_block = map_geo.classify(legacy_spec)
+            map_obj = MapObjectV1(
+                name=actual_map_id,
+                lifecycle=ObjectLifecycleV1.ALIVE,
+                type=map_type,
+                geo=map_geo_block,
+                **legacy_spec,
                 status=MapStatusV1(
                     node_count=stats.get("node_count", len(nodes)),
                     edge_count=stats.get("edge_count", len(edges)),
+                    state="ready",
                 ),
             )
             try:
@@ -808,9 +820,19 @@ class ApiDelegationService:
                 self.logger.info(f"Registered map '{actual_map_id}' in Postgres")
             except Exception:
                 if datum_latitude is not None and datum_longitude is not None:
-                    # Explicit datum provided — update the full spec including datum.
+                    # Explicit datum provided — update the full spec including datum, but keep
+                    # the stored map's type and geo origin (maps redesign M1): a legacy load
+                    # never retypes a map.
+                    new_spec = map_obj.spec
+                    try:
+                        existing = await self.database.get_object(MapObjectV1, actual_map_id)
+                    except Exception:
+                        existing = None
+                    if isinstance(existing, MapObjectV1) and existing.type is not None:
+                        new_spec = MapSpecV1(**{**map_obj.spec.dict(), "type": existing.type,
+                                                "geo": existing.geo})
                     await self.database.update_spec(
-                        MapObjectV1, actual_map_id, map_obj.spec, _uuid.uuid4()
+                        MapObjectV1, actual_map_id, new_spec, _uuid.uuid4()
                     )
                     self.logger.info(f"Updated existing map '{actual_map_id}' in Postgres")
                 else:
@@ -828,34 +850,8 @@ class ApiDelegationService:
             # Fetch existing nodes and edges from the database
             try:
                 self.logger.info(f"Fetching nodes and edges for map: {actual_map_id}")
-                all_nodes_response = self.graph_db.get_all_nodes(actual_map_id)
-                all_edges_response = self.graph_db.get_edges(actual_map_id)
-                self.logger.info(f"Fetched {len(all_nodes_response)} nodes and {len(all_edges_response)} edges for map {actual_map_id}")
-
-                nodes_data = []
-                for node in all_nodes_response:
-                    pose = node.get("pose", {})
-                    x = pose.get("x") if pose else node.get("x", 0)
-                    y = pose.get("y") if pose else node.get("y", 0)
-                    yaw = pose.get("yaw") if pose else (node.get("theta") or node.get("yaw", 0))
-                    node_id = str(node.get("node_id") or node.get("_key"))
-                    nodes_data.append({
-                        "id": node_id,
-                        "x": x,
-                        "y": y,
-                        "theta": yaw,
-                        "timestamp": node.get("created_at"),
-                        "metadata": node.get("metadata", {})
-                    })
-
-                edges_data = []
-                for edge in all_edges_response:
-                    edges_data.append({
-                        "from": str(edge.get("from") or edge.get("from_node_id")),
-                        "to": str(edge.get("to") or edge.get("to_node_id")),
-                        "weight": edge.get("weight"),
-                        "metadata": edge.get("metadata", {})
-                    })
+                nodes_data, edges_data = self.read_graph(actual_map_id)
+                self.logger.info(f"Fetched {len(nodes_data)} nodes and {len(edges_data)} edges for map {actual_map_id}")
             except Exception as e:
                 self.logger.error(f"Failed to fetch nodes/edges for map {actual_map_id}: {e}", exc_info=True)
                 nodes_data = []
@@ -882,6 +878,54 @@ class ApiDelegationService:
                 "map_id": actual_map_id,
                 "error": str(e)
             }
+
+    def read_graph(self, map_id: str):
+        """(nodes, edges) of a map from ArangoDB in the POST /map/load / GET /maps/{id}/graph
+        shape. Read-only: a map without collections has none."""
+        nodes_data = []
+        for node in self.graph_db.get_all_nodes(map_id):
+            pose = node.get("pose", {})
+            x = pose.get("x") if pose else node.get("x", 0)
+            y = pose.get("y") if pose else node.get("y", 0)
+            yaw = pose.get("yaw") if pose else (node.get("theta") or node.get("yaw", 0))
+            node_id = str(node.get("node_id") or node.get("_key"))
+            nodes_data.append({
+                "id": node_id,
+                "x": x,
+                "y": y,
+                "theta": yaw,
+                "timestamp": node.get("created_at"),
+                "metadata": node.get("metadata", {})
+            })
+
+        edges_data = []
+        for edge in self.graph_db.get_edges(map_id):
+            edges_data.append({
+                "from": str(edge.get("from") or edge.get("from_node_id")),
+                "to": str(edge.get("to") or edge.get("to_node_id")),
+                "weight": edge.get("weight"),
+                "metadata": edge.get("metadata", {})
+            })
+        return nodes_data, edges_data
+
+    async def get_map_graph(self, map_id: str) -> Dict[str, Any]:
+        """GET /api/v1/maps/{id}/graph: the map's nodes and edges plus what places them (type,
+        geo, the legacy datum `transform`). 404 without a Postgres row, 409 while deleting."""
+        map_obj = await self.database.get_object(MapObjectV1, map_id)
+        if map_obj.lifecycle == ObjectLifecycleV1.DELETING:
+            raise HTTPException(status_code=409, detail=f"Map '{map_id}' is being deleted")
+        nodes, edges = await asyncio.to_thread(self.read_graph, map_id)
+        return {
+            "map_id": map_id,
+            "type": effective_type(map_obj),
+            "geo": map_obj.geo.dict() if map_obj.geo is not None else None,
+            "state": effective_state(map_obj.status),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "nodes": nodes,
+            "edges": edges,
+            "transform": map_datum_transform(map_obj.spec),
+        }
 
     async def get_map_status(self, map_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -946,6 +990,11 @@ class ApiDelegationService:
             "node_count": stats.get("node_count", 0),
             "edge_count": stats.get("edge_count", 0),
             "lifecycle": map_obj.lifecycle.value,
+            # Maps redesign M1: type (effective for rows stored without one), lifecycle state.
+            "type": effective_type(map_obj),
+            "state": effective_state(map_obj.status),
+            "open_session_id": map_obj.status.open_session_id,
+            "grid_version": map_obj.status.grid_version,
         }
         if map_obj.lifecycle == ObjectLifecycleV1.DELETING:
             # Progress of the background delete (packages/api/map_delete.py).
@@ -1061,7 +1110,8 @@ class ApiDelegationService:
         """Mark the map DELETING and start its ArangoDB/MinIO cleanup in the background
         (packages/api/map_delete.py). The Postgres row goes only once both stores are clean."""
         self.logger.info(f"Deleting map: {map_id}")
-        return await self.map_deleter.request(map_id)
+        # 409 while a mapping session is open (maps redesign M1).
+        return await self.map_deleter.request(map_id, guard=maps.refuse_open_session)
 
     async def map_lifecycle(self, map_id: str) -> Optional[ObjectLifecycleV1]:
         """The map's lifecycle, or None if it has no Postgres row."""

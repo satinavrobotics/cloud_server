@@ -1,0 +1,623 @@
+"""Typed maps, map lifecycle and mapping sessions (docs/satinav-maps-redesign.md §2-§4, §7; M1).
+
+    POST   /api/v1/maps                                  create_map()     -> draft
+    GET    /api/v1/maps?type=&state=&include_archived=   filter_maps()
+    GET    /api/v1/maps/{id}                             session_summary() (added to the old body)
+    PATCH  /api/v1/maps/{id}                             patch_map()      description only
+    POST   /api/v1/maps/{id}/sessions                    start_session()
+    POST   /api/v1/maps/{id}/sessions/{sid}/pause|resume|finish   session_action()
+    POST   /api/v1/maps/{id}/archive|restore             archive_map() / restore_map()
+    DELETE /api/v1/maps/{id}                             refuse_open_session() guards it
+
+The old map routes (POST /map/load, PUT /maps/{id}/datum, PUT /robots/{r}/map) are unchanged.
+
+Storage: the map is its `mapobjectv1` row (spec.type/geo, status.state/open_session_id; the
+object `lifecycle` ALIVE/DELETING stays the delete bookkeeping), sessions are `map_sessions`
+rows (migration 20260928_01_map_sessions). Every write here is ONE transaction on a pooled
+connection (PostgresDatabase.connection()): the map row is locked FOR UPDATE first, so writes to
+one map serialise; the session row, the map status, the `<publisher> <name> <lifecycle>` NOTIFY
+on the map table and the MAP.* event commit together. The event is written in a savepoint: a
+failing event write is logged and never fails the change.
+
+Session rules (M1):
+- the robot must exist (404) and be online (409); a robot has at most one open session anywhere
+  (409; the partial unique index backs this up);
+- one open session per map (409). The schema allows several (multi-robot mapping, doc §10), the
+  API does not yet;
+- geo map: the robot's current datum is required (409 without one). The first session of a geo
+  map without an origin sets it (doc Q1): `geo` = the datum's UTM point in its own zone, and the
+  map's legacy datum_* fields (when unset) = that origin as a 'utm' datum, so the old client and
+  planner place the map exactly. map_T_session: packages/utils/map_geo.py;
+- local map: identity; aligned only for the map's first session (a later one waits for M6);
+- no MQTT here: the robot-side mapping switch is M3, and graph-builder still ingests by
+  robot.current_map until M2 (sessions do not route nodes yet).
+
+Lifecycle: draft -> mapping <-> paused -> ready (finish) -> archived -> ready|draft (restore).
+Archive and delete are refused while a session is open. Repeating pause/resume/finish/archive/
+restore on a map or session already in that state is a no-op (`changed: false`, no event).
+"""
+
+import contextlib
+import datetime
+import json
+import logging
+import re
+import uuid
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
+
+import psycopg
+import pydantic
+from fastapi import HTTPException
+
+from cloud_common.objects.map import (
+    MAP_STATES, MAP_TYPES, MapObjectV1, MapSpecV1, MapStatusV1, effective_state,
+    effective_type,
+)
+from cloud_common.objects.object import ObjectLifecycleV1
+from cloud_common.objects.robot import RobotObjectV1
+from packages.events.codes import EventCode, Source
+from packages.events.emit import Event, emit
+from packages.utils import map_geo
+
+logger = logging.getLogger("ApiDelegationService.maps")
+
+MAP_TABLE = MapObjectV1.table_name()
+ROBOT_TABLE = RobotObjectV1.table_name()
+SESSIONS_TABLE = "map_sessions"
+DELETING = ObjectLifecycleV1.DELETING.value
+ALIVE = ObjectLifecycleV1.ALIVE.value
+
+DRAFT, MAPPING, PAUSED, READY, ARCHIVED = MAP_STATES
+OPEN_STATES = (MAPPING, PAUSED)
+SESSION_ACTIONS = ("pause", "resume", "finish")
+# Robot-map sentinels of the old API (robot.current_map); never real map names.
+RESERVED_NAMES = frozenset({"GEO", "LOCAL"})
+# The name is the key in Postgres, ArangoDB (nodes_<name>) and MinIO (bucket map-<name>,
+# lower-cased, '_' -> '-'; 63 characters at most), so it is restricted to what all three take.
+NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,57}[A-Za-z0-9])?$")
+SUMMARY_MAX_SESSIONS = 50
+
+SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "started_at", "paused_at",
+                   "ended_at", "datum", "map_t_session", "aligned", "node_count")
+
+# Event counters for health/debugging (as packages/api/recording.py).
+stats: Dict[str, int] = {"written": 0, "failed": 0}
+
+
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def bucket_key(name: str) -> str:
+    """What the name becomes in MinIO (packages/topomap_dbs/minio_base.py::_bucket_name)."""
+    return name.lower().replace("_", "-")
+
+
+# --- request bodies ----------------------------------------------------------------------------
+
+class CreateMapRequest(pydantic.BaseModel):
+    name: str
+    type: str
+    description: Optional[str] = None
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+    @pydantic.validator("name")
+    def _name(cls, value):  # noqa: N805 - pydantic v1 validator
+        if not NAME_RE.match(value):
+            raise ValueError("map name must be 1-59 characters of letters, digits, '_' or '-', "
+                             "starting and ending with a letter or digit")
+        if value in RESERVED_NAMES:
+            raise ValueError(f"{value!r} is reserved (robot-map sentinel)")
+        return value
+
+    @pydantic.validator("type")
+    def _type(cls, value):  # noqa: N805
+        if value not in MAP_TYPES:
+            raise ValueError(f"type must be one of {', '.join(MAP_TYPES)}")
+        return value
+
+
+class PatchMapRequest(pydantic.BaseModel):
+    description: Optional[str] = None
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+
+class StartSessionRequest(pydantic.BaseModel):
+    robot: str
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+
+def _unprocessable(exc: pydantic.ValidationError) -> HTTPException:
+    return HTTPException(422, [{"loc": ["body", *err["loc"]], "msg": err["msg"],
+                                "type": err["type"]} for err in exc.errors()])
+
+
+def parse_body(model: Any, data: Any) -> Any:
+    """`model` from a JSON body; 422 in FastAPI's shape on anything else. PATCH with `name`
+    says why (rename is not in M1)."""
+    if not isinstance(data, Mapping):
+        raise HTTPException(422, [{"loc": ["body"], "msg": "expected a JSON object",
+                                   "type": "type_error.dict"}])
+    if model is PatchMapRequest and "name" in data:
+        raise HTTPException(422, [{"loc": ["body", "name"], "type": "value_error",
+                                   "msg": "a map cannot be renamed (the name keys its data in "
+                                          "Postgres, ArangoDB and MinIO)"}])
+    try:
+        return model(**data)
+    except pydantic.ValidationError as exc:
+        raise _unprocessable(exc) from exc
+
+
+def check_filters(type_: Optional[str], state: Optional[str]) -> None:
+    for loc, value, allowed in (("type", type_, MAP_TYPES), ("state", state, MAP_STATES)):
+        if value is not None and value not in allowed:
+            raise HTTPException(422, [{"loc": ["query", loc], "type": "value_error",
+                                       "msg": f"must be one of {', '.join(allowed)}"}])
+
+
+# --- rows --------------------------------------------------------------------------------------
+
+class MapRow:
+    """A locked mapobjectv1 row: raw spec/status JSON plus the parsed object."""
+
+    def __init__(self, name: str, lifecycle: str, spec: Dict[str, Any],
+                 status: Dict[str, Any]):
+        self.name = name
+        self.lifecycle = lifecycle
+        self.spec = dict(spec or {})
+        self.status = dict(status or {})
+        self.obj = MapObjectV1(name=name, lifecycle=ObjectLifecycleV1[lifecycle],
+                               status=self.status, **self.spec)
+
+    @property
+    def type(self) -> str:
+        return effective_type(self.obj)
+
+    @property
+    def state(self) -> str:
+        return effective_state(self.obj.status)
+
+
+def _iso(ts: Any) -> Any:
+    return ts.isoformat() if isinstance(ts, datetime.datetime) else ts
+
+
+def session_dict(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """A session as the API returns it (map_t_session is shown as map_T_session, doc §4)."""
+    state = ("finished" if row.get("ended_at") is not None
+             else "paused" if row.get("paused_at") is not None else "mapping")
+    return {
+        "session_id": str(row["session_id"]),
+        "map_name": row["map_name"],
+        "robot_name": row["robot_name"],
+        "kind": row.get("kind", "live"),
+        "state": state,
+        "started_at": _iso(row.get("started_at")),
+        "paused_at": _iso(row.get("paused_at")),
+        "ended_at": _iso(row.get("ended_at")),
+        "datum": row.get("datum"),
+        "map_T_session": row.get("map_t_session"),
+        "aligned": row.get("aligned"),
+        "node_count": row.get("node_count", 0),
+    }
+
+
+# --- the SQL store -----------------------------------------------------------------------------
+
+class SqlStore:
+    """The statements of one transaction (unit tests substitute an in-memory store)."""
+
+    def __init__(self, conn: Any, cursor: Any, publisher_id: uuid.UUID):
+        self.conn = conn
+        self.cursor = cursor
+        self.publisher_id = publisher_id
+
+    async def lock_map(self, name: str) -> Optional[MapRow]:
+        await self.cursor.execute(
+            f"SELECT name, lifecycle, spec, status FROM {MAP_TABLE} WHERE name = %s "
+            "AND lifecycle <> 'DELETED' FOR UPDATE", (name,))
+        row = await self.cursor.fetchone()
+        return MapRow(*row) if row is not None else None
+
+    async def map_names(self) -> List[str]:
+        await self.cursor.execute(f"SELECT name FROM {MAP_TABLE}")
+        return [r[0] for r in await self.cursor.fetchall()]
+
+    async def insert_map(self, name: str, spec: Dict[str, Any], status: Dict[str, Any]) -> bool:
+        await self.cursor.execute(
+            f"INSERT INTO {MAP_TABLE} (name, lifecycle, spec, status) "
+            "VALUES (%s, %s, %s::jsonb, %s::jsonb) ON CONFLICT (name) DO NOTHING",
+            (name, ALIVE, json.dumps(spec), json.dumps(status)))
+        if not self.cursor.rowcount:
+            return False
+        await self._notify(name, ALIVE)
+        return True
+
+    async def update_map(self, row: MapRow, spec: Optional[Dict[str, Any]] = None,
+                         status: Optional[Dict[str, Any]] = None) -> None:
+        """Merge `spec` / `status` keys into the row (jsonb ||) and NOTIFY."""
+        await self.cursor.execute(
+            f"UPDATE {MAP_TABLE} SET spec = spec || %s::jsonb, status = status || %s::jsonb "
+            "WHERE name = %s", (json.dumps(spec or {}), json.dumps(status or {}), row.name))
+        await self._notify(row.name, row.lifecycle)
+
+    async def _notify(self, name: str, lifecycle: str) -> None:
+        # Same payload as PostgresDatabase._notify, so a PostgresWatcher(MapObjectV1) reads it.
+        await self.cursor.execute("SELECT pg_notify(%s, %s)",
+                                  (MAP_TABLE, f"{self.publisher_id} {name} {lifecycle}"))
+
+    async def robot(self, name: str) -> Optional[RobotObjectV1]:
+        await self.cursor.execute(
+            f"SELECT name, lifecycle, spec, status FROM {ROBOT_TABLE} WHERE name = %s "
+            "AND lifecycle <> 'DELETED'", (name,))
+        row = await self.cursor.fetchone()
+        if row is None:
+            return None
+        name, lifecycle, spec, status = row
+        return RobotObjectV1(name=name, lifecycle=ObjectLifecycleV1[lifecycle], status=status,
+                             **spec)
+
+    async def _sessions(self, where: str, params: tuple) -> List[Dict[str, Any]]:
+        await self.cursor.execute(
+            f"SELECT {', '.join(SESSION_COLUMNS)} FROM {SESSIONS_TABLE} WHERE {where} "
+            "ORDER BY started_at, session_id", params)
+        return [dict(zip(SESSION_COLUMNS, r)) for r in await self.cursor.fetchall()]
+
+    async def sessions(self, map_name: str) -> List[Dict[str, Any]]:
+        return await self._sessions("map_name = %s", (map_name,))
+
+    async def open_sessions_of_robot(self, robot_name: str) -> List[Dict[str, Any]]:
+        return await self._sessions("robot_name = %s AND ended_at IS NULL", (robot_name,))
+
+    async def lock_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        await self.cursor.execute(
+            f"SELECT {', '.join(SESSION_COLUMNS)} FROM {SESSIONS_TABLE} "
+            "WHERE session_id = %s FOR UPDATE", (uuid.UUID(str(session_id)),))
+        row = await self.cursor.fetchone()
+        return dict(zip(SESSION_COLUMNS, row)) if row is not None else None
+
+    async def insert_session(self, session: Dict[str, Any]) -> None:
+        try:
+            await self.cursor.execute(
+                f"INSERT INTO {SESSIONS_TABLE} (session_id, map_name, robot_name, kind, "
+                "started_at, datum, map_t_session, aligned, node_count) "
+                "VALUES (%s, %s, %s, 'live', %s, %s::jsonb, %s::jsonb, %s, 0)",
+                (uuid.UUID(str(session["session_id"])), session["map_name"], session["robot_name"],
+                 session["started_at"],
+                 json.dumps(session["datum"]) if session["datum"] is not None else None,
+                 json.dumps(session["map_t_session"]), session["aligned"]))
+        except psycopg.errors.UniqueViolation as exc:
+            raise HTTPException(409, f"Robot {session['robot_name']!r} already has an open "
+                                     "mapping session") from exc
+
+    async def update_session(self, session_id: str, **fields: Any) -> None:
+        cols = ", ".join(f"{k} = %s" for k in fields)
+        await self.cursor.execute(f"UPDATE {SESSIONS_TABLE} SET {cols} WHERE session_id = %s",
+                                  (*fields.values(), uuid.UUID(str(session_id))))
+
+    async def emit(self, event: Event) -> None:
+        """The event in a savepoint: its failure is logged and never fails the change."""
+        try:
+            async with self.conn.transaction():
+                await emit(self.conn, event)
+            stats["written"] += 1
+        except Exception:  # noqa: BLE001
+            stats["failed"] += 1
+            logger.exception("Could not write %s (the map change still commits)", event.code)
+
+
+@contextlib.asynccontextmanager
+async def open_store(db: Any, publisher_id: uuid.UUID) -> AsyncIterator[SqlStore]:
+    """One transaction: commits on a clean exit, rolls back on an exception."""
+    async with db.connection() as conn:
+        async with conn.cursor() as cursor:
+            yield SqlStore(conn, cursor, publisher_id)
+
+
+def _undefined_table(exc: Exception) -> HTTPException:
+    return HTTPException(503, "Mapping sessions are not available (database migrations not "
+                              "applied)")
+
+
+# --- helpers -----------------------------------------------------------------------------------
+
+async def _lock_alive_map(store: Any, name: str) -> MapRow:
+    row = await store.lock_map(name)
+    if row is None:
+        raise HTTPException(404, f"Did not find \"map\" with name \"{name}\"")
+    if row.lifecycle == DELETING:
+        raise HTTPException(409, f"Map '{name}' is being deleted")
+    return row
+
+
+def _map_event(code: EventCode, row_name: str, map_type: Optional[str], state: str,
+               actor: Optional[str], ts: datetime.datetime) -> Event:
+    return Event(code, ts, source=Source.API, discriminator=f"map:{row_name}:{state}",
+                 payload={"map_name": row_name, "map_type": map_type, "state": state,
+                          "actor": actor})
+
+
+def _session_event(code: EventCode, session: Mapping[str, Any], map_state: str,
+                   actor: Optional[str], ts: datetime.datetime) -> Event:
+    action = code.value.rsplit("_", 1)[-1].lower()
+    return Event(code, ts, robot_name=session["robot_name"], source=Source.API,
+                 discriminator=f"session:{session['session_id']}:{action}",
+                 payload={"map_name": session["map_name"],
+                          "session_id": str(session["session_id"]), "map_state": map_state,
+                          "aligned": session.get("aligned"),
+                          "map_T_session": session.get("map_t_session"), "actor": actor})
+
+
+def map_view(obj: MapObjectV1) -> Dict[str, Any]:
+    """obj.dict() with the effective type/state filled in (old rows have neither)."""
+    data = obj.dict()
+    data["type"] = effective_type(obj)
+    data.setdefault("status", {})["state"] = effective_state(obj.status)
+    return data
+
+
+# --- maps --------------------------------------------------------------------------------------
+
+async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optional[str] = None,
+                     arango_node_count: Optional[Callable[[str], int]] = None
+                     ) -> Dict[str, Any]:
+    """A new draft map. 409 if the name exists (or is being deleted), if it collides with an
+    existing map's MinIO bucket, or if ArangoDB already holds nodes under it (a map without a
+    Postgres row: adopt it with POST /map/load, or delete it first)."""
+    req = parse_body(CreateMapRequest, data)
+    if arango_node_count is not None:
+        nodes = arango_node_count(req.name)
+        if nodes:
+            raise HTTPException(409, f"ArangoDB already has {nodes} nodes for map "
+                                     f"'{req.name}' (no Postgres row); choose another name")
+    spec = json.loads(MapSpecV1(description=req.description, type=req.type).json())
+    status = json.loads(MapStatusV1(state=DRAFT).json())
+    now = _utcnow()
+    async with open_store(db, publisher_id) as store:
+        clash = [n for n in await store.map_names()
+                 if n != req.name and bucket_key(n) == bucket_key(req.name)]
+        if clash:
+            raise HTTPException(409, f"Map name '{req.name}' collides with existing map "
+                                     f"'{clash[0]}' (same image bucket)")
+        if not await store.insert_map(req.name, spec, status):
+            raise HTTPException(409, f"Map '{req.name}' already exists")
+        await store.emit(_map_event(EventCode.MAP_CREATED, req.name, req.type, DRAFT, actor, now))
+    obj = MapObjectV1(name=req.name, status=status, **spec)
+    return map_view(obj)
+
+
+def filter_maps(maps: List[MapObjectV1], type_: Optional[str] = None,
+                state: Optional[str] = None, include_archived: bool = False
+                ) -> List[Dict[str, Any]]:
+    """GET /api/v1/maps: DELETING maps hidden (as before), archived ones unless asked for."""
+    check_filters(type_, state)
+    out = []
+    for m in maps:
+        if m.lifecycle == ObjectLifecycleV1.DELETING:
+            continue
+        view = map_view(m)
+        s = view["status"]["state"]
+        if state is not None and s != state:
+            continue
+        if state is None and s == ARCHIVED and not include_archived:
+            continue
+        if type_ is not None and view["type"] != type_:
+            continue
+        out.append(view)
+    return out
+
+
+async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID) -> Dict[str, Any]:
+    req = parse_body(PatchMapRequest, data)
+    changes = req.dict(exclude_unset=True)
+    async with open_store(db, publisher_id) as store:
+        row = await _lock_alive_map(store, name)
+        if changes:
+            await store.update_map(row, spec=changes)
+            row.spec.update(changes)
+    return map_view(MapObjectV1(name=name, status=row.status, **row.spec))
+
+
+async def session_summary(db: Any, name: str) -> Dict[str, Any]:
+    """The `sessions` block of GET /api/v1/maps/{id}: counts, the open session, and the newest
+    SUMMARY_MAX_SESSIONS sessions (newest first)."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            rows = await store.sessions(name)
+    except psycopg.errors.UndefinedTable as exc:
+        raise _undefined_table(exc) from exc
+    items = [session_dict(r) for r in reversed(rows)]
+    open_items = [s for s in items if s["state"] != "finished"]
+    return {"count": len(items), "open": open_items[0] if open_items else None,
+            "unaligned": sum(1 for s in items if s["aligned"] is False),
+            "items": items[:SUMMARY_MAX_SESSIONS]}
+
+
+async def _archive_or_restore(db: Any, name: str, archive: bool, publisher_id: uuid.UUID,
+                              actor: Optional[str]) -> Dict[str, Any]:
+    now = _utcnow()
+    async with open_store(db, publisher_id) as store:
+        row = await _lock_alive_map(store, name)
+        state = row.state
+        if archive:
+            if state == ARCHIVED:
+                return {"map_id": name, "state": state, "changed": False}
+            open_sessions = [s for s in await store.sessions(name) if s["ended_at"] is None]
+            if open_sessions or state in OPEN_STATES:
+                raise HTTPException(409, f"Map '{name}' has an open mapping session; finish "
+                                         "it before archiving")
+            new_state, code = ARCHIVED, EventCode.MAP_ARCHIVED
+        else:
+            if state != ARCHIVED:
+                return {"map_id": name, "state": state, "changed": False}
+            new_state = READY if await store.sessions(name) else DRAFT
+            code = EventCode.MAP_RESTORED
+        await store.update_map(row, status={"state": new_state})
+        await store.emit(_map_event(code, name, row.type, new_state, actor, now))
+    return {"map_id": name, "state": new_state, "changed": True}
+
+
+async def archive_map(db: Any, name: str, publisher_id: uuid.UUID,
+                      actor: Optional[str] = None) -> Dict[str, Any]:
+    return await _archive_or_restore(db, name, True, publisher_id, actor)
+
+
+async def restore_map(db: Any, name: str, publisher_id: uuid.UUID,
+                      actor: Optional[str] = None) -> Dict[str, Any]:
+    return await _archive_or_restore(db, name, False, publisher_id, actor)
+
+
+REFUSE_OPEN_SESSION_SQL = (f"SELECT session_id FROM {SESSIONS_TABLE} "
+                           "WHERE map_name = %s AND ended_at IS NULL LIMIT 1")
+LOCK_MAP_SQL = f"SELECT 1 FROM {MAP_TABLE} WHERE name = %s FOR UPDATE"
+
+
+async def refuse_open_session(cursor: Any, map_id: str) -> None:
+    """DELETE /api/v1/maps/{id} guard, run by MapDeleter.request() in its own transaction before
+    the map is marked DELETING: the map row lock serialises it with a session start."""
+    await cursor.execute(LOCK_MAP_SQL, (map_id,))
+    await cursor.execute(REFUSE_OPEN_SESSION_SQL, (map_id,))
+    if await cursor.fetchone() is not None:
+        raise HTTPException(409, f"Map '{map_id}' has an open mapping session; finish it "
+                                 "before deleting the map")
+
+
+# --- sessions ----------------------------------------------------------------------------------
+
+def plan_session(row: MapRow, robot: RobotObjectV1, previous: List[Dict[str, Any]]
+                 ) -> Dict[str, Any]:
+    """What a new session on `row` by `robot` records, and what it changes on the map:
+    {'datum', 'map_t_session', 'aligned', 'spec'} (pure; 409 if a geo map has no datum)."""
+    map_type = row.type
+    spec_patch: Dict[str, Any] = {}
+    if row.obj.type is None:
+        spec_patch["type"] = map_type
+    if map_type == "geo":
+        datum = map_geo.robot_datum(robot.datum)
+        if datum is None:
+            raise HTTPException(409, f"Map '{row.name}' is a geo map and robot "
+                                     f"'{robot.name}' has no datum; start the robot's "
+                                     "localization (GNSS) first")
+        geo = row.spec.get("geo")
+        if not geo:
+            geo = map_geo.geo_from_datum(datum)
+            spec_patch["geo"] = geo
+            if row.obj.datum_latitude is None:
+                spec_patch.update(origin_as_legacy_datum(geo))
+        return {"datum": datum, "map_t_session": map_geo.session_transform(geo, datum),
+                "aligned": True, "spec": spec_patch}
+    return {"datum": None, "map_t_session": dict(map_geo.IDENTITY), "aligned": not previous,
+            "spec": spec_patch}
+
+
+def origin_as_legacy_datum(geo: Mapping[str, Any]) -> Dict[str, Any]:
+    """The map's datum_* fields for a geo map origin: a 'utm' datum at the origin, bearing 0,
+    i.e. exactly the map frame, for the old client/planner (map/load `transform`)."""
+    from packages.utils import geo as geo_mod
+    lat, lon = geo_mod.utm_to_latlon(geo["origin_e"], geo["origin_n"], geo["utm_zone"],
+                                     geo["utm_north"])
+    return {"datum_latitude": lat, "datum_longitude": lon, "datum_bearing_deg": 0.0,
+            "datum_frame": "utm", "datum_utm_zone": geo["utm_zone"],
+            "datum_utm_north": geo["utm_north"], "datum_utm_easting": geo["origin_e"],
+            "datum_utm_northing": geo["origin_n"]}
+
+
+async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UUID,
+                        actor: Optional[str] = None) -> Dict[str, Any]:
+    req = parse_body(StartSessionRequest, data)
+    now = _utcnow()
+    try:
+        async with open_store(db, publisher_id) as store:
+            row = await _lock_alive_map(store, map_name)
+            if row.state == ARCHIVED:
+                raise HTTPException(409, f"Map '{map_name}' is archived; restore it first")
+            robot = await store.robot(req.robot)
+            if robot is None:
+                raise HTTPException(404, f"Did not find \"robot\" with name \"{req.robot}\"")
+            if not robot.status.online:
+                raise HTTPException(409, f"Robot '{req.robot}' is offline")
+            mine = await store.open_sessions_of_robot(req.robot)
+            if mine:
+                raise HTTPException(409, f"Robot '{req.robot}' already has an open mapping "
+                                         f"session on map '{mine[0]['map_name']}'")
+            previous = await store.sessions(map_name)
+            if any(s["ended_at"] is None for s in previous):
+                raise HTTPException(409, f"Map '{map_name}' already has an open mapping "
+                                         "session (one robot per map for now)")
+            plan = plan_session(row, robot, previous)
+            session = {"session_id": str(uuid.uuid4()), "map_name": map_name,
+                       "robot_name": req.robot, "kind": "live", "started_at": now,
+                       "paused_at": None, "ended_at": None, "datum": plan["datum"],
+                       "map_t_session": plan["map_t_session"], "aligned": plan["aligned"],
+                       "node_count": 0}
+            await store.insert_session(session)
+            await store.update_map(row, spec=plan["spec"] or None,
+                                   status={"state": MAPPING,
+                                           "open_session_id": session["session_id"]})
+            await store.emit(_session_event(EventCode.MAP_SESSION_STARTED, session, MAPPING,
+                                            actor, now))
+    except psycopg.errors.UndefinedTable as exc:
+        raise _undefined_table(exc) from exc
+    return {"map_id": map_name, "map_state": MAPPING, "changed": True,
+            "session": session_dict(session)}
+
+
+async def session_action(db: Any, map_name: str, session_id: str, action: str,
+                         publisher_id: uuid.UUID, actor: Optional[str] = None
+                         ) -> Dict[str, Any]:
+    """pause / resume / finish (see the module docstring)."""
+    if action not in SESSION_ACTIONS:
+        raise HTTPException(404, f"Unknown session action {action!r}")
+    try:
+        uuid.UUID(str(session_id))
+    except ValueError:
+        raise HTTPException(404, f"Did not find mapping session \"{session_id}\"") from None
+    now = _utcnow()
+    try:
+        async with open_store(db, publisher_id) as store:
+            row = await _lock_alive_map(store, map_name)
+            session = await store.lock_session(session_id)
+            if session is None or session["map_name"] != map_name:
+                raise HTTPException(404, f"Did not find mapping session \"{session_id}\" on "
+                                         f"map \"{map_name}\"")
+            ended = session["ended_at"] is not None
+            paused = session["paused_at"] is not None
+            if action == "finish":
+                if ended:
+                    return _unchanged(map_name, row.state, session)
+                session.update(ended_at=now, paused_at=None)
+                await store.update_session(session_id, ended_at=now, paused_at=None)
+                others = [s for s in await store.sessions(map_name)
+                          if s["ended_at"] is None and str(s["session_id"]) != str(session_id)]
+                status = ({"state": READY, "open_session_id": None} if not others else
+                          {"open_session_id": str(others[0]["session_id"])})
+                code = EventCode.MAP_SESSION_FINISHED
+            else:
+                if ended:
+                    raise HTTPException(409, f"Mapping session {session_id} is finished")
+                if (action == "pause") == paused:
+                    return _unchanged(map_name, row.state, session)
+                stamp = now if action == "pause" else None
+                session["paused_at"] = stamp
+                await store.update_session(session_id, paused_at=stamp)
+                status = {"state": PAUSED if action == "pause" else MAPPING}
+                code = (EventCode.MAP_SESSION_PAUSED if action == "pause"
+                        else EventCode.MAP_SESSION_RESUMED)
+            await store.update_map(row, status=status)
+            map_state = status.get("state", row.state)
+            await store.emit(_session_event(code, session, map_state, actor, now))
+    except psycopg.errors.UndefinedTable as exc:
+        raise _undefined_table(exc) from exc
+    return {"map_id": map_name, "map_state": map_state, "changed": True,
+            "session": session_dict(session)}
+
+
+def _unchanged(map_name: str, map_state: str, session: Mapping[str, Any]) -> Dict[str, Any]:
+    return {"map_id": map_name, "map_state": map_state, "changed": False,
+            "session": session_dict(session)}

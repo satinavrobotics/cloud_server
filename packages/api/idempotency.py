@@ -58,6 +58,8 @@ GUARDED_ROUTES: Tuple[Tuple[str, str], ...] = (
     ("POST", "/api/v1/robots/{robot_name}/cancel-order"),
     ("POST", "/api/v1/map/load"),
     ("DELETE", "/api/v1/maps/{map_id}"),
+    ("POST", "/api/v1/maps"),
+    ("POST", "/api/v1/maps/{map_id}/sessions"),
     ("DELETE", "/api/v1/missions/{mission_name}"),
     ("POST", "/api/v1/runs/archive"),
 )

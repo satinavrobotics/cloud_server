@@ -1,6 +1,8 @@
 """Unit tests for map CRUD API endpoints and GPS navigation."""
 
 import pytest
+
+from packages.api import maps
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 import uuid
 
@@ -409,7 +411,8 @@ class TestApiDelegationDeleteMapPostgres:
         result = await service.delete_map("site_a")
 
         assert result == body
-        service.map_deleter.request.assert_awaited_once_with("site_a")
+        service.map_deleter.request.assert_awaited_once_with(
+            "site_a", guard=maps.refuse_open_session)
         # Nothing is deleted in the request path any more.
         mock_graph_inst.delete_map.assert_not_called()
         mock_image.return_value.delete_map.assert_not_called()

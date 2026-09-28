@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import fleet_reads, recorder_health, recording, run_admin, sites
+from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, sites
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -396,6 +396,18 @@ async def root():
             "stats": "GET /stats",
             "list_maps": "GET /api/v1/maps",
             "load_map": "POST /api/v1/map/load",
+            "maps": {
+                "create": "POST /api/v1/maps",
+                "get": "GET /api/v1/maps/{map_id}",
+                "update": "PATCH /api/v1/maps/{map_id}",
+                "graph": "GET /api/v1/maps/{map_id}/graph",
+                "start_session": "POST /api/v1/maps/{map_id}/sessions",
+                "session_action": "POST /api/v1/maps/{map_id}/sessions/{session_id}/"
+                                  "{pause|resume|finish}",
+                "archive": "POST /api/v1/maps/{map_id}/archive",
+                "restore": "POST /api/v1/maps/{map_id}/restore",
+                "delete": "DELETE /api/v1/maps/{map_id}",
+            },
             "get_image": "GET /api/v1/images/{map_id}/{node_id}",
             "rosbags": {
                 "upload_url": "POST /api/v1/rosbags/upload-url",
@@ -451,20 +463,42 @@ async def root():
 # ==================== Map Operations ====================
 
 @app.get("/api/v1/maps")
-async def list_maps():
-    """List all maps registered in Postgres (includes datum and metadata)."""
+async def list_maps(type: Optional[str] = None, state: Optional[str] = None,
+                    include_archived: bool = False):
+    """List all maps registered in Postgres (includes datum and metadata).
+
+    Maps redesign M1: every map carries `type` ('local'|'geo', plus `geo` for a geo map) and
+    `status.state`. Optional filters `type=` and `state=`; archived maps are left out unless
+    `include_archived=true` or `state=archived`. DELETING maps are always hidden."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
-        maps = await service.database.list_objects(MapObjectV1)
+        found = await service.database.list_objects(MapObjectV1)
         # A DELETING map is on its way out (packages/api/map_delete.py): hidden.
-        maps = [m for m in maps if m.lifecycle != ObjectLifecycleV1.DELETING]
-        return {"maps": [m.dict() for m in maps], "count": len(maps)}
+        views = maps.filter_maps(found, type_=type, state=state,
+                                 include_archived=include_archived)
+        return {"maps": views, "count": len(views)}
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"Failed to list maps: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list maps: {str(e)}")
+
+
+@app.post("/api/v1/maps", status_code=201)
+async def create_map(body: Dict[str, Any]):
+    """Create a map `{name, type: 'local'|'geo', description?}` in state `draft` (maps
+    redesign M1). 409 if the name is taken. A geo map gets its UTM zone and origin from its
+    first mapping session's datum."""
+    _require_service()
+
+    def arango_nodes(name: str) -> int:
+        stats = service.graph_db.get_map_stats(name)
+        return 0 if "error" in stats else int(stats.get("node_count") or 0)
+
+    return await _site_call("create map", maps.create_map(
+        service.database, body, uuid.uuid4(), recording.request_actor(),
+        arango_node_count=arango_nodes))
 
 
 
@@ -499,7 +533,64 @@ async def get_map(map_id: str):
     result = await service.get_map(map_id)
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error"))
+    # Maps redesign M1: the map's mapping sessions (count, open one, newest first).
+    result["sessions"] = await _site_call("list map sessions",
+                                          maps.session_summary(service.database, map_id))
     return result
+
+
+@app.patch("/api/v1/maps/{map_id}")
+async def patch_map(map_id: str, body: Dict[str, Any]):
+    """Change a map's `description` (maps redesign M1). A map cannot be renamed (422)."""
+    _require_service()
+    return await _site_call("update map", maps.patch_map(service.database, map_id, body,
+                                                         uuid.uuid4()))
+
+
+@app.get("/api/v1/maps/{map_id}/graph")
+async def get_map_graph(map_id: str):
+    """The map's nodes and edges (what POST /api/v1/map/load returns, without its side
+    effects), with type/geo/state and the legacy datum `transform`."""
+    _require_service()
+    return await _site_call("read map graph", service.get_map_graph(map_id))
+
+
+@app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
+async def start_map_session(map_id: str, body: Dict[str, Any]):
+    """Start a mapping session `{robot}` on the map (maps redesign M1): the robot must be
+    online and have no other open session; a geo map needs the robot's datum. The map goes to
+    `mapping`. Robot-side switching is not wired yet (M3) and graph-builder still ingests by
+    the robot's current_map (until M2)."""
+    _require_service()
+    return await _site_call("start map session", maps.start_session(
+        service.database, map_id, body, uuid.uuid4(), recording.request_actor()))
+
+
+@app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
+async def map_session_action(map_id: str, session_id: str, action: str):
+    """`pause`, `resume` or `finish` a mapping session. Finishing the map's only open session
+    makes the map `ready`. Repeating an action that is already in effect changes nothing."""
+    _require_service()
+    return await _site_call(f"{action} map session", maps.session_action(
+        service.database, map_id, session_id, action, uuid.uuid4(),
+        recording.request_actor()))
+
+
+@app.post("/api/v1/maps/{map_id}/archive")
+async def archive_map(map_id: str):
+    """Archive a map: hidden from GET /api/v1/maps by default, nothing deleted. 409 while a
+    mapping session is open."""
+    _require_service()
+    return await _site_call("archive map", maps.archive_map(
+        service.database, map_id, uuid.uuid4(), recording.request_actor()))
+
+
+@app.post("/api/v1/maps/{map_id}/restore")
+async def restore_map(map_id: str):
+    """Restore an archived map (to `ready`, or `draft` if it never had a session)."""
+    _require_service()
+    return await _site_call("restore map", maps.restore_map(
+        service.database, map_id, uuid.uuid4(), recording.request_actor()))
 
 
 class UpdateDatumRequest(BaseModel):
@@ -548,6 +639,8 @@ async def update_map_datum(map_id: str, request: UpdateDatumRequest):
 async def delete_map(map_id: str):
     """
     Delete a map and all its data from the graph and image databases.
+
+    409 while the map has an open mapping session (maps redesign M1).
 
     Returns 202 at once: the map is marked DELETING (hidden from GET /api/v1/maps, 409 on
     assign/load/datum) and a background task deletes it from ArangoDB and MinIO, retrying
