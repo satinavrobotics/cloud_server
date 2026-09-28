@@ -223,13 +223,14 @@ class Arango:
 
 
 class Postgres:
-    def __init__(self):
+    def __init__(self, read_only: bool = True):
         import psycopg
         from packages import config
         self.conn = psycopg.connect(
             f"dbname={config.POSTGRES_DATABASE_NAME} user={config.POSTGRES_DATABASE_USERNAME} "
             f"host={config.POSTGRES_DATABASE_HOST} port={config.POSTGRES_DATABASE_PORT} "
-            f"password={config.POSTGRES_DATABASE_PASSWORD}")
+            f"password={config.POSTGRES_DATABASE_PASSWORD}"
+            + (" options='-c default_transaction_read_only=on'" if read_only else ""))
 
     def maps(self, names: Optional[List[str]]) -> List[tuple]:
         sql = ("SELECT name, spec, status FROM mapobjectv1 WHERE lifecycle = 'ALIVE'"
@@ -301,7 +302,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--include-live", action="store_true",
                     help="with --revert: also nodes of live (M2) sessions")
     args = ap.parse_args(argv)
-    pg, arango = Postgres(), Arango()
+    pg, arango = Postgres(read_only=not args.apply), Arango()  # a dry run cannot write
     mode = ("REVERT" if args.revert else "MIGRATE") + (" (apply)" if args.apply else " (dry run)")
     print(f"maps_m2_legacy_nodes: {mode}")
     total = 0
