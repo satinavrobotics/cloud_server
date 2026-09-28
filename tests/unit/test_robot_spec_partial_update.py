@@ -70,7 +70,9 @@ async def test_datum_write_keeps_a_concurrent_level_change():
     assert db.writes == [("fields", "r1", ["datum"])]
     assert db.spec["telemetry_recording"] == "full"       # survived the datum write
     assert db.spec["labels"] == ["ops"]
-    assert db.spec["datum"] == {"latitude": 47.5, "longitude": 19.0, "bearing_deg": 12.0}
+    assert db.spec["datum"] == {"latitude": 47.5, "longitude": 19.0, "bearing_deg": 12.0,
+                                "frame": "enu", "utm_zone": None, "utm_north": None,
+                                "utm_easting": None, "utm_northing": None}
     assert r._robot_object.datum.latitude == 47.5          # cache kept in sync as before
     # the stored spec still loads as a robot
     api_objects.RobotObjectV1(name="r1", status={}, **db.spec)

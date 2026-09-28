@@ -646,7 +646,21 @@ class VDA5050Connection(pydantic.BaseModel):
 
 
 class RobotDatum(pydantic.BaseModel):
-    """GPS origin published by the robot on its /{robot_name}/datum MQTT topic."""
+    """GPS origin published by the robot on its /{robot_name}/datum MQTT topic.
+
+    `frame` says what the robot's local x/y are (packages/utils/geo.py): "utm" (the robot's
+    VDA5050 client: UTM grid offsets from the datum, with the zone/hemisphere and the datum's
+    exact easting/northing) or "enu" (the orchestrator's gps_anchor: tangent-plane east/north).
+    Robots from before the field existed send no frame, which means "enu".
+    """
     latitude: float
     longitude: float
     bearing_deg: float = 0.0
+    frame: common.DatumFrameV1 = "enu"
+    utm_zone: Optional[int] = pydantic.Field(None, ge=1, le=60)
+    utm_north: Optional[bool] = None
+    utm_easting: Optional[float] = None
+    utm_northing: Optional[float] = None
+
+    _normalize_frame = pydantic.validator("frame", pre=True, allow_reuse=True)(
+        common.normalize_datum_frame)

@@ -796,9 +796,7 @@ class Robot:
         return finished_instant_actions
     async def _process_datum_message(self, msg: types.RobotDatum) -> None:
         """Persist robot datum and auto-seed the current map's datum if it has none."""
-        self._robot_object.datum.latitude = msg.latitude
-        self._robot_object.datum.longitude = msg.longitude
-        self._robot_object.datum.bearing_deg = msg.bearing_deg
+        self._robot_object.datum = robot_object.RobotDatumV1(**msg.dict())
         # Only the datum (robots send it every few seconds): writing the cached full spec
         # back would revert any spec change committed since the cache was filled.
         await self._database.update_spec_fields(
@@ -813,6 +811,12 @@ class Robot:
                     map_obj.datum_latitude = msg.latitude
                     map_obj.datum_longitude = msg.longitude
                     map_obj.datum_bearing_deg = msg.bearing_deg
+                    # The frame too: without it a UTM robot's map would be read as ENU.
+                    map_obj.datum_frame = msg.frame
+                    map_obj.datum_utm_zone = msg.utm_zone
+                    map_obj.datum_utm_north = msg.utm_north
+                    map_obj.datum_utm_easting = msg.utm_easting
+                    map_obj.datum_utm_northing = msg.utm_northing
                     await self._database.update_spec(
                         api_objects.MapObjectV1, current_map, map_obj.spec, uuid.uuid4()
                     )

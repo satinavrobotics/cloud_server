@@ -33,6 +33,21 @@ TELEMETRY_RECORDING_LEVELS = ("full", "events_only", "off")
 TelemetryRecordingV1 = Literal["full", "events_only", "off"]
 
 
+# Frame of a GPS datum's local x/y (packages/utils/geo.py): "utm" = UTM grid offsets from the
+# datum (robot with GNSS, sati_vda5050_client), "enu" = east/north in the tangent plane at the
+# datum (sim, orchestrator gps_anchor). A datum without a frame is "enu" (all of them were,
+# before the frame was sent).
+DATUM_FRAMES = ("enu", "utm")
+DatumFrameV1 = Literal["enu", "utm"]
+
+
+def normalize_datum_frame(value: Any) -> Any:
+    """Pre-validator body for a datum frame field: None/"" -> "enu", case-insensitive."""
+    if value is None or value == "":
+        return "enu"
+    return value.strip().lower() if isinstance(value, str) else value
+
+
 def telemetry_recording_field(scope: str) -> Any:
     """The optional `telemetry_recording` spec field; None means "not set here"."""
     return pydantic.Field(

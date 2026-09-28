@@ -21,7 +21,7 @@ import datetime
 from typing import Any, Dict, Optional
 import pydantic
 
-from cloud_common.objects import object
+from cloud_common.objects import common, object
 
 
 class MapSpecV1(pydantic.BaseModel):
@@ -35,12 +35,30 @@ class MapSpecV1(pydantic.BaseModel):
     datum_bearing_deg: float = pydantic.Field(
         0.0,
         description=(
-            "Angle in degrees (counter-clockwise positive, standard math convention) "
-            "from the map's positive X-axis to true north. "
-            "Example: 0° means map +X points east and +Y points north; "
-            "90° means map +X points north and +Y points west. "
-            "Used to rotate between local Cartesian and geographic frames."
+            "Angle in degrees of the map's +X axis from east (grid east for a 'utm' datum), "
+            "counter-clockwise positive. 0 means +X east and +Y north; 90 means +X north and "
+            "+Y west. Rotates between the local Cartesian and the geographic frame "
+            "(packages/utils/geo.py)."
         ))
+    datum_frame: common.DatumFrameV1 = pydantic.Field(
+        "enu",
+        description=(
+            "Frame of the map's local x/y: 'utm' = UTM grid offsets from the datum (real robot "
+            "with GNSS), 'enu' = east/north in the tangent plane at the datum (sim). Maps "
+            "stored before this field existed are 'enu'."
+        ))
+    datum_utm_zone: Optional[int] = pydantic.Field(
+        None, ge=1, le=60,
+        description="UTM zone of a 'utm' datum (default: the datum longitude's zone).")
+    datum_utm_north: Optional[bool] = pydantic.Field(
+        None, description="UTM hemisphere of a 'utm' datum (default: the datum's own).")
+    datum_utm_easting: Optional[float] = pydantic.Field(
+        None, description="Exact UTM easting of a 'utm' datum, when the robot reported it.")
+    datum_utm_northing: Optional[float] = pydantic.Field(
+        None, description="Exact UTM northing of a 'utm' datum, when the robot reported it.")
+
+    _normalize_frame = pydantic.validator("datum_frame", pre=True, allow_reuse=True)(
+        common.normalize_datum_frame)
 
 
 class MapStatusV1(pydantic.BaseModel):

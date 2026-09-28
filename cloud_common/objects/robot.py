@@ -117,7 +117,22 @@ class RobotDatumV1(pydantic.BaseModel):
     longitude: Optional[float] = pydantic.Field(
         None, description="WGS84 longitude of the robot's local-frame origin.")
     bearing_deg: float = pydantic.Field(
-        0.0, description="Angle from robot local +X axis to true north, in degrees.")
+        0.0, description="Angle of the robot's local +X axis from east (grid east for 'utm'), "
+                         "counter-clockwise positive, in degrees.")
+    frame: common.DatumFrameV1 = pydantic.Field(
+        "enu", description="Frame of the local x/y: 'utm' = UTM grid offsets from the datum, "
+                           "'enu' = east/north in the tangent plane at the datum.")
+    utm_zone: Optional[int] = pydantic.Field(
+        None, ge=1, le=60, description="UTM zone of a 'utm' datum.")
+    utm_north: Optional[bool] = pydantic.Field(
+        None, description="UTM hemisphere of a 'utm' datum (True = north).")
+    utm_easting: Optional[float] = pydantic.Field(
+        None, description="Exact UTM easting of a 'utm' datum, if the robot sent it.")
+    utm_northing: Optional[float] = pydantic.Field(
+        None, description="Exact UTM northing of a 'utm' datum, if the robot sent it.")
+
+    _normalize_frame = pydantic.validator("frame", pre=True, allow_reuse=True)(
+        common.normalize_datum_frame)
 
 
 class RobotStatusV1(pydantic.BaseModel):
