@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 built, not deployed** (branch off `2e0b63a`; deploy script `~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). M3 onwards: not started.
+**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). M3 onwards: not started.
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -193,7 +193,8 @@ Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.ARCHI
 
 ## 8. Robot side (this phase only)
 
-- **Mapping switch over MQTT.** `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to `{prefix}/{robot}/mapping/set` (`{enabled, session_id}`) and publishes `{prefix}/{robot}/mapping/state` (retained: `enabled`, `session_id`, node counter). It already has an MQTT connection, so no orchestrator or VDA5050 change is needed. It tags every node and image with `session_id`.
+- **Mapping switch over MQTT.** `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to `{prefix}/{robot}/mapping/set` (`{enabled, session_id}`) and publishes `{prefix}/{robot}/mapping/state` (retained: `enabled`, `session_id`, node counter). It already has an MQTT connection, so no orchestrator or VDA5050 change is needed.
+- **No session tagging for now** (decided 2026-09-28). The server resolves the session from the robot name. Tagging would only catch a late node from a finished session (e.g. re-sent after an MQTT reconnect) landing in the robot's next session; graph-builder already rejects a mismatching `session_id` if one is ever sent, so it can be added later without a server change.
 - **Starting the topomap service itself:** the session-start call checks, through the existing orchestrator proxy, whether the mapping service is running. If it isn't, the client tells the user to start it; nothing is started automatically (Q3, decided).
 - **No map download, no relocalization.**
 
@@ -258,7 +259,7 @@ Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are
 | M0 | Coordinate conversion fix (§5) | all four; in progress |
 | M1 | Map spec + `map_sessions` + migration of today's data (§4, §12); new map endpoints (§7) behind the old ones | cloud_server; **built, not deployed** (§13.1) |
 | M2 | graph-builder ingest by session (§6); `MAP.INGEST_REJECTED`; clear `robot.current_map` (§12 step 4); legacy node poses (§12) | cloud_server; **built, not deployed** (§13.2) |
-| M3 | Robot mapping switch over MQTT, session tagging (§8) | sati_ros_navstack |
+| M3 | Robot mapping switch over MQTT (§8); no session tagging | sati_ros_navstack |
 | M4 | Client: Maps page, mapping bar, session start (§9, first half) | sati-client |
 | M5 | Client: one `MapView` replacing the three map views (§9, second half) | sati-client |
 | M6 | Local-map session alignment tool | cloud_server, sati-client |
