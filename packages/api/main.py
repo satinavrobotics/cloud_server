@@ -559,8 +559,10 @@ async def get_map_graph(map_id: str):
 async def start_map_session(map_id: str, body: Dict[str, Any]):
     """Start a mapping session `{robot}` on the map (maps redesign M1): the robot must be
     online and have no other open session; a geo map needs the robot's datum. The map goes to
-    `mapping`. Robot-side switching is not wired yet (M3) and graph-builder still ingests by
-    the robot's current_map (until M2)."""
+    `mapping`, and graph-builder stores the robot's nodes and images in it (maps M2).
+    Robot-side switching is not wired yet (M3): the robot sends nodes whenever its topomap
+    service runs, and graph-builder drops them without an open, unpaused session. Note: this
+    route does not write robot.current_map (the deprecated PUT /robots/{r}/map does)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor()))
@@ -1530,34 +1532,34 @@ async def delete_robot(robot_name: str):
 
 
 class UpdateRobotMapRequest(BaseModel):
-    """Request model for setting a robot's current map."""
-    map_id: str = Field(..., description="Map ID the robot is currently operating on")
+    """Request model for the (deprecated) robot map assignment."""
+    map_id: Optional[str] = Field(
+        None, description="Map name to map into, 'GEO' / 'LOCAL' (the old sentinels), or "
+                          "null / '' to stop mapping")
 
 
 @app.put("/api/v1/robots/{robot_name}/map")
 async def update_robot_map(robot_name: str, request: UpdateRobotMapRequest):
     """
-    Set the current map for a robot.
+    DEPRECATED (maps redesign M2; removed with the client's Maps page, M4): the old "assign
+    map". Use POST /api/v1/maps/{id}/sessions and .../sessions/{sid}/finish.
 
-    Updates robot.current_map in the database. The graph_builder service reads
-    this field when processing node_update MQTT messages so that map_id is
-    authoritative from the server side rather than trusted from the robot payload.
+    A real map name starts a mapping session for the robot on that map (creating the map,
+    typed from the robot's datum, if it does not exist; finishing the robot's session on
+    another map first); 'GEO' / 'LOCAL' / null finish the robot's open session. Errors are
+    those of POST /api/v1/maps/{id}/sessions (404 robot, 409 offline / no datum for a geo map /
+    map busy / archived / being deleted, 422 invalid new-map name). robot.current_map is still
+    written for its remaining readers (packages/api/maps.py::assign_robot_map).
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        publisher_id = uuid.uuid4()
-        robot = await service.database.get_object(RobotObjectV1, robot_name)
-        await service.ensure_map_not_deleting(request.map_id)
-        robot.current_map = request.map_id
-        await service.database.update_spec(RobotObjectV1, robot_name, robot.spec, publisher_id)
-        updated_robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return {"success": True, "robot_name": robot_name, "current_map": updated_robot.current_map}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Failed to update robot map: {str(e)}")
+    def arango_nodes(name: str) -> int:
+        stats = service.graph_db.get_map_stats(name)
+        return 0 if "error" in stats else int(stats.get("node_count") or 0)
+
+    return await _site_call("assign robot map", maps.assign_robot_map(
+        service.database, robot_name, request.map_id, uuid.uuid4(),
+        recording.request_actor(), arango_nodes))
 
 
 @app.post("/api/v1/robots/{robot_name}/cancel-order")

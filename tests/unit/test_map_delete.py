@@ -446,19 +446,8 @@ async def test_list_hides_deleting_maps():
     assert [m["name"] for m in result["maps"]] == ["a"] and result["count"] == 1
 
 
-async def test_assigning_a_deleting_map_is_409():
-    robot = RobotObjectV1(name="r1", status=RobotStatusV1())
-    svc = _svc({"gone": _map("gone", ObjectLifecycleV1.DELETING), "ok": _map("ok")}, robot)
-    with patch.object(main, "service", svc):
-        with pytest.raises(HTTPException) as exc:
-            await main.update_robot_map("r1", main.UpdateRobotMapRequest(map_id="gone"))
-        assert exc.value.status_code == 409
-        svc.database.update_spec.assert_not_called()
-
-        # An alive map, and an id with no map row (sentinels), still work.
-        for map_id in ("ok", "unregistered"):
-            result = await main.update_robot_map("r1", main.UpdateRobotMapRequest(map_id=map_id))
-            assert result["success"] is True
+# PUT /robots/{r}/map on a DELETING map (409): tests/unit/test_maps_m2.py (the route is the
+# maps M2 session shim now).
 
 
 async def test_put_robot_with_a_deleting_current_map_is_409():

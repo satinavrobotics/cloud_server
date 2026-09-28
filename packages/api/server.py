@@ -738,6 +738,16 @@ class ApiDelegationService:
 
         self.logger.info(f"Loading map: {actual_map_id}")
 
+        if actual_map_id in maps.RESERVED_NAMES and not nodes and not edges:
+            # The old client loads 'GEO' (a robot's mapless GPS view). It is a sentinel, not a
+            # map (maps M2): no ArangoDB collections, no Postgres row (which the dispatcher's
+            # removed datum auto-seed used to fill with the first robot's datum). Without a
+            # map transform the client places things with the robot's own datum.
+            return {"success": True, "map_id": actual_map_id,
+                    "message": f"{actual_map_id} is a robot-map sentinel, not a map",
+                    "stats": {"node_count": 0, "edge_count": 0}, "nodes": [], "edges": [],
+                    "transform": None}
+
         try:
             # Create map in ArangoDB
             result = self.graph_db.create_map(actual_map_id)
