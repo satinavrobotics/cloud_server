@@ -107,29 +107,20 @@ class TestDispatchDatumMessage:
         assert r._robot_object.datum.frame == "utm"
         assert db.map_specs == []  # the map already had a datum: not re-seeded
 
-    async def test_auto_seed_copies_the_frame(self):
-        db = _Db(MapObjectV1(name="site_a", description="yard"))
-        r = _robot(db)
-        await r._process_datum_message(types.RobotDatum(**UTM_WIRE))
-        assert len(db.map_specs) == 1
-        spec = db.map_specs[0]
-        assert spec["description"] == "yard"
-        assert spec["datum_latitude"] == 47.47946
-        assert spec["datum_frame"] == "utm"
-        assert spec["datum_utm_zone"] == 34
-        assert spec["datum_utm_north"] is True
-        assert spec["datum_utm_easting"] == 351756.484938
-        assert spec["datum_utm_northing"] == 5260323.440888
-
-    async def test_auto_seed_legacy_datum_is_enu(self):
-        db = _Db(MapObjectV1(name="site_a"))
-        r = _robot(db)
+    async def test_no_map_datum_auto_seed(self):
+        """Maps M2: a map's datum comes from its first mapping session (doc Q1), never from
+        a datum message of a robot whose current_map names it (or the GEO sentinel)."""
+        for current_map in ("site_a", "GEO", "LOCAL"):
+            db = _Db(MapObjectV1(name="site_a", description="yard"))
+            r = _robot(db, current_map)
+            await r._process_datum_message(types.RobotDatum(**UTM_WIRE))
+            assert db.robot_fields == {"datum": UTM_WIRE}
+            assert db.map_specs == []
+        legacy = _Db(MapObjectV1(name="site_a"))
+        r = _robot(legacy)
         await r._process_datum_message(
             types.RobotDatum(latitude=47.5, longitude=19.1, bearing_deg=4.0))
-        spec = db.map_specs[0]
-        assert spec["datum_frame"] == "enu"
-        assert spec["datum_bearing_deg"] == 4.0
-        assert spec["datum_utm_zone"] is None
+        assert r._robot_object.datum.frame == "enu" and legacy.map_specs == []
 
 
 class TestMapLoadTransform:

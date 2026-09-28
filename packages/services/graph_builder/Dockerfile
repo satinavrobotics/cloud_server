@@ -26,6 +26,9 @@ COPY packages/utils/ /app/packages/utils/
 # Copy database package
 COPY packages/database/ /app/packages/database/
 
+# Copy events package (MAP.INGEST_REJECTED, maps redesign M2)
+COPY packages/events/ /app/packages/events/
+
 # Copy cloud_common package
 COPY cloud_common/ /app/cloud_common/
 

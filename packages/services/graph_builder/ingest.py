@@ -152,8 +152,7 @@ def decide(robot_name: str, session: Optional[OpenSession],
 def map_pose(transform: Mapping[str, float], x: float, y: float,
              yaw: float) -> Tuple[float, float, float]:
     """A robot-frame pose in the map frame: map_T_session applied, yaw wrapped to (-pi, pi]."""
-    mx, my = map_geo.apply_transform(transform, float(x), float(y))
-    return mx, my, map_geo.normalize_yaw(float(yaw) + float(transform.get("yaw", 0.0)))
+    return map_geo.apply_pose(transform, x, y, yaw)
 
 
 class SessionResolver:

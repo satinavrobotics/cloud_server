@@ -39,7 +39,7 @@ from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
-from packages.utils import metrics
+from packages.utils import map_geo, metrics
 import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
 import cloud_common.objects.robot as robot_object
@@ -460,7 +460,8 @@ class Robot:
 
             if mission_node.type == mission_object.MissionNodeType.ROUTE and \
                     mission_node.route is not None:
-                order = types.VDA5050Order.from_route(mission_node.route, self._robot_object,
+                route = await self._route_in_robot_frame(mission_node.route)
+                order = types.VDA5050Order.from_route(route, self._robot_object,
                                                       self._order_prefix(), idx)
                 self.mission_info("Sending mission route node "
                                   f"{mission_node.name}")
@@ -795,7 +796,12 @@ class Robot:
             self._instant_action_resends.pop(action_id, None)
         return finished_instant_actions
     async def _process_datum_message(self, msg: types.RobotDatum) -> None:
-        """Persist robot datum and auto-seed the current map's datum if it has none."""
+        """Persist the robot's datum.
+
+        Maps redesign M2: the map datum auto-seed is gone. A geo map's origin (and its legacy
+        datum_* fields) comes from its first mapping session (doc Q1, packages/api/maps.py);
+        seeding from robot.current_map gave local maps a datum, and wrote the GEO sentinel's
+        row with whichever robot sent a datum first."""
         self._robot_object.datum = robot_object.RobotDatumV1(**msg.dict())
         # Only the datum (robots send it every few seconds): writing the cached full spec
         # back would revert any spec change committed since the cache was filled.
@@ -803,26 +809,44 @@ class Robot:
             api_objects.RobotObjectV1, self._name,
             {"datum": json.loads(self._robot_object.datum.json())}, uuid.uuid4()
         )
-        current_map = self._robot_object.current_map
-        if current_map:
+
+    async def _route_in_robot_frame(
+            self, route: mission_object.MissionRouteNodeV1) -> mission_object.MissionRouteNodeV1:
+        """The route's waypoints in the robot's current frame (maps redesign M2).
+
+        Waypoints that name a real map (`map_id`) are in that map's frame: node poses are
+        stored in the map frame since M2, and the client places waypoints with the map's
+        transform. For a geo map with an origin that frame differs from the robot's own run
+        frame (its datum), so each such waypoint goes through robot_T_map
+        (packages/utils/map_geo.py::robot_frame_in_map, inverted). Local maps, waypoints
+        without a map (mapless / GEO / LOCAL missions: already robot frame) and robots without
+        a datum are sent as they are, as before M2. The stored mission is not changed."""
+        names = {wp.map_id for wp in route.waypoints
+                 if wp.map_id and wp.map_id not in ("GEO", "LOCAL")}
+        inverse: Dict[str, Dict[str, float]] = {}
+        for name in sorted(names):
             try:
-                map_obj = await self._database.get_object(api_objects.MapObjectV1, current_map)
-                if map_obj and map_obj.datum_latitude is None:
-                    map_obj.datum_latitude = msg.latitude
-                    map_obj.datum_longitude = msg.longitude
-                    map_obj.datum_bearing_deg = msg.bearing_deg
-                    # The frame too: without it a UTM robot's map would be read as ENU.
-                    map_obj.datum_frame = msg.frame
-                    map_obj.datum_utm_zone = msg.utm_zone
-                    map_obj.datum_utm_north = msg.utm_north
-                    map_obj.datum_utm_easting = msg.utm_easting
-                    map_obj.datum_utm_northing = msg.utm_northing
-                    await self._database.update_spec(
-                        api_objects.MapObjectV1, current_map, map_obj.spec, uuid.uuid4()
-                    )
-                    self.info(f"Auto-seeded datum for map '{current_map}' from robot datum.")
-            except Exception as e:
-                self.warning(f"Failed to auto-seed datum for map '{current_map}': {e}")
+                map_obj = await self._database.get_object(api_objects.MapObjectV1, name)
+                t = map_geo.robot_frame_in_map(map_obj, self._robot_object.datum)
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Map '{name}' not readable ({err}); its waypoints are sent "
+                             "unconverted")
+                continue
+            if t is None:
+                self.warning(f"No robot datum: waypoints on geo map '{name}' are sent "
+                             "unconverted")
+            elif not map_geo.is_identity(t):
+                inverse[name] = map_geo.invert_transform(t)
+        if not inverse:
+            return route
+        converted = route.copy(deep=True)
+        for wp in converted.waypoints:
+            t = inverse.get(wp.map_id)
+            if t is not None:
+                wp.x, wp.y, wp.theta = map_geo.apply_pose(t, wp.x, wp.y, wp.theta)
+        self.mission_info(f"Route waypoints converted from the frame of map(s) "
+                          f"{', '.join(sorted(inverse))} into the robot's frame")
+        return converted
 
     async def _on_client_message(self, message: types.VDA5050State):
         self.debug(f"[{message.orderId}] Got feedback")

@@ -15,8 +15,8 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
-from packages.config import GPS_MAP_SENTINEL
-from packages.utils.geo import gps_to_local
+from packages.utils import map_geo
+from packages.utils.geo import gps_to_local, latlon_to_utm
 DatabaseClient = PostgresDatabase
 import uuid
 from cloud_common.objects import mission as mission_object
@@ -103,6 +103,50 @@ class MissionPlannerService:
             self.logger.error(f"Failed to get robot status for {robot_name}: {e}")
             return None
 
+    async def _robot_xy_in_map(self, robot: robot_object.RobotObjectV1,
+                               map_id: str) -> Tuple[float, float]:
+        """The robot's position (robot.status.pose, its own frame) in the map's frame, for
+        comparing it with node poses (maps redesign M2: nodes are stored in the map frame).
+        Identity for a local map; a geo map converts with the robot's current datum
+        (packages/utils/map_geo.py::robot_frame_in_map). Unknown (no map row, geo map and a
+        robot without a datum): the raw pose, as before M2."""
+        x, y = robot.status.pose.x, robot.status.pose.y
+        from cloud_common.objects.map import MapObjectV1
+        try:
+            map_obj = await self.database.get_object(MapObjectV1, map_id)
+            t = map_geo.robot_frame_in_map(map_obj, getattr(robot, "datum", None))
+        except Exception:
+            return x, y
+        if t is None:
+            self.logger.warning(f"Robot {robot.name} has no datum; its pose is compared with "
+                                f"geo map '{map_id}' unconverted")
+            return x, y
+        return map_geo.apply_transform(t, x, y)
+
+    async def _gps_to_map(self, map_id: str, lat: float, lon: float
+                          ) -> Optional[Tuple[float, float, str]]:
+        """A GPS goal in the map frame: a geo map with an origin converts exactly into its UTM
+        zone (map x/y are UTM metres from the origin); any other map uses its legacy datum_*
+        fields as before. None if the map has neither."""
+        from cloud_common.objects.map import MapObjectV1
+        try:
+            map_obj = await self.database.get_object(MapObjectV1, map_id)
+        except Exception:
+            map_obj = None
+        if map_obj is not None and map_obj.geo is not None and map_obj.type != "local":
+            g = map_obj.geo
+            e, n = latlon_to_utm(lat, lon, g.utm_zone, g.utm_north)
+            return e - g.origin_e, n - g.origin_n, f"utm zone {g.utm_zone} map origin"
+        datum = await self._get_map_datum(map_id)
+        if datum is None:
+            return None
+        x, y = gps_to_local(
+            lat, lon, datum["lat"], datum["lon"], datum["bearing_deg"],
+            frame=datum.get("frame"), utm_zone=datum.get("utm_zone"),
+            utm_north=datum.get("utm_north"), utm_easting=datum.get("utm_easting"),
+            utm_northing=datum.get("utm_northing"))
+        return x, y, f"{datum.get('frame') or 'enu'} datum"
+
     async def _get_map_datum(self, map_id: str) -> Optional[Dict[str, Any]]:
         """Return the GPS datum for map_id from Postgres, or None if not set."""
         from cloud_common.objects.map import MapObjectV1
@@ -150,9 +194,8 @@ class MissionPlannerService:
             if not robot:
                 return None, f"Robot '{robot_name}' not found in database"
 
-            # Get robot position from the robot object
-            robot_x = robot.status.pose.x
-            robot_y = robot.status.pose.y
+            # The robot's position, in the map frame
+            robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
 
             self.logger.info(f"Finding closest node to robot at ({robot_x:.2f}, {robot_y:.2f}) on map '{query_map_id}'")
             nodes, distances = self.graph_db.k_nearest_neighbors(
@@ -314,7 +357,7 @@ class MissionPlannerService:
                 return None
 
             start_node, start_error = await self._find_node_near_position(
-                robot.status.pose.x, robot.status.pose.y, query_map_id
+                *(await self._robot_xy_in_map(robot, query_map_id)), query_map_id
             )
             if start_node is None:
                 self.logger.error(f"Could not find start node near robot position: {start_error}")
@@ -513,12 +556,10 @@ class MissionPlannerService:
         }
 
         # Step 0: GPS → local conversion if GPS coordinates were provided.
-        # datum is also reused by the robot guard below to avoid a second DB fetch.
-        datum = None
         if target_lat is not None and target_lon is not None:
             self.logger.info(f"Step 0: Converting GPS ({target_lat}, {target_lon}) to local frame")
-            datum = await self._get_map_datum(effective_map_id)
-            if datum is None:
+            converted = await self._gps_to_map(effective_map_id, target_lat, target_lon)
+            if converted is None:
                 result["error"] = (
                     f"Map '{effective_map_id}' has no GPS datum registered. "
                     "Register one via PUT /api/v1/maps/{map_id}/datum before "
@@ -526,18 +567,10 @@ class MissionPlannerService:
                 )
                 result["failed_at"] = "gps_conversion"
                 return result
-            target_x, target_y = gps_to_local(
-                target_lat, target_lon,
-                datum["lat"], datum["lon"], datum["bearing_deg"],
-                frame=datum.get("frame"),
-                utm_zone=datum.get("utm_zone"),
-                utm_north=datum.get("utm_north"),
-                utm_easting=datum.get("utm_easting"),
-                utm_northing=datum.get("utm_northing"),
-            )
+            target_x, target_y, how = converted
             self.logger.info(
-                f"GPS ({target_lat}, {target_lon}) → local ({target_x:.2f}, {target_y:.2f}) "
-                f"[{datum.get('frame') or 'enu'} datum]"
+                f"GPS ({target_lat}, {target_lon}) → map ({target_x:.2f}, {target_y:.2f}) "
+                f"[{how}]"
             )
 
         if target_x is None or target_y is None:
@@ -682,14 +715,12 @@ class MissionPlannerService:
         if not robot:
             return {"nodes": [], "error": f"Robot '{robot_id}' not found"}
 
-        robot_x = robot.status.pose.x
-        robot_y = robot.status.pose.y
-
         # Use range search
         search_radius = radius if radius is not None else self.range_search_radius
 
         # Use map_id if provided, otherwise use default
         query_map_id = map_id if map_id is not None else self.default_map_id
+        robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
 
         try:
             nodes, distances = self.graph_db.nodes_in_range(
