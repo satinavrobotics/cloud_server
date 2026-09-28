@@ -750,6 +750,21 @@ class TestImageDatabaseServiceDeleteMap:
         assert result is True
 
     @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_delete_map_invalid_bucket_name(self, mock_minio):
+        """A map name that is no valid bucket name (e.g. with a space) never had a bucket."""
+        mock_client = Mock()
+        mock_client.list_buckets.return_value = []
+        mock_client.bucket_exists.side_effect = ValueError(
+            "invalid bucket name map-example trajectory")
+        mock_minio.return_value = mock_client
+
+        service = ImageDatabaseService()
+        result = service.delete_map("example trajectory")
+
+        assert result is True
+        mock_client.remove_bucket.assert_not_called()
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
     def test_delete_map_error(self, mock_minio):
         """Test deleting a map with error."""
         mock_client = Mock()

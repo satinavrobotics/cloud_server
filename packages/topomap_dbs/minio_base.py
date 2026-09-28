@@ -88,7 +88,13 @@ class MinIOService:
     def _delete_bucket(self, bucket_name: str) -> bool:
         """Empty and remove a bucket. Idempotent: returns True if already absent."""
         try:
-            if not self.client.bucket_exists(bucket_name):
+            try:
+                exists = self.client.bucket_exists(bucket_name)
+            except ValueError:
+                # The client rejects an invalid name (e.g. a map id with a space) before any
+                # request: such a bucket can never have been created, so it is absent.
+                return True
+            if not exists:
                 return True
             names = [
                 obj.object_name
