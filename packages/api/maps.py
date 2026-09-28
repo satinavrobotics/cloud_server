@@ -34,9 +34,14 @@ Session rules (M1):
   map's legacy datum_* fields (when unset) = that origin as a 'utm' datum, so the old client and
   planner place the map exactly. map_T_session: packages/utils/map_geo.py;
 - local map: identity; aligned only for the map's first session (a later one waits for M6);
-- no MQTT here: the robot-side mapping switch is M3. Since M2 graph-builder ingests by the
-  robot's open session (packages/services/graph_builder/ingest.py), so a session is what makes
-  a robot's nodes land in a map.
+- since M2 graph-builder ingests by the robot's open session
+  (packages/services/graph_builder/ingest.py), so a session is what makes a robot's nodes land
+  in a map;
+- M3: after every session change commits (start, pause, resume, finish, the shim), the robot's
+  retained `{prefix}/{robot}/mapping/set` is published from its open session (notify_robot;
+  contract in packages/api/mapping_control.py). A publish failure never fails the call: the
+  response says `robot_notified: false`. A session starts even when the robot's topomap
+  service is not running (`mapping_service: "not_running"`, doc Q3).
 
 Lifecycle: draft -> mapping <-> paused -> ready (finish) -> archived -> ready|draft (restore).
 Archive and delete are refused while a session is open. Repeating pause/resume/finish/archive/
@@ -61,6 +66,7 @@ from cloud_common.objects.map import (
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
+from packages.api.mapping_control import set_payload
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.utils import map_geo
@@ -302,6 +308,13 @@ class SqlStore:
     async def open_sessions_of_robot(self, robot_name: str) -> List[Dict[str, Any]]:
         return await self._sessions("robot_name = %s AND ended_at IS NULL", (robot_name,))
 
+    async def open_sessions(self) -> List[Dict[str, Any]]:
+        return await self._sessions("ended_at IS NULL", ())
+
+    async def robot_names(self) -> List[str]:
+        await self.cursor.execute(f"SELECT name FROM {ROBOT_TABLE} WHERE lifecycle <> 'DELETED'")
+        return [r[0] for r in await self.cursor.fetchall()]
+
     async def lock_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         await self.cursor.execute(
             f"SELECT {', '.join(SESSION_COLUMNS)} FROM {SESSIONS_TABLE} "
@@ -451,9 +464,11 @@ async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID) -> D
     return map_view(MapObjectV1(name=name, status=row.status, **row.spec))
 
 
-async def session_summary(db: Any, name: str) -> Dict[str, Any]:
+async def session_summary(db: Any, name: str, control: Optional[Any] = None
+                          ) -> Dict[str, Any]:
     """The `sessions` block of GET /api/v1/maps/{id}: counts, the open session, and the newest
-    SUMMARY_MAX_SESSIONS sessions (newest first)."""
+    SUMMARY_MAX_SESSIONS sessions (newest first). M3: `mapping_state` / `mapping_service` of
+    the open session's robot (null without an open session; packages/api/mapping_control.py)."""
     try:
         async with open_store(db, uuid.uuid4()) as store:
             rows = await store.sessions(name)
@@ -461,9 +476,16 @@ async def session_summary(db: Any, name: str) -> Dict[str, Any]:
         raise _undefined_table(exc) from exc
     items = [session_dict(r) for r in reversed(rows)]
     open_items = [s for s in items if s["state"] != "finished"]
-    return {"count": len(items), "open": open_items[0] if open_items else None,
-            "unaligned": sum(1 for s in items if s["aligned"] is False),
-            "items": items[:SUMMARY_MAX_SESSIONS]}
+    open_session = open_items[0] if open_items else None
+    summary = {"count": len(items), "open": open_session,
+               "unaligned": sum(1 for s in items if s["aligned"] is False),
+               "items": items[:SUMMARY_MAX_SESSIONS],
+               "mapping_state": None, "mapping_service": None}
+    if open_session is not None and control is not None:
+        robot = open_session["robot_name"]
+        summary["mapping_state"] = control.state(robot)
+        summary["mapping_service"] = control.mapping_service(robot)
+    return summary
 
 
 async def _archive_or_restore(db: Any, name: str, archive: bool, publisher_id: uuid.UUID,
@@ -608,8 +630,53 @@ async def _finish_in(store: Any, row: MapRow, session: Dict[str, Any], now: date
     return map_state
 
 
+async def notify_robot(control: Optional[Any], db: Any, robot_name: str,
+                       with_service: bool = False) -> Dict[str, Any]:
+    """M3: after a session change has COMMITTED, publish the robot's retained
+    `{prefix}/{robot}/mapping/set` from its open session as it is now (re-read, so the newest
+    committed state is what the robot ends up with; per-robot lock). Never raises: a failure
+    is logged and reported as `robot_notified: false` (the API call itself succeeded). The
+    response keys (additive): robot_notified, mapping_state, and with `with_service`
+    mapping_service ("running" | "not_running", doc Q3)."""
+    if control is None:
+        return {}
+    ok = False
+    try:
+        async with control.lock(robot_name):
+            async with open_store(db, uuid.uuid4()) as store:
+                mine = await store.open_sessions_of_robot(robot_name)
+            ok = await control.publish_set(robot_name, set_payload(mine[0] if mine else None))
+    except Exception:  # noqa: BLE001
+        logger.exception("Mapping switch for robot %s not published", robot_name)
+    out: Dict[str, Any] = {"robot_notified": ok, "mapping_state": control.state(robot_name)}
+    if with_service:
+        out["mapping_service"] = control.mapping_service(robot_name)
+    return out
+
+
+async def sync_all_robots(control: Any, db: Any) -> Dict[str, bool]:
+    """Re-publish every robot's set message (on every API (re)connect to the broker: the
+    broker keeps no retained messages across its own restart, and this also covers sessions
+    opened before M3). Robots without an open session get `enabled: false`."""
+    async with open_store(db, uuid.uuid4()) as store:
+        names = await store.robot_names()
+        open_rows = await store.open_sessions()
+    by_robot = {s["robot_name"]: s for s in open_rows}
+    results: Dict[str, bool] = {}
+    for name in sorted(set(names) | set(by_robot)):
+        async with control.lock(name):
+            async with open_store(db, uuid.uuid4()) as store:  # fresh: a change may have won
+                mine = await store.open_sessions_of_robot(name)
+            results[name] = await control.publish_set(name,
+                                                      set_payload(mine[0] if mine else None))
+    logger.info("Mapping switch re-published for %d robots (%d not acknowledged)",
+                len(results), sum(1 for ok in results.values() if not ok))
+    return results
+
+
 async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UUID,
-                        actor: Optional[str] = None) -> Dict[str, Any]:
+                        actor: Optional[str] = None, control: Optional[Any] = None
+                        ) -> Dict[str, Any]:
     req = parse_body(StartSessionRequest, data)
     now = _utcnow()
     try:
@@ -619,14 +686,24 @@ async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UU
             session = await _start_in(store, row, robot, req.robot, now, actor)
     except psycopg.errors.UndefinedTable as exc:
         raise _undefined_table(exc) from exc
-    return {"map_id": map_name, "map_state": MAPPING, "changed": True,
-            "session": session_dict(session)}
+    out = {"map_id": map_name, "map_state": MAPPING, "changed": True,
+           "session": session_dict(session)}
+    out.update(await notify_robot(control, db, req.robot, with_service=True))
+    return out
 
 
 async def session_action(db: Any, map_name: str, session_id: str, action: str,
-                         publisher_id: uuid.UUID, actor: Optional[str] = None
-                         ) -> Dict[str, Any]:
-    """pause / resume / finish (see the module docstring)."""
+                         publisher_id: uuid.UUID, actor: Optional[str] = None,
+                         control: Optional[Any] = None) -> Dict[str, Any]:
+    """pause / resume / finish (see the module docstring). M3: then the robot's set message
+    (also on a no-op repeat, which re-sends the current state)."""
+    out = await _session_action(db, map_name, session_id, action, publisher_id, actor)
+    out.update(await notify_robot(control, db, out["session"]["robot_name"]))
+    return out
+
+
+async def _session_action(db: Any, map_name: str, session_id: str, action: str,
+                          publisher_id: uuid.UUID, actor: Optional[str]) -> Dict[str, Any]:
     if action not in SESSION_ACTIONS:
         raise HTTPException(404, f"Unknown session action {action!r}")
     try:
@@ -690,8 +767,8 @@ def _new_map_type(robot: Optional[RobotObjectV1]) -> str:
 
 async def assign_robot_map(db: Any, robot_name: str, map_id: Optional[str],
                            publisher_id: uuid.UUID, actor: Optional[str] = None,
-                           arango_node_count: Optional[Callable[[str], int]] = None
-                           ) -> Dict[str, Any]:
+                           arango_node_count: Optional[Callable[[str], int]] = None,
+                           control: Optional[Any] = None) -> Dict[str, Any]:
     """DEPRECATED (goes away with the client's Maps page, M4): the old client's "assign map",
     PUT /api/v1/robots/{r}/map, now drives mapping sessions so live mapping keeps working.
 
@@ -751,12 +828,14 @@ async def assign_robot_map(db: Any, robot_name: str, map_id: Optional[str],
                 await store.set_current_map(robot, target)
     except psycopg.errors.UndefinedTable as exc:
         raise _undefined_table(exc) from exc
-    return {"success": True, "robot_name": robot_name, "current_map": target,
-            "deprecated": "PUT /api/v1/robots/{robot}/map: use POST /api/v1/maps/{id}/sessions "
-                          "and .../sessions/{sid}/finish",
-            "map_created": created,
-            "finished_session": session_dict(finished) if finished else None,
-            "session": session_dict(session) if session else None}
+    out = {"success": True, "robot_name": robot_name, "current_map": target,
+           "deprecated": "PUT /api/v1/robots/{robot}/map: use POST /api/v1/maps/{id}/sessions "
+                         "and .../sessions/{sid}/finish",
+           "map_created": created,
+           "finished_session": session_dict(finished) if finished else None,
+           "session": session_dict(session) if session else None}
+    out.update(await notify_robot(control, db, robot_name, with_service=True))
+    return out
 
 
 async def _create_for_assign(store: Any, name: str, robot: RobotObjectV1,

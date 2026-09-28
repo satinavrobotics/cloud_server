@@ -9,7 +9,7 @@ Delegates requests to appropriate microservices and manages WebSocket connection
 import logging
 import json
 from typing import Dict, Any, Optional, List, Set
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import threading
 import time
@@ -35,9 +35,11 @@ from packages.config import (
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
     MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE, DEFAULT_MAP_ID,
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
+    MQTT_VDA5050_PREFIX,
 )
 from packages.api.map_delete import MapDeleter
 from packages.api import maps
+from packages.api.mapping_control import MappingControl
 from packages.utils import map_geo
 
 
@@ -618,6 +620,9 @@ class ApiDelegationService:
             mqtt_keepalive=mqtt_keepalive,
             ws_manager=self.ws_manager,
         )
+        # Maps M3: the robot mapping switch (retained {prefix}/{robot}/mapping/set, state from
+        # {prefix}/+/mapping/state) on the diagnostics MQTT connection.
+        self.mapping_control = MappingControl(MQTT_VDA5050_PREFIX)
 
         # WebSocket proxy manager (new implementation)
         self.ws_proxy = WebSocketProxyManager(
@@ -1882,9 +1887,30 @@ class ApiDelegationService:
 
         self.diagnostics.set_event_loop(event_loop)
         self._start_telemetry()
-        self.diagnostics.connect_mqtt()
+        self.mapping_control.on_state = self._broadcast_mapping_state
+        self.mapping_control.on_connect = self._sync_mapping_switch
+        self.diagnostics.connect_mqtt(
+            before_connect=lambda client: self.mapping_control.attach(client, event_loop))
 
         self.logger.info("✅ Database watchers started for WebSocket broadcasting")
+
+    async def _broadcast_mapping_state(self, robot_name: str,
+                                       view: Optional[Dict[str, Any]]) -> None:
+        """Maps M3: a robot's mapping/state message, pushed on /ws/robot/{robot}."""
+        try:
+            await self.ws_manager.broadcast("robot_status", robot_name, {
+                "type": "mapping_state_update", "robot_name": robot_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(), "mapping_state": view})
+        except Exception as e:
+            self.logger.error(f"Failed to broadcast mapping state for {robot_name}: {e}")
+
+    async def _sync_mapping_switch(self) -> None:
+        """Maps M3: on every broker (re)connect, re-publish every robot's retained
+        mapping/set message from its open session. Never raises."""
+        try:
+            await maps.sync_all_robots(self.mapping_control, self.database)
+        except Exception as e:
+            self.logger.error(f"Mapping switch re-publish failed: {e}")
 
     def _start_telemetry(self):
         """Phase 0 ingest (packages/api/telemetry.py): start the writer election. Any failure

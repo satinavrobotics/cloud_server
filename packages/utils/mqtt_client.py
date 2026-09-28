@@ -3,7 +3,7 @@ import asyncio
 import threading
 import time
 import json
-from typing import Callable, Dict, Any, Optional
+from typing import Callable, Dict, Any, List, Optional
 import paho.mqtt.client as mqtt_client
 
 # How long the client can go without a broker connection before the watchdog
@@ -38,6 +38,10 @@ class MQTTClient:
         self._connected = False
         self._disconnected_since: Optional[float] = None
         self._callbacks: Dict[str, Callable[[Any, Any, mqtt_client.MQTTMessage], None]] = {}
+        self._qos: Dict[str, int] = {}
+        # Called (no arguments, on paho's network thread) after every successful (re)connect,
+        # once the registered topics are subscribed again.
+        self._connect_listeners: List[Callable[[], None]] = []
 
         self.client = mqtt_client.Client(client_id=client_id, transport=transport, protocol=mqtt_client.MQTTv311)
         # Surface paho's own connection/reconnection logging, which is otherwise
@@ -65,9 +69,15 @@ class MQTTClient:
     def register_callback(self, topic: str, callback: Callable[[Any, Any, mqtt_client.MQTTMessage], None], qos: int = 0):
         """Register a callback for a specific topic."""
         self._callbacks[topic] = callback
+        self._qos[topic] = qos
         if self._connected:
             self.client.subscribe(topic, qos=qos)
             self.logger.info(f"Subscribed to topic: {topic}")
+
+    def add_connect_listener(self, listener: Callable[[], None]) -> None:
+        """`listener()` runs on paho's network thread after every successful (re)connect,
+        after the registered topics are re-subscribed. Exceptions are logged."""
+        self._connect_listeners.append(listener)
 
     def connect(self):
         """Connect to the MQTT broker and start the background thread loop."""
@@ -121,9 +131,14 @@ class MQTTClient:
             self._disconnected_since = None
             self.logger.info(f"Successfully connected to MQTT broker at {self.broker}:{self.port}")
             # Re-subscribe to all registered topics upon connection/reconnection
-            for topic in self._callbacks.keys():
-                client.subscribe(topic)
+            for topic in list(self._callbacks.keys()):
+                client.subscribe(topic, qos=self._qos.get(topic, 0))
                 self.logger.info(f"Subscribed to topic: {topic}")
+            for listener in list(self._connect_listeners):
+                try:
+                    listener()
+                except Exception as e:
+                    self.logger.error(f"MQTT connect listener failed: {e}")
         else:
             self._connected = False
             self._disconnected_since = self._disconnected_since or time.monotonic()

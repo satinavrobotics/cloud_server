@@ -316,6 +316,9 @@ services:
       - ROSBAG_PRESIGN_EXPIRY=${ROSBAG_PRESIGN_EXPIRY:-3600}
       - GRAPH_BUILDER_WS_URL=ws://localhost:${GRAPH_BUILDER_PORT:-8004}
       - MISSION_DISPATCHER_WS_URL=ws://localhost:${DATABASE_API_PORT:-5000}
+      # Maps M3: the robot mapping switch ({prefix}/{robot}/mapping/set|state); same prefix as
+      # mission-dispatch's --mqtt_prefix and the robots' VDA5050 clients.
+      - MQTT_VDA5050_PREFIX=${MQTT_VDA5050_PREFIX:-uagv/v2/RobotCompany}
     network_mode: "host"
     restart: on-failure
     depends_on:

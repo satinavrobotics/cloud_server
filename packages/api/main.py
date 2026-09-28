@@ -534,8 +534,10 @@ async def get_map(map_id: str):
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error"))
     # Maps redesign M1: the map's mapping sessions (count, open one, newest first).
+    # M3: plus `mapping_state` / `mapping_service` of the open session's robot.
     result["sessions"] = await _site_call("list map sessions",
-                                          maps.session_summary(service.database, map_id))
+                                          maps.session_summary(service.database, map_id,
+                                                               service.mapping_control))
     return result
 
 
@@ -560,22 +562,28 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     """Start a mapping session `{robot}` on the map (maps redesign M1): the robot must be
     online and have no other open session; a geo map needs the robot's datum. The map goes to
     `mapping`, and graph-builder stores the robot's nodes and images in it (maps M2).
-    Robot-side switching is not wired yet (M3): the robot sends nodes whenever its topomap
-    service runs, and graph-builder drops them without an open, unpaused session. Note: this
-    route does not write robot.current_map (the deprecated PUT /robots/{r}/map does)."""
+    Maps M3: then the robot's retained MQTT `{prefix}/{robot}/mapping/set` turns its topomap
+    capture on. The response adds `robot_notified` (the broker acknowledged the set message;
+    false never fails the call), `mapping_service` ("running" | "not_running": whether the
+    robot's topomap service is connected; the session starts either way, doc Q3) and
+    `mapping_state` (the robot's last mapping/state, or null). Note: this route does not write
+    robot.current_map (the deprecated PUT /robots/{r}/map does)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
-        service.database, map_id, body, uuid.uuid4(), recording.request_actor()))
+        service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
+        control=service.mapping_control))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
 async def map_session_action(map_id: str, session_id: str, action: str):
     """`pause`, `resume` or `finish` a mapping session. Finishing the map's only open session
-    makes the map `ready`. Repeating an action that is already in effect changes nothing."""
+    makes the map `ready`. Repeating an action that is already in effect changes nothing.
+    Maps M3: the robot's mapping/set is (re)published (pause/finish: capture off; resume: on);
+    the response adds `robot_notified` and `mapping_state`."""
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
-        recording.request_actor()))
+        recording.request_actor(), control=service.mapping_control))
 
 
 @app.post("/api/v1/maps/{map_id}/archive")
@@ -1190,6 +1198,14 @@ async def create_livekit_token(request: CreateTokenRequest):
 
 # ==================== Robot Operations ====================
 
+def _robot_view(robot: RobotObjectV1) -> Dict[str, Any]:
+    """robot.dict() plus (maps M3) `mapping_state`: the robot's last MQTT mapping/state with
+    `status` on/off/unreachable and `received_at`, or null (packages/api/mapping_control.py)."""
+    data = robot.dict()
+    data["mapping_state"] = service.mapping_control.state(robot.name) if service else None
+    return data
+
+
 @app.get("/api/v1/robots", response_model=List[dict])
 async def list_robots(
     min_battery: Optional[float] = Query(None, description="Minimum battery level"),
@@ -1220,7 +1236,7 @@ async def list_robots(
             params["robot_type"] = robot_type
 
         robots = await service.database.list_objects(RobotObjectV1, query_params=params.items() if params else None)
-        return [robot.dict() for robot in robots]
+        return [_robot_view(robot) for robot in robots]
     except HTTPException:
         raise
     except Exception as e:
@@ -1239,7 +1255,7 @@ async def get_robot(robot_name: str):
 
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return robot.dict()
+        return _robot_view(robot)
     except HTTPException:
         raise
     except Exception as e:
@@ -1559,7 +1575,7 @@ async def update_robot_map(robot_name: str, request: UpdateRobotMapRequest):
 
     return await _site_call("assign robot map", maps.assign_robot_map(
         service.database, robot_name, request.map_id, uuid.uuid4(),
-        recording.request_actor(), arango_nodes))
+        recording.request_actor(), arango_nodes, control=service.mapping_control))
 
 
 @app.post("/api/v1/robots/{robot_name}/cancel-order")
