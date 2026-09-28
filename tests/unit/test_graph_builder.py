@@ -10,7 +10,25 @@ import json
 import base64
 import asyncio
 from unittest.mock import Mock, MagicMock, AsyncMock, patch, call
+from packages.services.graph_builder import ingest
 from packages.services.graph_builder.server import GraphBuilderService
+
+
+def open_row(map_name="test_map", sid="s1", paused=False, t=None, lifecycle="ALIVE",
+             state="mapping", sdatum=None, rdatum=None):
+    """One row of ingest.OPEN_SESSION_SQL: the robot's open mapping session (maps M2)."""
+    return (sid, map_name, paused, t or {"tx": 0.0, "ty": 0.0, "yaw": 0.0}, lifecycle, state,
+            sdatum, rdatum)
+
+
+def with_session(service, row=None):
+    """Stub the open-session lookup (row None: no open session) and the Postgres writes."""
+    async def fetch(_robot):
+        return row
+    service.sessions = ingest.SessionResolver(fetch, ttl=0)
+    service._count_nodes = AsyncMock()
+    service._write_event = AsyncMock()
+    return service
 
 
 @pytest.mark.unit
@@ -25,7 +43,7 @@ class TestGraphBuilderServiceInit:
         assert service.mqtt_host == "localhost"
         assert service.mqtt_port == 1883
         assert service.radius_threshold == 5.0
-        assert service.default_map_id == "default"
+        assert not hasattr(service, "default_map_id")  # no default map since maps M2
         assert service.stats["nodes_processed"] == 0
         assert service.stats["images_saved"] == 0
         assert service.stats["edges_created"] == 0
@@ -37,13 +55,11 @@ class TestGraphBuilderServiceInit:
             mqtt_host="192.168.1.100",
             mqtt_port=1884,
             radius_threshold=10.0,
-            default_map_id="custom_map"
         )
 
         assert service.mqtt_host == "192.168.1.100"
         assert service.mqtt_port == 1884
         assert service.radius_threshold == 10.0
-        assert service.default_map_id == "custom_map"
 
 
 @pytest.mark.unit
@@ -213,7 +229,7 @@ class TestGraphBuilderMQTTMessageHandling:
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     def test_on_mqtt_message_image_upload(self, mock_topomap):
         """Test image upload callback buffers image when no node mapping exists."""
-        service = GraphBuilderService()
+        service = with_session(GraphBuilderService(), open_row())
         image_payload = {
             "session_node_id": 1000,
             "robot_name": "robot_1",
@@ -223,7 +239,12 @@ class TestGraphBuilderMQTTMessageHandling:
             "timestamp": "2024-01-01T00:00:00",
             "map_id": "default",
         }
-        service._on_image_upload_message(None, None, self._make_msg(image_payload))
+        loop = asyncio.new_event_loop()
+        service._event_loop = loop
+        with patch('packages.services.graph_builder.server.asyncio.run_coroutine_threadsafe',
+                   side_effect=lambda coro, _loop: loop.run_until_complete(coro)):
+            service._on_image_upload_message(None, None, self._make_msg(image_payload))
+        loop.close()
 
         assert ("robot_1", 1000) in service.image_buffer
         assert "front_camera" in service.image_buffer[("robot_1", 1000)]
@@ -236,7 +257,7 @@ class TestGraphBuilderMQTTMessageHandling:
 
         service = GraphBuilderService()
         bad_payload = {"x": 1.0, "y": 2.0}  # missing session_node_id, robot_name
-        result = service._process_topology(bad_payload)
+        result = service._process_topology(bad_payload, map_id="m")
 
         assert result is None
         assert service.stats["errors"] == 1
@@ -269,12 +290,13 @@ class TestGraphBuilderSessionMapping:
             "yaw": 0.0,
         }
 
-        service._process_topology(node_data)
+        service._process_topology(node_data, map_id="m", session_id="s1")
 
         # Check that a mapping was created
         assert len(service.session_to_global_map) == 1
         assert ("robot_1", 1000) in service.session_to_global_map
-        global_id, timestamp = service.session_to_global_map[("robot_1", 1000)]
+        global_id, timestamp, map_id, sid = service.session_to_global_map[("robot_1", 1000)]
+        assert (map_id, sid) == ("m", "s1")
         assert isinstance(global_id, str)
         assert len(global_id) > 0  # UUID should be non-empty
 
@@ -284,12 +306,14 @@ class TestGraphBuilderSessionMapping:
         mock_image_instance = mock_topomap.return_value.image
         mock_image_instance.store_image.return_value = True
 
-        service = GraphBuilderService()
+        service = with_session(GraphBuilderService(), open_row(map_name="yard"))
+        service._publish_image_update = AsyncMock()
 
         # Create a session mapping
         global_id = "test-global-id-123"
         from datetime import datetime
-        service.session_to_global_map[("robot_1", 1000)] = (global_id, datetime.now())
+        service.session_to_global_map[("robot_1", 1000)] = (global_id, datetime.now(), "yard",
+                                                            "s1")
 
         image_data = {
             "session_node_id": 1000,
@@ -301,17 +325,18 @@ class TestGraphBuilderSessionMapping:
             "map_id": "default"
         }
 
-        service._on_image_upload_message(None, None, self._make_msg(image_data))
+        asyncio.run(service._handle_image_upload(image_data))
 
-        # Image should be saved immediately
+        # Image should be saved immediately, in the node's map (not the payload's map_id)
         mock_image_instance.store_image.assert_called_once()
         call_args = mock_image_instance.store_image.call_args
         assert call_args[1]["node_id"] == global_id
+        assert call_args[1]["map_id"] == "yard"
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     def test_image_upload_buffered_when_no_mapping(self, mock_topomap):
         """Test image upload is buffered when node mapping doesn't exist yet."""
-        service = GraphBuilderService()
+        service = with_session(GraphBuilderService(), open_row())
 
         image_data = {
             "session_node_id": 1000,
@@ -323,7 +348,7 @@ class TestGraphBuilderSessionMapping:
             "map_id": "default"
         }
 
-        service._on_image_upload_message(None, None, self._make_msg(image_data))
+        asyncio.run(service._handle_image_upload(image_data))
 
         # Image should be buffered
         assert len(service.image_buffer) == 1
@@ -365,7 +390,7 @@ class TestGraphBuilderSessionMapping:
             "yaw": 0.0,
         }
 
-        service._process_topology(node_data)
+        service._process_topology(node_data, map_id="m")
 
         # Buffered image should be processed
         assert len(service.image_buffer) == 0  # Buffer should be cleared
@@ -411,7 +436,8 @@ class TestGraphBuilderNodeProcessing:
             "node_id": "node_1",
             "x": 1.0,
             "y": 2.0,
-            "yaw": 0.5
+            "yaw": 0.5,
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -435,7 +461,8 @@ class TestGraphBuilderNodeProcessing:
             "node_id": "node_1",
             "x": 1.0,
             "y": 2.0,
-            "theta": 1.5  # Using theta instead of yaw
+            "theta": 1.5,  # Using theta instead of yaw
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -479,7 +506,8 @@ class TestGraphBuilderNodeProcessing:
         node_data = {
             "node_id": "node_1",
             "x": 1.0,
-            "y": 2.0
+            "y": 2.0,
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -502,7 +530,8 @@ class TestGraphBuilderNodeProcessing:
         node_data = {
             "node_id": "node_1",
             "x": 1.0,
-            "y": 2.0
+            "y": 2.0,
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -657,7 +686,8 @@ class TestGraphBuilderImageSaving:
             "node_id": "node_1",
             "x": 1.0,
             "y": 2.0,
-            "image": test_image_data  # Single image field
+            "image": test_image_data,  # Single image field
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -685,7 +715,8 @@ class TestGraphBuilderImageSaving:
             "images": [
                 {"image_id": "img_1", "data": test_image_data},
                 {"image_id": "img_2", "data": test_image_data}
-            ]
+            ],
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -822,7 +853,8 @@ class TestGraphBuilderEdgeCreation:
             "node_id": "node_1",
             "x": 1.0,
             "y": 2.0,
-            "yaw": 0.5
+            "yaw": 0.5,
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -955,7 +987,8 @@ class TestGraphBuilderEventLoop:
             "node_id": "node_1",
             "x": 1.0,
             "y": 2.0,
-            "yaw": 0.5
+            "yaw": 0.5,
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -980,7 +1013,8 @@ class TestGraphBuilderEventLoop:
             "node_id": "node_1",
             "x": 1.0,
             "y": 2.0,
-            "yaw": 0.5
+            "yaw": 0.5,
+            "map_id": "m",
         }
 
         result = service.process_node_update(node_data)
@@ -1216,6 +1250,10 @@ class TestGraphBuilderProcessTopology:
         service.graph_db.nodes_in_range = Mock(return_value=([], []))
         return service
 
+    def _process(self, service, payload, **kw):
+        kw.setdefault("map_id", "test_map")
+        return service._process_topology(payload, **kw)
+
     def _valid_payload(self):
         # Note: map_id is intentionally omitted — it is now resolved from the
         # robot's DB record by _handle_node_update and passed into
@@ -1251,7 +1289,7 @@ class TestGraphBuilderProcessTopology:
         service = self._make_service(mock_topomap)
         payload = self._valid_payload()
         del payload["session_node_id"]
-        result = service._process_topology(payload)
+        result = self._process(service, payload)
         assert result is None
         assert service.stats["errors"] == 1
 
@@ -1260,7 +1298,7 @@ class TestGraphBuilderProcessTopology:
         service = self._make_service(mock_topomap)
         payload = self._valid_payload()
         del payload["robot_name"]
-        result = service._process_topology(payload)
+        result = self._process(service, payload)
         assert result is None
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
@@ -1268,7 +1306,7 @@ class TestGraphBuilderProcessTopology:
         service = self._make_service(mock_topomap)
         payload = self._valid_payload()
         del payload["x"]
-        result = service._process_topology(payload)
+        result = self._process(service, payload)
         assert result is None
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
@@ -1276,7 +1314,7 @@ class TestGraphBuilderProcessTopology:
         """add_node returning False stops processing and increments error count."""
         service = self._make_service(mock_topomap)
         service.graph_db.add_node = Mock(return_value=False)
-        result = service._process_topology(self._valid_payload())
+        result = self._process(service, self._valid_payload())
         assert result is None
         assert service.stats["nodes_processed"] == 0
         assert service.stats["errors"] == 1
@@ -1284,18 +1322,19 @@ class TestGraphBuilderProcessTopology:
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     def test_increments_nodes_processed_on_success(self, mock_topomap):
         service = self._make_service(mock_topomap)
-        service._process_topology(self._valid_payload())
+        self._process(service, self._valid_payload())
         assert service.stats["nodes_processed"] == 1
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     def test_stores_session_to_global_mapping(self, mock_topomap):
         """The session→global mapping must be populated so image uploads can look it up."""
         service = self._make_service(mock_topomap)
-        result = service._process_topology(self._valid_payload())
+        result = self._process(service, self._valid_payload())
         assert result is not None
         global_node_id = result[0]
         assert ("robot1", 1) in service.session_to_global_map
-        stored_id, _ = service.session_to_global_map[("robot1", 1)]
+        stored_id, _, map_id, _sid = service.session_to_global_map[("robot1", 1)]
+        assert map_id == "test_map"
         assert stored_id == global_node_id
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
@@ -1305,7 +1344,7 @@ class TestGraphBuilderProcessTopology:
         payload = self._valid_payload()
         del payload["yaw"]
         payload["theta"] = 1.23
-        result = service._process_topology(payload)
+        result = self._process(service, payload)
         assert result is not None
         _, _, _, yaw, _, _, _, _ = result
         assert yaw == 1.23
@@ -1319,19 +1358,36 @@ class TestGraphBuilderProcessTopology:
             [0.5]
         ))
         service.graph_db.add_edges_bulk = Mock(return_value=2)
-        result = service._process_topology(self._valid_payload())
+        result = self._process(service, self._valid_payload())
         assert result is not None
         assert service.stats["edges_created"] == 2
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
-    def test_map_id_defaults_to_service_default(self, mock_topomap):
-        """When no map_id is passed to _process_topology, falls back to service.default_map_id."""
+    def test_no_map_is_refused(self, mock_topomap):
+        """Maps M2: no default map. Without a map_id nothing is written."""
         service = self._make_service(mock_topomap)
-        # Do not pass map_id — the method must use service.default_map_id
-        result = service._process_topology(self._valid_payload())
-        assert result is not None
-        _, _, _, _, map_id, _, _, _ = result
-        assert map_id == service.default_map_id
+        assert service._process_topology(self._valid_payload()) is None
+        service.graph_db.add_node.assert_not_called()
+        assert service.stats["errors"] == 1
+
+    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
+    def test_pose_converted_into_the_map_frame(self, mock_topomap):
+        """map_T_session applied: pose = map frame, robot_pose = as received, session_id."""
+        import math
+        service = self._make_service(mock_topomap)
+        t = {"tx": 10.0, "ty": -5.0, "yaw": math.pi / 2}
+        result = self._process(service, self._valid_payload(), transform=t, session_id="s1")
+        _, x, y, yaw, *_ = result
+        assert (x, y) == pytest.approx((10.0 - 2.0, -5.0 + 1.0))
+        assert yaw == pytest.approx(0.5 + math.pi / 2)
+        kw = service.graph_db.add_node.call_args.kwargs
+        assert (kw["x"], kw["y"]) == pytest.approx((8.0, -4.0))
+        meta = kw["metadata"]
+        assert meta["robot_pose"] == {"x": 1.0, "y": 2.0, "yaw": 0.5}
+        assert meta["session_id"] == "s1" and meta["map_id"] == "test_map"
+        # edges are searched around the map-frame position
+        service.graph_db.nodes_in_range.assert_called_once()
+        assert service.graph_db.nodes_in_range.call_args.kwargs["x"] == pytest.approx(8.0)
 
 
 @pytest.mark.unit
@@ -1494,9 +1550,8 @@ class TestGraphBuilderHandleNodeUpdate:
         service.graph_db.add_node = Mock(return_value=True)
         service.graph_db.add_edge = Mock(return_value=True)
         service.graph_db.nodes_in_range = Mock(return_value=([], []))
-        # Stub out _get_robot_map_id so tests don't need a live DB for map lookup
-        service._get_robot_map_id = AsyncMock(return_value="test_map")
-        return service
+        # The robot's open session on "test_map" (maps M2), no live DB needed
+        return with_session(service, open_row())
 
     def _valid_payload(self):
         # map_id is no longer read from the payload; it is resolved from the
@@ -1609,75 +1664,16 @@ class TestGraphBuilderHandleNodeUpdate:
         assert service.stats["errors"] == 1
 
 
-class TestGraphBuilderGetRobotMapIdGeo:
-    """Tests for the GEO sentinel in _get_robot_map_id."""
-
-    def _make_service(self, mock_topomap):
-        return GraphBuilderService()
-
-    @patch('packages.services.graph_builder.server.PostgresDatabase')
-    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
-    async def test_geo_sentinel_returns_none(self, mock_topomap, mock_postgres):
-        """current_map == 'GEO' must return None, not the string 'GEO'."""
-        robot = Mock()
-        robot.current_map = 'GEO'
-        mock_postgres.return_value.get_object = AsyncMock(return_value=robot)
-
-        service = self._make_service(mock_topomap)
-        result = await service._get_robot_map_id('sati-beta')
-
-        assert result is None
-
-    @patch('packages.services.graph_builder.server.PostgresDatabase')
-    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
-    async def test_local_sentinel_returns_none(self, mock_topomap, mock_postgres):
-        """current_map == 'LOCAL' must return None, not the string 'LOCAL'."""
-        robot = Mock()
-        robot.current_map = 'LOCAL'
-        mock_postgres.return_value.get_object = AsyncMock(return_value=robot)
-
-        service = self._make_service(mock_topomap)
-        result = await service._get_robot_map_id('sati-gamma')
-
-        assert result is None
-
-    @patch('packages.services.graph_builder.server.PostgresDatabase')
-    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
-    async def test_real_map_id_returned_unchanged(self, mock_topomap, mock_postgres):
-        """A real map ID passes through unmodified."""
-        robot = Mock()
-        robot.current_map = 'warehouse-floor1'
-        mock_postgres.return_value.get_object = AsyncMock(return_value=robot)
-
-        service = self._make_service(mock_topomap)
-        result = await service._get_robot_map_id('sati-alpha')
-
-        assert result == 'warehouse-floor1'
-
-    @patch('packages.services.graph_builder.server.PostgresDatabase')
-    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
-    async def test_no_current_map_falls_back_to_default(self, mock_topomap, mock_postgres):
-        """Robot with current_map=None falls back to service default."""
-        robot = Mock()
-        robot.current_map = None
-        mock_postgres.return_value.get_object = AsyncMock(return_value=robot)
-
-        service = self._make_service(mock_topomap)
-        result = await service._get_robot_map_id('unknown-robot')
-
-        assert result == service.default_map_id
-
-
 class TestGraphBuilderHandleNodeUpdateGeoMode:
-    """Tests for _handle_node_update when the robot is in GEO mode (map_id is None)."""
+    """_handle_node_update for a robot without an open mapping session (formerly GEO/LOCAL
+    mode: current_map 'GEO'/'LOCAL'): no topology, the waypoint is still logged."""
 
     def _make_service(self, mock_topomap, mock_postgres=None):
         service = GraphBuilderService()
         service.graph_db.add_node = Mock(return_value=True)
         service.graph_db.add_edge = Mock(return_value=True)
         service.graph_db.nodes_in_range = Mock(return_value=([], []))
-        service._get_robot_map_id = AsyncMock(return_value=None)
-        return service
+        return with_session(service, None)
 
     def _valid_payload(self):
         return {

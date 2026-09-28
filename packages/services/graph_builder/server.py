@@ -3,6 +3,15 @@
 Graph Builder Service
 
 Processes new node updates from MQTT and builds the topological graph.
+
+Maps redesign M2 (docs/satinav-maps-redesign.md §6): nodes and images go to the robot's open
+mapping session (ingest.py), never to `robot.current_map` or a `"default"` map. Data without
+a session is dropped, counted, and reported as MAP.INGEST_REJECTED (rate-limited). Node poses
+are converted into the map frame with the session's map_T_session; the robot-frame pose is kept
+as `robot_pose`, and the node carries `session_id`.
+
+A RUNNING mission with `register_map = False` still suppresses ingest (unchanged; the node only
+goes to the mission's waypoint log).
 """
 
 import logging
@@ -26,10 +35,9 @@ from packages.topomap_dbs.client import TopomapDatabaseClient
 from packages.config import (
     MQTT_KEEPALIVE,
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
-    DEFAULT_MAP_ID,
-    GPS_MAP_SENTINEL,
-    LOCAL_MAP_SENTINEL,
 )
+from packages.events.emit import Event, emit
+from packages.services.graph_builder import ingest
 
 
 class UpdatePublisher:
@@ -129,8 +137,9 @@ class GraphBuilderService:
         postgres_host: str = "localhost",
         postgres_port: int = 5432,
         radius_threshold: float = 5.0,
-        default_map_id: str = DEFAULT_MAP_ID,
-        image_buffer_timeout: float = 30.0
+        image_buffer_timeout: float = 30.0,
+        session_cache_ttl: float = ingest.SESSION_CACHE_TTL_S,
+        reject_event_interval: float = ingest.REJECT_EVENT_INTERVAL_S,
     ):
         """
         Initialize the Graph Builder Service.
@@ -152,8 +161,10 @@ class GraphBuilderService:
             minio_secure: Whether to use HTTPS for MinIO
             distance_threshold: Maximum distance (in meters) for nodes to be considered traversable
             radius_threshold: Radius in meters for finding nearby nodes
-            default_map_id: Default map ID for nodes
             image_buffer_timeout: Timeout in seconds for buffering images
+            session_cache_ttl: How long a robot's open-session lookup is reused (s)
+            reject_event_interval: Minimum time between MAP.INGEST_REJECTED events per robot
+                and reason (s)
         """
         self.logger = logging.getLogger("GraphBuilderService")
 
@@ -164,17 +175,21 @@ class GraphBuilderService:
         self.mqtt_image_topic = mqtt_image_topic
         self.radius_threshold = radius_threshold
         self.distance_threshold = distance_threshold
-        self.default_map_id = default_map_id
         self.image_buffer_timeout = image_buffer_timeout
 
-        # Initialize PostgreSQL connection
+        # Initialize PostgreSQL connection. map_sessions and fleet_events come from the API's
+        # migrations: startup waits for them.
         self.database = PostgresDatabase(
             dbname=postgres_db,
             user=postgres_user,
             password=postgres_password,
             host=postgres_host,
-            port=postgres_port
+            port=postgres_port,
+            required_tables=("map_sessions", "fleet_events"),
         )
+        # Where a robot's data goes (its open mapping session), and the drop reports.
+        self.sessions = ingest.SessionResolver(self._fetch_open_session, ttl=session_cache_ttl)
+        self.rejects = ingest.RejectLimiter(interval=reject_event_interval)
 
         # Initialize service clients
         from packages.config import ARANGO_PASSWORD
@@ -189,7 +204,6 @@ class GraphBuilderService:
             minio_access_key=minio_access_key,
             minio_secret_key=minio_secret_key,
             minio_secure=minio_secure,
-            default_map_id=default_map_id,
         )
         self.graph_db = self.topomap_db.graph
         self.image_db = self.topomap_db.image
@@ -198,9 +212,9 @@ class GraphBuilderService:
         self.mqtt_client: Optional[MQTTClient] = None
         self._mqtt_connected = False
 
-        # Session ID to Global ID mapping
-        # Key: (robot_name, session_node_id) -> Value: (global_node_id, timestamp)
-        self.session_to_global_map: Dict[Tuple[str, int], Tuple[str, datetime]] = {}
+        # Robot node counter to global node ID
+        # Key: (robot_name, session_node_id) -> (global_id, timestamp, map_name, session_id)
+        self.session_to_global_map: Dict[Tuple[str, int], Tuple[str, datetime, str, str]] = {}
 
         # Image buffer for out-of-order arrivals
         # Key: (robot_name, session_node_id) -> {camera_name: (image_data, timestamp)}
@@ -218,7 +232,11 @@ class GraphBuilderService:
             "errors": 0,
             "buffered_images": 0,
             "session_mappings": 0,
-            "robots_auto_created": 0
+            "robots_auto_created": 0,
+            "nodes_rejected": 0,
+            "images_rejected": 0,
+            "reject_events_written": 0,
+            "reject_events_failed": 0,
         }
 
         # WebSocket update publisher
@@ -300,118 +318,150 @@ class GraphBuilderService:
             self.logger.error(f"Error processing node update message: {e}")
             self.stats["errors"] += 1
 
-    async def _get_robot_map_id(self, robot_name: str) -> Optional[str]:
-        """
-        Look up the robot's current_map from its database record.
+    # ==================== Sessions and rejections (M2) ====================
 
-        Returns None when the robot is in GEO or LOCAL mode
-        (current_map == GPS_MAP_SENTINEL or LOCAL_MAP_SENTINEL), which
-        signals _handle_node_update to skip topology recording entirely.
+    async def _fetch_open_session(self, robot_name: str) -> Optional[Tuple]:
+        """ingest.OPEN_SESSION_SQL for one robot (SessionResolver's fetch)."""
+        async with self.database.connection() as conn:
+            cursor = await conn.execute(ingest.OPEN_SESSION_SQL, (robot_name,))
+            return await cursor.fetchone()
 
-        Falls back to self.default_map_id if the robot is not found, has no
-        current_map set, or the DB query fails.
-
-        Args:
-            robot_name: Name of the robot to look up
-
-        Returns:
-            The map ID to use, or None if the robot is in GEO or LOCAL mode.
-        """
+    async def _count_nodes(self, session_id: str, count: int = 1) -> None:
+        """map_sessions.node_count += count. A failure is logged: the node is stored already."""
         try:
-            robot = await self.database.get_object(RobotObjectV1, robot_name)
-            if robot is not None and robot.current_map:
-                if robot.current_map in (GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL):
-                    return None
-                return robot.current_map
+            async with self.database.connection() as conn:
+                await conn.execute(ingest.COUNT_SQL, (count, uuid.UUID(str(session_id))))
         except Exception as e:
-            self.logger.warning(
-                f"Could not fetch current_map for robot '{robot_name}': {e}. "
-                f"Falling back to default map '{self.default_map_id}'."
+            self.logger.warning(f"Could not count a node for session {session_id}: {e}")
+
+    async def _write_event(self, event: Event) -> None:
+        try:
+            async with self.database.connection() as conn:
+                await emit(conn, event)
+            self.stats["reject_events_written"] += 1
+        except Exception as e:  # noqa: BLE001 - a lost report must not stop ingest
+            self.stats["reject_events_failed"] += 1
+            self.logger.warning(f"Could not write {event.code.value}: {e}")
+
+    async def _reject(self, resolution: "ingest.Resolution", kind: str, count: int = 1) -> None:
+        """Drop `count` nodes or images ('node' | 'image'): count them and report when due."""
+        stat = "nodes_rejected" if kind == "node" else "images_rejected"
+        self.stats[stat] += count
+        if count:
+            self.logger.info(
+                f"Dropped {count} {kind}(s) from {resolution.robot_name}: {resolution.reason}"
+                + (f" (map {resolution.map_name})" if resolution.map_name else ""))
+        for _ in range(count):
+            event = self.rejects.record(resolution, kind)
+            if event is not None:
+                await self._write_event(event)
+
+    async def flush_rejects(self) -> None:
+        """Report drops no later drop has carried yet (periodic, main.py)."""
+        for event in self.rejects.due():
+            await self._write_event(event)
+
+    async def manual_target_state(self, map_id: str) -> str:
+        """POST /node's guard: the map's effective state ('mapping' accepts), or 'missing' /
+        'deleting'."""
+        async with self.database.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT lifecycle, status->>'state' FROM mapobjectv1 WHERE name = %s "
+                "AND lifecycle <> 'DELETED'", (map_id,))
+            row = await cursor.fetchone()
+        if row is None:
+            return "missing"
+        if row[0] == "DELETING":
+            return "deleting"
+        return row[1] or "ready"
+
+    async def _active_mission(self, robot_name: str):
+        """(RUNNING mission or None, register_map). Unchanged rule: no mission -> ingest."""
+        try:
+            missions = await self.database.list_objects(
+                MissionObjectV1,
+                MissionQueryParamsV1(
+                    robot=robot_name,
+                    state=MissionStateV1.RUNNING,
+                    started_after=None,
+                    started_before=None,
+                    most_recent=None,
+                )
             )
-        return self.default_map_id
+            if missions:
+                return missions[0], missions[0].register_map
+        except Exception as e:
+            self.logger.error(f"Failed to look up active mission for '{robot_name}': {e}")
+        return None, True
+
+    def _pop_buffered_images(self, robot_name: str, session_node_id: Any) -> int:
+        """Discard the images buffered for a node that was dropped; how many there were."""
+        cameras = self.image_buffer.pop((robot_name, session_node_id), None) or {}
+        self.stats["buffered_images"] -= len(cameras)
+        return len(cameras)
 
     async def _handle_node_update(self, payload: Dict[str, Any]):
         """
         Async handler for MQTT node update messages.
 
-        Looks up the robot's active mission once to read the register_map flag.
-        When register_map=True (or no mission is active): builds topology and logs.
-        When register_map=False: skips topology entirely, logs position only.
-        When map_id is None (robot in GEO or LOCAL mode): skips topology, logs position only
-          (register_map is not available in GEO/LOCAL mode regardless of mission settings).
+        1. A RUNNING mission with register_map=False: no topology, the node only goes to the
+           mission's waypoint log (robot frame). Unchanged from before M2.
+        2. Otherwise the robot's open mapping session decides (ingest.py): accepted -> the
+           node is stored in the session's map, in the map frame; dropped -> counted and
+           reported (MAP.INGEST_REJECTED), and so are the images buffered for it. A running
+           mission still gets its waypoint.
 
-        The map_id is always resolved from the robot's database record
-        (robot.current_map), falling back to self.default_map_id. Any map_id
-        field present in the MQTT payload is silently ignored.
+        The robot comes from the payload's robot_name; a map_id in the payload is ignored.
         """
         robot_name = payload.get('robot_name')
+        session_node_id = payload.get('session_node_id')
+        x, y = payload.get('x'), payload.get('y')
+        yaw = payload.get('yaw', payload.get('theta', 0.0))
+        if session_node_id is None or robot_name is None or x is None or y is None:
+            self.logger.error("Missing required fields: session_node_id, robot_name, x, y")
+            self.stats["errors"] += 1
+            return
 
-        # Resolve map_id from the robot's DB record, not from the payload.
-        # None means GEO/LOCAL mode — topology recording is not available.
-        map_id: Optional[str] = self.default_map_id
-        if robot_name:
-            map_id = await self._get_robot_map_id(robot_name)
+        active_mission, register_map = await self._active_mission(robot_name)
+        if not register_map:
+            await self._log_mission_waypoint(
+                robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
+                _mission=active_mission,
+            )
+            return
 
-        active_mission = None
-        register_map = True  # default when no mission is running
-        if robot_name:
-            try:
-                missions = await self.database.list_objects(
-                    MissionObjectV1,
-                    MissionQueryParamsV1(
-                        robot=robot_name,
-                        state=MissionStateV1.RUNNING,
-                        started_after=None,
-                        started_before=None,
-                        most_recent=None,
-                    )
-                )
-                if missions:
-                    active_mission = missions[0]
-                    register_map = active_mission.register_map
-            except Exception as e:
-                self.logger.error(f"Failed to look up active mission for '{robot_name}': {e}")
-
-        # GEO/LOCAL mode: no map assigned, skip topology regardless of register_map
-        if map_id is None:
-            register_map = False
-
-        if register_map:
-            # Awaited here rather than inside _process_topology: that one runs in a
-            # worker thread, where calling this coroutine only built (and dropped) a
-            # coroutine object -- always truthy, so registration silently never ran.
-            if robot_name and not await self._ensure_robot_exists(robot_name):
-                self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
-            result = await asyncio.to_thread(self._process_topology, payload, map_id=map_id)
-            if result is None:
-                return
-            global_node_id, x, y, yaw, map_id, edges, session_node_id, robot_name = result
-            await self._publish_node_update(map_id, global_node_id, x, y, yaw, edges, image_ids=None)
+        resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+        if not resolution.accepted:
+            await self._reject(resolution, "node")
+            await self._reject(resolution, "image",
+                               self._pop_buffered_images(robot_name, session_node_id))
             if active_mission is not None:
                 await self._log_mission_waypoint(
-                    robot_name, global_node_id, session_node_id, x, y, yaw, map_id,
+                    robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
                     _mission=active_mission,
                 )
-        else:
-            x = payload.get('x')
-            y = payload.get('y')
-            yaw = payload.get('yaw', payload.get('theta', 0.0))
-            session_node_id = payload.get('session_node_id')
+            return
 
-            if session_node_id is None or robot_name is None or x is None or y is None:
-                self.logger.error(
-                    "Missing required fields for waypoint logging: session_node_id, robot_name, x, y"
-                )
-                self.stats["errors"] += 1
-                return
-
+        session = resolution.session
+        if not await self._ensure_robot_exists(robot_name):
+            self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
+        result = await asyncio.to_thread(
+            self._process_topology, payload, map_id=session.map_name,
+            transform=session.map_t_session, session_id=session.session_id)
+        if result is None:
+            return
+        global_node_id, mx, my, myaw, map_id, edges, session_node_id, robot_name = result
+        await self._count_nodes(session.session_id)
+        await self._publish_node_update(map_id, global_node_id, mx, my, myaw, edges, image_ids=None)
+        if active_mission is not None:
             await self._log_mission_waypoint(
-                robot_name, str(session_node_id), session_node_id, x, y, yaw,
-                map_id or '',
+                robot_name, global_node_id, session_node_id, mx, my, myaw, map_id,
                 _mission=active_mission,
             )
 
-    def _process_topology(self, payload: Dict[str, Any], map_id: Optional[str] = None) -> Optional[Tuple]:
+    def _process_topology(self, payload: Dict[str, Any], map_id: Optional[str] = None,
+                          transform: Optional[Dict[str, float]] = None,
+                          session_id: Optional[str] = None) -> Optional[Tuple]:
         """
         Build topological graph from a node-update payload.
 
@@ -419,30 +469,34 @@ class GraphBuilderService:
         and writes the node and edges to the graph database.
 
         Args:
-            payload: The incoming MQTT node-update dict.
-            map_id: Map identifier resolved externally (e.g. from robot.current_map).
-                    When called from the MQTT path this is always provided by
-                    _handle_node_update.  When called directly (e.g. via
-                    process_node_update or tests) it falls back to self.default_map_id.
-                    Any ``map_id`` key present in the payload is silently ignored.
+            payload: The incoming MQTT node-update dict (robot-frame x, y, yaw).
+            map_id: The session's map (required; there is no default map any more). Any
+                    ``map_id`` key present in the payload is ignored.
+            transform: The session's map_T_session; the stored `pose` is the payload pose in
+                    the map frame. None: identity.
+            session_id: The session; stored on the node with `robot_pose` (the payload pose).
 
-        Returns (global_node_id, x, y, yaw, map_id, edges, session_node_id, robot_name)
-        or None on failure.
+        Returns (global_node_id, x, y, yaw, map_id, edges, session_node_id, robot_name), with
+        x, y, yaw in the map frame, or None on failure.
         """
         session_node_id = payload.get('session_node_id')
         robot_name = payload.get('robot_name')
-        x = payload.get('x')
-        y = payload.get('y')
-        yaw = payload.get('yaw', payload.get('theta', 0.0))
-        if map_id is None:
-            map_id = self.default_map_id
+        rx = payload.get('x')
+        ry = payload.get('y')
+        ryaw = payload.get('yaw', payload.get('theta', 0.0))
         camera_metadata = payload.get('camera_metadata', [])
-        metadata = payload.get('metadata', {})
+        metadata = dict(payload.get('metadata') or {})
 
-        if session_node_id is None or robot_name is None or x is None or y is None:
+        if session_node_id is None or robot_name is None or rx is None or ry is None:
             self.logger.error("Missing required fields: session_node_id, robot_name, x, y")
             self.stats["errors"] += 1
             return None
+        if not map_id:
+            self.logger.error("No map for node update (no default map since maps M2)")
+            self.stats["errors"] += 1
+            return None
+
+        x, y, yaw = ingest.map_pose(transform or ingest.map_geo.IDENTITY, rx, ry, ryaw)
 
         self.logger.info(f"📨 Received node update from {robot_name}, session_node_id={session_node_id}")
 
@@ -451,7 +505,8 @@ class GraphBuilderService:
         global_node_id = self._generate_global_node_id()
 
         session_key = (robot_name, session_node_id)
-        self.session_to_global_map[session_key] = (global_node_id, datetime.now())
+        self.session_to_global_map[session_key] = (global_node_id, datetime.now(), map_id,
+                                                   session_id)
         self.stats["session_mappings"] += 1
 
         self.logger.info(f"🔑 Mapped ({robot_name}, {session_node_id}) -> {global_node_id}")
@@ -459,6 +514,9 @@ class GraphBuilderService:
         metadata['robot_name'] = robot_name
         metadata['session_node_id'] = session_node_id
         metadata['camera_metadata'] = camera_metadata
+        if session_id is not None:
+            metadata['session_id'] = session_id
+            metadata['robot_pose'] = {'x': rx, 'y': ry, 'yaw': ryaw}
 
         buffered_images = self._get_buffered_images(robot_name, session_node_id)
         if buffered_images:
@@ -544,96 +602,85 @@ class GraphBuilderService:
             self.logger.error(f"Failed to log mission waypoint: {e}")
 
     def _on_image_upload_message(self, client, userdata, msg):
-        """
-        Handle image upload message from MQTT.
-
-        Looks up the global node ID and saves the image.
-
-        Args:
-            payload: Image upload message containing:
-                - session_node_id: Robot local session node ID
-                - robot_name: Name of the robot
-                - camera_name: Camera identifier
-                - image_data: Base64-encoded image data
-                - content_type: Image content type
-                - timestamp: Image timestamp
-                - map_id: Map identifier
-                - yaw_offset: Camera yaw offset in radians (optional)
-        """
+        """Handle an image upload message from MQTT (paho thread): parse it and hand it to
+        _handle_image_upload on the event loop, which needs the session lookup."""
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
-            # Extract required fields
+            if self._event_loop is None:
+                self.logger.error("Image upload before the event loop was set; dropped")
+                self.stats["errors"] += 1
+                return
+            asyncio.run_coroutine_threadsafe(self._handle_image_upload(payload),
+                                             self._event_loop)
+        except Exception as e:
+            self.logger.error(f"Error processing image upload message: {e}")
+            self.stats["errors"] += 1
+
+    async def _handle_image_upload(self, payload: Dict[str, Any]):
+        """
+        Save one camera image of a node, or buffer it until the node arrives.
+
+        The image goes where its node goes: the robot's open mapping session decides
+        (ingest.py; a dropped image is counted and reported like a node). A map_id in the
+        payload is ignored (before M2 it was used, so images landed in "default" while their
+        nodes went to the robot's current_map).
+
+        Payload: session_node_id, robot_name, camera_name, image_data (base64), and optionally
+        content_type, timestamp, yaw_offset, session_id (M3 robots).
+        """
+        try:
             session_node_id = payload.get('session_node_id')
             robot_name = payload.get('robot_name')
             camera_name = payload.get('camera_name')
             image_data_b64 = payload.get('image_data')
             content_type = payload.get('content_type', 'image/jpeg')
             timestamp = payload.get('timestamp')
-            map_id = payload.get('map_id', self.default_map_id)
             yaw_offset = payload.get('yaw_offset', 0.0)
 
-            # Validate required fields
             if session_node_id is None or robot_name is None or camera_name is None or image_data_b64 is None:
                 self.logger.error("Missing required fields in image upload: session_node_id, robot_name, camera_name, image_data")
                 self.stats["errors"] += 1
                 return
 
-            # Look up global node ID
-            session_key = (robot_name, session_node_id)
-            mapping = self.session_to_global_map.get(session_key)
-
             self.logger.info(f"📸 Image upload: camera={camera_name}, yaw_offset={yaw_offset}, robot={robot_name}, session_node={session_node_id}")
 
-            if mapping:
-                # Node update already received, save image immediately
-                global_node_id, _ = mapping
+            resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+            if not resolution.accepted:
+                await self._reject(resolution, "image")
+                return
+            session = resolution.session
 
-                # Prepare image data
-                image_dict = {
-                    'image_id': camera_name,
-                    'data': image_data_b64,
-                    'content_type': content_type,
-                    'metadata': {
-                        'camera_name': camera_name,
-                        'timestamp': timestamp,
-                        'robot_name': robot_name,
-                        'session_node_id': session_node_id,
-                        'yaw_offset': yaw_offset
-                    }
+            image_dict = {
+                'image_id': camera_name,
+                'data': image_data_b64,
+                'content_type': content_type,
+                'metadata': {
+                    'camera_name': camera_name,
+                    'timestamp': timestamp,
+                    'robot_name': robot_name,
+                    'session_node_id': session_node_id,
+                    'yaw_offset': yaw_offset,
+                    'session_id': session.session_id,
                 }
+            }
 
-                # Save image with global node ID
-                saved_image_ids = self._save_images(global_node_id, map_id, [image_dict])
-
-                # Notify WebSocket clients that image is available
-                if saved_image_ids and self._event_loop is not None:
-                    asyncio.run_coroutine_threadsafe(
-                        self._publish_image_update(map_id, global_node_id, saved_image_ids),
-                        self._event_loop
-                    )
-
+            node_key = (robot_name, session_node_id)
+            mapping = self.session_to_global_map.get(node_key)
+            if mapping and mapping[3] == session.session_id:
+                # Node update already received in this session: save to the node's map.
+                global_node_id, _, map_id, _ = mapping
+                saved_image_ids = await asyncio.to_thread(
+                    self._save_images, global_node_id, map_id, [image_dict])
+                if saved_image_ids:
+                    await self._publish_image_update(map_id, global_node_id, saved_image_ids)
             else:
-                # Node update not yet received, buffer the image
+                # Node update not yet received (the robot sends images first): buffer it.
                 self.logger.debug(f"Buffering image for ({robot_name}, {session_node_id}, {camera_name})")
-
-                node_key = (robot_name, session_node_id)
-                image_dict = {
-                    'image_id': camera_name,
-                    'data': image_data_b64,
-                    'content_type': content_type,
-                    'metadata': {
-                        'camera_name': camera_name,
-                        'timestamp': timestamp,
-                        'robot_name': robot_name,
-                        'session_node_id': session_node_id,
-                        'yaw_offset': yaw_offset
-                    }
-                }
-
                 if node_key not in self.image_buffer:
                     self.image_buffer[node_key] = {}
+                if camera_name not in self.image_buffer[node_key]:
+                    self.stats["buffered_images"] += 1
                 self.image_buffer[node_key][camera_name] = (image_dict, datetime.now())
-                self.stats["buffered_images"] += 1
 
         except Exception as e:
             self.logger.error(f"Error processing image upload message: {e}")
@@ -643,7 +690,11 @@ class GraphBuilderService:
 
     def process_node_update(self, node_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Process a new node update.
+        Process a manual node update (POST /node, a debug/test hook; robots use MQTT).
+
+        Writes straight into `map_id`, which is required (no default map since maps M2) and
+        must be a map in the `mapping` state (checked by the route, main.py). The pose is
+        taken as map-frame; there is no session transform.
 
         Steps:
         1. Save images to image database
@@ -656,7 +707,7 @@ class GraphBuilderService:
             node_data: Node update data containing:
                 - node_id: Unique node identifier
                 - x, y, theta/yaw: Node pose
-                - map_id: Map identifier (optional)
+                - map_id: Map identifier (required)
                 - image/images: Image data (base64 encoded)
                 - metadata: Additional node metadata (optional)
 
@@ -670,12 +721,12 @@ class GraphBuilderService:
             y = node_data.get('y')
             # Support both theta and yaw
             yaw = node_data.get('yaw', node_data.get('theta', 0.0))
-            map_id = node_data.get('map_id', self.default_map_id)
+            map_id = node_data.get('map_id')
             metadata = node_data.get('metadata', {})
 
             # Validate required fields
-            if node_id is None or x is None or y is None:
-                self.logger.error("Missing required fields: node_id, x, y")
+            if node_id is None or x is None or y is None or not map_id:
+                self.logger.error("Missing required fields: node_id, x, y, map_id")
                 self.stats["errors"] += 1
                 return {"success": False, "error": "Missing required fields"}
 
@@ -1164,7 +1215,7 @@ class GraphBuilderService:
 
         # Clean up old session mappings
         old_mappings = []
-        for session_key, (global_id, timestamp) in self.session_to_global_map.items():
+        for session_key, (global_id, timestamp, *_rest) in self.session_to_global_map.items():
             age = (now - timestamp).total_seconds()
             if age > threshold_seconds:
                 old_mappings.append(session_key)

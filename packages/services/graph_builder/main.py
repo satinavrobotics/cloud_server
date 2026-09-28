@@ -27,7 +27,7 @@ from packages.config import (
     MQTT_HOST, MQTT_PORT, MQTT_TOPIC_NODE_UPDATE, MQTT_IMAGE_TOPIC,
     POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, POSTGRES_DATABASE_PASSWORD,
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
-    RADIUS_THRESHOLD, DISTANCE_THRESHOLD, DEFAULT_MAP_ID, IMAGE_BUFFER_TIMEOUT,
+    RADIUS_THRESHOLD, DISTANCE_THRESHOLD, IMAGE_BUFFER_TIMEOUT,
     PORT_GRAPH_BUILDER, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
 )
 
@@ -35,12 +35,13 @@ from packages.config import (
 # ==================== Request/Response Models ====================
 
 class NodeUpdate(BaseModel):
-    """Model for manual node update (for testing)."""
+    """Model for manual node update (for testing). `map_id` is required since maps M2 (no
+    default map) and must name a map in the `mapping` state; x/y/yaw are map-frame."""
     node_id: Union[int, str]
     x: float
     y: float
     yaw: float = 0.0
-    map_id: Optional[str] = None
+    map_id: str
     images: Optional[list] = []
     metadata: Optional[Dict[str, Any]] = None
 
@@ -99,7 +100,6 @@ async def lifespan(app: FastAPI):
         postgres_host=POSTGRES_DATABASE_HOST,
         postgres_port=POSTGRES_DATABASE_PORT,
         radius_threshold=RADIUS_THRESHOLD,
-        default_map_id=DEFAULT_MAP_ID,
         image_buffer_timeout=IMAGE_BUFFER_TIMEOUT,
     )
 
@@ -112,7 +112,17 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(60)
             service._cleanup_old_mappings()
 
+    async def _periodic_reject_flush():
+        # MAP.INGEST_REJECTED for drops that no later drop has reported (maps M2).
+        while True:
+            await asyncio.sleep(10)
+            try:
+                await service.flush_rejects()
+            except Exception as e:  # noqa: BLE001
+                logging.warning(f"Rejection flush failed: {e}")
+
     asyncio.create_task(_periodic_cleanup())
+    asyncio.create_task(_periodic_reject_flush())
     logging.info("🚀 Graph Builder Service started")
 
     yield
@@ -181,6 +191,11 @@ async def process_node(node: NodeUpdate):
     
     In production, nodes are processed automatically from MQTT.
     """
+    state = await service.manual_target_state(node.map_id)
+    if state != "mapping":
+        raise HTTPException(status_code=409,
+                            detail=f"Map '{node.map_id}' does not accept nodes ({state}); "
+                                   "start a mapping session first")
     try:
         node_data = {
             "node_id": node.node_id,
