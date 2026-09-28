@@ -185,7 +185,7 @@ Since M2 a session is what routes robot data: graph-builder stores a robot's nod
 in the map of its open, unpaused session (node `pose` in the map frame, plus `robot_pose` and
 `session_id`) and drops everything else, reported as `MAP.INGEST_REJECTED` (at most one per robot
 and reason a minute, with the drop counts). A pause or finish takes effect within ~1 s. Not yet:
-MQTT to the robot (M3), alignment (M6), grid (M7). Events: `MAP.CREATED`, `MAP.ARCHIVED`,
+alignment (M6), grid (M7). Events: `MAP.CREATED`, `MAP.ARCHIVED`,
 `MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.DELETED` (background delete
 finished), `MAP.INGEST_REJECTED` (source `graph_builder`) in `fleet_events`. `POST /api/v1/maps`
 and `POST .../sessions` accept `Idempotency-Key`.
@@ -205,6 +205,30 @@ modes and map selection, the run recorder's `map_id` and the bag metadata read i
 (`docs/satinav-maps-redesign.md` §13.2). A refused call changes nothing. Body:
 `{success, robot_name, current_map, deprecated, map_created, finished_session, session}`.
 `POST /api/v1/maps/{id}/sessions` does not write `current_map`.
+
+#### Robot mapping switch over MQTT (maps M3)
+
+After every committed session change (`POST .../sessions`, `.../pause|resume|finish`, the shim)
+the API publishes the robot's **retained** `{prefix}/{robot}/mapping/set` (`prefix` =
+`MQTT_VDA5050_PREFIX`, `uagv/v2/RobotCompany`) from its open session, and re-publishes every
+robot's on each broker (re)connect. It caches the robots' retained `{prefix}/+/mapping/state`.
+Topic and payload contract: `packages/api/mapping_control.py` (docstring); robot side:
+`sati_topo_mapping` in sati_ros_navstack. Additive response fields:
+
+| Where | Field |
+|---|---|
+| `POST .../sessions`, `PUT /robots/{r}/map` | `robot_notified` (bool: the broker acknowledged the set message; false never fails the call), `mapping_service` (`"running"` \| `"not_running"`: the robot's topomap is connected; the session starts either way), `mapping_state` |
+| `POST .../sessions/{sid}/pause\|resume\|finish` | `robot_notified`, `mapping_state` |
+| `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service` (of the open session's robot; null without an open session) |
+| `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state` per robot |
+| `WS /ws/robot/{r}` | `{type: "mapping_state_update", robot_name, timestamp, mapping_state}` on every state message |
+
+`mapping_state`: null (nothing received since the API started: the topomap never connected, or
+runs a build without the switch) or `{status: "on"|"off"|"unreachable", online, enabled,
+session_id, map, nodes_sent, since, stamp, source: "mqtt"|"local"|"startup", received_at}`.
+`unreachable` = the robot's last will (or clean shutdown): its topomap service is not running.
+The robot confirmed a session when `mapping_state.session_id` equals the open session's id and
+`enabled` matches (`true` while mapping, `false` while paused).
 
 #### `WS /ws/map/{map_id}`
 WebSocket endpoint for real-time map updates.
