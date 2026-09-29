@@ -11,11 +11,9 @@
     POST   /api/v1/maps/{id}/archive|restore             archive_map() / restore_map()
     DELETE /api/v1/maps/{id}                             refuse_open_session() guards it
 
-    PUT    /api/v1/robots/{r}/map                        assign_robot_map() DEPRECATED shim (M2)
-
-The old map routes POST /map/load and PUT /maps/{id}/datum are unchanged. PUT
-/robots/{r}/map (the old client's "assign map") drives sessions since M2 (assign_robot_map,
-below) and still writes robot.current_map for the consumers that read it; it goes away in U6.
+The old map routes POST /map/load and PUT /maps/{id}/datum are unchanged. The old "assign map"
+(PUT /robots/{r}/map, a shim over sessions since M2) and robot.current_map were removed in U6:
+the robot's map is its open session; the route answers 410 for one release (main.py).
 
 Storage: the map is its `mapobjectv1` row (spec.type/geo, status.state/open_session_id; the
 object `lifecycle` ALIVE/DELETING stays the delete bookkeeping), sessions are `map_sessions`
@@ -102,7 +100,8 @@ ALIVE = ObjectLifecycleV1.ALIVE.value
 DRAFT, MAPPING, PAUSED, READY, ARCHIVED = MAP_STATES
 OPEN_STATES = (MAPPING, PAUSED)
 SESSION_ACTIONS = ("pause", "resume", "finish")
-# Robot-map sentinels of the old API (robot.current_map); never real map names.
+# The old API's mapless sentinels (robot.current_map, removed in U6). Still never map names:
+# old missions and mission_runs rows carry them as map ids, and must not attach to a map.
 RESERVED_NAMES = frozenset({"GEO", "LOCAL"})
 # The name is the key in Postgres, ArangoDB (nodes_<name>) and MinIO (bucket map-<name>,
 # lower-cased, '_' -> '-'; 63 characters at most), so it is restricted to what all three take.
@@ -145,7 +144,7 @@ class CreateMapRequest(pydantic.BaseModel):
             raise ValueError("map name must be 1-59 characters of letters, digits, '_' or '-', "
                              "starting and ending with a letter or digit")
         if value in RESERVED_NAMES:
-            raise ValueError(f"{value!r} is reserved (robot-map sentinel)")
+            raise ValueError(f"{value!r} is reserved (the old mapless sentinel)")
         return value
 
     @pydantic.validator("type")
@@ -432,15 +431,6 @@ class SqlStore:
                            name, exc)
             return None
         return (row[0], row[1]) if row is not None else None
-
-    async def set_current_map(self, robot: RobotObjectV1, value: Optional[str]) -> None:
-        """robot.current_map only (spec || patch, like update_spec_fields) and the robot NOTIFY
-        the dispatcher's watcher reads."""
-        await self.cursor.execute(
-            f"UPDATE {ROBOT_TABLE} SET spec = spec || %s::jsonb WHERE name = %s",
-            (json.dumps({"current_map": value}), robot.name))
-        await self.cursor.execute("SELECT pg_notify(%s, %s)", (
-            ROBOT_TABLE, f"{self.publisher_id} {robot.name} {robot.lifecycle.value}"))
 
     async def _sessions(self, where: str, params: tuple, order: str = "started_at, session_id",
                         limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -1284,113 +1274,3 @@ async def _session_action(db: Any, map_name: str, session_id: str, action: str,
 def _unchanged(map_name: str, map_state: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     return {"map_id": map_name, "map_state": map_state, "changed": False,
             "session": session_dict(session)}
-
-
-# --- the old "assign map" (DEPRECATED shim, maps redesign M2) --------------------------------
-
-class AssignRobotMapRequest(pydantic.BaseModel):
-    """PUT /api/v1/robots/{r}/map. `map_id`: a map name, the old 'GEO' / 'LOCAL' sentinels, or
-    null / '' to clear."""
-    map_id: Optional[str] = None
-
-
-def _new_map_type(robot: Optional[RobotObjectV1]) -> str:
-    """The type of a map the shim creates: the M1 rule (geo iff a real datum), applied to the
-    robot's datum, as POST /map/load applies it to the datum it is given."""
-    return "geo" if robot is not None and map_geo.robot_datum(robot.datum) is not None else "local"
-
-
-async def assign_robot_map(db: Any, robot_name: str, map_id: Optional[str],
-                           publisher_id: uuid.UUID, actor: Optional[str] = None,
-                           arango_node_count: Optional[Callable[[str], int]] = None,
-                           control: Optional[Any] = None) -> Dict[str, Any]:
-    """DEPRECATED (goes away in U6): the old client's "assign map", PUT
-    /api/v1/robots/{r}/map, drives mapping sessions so live mapping keeps working.
-
-    - a real map name: finish the robot's open session if it is on another map; create the map
-      if it does not exist (draft, typed from the robot's datum, MAP.CREATED; name rules and
-      409s as POST /api/v1/maps); start a MAPPING session on it (the rules and errors of POST
-      /api/v1/maps/{id}/sessions: robot online, geo needs a datum, one open mapping session
-      per map, not archived; a local map that has nodes starts NOT placed, maps §14 Q-U4).
-      Re-assigning the map the robot is already on (mapping or using) changes nothing.
-    - 'GEO' / 'LOCAL' / null / '': finish the robot's open session, if any.
-
-    robot.current_map is still written (the sentinel, the name, or null): the old client, the
-    run recorder and the bag metadata read it (docs/satinav-maps-redesign.md §13.2). All of it
-    is one transaction: a refused session start leaves the old session, the map list and
-    current_map as they were."""
-    target = (map_id or "").strip() or None
-    sentinel = target is None or target in RESERVED_NAMES
-    now = _utcnow()
-    created = False
-    finished: Optional[Dict[str, Any]] = None
-    session: Optional[Dict[str, Any]] = None
-    try:
-        async with open_store(db, publisher_id) as store:
-            robot = await store.lock_robot(robot_name)
-            if robot is None:
-                raise HTTPException(404, f"Did not find \"robot\" with name \"{robot_name}\"")
-            mine = await store.open_sessions_of_robot(robot_name)
-            current = mine[0] if mine else None
-            if not sentinel and current is not None and current["map_name"] == target:
-                session = current  # already on this map (maybe paused): nothing to do
-            else:
-                names = sorted({n for n in (None if sentinel else target,
-                                            current["map_name"] if current else None) if n})
-                rows: Dict[str, Optional[MapRow]] = {}
-                for name in names:  # lock in name order: two assigns never deadlock
-                    rows[name] = await store.lock_map(name)
-                row = None
-                if not sentinel:
-                    row = rows[target]
-                    if row is None:
-                        row = await _create_for_assign(store, target, robot, now, actor,
-                                                       arango_node_count)
-                        created = True
-                    elif row.lifecycle == DELETING:
-                        raise HTTPException(409, f"Map '{target}' is being deleted")
-                if current is not None:
-                    await _finish_in(store, rows.get(current["map_name"]), current, now, actor)
-                    finished = current
-                if row is not None:
-                    session = await _start_in(store, row, robot, robot_name, now, actor,
-                                              arango_node_count=arango_node_count)
-            if robot.current_map != target:
-                await store.set_current_map(robot, target)
-    except _SCHEMA_ERRORS as exc:
-        raise _undefined_table(exc) from exc
-    out = {"success": True, "robot_name": robot_name, "current_map": target,
-           "deprecated": "PUT /api/v1/robots/{robot}/map: use POST /api/v1/maps/{id}/sessions "
-                         "and .../sessions/{sid}/finish",
-           "map_created": created,
-           "finished_session": session_dict(finished) if finished else None,
-           "session": session_dict(session) if session else None}
-    out.update(await notify_robot(control, db, robot_name, with_service=True))
-    return out
-
-
-async def _create_for_assign(store: Any, name: str, robot: RobotObjectV1,
-                             now: datetime.datetime, actor: Optional[str],
-                             arango_node_count: Optional[Callable[[str], int]]) -> MapRow:
-    """A map for the shim's "NEW MAP" flow, with create_map()'s checks; the new locked row."""
-    map_type = _new_map_type(robot)
-    req = parse_body(CreateMapRequest, {"name": name, "type": map_type})
-    if arango_node_count is not None:
-        nodes = arango_node_count(req.name)
-        if nodes:
-            raise HTTPException(409, f"ArangoDB already has {nodes} nodes for map "
-                                     f"'{req.name}' (no Postgres row); choose another name")
-    clash = [n for n in await store.map_names()
-             if n != req.name and bucket_key(n) == bucket_key(req.name)]
-    if clash:
-        raise HTTPException(409, f"Map name '{req.name}' collides with existing map "
-                                 f"'{clash[0]}' (same image bucket)")
-    spec = json.loads(MapSpecV1(type=map_type).json())
-    status = json.loads(MapStatusV1(state=DRAFT).json())
-    if not await store.insert_map(req.name, spec, status):
-        raise HTTPException(409, f"Map '{req.name}' already exists")
-    await store.emit(_map_event(EventCode.MAP_CREATED, req.name, map_type, DRAFT, actor, now))
-    row = await store.lock_map(req.name)
-    if row is None:  # pragma: no cover - just inserted in this transaction
-        raise HTTPException(500, f"Map '{req.name}' vanished")
-    return row

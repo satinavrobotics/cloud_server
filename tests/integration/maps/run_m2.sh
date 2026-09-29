@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Maps redesign M2 integration test (docs/satinav-maps-redesign.md §6, §12, §13.2): migration
 # 20260929_01_maps_m2, tools.maps_m2_legacy_nodes (dry run, apply, idempotent re-run, revert,
-# re-apply), and graph-builder ingesting over MQTT by mapping session, driven by the
-# PUT /robots/{r}/map shim, pause/resume, rejections and MAP.INGEST_REJECTED. Maps M3 adds a
+# re-apply), and graph-builder ingesting over MQTT by mapping session, driven by session
+# start/finish (the PUT /robots/{r}/map shim until U6), pause/resume, rejections and
+# MAP.INGEST_REJECTED. Maps M3 adds a
 # step: the robot mapping switch over the test mosquitto (checks_m3.py).
 #
 #   tests/integration/maps/run_m2.sh [--dump PG_DUMP --arango-dump DIR] [TEST_IMAGE]

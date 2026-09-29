@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.**
+**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.** **U6 (2026-09-29, built, not deployed; §14.14): `robot.current_map`, the `PUT /robots/{r}/map` shim (now 410), the `GEO`/`LOCAL` sentinels and the §14.6 fallbacks are gone; a robot's map is only its open session.**
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -447,10 +447,10 @@ counts per session. `since`: when `enabled` last flipped.
   without a datum. No migration (the event code has no DB constraint). Caveat: the robot's datum
   reaches Postgres a moment after its restart; nodes arriving in that gap are placed with the old
   transform (as before this change), the first node after the datum arrives realigns.
-- **Map delete** resets `current_map` of robots still pointing at the map to their mapless
+- *(Removed in U6, §14.14: robots have no `current_map`, and a map with an open session cannot be deleted.)* **Map delete** resets `current_map` of robots still pointing at the map to their mapless
   sentinel: `GEO` for a `gps` robot, `LOCAL` otherwise (what `PUT /robots/{r}/map` with no map
   writes), in the delete's finishing transaction, with the robot NOTIFY.
-- **Planner without `map_id`**: the robot's `current_map` (a real map, not `GEO`/`LOCAL`); with no
+- **Planner without `map_id`** *(since U2 the session's map; since U6 only the session's map, §14.14)*: the robot's `current_map` (a real map, not `GEO`/`LOCAL`); with no
   robot or no usable current map: 400 (`POST /api/v1/navigate`, `GET /missions/{id}/plan`; the
   API passes the 400 on). The implicit `default` map is gone (`default_map_id` is an opt-in
   constructor argument, unset in production). The API's `plan_mission` passes `map_id` on.
@@ -462,7 +462,7 @@ counts per session. `since`: when `enabled` last flipped.
 
 ## 14. Using maps: operate sessions and the map window
 
-**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client; U7 (placement reuse, §14.13, with the stale-`ON_TASK` fix) built, not deployed. Revises the M5–M7 plan (§14.9).
+**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client; U7 (placement reuse, §14.13, with the stale-`ON_TASK` fix) built, not deployed; U6 (removals, §14.14) built on the cloud side, not deployed. Revises the M5–M7 plan (§14.9).
 
 ### 14.1 The gap
 
@@ -615,7 +615,7 @@ ALTER TABLE map_sessions ADD CONSTRAINT map_sessions_legacy_mapping_check
 | graph-builder `decide()` | open session | plus `not_mapping_session` (operate) and `session_unplaced` |
 | Client marker | the map's transform (off by −1.445° on `map` with the sim, §13.2) | `robot.session.map_T_session` |
 
-**Transition (U2 to U6):** while the old client still sends missions without a session, a waypoint on a map the robot has no session on falls back to today's `robot_frame_in_map`, with a warning. U6 removes the fallback.
+**Transition (U2 to U6):** while the old client still sends missions without a session, a waypoint on a map the robot has no session on falls back to today's `robot_frame_in_map`, with a warning. U6 removes the fallback (§14.14): such a waypoint fails the node ("robot is not using map X"), the planner answers 409, and `robot_frame_in_map` is gone.
 
 ### 14.7 Client: the map window
 
@@ -704,7 +704,7 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 | U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
 | U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server; cloud **deployed 2026-09-29** (in the `mapsu1.sh` build of main; `mapsu5.sh` then found the image unchanged), robot topomap rebuild pending (§14.12) |
 | U7 | Placement reuse across sessions (§14.13): `robot_run_epochs`, `map_sessions.run_epoch`, carry on start, `placement_reusable`; with it the stale-`ON_TASK` fix (§14.11) | cloud_server (`mapsu7.sh`), sati-client (Use skips place mode when reusable) |
-| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server, sati-client |
+| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server (**built 2026-09-29**, not deployed: §14.14, `mapsu6.sh`, after `mapsu7.sh` and the U6 client), sati-client |
 | M5 | One `MapView` (unchanged goal; its local/geo rendering starts from U4's preview) | sati-client; **built 2026-09-29** (`6798aa0..c39953b`): `MapView` replaces CostmapRenderer and GeoMap; robots drawn through `map_T_session`, or without a session through their own datum (fixes the −1.445° marker). Left: costmap bitmaps still drawn in the run frame; `current_map` readers go in U6 |
 | M6 | **Shrinks** to aligning *existing* unaligned sessions (legacy data), since new ones are placed before capture. Drop it if none remain | cloud_server, sati-client |
 | M7 | Grid storage and display once `sati_grid_mapping` exists; it plugs in as service `grid` | all |
@@ -739,9 +739,9 @@ As designed, except:
 - **Stale `ON_TASK` (found 2026-09-29, fixed in U7).** `masked-frigatebird` stayed `ON_TASK` for hours after its mission completed (ON_TASK → IDLE logged and recorded at 15:23:21), so placing it was refused as "driving". Cause: mission-dispatch received its **own** robot-status writes back through the Postgres watcher (each write used a fresh publisher id, so the watcher's "skip our own changes" never matched), and the watcher reads the row when it handles the NOTIFY, not when it was sent. The state message at mission end first wrote the status (still ON_TASK), then completed the mission and wrote IDLE with `ensure_future`; the echo of the first write, read before the IDLE write committed, replaced the dispatcher's in-memory robot object with `ON_TASK`, and every later state message (about 1/s) wrote that `ON_TASK` back, with no `ROBOT.STATE_CHANGED` since `_set_robot_state` was never involved. The same echo class as the mission "stale echo" the dispatcher already guards against. Fix: the dispatcher's robot writes carry one publisher id that its robot watcher skips; an echo from anyone else never changes `status.state` (only `_set_robot_state` does); and `ON_TASK`/`MAP_DEPLOYMENT` with no current or queued mission is set back to IDLE (with the event) 30 s after the robot's controller was created, which also heals a stuck robot at the deploy. The repeated "Object from DB: …" lines were the mission watcher's full resync every 60 s on a quiet table (done missions are skipped there, nothing re-ran); it now logs one line per resync.
 - **API details.** Session `state` is `mapping` | `paused` | `operating` | `finished`. The robot's `session` view has `map_T_session: null` while not placed (never a guessed identity) and `unplaced_reason` (`run_changed`). `sessions.open` in `GET /maps/{id}` is the open **mapping** session; `sessions.unaligned` counts mapping sessions only. History paging: `before` = the previous page's `next_before` (a session id). `services` accepts `topo` and the reserved `grid`; `mapping_services` was `{topo: ...}` until U5 (§14.12). WS: `robot_update` carries `session` (from a 1 s cache, so dispatcher changes show within about a second) and the API pushes `session_update` right after its own changes. `POST /robots/{r}/mapping/off` is allowed with an operate session (only an open mapping session blocks it).
 - **Migration** adds a third constraint, `map_sessions_services_check` (only mapping sessions have services). Downgrade deletes operate sessions first (they own no nodes; their robots become mapless). Rehearsed on the production schema: up, idempotent re-run, down, up.
-- **Dispatcher refusal.** A route node on a map the robot is not placed on is not sent: the node fails (`MISSION.NODE_FAILED`, `failure_reason` "Route node N: robot is not placed on map X") and the behavior tree decides the mission; it is wrapped up on the robot's next state message. With the transition fallback (`SESSIONLESS_FALLBACK = True` in the dispatcher and the planner, removed in U6) a map the robot has **no** session on keeps the M2 rule with a warning.
+- **Dispatcher refusal.** A route node on a map the robot is not placed on is not sent: the node fails (`MISSION.NODE_FAILED`, `failure_reason` "Route node N: robot is not placed on map X") and the behavior tree decides the mission; it is wrapped up on the robot's next state message. With the transition fallback (`SESSIONLESS_FALLBACK = True` in the dispatcher and the planner, removed in U6, §14.14) a map the robot has **no** session on keeps the M2 rule with a warning.
 - **Transition, old client.** The shim (`PUT /robots/{r}/map`) extending a local map that has nodes now starts the mapping session **unplaced** (Q-U4): capture stays off and route orders on that map are refused until the robot is placed, which only the new client (U4) can do. Geo maps and new/empty local maps behave as before.
-- **Run recorder / bags.** `mission_runs.map_id` = the session's map, or null when mapless (no longer the `GEO`/`LOCAL` sentinel or the pose's literal `"map"`); if the session cannot be read the M2 rule applies. Bag sidecars gain `session_id`.
+- **Run recorder / bags.** `mission_runs.map_id` = the session's map, or null when mapless (no longer the `GEO`/`LOCAL` sentinel or the pose's literal `"map"`); if the session cannot be read the M2 rule applies (since U6: null). Bag sidecars gain `session_id`.
 
 Deploy notes: open local sessions that are not aligned (later M1/M2 sessions on a local map) stop capturing at deploy; `mapsu1.sh` lists them. mission-dispatch starts with no header-id baseline, so the deploy itself unplaces nothing.
 
@@ -794,6 +794,26 @@ Deploy order: the robot and the cloud are independent (a U5 topomap talks to a U
 **Deploy.** Migration first (the API runs it), then mission-dispatch. Until the new dispatcher runs, `robot_run_epochs` is empty and nothing is carried. The new dispatcher also sets a stale `ON_TASK` (no mission) to IDLE 30 s after it starts.
 
 Code: `packages/utils/map_sessions.py` (`run_continues`, `epoch_to_stamp`, `reusable_session`, the epoch SQL), `packages/api/maps.py` (`_finish_in`, `_start_in`, `session_summary`, `SqlStore.robot_run_epoch`), `packages/controllers/mission/server.py` (`_check_run_continuity`, `_persist_run_header`, `_new_run_epoch`, `_unverify_run_epochs`), migration `20261001_01_run_epochs`. Tests: `tests/unit/test_maps_u7.py`; `tests/integration/maps/checks_reuse.py` (real Postgres, in the `mapsu7.sh` dry run).
+
+### 14.14 U6 as built
+
+**Status:** built 2026-09-29 (cloud_server), not deployed. Deploy: `~/pg-cutover/scripts/mapsu6.sh` (migration `20261002_01_drop_current_map`; rebuilds api-delegation-service, mission-dispatch, mission-planner-service). **Prerequisites:** U7 deployed (`mapsu7.sh`; the migration follows `20261001_01_run_epochs`) and **the U6 client deployed first**: an older client still calls `PUT /robots/{r}/map`, reads `current_map`, and sends `GEO`/`LOCAL` waypoints, all of which stop working. The script cannot detect which client browsers run, so it prints this as a manual prerequisite.
+
+A robot's map is only its open session (§14.2). Removed:
+
+- **`PUT /api/v1/robots/{r}/map`** (the M2 shim, `maps.assign_robot_map`, `SqlStore.set_current_map`, `_create_for_assign`, `UpdateRobotMapRequest`). The route stays registered for **one release** and always answers **410 Gone**: "PUT /api/v1/robots/{robot}/map was removed (maps U6): a robot's map is its open session. Use POST /api/v1/maps/{id}/sessions (purpose mapping or operate) and POST /api/v1/maps/{id}/sessions/{sid}/finish." (410 rather than dropping the route, so an old client gets a clear answer instead of a 405; the release after U6 deletes it.) `set_map` is gone from `GET /api`.
+- **`robot.current_map`**: the field of `RobotSpecV1`, so robot views (`GET /robots[/{r}]`, WS) no longer carry it. Every reader and writer: the API's robot create/update (a `current_map` in the body is now **ignored**, not 409 for a deleting map), the planner, the run recorder, the map delete. Migration `20261002_01_drop_current_map` strips the stored key from every `robotobjectv1` row (`spec - 'current_map'`, idempotent); pydantic v1 would ignore it on read anyway (`Extra.ignore`), but `spec || patch` writes would carry it forever. Downgrade writes `current_map` = the map of the robot's **open** session, for robots with one (what the pre-U6 code would have shown), and leaves the others without the key (null to the old model); it never recreates `GEO`/`LOCAL`.
+- **The `GEO`/`LOCAL` sentinels**: `config.GPS_MAP_SENTINEL` / `LOCAL_MAP_SENTINEL`, the dispatcher's "`GEO`/`LOCAL` waypoints are mapless" rule and the planner's "not a map" rule. A mission waypoint whose `map_id` is `GEO` or `LOCAL` is now a waypoint on a map the robot is not using: the node fails. Mapless waypoints have an empty `map_id`. The names stay **reserved** (`maps.RESERVED_NAMES`: `POST /maps` refuses them, `POST /map/load` returns an empty answer for them and registers nothing), because old missions and `mission_runs` rows carry them as map ids and must never attach to a real map.
+- **The map delete's `current_map` reset** (`map_delete.ROBOTS_SQL` and its robot NOTIFYs). Since U1 a map with any open session cannot be deleted, so no robot is on it.
+- **The §14.6 fallbacks** (`SESSIONLESS_FALLBACK` in the dispatcher and the planner, and `map_geo.robot_frame_in_map`):
+  - Dispatcher `_route_in_robot_frame`: a waypoint on the session's map goes through inverse(`map_T_session`); anything else that names a map fails the node: "robot is not using map X" (no session, or a session on another map), "robot is not placed on map X", or "the robot's map session could not be read" (Postgres error; before U6 the M2 rule applied). The map row is no longer read.
+  - Planner: without `map_id` the session's map, else 400 ("has no open map session: pass map_id"; the opt-in `default_map_id` of the tests still applies). The robot's position only through a placed session on that map; no session there → `RobotNotPlacedError` "not using map X" (409 at `POST /api/v1/navigate`, like "not placed"). A failing session lookup is no longer swallowed: it propagates (500 / the caller's error path).
+  - Run recorder: `mission_runs.map_id` = the session's map; null when mapless **or** when the session could not be read (no more `current_map` / pose-map-id rule).
+  - Bag metadata already used the session (U2).
+
+Unchanged: the mission's own `map_id` / waypoint `map_id` (the map a mission's waypoints are on), `POST /map/load`, `PUT /maps/{id}/datum`, graph-builder (comments only; not rebuilt).
+
+Tests: `tests/unit/test_maps_u6.py` (model, 410, removals, migration SQL), `test_maps_use_consumers.py` (the refusals), `test_planner_map_resolution.py`, `test_map_delete.py`; `tests/integration/maps/checks_m2.py` drives ingest by `start_session` / `finish` instead of the shim. `mapsu6.sh --dry-run` runs the unit tests and the migration (up, idempotent re-run, down, up) on a throwaway Postgres restored from production's schema.
 
 ---
 

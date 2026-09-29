@@ -435,7 +435,6 @@ async def root():
                 "update": "PUT /api/v1/robots/{robot_name}",
                 "delete": "DELETE /api/v1/robots/{robot_name}",
                 "status": "GET /api/v1/robots/{robot_name}/status",
-                "set_map": "PUT /api/v1/robots/{robot_name}/map",
                 "invoke_action": "POST /api/v1/robots/{robot_name}/actions"
             },
             "missions": {
@@ -575,8 +574,8 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     transaction. Errors: packages/api/maps.py (module docstring). Maps M3: then the robot's
     retained MQTT `{prefix}/{robot}/mapping/set` (capture on only for a placed, unpaused
     mapping session). The response: {map_id, map_state, changed, session, replaced_session,
-    robot_notified, mapping_service, mapping_services, mapping_state}. Note: this route does
-    not write robot.current_map (the deprecated PUT /robots/{r}/map does)."""
+    robot_notified, mapping_service, mapping_services, mapping_state}. The session is the
+    robot's map (maps §14.2; robots have no current_map since U6)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
@@ -1242,8 +1241,8 @@ def _robot_view(robot: RobotObjectV1,
     (maps U5) `mapping_services`: {service: running | not_running | not_available};
     plus (maps §14) `session`: the robot's open session, derived from map_sessions and never
     stored on the robot: {session_id, map, purpose, state, aligned, map_T_session,
-    unplaced_reason} or null (mapless). It replaces `current_map` for the client
-    (packages/utils/map_sessions.py::robot_session_view)."""
+    unplaced_reason} or null (mapless). It is the robot's map (robot.current_map was removed in
+    maps U6; packages/utils/map_sessions.py::robot_session_view)."""
     data = robot.dict()
     data["mapping_state"] = service.mapping_control.state(robot.name) if service else None
     data["mapping_services"] = (service.mapping_control.mapping_services(robot.name)
@@ -1492,9 +1491,8 @@ async def create_robot(robot_data: dict):
                 await service.database.update_status(RobotObjectV1, robot.name, robot.status, publisher_id)
             return (await service.database.get_object(RobotObjectV1, robot_data["name"])).dict()
         else:
-            # Robot doesn't exist — create it
-            if robot_data.get("current_map"):
-                await service.ensure_map_not_deleting(robot_data["current_map"])
+            # Robot doesn't exist — create it (a `current_map` in the body is ignored: maps U6,
+            # the robot's map is its open session)
             status = RobotStatusV1()
             if factsheet_data:
                 status.factsheet.agv_class = factsheet_data.get("agv_class", "")
@@ -1542,8 +1540,9 @@ async def update_robot(robot_name: str, robot_data: dict):
         recording.check_level(robot_data)
         # Get existing robot
         robot = await service.database.get_object(RobotObjectV1, robot_name)
-        if robot_data.get("current_map") and robot_data["current_map"] != robot.current_map:
-            await service.ensure_map_not_deleting(robot_data["current_map"])
+        # Maps U6: robots have no current_map (their map is the open session); an old
+        # caller's field is ignored rather than failing the whole update.
+        robot_data = {k: v for k, v in robot_data.items() if k != "current_map"}
 
         publisher_id = uuid.uuid4()
 
@@ -1594,35 +1593,18 @@ async def delete_robot(robot_name: str):
         raise HTTPException(status_code=404, detail=f"Failed to delete robot: {str(e)}")
 
 
-class UpdateRobotMapRequest(BaseModel):
-    """Request model for the (deprecated) robot map assignment."""
-    map_id: Optional[str] = Field(
-        None, description="Map name to map into, 'GEO' / 'LOCAL' (the old sentinels), or "
-                          "null / '' to stop mapping")
+# Maps U6: the deprecated "assign map" is gone. 410 for one release so an old client gets a
+# clear answer instead of a 404/405; remove the route in the release after U6.
+ROBOT_MAP_GONE = ("PUT /api/v1/robots/{robot}/map was removed (maps U6): a robot's map is its "
+                  "open session. Use POST /api/v1/maps/{id}/sessions (purpose mapping or "
+                  "operate) and POST /api/v1/maps/{id}/sessions/{sid}/finish.")
 
 
-@app.put("/api/v1/robots/{robot_name}/map")
-async def update_robot_map(robot_name: str, request: UpdateRobotMapRequest):
-    """
-    DEPRECATED (maps redesign M2; removed with the client's Maps page, M4): the old "assign
-    map". Use POST /api/v1/maps/{id}/sessions and .../sessions/{sid}/finish.
-
-    A real map name starts a mapping session for the robot on that map (creating the map,
-    typed from the robot's datum, if it does not exist; finishing the robot's session on
-    another map first); 'GEO' / 'LOCAL' / null finish the robot's open session. Errors are
-    those of POST /api/v1/maps/{id}/sessions (404 robot, 409 offline / no datum for a geo map /
-    map busy / archived / being deleted, 422 invalid new-map name). robot.current_map is still
-    written for its remaining readers (packages/api/maps.py::assign_robot_map).
-    """
-    _require_service()
-
-    def arango_nodes(name: str) -> int:
-        stats = service.graph_db.get_map_stats(name)
-        return 0 if "error" in stats else int(stats.get("node_count") or 0)
-
-    return await _site_call("assign robot map", maps.assign_robot_map(
-        service.database, robot_name, request.map_id, uuid.uuid4(),
-        recording.request_actor(), arango_nodes, control=service.mapping_control))
+@app.put("/api/v1/robots/{robot_name}/map", status_code=410)
+async def update_robot_map(robot_name: str):
+    """REMOVED in maps U6 (was the deprecated M2 shim over sessions): always 410 Gone, pointing
+    to POST /api/v1/maps/{id}/sessions and .../sessions/{sid}/finish. Kept for one release."""
+    raise HTTPException(status_code=410, detail=ROBOT_MAP_GONE)
 
 
 @app.post("/api/v1/robots/{robot_name}/mapping/off")

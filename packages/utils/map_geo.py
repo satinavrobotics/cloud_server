@@ -141,27 +141,3 @@ def invert_transform(t: Mapping[str, float]) -> Dict[str, float]:
 
 def is_identity(t: Mapping[str, float], tol: float = 1e-12) -> bool:
     return all(abs(float(t.get(k, 0.0))) <= tol for k in ("tx", "ty", "yaw"))
-
-
-def robot_frame_in_map(map_spec: Any, current_datum: Any) -> Optional[Dict[str, float]]:
-    """Where the robot's CURRENT frame sits in a map's frame (maps redesign M2), for code that
-    meets robot-frame data (robot.status.pose, VDA5050 orders) with map-frame data (node poses):
-
-    - geo map with an origin: session_transform() of the robot's current datum; None if the
-      robot has no datum (unknown: callers keep the old behaviour, no conversion);
-    - local map, or a geo map without an origin yet: identity (there is no relocalization; a
-      local map's frame is the frame of the run that made it, doc §3. M6 alignment will need
-      the robot's aligned session here).
-
-    Returns map_T_robot. `map_spec`: a MapSpecV1/MapObjectV1 or its dict; `current_datum`:
-    the robot's RobotDatumV1 or dict."""
-    geo_block = _get(map_spec, "geo")
-    map_type = _get(map_spec, "type")
-    if geo_block is None or map_type == "local":
-        return dict(IDENTITY)
-    if not isinstance(geo_block, Mapping):
-        geo_block = geo_block.dict()
-    datum = robot_datum(current_datum) if current_datum is not None else None
-    if datum is None:
-        return None
-    return session_transform(geo_block, datum)

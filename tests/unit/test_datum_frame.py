@@ -88,13 +88,13 @@ class _Db:
         self.map_specs.append(json.loads(spec.json()))
 
 
-def _robot(db, current_map="site_a"):
+def _robot(db):
     server = MagicMock()
     server.disable_request_factsheet = True
     server.push_telemetry = False
     server.mission_ctrl_url = None
     r = Robot("r1", db, MagicMock(), "prefix", server)
-    r._robot_object = api_objects.RobotObjectV1(name="r1", status={}, current_map=current_map)
+    r._robot_object = api_objects.RobotObjectV1(name="r1", status={})
     return r
 
 
@@ -109,13 +109,12 @@ class TestDispatchDatumMessage:
 
     async def test_no_map_datum_auto_seed(self):
         """Maps M2: a map's datum comes from its first mapping session (doc Q1), never from
-        a datum message of a robot whose current_map names it (or the GEO sentinel)."""
-        for current_map in ("site_a", "GEO", "LOCAL"):
-            db = _Db(MapObjectV1(name="site_a", description="yard"))
-            r = _robot(db, current_map)
-            await r._process_datum_message(types.RobotDatum(**UTM_WIRE))
-            assert db.robot_fields == {"datum": UTM_WIRE}
-            assert db.map_specs == []
+        a robot's datum message."""
+        db = _Db(MapObjectV1(name="site_a", description="yard"))
+        r = _robot(db)
+        await r._process_datum_message(types.RobotDatum(**UTM_WIRE))
+        assert db.robot_fields == {"datum": UTM_WIRE}
+        assert db.map_specs == []
         legacy = _Db(MapObjectV1(name="site_a"))
         r = _robot(legacy)
         await r._process_datum_message(

@@ -10,10 +10,10 @@ the test's private network). docs/satinav-maps-redesign.md §6, §12, §13.2.
                                datum_* = the origin as a utm datum
     checks_m2.py reverted      after --revert --apply: the nodes and datum as before
     checks_m2.py ingest        graph-builder end to end over MQTT: no session -> dropped +
-                               MAP.INGEST_REJECTED; the PUT /robots/{r}/map shim opens a session
-                               -> image + node stored in the map frame, node_count counted; pause
-                               -> dropped within ~1 s; resume; GEO -> finished -> dropped; a new
-                               map through the shim
+                               MAP.INGEST_REJECTED; a mapping session (POST .../sessions; the
+                               PUT /robots/{r}/map shim was removed in U6) -> image + node stored
+                               in the map frame, node_count counted; pause -> dropped within
+                               ~1 s; resume; finish -> dropped; a new geo map
     checks_m2.py downgraded    after alembic downgrade -1: the old CHECK, no graph_builder rows
 
 Environment: as checks.py, plus ARANGO_HOST/ARANGO_PASSWORD, MINIO_HOST/MINIO_PORT/keys,
@@ -72,7 +72,7 @@ def seed():
             "created_at": f"2026-09-28T14:10:{20 + i}", "map_id": MAP, "robot_name": ROBOT,
             "session_node_id": i})
     query("INSERT INTO robotobjectv1 (name, lifecycle, spec, status) VALUES (%s, 'ALIVE', %s, %s)",
-          (ROBOT, json.dumps({"current_map": MAP, "datum": ENU_DATUM}),
+          (ROBOT, json.dumps({"datum": ENU_DATUM}),
            json.dumps({"online": True, "state": "IDLE"})))
     print("seed done")
 
@@ -86,9 +86,8 @@ def show():
                    "node_count, map_t_session FROM map_sessions ORDER BY map_name, started_at"):
         print(f"  session map={r[0]} robot={r[1]} kind={r[2]} open={r[3]} paused={r[4]} "
               f"nodes={r[5]} T={json.dumps(r[6], sort_keys=True)}")
-    for name, cm, online in query("SELECT name, spec->>'current_map', status->>'online' "
-                                  "FROM robotobjectv1 ORDER BY name"):
-        print(f"  robot {name}: current_map={cm} online={online}")
+    for name, online in query("SELECT name, status->>'online' FROM robotobjectv1 ORDER BY name"):
+        print(f"  robot {name}: online={online}")
     for d in nodes(arango()):
         p, rp = d["pose"], d.get("robot_pose")
         print(f"  node {d['_key'][:12]} pose=({p['x']:.4f}, {p['y']:.4f}, {p['yaw']:.4f})"
@@ -235,16 +234,15 @@ async def ingest():
     check(not _node_by_seq(base + 1) and len(nodes(arango(), "default")) == before_default,
           "nothing stored, no 'default' map")
 
-    # 2. the shim opens a session on `map` (current_map stays `map`)
-    out = await maps.assign_robot_map(db, ROBOT, MAP, PUB, "m2it")
+    # 2. a mapping session on `map`
+    out = await maps.start_session(db, MAP, {"robot": ROBOT}, PUB, "m2it")
     s = out["session"]
-    check(s and s["map_name"] == MAP and s["state"] == "mapping", "shim: session open on `map`")
+    check(s and s["map_name"] == MAP and s["state"] == "mapping", "session open on `map`")
     t = s["map_T_session"]
     check(abs(math.degrees(t["yaw"]) + 1.445) < 0.002 and abs(t["tx"]) < 1e-6,
           f"session transform = the convergence rotation {t}")
-    rows = query("SELECT spec->>'current_map', (SELECT status->>'state' FROM mapobjectv1 "
-                 "WHERE name = %s) FROM robotobjectv1 WHERE name = %s", (MAP, ROBOT))
-    check(rows[0] == (MAP, "mapping"), f"current_map / map state: {rows[0]}")
+    rows = query("SELECT status->>'state' FROM mapobjectv1 WHERE name = %s", (MAP,))
+    check(rows[0] == ("mapping",), f"map state: {rows[0]}")
     time.sleep(1.2)  # the ingest cache (1 s)
     _send(m, base + 2, 10.0, 0.0, 0.5)
     doc = _wait(lambda: _node_by_seq(base + 2))
@@ -281,10 +279,10 @@ async def ingest():
     _send(m, base + 5, 13.0, 0.0, session_id=str(uuid.uuid4()))
     check(bool(_wait(lambda: _events("session_mismatch"))), "foreign session_id rejected")
 
-    # 6. GEO through the shim finishes the session; data dropped again
-    out = await maps.assign_robot_map(db, ROBOT, "GEO", PUB, "m2it")
-    check(out["finished_session"]["session_id"] == s["session_id"] and out["session"] is None,
-          "shim GEO: session finished")
+    # 6. finishing the session; data dropped again
+    out = await maps.session_action(db, MAP, s["session_id"], "finish", PUB, "m2it")
+    check(out["session"]["session_id"] == s["session_id"]
+          and out["session"]["state"] == "finished", "session finished")
     state = query("SELECT status->>'state' FROM mapobjectv1 WHERE name = %s", (MAP,))[0][0]
     check(state == "ready", "`map` ready")
     time.sleep(1.2)
@@ -294,9 +292,10 @@ async def ingest():
     check(not _node_by_seq(base + 6), "after finish: node not stored (reported once a minute: "
                                       f"{len(_events('no_session')) - n_before} new event(s))")
 
-    # 7. a new map through the shim ("NEW MAP" flow): created geo, origin = the robot's datum
-    out = await maps.assign_robot_map(db, ROBOT, "m2it-new", PUB, "m2it")
-    check(out["map_created"] and out["session"]["map_name"] == "m2it-new", "shim created a map")
+    # 7. a new geo map: origin = the robot's datum at its first session
+    await maps.create_map(db, {"name": "m2it-new", "type": "geo"}, PUB, "m2it")
+    out = await maps.start_session(db, "m2it-new", {"robot": ROBOT}, PUB, "m2it")
+    check(out["session"]["map_name"] == "m2it-new", "new map: session open")
     spec = query("SELECT spec FROM mapobjectv1 WHERE name = 'm2it-new'")[0][0]
     check(spec["type"] == "geo" and spec["datum_frame"] == "utm",
           "new map: geo, legacy datum = its origin (utm)")
@@ -307,7 +306,8 @@ async def ingest():
     t2 = out["session"]["map_T_session"]
     check(abs(t2["tx"]) < 1e-6 and abs(t2["ty"]) < 1e-6, "first session of a new geo map: "
                                                          "no translation")
-    await maps.assign_robot_map(db, ROBOT, MAP, PUB, "m2it")  # back on `map`, as before
+    await maps.start_session(db, MAP, {"robot": ROBOT, "replace": True}, PUB,
+                             "m2it")  # back on `map`, as before
     rows = query("SELECT map_name FROM map_sessions WHERE robot_name = %s AND ended_at IS NULL",
                  (ROBOT,))
     check(rows == [(MAP,)], "switched back: one open session, on `map`")

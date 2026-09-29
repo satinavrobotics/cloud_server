@@ -29,6 +29,7 @@ class TestMissionPlannerLegacy:
         mock_status.online = True
 
         mock_robot = Mock(spec=robot_object.RobotObjectV1)
+        mock_robot.name = "robot_1"
         mock_robot.status = mock_status
         mock_robot.position_mode = 'local'
 
@@ -59,6 +60,10 @@ class TestMissionPlannerLegacy:
         mock_graph_client.return_value = mock_graph_instance
 
         service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
+        # maps U6: the robot's position needs a placed session on the map (identity here)
+        service._open_session = AsyncMock(return_value={
+            "map_name": "default", "aligned": True,
+            "map_t_session": {"tx": 0.0, "ty": 0.0, "yaw": 0.0}})
 
         result = await service.plan_mission(
             robot_id="robot_1",
@@ -72,6 +77,15 @@ class TestMissionPlannerLegacy:
 
 @pytest.mark.unit
 class TestMissionPlannerGetMissionPlan:
+
+    @pytest.fixture(autouse=True)
+    def _mapless_robot(self):
+        """Maps U6: without map_id the planner resolves the robot's open session (no
+        current_map, no fallback). These missions' robots have none, so the opt-in
+        default_map_id applies."""
+        with patch.object(MissionPlannerService, "_open_session",
+                          AsyncMock(return_value=None)):
+            yield
     """Test get_mission_plan method with database-only approach."""
 
     @pytest.mark.asyncio

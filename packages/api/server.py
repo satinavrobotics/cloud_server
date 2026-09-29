@@ -747,12 +747,11 @@ class ApiDelegationService:
         self.logger.info(f"Loading map: {actual_map_id}")
 
         if actual_map_id in maps.RESERVED_NAMES and not nodes and not edges:
-            # The old client loads 'GEO' (a robot's mapless GPS view). It is a sentinel, not a
-            # map (maps M2): no ArangoDB collections, no Postgres row (which the dispatcher's
-            # removed datum auto-seed used to fill with the first robot's datum). Without a
-            # map transform the client places things with the robot's own datum.
+            # 'GEO' / 'LOCAL' (the mapless sentinels of the old API, removed in maps U6) are
+            # reserved and never maps: no ArangoDB collections, no Postgres row. An empty
+            # answer without a transform (the old client loaded 'GEO' for its mapless view).
             return {"success": True, "map_id": actual_map_id,
-                    "message": f"{actual_map_id} is a robot-map sentinel, not a map",
+                    "message": f"{actual_map_id} is a reserved name, not a map",
                     "stats": {"node_count": 0, "edge_count": 0}, "nodes": [], "edges": [],
                     "transform": None}
 

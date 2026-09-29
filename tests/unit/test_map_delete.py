@@ -85,13 +85,6 @@ class FakeCursor:
                 self.rowcount = 1
         elif sql == map_delete.SESSIONS_SQL:
             db.sessions_deleted.append(params[0])
-        elif sql == map_delete.ROBOTS_SQL:
-            gps_value, local_value, name = params
-            for rname, spec in db.robots.items():
-                if spec.get("current_map") == name:
-                    spec["current_map"] = gps_value if spec.get("position_mode") == "gps" \
-                        else local_value
-                    self._rows.append((rname, "ALIVE"))
         elif sql == emit_mod.INSERT_SQL:
             if db.fail_events:
                 raise RuntimeError("fleet_events unavailable")
@@ -243,30 +236,17 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
                                             "requested_at": T0.isoformat()}
 
 
-async def test_delete_resets_robots_current_map_to_their_mode_sentinel():
+async def test_delete_touches_no_robot():
+    """Maps U6: a robot's map is its open session (and a map with an open session cannot be
+    deleted), so the finishing transaction no longer resets any robot (no robot.current_map)."""
     db = FakeDb()
     db.seed("yard")
-    db.robots = {"gps1": {"current_map": "yard", "position_mode": "gps"},
-                 "loc1": {"current_map": "yard"},
-                 "other": {"current_map": "elsewhere", "position_mode": "gps"},
-                 "none": {}}
     deleter, _ = _deleter(db)
     await _request_and_wait(deleter, "yard")
-    assert db.robots["gps1"]["current_map"] == "GEO"
-    assert db.robots["loc1"]["current_map"] == "LOCAL"
-    assert db.robots["other"]["current_map"] == "elsewhere" and "current_map" not in db.robots["none"]
-    robot_notifies = [n for n in db.notifies if n[0] == map_delete.ROBOT_TABLE]
-    assert sorted(n[1].split()[1] for n in robot_notifies) == ["gps1", "loc1"]
     assert "yard" not in db.rows
-
-
-async def test_failed_delete_does_not_touch_robots():
-    db = FakeDb()
-    db.seed("yard")
-    db.robots = {"r1": {"current_map": "yard"}}
-    deleter, _ = _deleter(db, graph=Store(fail=99), max_attempts=2)
-    await _request_and_wait(deleter, "yard")
-    assert db.robots["r1"]["current_map"] == "yard"
+    assert not [n for n in db.notifies if n[0] == RobotObjectV1.table_name()]
+    assert not [sql for sql in db.statements if "robotobjectv1" in str(sql).lower()]
+    assert not hasattr(map_delete, "ROBOTS_SQL")
 
 
 async def test_arango_failure_retries_with_backoff_then_emits_delete_failed():
@@ -480,28 +460,26 @@ async def test_list_hides_deleting_maps():
     assert [m["name"] for m in result["maps"]] == ["a"] and result["count"] == 1
 
 
-# PUT /robots/{r}/map on a DELETING map (409): tests/unit/test_maps_m2.py (the route is the
-# maps M2 session shim now).
+# Maps U6: PUT /robots/{r}/map is gone (410, tests/unit/test_maps_u6.py) and robots have no
+# current_map; a `current_map` in a robot create/update body is ignored.
 
 
-async def test_put_robot_with_a_deleting_current_map_is_409():
+async def test_put_robot_ignores_current_map():
     robot = RobotObjectV1(name="r1", status=RobotStatusV1())
     svc = _svc({"gone": _map("gone", ObjectLifecycleV1.DELETING)}, robot)
     with patch.object(main, "service", svc):
-        with pytest.raises(HTTPException) as exc:
-            await main.update_robot("r1", {"current_map": "gone"})
-    assert exc.value.status_code == 409
-    svc.database.update_spec.assert_not_called()
+        await main.update_robot("r1", {"current_map": "gone", "labels": ["a"]})
+    spec = svc.database.update_spec.await_args.args[2]
+    assert "current_map" not in spec.dict() and spec.labels == ["a"]
 
 
-async def test_create_robot_on_a_deleting_map_is_409():
+async def test_create_robot_ignores_current_map():
     svc = _svc({"gone": _map("gone", ObjectLifecycleV1.DELETING)})
     svc.database.create_object = AsyncMock()
     with patch.object(main, "service", svc):
-        with pytest.raises(HTTPException) as exc:
-            await main.create_robot({"name": "r9", "current_map": "gone"})
-    assert exc.value.status_code == 409
-    svc.database.create_object.assert_not_called()
+        await main.create_robot({"name": "r9", "current_map": "gone"})
+    created = svc.database.create_object.await_args.args[0]
+    assert "current_map" not in created.dict()
 
 
 async def test_load_and_datum_on_a_deleting_map_are_409():

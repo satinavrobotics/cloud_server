@@ -1,8 +1,8 @@
 """Ingest by mapping session (docs/satinav-maps-redesign.md §6, maps redesign M2).
 
-graph-builder no longer writes to `robot.current_map` or a `"default"` map. Every node and
-image from a robot goes to the robot's **open mapping session** (`map_sessions`, one per robot
-at most) or is dropped:
+graph-builder no longer writes to the robot's old `current_map` (removed in U6) or a
+`"default"` map. Every node and image from a robot goes to the robot's **open mapping
+session** (`map_sessions`, one per robot at most) or is dropped:
 
     reason            when
     no_session        the robot has no open session

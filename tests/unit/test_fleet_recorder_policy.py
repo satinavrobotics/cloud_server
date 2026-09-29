@@ -38,7 +38,6 @@ def _robot(level=None, deleted=False, name="r1"):
     robot = api_objects.RobotObjectV1(
         name=name, status={}, telemetry_recording=level,
         lifecycle=ObjectLifecycleV1.DELETED if deleted else ObjectLifecycleV1.ALIVE)
-    robot.current_map = "map1"
     return robot
 
 

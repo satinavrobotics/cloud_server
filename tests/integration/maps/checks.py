@@ -131,8 +131,8 @@ def upgraded():
                                    "WHERE tablename = 'map_sessions'")}
     check({"map_sessions_one_open_per_robot", "map_sessions_one_legacy_per_map"} <= indexes,
           "partial unique indexes exist")
-    robots = query("SELECT name, spec->>'current_map' FROM robotobjectv1 ORDER BY name")
-    print(f"  robots (current_map untouched): {robots}")
+    robots = query("SELECT name FROM robotobjectv1 ORDER BY name")
+    print(f"  robots: {robots}")
 
 
 async def scenario():

@@ -15,8 +15,8 @@ The Graph Builder Service is a critical component of the topological mapping sys
 ## Which map (maps redesign M2)
 
 Nodes and images go to the robot's **open mapping session** (`map_sessions`, resolved by the
-payload's `robot_name`; `ingest.py`), never to `robot.current_map` or a `default` map; a
-`map_id` in the payload is ignored. The node's `pose` is stored in the map frame (the session's
+payload's `robot_name`; `ingest.py`), never to the old `robot.current_map` (removed in U6) or
+a `default` map; a `map_id` in the payload is ignored. The node's `pose` is stored in the map frame (the session's
 `map_T_session` applied), with `robot_pose` (as received) and `session_id`. No open session, a
 paused one, a map that is not `mapping` or is being deleted, a payload `session_id` that is not
 the open session, or a session whose robot datum changed since it started and cannot be re-anchored (a local map,

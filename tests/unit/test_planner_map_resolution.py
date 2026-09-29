@@ -1,4 +1,5 @@
-"""A planner request without map_id: the robot's current map, else a clear 400 (never `default`)."""
+"""A planner request without map_id: the map of the robot's open session (maps §14.2; there is
+no robot.current_map since U6), else a clear 400 (never `default`)."""
 
 import os
 
@@ -26,33 +27,48 @@ def service():
     return svc
 
 
-def robot(current_map):
-    return SimpleNamespace(name="r1", current_map=current_map,
-                           status=SimpleNamespace(pose=SimpleNamespace(x=0.0, y=0.0)))
+def robot():
+    return SimpleNamespace(name="r1", status=SimpleNamespace(pose=SimpleNamespace(x=0.0, y=0.0)))
+
+
+def on_map(service, map_name):
+    """The robot's open session (None: mapless)."""
+    service._open_session = AsyncMock(return_value=None if map_name is None else {
+        "session_id": "s1", "map_name": map_name, "aligned": True,
+        "map_t_session": {"tx": 0.0, "ty": 0.0, "yaw": 0.0}})
 
 
 class TestResolve:
     async def test_explicit_map_wins(self, service):
-        service.get_robot_status = AsyncMock(return_value=robot("other"))
+        on_map(service, "other")
         assert await service._resolve_map("yard", "r1") == "yard"
-        service.get_robot_status.assert_not_awaited()
+        service._open_session.assert_not_awaited()
 
-    async def test_robot_current_map(self, service):
-        service.get_robot_status = AsyncMock(return_value=robot("yard"))
+    async def test_robot_session_map(self, service):
+        on_map(service, "yard")
         assert await service._resolve_map(None, "r1") == "yard"
         assert await service._resolve_map("", "r1") == "yard"
 
-    @pytest.mark.parametrize("current", [None, "", "GEO", "LOCAL"])
-    async def test_robot_without_a_real_map_is_an_error(self, service, current):
-        service.get_robot_status = AsyncMock(return_value=robot(current))
+    async def test_robot_without_a_session_is_an_error(self, service):
+        on_map(service, None)
         with pytest.raises(MapResolutionError, match="r1"):
             await service._resolve_map(None, "r1")
 
-    async def test_sentinel_map_id_is_not_a_map(self, service):
-        service.get_robot_status = AsyncMock(return_value=robot("yard"))
-        assert await service._resolve_map("GEO", "r1") == "yard"
+    async def test_no_current_map_fallback(self, service):
+        """Maps U6: a robot without a session is mapless, whatever its row still holds."""
+        on_map(service, None)
+        service.get_robot_status = AsyncMock(return_value=SimpleNamespace(
+            name="r1", current_map="yard", status=None))
         with pytest.raises(MapResolutionError):
-            service._require_map("LOCAL")
+            await service._resolve_map(None, "r1")
+        service.get_robot_status.assert_not_awaited()
+
+    async def test_old_sentinels_are_plain_map_ids(self, service):
+        """Maps U6: 'GEO' / 'LOCAL' are no longer special; they name no map (the map API
+        reserves them), so a plan on them finds nothing."""
+        on_map(service, "yard")
+        assert await service._resolve_map("GEO", "r1") == "GEO"
+        assert service._require_map("LOCAL") == "LOCAL"
 
     async def test_no_robot_no_map_is_an_error_not_default(self, service):
         assert service.default_map_id is None
@@ -62,7 +78,7 @@ class TestResolve:
             service._require_map(None)
 
     async def test_unknown_robot_is_an_error(self, service):
-        service.get_robot_status = AsyncMock(return_value=None)
+        on_map(service, None)  # no session row for an unknown robot
         with pytest.raises(MapResolutionError):
             await service._resolve_map(None, "ghost")
 
@@ -75,14 +91,16 @@ class TestResolve:
 
 class TestPlannerCalls:
     async def test_plan_and_execute_uses_the_robot_map(self, service):
-        service.get_robot_status = AsyncMock(return_value=robot("yard"))
+        on_map(service, "yard")
+        service.get_robot_status = AsyncMock(return_value=robot())
         service.find_closest_node_to_robot = AsyncMock(return_value=(None, "stop here"))
         result = await service.plan_and_execute_mission("r1", target_x=1.0, target_y=2.0)
         assert result["failed_at"] == "find_robot_node"
         assert service.find_closest_node_to_robot.await_args.args[1] == "yard"
 
     async def test_plan_and_execute_without_a_map_fails_clearly(self, service):
-        service.get_robot_status = AsyncMock(return_value=robot(None))
+        on_map(service, None)
+        service.get_robot_status = AsyncMock(return_value=robot())
         result = await service.plan_and_execute_mission("r1", target_x=1.0, target_y=2.0)
         assert result["success"] is False and result["failed_at"] == "map_resolution"
         assert "map_id" in result["error"]
@@ -98,7 +116,8 @@ class TestPlannerCalls:
         service.graph_db.shortest_path.assert_not_called()
 
     async def test_find_nearby_nodes_uses_the_robot_map(self, service):
-        service.get_robot_status = AsyncMock(return_value=robot("yard"))
+        on_map(service, "yard")
+        service.get_robot_status = AsyncMock(return_value=robot())
         service.graph_db.nodes_in_range.return_value = ([], [])
         service._robot_xy_in_map = AsyncMock(return_value=(0.0, 0.0))
         await service.find_nearby_nodes("r1")
@@ -110,7 +129,7 @@ class TestRoutes:
         fake = MagicMock()
         fake.plan_and_execute_mission = AsyncMock(return_value={
             "success": False, "robot_name": "r1", "failed_at": "map_resolution",
-            "error": "No map_id given and robot 'r1' has no current map: pass map_id"})
+            "error": "No map_id given and robot 'r1' has no open map session: pass map_id"})
         with patch.object(planner_main, "service", fake):
             with pytest.raises(HTTPException) as exc:
                 await planner_main.navigate(planner_main.NavigationRequest(

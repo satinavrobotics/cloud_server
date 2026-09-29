@@ -3,9 +3,10 @@
 - graph-builder ingest by session (packages/services/graph_builder/ingest.py + server.py):
   resolution and every rejection reason, the session cache, the pose transform, rate-limited
   MAP.INGEST_REJECTED, images following their node;
-- the deprecated PUT /robots/{r}/map shim (packages/api/maps.py::assign_robot_map) on the M1
-  in-memory store;
-- map frame vs robot frame: map_geo helpers, the planner, the dispatcher's order conversion;
+- (the PUT /robots/{r}/map shim was removed in U6: tests/unit/test_maps_u6.py; ShimDb /
+  ShimStore stay as the M1 in-memory store with robot locks, used by test_maps_m3.py);
+- map frame vs robot frame: map_geo helpers, the planner, the dispatcher's order conversion
+  (through the robot's session since §14);
 - tools/maps_m2_legacy_nodes.py planning (the live map `map`), idempotency, revert;
 - MAP.DELETED on a finished background delete.
 
@@ -15,7 +16,6 @@ import asyncio
 import contextlib
 import copy
 import datetime
-import json
 import math
 import os
 import uuid
@@ -29,7 +29,6 @@ import pytest  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 
 import cloud_common.objects as api_objects  # noqa: E402
-import packages.api.main as main  # noqa: E402
 from cloud_common.objects.map import MapObjectV1  # noqa: E402
 from cloud_common.objects.robot import RobotObjectV1, RobotStatusV1  # noqa: E402
 from packages.api import maps  # noqa: E402
@@ -378,18 +377,11 @@ class TestIngestService:
         assert exc.value.status_code == 409
 
 
-# --- the PUT /robots/{r}/map shim -------------------------------------------------------------
+# --- the M1 store with robot locks (test_maps_m3.py builds on it) ------------------------------
 
 class ShimStore(m1.FakeStore):
-    def __init__(self, db):
-        super().__init__(db)
-        self.pending_current = {}
-
     async def lock_robot(self, name):
         return self.db.robots.get(name)
-
-    async def set_current_map(self, robot, value):
-        self.pending_current[robot.name] = value
 
 
 class ShimDb(m1.FakeDb):
@@ -404,134 +396,9 @@ class ShimDb(m1.FakeDb):
             raise
         self.events.extend(store.pending_events)
         self.notifies.extend(store.pending_notifies)
-        for name, value in store.pending_current.items():
-            self.robots[name].current_map = value
 
     def open_session(self, robot):
         return [s for s in self.sessions if s["robot_name"] == robot and s["ended_at"] is None]
-
-
-@pytest.fixture
-def sdb():
-    db = ShimDb()
-    with patch.object(maps, "open_store", db.store), patch.object(maps, "_utcnow", m1.Clock()):
-        yield db
-
-
-async def _assign(map_id, robot="r1", arango=None):
-    return await maps.assign_robot_map(None, robot, map_id, m1.PUB, "op", arango)
-
-
-class TestShim:
-    async def test_new_map_is_created_typed_from_the_datum_and_mapped(self, sdb):
-        sdb.add_robot("r1", **ENU_DATUM)
-        out = await _assign("yard")
-        assert out["map_created"] and out["current_map"] == "yard"
-        assert out["session"]["map_name"] == "yard" and out["session"]["state"] == "mapping"
-        spec, status = sdb.maps["yard"]["spec"], sdb.maps["yard"]["status"]
-        assert spec["type"] == "geo" and spec["geo"]["utm_zone"] == 34  # origin: this datum
-        assert status["state"] == "mapping"
-        assert sdb.robots["r1"].current_map == "yard"
-        assert sdb.codes() == ["MAP.CREATED", "MAP.SESSION_STARTED"]
-
-    async def test_new_map_without_datum_is_local(self, sdb):
-        sdb.add_robot("r1")
-        await _assign("shed")
-        assert sdb.maps["shed"]["spec"]["type"] == "local"
-
-    async def test_switching_maps_finishes_the_old_session(self, sdb):
-        sdb.add_robot("r1", **ENU_DATUM)
-        sdb.add_map("a", **LIVE_SPEC)
-        sdb.add_map("b", type="local")
-        first = (await _assign("a"))["session"]
-        out = await _assign("b")
-        assert out["finished_session"]["session_id"] == first["session_id"]
-        assert sdb.maps["a"]["status"]["state"] == "ready"
-        assert sdb.maps["b"]["status"]["state"] == "mapping"
-        assert [s["map_name"] for s in sdb.open_session("r1")] == ["b"]
-
-    async def test_same_map_again_changes_nothing(self, sdb):
-        sdb.add_robot("r1", **ENU_DATUM)
-        sdb.add_map("a", **LIVE_SPEC)
-        first = (await _assign("a"))["session"]
-        n = len(sdb.events)
-        out = await _assign("a")
-        assert out["session"]["session_id"] == first["session_id"] and len(sdb.events) == n
-
-    @pytest.mark.parametrize("value", ["GEO", "LOCAL", None, ""])
-    async def test_sentinel_or_clear_finishes(self, sdb, value):
-        sdb.add_robot("r1", **ENU_DATUM)
-        sdb.add_map("a", **LIVE_SPEC)
-        await _assign("a")
-        out = await _assign(value)
-        assert out["session"] is None and out["finished_session"]["map_name"] == "a"
-        assert sdb.open_session("r1") == [] and sdb.maps["a"]["status"]["state"] == "ready"
-        assert sdb.robots["r1"].current_map == (value or None)
-        assert "GEO" not in sdb.maps and "LOCAL" not in sdb.maps
-
-    async def test_sentinel_without_session(self, sdb):
-        sdb.add_robot("r1")
-        out = await _assign("LOCAL")
-        assert out["finished_session"] is None and sdb.robots["r1"].current_map == "LOCAL"
-
-    @pytest.mark.parametrize("setup,target,code", [
-        (lambda db: db.add_robot("r1", online=False, **ENU_DATUM), "a", 409),   # offline
-        (lambda db: db.add_robot("r1"), "a", 409),                              # geo, no datum
-        (lambda db: (db.add_robot("r1", **ENU_DATUM),
-                     db.add_map("dying", lifecycle="DELETING")), "dying", 409),
-        (lambda db: (db.add_robot("r1", **ENU_DATUM),
-                     db.add_map("old", type="local", status={"state": "archived"})), "old", 409),
-        (lambda db: db.add_robot("r1", **ENU_DATUM), "bad name!", 422),
-        (lambda db: None, "a", 404),                                            # no robot
-    ])
-    async def test_refusals_change_nothing(self, sdb, setup, target, code):
-        sdb.add_map("a", **LIVE_SPEC)
-        sdb.add_map("b", type="local")
-        setup(sdb)
-        if "r1" in sdb.robots:
-            sdb.add_session("b", "r1", "live", ended=False)
-            sdb.maps["b"]["status"] = {"state": "mapping"}
-            sdb.robots["r1"].current_map = "b"
-        before = copy.deepcopy((sdb.maps, sdb.sessions))
-        status, _detail = await m1._status(_assign(target))
-        assert status == code
-        assert (sdb.maps, sdb.sessions) == before  # the old session is still open
-        if "r1" in sdb.robots:
-            assert sdb.robots["r1"].current_map == "b"
-
-    async def test_map_busy_with_another_robot(self, sdb):
-        sdb.add_robot("r1", **ENU_DATUM)
-        sdb.add_robot("r2", **ENU_DATUM)
-        sdb.add_map("a", **LIVE_SPEC)
-        await _assign("a", "r1")
-        status, detail = await m1._status(_assign("a", "r2"))
-        assert status == 409 and "already has an open mapping session" in detail
-
-    async def test_arango_leftover_refused(self, sdb):
-        sdb.add_robot("r1")
-        status, _ = await m1._status(_assign("old", arango=lambda n: 441))
-        assert status == 409 and "old" not in sdb.maps
-
-    async def test_route(self, sdb):
-        sdb.add_robot("r1")
-        svc = MagicMock()
-        svc.graph_db.get_map_stats.return_value = {"error": "Map not found"}
-        with patch.object(main, "service", svc):
-            out = await main.update_robot_map("r1", main.UpdateRobotMapRequest(map_id="shed"))
-            assert out["success"] and out["session"]["map_name"] == "shed"
-            assert "deprecated" in out
-            out = await main.update_robot_map("r1", main.UpdateRobotMapRequest())
-            assert out["current_map"] is None and out["finished_session"] is not None
-
-    async def test_store_sql(self):
-        cursor = m1._Cursor(rows=[("r1", "ALIVE", {}, {})])
-        store = maps.SqlStore(None, cursor, m1.PUB)
-        robot = await store.lock_robot("r1")
-        assert "FOR UPDATE" in cursor.sql[-1][0]
-        await store.set_current_map(robot, "yard")
-        (update, params), (notify, nparams) = cursor.sql[-2], cursor.sql[-1]
-        assert "spec = spec ||" in update and json.loads(params[0]) == {"current_map": "yard"}
-        assert nparams == ("robotobjectv1", f"{m1.PUB} r1 ALIVE")
 
 
 # --- frames: map_geo, planner, dispatcher ------------------------------------------------------
@@ -543,27 +410,16 @@ class TestFrames:
         x, y, yaw = map_geo.apply_pose(inv, *map_geo.apply_pose(t, 1.5, -2.0, 0.1))
         assert (x, y, yaw) == pytest.approx((1.5, -2.0, 0.1))
 
-    def test_robot_frame_in_map(self):
-        obj = MapObjectV1(name="map", **LIVE_SPEC)
-        t = map_geo.robot_frame_in_map(obj, ENU_DATUM)
-        assert abs(t["tx"]) < 1e-6 and abs(t["ty"]) < 1e-6
-        assert math.degrees(t["yaw"]) == pytest.approx(CONVERGENCE_DEG, abs=0.001)
-        assert map_geo.robot_frame_in_map(obj, {"latitude": None, "longitude": None}) is None
-        assert map_geo.robot_frame_in_map(MapObjectV1(name="l", type="local"),
-                                          ENU_DATUM) == map_geo.IDENTITY
-        assert map_geo.robot_frame_in_map(MapObjectV1(name="g", type="geo"),
-                                          ENU_DATUM) == map_geo.IDENTITY  # no origin yet
-        utm_origin = {"latitude": 47.47946, "longitude": 19.03238, "frame": "utm",
-                      "utm_zone": 34, "utm_north": True, "utm_easting": LIVE_GEO["origin_e"] + 25,
-                      "utm_northing": LIVE_GEO["origin_n"]}
-        assert map_geo.robot_frame_in_map(obj, utm_origin) == pytest.approx(
-            {"tx": 25.0, "ty": 0.0, "yaw": 0.0})
-
     async def test_planner_robot_position_and_gps_goal(self):
-        from packages.services.mission_planner.server import MissionPlannerService
+        from packages.services.mission_planner.server import (MissionPlannerService,
+                                                              RobotNotPlacedError)
         svc = MagicMock()
         svc.logger = MagicMock()
         svc.database.get_object = AsyncMock(return_value=MapObjectV1(name="map", **LIVE_SPEC))
+        # a placed geo session: map_T_session from the robot's datum (as the session start)
+        t = map_geo.session_transform(LIVE_GEO, map_geo.robot_datum(ENU_DATUM))
+        svc._open_session = AsyncMock(return_value={"map_name": "map", "aligned": True,
+                                                    "map_t_session": t})
         robot = RobotObjectV1(name="r", status={"pose": {"x": 100.0, "y": 0.0}},
                               datum=ENU_DATUM)
         x, y = await MissionPlannerService._robot_xy_in_map(svc, robot, "map")
@@ -573,12 +429,13 @@ class TestFrames:
         gx, gy, how = await MissionPlannerService._gps_to_map(svc, "map", 47.4989, 19.0412)
         assert (gx, gy) == pytest.approx((e - LIVE_GEO["origin_e"], n - LIVE_GEO["origin_n"]))
         assert "utm" in how
-        # a robot without a datum: unconverted, as before M2
-        bare = RobotObjectV1(name="r", status={"pose": {"x": 100.0, "y": 0.0}})
-        assert await MissionPlannerService._robot_xy_in_map(svc, bare, "map") == (100.0, 0.0)
+        # maps U6: no session on the map, no position (no map/datum fallback any more)
+        svc._open_session = AsyncMock(return_value=None)
+        with pytest.raises(RobotNotPlacedError, match="not using map"):
+            await MissionPlannerService._robot_xy_in_map(svc, robot, "map")
 
     async def test_dispatcher_sends_map_waypoints_in_the_robot_frame(self):
-        from packages.controllers.mission.server import Robot
+        from packages.controllers.mission.server import Robot, RouteRefused
         import cloud_common.objects.mission as mission_object
         server = MagicMock()
         server.disable_request_factsheet = True
@@ -588,27 +445,31 @@ class TestFrames:
         db.get_object = AsyncMock(return_value=MapObjectV1(name="map", **LIVE_SPEC))
         r = Robot("r1", db, MagicMock(), "prefix", server)
         r._robot_object = api_objects.RobotObjectV1(name="r1", status={}, datum=ENU_DATUM)
+        t = map_geo.session_transform(LIVE_GEO, map_geo.robot_datum(ENU_DATUM))
+        r._read_open_session = AsyncMock(return_value={"map_name": "map", "aligned": True,
+                                                       "map_t_session": t})
         # a node stored by M2 ingest: robot pose (10, 0) -> map frame
-        t = map_geo.robot_frame_in_map(db.get_object.return_value, ENU_DATUM)
         mx, my, myaw = map_geo.apply_pose(t, 10.0, 0.0, 0.3)
         route = mission_object.MissionRouteNodeV1(waypoints=[
             {"x": mx, "y": my, "theta": myaw, "map_id": "map"},
-            {"x": 5.0, "y": 5.0, "theta": 0.0, "map_id": ""},        # mapless: as is
-            {"x": 1.0, "y": 1.0, "theta": 0.0, "map_id": "GEO"}])
+            {"x": 5.0, "y": 5.0, "theta": 0.0, "map_id": ""}])        # mapless: as is
         out = await r._route_in_robot_frame(route)
         w = out.waypoints
         assert (w[0].x, w[0].y, w[0].theta) == pytest.approx((10.0, 0.0, 0.3))
-        assert (w[1].x, w[1].y) == (5.0, 5.0) and (w[2].x, w[2].y) == (1.0, 1.0)
+        assert (w[1].x, w[1].y) == (5.0, 5.0)
         assert route.waypoints[0].x == mx  # the stored mission is not changed
-        db.get_object.assert_awaited_once()
-        # local map / identity: the same object back
-        db.get_object = AsyncMock(return_value=MapObjectV1(name="l", type="local"))
+        db.get_object.assert_not_awaited()  # the session alone converts (no map/datum rule)
+        # identity session: the same object back
+        r._read_open_session = AsyncMock(return_value={
+            "map_name": "l", "aligned": True, "map_t_session": dict(map_geo.IDENTITY)})
         local = mission_object.MissionRouteNodeV1(waypoints=[{"x": 1.0, "y": 2.0,
                                                               "map_id": "l"}])
         assert await r._route_in_robot_frame(local) is local
-        # unreadable map: unconverted
-        db.get_object = AsyncMock(side_effect=HTTPException(404, "gone"))
-        assert await r._route_in_robot_frame(local) is local
+        # maps U6: 'GEO' is not a map any more, the robot is not using it: refused
+        geo_wp = mission_object.MissionRouteNodeV1(waypoints=[{"x": 1.0, "y": 1.0,
+                                                               "map_id": "GEO"}])
+        with pytest.raises(RouteRefused, match="not using map GEO"):
+            await r._route_in_robot_frame(geo_wp)
 
 
 # --- tools/maps_m2_legacy_nodes.py -------------------------------------------------------------
