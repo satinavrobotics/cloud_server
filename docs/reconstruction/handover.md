@@ -20,7 +20,7 @@ service reading ArangoDB/MinIO itself): the pipeline stays; what changes is the 
 | `POST /maps/{map}/reconstruction` with settings only | `POST /jobs` with the whole manifest (§2.1): frames, map-frame poses, camera params, presigned GET URLs |
 | the service reads ArangoDB and MinIO with credentials | no credentials: only the manifest's URLs (a new input source) |
 | results kept by the service, fetched from it | results PUT to the presigned URLs, then the `finish` callback (§3, §7) |
-| `cloud.ply` + `meta.json` | also `ortho.png` and `height.png`, the 2.5D top view (§7.2, §7.3) |
+| `cloud.ply` + `meta.json` | the same: **only** `cloud.ply` + `meta.json` (§7). The cloud makes the 2.5D top view (`ortho.png`, `height.png`) itself from `cloud.ply` |
 | no auth, no callbacks | bearer key on every call to the service; HMAC-token callbacks for progress / finish / fail (§2, §3) |
 | depth layout `depth_cameras`, `{cam}.json` | irrelevant to the service: camera params arrive in the manifest |
 
@@ -31,8 +31,9 @@ service reading ArangoDB/MinIO itself): the pipeline stays; what changes is the 
 1. Receives a job (`POST /jobs`) with a manifest: a map's camera frames with map-frame poses,
    camera parameters, and presigned URLs for each RGB and depth image.
 2. Runs one job at a time: downloads the images, back-projects the depth into 3D in the map
-   frame, voxel-filters, removes outliers, and derives a 2.5D top view.
-3. Uploads `cloud.ply`, `ortho.png`, `height.png`, `meta.json` to the presigned PUT URLs.
+   frame, voxel-filters and removes outliers.
+3. Uploads `cloud.ply` and `meta.json` to the presigned PUT URLs. (The 2.5D top view is made
+   by cloud_server from `cloud.ply`; the service does not make rasters.)
 4. Reports progress, success or failure to the callback URLs; answers status polls.
 
 It has **no** database, no MinIO credentials, no MQTT, and knows nothing about maps beyond the
@@ -103,8 +104,6 @@ is ~400 characters and must be used **byte for byte**):
   ],
   "outputs": {
     "cloud":  {"url": "http://sati-cloud:9000/recon-staging/5b0c…/1/cloud.ply?X-Amz-…",  "content_type": "application/octet-stream"},
-    "ortho":  {"url": "http://sati-cloud:9000/recon-staging/5b0c…/1/ortho.png?X-Amz-…",  "content_type": "image/png"},
-    "height": {"url": "http://sati-cloud:9000/recon-staging/5b0c…/1/height.png?X-Amz-…", "content_type": "image/png"},
     "meta":   {"url": "http://sati-cloud:9000/recon-staging/5b0c…/1/meta.json?X-Amz-…",  "content_type": "application/json"}
   },
   "callback": {
@@ -221,8 +220,6 @@ After **all four** outputs were uploaded successfully.
   },
   "outputs": {
     "cloud":  {"bytes": 39277735, "sha256": "…"},
-    "ortho":  {"bytes": 4120334,  "sha256": "…"},
-    "height": {"bytes": 1893002,  "sha256": "…"},
     "meta":   {"bytes": 612,      "sha256": "…"}
   }
 }
@@ -359,15 +356,15 @@ RGB: if `rgb_width/rgb_height` differ from `width/height`, resize the RGB to the
    26-neighbourhood (hash lookups on the keys; no k-d tree needed).
 4. **Per voxel:** mean position, mean colour, count (clamped to 65535).
 5. No points left → fail `no_points`.
-6. Write `cloud.ply`, the rasters, `meta.json` (§7), upload, call `finish`.
+6. Write `cloud.ply` and `meta.json` (§7), upload, call `finish`.
 
 Frame counts: `frames_total` = all node-cameras in the manifest; `frames_used` = frames that
 contributed at least one point; the rest go into `frames_skipped` by reason (`missing_depth`,
 `bad_depth`, `unsupported_camera`, `no_valid_depth`).
 
 Progress: `integrating` covers 0–0.85 (by frames), then `filtering` 0.87, `writing` 0.9,
-`rasterizing` 0.93, `uploading` 0.95–1.0. Stages in order: `queued`, `integrating`, `filtering`,
-`writing`, `rasterizing`, `uploading`.
+`uploading` 0.95–1.0. Stages in order: `queued`, `integrating`, `filtering`, `writing`,
+`uploading`.
 
 ---
 
@@ -403,25 +400,13 @@ The `crs` comment only for geo maps. Coordinates: map frame, metres. Write with 
 structured dtype `[('x','<f4'),('y','<f4'),('z','<f4'),('red','u1'),('green','u1'),
 ('blue','u1'),('count','<u2')]` and `tobytes()`.
 
-### 7.2 Top-view grid
+### 7.2 Top view
 
-- `z_floor` = median of the frames' base z (`t_mb.z`; 0 without `pose3d`).
-- `clip_abs = z_floor + params.clip_z`. Only voxels with `z < clip_abs` are rastered.
-- `res = max(voxel_m, max(extent_x, extent_y) / raster_max_px)` over the rastered voxels.
-- `origin = (floor(min_x / res) · res, floor(min_y / res) · res)`;
-  `width = floor((max_x − origin.x) / res) + 1`, `height` likewise in y.
-- Cell of a point: `col = floor((x − origin.x) / res)`,
-  `row = height − 1 − floor((y − origin.y) / res)` (row 0 is the north / +y edge).
-- Per cell, the voxel with the **highest** z wins.
+Not the service's job: cloud_server derives `ortho.png` and `height.png` from `cloud.ply` (and
+the manifest's poses) after `finish`. `params.clip_z` and `params.raster_max_px` are for that
+step; the service accepts them and ignores them.
 
-### 7.3 `ortho.png` and `height.png`
-
-- `ortho.png`: RGBA 8-bit, `height × width`. Winner's colour, alpha 255; empty cells
-  (0, 0, 0, 0).
-- `height.png`: 16-bit single channel. `z_offset` = min z of the rastered voxels,
-  `z_scale = 0.01`; value `min(65535, round((z − z_offset) / z_scale) + 1)`; empty cells 0.
-
-### 7.4 `meta.json`
+### 7.3 `meta.json`
 
 ```json
 {
@@ -429,18 +414,12 @@ structured dtype `[('x','<f4'),('y','<f4'),('z','<f4'),('red','u1'),('green','u1
   "map_name": "lab", "job_id": "5b0c8e1e-…", "map_type": "geo",
   "frame": "map",
   "crs": {"utm_zone": 34, "utm_north": true, "origin_e": 352397.33, "origin_n": 5262357.80},
-  "resolution_m": 0.05,
-  "origin": {"x": -12.35, "y": -40.10},
-  "width": 1840, "height": 1320,
-  "z_floor": 0.0, "clip_z": 2.0, "clip_abs": 2.0,
-  "z_offset": -1.2, "z_scale": 0.01,
   "bounds3d": {"min": [-12.35, -40.10, -1.2], "max": [79.65, 25.9, 6.3]},
   "points": 2310455, "voxel_m": 0.05
 }
 ```
 
-`origin` is the lower-left corner of the cell at row `height − 1`, column 0. `crs` is `null`
-for a local map. `bounds3d` is over all cloud points (not only rastered ones).
+`crs` is `null` for a local map. `bounds3d` is over all cloud points.
 
 ---
 
@@ -549,9 +528,8 @@ Params: `voxel_m 0.05`, `max_depth_m 10`, `clip_z 2.0`, others default.
 | Coverage | ≥ 90 % of the voxels of the true hit points (from the renderer) present in the cloud |
 | Colour | points within 1 cm of wall A: mean colour within ±30 per channel of (200, 40, 40); same for B, box, floor |
 | Frames | `frames_total = 28`, `frames_used = 28` (every frame sees something) |
-| Clip | `z_floor = 0`, `clip_abs = 2.0`; no ortho cell has the ceiling colour; `bounds3d.max[2] ≈ 2.8` (the ceiling is in the cloud) |
-| Ortho | the cell containing (5.0, 1.0) is red-ish; (2.0, −1.0) blue-ish with height ≈ 0.5 ± 0.03 m; (1.0, 2.0) grey with height ≈ 0 ± 0.03 m; (−2, 0) is outside the grid or alpha 0 |
-| meta.json | `origin`, `width`, `height`, `resolution_m` consistent with §7.2; reading a cell back through the formulas lands on the same world point |
+| Ceiling | `bounds3d.max[2] ≈ 2.8` (the ceiling is in the cloud) |
+| meta.json | `points` = the PLY's N; `bounds3d` = the PLY's min/max; `voxel_m` as used |
 | PLY | reads back in Open3D/CloudCompare or a 10-line numpy reader with the same N and values |
 
 A frame-order or sign bug shows immediately: the yaw ±π/2 nodes put wall B at y ≠ 3 or mirror
@@ -586,7 +564,7 @@ the box, and the `pose3d` nodes tilt the floor.
 - [ ] Geometry per §5 with the worked-example unit test and a round-trip property test (a
       random point in the map, projected into a random camera and back, lands on itself).
 - [ ] Algorithm per §6 (edge filter, voxel accumulation, coarsening, neighbour filter).
-- [ ] Outputs per §7 (PLY read-back test, raster row/origin convention test, `meta.json`).
+- [ ] Outputs per §7 (PLY read-back test, `meta.json`).
 - [ ] Uploads per §7 with `bytes` and `sha256`; callbacks per §3 incl. the answer handling and
       the retry policy.
 - [ ] Fake gateway and synthetic scene (§9); all checks of §9.2 and §9.3 green, in memory-capped
