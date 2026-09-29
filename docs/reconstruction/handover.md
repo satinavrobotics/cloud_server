@@ -7,8 +7,22 @@ everything the service needs arrives in one JSON **manifest**, and everything it
 out through URLs and callbacks given in that manifest.
 
 Background and the reasons for each choice: [`design.md`](design.md) (§ numbers point there).
-Build order: this starts after maps U6 (in progress now); the service (step R4) can be built in
-parallel with the robot and cloud steps, against the synthetic scene of §9.
+Status (2026-09-29): the cloud side is **deployed** (robot depth R1 built, depth storage R2 and
+the gateway R3 live in production, switched off until the service is configured), so this page is
+the contract the running gateway speaks. Test against the synthetic scene of §9, then against real
+maps (the sim records depth now).
+
+**If you built against the earlier draft of this page** (routes `/maps/{map}/reconstruction`, the
+service reading ArangoDB/MinIO itself): the pipeline stays; what changes is the edge of the service.
+
+| Earlier draft | This contract |
+|---|---|
+| `POST /maps/{map}/reconstruction` with settings only | `POST /jobs` with the whole manifest (§2.1): frames, map-frame poses, camera params, presigned GET URLs |
+| the service reads ArangoDB and MinIO with credentials | no credentials: only the manifest's URLs (a new input source) |
+| results kept by the service, fetched from it | results PUT to the presigned URLs, then the `finish` callback (§2.4, §3) |
+| `cloud.ply` + `meta.json` | also `ortho.png` and `height.png`, the 2.5D top view (§4) |
+| no auth, no callbacks | bearer key on every call to the service; HMAC-token callbacks for progress / finish / fail (§2) |
+| depth layout `depth_cameras`, `{cam}.json` | irrelevant to the service: camera params arrive in the manifest |
 
 ---
 
