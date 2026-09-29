@@ -81,6 +81,8 @@ SESSIONLESS_FALLBACK = True
 # A robot state of ON_TASK with no mission is set back to IDLE only this long after the robot's
 # controller was created (a dispatcher restart re-queues a running mission first).
 STALE_STATE_GRACE_S = 30.0
+# Maps §14.13: a run-epoch check that failed (database) is retried after this long.
+RUN_CHECK_RETRY_S = 30.0
 
 
 class RouteRefused(Exception):
@@ -249,6 +251,7 @@ class Robot:
         # state message of this process decided it (continuity proved, or a new epoch);
         # `_run_header_saved_at`: when the last state headerId was stored (monotonic).
         self._run_checked = False
+        self._run_check_after = 0.0  # monotonic; a failed check is retried after RUN_CHECK_RETRY_S
         self._run_epoch: Optional[uuid.UUID] = None
         self._run_header_saved_at: Optional[float] = None
 
@@ -962,7 +965,9 @@ class Robot:
                         self.info(f"New run epoch ({reason}, {evidence}): placements of "
                                   "finished sessions are not reused")
         except Exception as err:  # pylint: disable=broad-except
-            self.warning(f"Run epoch not checked ({err}); placements are not reused")
+            self.warning(f"Run epoch not checked ({err}); placements are not reused (retry in "
+                         f"{RUN_CHECK_RETRY_S:.0f} s)")
+            self._run_check_after = time.monotonic() + RUN_CHECK_RETRY_S
             return
         self._run_checked = True
         self._run_epoch = epoch
@@ -2137,7 +2142,7 @@ class Robot:
         the recorded robot state and run are the ones this message led to. Events the
         dispatcher raises meanwhile carry the message's timestamp."""
         self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
-        if not self._run_checked:
+        if not self._run_checked and time.monotonic() >= self._run_check_after:
             await self._check_run_continuity(message.headerId)
         evidence = self._run_detector.on_state(message.headerId)
         if evidence is not None:

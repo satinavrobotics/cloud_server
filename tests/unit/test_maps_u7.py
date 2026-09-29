@@ -505,6 +505,14 @@ class TestDispatcherEpoch:
         r._on_client_message = AsyncMock()
         await r._on_state_message(_state_msg(5))
         assert r._run_checked is False and r._run_epoch is None
+        # retried after RUN_CHECK_RETRY_S, not on every state message
+        assert r._run_check_after > time.monotonic() + dispatch_server.RUN_CHECK_RETRY_S - 5
+        r._database = SqlDb([("SELECT epoch", ([], 0))])
+        await r._on_state_message(_state_msg(6))
+        assert r._database.sql == []
+        r._run_check_after = 0.0
+        await r._on_state_message(_state_msg(7))
+        assert r._run_checked and _epoch_writes(r._database, NEW)[0][4] == 7
 
     async def test_start_resets_continuity(self):
         db = SqlDb([])
