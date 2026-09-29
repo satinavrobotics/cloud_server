@@ -539,7 +539,7 @@ Changed:
     - the map is archived, deleting, or `draft` for `operate` (nothing to use);
     - the map already has an open mapping session (for `mapping`);
     - geo map and the robot has no datum;
-    - `robot_pose` is more than 0.10 m or 3° from the robot's current pose (the robot moved; place again).
+    - the robot is driving (an active order or a non-zero velocity), or `robot_pose` differs from the robot's current pose by more than sensor noise (0.02 m / 0.5°): the robot must stand still while placed (Q-U7); stop it and place again.
   - 422:
     - `placement` on a geo map;
     - `services` on `operate`;
@@ -710,17 +710,17 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 
 U1 → U2 → U3 are sequential. U4 needs U1 (and U3 for the "not placed" state). U5 is independent. U6 comes last, after U4 is deployed.
 
-### 14.10 Open questions (with recommendation)
+### 14.10 Decisions (2026-09-29, user)
 
-- **Q-U1.** API name for the purpose: `operate` or `use`? *Rec:* `operate` in the API, "Use / Using" in the UI.
-- **Q-U2.** Deleting or archiving a map that robots are using: refuse (409), or stop their sessions? *Rec:* refuse, and name the robots.
-- **Q-U3.** Restart detection for robots without GNSS: header-id reset only, or also a robot-side `run_id`? *Rec:* header ids now (no robot change); add `run_id` with relocalization.
-- **Q-U4.** Require placement before capture when extending a local map (a change from M1, where later sessions record unaligned)? *Rec:* yes. M6 shrinks.
-- **Q-U5.** May a robot use a map that another robot is mapping at the same time? *Rec:* yes. It sees the map grow; missions plan on what exists.
-- **Q-U6.** If M3 is not deployed yet, rename `mapping/state` to `mapping/topo/state` before it is? *Rec:* yes. Otherwise keep the alias for one release.
-- **Q-U7.** How far may the robot move during placement before it is refused? *Rec:* 0.10 m / 3°. Placement is meant with the robot standing still.
-- **Q-U8.** Manual correction of a geo map's placement (a datum off by metres)? *Rec:* no, not now; the datum defines it.
-- **Q-U9.** End an operate session automatically when a robot stays offline? *Rec:* no. It stays open and becomes unplaced on the next run change.
+- **Q-U1** `operate` in the API, "Use / Using" in the UI (recommendation taken).
+- **Q-U2** Deleting or archiving a map that robots are using: **refuse (409) and name the robots.**
+- **Q-U3** Restart detection without GNSS: header-id reset now; a robot `run_id` comes with relocalization (recommendation taken).
+- **Q-U4** Extending a local map: **placement is required before capture.** M6 shrinks.
+- **Q-U5** A robot may use a map another robot is mapping: yes. Several robots mapping the same place (and sharing maps in general) is a **later, separate design step** (not in the coming weeks); nothing in U1–U6 designs for it beyond not blocking it.
+- **Q-U6** M3 is already deployed: keep `mapping/state` as an alias for one release next to `mapping/topo/state`.
+- **Q-U7** **The robot must not move while being placed.** No movement allowance: `place` is refused while the robot drives (an active order, or a non-zero velocity in its state) and if its pose changed between the pose shown and the confirm by more than sensor noise (0.02 m / 0.5°; noise, not an allowance). The UI says to stop the robot first.
+- **Q-U8** No manual correction of a geo map's placement now (recommendation taken).
+- **Q-U9** An operate session does not end on its own while the robot is offline; it becomes unplaced on the next run change (recommendation taken).
 
 ---
 
