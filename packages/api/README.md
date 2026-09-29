@@ -148,14 +148,15 @@ Load a map from the graph database.
 
 A map this route registers is typed like the M1 migration types old maps: `geo` if the datum is
 real (not null, not (0, 0)), else `local`; state `ready`. It never retypes an existing map.
-Since M2 `POST /map/load` with `GEO` / `LOCAL` (the old client's mapless views) registers
-nothing: it returns no nodes and `transform: null` (the client then uses the robot's datum).
+Since M2 `POST /map/load` with `GEO` / `LOCAL` (the old client's mapless views; reserved names,
+never maps, since U6 no sentinels either) registers nothing: it returns no nodes and
+`transform: null`.
 
 #### Typed maps and mapping sessions (maps redesign M1)
 
 See `docs/satinav-maps-redesign.md` §2-§4, §7, §13.1-§13.2. Code: `packages/api/maps.py`. The
-routes above and `PUT /api/v1/maps/{id}/datum` are unchanged; `PUT /api/v1/robots/{r}/map` is a
-deprecated shim over sessions since M2 (below).
+routes above and `PUT /api/v1/maps/{id}/datum` are unchanged; `PUT /api/v1/robots/{r}/map` (a
+deprecated shim over sessions since M2) was removed in U6 (below).
 
 Every map has `type` (`local` | `geo`), `geo` (`{utm_zone, utm_north, origin_e, origin_n}` for a
 geo map once its origin is known, else null) and `status.state` (`draft` | `mapping` | `paused`
@@ -190,25 +191,22 @@ alignment (M6), grid (M7). Events: `MAP.CREATED`, `MAP.ARCHIVED`,
 finished), `MAP.INGEST_REJECTED` (source `graph_builder`) in `fleet_events`. `POST /api/v1/maps`
 and `POST .../sessions` accept `Idempotency-Key`.
 
-#### `PUT /api/v1/robots/{robot}/map` — DEPRECATED (maps M2; removed with the client's Maps page, M4)
+#### `PUT /api/v1/robots/{robot}/map` — REMOVED (maps U6)
 
-The old client's "assign map", kept working on top of sessions (`maps.assign_robot_map`), in
-one transaction:
-
-| `map_id` | Does |
-|---|---|
-| a real map name | Finishes the robot's open session if it is on another map; creates the map if it does not exist (`draft`, typed from the robot's datum: `geo` with a real datum, else `local`; `MAP.CREATED`; the name rules and 409s of `POST /api/v1/maps`); starts a session on it with the rules and errors of `POST /api/v1/maps/{id}/sessions` (404 robot, 409 offline / geo map without a robot datum / map busy / archived / being deleted). The map the robot already maps: nothing changes. |
-| `GEO`, `LOCAL`, null, `""` | Finishes the robot's open session, if any. |
-
-`robot.current_map` is still written (the value sent; null to clear): the old client's mission
-modes and map selection, the run recorder's `map_id` and the bag metadata read it
-(`docs/satinav-maps-redesign.md` §13.2). A refused call changes nothing. Body:
-`{success, robot_name, current_map, deprecated, map_created, finished_session, session}`.
-`POST /api/v1/maps/{id}/sessions` does not write `current_map`.
+The old client's "assign map" (a shim over sessions since M2) and `robot.current_map` are gone:
+a robot's map is its one open session (`GET /api/v1/robots[/{r}]` → `session`, below). The route
+answers **410 Gone** for one release, with a message pointing to `POST /api/v1/maps/{id}/sessions`
+(`purpose` `mapping` or `operate`, `replace: true` to switch maps) and
+`POST /api/v1/maps/{id}/sessions/{sid}/finish` (mapless); it is removed in the release after.
+Robot objects no longer have `current_map` (migration `20261002_01_drop_current_map` strips the
+stored key); a `current_map` in a `POST` / `PUT /api/v1/robots[/{r}]` body is ignored. `GEO` /
+`LOCAL` are no longer mapless sentinels: they stay reserved map names (old missions and runs carry
+them as map ids), and a mission waypoint naming them is refused by the dispatcher like any map the
+robot is not using. Mapless waypoints have an empty `map_id`.
 
 #### Robot mapping switch over MQTT (maps M3)
 
-After every committed session change (`POST .../sessions`, `.../pause|resume|finish`, the shim)
+After every committed session change (`POST .../sessions`, `.../pause|resume|finish`, `.../place`)
 the API publishes the robot's **retained** `{prefix}/{robot}/mapping/set` (`prefix` =
 `MQTT_VDA5050_PREFIX`, `uagv/v2/RobotCompany`) from its open session, and re-publishes every
 robot's on each broker (re)connect. The set message carries `services` (maps U5: the open
@@ -221,7 +219,7 @@ Topic and payload contract: `packages/api/mapping_control.py` (docstring); robot
 
 | Where | Field |
 |---|---|
-| `POST .../sessions`, `PUT /robots/{r}/map` | `robot_notified` (bool: the broker acknowledged the set message; false never fails the call), `mapping_service` (`"running"` \| `"not_running"`: the robot's topomap is connected; the session starts either way), `mapping_services` (U5, below), `mapping_state` |
+| `POST .../sessions` | `robot_notified` (bool: the broker acknowledged the set message; false never fails the call), `mapping_service` (`"running"` \| `"not_running"`: the robot's topomap is connected; the session starts either way), `mapping_services` (U5, below), `mapping_state` |
 | `POST .../sessions/{sid}/pause\|resume\|finish` | `robot_notified`, `mapping_state` |
 | `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service`, `sessions.mapping_services` (of the open session's robot; null without an open session) |
 | `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state`, `mapping_services` per robot |
@@ -256,7 +254,7 @@ session that is not placed captures nothing, gets no route orders on that map an
 | GET | `/api/v1/maps/{id}/sessions?limit=&before=` | the whole history, newest first: `{map_id, count, items, next_before}`; `limit` 1-200 (default 50); `before` = the previous page's `next_before`. |
 | GET | `/api/v1/maps/{id}` | `sessions.open` is the open **mapping** session; new `sessions.operating: [{robot, session_id, aligned}]`; §14.13 `sessions.placement_reusable: {robot: from_session_id}` (local maps; `{}` otherwise): robots not on this map whose start here without `placement` would be placed from their last session (a hint; the start decides again). |
 | GET | `/api/v1/maps/{id}/graph`, `POST /map/load` | nodes gain `session_id` (null for untagged legacy nodes). |
-| GET | `/api/v1/robots[/{r}]` | new `session`: `{session_id, map, purpose, state: "mapping"\|"paused"\|"operating", aligned, map_T_session (null while not placed), unplaced_reason}` or null (mapless). Derived from `map_sessions`; replaces `current_map`. |
+| GET | `/api/v1/robots[/{r}]` | new `session`: `{session_id, map, purpose, state: "mapping"\|"paused"\|"operating", aligned, map_T_session (null while not placed), unplaced_reason}` or null (mapless). Derived from `map_sessions`; it is the robot's map (`current_map` was removed in U6). |
 | WS | `/ws/robot/{r}` | `robot_update` carries `session` (cached ≤ 1 s); `{type: "session_update", robot_name, timestamp, session}` right after a session change through the API. |
 | DELETE / POST | `/api/v1/maps/{id}` / `.../archive` | 409 while **any** session is open; the message names the robots (`r1 (mapping), r2 (using)`). |
 

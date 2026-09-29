@@ -17,7 +17,6 @@ from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import map_geo
 from packages.utils import map_sessions
-from packages.config import GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL
 from packages.utils.geo import gps_to_local, latlon_to_utm
 DatabaseClient = PostgresDatabase
 import uuid
@@ -27,28 +26,22 @@ from cloud_common.objects import common
 
 
 class MapResolutionError(ValueError):
-    """The request names no usable map (missing map_id, robot without a current map)."""
+    """The request names no usable map (missing map_id, robot without an open session)."""
 
 
 class RobotNotPlacedError(ValueError):
-    """The robot's open session on the map is not placed (maps §14): its position in the map
-    frame is unknown, so no path is planned from it (409 at the routes)."""
+    """The robot has no placed open session on the map (maps §14): it is not using the map, or
+    its session there is not placed, so its position in the map frame is unknown and no path
+    is planned from it (409 at the routes)."""
 
 
-# Maps §14.6 transition (U2 to U6): a robot without an open session on the map it is asked
-# about (the old client plans without sessions) falls back to the M2 rule
-# (map_geo.robot_frame_in_map) and robot.current_map, with a warning. U6 removes the fallback.
-SESSIONLESS_FALLBACK = True
-
-
-_MAP_SENTINELS = (GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL)
 # find_closest_node_to_robot's error text for RobotNotPlacedError (-> failed_at
 # "robot_not_placed", 409 at POST /api/v1/navigate).
 NOT_PLACED_PREFIX = "not placed: "
 
 
 def _is_real_map(map_id: Optional[str]) -> bool:
-    return isinstance(map_id, str) and bool(map_id) and map_id not in _MAP_SENTINELS
+    return isinstance(map_id, str) and bool(map_id)
 
 
 class MissionPlannerService:
@@ -81,7 +74,7 @@ class MissionPlannerService:
             arango_password: ArangoDB password
             arango_database: ArangoDB database name
             default_map_id: Optional fallback map for a request without a map_id and
-                without a robot current map (tests). None (production): such a request
+                without a robot session (tests). None (production): such a request
                 is refused, there is no implicit "default" map.
             knn_k: Number of nearest neighbors to find (default 1 for closest)
             range_search_radius: Radius for range search in meters
@@ -122,7 +115,7 @@ class MissionPlannerService:
             return self.default_map_id
         raise MapResolutionError(
             "No map_id given" + (f" ('{map_id}' is not a map)" if map_id else "") +
-            ": pass map_id" + " (or give the robot a current map)")
+            ": pass map_id" + " (or start a session for the robot on a map)")
 
     async def _open_session(self, robot_name: str) -> Optional[Dict[str, Any]]:
         """The robot's open session (maps §14; packages/utils/map_sessions.py), or None."""
@@ -131,35 +124,20 @@ class MissionPlannerService:
                 await cursor.execute(map_sessions.ROBOT_SESSION_SQL, (robot_name,))
                 return map_sessions.robot_session_from_row(await cursor.fetchone())
 
-    async def _session_or_unknown(self, robot_name: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """(known, session): known is False when the lookup failed (then callers keep the M2
-        behaviour, as for a robot without a session)."""
-        try:
-            return True, await self._open_session(robot_name)
-        except Exception as e:  # pylint: disable=broad-except
-            self.logger.warning(f"Open session of {robot_name} not readable ({e}); using the "
-                                "robot's current map / datum")
-            return False, None
-
     async def _resolve_map(self, map_id: Optional[str], robot_name: Optional[str]) -> str:
         """The map to plan on: the request's map_id, else the map of the robot's open session
-        (maps §14), else (transition) the robot's current map, else MapResolutionError (a
-        clear 400 at the routes)."""
+        (maps §14.2: the robot's map is its session; there is no robot.current_map since U6),
+        else MapResolutionError (a clear 400 at the routes). A session lookup that fails
+        raises."""
         if _is_real_map(map_id):
             return map_id
         if robot_name:
-            _known, session = await self._session_or_unknown(robot_name)
+            session = await self._open_session(robot_name)
             if session is not None:
                 return session["map_name"]
-            robot = await self.get_robot_status(robot_name)
-            current = getattr(robot, "current_map", None) if robot else None
-            if _is_real_map(current) and SESSIONLESS_FALLBACK:
-                self.logger.warning(f"Robot {robot_name} has no open session; planning on its "
-                                    f"current_map '{current}' (transition fallback)")
-                return current
             if not self.default_map_id:
                 raise MapResolutionError(
-                    f"No map_id given and robot '{robot_name}' has no current map: "
+                    f"No map_id given and robot '{robot_name}' has no open map session: "
                     "pass map_id")
         return self._require_map(map_id)
 
@@ -184,43 +162,25 @@ class MissionPlannerService:
 
     async def _robot_xy_in_map(self, robot: robot_object.RobotObjectV1,
                                map_id: str) -> Tuple[float, float]:
-        """The robot's position (robot.status.pose, its own frame) in the map's frame, for
+        """The robot's position (robot.status.pose, its own run frame) in the map's frame, for
         comparing it with node poses (maps redesign M2: nodes are stored in the map frame).
 
-        Maps §14: through the robot's open session on that map (map_T_session);
-        RobotNotPlacedError when that session is not placed. Transition fallback (no session on
-        the map, or the lookup failed): the M2 rule, identity for a local map, a geo map
-        converts with the robot's current datum (map_geo.robot_frame_in_map); unknown (no map
-        row, geo map and a robot without a datum): the raw pose, as before M2."""
+        Maps §14: only through the robot's open session on that map (map_T_session).
+        RobotNotPlacedError when the robot has no open session on the map ("not using") or
+        that session is not placed. Since U6 there is no map/datum fallback; a session lookup
+        that fails raises."""
         x, y = robot.status.pose.x, robot.status.pose.y
         name = getattr(robot, "name", None)
-        try:
-            _known, session = (await self._session_or_unknown(name) if isinstance(name, str)
-                               else (False, None))
-        except Exception:  # pylint: disable=broad-except
-            _known, session = False, None
-        if session is not None and session["map_name"] == map_id:
-            if not map_sessions.is_placed(session):
-                raise RobotNotPlacedError(
-                    f"Robot '{name}' is not placed on map '{map_id}' (its run frame "
-                    "changed or it was never placed): place it on the map first")
-            return map_geo.apply_transform(session["map_t_session"], x, y)
-        if not SESSIONLESS_FALLBACK:
-            raise RobotNotPlacedError(f"Robot '{name}' is not using map '{map_id}'")
-        if _known:
-            self.logger.warning(f"Robot {name} has no open session on map '{map_id}'; "
-                                "its position uses the map/datum rule (transition fallback)")
-        from cloud_common.objects.map import MapObjectV1
-        try:
-            map_obj = await self.database.get_object(MapObjectV1, map_id)
-            t = map_geo.robot_frame_in_map(map_obj, getattr(robot, "datum", None))
-        except Exception:
-            return x, y
-        if t is None:
-            self.logger.warning(f"Robot {robot.name} has no datum; its pose is compared with "
-                                f"geo map '{map_id}' unconverted")
-            return x, y
-        return map_geo.apply_transform(t, x, y)
+        session = await self._open_session(name) if isinstance(name, str) else None
+        if session is None or session["map_name"] != map_id:
+            raise RobotNotPlacedError(
+                f"Robot '{name}' is not using map '{map_id}': start a session for it on the "
+                "map (Use) first")
+        if not map_sessions.is_placed(session):
+            raise RobotNotPlacedError(
+                f"Robot '{name}' is not placed on map '{map_id}' (its run frame "
+                "changed or it was never placed): place it on the map first")
+        return map_geo.apply_transform(session["map_t_session"], x, y)
 
     async def _gps_to_map(self, map_id: str, lat: float, lon: float
                           ) -> Optional[Tuple[float, float, str]]:

@@ -184,10 +184,6 @@ class RobotSpecV1(pydantic.BaseModel):
                            "for that state, previously only reachable by hand-publishing "
                            "MQTT."
     )
-    current_map: Optional[str] = pydantic.Field(
-        None, description="The map ID that this robot is currently operating on. "
-                          "Set via PUT /api/v1/robots/{robot_name}/map."
-    )
     current_model: Optional[str] = pydantic.Field(
         None, description="The model the robot currently has loaded/active. "
                           "Reported by the orchestrator at registration and on change."

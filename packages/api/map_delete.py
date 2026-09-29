@@ -24,10 +24,9 @@ MAP.DELETED (maps redesign M2): ts = when the row was removed, discriminator
 the row, so once per delete.
 
 Not deleted: ROS bags (a robot's recordings; they only name the map in a sidecar) and base
-models (not per map). Robots whose `current_map` is the deleted map are reset in the finishing
-transaction to the mapless sentinel of their position mode ('GEO' for a `gps` robot, 'LOCAL'
-otherwise: what `PUT /robots/{r}/map` with no map writes), and the robot NOTIFY is sent; the
-assign routes refuse a DELETING map with 409 (packages/api/main.py).
+models (not per map). No robot refers to the map: a robot's map is its open session (maps
+§14.2), and the delete is refused while any session on the map is open (maps.py); the session
+start refuses a DELETING map with 409.
 
 At startup every worker lists the DELETING maps and starts a task for each; the lock makes
 only one of them run it.
@@ -42,9 +41,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1
 from cloud_common.objects.object import ObjectLifecycleV1
-from cloud_common.objects.robot import RobotObjectV1
 from packages.api.entrypoint import advisory_lock_key
-from packages import config
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 
@@ -68,12 +65,6 @@ RECORD_SQL = (f"UPDATE {MAP_TABLE} SET status = status || %s::jsonb "
 FINISH_SQL = f"DELETE FROM {MAP_TABLE} WHERE name = %s AND lifecycle = '{DELETING}'"
 # The map's mapping sessions (maps redesign M1) go with its row, in the same transaction.
 SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
-ROBOT_TABLE = RobotObjectV1.table_name()
-# Robots still pointing at the deleted map fall back to the mapless sentinel of their mode.
-ROBOTS_SQL = (
-    f"UPDATE {ROBOT_TABLE} SET spec = spec || jsonb_build_object('current_map', "
-    "CASE WHEN spec->>'position_mode' = 'gps' THEN %s ELSE %s END) "
-    "WHERE spec->>'current_map' = %s AND lifecycle <> 'DELETED' RETURNING name, lifecycle")
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
 
 
@@ -295,11 +286,6 @@ class MapDeleter:
                 removed = bool(cursor.rowcount)
                 if removed:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
-                    await cursor.execute(ROBOTS_SQL, (config.GPS_MAP_SENTINEL,
-                                                      config.LOCAL_MAP_SENTINEL, map_id))
-                    for robot_name, robot_lifecycle in await cursor.fetchall():
-                        await cursor.execute(NOTIFY_SQL, (
-                            ROBOT_TABLE, f"{self._publisher_id} {robot_name} {robot_lifecycle}"))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
             if removed:

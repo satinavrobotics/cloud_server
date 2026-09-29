@@ -2,8 +2,8 @@
 
 - packages/api/mapping_control.py: the set payload from the open session, the state cache
   (mapping/state messages), the status view, publishing with a broker acknowledgement;
-- packages/api/maps.py: after every committed session change (start, pause, resume, finish,
-  the PUT /robots/{r}/map shim) the robot's retained set message is published from its open
+- packages/api/maps.py: after every committed session change (start, pause, resume, finish)
+  the robot's retained set message is published from its open
   session; a failed publish never fails the call (robot_notified false); mapping_service;
   re-publishing every robot on (re)connect; the session summary's mapping_state;
 - the routes pass the control and the robot view carries mapping_state.
@@ -111,8 +111,6 @@ class M3Db(ShimDb):
             raise
         self.events.extend(store.pending_events)
         self.notifies.extend(store.pending_notifies)
-        for name, value in store.pending_current.items():
-            self.robots[name].current_map = value
 
 
 @pytest.fixture
@@ -343,26 +341,6 @@ class TestTransitions:
         db.add_robot("r1")
         out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB)
         assert set(out) == {"map_id", "map_state", "changed", "session", "replaced_session"}
-
-
-class TestShim:
-    async def test_assign_and_clear(self, db):
-        db.add_robot("r1", **ENU_DATUM)
-        ctl = control()
-        out = await maps.assign_robot_map(None, "r1", "yard", m1.PUB, "op", None, control=ctl)
-        assert out["robot_notified"] is True and out["mapping_service"] == "not_running"
-        last = ctl.client.sets()[-1]
-        assert last["enabled"] and last["map"] == "yard"
-        assert last["session_id"] == out["session"]["session_id"]
-
-        out = await maps.assign_robot_map(None, "r1", "other", m1.PUB, "op", None, control=ctl)
-        last = ctl.client.sets()[-1]
-        assert last["map"] == "other" and last["session_id"] == out["session"]["session_id"]
-        assert len(ctl.client.sets()) == 2  # finish + start in one transaction: one message
-
-        await maps.assign_robot_map(None, "r1", "GEO", m1.PUB, "op", None, control=ctl)
-        assert ctl.client.sets()[-1]["enabled"] is False
-        assert ctl.client.sets()[-1]["session_id"] is None
 
 
 class TestResync:

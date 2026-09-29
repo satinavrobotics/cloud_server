@@ -445,12 +445,6 @@ class TestOperateLifecycle:
         out = await maps.robot_mapping_off(None, "r1", ctl)
         assert out["robot_notified"] is True and ctl.client.sets()[-1]["force"] is True
 
-    async def test_shim_extends_a_local_map_unplaced(self, db):
-        _local_with_nodes(db)
-        _robot(db)
-        out = await maps.assign_robot_map(None, "r1", "shed", PUB)
-        assert out["session"]["purpose"] == "mapping" and out["session"]["aligned"] is False
-
     async def test_start_response_keys(self, db):
         _local_with_nodes(db)
         _robot(db)

@@ -396,7 +396,8 @@ which both maps grow unbounded); buffered base64 images for nodes that never
 arrive live up to 3600 s although `image_buffer_timeout` is 30 s;
 `_mqtt_connected` is never set True so `is_healthy()` is always False; late images
 take `map_id` from the MQTT payload while nodes use `robot.current_map`, so an
-image can land in a different bucket than its node.
+image can land in a different bucket than its node. *(Map part fixed in maps M2: images and
+nodes both go to the robot's open session; `robot.current_map` itself was removed in U6.)*
 
 ### D6. Postgres watcher hygiene — **low/medium**
 `self._connection` replaced without closing (one leak per 60 s idle timeout);

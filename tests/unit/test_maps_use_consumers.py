@@ -2,11 +2,12 @@
 
 - dispatcher `_route_in_robot_frame`: waypoints on the session's map go through
   inverse(map_T_session); an unplaced session fails the node ("robot is not placed on map X");
-  a map the robot has no session on: the transition fallback (M2 rule, warning), refused once
-  SESSIONLESS_FALLBACK is off; an unreadable session: the M2 rule;
+  since U6 a map the robot has no session on fails it too ("robot is not using map X"; the
+  transition fallback is gone), and so does an unreadable session;
 - planner: the default map is the session's map, the robot's position goes through
-  map_T_session, an unplaced session is a 409 (POST /api/v1/navigate, passed on by the API);
-- run recorder: mission_runs.map_id = the session's map (null when mapless);
+  map_T_session, an unplaced session or no session on the map is a 409 (POST /api/v1/navigate,
+  passed on by the API); no robot.current_map fallback (U6);
+- run recorder: mission_runs.map_id = the session's map (null when mapless or unreadable);
 - bag metadata: the session's map and session_id.
 """
 import math
@@ -82,28 +83,38 @@ class TestDispatcherRoute:
         with pytest.raises(RouteRefused, match="not placed on map shed"):
             await r._route_in_robot_frame(_route())
 
-    async def test_other_map_falls_back_with_a_warning(self):
+    async def test_other_map_is_refused(self):
+        """U6: no transition fallback (the M2 map/datum rule) for a map the robot is not on."""
         r, db = _robot()
         r._read_open_session = AsyncMock(return_value=session(map_name="barn"))
         db.get_object = AsyncMock(return_value=MapObjectV1(name="shed", type="local"))
-        r.warning = MagicMock()
-        route = _route()
-        assert await r._route_in_robot_frame(route) is route  # local: identity, as M2
-        assert any("transition fallback" in c.args[0] for c in r.warning.call_args_list)
+        with pytest.raises(RouteRefused, match="not using map shed"):
+            await r._route_in_robot_frame(_route())
+        db.get_object.assert_not_awaited()
+        assert not hasattr(dispatch_server, "SESSIONLESS_FALLBACK")
 
-    async def test_no_fallback_after_u6(self):
+    async def test_mapless_robot_is_refused(self):
         r, _ = _robot()
         r._read_open_session = AsyncMock(return_value=None)
-        with patch.object(dispatch_server, "SESSIONLESS_FALLBACK", False):
-            with pytest.raises(RouteRefused, match="not using map shed"):
-                await r._route_in_robot_frame(_route())
+        with pytest.raises(RouteRefused, match="not using map shed"):
+            await r._route_in_robot_frame(_route())
 
-    async def test_unreadable_session_uses_the_m2_rule(self):
+    async def test_unreadable_session_is_refused(self):
         r, db = _robot()
         r._read_open_session = AsyncMock(return_value=dispatch_server.SESSION_UNKNOWN)
         db.get_object = AsyncMock(return_value=MapObjectV1(name="shed", type="local"))
-        route = _route()
-        assert await r._route_in_robot_frame(route) is route
+        with pytest.raises(RouteRefused, match="could not be read"):
+            await r._route_in_robot_frame(_route())
+        db.get_object.assert_not_awaited()
+
+    async def test_old_sentinel_waypoints_are_refused(self):
+        """U6: 'GEO' / 'LOCAL' waypoints (the old client's mapless missions) are not mapless
+        any more; mapless waypoints have no map_id."""
+        r, _ = _robot()
+        r._read_open_session = AsyncMock(return_value=None)
+        for name in ("GEO", "LOCAL"):
+            with pytest.raises(RouteRefused, match=f"not using map {name}"):
+                await r._route_in_robot_frame(_route(map_id=name))
 
     async def test_mapless_route_reads_nothing(self):
         r, _ = _robot()
@@ -163,8 +174,7 @@ class TestRecorder:
         mission = api_objects.MissionObjectV1(
             name="m1", robot="r1", status={},
             mission_tree=[{"name": "0", "parent": "root", "route": _route().dict()}])
-        robot = api_objects.RobotObjectV1(name="r1", status={"pose": {"map_id": "map"}},
-                                          current_map="GEO")
+        robot = api_objects.RobotObjectV1(name="r1", status={"pose": {"map_id": "map"}})
         rec.run_started("r1", mission, robot, session_map=None)
         assert captured["run"].map_id is None  # mapless: not the GEO sentinel, not "map"
         rec._runs, captured = {}, {}
@@ -173,8 +183,8 @@ class TestRecorder:
         assert captured["run"].map_id == "shed"
         rec._runs, captured = {}, {}
         rec._submit = lambda job: captured.setdefault("run", job.info)
-        rec.run_started("r1", mission, robot)  # session unknown: the M2 rule
-        assert captured["run"].map_id == "GEO"
+        rec.run_started("r1", mission, robot)  # session unknown: no map (U6: no M2 rule)
+        assert captured["run"].map_id is None
 
 
 # --- planner ----------------------------------------------------------------------------------------
@@ -187,25 +197,23 @@ def planner():
     return svc
 
 
-def _probot(current_map=None, pose=(2.0, 1.0)):
-    return SimpleNamespace(name="r1", current_map=current_map, datum=None,
+def _probot(pose=(2.0, 1.0)):
+    return SimpleNamespace(name="r1", datum=None,
                            status=SimpleNamespace(pose=SimpleNamespace(x=pose[0], y=pose[1])))
 
 
 class TestPlanner:
     async def test_default_map_is_the_session_map(self, planner):
         planner._open_session = AsyncMock(return_value=session())
-        planner.get_robot_status = AsyncMock(return_value=_probot(current_map="old"))
+        planner.get_robot_status = AsyncMock(return_value=_probot())
         assert await planner._resolve_map(None, "r1") == "shed"
         assert await planner._resolve_map("yard", "r1") == "yard"
 
-    async def test_current_map_fallback_without_a_session(self, planner):
+    async def test_no_map_without_a_session(self, planner):
         planner._open_session = AsyncMock(return_value=None)
-        planner.get_robot_status = AsyncMock(return_value=_probot(current_map="old"))
-        assert await planner._resolve_map(None, "r1") == "old"
-        with patch.object(planner_server, "SESSIONLESS_FALLBACK", False):
-            with pytest.raises(planner_server.MapResolutionError):
-                await planner._resolve_map(None, "r1")
+        with pytest.raises(planner_server.MapResolutionError, match="no open map session"):
+            await planner._resolve_map(None, "r1")
+        assert not hasattr(planner_server, "SESSIONLESS_FALLBACK")
 
     async def test_robot_position_through_the_session(self, planner):
         planner._open_session = AsyncMock(return_value=session())
@@ -226,11 +234,21 @@ class TestPlanner:
         out = await planner.find_nearby_nodes("r1", "shed")
         assert out["nodes"] == [] and "not placed" in out["error"]
 
-    async def test_other_map_falls_back(self, planner):
+    async def test_other_map_is_refused(self, planner):
         planner._open_session = AsyncMock(return_value=session(map_name="barn"))
         planner.database.get_object = AsyncMock(return_value=MapObjectV1(name="shed",
                                                                           type="local"))
-        assert await planner._robot_xy_in_map(_probot(), "shed") == (2.0, 1.0)
+        with pytest.raises(RobotNotPlacedError, match="not using map 'shed'"):
+            await planner._robot_xy_in_map(_probot(), "shed")
+        planner._open_session = AsyncMock(return_value=None)
+        with pytest.raises(RobotNotPlacedError, match="not using map 'shed'"):
+            await planner._robot_xy_in_map(_probot(), "shed")
+        planner.database.get_object.assert_not_awaited()
+
+    async def test_unreadable_session_raises(self, planner):
+        planner._open_session = AsyncMock(side_effect=RuntimeError("db down"))
+        with pytest.raises(RuntimeError):
+            await planner._robot_xy_in_map(_probot(), "shed")
 
     async def test_navigate_route_is_409(self):
         fake = MagicMock()
@@ -266,7 +284,7 @@ class TestBagMetadata:
         svc = ApiDelegationService.__new__(ApiDelegationService)
         svc.logger = MagicMock()
         svc.database = MagicMock(get_object=AsyncMock(return_value=api_objects.RobotObjectV1(
-            name="r1", status={}, current_map="GEO")))
+            name="r1", status={})))
         svc.rosbag_db = MagicMock()
         svc.rosbag_db.create_upload_url.return_value = {"upload_url": "u", "expires_in": 60}
         with patch.object(maps, "robot_sessions", AsyncMock(return_value={

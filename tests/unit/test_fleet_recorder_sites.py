@@ -38,7 +38,6 @@ def _at(seconds):
 
 def _robot(level=None):
     robot = api_objects.RobotObjectV1(name="r1", status={}, telemetry_recording=level)
-    robot.current_map = "map1"
     return robot
 
 

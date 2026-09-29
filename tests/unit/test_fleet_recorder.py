@@ -48,7 +48,6 @@ def _mission(name="m1", robot="r1", run_id="abcd1234"):
 def _robot(name="r1", timeout_s=30):
     robot = api_objects.RobotObjectV1(name=name, status={},
                                       heartbeat_timeout=datetime.timedelta(seconds=timeout_s))
-    robot.current_map = "map1"
     return robot
 
 
@@ -64,7 +63,7 @@ async def test_run_start_and_finish_write_row_and_events_together(tmp_path):
     rec, db, clock = make_recorder(tmp_path)
     mission, robot = _mission(), _robot()
 
-    rec.run_started("r1", mission, robot)
+    rec.run_started("r1", mission, robot, session_map="map1")  # maps §14: the session map
     await rec.run_pending_ops()
 
     row = _run_row(db)

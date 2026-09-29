@@ -98,9 +98,6 @@ TRAJECTORY_GRACE_S = 5
 # Key inside robot_latest.state_msg holding dispatch's own detector baselines (the rest of
 # state_msg is the robot's last VDA5050 state message, as received).
 DISPATCH_KEY = "_dispatch"
-# run_started() without session information (maps §14: the dispatcher could not read the
-# robot's open session): the run's map_id follows the M2 rule.
-_NO_SESSION_INFO = object()
 # information[] entries that carry the robot's build id, and a bare protocol version
 # ("2.0.0"), which the VDA5050 header `version` field normally holds.
 SW_VERSION_INFO_TYPES = ("swVersion", "buildId", "softwareVersion")
@@ -857,11 +854,11 @@ class FleetRecorder:
     # --- mission hooks -------------------------------------------------------------------
     @_guarded
     def run_started(self, robot_name: str, mission: Any, robot_object: Any = None,
-                    session_map: Any = _NO_SESSION_INFO) -> None:
+                    session_map: Optional[str] = None) -> None:
         """The dispatcher is about to send the first order of `mission` (a fresh one, or one
         resumed after a restart, which adopts its existing run). `session_map` (maps §14): the
-        map of the robot's open session, None when it has none; the run's `map_id`. Without
-        it (the session could not be read) the M2 rule: current_map or the pose's map id."""
+        map of the robot's open session, None when it has none (or it could not be read); the
+        run's `map_id`."""
         current = self._runs.get(robot_name)
         if current is not None and current.mission_name == mission.name:
             return
@@ -869,11 +866,7 @@ class FleetRecorder:
         fresh = status.start_timestamp is None and status.passes_completed == 0
         now = self._clock()
         track = self._track(robot_name, robot_object)
-        map_id = None
-        if session_map is not _NO_SESSION_INFO:
-            map_id = session_map
-        elif robot_object is not None:
-            map_id = robot_object.current_map or robot_object.status.pose.map_id or None
+        map_id = session_map or None
         run = RunInfo(
             run_id=run_uuid(mission.name, status.run_id, status.start_timestamp),
             mission_name=mission.name, robot_name=robot_name,

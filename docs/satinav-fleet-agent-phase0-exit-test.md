@@ -34,7 +34,7 @@ curl -s $API/api/v1/health/recording | python3 -m json.tool | head -40
 # the robot: online, IDLE, nothing running for it
 curl -s $API/api/v1/robots/$R | python3 -c "import json,sys; r=json.load(sys.stdin); \
   print(r['name'], r['status']['state'], 'online' if r['status']['online'] else 'OFFLINE', \
-  'map', r.get('current_map'), 'pose', r['status']['pose'], 'level', r.get('telemetry_recording'))"
+  'map', (r.get('session') or {}).get('map'), 'pose', r['status']['pose'], 'level', r.get('telemetry_recording'))"
 curl -s $API/api/v1/missions | python3 -c "import json,sys; \
   print([m['name'] for m in json.load(sys.stdin) if m['robot']=='$R' and m['status']['state'] in ('PENDING','RUNNING')])"
 
@@ -66,7 +66,7 @@ mission() {  # mission NAME TIMEOUT_S DX1 DX2 : a route of two waypoints DX1 / D
 import json, sys, urllib.request
 name, timeout, dx1, dx2 = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
 r = json.load(urllib.request.urlopen("http://localhost:8000/api/v1/robots/masked-frigatebird"))
-p = r["status"]["pose"]; m = r.get("current_map") or p.get("map_id") or ""
+p = r["status"]["pose"]; m = ""  # mapless waypoints: robot frame (maps U6: no current_map)
 wp = lambda dx: {"x": p["x"] + dx, "y": p["y"], "theta": 0.0, "map_id": m}
 print(json.dumps({"name": name, "robot": "masked-frigatebird", "timeout": timeout,
                   "mission_tree": [{"name": "go",

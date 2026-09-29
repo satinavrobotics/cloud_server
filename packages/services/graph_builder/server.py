@@ -5,8 +5,8 @@ Graph Builder Service
 Processes new node updates from MQTT and builds the topological graph.
 
 Maps redesign M2 (docs/satinav-maps-redesign.md §6): nodes and images go to the robot's open
-mapping session (ingest.py), never to `robot.current_map` or a `"default"` map. Data without
-a session is dropped, counted, and reported as MAP.INGEST_REJECTED (rate-limited). Node poses
+mapping session (ingest.py), never to the old `robot.current_map` (removed in U6) or a
+`"default"` map. Data without a session is dropped, counted, and reported as MAP.INGEST_REJECTED (rate-limited). Node poses
 are converted into the map frame with the session's map_T_session; the robot-frame pose is kept
 as `robot_pose`, and the node carries `session_id`.
 
@@ -638,7 +638,7 @@ class GraphBuilderService:
         The image goes where its node goes: the robot's open mapping session decides
         (ingest.py; a dropped image is counted and reported like a node). A map_id in the
         payload is ignored (before M2 it was used, so images landed in "default" while their
-        nodes went to the robot's current_map).
+        nodes went to the robot's old current_map).
 
         Payload: session_node_id, robot_name, camera_name, image_data (base64), and optionally
         content_type, timestamp, yaw_offset, session_id (M3 robots).
