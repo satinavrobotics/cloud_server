@@ -41,6 +41,9 @@ pyyaml>=6.0
 # Image Processing (for tests)
 pillow>=10.0.0
 
+# 3D reconstruction top view (packages/api/reconstruction_topview.py; the API pins it too)
+numpy==1.26.4
+
 # Spatial indexing (for tests)
 rtree>=1.0.0
 
