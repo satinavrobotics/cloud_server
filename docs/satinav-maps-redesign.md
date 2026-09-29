@@ -462,7 +462,7 @@ counts per session. `since`: when `enabled` last flipped.
 
 ## 14. Using maps: operate sessions and the map window
 
-**Status:** design 2026-09-29; U1–U3 **built, not deployed** (§14.11); U5 **built, not deployed** (§14.12). Revises the M5–M7 plan (§14.9).
+**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client. Revises the M5–M7 plan (§14.9).
 
 ### 14.1 The gap
 
@@ -698,11 +698,11 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 
 | Step | Content | Repos |
 |---|---|---|
-| U1 | Migration; `purpose`/`services`/`placement`/`replace` on start; `place`; history endpoint; robot view `session`; graph `session_id`; `set_payload` and ingest rules; events | cloud_server; **built, not deployed** (§14.11) |
-| U2 | Consumers read the session (§14.6), with the transition fallback | cloud_server; **built, not deployed** (§14.11) |
-| U3 | Run-change detection in the dispatcher; unplace; geo re-place on the datum write (the same compare-and-set as graph-builder's) | cloud_server; **built, not deployed** (§14.11) |
+| U1 | Migration; `purpose`/`services`/`placement`/`replace` on start; `place`; history endpoint; robot view `session`; graph `session_id`; `set_payload` and ingest rules; events | cloud_server; **deployed 2026-09-29** (`mapsu1.sh`, §14.11) |
+| U2 | Consumers read the session (§14.6), with the transition fallback | cloud_server; **deployed 2026-09-29** (`mapsu1.sh`, §14.11) |
+| U3 | Run-change detection in the dispatcher; unplace; geo re-place on the datum write (the same compare-and-set as graph-builder's) | cloud_server; **deployed 2026-09-29** (`mapsu1.sh`, §14.11) |
 | U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
-| U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server; **built, not deployed** (§14.12) |
+| U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server; cloud **deployed 2026-09-29** (in the `mapsu1.sh` build of main; `mapsu5.sh` then found the image unchanged), robot topomap rebuild pending (§14.12) |
 | U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server, sati-client |
 | M5 | One `MapView` (unchanged goal; its local/geo rendering starts from U4's preview) | sati-client; **built 2026-09-29** (`6798aa0..c39953b`): `MapView` replaces CostmapRenderer and GeoMap; robots drawn through `map_T_session`, or without a session through their own datum (fixes the −1.445° marker). Left: costmap bitmaps still drawn in the run frame; `current_map` readers go in U6 |
 | M6 | **Shrinks** to aligning *existing* unaligned sessions (legacy data), since new ones are placed before capture. Drop it if none remain | cloud_server, sati-client |
