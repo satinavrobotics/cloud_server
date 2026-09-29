@@ -85,6 +85,13 @@ class FakeCursor:
                 self.rowcount = 1
         elif sql == map_delete.SESSIONS_SQL:
             db.sessions_deleted.append(params[0])
+        elif sql == map_delete.ROBOTS_SQL:
+            gps_value, local_value, name = params
+            for rname, spec in db.robots.items():
+                if spec.get("current_map") == name:
+                    spec["current_map"] = gps_value if spec.get("position_mode") == "gps" \
+                        else local_value
+                    self._rows.append((rname, "ALIVE"))
         elif sql == emit_mod.INSERT_SQL:
             if db.fail_events:
                 raise RuntimeError("fleet_events unavailable")
@@ -146,6 +153,7 @@ class FakeDb:
         self.notifies = []
         self.statements = []
         self.sessions_deleted = []
+        self.robots = {}
         self.locks = {} if locks is None else locks
         self.fail_events = False
 
@@ -233,6 +241,32 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
                                          f"map:site_a:deleted:{T0.isoformat()}")
     assert json.loads(event["payload"]) == {"map_name": "site_a", "attempts": 1,
                                             "requested_at": T0.isoformat()}
+
+
+async def test_delete_resets_robots_current_map_to_their_mode_sentinel():
+    db = FakeDb()
+    db.seed("yard")
+    db.robots = {"gps1": {"current_map": "yard", "position_mode": "gps"},
+                 "loc1": {"current_map": "yard"},
+                 "other": {"current_map": "elsewhere", "position_mode": "gps"},
+                 "none": {}}
+    deleter, _ = _deleter(db)
+    await _request_and_wait(deleter, "yard")
+    assert db.robots["gps1"]["current_map"] == "GEO"
+    assert db.robots["loc1"]["current_map"] == "LOCAL"
+    assert db.robots["other"]["current_map"] == "elsewhere" and "current_map" not in db.robots["none"]
+    robot_notifies = [n for n in db.notifies if n[0] == map_delete.ROBOT_TABLE]
+    assert sorted(n[1].split()[1] for n in robot_notifies) == ["gps1", "loc1"]
+    assert "yard" not in db.rows
+
+
+async def test_failed_delete_does_not_touch_robots():
+    db = FakeDb()
+    db.seed("yard")
+    db.robots = {"r1": {"current_map": "yard"}}
+    deleter, _ = _deleter(db, graph=Store(fail=99), max_attempts=2)
+    await _request_and_wait(deleter, "yard")
+    assert db.robots["r1"]["current_map"] == "yard"
 
 
 async def test_arango_failure_retries_with_backoff_then_emits_delete_failed():
