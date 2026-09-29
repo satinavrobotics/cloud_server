@@ -623,6 +623,20 @@ def filter_maps(maps: List[MapObjectV1], type_: Optional[str] = None,
     return out
 
 
+def apply_graph_counts(views: List[Dict[str, Any]], map_stats: Callable[[str], Mapping[str, Any]]
+                       ) -> List[Dict[str, Any]]:
+    """Overwrite status.node_count / status.edge_count of each map view with the graph's own
+    counts (what GET /maps/{id} reports; ArangoDB is the source of truth). The Postgres row
+    counters are not maintained after M1 and would be stale. Blocking: run in a thread."""
+    for view in views:
+        stats = map_stats(view["name"]) or {}
+        ok = "error" not in stats
+        st = view.setdefault("status", {})
+        st["node_count"] = int(stats.get("node_count") or 0) if ok else 0
+        st["edge_count"] = int(stats.get("edge_count") or 0) if ok else 0
+    return views
+
+
 async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID) -> Dict[str, Any]:
     req = parse_body(PatchMapRequest, data)
     changes = req.dict(exclude_unset=True)

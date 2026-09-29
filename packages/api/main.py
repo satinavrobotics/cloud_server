@@ -5,6 +5,7 @@ API Delegation Service - Main Entry Point
 FastAPI application that provides REST and WebSocket endpoints for clients.
 """
 
+import asyncio
 import logging
 import uuid
 import argparse
@@ -477,6 +478,9 @@ async def list_maps(type: Optional[str] = None, state: Optional[str] = None,
         # A DELETING map is on its way out (packages/api/map_delete.py): hidden.
         views = maps.filter_maps(found, type_=type, state=state,
                                  include_archived=include_archived)
+        # status.node_count/edge_count in the row are stale: report the graph's, as the detail does.
+        views = await asyncio.to_thread(maps.apply_graph_counts, views,
+                                        service.graph_db.get_map_stats)
         return {"maps": views, "count": len(views)}
     except HTTPException:
         raise

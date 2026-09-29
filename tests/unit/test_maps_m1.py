@@ -599,11 +599,31 @@ class TestList:
     async def test_route(self):
         svc = MagicMock()
         svc.database.list_objects = AsyncMock(return_value=self.MAPS)
+        svc.graph_db.get_map_stats = lambda n: {"node_count": 1, "edge_count": 0}
         with patch.object(main, "service", svc):
             body = await main.list_maps()
             assert body["count"] == 3
             body = await main.list_maps(type="geo", state=None, include_archived=True)
             assert [m["name"] for m in body["maps"]] == ["old_geo", "arch"]
+
+    async def test_list_counts_equal_detail_despite_stale_row(self):
+        """The row's status.node_count (never maintained after M1) is 0; the graph has 13
+        nodes / 12 edges: the list reports what GET /maps/{id} reports."""
+        stats = {"hosp": {"node_count": 13, "edge_count": 12}, "gone": {"error": "not found"}}
+        svc = MagicMock()
+        svc.database.list_objects = AsyncMock(return_value=[
+            _obj("hosp", type="local", status={"state": "ready", "node_count": 0}),
+            _obj("gone", type="local", status={"state": "draft", "node_count": 5})])
+        svc.graph_db.get_map_stats = lambda n: stats[n]
+        svc.database.get_object = AsyncMock(return_value=_obj("hosp", type="local"))
+        with patch.object(main, "service", svc):
+            listed = {m["name"]: m for m in (await main.list_maps())["maps"]}
+        from packages.api.server import ApiDelegationService
+        svc.get_map = ApiDelegationService.get_map.__get__(svc)
+        detail = await svc.get_map("hosp")
+        assert listed["hosp"]["status"]["node_count"] == detail["node_count"] == 13
+        assert listed["hosp"]["status"]["edge_count"] == detail["edge_count"] == 12
+        assert listed["gone"]["status"]["node_count"] == 0  # as the detail: error -> 0
 
 
 class TestPatch:
