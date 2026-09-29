@@ -193,6 +193,12 @@ RECONSTRUCTION_MAX_INFLIGHT = int(os.getenv("RECONSTRUCTION_MAX_INFLIGHT", "1"))
 RECONSTRUCTION_VOXEL_M = float(os.getenv("RECONSTRUCTION_VOXEL_M", "0.05"))
 RECONSTRUCTION_MAX_DEPTH_M = float(os.getenv("RECONSTRUCTION_MAX_DEPTH_M", "10.0"))
 RECONSTRUCTION_CLIP_Z = float(os.getenv("RECONSTRUCTION_CLIP_Z", "2.0"))
+# The top view (ortho.png, height.png) is derived by the API from cloud.ply in a child process
+# (packages/api/reconstruction_topview.py): its address-space cap, its time limit, and where the
+# PLY is downloaded to (empty = the system temp dir; needs ~200 MB free for a 10 M-point cloud).
+RECONSTRUCTION_TOPVIEW_MEM_MB = int(os.getenv("RECONSTRUCTION_TOPVIEW_MEM_MB", "1024"))
+RECONSTRUCTION_TOPVIEW_TIMEOUT_S = int(os.getenv("RECONSTRUCTION_TOPVIEW_TIMEOUT_S", "600"))
+RECONSTRUCTION_WORK_DIR = _env_or_none("RECONSTRUCTION_WORK_DIR")
 
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"

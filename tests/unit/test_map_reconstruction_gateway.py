@@ -42,6 +42,15 @@ CAMERA = {"frame_id": "camera", "width": 448, "height": 336, "fx": 300.0, "fy": 
                          "qw": 0.5}}
 
 
+def ply(n=2):
+    """A valid cloud.ply (handover §7.1) with n vertices."""
+    header = ("ply\nformat binary_little_endian 1.0\ncomment satinav map=lab\n"
+              f"element vertex {n}\nproperty float x\nproperty float y\nproperty float z\n"
+              "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+              "property ushort count\nend_header\n").encode()
+    return header + b"\0" * (17 * n)
+
+
 def node(key, x, y, yaw, depth=True, created="2026-10-20T08:00:00", pose3d=None):
     doc = {"_key": key, "node_id": key, "pose": {"x": x, "y": y, "yaw": yaw},
            "robot_pose": {"x": -99.0, "y": -99.0, "yaw": 3.0}, "created_at": created}
@@ -149,6 +158,16 @@ class FakeRepo:
     async def emit(self, event):
         self.events.append(event)
 
+    async def claim_finalize(self, job_id, attempt, now, stale_before):
+        j = self.jobs.get(job_id)
+        if j is None or j.state != rc.RUNNING or j.attempts != attempt:
+            return False
+        if j.stage == rc.FINALIZING and j.last_contact_at is not None \
+                and j.last_contact_at >= stale_before:
+            return False
+        j.stage, j.last_contact_at, j.progress = rc.FINALIZING, now, max(j.progress, 0.95)
+        return True
+
 
 class FakeObjects:
     def __init__(self):
@@ -172,6 +191,21 @@ class FakeObjects:
 
     def bucket_exists(self, bucket):
         return bucket in self.buckets
+
+    def download(self, bucket, key, path):
+        with open(path, "wb") as f:
+            f.write(self.objects[(bucket, key)])
+
+    def upload_file(self, bucket, key, path, content_type):
+        if bucket not in self.buckets:
+            raise RuntimeError("NoSuchBucket")
+        with open(path, "rb") as f:
+            self.objects[(bucket, key)] = f.read()
+
+    def put_bytes(self, bucket, key, data, content_type):
+        if bucket not in self.buckets:
+            raise RuntimeError("NoSuchBucket")
+        self.objects[(bucket, key)] = data
 
     def copy(self, sb, sk, db, dk):
         if self.fail_copy:
@@ -258,19 +292,39 @@ class World:
                          "qw": 0.71}),
             node("n3", 2.0, 0.0, 0.0, depth=False)])}
         self.reads = 0
+        self.derived = []          # the grid params of each top-view derivation
+        self.derive_error = None   # raise this from the derivation
         self.gw = rc.ReconstructionGateway(
             self.repo, self._depth_nodes, self.objects, FakePresigner(), self.client, config,
-            now=self.clock, monotonic=lambda: self.mono[0])
+            now=self.clock, monotonic=lambda: self.mono[0], derive_top_view=self._derive)
+
+    async def _derive(self, ply_path, out_dir, **grid):
+        """Stands in for reconstruction_topview's child process (tested on its own)."""
+        with open(ply_path, "rb") as f:
+            assert f.read(4) == b"ply\n"
+        self.derived.append(grid)
+        if self.derive_error is not None:
+            raise self.derive_error
+        for name in ("ortho.png", "height.png"):
+            with open(pathlib.Path(out_dir) / name, "wb") as f:
+                f.write(b"\x89PNG-" + name[:5].encode())
+        return {"resolution_m": 0.05, "origin": {"x": -1.0, "y": -2.0}, "width": 3,
+                "height": 4, "z_floor": grid["z_floor"], "clip_z": grid["clip_z"],
+                "clip_abs": grid["z_floor"] + grid["clip_z"], "z_offset": -0.1,
+                "z_scale": 0.01, "top_view": {"points": 2, "points_rastered": 2,
+                                              "cells_filled": 2}}
 
     def _depth_nodes(self, name):
         self.reads += 1
         docs = self.nodes.get(name, [])
         return len(docs), [d for d in docs if "depth" in d]
 
-    def stage(self, job_id, attempt, sizes=None, meta=b'{"version": 1}'):
+    def stage(self, job_id, attempt, points=2, meta=b'{"version": 1}'):
+        """What the service PUTs: cloud.ply + meta.json only (handover §7)."""
         outputs = {}
-        for name, (file, _ct) in rc.FILES.items():
-            data = meta if name == "meta" else b"x" * (sizes or {}).get(name, 10)
+        for name in rc.SERVICE_FILES:
+            file = rc.FILES[name][0]
+            data = meta if name == "meta" else ply(points)
             self.objects.put("recon-staging", rc.staging_key(job_id, attempt, file), data)
             outputs[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         return outputs
@@ -287,6 +341,7 @@ class World:
             "attempt": job.attempts, "result": {"points": 1000, "frames_used": 2,
                                                 "voxel_m": 0.05}, "outputs": outputs})
         assert (status, answer) == (200, {"action": "continue"})
+        await self.gw.settle()
         return self.repo.jobs[job.job_id]
 
 
@@ -372,7 +427,7 @@ class TestHelpers:
         assert "robot_pose" not in json.dumps(m) and "-99" not in json.dumps(m)
         assert m["outputs"]["cloud"] == {"url": "P:recon-staging/j1/2/cloud.ply",
                                          "content_type": "application/octet-stream"}
-        assert set(m["outputs"]) == {"cloud", "ortho", "height", "meta"}
+        assert set(m["outputs"]) == {"cloud", "meta"}  # the top view is the cloud's
         assert m["callback"] == {"base_url": "http://h:8000/internal/reconstruction/jobs/j1",
                                  "token": "tok"}
 
@@ -496,7 +551,7 @@ class TestRoutesLogic:
         w = World()
         done = await w.succeed()
         prefix = rc.result_prefix(done.job_id)
-        assert w.objects.size("map-lab", prefix + "cloud.ply") == 10
+        assert w.objects.size("map-lab", prefix + "cloud.ply") == len(ply())
         job = await w.running_job()
         await w.gw.delete("lab")
         assert w.repo.jobs[done.job_id].state == "superseded"
@@ -576,9 +631,13 @@ class TestCallbacks:
         assert (await w.gw.on_finish(second.job_id, {"attempt": 1}))[0] == 200
 
     @pytest.mark.parametrize("break_it,message", [
-        (lambda w, j: w.objects.objects.pop(("recon-staging", f"{j}/1/height.png")),
+        (lambda w, j: w.objects.objects.pop(("recon-staging", f"{j}/1/cloud.ply")),
          "missing"),
         (lambda w, j: w.objects.put("recon-staging", f"{j}/1/cloud.ply", b"short"), "bytes"),
+        (lambda w, j: w.objects.put("recon-staging", f"{j}/1/cloud.ply", ply(3)[:-17]),
+         "header says"),
+        (lambda w, j: w.objects.put("recon-staging", f"{j}/1/cloud.ply",
+                                    b"PLY?" + ply(2)[4:]), "not a PLY"),
         (lambda w, j: w.objects.put("recon-staging", f"{j}/1/meta.json", b"{" + b"x" * 26),
          "parse"),
     ])
@@ -596,6 +655,132 @@ class TestCallbacks:
         assert message in j.error["message"]
         assert w.repo.jobs[old.job_id].state == "succeeded"
 
+    async def test_finish_derives_the_top_view_from_the_cloud(self):
+        w = World()
+        done = await w.succeed()
+        # z_floor: median over the frames' base z (n2 pose3d z 0.05, n1 without pose3d -> 0)
+        assert done.inputs["z_floor"] == pytest.approx(0.025)
+        assert w.derived == [{"z_floor": pytest.approx(0.025), "clip_z": 2.0, "voxel_m": 0.05,
+                              "raster_max_px": 4096}]
+        prefix = rc.result_prefix(done.job_id)
+        files = done.artifacts["files"]
+        assert set(files) == {"cloud", "ortho", "height", "meta"}
+        for name, file in (("ortho", "ortho.png"), ("height", "height.png")):
+            data = w.objects.objects[("map-lab", prefix + file)]
+            assert files[name] == {"key": prefix + file, "bytes": len(data),
+                                   "sha256": hashlib.sha256(data).hexdigest(),
+                                   "content_type": "image/png"}
+        meta = json.loads(w.objects.objects[("map-lab", prefix + "meta.json")])
+        assert meta["version"] == 1  # the service's fields ...
+        assert meta["resolution_m"] == 0.05 and meta["origin"] == {"x": -1.0, "y": -2.0}
+        assert (meta["width"], meta["height"], meta["z_scale"]) == (3, 4, 0.01)  # ... + grid
+        assert meta["clip_abs"] == pytest.approx(2.025) and "top_view" not in meta
+        assert files["meta"]["bytes"] == len(w.objects.objects[("map-lab",
+                                                                prefix + "meta.json")])
+        assert done.result["top_view"]["cells_filled"] == 2
+        status = (await w.gw.status("lab"))["reconstruction"]
+        assert set(status["files"]) == {"cloud", "ortho", "height", "meta"}
+        assert status["files"]["height"]["url"].endswith(f"height.png?v={done.job_id}")
+
+    async def test_top_view_uses_the_job_params_and_the_voxel_the_service_used(self):
+        w = World()
+        job = await w.gw.start("lab", {"clip_z": 1.5, "voxel_m": 0.1})
+        await w.gw.tick()
+        outputs = w.stage(job["job_id"], 1)
+        await w.gw.on_finish(job["job_id"], {"attempt": 1, "result": {"voxel_m": 0.15},
+                                             "outputs": outputs})
+        await w.gw.settle()
+        assert w.derived[-1]["clip_z"] == 1.5 and w.derived[-1]["voxel_m"] == 0.15
+        assert w.repo.jobs[job["job_id"]].state == "succeeded"
+
+    @pytest.mark.parametrize("error,reason", [
+        (rc.TopViewError("top_view_failed", "no cloud point below the clip height"),
+         "top_view_failed"),
+        (rc.TopViewError("bad_output", "cloud.ply: PLY truncated"), "bad_output"),
+        (RuntimeError("MinIO down"), "error"),
+    ])
+    async def test_top_view_failure_fails_the_job_and_keeps_the_old_result(self, error, reason):
+        w = World()
+        old = await w.succeed()
+        job = await w.running_job()
+        outputs = w.stage(job.job_id, 1)
+        w.derive_error = error
+        assert (await w.gw.on_finish(job.job_id, {"attempt": 1, "outputs": outputs}))[0] == 200
+        await w.gw.settle()
+        j = w.repo.jobs[job.job_id]
+        assert j.state == "failed" and j.error["reason"] == reason
+        assert j.error["stage"] == "finalizing"
+        assert not [k for k in w.objects.objects
+                    if k[1].startswith(rc.result_prefix(job.job_id))]
+        assert w.repo.jobs[old.job_id].state == "succeeded"
+        assert not [k for k in w.objects.objects if k[0] == "recon-staging"]
+        failed = [e for e in w.repo.events if e.code == EventCode.MAP_RECONSTRUCTION_FAILED]
+        assert failed[-1].payload["reason"] == reason
+
+    async def test_one_finalizer_per_attempt(self):
+        import asyncio
+        w = World()
+        job = await w.running_job()
+        outputs = w.stage(job.job_id, 1)
+        gate, calls = asyncio.Event(), []
+        inner = w._derive
+
+        async def slow(ply_path, out_dir, **grid):
+            calls.append(1)
+            await gate.wait()
+            return await inner(ply_path, out_dir, **grid)
+        w.gw._derive = slow
+        body = {"attempt": 1, "outputs": outputs, "result": {"points": 2}}
+        assert await w.gw.on_finish(job.job_id, body) == (200, {"action": "continue"})
+        await asyncio.sleep(0)
+        j = w.repo.jobs[job.job_id]
+        assert (j.state, j.stage) == ("running", "finalizing")
+        # a repeated finish (the service retried) and the poll start nothing new
+        assert await w.gw.on_finish(job.job_id, body) == (200, {"action": "continue"})
+        w.clock.advance(rc.POLL_AFTER_S - 1)
+        w.client.job_answer = AssertionError("must not poll a fresh finalizer")
+        await w.gw.tick()
+        # another worker (no in-process task) is refused by the claim while it is fresh
+        other = rc.ReconstructionGateway(w.repo, w._depth_nodes, w.objects, FakePresigner(),
+                                         w.client, CFG, now=w.clock, derive_top_view=slow)
+        assert await other.on_finish(job.job_id, body) == (200, {"action": "continue"})
+        assert not other._finalizers
+        gate.set()
+        await w.gw.settle()
+        assert calls == [1] and w.repo.jobs[job.job_id].state == "succeeded"
+
+    async def test_a_stale_finalize_claim_is_taken_over_by_the_poll(self):
+        w = World()
+        job = await w.running_job()
+        outputs = w.stage(job.job_id, 1)
+        j = w.repo.jobs[job.job_id]
+        j.stage, j.last_contact_at = rc.FINALIZING, w.clock.t  # a worker died finalizing
+        w.clock.advance(rc.FINALIZE_STALE_S + 1)
+        w.client.job_answer = (200, {"state": "succeeded", "attempt": 1,
+                                     "result": {"points": 2}, "outputs": outputs})
+        await w.gw.tick()
+        await w.gw.settle()
+        assert w.repo.jobs[job.job_id].state == "succeeded" and len(w.derived) == 1
+
+    async def test_cancel_while_finalizing_discards_the_result(self):
+        import asyncio
+        w = World()
+        job = await w.running_job()
+        outputs = w.stage(job.job_id, 1)
+        gate, inner = asyncio.Event(), w._derive
+
+        async def slow(ply_path, out_dir, **grid):
+            await gate.wait()
+            return await inner(ply_path, out_dir, **grid)
+        w.gw._derive = slow
+        await w.gw.on_finish(job.job_id, {"attempt": 1, "outputs": outputs})
+        await asyncio.sleep(0)
+        await w.gw.cancel("lab")
+        gate.set()
+        await w.gw.settle()
+        assert w.repo.jobs[job.job_id].state == "cancelled"
+        assert not [k for k in w.objects.objects if k[0] == "map-lab"]
+
     async def test_finish_refused_for_a_deleting_map(self):
         w = World()
         job = await w.running_job()
@@ -611,7 +796,8 @@ class TestCallbacks:
         job = await w.running_job()
         outputs = w.stage(job.job_id, 1)
         w.objects.buckets.discard("map-lab")
-        assert (await w.gw.on_finish(job.job_id, {"attempt": 1, "outputs": outputs}))[0] == 410
+        assert (await w.gw.on_finish(job.job_id, {"attempt": 1, "outputs": outputs}))[0] == 200
+        await w.gw.settle()
         assert "map-lab" not in w.objects.buckets
         assert w.repo.jobs[job.job_id].error["reason"] == "map_deleting"
 
@@ -729,6 +915,7 @@ class TestDispatcher:
         w.client.job_answer = (200, {"state": "succeeded", "attempt": 1,
                                      "result": {"points": 7}, "outputs": outputs})
         await w.gw.tick()
+        await w.gw.settle()
         assert w.repo.jobs[job.job_id].state == "succeeded"
 
     async def test_poll_failed(self):
@@ -790,7 +977,7 @@ class TestDispatcher:
             w.objects.put("map-lab", f"reconstruction/{j}/cloud.ply", b"x")
         await w.gw.prepare()
         assert ("map-lab", "reconstruction/orphan/") in w.objects.removed
-        assert w.objects.size("map-lab", f"reconstruction/{done.job_id}/cloud.ply") == 10
+        assert w.objects.size("map-lab", f"reconstruction/{done.job_id}/cloud.ply") == len(ply())
         assert w.objects.size("map-lab", f"reconstruction/{running.job_id}/cloud.ply") == 1
 
 
@@ -912,8 +1099,10 @@ class TestHttp:
                                                      "outputs": outputs},
                              headers={"Authorization": f"Bearer {tok}"})
             assert r.status_code == 200
+            await w.gw.settle()
             r = await c.get(f"/api/v1/maps/lab/reconstruction/files/meta.json?v={job.job_id}")
-            assert r.status_code == 200 and r.content == b'{"version": 1}'
+            assert r.status_code == 200 and r.json()["version"] == 1
+            assert r.json()["width"] == 3 and r.json()["z_scale"] == 0.01
             assert r.headers["etag"] == f'"{job.job_id}"'
             assert "immutable" in r.headers["cache-control"]
             assert r.headers["content-type"].startswith("application/json")

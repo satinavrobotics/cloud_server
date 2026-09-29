@@ -35,12 +35,22 @@ Callbacks (§6.3): `Authorization: Bearer base64url(HMAC-SHA256(CALLBACK_SECRET,
 recomputed and compared in constant time (401). 200 {"action": "continue" | "cancel"}; 410
 {"action": "stop"} when the job is no longer running or the attempt is old.
 
-Finish (§6.4, §8.2): each output is stat'ed in the staging bucket (size = reported bytes,
-meta.json parses; else failed `bad_output`), the map must exist and not be DELETING, the files
-are copied server-side to `map-{id}/reconstruction/{job}/`, then one transaction (the map row
-locked FOR SHARE) supersedes the old result, marks this one succeeded and writes
-MAP.RECONSTRUCTION_FINISHED; after it, the old result's prefix and the staging prefix go. The
-map bucket is never created here: a copy into a deleted map fails (`map_deleting`).
+Finish (§6.4, §7.2, §8.2): the service delivers only `cloud.ply` + `meta.json`. Each is stat'ed
+in the staging bucket (size = reported bytes, meta.json parses, the PLY header is the §7.1 vertex
+layout and its size matches N; else failed `bad_output`), the map must exist and not be
+DELETING. The job is then CLAIMED (stage `finalizing`, so a repeated finish or the poll does not
+start a second one) and the rest runs in a background task, the callback answering at once:
+cloud.ply is copied server-side to `map-{id}/reconstruction/{job}/`, downloaded to a temp file,
+and the top view (ortho.png, height.png) is derived from it in a child process
+(reconstruction_topview.py: chunked, memory-capped, off the event loop); the rasters and the
+merged meta.json (the service's fields + the grid) are stored next to it. A failed derivation
+fails the job (`top_view_failed`, or `bad_output` for a malformed PLY): a result is committed
+only with all four files. Then one transaction (the map row locked FOR SHARE) supersedes the old
+result, marks this one succeeded and writes MAP.RECONSTRUCTION_FINISHED; after it, the old
+result's prefix and the staging prefix go. While finalizing, `last_contact_at` is refreshed
+every HEARTBEAT_S; a claim older than FINALIZE_STALE_S (a crashed worker) may be taken over by
+the poll. The map bucket is never created here: a copy into a deleted map fails
+(`map_deleting`).
 
 Stale (§8.3): `inputs.digest` = SHA-256 over the sorted (node_id, x, y, yaw, cameras) of the
 nodes with depth when the manifest was built; GET recomputes it (cached STALE_CACHE_S per map).
@@ -63,6 +73,9 @@ import hmac
 import io
 import json
 import logging
+import os
+import statistics
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -73,6 +86,9 @@ from fastapi import HTTPException
 
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.reconstruction_client import ReconstructionClient, ServiceUnreachable
+from packages.api.reconstruction_topview import (MAX_HEADER, PlyError, TopViewError,
+                                                 derive_in_subprocess, ply_size,
+                                                 read_ply_header)
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 
@@ -85,7 +101,7 @@ FAILED, CANCELLED, SUPERSEDED = "failed", "cancelled", "superseded"
 ACTIVE = (QUEUED, RUNNING)
 TERMINAL = (SUCCEEDED, FAILED, CANCELLED, SUPERSEDED)
 
-# name -> (file, content type), handover §2.1 / §7
+# name -> (file, content type): every file of a result (§8.4), as the client reads them
 FILES: Dict[str, Tuple[str, str]] = {
     "cloud": ("cloud.ply", "application/octet-stream"),
     "ortho": ("ortho.png", "image/png"),
@@ -93,6 +109,11 @@ FILES: Dict[str, Tuple[str, str]] = {
     "meta": ("meta.json", "application/json"),
 }
 FILE_BY_NAME = {f: (k, ct) for k, (f, ct) in FILES.items()}
+# what the service PUTs (handover §2.1, §7); ortho/height are derived here (§7.2)
+SERVICE_FILES = ("cloud", "meta")
+DERIVED_FILES = ("ortho", "height")
+FINALIZING = "finalizing"
+HEARTBEAT_S = 15.0
 
 MANIFEST_VERSION = 1
 MAX_NODES = 20000
@@ -103,6 +124,7 @@ UNREACHABLE_S = 300.0
 CANCEL_GRACE_S = 60.0
 STALE_CACHE_S = 10.0
 AUTO_RETRY_MAX_ATTEMPTS = 2   # url_expired / lost: resubmit while attempts < 2
+FINALIZE_STALE_S = POLL_AFTER_S
 BACKOFF_S = (10.0, 30.0, 60.0)
 BACKOFF_MAX_S = 120.0
 LOCK_NAME = "reconstruction_dispatcher"
@@ -155,6 +177,9 @@ class ReconConfig:
     voxel_m: float = 0.05
     max_depth_m: float = 10.0
     clip_z: float = 2.0
+    topview_mem_mb: int = 1024
+    topview_timeout_s: int = 600
+    work_dir: Optional[str] = None
 
     @property
     def configured(self) -> bool:
@@ -175,7 +200,9 @@ class ReconConfig:
             queue_timeout_s=c.RECONSTRUCTION_QUEUE_TIMEOUT_S,
             max_inflight=max(1, c.RECONSTRUCTION_MAX_INFLIGHT),
             voxel_m=c.RECONSTRUCTION_VOXEL_M, max_depth_m=c.RECONSTRUCTION_MAX_DEPTH_M,
-            clip_z=c.RECONSTRUCTION_CLIP_Z)
+            clip_z=c.RECONSTRUCTION_CLIP_Z, topview_mem_mb=c.RECONSTRUCTION_TOPVIEW_MEM_MB,
+            topview_timeout_s=c.RECONSTRUCTION_TOPVIEW_TIMEOUT_S,
+            work_dir=c.RECONSTRUCTION_WORK_DIR)
 
     def default_params(self) -> Dict[str, Any]:
         return {"voxel_m": self.voxel_m, "max_depth_m": self.max_depth_m,
@@ -288,6 +315,18 @@ def input_digest(frames: Sequence[Frame]) -> str:
     return hashlib.sha256(json.dumps(items, separators=(",", ":")).encode()).hexdigest()
 
 
+def floor_z(frames: Sequence[Frame]) -> float:
+    """§7.2 z_floor: the median base z over the manifest's frames (node-cameras): `pose3d_map.z`,
+    0 for a frame without pose3d. Taken when the manifest is built (stored as inputs.z_floor)."""
+    zs = []
+    for f in frames:
+        for rec in f.cameras.values():
+            pose3d = rec.get("pose3d_map")
+            z = _float(pose3d.get("z")) if isinstance(pose3d, Mapping) else None
+            zs.append(z if z is not None and z == z else 0.0)
+    return float(statistics.median(zs)) if zs else 0.0
+
+
 def stale_reason(old_nodes: Optional[Sequence[Sequence[Any]]],
                  frames: Sequence[Frame]) -> Dict[str, int]:
     """{new_nodes, removed_nodes, moved_nodes} between the stored inputs.nodes and now."""
@@ -321,6 +360,14 @@ def staging_key(job_id: str, attempt: int, file: str) -> str:
     return f"{job_id}/{attempt}/{file}"
 
 
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def result_prefix(job_id: str) -> str:
     return f"{RESULT_PREFIX}{job_id}/"
 
@@ -347,8 +394,9 @@ def build_manifest(*, job_id: str, attempt: int, map_name: str, map_type: Option
             cameras.append(cam)
         nodes.append({"node_id": f.node_id, "pose": {"x": f.x, "y": f.y, "yaw": f.yaw},
                       "cameras": cameras})
-    outputs = {name: {"url": presign_put(staging_bucket, staging_key(job_id, attempt, file)),
-                      "content_type": ct} for name, (file, ct) in FILES.items()}
+    outputs = {name: {"url": presign_put(staging_bucket,
+                                         staging_key(job_id, attempt, FILES[name][0])),
+                      "content_type": FILES[name][1]} for name in SERVICE_FILES}
     return {
         "manifest_version": MANIFEST_VERSION,
         "job_id": job_id, "attempt": attempt,
@@ -540,6 +588,11 @@ SUCCEED_SQL = (f"UPDATE {TABLE} SET state = 'succeeded', result = %s::jsonb, "
                "artifacts = %s::jsonb, finished_at = %s, last_contact_at = %s, progress = 1, "
                "stage = 'done', error = NULL "
                "WHERE job_id = %s AND state = 'running' AND attempts = %s")
+# Finish: the one finalizer of a running attempt (a stale claim = a crashed worker, retaken)
+CLAIM_SQL = (f"UPDATE {TABLE} SET stage = 'finalizing', last_contact_at = %s, "
+             "progress = GREATEST(progress, 0.95) WHERE job_id = %s AND state = 'running' "
+             "AND attempts = %s AND (stage IS DISTINCT FROM 'finalizing' "
+             "OR last_contact_at IS NULL OR last_contact_at < %s)")
 # Map delete (packages/api/map_delete.py::MapDeleter.request, in its transaction): the active job
 # is cancelled; the old state says whether the service may still be working on it.
 MAP_DELETE_CANCEL_SQL = (
@@ -650,6 +703,13 @@ class PgRepo:
             if changed and event is not None:
                 await _emit_safe(conn, event)
         return changed
+
+    async def claim_finalize(self, job_id: str, attempt: int, now: datetime.datetime,
+                             stale_before: datetime.datetime) -> bool:
+        """Stage -> finalizing unless another finalizer holds a fresh claim. True = ours."""
+        async with self._db.connection() as conn:
+            cur = await conn.execute(CLAIM_SQL, (now, uuid.UUID(job_id), attempt, stale_before))
+            return cur.rowcount == 1
 
     async def commit_success(self, job: Job, attempt: int, result: Mapping[str, Any],
                              artifacts: Mapping[str, Any], now: datetime.datetime,
@@ -783,6 +843,17 @@ class ObjectStore:
             response.close()
             response.release_conn()
 
+    def download(self, bucket: str, key: str, path: str) -> None:
+        """Stream the object into `path` (bounded memory)."""
+        self.client.fget_object(bucket, key, path)
+
+    def upload_file(self, bucket: str, key: str, path: str, content_type: str) -> None:
+        self.client.fput_object(bucket, key, path, content_type=content_type)
+
+    def put_bytes(self, bucket: str, key: str, data: bytes, content_type: str) -> None:
+        self.client.put_object(bucket, key, io.BytesIO(data), len(data),
+                               content_type=content_type)
+
     def bucket_exists(self, bucket: str) -> bool:
         try:
             return bool(self.client.bucket_exists(bucket))
@@ -838,13 +909,16 @@ class ReconstructionGateway:
     """Everything the routes, callbacks and dispatcher do. `repo` is PgRepo (tests: a fake),
     `depth_nodes(map)` returns (node count, node docs with depth) from ArangoDB, `objects` an
     ObjectStore, `presigner` a Presigner, `client` a ReconstructionClient (None when not
-    configured). Blocking calls (ArangoDB, MinIO) run in a thread."""
+    configured). Blocking calls (ArangoDB, MinIO) run in a thread. `derive_top_view(ply, out_dir,
+    **grid params)` makes ortho.png + height.png (default: reconstruction_topview's child
+    process)."""
 
     def __init__(self, repo: Any, depth_nodes: Callable[[str], Tuple[int, List[Dict]]],
                  objects: Any, presigner: Any, client: Optional[ReconstructionClient],
                  config: ReconConfig, *,
                  now: Callable[[], datetime.datetime] = _utcnow,
-                 monotonic: Callable[[], float] = time.monotonic):
+                 monotonic: Callable[[], float] = time.monotonic,
+                 derive_top_view: Optional[Callable[..., Any]] = None):
         self.repo = repo
         self._depth_nodes = depth_nodes
         self.objects = objects
@@ -853,6 +927,8 @@ class ReconstructionGateway:
         self.config = config
         self._now = now
         self._mono = monotonic
+        self._derive = derive_top_view or self._derive_in_subprocess
+        self._finalizers: Dict[str, asyncio.Task] = {}
         self._stale_cache: Dict[str, Tuple[float, Tuple[int, List[Frame]]]] = {}
         self._task: Optional[asyncio.Task] = None
         self._wake: Optional[asyncio.Event] = None
@@ -1083,8 +1159,10 @@ class ReconstructionGateway:
             await self._end(job, CANCELLED, _error("cancelled", "cancelled by the user"),
                             states=(RUNNING,), attempts=attempt)
             return 410, {"action": "stop"}
-        cfg = self.config
-        problem = await asyncio.to_thread(self._verify, job.job_id, attempt, outputs)
+        live = self._finalizers.get(job.job_id)
+        if live is not None and not live.done():
+            return 200, {"action": "continue"}  # this worker is finalizing it already
+        problem, meta = await asyncio.to_thread(self._verify, job.job_id, attempt, outputs)
         if problem:
             await self._end(job, FAILED, _error("bad_output", problem, "finish"),
                             states=(RUNNING,), attempts=attempt)
@@ -1095,74 +1173,185 @@ class ReconstructionGateway:
                             _error("map_deleting", "the map is being deleted", "finish"),
                             states=(RUNNING,), attempts=attempt)
             return 410, {"action": "stop"}
+        now = self._now()
+        stale = now - datetime.timedelta(seconds=FINALIZE_STALE_S)
+        if not await self.repo.claim_finalize(job.job_id, attempt, now, stale):
+            return 200, {"action": "continue"}  # another worker is finalizing it
+        result = dict(result) if isinstance(result, Mapping) else {}
+        task = asyncio.get_running_loop().create_task(
+            self._finalize(job, attempt, result, outputs, meta),
+            name=f"api.reconstruction.finalize.{job.job_id}")
+        self._finalizers[job.job_id] = task
+        task.add_done_callback(lambda t, j=job.job_id: self._finalizers.pop(j, None)
+                               if self._finalizers.get(j) is t else None)
+        return 200, {"action": "continue"}
+
+    async def settle(self) -> None:
+        """Wait for the running finalizations (tests; shutdown cancels them instead)."""
+        while self._finalizers:
+            await asyncio.gather(*list(self._finalizers.values()), return_exceptions=True)
+
+    async def _heartbeat(self, job: Job, attempt: int) -> None:
+        """Keep the finalize claim fresh (and the poll away) while the top view is made."""
+        while True:
+            await asyncio.sleep(HEARTBEAT_S)
+            try:
+                await self.repo.update(job.job_id, {"last_contact_at": self._now()},
+                                       states=(RUNNING,), attempts=attempt)
+            except Exception as exc:  # noqa: BLE001 - the next beat retries
+                logger.warning("Job %s: finalize heartbeat failed: %s", job.job_id, exc)
+
+    async def _derive_in_subprocess(self, ply: str, out_dir: str, **grid: Any) -> Dict[str, Any]:
+        return await derive_in_subprocess(ply, out_dir, mem_mb=self.config.topview_mem_mb,
+                                          timeout_s=self.config.topview_timeout_s, **grid)
+
+    async def _finalize(self, job: Job, attempt: int, result: Dict[str, Any], outputs: Any,
+                        meta: Dict[str, Any]) -> None:
+        """Copy cloud.ply, derive and store the top view and meta.json, commit (module doc)."""
+        beat = asyncio.get_running_loop().create_task(self._heartbeat(job, attempt))
+        try:
+            await self._finalize_steps(job, attempt, result, outputs, meta)
+        except asyncio.CancelledError:
+            raise  # shutdown: the job stays running/finalizing; the poll finishes it later
+        except Exception:  # noqa: BLE001
+            logger.exception("Job %s: finalizing failed", job.job_id)
+        finally:
+            beat.cancel()
+
+    async def _finalize_steps(self, job: Job, attempt: int, result: Dict[str, Any],
+                              outputs: Any, meta: Dict[str, Any]) -> None:
+        cfg = self.config
         bucket = self.objects.bucket_for(job.map_name)
         prefix = result_prefix(job.job_id)
         files: Dict[str, Dict[str, Any]] = {}
+        cloud_key = staging_key(job.job_id, attempt, FILES["cloud"][0])
+
+        async def fail(reason: str, message: str) -> None:
+            await self._remove_result({"bucket": bucket, "prefix": prefix})
+            await self._end(job, FAILED, _error(reason, message, FINALIZING),
+                            states=(RUNNING,), attempts=attempt)
+
         try:
             if not await asyncio.to_thread(self.objects.bucket_exists, bucket):
                 raise LookupError("the map bucket does not exist")
-            for name, (file, ct) in FILES.items():
-                await asyncio.to_thread(self.objects.copy, cfg.staging_bucket,
-                                        staging_key(job.job_id, attempt, file), bucket,
-                                        prefix + file)
-                out = outputs[name]
-                files[name] = {"key": prefix + file, "bytes": int(out["bytes"]),
-                               "sha256": out.get("sha256"), "content_type": ct}
+            await asyncio.to_thread(self.objects.copy, cfg.staging_bucket, cloud_key, bucket,
+                                    prefix + FILES["cloud"][0])
+            files["cloud"] = {"key": prefix + FILES["cloud"][0],
+                              "bytes": int(outputs["cloud"]["bytes"]),
+                              "sha256": outputs["cloud"].get("sha256"),
+                              "content_type": FILES["cloud"][1]}
+            with tempfile.TemporaryDirectory(prefix="recon-", dir=cfg.work_dir) as tmp:
+                ply = os.path.join(tmp, "cloud.ply")
+                await asyncio.to_thread(self.objects.download, cfg.staging_bucket, cloud_key,
+                                        ply)
+                grid = await self._derive(ply, tmp, **self._grid_params(job, result))
+                for name in DERIVED_FILES:
+                    file, ct = FILES[name]
+                    path = os.path.join(tmp, file)
+                    await asyncio.to_thread(self.objects.upload_file, bucket, prefix + file,
+                                            path, ct)
+                    files[name] = {"key": prefix + file, "bytes": os.path.getsize(path),
+                                   "sha256": await asyncio.to_thread(_sha256_file, path),
+                                   "content_type": ct}
+            data = json.dumps({**meta, **{k: v for k, v in grid.items() if k != "top_view"}},
+                              separators=(",", ":")).encode("utf-8")
+            file, ct = FILES["meta"]
+            await asyncio.to_thread(self.objects.put_bytes, bucket, prefix + file, data, ct)
+            files["meta"] = {"key": prefix + file, "bytes": len(data),
+                             "sha256": hashlib.sha256(data).hexdigest(), "content_type": ct}
+        except TopViewError as exc:
+            logger.warning("Job %s: top view failed (%s): %s", job.job_id, exc.reason,
+                           exc.message)
+            await fail(exc.reason, exc.message)
+            return
         except LookupError as exc:
-            await self._end(job, FAILED, _error("map_deleting", str(exc), "finish"),
+            await self._end(job, FAILED, _error("map_deleting", str(exc), FINALIZING),
                             states=(RUNNING,), attempts=attempt)
-            return 410, {"action": "stop"}
+            return
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Job %s: copying the outputs failed", job.job_id)
-            await self._remove_result({"bucket": bucket, "prefix": prefix})
-            await self._end(job, FAILED, _error("error", f"copying the outputs: {exc}",
-                                                "finish"),
-                            states=(RUNNING,), attempts=attempt)
-            return 200, {"action": "continue"}
-        result = dict(result) if isinstance(result, Mapping) else {}
+            logger.exception("Job %s: storing the outputs failed", job.job_id)
+            await fail("error", f"storing the outputs: {exc}")
+            return
+        result = {**result, "top_view": grid.get("top_view")}
         artifacts = {"bucket": bucket, "prefix": prefix, "files": files}
+        mine = await self.repo.get(job.job_id)
+        if mine is not None and mine.cancel_requested and mine.state == RUNNING:
+            await self._remove_result(artifacts)
+            await self._end(job, CANCELLED, _error("cancelled", "cancelled by the user"),
+                            states=(RUNNING,), attempts=attempt)
+            return
         now = self._now()
         outcome, old = await self.repo.commit_success(job, attempt, result, artifacts, now,
                                                       finished_event(job, result, now))
         if outcome != "ok":
-            await self._remove_result(artifacts)
+            mine = await self.repo.get(job.job_id)
+            if not (mine is not None and mine.state == SUCCEEDED and mine.attempts == attempt):
+                await self._remove_result(artifacts)  # (not when another finalizer won)
             if outcome == "map_deleting":
                 await self._end(job, CANCELLED, _error("map_deleting",
-                                                       "the map is being deleted", "finish"),
+                                                       "the map is being deleted", FINALIZING),
                                 states=(RUNNING,), attempts=attempt)
-            return 410, {"action": "stop"}
-        logger.info("Job %s (map %s) succeeded: %s points", job.job_id, job.map_name,
-                    result.get("points"))
+            return
+        logger.info("Job %s (map %s) succeeded: %s points, top view %sx%s", job.job_id,
+                    job.map_name, result.get("points"), grid.get("width"), grid.get("height"))
         for artifacts_old in old:
             await self._remove_result(artifacts_old)
         await self._cleanup_staging(job.job_id)
         self._stale_cache.pop(job.map_name, None)
-        return 200, {"action": "continue"}
 
-    def _verify(self, job_id: str, attempt: int, outputs: Any) -> Optional[str]:
-        """Why the staged outputs are unusable, or None (blocking)."""
+    def _grid_params(self, job: Job, result: Mapping[str, Any]) -> Dict[str, Any]:
+        """The §7.2 inputs, all the cloud's own: z_floor from the manifest's poses
+        (inputs.z_floor), clip_z / raster_max_px from the job, voxel_m as the service used it
+        (result.voxel_m, else the job's)."""
+        params = job.params or {}
+        voxel = _float(result.get("voxel_m"))
+        if voxel is None or not voxel > 0:
+            voxel = _float(params.get("voxel_m")) or self.config.voxel_m
+        return {"z_floor": _float((job.inputs or {}).get("z_floor")) or 0.0,
+                "clip_z": _float(params.get("clip_z"))
+                if params.get("clip_z") is not None else self.config.clip_z,
+                "voxel_m": voxel,
+                "raster_max_px": _int(params.get("raster_max_px"))
+                or FIXED_PARAMS["raster_max_px"]}
+
+    def _verify(self, job_id: str, attempt: int,
+                outputs: Any) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """(why the staged outputs are unusable, None) or (None, meta.json) (blocking)."""
         if not isinstance(outputs, Mapping):
-            return "finish without outputs"
+            return "finish without outputs", None
         bucket = self.config.staging_bucket
-        for name, (file, _ct) in FILES.items():
+        sizes = {}
+        for name in SERVICE_FILES:
+            file = FILES[name][0]
             out = outputs.get(name)
             if not isinstance(out, Mapping) or _int(out.get("bytes")) is None:
-                return f"output {name} not reported"
+                return f"output {name} not reported", None
             size = self.objects.size(bucket, staging_key(job_id, attempt, file))
             if size is None:
-                return f"{file} missing in staging"
+                return f"{file} missing in staging", None
             if size != int(out["bytes"]):
-                return f"{file}: {size} bytes staged, {out['bytes']} reported"
+                return f"{file}: {size} bytes staged, {out['bytes']} reported", None
+            sizes[name] = size
         raw = self.objects.read(bucket, staging_key(job_id, attempt, "meta.json"),
                                 MAX_META_BYTES)
         if len(raw) > MAX_META_BYTES:
-            return "meta.json too large"
+            return "meta.json too large", None
         try:
-            if not isinstance(json.loads(raw), dict):
-                return "meta.json is not an object"
+            meta = json.loads(raw)
         except ValueError as exc:
-            return f"meta.json does not parse: {exc}"
-        return None
+            return f"meta.json does not parse: {exc}", None
+        if not isinstance(meta, dict):
+            return "meta.json is not an object", None
+        head = self.objects.read(bucket, staging_key(job_id, attempt, "cloud.ply"),
+                                 MAX_HEADER + 16)
+        try:
+            header_len, count, props = read_ply_header(head)
+        except PlyError as exc:
+            return f"cloud.ply: {exc}", None
+        want = ply_size(header_len, count, props)
+        if want != sizes["cloud"]:
+            return f"cloud.ply: {sizes['cloud']} bytes, its header says {want}", None
+        return None, meta
 
     async def on_fail(self, job_id: str, body: Mapping[str, Any]) -> Tuple[int, Dict]:
         attempt = _int(body.get("attempt"))
@@ -1326,7 +1515,8 @@ class ReconstructionGateway:
         if status in (200, 202):
             inputs = {"nodes_total": total, "nodes_with_depth": len(frames),
                       "frames": sum(len(f.cameras) for f in frames),
-                      "digest": input_digest(frames), "nodes": digest_nodes(frames)}
+                      "digest": input_digest(frames), "nodes": digest_nodes(frames),
+                      "z_floor": floor_z(frames)}
             changed = await self.repo.update(job.job_id, {
                 "state": RUNNING, "attempts": attempt, "dispatched_at": now,
                 "last_contact_at": now, "next_try_at": None, "stage": QUEUED, "progress": 0.0,
@@ -1449,6 +1639,10 @@ class ReconstructionGateway:
                 await task
             except BaseException:  # noqa: BLE001
                 pass
+        for task in list(self._finalizers.values()):  # the poll finishes them after a restart
+            task.cancel()
+        if self._finalizers:
+            await asyncio.gather(*list(self._finalizers.values()), return_exceptions=True)
         if self.client is not None:
             await self.client.close()
 
