@@ -99,13 +99,28 @@ services:
   # Create MinIO for image storage
   minio:
     image: minio/minio:latest
-    command: server /data --console-address ":${MINIO_CONSOLE_PORT:-9001}"
+    # Loopback only; minio-tailnet (below) adds the Tailscale address. Never the LAN/internet.
+    command: server /data --address "127.0.0.1:9000" --console-address "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}"
     environment:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
     network_mode: "host"
     volumes:
       - /media/satiadmin/data0/minio_data:/data
+
+  # Forwards ${MINIO_TAILNET_IP}:9000 (and the console port) to MinIO on 127.0.0.1, so robots
+  # and clients on the tailnet keep using presigned URLs on the Tailscale IP. Without
+  # MINIO_TAILNET_IP only this container fails; it retries until tailscale0 has the address.
+  minio-tailnet:
+    image: nginx:alpine
+    environment:
+      - MINIO_TAILNET_IP=${MINIO_TAILNET_IP:-}
+      - MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-9001}
+    command: ["sh", "-c", ": \"$${MINIO_TAILNET_IP:?set MINIO_TAILNET_IP}\" && envsubst '$${MINIO_TAILNET_IP} $${MINIO_CONSOLE_PORT}' < /minio_tailnet.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
+    network_mode: "host"
+    restart: unless-stopped
+    volumes:
+      - ./minio_tailnet.nginx.conf.template:/minio_tailnet.conf.template:ro
 
   # Create Graph Builder Service
   graph-builder-service:

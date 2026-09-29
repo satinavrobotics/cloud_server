@@ -1,0 +1,10 @@
+# minio-tailnet: MinIO itself listens on 127.0.0.1 only; this forwards the tailnet address
+# to it, so MinIO is reachable from localhost and Tailscale but not from the LAN/internet.
+# Plain TCP (stream), so the Host header of presigned URLs reaches MinIO unchanged.
+worker_processes 1;
+error_log /dev/stderr warn;
+events { worker_connections 1024; }
+stream {
+    server { listen ${MINIO_TAILNET_IP}:9000; proxy_pass 127.0.0.1:9000; }
+    server { listen ${MINIO_TAILNET_IP}:${MINIO_CONSOLE_PORT}; proxy_pass 127.0.0.1:${MINIO_CONSOLE_PORT}; }
+}
