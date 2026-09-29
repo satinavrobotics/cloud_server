@@ -114,6 +114,7 @@ class TestApiDelegationUpdateDatum:
         mock_graph.return_value = Mock()
 
         service = ApiDelegationService(arango_password="x", postgres_password="x")
+        service._geo_map_usage = AsyncMock(return_value=(0, 0))
         result = await service.update_map_datum("site_a", 47.999, 8.888, 45.0)
 
         assert result["success"] is True
@@ -141,6 +142,7 @@ class TestApiDelegationUpdateDatum:
         mock_graph.return_value = Mock()
 
         service = ApiDelegationService(arango_password="x", postgres_password="x")
+        service._geo_map_usage = AsyncMock(return_value=(0, 0))
         result = await service.update_map_datum("ghost", 0.0, 0.0)
 
         assert result["success"] is False
@@ -166,6 +168,7 @@ class TestApiDelegationUpdateDatum:
         mock_graph.return_value = Mock()
 
         service = ApiDelegationService(arango_password="x", postgres_password="x")
+        service._geo_map_usage = AsyncMock(return_value=(0, 0))
         result = await service.update_map_datum(
             "site_a", 47.47946, 19.03238, 0.0, datum_frame="utm", datum_utm_zone=34,
             datum_utm_north=True)
@@ -203,6 +206,7 @@ class TestApiDelegationUpdateDatum:
         mock_graph.return_value = Mock()
 
         service = ApiDelegationService(arango_password="x", postgres_password="x")
+        service._geo_map_usage = AsyncMock(return_value=(0, 0))
         result = await service.update_map_datum("site_a", 47.0, 8.0)
 
         assert result["datum_frame"] == "enu"

@@ -625,7 +625,8 @@ class UpdateDatumRequest(BaseModel):
 
 @app.put("/api/v1/maps/{map_id}/datum")
 async def update_map_datum(map_id: str, request: UpdateDatumRequest):
-    """Register or update the GPS datum for an existing map."""
+    """Register or update the GPS datum for an existing map. 409 on a geo map that has nodes
+    or mapping sessions: its origin is its first session's datum and fixed."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     await service.ensure_map_not_deleting(map_id)

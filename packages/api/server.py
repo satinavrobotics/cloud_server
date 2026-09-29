@@ -8,7 +8,7 @@ Delegates requests to appropriate microservices and manages WebSocket connection
 
 import logging
 import json
-from typing import Dict, Any, Optional, List, Set
+from typing import Dict, Any, Optional, List, Set, Tuple
 from datetime import datetime, timezone
 import asyncio
 import threading
@@ -24,7 +24,7 @@ from packages.api.diagnostics import DiagnosticsService
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.map import (
-    MapObjectV1, MapSpecV1, MapStatusV1, effective_state, effective_type)
+    MapGeoV1, MapObjectV1, MapSpecV1, MapStatusV1, effective_state, effective_type)
 from cloud_common.objects.mission import MissionObjectV1
 from cloud_common.objects.settings import SettingsObjectV1
 from cloud_common.objects.site import SiteObjectV1
@@ -1018,6 +1018,15 @@ class ApiDelegationService:
             result["delete_error"] = map_obj.status.delete_error
         return result
 
+    async def _geo_map_usage(self, map_id: str) -> Tuple[int, int]:
+        """(mapping sessions, graph nodes) of a map: what fixes a geo map's origin."""
+        async with self.database.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT count(*) FROM map_sessions WHERE map_name = %s", (map_id,))
+            sessions = int((await cursor.fetchone())[0])
+        stats = await asyncio.to_thread(self.graph_db.get_map_stats, map_id)
+        return sessions, int((stats or {}).get("node_count", 0) or 0)
+
     async def update_map_datum(
         self,
         map_id: str,
@@ -1034,12 +1043,26 @@ class ApiDelegationService:
 
         The whole datum is replaced: a frame left out is 'enu', and UTM zone/hemisphere/
         easting/northing left out are cleared (they belonged to the previous datum).
+
+        A geo map's origin (`spec.geo`) is its first session's datum and fixed: every node and
+        session is stored relative to it, so this refuses (409) once the map has nodes or
+        sessions. On a geo map that has neither, `spec.geo` follows the new datum, so the
+        display transform and the origin never disagree. Local maps: unchanged.
         """
         import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
         except Exception:
             return {"success": False, "error": f"Map '{map_id}' not found"}
+        is_geo = effective_type(map_obj.spec) == "geo"
+        if is_geo:
+            sessions, nodes = await self._geo_map_usage(map_id)
+            if sessions or nodes:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"Map '{map_id}' is a geo map with {nodes} node(s) and {sessions} "
+                            "mapping session(s): its origin is its first session's datum and "
+                            "cannot be changed. Create a new map to use another datum."))
         spec = map_obj.spec.dict()
         spec.update(
             datum_latitude=datum_latitude,
@@ -1052,6 +1075,10 @@ class ApiDelegationService:
             datum_utm_northing=datum_utm_northing,
         )
         new_spec = MapSpecV1(**spec)
+        if is_geo and new_spec.geo is not None:
+            new_datum = map_geo.map_datum(new_spec)
+            if new_datum is not None:
+                new_spec = new_spec.copy(update={"geo": MapGeoV1(**map_geo.geo_from_datum(new_datum))})
         await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
         self.logger.info(
             f"Updated datum for map '{map_id}': "

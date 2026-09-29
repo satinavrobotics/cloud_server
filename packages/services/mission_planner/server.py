@@ -606,6 +606,11 @@ class MissionPlannerService:
             "success": False,
             "robot_name": robot_name,
         }
+        has_gps = target_lat is not None and target_lon is not None
+        if not has_gps and (target_x is None or target_y is None):
+            result["error"] = "No target coordinates provided."
+            result["failed_at"] = "validation"
+            return result
         try:
             effective_map_id = await self._resolve_map(map_id, robot_name)
         except MapResolutionError as e:
