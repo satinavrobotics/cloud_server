@@ -1,8 +1,15 @@
 # SatiNav Maps: 3D reconstruction
 
 **Status:** design, revised 2026-09-29. **R2 and R3 deployed 2026-09-29 (`recon.sh`; feature off until `RECONSTRUCTION_*` is set); R1 built in sati_ros_navstack** (§12.1;
-deploy `~/pg-cutover/scripts/recon.sh`, dry run passed). R1, R4, R5 elsewhere. The spec for the
-external service's developer is [`handover.md`](handover.md).
+deploy `~/pg-cutover/scripts/recon.sh`, dry run passed). **R3b built** (§12.1): the service
+outputs only `cloud.ply` + `meta.json`, the cloud derives the top view (§7.2); deploy
+`~/pg-cutover/scripts/recon2.sh` (API only, no migration), dry run passed. R1, R4, R5 elsewhere.
+The spec for the external service's developer is [`handover.md`](handover.md).
+
+**Revision 2026-09-29 (user decision, R3b):** the service delivers only the 3D result,
+`cloud.ply` and `meta.json`. The 2.5D top view (`ortho.png`, `height.png`) is made by the
+gateway from `cloud.ply` after `finish` (§7.2), so the service stays minimal and the top-view
+rules live where the client that draws them does.
 
 **Revision 2026-09-29 (user decision):** the reconstruction runs in a **separate FastAPI
 service in its own repository**, outside cloud_server (not `~/satinavrobotics/pcconstruction`).
@@ -61,10 +68,11 @@ client "Reconstruct" ─▶ POST /api/v1/maps/{map}/reconstruction ─▶ api-de
                           reconstruction service (own repo, any host) ◀───────┘
                             ├─ GET inputs  ◀── MinIO presigned GET (map bucket)
                             ├─ compute (numpy / GPU)
-                            ├─ PUT outputs ──▶ MinIO presigned PUT (staging bucket)
+                            ├─ PUT cloud.ply, meta.json ──▶ MinIO presigned PUT (staging bucket)
                             └─ POST progress / finish / fail ──▶ gateway /internal/reconstruction/…
-gateway on finish: verify outputs ─▶ copy staging → map-{id}/reconstruction/{job}/ ─▶ row succeeded
-                   ─▶ MAP.RECONSTRUCTION_FINISHED
+gateway on finish: verify ─▶ copy cloud.ply → map-{id}/reconstruction/{job}/ ─▶ derive ortho.png +
+                   height.png from it (child process, §7.2) ─▶ store them + meta.json ─▶ row
+                   succeeded ─▶ MAP.RECONSTRUCTION_FINISHED
 client polls GET …/reconstruction ─▶ loads ortho.png + meta.json ─▶ deck.gl BitmapLayer
 ```
 
@@ -78,6 +86,7 @@ client polls GET …/reconstruction ─▶ loads ortho.png + meta.json ─▶ de
 | MinIO: inputs, staging, final storage; presigning | Only the presigned URLs it is given |
 | Stale digest, map delete, rebuild/supersede | Nothing about maps beyond one manifest |
 | Retry, timeout, poll fallback | Idempotency per `job_id`, cancel, memory caps, concurrency 1 |
+| The 2.5D top view (`ortho.png`, `height.png`) and the grid in `meta.json` (§7.2) | The 3D cloud (`cloud.ply`) and its `meta.json` |
 
 Why this split:
 
@@ -324,8 +333,10 @@ the URLs are fresh:
 - `nodes`, sorted by `created_at`: `node_id`, map-frame `pose` {x, y, yaw}, and per camera with
   depth: the camera parameters, `depth_scale`, optional `pose3d` (= `pose3d_map`), a presigned
   **GET** URL for the RGB JPEG and one for the depth PNG.
-- `outputs`: a presigned **PUT** URL and content type for `cloud.ply`, `ortho.png`,
-  `height.png`, `meta.json`, all in the **staging bucket** (§6.4).
+- `outputs`: a presigned **PUT** URL and content type for `cloud.ply` and `meta.json`, in the
+  **staging bucket** (§6.4). (Before R3b also `ortho.png` and `height.png`; the cloud makes
+  those now, §7.2.) `params.clip_z` and `params.raster_max_px` stay in the manifest; the service
+  ignores them.
 - `callback`: base URL of the gateway's callback routes for this job, and a per-job bearer
   token.
 - `expires_at`: when the URLs stop working.
@@ -354,7 +365,7 @@ never forwards them to browsers:
 | Route | When | Body |
 |---|---|---|
 | `POST /internal/reconstruction/jobs/{job_id}/progress` | at start, then every ≤ 10 s | `{attempt, stage, progress, frames_done, frames_total}` |
-| `POST /internal/reconstruction/jobs/{job_id}/finish` | after all outputs are PUT | `{attempt, result, outputs: {name: {bytes, sha256}}}` |
+| `POST /internal/reconstruction/jobs/{job_id}/finish` | after both outputs are PUT | `{attempt, result, outputs: {name: {bytes, sha256}}}` |
 | `POST /internal/reconstruction/jobs/{job_id}/fail` | on error or after a cancel | `{attempt, reason, stage, message}` |
 
 - **Auth:** `Authorization: Bearer <token>`. The token is
@@ -370,9 +381,11 @@ never forwards them to browsers:
 ### 6.4 Where outputs go: a staging bucket, then a copy
 
 The service PUTs into a separate bucket, `RECONSTRUCTION_STAGING_BUCKET` = `recon-staging`,
-key `{job_id}/{attempt}/{file}`. On `finish` the gateway checks each object (`stat_object`:
-size matches, `meta.json` parses), copies it server-side into the map bucket at
-`reconstruction/{job_id}/{file}`, then deletes the staging prefix.
+key `{job_id}/{attempt}/{file}`. On `finish` the gateway checks both objects (`stat_object`:
+size matches, `meta.json` parses, the PLY header is the vertex layout and the size is exactly
+header + N × stride), copies `cloud.ply` server-side into the map bucket at
+`reconstruction/{job_id}/cloud.ply`, derives the top view from it (§7.2), writes `ortho.png`,
+`height.png` and the merged `meta.json` next to it, commits, then deletes the staging prefix.
 
 Why not presigned PUTs straight into the map bucket:
 
@@ -436,7 +449,9 @@ jobs (a running job restarts from the beginning), terminal states kept 24 h for 
 | Map grew mid-job | The input digest is taken when the manifest is built; the next `GET` reports `stale: true` (§8.3). No action |
 | Superseded attempt reports | Callbacks carry `attempt`; an old attempt gets 410 |
 | API restarts | Dispatcher resumes from Postgres; running jobs are polled |
-| Finish verification fails (object missing, size mismatch) | `failed` (`bad_output`); the previous result stays |
+| Finish verification fails (object missing, size mismatch, bad PLY header) | `failed` (`bad_output`); the previous result stays |
+| Top view cannot be made (no point below floor + `clip_z`, child killed by its memory cap, over `RECONSTRUCTION_TOPVIEW_TIMEOUT_S`, MinIO error while storing) | `failed` (`top_view_failed`, `error` for a storage error, `bad_output` for a PLY truncated after its header), stage `finalizing`; the previous result stays; Retry rebuilds (§7.2) |
+| API restarts while finalizing | The claim goes stale (no heartbeat for 60 s); the poll reads the service's `succeeded` and finalizes again |
 
 A failed or cancelled job never touches the previous good result.
 
@@ -475,6 +490,7 @@ with `RECONSTRUCTION_MINIO_ENDPOINT`:
 | Config keys (§6.9) | `packages/config.py` |
 | Gateway logic: SQL, dispatcher, manifest builder, presigning, callbacks, finish/commit, stale digest, file streaming | `packages/api/reconstruction.py` (pure helpers testable without I/O) |
 | httpx client for the service | `packages/api/reconstruction_client.py` |
+| Top view from `cloud.ply` (§7.2), run as a child process | `packages/api/reconstruction_topview.py` (numpy; `packages/api/requirements.txt`) |
 | Client routes + callback routes | `packages/api/main.py` (logic in `reconstruction.py`) |
 | Migration | `packages/api/migrations/versions/20261003_01_map_reconstructions.py`, `down_revision` = `20261002_01_drop_current_map` (built) |
 | Map delete hook | `packages/api/map_delete.py`: in `request()` (same transaction as `MARK_SQL`) mark the active job `cancelled` (`map_deleting`), then gateway cancel; in `_finish`, `DELETE FROM map_reconstructions WHERE map_name = %s` next to `SESSIONS_SQL` |
@@ -501,6 +517,9 @@ built, compose only passes the API its `RECONSTRUCTION_*` settings, §12.1.)
 | `RECONSTRUCTION_QUEUE_TIMEOUT_S` | `1800` | Queued with the service down → `failed` |
 | `RECONSTRUCTION_MAX_INFLIGHT` | `1` | Jobs sent to the service at once |
 | `RECONSTRUCTION_VOXEL_M`, `_MAX_DEPTH_M`, `_CLIP_Z` | `0.05`, `10.0`, `2.0` | Default job parameters |
+| `RECONSTRUCTION_TOPVIEW_MEM_MB` | `1024` | Address-space cap (RLIMIT_AS) of the top-view child process |
+| `RECONSTRUCTION_TOPVIEW_TIMEOUT_S` | `600` | The child is killed after this → `failed` (`top_view_failed`) |
+| `RECONSTRUCTION_WORK_DIR` | unset (system temp) | Where `cloud.ply` is downloaded for the top view (~200 MB for 10 M points) |
 | `MQTT_DEPTH_TOPIC` | `robot/depth_upload` | R2 |
 
 The three secrets are **not** added to the import-time required list (that would break every
@@ -510,19 +529,19 @@ other service); the gateway refuses to start jobs (503 `not_configured`) when an
 
 ## 7. Algorithm and storage formats
 
-The algorithm (decode, edge filter, back-project, transform, voxel accumulate, neighbour filter,
-rasterize) is specified for the service's developer in `handover.md` §5–§7. Parameters and
-limits:
+The algorithm (decode, edge filter, back-project, transform, voxel accumulate, neighbour filter)
+is specified for the service's developer in `handover.md` §5–§7. The top view (§7.2) is the
+cloud's. Parameters and limits:
 
 | Parameter | Default | Range / note |
 |---|---|---|
 | `voxel_m` | 0.05 | 0.02–0.5; coarsened ×1.5 and restarted when above `max_voxels` |
 | `max_depth_m` | 10.0 | 0.5–65; far LiDAR points are sparse and noisy |
-| `clip_z` | 2.0 | relative to the floor estimate (median base z); −5–20 |
+| `clip_z` | 2.0 | relative to the floor estimate (median base z); −5–20; used by the cloud's top view (§7.2) |
 | `edge_rel` | 0.05 | flying-pixel filter |
 | `min_neighbours` | 2 | of 26 |
 | `max_voxels` | 10 M | memory bound |
-| `raster_max_px` | 4096 | safe WebGL texture size |
+| `raster_max_px` | 4096 | safe WebGL texture size; used by the cloud's top view (§7.2) |
 | Nodes per job | ≤ 20 000 | gateway refuses more (422) |
 
 ### 7.1 Full 3D: binary PLY
@@ -545,16 +564,66 @@ fit naturally.
 Sizes (estimates): Odin 300 nodes ≈ 0.5–1 M points, 9–17 MB; Odin 1 000 nodes ≈ 25–50 MB; sim
 1 000 nodes (per-pixel depth) ≈ 50–170 MB.
 
-### 7.2 Derived 2.5D product for the map view
+### 7.2 Derived 2.5D product for the map view (made by the cloud)
+
+The service delivers only `cloud.ply` and `meta.json` (handover §7). After `finish`, the gateway
+derives the top view from `cloud.ply` itself (`packages/api/reconstruction_topview.py`):
 
 | File | Content |
 |---|---|
 | `ortho.png` | RGBA 8-bit top view. Per cell the colour of the **highest** voxel **below** the clip height (floor + `clip_z`), so ceilings and tree tops don't hide the floor and walls. Alpha 0 = no data |
 | `height.png` | 16-bit grey. That voxel's z as `round((z − z_offset) / z_scale) + 1`; 0 = no data (`z_scale` 0.01 m) |
-| `meta.json` | grid, frame, CRS, bounds (format in `handover.md` §7.4) |
+| `meta.json` | the service's `meta.json` (frame, CRS, bounds, points, voxel) plus the grid below, written by the gateway |
 
-Resolution = `max(voxel_m, longest extent / 4096)`. A 200 m x 100 m map at 5 cm = 4000 x 2000 px,
-`ortho.png` ≈ 3–8 MB, `height.png` ≈ 1–4 MB. Tiling only when maps get bigger: later.
+**Rules** (all inputs are the cloud's own; nothing is read from the service's `meta.json`):
+
+- `z_floor` = median of the manifest frames' base z: per node-camera `pose3d_map.z`, 0 for a
+  frame without `pose3d`. Computed when the manifest is built, stored as `inputs.z_floor`.
+- `clip_abs = z_floor + clip_z` (`clip_z` from the job's params). Only points with
+  `z < clip_abs` (and finite x, y, z) are rastered.
+- `res = max(voxel_m, max(extent_x, extent_y) / (raster_max_px − 2))` over the rastered points;
+  `voxel_m` is the finish callback's `result.voxel_m` (the voxel the service used after any
+  coarsening), else the job's. (The earlier handover draft divided by `raster_max_px`; that let
+  a side reach `raster_max_px + 2`. With `− 2` neither side exceeds `raster_max_px`.)
+- `origin = (floor(min_x / res) · res, floor(min_y / res) · res)`;
+  `width = floor((max_x − origin.x) / res) + 1`, `height` likewise in y.
+- Cell of a point: `col = floor((x − origin.x) / res)`,
+  `row = height − 1 − floor((y − origin.y) / res)` (row 0 is the north / +y edge). `origin` is
+  the lower-left corner of the cell at row `height − 1`, column 0.
+- Per cell the point with the **highest** z wins.
+- `ortho.png`: RGBA 8-bit, `height × width`; the winner's colour, alpha 255; empty cells
+  (0, 0, 0, 0). A PLY without `red/green/blue` gives grey (128, 128, 128).
+- `height.png`: 16-bit grey, `height × width`. `z_offset` = min z of the rastered points,
+  `z_scale = 0.01`; value `min(65535, round((z − z_offset) / z_scale) + 1)` (round half up);
+  empty cells 0.
+- `meta.json` gains `resolution_m`, `origin {x, y}`, `width`, `height`, `z_floor`, `clip_z`,
+  `clip_abs`, `z_offset`, `z_scale` (the gateway's values win over same-named service fields).
+  `bounds3d` stays the service's (over all cloud points).
+- No rastered point (everything above the clip) → the job fails `top_view_failed` ("no cloud
+  point below the clip height"); rebuild with a larger `clip_z`.
+
+**How it runs.** The finish callback verifies the two files, claims the job (stage
+`finalizing`), and answers at once; a background task copies `cloud.ply`, downloads it to a temp
+file (`RECONSTRUCTION_WORK_DIR`), and runs `python packages/api/reconstruction_topview.py` as a
+**child process** (by path, so it does not import the API): two passes over the PLY in chunks
+of 1 M vertices (extent, then the per-cell winner), holding only the raster buffers (≤
+`raster_max_px`² cells: z float32 + RGB), PNGs written band by band (numpy + zlib, the "Up"
+filter). The child caps its own address space (`RECONSTRUCTION_TOPVIEW_MEM_MB`, RLIMIT_AS) and
+is killed after `RECONSTRUCTION_TOPVIEW_TIMEOUT_S`; the API's event loop only waits on a pipe,
+and all memory goes back when the child exits. Measured on this host, 10 M points (170 MB PLY):
+6.2 s and 205 MB peak RSS for a 4001 × 2000 grid, 6.2 s and 220 MB for 2048 × 4095
+(`RLIMIT_AS` 1024 MB is enough). While it runs, the job's `last_contact_at` is refreshed every
+15 s, so the poll leaves it alone; a claim with no heartbeat for 60 s (a crashed API) is taken
+over by the poll, which reads the service's `succeeded` and finalizes again.
+
+**When it fails** the job fails (`top_view_failed`; `bad_output` for a PLY cut short after its
+header; `error` for a MinIO error), and the previous result stays. Why not keep the 3D result
+without a top view: `succeeded` then always means all four files, so the client, the file
+routes and supersede need no "partial" state; the causes (a clip below every point, a PLY the
+service wrote wrongly, a crash) are fixed by a rebuild, not by keeping half a result.
+
+A 200 m x 100 m map at 5 cm = 4000 x 2000 px, `ortho.png` ≈ 3–13 MB, `height.png` ≈ 1–10 MB
+(random test data compresses worst). Tiling only when maps get bigger: later.
 
 **How the client draws it:** `GET …/reconstruction` → fetch `meta.json`, then `ortho.png`
 (`?v={job_id}`, cached forever) → a `BitmapLayer` with the 4 map-frame corners: through the
@@ -610,7 +679,8 @@ The same migration widens `fleet_events_source_check` with the source `reconstru
 ```
 queued ──▶ running ──▶ succeeded ──(newer job succeeds, or DELETE)──▶ superseded
   │           ├──▶ failed      (error, crashed, timeout, service_unavailable, lost,
-  │           │                 url_expired after its retry, rejected, bad_output)
+  │           │                 url_expired after its retry, rejected, bad_output,
+  │           │                 top_view_failed)
   │           └──▶ cancelled   (user, map_deleting)
   └──▶ failed (service_unavailable, rejected) / cancelled
 ```
@@ -624,6 +694,9 @@ queued ──▶ running ──▶ succeeded ──(newer job succeeds, or DELET
   reconstruction per map, and a failed rebuild never removes it.
 - **API start:** the dispatcher resumes; also delete any `reconstruction/{job}/` prefix in a map
   bucket whose job is not `succeeded` (orphans from a crash between copy and commit).
+- **Finalizing** (R3b): between the verified `finish` and the commit the job stays `running`
+  with stage `finalizing` while the gateway makes the top view (§7.2); a failure there is
+  `failed` (`top_view_failed`), like any other failed job.
 - `superseded` rows are kept as history (a few hundred bytes each; the `inputs.nodes` list is
   dropped on supersede).
 
@@ -643,8 +716,9 @@ objects deleted.
 |---|---|
 | `map-{id}/{node_id}/images/{camera}` | graph-builder (today) |
 | `map-{id}/{node_id}/depth/{camera}.png` | graph-builder (R2) |
-| `recon-staging/{job_id}/{attempt}/{cloud.ply,ortho.png,height.png,meta.json}` | the service, via presigned PUT |
-| `map-{id}/reconstruction/{job_id}/{cloud.ply,ortho.png,height.png,meta.json}` | the gateway (server-side copy) |
+| `recon-staging/{job_id}/{attempt}/{cloud.ply,meta.json}` | the service, via presigned PUT |
+| `map-{id}/reconstruction/{job_id}/cloud.ply` | the gateway (server-side copy) |
+| `map-{id}/reconstruction/{job_id}/{ortho.png,height.png,meta.json}` | the gateway (derived from `cloud.ply`, §7.2; `meta.json` = the service's + the grid) |
 
 The gateway creates `recon-staging` at start (with the 1-day expiry rule). It **never creates a
 map bucket**.
@@ -760,8 +834,13 @@ kill timeout **inside** the container. Pydantic v1 in cloud_server.
   an old attempt, a deleted map; `cancel` action when `cancel_requested`.
 - Dispatcher: backoff and queue timeout; 202 → running; 404 on poll → one resubmit then `lost`;
   poll `succeeded` → finish; job timeout; `url_expired` → one retry.
-- Finish: staging verification (missing, size mismatch → `bad_output`), copy, supersede, old
-  prefix deleted, failure keeps the old result, refused for a `DELETING` map.
+- Finish: staging verification (missing, size mismatch, bad PLY header → `bad_output`), copy,
+  top view derived and stored, supersede, old prefix deleted, failure (also of the top view)
+  keeps the old result, refused for a `DELETING` map; one finalizer per attempt (repeated
+  finish, poll, another worker), a stale claim retaken, cancel while finalizing.
+- Top view (`test_map_reconstruction_topview.py`): the §7.2 rules on a small scene (highest z,
+  clip, row/origin convention, empty cells, height encoding and clamp, chunk boundaries, PNG
+  bands; decoded with Pillow), bad PLYs, the child process (errors, crash, timeout).
 - Digest and stale reasons (new, removed, moved).
 - Routes: 404/409/422/503 mapping; file streaming headers.
 - Presign client uses `RECONSTRUCTION_MINIO_ENDPOINT` (the URL host is that endpoint).
@@ -773,7 +852,8 @@ kill timeout **inside** the container. Pydantic v1 in cloud_server.
 **cloud_server integration** (`tests/integration/reconstruction/run.sh`, harness of
 `tests/integration/maps/run_m2.sh`): Postgres, ArangoDB, MinIO, mosquitto, graph-builder, the
 API from the checkout, and a **stub service** (a few dozen lines in the test dir) that accepts
-the manifest, GETs every input URL, PUTs fixed small outputs and calls back. Checks the
+the manifest, GETs every input URL, PUTs a synthetic `cloud.ply` and `meta.json` and calls back
+(the API's top view of it is checked pixel by pixel). Checks the
 plumbing: presigned URLs work from another container (the endpoint rule), staging copy,
 supersede, cancel, map delete mid-job (late PUT and late callback harmless, no bucket
 re-created), stub down → queued then `service_unavailable`, stub loses the job → resubmit.
@@ -796,6 +876,7 @@ costmap lines up with the reconstruction.
 | R1 | Topomap depth capture (§4): nearest-stamp ≤ 80 ms, u16 mm PNG, camera params per node (cached `camera_info` + static TF), `robot_pose3d`, `robot/depth_upload`; codec/matcher unit tests; `enable_dense_depth:=true` in the navstack launch; verify optical frame and z depth (Q-R1) | sati_ros_navstack | — |
 | R2 | graph-builder depth ingest (§5): `MQTT_DEPTH_TOPIC`, PNG in MinIO, `depth.{cam}` on the node, `pose3d_map`, `get_stats` filter, `dropped_depth` — **deployed 2026-09-29** (§12.1) | cloud_server | — |
 | R3 | Gateway (§6, §8, §9): config, migration, `reconstruction.py` + client, routes, callbacks, dispatcher, staging bucket, events, map-delete hook, stub-service integration test, README — **deployed 2026-09-29** (§12.1) | cloud_server | the §5 node shape (not R2's code) |
+| R3b | The top view made by the cloud from `cloud.ply` (§7.2); the service uploads only `cloud.ply` + `meta.json` — **built** (§12.1), deploy `recon2.sh` | cloud_server | R3 |
 | R4 | The reconstruction service, per `handover.md`, tested standalone with the synthetic scene | own repo | the contract only |
 | R5 | Client: reconstruction row, polling, `reconstruction` layer (local + geo) | sati-client | R3's API (can start on mocked responses) |
 | R6 | Deploy (cloud: `~/pg-cutover/scripts/recon.sh`, `--dry-run` with the migration on a throwaway copy; then API and graph-builder; the service by its own deploy), robot rollout, sim end-to-end | all | R1–R5 |
@@ -857,6 +938,35 @@ as §6, §8, §9, with these details and deviations:
   graph-builder and API from the checkout, MinIO reached by the stub under the alias
   `minio-public` = `RECONSTRUCTION_MINIO_ENDPOINT`; ~4 min).
 
+**R3b: the cloud makes the top view** (2026-09-29, built; deploy `~/pg-cutover/scripts/recon2.sh`,
+API only, no migration). User decision: the service outputs only `cloud.ply` + `meta.json`.
+
+- Manifest `outputs` = `cloud`, `meta` (`params` unchanged; the service ignores `clip_z`,
+  `raster_max_px`). `finish` verifies those two: sizes, `meta.json` an object, the PLY header
+  (`binary_little_endian 1.0`, one vertex element with x/y/z and scalar properties) and
+  `size == header + N × stride` (`reconstruction_topview.read_ply_header` / `ply_size`, no
+  numpy in the API process).
+- Then `CLAIM_SQL` sets stage `finalizing` (only if no fresh claim: another worker, a repeated
+  finish, the poll) and a background task does copy → download → child process (§7.2) → upload
+  `ortho.png`, `height.png`, `meta.json` (service fields + grid) → the unchanged commit
+  transaction. The callback answers 200 right after the claim. `artifacts.files` still lists
+  all four (the derived ones with the gateway's own `bytes`/`sha256`), so the status body and
+  the file routes are unchanged for the client; `result.top_view` = `{points, points_rastered,
+  cells_filled}`.
+- `inputs.z_floor` (new key, set at dispatch; a job dispatched before R3b has none and uses 0).
+- A cancel or `DELETE` while finalizing wins: the task sees the job is no longer running (or
+  `cancel_requested`) and removes what it wrote. After a lost commit it removes the prefix only
+  if no other finalizer committed that attempt.
+- Failure → `failed` with `top_view_failed` / `bad_output` / `error`, stage `finalizing`
+  (§7.2 "When it fails"). No new job state, no schema change.
+- numpy (`1.26.4`) is new in the API image (`packages/api/requirements.txt`) and in
+  `tests/requirements-test.txt`; `wp6-test:py310` lacks it, so the top-view unit tests skip
+  there, and `tests/integration/reconstruction/run.sh` and `recon2.sh --dry-run` build a
+  throwaway image with it.
+- Tests: `tests/unit/test_map_reconstruction_topview.py` (new), the gateway tests with a fake
+  derivation, and the integration test's stub PUTs a synthetic 53-point PLY whose top view is
+  checked pixel by pixel.
+
 ---
 
 ### 12.2 Map export for model training
@@ -891,6 +1001,8 @@ Hospital --out /out --compose-env /src/docker_compose/.env`.
   `RECONSTRUCTION_CALLBACK_BASE_URL` to the cloud host's Tailscale name. Check from the GPU host:
   `curl http://sati-cloud:9000/minio/health/live` and `curl http://sati-cloud:8000/health`.
 - Secrets live in `docker_compose/.env` (cloud) and the service's own env file; never committed.
+- The API host needs temp disk for one `cloud.ply` while a top view is made (~200 MB for 10 M
+  points; `RECONSTRUCTION_WORK_DIR`) and ~250 MB of memory for the child process (§7.2).
 
 ---
 

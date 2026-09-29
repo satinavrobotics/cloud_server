@@ -9,8 +9,11 @@ out through URLs and callbacks given in that manifest.
 Background and the reasons for each choice: [`design.md`](design.md) (§ numbers point there).
 Status (2026-09-29): the cloud side is **deployed** (robot depth R1 built, depth storage R2 and
 the gateway R3 live in production, switched off until the service is configured), so this page is
-the contract the running gateway speaks. Test against the synthetic scene of §9, then against real
-maps (the sim records depth now).
+the contract the running gateway speaks. The two-output edge (the service uploads only
+`cloud.ply` + `meta.json`, the cloud makes the top view) is built and deploys with
+`recon2.sh`; the gateway deployed before it still asks for four outputs, which matters only if
+you connect a service before that deploy. Test against the synthetic scene of §9, then against
+real maps (the sim records depth now).
 
 **If you built against the earlier draft of this page** (routes `/maps/{map}/reconstruction`, the
 service reading ArangoDB/MinIO itself): the pipeline stays; what changes is the edge of the service.
@@ -224,6 +227,11 @@ After **both** outputs (`cloud`, `meta`) were uploaded successfully.
   }
 }
 ```
+
+The gateway checks both files (sizes as reported, `meta.json` parses, the PLY header of §7.1
+with exactly N × 17 bytes after it; else the job fails `bad_output`), answers at once, and
+makes the top view afterwards; nothing of that comes back to the service. It sizes the top view
+with `result.voxel_m` (the voxel actually used), so report it.
 
 ### 3.3 `fail`
 

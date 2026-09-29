@@ -268,8 +268,10 @@ payload. `MAP.SESSION_STARTED/FINISHED` payloads carry `purpose`.
 `docs/reconstruction/design.md` §6, §8, §9 (logic: `packages/api/reconstruction.py`). The work
 runs in an **external service** (own repo; contract `docs/reconstruction/handover.md`); the API
 is its gateway: it owns the job (`map_reconstructions`), sends a manifest of presigned MinIO
-URLs, receives callbacks, verifies and stores the result under
-`map-{id}/reconstruction/{job_id}/`.
+URLs, receives callbacks, verifies the service's `cloud.ply` + `meta.json`, derives the top view
+(`ortho.png`, `height.png`) from the PLY itself in a child process (`reconstruction_topview.py`,
+design.md §7.2; the job is `running`, stage `finalizing`, meanwhile) and stores the four files
+under `map-{id}/reconstruction/{job_id}/`.
 
 | Method | Path | |
 |---|---|---|
@@ -295,7 +297,8 @@ Config (`packages/config.py`, passed by compose from `docker_compose/.env`):
 `RECONSTRUCTION_MINIO_ENDPOINT` (default `localhost:9000`: the host the SERVICE reaches MinIO
 at; presigned URLs are signed for it), `RECONSTRUCTION_STAGING_BUCKET` (`recon-staging`, 1-day
 expiry), `_URL_EXPIRY_S` (4 h), `_JOB_TIMEOUT_S` (1 h), `_QUEUE_TIMEOUT_S` (30 min),
-`_MAX_INFLIGHT` (1), `_VOXEL_M` / `_MAX_DEPTH_M` / `_CLIP_Z`. Events: `MAP.RECONSTRUCTION_STARTED`
+`_MAX_INFLIGHT` (1), `_VOXEL_M` / `_MAX_DEPTH_M` / `_CLIP_Z`, `RECONSTRUCTION_TOPVIEW_MEM_MB`
+(1024), `_TOPVIEW_TIMEOUT_S` (600), `RECONSTRUCTION_WORK_DIR` (system temp). Events: `MAP.RECONSTRUCTION_STARTED`
 / `_FINISHED` / `_FAILED` (source `reconstruction`). A map delete cancels the active job and
 removes the rows; the bucket delete removes the files. Migration
 `20261003_01_map_reconstructions`. Integration test with a stub service:
