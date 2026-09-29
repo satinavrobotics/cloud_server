@@ -537,7 +537,8 @@ async def get_map(map_id: str):
     # M3: plus `mapping_state` / `mapping_service` of the open session's robot.
     result["sessions"] = await _site_call("list map sessions",
                                           maps.session_summary(service.database, map_id,
-                                                               service.mapping_control))
+                                                               service.mapping_control,
+                                                               result.get("type")))
     return result
 
 

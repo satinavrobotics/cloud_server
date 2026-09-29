@@ -52,7 +52,7 @@ UNPLACED_RUN_CHANGED = "run_changed"
 
 SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "purpose", "services",
                    "placement", "started_at", "paused_at", "ended_at", "datum",
-                   "map_t_session", "aligned", "node_count")
+                   "map_t_session", "aligned", "node_count", "run_epoch")
 
 # The robot's open session with its map (one row at most: map_sessions_one_open_per_robot).
 ROBOT_SESSION_SQL = (
@@ -127,12 +127,19 @@ def pose_moved(shown: Mapping[str, Any], now: Mapping[str, Any],
     return None
 
 
-def driving_reason(robot_state: Optional[str], state_msg: Optional[Mapping[str, Any]]
-                   ) -> Optional[str]:
+def driving_reason(robot_state: Optional[str], state_msg: Optional[Mapping[str, Any]],
+                   mission_open: Optional[bool] = None) -> Optional[str]:
     """Why the robot counts as driving (decision Q-U7: it must stand still while placed), or
     None. `robot_state`: RobotStatusV1.state (ON_TASK / MAP_DEPLOYMENT = an active order);
-    `state_msg`: the robot's last VDA5050 state message (robot_latest.state_msg) or None."""
-    if robot_state in ("ON_TASK", "MAP_DEPLOYMENT"):
+    `state_msg`: the robot's last VDA5050 state message (robot_latest.state_msg) or None;
+    `mission_open`: whether the robot has a PENDING or RUNNING mission (None = unknown).
+
+    ON_TASK is mission-dispatch's summary of "I am running a mission for this robot". When the
+    robot has no open mission at all, it cannot be executing one of our orders: the state is
+    stale and the robot's own fresh state message decides (driving, velocity, remaining
+    nodeStates). Without a fresh state message the stored state still refuses."""
+    if robot_state in ("ON_TASK", "MAP_DEPLOYMENT") and not (
+            mission_open is False and state_msg is not None):
         return f"it has an active order (state {robot_state})"
     msg = state_msg or {}
     if msg.get("driving") is True:
@@ -228,6 +235,105 @@ REPLACE_SQL = (
     "placement = %s::jsonb "
     "WHERE session_id = %s AND ended_at IS NULL AND aligned = %s "
     "AND datum IS NOT DISTINCT FROM %s::jsonb")
+
+
+# --- the robot's run epoch: placement reuse across sessions (§14.13) -------------------------------
+#
+# robot_run_epochs (migration 20261001_01_run_epochs), one row per robot, written only by
+# mission-dispatch: `epoch` is a fresh uuid at every run change it detects and whenever it cannot
+# prove that the run it sees continues the one it saw before (first sight of the robot, a
+# dispatcher restart without the proof below). `continuity_known` is false from a dispatcher start
+# until the robot's first state message decided (proved: same epoch; else: a new one). A finished
+# session stamps the epoch it was placed in (`map_sessions.run_epoch`, at finish, only while
+# placed and continuity_known); a new session on the same local map without a placement carries
+# that session's map_T_session when the robot's epoch is still the same (reusable_session).
+
+# At most this many state messages per second from one VDA5050 client (sati_vda5050_client sends
+# about 1/s plus event-driven ones). Used only to PROVE continuity across a dispatcher restart:
+# a new client process started after the last header id we stored cannot have sent more than
+# elapsed * this many messages, so a header id at or above that (and above the stored one) is the
+# old process. Too high only costs a missed reuse (the user places again), never a wrong one.
+MAX_STATE_RATE_HZ = 20.0
+# How often the dispatcher stores a robot's last state header id (the baseline of that proof).
+RUN_HEADER_PERSIST_S = 10.0
+RUN_EPOCH_TABLE = "robot_run_epochs"
+REASON_RUN_CHANGED, REASON_FIRST_SEEN, REASON_DISPATCHER_RESTART = (
+    "run_changed", "first_seen", "dispatcher_restart")
+
+RUN_EPOCH_UNVERIFY_ALL_SQL = (
+    f"UPDATE {RUN_EPOCH_TABLE} SET continuity_known = false, updated_at = now() "
+    "WHERE continuity_known")
+RUN_EPOCH_READ_SQL = (
+    f"SELECT epoch, continuity_known, last_state_header, "
+    "EXTRACT(EPOCH FROM (now() - last_state_at))::float8 "
+    f"FROM {RUN_EPOCH_TABLE} WHERE robot_name = %s")
+RUN_EPOCH_CONFIRM_SQL = (
+    f"UPDATE {RUN_EPOCH_TABLE} SET continuity_known = true, last_state_header = %s, "
+    "last_state_at = now(), updated_at = now() WHERE robot_name = %s AND epoch = %s")
+# (robot_name, epoch, reason, evidence json, last_state_header or NULL)
+RUN_EPOCH_NEW_SQL = (
+    f"INSERT INTO {RUN_EPOCH_TABLE} (robot_name, epoch, started_at, reason, evidence, "
+    "continuity_known, last_state_header, last_state_at, updated_at) "
+    "VALUES (%s, %s, now(), %s, %s::jsonb, true, %s, now(), now()) "
+    "ON CONFLICT (robot_name) DO UPDATE SET epoch = EXCLUDED.epoch, "
+    "started_at = EXCLUDED.started_at, reason = EXCLUDED.reason, evidence = EXCLUDED.evidence, "
+    "continuity_known = true, last_state_header = EXCLUDED.last_state_header, "
+    "last_state_at = EXCLUDED.last_state_at, updated_at = EXCLUDED.updated_at")
+RUN_EPOCH_HEADER_SQL = (
+    f"UPDATE {RUN_EPOCH_TABLE} SET last_state_header = %s, last_state_at = now() "
+    "WHERE robot_name = %s AND epoch = %s AND continuity_known")
+# The API: the robot's epoch, for stamping a finished session and for reuse.
+RUN_EPOCH_OF_SQL = f"SELECT epoch, continuity_known FROM {RUN_EPOCH_TABLE} WHERE robot_name = %s"
+
+
+def run_continues(stored_header: Any, elapsed_s: Any, header: Any,
+                  max_rate_hz: float = MAX_STATE_RATE_HZ) -> bool:
+    """Whether a robot's first state message after a dispatcher (re)start (headerId `header`)
+    PROVABLY comes from the same VDA5050 client process as the last one the dispatcher stored
+    (`stored_header`, `elapsed_s` seconds ago). The client numbers its state messages from 0 per
+    process; a process started after the stored message has sent at most elapsed * max_rate
+    since. So: `header` above the stored one AND at least elapsed * max_rate. Anything unknown
+    or unparsable is not a proof."""
+    try:
+        stored, elapsed, hid = int(stored_header), float(elapsed_s), int(header)
+    except (TypeError, ValueError):
+        return False
+    if elapsed < 0 or not math.isfinite(elapsed):
+        return False
+    return hid > stored and hid >= elapsed * max_rate_hz
+
+
+def epoch_to_stamp(session: Mapping[str, Any], epoch_row: Optional[Tuple[Any, Any]]
+                   ) -> Optional[str]:
+    """The run epoch a session that is finishing records (map_sessions.run_epoch): the robot's
+    current epoch while the session is placed and the dispatcher knows the run is continuous;
+    else None (the session can never be reused)."""
+    if not is_placed(session) or epoch_row is None:
+        return None
+    epoch, known = epoch_row
+    return str(epoch) if epoch is not None and known is True else None
+
+
+def reusable_session(sessions: Iterable[Mapping[str, Any]], robot_name: str,
+                     epoch_row: Optional[Tuple[Any, Any]]) -> Optional[Mapping[str, Any]]:
+    """The finished session of `robot_name` whose placement a new session on the same LOCAL map
+    reuses (§14.13), or None. `sessions`: that map's sessions (any robot); `epoch_row`: the
+    robot's (epoch, continuity_known). Only the robot's most recent finished session on the
+    map counts, and only if it ended placed (a run change unplaces, so an unplaced end never
+    counts), stamped an epoch, and that epoch is still the robot's, with continuity known."""
+    if epoch_row is None:
+        return None
+    epoch, known = epoch_row
+    if epoch is None or known is not True:
+        return None
+    mine = [s for s in sessions
+            if s.get("robot_name") == robot_name and s.get("ended_at") is not None]
+    if not mine:
+        return None
+    last = max(mine, key=lambda s: (s["ended_at"], str(s.get("session_id"))))
+    if not is_placed(last) or last.get("run_epoch") is None:
+        return None
+    return last if str(last["run_epoch"]) == str(epoch) else None
 
 
 # --- the mapping switch (contract: packages/api/mapping_control.py) -------------------------------

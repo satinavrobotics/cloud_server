@@ -72,7 +72,7 @@ import logging
 import math
 import re
 import uuid
-from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional, Tuple
 
 import psycopg
 import pydantic
@@ -95,6 +95,7 @@ logger = logging.getLogger("ApiDelegationService.maps")
 MAP_TABLE = MapObjectV1.table_name()
 ROBOT_TABLE = RobotObjectV1.table_name()
 SESSIONS_TABLE = "map_sessions"
+MISSION_TABLE = "missionobjectv1"
 DELETING = ObjectLifecycleV1.DELETING.value
 ALIVE = ObjectLifecycleV1.ALIVE.value
 
@@ -402,6 +403,36 @@ class SqlStore:
             return None
         return dict(row[0]) if row is not None and row[0] else None
 
+    async def robot_mission_open(self, name: str) -> Optional[bool]:
+        """Whether the robot has a PENDING or RUNNING (alive) mission, for the "robot drives"
+        check (map_sessions.driving_reason); None when it cannot be read. In a savepoint."""
+        try:
+            async with self.conn.transaction():
+                await self.cursor.execute(
+                    f"SELECT EXISTS (SELECT 1 FROM {MISSION_TABLE} WHERE spec->>'robot' = %s "
+                    "AND lifecycle = 'ALIVE' AND status->>'state' IN ('PENDING', 'RUNNING'))",
+                    (name,))
+                row = await self.cursor.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Missions of %s not readable (%s); the placement check uses the "
+                           "robot state", name, exc)
+            return None
+        return bool(row[0]) if row is not None else None
+
+    async def robot_run_epoch(self, name: str) -> Optional[Tuple[Any, Any]]:
+        """The robot's (run epoch, continuity_known) from robot_run_epochs (written by
+        mission-dispatch, §14.13), None without a row or when it cannot be read (then nothing
+        is reused). In a savepoint: a missing table never aborts the caller's transaction."""
+        try:
+            async with self.conn.transaction():
+                await self.cursor.execute(ms.RUN_EPOCH_OF_SQL, (name,))
+                row = await self.cursor.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Run epoch of %s not readable (%s); no placement is reused",
+                           name, exc)
+            return None
+        return (row[0], row[1]) if row is not None else None
+
     async def set_current_map(self, robot: RobotObjectV1, value: Optional[str]) -> None:
         """robot.current_map only (spec || patch, like update_spec_fields) and the robot NOTIFY
         the dispatcher's watcher reads."""
@@ -648,16 +679,26 @@ async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID) -> D
     return map_view(MapObjectV1(name=name, status=row.status, **row.spec))
 
 
-async def session_summary(db: Any, name: str, control: Optional[Any] = None
-                          ) -> Dict[str, Any]:
+async def session_summary(db: Any, name: str, control: Optional[Any] = None,
+                          map_type: Optional[str] = None) -> Dict[str, Any]:
     """The `sessions` block of GET /api/v1/maps/{id}: counts, the open MAPPING session, the
     robots using the map (`operating`), and the newest SUMMARY_MAX_SESSIONS sessions (newest
     first; the full history is GET .../sessions). M3: `mapping_state` / `mapping_service` (and,
     U5, `mapping_services`) of the open mapping session's robot (null without one;
-    packages/api/mapping_control.py)."""
+    packages/api/mapping_control.py). §14.13: `placement_reusable` {robot: from_session_id}
+    for a `local` map: the robots whose start on this map without a placement would be placed
+    from their last session here (same run; with `replace: true` if they use another map now);
+    {} otherwise. A hint: the start decides again when it runs."""
+    reusable: Dict[str, str] = {}
     try:
         async with open_store(db, uuid.uuid4()) as store:
             rows = await store.sessions(name)
+            if map_type == "local":
+                here = {r["robot_name"] for r in rows if r["ended_at"] is None}
+                for robot in sorted({r["robot_name"] for r in rows} - here):
+                    last = ms.reusable_session(rows, robot, await store.robot_run_epoch(robot))
+                    if last is not None:
+                        reusable[robot] = str(last["session_id"])
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
     items = [session_dict(r) for r in reversed(rows)]
@@ -670,6 +711,7 @@ async def session_summary(db: Any, name: str, control: Optional[Any] = None
                "unaligned": sum(1 for s in items
                                 if s["aligned"] is False and s["purpose"] == ms.MAPPING),
                "items": items[:SUMMARY_MAX_SESSIONS],
+               "placement_reusable": reusable,
                "mapping_state": None, "mapping_service": None, "mapping_services": None}
     if open_session is not None and control is not None:
         robot = open_session["robot_name"]
@@ -839,7 +881,9 @@ async def check_robot_still(store: Any, robot: RobotObjectV1,
     """409 unless the robot stands still where the user saw it (decision Q-U7): no active
     order, no velocity, and its pose now within sensor noise of `robot_pose`."""
     state = robot.status.state.value if robot.status.state is not None else None
-    reason = ms.driving_reason(state, await store.robot_state_msg(robot.name))
+    mission_open = (await store.robot_mission_open(robot.name)
+                    if state in ("ON_TASK", "MAP_DEPLOYMENT") else None)
+    reason = ms.driving_reason(state, await store.robot_state_msg(robot.name), mission_open)
     if reason is not None:
         raise HTTPException(409, f"Robot '{robot.name}' is driving ({reason}); stop it and "
                                  "place it again")
@@ -896,6 +940,11 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
         await check_robot_still(store, robot, req.placement.robot_pose.dict())
         placement = _placement_record(req.placement, ms.SOURCE_USER, actor, now)
     carried = carried if carried is not None and ms.is_placed(carried) else None
+    if carried is None and placement is None and row.type == "local":
+        # §14.13: the robot's last session on this map, finished placed in the run it is
+        # still in, lends its placement (the robot has not restarted since).
+        carried = ms.reusable_session(previous, robot_name,
+                                      await store.robot_run_epoch(robot_name))
     has_nodes = (row.type == "local" and placement is None and carried is None
                  and _map_has_nodes(row, previous, arango_node_count))
     plan = plan_session(row, robot, previous, purpose, placement, carried, has_nodes)
@@ -924,8 +973,13 @@ async def _finish_in(store: Any, row: Optional[MapRow], session: Dict[str, Any],
     A mapping session makes its map `ready` unless another mapping session is still open; an
     operate session leaves the map as it is. `row`: the locked map row, None when it is gone."""
     session_id = str(session["session_id"])
-    session.update(ended_at=now, paused_at=None)
-    await store.update_session(session_id, ended_at=now, paused_at=None)
+    # §14.13: the run epoch the placement belongs to, so a later session on this map in the
+    # same run can reuse it (None: never reused).
+    stamp = ms.epoch_to_stamp(session, await store.robot_run_epoch(session["robot_name"])
+                              if ms.is_placed(session) else None)
+    run_epoch = uuid.UUID(stamp) if stamp is not None else None
+    session.update(ended_at=now, paused_at=None, run_epoch=run_epoch)
+    await store.update_session(session_id, ended_at=now, paused_at=None, run_epoch=run_epoch)
     if row is None:
         return None
     if ms.purpose_of(session) == ms.MAPPING:

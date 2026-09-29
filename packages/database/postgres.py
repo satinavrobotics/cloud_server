@@ -160,8 +160,13 @@ class PostgresWatcher:
                                                lifecycle=objects.ObjectLifecycleV1[lifecycle],
                                                status=status, **spec)
                             for name, lifecycle, spec, status in values]
+                    # A resync happens at every (re)connect, including the reconnect after
+                    # WATCHER_NOTIFY_TIMEOUT_S without a notification (every minute on a
+                    # quiet table), so one line per resync, not one warning per object.
+                    self._logger.info("Resync of %s: %d objects",
+                                      self._object_class.table_name(), len(objs))
                     for obj in objs:
-                        self._logger.warning("Object from DB: %s", obj.name)
+                        self._logger.debug("Object from DB: %s", obj.name)
                         yield obj
 
                     # Now handle all notifications. timeout bounds how long we'll wait

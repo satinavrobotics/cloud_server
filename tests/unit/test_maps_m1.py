@@ -390,6 +390,12 @@ class FakeStore:
     async def robot_state_msg(self, name):
         return self.db.state_msgs.get(name)
 
+    async def robot_mission_open(self, name):
+        return self.db.missions_open.get(name)
+
+    async def robot_run_epoch(self, name):
+        return self.db.run_epochs.get(name)
+
     async def sessions(self, map_name):
         return [dict(s) for s in self.db.sessions if s["map_name"] == map_name]
 
@@ -441,6 +447,8 @@ class FakeDb:
         self.events = []
         self.notifies = []
         self.state_msgs = {}
+        self.missions_open = {}   # robot -> bool (None: unknown)
+        self.run_epochs = {}      # robot -> (epoch, continuity_known) (§14.13)
 
     def add_map(self, name, lifecycle="ALIVE", **spec_and_status):
         status = spec_and_status.pop("status", {"state": "ready"})

@@ -78,6 +78,9 @@ SETTINGS_WATCH_RETRY_S = 5.0
 # (map_geo.robot_frame_in_map), with a warning. U6 sets this False: such a node then fails
 # ("robot is not using map X").
 SESSIONLESS_FALLBACK = True
+# A robot state of ON_TASK with no mission is set back to IDLE only this long after the robot's
+# controller was created (a dispatcher restart re-queues a running mission first).
+STALE_STATE_GRACE_S = 30.0
 
 
 class RouteRefused(Exception):
@@ -240,6 +243,14 @@ class Robot:
         # retained one of an older run).
         self._run_detector = run_change.RunChangeDetector()
         self._datum_epoch: Optional[int] = None
+        # For _reconcile_stale_state's grace period.
+        self._created_at = time.monotonic()
+        # Maps §14.13: the robot's run epoch (robot_run_epochs). `_run_checked`: the first
+        # state message of this process decided it (continuity proved, or a new epoch);
+        # `_run_header_saved_at`: when the last state headerId was stored (monotonic).
+        self._run_checked = False
+        self._run_epoch: Optional[uuid.UUID] = None
+        self._run_header_saved_at: Optional[float] = None
 
         if self._robot_server.push_telemetry:
             self._telemetry = metrics.Telemetry()
@@ -714,6 +725,15 @@ class Robot:
             await self._handle_force_cancel(message)
             await self._try_start_mission()
         else:
+            # The robot's `status.state` is this controller's: only _set_robot_state changes
+            # it (and records ROBOT.STATE_CHANGED). The row a watcher notification carries is
+            # read when the notification is handled, so it can predate a state write still in
+            # flight (_set_robot_state writes with ensure_future) -- adopting it silently put a
+            # finished mission's ON_TASK back after ON_TASK -> IDLE, and every later state
+            # message then wrote that ON_TASK again (masked-frigatebird, 2026-09-29: ON_TASK
+            # with no mission for hours, placement refused as "driving"). Spec and the other
+            # status fields still come from the row.
+            message.status.state = self._robot_object.status.state
             # Delete robot update
             if message.lifecycle == api_objects.object.ObjectLifecycleV1.PENDING_DELETE:
                 if message.status.state == api_objects.robot.RobotStateV1.ON_TASK:
@@ -769,11 +789,11 @@ class Robot:
             self._robot_object.status.recording_state = None
             self._robot_object.status.nav_reasoning = None
             if not self._robot_object.status.online:
-                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
+                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
                 return
             self._robot_object.status.online = False
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
-                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
+                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
         except asyncio.CancelledError:
             self.debug("Cancelled robot online check.")
 
@@ -854,7 +874,7 @@ class Robot:
         # back would revert any spec change committed since the cache was filled.
         await self._database.update_spec_fields(
             api_objects.RobotObjectV1, self._name,
-            {"datum": json.loads(self._robot_object.datum.json())}, uuid.uuid4()
+            {"datum": json.loads(self._robot_object.datum.json())}, self._writer_id()
         )
         epoch = getattr(self._robot_server, "mqtt_epoch", 0)
         trusted = self._datum_epoch == epoch
@@ -890,14 +910,104 @@ class Robot:
                         payload={"map_name": map_name, "session_id": str(session_id),
                                  "purpose": purpose, "reason": map_sessions.UNPLACED_RUN_CHANGED,
                                  "evidence": evidence, "old_map_T_session": transform}))
+                # Every run change, with or without an open session (§14.13).
+                await self._new_run_epoch(conn, evidence)
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Could not unplace the open session after a run change: {err}")
+            # The epoch was not renewed either: decide again on the next state message (its
+            # header id cannot prove continuity with the old run's, so a new epoch follows).
+            self._run_checked = False
+            self._run_epoch = None
             return
         for _sid, map_name, purpose, _t in rows:
             self.warning(f"Session on map '{map_name}' ({purpose}) is no longer placed: the "
                          "robot's run frame changed")
         if rows:
             await self._publish_mapping_set()
+
+    # --- maps §14.13: the run epoch (placement reuse across sessions) ----------------------------
+
+    async def _check_run_continuity(self, header_id: Any) -> None:
+        """The robot's first state message in this dispatcher process: keep its stored run
+        epoch only if the header id PROVES the VDA5050 client process is the one seen before
+        (map_sessions.run_continues); otherwise start a new epoch (reason first_seen /
+        dispatcher_restart), so no session finished before the gap lends its placement. Never
+        raises; on a database error the next state message tries again."""
+        try:
+            hid = int(header_id)
+        except (TypeError, ValueError):
+            return
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.RUN_EPOCH_READ_SQL, (self._name,))
+                    row = await cursor.fetchone()
+                    if row is not None and row[0] is not None and \
+                            map_sessions.run_continues(row[2], row[3], hid):
+                        epoch = row[0] if isinstance(row[0], uuid.UUID) else uuid.UUID(str(row[0]))
+                        await cursor.execute(map_sessions.RUN_EPOCH_CONFIRM_SQL,
+                                             (hid, self._name, epoch))
+                        self.info(f"Robot run continues across the dispatcher restart (state "
+                                  f"headerId {row[2]} -> {hid}): run epoch kept")
+                    else:
+                        epoch = uuid.uuid4()
+                        reason = (map_sessions.REASON_FIRST_SEEN if row is None
+                                  else map_sessions.REASON_DISPATCHER_RESTART)
+                        evidence = {"state_header_id": hid,
+                                    "last_state_header_id": row[2] if row else None,
+                                    "elapsed_s": (round(float(row[3]), 1)
+                                                  if row and row[3] is not None else None)}
+                        await cursor.execute(map_sessions.RUN_EPOCH_NEW_SQL, (
+                            self._name, epoch, reason, json.dumps(evidence), hid))
+                        self.info(f"New run epoch ({reason}, {evidence}): placements of "
+                                  "finished sessions are not reused")
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Run epoch not checked ({err}); placements are not reused")
+            return
+        self._run_checked = True
+        self._run_epoch = epoch
+        self._run_header_saved_at = time.monotonic()
+
+    async def _persist_run_header(self, header_id: Any) -> None:
+        """Store the robot's state headerId every RUN_HEADER_PERSIST_S (the baseline a later
+        dispatcher start proves continuity against). Never raises."""
+        if self._run_epoch is None:
+            return
+        now = time.monotonic()
+        if self._run_header_saved_at is not None and \
+                now - self._run_header_saved_at < map_sessions.RUN_HEADER_PERSIST_S:
+            return
+        try:
+            hid = int(header_id)
+        except (TypeError, ValueError):
+            return
+        self._run_header_saved_at = now
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.RUN_EPOCH_HEADER_SQL,
+                                         (hid, self._name, self._run_epoch))
+        except Exception as err:  # pylint: disable=broad-except
+            self.debug(f"Run header not stored: {err}")
+
+    async def _new_run_epoch(self, conn: Any, evidence: Dict[str, Any]) -> None:
+        """A detected run change starts a new run epoch (in a savepoint of the caller's
+        transaction: a failure, e.g. before the migration, never undoes the unplace)."""
+        epoch = uuid.uuid4()
+        header = evidence.get("state_header_id")
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.RUN_EPOCH_NEW_SQL, (
+                        self._name, epoch, map_sessions.REASON_RUN_CHANGED,
+                        json.dumps(evidence), header))
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Run epoch not recorded ({err}); placements are not reused")
+            self._run_epoch = None
+            return
+        self._run_checked = True
+        self._run_epoch = epoch
+        self._run_header_saved_at = time.monotonic() if header is not None else None
 
     async def _replace_geo_session(self, datum: Optional[Dict[str, Any]], trusted: bool) -> None:
         """A datum message for a robot whose open session is on a geo map: re-place a session a
@@ -1173,7 +1283,7 @@ class Robot:
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,
                                                     serial_number=message.serialNumber)
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
-                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
+                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
 
             # Update object detection results if necessary
             for action_state in message.actionStates:
@@ -1199,6 +1309,7 @@ class Robot:
 
         # Make sure there is a mission to update
         if self._current_mission is None or self._current_behavior_tree is None:
+            self._reconcile_stale_state()
             return
 
         # In case mission failed due to timeout
@@ -1299,7 +1410,7 @@ class Robot:
                 ]
                 self.info(f"Stored {len(message.actions)} custom actions from factsheet")
 
-            await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4())
+            await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
 
     async def post_mission_completion(self):
         # Delete a completed/failure mission
@@ -2026,9 +2137,13 @@ class Robot:
         the recorded robot state and run are the ones this message led to. Events the
         dispatcher raises meanwhile carry the message's timestamp."""
         self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
+        if not self._run_checked:
+            await self._check_run_continuity(message.headerId)
         evidence = self._run_detector.on_state(message.headerId)
         if evidence is not None:
             await self._on_run_changed(evidence)
+        else:
+            await self._persist_run_header(message.headerId)
         try:
             await self._on_client_message(message)
         finally:
@@ -2058,6 +2173,30 @@ class Robot:
         self._logger.warning(
             "[Isaac Mission Dispatch] | WARNING: [%s] %s", self._name, message)
 
+    def _writer_id(self) -> uuid.UUID:
+        """Publisher id of this controller's robot-object writes: the robot watcher of the
+        RobotServer skips notifications with it, so our own writes do not come back as
+        robot changes (they carried a possibly older copy of the row; see _on_robot_change)."""
+        writer = getattr(self._robot_server, "robot_writer_id", None)
+        return writer if isinstance(writer, uuid.UUID) else uuid.uuid4()
+
+    def _reconcile_stale_state(self) -> None:
+        """ON_TASK / MAP_DEPLOYMENT only ever mean "this controller is running a mission". With
+        none current or queued they are stale: a state left in the database by an older
+        process or written back by a stale watcher echo (see _on_robot_change). Fixed to IDLE
+        (with ROBOT.STATE_CHANGED), but only STALE_STATE_GRACE_S after this controller was
+        created, so a mission the dispatcher resumes after its own restart is queued first."""
+        if self._robot_object is None or self._current_mission is not None or self._missions:
+            return
+        state = self._robot_object.status.state
+        if state not in (robot_object.RobotStateV1.ON_TASK,
+                         robot_object.RobotStateV1.MAP_DEPLOYMENT):
+            return
+        if time.monotonic() - self._created_at < STALE_STATE_GRACE_S:
+            return
+        self.warning(f"Robot state {state.value} without a mission: setting it to IDLE")
+        self._set_robot_state(robot_object.RobotStateV1.IDLE)
+
     def _set_robot_state(self, state: robot_object.RobotStateV1):
         if self._robot_object is None or state == self._robot_object.status.state:
             return
@@ -2076,7 +2215,7 @@ class Robot:
         self._record("on_robot_state", self._name, self._robot_object.status.state, state,
                      self._event_ts)
         self._robot_object.status.state = state
-        asyncio.ensure_future(self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, uuid.uuid4()))
+        asyncio.ensure_future(self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id()))
 
     def _set_robot_idle_after_mission(self):
         """The robot's state once a mission has ended -- unless it is teleoperated.
@@ -2258,6 +2397,9 @@ class RobotServer:
         self._event_loop = asyncio.get_event_loop()
         self._mission_changes: asyncio.Queue[api_objects.MissionObjectV1] = asyncio.Queue()
         self._robot_changes: asyncio.Queue[api_objects.RobotObjectV1] = asyncio.Queue()
+        # Publisher id of the robot controllers' own robot-object writes (Robot._writer_id);
+        # the robot watcher skips their notifications.
+        self.robot_writer_id = uuid.uuid4()
         self._mqtt_messages: asyncio.Queue = asyncio.Queue()
 
         # Maps §14 U3: bumped on every (re)connect to the broker; a robot's first datum in an
@@ -2354,10 +2496,12 @@ class RobotServer:
         loop = asyncio.get_event_loop()
         loop.stop()
 
-    async def _watch_changes(self, object_class: Any, queue: asyncio.Queue):
+    async def _watch_changes(self, object_class: Any, queue: asyncio.Queue,
+                             publisher_id: Optional[uuid.UUID] = None):
+        """`publisher_id`: notifications of writes with this id are skipped (our own)."""
         while True:
             try:
-                publisher_id = uuid.uuid4()
+                publisher_id = publisher_id or uuid.uuid4()
                 watcher_instance = await self._database.get_watcher(object_class, publisher_id)
                 with watcher_instance:
                     async for update in watcher_instance.watch():
@@ -2494,8 +2638,21 @@ class RobotServer:
                     continue
             await self._robots[message.name].send_message(message.payload)
 
+    async def _unverify_run_epochs(self) -> None:
+        """Maps §14.13: at start, before any robot message is handled, no robot's run is known
+        to continue (it may have restarted while dispatch was down): continuity_known = false
+        until each robot's first state message decides. Never raises."""
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.RUN_EPOCH_UNVERIFY_ALL_SQL)
+                    self.info(f"Run epochs of {cursor.rowcount} robots to re-check")
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Run epochs not reset ({err}); placements may not be reused")
+
     async def _run(self):
         await self._database.async_init()
+        await self._unverify_run_epochs()
         if self.fleet_recorder is not None:
             # Before the watchers start, so detectors are rehydrated and the orphan
             # reconciliation is queued ahead of any run this process starts. Bounded and
@@ -2506,7 +2663,8 @@ class RobotServer:
                 self.warning(f"Fleet recording failed to start: {err}")
         tasks = [
             self._watch_changes(api_objects.MissionObjectV1, self._mission_changes),
-            self._watch_changes(api_objects.RobotObjectV1, self._robot_changes),
+            self._watch_changes(api_objects.RobotObjectV1, self._robot_changes,
+                                self.robot_writer_id),
             self._handle_robot_changes(),
             self._handle_mission_changes(),
             self._handle_mqtt_messages()
