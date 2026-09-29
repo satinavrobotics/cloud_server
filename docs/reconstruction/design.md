@@ -1,8 +1,8 @@
 # SatiNav Maps: 3D reconstruction
 
-**Status:** design, revised 2026-09-29. Not built. Build order: reconstruction starts **after
-maps U6** (in progress now; `docs/satinav-maps-redesign.md` §14.9). The spec for the external
-service's developer is [`handover.md`](handover.md).
+**Status:** design, revised 2026-09-29. **R2 and R3 built 2026-09-29, not deployed** (§12.1;
+deploy `~/pg-cutover/scripts/recon.sh`, dry run passed). R1, R4, R5 elsewhere. The spec for the
+external service's developer is [`handover.md`](handover.md).
 
 **Revision 2026-09-29 (user decision):** the reconstruction runs in a **separate FastAPI
 service in its own repository**, outside cloud_server (not `~/satinavrobotics/pcconstruction`).
@@ -476,13 +476,14 @@ with `RECONSTRUCTION_MINIO_ENDPOINT`:
 | Gateway logic: SQL, dispatcher, manifest builder, presigning, callbacks, finish/commit, stale digest, file streaming | `packages/api/reconstruction.py` (pure helpers testable without I/O) |
 | httpx client for the service | `packages/api/reconstruction_client.py` |
 | Client routes + callback routes | `packages/api/main.py` (logic in `reconstruction.py`) |
-| Migration | `packages/api/migrations/versions/<date>_01_map_reconstructions.py`, `down_revision` = head at build time (today `20261001_01_run_epochs`) |
+| Migration | `packages/api/migrations/versions/20261003_01_map_reconstructions.py`, `down_revision` = `20261002_01_drop_current_map` (built) |
 | Map delete hook | `packages/api/map_delete.py`: in `request()` (same transaction as `MARK_SQL`) mark the active job `cancelled` (`map_deleting`), then gateway cancel; in `_finish`, `DELETE FROM map_reconstructions WHERE map_name = %s` next to `SESSIONS_SQL` |
 | Events | `packages/events/codes.py`, `packages/events/schemas.py`, source `reconstruction` |
 | Depth ingest | `packages/services/graph_builder/` (R2), `get_stats` filter in `packages/topomap_dbs/image_db/server.py` |
 | Docs | `packages/api/README.md` (routes), `CLAUDE.md` (data flow: the external service) |
 
-Nothing goes into `docker_compose/`: the service has its own repo and its own deployment.
+The service goes nowhere in `docker_compose/`: it has its own repo and its own deployment. (As
+built, compose only passes the API its `RECONSTRUCTION_*` settings, §12.1.)
 
 ### 6.9 Config keys (`packages/config.py`)
 
@@ -793,8 +794,8 @@ costmap lines up with the reconstruction.
 | Step | Content | Repo | Needs |
 |---|---|---|---|
 | R1 | Topomap depth capture (§4): nearest-stamp ≤ 80 ms, u16 mm PNG, camera params per node (cached `camera_info` + static TF), `robot_pose3d`, `robot/depth_upload`; codec/matcher unit tests; `enable_dense_depth:=true` in the navstack launch; verify optical frame and z depth (Q-R1) | sati_ros_navstack | — |
-| R2 | graph-builder depth ingest (§5): `MQTT_DEPTH_TOPIC`, PNG in MinIO, `depth.{cam}` on the node, `pose3d_map`, `get_stats` filter, `dropped_depth` | cloud_server | — |
-| R3 | Gateway (§6, §8, §9): config, migration, `reconstruction.py` + client, routes, callbacks, dispatcher, staging bucket, events, map-delete hook, stub-service integration test, README | cloud_server | the §5 node shape (not R2's code) |
+| R2 | graph-builder depth ingest (§5): `MQTT_DEPTH_TOPIC`, PNG in MinIO, `depth.{cam}` on the node, `pose3d_map`, `get_stats` filter, `dropped_depth` — **built 2026-09-29** (§12.1) | cloud_server | — |
+| R3 | Gateway (§6, §8, §9): config, migration, `reconstruction.py` + client, routes, callbacks, dispatcher, staging bucket, events, map-delete hook, stub-service integration test, README — **built 2026-09-29** (§12.1) | cloud_server | the §5 node shape (not R2's code) |
 | R4 | The reconstruction service, per `handover.md`, tested standalone with the synthetic scene | own repo | the contract only |
 | R5 | Client: reconstruction row, polling, `reconstruction` layer (local + geo) | sati-client | R3's API (can start on mocked responses) |
 | R6 | Deploy (cloud: `~/pg-cutover/scripts/recon.sh`, `--dry-run` with the migration on a throwaway copy; then API and graph-builder; the service by its own deploy), robot rollout, sim end-to-end | all | R1–R5 |
@@ -802,6 +803,59 @@ costmap lines up with the reconstruction.
 **Parallel:** R1, R2, R3 and R4 can all run at the same time (the MQTT topic, the node shape of
 §5 and the manifest/callback contract decouple them). R5 can start with R3 and finishes after
 it. R6 needs everything.
+
+### 12.1 R2 and R3 as built (2026-09-29, not deployed)
+
+**R2** (`packages/services/graph_builder/ingest.py`, `server.py`):
+
+- `robot/depth_upload` is validated cheaply (`check_depth_payload`: fields, `u16_mm`,
+  `image/png`, scale > 0, a `robot_pose3d` with all 7 values or null), resolved by session like an
+  image, and buffered per `(robot, session_node_id)` until the node exists (R1 publishes depth
+  **before** `node_update`; ordering is not a drop). A malformed message is an error, not a
+  rejection. A buffered depth of another session or older than `IMAGE_BUFFER_TIMEOUT` is
+  discarded when its node arrives.
+- The PNG is stored first (`ImageDatabaseService.store_depth`, `{node}/depth/{camera}.png`),
+  then `depth.{camera}` with one AQL `UPDATE … MERGE(d.depth, {[cam]: rec})`
+  (`GraphDatabaseService.set_node_depth`), so two cameras of a node never overwrite each other
+  and a node never names a PNG that is not there.
+- `robot_pose3d: null` (TF had no pose at the depth stamp) → no `robot_pose3d`/`pose3d_map` on
+  the node; the manifest then has no `pose3d` and the service uses the 2D node pose (§3).
+  `valid_range_m` is stored as reported; nothing applies it at ingest.
+- `pose3d_map`: x/y through `map_T_session`, z kept, orientation `Rz(yaw)·q` (roll and pitch
+  unchanged), quaternion normalized.
+- `MAP.INGEST_REJECTED` gains `dropped_depth` (optional; absent on older events); stats
+  `depth_saved`, `depth_rejected`, `buffered_depth`.
+- `get_stats(map)` counts only `{node}/images/*` as images and `{node}/{images,depth}/*` parents
+  as nodes (`reconstruction/` is not a node); new `depth_count`.
+
+**R3** (`packages/api/reconstruction.py`, `reconstruction_client.py`, routes in `main.py`):
+as §6, §8, §9, with these details and deviations:
+
+- Table: three columns beyond §8.1: `cancel_requested_at` (the 60 s cancel grace), `frames_done`,
+  `frames_total` (the progress in the status body).
+- `GET` also returns `configured`; `cancel` without an active job is 404 `no_active_job`.
+  `DELETE` ends a running job `cancelled` at once (the service gets a best-effort cancel).
+- A `finish` after the user asked to cancel ends the job `cancelled` (410), the result is not
+  kept. A repeated `finish` for an already committed attempt answers 200 (idempotent).
+- Queue timeout is measured from the last send (`dispatched_at`) or, if never sent, from
+  `requested_at`, so the automatic retry of an old job is not failed at once.
+  `waiting_for_service` = queued with a send error (`error.reason = service_unavailable`; the
+  error is hidden from the client while queued).
+- A 409 (stale attempt) from `POST /jobs` skips to the next attempt number; a job is tried once
+  per dispatcher pass.
+- The startup orphan sweep removes `reconstruction/{job}/` prefixes whose job is neither
+  `running` nor `succeeded` (not "not succeeded": another worker may be copying a running job's
+  files in a finish callback).
+- The dispatcher runs only when the service is configured, on the worker holding the advisory
+  lock `reconstruction_dispatcher`; a POST wakes it on its own worker (others wait ≤ 5 s).
+- `docker_compose/mission_dispatch_services.yaml` passes the five `RECONSTRUCTION_*` settings
+  that matter for deployment into the API (empty = off). Nothing else in compose.
+- The map delete hook is two optional `MapDeleter` callbacks (`on_mark` in the marking
+  transaction, `after_mark` after it), so `map_delete.py` does not import the gateway.
+- Tests: `tests/unit/test_map_reconstruction_ingest.py`, `test_map_reconstruction_gateway.py`
+  (in-memory repo; routes over ASGI), and `tests/integration/reconstruction/run.sh` (stub service,
+  graph-builder and API from the checkout, MinIO reached by the stub under the alias
+  `minio-public` = `RECONSTRUCTION_MINIO_ENDPOINT`; ~4 min).
 
 ---
 
