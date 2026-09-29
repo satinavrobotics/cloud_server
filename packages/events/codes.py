@@ -52,6 +52,7 @@ class EventCode(str, enum.Enum):
     MAP_SESSION_FINISHED = "MAP.SESSION_FINISHED"
     MAP_DELETED = "MAP.DELETED"
     MAP_INGEST_REJECTED = "MAP.INGEST_REJECTED"
+    MAP_SESSION_REALIGNED = "MAP.SESSION_REALIGNED"
 
 
 class Severity(str, enum.Enum):
@@ -133,6 +134,9 @@ CODES: Dict[EventCode, CodeMeta] = {
     # robot and reason (packages/services/graph_builder/ingest.py).
     _C.MAP_DELETED: CodeMeta(_S.INFO, True, schemas.MapDeleted, _A),
     _C.MAP_INGEST_REJECTED: CodeMeta(_S.WARNING, True, schemas.MapIngestRejected, _G),
+    # A geo session re-anchored to the robot's new datum after a robot restart (graph-builder).
+    # Discriminator `session:<id>:realigned:<tx>:<ty>:<yaw>`.
+    _C.MAP_SESSION_REALIGNED: CodeMeta(_S.INFO, True, schemas.MapSessionRealigned, _G),
 }
 
 

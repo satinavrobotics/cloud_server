@@ -14,9 +14,21 @@ at most) or is dropped:
     session_mismatch  the payload carries a `session_id` that is not the open session (robot-side
                       tagging is M3; a payload without `session_id` is accepted)
     datum_changed     geo session: the robot's current datum is not the one the session was
-                      started with (a new robot run: its frame moved, so map_T_session is stale).
-                      Finish the session and start a new one (or re-assign the map, the shim)
+                      started with (a new robot run: its frame moved) and cannot be used to
+                      re-anchor the session (see below: a datum in another UTM zone, a map
+                      without an origin); a local map's session too. Finish the session and
+                      start a new one
     lookup_failed     Postgres could not be asked
+
+Realignment (a robot restart mid-session on a GEO map): the robot takes a new datum at every
+navstack start, and a geo map's frame is absolute (UTM grid metres from the map's `geo` origin),
+so the session's map_T_session is re-derived from the new datum (map_geo.session_transform) and
+stored with it in `map_sessions` (`plan_realign`, `REALIGN_SQL`), and MAP.SESSION_REALIGNED is
+recorded. The update is a compare-and-set on the old stored datum, so concurrent ingests agree:
+one wins and writes the event, the others re-read the session and use the stored transform.
+Nodes stored before keep their map-frame poses; nothing links the last node before the restart
+to the first after (edges are proximity edges, as always). A local map has no absolute frame and
+still rejects (`datum_changed`), as does a datum outside the map's UTM zone / hemisphere.
 
 The robot is taken from the payload's `robot_name`; any `map_id` in the payload is ignored.
 
@@ -36,8 +48,10 @@ Poses: a node's robot-frame pose (x, y, yaw) becomes `pose` = map_T_session appl
 
 import dataclasses
 import datetime
+import json
 import logging
 import time
+import uuid as uuid_t
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from packages.events.codes import EventCode, Source
@@ -67,11 +81,15 @@ _M_TOL = 1e-4
 # One row per robot at most (partial unique index map_sessions_one_open_per_robot).
 OPEN_SESSION_SQL = (
     "SELECT s.session_id, s.map_name, s.paused_at IS NOT NULL, s.map_t_session, "
-    "m.lifecycle, m.status->>'state', s.datum, r.spec->'datum' "
+    "m.lifecycle, m.status->>'state', s.datum, r.spec->'datum', "
+    "m.spec->'geo', m.spec->>'type' "
     "FROM map_sessions s LEFT JOIN mapobjectv1 m "
     "ON m.name = s.map_name AND m.lifecycle <> 'DELETED' "
     "LEFT JOIN robotobjectv1 r ON r.name = s.robot_name AND r.lifecycle <> 'DELETED' "
     "WHERE s.robot_name = %s AND s.ended_at IS NULL")
+# Compare-and-set on the datum read: only the ingest that saw the old datum wins (rowcount 1).
+REALIGN_SQL = ("UPDATE map_sessions SET datum = %s::jsonb, map_t_session = %s::jsonb "
+               "WHERE session_id = %s AND ended_at IS NULL AND datum = %s::jsonb")
 COUNT_SQL = "UPDATE map_sessions SET node_count = node_count + %s WHERE session_id = %s"
 
 
@@ -86,14 +104,17 @@ class OpenSession:
     map_state: Optional[str]
     session_datum: Optional[Dict[str, Any]] = None  # set for geo sessions only
     robot_datum: Optional[Dict[str, Any]] = None    # the robot's datum now (map_geo shape)
+    map_geo: Optional[Dict[str, Any]] = None        # the map's `geo` block (geo maps)
+    map_type: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: Tuple) -> "OpenSession":
-        session_id, map_name, paused, transform, lifecycle, state, sdatum, rdatum = row
+        session_id, map_name, paused, transform, lifecycle, state, sdatum, rdatum = row[:8]
+        mgeo, mtype = (row[8], row[9]) if len(row) >= 10 else (None, None)
         t = dict(map_geo.IDENTITY)
         t.update({k: float(v) for k, v in (transform or {}).items() if k in t})
         return cls(str(session_id), map_name, bool(paused), t, lifecycle, state or "ready",
-                   sdatum or None, map_geo.robot_datum(rdatum or {}))
+                   sdatum or None, map_geo.robot_datum(rdatum or {}), mgeo or None, mtype)
 
 
 def same_datum(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
@@ -149,6 +170,56 @@ def decide(robot_name: str, session: Optional[OpenSession],
     return Resolution(robot_name, session, reason, psid)
 
 
+@dataclasses.dataclass(frozen=True)
+class Realign:
+    """The new anchor of a geo session after the robot's datum changed."""
+    datum: Dict[str, Any]
+    map_t_session: Dict[str, float]
+
+
+def plan_realign(session: OpenSession) -> Optional[Realign]:
+    """How to re-anchor a geo session whose robot took a new datum, or None when it cannot be
+    (then the ingest rejects with `datum_changed`): a geo session on a geo map with an origin,
+    and a new datum that lies in the map's UTM zone and hemisphere. Pure."""
+    old, new, geo_block = session.session_datum, session.robot_datum, session.map_geo
+    if old is None or new is None or same_datum(old, new):
+        return None
+    if session.map_type == "local" or not geo_block:
+        return None
+    try:
+        zone, north = int(geo_block["utm_zone"]), bool(geo_block["utm_north"])
+        float(geo_block["origin_e"])
+        float(geo_block["origin_n"])
+        dzone, dnorth, _e, _n = map_geo.datum_utm(new)
+        if dzone != zone or dnorth != north:
+            return None
+        transform = map_geo.session_transform(geo_block, new)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return Realign(dict(new), transform)
+
+
+def realign_event(robot_name: str, session: OpenSession, plan: Realign,
+                  ts: datetime.datetime) -> Event:
+    """MAP.SESSION_REALIGNED for a won realignment."""
+    t = plan.map_t_session
+    return Event(EventCode.MAP_SESSION_REALIGNED, ts, robot_name=robot_name,
+                 source=Source.GRAPH_BUILDER,
+                 discriminator=(f"session:{session.session_id}:realigned:"
+                                f"{t['tx']:.4f}:{t['ty']:.4f}:{t['yaw']:.6f}"),
+                 payload={"map_name": session.map_name, "session_id": session.session_id,
+                          "map_state": session.map_state, "aligned": True,
+                          "map_T_session": dict(t),
+                          "old_map_T_session": dict(session.map_t_session),
+                          "datum": plan.datum, "old_datum": session.session_datum})
+
+
+def realign_params(session: OpenSession, plan: Realign) -> Tuple[str, str, uuid_t.UUID, str]:
+    """Parameters of REALIGN_SQL."""
+    return (json.dumps(plan.datum), json.dumps(plan.map_t_session),
+            uuid_t.UUID(session.session_id), json.dumps(session.session_datum))
+
+
 def map_pose(transform: Mapping[str, float], x: float, y: float,
              yaw: float) -> Tuple[float, float, float]:
     """A robot-frame pose in the map frame: map_T_session applied, yaw wrapped to (-pi, pi]."""
@@ -162,8 +233,11 @@ class SessionResolver:
     passes a Postgres query, tests a fake). A failing fetch is not cached."""
 
     def __init__(self, fetch: Callable[[str], Any], ttl: float = SESSION_CACHE_TTL_S,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 realign: Optional[Callable[..., Any]] = None):
         self._fetch = fetch
+        # async (robot_name, session, Realign) -> bool: the compare-and-set + event; True = won.
+        self._realign = realign
         self.ttl = ttl
         self._clock = clock
         self._cache: Dict[str, Tuple[float, Optional[OpenSession]]] = {}
@@ -187,7 +261,32 @@ class SessionResolver:
             logger.warning("Session lookup for %s failed: %s", robot_name, exc)
             psid = str(payload_session_id) if payload_session_id not in (None, "") else None
             return Resolution(robot_name, None, LOOKUP_FAILED, psid)
-        return decide(robot_name, session, payload_session_id)
+        resolution = decide(robot_name, session, payload_session_id)
+        if resolution.reason == DATUM_CHANGED and self._realign is not None:
+            resolution = await self._try_realign(robot_name, session, payload_session_id,
+                                                 resolution)
+        return resolution
+
+    async def _try_realign(self, robot_name: str, session: OpenSession,
+                           payload_session_id: Any, rejected: Resolution) -> Resolution:
+        """Re-anchor a geo session after a datum change (module docstring), then decide again on
+        the session as stored. Losing the compare-and-set to a concurrent ingest, or any failure,
+        re-reads (or keeps) the state as it is; still-unusable means the rejection stands."""
+        plan = plan_realign(session)
+        if plan is None:
+            return rejected
+        try:
+            won = await self._realign(robot_name, session, plan)
+            if won:
+                logger.info("Realigned session %s of %s to its new datum (map_T_session %s)",
+                            session.session_id, robot_name, plan.map_t_session)
+            self.invalidate(robot_name)
+            fresh = await self.open_session(robot_name)
+        except Exception as exc:  # noqa: BLE001 - Postgres down: keep the rejection
+            logger.warning("Realigning %s failed: %s", robot_name, exc)
+            self.invalidate(robot_name)
+            return rejected
+        return decide(robot_name, fresh, payload_session_id)
 
     def invalidate(self, robot_name: Optional[str] = None) -> None:
         if robot_name is None:

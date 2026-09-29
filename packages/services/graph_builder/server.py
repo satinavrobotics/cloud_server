@@ -20,7 +20,7 @@ import base64
 import asyncio
 import uuid
 from typing import Dict, Any, Optional, List, Union, Set, Tuple
-from datetime import datetime
+from datetime import datetime, timezone as _dt_timezone
 from collections import defaultdict
 
 import math
@@ -188,7 +188,8 @@ class GraphBuilderService:
             required_tables=("map_sessions", "fleet_events"),
         )
         # Where a robot's data goes (its open mapping session), and the drop reports.
-        self.sessions = ingest.SessionResolver(self._fetch_open_session, ttl=session_cache_ttl)
+        self.sessions = ingest.SessionResolver(self._fetch_open_session, ttl=session_cache_ttl,
+                                               realign=self._realign_session)
         self.rejects = ingest.RejectLimiter(interval=reject_event_interval)
 
         # Initialize service clients
@@ -325,6 +326,20 @@ class GraphBuilderService:
         async with self.database.connection() as conn:
             cursor = await conn.execute(ingest.OPEN_SESSION_SQL, (robot_name,))
             return await cursor.fetchone()
+
+    async def _realign_session(self, robot_name: str, session: "ingest.OpenSession",
+                               plan: "ingest.Realign") -> bool:
+        """Store the session's new datum and map_T_session (compare-and-set on the old datum)
+        and record MAP.SESSION_REALIGNED in the same transaction. True: this call won."""
+        async with self.database.connection() as conn:
+            cursor = await conn.execute(ingest.REALIGN_SQL,
+                                        ingest.realign_params(session, plan))
+            if cursor.rowcount != 1:
+                return False
+            await emit(conn, ingest.realign_event(
+                robot_name, session, plan, datetime.now(_dt_timezone.utc)))
+        self.stats["realigned_sessions"] = self.stats.get("realigned_sessions", 0) + 1
+        return True
 
     async def _count_nodes(self, session_id: str, count: int = 1) -> None:
         """map_sessions.node_count += count. A failure is logged: the node is stored already."""

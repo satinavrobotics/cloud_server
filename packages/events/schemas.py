@@ -222,6 +222,20 @@ class MapSession(Payload):
     actor: Optional[str] = None
 
 
+class MapSessionRealigned(Payload):
+    """MAP.SESSION_REALIGNED (packages/services/graph_builder/ingest.py): the robot took a new
+    datum mid-session (a restart); the geo session's map_T_session was re-derived from it.
+    Nodes stored before keep their map-frame poses."""
+    map_name: str
+    session_id: str
+    map_state: Optional[str] = None
+    aligned: Optional[bool] = None
+    map_T_session: Dict[str, float]
+    old_map_T_session: Optional[Dict[str, float]] = None
+    datum: Optional[Dict[str, Any]] = None
+    old_datum: Optional[Dict[str, Any]] = None
+
+
 class MapDeleted(Payload):
     """MAP.DELETED (packages/api/map_delete.py): the background delete finished; the map's
     Postgres row, sessions, ArangoDB graph and MinIO bucket are gone."""

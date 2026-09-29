@@ -67,6 +67,8 @@ VALID_PAYLOADS = {
                                      "map_state": "ready", "aligned": False},
     EventCode.MAP_DELETED: {"map_name": "yard", "requested_at": "2026-09-29T08:00:00+00:00",
                             "attempts": 1},
+    EventCode.MAP_SESSION_REALIGNED: {"map_name": "yard", "session_id": "s1",
+                                      "map_T_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.1}},
     EventCode.MAP_INGEST_REJECTED: {"reason": "session_paused", "dropped_nodes": 3,
                                     "dropped_images": 6, "since": "2026-09-29T08:00:00+00:00",
                                     "map_name": "yard", "map_state": "paused",
