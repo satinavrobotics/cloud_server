@@ -107,6 +107,9 @@ Fields:
   stamp. When present it **replaces** `pose` for that camera (§5).
 - `nodes` is sorted by capture time. Only frames with depth are included.
 - `map.crs` is `null` for a local map. It is copied into the outputs and not used for math.
+- `params` are the cloud's defaults (tuned indoors). The service owns the real defaults: it may
+  use other values per map (e.g. outdoor, from `map.type` or the extent of the poses) and must
+  report what it used in `meta.json`.
 
 Responses:
 

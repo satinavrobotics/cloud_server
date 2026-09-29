@@ -456,16 +456,16 @@ A failed or cancelled job never touches the previous good result.
   tailnet; the API has no per-user auth today). `requested_by` is filled when an identity
   exists.
 
-**MinIO endpoint for presigning.** MinIO runs with host networking on port 9000 and listens on
-all interfaces. A presigned URL embeds the host it was signed for, and SigV4 signs the `Host`
+**MinIO endpoint for presigning.** MinIO runs with host networking on port 9000 and, since
+2026-09-29 (`c76b782`), listens only on `127.0.0.1` and, through the `minio-tailnet` proxy, the
+Tailscale IP; never the LAN or the internet. A presigned URL embeds the host it was signed for, and SigV4 signs the `Host`
 header, so a URL **cannot be rewritten** after signing (`MinioBase._rewrite_presigned_url`
 is a no-op for this reason). The gateway therefore presigns with a second MinIO client created
 with `RECONSTRUCTION_MINIO_ENDPOINT`:
 
 - Service on the same host: `localhost:9000` (default).
 - Service on another host: the cloud host's Tailscale name or IP, e.g. `sati-cloud:9000`, which
-  the service host must resolve and reach. The cloud host's firewall must allow 9000 from the
-  tailnet only.
+  the service host must resolve and reach over the tailnet.
 - The presign client gets `region="us-east-1"` so presigning makes no network call.
 
 ### 6.8 Where things go in cloud_server
@@ -838,10 +838,13 @@ it. R6 needs everything.
 - **Q-R3 (decided 2026-09-29).** Odin sends **dense** depth (`odin1/depth_dense_image`).
 - **Q-R4 (decided 2026-09-29).** Rebuild only from the button.
 - **Q-R5.** Set a broker `max_packet_size` guard (e.g. 4 MB) now?
-- **Q-R6.** Default voxel and clip height (5 cm, floor + 2 m); different for outdoor maps?
+- **Q-R6 (decided 2026-09-29).** The service owns its defaults, outdoor ones included. The
+  manifest's `params` are the gateway's defaults (5 cm, floor + 2 m); the service may use other
+  values per map and reports what it used in `meta.json`.
 - **Q-R7.** Cameras other than `left`: supported by the design, none exists today.
 - **Q-R8 (decided 2026-09-29).** The service is external (own repo, any host), reached through
   a gateway with presigned URLs and callbacks.
-- **Q-R9.** Where does the service run first (this host, or which GPU host), and its repo name?
-- **Q-R10.** Is MinIO port 9000 on the cloud host reachable only from the tailnet today? A
-  remote service needs it from the tailnet, and it must not be public.
+- **Q-R9 (decided 2026-09-29).** It runs on the cloud host first, so
+  `RECONSTRUCTION_MINIO_ENDPOINT` stays `localhost:9000`. Repo name still open.
+- **Q-R10 (fixed 2026-09-29).** MinIO listened on every interface; it now listens on localhost
+  and the Tailscale IP only (`c76b782`).

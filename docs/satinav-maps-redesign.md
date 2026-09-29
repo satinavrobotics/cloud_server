@@ -462,7 +462,7 @@ counts per session. `since`: when `enabled` last flipped.
 
 ## 14. Using maps: operate sessions and the map window
 
-**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client; U7 (placement reuse, §14.13, with the stale-`ON_TASK` fix) built, not deployed; U6 (removals, §14.14) built on the cloud side, not deployed. Revises the M5–M7 plan (§14.9).
+**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client; U7 (placement reuse, §14.13, with the stale-`ON_TASK` fix) **deployed 2026-09-29**; U6 (removals, §14.14) built in cloud_server and sati-client, not deployed. Revises the M5–M7 plan (§14.9).
 
 ### 14.1 The gap
 
@@ -704,7 +704,7 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 | U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
 | U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server; cloud **deployed 2026-09-29** (in the `mapsu1.sh` build of main; `mapsu5.sh` then found the image unchanged), robot topomap rebuild pending (§14.12) |
 | U7 | Placement reuse across sessions (§14.13): `robot_run_epochs`, `map_sessions.run_epoch`, carry on start, `placement_reusable`; with it the stale-`ON_TASK` fix (§14.11) | cloud_server (`mapsu7.sh`), sati-client (Use skips place mode when reusable) |
-| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server (**built 2026-09-29**, not deployed: §14.14, `mapsu6.sh`, after `mapsu7.sh` and the U6 client), sati-client |
+| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server (**built 2026-09-29**, not deployed: §14.14, `mapsu6.sh`, after `mapsu7.sh` and the U6 client), sati-client (**built 2026-09-29**) |
 | M5 | One `MapView` (unchanged goal; its local/geo rendering starts from U4's preview) | sati-client; **built 2026-09-29** (`6798aa0..c39953b`): `MapView` replaces CostmapRenderer and GeoMap; robots drawn through `map_T_session`, or without a session through their own datum (fixes the −1.445° marker). Left: costmap bitmaps still drawn in the run frame; `current_map` readers go in U6 |
 | M6 | **Shrinks** to aligning *existing* unaligned sessions (legacy data), since new ones are placed before capture. Drop it if none remain | cloud_server, sati-client |
 | M7 | Grid storage and display once `sati_grid_mapping` exists; it plugs in as service `grid` | all |
@@ -770,7 +770,7 @@ Deploy order: the robot and the cloud are independent (a U5 topomap talks to a U
 
 ### 14.13 Placement reuse across sessions (U7)
 
-**Status:** built 2026-09-29, not deployed (`~/pg-cutover/scripts/mapsu7.sh`: migration `20261001_01_run_epochs`, rebuilds api-delegation-service and mission-dispatch).
+**Status:** built and **deployed 2026-09-29** (`~/pg-cutover/scripts/mapsu7.sh`: migration `20261001_01_run_epochs`, rebuilds api-delegation-service and mission-dispatch).
 
 "Use" on a local map needed a placement every time unless the robot's *open* session was on the same map (`replace`, §14.11). Now a session started on a **local** map **without** `placement` (operate or mapping) is placed from the robot's **most recent finished session on that map** when that session ended placed and the robot's run has not changed since. The new session gets that session's `map_T_session`, `aligned = true`, `placement = {source: "session", from_session_id, at}`; `MAP.SESSION_STARTED` carries it as for the `replace` carry-over. A `placement` in the request always wins; geo maps are unaffected (their datum places them); another map's sessions never count; if the most recent session on the map ended unplaced (a run change), nothing is carried even if an older one was placed.
 
