@@ -4,9 +4,12 @@
 # reconstruction service (stub_service.py) that speaks the handover.md contract. Checks the
 # plumbing: presigned URLs work from another container and carry RECONSTRUCTION_MINIO_ENDPOINT
 # (MinIO is reached by the stub under the alias `minio-public`, by the API under its container
-# name), staging copy, supersede, stale, cancel, map delete mid-job (late PUT and late callback
-# harmless, no bucket re-created), stub down -> queued then service_unavailable, stub loses the
-# job -> resubmit. Then the migration: downgrade -1 and upgrade again.
+# name), staging copy, the top view derived by the API from the stub's cloud.ply (the stub
+# uploads only cloud.ply + meta.json), supersede, stale, cancel, map delete mid-job (late PUT
+# and late callback harmless, no bucket re-created), stub down -> queued then
+# service_unavailable, stub loses the job -> resubmit. Then the migration: downgrade -1 and
+# upgrade again. Without numpy in TEST_IMAGE, a throwaway image with it is built (removed on
+# exit).
 #
 #   tests/integration/reconstruction/run.sh [TEST_IMAGE]
 #
@@ -41,6 +44,7 @@ cleanup() {
   docker rm -f "$ID-db" "$ID-py" "$ID-arango" "$ID-minio" "$ID-mqtt" "$ID-gb" "$ID-api" \
     "$ID-stub" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
+  [ "$IMAGE" = "$ID-image" ] && docker rmi "$ID-image" >/dev/null 2>&1 || true
   rm -rf "$CONF"
   exit $status
 }
@@ -80,6 +84,15 @@ wait_log() {  # wait_log CONTAINER TEXT
   echo "$1 did not log '$2'"; docker logs --tail 40 "$1"; return 1
 }
 checks() { run_py python tests/integration/reconstruction/checks.py "$@"; }
+
+step "test image with numpy (the API derives the top view with it; packages/api/requirements.txt)"
+if ! docker run --rm --network none --memory=256m "$IMAGE" python -c "import numpy" \
+    >/dev/null 2>&1; then
+  printf 'FROM %s\nRUN pip install --no-cache-dir numpy==1.26.4\n' "$IMAGE" \
+    | docker build -q -t "$ID-image" - >/dev/null
+  IMAGE="$ID-image"
+fi
+echo "  $IMAGE"
 
 step "network + postgres, arangodb, minio (alias minio-public), mosquitto"
 docker network create --internal "$NET" >/dev/null

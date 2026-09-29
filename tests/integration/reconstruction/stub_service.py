@@ -1,7 +1,8 @@
 """A stub reconstruction service for tests/integration/reconstruction (docs/reconstruction/
 handover.md §2-§3): it speaks the contract but computes nothing. For each job it GETs every
-input URL (recording status, host and sha256 of what came back), PUTs small fixed outputs to
-the presigned PUT URLs and calls back.
+input URL (recording status, host and sha256 of what came back), PUTs the two outputs of the
+contract (handover §7: a small synthetic cloud.ply, SCENE, and meta.json; the gateway derives
+the top view from the PLY) to the presigned PUT URLs and calls back.
 
     POST /jobs, GET /jobs/{id}, POST /jobs/{id}/cancel, GET /health  (the contract)
     POST /control {"mode": ...}   test control (no auth):
@@ -19,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import os
+import struct
 import urllib.parse
 
 import httpx
@@ -33,8 +35,27 @@ JOBS = {}       # job_id -> status dict
 RELEASE = {}    # job_id -> asyncio.Event
 CANCEL = {}     # job_id -> asyncio.Event
 RECORD = {"manifests": [], "fetches": [], "puts": [], "callbacks": []}
-META = {"version": 1, "map_name": None, "job_id": None, "frame": "map", "resolution_m": 0.05,
-        "origin": {"x": 0.0, "y": 0.0}, "width": 2, "height": 2, "points": 3}
+VOXEL_M = 0.1
+# The synthetic cloud (map frame): a 1 m x 0.5 m grey floor at z 0 (points on the 0.1 m cell
+# centres), a blue box top at z 0.5 over (0.35, 0.25), a red wall point at z 1.2 over
+# (0.75, 0.25) and a white ceiling point at z 2.5 over (0.55, 0.25), above floor + clip_z.
+SCENE = ([(0.05 + 0.1 * i, 0.05 + 0.1 * j, 0.0, 128, 128, 128)
+          for i in range(10) for j in range(5)]
+         + [(0.35, 0.25, 0.5, 40, 40, 200), (0.75, 0.25, 1.2, 200, 40, 40),
+            (0.55, 0.25, 2.5, 240, 240, 240)])
+META = {"version": 1, "map_name": None, "job_id": None, "map_type": "local", "frame": "map",
+        "crs": None, "bounds3d": {"min": [0.05, 0.05, 0.0], "max": [0.95, 0.45, 2.5]},
+        "points": len(SCENE), "voxel_m": VOXEL_M}
+
+
+def cloud_ply(manifest):
+    """cloud.ply as handover §7.1 specifies it (binary little-endian, 17 bytes a vertex)."""
+    header = ("ply\nformat binary_little_endian 1.0\n"
+              f"comment satinav map={manifest['map']['name']} job={manifest['job_id']} "
+              f"voxel_m={VOXEL_M} frame=map\nelement vertex {len(SCENE)}\n"
+              "property float x\nproperty float y\nproperty float z\nproperty uchar red\n"
+              "property uchar green\nproperty uchar blue\nproperty ushort count\nend_header\n")
+    return header.encode() + b"".join(struct.pack("<fffBBBH", *p, 1) for p in SCENE)
 
 
 def _auth(authorization):
@@ -44,9 +65,7 @@ def _auth(authorization):
 
 def _outputs(manifest):
     meta = dict(META, map_name=manifest["map"]["name"], job_id=manifest["job_id"])
-    return {"cloud": b"ply\nformat binary_little_endian 1.0\nelement vertex 0\nend_header\n",
-            "ortho": b"\x89PNG-ortho-stub", "height": b"\x89PNG-height-stub",
-            "meta": json.dumps(meta).encode()}
+    return {"cloud": cloud_ply(manifest), "meta": json.dumps(meta).encode()}
 
 
 async def _callback(client, manifest, kind, body):
@@ -99,8 +118,8 @@ async def _run(manifest, mode):
             RECORD["puts"].append({"job_id": job_id, "name": name, "status": r.status_code,
                                    "host": urllib.parse.urlsplit(out["url"]).netloc})
             outputs[name] = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-        result = {"points": 3, "frames_total": 1, "frames_used": 1,
-                  "frames_skipped": {"no_valid_depth": 0}, "voxel_m": 0.05,
+        result = {"points": len(SCENE), "frames_total": 1, "frames_used": 1,
+                  "frames_skipped": {"no_valid_depth": 0}, "voxel_m": VOXEL_M,
                   "bounds3d": {"min": [0, 0, 0], "max": [1, 1, 1]}, "duration_s": 0.1}
         status.update(state="succeeded", stage="uploading", progress=1.0, result=result,
                       outputs=outputs)

@@ -6,9 +6,11 @@ container on the test's private network). docs/reconstruction/design.md §5, §6
                         over MQTT through graph-builder (depth sent BEFORE its node, as the robot
                         does): PNG in MinIO, depth.left + pose3d_map on the ArangoDB node
     checks.py build     POST .../reconstruction -> the stub fetches every presigned input URL
-                        from its own container (host = RECONSTRUCTION_MINIO_ENDPOINT), PUTs to
-                        staging, calls back; the gateway verifies, copies, commits; the files
-                        stream; STARTED/FINISHED events; the staging bucket and its expiry rule
+                        from its own container (host = RECONSTRUCTION_MINIO_ENDPOINT), PUTs
+                        cloud.ply + meta.json to staging, calls back; the gateway verifies,
+                        copies, derives ortho.png + height.png from the PLY (checked pixel by
+                        pixel), commits; the files stream; STARTED/FINISHED events; the staging
+                        bucket and its expiry rule
     checks.py rebuild   a second job supersedes the first (old prefix removed); a new node with
                         depth makes the result stale (new_nodes 1)
     checks.py cancel    a held job, cancelled: the stub gets the cancel, fails `cancelled`; the
@@ -249,12 +251,60 @@ def build():
           and "immutable" in r.headers["cache-control"], "meta.json streamed, immutable")
     r = api("GET", f"/api/v1/maps/{MAP}/reconstruction/files/cloud.ply")
     check(r.status_code == 200 and r.content.startswith(b"ply"), "cloud.ply streamed")
+    check_top_view(jid)
     s = status()
     check(s["reconstruction"]["stale"] is False and s["job"] is None,
           "status: current, not stale, no job")
     check(len(events("MAP.RECONSTRUCTION_STARTED", jid)) == 1
           and len(events("MAP.RECONSTRUCTION_FINISHED", jid)) == 1,
           "STARTED and FINISHED events")
+
+
+def check_top_view(jid):
+    """The stub uploaded only cloud.ply + meta.json (its SCENE); the API derived the top view
+    (design.md §7.2): z_floor = median base z of the 4 frames (0.02, 0.02, 0, 0) = 0.01, so
+    clip_abs = 2.01; res = the stub's voxel_m 0.1; every floor cell filled; the box and the
+    wall point win over the floor below them, the ceiling point is clipped away."""
+    import io
+    from PIL import Image
+    rec = stub("GET", "/record").json()
+    check(sorted(p["name"] for p in rec["puts"] if p["job_id"] == jid) == ["cloud", "meta"],
+          "the stub PUT only cloud.ply and meta.json")
+    meta = api("GET", f"/api/v1/maps/{MAP}/reconstruction/files/meta.json?v={jid}").json()
+    check(meta["map_type"] == "local" and meta["points"] == 53 and meta["job_id"] == jid,
+          "meta.json keeps the service's fields")
+    grid = {k: meta.get(k) for k in ("resolution_m", "width", "height", "z_scale", "z_offset")}
+    check(grid == {"resolution_m": 0.1, "width": 10, "height": 5, "z_scale": 0.01,
+                   "z_offset": 0.0}, f"meta.json has the cloud's grid {grid}")
+    check(abs(meta["origin"]["x"]) < 1e-9 and abs(meta["origin"]["y"]) < 1e-9
+          and abs(meta["z_floor"] - 0.01) < 1e-9 and abs(meta["clip_abs"] - 2.01) < 1e-9
+          and meta["clip_z"] == 2.0, f"origin, z_floor, clip from the manifest's poses {meta}")
+    imgs = {}
+    for name in ("ortho.png", "height.png"):
+        r = api("GET", f"/api/v1/maps/{MAP}/reconstruction/files/{name}?v={jid}")
+        check(r.status_code == 200 and r.headers["content-type"] == "image/png",
+              f"{name} streamed")
+        imgs[name] = Image.open(io.BytesIO(r.content))
+        imgs[name].load()
+    ortho, height = imgs["ortho.png"], imgs["height.png"]
+    check(ortho.mode == "RGBA" and ortho.size == (10, 5) and height.size == (10, 5)
+          and height.mode.startswith("I;16"), f"ortho RGBA 10x5, height 16-bit ({height.mode})")
+
+    def cell(x, y):  # map point -> (col, row), row 0 = +y edge
+        return int(x // 0.1), 4 - int(y // 0.1)
+    for (x, y), rgba, h in (((0.35, 0.25), (40, 40, 200, 255), 51),
+                            ((0.75, 0.25), (200, 40, 40, 255), 121),
+                            ((0.55, 0.25), (128, 128, 128, 255), 1),
+                            ((0.05, 0.45), (128, 128, 128, 255), 1)):
+        got = (ortho.getpixel(cell(x, y)), height.getpixel(cell(x, y)))
+        check(got == (rgba, h), f"top view at ({x}, {y}): {got}")
+    colours = {ortho.getpixel((c, r)) for c in range(10) for r in range(5)}
+    check((240, 240, 240, 255) not in colours and all(a == 255 for *_, a in colours),
+          "every cell filled, the ceiling clipped away")
+    s = status()["reconstruction"]
+    check(s["files"]["ortho"]["bytes"] == len(api(
+        "GET", f"/api/v1/maps/{MAP}/reconstruction/files/ortho.png?v={jid}").content),
+        "status lists the derived ortho.png with its size")
 
 
 def rebuild():
