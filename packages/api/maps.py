@@ -111,6 +111,8 @@ HISTORY_DEFAULT_LIMIT = 50
 HISTORY_MAX_LIMIT = 200
 
 SESSION_COLUMNS = ms.SESSION_COLUMNS
+# robot_latest.state_msg older than this is not used for the "robot drives" check.
+STATE_MSG_MAX_AGE = "30 seconds"
 JSONB_SESSION_COLUMNS = frozenset({"datum", "map_t_session", "placement"})
 
 # Event counters for health/debugging (as packages/api/recording.py).
@@ -384,12 +386,15 @@ class SqlStore:
 
     async def robot_state_msg(self, name: str) -> Optional[Dict[str, Any]]:
         """The robot's last VDA5050 state message (robot_latest.state_msg, written by
-        mission-dispatch), for the "robot drives" check; None when there is none. In a
-        savepoint: a missing table never aborts the caller's transaction."""
+        mission-dispatch's recorder, merged about once a second), for the "robot drives" check;
+        None when there is none or it is older than STATE_MSG_MAX_AGE (then only the robot
+        state counts). In a savepoint: a missing table never aborts the caller's
+        transaction."""
         try:
             async with self.conn.transaction():
                 await self.cursor.execute(
-                    "SELECT state_msg FROM robot_latest WHERE robot_name = %s", (name,))
+                    "SELECT state_msg FROM robot_latest WHERE robot_name = %s "
+                    "AND updated_at > now() - %s::interval", (name, STATE_MSG_MAX_AGE))
                 row = await self.cursor.fetchone()
         except Exception as exc:  # noqa: BLE001
             logger.warning("robot_latest of %s not readable (%s); the placement check uses "

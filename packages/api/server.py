@@ -1349,7 +1349,8 @@ class ApiDelegationService:
         Generate a presigned PUT URL for direct robot upload.
 
         Resolves map_id and GPS datum from the robot's current state.
-        Both are stored as sidecar metadata and may be None.
+        Both are stored as sidecar metadata and may be None. Maps §14: map_id is the map of
+        the robot's open session (null when mapless), plus that session's `session_id`.
 
         Returns dict with bag_id, upload_url, expires_in, map_id, robot_name,
         datum fields, or None on error.
@@ -1359,12 +1360,15 @@ class ApiDelegationService:
 
         # Resolve map and datum from robot state; neither is required.
         map_id = None
+        session_id = None
         datum_latitude = None
         datum_longitude = None
         datum_bearing_deg = None
         try:
             robot = await self.database.get_object(RobotObjectV1, robot_name)
-            map_id = robot.current_map
+            session = (await maps.robot_sessions(self.database)).get(robot_name)
+            if session is not None:
+                map_id, session_id = session["map"], session["session_id"]
             if robot.datum:
                 datum_latitude = robot.datum.latitude
                 datum_longitude = robot.datum.longitude
@@ -1383,6 +1387,7 @@ class ApiDelegationService:
             datum_bearing_deg=datum_bearing_deg,
             description=description,
             recorded_at=recorded_at,
+            session_id=session_id,
         )
         if result is None:
             return None
@@ -1392,6 +1397,7 @@ class ApiDelegationService:
             "upload_url": result["upload_url"],
             "expires_in": result["expires_in"],
             "map_id": map_id,
+            "session_id": session_id,
             "robot_name": robot_name,
             "datum_latitude": datum_latitude,
             "datum_longitude": datum_longitude,
@@ -1621,12 +1627,14 @@ class ApiDelegationService:
             return result
         except Exception as e:
             response = getattr(e, "response", None)
-            if getattr(response, "status_code", None) == 400:  # e.g. no map to plan on
+            status = getattr(response, "status_code", None)
+            # 400: no map to plan on; 409: the robot is not placed on the map (maps §14)
+            if status in (400, 409):
                 try:
                     detail = response.json().get("detail")
                 except Exception:  # noqa: BLE001
                     detail = None
-                raise HTTPException(status_code=400, detail=detail or str(e))
+                raise HTTPException(status_code=status, detail=detail or str(e))
             self.logger.error(f"Navigation request failed: {e}")
             return {"success": False, "error": str(e)}
 

@@ -112,9 +112,11 @@ class RosbagDatabaseService(MinIOService):
         datum_bearing_deg: Optional[float] = None,
         description: Optional[str] = None,
         recorded_at: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Write sidecar metadata and return a presigned PUT URL for the binary.
+        `session_id`: the robot's open map session (maps §14), next to its map_id.
 
         Returns dict with upload_url, bag_id, expires_in, map_id, robot_name,
         datum fields, or None on error.
@@ -127,6 +129,7 @@ class RosbagDatabaseService(MinIOService):
                 "bag_id": bag_id,
                 "robot_name": robot_name,
                 "map_id": map_id,
+                "session_id": session_id,
                 "datum_latitude": datum_latitude,
                 "datum_longitude": datum_longitude,
                 "datum_bearing_deg": datum_bearing_deg,

@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import map_geo
+from packages.utils import map_sessions
 from packages.config import GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL
 from packages.utils.geo import gps_to_local, latlon_to_utm
 DatabaseClient = PostgresDatabase
@@ -29,7 +30,21 @@ class MapResolutionError(ValueError):
     """The request names no usable map (missing map_id, robot without a current map)."""
 
 
+class RobotNotPlacedError(ValueError):
+    """The robot's open session on the map is not placed (maps §14): its position in the map
+    frame is unknown, so no path is planned from it (409 at the routes)."""
+
+
+# Maps §14.6 transition (U2 to U6): a robot without an open session on the map it is asked
+# about (the old client plans without sessions) falls back to the M2 rule
+# (map_geo.robot_frame_in_map) and robot.current_map, with a warning. U6 removes the fallback.
+SESSIONLESS_FALLBACK = True
+
+
 _MAP_SENTINELS = (GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL)
+# find_closest_node_to_robot's error text for RobotNotPlacedError (-> failed_at
+# "robot_not_placed", 409 at POST /api/v1/navigate).
+NOT_PLACED_PREFIX = "not placed: "
 
 
 def _is_real_map(map_id: Optional[str]) -> bool:
@@ -109,15 +124,38 @@ class MissionPlannerService:
             "No map_id given" + (f" ('{map_id}' is not a map)" if map_id else "") +
             ": pass map_id" + " (or give the robot a current map)")
 
+    async def _open_session(self, robot_name: str) -> Optional[Dict[str, Any]]:
+        """The robot's open session (maps §14; packages/utils/map_sessions.py), or None."""
+        async with self.database.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(map_sessions.ROBOT_SESSION_SQL, (robot_name,))
+                return map_sessions.robot_session_from_row(await cursor.fetchone())
+
+    async def _session_or_unknown(self, robot_name: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """(known, session): known is False when the lookup failed (then callers keep the M2
+        behaviour, as for a robot without a session)."""
+        try:
+            return True, await self._open_session(robot_name)
+        except Exception as e:  # pylint: disable=broad-except
+            self.logger.warning(f"Open session of {robot_name} not readable ({e}); using the "
+                                "robot's current map / datum")
+            return False, None
+
     async def _resolve_map(self, map_id: Optional[str], robot_name: Optional[str]) -> str:
-        """The map to plan on: the request's map_id, else the robot's current map, else
-        MapResolutionError (a clear 400 at the routes)."""
+        """The map to plan on: the request's map_id, else the map of the robot's open session
+        (maps §14), else (transition) the robot's current map, else MapResolutionError (a
+        clear 400 at the routes)."""
         if _is_real_map(map_id):
             return map_id
         if robot_name:
+            _known, session = await self._session_or_unknown(robot_name)
+            if session is not None:
+                return session["map_name"]
             robot = await self.get_robot_status(robot_name)
             current = getattr(robot, "current_map", None) if robot else None
-            if _is_real_map(current):
+            if _is_real_map(current) and SESSIONLESS_FALLBACK:
+                self.logger.warning(f"Robot {robot_name} has no open session; planning on its "
+                                    f"current_map '{current}' (transition fallback)")
                 return current
             if not self.default_map_id:
                 raise MapResolutionError(
@@ -148,10 +186,30 @@ class MissionPlannerService:
                                map_id: str) -> Tuple[float, float]:
         """The robot's position (robot.status.pose, its own frame) in the map's frame, for
         comparing it with node poses (maps redesign M2: nodes are stored in the map frame).
-        Identity for a local map; a geo map converts with the robot's current datum
-        (packages/utils/map_geo.py::robot_frame_in_map). Unknown (no map row, geo map and a
-        robot without a datum): the raw pose, as before M2."""
+
+        Maps §14: through the robot's open session on that map (map_T_session);
+        RobotNotPlacedError when that session is not placed. Transition fallback (no session on
+        the map, or the lookup failed): the M2 rule, identity for a local map, a geo map
+        converts with the robot's current datum (map_geo.robot_frame_in_map); unknown (no map
+        row, geo map and a robot without a datum): the raw pose, as before M2."""
         x, y = robot.status.pose.x, robot.status.pose.y
+        name = getattr(robot, "name", None)
+        try:
+            _known, session = (await self._session_or_unknown(name) if isinstance(name, str)
+                               else (False, None))
+        except Exception:  # pylint: disable=broad-except
+            _known, session = False, None
+        if session is not None and session["map_name"] == map_id:
+            if not map_sessions.is_placed(session):
+                raise RobotNotPlacedError(
+                    f"Robot '{name}' is not placed on map '{map_id}' (its run frame "
+                    "changed or it was never placed): place it on the map first")
+            return map_geo.apply_transform(session["map_t_session"], x, y)
+        if not SESSIONLESS_FALLBACK:
+            raise RobotNotPlacedError(f"Robot '{name}' is not using map '{map_id}'")
+        if _known:
+            self.logger.warning(f"Robot {name} has no open session on map '{map_id}'; "
+                                "its position uses the map/datum rule (transition fallback)")
         from cloud_common.objects.map import MapObjectV1
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
@@ -238,7 +296,10 @@ class MissionPlannerService:
                 return None, f"Robot '{robot_name}' not found in database"
 
             # The robot's position, in the map frame
-            robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
+            try:
+                robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
+            except RobotNotPlacedError as e:
+                return None, f"{NOT_PLACED_PREFIX}{e}"
 
             self.logger.info(f"Finding closest node to robot at ({robot_x:.2f}, {robot_y:.2f}) on map '{query_map_id}'")
             nodes, distances = self.graph_db.k_nearest_neighbors(
@@ -408,8 +469,13 @@ class MissionPlannerService:
                 self.logger.error(f"Robot {robot_id} status not found")
                 return None
 
+            try:
+                robot_xy = await self._robot_xy_in_map(robot, query_map_id)
+            except RobotNotPlacedError as e:
+                self.logger.error(str(e))
+                return None
             start_node, start_error = await self._find_node_near_position(
-                *(await self._robot_xy_in_map(robot, query_map_id)), query_map_id
+                *robot_xy, query_map_id
             )
             if start_node is None:
                 self.logger.error(f"Could not find start node near robot position: {start_error}")
@@ -649,8 +715,9 @@ class MissionPlannerService:
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")
         start_node, error = await self.find_closest_node_to_robot(robot_name, map_id)
         if error:
-            result["error"] = error
-            result["failed_at"] = "find_robot_node"
+            not_placed = error.startswith(NOT_PLACED_PREFIX)
+            result["error"] = error[len(NOT_PLACED_PREFIX):] if not_placed else error
+            result["failed_at"] = "robot_not_placed" if not_placed else "find_robot_node"
             return result
 
         result["start_node_id"] = start_node['node_id']
@@ -787,7 +854,10 @@ class MissionPlannerService:
             query_map_id = await self._resolve_map(map_id, robot_id)
         except MapResolutionError as e:
             return {"nodes": [], "error": str(e)}
-        robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
+        try:
+            robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
+        except RobotNotPlacedError as e:
+            return {"nodes": [], "error": str(e)}
 
         try:
             nodes, distances = self.graph_db.nodes_in_range(

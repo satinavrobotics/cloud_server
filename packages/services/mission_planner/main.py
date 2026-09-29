@@ -212,6 +212,8 @@ async def navigate(request: NavigationRequest):
         )
         if result.get("failed_at") == "map_resolution":
             raise HTTPException(status_code=400, detail=result.get("error"))
+        if result.get("failed_at") == "robot_not_placed":  # maps §14: place the robot first
+            raise HTTPException(status_code=409, detail=result.get("error"))
         return NavigationResponse(**result)
 
     except HTTPException:

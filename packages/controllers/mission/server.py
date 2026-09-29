@@ -39,7 +39,7 @@ from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
-from packages.utils import map_geo, metrics
+from packages.utils import map_geo, map_sessions, metrics
 import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
 import cloud_common.objects.robot as robot_object
@@ -69,6 +69,24 @@ DATABASE_RECONNECT_PERIOD = 0.5
 
 # How long the recording-only settings watcher waits before re-watching after a failure
 SETTINGS_WATCH_RETRY_S = 5.0
+
+# Maps §14.6 transition (U2 to U6): a route waypoint on a map the robot has no open session on
+# (the old client sends missions without sessions) is converted with the M2 rule
+# (map_geo.robot_frame_in_map), with a warning. U6 sets this False: such a node then fails
+# ("robot is not using map X").
+SESSIONLESS_FALLBACK = True
+
+
+class RouteRefused(Exception):
+    """A route node that must not be sent (maps §14): its waypoints are on a map the robot is
+    not placed on (or not using, once the transition fallback is gone). The node fails."""
+
+
+class _SessionUnknown:
+    """The robot's open session could not be read (Postgres down): the M2 rule applies."""
+
+
+SESSION_UNKNOWN = _SessionUnknown()
 
 class WaitElapsed(pydantic.BaseModel):
     """Posted to a robot's own message queue when a "wait" action node's timer runs out.
@@ -288,7 +306,11 @@ class Robot:
             await self.get_next_mission()
             return
 
-        self._record("run_started", self._name, self._current_mission, self._robot_object)
+        session = await self._read_open_session()
+        extra = ({} if session is SESSION_UNKNOWN
+                 else {"session_map": session["map_name"] if session else None})
+        self._record("run_started", self._name, self._current_mission, self._robot_object,
+                     **extra)
         self.update_mission_from_behavior_tree()
         self._arm_mission_timeout()
         await self._send_order()
@@ -460,7 +482,11 @@ class Robot:
 
             if mission_node.type == mission_object.MissionNodeType.ROUTE and \
                     mission_node.route is not None:
-                route = await self._route_in_robot_frame(mission_node.route)
+                try:
+                    route = await self._route_in_robot_frame(mission_node.route)
+                except RouteRefused as err:
+                    self._refuse_route_node(mission_node, str(err))
+                    return
                 order = types.VDA5050Order.from_route(route, self._robot_object,
                                                       self._order_prefix(), idx)
                 self.mission_info("Sending mission route node "
@@ -488,6 +514,17 @@ class Robot:
                 f"{self._mqtt_prefix}/{self._name}/order", order.json())
             self.set_mission_node_state(f"{mission_node.name}",
                                         mission_object.MissionStateV1.RUNNING)
+
+    def _refuse_route_node(self, mission_node: mission_object.MissionNodeV1, reason: str):
+        """Maps §14: a route node whose map the robot is not placed on is not sent; it fails
+        (MISSION.NODE_FAILED), and the behavior tree decides what that means for the mission.
+        The mission is wrapped up on the robot's next state message, as after any failure."""
+        self.warning(f"[{self._current_mission.name}] Route node {mission_node.name} not "
+                     f"sent: {reason}")
+        self._current_mission.status.failure_reason = \
+            f"Route node {mission_node.name}: {reason}"
+        self.set_mission_node_state(f"{mission_node.name}", mission_object.MissionStateV1.FAILED)
+        self.update_mission_from_behavior_tree()
 
     def _update_mission_from_api(self, mission: api_objects.MissionObjectV1,
                                  message: api_objects.MissionObjectV1) -> bool:
@@ -810,21 +847,51 @@ class Robot:
             {"datum": json.loads(self._robot_object.datum.json())}, uuid.uuid4()
         )
 
+    async def _read_open_session(self) -> Any:
+        """The robot's open map session (maps §14; packages/utils/map_sessions.py), None when
+        it has none, SESSION_UNKNOWN when it could not be read."""
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.ROBOT_SESSION_SQL, (self._name,))
+                    return map_sessions.robot_session_from_row(await cursor.fetchone())
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Open session not readable ({err}); maps use the M2 rule")
+            return SESSION_UNKNOWN
+
     async def _route_in_robot_frame(
             self, route: mission_object.MissionRouteNodeV1) -> mission_object.MissionRouteNodeV1:
-        """The route's waypoints in the robot's current frame (maps redesign M2).
+        """The route's waypoints in the robot's current frame (maps redesign M2, §14).
 
         Waypoints that name a real map (`map_id`) are in that map's frame: node poses are
-        stored in the map frame since M2, and the client places waypoints with the map's
-        transform. For a geo map with an origin that frame differs from the robot's own run
-        frame (its datum), so each such waypoint goes through robot_T_map
-        (packages/utils/map_geo.py::robot_frame_in_map, inverted). Local maps, waypoints
-        without a map (mapless / GEO / LOCAL missions: already robot frame) and robots without
-        a datum are sent as they are, as before M2. The stored mission is not changed."""
+        stored in the map frame, and the client places waypoints with the map's transform.
+        Maps §14: a waypoint on the map of the robot's open session goes through
+        inverse(map_T_session) (the session knows where the robot's current run sits in the
+        map); if that session is not placed, RouteRefused ("robot is not placed on map X").
+        A waypoint on another map (no session on it): the transition fallback, the M2 rule
+        (map_geo.robot_frame_in_map: geo map -> the robot's datum, local map -> identity),
+        with a warning; RouteRefused once SESSIONLESS_FALLBACK is off. Waypoints without a map
+        (mapless / GEO / LOCAL missions: already robot frame) are sent as they are. The
+        stored mission is not changed."""
         names = {wp.map_id for wp in route.waypoints
                  if wp.map_id and wp.map_id not in ("GEO", "LOCAL")}
+        if not names:
+            return route
+        session = await self._read_open_session()
         inverse: Dict[str, Dict[str, float]] = {}
         for name in sorted(names):
+            if isinstance(session, dict) and session["map_name"] == name:
+                if not map_sessions.is_placed(session):
+                    raise RouteRefused(f"robot is not placed on map {name}")
+                t = session["map_t_session"]
+                if not map_geo.is_identity(t):
+                    inverse[name] = map_geo.invert_transform(t)
+                continue
+            if session is not SESSION_UNKNOWN:
+                if not SESSIONLESS_FALLBACK:
+                    raise RouteRefused(f"robot is not using map {name}")
+                self.warning(f"Waypoints on map '{name}': the robot has no open session on it; "
+                             "converted with the map/datum rule (transition fallback)")
             try:
                 map_obj = await self._database.get_object(api_objects.MapObjectV1, name)
                 t = map_geo.robot_frame_in_map(map_obj, self._robot_object.datum)
