@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 onwards: not started.
+**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.**
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -125,7 +125,7 @@ As built in M1 (migration `20260928_01_map_sessions`): the column is `map_t_sess
 - `{node_id}/images/...` (unchanged)
 - `grid/{version}/{layer}.png` plus `grid/{version}/meta.yaml` (resolution, origin in the map frame, source session(s)). ROS `map_server`-style, so a later robot-sync phase can hand it to the robot as is. The robot uploads the grid **once, at session end** (Q5); each upload is a new version. A map can hold topo and grid layers at the same time.
 
-**Robot object:** `current_map` is replaced by `mapping_session` (read-only; the open session, if any). The `'GEO'` / `'LOCAL'` sentinels go away: "no map" is simply no session. Whether a mission is mapped or mapless stays on the mission (`Mission.mode`).
+**Robot object:** `current_map` goes away and is **not** replaced by a stored field (superseded by §14: the robot view derives `session` from `map_sessions`). The `'GEO'` / `'LOCAL'` sentinels go away: "no map" is simply no session. Whether a mission is mapped or mapless stays on the mission (`Mission.mode`).
 
 ---
 
@@ -458,7 +458,273 @@ counts per session. `since`: when `enabled` last flipped.
   the first session's datum and fixed); on an empty geo map with an origin, `spec.geo` follows
   the new datum. Local maps unchanged.
 
-## 14. Questions
+---
+
+## 14. Using maps: operate sessions and the map window
+
+**Status:** design, 2026-09-29. Not built. Revises the M5–M7 plan (§14.9).
+
+### 14.1 The gap
+
+M1–M4 built **making** maps: create, map with a robot, pause, finish, archive. They did not build **using** one:
+
+- The robot panel's "Assign" (`AssignMapModal`) either picks a mapless mode (`GEO`/`LOCAL`, the deprecated `PUT /robots/{r}/map`) or starts a mapping session. A finished (`ready`) map cannot be chosen for a robot, except by starting a new mapping session on it, which records more nodes.
+- What a robot "is on" is still `robot.current_map`, a free string that the shim writes. The dispatcher, the planner, the run recorder and the bag metadata read it, or they derive the transform from the map and the robot's datum without any session (`map_geo.robot_frame_in_map`).
+- A **local** map can't be reused after a robot restart. The robot's pose is in its odom frame, which resets to the robot's position at every navstack start (`agvPosition` from `/odom`, `mapId` always the literal `"map"`). `robot_frame_in_map` assumes identity for local maps, so after a restart every mission waypoint and the robot marker are off by wherever the robot was started. Nothing detects this. Local sessions store no datum, so graph-builder's `datum_changed` check never fires for them.
+- A later mapping session on a local map starts `unaligned` with identity. Its nodes land at wrong positions until the M6 alignment tool exists.
+- The client offers no choice of mapping service. The contract (`mapping/set`, `mapping/state`) has no service name. The only grid producers on the robot, `sati_map_builder` (an odom-frame `/map`) and a `slam_toolbox` wrapper, are in no bringup launch and upload nothing.
+
+### 14.2 The model
+
+**A robot uses a map through an open session.** A session gets a **purpose**:
+
+- `mapping`: the robot adds data to the map (as today).
+- `operate`: the robot uses the map for missions and display and adds nothing.
+
+Both purposes carry the same thing: `map_T_session`, where the robot's **current run frame** sits in the map frame. Everything that meets robot-frame data with map-frame data reads it from the robot's open session:
+
+- the dispatcher (order waypoints),
+- the planner (the robot's position, the default map),
+- the client (the robot marker),
+- graph-builder (node poses, mapping sessions only).
+
+That makes `robot.current_map` and `robot_frame_in_map` redundant, and M5 can remove them.
+
+Rules:
+
+1. **One open session per robot, of any purpose.** The existing partial unique index `map_sessions_one_open_per_robot` already enforces this. Mapping implies using, so a robot mapping map A is also on map A. "No open session" means mapless, and the mission's `mode` says so; the `GEO`/`LOCAL` sentinels go away.
+2. **Per map:** at most one open `mapping` session (API rule, as now) and any number of `operate` sessions. Operate sessions do not change the map's lifecycle state: a `ready` map stays `ready` while robots use it.
+3. **Where `map_T_session` comes from** (the source is recorded on the session):
+   - *Geo map:* from the robot's datum (`session_transform`, as today), re-derived on every datum change (§13.4).
+   - *Local map:* from **placement**. The user puts the robot on the map by hand (position and heading). `map_T_session = P_map ⊕ P_robot⁻¹`, where `P_map` is the placed pose and `P_robot` is the robot's own pose at that moment.
+   - *First mapping session of an empty local map:* identity. The run defines the map frame, as today.
+   - *Later:* relocalization. The robot reports its pose in the loaded map (§11), and this uses the same `place` operation with source `robot`.
+4. **Placed or not.** The existing `aligned` column now means "`map_T_session` is valid for the robot's current run"; the UI calls it *placed*. A session that is not placed:
+   - captures nothing (`mapping/set` has `enabled: false`; graph-builder rejects with `session_unplaced`),
+   - gets no route orders on that map,
+   - gets no planned paths.
+   It never guesses identity.
+5. **Robot restart = run change.** When the robot's run frame resets, every open session of the robot becomes unplaced (`MAP.SESSION_UNPLACED`, reason `run_changed`).
+   - A geo session is re-placed automatically when the new datum arrives (`MAP.SESSION_REALIGNED`, as §13.4). This also closes §13.4's gap: nodes that arrive between the restart and the new datum are no longer placed with the old transform.
+   - A local session waits for the user to place the robot again.
+6. **Extending a local map:** a `mapping` session on a local map that already has nodes starts unplaced, and the user places the robot before capture turns on. New data is then aligned when it is recorded. This replaces M6's "later sessions start unaligned" for all new data (§14.9).
+
+**Detecting a run change** (dispatcher, which already receives `state`, `connection` and `datum` per robot):
+
+- *GNSS robots:* a changed datum. This already works.
+- *Every robot:* the VDA5050 client's header ids restart at 0 per process, for `connection`, `state` and `factsheet`. A `connection: ONLINE`, or a `state` whose `headerId` is lower than the last one seen, means a new client process. That is a navstack restart, and with it a new odom frame. After a dispatcher restart the last header id is unknown, so the first message changes nothing.
+- *Limits:* an odom reset inside a running navstack (e.g. a VIO reset) is missed. A restart of only the VDA5050 client is a false positive, which costs one extra placement.
+- A robot-side `run_id` would make this exact. It is a later, small robot change (Q-U3).
+
+**What the robot needs to know:** nothing new for `operate`. Capture is the only thing it does for the cloud, and `mapping/set` covers that. The robot gets a map only with relocalization (§11). At that point the placement becomes the robot's initial pose.
+
+### 14.3 API
+
+Changed:
+
+- `POST /api/v1/maps/{id}/sessions` body:
+  - `robot`
+  - `purpose: "mapping" | "operate"` (default `mapping`)
+  - `services: ["topo"]` (mapping only; default `["topo"]`)
+  - `placement?: {pose: {x, y, yaw}, robot_pose: {x, y, theta}}`
+  - `replace: bool` (default false)
+
+  `replace: true` finishes the robot's open session in the same transaction, so "Use this map" works when the robot is on another map.
+
+  Errors:
+  - 404: unknown map or robot.
+  - 409:
+    - the robot is offline;
+    - the robot has an open session (without `replace`);
+    - the map is archived, deleting, or `draft` for `operate` (nothing to use);
+    - the map already has an open mapping session (for `mapping`);
+    - geo map and the robot has no datum;
+    - `robot_pose` is more than 0.10 m or 3° from the robot's current pose (the robot moved; place again).
+  - 422:
+    - `placement` on a geo map;
+    - `services` on `operate`;
+    - an unknown service.
+
+  The response is as today. The session adds `purpose`, `services`, `aligned` (placed) and `placement`. `mapping_service` becomes per service (`mapping_services: {topo: "running"}`).
+- `POST .../sessions/{sid}/finish`: both purposes. For `operate` it is the "Stop using" action.
+- `POST .../sessions/{sid}/pause|resume`: 409 on `operate`.
+- `GET /api/v1/maps/{id}`: `sessions` gains `operating: [{robot, session_id, aligned}]`.
+- `GET /api/v1/maps/{id}/graph`: nodes gain `session_id`, for highlighting one session in the history.
+- `GET /api/v1/robots[/{r}]` and WS `/ws/robot/{r}`: a derived, read-only `session` key: the open session `{session_id, map, purpose, state, aligned, map_T_session}` or null. It is read from `map_sessions` and not stored on the robot. It replaces `current_map` for the client.
+- `DELETE /maps/{id}` and `POST .../archive`: 409 while **any** session is open. The message names the robots using the map (Q-U2).
+
+New:
+
+- `POST /api/v1/maps/{id}/sessions/{sid}/place` `{pose: {x, y, yaw}, robot_pose: {x, y, theta}}`.
+  - It sets `map_T_session`, `aligned = true` and `placement` (`{pose, robot_pose, source: "user", actor, at}`).
+  - It writes `MAP.SESSION_PLACED` and re-publishes `mapping/set`, so capture turns on for a placed mapping session.
+  - 404 unknown session; 409 finished; 409 geo map (placed by its datum); 409 a *placed* `mapping` session (re-placing would split its nodes; alignment after the fact is M6); 409 robot moved (as above).
+  - An `operate` session can be re-placed at any time, as a correction.
+- `GET /api/v1/maps/{id}/sessions?limit=&before=`: the full history, newest first, paged. The summary stays capped at 50.
+
+Removed at the end (step U6): `PUT /api/v1/robots/{r}/map`, `robot.current_map`, the `GEO`/`LOCAL` sentinels, the map delete's `current_map` reset, and the fallbacks of §14.6.
+
+Events:
+- `MAP.SESSION_STARTED/FINISHED` payloads gain `purpose`.
+- New: `MAP.SESSION_PLACED` (source `api`, payload `map_T_session`, `placement`).
+- New: `MAP.SESSION_UNPLACED` (source `dispatcher`, reason `run_changed`, the header ids or datums that showed it).
+
+### 14.4 Data model and migration
+
+Migration `…_maps_use` (idempotent):
+
+```sql
+ALTER TABLE map_sessions
+  ADD COLUMN purpose   text   NOT NULL DEFAULT 'mapping'
+      CHECK (purpose IN ('mapping', 'operate')),
+  ADD COLUMN services  text[],          -- mapping: e.g. {topo}; operate: NULL
+  ADD COLUMN placement jsonb;           -- {pose, robot_pose, source, actor, at}
+UPDATE map_sessions SET services = '{topo}' WHERE purpose = 'mapping' AND services IS NULL;
+ALTER TABLE map_sessions ADD CONSTRAINT map_sessions_legacy_mapping_check
+  CHECK (kind <> 'legacy' OR purpose = 'mapping');
+```
+
+- `kind` (`live`/`legacy`) stays as it is: provenance, not purpose.
+- The unique indexes are unchanged.
+- Existing open local sessions with `aligned = false` stay unplaced and stop capturing until placed. At deploy the script lists them.
+- The event code needs no DB change.
+- The robot object gets **no new field**.
+
+### 14.5 Robot and MQTT
+
+- **`mapping/set`** (one retained message per robot, as M3):
+  - adds `services: [..]`;
+  - `enabled` is true only for an open, unpaused, placed **mapping** session;
+  - an `operate` session publishes the no-session payload.
+  - Each mapping service enables itself iff `enabled` and its name is in `services`. A missing `services` field means `["topo"]`, so an M3 topomap keeps working.
+- **State per service:** `{prefix}/{robot}/mapping/{service}/state`, with the same payload plus `service`, and a last will per service process (each service has its own MQTT connection).
+  - The topomap publishes `mapping/topo/state`.
+  - The API subscribes to `{prefix}/+/mapping/+/state` and still reads the old `mapping/state` as `topo` for one release (or not at all, if M3 is not yet deployed when this lands: Q-U6).
+  - `mapping_state` in API responses stays the topo state. `mapping_services` adds all of them.
+- **Services named now:** `topo` (sati_topo_mapping). `grid` is reserved for `sati_grid_mapping`, which doesn't exist yet. `sati_map_builder` or `slam_toolbox` would need a bringup entry, the switch and a map-frame upload at session end (Q5) first. A service the robot has never reported shows as "not available on this robot".
+- **No robot change for operate or placement.** Optional later: a `run_id` in the VDA5050 client (Q-U3).
+
+### 14.6 What changes for the consumers
+
+| Consumer | Today | Now |
+|---|---|---|
+| Dispatcher `_route_in_robot_frame` | `robot_frame_in_map(map, robot.datum)` per waypoint map | waypoints on the robot's session map go through `inverse(map_T_session)`. A waypoint on another map, or a session that is not placed, **fails the node** ("robot is not placed on map X" / "robot is not using map X"). Mapless waypoints are unchanged |
+| Planner `_resolve_map`, `_robot_xy_in_map` | `robot.current_map`, `robot_frame_in_map` | the session's map and `map_T_session`; unplaced → 409 |
+| Run recorder `mission_runs.map_id` | `current_map` or the pose's map id | the session's map (null when mapless) |
+| Bag metadata `map_id` | `current_map` | the session's map, plus `session_id` |
+| graph-builder `decide()` | open session | plus `not_mapping_session` (operate) and `session_unplaced` |
+| Client marker | the map's transform (off by −1.445° on `map` with the sim, §13.2) | `robot.session.map_T_session` |
+
+**Transition (U2 to U6):** while the old client still sends missions without a session, a waypoint on a map the robot has no session on falls back to today's `robot_frame_in_map`, with a warning. U6 removes the fallback.
+
+### 14.7 Client: the map window
+
+`AssignMapModal` (480 px) is replaced by a **map window**: `ModalShell` size `lg` (900 px), height `fill` (85 %), full screen on compact screens. It opens from the robot panel. The "Assign" link under the robot name becomes "Map…", and `RobotMappingLine` shows the session.
+
+Regions:
+
+1. **Header:** icon `map-outline`, title `MAPS`, and the robot as the subject pill.
+2. **Robot strip** (top, full width): what the robot is on now. For example:
+   - "Using `map` · placed", with the buttons *Place again* (local maps only) and *Stop using*;
+   - "Mapping `lab` · 42 nodes" (the mapping bar stays on the map view);
+   - "Using `lab` · **not placed** — the robot restarted", warn tone, with the button *Place robot*;
+   - "No map · mapless missions".
+3. **Map list** (left, about 40 %):
+   - search, type chips All / Geo / Local, "Show archived";
+   - rows with name, `MapBadges`, node count, last activity, and chips for robots using or mapping the map;
+   - the header button **Create new map**.
+4. **Preview** (right, top):
+   - the selected map's nodes and edges (DeckGL `fitToContent` for local, MapLibre with tiles for geo), the grid when there is one, and robots using it;
+   - a map without data shows the empty state "No data yet — start mapping".
+5. **History / Details tabs** (right, bottom):
+   - History lists sessions, newest first: purpose icon, robot, start → end or "open", duration, nodes, placed/not placed. Selecting a session highlights its nodes in the preview.
+   - Details: type, UTM zone and origin, description, created.
+6. **Action bar** (bottom, for the selected map and this robot):
+   - **Use for {robot}** (primary);
+   - **Map more** (start a mapping session, with the service choice);
+   - disabled reasons shown inline (offline, no GNSS datum for geo, draft has nothing to use, another robot is mapping it).
+
+Flows:
+
+- **Use a geo map:** *Use* → confirm, which shows the datum check → `POST sessions {purpose: operate, replace: true}` → the strip says "Using · placed".
+- **Use a local map:** *Use* → **place mode**.
+  - The preview becomes interactive. Click to set the position, drag the arrow to set the heading, or type x, y and heading.
+  - The note "Keep the robot still" is shown, with the robot's live pose next to it.
+  - *Confirm* sends `start` with `placement` (or `place` for an existing session). *Cancel* leaves the session as it was.
+- **Create new map:** name, type (Local/Geo), then **mapping service** cards:
+  - *Topological map* (`topo`), with its state: running / not running;
+  - *Occupancy grid* (`grid`): "not available on this robot" until the robot reports it.
+  - *Create & start mapping* runs `POST /maps`, then `POST sessions {purpose: mapping, services}`. If the start fails, the draft map stays in the list, marked "draft".
+- **Map more on an existing map:** the service cards; on a local map with nodes, place mode first; then start.
+- **Mapless:** *Stop using* / *Finish mapping* (with confirmation) in the strip.
+
+The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpad, not in the repo).
+
+### 14.8 Tests
+
+**Unit (cloud):**
+- The start rules as a matrix: purpose × map state × map type × robot online/datum × existing session × `replace`.
+- Placement math, as a property test: the robot pose placed through `map_T_session` gives the placed pose.
+- The `place` rules, and the robot-moved tolerance.
+- `set_payload`: operate gives off; unplaced gives off; `services`.
+- `decide()`: the new reasons.
+- The run-change detector over header-id sequences: fresh ONLINE, a decreasing state, a dispatcher restart, and the datum path.
+- Geo re-place after a run change.
+- Dispatcher route conversion from the session, and its refusals.
+- Planner resolution.
+- History paging.
+- The robot view's `session` key.
+- The migration on a copy of production (`run_m2.sh --dump`).
+
+**Integration** (extend `tests/integration/maps/run_m2.sh`):
+- Local operate with placement → a mission's order on MQTT carries robot-frame waypoints.
+- Simulated restart (state `headerId` back to 0) → `MAP.SESSION_UNPLACED`, the order is refused, `mapping/set` is off.
+- Re-place → the order goes out.
+- Geo operate + a new datum → realigned.
+- Extending a local map → no capture until placed; after placement the nodes land at the placed offset.
+- `replace` is atomic: a refused start keeps the old session.
+
+**Client:**
+- Pure-logic tests for the window model, like `buildMappingBarModel`: region contents and enabled actions per state.
+- Screen-to-pose conversion in place mode.
+
+**Manual, with the sim robot:**
+1. Use `map`, run a mission.
+2. Restart the sim navstack and check "not placed".
+3. Place the robot, run the mission again.
+4. Create a local map and map it, finish, restart, use it with placement.
+
+### 14.9 Plan (revises M5–M7)
+
+| Step | Content | Repos |
+|---|---|---|
+| U1 | Migration; `purpose`/`services`/`placement`/`replace` on start; `place`; history endpoint; robot view `session`; graph `session_id`; `set_payload` and ingest rules; events | cloud_server |
+| U2 | Consumers read the session (§14.6), with the transition fallback | cloud_server |
+| U3 | Run-change detection in the dispatcher; unplace; geo re-place on the datum write (the same compare-and-set as graph-builder's) | cloud_server |
+| U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
+| U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server |
+| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server, sati-client |
+| M5 | One `MapView` (unchanged goal; its local/geo rendering starts from U4's preview) | sati-client |
+| M6 | **Shrinks** to aligning *existing* unaligned sessions (legacy data), since new ones are placed before capture. Drop it if none remain | cloud_server, sati-client |
+| M7 | Grid storage and display once `sati_grid_mapping` exists; it plugs in as service `grid` | all |
+
+U1 → U2 → U3 are sequential. U4 needs U1 (and U3 for the "not placed" state). U5 is independent. U6 comes last, after U4 is deployed.
+
+### 14.10 Open questions (with recommendation)
+
+- **Q-U1.** API name for the purpose: `operate` or `use`? *Rec:* `operate` in the API, "Use / Using" in the UI.
+- **Q-U2.** Deleting or archiving a map that robots are using: refuse (409), or stop their sessions? *Rec:* refuse, and name the robots.
+- **Q-U3.** Restart detection for robots without GNSS: header-id reset only, or also a robot-side `run_id`? *Rec:* header ids now (no robot change); add `run_id` with relocalization.
+- **Q-U4.** Require placement before capture when extending a local map (a change from M1, where later sessions record unaligned)? *Rec:* yes. M6 shrinks.
+- **Q-U5.** May a robot use a map that another robot is mapping at the same time? *Rec:* yes. It sees the map grow; missions plan on what exists.
+- **Q-U6.** If M3 is not deployed yet, rename `mapping/state` to `mapping/topo/state` before it is? *Rec:* yes. Otherwise keep the alias for one release.
+- **Q-U7.** How far may the robot move during placement before it is refused? *Rec:* 0.10 m / 3°. Placement is meant with the robot standing still.
+- **Q-U8.** Manual correction of a geo map's placement (a datum off by metres)? *Rec:* no, not now; the datum defines it.
+- **Q-U9.** End an operate session automatically when a robot stays offline? *Rec:* no. It stays open and becomes unplaced on the next run change.
+
+---
+
+## 15. Questions
 
 Decided 2026-09-28:
 
