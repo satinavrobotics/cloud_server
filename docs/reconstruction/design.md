@@ -1,6 +1,6 @@
 # SatiNav Maps: 3D reconstruction
 
-**Status:** design, revised 2026-09-29. **R2 and R3 built 2026-09-29, not deployed** (§12.1;
+**Status:** design, revised 2026-09-29. **R2 and R3 deployed 2026-09-29 (`recon.sh`; feature off until `RECONSTRUCTION_*` is set); R1 built in sati_ros_navstack** (§12.1;
 deploy `~/pg-cutover/scripts/recon.sh`, dry run passed). R1, R4, R5 elsewhere. The spec for the
 external service's developer is [`handover.md`](handover.md).
 
@@ -794,8 +794,8 @@ costmap lines up with the reconstruction.
 | Step | Content | Repo | Needs |
 |---|---|---|---|
 | R1 | Topomap depth capture (§4): nearest-stamp ≤ 80 ms, u16 mm PNG, camera params per node (cached `camera_info` + static TF), `robot_pose3d`, `robot/depth_upload`; codec/matcher unit tests; `enable_dense_depth:=true` in the navstack launch; verify optical frame and z depth (Q-R1) | sati_ros_navstack | — |
-| R2 | graph-builder depth ingest (§5): `MQTT_DEPTH_TOPIC`, PNG in MinIO, `depth.{cam}` on the node, `pose3d_map`, `get_stats` filter, `dropped_depth` — **built 2026-09-29** (§12.1) | cloud_server | — |
-| R3 | Gateway (§6, §8, §9): config, migration, `reconstruction.py` + client, routes, callbacks, dispatcher, staging bucket, events, map-delete hook, stub-service integration test, README — **built 2026-09-29** (§12.1) | cloud_server | the §5 node shape (not R2's code) |
+| R2 | graph-builder depth ingest (§5): `MQTT_DEPTH_TOPIC`, PNG in MinIO, `depth.{cam}` on the node, `pose3d_map`, `get_stats` filter, `dropped_depth` — **deployed 2026-09-29** (§12.1) | cloud_server | — |
+| R3 | Gateway (§6, §8, §9): config, migration, `reconstruction.py` + client, routes, callbacks, dispatcher, staging bucket, events, map-delete hook, stub-service integration test, README — **deployed 2026-09-29** (§12.1) | cloud_server | the §5 node shape (not R2's code) |
 | R4 | The reconstruction service, per `handover.md`, tested standalone with the synthetic scene | own repo | the contract only |
 | R5 | Client: reconstruction row, polling, `reconstruction` layer (local + geo) | sati-client | R3's API (can start on mocked responses) |
 | R6 | Deploy (cloud: `~/pg-cutover/scripts/recon.sh`, `--dry-run` with the migration on a throwaway copy; then API and graph-builder; the service by its own deploy), robot rollout, sim end-to-end | all | R1–R5 |
@@ -804,7 +804,7 @@ costmap lines up with the reconstruction.
 §5 and the manifest/callback contract decouple them). R5 can start with R3 and finishes after
 it. R6 needs everything.
 
-### 12.1 R2 and R3 as built (2026-09-29, not deployed)
+### 12.1 R2 and R3 as built (2026-09-29, deployed 2026-09-29 21:59)
 
 **R2** (`packages/services/graph_builder/ingest.py`, `server.py`):
 
