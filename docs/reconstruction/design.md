@@ -859,6 +859,28 @@ as §6, §8, §9, with these details and deviations:
 
 ---
 
+### 12.2 Map export for model training
+
+`scripts/export_map.py` writes one plain folder per map from the stored data (read-only:
+ArangoDB, MinIO, and Postgres for the map's type/CRS), for training outside cloud_server:
+
+```bash
+python scripts/export_map.py Hospital --out ~/map_export --compose-env docker_compose/.env \
+  && rsync -a ~/map_export/ trainserver:/data/maps/
+```
+
+`<out>/<map>/map.json` (name, id, type, crs, counts), `nodes.json` (per node: id, map-frame
+pose, `pose3d_map` or null, timestamps, `rgb` file, `depth` = null or {file, K, width/height,
+distortion, `T_base_cam`, `depth_scale`, units mm, stamps}; plus the edge list),
+`rgb/<node_id>.jpg`, `depth/<node_id>.png` (the stored u16 mm PNG, byte for byte). Nodes
+without depth are included with `depth: null`. Re-runs skip files already present with the
+same size. It opens the stores directly rather than through `TopomapDatabaseClient`, whose
+constructor creates missing databases, graphs, indexes and buckets. Without `--compose-env` it
+reads the services' variable names (`ARANGO_PASSWORD`, `MINIO_ACCESS_KEY`, ...). The host has no
+python deps: run it in the test image, e.g. `docker run --rm --network host -v $PWD:/src:ro -w
+/src -v ~/map_export:/out -e PYTHONPATH=/src wp6-test:py310 python scripts/export_map.py
+Hospital --out /out --compose-env /src/docker_compose/.env`.
+
 ## 13. Deployment notes
 
 - Same host: the service runs in its own compose project with host networking, bound to
