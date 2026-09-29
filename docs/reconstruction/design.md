@@ -34,7 +34,7 @@ reconstruction.
 - Old nodes without depth are not reconstructed. They are skipped (decided).
 - No 3D viewer in the client in v1 (the full cloud is downloadable; a 3D view is §13).
 - No change to the Odin driver or its relocalization.
-- No automatic rebuild in v1 (open question Q-R4).
+- No automatic rebuild: the reconstruction runs only from the button (decided, Q-R4).
 
 ---
 
@@ -163,7 +163,7 @@ So stamps never match exactly on the real robot. The rule:
 
 At 10 Hz frames are 100 ms apart, so nearest-stamp picks the depth built from our image in
 almost all cases. The rare p99 case (55 ms > 50 ms) can pick the neighbour frame: ≈ 10 cm error
-at 1 m/s. Accepted for v1; Q-R2 has the exact fix.
+at 1 m/s. Accepted: `sati_odin_gpu_bridge` is not to be changed (decided, Q-R2).
 
 Depth is only subscribed while a capture is pending, like the RGB (no cost between keyframes).
 
@@ -717,7 +717,6 @@ R1 and R2–R4 can run in parallel (the new topic decouples them). R5 needs R4.
 - LAZ export for GIS tools on geo maps.
 - Tiled output (COPC or 3D Tiles) if maps reach tens of millions of points.
 - Incremental update: add only new nodes' voxels instead of a full rebuild.
-- Automatic rebuild when a mapping session finishes (Q-R4).
 - Meshing (Poisson / TSDF) for nicer visuals.
 
 ---
@@ -727,16 +726,12 @@ R1 and R2–R4 can run in parallel (the new topic decouples them). R5 needs R4.
 - **Q-R1. Camera frame and depth type.** Is Odin's depth `frame_id` (`camera`) an optical
   frame (z forward)? Is Isaac Sim's `/left/depth` distance-to-image-plane? The design assumes
   both; R1 verifies with a flat wall at a known distance.
-- **Q-R2. Exact depth/RGB pairing on Odin.** The packer stamps depth with the cloud stamp, so
-  matching is nearest-stamp within 80 ms. An exact fix is small: the depth republisher (or the
-  packer) also carries the paired image's stamp. It is our code (`sati_odin_gpu_bridge`), not
-  the Odin driver, but it is in the relocalization pipeline's container. OK to change?
-- **Q-R3. Dense vs sparse depth on Odin.** `depth_dense_image` is a 64x48 grid dilated and
-  upsampled 7x (a smearing radius). The always-on `odin1/depth_sparse_image` is one LiDAR point
-  per pixel, unsmeared, and also compresses well. Dense was decided; a smaller
-  `dense_depth_scale` (e.g., 4 → 112x84) gives more detail at more GPU cost. Revisit after the
-  first real reconstruction.
-- **Q-R4. Automatic rebuild** when a mapping session finishes, or only by the button (v1)?
+- **Q-R2 (decided 2026-09-29).** Exact depth/RGB pairing on Odin: **no**, do not change
+  `sati_odin_gpu_bridge`. Nearest-stamp matching within 80 ms stays.
+- **Q-R3 (decided 2026-09-29).** Odin sends **dense** depth (`odin1/depth_dense_image`). It is
+  a 64x48 grid upsampled 7x; compare with the sparse depth after the first real
+  reconstruction.
+- **Q-R4 (decided 2026-09-29).** Rebuild **only from the button**; no automatic rebuild.
 - **Q-R5.** Set a broker `max_packet_size` guard (e.g., 4 MB) now?
 - **Q-R6. Default voxel and clip height:** 5 cm and floor + 2 m. Different defaults for
   indoor/outdoor maps?
