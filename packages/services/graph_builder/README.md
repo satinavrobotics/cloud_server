@@ -19,8 +19,9 @@ payload's `robot_name`; `ingest.py`), never to `robot.current_map` or a `default
 `map_id` in the payload is ignored. The node's `pose` is stored in the map frame (the session's
 `map_T_session` applied), with `robot_pose` (as received) and `session_id`. No open session, a
 paused one, a map that is not `mapping` or is being deleted, a payload `session_id` that is not
-the open session, or a geo session whose robot datum changed since it started (a new robot run):
-the data is dropped, counted (`GET /stats`: `nodes_rejected`, `images_rejected`) and reported as
+the open session, or a session whose robot datum changed since it started and cannot be re-anchored (a local map,
+a datum in another UTM zone; a geo map is re-anchored to the new datum and
+`MAP.SESSION_REALIGNED` is written): the data is dropped, counted (`GET /stats`: `nodes_rejected`, `images_rejected`) and reported as
 `MAP.INGEST_REJECTED` in `fleet_events` (at most one per robot and reason a minute). The session
 lookup is cached for 1 s, so a pause or finish takes effect within about a second. A RUNNING
 mission with `register_map = false` still suppresses ingest, as before. `POST /node` (a test

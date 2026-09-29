@@ -299,8 +299,9 @@ graph-builder, dispatch, planner; with 2e0b63a).
   go to the session's map; the payload `map_id` is ignored (images used to land in `default`).
   Dropped, with a reason: `no_session`, `session_paused`, `map_not_mapping`, `map_deleting`,
   `map_missing`, `session_mismatch` (a payload `session_id` that is not the open one; untagged
-  payloads are accepted until M3), `datum_changed` (a geo session whose robot datum changed since
-  it started: a new robot run, so `map_T_session` would be stale; finish and start again),
+  payloads are accepted until M3), `datum_changed` (a session whose robot datum changed since
+  it started and cannot be re-anchored: a local map, or a datum in another UTM zone; on a geo
+  map a restart is re-anchored, see §13.4),
   `lookup_failed`. The images buffered for a dropped node are dropped with it. The silent
   `default` map is gone (`POST /node`, a test hook, needs a map in `mapping`). Stored: `pose` =
   `map_T_session` applied (rigid, as in M1: no UTM scale factor, ≤1.3 cm per 100 m), `robot_pose`,
@@ -356,8 +357,8 @@ graph-builder, dispatch, planner; with 2e0b63a).
   on `map` with the sim robot it is now off by the −1.445° rotation about the origin (2.5 cm per
   m) until M5 projects `robot.status.pose` with the robot's own datum (or `map_T_robot`).
   Client-built mission waypoints are map-frame and converted by the dispatcher, so missions are
-  right. A robot restart mid-session on a geo map is rejected (`datum_changed`), not re-anchored:
-  M3 should end the session when the robot's run ends. graph-builder's `GET /health`
+  right. A robot restart mid-session on a geo map was rejected (`datum_changed`) here; it is
+  re-anchored since §13.4. graph-builder's `GET /health`
   `mqtt_connected` is always false (pre-existing flag, never set).
 
 ### 13.3 M3 as built
@@ -412,9 +413,9 @@ counts per session. `since`: when `enabled` last flipped.
   heard from). "Robot confirmed" = `mapping_state.session_id` equals the open session and
   `enabled` matches its state.
 - **Not done / deferred.** No per-node `session_id` tagging (decided). No session end when the
-  robot's run ends (the §13.2 note): the last will says the topomap went away, but a geo session
-  is still rejected with `datum_changed` after a robot restart rather than ended. The client
-  shows the state; ending sessions automatically is a later decision. The API re-publishes to
+  robot's run ends (the §13.2 note): the last will says the topomap went away, but the session
+  stays open; a geo session is re-anchored to the robot's new datum after a restart (§13.4). The
+  client shows the state; ending sessions automatically is a later decision. The API re-publishes to
   every robot row on each (re)connect, including robots without the new topomap (harmless: a
   retained message nobody reads). Rare race: an API reconnect re-publish that reads the database
   just before a concurrent session change commits can land after that change's publish; the next
@@ -425,6 +426,37 @@ counts per session. `since`: when `enabled` last flipped.
   `sim_base_services.launch.py` with `enable_topomap`; real robot: the navstack service launch
   through `components/communication.launch.py`). No config change: the default prefix matches
   every checked-in VDA5050 config (`uagv` / `v2` / `RobotCompany`).
+
+### 13.4 Fixes after M3 (as built)
+
+- **Geo session after a robot restart (re-anchoring).** The real robot takes a new datum at every
+  navstack start. A geo map's frame is absolute (UTM grid metres from `spec.geo`), so a new datum
+  fixes where the robot's new run sits in it: graph-builder no longer rejects with
+  `datum_changed` but re-derives the session's transform (`map_geo.session_transform` of the new
+  datum, as at session start), stores it and the new datum in `map_sessions` (`datum`,
+  `map_t_session`) and writes `MAP.SESSION_REALIGNED` (source `graph_builder`; payload: `datum`,
+  `old_datum`, `map_T_session`, `old_map_T_session`). The write is a compare-and-set on the old
+  stored datum in one transaction with the event, so concurrent ingests agree: one wins and emits
+  the event, the others re-read and use the stored transform (`ingest.py`: `plan_realign`,
+  `REALIGN_SQL`, `SessionResolver`). Only when the session is otherwise accepted (mapping, not
+  paused, matching session id). Nodes stored before keep their map-frame poses; edges are, as
+  ever, proximity edges between nodes within the distance threshold, so nothing links "the last
+  node before the restart" to "the first after" except geometry (they meet only if the new run
+  really starts near them). Still rejected (`datum_changed`): local maps (no absolute frame), a
+  new datum in another UTM zone or hemisphere than the map, a geo map without an origin, a robot
+  without a datum. No migration (the event code has no DB constraint). Caveat: the robot's datum
+  reaches Postgres a moment after its restart; nodes arriving in that gap are placed with the old
+  transform (as before this change), the first node after the datum arrives realigns.
+- **Map delete** resets `current_map` of robots still pointing at the map to their mapless
+  sentinel: `GEO` for a `gps` robot, `LOCAL` otherwise (what `PUT /robots/{r}/map` with no map
+  writes), in the delete's finishing transaction, with the robot NOTIFY.
+- **Planner without `map_id`**: the robot's `current_map` (a real map, not `GEO`/`LOCAL`); with no
+  robot or no usable current map: 400 (`POST /api/v1/navigate`, `GET /missions/{id}/plan`; the
+  API passes the 400 on). The implicit `default` map is gone (`default_map_id` is an opt-in
+  constructor argument, unset in production). The API's `plan_mission` passes `map_id` on.
+- **`PUT /maps/{id}/datum`** on a geo map: 409 when the map has nodes or sessions (its origin is
+  the first session's datum and fixed); on an empty geo map with an origin, `spec.geo` follows
+  the new datum. Local maps unchanged.
 
 ## 14. Questions
 

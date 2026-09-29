@@ -249,7 +249,8 @@ class MapIngestRejected(Payload):
     graph-builder because it had no session to go to. Rate-limited per robot and reason:
     `dropped_nodes` / `dropped_images` count every drop since `since` (the first drop not yet
     reported). `reason`: no_session, session_paused, map_not_mapping, map_deleting,
-    map_missing, session_mismatch, datum_changed, lookup_failed."""
+    map_missing, session_mismatch, datum_changed (not re-anchorable: local map, other UTM
+    zone), lookup_failed."""
     reason: str
     dropped_nodes: int = 0
     dropped_images: int = 0
