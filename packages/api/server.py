@@ -38,7 +38,7 @@ from packages.config import (
     MQTT_VDA5050_PREFIX,
 )
 from packages.api.map_delete import MapDeleter
-from packages.api import maps
+from packages.api import maps, reconstruction
 from packages.api.mapping_control import MappingControl
 from packages.utils import map_geo
 
@@ -598,13 +598,23 @@ class ApiDelegationService:
         import uuid
         self._publisher_id = uuid.uuid4()
 
+        # 3D reconstruction gateway (R3, docs/reconstruction/design.md): jobs in Postgres, the
+        # external service over HTTP, files in MinIO. Feature off (503 on POST) until
+        # RECONSTRUCTION_SERVICE_URL/_SERVICE_KEY/_CALLBACK_SECRET are set.
+        self.reconstruction = reconstruction.create_gateway(
+            self.database, self.graph_db, self.image_db,
+            minio_access_key or MINIO_ACCESS_KEY, minio_secret_key or MINIO_SECRET_KEY)
+
         # WP11 F1: DELETE /maps/{id} marks the map DELETING; this cleans up in the background.
+        # The mark also cancels the map's active reconstruction job (same transaction).
         self.map_deleter = MapDeleter(
             self.database,
             lambda map_id: self.graph_db.delete_map(map_id),
             lambda map_id: self.image_db.delete_map(map_id),
             max_attempts=MAP_DELETE_MAX_ATTEMPTS, backoff_s=MAP_DELETE_BACKOFF_S,
-            backoff_max_s=MAP_DELETE_BACKOFF_MAX_S)
+            backoff_max_s=MAP_DELETE_BACKOFF_MAX_S,
+            on_mark=reconstruction.mark_map_deleting,
+            after_mark=self.reconstruction.after_map_delete_marked)
 
         # Configuration
         self.default_map_id = default_map_id

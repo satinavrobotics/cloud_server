@@ -163,6 +163,37 @@ IDEMPOTENCY_TTL_S = int(os.getenv("IDEMPOTENCY_TTL_S", str(24 * 3600)))
 IDEMPOTENCY_LEASE_S = int(os.getenv("IDEMPOTENCY_LEASE_S", "120"))
 IDEMPOTENCY_PURGE_INTERVAL_S = float(os.getenv("IDEMPOTENCY_PURGE_INTERVAL_S", "600"))
 
+# ==================== 3D reconstruction gateway (API, R3) ====================
+# docs/reconstruction/design.md §6.9 (packages/api/reconstruction.py). The reconstruction runs in
+# an external service (its own repo, any host); the API owns the job and talks to it over HTTP.
+# Unset (or empty) service URL, key or callback secret = feature off: POST .../reconstruction
+# answers 503 not_configured. The secrets are deliberately NOT in the import-time required list.
+def _env_or_none(name: str):
+    value = os.getenv(name)
+    return value if value else None
+
+
+RECONSTRUCTION_SERVICE_URL = _env_or_none("RECONSTRUCTION_SERVICE_URL")
+RECONSTRUCTION_SERVICE_KEY = _env_or_none("RECONSTRUCTION_SERVICE_KEY")
+RECONSTRUCTION_CALLBACK_SECRET = _env_or_none("RECONSTRUCTION_CALLBACK_SECRET")
+# How the service reaches the API's /internal/reconstruction/... callbacks.
+RECONSTRUCTION_CALLBACK_BASE_URL = os.getenv("RECONSTRUCTION_CALLBACK_BASE_URL",
+                                             "http://localhost:8000")
+# MinIO host:port as the SERVICE sees it: presigned URLs are signed for this host (SigV4 signs
+# the Host header; they cannot be rewritten afterwards). localhost:9000 while the service runs
+# on this host (MinIO listens on 127.0.0.1 and the Tailscale IP only).
+RECONSTRUCTION_MINIO_ENDPOINT = os.getenv("RECONSTRUCTION_MINIO_ENDPOINT", "localhost:9000")
+RECONSTRUCTION_MINIO_SECURE = os.getenv("RECONSTRUCTION_MINIO_SECURE",
+                                        "false").lower() in ("true", "1", "yes")
+RECONSTRUCTION_STAGING_BUCKET = os.getenv("RECONSTRUCTION_STAGING_BUCKET", "recon-staging")
+RECONSTRUCTION_URL_EXPIRY_S = int(os.getenv("RECONSTRUCTION_URL_EXPIRY_S", "14400"))
+RECONSTRUCTION_JOB_TIMEOUT_S = int(os.getenv("RECONSTRUCTION_JOB_TIMEOUT_S", "3600"))
+RECONSTRUCTION_QUEUE_TIMEOUT_S = int(os.getenv("RECONSTRUCTION_QUEUE_TIMEOUT_S", "1800"))
+RECONSTRUCTION_MAX_INFLIGHT = int(os.getenv("RECONSTRUCTION_MAX_INFLIGHT", "1"))
+RECONSTRUCTION_VOXEL_M = float(os.getenv("RECONSTRUCTION_VOXEL_M", "0.05"))
+RECONSTRUCTION_MAX_DEPTH_M = float(os.getenv("RECONSTRUCTION_MAX_DEPTH_M", "10.0"))
+RECONSTRUCTION_CLIP_Z = float(os.getenv("RECONSTRUCTION_CLIP_Z", "2.0"))
+
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
 

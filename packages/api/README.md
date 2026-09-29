@@ -263,6 +263,44 @@ Session objects gain `purpose`, `services` (mapping) and `placement`; `state` is
 open, unpaused, placed mapping session, and an operate session publishes the no-session
 payload. `MAP.SESSION_STARTED/FINISHED` payloads carry `purpose`.
 
+#### 3D reconstruction (R3)
+
+`docs/reconstruction/design.md` §6, §8, §9 (logic: `packages/api/reconstruction.py`). The work
+runs in an **external service** (own repo; contract `docs/reconstruction/handover.md`); the API
+is its gateway: it owns the job (`map_reconstructions`), sends a manifest of presigned MinIO
+URLs, receives callbacks, verifies and stores the result under
+`map-{id}/reconstruction/{job_id}/`.
+
+| Method | Path | |
+|---|---|---|
+| POST | `/api/v1/maps/{map}/reconstruction` | start / rebuild; body optional `{voxel_m, max_depth_m, clip_z}`; 202 + the job |
+| GET | `/api/v1/maps/{map}/reconstruction` | `{map_name, configured, reconstruction, job}`: the current result (`stale`, `stale_reason`, file URLs) and the active job (or the newest failed/cancelled one); poll every 2 s while a job is active |
+| POST | `/api/v1/maps/{map}/reconstruction/cancel` | cancel the active job |
+| DELETE | `/api/v1/maps/{map}/reconstruction` | delete the result, cancel an active job; 204 |
+| GET | `/api/v1/maps/{map}/reconstruction/files/{cloud.ply,ortho.png,height.png,meta.json}` | streamed; `ETag` = job id; `?v={job_id}` -> cached forever |
+
+Errors: `detail = {code, message}`: 404 `map_not_found` / `no_active_job` / `no_reconstruction`
+/ `file_not_found`; 409 `map_deleting` / `job_active` (with `job`) / `no_depth`; 422 bad
+parameters / `too_many_nodes`; 503 `not_configured`. The service being down is not an error:
+the job stays `queued` (`job.waiting_for_service: true`) for up to 30 min.
+
+Callbacks from the service (not under `/api/`, never proxied by the client's nginx):
+`POST /internal/reconstruction/jobs/{job_id}/{progress|finish|fail}` with
+`Authorization: Bearer base64url(HMAC-SHA256(RECONSTRUCTION_CALLBACK_SECRET, job_id))`; answers
+`200 {"action": "continue"|"cancel"}` or `410 {"action": "stop"}`.
+
+Config (`packages/config.py`, passed by compose from `docker_compose/.env`):
+`RECONSTRUCTION_SERVICE_URL`, `_SERVICE_KEY`, `_CALLBACK_SECRET` (all three set = feature on),
+`RECONSTRUCTION_CALLBACK_BASE_URL` (default `http://localhost:8000`),
+`RECONSTRUCTION_MINIO_ENDPOINT` (default `localhost:9000`: the host the SERVICE reaches MinIO
+at; presigned URLs are signed for it), `RECONSTRUCTION_STAGING_BUCKET` (`recon-staging`, 1-day
+expiry), `_URL_EXPIRY_S` (4 h), `_JOB_TIMEOUT_S` (1 h), `_QUEUE_TIMEOUT_S` (30 min),
+`_MAX_INFLIGHT` (1), `_VOXEL_M` / `_MAX_DEPTH_M` / `_CLIP_Z`. Events: `MAP.RECONSTRUCTION_STARTED`
+/ `_FINISHED` / `_FAILED` (source `reconstruction`). A map delete cancels the active job and
+removes the rows; the bucket delete removes the files. Migration
+`20261003_01_map_reconstructions`. Integration test with a stub service:
+`tests/integration/reconstruction/run.sh`.
+
 #### `WS /ws/map/{map_id}`
 WebSocket endpoint for real-time map updates.
 

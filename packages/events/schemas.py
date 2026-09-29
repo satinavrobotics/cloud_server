@@ -297,6 +297,39 @@ class MapIngestRejected(Payload):
     payload_session_id: Optional[str] = None
 
 
+class ReconstructionStarted(Payload):
+    """MAP.RECONSTRUCTION_STARTED (packages/api/reconstruction.py): the service's first
+    progress callback for the job."""
+    map_name: str
+    job_id: str
+    params: Dict[str, Any] = {}
+    nodes_with_depth: Optional[int] = None
+    attempt: Optional[int] = None
+
+
+class ReconstructionFinished(Payload):
+    """MAP.RECONSTRUCTION_FINISHED: the job's outputs were verified and committed; it is the
+    map's current reconstruction."""
+    map_name: str
+    job_id: str
+    points: Optional[int] = None
+    nodes_used: Optional[int] = None
+    frames_skipped: Optional[Dict[str, int]] = None
+    voxel_m: Optional[float] = None
+    duration_s: Optional[float] = None
+
+
+class ReconstructionFailed(Payload):
+    """MAP.RECONSTRUCTION_FAILED: the job ended without a result (`reason`: error, crashed,
+    timeout, service_unavailable, lost, url_expired, rejected, bad_output, no_points,
+    upload_failed, no_depth, cancelled, map_deleting). The previous result is untouched."""
+    map_name: str
+    job_id: str
+    reason: str
+    stage: Optional[str] = None
+    message: Optional[str] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel

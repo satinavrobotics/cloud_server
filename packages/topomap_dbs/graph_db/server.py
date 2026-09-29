@@ -627,6 +627,23 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to set depth {camera} on node {node_id} in {map_id}: {e}")
             return False
 
+    DEPTH_NODES_AQL = (
+        "FOR d IN @@col FILTER d.depth != null "
+        "RETURN {_key: d._key, node_id: d.node_id, pose: d.pose, depth: d.depth, "
+        "created_at: d.created_at}")
+
+    def depth_nodes(self, map_id: str) -> Tuple[int, List[Dict[str, Any]]]:
+        """(node count, the nodes that carry `depth`) of a map, for the 3D reconstruction
+        gateway (packages/api/reconstruction.py): one collection scan, only the fields the
+        manifest and the stale digest need. (0, []) for a map without a collection. Raises on
+        an ArangoDB error (the caller must not mistake it for "no depth")."""
+        name = f"nodes_{map_id}"
+        if not self.db.has_collection(name):
+            return 0, []
+        total = int(self.db.collection(name).count())
+        docs = list(self.db.aql.execute(self.DEPTH_NODES_AQL, bind_vars={"@col": name}))
+        return total, docs
+
     def delete_node(
         self,
         map_id: str,

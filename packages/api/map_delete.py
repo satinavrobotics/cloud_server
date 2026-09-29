@@ -9,7 +9,9 @@ ArangoDB/MinIO can still be deleted) and the route returns 202. A background tas
    else skips the map. The lock goes with the connection, so a crashed worker never keeps it;
 2. deletes the map's graph from ArangoDB and its image bucket from MinIO. Both deletes are
    idempotent and treat "not there" as success, so a re-run after a partial success is safe;
-3. on success deletes the row (only while it is still DELETING) and its `map_sessions` rows,
+3. on success deletes the row (only while it is still DELETING), its `map_sessions` rows and
+   its `map_reconstructions` rows (3D reconstruction R3; `request()` already cancelled the
+   active job in the marking transaction, through the `on_mark` hook),
    NOTIFYs `DELETED` and writes MAP.DELETED, all in one transaction (the event in a savepoint:
    a failing event write never keeps the map);
 4. on failure records the attempt in the map's status (`delete_attempts`, `delete_error`) and
@@ -65,6 +67,9 @@ RECORD_SQL = (f"UPDATE {MAP_TABLE} SET status = status || %s::jsonb "
 FINISH_SQL = f"DELETE FROM {MAP_TABLE} WHERE name = %s AND lifecycle = '{DELETING}'"
 # The map's mapping sessions (maps redesign M1) go with its row, in the same transaction.
 SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
+# Its 3D reconstruction jobs (R3, docs/reconstruction/design.md §8.5) too; their files go with
+# the bucket.
+RECONSTRUCTIONS_SQL = "DELETE FROM map_reconstructions WHERE map_name = %s"
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
 
 
@@ -106,8 +111,15 @@ class MapDeleter:
                  delete_images: Callable[[str], bool], *, max_attempts: int = 5,
                  backoff_s: float = 2.0, backoff_max_s: float = 60.0,
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
-                 now: Callable[[], datetime.datetime] = _utcnow):
+                 now: Callable[[], datetime.datetime] = _utcnow,
+                 on_mark: Optional[Callable[[Any, str], Awaitable[Any]]] = None,
+                 after_mark: Optional[Callable[[str, Any], Awaitable[Any]]] = None):
         self._db = db
+        # 3D reconstruction (R3): `on_mark(cursor, map_id)` runs in request()'s transaction
+        # after the mark (cancels the map's active job); `after_mark(map_id, its result)` after
+        # the commit (service cancel, events). An after_mark failure never fails the delete.
+        self._on_mark = on_mark
+        self._after_mark = after_mark
         self._steps = (("graph_db", delete_graph), ("image_db", delete_images))
         self.max_attempts = max(1, int(max_attempts))
         self._backoff_s = backoff_s
@@ -145,8 +157,15 @@ class MapDeleter:
                 if marked:
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETING}"))
+                hooked = (await self._on_mark(cursor, map_id)
+                          if self._on_mark is not None else None)
         if marked:
             logger.info("Map %s marked DELETING", map_id)
+        if self._after_mark is not None and hooked:
+            try:
+                await self._after_mark(map_id, hooked)
+            except Exception:  # noqa: BLE001
+                logger.exception("Map %s: post-mark hook failed", map_id)
         self.start(map_id)
         return {"success": True, "map_id": map_id, "lifecycle": DELETING,
                 "message": f"Map {map_id} is being deleted"}
@@ -286,6 +305,7 @@ class MapDeleter:
                 removed = bool(cursor.rowcount)
                 if removed:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
+                    await cursor.execute(RECONSTRUCTIONS_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
             if removed:

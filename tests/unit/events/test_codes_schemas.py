@@ -82,6 +82,16 @@ VALID_PAYLOADS = {
                                     "dropped_images": 6, "since": "2026-09-29T08:00:00+00:00",
                                     "map_name": "yard", "map_state": "paused",
                                     "session_id": "s1"},
+    EventCode.MAP_RECONSTRUCTION_STARTED: {"map_name": "lab", "job_id": "j1",
+                                           "params": {"voxel_m": 0.05}, "nodes_with_depth": 412,
+                                           "attempt": 1},
+    EventCode.MAP_RECONSTRUCTION_FINISHED: {"map_name": "lab", "job_id": "j1",
+                                            "points": 2310455, "nodes_used": 409,
+                                            "frames_skipped": {"no_valid_depth": 3},
+                                            "voxel_m": 0.05, "duration_s": 58.2},
+    EventCode.MAP_RECONSTRUCTION_FAILED: {"map_name": "lab", "job_id": "j1",
+                                          "reason": "url_expired", "stage": "integrating",
+                                          "message": "GET depth returned 403"},
 }
 
 
@@ -97,8 +107,9 @@ def test_codes_are_str_enums_with_spec_values():
 
 def test_severity_and_source_values_match_schema():
     assert [s.value for s in Severity] == ["info", "warning", "error", "critical"]
-    # graph_builder: migration 20260929_01_maps_m2 widens fleet_events_source_check.
-    assert [s.value for s in Source] == ["dispatch", "api", "graph_builder"]
+    # graph_builder: migration 20260929_01_maps_m2 widens fleet_events_source_check;
+    # reconstruction: 20261003_01_map_reconstructions.
+    assert [s.value for s in Source] == ["dispatch", "api", "graph_builder", "reconstruction"]
 
 
 def test_meta_for_accepts_plain_string():

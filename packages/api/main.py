@@ -14,8 +14,8 @@ from typing import Optional, Dict, Any, List, Literal
 import os
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import Response, StreamingResponse
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
@@ -313,6 +313,9 @@ async def lifespan(app: FastAPI):
     service.start_watchers(asyncio.get_event_loop())
     # Map deletes left DELETING by a previous run (WP11 F1); one runner per map across workers.
     service.map_deleter.start_resume()
+    # 3D reconstruction dispatcher (R3); only when the service is configured, one leader per
+    # cluster (advisory lock).
+    service.reconstruction.start_dispatcher()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -329,6 +332,7 @@ async def lifespan(app: FastAPI):
     if service:
         service.stop_watchers()
         await service.map_deleter.stop()
+        await service.reconstruction.stop()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
@@ -705,6 +709,86 @@ async def delete_map(map_id: str):
     except Exception as e:
         logging.error(f"Failed to delete map {map_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete map: {str(e)}")
+
+
+# ==================== 3D reconstruction (R3) ====================
+# docs/reconstruction/design.md §9; the logic is packages/api/reconstruction.py. The work runs in
+# an external service; these routes own the job. Errors carry {code, message}: 404
+# map_not_found / no_active_job / no_reconstruction / file_not_found, 409 map_deleting /
+# job_active (with the job) / no_depth, 422 bad parameters / too_many_nodes, 503
+# not_configured. The service being down is not an error here: the job queues.
+
+@app.post("/api/v1/maps/{map_id}/reconstruction", status_code=202)
+async def start_map_reconstruction(map_id: str, body: Optional[Dict[str, Any]] = None):
+    """Start (or rebuild) the map's 3D reconstruction. Body optional: {voxel_m?, max_depth_m?,
+    clip_z?}. 202 + the job (queued); the dispatcher sends it to the reconstruction service."""
+    _require_service()
+    return await _site_call("start reconstruction", service.reconstruction.start(
+        map_id, body, recording.request_actor()))
+
+
+@app.get("/api/v1/maps/{map_id}/reconstruction")
+async def get_map_reconstruction(map_id: str):
+    """{map_name, configured, reconstruction, job}: the current result (with `stale` and
+    `stale_reason`, and file URLs) and the active job, or the newest job if it failed or was
+    cancelled after the current result. Poll every 2 s while a job is active."""
+    _require_service()
+    return await _site_call("read reconstruction", service.reconstruction.status(map_id))
+
+
+@app.post("/api/v1/maps/{map_id}/reconstruction/cancel")
+async def cancel_map_reconstruction(map_id: str):
+    """Cancel the active job (queued: at once; running: the service is asked, the job ends
+    `cancelled` when it stops, at the latest 60 s later). The job."""
+    _require_service()
+    return await _site_call("cancel reconstruction", service.reconstruction.cancel(map_id))
+
+
+@app.delete("/api/v1/maps/{map_id}/reconstruction", status_code=204)
+async def delete_map_reconstruction(map_id: str):
+    """Delete the current result (its files go) and cancel an active job."""
+    _require_service()
+    await _site_call("delete reconstruction", service.reconstruction.delete(map_id))
+    return Response(status_code=204)
+
+
+@app.get("/api/v1/maps/{map_id}/reconstruction/files/{name}")
+async def get_map_reconstruction_file(map_id: str, name: str, v: Optional[str] = None,
+                                      if_none_match: Optional[str] = Header(None)):
+    """cloud.ply | ortho.png | height.png | meta.json of the current result, streamed from the
+    map bucket. ETag = the job id; with `?v=<job id>` the response is cached forever."""
+    _require_service()
+    info = await _site_call("read reconstruction file",
+                            service.reconstruction.open_file(map_id, name))
+    etag = f'"{info["job_id"]}"'
+    cache = ("public, max-age=31536000, immutable" if v == info["job_id"] else "no-cache")
+    headers = {"ETag": etag, "Cache-Control": cache}
+    if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
+        return Response(status_code=304, headers=headers)
+    if info.get("bytes") is not None:
+        headers["Content-Length"] = str(info["bytes"])
+    if name == "cloud.ply":
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in map_id)
+        headers["Content-Disposition"] = f'attachment; filename="{safe}-reconstruction.ply"'
+    stream = service.reconstruction.objects.stream(info["bucket"], info["key"])
+    return StreamingResponse(stream, media_type=info["content_type"], headers=headers)
+
+
+# Service -> gateway callbacks (design §6.3). Not under /api/, so the client's nginx never
+# forwards them. Authorization: Bearer <per-job HMAC token>. Answers are the bare
+# {"action": ...} bodies of handover §3.4 (200 continue|cancel, 410 stop).
+@app.post("/internal/reconstruction/jobs/{job_id}/{kind}")
+async def reconstruction_callback(job_id: str, kind: str, body: Dict[str, Any],
+                                  authorization: Optional[str] = Header(None)):
+    _require_service()
+    handlers = {"progress": service.reconstruction.on_progress,
+                "finish": service.reconstruction.on_finish,
+                "fail": service.reconstruction.on_fail}
+    if kind not in handlers:
+        raise HTTPException(status_code=404, detail="unknown callback")
+    service.reconstruction.authorize(job_id, authorization)
+    status, answer = await _site_call(f"reconstruction {kind}", handlers[kind](job_id, body))
+    return JSONResponse(status_code=status, content=answer)
 
 
 # ==================== Fleet Settings ====================
