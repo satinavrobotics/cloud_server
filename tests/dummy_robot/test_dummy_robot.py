@@ -41,7 +41,7 @@ class TestDummyRobot(unittest.TestCase):
         
         self.robot = DummyRobot(
             robot_name="test_robot",
-            mqtt_host="localhost",
+            mqtt_host="mqtt.invalid",  # paho is patched here: nothing connects
             mqtt_port=1883,
             publish_nodes=True
         )
@@ -221,24 +221,33 @@ class TestDummyRobot(unittest.TestCase):
         self.mock_client.publish.assert_not_called()
 
 
+# The live-broker test never falls back to a default broker: on the development host
+# localhost:1883 is the PRODUCTION broker. Point it at a throwaway one explicitly
+# (TEST_MQTT_HOST, optional TEST_MQTT_PORT, default 1883); unset, the test is skipped.
+# Deliberately not MQTT_HOST: .env.example sets that to localhost for the real services.
+TEST_MQTT_HOST = os.getenv("TEST_MQTT_HOST", "").strip()
+TEST_MQTT_PORT = int(os.getenv("TEST_MQTT_PORT", "1883"))
+
+
+@unittest.skipUnless(TEST_MQTT_HOST,
+                     "TEST_MQTT_HOST is not set: no test MQTT broker to connect to "
+                     "(localhost:1883 is the production broker on the dev host)")
 class TestDummyRobotIntegration(unittest.TestCase):
-    """Integration tests (require MQTT broker)"""
+    """Integration tests (require a test MQTT broker named by TEST_MQTT_HOST)"""
 
     def test_mqtt_connection(self):
         """Test MQTT connection (requires broker)"""
-        # This test requires a running MQTT broker
-        # Skip if not available
         try:
             robot = DummyRobot(
                 robot_name="integration_test_robot",
-                mqtt_host="localhost",
-                mqtt_port=1883
+                mqtt_host=TEST_MQTT_HOST,
+                mqtt_port=TEST_MQTT_PORT
             )
             time.sleep(1)  # Wait for connection
-            
+
             # If we get here, connection succeeded
             robot.client.disconnect()
-            
+
         except Exception as e:
             self.skipTest(f"MQTT broker not available: {e}")
 
