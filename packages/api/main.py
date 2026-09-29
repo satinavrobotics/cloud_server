@@ -1232,14 +1232,17 @@ async def create_livekit_token(request: CreateTokenRequest):
 
 def _robot_view(robot: RobotObjectV1,
                 sessions: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """robot.dict() plus (maps M3) `mapping_state`: the robot's last MQTT mapping/state with
+    """robot.dict() plus (maps M3) `mapping_state`: the robot's last MQTT topo mapping state with
     `status` on/off/unreachable and `received_at`, or null (packages/api/mapping_control.py);
+    (maps U5) `mapping_services`: {service: running | not_running | not_available};
     plus (maps §14) `session`: the robot's open session, derived from map_sessions and never
     stored on the robot: {session_id, map, purpose, state, aligned, map_T_session,
     unplaced_reason} or null (mapless). It replaces `current_map` for the client
     (packages/utils/map_sessions.py::robot_session_view)."""
     data = robot.dict()
     data["mapping_state"] = service.mapping_control.state(robot.name) if service else None
+    data["mapping_services"] = (service.mapping_control.mapping_services(robot.name)
+                                if service else None)
     data["session"] = (sessions or {}).get(robot.name)
     return data
 

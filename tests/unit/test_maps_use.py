@@ -456,7 +456,7 @@ class TestOperateLifecycle:
         _robot(db)
         out = await maps.start_session(None, "shed", {"robot": "r1", "purpose": "operate"},
                                        PUB, control=control())
-        assert out["mapping_services"] == {"topo": "not_running"}
+        assert out["mapping_services"] == {"topo": "not_available", "grid": "not_available"}
         assert {"robot_notified", "mapping_service", "mapping_state",
                 "replaced_session"} <= set(out)
 

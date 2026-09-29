@@ -1944,13 +1944,19 @@ class ApiDelegationService:
 
         self.logger.info("✅ Database watchers started for WebSocket broadcasting")
 
-    async def _broadcast_mapping_state(self, robot_name: str,
+    async def _broadcast_mapping_state(self, robot_name: str, service_name: str,
                                        view: Optional[Dict[str, Any]]) -> None:
-        """Maps M3: a robot's mapping/state message, pushed on /ws/robot/{robot}."""
+        """Maps M3/U5: a robot's mapping state message (of one mapping service), pushed on
+        /ws/robot/{robot}. `mapping_state` is always the topo state (as M3), `service` /
+        `service_state` the service whose state changed, `mapping_services` all of them."""
+        control = self.mapping_control
         try:
             await self.ws_manager.broadcast("robot_status", robot_name, {
                 "type": "mapping_state_update", "robot_name": robot_name,
-                "timestamp": datetime.now(timezone.utc).isoformat(), "mapping_state": view})
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "mapping_state": control.state(robot_name),
+                "service": service_name, "service_state": view,
+                "mapping_services": control.mapping_services(robot_name)})
         except Exception as e:
             self.logger.error(f"Failed to broadcast mapping state for {robot_name}: {e}")
 

@@ -159,6 +159,7 @@ class TestStateIngest:
         ctl = control()
         topic = "uagv/v2/RobotCompany/+/mapping/state"
         assert ctl.client.callbacks[topic][1] == 1 and len(ctl.client.listeners) == 1
+        assert ctl.client.callbacks["uagv/v2/RobotCompany/+/mapping/+/state"][1] == 1
 
     def test_cached_with_received_at(self):
         ctl = control()
@@ -196,7 +197,7 @@ class TestStateIngest:
         ctl = mc.MappingControl(PREFIX)
         seen, synced = [], asyncio.Event()
 
-        async def on_state(robot, view):
+        async def on_state(robot, service, view):
             seen.append((robot, view["status"]))
 
         async def on_connect():

@@ -20,21 +20,32 @@ sati_ros_navstack). `{prefix}` is the VDA5050 prefix (config MQTT_VDA5050_PREFIX
       Optional `"force": true` (only POST /robots/{r}/mapping/off sets it): the robot applies
       the message even if unchanged, so it also ends a local `~/set_enabled` override.
 
-  {prefix}/{robot}/mapping/state    robot -> API, RETAINED, QoS 1
-      {"online": true, "enabled": bool, "session_id": str|null, "map": str|null,
-       "nodes_sent": int, "since": iso8601|null, "stamp": iso8601,
+  {prefix}/{robot}/mapping/{service}/state    robot -> API, RETAINED, QoS 1 (maps U5, §14.5)
+      {"online": true, "service": str, "enabled": bool, "session_id": str|null,
+       "map": str|null, "nodes_sent": int, "since": iso8601|null, "stamp": iso8601,
        "source": "mqtt"|"local"|"startup"}
-      On every change and every (re)connect. Last will (and clean shutdown):
-      {"online": false, "enabled": false, "session_id": null, "map": null, ...}.
+      One topic per mapping service process (the topomap publishes `mapping/topo/state`), on
+      every change and every (re)connect, with its own last will (and clean shutdown):
+      {"online": false, "service": str, "enabled": false, "session_id": null, "map": null, ...}.
 
-What the API exposes (`mapping_state`, see state_view): the last state received for the
-robot, with `received_at` (when the API got it; a retained message is received again when the
-API reconnects) and `status`: "on" (online, enabled), "off" (online, disabled) or
+  {prefix}/{robot}/mapping/state    robot -> API, RETAINED, QoS 1  (M3; alias, Q-U6)
+      The M3 topomap's state topic (same payload without `service`). A U5 topomap still
+      publishes it for one release, so an API without U5 keeps working; this API reads it as
+      the `topo` state of a robot that has sent no `mapping/topo/state` (an M3 topomap).
+      Once a robot's `mapping/topo/state` has been received, its alias is ignored (clearing
+      the retained `mapping/topo/state` with an empty message falls back to the alias).
+
+What the API exposes. `mapping_state` (see state_view) is the TOPO state: the last topo state
+received for the robot, with `received_at` (when the API got it; a retained message is received
+again when the API reconnects) and `status`: "on" (online, enabled), "off" (online, disabled) or
 "unreachable" (the last will / clean-shutdown state: the topomap service is not running). null
 when nothing was received since the API started: the topomap has never connected (or runs a
-build without the switch). `mapping_service` is "running" when the last state is online, else
-"not_running" (doc Q3: the session still starts; the client tells the user to start the
-service; nothing is started automatically).
+build without the switch). `mapping_service` is the topo service: "running" when the last state
+is online, else "not_running" (doc Q3: the session still starts; the client tells the user to
+start the service; nothing is started automatically). `mapping_services` (§14.3/§14.5):
+{service: "running" | "not_running" | "not_available"} for every known service
+(map_sessions.KNOWN_SERVICES) and every service the robot reported; "not_available" = the robot
+has never reported that service since the API started ("not available on this robot").
 """
 
 import asyncio
@@ -44,15 +55,18 @@ import logging
 import re
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
+from packages.utils.map_sessions import KNOWN_SERVICES, TOPO
 from packages.utils.map_sessions import set_payload  # noqa: F401 - the contract, re-exported
 
 logger = logging.getLogger("ApiDelegationService.mapping_control")
 
 SET_SUFFIX = "mapping/set"
-STATE_SUFFIX = "mapping/state"
+STATE_SUFFIX = "mapping/state"          # M3 alias: the topomap's state (Q-U6)
+SERVICE_STATE_SUFFIX = "mapping/+/state"  # U5: one state topic per mapping service
 PUBLISH_TIMEOUT_S = 2.0
 
-RUNNING, NOT_RUNNING = "running", "not_running"
+RUNNING, NOT_RUNNING, NOT_AVAILABLE = "running", "not_running", "not_available"
+ALIAS = ""  # cache key of the M3 alias topic's state
 
 
 def _utcnow() -> datetime.datetime:
@@ -64,7 +78,17 @@ def set_topic(prefix: str, robot: str) -> str:
 
 
 def state_subscription(prefix: str) -> str:
+    """The M3 alias topic, for every robot."""
     return f"{prefix.rstrip('/')}/+/{STATE_SUFFIX}"
+
+
+def service_state_subscription(prefix: str) -> str:
+    """The per-service state topics (U5), for every robot and service."""
+    return f"{prefix.rstrip('/')}/+/{SERVICE_STATE_SUFFIX}"
+
+
+def service_state_topic(prefix: str, robot: str, service: str) -> str:
+    return f"{prefix.rstrip('/')}/{robot}/mapping/{service}/state"
 
 
 def force_off_payload(now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
@@ -91,6 +115,11 @@ def service_of(state: Optional[Mapping[str, Any]]) -> str:
     return RUNNING if state is not None and state.get("online") is True else NOT_RUNNING
 
 
+def availability_of(state: Optional[Mapping[str, Any]]) -> str:
+    """One entry of `mapping_services`: never reported -> not_available."""
+    return NOT_AVAILABLE if state is None else service_of(state)
+
+
 class MappingControl:
     """Publishes set messages and caches state messages. The MQTT client is the API's
     existing diagnostics connection (packages/api/diagnostics.py), attached with attach()."""
@@ -99,13 +128,18 @@ class MappingControl:
         self.prefix = prefix.rstrip("/")
         self.publish_timeout = publish_timeout
         self.client: Optional[Any] = None
-        self._state_re = re.compile(rf"^{re.escape(self.prefix)}/([^/]+)/{STATE_SUFFIX}$")
-        self._states: Dict[str, Dict[str, Any]] = {}
+        # group 1: robot; group 2: service (None for the M3 alias topic)
+        self._state_re = re.compile(
+            rf"^{re.escape(self.prefix)}/([^/]+)/mapping/(?:([^/]+)/)?state$")
+        # robot -> {service (ALIAS for the M3 topic): last state message}
+        self._states: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Set by the service: async fn(robot, view) broadcasting a state change, and async fn()
+        # Set by the service: async fn(robot, service, view) broadcasting a state change of one
+        # mapping service (view = its state_view, or None when cleared), and async fn()
         # re-publishing every robot's set message (on every broker (re)connect).
-        self.on_state: Optional[Callable[[str, Optional[Dict[str, Any]]], Awaitable[None]]] = None
+        self.on_state: Optional[
+            Callable[[str, str, Optional[Dict[str, Any]]], Awaitable[None]]] = None
         self.on_connect: Optional[Callable[[], Awaitable[None]]] = None
         # Maps §14: async fn(robot, session view or None) pushing the robot's `session` after a
         # session change through the API (packages/api/maps.py::notify_robot).
@@ -118,6 +152,8 @@ class MappingControl:
         """Register on `client` (a packages.utils.mqtt_client.MQTTClient) BEFORE it connects."""
         self.client = client
         self._loop = loop
+        client.register_callback(service_state_subscription(self.prefix),
+                                 self.on_state_message, qos=1)
         client.register_callback(state_subscription(self.prefix), self.on_state_message, qos=1)
         client.add_connect_listener(self._connected)
 
@@ -129,41 +165,59 @@ class MappingControl:
     # --- state (robot -> API) ------------------------------------------------------------------
 
     def on_state_message(self, client: Any, userdata: Any, msg: Any) -> None:
-        """paho thread: cache a state message (an empty payload clears the retained topic)."""
+        """paho thread: cache a state message, per service (an empty payload clears the
+        retained topic). `mapping/{service}/state` is that service's; `mapping/state` (the M3
+        alias) is the topomap's, used only while no `mapping/topo/state` was received."""
         match = self._state_re.match(msg.topic)
         if not match:
             return
-        robot = match.group(1)
+        robot, service = match.group(1), match.group(2)
+        key = ALIAS if service is None else service
+        cache = self._states.setdefault(robot, {})
         if not msg.payload:
-            self._states.pop(robot, None)
-            self._broadcast(robot, None)
-            return
-        try:
-            payload = json.loads(msg.payload.decode("utf-8"))
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Bad mapping state from %s: %s", robot, e)
-            return
-        if not isinstance(payload, dict):
-            return
-        payload["received_at"] = _utcnow().isoformat()
-        self._states[robot] = payload
-        self._broadcast(robot, state_view(payload))
+            cache.pop(key, None)
+        else:
+            try:
+                payload = json.loads(msg.payload.decode("utf-8"))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Bad mapping state from %s (%s): %s", robot, msg.topic, e)
+                return
+            if not isinstance(payload, dict):
+                return
+            payload["received_at"] = _utcnow().isoformat()
+            payload["service"] = TOPO if service is None else service
+            cache[key] = payload
+        if service is None and TOPO in cache:
+            return  # the alias of a robot that reports mapping/topo/state: nothing changes
+        name = TOPO if service is None else service
+        self._broadcast(robot, name, state_view(self._raw(robot, name)))
 
-    def _broadcast(self, robot: str, view: Optional[Dict[str, Any]]) -> None:
+    def _broadcast(self, robot: str, service: str, view: Optional[Dict[str, Any]]) -> None:
         if self.on_state is not None and self._loop is not None:
-            asyncio.run_coroutine_threadsafe(self.on_state(robot, view), self._loop)
+            asyncio.run_coroutine_threadsafe(self.on_state(robot, service, view), self._loop)
 
-    def state(self, robot: str) -> Optional[Dict[str, Any]]:
-        """The robot's `mapping_state` (state_view of the last message), or None."""
-        return state_view(self._states.get(robot))
+    def _raw(self, robot: str, service: str) -> Optional[Dict[str, Any]]:
+        cache = self._states.get(robot) or {}
+        found = cache.get(service)
+        if found is None and service == TOPO:
+            found = cache.get(ALIAS)
+        return found
+
+    def state(self, robot: str, service: str = TOPO) -> Optional[Dict[str, Any]]:
+        """The robot's `mapping_state` (state_view of the last topo state message), or None;
+        with `service`, that service's state."""
+        return state_view(self._raw(robot, service))
 
     def mapping_service(self, robot: str) -> str:
-        return service_of(self._states.get(robot))
+        """The topomap: running | not_running (M3 `mapping_service`)."""
+        return service_of(self._raw(robot, TOPO))
 
     def mapping_services(self, robot: str) -> Dict[str, str]:
-        """Per mapping service (maps §14.3, `mapping_services`). Until the per-service state
-        topics exist (U5) the robot reports only the topomap, on mapping/state."""
-        return {"topo": self.mapping_service(robot)}
+        """Per mapping service (maps §14.3/§14.5, `mapping_services`): every known service
+        and every service the robot reported -> running | not_running | not_available."""
+        reported = [k for k in (self._states.get(robot) or {}) if k != ALIAS]
+        names = list(KNOWN_SERVICES) + sorted(set(reported) - set(KNOWN_SERVICES))
+        return {name: availability_of(self._raw(robot, name)) for name in names}
 
     # --- set (API -> robot) --------------------------------------------------------------------
 

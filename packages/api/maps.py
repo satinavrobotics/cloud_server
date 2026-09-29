@@ -638,8 +638,9 @@ async def session_summary(db: Any, name: str, control: Optional[Any] = None
                           ) -> Dict[str, Any]:
     """The `sessions` block of GET /api/v1/maps/{id}: counts, the open MAPPING session, the
     robots using the map (`operating`), and the newest SUMMARY_MAX_SESSIONS sessions (newest
-    first; the full history is GET .../sessions). M3: `mapping_state` / `mapping_service` of
-    the open mapping session's robot (null without one; packages/api/mapping_control.py)."""
+    first; the full history is GET .../sessions). M3: `mapping_state` / `mapping_service` (and,
+    U5, `mapping_services`) of the open mapping session's robot (null without one;
+    packages/api/mapping_control.py)."""
     try:
         async with open_store(db, uuid.uuid4()) as store:
             rows = await store.sessions(name)
@@ -655,11 +656,12 @@ async def session_summary(db: Any, name: str, control: Optional[Any] = None
                "unaligned": sum(1 for s in items
                                 if s["aligned"] is False and s["purpose"] == ms.MAPPING),
                "items": items[:SUMMARY_MAX_SESSIONS],
-               "mapping_state": None, "mapping_service": None}
+               "mapping_state": None, "mapping_service": None, "mapping_services": None}
     if open_session is not None and control is not None:
         robot = open_session["robot_name"]
         summary["mapping_state"] = control.state(robot)
         summary["mapping_service"] = control.mapping_service(robot)
+        summary["mapping_services"] = control.mapping_services(robot)
     return summary
 
 

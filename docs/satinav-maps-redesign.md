@@ -462,7 +462,7 @@ counts per session. `since`: when `enabled` last flipped.
 
 ## 14. Using maps: operate sessions and the map window
 
-**Status:** design 2026-09-29; U1–U3 **built, not deployed** (§14.11). Revises the M5–M7 plan (§14.9).
+**Status:** design 2026-09-29; U1–U3 **built, not deployed** (§14.11); U5 **built, not deployed** (§14.12). Revises the M5–M7 plan (§14.9).
 
 ### 14.1 The gap
 
@@ -702,7 +702,7 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 | U2 | Consumers read the session (§14.6), with the transition fallback | cloud_server; **built, not deployed** (§14.11) |
 | U3 | Run-change detection in the dispatcher; unplace; geo re-place on the datum write (the same compare-and-set as graph-builder's) | cloud_server; **built, not deployed** (§14.11) |
 | U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
-| U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server |
+| U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server; **built, not deployed** (§14.12) |
 | U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server, sati-client |
 | M5 | One `MapView` (unchanged goal; its local/geo rendering starts from U4's preview) | sati-client |
 | M6 | **Shrinks** to aligning *existing* unaligned sessions (legacy data), since new ones are placed before capture. Drop it if none remain | cloud_server, sati-client |
@@ -735,13 +735,36 @@ As designed, except:
 - **Empty local map.** "The first mapping session of an empty local map is identity and placed" uses the map's node count (ArangoDB, falling back to the sessions' and the row's stored counts), not "the first session": a local map whose earlier sessions recorded nothing is still empty.
 - **Placement carried over (addition).** `replace: true` on the **same** local map carries a placed session's `map_T_session` into the new one (`placement.source: "session"`, `from_session_id`), e.g. "Finish mapping → Use" in one step without placing by hand. Only while it is placed, i.e. within the same run.
 - **Stillness check details (Q-U7).** Driving = robot state `ON_TASK`/`MAP_DEPLOYMENT` (an active order), or in the robot's last VDA5050 state (`robot_latest.state_msg`, merged about once a second; ignored when older than 30 s): `driving: true`, a velocity above the noise floor (0.01 m/s, 0.01 rad/s), or remaining `nodeStates`. Moved = `robot_pose` vs `robot.status.pose` beyond 0.02 m / 0.5°. `place` also requires the robot online (its pose must be live).
-- **API details.** Session `state` is `mapping` | `paused` | `operating` | `finished`. The robot's `session` view has `map_T_session: null` while not placed (never a guessed identity) and `unplaced_reason` (`run_changed`). `sessions.open` in `GET /maps/{id}` is the open **mapping** session; `sessions.unaligned` counts mapping sessions only. History paging: `before` = the previous page's `next_before` (a session id). `services` accepts `topo` and the reserved `grid`; `mapping_services` is `{topo: ...}` until U5. WS: `robot_update` carries `session` (from a 1 s cache, so dispatcher changes show within about a second) and the API pushes `session_update` right after its own changes. `POST /robots/{r}/mapping/off` is allowed with an operate session (only an open mapping session blocks it).
+- **API details.** Session `state` is `mapping` | `paused` | `operating` | `finished`. The robot's `session` view has `map_T_session: null` while not placed (never a guessed identity) and `unplaced_reason` (`run_changed`). `sessions.open` in `GET /maps/{id}` is the open **mapping** session; `sessions.unaligned` counts mapping sessions only. History paging: `before` = the previous page's `next_before` (a session id). `services` accepts `topo` and the reserved `grid`; `mapping_services` was `{topo: ...}` until U5 (§14.12). WS: `robot_update` carries `session` (from a 1 s cache, so dispatcher changes show within about a second) and the API pushes `session_update` right after its own changes. `POST /robots/{r}/mapping/off` is allowed with an operate session (only an open mapping session blocks it).
 - **Migration** adds a third constraint, `map_sessions_services_check` (only mapping sessions have services). Downgrade deletes operate sessions first (they own no nodes; their robots become mapless). Rehearsed on the production schema: up, idempotent re-run, down, up.
 - **Dispatcher refusal.** A route node on a map the robot is not placed on is not sent: the node fails (`MISSION.NODE_FAILED`, `failure_reason` "Route node N: robot is not placed on map X") and the behavior tree decides the mission; it is wrapped up on the robot's next state message. With the transition fallback (`SESSIONLESS_FALLBACK = True` in the dispatcher and the planner, removed in U6) a map the robot has **no** session on keeps the M2 rule with a warning.
 - **Transition, old client.** The shim (`PUT /robots/{r}/map`) extending a local map that has nodes now starts the mapping session **unplaced** (Q-U4): capture stays off and route orders on that map are refused until the robot is placed, which only the new client (U4) can do. Geo maps and new/empty local maps behave as before.
 - **Run recorder / bags.** `mission_runs.map_id` = the session's map, or null when mapless (no longer the `GEO`/`LOCAL` sentinel or the pose's literal `"map"`); if the session cannot be read the M2 rule applies. Bag sidecars gain `session_id`.
 
 Deploy notes: open local sessions that are not aligned (later M1/M2 sessions on a local map) stop capturing at deploy; `mapsu1.sh` lists them. mission-dispatch starts with no header-id baseline, so the deploy itself unplaces nothing.
+
+### 14.12 U5 as built
+
+Code: robot `sati_topo_mapping/mapping_switch.py` + `topomap_node.py` (sati_ros_navstack `main`); cloud `packages/api/mapping_control.py` (the per-service cache), `main.py` (robot view), `maps.py` (session summary), `server.py` (WS). `services` in `mapping/set` and "enabled only for an open, unpaused, placed mapping session; operate = the no-session payload" were already built in U1 (`map_sessions.set_payload`, published by the API and mission-dispatch). Tests: robot `test/test_mapping_switch.py` (pure Python); cloud `tests/unit/test_maps_u5.py`. Deploy: `~/pg-cutover/scripts/mapsu5.sh` (API only, no migration; **after `mapsu1.sh`**).
+
+**The contract** (adds to §13.3):
+
+| Topic | Direction | Retained, QoS | Payload |
+|---|---|---|---|
+| `{prefix}/{robot}/mapping/set` | API, dispatcher → robot | yes, 1 | `{enabled, session_id, map, services: [..], issued_at}` (+ `force`); `services` is `[]` in the no-session payload |
+| `{prefix}/{robot}/mapping/{service}/state` | robot → API | yes, 1 | the M3 state payload + `service`; last will (and clean shutdown) `{online: false, service, enabled: false, session_id: null, map: null, nodes_sent: 0, since: null}` |
+| `{prefix}/{robot}/mapping/state` | robot → API | yes, 1 | the M3 topic, kept as an alias for one release (Q-U6): the same payloads, with its own last will |
+
+- **Robot.** The topomap is service `topo`: enabled iff `enabled` and `"topo"` in `services`. A missing or null `services` means `["topo"]` (an M3 API); a `services` that is not a list of strings makes the message malformed (ignored, as a non-boolean `enabled` already did). A set message whose `services` do not list `topo` is "no session" for the topomap: off, `session_id`/`map` null (it does not claim a session it is not part of). `services` is part of the repeat check, so the U5 API's re-publish of a session an M3 API had published (`["topo"]` vs. missing) is not a new command and a local `~/set_enabled` override survives the API upgrade. State goes to `mapping/topo/state`, with the last will there. **The alias needs a second MQTT connection:** a connection has exactly one last will, and the alias without one would leave an M3 API showing a crashed topomap as `on`. It connects with client id `{robot}_{mqtt.client_id}_m3state` (the checked-in configs give every robot's topomap the same `mqtt.client_id` `topomap_publisher`, so the robot name keeps two robots from kicking each other off); param `mqtt.legacy_state_alias` (default true) turns it off. Each connection re-publishes its own topic on (re)connect; a change publishes both.
+- **API.** Subscribes to `{prefix}/+/mapping/+/state` and to the M3 `{prefix}/+/mapping/state` (`+` is one level, so they do not overlap), one callback, a cache per robot and service. The alias is the `topo` state only while no `mapping/topo/state` has been received for that robot; once one has, the alias is ignored (and not broadcast), whatever order the retained messages arrive in after an API reconnect. An empty (cleared) `mapping/topo/state` falls back to the alias. `mapping_state` / `mapping_service` stay the topo ones (the M3 keys and values); `mapping_state` gains `service: "topo"`. `mapping_services` = `{service: running | not_running | not_available}` for every known service (`topo`, `grid`, in that order) plus every other service the robot reported; `not_available` = never reported since the API started ("not available on this robot"), `not_running` = the last will. Where: `GET /robots[/{r}]`, `GET /maps/{id}` `sessions.mapping_services` (open mapping session's robot, else null), the start and shim responses, WS `mapping_state_update` (which gains `service`, `service_state` and `mapping_services`; `mapping_state` in it is always the topo state, so an M3 client that replaces its topo state with it keeps working).
+
+As designed, except:
+
+- **A never-reported topo is `not_available`** in `mapping_services` (U1 returned `not_running`), per §14.5; `mapping_service` (singular, M3) still says `not_running` for it.
+- **Downgrading a robot to an M3 topomap** after it ran U5 leaves its last retained `mapping/topo/state` (the clean-shutdown or will state, `online: false`) on the broker, which the API prefers over the M3 topomap's live alias: the robot shows `unreachable`. Clear it with an empty retained message (`mosquitto_pub -r -n -t {prefix}/{robot}/mapping/topo/state`); the broker also drops it at its own restart (no persistence).
+- **Ending the alias** (next release): remove the second connection (robot) and the `mapping/state` subscription (API) together, after every robot runs U5 and every API reads the per-service topic.
+
+Deploy order: the robot and the cloud are independent (a U5 topomap talks to a U1 API through the alias, and a U5 API reads an M3 topomap through the alias). The cloud part is built on U1–U3 and runs after `mapsu1.sh`. Robot rollout: rebuild `sati_topo_mapping` (colcon; `sati_mqtt_common` is unchanged) on the sim workspace and the real robot, then restart the service that runs the topomap (as §13.3); no config change.
 
 ---
 

@@ -211,23 +211,31 @@ modes and map selection, the run recorder's `map_id` and the bag metadata read i
 After every committed session change (`POST .../sessions`, `.../pause|resume|finish`, the shim)
 the API publishes the robot's **retained** `{prefix}/{robot}/mapping/set` (`prefix` =
 `MQTT_VDA5050_PREFIX`, `uagv/v2/RobotCompany`) from its open session, and re-publishes every
-robot's on each broker (re)connect. It caches the robots' retained `{prefix}/+/mapping/state`.
+robot's on each broker (re)connect. The set message carries `services` (maps U5: the open
+mapping session's services; `[]` without one). It caches the robots' retained per-service
+`{prefix}/+/mapping/+/state` (U5; the topomap sends `mapping/topo/state`) and the M3
+`{prefix}/+/mapping/state`, read as `topo` for a robot that sends no `mapping/topo/state`
+(alias for one release).
 Topic and payload contract: `packages/api/mapping_control.py` (docstring); robot side:
 `sati_topo_mapping` in sati_ros_navstack. Additive response fields:
 
 | Where | Field |
 |---|---|
-| `POST .../sessions`, `PUT /robots/{r}/map` | `robot_notified` (bool: the broker acknowledged the set message; false never fails the call), `mapping_service` (`"running"` \| `"not_running"`: the robot's topomap is connected; the session starts either way), `mapping_state` |
+| `POST .../sessions`, `PUT /robots/{r}/map` | `robot_notified` (bool: the broker acknowledged the set message; false never fails the call), `mapping_service` (`"running"` \| `"not_running"`: the robot's topomap is connected; the session starts either way), `mapping_services` (U5, below), `mapping_state` |
 | `POST .../sessions/{sid}/pause\|resume\|finish` | `robot_notified`, `mapping_state` |
-| `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service` (of the open session's robot; null without an open session) |
-| `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state` per robot |
+| `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service`, `sessions.mapping_services` (of the open session's robot; null without an open session) |
+| `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state`, `mapping_services` per robot |
 | `POST /api/v1/robots/{r}/mapping/off` | new: force a robot's capture off when it has **no** open session (404 unknown robot; 409 `finish or pause the session on map X` otherwise). Publishes the retained `{enabled: false, session_id: null, map: null, force: true, issued_at}`; `force` makes the robot apply it even if unchanged (it also ends a local `~/set_enabled` override). Returns `robot_notified`, `mapping_state` |
-| `WS /ws/robot/{r}` | `{type: "mapping_state_update", robot_name, timestamp, mapping_state}` on every state message |
+| `WS /ws/robot/{r}` | `{type: "mapping_state_update", robot_name, timestamp, mapping_state, service, service_state, mapping_services}` on every state message of any mapping service (`mapping_state` is always the topo state; `service` / `service_state` the service whose message it was) |
 
 `mapping_state`: null (nothing received since the API started: the topomap never connected, or
 runs a build without the switch) or `{status: "on"|"off"|"unreachable", online, enabled,
 session_id, map, nodes_sent, since, stamp, source: "mqtt"|"local"|"startup", received_at}`.
 `unreachable` = the robot's last will (or clean shutdown): its topomap service is not running.
+Since U5 it is the **topo** service's state and also carries `service: "topo"`.
+`mapping_services` (U5): `{service: "running" | "not_running" | "not_available"}` for every
+known service (`topo`, `grid`) and every service the robot reported; `not_available` = never
+reported since the API started ("not available on this robot"), `not_running` = its last will.
 The robot confirmed a session when `mapping_state.session_id` equals the open session's id and
 `enabled` matches (`true` while mapping, `false` while paused).
 
@@ -242,7 +250,7 @@ session that is not placed captures nothing, gets no route orders on that map an
 
 | Method | Path | Does |
 |---|---|---|
-| POST | `/api/v1/maps/{id}/sessions` | `{robot, purpose?: "mapping"\|"operate" (default mapping), services?: ["topo"\|"grid"] (mapping only, default ["topo"]), placement?: {pose: {x, y, yaw}, robot_pose: {x, y, theta}}, replace?: bool}` → 201 `{map_id, map_state, changed, session, replaced_session, robot_notified, mapping_service, mapping_services: {topo: ...}, mapping_state}`. 409: robot offline; robot has an open session without `replace`; map archived / being deleted / `draft` for operate; another open mapping session (mapping); geo map and no robot datum; placing while the robot drives or after it moved (> 0.02 m / 0.5°). 422: `placement` on a geo map, `services` on operate, unknown service. `replace: true` finishes the robot's open session in the same transaction (a refused start keeps it); on the same local map a placed session's transform carries over (`placement.source: "session"`). |
+| POST | `/api/v1/maps/{id}/sessions` | `{robot, purpose?: "mapping"\|"operate" (default mapping), services?: ["topo"\|"grid"] (mapping only, default ["topo"]), placement?: {pose: {x, y, yaw}, robot_pose: {x, y, theta}}, replace?: bool}` → 201 `{map_id, map_state, changed, session, replaced_session, robot_notified, mapping_service, mapping_services: {topo: ..., grid: ...}, mapping_state}`. 409: robot offline; robot has an open session without `replace`; map archived / being deleted / `draft` for operate; another open mapping session (mapping); geo map and no robot datum; placing while the robot drives or after it moved (> 0.02 m / 0.5°). 422: `placement` on a geo map, `services` on operate, unknown service. `replace: true` finishes the robot's open session in the same transaction (a refused start keeps it); on the same local map a placed session's transform carries over (`placement.source: "session"`). |
 | POST | `/api/v1/maps/{id}/sessions/{sid}/place` | `{pose: {x, y, yaw}, robot_pose: {x, y, theta}}` → `{map_id, map_state, changed, session, robot_notified, mapping_state}`; `map_T_session = pose ⊕ robot_pose⁻¹`, `placement = {pose, robot_pose, source: "user", actor, at}`, `MAP.SESSION_PLACED`, then `mapping/set`. 404 unknown map/session; 409 finished, geo map, an already placed mapping session, robot offline / driving / moved. An operate session can be re-placed any time. |
 | POST | `.../sessions/{sid}/finish` | both purposes (operate: "Stop using"; the map state stays). `pause` / `resume`: 409 on operate. |
 | GET | `/api/v1/maps/{id}/sessions?limit=&before=` | the whole history, newest first: `{map_id, count, items, next_before}`; `limit` 1-200 (default 50); `before` = the previous page's `next_before`. |
