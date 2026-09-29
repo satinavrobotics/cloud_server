@@ -201,7 +201,7 @@ Fire and forget (a 2 s timeout, no retry).
 
 ### 3.2 `finish`
 
-After **all four** outputs were uploaded successfully.
+After **both** outputs (`cloud`, `meta`) were uploaded successfully.
 
 ```json
 {
