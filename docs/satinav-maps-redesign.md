@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.** **U6 (2026-09-29, built, not deployed; §14.14): `robot.current_map`, the `PUT /robots/{r}/map` shim (now 410), the `GEO`/`LOCAL` sentinels and the §14.6 fallbacks are gone; a robot's map is only its open session.**
+**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.** **U6 (deployed 2026-09-29, `mapsu6.sh`; §14.14): `robot.current_map`, the `PUT /robots/{r}/map` shim (now 410), the `GEO`/`LOCAL` sentinels and the §14.6 fallbacks are gone; a robot's map is only its open session.**
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -462,7 +462,7 @@ counts per session. `since`: when `enabled` last flipped.
 
 ## 14. Using maps: operate sessions and the map window
 
-**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client; U7 (placement reuse, §14.13, with the stale-`ON_TASK` fix) **deployed 2026-09-29**; U6 (removals, §14.14) built in cloud_server and sati-client, not deployed. Revises the M5–M7 plan (§14.9).
+**Status:** design 2026-09-29; U1–U3 **deployed 2026-09-29** (§14.11); U5 cloud **deployed 2026-09-29**, robot rebuild pending (§14.12); U4 and M5 built in sati-client; U7 (placement reuse, §14.13, with the stale-`ON_TASK` fix) **deployed 2026-09-29**; U6 (removals, §14.14) **deployed 2026-09-29**. Revises the M5–M7 plan (§14.9).
 
 ### 14.1 The gap
 
@@ -704,7 +704,7 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 | U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
 | U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server; cloud **deployed 2026-09-29** (in the `mapsu1.sh` build of main; `mapsu5.sh` then found the image unchanged), robot topomap rebuild pending (§14.12) |
 | U7 | Placement reuse across sessions (§14.13): `robot_run_epochs`, `map_sessions.run_epoch`, carry on start, `placement_reusable`; with it the stale-`ON_TASK` fix (§14.11) | cloud_server (`mapsu7.sh`), sati-client (Use skips place mode when reusable) |
-| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server (**built 2026-09-29**, not deployed: §14.14, `mapsu6.sh`, after `mapsu7.sh` and the U6 client), sati-client (**built 2026-09-29**) |
+| U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server (**deployed 2026-09-29**: §14.14, `mapsu6.sh`), sati-client (**built 2026-09-29**) |
 | M5 | One `MapView` (unchanged goal; its local/geo rendering starts from U4's preview) | sati-client; **built 2026-09-29** (`6798aa0..c39953b`): `MapView` replaces CostmapRenderer and GeoMap; robots drawn through `map_T_session`, or without a session through their own datum (fixes the −1.445° marker). Left: costmap bitmaps still drawn in the run frame; `current_map` readers go in U6 |
 | M6 | **Shrinks** to aligning *existing* unaligned sessions (legacy data), since new ones are placed before capture. Drop it if none remain | cloud_server, sati-client |
 | M7 | Grid storage and display once `sati_grid_mapping` exists; it plugs in as service `grid` | all |
@@ -797,7 +797,7 @@ Code: `packages/utils/map_sessions.py` (`run_continues`, `epoch_to_stamp`, `reus
 
 ### 14.14 U6 as built
 
-**Status:** built 2026-09-29 (cloud_server), not deployed. Deploy: `~/pg-cutover/scripts/mapsu6.sh` (migration `20261002_01_drop_current_map`; rebuilds api-delegation-service, mission-dispatch, mission-planner-service). **Prerequisites:** U7 deployed (`mapsu7.sh`; the migration follows `20261001_01_run_epochs`) and **the U6 client deployed first**: an older client still calls `PUT /robots/{r}/map`, reads `current_map`, and sends `GEO`/`LOCAL` waypoints, all of which stop working. The script cannot detect which client browsers run, so it prints this as a manual prerequisite.
+**Status:** built 2026-09-29, **deployed 2026-09-29 21:10** (rollback tags `:pre-mapsu6`). Deploy: `~/pg-cutover/scripts/mapsu6.sh` (migration `20261002_01_drop_current_map`; rebuilds api-delegation-service, mission-dispatch, mission-planner-service). **Prerequisites:** U7 deployed (`mapsu7.sh`; the migration follows `20261001_01_run_epochs`) and **the U6 client deployed first**: an older client still calls `PUT /robots/{r}/map`, reads `current_map`, and sends `GEO`/`LOCAL` waypoints, all of which stop working. The script cannot detect which client browsers run, so it prints this as a manual prerequisite.
 
 A robot's map is only its open session (§14.2). Removed:
 
