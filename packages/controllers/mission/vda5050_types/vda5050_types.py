@@ -644,6 +644,14 @@ class VDA5050Connection(pydantic.BaseModel):
     serialNumber: str = ""
     connectionState: VDA5050ConnectionState = VDA5050ConnectionState.OFFLINE
 
+    @pydantic.root_validator(pre=True)
+    def _state_alias(cls, values):  # noqa: N805 - pydantic v1 validator
+        """sati_vda5050_client sends the connection state as `state` (not VDA5050's
+        `connectionState`); without this every message read as the OFFLINE default."""
+        if isinstance(values, dict) and "connectionState" not in values and "state" in values:
+            values = {**values, "connectionState": values["state"]}
+        return values
+
 
 class RobotDatum(pydantic.BaseModel):
     """GPS origin published by the robot on its /{robot_name}/datum MQTT topic.

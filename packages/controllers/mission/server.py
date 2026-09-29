@@ -37,6 +37,9 @@ from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import behavior_tree
 from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
+from packages.controllers.mission import run_change
+from packages.events.codes import EventCode, Source
+from packages.events.emit import Event, emit as emit_event
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
 from packages.utils import map_geo, map_sessions, metrics
@@ -103,6 +106,7 @@ RobotMessage = Union[api_objects.RobotObjectV1,
                      types.VDA5050State,
                      types.VDA5050Factsheet,
                      types.RobotDatum,
+                     types.VDA5050Connection,
                      WaitElapsed]
 
 
@@ -230,6 +234,12 @@ class Robot:
         # Timestamp of the robot state message being handled, for the events it causes
         # (see _record); None outside that.
         self._event_ts: Optional[datetime.datetime] = None
+        # Maps §14 U3: a new robot run (VDA5050 header ids restart) unplaces its session; a
+        # datum re-places a geo one. `_datum_epoch`: the dispatcher's MQTT connection epoch in
+        # which this robot's last datum arrived (the first datum of an epoch may be the
+        # retained one of an older run).
+        self._run_detector = run_change.RunChangeDetector()
+        self._datum_epoch: Optional[int] = None
 
         if self._robot_server.push_telemetry:
             self._telemetry = metrics.Telemetry()
@@ -846,6 +856,123 @@ class Robot:
             api_objects.RobotObjectV1, self._name,
             {"datum": json.loads(self._robot_object.datum.json())}, uuid.uuid4()
         )
+        epoch = getattr(self._robot_server, "mqtt_epoch", 0)
+        trusted = self._datum_epoch == epoch
+        self._datum_epoch = epoch
+        await self._replace_geo_session(map_geo.robot_datum(self._robot_object.datum), trusted)
+
+    # --- maps §14 U3: run changes and geo re-placement -----------------------------------------
+
+    async def _on_connection_message(self, message: types.VDA5050Connection) -> None:
+        evidence = self._run_detector.on_connection(message.connectionState, message.headerId)
+        if evidence is not None:
+            await self._on_run_changed(evidence)
+
+    async def _on_run_changed(self, evidence: Dict[str, Any]) -> None:
+        """The robot's run frame reset (run_change.py): its open session is no longer placed.
+        One transaction: aligned = false, placement.unplaced_reason = run_changed (+ when, and
+        the evidence), MAP.SESSION_UNPLACED. Then the robot's mapping/set (capture off). A geo
+        session is re-placed by the next datum (_replace_geo_session). Never raises."""
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self.info(f"New robot run ({evidence}): unplacing its open map session")
+        patch = {"unplaced_reason": map_sessions.UNPLACED_RUN_CHANGED,
+                 "unplaced_at": now.isoformat(), "unplaced_evidence": evidence}
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.UNPLACE_SQL, (json.dumps(patch), self._name))
+                    rows = await cursor.fetchall()
+                for session_id, map_name, purpose, transform in rows:
+                    await self._emit(conn, Event(
+                        EventCode.MAP_SESSION_UNPLACED, now, robot_name=self._name,
+                        source=Source.DISPATCH,
+                        discriminator=f"session:{session_id}:unplaced:{now.isoformat()}",
+                        payload={"map_name": map_name, "session_id": str(session_id),
+                                 "purpose": purpose, "reason": map_sessions.UNPLACED_RUN_CHANGED,
+                                 "evidence": evidence, "old_map_T_session": transform}))
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Could not unplace the open session after a run change: {err}")
+            return
+        for _sid, map_name, purpose, _t in rows:
+            self.warning(f"Session on map '{map_name}' ({purpose}) is no longer placed: the "
+                         "robot's run frame changed")
+        if rows:
+            await self._publish_mapping_set()
+
+    async def _replace_geo_session(self, datum: Optional[Dict[str, Any]], trusted: bool) -> None:
+        """A datum message for a robot whose open session is on a geo map: re-place a session a
+        run change unplaced, or re-derive a placed one whose datum changed (plan_geo_replace).
+        Compare-and-set on the state read (graph-builder realigns the same way), with
+        MAP.SESSION_REALIGNED in the same transaction; then the robot's mapping/set. Never
+        raises."""
+        session = await self._read_open_session()
+        if not isinstance(session, dict):
+            return
+        plan = map_sessions.plan_geo_replace(session, datum, trusted)
+        if plan is None:
+            return
+        transform, reason = plan
+        now = datetime.datetime.now(datetime.timezone.utc)
+        old_placement = session.get("placement") or {}
+        placement = {"source": map_sessions.SOURCE_DATUM, "at": now.isoformat(),
+                     "reason": reason}
+        if not map_sessions.is_placed(session):
+            placement["replaced_after"] = {k: old_placement.get(k) for k in
+                                           ("unplaced_reason", "unplaced_at")}
+        won = False
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.REPLACE_SQL, (
+                        json.dumps(datum), json.dumps(transform), json.dumps(placement),
+                        uuid.UUID(session["session_id"]), map_sessions.is_placed(session),
+                        json.dumps(session["datum"]) if session.get("datum") is not None
+                        else None))
+                    won = cursor.rowcount == 1
+                if won:
+                    await self._emit(conn, Event(
+                        EventCode.MAP_SESSION_REALIGNED, now, robot_name=self._name,
+                        source=Source.DISPATCH,
+                        discriminator=(f"session:{session['session_id']}:realigned:"
+                                       f"{transform['tx']:.4f}:{transform['ty']:.4f}:"
+                                       f"{transform['yaw']:.6f}:{now.isoformat()}"),
+                        payload={"map_name": session["map_name"],
+                                 "session_id": session["session_id"], "aligned": True,
+                                 "purpose": session["purpose"], "reason": reason,
+                                 "map_T_session": dict(transform),
+                                 "old_map_T_session": dict(session["map_t_session"]),
+                                 "datum": dict(datum), "old_datum": session.get("datum")}))
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Could not re-place the geo session from the new datum: {err}")
+            return
+        if won:
+            self.info(f"Session on geo map '{session['map_name']}' placed from the robot's "
+                      f"datum ({reason}): map_T_session {transform}")
+            await self._publish_mapping_set()
+
+    async def _emit(self, conn: Any, event: Event) -> None:
+        """An event in a savepoint of the caller's transaction: a failed write is logged and
+        never undoes the session change."""
+        try:
+            async with conn.transaction():
+                await emit_event(conn, event)
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Could not write {event.code}: {err}")
+
+    async def _publish_mapping_set(self) -> None:
+        """The robot's retained `{prefix}/{robot}/mapping/set` from its open session as it is
+        now (contract: packages/api/mapping_control.py; the API publishes it after its own
+        session changes). Never raises."""
+        session = await self._read_open_session()
+        if session is SESSION_UNKNOWN:
+            return
+        try:
+            payload = map_sessions.set_payload(session)
+            self._mqtt_client.publish(map_sessions.set_topic(self._mqtt_prefix, self._name),
+                                      json.dumps(payload), qos=1, retain=True)
+            self.info(f"Mapping set published: {payload}")
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Mapping set not published: {err}")
 
     async def _read_open_session(self) -> Any:
         """The robot's open map session (maps §14; packages/utils/map_sessions.py), None when
@@ -1885,6 +2012,8 @@ class Robot:
                     self._record("on_factsheet", self._name, message)
                 elif isinstance(message, types.RobotDatum):
                     await self._process_datum_message(message)
+                elif isinstance(message, types.VDA5050Connection):
+                    await self._on_connection_message(message)
                 elif isinstance(message, WaitElapsed):
                     await self._on_wait_elapsed(message)
             except asyncio.CancelledError:
@@ -1897,6 +2026,9 @@ class Robot:
         the recorded robot state and run are the ones this message led to. Events the
         dispatcher raises meanwhile carry the message's timestamp."""
         self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
+        evidence = self._run_detector.on_state(message.headerId)
+        if evidence is not None:
+            await self._on_run_changed(evidence)
         try:
             await self._on_client_message(message)
         finally:
@@ -2128,6 +2260,10 @@ class RobotServer:
         self._robot_changes: asyncio.Queue[api_objects.RobotObjectV1] = asyncio.Queue()
         self._mqtt_messages: asyncio.Queue = asyncio.Queue()
 
+        # Maps §14 U3: bumped on every (re)connect to the broker; a robot's first datum in an
+        # epoch may be a retained re-delivery (Robot._process_datum_message).
+        self.mqtt_epoch = 0
+
         # Connect to MQTT
         self._mqtt_client = self._connect_to_mqtt(
             mqtt_host, mqtt_port, mqtt_transport, mqtt_ws_path,
@@ -2175,8 +2311,6 @@ class RobotServer:
                 self._enqueue(self._mqtt_messages, ClientDatumMessage(name=robot,
                                                                       payload=json.loads(pl)))
             elif connection_match:
-                if self.fleet_recorder is None:
-                    return
                 robot = connection_match.groups()[0]
                 self._enqueue(self._mqtt_messages, ClientConnectionMessage(
                     name=robot, payload=json.loads(msg.payload)))
@@ -2206,9 +2340,15 @@ class RobotServer:
         client.register_callback(f"{self._mqtt_prefix}/+/factsheet", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/datum", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/connection", self._mqtt_on_message)
+        if hasattr(client, "add_connect_listener"):
+            client.add_connect_listener(self._mqtt_connected)
 
         client.connect()
         return client
+
+    def _mqtt_connected(self) -> None:
+        """paho thread, on every (re)connect: a new epoch for the datum trust rule."""
+        self.mqtt_epoch += 1
 
     async def stop(self):
         loop = asyncio.get_event_loop()
@@ -2331,10 +2471,13 @@ class RobotServer:
         while True:
             message = await self._mqtt_messages.get()
             if isinstance(message, ClientConnectionMessage):
-                # Recording only (ROBOT.ONLINE/OFFLINE); mission handling ignores it.
+                # Recording (ROBOT.ONLINE/OFFLINE), and maps §14 U3: a new robot run unplaces
+                # its map session (Robot._on_connection_message). Unknown robots are ignored.
                 if self.fleet_recorder is not None and (
                         message.name in self._robots or self.fleet_recorder.knows(message.name)):
                     self.fleet_recorder.on_connection(message.name, message.payload)
+                if message.name in self._robots:
+                    await self._robots[message.name].send_message(message.payload)
                 continue
             if message.name not in self._robots:
                 # Try to get the robot from the database

@@ -247,7 +247,7 @@ async def test_recording_failures_do_not_change_mission_execution(tmp_path, brea
     assert robot._robot_object.status.state == ref_robot._robot_object.status.state
 
 
-async def test_connection_messages_reach_the_recorder_only(tmp_path):
+async def test_connection_messages_reach_the_recorder_and_known_robots(tmp_path):
     recorder, _, _ = make_recorder(tmp_path)
     server = mission_server.RobotServer.__new__(mission_server.RobotServer)
     server._logger = MagicMock()
@@ -274,5 +274,7 @@ async def test_connection_messages_reach_the_recorder_only(tmp_path):
 
     [event] = queued(recorder)
     assert (event["code"], event["robot_name"]) == ("ROBOT.OFFLINE", "r1")
-    server._robots["r1"].send_message.assert_not_called()
+    # maps §14 U3: the robot sees its connection messages (run-change detection); an
+    # unknown robot is not created for them
+    assert server._robots["r1"].send_message.await_count == 2
     server._database.get_object.assert_not_called()

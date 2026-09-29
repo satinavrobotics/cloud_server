@@ -57,12 +57,12 @@ SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "purpose", "s
 # The robot's open session with its map (one row at most: map_sessions_one_open_per_robot).
 ROBOT_SESSION_SQL = (
     "SELECT s.session_id, s.map_name, s.purpose, s.aligned, s.map_t_session, s.datum, "
-    "s.placement, s.paused_at, m.spec->'geo', m.spec->>'type' "
+    "s.placement, s.paused_at, m.spec->'geo', m.spec->>'type', s.services "
     "FROM map_sessions s LEFT JOIN mapobjectv1 m "
     "ON m.name = s.map_name AND m.lifecycle <> 'DELETED' "
     "WHERE s.robot_name = %s AND s.ended_at IS NULL")
 ROBOT_SESSION_KEYS = ("session_id", "map_name", "purpose", "aligned", "map_t_session", "datum",
-                      "placement", "paused_at", "map_geo", "map_type")
+                      "placement", "paused_at", "map_geo", "map_type", "services")
 
 
 def robot_session_from_row(row: Optional[Tuple]) -> Optional[Dict[str, Any]]:
@@ -186,6 +186,48 @@ def geo_transform_for(map_geo_block: Optional[Mapping[str, Any]], map_type: Opti
         return map_geo.session_transform(map_geo_block, datum)
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def plan_geo_replace(session: Optional[Mapping[str, Any]], datum: Optional[Mapping[str, Any]],
+                     trust_same_datum: bool) -> Optional[Tuple[Dict[str, float], str]]:
+    """What a robot datum message does to the robot's open session (maps §14 U3, the
+    dispatcher on the datum write): (map_T_session, reason) to store (placed), or None.
+
+    - a geo session a run change unplaced: re-placed from this datum (reason `run_changed`).
+      The same datum as the session's counts only when `trust_same_datum` (the message is not
+      a retained re-delivery at the dispatcher's (re)subscribe, which may be the OLD run's);
+    - a placed geo session whose datum changed: re-derived (reason `datum`, §13.4);
+    - anything else (no session, a local map, a datum that cannot place the robot on the map:
+      another UTM zone, no origin): None.
+    `session`: ROBOT_SESSION_SQL's dict; `datum`: map_geo.robot_datum() shape."""
+    if session is None or datum is None:
+        return None
+    transform = geo_transform_for(session.get("map_geo"), session.get("map_type"), datum)
+    if transform is None:
+        return None
+    old = session.get("datum")
+    changed = old is None or not same_datum(old, datum)
+    if not is_placed(session):
+        if changed or trust_same_datum:
+            return transform, UNPLACED_RUN_CHANGED
+        return None
+    if changed:
+        return transform, "datum"
+    return None
+
+
+# SQL of the dispatcher's session writes (maps §14 U3).
+UNPLACE_SQL = (
+    "UPDATE map_sessions SET aligned = false, "
+    "placement = COALESCE(placement, '{}'::jsonb) || %s::jsonb "
+    "WHERE robot_name = %s AND ended_at IS NULL AND aligned "
+    "RETURNING session_id, map_name, purpose, map_t_session")
+# Compare-and-set, like graph-builder's REALIGN_SQL: only the writer that read this state wins.
+REPLACE_SQL = (
+    "UPDATE map_sessions SET datum = %s::jsonb, map_t_session = %s::jsonb, aligned = true, "
+    "placement = %s::jsonb "
+    "WHERE session_id = %s AND ended_at IS NULL AND aligned = %s "
+    "AND datum IS NOT DISTINCT FROM %s::jsonb")
 
 
 # --- the mapping switch (contract: packages/api/mapping_control.py) -------------------------------
