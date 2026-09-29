@@ -335,21 +335,7 @@ the host). FastAPI, one process, one worker. Details for the builder: `handover.
 No new heavy dependency: numpy and opencv-python-headless (PNG/JPEG decode and encode). Not
 Open3D (a ~400 MB wheel for things we do in 50 lines of numpy).
 
-### 6.2 Reuse of the prototype (`~/satinavrobotics/pcconstruction`)
-
-| Prototype | Reuse |
-|---|---|
-| `depth_to_pcd.py` `depth_to_points` | Yes: the vectorised meshgrid back-projection. Take K from the camera JSON instead of the hard-coded BotanicGarden K |
-| `depth_odom_to_pcd.py` `transform_points` | **No, do not copy.** It applies `inv(T_WL)` to go from sensor to world; for a world←sensor pose that is the wrong direction. Write `T_map_base · T_base_cam · p` and test it (§11) |
-| `depth_odom_to_pcd.py` pose lookup by nearest time | No: we have the pose per node |
-| `save_pcd_xyz` (binary PCD writer) | The idea (header + `ndarray.tobytes()`); we write PLY with colour instead |
-| `check_pcd.py` | As a model for a small "read back and print ranges" check tool |
-| `explore_filters.py` / `filter_config.yaml` | Ideas for filter parameters only |
-
-Outputs in `~/satinavrobotics/pcconstructio0` (a 1920x1080 `uint16` depth PNG, 14 % valid,
-938 KB; coloured PLYs) confirm the 16-bit mm PNG format and PLY as a working exchange format.
-
-### 6.3 Limits and memory
+### 6.2 Limits and memory
 
 | Limit | Default | Why |
 |---|---|---|
@@ -661,8 +647,8 @@ All test containers are memory-capped (`--memory=2g --memory-swap=2g`), with the
 - Depth codec: float m → u16 mm → float m round trip; NaN/inf/>65.535 m → 0.
 - Back-projection with a known K: a pixel at (cx, cy) with depth d → (0, 0, d).
 - Transform chain, as a property test: random node pose, extrinsic, pitch/roll; a point built
-  in the map frame, projected into the camera and back-projected, lands on itself (catches the
-  inverted-transform bug of the prototype).
+  in the map frame, projected into the camera and back-projected, lands on itself (catches an
+  inverted transform).
 - `pose3d_map` = `map_T_session` ⊕ `robot_pose3d` keeps z/roll/pitch.
 - Voxel accumulator: mean colour, mean position, counts; batch merge = single pass.
 - Neighbour filter: an isolated voxel is removed, a plane survives.

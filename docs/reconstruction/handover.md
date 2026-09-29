@@ -141,9 +141,7 @@ Design §6.1 has the full list. Per job:
 4. Mean colour and position per voxel → `cloud.ply`.
 5. Top-down rasters `ortho.png` + `height.png` + `meta.json` (design §7.2).
 
-Reuse from `~/satinavrobotics/pcconstruction/depth_to_pcd.py`: the vectorised
-`depth_to_points`. **Do not** copy `transform_points` from `depth_odom_to_pcd.py`: it inverts the
-pose. Dependencies: numpy, opencv-python-headless. No Open3D.
+Dependencies: numpy, opencv-python-headless. No Open3D.
 
 ---
 
