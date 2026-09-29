@@ -52,12 +52,19 @@ short is simpler than keeping a second watcher connection alive.
 Poses: a node's robot-frame pose (x, y, yaw) becomes `pose` = map_T_session applied
 (packages/utils/map_geo.py), and the document keeps `robot_pose` (as received) and
 `session_id`.
+
+Depth (3D reconstruction R2, docs/reconstruction/design.md §5): a `robot/depth_upload` message
+is resolved like an image and dropped with kind `depth` (`dropped_depth`). Its camera
+parameters go onto the ArangoDB node as `depth.{camera}` (`depth_record`), with the robot's
+full 6-DoF pose at the depth stamp converted into the map frame (`pose3d_map`: x, y and yaw
+change with map_T_session; z, roll and pitch do not).
 """
 
 import dataclasses
 import datetime
 import json
 import logging
+import math
 import time
 import uuid as uuid_t
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -224,6 +231,98 @@ def map_pose(transform: Mapping[str, float], x: float, y: float,
     return map_geo.apply_pose(transform, x, y, yaw)
 
 
+# --- depth (3D reconstruction R2) --------------------------------------------------------------
+
+DEPTH_ENCODING = "u16_mm"
+DEPTH_CONTENT_TYPE = "image/png"
+POSE3D_KEYS = ("x", "y", "z", "qx", "qy", "qz", "qw")
+
+
+class DepthPayloadError(ValueError):
+    """A robot/depth_upload message that cannot be stored (missing or malformed fields)."""
+
+
+def pose3d_map(transform: Mapping[str, float], pose3d: Mapping[str, Any]) -> Dict[str, float]:
+    """A robot-frame 6-DoF pose {x, y, z, qx, qy, qz, qw} in the map frame.
+
+    map_T_session is a rotation about z by `yaw` plus an x/y translation, so the position's
+    x/y are rotated and shifted, z is kept, and the orientation is Rz(yaw) * q (Hamilton): the
+    heading turns by `yaw`, roll and pitch are unchanged. The quaternion is normalized."""
+    x, y = map_geo.apply_transform(transform, float(pose3d["x"]), float(pose3d["y"]))
+    qx, qy, qz, qw = (float(pose3d[k]) for k in ("qx", "qy", "qz", "qw"))
+    n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not n or not math.isfinite(n):
+        raise DepthPayloadError("robot_pose3d has a zero or invalid quaternion")
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    h = float(transform.get("yaw", 0.0)) / 2.0
+    cz, sz = math.cos(h), math.sin(h)  # Rz(yaw) as a quaternion: (0, 0, sz, cz)
+    return {"x": x, "y": y, "z": float(pose3d["z"]),
+            "qx": cz * qx - sz * qy,
+            "qy": cz * qy + sz * qx,
+            "qz": cz * qz + sz * qw,
+            "qw": cz * qw - sz * qz}
+
+
+def _pose3d(value: Any) -> Optional[Dict[str, float]]:
+    if value in (None, {}):
+        return None
+    if not isinstance(value, Mapping) or any(k not in value for k in POSE3D_KEYS):
+        raise DepthPayloadError(f"robot_pose3d needs {', '.join(POSE3D_KEYS)}")
+    try:
+        pose = {k: float(value[k]) for k in POSE3D_KEYS}
+    except (TypeError, ValueError) as exc:
+        raise DepthPayloadError(f"robot_pose3d: {exc}") from exc
+    if not all(math.isfinite(v) for v in pose.values()):
+        raise DepthPayloadError("robot_pose3d has a non-finite value")
+    return pose
+
+
+def check_depth_payload(payload: Mapping[str, Any]) -> None:
+    """Raise DepthPayloadError unless `payload` is a storable robot/depth_upload message
+    (design.md §4.3). Cheap: the PNG itself is not decoded."""
+    for key in ("session_node_id", "robot_name", "camera_name", "depth_data"):
+        if payload.get(key) in (None, ""):
+            raise DepthPayloadError(f"missing {key}")
+    camera = str(payload["camera_name"])
+    if "/" in camera or camera in (".", ".."):
+        raise DepthPayloadError(f"invalid camera_name {camera!r}")
+    if not isinstance(payload.get("camera"), Mapping):
+        raise DepthPayloadError("missing camera block")
+    encoding = payload.get("depth_encoding", DEPTH_ENCODING)
+    if encoding != DEPTH_ENCODING:
+        raise DepthPayloadError(f"unsupported depth_encoding {encoding!r}")
+    content_type = payload.get("content_type", DEPTH_CONTENT_TYPE)
+    if content_type != DEPTH_CONTENT_TYPE:
+        raise DepthPayloadError(f"unsupported content_type {content_type!r}")
+    try:
+        scale = float(payload.get("depth_scale", 0.001))
+    except (TypeError, ValueError) as exc:
+        raise DepthPayloadError(f"depth_scale: {exc}") from exc
+    if not (scale > 0 and math.isfinite(scale)):
+        raise DepthPayloadError("depth_scale must be > 0")
+    _pose3d(payload.get("robot_pose3d"))
+
+
+def depth_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str, Any]:
+    """The node's `depth.{camera}` value (design.md §5) for an accepted depth message:
+    the camera block as sent, the scale and stamps, the session, and (when the robot sent
+    `robot_pose3d`) that pose plus `pose3d_map`, converted with the session's map_T_session."""
+    check_depth_payload(payload)
+    record: Dict[str, Any] = {
+        "camera": dict(payload["camera"]),
+        "depth_scale": float(payload.get("depth_scale", 0.001)),
+        "depth_encoding": DEPTH_ENCODING,
+        "depth_stamp_ms": payload.get("depth_stamp_ms"),
+        "rgb_stamp_ms": payload.get("rgb_stamp_ms"),
+        "session_id": session.session_id,
+    }
+    pose = _pose3d(payload.get("robot_pose3d"))
+    if pose is not None:
+        record["robot_pose3d"] = pose
+        record["pose3d_map"] = pose3d_map(session.map_t_session, pose)
+    return record
+
+
 class SessionResolver:
     """The robot's open session, cached per robot for `ttl` seconds.
 
@@ -298,6 +397,7 @@ class _Pending:
     since: datetime.datetime
     nodes: int = 0
     images: int = 0
+    depth: int = 0
     map_name: Optional[str] = None
     map_state: Optional[str] = None
     session_id: Optional[str] = None
@@ -318,10 +418,11 @@ class RejectLimiter:
         self._wall = wall
         self._pending: Dict[Tuple[str, str], _Pending] = {}
         self._last_report: Dict[Tuple[str, str], float] = {}
-        self.dropped: Dict[str, int] = {"nodes": 0, "images": 0}
+        self.dropped: Dict[str, int] = {"nodes": 0, "images": 0, "depth": 0}
 
     def record(self, resolution: Resolution, kind: str) -> Optional[Event]:
-        """Count one dropped `kind` ('node' | 'image'); the event to write now, if any."""
+        """Count one dropped `kind` ('node' | 'image' | 'depth'); the event to write now, if
+        any."""
         key = (resolution.robot_name, resolution.reason or LOOKUP_FAILED)
         pending = self._pending.get(key)
         if pending is None:
@@ -329,6 +430,9 @@ class RejectLimiter:
         if kind == "node":
             pending.nodes += 1
             self.dropped["nodes"] += 1
+        elif kind == "depth":
+            pending.depth += 1
+            self.dropped["depth"] += 1
         else:
             pending.images += 1
             self.dropped["images"] += 1
@@ -357,6 +461,7 @@ class RejectLimiter:
                      source=Source.GRAPH_BUILDER, discriminator=f"ingest:{reason}",
                      payload={"reason": reason, "dropped_nodes": pending.nodes,
                               "dropped_images": pending.images,
+                              "dropped_depth": pending.depth,
                               "since": pending.since.isoformat(),
                               "map_name": pending.map_name, "map_state": pending.map_state,
                               "session_id": pending.session_id,

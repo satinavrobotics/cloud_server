@@ -604,6 +604,29 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to update node {node_id} in map {map_id}: {e}")
             return False
 
+    # One document update: the new camera is merged into `depth` without a read-modify-write
+    # race between two cameras of the same node.
+    SET_NODE_DEPTH_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {depth: MERGE(d.depth || {}, {[@camera]: @record})} IN @@col "
+        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+
+    def set_node_depth(self, map_id: str, node_id: Union[int, str], camera: str,
+                       record: Dict[str, Any]) -> bool:
+        """Set `depth.{camera}` on a node (3D reconstruction R2, docs/reconstruction/design.md
+        §5), keeping the other cameras. False when the map or node does not exist."""
+        try:
+            name = f"nodes_{map_id}"
+            if not self.db.has_collection(name):
+                self.logger.error(f"Collection {name} doesn't exist")
+                return False
+            cursor = self.db.aql.execute(self.SET_NODE_DEPTH_AQL, bind_vars={
+                "@col": name, "key": str(node_id), "camera": camera, "record": record})
+            return bool(list(cursor))
+        except Exception as e:
+            self.logger.error(f"Failed to set depth {camera} on node {node_id} in {map_id}: {e}")
+            return False
+
     def delete_node(
         self,
         map_id: str,

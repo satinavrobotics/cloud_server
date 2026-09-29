@@ -92,6 +92,9 @@ MQTT_TOPIC_NODE_UPDATE = "robot/node_update"
 # Some services use MQTT_BROKER; normalise to MQTT_HOST as fallback
 MQTT_BROKER    = os.getenv("MQTT_BROKER", MQTT_HOST)
 MQTT_IMAGE_TOPIC = os.getenv("MQTT_IMAGE_TOPIC", "robot/image_upload")
+# 3D reconstruction R2 (docs/reconstruction/design.md §5): one u16-mm depth PNG + camera
+# parameters per node and camera (graph-builder).
+MQTT_DEPTH_TOPIC = os.getenv("MQTT_DEPTH_TOPIC", "robot/depth_upload")
 # VDA5050 topic prefix — must match the mission controller's prefix so the agent
 # orchestrator subscribes to the same robot state stream (`{prefix}/+/state`).
 MQTT_VDA5050_PREFIX = os.getenv("MQTT_VDA5050_PREFIX", "uagv/v2/RobotCompany")

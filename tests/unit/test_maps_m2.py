@@ -176,7 +176,7 @@ class TestRejectLimiter:
         assert payload["dropped_images"] == 3 and payload["dropped_nodes"] == 0
         assert payload["since"].startswith("2026-09-29T08:00:10")
         assert lim.due() == []
-        assert lim.dropped == {"nodes": 1, "images": 3}
+        assert lim.dropped == {"nodes": 1, "images": 3, "depth": 0}
 
     def test_per_robot_and_reason(self):
         now = [0.0]
@@ -269,7 +269,7 @@ class TestIngestService:
         # the rest of the drops wait for the next report (one per minute)
         await service._handle_node_update(dict(NODE))
         assert service._write_event.await_count == 1
-        assert service.rejects.dropped == {"nodes": 2, "images": 2}
+        assert service.rejects.dropped == {"nodes": 2, "images": 2, "depth": 0}
 
     async def test_payload_session_id_must_match(self):
         service = _gb(_row())

@@ -284,10 +284,12 @@ class MapIngestRejected(Payload):
     reported). `reason`: no_session, not_mapping_session (an operate session), session_paused,
     map_not_mapping, map_deleting, session_unplaced (maps §14: not placed yet),
     map_missing, session_mismatch, datum_changed (not re-anchorable: local map, other UTM
-    zone), lookup_failed."""
+    zone), lookup_failed. `dropped_depth` (3D reconstruction R2): depth images dropped (absent
+    on events written before R2)."""
     reason: str
     dropped_nodes: int = 0
     dropped_images: int = 0
+    dropped_depth: Optional[int] = None
     since: datetime.datetime
     map_name: Optional[str] = None
     map_state: Optional[str] = None

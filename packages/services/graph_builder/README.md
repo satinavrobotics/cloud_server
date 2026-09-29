@@ -290,6 +290,16 @@ The service expects node update messages on the configured MQTT topic with the f
 - `images`: List of image data (base64 encoded)
 - `metadata`: Additional node metadata
 
+### Depth images (3D reconstruction R2)
+
+`robot/depth_upload` (`MQTT_DEPTH_TOPIC`): one message per node and camera with a lossless
+u16-millimetre PNG (`depth_data`, base64), `depth_scale`, the stamps, the robot's 6-DoF pose at
+the depth stamp (`robot_pose3d`, run frame) and the camera block (intrinsics, `T_base_cam`).
+Resolved by session and buffered like an image. Stored as `map-{id}/{node}/depth/{camera}.png`
+and, on the ArangoDB node, `depth.{camera}` = the camera block, scale, stamps, session and
+`pose3d_map` (the pose in the map frame). A dropped one counts as `dropped_depth` in
+`MAP.INGEST_REJECTED`. Payload: `docs/reconstruction/design.md` §4.3, §5.
+
 ## How It Works
 
 ### Node Processing Pipeline

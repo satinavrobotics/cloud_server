@@ -12,6 +12,11 @@ as `robot_pose`, and the node carries `session_id`.
 
 A RUNNING mission with `register_map = False` still suppresses ingest (unchanged; the node only
 goes to the mission's waypoint log).
+
+3D reconstruction R2 (docs/reconstruction/design.md §5): `robot/depth_upload` carries one
+u16-mm depth PNG and its camera parameters per node and camera. It follows the image path
+(resolved by session, buffered until its node exists); the PNG goes to MinIO at
+`{node}/depth/{camera}.png` and the parameters onto the ArangoDB node as `depth.{camera}`.
 """
 
 import logging
@@ -140,6 +145,7 @@ class GraphBuilderService:
         image_buffer_timeout: float = 30.0,
         session_cache_ttl: float = ingest.SESSION_CACHE_TTL_S,
         reject_event_interval: float = ingest.REJECT_EVENT_INTERVAL_S,
+        mqtt_depth_topic: str = "robot/depth_upload",
     ):
         """
         Initialize the Graph Builder Service.
@@ -173,6 +179,7 @@ class GraphBuilderService:
         self.mqtt_port = mqtt_port
         self.mqtt_topic = mqtt_topic
         self.mqtt_image_topic = mqtt_image_topic
+        self.mqtt_depth_topic = mqtt_depth_topic
         self.radius_threshold = radius_threshold
         self.distance_threshold = distance_threshold
         self.image_buffer_timeout = image_buffer_timeout
@@ -220,6 +227,9 @@ class GraphBuilderService:
         # Image buffer for out-of-order arrivals
         # Key: (robot_name, session_node_id) -> {camera_name: (image_data, timestamp)}
         self.image_buffer: Dict[Tuple[str, int], Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
+        # Depth buffer, the same shape (3D reconstruction R2): camera -> ({png, record,
+        # session_id}, buffered at)
+        self.depth_buffer: Dict[Tuple[str, int], Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
 
         # Robot registration cache
         # Set of robot names that are known to exist in Mission Dispatch
@@ -238,6 +248,9 @@ class GraphBuilderService:
             "images_rejected": 0,
             "reject_events_written": 0,
             "reject_events_failed": 0,
+            "depth_saved": 0,
+            "depth_rejected": 0,
+            "buffered_depth": 0,
         }
 
         # WebSocket update publisher
@@ -252,6 +265,7 @@ class GraphBuilderService:
         self.logger.info(f"   MQTT: {mqtt_host}:{mqtt_port}")
         self.logger.info(f"   Node topic: {mqtt_topic}")
         self.logger.info(f"   Image topic: {mqtt_image_topic}")
+        self.logger.info(f"   Depth topic: {mqtt_depth_topic}")
         self.logger.info(f"   Radius threshold: {radius_threshold}m")
         self.logger.info(f"   Distance threshold: {distance_threshold}m")
         self.logger.info(f"   Image buffer timeout: {image_buffer_timeout}s")
@@ -288,6 +302,9 @@ class GraphBuilderService:
             # Register callbacks
             self.mqtt_client.register_callback(self.mqtt_topic, self._on_node_update_message)
             self.mqtt_client.register_callback(self.mqtt_image_topic, self._on_image_upload_message)
+            if self.mqtt_depth_topic:
+                self.mqtt_client.register_callback(self.mqtt_depth_topic,
+                                                   self._on_depth_upload_message)
 
             # Connect and start background loop
             self.mqtt_client.connect()
@@ -359,8 +376,9 @@ class GraphBuilderService:
             self.logger.warning(f"Could not write {event.code.value}: {e}")
 
     async def _reject(self, resolution: "ingest.Resolution", kind: str, count: int = 1) -> None:
-        """Drop `count` nodes or images ('node' | 'image'): count them and report when due."""
-        stat = "nodes_rejected" if kind == "node" else "images_rejected"
+        """Drop `count` nodes, images or depth images ('node' | 'image' | 'depth'): count them
+        and report when due."""
+        stat = {"node": "nodes_rejected", "depth": "depth_rejected"}.get(kind, "images_rejected")
         self.stats[stat] += count
         if count:
             self.logger.info(
@@ -415,6 +433,12 @@ class GraphBuilderService:
         self.stats["buffered_images"] -= len(cameras)
         return len(cameras)
 
+    def _pop_buffered_depth(self, robot_name: str, session_node_id: Any) -> int:
+        """Discard the depth images buffered for a node that was dropped; how many."""
+        cameras = self.depth_buffer.pop((robot_name, session_node_id), None) or {}
+        self.stats["buffered_depth"] -= len(cameras)
+        return len(cameras)
+
     async def _handle_node_update(self, payload: Dict[str, Any]):
         """
         Async handler for MQTT node update messages.
@@ -450,6 +474,8 @@ class GraphBuilderService:
             await self._reject(resolution, "node")
             await self._reject(resolution, "image",
                                self._pop_buffered_images(robot_name, session_node_id))
+            await self._reject(resolution, "depth",
+                               self._pop_buffered_depth(robot_name, session_node_id))
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
@@ -560,6 +586,11 @@ class GraphBuilderService:
 
         inserted = self.graph_db.add_edges_bulk(edges, map_id=map_id)
         self.stats["edges_created"] += inserted
+
+        # Depth needs the node document (its parameters go onto it): after add_node.
+        buffered_depth = self._get_buffered_depth(robot_name, session_node_id, session_id)
+        if buffered_depth:
+            self._save_depth(global_node_id, map_id, buffered_depth)
 
         self.stats["nodes_processed"] += 1
         self.logger.info(
@@ -700,6 +731,118 @@ class GraphBuilderService:
         except Exception as e:
             self.logger.error(f"Error processing image upload message: {e}")
             self.stats["errors"] += 1
+
+    # ==================== Depth (3D reconstruction R2) ====================
+
+    def _on_depth_upload_message(self, client, userdata, msg):
+        """robot/depth_upload (paho thread): parse and hand to _handle_depth_upload."""
+        try:
+            payload = json.loads(msg.payload.decode('utf-8'))
+            if self._event_loop is None:
+                self.logger.error("Depth upload before the event loop was set; dropped")
+                self.stats["errors"] += 1
+                return
+            asyncio.run_coroutine_threadsafe(self._handle_depth_upload(payload),
+                                             self._event_loop)
+        except Exception as e:
+            self.logger.error(f"Error processing depth upload message: {e}")
+            self.stats["errors"] += 1
+
+    async def _handle_depth_upload(self, payload: Dict[str, Any]):
+        """
+        Store one camera's depth image of a node, or buffer it until the node arrives
+        (docs/reconstruction/design.md §5). Resolved like an image: a dropped depth image is
+        counted as `depth` in MAP.INGEST_REJECTED. The node's `depth.{camera}` carries the
+        camera block, scale, stamps, `robot_pose3d` and its map-frame `pose3d_map`, converted
+        with the session's map_T_session as it is now (the same transform the node gets).
+        """
+        try:
+            try:
+                ingest.check_depth_payload(payload)
+            except ingest.DepthPayloadError as e:
+                self.logger.error(f"Invalid depth upload: {e}")
+                self.stats["errors"] += 1
+                return
+            robot_name = payload['robot_name']
+            session_node_id = payload['session_node_id']
+            camera = str(payload['camera_name'])
+
+            resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+            if not resolution.accepted:
+                await self._reject(resolution, "depth")
+                return
+            session = resolution.session
+            try:
+                record = ingest.depth_record(payload, session)
+            except ingest.DepthPayloadError as e:
+                self.logger.error(f"Invalid depth upload: {e}")
+                self.stats["errors"] += 1
+                return
+            entry = {"camera": camera, "data": payload['depth_data'], "record": record,
+                     "session_id": session.session_id}
+
+            node_key = (robot_name, session_node_id)
+            mapping = self.session_to_global_map.get(node_key)
+            if mapping and mapping[3] == session.session_id:
+                global_node_id, _, map_id, _ = mapping
+                await asyncio.to_thread(self._save_depth, global_node_id, map_id, [entry])
+            else:
+                cameras = self.depth_buffer.setdefault(node_key, {})
+                if camera not in cameras:
+                    self.stats["buffered_depth"] += 1
+                cameras[camera] = (entry, datetime.now())
+        except Exception as e:
+            self.logger.error(f"Error processing depth upload message: {e}")
+            self.stats["errors"] += 1
+
+    def _get_buffered_depth(self, robot_name: str, session_node_id: Any,
+                            session_id: Optional[str]) -> List[Dict[str, Any]]:
+        """Take the depth images buffered for a node: those of its session and younger than
+        the buffer timeout (the rest are discarded)."""
+        cameras = self.depth_buffer.pop((robot_name, session_node_id), None)
+        if not cameras:
+            return []
+        now = datetime.now()
+        entries = []
+        for camera, (entry, at) in cameras.items():
+            self.stats["buffered_depth"] -= 1
+            age = (now - at).total_seconds()
+            if age > self.image_buffer_timeout:
+                self.logger.warning(f"Buffered depth timed out: ({robot_name}, "
+                                    f"{session_node_id}, {camera}), age={age:.1f}s")
+            elif session_id is not None and entry.get("session_id") != session_id:
+                self.logger.warning(f"Buffered depth of ({robot_name}, {session_node_id}, "
+                                    f"{camera}) is from another session; discarded")
+            else:
+                entries.append(entry)
+        return entries
+
+    def _save_depth(self, node_id: str, map_id: str, entries: List[Dict[str, Any]]) -> int:
+        """Store each depth PNG in MinIO, then its parameters on the node. How many were
+        stored (the PNG first: a node never names a depth image that does not exist)."""
+        saved = 0
+        for entry in entries:
+            camera = entry["camera"]
+            try:
+                data = entry["data"]
+                png = data if isinstance(data, bytes) else base64.b64decode(data, validate=True)
+                record = entry["record"]
+                if not self.image_db.store_depth(
+                        png, str(node_id), camera, map_id,
+                        metadata={"camera_name": camera,
+                                  "depth_stamp_ms": record.get("depth_stamp_ms"),
+                                  "session_id": record.get("session_id")}):
+                    self.stats["errors"] += 1
+                    continue
+                if not self.graph_db.set_node_depth(map_id, str(node_id), camera, record):
+                    self.stats["errors"] += 1
+                    continue
+                saved += 1
+                self.stats["depth_saved"] += 1
+            except Exception as e:
+                self.logger.error(f"Error saving depth {camera} of node {node_id}: {e}")
+                self.stats["errors"] += 1
+        return saved
 
     # ==================== Node Processing ====================
 
@@ -1099,6 +1242,8 @@ class GraphBuilderService:
             buffer_keys_to_remove = [k for k in self.image_buffer if k[0] == robot_name]
             for key in buffer_keys_to_remove:
                 self.stats["buffered_images"] -= len(self.image_buffer.pop(key))
+            for key in [k for k in self.depth_buffer if k[0] == robot_name]:
+                self.stats["buffered_depth"] -= len(self.depth_buffer.pop(key))
 
             self.logger.info(
                 f"✅ Cleared {len(keys_to_remove)} session mappings and "
@@ -1252,6 +1397,15 @@ class GraphBuilderService:
                 old_node_keys.append(node_key)
         for key in old_node_keys:
             del self.image_buffer[key]
+
+        for node_key in list(self.depth_buffer):
+            cameras = self.depth_buffer[node_key]
+            for cam in [c for c, (_, ts) in cameras.items()
+                        if (now - ts).total_seconds() > threshold_seconds]:
+                del cameras[cam]
+                self.stats["buffered_depth"] -= 1
+            if not cameras:
+                del self.depth_buffer[node_key]
 
     # ==================== Service Management ====================
 

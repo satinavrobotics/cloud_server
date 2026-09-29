@@ -101,6 +101,41 @@ class ImageDatabaseService(MinIOService):
             self.logger.error(f"Failed to store image {image_id} for node {node_id}: {e}")
             return False
 
+    # ==================== Depth (3D reconstruction R2) ====================
+
+    @staticmethod
+    def depth_key(node_id: str, camera: str) -> str:
+        """Object key of a node's depth PNG: `{node_id}/depth/{camera}.png` (not under
+        `images/`, so it never shows up as a photo)."""
+        return f"{node_id}/depth/{camera}.png"
+
+    def store_depth(
+        self,
+        png_data: bytes,
+        node_id: str,
+        camera: str,
+        map_id: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Store a node's u16-mm depth PNG for one camera. Returns True if successful."""
+        try:
+            if not self._ensure_map_bucket(map_id):
+                return False
+            meta = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
+            meta["node_id"] = str(node_id)
+            self.client.put_object(
+                self._bucket_name(map_id),
+                self.depth_key(str(node_id), camera),
+                io.BytesIO(png_data),
+                length=len(png_data),
+                content_type="image/png",
+                metadata=meta,
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to store depth {camera} for node {node_id}: {e}")
+            return False
+
     def get_image(
         self,
         image_id: str,
@@ -291,6 +326,29 @@ class ImageDatabaseService(MinIOService):
 
     # ==================== Statistics ====================
 
+    # Top-level prefixes of a map bucket that are not nodes (3D reconstruction results live
+    # under `reconstruction/{job_id}/`, docs/reconstruction/design.md §8.4).
+    NON_NODE_PREFIXES = frozenset({"reconstruction"})
+
+    @classmethod
+    def _count_node_objects(cls, names) -> tuple:
+        """(images, depth images, node ids) of a map bucket's object names: images are
+        `{node}/images/{id}`, depth `{node}/depth/{camera}.png`; other prefixes (the
+        reconstruction) are not nodes."""
+        images, depth, nodes = 0, 0, set()
+        for name in names:
+            parts = name.split("/")
+            if len(parts) < 3 or parts[0] in cls.NON_NODE_PREFIXES:
+                continue
+            if parts[1] == "images":
+                images += 1
+            elif parts[1] == "depth":
+                depth += 1
+            else:
+                continue
+            nodes.add(parts[0])
+        return images, depth, nodes
+
     def get_stats(
         self, map_id: Optional[str] = None, node_id: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -309,11 +367,12 @@ class ImageDatabaseService(MinIOService):
                 if not self.client.bucket_exists(bucket_name):
                     return {"map_id": map_id, "exists": False, "image_count": 0, "node_count": 0}
                 objects = list(self.client.list_objects(bucket_name, recursive=True))
-                nodes = {obj.object_name.split("/")[0] for obj in objects}
+                images, depth, nodes = self._count_node_objects(o.object_name for o in objects)
                 return {
                     "map_id": map_id,
                     "exists": True,
-                    "image_count": len(objects),
+                    "image_count": images,
+                    "depth_count": depth,
                     "node_count": len(nodes),
                 }
 
@@ -323,11 +382,10 @@ class ImageDatabaseService(MinIOService):
                 for m in maps:
                     bucket_name = self._bucket_name(m)
                     objects = list(self.client.list_objects(bucket_name, recursive=True))
-                    total_images += len(objects)
-                    for obj in objects:
-                        parts = obj.object_name.split("/")
-                        if parts:
-                            total_nodes.add(f"{m}/{parts[0]}")
+                    images, _depth, nodes = self._count_node_objects(
+                        o.object_name for o in objects)
+                    total_images += images
+                    total_nodes.update(f"{m}/{n}" for n in nodes)
                 return {
                     "total_maps": len(maps),
                     "total_images": total_images,
