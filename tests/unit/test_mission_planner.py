@@ -58,7 +58,7 @@ class TestMissionPlannerLegacy:
         ]
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.plan_mission(
             robot_id="robot_1",
@@ -129,7 +129,7 @@ class TestMissionPlannerGetMissionPlan:
         ]
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         # Call get_mission_plan
         result = await service.get_mission_plan("nav_robot_1_20250104_123456")
@@ -184,7 +184,7 @@ class TestMissionPlannerGetMissionPlan:
         mock_graph_instance.get_node = Mock()
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         # Call get_mission_plan
         result = await service.get_mission_plan("stored_path_mission")
@@ -210,7 +210,7 @@ class TestMissionPlannerGetMissionPlan:
 
         mock_graph_client.return_value = Mock()
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         # Call get_mission_plan
         result = await service.get_mission_plan("nonexistent_mission")
@@ -240,7 +240,7 @@ class TestMissionPlannerGetMissionPlan:
 
         mock_graph_client.return_value = Mock()
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("test_mission")
 
@@ -272,7 +272,7 @@ class TestMissionPlannerGetMissionPlan:
 
         mock_graph_client.return_value = Mock()
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("test_mission")
 
@@ -307,7 +307,7 @@ class TestMissionPlannerGetMissionPlan:
 
         mock_graph_client.return_value = Mock()
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("test_mission")
 
@@ -359,7 +359,7 @@ class TestMissionPlannerGetMissionPlan:
         mock_graph_instance.k_nearest_neighbors.return_value = ([], [])
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("test_mission")
 
@@ -414,7 +414,7 @@ class TestMissionPlannerGetMissionPlan:
         mock_graph_instance.k_nearest_neighbors.side_effect = Exception("Graph DB error")
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("test_mission")
 
@@ -469,7 +469,7 @@ class TestMissionPlannerGetMissionPlan:
         ]
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("test_mission", map_id="custom_map")
 
@@ -535,7 +535,7 @@ class TestMissionPlannerGetMissionPlan:
         ]
         mock_graph_client.return_value = mock_graph_instance
 
-        service = MissionPlannerService()
+        service = MissionPlannerService(default_map_id="default")  # tests opt in to a fallback map
 
         result = await service.get_mission_plan("completed_mission")
 

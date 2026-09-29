@@ -1506,7 +1506,8 @@ class ApiDelegationService:
             result = await self.mission_planner.navigate(
                 robot_name=robot_id,
                 target_x=goal_x,
-                target_y=goal_y
+                target_y=goal_y,
+                map_id=map_id,
             )
             return result
         except Exception as e:
@@ -1564,7 +1565,7 @@ class ApiDelegationService:
         )
         self.logger.info(
             f"Navigation request for robot '{robot_name}' to {coord_desc} "
-            f"on map '{map_id or 'default'}'"
+            f"on map '{map_id or '(robot current map)'}'"
         )
 
         try:
@@ -1586,6 +1587,13 @@ class ApiDelegationService:
             )
             return result
         except Exception as e:
+            response = getattr(e, "response", None)
+            if getattr(response, "status_code", None) == 400:  # e.g. no map to plan on
+                try:
+                    detail = response.json().get("detail")
+                except Exception:  # noqa: BLE001
+                    detail = None
+                raise HTTPException(status_code=400, detail=detail or str(e))
             self.logger.error(f"Navigation request failed: {e}")
             return {"success": False, "error": str(e)}
 

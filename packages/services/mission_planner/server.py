@@ -16,12 +16,24 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import map_geo
+from packages.config import GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL
 from packages.utils.geo import gps_to_local, latlon_to_utm
 DatabaseClient = PostgresDatabase
 import uuid
 from cloud_common.objects import mission as mission_object
 from cloud_common.objects import robot as robot_object
 from cloud_common.objects import common
+
+
+class MapResolutionError(ValueError):
+    """The request names no usable map (missing map_id, robot without a current map)."""
+
+
+_MAP_SENTINELS = (GPS_MAP_SENTINEL, LOCAL_MAP_SENTINEL)
+
+
+def _is_real_map(map_id: Optional[str]) -> bool:
+    return isinstance(map_id, str) and bool(map_id) and map_id not in _MAP_SENTINELS
 
 
 class MissionPlannerService:
@@ -39,7 +51,7 @@ class MissionPlannerService:
         arango_username: str = "root",
         arango_password: Optional[str] = None,
         arango_database: str = "topomap_db",
-        default_map_id: str = "default",
+        default_map_id: Optional[str] = None,
         knn_k: int = 1,
         range_search_radius: float = 5.0,
         **kwargs
@@ -53,7 +65,9 @@ class MissionPlannerService:
             arango_username: ArangoDB username
             arango_password: ArangoDB password
             arango_database: ArangoDB database name
-            default_map_id: Default map ID to use
+            default_map_id: Optional fallback map for a request without a map_id and
+                without a robot current map (tests). None (production): such a request
+                is refused, there is no implicit "default" map.
             knn_k: Number of nearest neighbors to find (default 1 for closest)
             range_search_radius: Radius for range search in meters
         """
@@ -83,6 +97,33 @@ class MissionPlannerService:
         self.range_search_radius = range_search_radius
 
         self.logger.info("Mission Planner Service initialized")
+
+    def _require_map(self, map_id: Optional[str]) -> str:
+        """`map_id` if it names a map; else the configured fallback (None in production);
+        else MapResolutionError. Never an implicit "default" map."""
+        if _is_real_map(map_id):
+            return map_id
+        if self.default_map_id:
+            return self.default_map_id
+        raise MapResolutionError(
+            "No map_id given" + (f" ('{map_id}' is not a map)" if map_id else "") +
+            ": pass map_id" + " (or give the robot a current map)")
+
+    async def _resolve_map(self, map_id: Optional[str], robot_name: Optional[str]) -> str:
+        """The map to plan on: the request's map_id, else the robot's current map, else
+        MapResolutionError (a clear 400 at the routes)."""
+        if _is_real_map(map_id):
+            return map_id
+        if robot_name:
+            robot = await self.get_robot_status(robot_name)
+            current = getattr(robot, "current_map", None) if robot else None
+            if _is_real_map(current):
+                return current
+            if not self.default_map_id:
+                raise MapResolutionError(
+                    f"No map_id given and robot '{robot_name}' has no current map: "
+                    "pass map_id")
+        return self._require_map(map_id)
 
     async def get_robot_status(self, robot_name: str) -> Optional[robot_object.RobotObjectV1]:
         """
@@ -184,8 +225,10 @@ class MissionPlannerService:
         Returns:
             Tuple of (node_dict, error_message)
         """
-        # Use map_id if provided, otherwise use default
-        query_map_id = map_id if map_id is not None else self.default_map_id
+        try:
+            query_map_id = await self._resolve_map(map_id, robot_name)
+        except MapResolutionError as e:
+            return None, str(e)
 
         # Query KNN
         try:
@@ -239,8 +282,10 @@ class MissionPlannerService:
         Returns:
             Tuple of (node_dict, error_message)
         """
-        # Use map_id if provided, otherwise use default
-        query_map_id = map_id if map_id is not None else self.default_map_id
+        try:
+            query_map_id = self._require_map(map_id)
+        except MapResolutionError as e:
+            return None, str(e)
 
         self.logger.info(f"Finding closest node to target at ({target_x:.2f}, {target_y:.2f}) on map '{query_map_id}' (map_id param={map_id})")
 
@@ -321,7 +366,10 @@ class MissionPlannerService:
         Returns:
             Tuple of (path_node_ids, error_message)
         """
-        query_map_id = map_id if map_id is not None else self.default_map_id
+        try:
+            query_map_id = self._require_map(map_id)
+        except MapResolutionError as e:
+            return None, str(e)
         self.logger.info(f"Finding path from node {start_node_id} to node {end_node_id}")
         try:
             path = self.graph_db.shortest_path(
@@ -348,7 +396,11 @@ class MissionPlannerService:
         Returns:
             List of node IDs or None if no path found.
         """
-        query_map_id = map_id if map_id is not None else self.default_map_id
+        try:
+            query_map_id = await self._resolve_map(map_id, robot_id)
+        except MapResolutionError as e:
+            self.logger.error(str(e))
+            return None
         self.logger.info(f"Finding path for robot {robot_id} to goal {goal_position}")
         try:
             robot = await self.get_robot_status(robot_id)
@@ -394,7 +446,10 @@ class MissionPlannerService:
             Tuple of (poses, error_message)
         """
         poses = []
-        query_map_id = map_id if map_id is not None else self.default_map_id
+        try:
+            query_map_id = self._require_map(map_id)
+        except MapResolutionError as e:
+            return None, str(e)
 
         for node_id in node_ids:
             try:
@@ -547,13 +602,18 @@ class MissionPlannerService:
         5. Create mission with waypoints
         6. Submit mission to dispatcher
         """
-        effective_map_id = map_id if map_id is not None else self.default_map_id
-        self.logger.info(f"🗺️  plan_and_execute_mission called with map_id={map_id} (effective: {effective_map_id})")
-
         result = {
             "success": False,
             "robot_name": robot_name,
         }
+        try:
+            effective_map_id = await self._resolve_map(map_id, robot_name)
+        except MapResolutionError as e:
+            result["error"] = str(e)
+            result["failed_at"] = "map_resolution"
+            return result
+        map_id = effective_map_id
+        self.logger.info(f"🗺️  plan_and_execute_mission: map_id={effective_map_id}")
 
         # Step 0: GPS → local conversion if GPS coordinates were provided.
         if target_lat is not None and target_lon is not None:
@@ -718,8 +778,10 @@ class MissionPlannerService:
         # Use range search
         search_radius = radius if radius is not None else self.range_search_radius
 
-        # Use map_id if provided, otherwise use default
-        query_map_id = map_id if map_id is not None else self.default_map_id
+        try:
+            query_map_id = await self._resolve_map(map_id, robot_id)
+        except MapResolutionError as e:
+            return {"nodes": [], "error": str(e)}
         robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
 
         try:
@@ -785,7 +847,7 @@ class MissionPlannerService:
             else:
                 self.logger.info(f"Reconstructing path for mission '{mission_id}' using KNN")
                 # Reconstruct path by finding closest graph nodes to each waypoint
-                query_map_id = map_id if map_id is not None else self.default_map_id
+                query_map_id = await self._resolve_map(map_id, mission.robot)  # may raise
                 path_node_ids = []
 
                 for i, waypoint in enumerate(waypoints):
@@ -840,6 +902,8 @@ class MissionPlannerService:
             self.logger.info(f"Successfully reconstructed plan for mission '{mission_id}' with {len(path_node_ids)} nodes")
             return result
 
+        except MapResolutionError:
+            raise  # a clear 400 at the route
         except Exception as e:
             self.logger.error(f"Failed to get mission plan for '{mission_id}': {e}")
             return None

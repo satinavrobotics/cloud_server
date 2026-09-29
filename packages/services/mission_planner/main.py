@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, Field
 
-from .server import MissionPlannerService
+from .server import MapResolutionError, MissionPlannerService
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
     configure_service_logging, DependencyHealthChecker
@@ -24,7 +24,7 @@ from packages.config import (
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
     POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, POSTGRES_DATABASE_PASSWORD,
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
-    DEFAULT_MAP_ID, KNN_K, RANGE_SEARCH_RADIUS,
+    KNN_K, RANGE_SEARCH_RADIUS,
     PORT_MISSION_PLANNER, DEFAULT_HOST, LOG_LEVEL_DEFAULT, TIMEOUT_HTTP_REQUEST_SHORT,
 )
 
@@ -43,7 +43,7 @@ class NavigationRequest(BaseModel):
     target_y: Optional[float] = Field(None, description="Target y coordinate in meters (local frame)")
     target_lat: Optional[float] = Field(None, description="Target WGS84 latitude in degrees")
     target_lon: Optional[float] = Field(None, description="Target WGS84 longitude in degrees")
-    map_id: Optional[str] = Field(None, description="Map ID to use for navigation (uses default if not provided)")
+    map_id: Optional[str] = Field(None, description="Map ID to use for navigation; without it the robot's current map, else 400")
     mission_name: Optional[str] = Field(None, description="Optional mission name (auto-generated if not provided)")
     timeout_seconds: int = Field(300, description="Mission timeout in seconds", ge=1, le=3600)
     register_map: bool = Field(True, description="Whether the graph builder should record topology during this mission")
@@ -75,7 +75,7 @@ class StatsResponse(BaseModel):
     service: str
     graph_db_url: str
     database_url: str
-    default_map_id: str
+    default_map_id: Optional[str] = None
     knn_k: int
     range_search_radius: float
 
@@ -118,7 +118,6 @@ async def lifespan(app: FastAPI):
         postgres_password=POSTGRES_DATABASE_PASSWORD,
         postgres_host=POSTGRES_DATABASE_HOST,
         postgres_port=POSTGRES_DATABASE_PORT,
-        default_map_id=DEFAULT_MAP_ID,
         knn_k=KNN_K,
         range_search_radius=RANGE_SEARCH_RADIUS,
     )
@@ -211,8 +210,12 @@ async def navigate(request: NavigationRequest):
             timeout_seconds=request.timeout_seconds,
             register_map=request.register_map,
         )
+        if result.get("failed_at") == "map_resolution":
+            raise HTTPException(status_code=400, detail=result.get("error"))
         return NavigationResponse(**result)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Navigation request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Navigation request failed: {str(e)}")
@@ -239,7 +242,7 @@ async def get_mission_plan(mission_id: str, map_id: Optional[str] = None):
 
     Args:
         mission_id: Mission identifier (mission name)
-        map_id: Map ID to use for node lookup (uses default if not provided)
+        map_id: Map ID to use for node lookup (else the mission robot's current map, else 400)
 
     Returns:
         NavigationPlanResponse with mission plan details and current state
@@ -261,6 +264,8 @@ async def get_mission_plan(mission_id: str, map_id: Optional[str] = None):
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
+    except MapResolutionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logging.error(f"Failed to get mission plan for '{mission_id}': {e}")
         raise HTTPException(
