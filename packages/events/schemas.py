@@ -217,15 +217,21 @@ class MapSession(Payload):
     map_name: str
     session_id: str
     map_state: str
+    # Maps §14: `mapping` | `operate` (absent on events written before U1: mapping).
+    purpose: Optional[str] = None
+    services: Optional[List[str]] = None
     aligned: Optional[bool] = None
     map_T_session: Optional[Dict[str, float]] = None
+    placement: Optional[Dict[str, Any]] = None
     actor: Optional[str] = None
 
 
 class MapSessionRealigned(Payload):
-    """MAP.SESSION_REALIGNED (packages/services/graph_builder/ingest.py): the robot took a new
-    datum mid-session (a restart); the geo session's map_T_session was re-derived from it.
-    Nodes stored before keep their map-frame poses."""
+    """MAP.SESSION_REALIGNED: a geo session's map_T_session was re-derived from the robot's
+    datum. graph-builder (packages/services/graph_builder/ingest.py) when a node arrives after
+    the datum changed; mission-dispatch (maps §14, U3) on the datum write itself, which also
+    re-places a session the run change had unplaced (`reason` run_changed; `datum` changed
+    for a datum change alone). Nodes stored before keep their map-frame poses."""
     map_name: str
     session_id: str
     map_state: Optional[str] = None
@@ -234,6 +240,33 @@ class MapSessionRealigned(Payload):
     old_map_T_session: Optional[Dict[str, float]] = None
     datum: Optional[Dict[str, Any]] = None
     old_datum: Optional[Dict[str, Any]] = None
+    purpose: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class MapSessionPlaced(Payload):
+    """MAP.SESSION_PLACED (packages/api/maps.py, maps §14): the user placed the robot on a local
+    map: map_T_session = placed pose (+) robot pose^-1. `placement`: {pose, robot_pose, source,
+    actor, at}."""
+    map_name: str
+    session_id: str
+    purpose: Optional[str] = None
+    map_T_session: Dict[str, float]
+    old_map_T_session: Optional[Dict[str, float]] = None
+    placement: Optional[Dict[str, Any]] = None
+
+
+class MapSessionUnplaced(Payload):
+    """MAP.SESSION_UNPLACED (mission-dispatch, maps §14 U3): the robot's run frame reset, so its
+    open session is no longer placed. `reason` run_changed; `evidence`: what showed it (the
+    VDA5050 header ids: `connection_header_id` / `last_connection_header_id`, or
+    `state_header_id` / `last_state_header_id`)."""
+    map_name: str
+    session_id: str
+    purpose: Optional[str] = None
+    reason: str
+    evidence: Optional[Dict[str, Any]] = None
+    old_map_T_session: Optional[Dict[str, float]] = None
 
 
 class MapDeleted(Payload):
@@ -248,7 +281,8 @@ class MapIngestRejected(Payload):
     """MAP.INGEST_REJECTED (packages/services/graph_builder/ingest.py): robot data dropped by
     graph-builder because it had no session to go to. Rate-limited per robot and reason:
     `dropped_nodes` / `dropped_images` count every drop since `since` (the first drop not yet
-    reported). `reason`: no_session, session_paused, map_not_mapping, map_deleting,
+    reported). `reason`: no_session, not_mapping_session (an operate session), session_paused,
+    map_not_mapping, map_deleting, session_unplaced (maps §14: not placed yet),
     map_missing, session_mismatch, datum_changed (not re-anchorable: local map, other UTM
     zone), lookup_failed."""
     reason: str

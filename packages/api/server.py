@@ -623,6 +623,9 @@ class ApiDelegationService:
         # Maps M3: the robot mapping switch (retained {prefix}/{robot}/mapping/set, state from
         # {prefix}/+/mapping/state) on the diagnostics MQTT connection.
         self.mapping_control = MappingControl(MQTT_VDA5050_PREFIX)
+        # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
+        # for the robot WebSocket (one robot_update per robot state message).
+        self.session_cache = maps.OpenSessionCache(self.database)
 
         # WebSocket proxy manager (new implementation)
         self.ws_proxy = WebSocketProxyManager(
@@ -910,7 +913,10 @@ class ApiDelegationService:
                 "y": y,
                 "theta": yaw,
                 "timestamp": node.get("created_at"),
-                "metadata": node.get("metadata", {})
+                "metadata": node.get("metadata", {}),
+                # Maps §14.3: the session that recorded the node (null for untagged legacy
+                # nodes), to highlight one session in the history.
+                "session_id": node.get("session_id"),
             })
 
         edges_data = []
@@ -1924,6 +1930,7 @@ class ApiDelegationService:
         self._start_telemetry()
         self.mapping_control.on_state = self._broadcast_mapping_state
         self.mapping_control.on_connect = self._sync_mapping_switch
+        self.mapping_control.on_session = self._broadcast_session
         self.diagnostics.connect_mqtt(
             before_connect=lambda client: self.mapping_control.attach(client, event_loop))
 
@@ -1938,6 +1945,19 @@ class ApiDelegationService:
                 "timestamp": datetime.now(timezone.utc).isoformat(), "mapping_state": view})
         except Exception as e:
             self.logger.error(f"Failed to broadcast mapping state for {robot_name}: {e}")
+
+    async def _broadcast_session(self, robot_name: str,
+                                 view: Optional[Dict[str, Any]]) -> None:
+        """Maps §14: after a session change through the API, the robot's `session` (its open
+        session, or null) on /ws/robot/{robot} as `session_update`, at once; robot_update
+        messages carry it too (cached, so changes by mission-dispatch show within ~1 s)."""
+        self.session_cache.invalidate()
+        try:
+            await self.ws_manager.broadcast("robot_status", robot_name, {
+                "type": "session_update", "robot_name": robot_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(), "session": view})
+        except Exception as e:
+            self.logger.error(f"Failed to broadcast session for {robot_name}: {e}")
 
     async def _sync_mapping_switch(self) -> None:
         """Maps M3: on every broker (re)connect, re-publish every robot's retained
@@ -2105,6 +2125,13 @@ class ApiDelegationService:
         except Exception as e:  # pylint: disable=broad-except
             self.logger.error(f"Recording policy update failed: {e}")
 
+    async def _robot_session(self, robot_name: str) -> Optional[Dict[str, Any]]:
+        try:
+            return await self.session_cache.get(robot_name)
+        except Exception as e:  # pylint: disable=broad-except
+            self.logger.error(f"Session of {robot_name} not readable: {e}")
+            return None
+
     async def _handle_robot_updates(self):
         """
         Async task that processes robot updates from the queue and broadcasts them
@@ -2141,7 +2168,9 @@ class ApiDelegationService:
                         "recording_state": robot.status.recording_state if hasattr(robot.status, 'recording_state') else None,
                         "nav_reasoning": robot.status.nav_reasoning if hasattr(robot.status, 'nav_reasoning') else None,
                         "errors": robot.status.errors if hasattr(robot.status, 'errors') else {},
-                    }
+                    },
+                    # Maps §14: the robot's open session (derived; null = mapless).
+                    "session": await self._robot_session(robot.name),
                 }
 
                 # Broadcast to all WebSocket clients subscribed to this robot

@@ -53,6 +53,8 @@ class EventCode(str, enum.Enum):
     MAP_DELETED = "MAP.DELETED"
     MAP_INGEST_REJECTED = "MAP.INGEST_REJECTED"
     MAP_SESSION_REALIGNED = "MAP.SESSION_REALIGNED"
+    MAP_SESSION_PLACED = "MAP.SESSION_PLACED"
+    MAP_SESSION_UNPLACED = "MAP.SESSION_UNPLACED"
 
 
 class Severity(str, enum.Enum):
@@ -137,6 +139,13 @@ CODES: Dict[EventCode, CodeMeta] = {
     # A geo session re-anchored to the robot's new datum after a robot restart (graph-builder).
     # Discriminator `session:<id>:realigned:<tx>:<ty>:<yaw>`.
     _C.MAP_SESSION_REALIGNED: CodeMeta(_S.INFO, True, schemas.MapSessionRealigned, _G),
+    # Maps §14 (operate sessions and placement). PLACED: the user put the robot on a local map
+    # (packages/api/maps.py; discriminator `session:<id>:placed:<tx>:<ty>:<yaw>:<ts>`).
+    # UNPLACED: the robot's run frame reset (a restart), so its session's map_T_session is no
+    # longer valid (mission-dispatch; `session:<id>:unplaced:<ts>`). A geo session re-placed
+    # from the new datum is MAP.SESSION_REALIGNED with source dispatch.
+    _C.MAP_SESSION_PLACED: CodeMeta(_S.INFO, True, schemas.MapSessionPlaced, _A),
+    _C.MAP_SESSION_UNPLACED: CodeMeta(_S.WARNING, True, schemas.MapSessionUnplaced, _D),
 }
 
 

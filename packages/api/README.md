@@ -231,6 +231,32 @@ session_id, map, nodes_sent, since, stamp, source: "mqtt"|"local"|"startup", rec
 The robot confirmed a session when `mapping_state.session_id` equals the open session's id and
 `enabled` matches (`true` while mapping, `false` while paused).
 
+#### Operate sessions and placement (maps §14, U1)
+
+A robot uses a map through its one open session. `purpose`: `mapping` (adds data, as above) or
+`operate` (uses the map, adds nothing; the map state does not change; several robots may use a
+map, also while another robot maps it). `aligned` = **placed**: `map_T_session` is valid for the
+robot's current run. Geo sessions are placed by the robot's datum; a local map's first mapping
+session on an empty map is identity; otherwise a local-map session is placed by the user. A
+session that is not placed captures nothing, gets no route orders on that map and no plans.
+
+| Method | Path | Does |
+|---|---|---|
+| POST | `/api/v1/maps/{id}/sessions` | `{robot, purpose?: "mapping"\|"operate" (default mapping), services?: ["topo"\|"grid"] (mapping only, default ["topo"]), placement?: {pose: {x, y, yaw}, robot_pose: {x, y, theta}}, replace?: bool}` → 201 `{map_id, map_state, changed, session, replaced_session, robot_notified, mapping_service, mapping_services: {topo: ...}, mapping_state}`. 409: robot offline; robot has an open session without `replace`; map archived / being deleted / `draft` for operate; another open mapping session (mapping); geo map and no robot datum; placing while the robot drives or after it moved (> 0.02 m / 0.5°). 422: `placement` on a geo map, `services` on operate, unknown service. `replace: true` finishes the robot's open session in the same transaction (a refused start keeps it); on the same local map a placed session's transform carries over (`placement.source: "session"`). |
+| POST | `/api/v1/maps/{id}/sessions/{sid}/place` | `{pose: {x, y, yaw}, robot_pose: {x, y, theta}}` → `{map_id, map_state, changed, session, robot_notified, mapping_state}`; `map_T_session = pose ⊕ robot_pose⁻¹`, `placement = {pose, robot_pose, source: "user", actor, at}`, `MAP.SESSION_PLACED`, then `mapping/set`. 404 unknown map/session; 409 finished, geo map, an already placed mapping session, robot offline / driving / moved. An operate session can be re-placed any time. |
+| POST | `.../sessions/{sid}/finish` | both purposes (operate: "Stop using"; the map state stays). `pause` / `resume`: 409 on operate. |
+| GET | `/api/v1/maps/{id}/sessions?limit=&before=` | the whole history, newest first: `{map_id, count, items, next_before}`; `limit` 1-200 (default 50); `before` = the previous page's `next_before`. |
+| GET | `/api/v1/maps/{id}` | `sessions.open` is the open **mapping** session; new `sessions.operating: [{robot, session_id, aligned}]`. |
+| GET | `/api/v1/maps/{id}/graph`, `POST /map/load` | nodes gain `session_id` (null for untagged legacy nodes). |
+| GET | `/api/v1/robots[/{r}]` | new `session`: `{session_id, map, purpose, state: "mapping"\|"paused"\|"operating", aligned, map_T_session (null while not placed), unplaced_reason}` or null (mapless). Derived from `map_sessions`; replaces `current_map`. |
+| WS | `/ws/robot/{r}` | `robot_update` carries `session` (cached ≤ 1 s); `{type: "session_update", robot_name, timestamp, session}` right after a session change through the API. |
+| DELETE / POST | `/api/v1/maps/{id}` / `.../archive` | 409 while **any** session is open; the message names the robots (`r1 (mapping), r2 (using)`). |
+
+Session objects gain `purpose`, `services` (mapping) and `placement`; `state` is `mapping`,
+`paused`, `operating` or `finished`. `mapping/set` gains `services`; it is `enabled` only for an
+open, unpaused, placed mapping session, and an operate session publishes the no-session
+payload. `MAP.SESSION_STARTED/FINISHED` payloads carry `purpose`.
+
 #### `WS /ws/map/{map_id}`
 WebSocket endpoint for real-time map updates.
 

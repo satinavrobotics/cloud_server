@@ -5,10 +5,16 @@ sati_ros_navstack). `{prefix}` is the VDA5050 prefix (config MQTT_VDA5050_PREFIX
 `uagv/v2/RobotCompany`), `{robot}` the robot name (= its VDA5050 serial number):
 
   {prefix}/{robot}/mapping/set      API -> robot, RETAINED, QoS 1
-      {"enabled": bool, "session_id": str|null, "map": str|null, "issued_at": iso8601}
-      Derived from the robot's open session after every session change commits: an open,
-      unpaused session -> enabled with its id and map; paused -> disabled, same id and map;
-      no open session -> disabled, nulls. Retained, so a topomap that (re)starts picks up the
+      {"enabled": bool, "session_id": str|null, "map": str|null, "services": [str],
+       "issued_at": iso8601}
+      Derived from the robot's open session after every session change commits
+      (packages/utils/map_sessions.py::set_payload): an open, unpaused, placed MAPPING
+      session -> enabled with its id, map and services; paused or not placed -> disabled,
+      same id and map; no open session, or an `operate` session (maps §14) -> disabled,
+      nulls, no services. `services` (§14.5): each mapping service runs iff `enabled` and
+      its name is listed; a robot that ignores the field runs topo (the M3 topomap). Since
+      U3 mission-dispatch publishes it too, after it unplaces a robot's session on a run
+      change or re-places a geo session from a new datum. Retained, so a topomap that (re)starts picks up the
       current state. Also re-published for every robot whenever the API (re)connects to the
       broker (the broker keeps no retained messages across its own restart).
       Optional `"force": true` (only POST /robots/{r}/mapping/off sets it): the robot applies
@@ -38,6 +44,8 @@ import logging
 import re
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
+from packages.utils.map_sessions import set_payload  # noqa: F401 - the contract, re-exported
+
 logger = logging.getLogger("ApiDelegationService.mapping_control")
 
 SET_SUFFIX = "mapping/set"
@@ -57,17 +65,6 @@ def set_topic(prefix: str, robot: str) -> str:
 
 def state_subscription(prefix: str) -> str:
     return f"{prefix.rstrip('/')}/+/{STATE_SUFFIX}"
-
-
-def set_payload(open_session: Optional[Mapping[str, Any]],
-                now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
-    """What the robot should do, from its open session (a map_sessions row, or None)."""
-    issued_at = (now or _utcnow()).isoformat()
-    if open_session is None:
-        return {"enabled": False, "session_id": None, "map": None, "issued_at": issued_at}
-    return {"enabled": open_session.get("paused_at") is None,
-            "session_id": str(open_session["session_id"]),
-            "map": open_session["map_name"], "issued_at": issued_at}
 
 
 def force_off_payload(now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
@@ -110,6 +107,10 @@ class MappingControl:
         # re-publishing every robot's set message (on every broker (re)connect).
         self.on_state: Optional[Callable[[str, Optional[Dict[str, Any]]], Awaitable[None]]] = None
         self.on_connect: Optional[Callable[[], Awaitable[None]]] = None
+        # Maps §14: async fn(robot, session view or None) pushing the robot's `session` after a
+        # session change through the API (packages/api/maps.py::notify_robot).
+        self.on_session: Optional[
+            Callable[[str, Optional[Dict[str, Any]]], Awaitable[None]]] = None
 
     # --- wiring --------------------------------------------------------------------------------
 
@@ -158,6 +159,11 @@ class MappingControl:
 
     def mapping_service(self, robot: str) -> str:
         return service_of(self._states.get(robot))
+
+    def mapping_services(self, robot: str) -> Dict[str, str]:
+        """Per mapping service (maps §14.3, `mapping_services`). Until the per-service state
+        topics exist (U5) the robot reports only the topomap, on mapping/state."""
+        return {"topo": self.mapping_service(robot)}
 
     # --- set (API -> robot) --------------------------------------------------------------------
 

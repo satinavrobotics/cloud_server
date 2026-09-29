@@ -384,8 +384,29 @@ class FakeStore:
     async def robot(self, name):
         return self.db.robots.get(name)
 
+    async def lock_robot(self, name):
+        return self.db.robots.get(name)
+
+    async def robot_state_msg(self, name):
+        return self.db.state_msgs.get(name)
+
     async def sessions(self, map_name):
         return [dict(s) for s in self.db.sessions if s["map_name"] == map_name]
+
+    async def sessions_page(self, map_name, limit, before):
+        rows = sorted((s for s in self.db.sessions if s["map_name"] == map_name),
+                      key=lambda s: (s["started_at"], str(s["session_id"])), reverse=True)
+        if before is not None:
+            anchor = next(s for s in self.db.sessions if str(s["session_id"]) == str(before))
+            key = (anchor["started_at"], str(anchor["session_id"]))
+            rows = [s for s in rows if (s["started_at"], str(s["session_id"])) < key]
+        return [dict(s) for s in rows[:limit]]
+
+    async def session_count(self, map_name):
+        return sum(1 for s in self.db.sessions if s["map_name"] == map_name)
+
+    async def open_sessions(self):
+        return [dict(s) for s in self.db.sessions if s["ended_at"] is None]
 
     async def open_sessions_of_robot(self, robot_name):
         return [dict(s) for s in self.db.sessions
@@ -419,6 +440,7 @@ class FakeDb:
         self.sessions = []
         self.events = []
         self.notifies = []
+        self.state_msgs = {}
 
     def add_map(self, name, lifecycle="ALIVE", **spec_and_status):
         status = spec_and_status.pop("status", {"state": "ready"})
@@ -660,12 +682,18 @@ class TestSessions:
         assert s1["aligned"] is True and s1["datum"] is None
         assert s1["map_T_session"] == map_geo.IDENTITY
         await maps.session_action(None, "shed", s1["session_id"], "finish", PUB)
+        # Still empty (no node arrived): the next mapping session still defines the frame.
         s2 = (await self._start(fdb, "shed"))["session"]
-        assert s2["aligned"] is False and s2["map_T_session"] == map_geo.IDENTITY
+        assert s2["aligned"] is True
+        await maps.session_action(None, "shed", s2["session_id"], "finish", PUB)
+        fdb.sessions[-1]["node_count"] = 4
+        # Maps §14 (Q-U4): extending a local map with nodes starts NOT placed.
+        s3 = (await self._start(fdb, "shed"))["session"]
+        assert s3["aligned"] is False and s3["map_T_session"] == map_geo.IDENTITY
 
     async def test_migrated_local_map_extends_unaligned(self, fdb):
         fdb.add_map("old", type="local")
-        fdb.add_session("old")  # the legacy session
+        fdb.add_session("old", node_count=12)  # the legacy session
         fdb.add_robot("r1")
         assert (await self._start(fdb, "old"))["session"]["aligned"] is False
 
@@ -789,13 +817,19 @@ class _Cursor:
     async def fetchone(self):
         return self.rows.pop(0) if self.rows else None
 
+    async def fetchall(self):
+        rows, self.rows = self.rows, []
+        return rows
+
 
 class TestGuardsAndStore:
     async def test_delete_guard(self):
-        cur = _Cursor(rows=[("sid",)])
+        cur = _Cursor(rows=[("r1", "mapping"), ("r2", "operate")])
         with pytest.raises(HTTPException) as exc:
             await maps.refuse_open_session(cur, "yard")
         assert exc.value.status_code == 409
+        # Maps §14 (Q-U2): the message names the robots using the map.
+        assert "r1 (mapping)" in exc.value.detail and "r2 (using)" in exc.value.detail
         assert cur.sql[0][0] == maps.LOCK_MAP_SQL  # locks the map row first
         await maps.refuse_open_session(_Cursor(), "yard")  # no open session: passes
 
@@ -900,7 +934,7 @@ class TestRoutes:
         svc.graph_db.get_edges.return_value = [{"from": 7, "to": 8, "weight": 1.5}]
         nodes, edges = ApiDelegationService.read_graph(svc, "yard")
         assert nodes == [{"id": "7", "x": 1.0, "y": 2.0, "theta": 0.5, "timestamp": "t",
-                          "metadata": {}}]
+                          "metadata": {}, "session_id": None}]
         assert edges == [{"from": "7", "to": "8", "weight": 1.5, "metadata": {}}]
 
     async def test_new_routes_are_registered(self):

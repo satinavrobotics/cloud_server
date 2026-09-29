@@ -6,11 +6,16 @@ at most) or is dropped:
 
     reason            when
     no_session        the robot has no open session
+    not_mapping_session  its open session is an `operate` session (maps §14: the robot uses
+                      the map and adds nothing)
     session_paused    its session is paused
     map_not_mapping   the session's map is not `mapping` (draft/ready/archived: defensive, the
                       API keeps the two in step)
     map_deleting      the map is being deleted (object lifecycle DELETING)
     map_missing       the session names a map without a Postgres row
+    session_unplaced  its mapping session is not placed (maps §14: a local map that already
+                      has nodes, until the user places the robot; any session after the
+                      robot's run frame reset, until it is placed again)
     session_mismatch  the payload carries a `session_id` that is not the open session (robot-side
                       tagging is M3; a payload without `session_id` is accepted)
     datum_changed     geo session: the robot's current datum is not the one the session was
@@ -29,6 +34,9 @@ one wins and writes the event, the others re-read the session and use the stored
 Nodes stored before keep their map-frame poses; nothing links the last node before the restart
 to the first after (edges are proximity edges, as always). A local map has no absolute frame and
 still rejects (`datum_changed`), as does a datum outside the map's UTM zone / hemisphere.
+Only a placed session is realigned here; one that a run change unplaced (maps §14 U3) is
+re-placed by mission-dispatch when the robot's new datum arrives, and until then its nodes are
+rejected (`session_unplaced`) instead of being placed with the old transform.
 
 The robot is taken from the payload's `robot_name`; any `map_id` in the payload is ignored.
 
@@ -56,7 +64,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event
-from packages.utils import geo, map_geo
+from packages.utils import map_geo, map_sessions
 
 logger = logging.getLogger("GraphBuilderService.ingest")
 
@@ -65,6 +73,8 @@ REJECT_EVENT_INTERVAL_S = 60.0
 ACCEPTING_STATES = ("mapping",)
 
 NO_SESSION = "no_session"
+NOT_MAPPING_SESSION = "not_mapping_session"
+SESSION_UNPLACED = "session_unplaced"
 SESSION_PAUSED = "session_paused"
 MAP_NOT_MAPPING = "map_not_mapping"
 MAP_DELETING = "map_deleting"
@@ -72,24 +82,22 @@ MAP_MISSING = "map_missing"
 SESSION_MISMATCH = "session_mismatch"
 DATUM_CHANGED = "datum_changed"
 LOOKUP_FAILED = "lookup_failed"
-REASONS = (NO_SESSION, SESSION_PAUSED, MAP_NOT_MAPPING, MAP_DELETING, MAP_MISSING,
-           SESSION_MISMATCH, DATUM_CHANGED, LOOKUP_FAILED)
-# Datum comparison tolerances: the datum is a fixed per-run origin, re-sent unchanged.
-_DEG_TOL = 1e-9
-_M_TOL = 1e-4
+REASONS = (NO_SESSION, NOT_MAPPING_SESSION, SESSION_PAUSED, MAP_NOT_MAPPING, MAP_DELETING,
+           MAP_MISSING, SESSION_UNPLACED, SESSION_MISMATCH, DATUM_CHANGED, LOOKUP_FAILED)
 
 # One row per robot at most (partial unique index map_sessions_one_open_per_robot).
 OPEN_SESSION_SQL = (
     "SELECT s.session_id, s.map_name, s.paused_at IS NOT NULL, s.map_t_session, "
     "m.lifecycle, m.status->>'state', s.datum, r.spec->'datum', "
-    "m.spec->'geo', m.spec->>'type' "
+    "m.spec->'geo', m.spec->>'type', s.purpose, s.aligned "
     "FROM map_sessions s LEFT JOIN mapobjectv1 m "
     "ON m.name = s.map_name AND m.lifecycle <> 'DELETED' "
     "LEFT JOIN robotobjectv1 r ON r.name = s.robot_name AND r.lifecycle <> 'DELETED' "
     "WHERE s.robot_name = %s AND s.ended_at IS NULL")
 # Compare-and-set on the datum read: only the ingest that saw the old datum wins (rowcount 1).
+# Only a placed session (maps §14): an unplaced one waits for mission-dispatch's re-placement.
 REALIGN_SQL = ("UPDATE map_sessions SET datum = %s::jsonb, map_t_session = %s::jsonb "
-               "WHERE session_id = %s AND ended_at IS NULL AND datum = %s::jsonb")
+               "WHERE session_id = %s AND ended_at IS NULL AND aligned AND datum = %s::jsonb")
 COUNT_SQL = "UPDATE map_sessions SET node_count = node_count + %s WHERE session_id = %s"
 
 
@@ -106,27 +114,22 @@ class OpenSession:
     robot_datum: Optional[Dict[str, Any]] = None    # the robot's datum now (map_geo shape)
     map_geo: Optional[Dict[str, Any]] = None        # the map's `geo` block (geo maps)
     map_type: Optional[str] = None
+    purpose: str = map_sessions.MAPPING
+    aligned: bool = True  # placed (maps §14)
 
     @classmethod
     def from_row(cls, row: Tuple) -> "OpenSession":
         session_id, map_name, paused, transform, lifecycle, state, sdatum, rdatum = row[:8]
         mgeo, mtype = (row[8], row[9]) if len(row) >= 10 else (None, None)
+        purpose, aligned = (row[10], row[11]) if len(row) >= 12 else (None, True)
         t = dict(map_geo.IDENTITY)
         t.update({k: float(v) for k, v in (transform or {}).items() if k in t})
         return cls(str(session_id), map_name, bool(paused), t, lifecycle, state or "ready",
-                   sdatum or None, map_geo.robot_datum(rdatum or {}), mgeo or None, mtype)
+                   sdatum or None, map_geo.robot_datum(rdatum or {}), mgeo or None, mtype,
+                   purpose or map_sessions.MAPPING, aligned is not False)
 
 
-def same_datum(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-    """Two datums (map_geo.robot_datum shape) describe the same robot frame."""
-    if geo.normalize_frame(a.get("frame")) != geo.normalize_frame(b.get("frame")):
-        return False
-    for key, tol in (("latitude", _DEG_TOL), ("longitude", _DEG_TOL), ("bearing_deg", _DEG_TOL),
-                     ("utm_easting", _M_TOL), ("utm_northing", _M_TOL)):
-        va, vb = a.get(key), b.get(key)
-        if (va is None) != (vb is None) or (va is not None and abs(float(va) - float(vb)) > tol):
-            return False
-    return True
+same_datum = map_sessions.same_datum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -156,10 +159,14 @@ def decide(robot_name: str, session: Optional[OpenSession],
         reason = MAP_MISSING
     elif session.map_lifecycle == "DELETING":
         reason = MAP_DELETING
+    elif session.purpose != map_sessions.MAPPING:
+        reason = NOT_MAPPING_SESSION
     elif session.paused or session.map_state == "paused":
         reason = SESSION_PAUSED
     elif session.map_state not in ACCEPTING_STATES:
         reason = MAP_NOT_MAPPING
+    elif not session.aligned:
+        reason = SESSION_UNPLACED
     elif psid is not None and psid != session.session_id:
         reason = SESSION_MISMATCH
     elif (session.session_datum is not None and session.robot_datum is not None
@@ -182,19 +189,10 @@ def plan_realign(session: OpenSession) -> Optional[Realign]:
     (then the ingest rejects with `datum_changed`): a geo session on a geo map with an origin,
     and a new datum that lies in the map's UTM zone and hemisphere. Pure."""
     old, new, geo_block = session.session_datum, session.robot_datum, session.map_geo
-    if old is None or new is None or same_datum(old, new):
+    if old is None or new is None or same_datum(old, new) or not session.aligned:
         return None
-    if session.map_type == "local" or not geo_block:
-        return None
-    try:
-        zone, north = int(geo_block["utm_zone"]), bool(geo_block["utm_north"])
-        float(geo_block["origin_e"])
-        float(geo_block["origin_n"])
-        dzone, dnorth, _e, _n = map_geo.datum_utm(new)
-        if dzone != zone or dnorth != north:
-            return None
-        transform = map_geo.session_transform(geo_block, new)
-    except (KeyError, TypeError, ValueError):
+    transform = map_sessions.geo_transform_for(geo_block, session.map_type, new)
+    if transform is None:
         return None
     return Realign(dict(new), transform)
 

@@ -131,14 +131,14 @@ class TestContract:
 
     def test_set_payload(self):
         sid = uuid.uuid4()
-        open_s = {"session_id": sid, "map_name": "yard", "paused_at": None}
+        open_s = {"session_id": sid, "map_name": "yard", "paused_at": None, "aligned": True}
         p = mc.set_payload(open_s, m1.T0)
         assert p == {"enabled": True, "session_id": str(sid), "map": "yard",
-                     "issued_at": m1.T0.isoformat()}
+                     "services": ["topo"], "issued_at": m1.T0.isoformat()}
         assert mc.set_payload({**open_s, "paused_at": m1.T0})["enabled"] is False
         assert mc.set_payload({**open_s, "paused_at": m1.T0})["session_id"] == str(sid)
         p = mc.set_payload(None, m1.T0)
-        assert p == {"enabled": False, "session_id": None, "map": None,
+        assert p == {"enabled": False, "session_id": None, "map": None, "services": [],
                      "issued_at": m1.T0.isoformat()}
 
     def test_state_view(self):
@@ -341,7 +341,7 @@ class TestTransitions:
         db.add_map("yard", type="local", status={"state": "draft"})
         db.add_robot("r1")
         out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB)
-        assert set(out) == {"map_id", "map_state", "changed", "session"}
+        assert set(out) == {"map_id", "map_state", "changed", "session", "replaced_session"}
 
 
 class TestShim:
@@ -414,6 +414,7 @@ class TestSummaryAndRoutes:
         svc = MagicMock()
         svc.database = None
         svc.mapping_control = control()
+        svc.graph_db.get_map_stats.return_value = {"node_count": 0}
         with patch.object(main, "service", svc):
             out = await main.start_map_session("yard", {"robot": "r1"})
             sid = out["session"]["session_id"]

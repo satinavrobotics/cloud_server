@@ -492,13 +492,9 @@ async def create_map(body: Dict[str, Any]):
     first mapping session's datum."""
     _require_service()
 
-    def arango_nodes(name: str) -> int:
-        stats = service.graph_db.get_map_stats(name)
-        return 0 if "error" in stats else int(stats.get("node_count") or 0)
-
     return await _site_call("create map", maps.create_map(
         service.database, body, uuid.uuid4(), recording.request_actor(),
-        arango_node_count=arango_nodes))
+        arango_node_count=_arango_node_count))
 
 
 
@@ -557,29 +553,63 @@ async def get_map_graph(map_id: str):
     return await _site_call("read map graph", service.get_map_graph(map_id))
 
 
+def _arango_node_count(name: str) -> int:
+    stats = service.graph_db.get_map_stats(name)
+    return 0 if "error" in stats else int(stats.get("node_count") or 0)
+
+
 @app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
 async def start_map_session(map_id: str, body: Dict[str, Any]):
-    """Start a mapping session `{robot}` on the map (maps redesign M1): the robot must be
-    online and have no other open session; a geo map needs the robot's datum. The map goes to
-    `mapping`, and graph-builder stores the robot's nodes and images in it (maps M2).
-    Maps M3: then the robot's retained MQTT `{prefix}/{robot}/mapping/set` turns its topomap
-    capture on. The response adds `robot_notified` (the broker acknowledged the set message;
-    false never fails the call), `mapping_service` ("running" | "not_running": whether the
-    robot's topomap service is connected; the session starts either way, doc Q3) and
-    `mapping_state` (the robot's last mapping/state, or null). Note: this route does not write
-    robot.current_map (the deprecated PUT /robots/{r}/map does)."""
+    """Start a session `{robot, purpose?, services?, placement?, replace?}` on the map (maps
+    redesign M1, §14). `purpose`: "mapping" (default: the robot adds data; the map goes to
+    `mapping` and graph-builder stores the robot's nodes and images in it) or "operate" (the
+    robot uses the map for missions and display and adds nothing; the map state does not
+    change). `services` (mapping only, default ["topo"]); `placement` {pose: {x, y, yaw},
+    robot_pose: {x, y, theta}} puts the robot on a LOCAL map (422 on a geo map, which is placed
+    by the robot's datum); `replace: true` finishes the robot's open session in the same
+    transaction. Errors: packages/api/maps.py (module docstring). Maps M3: then the robot's
+    retained MQTT `{prefix}/{robot}/mapping/set` (capture on only for a placed, unpaused
+    mapping session). The response: {map_id, map_state, changed, session, replaced_session,
+    robot_notified, mapping_service, mapping_services, mapping_state}. Note: this route does
+    not write robot.current_map (the deprecated PUT /robots/{r}/map does)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
+        control=service.mapping_control, arango_node_count=_arango_node_count))
+
+
+@app.get("/api/v1/maps/{map_id}/sessions")
+async def list_map_sessions(map_id: str, limit: Optional[int] = None,
+                            before: Optional[str] = None):
+    """The map's full session history, newest first, paged (maps §14.3): `limit` (1-200,
+    default 50), `before` = the previous page's `next_before`. {map_id, count, items,
+    next_before}."""
+    _require_service()
+    return await _site_call("list map sessions", maps.session_history(
+        service.database, map_id, limit, before))
+
+
+@app.post("/api/v1/maps/{map_id}/sessions/{session_id}/place")
+async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
+    """Place the session's robot on a local map (maps §14.3) `{pose: {x, y, yaw}, robot_pose:
+    {x, y, theta}}`: `pose` in the map frame, `robot_pose` = the robot's own pose the user saw.
+    The robot must stand still (409 while it drives or when it moved by more than 0.02 m /
+    0.5 deg). 409 on a finished session, a geo map, an already placed mapping session. Then
+    the robot's mapping/set (capture turns on for a placed mapping session)."""
+    _require_service()
+    return await _site_call("place map session", maps.place_session(
+        service.database, map_id, session_id, body, uuid.uuid4(), recording.request_actor(),
         control=service.mapping_control))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
 async def map_session_action(map_id: str, session_id: str, action: str):
-    """`pause`, `resume` or `finish` a mapping session. Finishing the map's only open session
-    makes the map `ready`. Repeating an action that is already in effect changes nothing.
-    Maps M3: the robot's mapping/set is (re)published (pause/finish: capture off; resume: on);
-    the response adds `robot_notified` and `mapping_state`."""
+    """`pause`, `resume` or `finish` a session. Finishing the map's only open mapping session
+    makes the map `ready`; finishing an operate session is "Stop using" (the map state does
+    not change). pause/resume: mapping sessions only (409 on operate). Repeating an action
+    that is already in effect changes nothing. Maps M3: the robot's mapping/set is
+    (re)published (pause/finish: capture off; resume: on if placed); the response adds
+    `robot_notified` and `mapping_state`."""
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
@@ -588,8 +618,8 @@ async def map_session_action(map_id: str, session_id: str, action: str):
 
 @app.post("/api/v1/maps/{map_id}/archive")
 async def archive_map(map_id: str):
-    """Archive a map: hidden from GET /api/v1/maps by default, nothing deleted. 409 while a
-    mapping session is open."""
+    """Archive a map: hidden from GET /api/v1/maps by default, nothing deleted. 409 while any
+    session is open (mapping or operate); the message names the robots (maps §14, Q-U2)."""
     _require_service()
     return await _site_call("archive map", maps.archive_map(
         service.database, map_id, uuid.uuid4(), recording.request_actor()))
@@ -651,7 +681,8 @@ async def delete_map(map_id: str):
     """
     Delete a map and all its data from the graph and image databases.
 
-    409 while the map has an open mapping session (maps redesign M1).
+    409 while any session is open on the map (mapping or operate; the message names the
+    robots, maps §14 Q-U2).
 
     Returns 202 at once: the map is marked DELETING (hidden from GET /api/v1/maps, 409 on
     assign/load/datum) and a background task deletes it from ArangoDB and MinIO, retrying
@@ -1199,11 +1230,17 @@ async def create_livekit_token(request: CreateTokenRequest):
 
 # ==================== Robot Operations ====================
 
-def _robot_view(robot: RobotObjectV1) -> Dict[str, Any]:
+def _robot_view(robot: RobotObjectV1,
+                sessions: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """robot.dict() plus (maps M3) `mapping_state`: the robot's last MQTT mapping/state with
-    `status` on/off/unreachable and `received_at`, or null (packages/api/mapping_control.py)."""
+    `status` on/off/unreachable and `received_at`, or null (packages/api/mapping_control.py);
+    plus (maps §14) `session`: the robot's open session, derived from map_sessions and never
+    stored on the robot: {session_id, map, purpose, state, aligned, map_T_session,
+    unplaced_reason} or null (mapless). It replaces `current_map` for the client
+    (packages/utils/map_sessions.py::robot_session_view)."""
     data = robot.dict()
     data["mapping_state"] = service.mapping_control.state(robot.name) if service else None
+    data["session"] = (sessions or {}).get(robot.name)
     return data
 
 
@@ -1237,7 +1274,8 @@ async def list_robots(
             params["robot_type"] = robot_type
 
         robots = await service.database.list_objects(RobotObjectV1, query_params=params.items() if params else None)
-        return [_robot_view(robot) for robot in robots]
+        sessions = await maps.robot_sessions(service.database)
+        return [_robot_view(robot, sessions) for robot in robots]
     except HTTPException:
         raise
     except Exception as e:
@@ -1256,7 +1294,7 @@ async def get_robot(robot_name: str):
 
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return _robot_view(robot)
+        return _robot_view(robot, await maps.robot_sessions(service.database))
     except HTTPException:
         raise
     except Exception as e:
