@@ -462,7 +462,7 @@ counts per session. `since`: when `enabled` last flipped.
 
 ## 14. Using maps: operate sessions and the map window
 
-**Status:** design, 2026-09-29. Not built. Revises the M5–M7 plan (§14.9).
+**Status:** design 2026-09-29; U1–U3 **built, not deployed** (§14.11). Revises the M5–M7 plan (§14.9).
 
 ### 14.1 The gap
 
@@ -698,9 +698,9 @@ The screen-by-screen brief for the mockup is in `map-window-brief.md` (scratchpa
 
 | Step | Content | Repos |
 |---|---|---|
-| U1 | Migration; `purpose`/`services`/`placement`/`replace` on start; `place`; history endpoint; robot view `session`; graph `session_id`; `set_payload` and ingest rules; events | cloud_server |
-| U2 | Consumers read the session (§14.6), with the transition fallback | cloud_server |
-| U3 | Run-change detection in the dispatcher; unplace; geo re-place on the datum write (the same compare-and-set as graph-builder's) | cloud_server |
+| U1 | Migration; `purpose`/`services`/`placement`/`replace` on start; `place`; history endpoint; robot view `session`; graph `session_id`; `set_payload` and ingest rules; events | cloud_server; **built, not deployed** (§14.11) |
+| U2 | Consumers read the session (§14.6), with the transition fallback | cloud_server; **built, not deployed** (§14.11) |
+| U3 | Run-change detection in the dispatcher; unplace; geo re-place on the datum write (the same compare-and-set as graph-builder's) | cloud_server; **built, not deployed** (§14.11) |
 | U4 | Map window (§14.7), place mode, robot strip, marker via the session; retire `AssignMapModal`'s GEO/LOCAL rows | sati-client |
 | U5 | Per-service state topics and `services` in `mapping/set` | sati_ros_navstack, cloud_server |
 | U6 | Remove `current_map`, the shim, the sentinels and the fallbacks | cloud_server, sati-client |
@@ -721,6 +721,27 @@ U1 → U2 → U3 are sequential. U4 needs U1 (and U3 for the "not placed" state)
 - **Q-U7** **The robot must not move while being placed.** No movement allowance: `place` is refused while the robot drives (an active order, or a non-zero velocity in its state) and if its pose changed between the pose shown and the confirm by more than sensor noise (0.02 m / 0.5°; noise, not an allowance). The UI says to stop the robot first.
 - **Q-U8** No manual correction of a geo map's placement now (recommendation taken).
 - **Q-U9** An operate session does not end on its own while the robot is offline; it becomes unplaced on the next run change (recommendation taken).
+
+### 14.11 U1–U3 as built
+
+Code: `packages/utils/map_sessions.py` (the shared rules: placement math, stillness, `set_payload`, the robot's `session` view, the dispatcher's SQL), `packages/api/maps.py` (start/place/history/archive/delete guard), `packages/api/main.py` / `server.py` (routes, robot view, WS), `packages/services/graph_builder/ingest.py`, `packages/services/mission_planner/server.py`, `packages/controllers/mission/server.py` + `run_change.py`, `fleet_recorder.py`, migration `20260930_01_maps_use`. Route reference: `packages/api/README.md` ("Operate sessions and placement"). Tests: `tests/unit/test_maps_use.py` (U1), `test_maps_use_consumers.py` (U2), `test_maps_use_run_change.py` (U3); `tests/integration/maps/checks_use.py` (the U1–U3 scenario on real Postgres, run against a copy of the production schema after the migration). Deploy: `~/pg-cutover/scripts/mapsu1.sh` (API with the migration, then graph-builder, mission-dispatch, mission-planner).
+
+As designed, except:
+
+- **Run-change detection (U3).** The design's "a `connection: ONLINE` means a new client process" is not true of `sati_vda5050_client`: it publishes ONLINE on every MQTT **reconnect** too (`HandleMqttReconnected`), with the next connection headerId. So an ONLINE counts only when its headerId is **not above** the last ONLINE's (a new process starts at 1; 0 goes to the will it sets before connecting); the last will (`CONNECTIONBROKEN`, also sent on a mere network blip) and OFFLINE are ignored. A `state` headerId below the last one also counts. After either signal both baselines reset, so one restart seen on both topics unplaces once. The dispatcher's `VDA5050Connection` read the client's `state` key as the OFFLINE default (the client sends `state`, not VDA5050's `connectionState`); it reads both now, which also fixes the recorder's ROBOT.ONLINE/OFFLINE.
+- **Geo re-place and the retained datum.** A geo session a run change unplaced is re-placed by the next datum message. The first datum after the dispatcher's (re)connect to the broker may be the retained one of the **old** run, so when it equals the session's datum it is not trusted (the "MQTT epoch" rule); a different datum always is. A placed geo session whose datum changed is re-derived as in §13.4 (the dispatcher and graph-builder use the same compare-and-set; graph-builder now realigns only placed sessions and otherwise rejects with `session_unplaced`). Events: `MAP.SESSION_REALIGNED` with source `dispatch` and `reason` (`run_changed` | `datum`).
+- **Limit: a robot whose new run does not re-send its datum** (the sim: the orchestrator publishes its fixed `gps_anchor` once at registration, not at a navstack restart) keeps an unplaced geo session after a navstack restart: capture off, route orders on that map refused, plans 409. Recovery: "Use" the map again (`POST sessions {purpose, replace: true}` on the same map re-derives the transform from the robot's current datum); with the old client, assign GEO and then the map again (the shim treats re-assigning the same map as a no-op). If the sim's odom does not actually reset at a navstack restart, a robot-side `run_id` (Q-U3) or a datum re-publish at navstack start would avoid this.
+- **Who publishes `mapping/set`:** the API after its own session changes (as M3), and **mission-dispatch** after it unplaces or re-places a session (same retained topic, same payload, re-read from the database right before publishing). The two processes do not share the M3 per-robot lock; a race can leave a stale retained message until the next change or API reconnect. graph-builder's `session_unplaced` check is the safety net (a robot capturing while unplaced has its nodes dropped).
+- **Empty local map.** "The first mapping session of an empty local map is identity and placed" uses the map's node count (ArangoDB, falling back to the sessions' and the row's stored counts), not "the first session": a local map whose earlier sessions recorded nothing is still empty.
+- **Placement carried over (addition).** `replace: true` on the **same** local map carries a placed session's `map_T_session` into the new one (`placement.source: "session"`, `from_session_id`), e.g. "Finish mapping → Use" in one step without placing by hand. Only while it is placed, i.e. within the same run.
+- **Stillness check details (Q-U7).** Driving = robot state `ON_TASK`/`MAP_DEPLOYMENT` (an active order), or in the robot's last VDA5050 state (`robot_latest.state_msg`, merged about once a second; ignored when older than 30 s): `driving: true`, a velocity above the noise floor (0.01 m/s, 0.01 rad/s), or remaining `nodeStates`. Moved = `robot_pose` vs `robot.status.pose` beyond 0.02 m / 0.5°. `place` also requires the robot online (its pose must be live).
+- **API details.** Session `state` is `mapping` | `paused` | `operating` | `finished`. The robot's `session` view has `map_T_session: null` while not placed (never a guessed identity) and `unplaced_reason` (`run_changed`). `sessions.open` in `GET /maps/{id}` is the open **mapping** session; `sessions.unaligned` counts mapping sessions only. History paging: `before` = the previous page's `next_before` (a session id). `services` accepts `topo` and the reserved `grid`; `mapping_services` is `{topo: ...}` until U5. WS: `robot_update` carries `session` (from a 1 s cache, so dispatcher changes show within about a second) and the API pushes `session_update` right after its own changes. `POST /robots/{r}/mapping/off` is allowed with an operate session (only an open mapping session blocks it).
+- **Migration** adds a third constraint, `map_sessions_services_check` (only mapping sessions have services). Downgrade deletes operate sessions first (they own no nodes; their robots become mapless). Rehearsed on the production schema: up, idempotent re-run, down, up.
+- **Dispatcher refusal.** A route node on a map the robot is not placed on is not sent: the node fails (`MISSION.NODE_FAILED`, `failure_reason` "Route node N: robot is not placed on map X") and the behavior tree decides the mission; it is wrapped up on the robot's next state message. With the transition fallback (`SESSIONLESS_FALLBACK = True` in the dispatcher and the planner, removed in U6) a map the robot has **no** session on keeps the M2 rule with a warning.
+- **Transition, old client.** The shim (`PUT /robots/{r}/map`) extending a local map that has nodes now starts the mapping session **unplaced** (Q-U4): capture stays off and route orders on that map are refused until the robot is placed, which only the new client (U4) can do. Geo maps and new/empty local maps behave as before.
+- **Run recorder / bags.** `mission_runs.map_id` = the session's map, or null when mapless (no longer the `GEO`/`LOCAL` sentinel or the pose's literal `"map"`); if the session cannot be read the M2 rule applies. Bag sidecars gain `session_id`.
+
+Deploy notes: open local sessions that are not aligned (later M1/M2 sessions on a local map) stop capturing at deploy; `mapsu1.sh` lists them. mission-dispatch starts with no header-id baseline, so the deploy itself unplaces nothing.
 
 ---
 
