@@ -19,9 +19,9 @@ service reading ArangoDB/MinIO itself): the pipeline stays; what changes is the 
 |---|---|
 | `POST /maps/{map}/reconstruction` with settings only | `POST /jobs` with the whole manifest (§2.1): frames, map-frame poses, camera params, presigned GET URLs |
 | the service reads ArangoDB and MinIO with credentials | no credentials: only the manifest's URLs (a new input source) |
-| results kept by the service, fetched from it | results PUT to the presigned URLs, then the `finish` callback (§2.4, §3) |
-| `cloud.ply` + `meta.json` | also `ortho.png` and `height.png`, the 2.5D top view (§4) |
-| no auth, no callbacks | bearer key on every call to the service; HMAC-token callbacks for progress / finish / fail (§2) |
+| results kept by the service, fetched from it | results PUT to the presigned URLs, then the `finish` callback (§3, §7) |
+| `cloud.ply` + `meta.json` | also `ortho.png` and `height.png`, the 2.5D top view (§7.2, §7.3) |
+| no auth, no callbacks | bearer key on every call to the service; HMAC-token callbacks for progress / finish / fail (§2, §3) |
 | depth layout `depth_cameras`, `{cam}.json` | irrelevant to the service: camera params arrive in the manifest |
 
 ---
