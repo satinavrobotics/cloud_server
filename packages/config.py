@@ -99,6 +99,28 @@ MQTT_DEPTH_TOPIC = os.getenv("MQTT_DEPTH_TOPIC", "robot/depth_upload")
 # orchestrator subscribes to the same robot state stream (`{prefix}/+/state`).
 MQTT_VDA5050_PREFIX = os.getenv("MQTT_VDA5050_PREFIX", "uagv/v2/RobotCompany")
 
+# ==================== Mapping switch through the robot's orchestrator ====================
+# A mapping session's services (packages/utils/map_sessions.py::KNOWN_SERVICES) are started and
+# stopped on the robot's satibot_orchestrator (packages/api/mapping_switch.py). The orchestrator
+# names them differently on the real robot and in the sim: per session service, an ordered list
+# of candidate orchestrator service names; the first one the robot's orchestrator lists is used.
+# Override with MAPPING_SERVICE_<NAME> (comma-separated), e.g. MAPPING_SERVICE_TOPO=topomap.
+def _candidates(env: str, default: str) -> list:
+    return [n.strip() for n in os.getenv(env, default).split(",") if n.strip()]
+
+
+MAPPING_SERVICE_CANDIDATES = {
+    "topo": _candidates("MAPPING_SERVICE_TOPO", "topomap,sim_topomap"),
+    "grid": _candidates("MAPPING_SERVICE_GRID", "grid"),
+}
+# Orchestrator HTTP timeouts (seconds): status/list are polled for the robot views, start can
+# take a while (the orchestrator launches the service's entrypoint), stop is a process kill.
+ORCHESTRATOR_QUERY_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_QUERY_TIMEOUT_S", "3.0"))
+ORCHESTRATOR_START_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_START_TIMEOUT_S", "30.0"))
+ORCHESTRATOR_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_STOP_TIMEOUT_S", "15.0"))
+# How long a fetched mapping service state is reused for the robot views (seconds).
+MAPPING_STATE_TTL_S = float(os.getenv("MAPPING_STATE_TTL_S", "5.0"))
+
 # ==================== Phase 0 telemetry ingest (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).
 # Kill switch: "false" leaves the API exactly as before (in-memory caches only).

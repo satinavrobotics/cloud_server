@@ -331,9 +331,6 @@ services:
       - ROSBAG_PRESIGN_EXPIRY=${ROSBAG_PRESIGN_EXPIRY:-3600}
       - GRAPH_BUILDER_WS_URL=ws://localhost:${GRAPH_BUILDER_PORT:-8004}
       - MISSION_DISPATCHER_WS_URL=ws://localhost:${DATABASE_API_PORT:-5000}
-      # Maps M3: the robot mapping switch ({prefix}/{robot}/mapping/set|state); same prefix as
-      # mission-dispatch's --mqtt_prefix and the robots' VDA5050 clients.
-      - MQTT_VDA5050_PREFIX=${MQTT_VDA5050_PREFIX:-uagv/v2/RobotCompany}
       # 3D reconstruction gateway (docs/reconstruction/design.md §6.9, §13). The service itself
       # is deployed from its own repo. Empty URL/key/secret = feature off (POST -> 503).
       - RECONSTRUCTION_SERVICE_URL=${RECONSTRUCTION_SERVICE_URL:-}

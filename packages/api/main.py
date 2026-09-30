@@ -537,10 +537,10 @@ async def get_map(map_id: str):
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error"))
     # Maps redesign M1: the map's mapping sessions (count, open one, newest first).
-    # M3: plus `mapping_state` / `mapping_service` of the open session's robot.
+    # Plus `mapping_state` / `mapping_service(s)` of the open session's robot (its orchestrator).
     result["sessions"] = await _site_call("list map sessions",
                                           maps.session_summary(service.database, map_id,
-                                                               service.mapping_control,
+                                                               service.mapping_switch,
                                                                result.get("type")))
     return result
 
@@ -575,15 +575,17 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     change). `services` (mapping only, default ["topo"]); `placement` {pose: {x, y, yaw},
     robot_pose: {x, y, theta}} puts the robot on a LOCAL map (422 on a geo map, which is placed
     by the robot's datum); `replace: true` finishes the robot's open session in the same
-    transaction. Errors: packages/api/maps.py (module docstring). Maps M3: then the robot's
-    retained MQTT `{prefix}/{robot}/mapping/set` (capture on only for a placed, unpaused
-    mapping session). The response: {map_id, map_state, changed, session, replaced_session,
-    robot_notified, mapping_service, mapping_services, mapping_state}. The session is the
-    robot's map (maps §14.2; robots have no current_map since U6)."""
+    transaction. Errors: packages/api/maps.py (module docstring). A mapping session's services
+    are started on the robot's orchestrator inside the transaction: when that fails (502 robot or
+    orchestrator unreachable / not registered, 504 timeout, 409 no such service there) nothing is
+    committed. The response: {map_id, map_state, changed, session, replaced_session,
+    robot_notified, mapping_switch, mapping_service, mapping_services, mapping_state} (+
+    `mapping_warning` when the replaced session's service could not be stopped). The session is
+    the robot's map (maps §14.2; robots have no current_map since U6)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
-        control=service.mapping_control, arango_node_count=_arango_node_count))
+        switch=service.mapping_switch, arango_node_count=_arango_node_count))
 
 
 @app.get("/api/v1/maps/{map_id}/sessions")
@@ -602,12 +604,12 @@ async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     """Place the session's robot on a local map (maps §14.3) `{pose: {x, y, yaw}, robot_pose:
     {x, y, theta}}`: `pose` in the map frame, `robot_pose` = the robot's own pose the user saw.
     The robot must stand still (409 while it drives or when it moved by more than 0.02 m /
-    0.5 deg). 409 on a finished session, a geo map, an already placed mapping session. Then
-    the robot's mapping/set (capture turns on for a placed mapping session)."""
+    0.5 deg). 409 on a finished session, a geo map, an already placed mapping session. From
+    then on graph-builder keeps the session's nodes (the services are not touched)."""
     _require_service()
     return await _site_call("place map session", maps.place_session(
         service.database, map_id, session_id, body, uuid.uuid4(), recording.request_actor(),
-        control=service.mapping_control))
+        switch=service.mapping_switch))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
@@ -615,13 +617,16 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     """`pause`, `resume` or `finish` a session. Finishing the map's only open mapping session
     makes the map `ready`; finishing an operate session is "Stop using" (the map state does
     not change). pause/resume: mapping sessions only (409 on operate). Repeating an action
-    that is already in effect changes nothing. Maps M3: the robot's mapping/set is
-    (re)published (pause/finish: capture off; resume: on if placed); the response adds
-    `robot_notified` and `mapping_state`."""
+    that is already in effect changes nothing in the session (a repeated pause/finish retries
+    the stop, a repeated resume the start). Resume starts the session's mapping services on the
+    robot's orchestrator inside the transaction (502/504/409 when that fails: the session stays
+    paused); pause/finish stop them after the commit, best effort: when the robot is offline the
+    session is closed anyway and the response has `robot_notified: false` and `mapping_warning`.
+    The response adds `robot_notified`, `mapping_switch` and `mapping_state`."""
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
-        recording.request_actor(), control=service.mapping_control))
+        recording.request_actor(), switch=service.mapping_switch))
 
 
 @app.post("/api/v1/maps/{map_id}/archive")
@@ -1318,21 +1323,28 @@ async def create_livekit_token(request: CreateTokenRequest):
 
 # ==================== Robot Operations ====================
 
-def _robot_view(robot: RobotObjectV1,
-                sessions: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """robot.dict() plus (maps M3) `mapping_state`: the robot's last MQTT topo mapping state with
-    `status` on/off/unreachable and `received_at`, or null (packages/api/mapping_control.py);
-    (maps U5) `mapping_services`: {service: running | not_running | not_available};
+async def _robot_views(robots: List[RobotObjectV1],
+                       sessions: Optional[Dict[str, Dict[str, Any]]] = None
+                       ) -> List[Dict[str, Any]]:
+    """robot.dict() plus `mapping_state`: the robot's topo mapping service as its orchestrator
+    reports it, with `status` on/off/unreachable (packages/api/mapping_switch.py), or null (robot
+    offline, no registered orchestrator, no topo service there); `mapping_services`:
+    {service: running | not_running | not_available};
     plus (maps §14) `session`: the robot's open session, derived from map_sessions and never
     stored on the robot: {session_id, map, purpose, state, aligned, map_T_session,
     unplaced_reason} or null (mapless). It is the robot's map (robot.current_map was removed in
     maps U6; packages/utils/map_sessions.py::robot_session_view)."""
-    data = robot.dict()
-    data["mapping_state"] = service.mapping_control.state(robot.name) if service else None
-    data["mapping_services"] = (service.mapping_control.mapping_services(robot.name)
-                                if service else None)
-    data["session"] = (sessions or {}).get(robot.name)
-    return data
+    snaps = await service.mapping_switch.snapshots(robots) if service else {}
+    out = []
+    for robot in robots:
+        data = robot.dict()
+        snap = snaps.get(robot.name)
+        session = (sessions or {}).get(robot.name)
+        data["mapping_state"] = snap.state(session) if snap else None
+        data["mapping_services"] = snap.mapping_services() if snap else None
+        data["session"] = session
+        out.append(data)
+    return out
 
 
 @app.get("/api/v1/robots", response_model=List[dict])
@@ -1366,7 +1378,7 @@ async def list_robots(
 
         robots = await service.database.list_objects(RobotObjectV1, query_params=params.items() if params else None)
         sessions = await maps.robot_sessions(service.database)
-        return [_robot_view(robot, sessions) for robot in robots]
+        return await _robot_views(robots, sessions)
     except HTTPException:
         raise
     except Exception as e:
@@ -1385,7 +1397,7 @@ async def get_robot(robot_name: str):
 
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return _robot_view(robot, await maps.robot_sessions(service.database))
+        return (await _robot_views([robot], await maps.robot_sessions(service.database)))[0]
     except HTTPException:
         raise
     except Exception as e:
@@ -1689,19 +1701,6 @@ async def update_robot_map(robot_name: str):
     """REMOVED in maps U6 (was the deprecated M2 shim over sessions): always 410 Gone, pointing
     to POST /api/v1/maps/{id}/sessions and .../sessions/{sid}/finish. Kept for one release."""
     raise HTTPException(status_code=410, detail=ROBOT_MAP_GONE)
-
-
-@app.post("/api/v1/robots/{robot_name}/mapping/off")
-async def robot_mapping_off(robot_name: str):
-    """Force a robot's mapping capture off when it has no open mapping session (maps M3; e.g.
-    a local `~/set_enabled true` on the robot, whose nodes graph-builder ignores). Publishes
-    the retained `{prefix}/{robot}/mapping/set` `{enabled: false, session_id: null, map: null,
-    force: true, issued_at}`. 404 unknown robot, 409 while the robot has an open session
-    (finish or pause it instead). Returns `robot_notified` (the broker acknowledged it) and
-    `mapping_state`."""
-    _require_service()
-    return await _site_call("turn robot mapping off", maps.robot_mapping_off(
-        service.database, robot_name, service.mapping_control))
 
 
 @app.post("/api/v1/robots/{robot_name}/cancel-order")

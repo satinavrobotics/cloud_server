@@ -890,7 +890,7 @@ class Robot:
     async def _on_run_changed(self, evidence: Dict[str, Any]) -> None:
         """The robot's run frame reset (run_change.py): its open session is no longer placed.
         One transaction: aligned = false, placement.unplaced_reason = run_changed (+ when, and
-        the evidence), MAP.SESSION_UNPLACED. Then the robot's mapping/set (capture off). A geo
+        the evidence), MAP.SESSION_UNPLACED (graph-builder then drops the session's nodes). A geo
         session is re-placed by the next datum (_replace_geo_session). Never raises."""
         now = datetime.datetime.now(datetime.timezone.utc)
         self.info(f"New robot run ({evidence}): unplacing its open map session")
@@ -921,8 +921,6 @@ class Robot:
         for _sid, map_name, purpose, _t in rows:
             self.warning(f"Session on map '{map_name}' ({purpose}) is no longer placed: the "
                          "robot's run frame changed")
-        if rows:
-            await self._publish_mapping_set()
 
     # --- maps §14.13: the run epoch (placement reuse across sessions) ----------------------------
 
@@ -1014,8 +1012,7 @@ class Robot:
         """A datum message for a robot whose open session is on a geo map: re-place a session a
         run change unplaced, or re-derive a placed one whose datum changed (plan_geo_replace).
         Compare-and-set on the state read (graph-builder realigns the same way), with
-        MAP.SESSION_REALIGNED in the same transaction; then the robot's mapping/set. Never
-        raises."""
+        MAP.SESSION_REALIGNED in the same transaction. Never raises."""
         session = await self._read_open_session()
         if not isinstance(session, dict):
             return
@@ -1059,7 +1056,6 @@ class Robot:
         if won:
             self.info(f"Session on geo map '{session['map_name']}' placed from the robot's "
                       f"datum ({reason}): map_T_session {transform}")
-            await self._publish_mapping_set()
 
     async def _emit(self, conn: Any, event: Event) -> None:
         """An event in a savepoint of the caller's transaction: a failed write is logged and
@@ -1069,21 +1065,6 @@ class Robot:
                 await emit_event(conn, event)
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Could not write {event.code}: {err}")
-
-    async def _publish_mapping_set(self) -> None:
-        """The robot's retained `{prefix}/{robot}/mapping/set` from its open session as it is
-        now (contract: packages/api/mapping_control.py; the API publishes it after its own
-        session changes). Never raises."""
-        session = await self._read_open_session()
-        if session is SESSION_UNKNOWN:
-            return
-        try:
-            payload = map_sessions.set_payload(session)
-            self._mqtt_client.publish(map_sessions.set_topic(self._mqtt_prefix, self._name),
-                                      json.dumps(payload), qos=1, retain=True)
-            self.info(f"Mapping set published: {payload}")
-        except Exception as err:  # pylint: disable=broad-except
-            self.warning(f"Mapping set not published: {err}")
 
     async def _read_open_session(self) -> Any:
         """The robot's open map session (maps §14; packages/utils/map_sessions.py), None when

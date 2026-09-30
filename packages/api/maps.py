@@ -49,8 +49,8 @@ Start rules:
   (an active order, or a velocity in its last state) and when its pose differs from the pose
   the user saw by more than sensor noise (0.02 m / 0.5 deg, decision Q-U7).
 
-A session that is not placed captures nothing (`mapping/set` enabled: false; graph-builder
-rejects with `session_unplaced`), gets no route orders on that map and no planned paths.
+A session that is not placed keeps nothing (graph-builder rejects its nodes with
+`session_unplaced`; its service still runs), gets no route orders on that map and no planned paths.
 
 Map lifecycle: draft -> mapping <-> paused -> ready (finish) -> archived -> ready|draft
 (restore). Only MAPPING sessions move it; operate sessions leave the map state alone.
@@ -58,9 +58,14 @@ Archive and delete are refused while ANY session is open (the message names the 
 decision Q-U2). Repeating pause/resume/finish/archive/restore on a map or session already in
 that state is a no-op (`changed: false`, no event). pause/resume are for mapping sessions only.
 
-M3/§14.5: after every session change commits, the robot's retained `{prefix}/{robot}/mapping/set`
-is published from its open session (notify_robot; contract in packages/api/mapping_control.py).
-A publish failure never fails the call: the response says `robot_notified: false`.
+The mapping switch (docs/satinav-maps-redesign.md §15, packages/api/mapping_switch.py): the
+mapping services of a session (`services`, today `topo`) run on the robot's orchestrator.
+Opening a mapping session STARTS them and resuming a paused one starts them again, both inside
+the session's transaction: when the start fails (robot or orchestrator unreachable, no such
+service, an error) nothing is committed and the call fails with a 502/504/409 that says why.
+Pause and finish STOP them after the commit, best effort: an offline robot's session is closed
+anyway and the response says `robot_notified: false` with a `mapping_warning`. The session
+still gates the nodes (graph-builder drops a node with no open, unpaused, placed session).
 """
 
 import contextlib
@@ -82,7 +87,7 @@ from cloud_common.objects.map import (
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
-from packages.api.mapping_control import force_off_payload, set_payload
+from packages.api.mapping_switch import Snapshot, StopResult
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.utils import map_geo
@@ -468,10 +473,6 @@ class SqlStore:
     async def open_sessions(self) -> List[Dict[str, Any]]:
         return await self._sessions("ended_at IS NULL", ())
 
-    async def robot_names(self) -> List[str]:
-        await self.cursor.execute(f"SELECT name FROM {ROBOT_TABLE} WHERE lifecycle <> 'DELETED'")
-        return [r[0] for r in await self.cursor.fetchall()]
-
     async def lock_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         await self.cursor.execute(
             f"SELECT {', '.join(SESSION_COLUMNS)} FROM {SESSIONS_TABLE} "
@@ -669,13 +670,13 @@ async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID) -> D
     return map_view(MapObjectV1(name=name, status=row.status, **row.spec))
 
 
-async def session_summary(db: Any, name: str, control: Optional[Any] = None,
+async def session_summary(db: Any, name: str, switch: Optional[Any] = None,
                           map_type: Optional[str] = None) -> Dict[str, Any]:
     """The `sessions` block of GET /api/v1/maps/{id}: counts, the open MAPPING session, the
     robots using the map (`operating`), and the newest SUMMARY_MAX_SESSIONS sessions (newest
-    first; the full history is GET .../sessions). M3: `mapping_state` / `mapping_service` (and,
-    U5, `mapping_services`) of the open mapping session's robot (null without one;
-    packages/api/mapping_control.py). §14.13: `placement_reusable` {robot: from_session_id}
+    first; the full history is GET .../sessions). `mapping_state` / `mapping_service` /
+    `mapping_services` of the open mapping session's robot, read from its orchestrator (null
+    without an open session; packages/api/mapping_switch.py). §14.13: `placement_reusable` {robot: from_session_id}
     for a `local` map: the robots whose start on this map without a placement would be placed
     from their last session here (same run; with `replace: true` if they use another map now);
     {} otherwise. A hint: the start decides again when it runs."""
@@ -703,12 +704,25 @@ async def session_summary(db: Any, name: str, control: Optional[Any] = None,
                "items": items[:SUMMARY_MAX_SESSIONS],
                "placement_reusable": reusable,
                "mapping_state": None, "mapping_service": None, "mapping_services": None}
-    if open_session is not None and control is not None:
-        robot = open_session["robot_name"]
-        summary["mapping_state"] = control.state(robot)
-        summary["mapping_service"] = control.mapping_service(robot)
-        summary["mapping_services"] = control.mapping_services(robot)
+    if open_session is not None and switch is not None:
+        snap = await _snapshot_of(db, switch, open_session["robot_name"])
+        summary["mapping_state"] = snap.state(open_session)
+        summary["mapping_service"] = snap.mapping_service()
+        summary["mapping_services"] = snap.mapping_services()
     return summary
+
+
+async def _snapshot_of(db: Any, switch: Any, robot_name: str, fresh: bool = False) -> Snapshot:
+    """The robot's mapping services as its orchestrator reports them. Never raises."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            robot = await store.robot(robot_name)
+        if robot is None:
+            return Snapshot(reachable=None)
+        return await switch.snapshot(robot, fresh=fresh)
+    except Exception:  # noqa: BLE001
+        logger.exception("Mapping state of robot %s not readable", robot_name)
+        return Snapshot(reachable=None)
 
 
 async def session_history(db: Any, name: str, limit: Optional[int] = None,
@@ -986,82 +1000,113 @@ async def _finish_in(store: Any, row: Optional[MapRow], session: Dict[str, Any],
     return map_state
 
 
-async def notify_robot(control: Optional[Any], db: Any, robot_name: str,
-                       with_service: bool = False) -> Dict[str, Any]:
-    """After a session change has COMMITTED, publish the robot's retained
-    `{prefix}/{robot}/mapping/set` from its open session as it is now (re-read, so the newest
-    committed state is what the robot ends up with; per-robot lock), and push the robot's
-    `session` to /ws/robot/{robot} (control.on_session). Never raises: a failure is logged and
-    reported as `robot_notified: false` (the API call itself succeeded). The response keys
-    (additive): robot_notified, mapping_state, and with `with_service` mapping_service
-    ("running" | "not_running", doc Q3) and mapping_services ({service: ...}, §14.3)."""
-    if control is None:
+def _services_of(session: Mapping[str, Any]) -> List[str]:
+    """The mapping services a session runs (none for an operate session)."""
+    if ms.purpose_of(session) != ms.MAPPING:
+        return []
+    return list(session.get("services") or ms.DEFAULT_SERVICES)
+
+
+async def start_services(switch: Optional[Any], session: Mapping[str, Any],
+                         robot: Optional[RobotObjectV1]) -> Dict[str, str]:
+    """Inside the caller's transaction: start the session's mapping services on the robot's
+    orchestrator. A failure raises HTTPException, so the caller's transaction rolls back (no
+    session, or the session stays paused). {} for an operate session or without a switch."""
+    services = _services_of(session)
+    if switch is None or not services:
         return {}
-    ok = False
-    current: Optional[Dict[str, Any]] = None
+    if robot is None:
+        raise HTTPException(404, f"Did not find \"robot\" with name \"{session['robot_name']}\"")
+    return await switch.start(robot, services)
+
+
+async def stop_services(db: Any, switch: Optional[Any], robot: Optional[RobotObjectV1],
+                        session: Mapping[str, Any]) -> Optional[StopResult]:
+    """After a session change committed: stop the mapping services of `session` (paused or
+    finished) unless the robot's open mapping session still runs them. Best effort, never
+    raises; None when there was nothing to stop."""
+    services = _services_of(session)
+    if switch is None or not services:
+        return None
     try:
-        async with control.lock(robot_name):
-            async with open_store(db, uuid.uuid4()) as store:
-                mine = await store.open_sessions_of_robot(robot_name)
-            current = mine[0] if mine else None
-            ok = await control.publish_set(robot_name, set_payload(current))
+        async with open_store(db, uuid.uuid4()) as store:
+            mine = await store.open_sessions_of_robot(session["robot_name"])
+        keep = {s for o in mine if ms.purpose_of(o) == ms.MAPPING and o["paused_at"] is None
+                for s in _services_of(o)}
+        services = [s for s in services if s not in keep]
+        if not services:
+            return None
+        if robot is None:
+            return StopResult(
+                {s: "failed" for s in services},
+                f"robot '{session['robot_name']}' not found: its mapping service(s) "
+                f"{', '.join(services)} were not stopped")
+        return await switch.stop(robot, services)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Mapping services of robot %s not stopped", session["robot_name"])
+        return StopResult({s: "failed" for s in services},
+                          f"mapping service(s) on robot '{session['robot_name']}' could not be "
+                          f"stopped: {exc}")
+
+
+async def notify_robot(switch: Optional[Any], db: Any, robot_name: str,
+                       with_service: bool = False, started: Optional[Mapping[str, str]] = None,
+                       stopped: Optional[StopResult] = None) -> Dict[str, Any]:
+    """After a session change has COMMITTED (and its services were started / stopped): push the
+    robot's `session` to /ws/robot/{robot} (switch.on_session) and describe the switch. Never
+    raises. The response keys (additive): `robot_notified` (false when a mapping service could
+    not be stopped), `mapping_warning` (only then: what), `mapping_switch` (only when a service
+    was started or stopped: {service: started | already_running | stopped | already_stopped |
+    failed}), `mapping_state`, and with `with_service` `mapping_service` ("running" |
+    "not_running") and `mapping_services` ({service: running | not_running | not_available})."""
+    if switch is None:
+        return {}
+    current: Optional[Dict[str, Any]] = None
+    robot: Optional[RobotObjectV1] = None
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            mine = await store.open_sessions_of_robot(robot_name)
+            robot = await store.robot(robot_name)
+        current = mine[0] if mine else None
     except Exception:  # noqa: BLE001
-        logger.exception("Mapping switch for robot %s not published", robot_name)
-    on_session = getattr(control, "on_session", None)
+        logger.exception("Open session of robot %s not readable", robot_name)
+    on_session = getattr(switch, "on_session", None)
     if on_session is not None:
         try:
             await on_session(robot_name, ms.robot_session_view(current))
         except Exception:  # noqa: BLE001
             logger.exception("Session update for robot %s not pushed", robot_name)
-    out: Dict[str, Any] = {"robot_notified": ok, "mapping_state": control.state(robot_name)}
+    if stopped is not None and not stopped.ok:
+        # The orchestrator did not answer the stop: do not wait for it again for the state.
+        snap = Snapshot(reachable=False, error=stopped.warning)
+    elif robot is not None:
+        try:
+            snap = await switch.snapshot(robot, fresh=True)
+        except Exception:  # noqa: BLE001
+            logger.exception("Mapping state of robot %s not readable", robot_name)
+            snap = Snapshot(reachable=None)
+    else:
+        snap = Snapshot(reachable=None)
+    session_row = dict(current, state=ms.session_state(current)) if current else None
+    state = snap.state(session_row)
+    out: Dict[str, Any] = {"robot_notified": stopped is None or stopped.ok,
+                           "mapping_state": state}
+    if stopped is not None and stopped.warning:
+        out["mapping_warning"] = stopped.warning
+    done = dict(started or {})
+    done.update(stopped.services if stopped is not None else {})
+    if done:
+        out["mapping_switch"] = done
     if with_service:
-        out["mapping_service"] = control.mapping_service(robot_name)
-        out["mapping_services"] = control.mapping_services(robot_name)
+        out["mapping_service"] = snap.mapping_service()
+        out["mapping_services"] = snap.mapping_services()
+    on_state = getattr(switch, "on_state", None)
+    if on_state is not None and done:
+        try:
+            await on_state(robot_name, ms.TOPO, state)
+        except Exception:  # noqa: BLE001
+            logger.exception("Mapping state update for robot %s not pushed", robot_name)
     return out
-
-
-async def robot_mapping_off(db: Any, robot_name: str, control: Any) -> Dict[str, Any]:
-    """POST /robots/{r}/mapping/off: turn off a robot's capture when it has NO open mapping
-    session (e.g. a local `~/set_enabled true` left on: its nodes are ignored). Publishes the
-    retained no-session set message with `force: true` (mapping_control.force_off_payload),
-    which the robot applies even if unchanged. 404 unknown robot; 409 while the robot has an
-    open mapping session (that session's pause / finish is the way to stop it); an operate
-    session captures nothing anyway, so it does not block this. Checked under the robot's
-    publish lock, so a session started concurrently is not overwritten by this message."""
-    async with control.lock(robot_name):
-        async with open_store(db, uuid.uuid4()) as store:
-            robot = await store.robot(robot_name)
-            mine = await store.open_sessions_of_robot(robot_name)
-        if robot is None:
-            raise HTTPException(status_code=404, detail=f"Robot {robot_name} not found")
-        mapping = [s for s in mine if ms.purpose_of(s) == ms.MAPPING]
-        if mapping:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Robot {robot_name} has an open mapping session: finish or pause the "
-                       f"session on map {mapping[0]['map_name']}")
-        ok = await control.publish_set(robot_name, force_off_payload())
-    return {"robot_notified": ok, "mapping_state": control.state(robot_name)}
-
-
-async def sync_all_robots(control: Any, db: Any) -> Dict[str, bool]:
-    """Re-publish every robot's set message (on every API (re)connect to the broker: the
-    broker keeps no retained messages across its own restart, and this also covers sessions
-    opened before M3). Robots without an open session get `enabled: false`."""
-    async with open_store(db, uuid.uuid4()) as store:
-        names = await store.robot_names()
-        open_rows = await store.open_sessions()
-    by_robot = {s["robot_name"]: s for s in open_rows}
-    results: Dict[str, bool] = {}
-    for name in sorted(set(names) | set(by_robot)):
-        async with control.lock(name):
-            async with open_store(db, uuid.uuid4()) as store:  # fresh: a change may have won
-                mine = await store.open_sessions_of_robot(name)
-            results[name] = await control.publish_set(name,
-                                                      set_payload(mine[0] if mine else None))
-    logger.info("Mapping switch re-published for %d robots (%d not acknowledged)",
-                len(results), sum(1 for ok in results.values() if not ok))
-    return results
 
 
 async def robot_sessions(db: Any) -> Dict[str, Dict[str, Any]]:
@@ -1104,17 +1149,35 @@ class OpenSessionCache:
         self._until = float("-inf")
 
 
+def _robot_lock(switch: Optional[Any], robot_name: str) -> Any:
+    """The switch's per-robot lock (serialises starts and stops of one robot's services), or a
+    no-op without a switch."""
+    return switch.lock(robot_name) if switch is not None else contextlib.nullcontext()
+
+
 async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UUID,
-                        actor: Optional[str] = None, control: Optional[Any] = None,
+                        actor: Optional[str] = None, switch: Optional[Any] = None,
                         arango_node_count: Optional[Callable[[str], int]] = None
                         ) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/sessions `{robot, purpose?, services?, placement?, replace?}`
     (rules: module docstring). With `replace` the robot's open session (any map, any purpose)
-    is finished in the same transaction; a refused start keeps it. The response:
+    is finished in the same transaction; a refused start keeps it. A mapping session's
+    services are started on the robot's orchestrator inside the transaction (a failed start:
+    502/504/409, nothing committed, the replaced session stays open); afterwards the replaced
+    session's services that the new one does not run are stopped (best effort). The response:
     {map_id, map_state, changed, session, replaced_session} + notify_robot's keys."""
     req = parse_body(StartSessionRequest, data)
+    async with _robot_lock(switch, req.robot):
+        return await _start_session(db, map_name, req, publisher_id, actor, switch,
+                                    arango_node_count)
+
+
+async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
+                         actor: Optional[str], switch: Optional[Any],
+                         arango_node_count: Optional[Callable[[str], int]]) -> Dict[str, Any]:
     now = _utcnow()
     replaced: Optional[Dict[str, Any]] = None
+    started: Dict[str, str] = {}
     try:
         async with open_store(db, publisher_id) as store:
             robot = await store.lock_robot(req.robot)
@@ -1148,23 +1211,30 @@ async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UU
                     carried = current
             session = await _start_in(store, row, robot, req.robot, now, actor, req, carried,
                                       arango_node_count)
+            # The session exists in this transaction only: a failed start raises and rolls it
+            # (and the replaced session's finish) back.
+            started = await start_services(switch, session, robot)
             map_state = row.state
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
+    stopped: Optional[StopResult] = None
+    if replaced is not None:
+        stopped = await stop_services(db, switch, robot, replaced)
     out = {"map_id": map_name, "map_state": map_state, "changed": True,
            "session": session_dict(session),
            "replaced_session": session_dict(replaced) if replaced else None}
-    out.update(await notify_robot(control, db, req.robot, with_service=True))
+    out.update(await notify_robot(switch, db, req.robot, with_service=True, started=started,
+                                  stopped=stopped))
     return out
 
 
 async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                         publisher_id: uuid.UUID, actor: Optional[str] = None,
-                        control: Optional[Any] = None) -> Dict[str, Any]:
+                        switch: Optional[Any] = None) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/sessions/{sid}/place `{pose: {x, y, yaw}, robot_pose: {x, y,
     theta}}`: put the robot on a local map. Sets map_T_session, aligned (placed) and
-    placement; MAP.SESSION_PLACED; then the robot's set message (capture turns on for a
-    placed, unpaused mapping session). 404 unknown map/session; 409: finished, geo map (placed
+    placement; MAP.SESSION_PLACED (from then on graph-builder keeps the session's nodes; the
+    services are not touched). 404 unknown map/session; 409: finished, geo map (placed
     by its datum), an already placed MAPPING session (re-placing would split its nodes;
     alignment after the fact is M6), the robot offline, driving or moved (Q-U7). An operate
     session can be re-placed at any time (a correction)."""
@@ -1209,29 +1279,50 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
         raise _undefined_table(exc) from exc
     out = {"map_id": map_name, "map_state": map_state, "changed": True,
            "session": session_dict(session)}
-    out.update(await notify_robot(control, db, session["robot_name"]))
+    out.update(await notify_robot(switch, db, session["robot_name"]))
     return out
 
 
 async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          publisher_id: uuid.UUID, actor: Optional[str] = None,
-                         control: Optional[Any] = None) -> Dict[str, Any]:
-    """pause / resume / finish (see the module docstring). M3: then the robot's set message
-    (also on a no-op repeat, which re-sends the current state)."""
-    out = await _session_action(db, map_name, session_id, action, publisher_id, actor)
-    out.update(await notify_robot(control, db, out["session"]["robot_name"]))
-    return out
-
-
-async def _session_action(db: Any, map_name: str, session_id: str, action: str,
-                          publisher_id: uuid.UUID, actor: Optional[str]) -> Dict[str, Any]:
+                         switch: Optional[Any] = None) -> Dict[str, Any]:
+    """pause / resume / finish (see the module docstring). Resume starts the session's
+    services on the robot's orchestrator inside the transaction (a failed start: 502/504/409,
+    the session stays paused; a no-op repeat starts them again if they are not running).
+    Pause and finish stop them after the commit, best effort (a no-op repeat retries the stop):
+    when that fails the session is closed anyway and the response has `robot_notified: false`
+    and `mapping_warning`. A service another open session of the robot still runs is kept."""
     if action not in SESSION_ACTIONS:
         raise HTTPException(404, f"Unknown session action {action!r}")
     try:
         uuid.UUID(str(session_id))
     except ValueError:
         raise HTTPException(404, f"Did not find mapping session \"{session_id}\"") from None
+    robot_name = None
+    if switch is not None:  # the robot's lock is taken before the transaction, as in start
+        async with open_store(db, uuid.uuid4()) as store:
+            found = await store.lock_session(session_id)
+        robot_name = found["robot_name"] if found is not None else None
+    async with _robot_lock(switch, robot_name):
+        out, robot, session = await _session_action(db, map_name, session_id, action,
+                                                    publisher_id, actor, switch)
+        started: Dict[str, str] = out.pop("_started", {})
+        stopped: Optional[StopResult] = None
+        if action != "resume":
+            stopped = await stop_services(db, switch, robot, session)
+        out.update(await notify_robot(switch, db, out["session"]["robot_name"], started=started,
+                                      stopped=stopped))
+    return out
+
+
+async def _session_action(db: Any, map_name: str, session_id: str, action: str,
+                          publisher_id: uuid.UUID, actor: Optional[str],
+                          switch: Optional[Any] = None
+                          ) -> Tuple[Dict[str, Any], Optional[RobotObjectV1], Dict[str, Any]]:
+    """(response, the session's robot, the session row)."""
     now = _utcnow()
+    robot: Optional[RobotObjectV1] = None
+    started: Dict[str, str] = {}
     try:
         async with open_store(db, publisher_id) as store:
             row = await _lock_alive_map(store, map_name)
@@ -1239,36 +1330,57 @@ async def _session_action(db: Any, map_name: str, session_id: str, action: str,
             if session is None or session["map_name"] != map_name:
                 raise HTTPException(404, f"Did not find mapping session \"{session_id}\" on "
                                          f"map \"{map_name}\"")
+            if switch is not None:
+                robot = await store.robot(session["robot_name"])
             ended = session["ended_at"] is not None
             paused = session["paused_at"] is not None
             if action == "finish":
                 if ended:
-                    return _unchanged(map_name, row.state, session)
+                    return _unchanged(map_name, row.state, session), robot, session
                 map_state = await _finish_in(store, row, session, now, actor)
-                return {"map_id": map_name, "map_state": map_state, "changed": True,
-                        "session": session_dict(session)}
-            else:
-                if ended:
-                    raise HTTPException(409, f"Mapping session {session_id} is finished")
-                if ms.purpose_of(session) != ms.MAPPING:
-                    raise HTTPException(409, f"Session {session_id} is an operate session: "
-                                             "only mapping sessions pause (finish it to stop "
-                                             "using the map)")
-                if (action == "pause") == paused:
-                    return _unchanged(map_name, row.state, session)
-                stamp = now if action == "pause" else None
-                session["paused_at"] = stamp
-                await store.update_session(session_id, paused_at=stamp)
-                status = {"state": PAUSED if action == "pause" else MAPPING}
-                code = (EventCode.MAP_SESSION_PAUSED if action == "pause"
-                        else EventCode.MAP_SESSION_RESUMED)
+                return ({"map_id": map_name, "map_state": map_state, "changed": True,
+                         "session": session_dict(session)}, robot, session)
+            if ended:
+                raise HTTPException(409, f"Mapping session {session_id} is finished")
+            if ms.purpose_of(session) != ms.MAPPING:
+                raise HTTPException(409, f"Session {session_id} is an operate session: "
+                                         "only mapping sessions pause (finish it to stop "
+                                         "using the map)")
+            if (action == "pause") == paused:
+                if action == "resume":  # already running: make sure its services are
+                    started = await _start_for_resume(switch, session, robot)
+                out = _unchanged(map_name, row.state, session)
+                if started:
+                    out["_started"] = started
+                return out, robot, session
+            stamp = now if action == "pause" else None
+            session["paused_at"] = stamp
+            await store.update_session(session_id, paused_at=stamp)
+            status = {"state": PAUSED if action == "pause" else MAPPING}
+            code = (EventCode.MAP_SESSION_PAUSED if action == "pause"
+                    else EventCode.MAP_SESSION_RESUMED)
             await store.update_map(row, status=status)
             map_state = status.get("state", row.state)
             await store.emit(_session_event(code, session, map_state, actor, now))
+            if action == "resume":  # a failed start rolls the resume back: still paused
+                started = await _start_for_resume(switch, session, robot)
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
-    return {"map_id": map_name, "map_state": map_state, "changed": True,
-            "session": session_dict(session)}
+    out = {"map_id": map_name, "map_state": map_state, "changed": True,
+           "session": session_dict(session)}
+    if started:
+        out["_started"] = started
+    return out, robot, session
+
+
+async def _start_for_resume(switch: Optional[Any], session: Mapping[str, Any],
+                            robot: Optional[RobotObjectV1]) -> Dict[str, str]:
+    if switch is None:
+        return {}
+    if robot is not None and not robot.status.online:
+        raise HTTPException(409, f"Robot '{robot.name}' is offline: its mapping service "
+                                 "cannot be started")
+    return await start_services(switch, session, robot)
 
 
 def _unchanged(map_name: str, map_state: str, session: Mapping[str, Any]) -> Dict[str, Any]:

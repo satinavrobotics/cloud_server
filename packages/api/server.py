@@ -35,11 +35,10 @@ from packages.config import (
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
     MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE, DEFAULT_MAP_ID,
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
-    MQTT_VDA5050_PREFIX,
 )
 from packages.api.map_delete import MapDeleter
 from packages.api import maps, reconstruction
-from packages.api.mapping_control import MappingControl
+from packages.api.mapping_switch import MappingSwitch
 from packages.utils import map_geo
 
 
@@ -630,9 +629,9 @@ class ApiDelegationService:
             mqtt_keepalive=mqtt_keepalive,
             ws_manager=self.ws_manager,
         )
-        # Maps M3: the robot mapping switch (retained {prefix}/{robot}/mapping/set, state from
-        # {prefix}/+/mapping/state) on the diagnostics MQTT connection.
-        self.mapping_control = MappingControl(MQTT_VDA5050_PREFIX)
+        # The mapping switch: a session's mapping services are started / stopped on the
+        # robot's orchestrator, their state read from it (packages/api/mapping_switch.py).
+        self.mapping_switch = MappingSwitch()
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)
@@ -1945,27 +1944,23 @@ class ApiDelegationService:
 
         self.diagnostics.set_event_loop(event_loop)
         self._start_telemetry()
-        self.mapping_control.on_state = self._broadcast_mapping_state
-        self.mapping_control.on_connect = self._sync_mapping_switch
-        self.mapping_control.on_session = self._broadcast_session
-        self.diagnostics.connect_mqtt(
-            before_connect=lambda client: self.mapping_control.attach(client, event_loop))
+        self.mapping_switch.on_state = self._broadcast_mapping_state
+        self.mapping_switch.on_session = self._broadcast_session
+        self.diagnostics.connect_mqtt()
 
         self.logger.info("✅ Database watchers started for WebSocket broadcasting")
 
     async def _broadcast_mapping_state(self, robot_name: str, service_name: str,
                                        view: Optional[Dict[str, Any]]) -> None:
-        """Maps M3/U5: a robot's mapping state message (of one mapping service), pushed on
-        /ws/robot/{robot}. `mapping_state` is always the topo state (as M3), `service` /
-        `service_state` the service whose state changed, `mapping_services` all of them."""
-        control = self.mapping_control
+        """A robot's mapping service was started / stopped through the API: its state, pushed on
+        /ws/robot/{robot} as `mapping_state_update` (`mapping_state` is always the topo state,
+        `service` / `service_state` the service that changed)."""
         try:
             await self.ws_manager.broadcast("robot_status", robot_name, {
                 "type": "mapping_state_update", "robot_name": robot_name,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "mapping_state": control.state(robot_name),
-                "service": service_name, "service_state": view,
-                "mapping_services": control.mapping_services(robot_name)})
+                "mapping_state": view if service_name == "topo" else None,
+                "service": service_name, "service_state": view})
         except Exception as e:
             self.logger.error(f"Failed to broadcast mapping state for {robot_name}: {e}")
 
@@ -1981,14 +1976,6 @@ class ApiDelegationService:
                 "timestamp": datetime.now(timezone.utc).isoformat(), "session": view})
         except Exception as e:
             self.logger.error(f"Failed to broadcast session for {robot_name}: {e}")
-
-    async def _sync_mapping_switch(self) -> None:
-        """Maps M3: on every broker (re)connect, re-publish every robot's retained
-        mapping/set message from its open session. Never raises."""
-        try:
-            await maps.sync_all_robots(self.mapping_control, self.database)
-        except Exception as e:
-            self.logger.error(f"Mapping switch re-publish failed: {e}")
 
     def _start_telemetry(self):
         """Phase 0 ingest (packages/api/telemetry.py): start the writer election. Any failure

@@ -1,4 +1,4 @@
-"""Open sessions: purpose, placement and the mapping switch (docs/satinav-maps-redesign.md §14).
+"""Open sessions: purpose and placement (docs/satinav-maps-redesign.md §14).
 
 A robot uses a map through its open session (`map_sessions`, one per robot at most). The
 session's `purpose` is `mapping` (the robot adds data to the map) or `operate` (it uses the map
@@ -14,12 +14,11 @@ Where map_T_session comes from:
   robot reports its own pose: map_T_session = P_map (+) P_robot^-1 (placement_transform);
 - the first mapping session of an empty local map: identity (the run defines the map frame).
 
-A session that is not placed captures nothing, gets no route orders and no planned paths.
+A session that is not placed keeps no nodes, gets no route orders and no planned paths.
 
 Pure functions plus the SQL that several services share (the API, mission-dispatch,
-mission-planner, graph-builder); no I/O here. The mapping switch payload (`set_payload`, the
-contract of packages/api/mapping_control.py) lives here too, because mission-dispatch publishes
-it after it unplaces or re-places a session (U3) and must not import packages.api.
+mission-planner, graph-builder); no I/O here. (The robot's mapping services are switched by the
+API through the robot's orchestrator: packages/api/mapping_switch.py.)
 """
 
 import datetime
@@ -334,38 +333,6 @@ def reusable_session(sessions: Iterable[Mapping[str, Any]], robot_name: str,
     if not is_placed(last) or last.get("run_epoch") is None:
         return None
     return last if str(last["run_epoch"]) == str(epoch) else None
-
-
-# --- the mapping switch (contract: packages/api/mapping_control.py) -------------------------------
-
-def capture_enabled(session: Optional[Mapping[str, Any]]) -> bool:
-    """Capture is on only for an open, unpaused, placed MAPPING session (§14.5)."""
-    return (session is not None and purpose_of(session) == MAPPING
-            and session.get("ended_at") is None and session.get("paused_at") is None
-            and is_placed(session))
-
-
-def set_payload(open_session: Optional[Mapping[str, Any]],
-                now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
-    """What the robot should capture, from its open session (a map_sessions row, or None).
-
-    - no open session, or an `operate` session: the no-session payload (off, nulls);
-    - a mapping session: its id and map; `enabled` only when it is unpaused and placed;
-    - `services`: the mapping services to run (a robot without `services` handling runs topo).
-    """
-    issued_at = (now or datetime.datetime.now(datetime.timezone.utc)).isoformat()
-    if open_session is None or purpose_of(open_session) != MAPPING:
-        return {"enabled": False, "session_id": None, "map": None, "services": [],
-                "issued_at": issued_at}
-    return {"enabled": capture_enabled(open_session),
-            "session_id": str(open_session["session_id"]),
-            "map": open_session["map_name"],
-            "services": list(open_session.get("services") or DEFAULT_SERVICES),
-            "issued_at": issued_at}
-
-
-def set_topic(prefix: str, robot: str) -> str:
-    return f"{prefix.rstrip('/')}/{robot}/mapping/set"
 
 
 # --- the robot view --------------------------------------------------------------------------------

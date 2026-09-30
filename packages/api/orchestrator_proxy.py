@@ -12,6 +12,8 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from cloud_common.objects.robot import RobotObjectV1
 
+from packages.api.orchestrator_client import orchestrator_address
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/orchestration", tags=["orchestration-proxy"])
@@ -30,16 +32,16 @@ async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
     except Exception:
         raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
-    ip = getattr(robot, "ip_address", None)
-    port = getattr(robot, "entrypoint_port", None)
+    address = orchestrator_address(robot)
 
-    if not ip or not port:
+    if address is None:
         raise HTTPException(
             status_code=502,
             detail=f"Robot '{robot_name}' has no registered IP/port. "
                    "Ensure the orchestrator has registered with the server.",
         )
 
+    ip, port = address
     target = f"http://{ip}:{port}/{path}"
     query = request.url.query
     if query:

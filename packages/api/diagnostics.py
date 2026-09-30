@@ -71,9 +71,7 @@ class DiagnosticsService:
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._event_loop = loop
 
-    def connect_mqtt(self, before_connect: Optional[Any] = None) -> bool:
-        """`before_connect(client)`: lets another feature share this connection (the maps M3
-        mapping switch, packages/api/mapping_control.py) by registering its topics first."""
+    def connect_mqtt(self) -> bool:
         try:
             client_id = f"api_delegation_diagnostics_{datetime.now(timezone.utc).timestamp()}"
             self.mqtt_client = MQTTClient(
@@ -86,11 +84,6 @@ class DiagnosticsService:
             self.mqtt_client.register_callback(BT_TREE_TOPIC, self._on_bt_tree_message)
             self.mqtt_client.register_callback(BT_STATE_TOPIC, self._on_bt_state_message)
             self.mqtt_client.register_callback(NAV_SUPERVISOR_TOPIC, self._on_nav_supervisor_message)
-            if before_connect is not None:
-                try:
-                    before_connect(self.mqtt_client)
-                except Exception as e:
-                    self.logger.error(f"[Diagnostics] before_connect hook failed: {e}")
             self.mqtt_client.connect()
             self.logger.info(
                 f"[Diagnostics] Subscribed to diagnostics streams: "
