@@ -3,8 +3,7 @@
 # 20260929_01_maps_m2, tools.maps_m2_legacy_nodes (dry run, apply, idempotent re-run, revert,
 # re-apply), and graph-builder ingesting over MQTT by mapping session, driven by session
 # start/finish (the PUT /robots/{r}/map shim until U6), pause/resume, rejections and
-# MAP.INGEST_REJECTED. Maps M3 adds a
-# step: the robot mapping switch over the test mosquitto (checks_m3.py).
+# MAP.INGEST_REJECTED.
 #
 #   tests/integration/maps/run_m2.sh [--dump PG_DUMP --arango-dump DIR] [TEST_IMAGE]
 #
@@ -159,9 +158,6 @@ run_py python tests/integration/maps/checks_m2.py ingest || { docker logs --tail
 echo "  graph-builder log (rejections / stored nodes):"
 docker logs "$ID-gb" 2>&1 | grep -E "Dropped|Processed node|Traceback|ERROR" | tail -15 | sed 's/^/    /'
 docker logs "$ID-gb" 2>&1 | grep -q Traceback && { echo "traceback in graph-builder"; exit 1; }
-
-step "scenario (M3): the robot mapping switch over MQTT (retained mapping/set, mapping/state)"
-run_py python tests/integration/maps/checks_m3.py switch
 
 step "AFTER"
 run_py python tests/integration/maps/checks_m2.py show

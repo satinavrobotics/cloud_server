@@ -142,8 +142,7 @@ async def scenario():
     check(n == 1, "MAP.SESSION_UNPLACED written")
     sets = [(p, qos, ret) for tpc, p, qos, ret in r._mqtt_client.sent
             if tpc.endswith(f"{r1}/mapping/set")]
-    check(sets and sets[-1][0]["enabled"] is False and sets[-1][1:] == (1, True),
-          "mapping/set re-published (retained, QoS 1)")
+    check(not sets, "no mapping/set is published (the switch is the orchestrator's)")
     # re-place by hand (an operate session may be re-placed any time)
     out = await maps.place_session(db, shed, op["session_id"], body, PUB)
     check(out["session"]["aligned"], "operate session placed again")

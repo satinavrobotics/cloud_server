@@ -43,7 +43,7 @@ from packages.controllers.mission.server import Robot  # noqa: E402
 from packages.utils import map_geo  # noqa: E402
 from packages.utils import map_sessions as ms  # noqa: E402
 from tests.unit import test_maps_m1 as m1  # noqa: E402
-from tests.unit.test_maps_m3 import M3Db  # noqa: E402
+from tests.unit.test_maps_m2 import ShimDb as M3Db  # noqa: E402
 from tests.unit.test_maps_use_run_change import FakeDb as SqlDb  # noqa: E402
 
 pytestmark = pytest.mark.unit

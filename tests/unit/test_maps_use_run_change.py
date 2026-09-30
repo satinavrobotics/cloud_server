@@ -7,7 +7,7 @@
 - map_sessions.plan_geo_replace (the datum path): re-place after a run change, realign on a
   changed datum, the retained-datum trust rule, local maps and other zones;
 - Robot._on_run_changed / _replace_geo_session on a fake Postgres: the SQL, MAP.SESSION_UNPLACED
-  / MAP.SESSION_REALIGNED, the lost compare-and-set, and the mapping/set publish;
+  / MAP.SESSION_REALIGNED, the lost compare-and-set, and that no mapping/set is published any more;
 - the connection message reaches the Robot even without the fleet recorder.
 """
 import contextlib
@@ -235,9 +235,7 @@ class TestDispatcherRunChange:
         payload = json.loads(db.events()[0][8])
         assert payload["reason"] == "run_changed" and payload["purpose"] == "mapping"
         assert payload["evidence"]["connection_header_id"] == 1
-        assert _sets(r)[-1]["enabled"] is False and _sets(r)[-1]["session_id"] == sid
-        call = r._mqtt_client.publish.call_args
-        assert call.kwargs == {"qos": 1, "retain": True}
+        assert _sets(r) == []  # the robot is not told over MQTT: the server gates the nodes
 
     async def test_state_message_triggers_it_too(self):
         db = FakeDb([("UPDATE map_sessions SET aligned = false", ([], 0))])
@@ -248,7 +246,7 @@ class TestDispatcherRunChange:
                 headerId=hid, timestamp="", nodeStates=[], edgeStates=[], errors=[]))
         unplaces = [s for s, _ in db.sql if s.startswith("UPDATE map_sessions SET aligned")]
         assert len(unplaces) == 1
-        assert _sets(r) == []  # nothing was unplaced: no publish
+        assert _sets(r) == []
 
     async def test_datum_re_places_an_unplaced_geo_session(self):
         s = geo_session(aligned=False,
@@ -275,7 +273,7 @@ class TestDispatcherRunChange:
         assert payload["map_T_session"]["tx"] == pytest.approx(40.0)
         assert db.events()[0][9] == "dispatch"
         assert placed["aligned"] is True
-        assert _sets(r)[-1]["enabled"] is False  # operate: never captures
+        assert _sets(r) == []
 
     async def test_first_datum_of_an_epoch_with_the_same_datum_is_not_trusted(self):
         s = geo_session(aligned=False)

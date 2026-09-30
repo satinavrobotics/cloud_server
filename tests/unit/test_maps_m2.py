@@ -4,7 +4,7 @@
   resolution and every rejection reason, the session cache, the pose transform, rate-limited
   MAP.INGEST_REJECTED, images following their node;
 - (the PUT /robots/{r}/map shim was removed in U6: tests/unit/test_maps_u6.py; ShimDb /
-  ShimStore stay as the M1 in-memory store with robot locks, used by test_maps_m3.py);
+  ShimStore stay as the M1 in-memory store with robot locks, used by test_mapping_switch.py);
 - map frame vs robot frame: map_geo helpers, the planner, the dispatcher's order conversion
   (through the robot's session since §14);
 - tools/maps_m2_legacy_nodes.py planning (the live map `map`), idempotency, revert;
@@ -377,7 +377,7 @@ class TestIngestService:
         assert exc.value.status_code == 409
 
 
-# --- the M1 store with robot locks (test_maps_m3.py builds on it) ------------------------------
+# --- the M1 store with robot locks (test_mapping_switch.py builds on it) ------------------------------
 
 class ShimStore(m1.FakeStore):
     async def lock_robot(self, name):

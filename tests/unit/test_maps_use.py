@@ -9,7 +9,7 @@
 - graph-builder's decide(): not_mapping_session, session_unplaced;
 - migration 20260930_01_maps_use (text; the real run is in the U1 rehearsal on Postgres).
 
-The in-memory store is the M1/M3 one (tests/unit/test_maps_m1.py, test_maps_m3.py).
+The in-memory store is the M1/M3 one (tests/unit/test_maps_m1.py, test_maps_m2.py).
 """
 import copy
 import importlib.util
@@ -22,7 +22,7 @@ from pathlib import Path
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
     os.environ.setdefault(_k, "test")
 
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 
 import pytest  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
@@ -34,7 +34,7 @@ from packages.services.graph_builder import ingest  # noqa: E402
 from packages.utils import map_geo  # noqa: E402
 from packages.utils import map_sessions as ms  # noqa: E402
 from tests.unit import test_maps_m1 as m1  # noqa: E402
-from tests.unit.test_maps_m3 import M3Db, control  # noqa: E402
+from tests.unit.test_maps_m2 import ShimDb as M3Db  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -127,9 +127,9 @@ class TestPlacementMath:
         assert (ms.driving_reason(state, msg) is not None) == driving
 
 
-# --- the mapping switch and the robot view --------------------------------------------------------
+# --- the robot view ---------------------------------------------------------------------------------
 
-class TestSetPayloadAndView:
+class TestRobotView:
     SID = uuid.uuid4()
 
     def _s(self, **kw):
@@ -138,21 +138,6 @@ class TestSetPayloadAndView:
                 "map_t_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.1}}
         base.update(kw)
         return base
-
-    def test_placed_mapping_is_on_with_services(self):
-        p = ms.set_payload(self._s(services=["topo", "grid"]))
-        assert p["enabled"] is True and p["services"] == ["topo", "grid"]
-        assert p["session_id"] == str(self.SID) and p["map"] == "shed"
-
-    def test_unplaced_and_paused_are_off_with_their_session(self):
-        for kw in ({"aligned": False}, {"paused_at": m1.T0}):
-            p = ms.set_payload(self._s(**kw))
-            assert p["enabled"] is False and p["session_id"] == str(self.SID)
-
-    def test_operate_is_the_no_session_payload(self):
-        p = ms.set_payload(self._s(purpose="operate", services=None))
-        assert p["enabled"] is False and p["session_id"] is None and p["map"] is None
-        assert p["services"] == []
 
     def test_robot_view(self):
         v = ms.robot_session_view({**self._s(), "robot_name": "r1"})
@@ -172,7 +157,7 @@ class TestSetPayloadAndView:
         await _start(db, purpose="operate", placement=_place_body())
         svc = MagicMock()
         svc.database = None
-        svc.mapping_control = control()
+        svc.mapping_switch.snapshots = AsyncMock(return_value={})
         svc.database_get = None
 
         async def get_object(_cls, name):
@@ -326,20 +311,16 @@ class TestPlacement:
     async def test_extending_a_local_map_starts_unplaced_until_placed(self, db):
         _local_with_nodes(db)
         _robot(db, pose=(2.0, 3.0, 0.25))
-        ctl = control()
-        out = await maps.start_session(None, "shed", {"robot": "r1"}, PUB, control=ctl)
+        out = await maps.start_session(None, "shed", {"robot": "r1"}, PUB)
         s = out["session"]
         assert s["aligned"] is False and out["map_state"] == "mapping"
-        assert ctl.client.sets()[-1]["enabled"] is False  # no capture until placed
-        assert ctl.client.sets()[-1]["session_id"] == s["session_id"]
         body = _place_body(pose=(10.0, -4.0, 1.0), robot_pose=(2.0, 3.0, 0.25))
-        out = await maps.place_session(None, "shed", s["session_id"], body, PUB, "ann", ctl)
+        out = await maps.place_session(None, "shed", s["session_id"], body, PUB, "ann")
         placed = out["session"]
         assert placed["aligned"] is True and placed["placement"]["source"] == "user"
         assert placed["placement"]["actor"] == "ann"
         x, y, yaw = map_geo.apply_pose(placed["map_T_session"], 2.0, 3.0, 0.25)
         assert (x, y, yaw) == pytest.approx((10.0, -4.0, 1.0))
-        assert ctl.client.sets()[-1]["enabled"] is True
         assert db.codes()[-1] == "MAP.SESSION_PLACED"
         # a placed mapping session is not re-placed (its nodes would split)
         code, _ = await _status(maps.place_session(None, "shed", s["session_id"], body, PUB))
@@ -436,23 +417,6 @@ class TestOperateLifecycle:
         await _start(db, purpose="operate")
         code, detail = await _status(maps.archive_map(None, "shed", PUB))
         assert code == 409 and "r1 (using)" in detail
-
-    async def test_mapping_off_is_allowed_with_an_operate_session(self, db):
-        _local_with_nodes(db)
-        _robot(db)
-        await _start(db, purpose="operate")
-        ctl = control()
-        out = await maps.robot_mapping_off(None, "r1", ctl)
-        assert out["robot_notified"] is True and ctl.client.sets()[-1]["force"] is True
-
-    async def test_start_response_keys(self, db):
-        _local_with_nodes(db)
-        _robot(db)
-        out = await maps.start_session(None, "shed", {"robot": "r1", "purpose": "operate"},
-                                       PUB, control=control())
-        assert out["mapping_services"] == {"topo": "not_available", "grid": "not_available"}
-        assert {"robot_notified", "mapping_service", "mapping_state",
-                "replaced_session"} <= set(out)
 
 
 class TestHistory:
