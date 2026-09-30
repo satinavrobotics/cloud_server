@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import cloud_common.objects as api_objects
+from cloud_common.objects.mission import MissionQueryParamsV1
 from packages.database.postgres import PostgresDatabase
 
 pytestmark = pytest.mark.unit
@@ -48,7 +49,7 @@ async def test_list_robots_is_ordered_by_name():
 
 async def test_most_recent_keeps_its_own_ordering():
     queries = []
-    params = api_objects.MissionQueryParamsV1(most_recent=3)
+    params = MissionQueryParamsV1(most_recent=3)
     await _db(queries).list_objects(api_objects.MissionObjectV1, params)
     assert "ORDER BY name" not in queries[0]
     assert "start_timestamp" in queries[0]
