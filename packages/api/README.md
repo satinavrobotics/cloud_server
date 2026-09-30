@@ -286,7 +286,7 @@ under `map-{id}/reconstruction/{job_id}/`.
 | GET | `/api/v1/maps/{map}/reconstruction` | `{map_name, configured, reconstruction, job}`: the current result (`stale`, `stale_reason`, file URLs) and the active job (or the newest failed/cancelled one); poll every 2 s while a job is active |
 | POST | `/api/v1/maps/{map}/reconstruction/cancel` | cancel the active job |
 | DELETE | `/api/v1/maps/{map}/reconstruction` | delete the result, cancel an active job; 204 |
-| GET | `/api/v1/maps/{map}/reconstruction/files/{cloud.ply,ortho.png,height.png,meta.json}` | streamed; `ETag` = job id; `?v={job_id}` -> cached forever |
+| GET | `/api/v1/maps/{map}/reconstruction/files/{cloud.ply,ortho.png,height.png,relief_rgb.png,relief_height.png,meta.json}` | streamed; `ETag` = job id; `?v={job_id}` -> cached forever |
 
 Errors: `detail = {code, message}`: 404 `map_not_found` / `no_active_job` / `no_reconstruction`
 / `file_not_found`; 409 `map_deleting` / `job_active` (with `job`) / `no_depth`; 422 bad

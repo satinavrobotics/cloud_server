@@ -17,6 +17,12 @@ floor((y - oy) / res) (row 0 = +y edge); per cell the point with the HIGHEST z w
 ortho.png RGBA8 (winner's colour, alpha 255; empty 0,0,0,0); height.png 16-bit grey,
 min(65535, round((z - z_offset) / z_scale) + 1), z_offset = min rastered z, z_scale 0.01; 0 empty.
 
+Relief (costmap-like raised cells, §7.2): a second, coarser grid (relief_res_m, doubled until
+width*height <= relief_max_cells) over the same rastered points (same floor and clip rule): per
+cell the HIGHEST voxel wins, relief_rgb.png = RGBA8 (its colour, alpha 255 / 0 only), relief_height.png
+= 8-bit grey, clamp(round((z - z_floor) / 0.02) + 1, 1, 255), 0 = no data. Same origin rule and row
+orientation as ortho.png. Two PNGs because browsers premultiply alpha on canvas decode.
+
 Only `read_ply_header` / `ply_size` are used in the API process (the cheap finish check); numpy
 is imported only in the child.
 """
@@ -32,6 +38,10 @@ CHUNK_POINTS = 1 << 20          # vertices per read (~17 MB of PLY, ~100 MB of t
 PNG_BAND_ROWS = 256             # rows per compressed band
 MAX_HEADER = 64 * 1024
 Z_SCALE = 0.01
+RELIEF_RES_M = 0.10
+RELIEF_MAX_CELLS = 4_000_000
+RELIEF_Z_STEP_M = 0.02
+RELIEF_ROWS = "row 0 = +y edge (same as ortho.png)"
 EXIT_BAD_PLY, EXIT_EMPTY = 3, 4
 SCRIPT = os.path.abspath(__file__)   # the child runs this file by path
 
@@ -147,10 +157,11 @@ def _chunks(path: str, header_len: int, count: int, dtype, chunk: int):
 
 
 def derive(ply_path: str, out_dir: str, *, z_floor: float, clip_z: float, voxel_m: float,
-           raster_max_px: int, chunk: int = CHUNK_POINTS) -> Dict[str, Any]:
-    """Write `out_dir/ortho.png` and `out_dir/height.png` from `ply_path`; return the grid
-    fields for meta.json. PlyError for a bad file; TopViewError('top_view_failed') when no point
-    lies below the clip height."""
+           raster_max_px: int, chunk: int = CHUNK_POINTS, relief_res_m: float = RELIEF_RES_M,
+           relief_max_cells: int = RELIEF_MAX_CELLS) -> Dict[str, Any]:
+    """Write `out_dir/ortho.png`, `height.png`, `relief_rgb.png` and `relief_height.png` from
+    `ply_path`; return the grid fields (incl. the `relief` block) for meta.json. PlyError for a bad file;
+    TopViewError('top_view_failed') when no point lies below the clip height."""
     import numpy as np
     with open(ply_path, "rb") as f:
         head = f.read(MAX_HEADER + 16)
@@ -189,30 +200,24 @@ def derive(ply_path: str, out_dir: str, *, z_floor: float, clip_z: float, voxel_
     w, h = g["width"], g["height"]
     z_offset = float(lo[2])
 
-    # pass 2: per cell the highest z wins
+    rg = relief_grid(lo[0], lo[1], hi[0], hi[1], relief_res_m, relief_max_cells)
+    rres, rox, roy, rw, rh = (rg["res_m"], rg["origin"]["x"], rg["origin"]["y"],
+                              rg["width"], rg["height"])
+
+    # pass 2: per cell the highest z wins (ortho grid and relief grid from the same chunk)
     zbuf = np.full(w * h, -np.inf, dtype=np.float32)
     rgb = np.zeros((w * h, 3), dtype=np.uint8)
+    rzbuf = np.full(rw * rh, -np.inf, dtype=np.float32)
+    rrgb = np.zeros((rw * rh, 3), dtype=np.uint8)
     for arr in _chunks(ply_path, header_len, count, dtype, chunk):
         x, y, z, keep = rastered(arr)
         if not len(x):
             continue
-        col = np.clip(np.floor((x - ox) / res).astype(np.int64), 0, w - 1)
-        row = (h - 1) - np.clip(np.floor((y - oy) / res).astype(np.int64), 0, h - 1)
-        idx = row * w + col
-        order = np.lexsort((z, idx))            # by cell, then z: the last of a cell wins
-        idx_s = idx[order]
-        last = np.r_[idx_s[1:] != idx_s[:-1], True]
-        cells, pick = idx_s[last], order[last]
-        zc = z[pick].astype(np.float32)
-        better = zc > zbuf[cells]
-        cells, pick = cells[better], pick[better]
-        zbuf[cells] = zc[better]
-        if has_rgb:
-            sub = arr[keep][pick]
-            rgb[cells, 0], rgb[cells, 1], rgb[cells, 2] = sub["red"], sub["green"], sub["blue"]
-        else:
-            rgb[cells] = 128
-        del x, y, z, keep, col, row, idx, order, idx_s, last, zc, better
+        sub = arr[keep] if has_rgb else None
+        for (b_z, b_rgb, bw, bh, bres, box, boy) in ((zbuf, rgb, w, h, res, ox, oy),
+                                                      (rzbuf, rrgb, rw, rh, rres, rox, roy)):
+            _splat(np, b_z, b_rgb, bw, bh, bres, box, boy, x, y, z, sub)
+        del x, y, z, keep, sub
 
     filled = np.isfinite(zbuf)
     cells_filled = int(filled.sum())
@@ -220,10 +225,59 @@ def derive(ply_path: str, out_dir: str, *, z_floor: float, clip_z: float, voxel_
                lambda r0, r1: _ortho_rows(rgb, filled, w, r0, r1))
     _write_png(os.path.join(out_dir, "height.png"), w, h, 16, 0,
                lambda r0, r1: _height_rows(zbuf, filled, w, r0, r1, z_offset))
+    rfilled = np.isfinite(rzbuf)
+    _write_png(os.path.join(out_dir, "relief_rgb.png"), rw, rh, 8, 6,
+               lambda r0, r1: _ortho_rows(rrgb, rfilled, rw, r0, r1))
+    _write_png(os.path.join(out_dir, "relief_height.png"), rw, rh, 8, 0,
+               lambda r0, r1: _relief_height_rows(rzbuf, rfilled, rw, r0, r1, float(z_floor)))
+    relief = {**rg, "z_floor": float(z_floor), "z_step_m": RELIEF_Z_STEP_M,
+              "clip_z": float(clip_z), "rows": RELIEF_ROWS}
     return {**g, "z_floor": float(z_floor), "clip_z": float(clip_z), "clip_abs": clip_abs,
-            "z_offset": z_offset, "z_scale": Z_SCALE,
+            "z_offset": z_offset, "z_scale": Z_SCALE, "relief": relief,
             "top_view": {"points": count, "points_rastered": n_rastered,
                          "cells_filled": cells_filled}}
+
+
+def relief_grid(min_x: float, min_y: float, max_x: float, max_y: float, res_m: float,
+                max_cells: int) -> Dict[str, Any]:
+    """The relief grid: res_m, doubled until width*height <= max_cells. Same origin rule as grid()."""
+    res = float(res_m)
+    while True:
+        g = grid(min_x, min_y, max_x, max_y, res, 1 << 40)
+        if g["width"] * g["height"] <= int(max_cells) or g["width"] * g["height"] <= 1:
+            return {"res_m": g["resolution_m"], "width": g["width"], "height": g["height"],
+                    "origin": g["origin"]}
+        res *= 2.0
+
+
+def _splat(np, zbuf, rgb, w, h, res, ox, oy, x, y, z, sub):
+    """Per cell the highest z of this chunk, kept if above what the buffers hold."""
+    col = np.clip(np.floor((x - ox) / res).astype(np.int64), 0, w - 1)
+    row = (h - 1) - np.clip(np.floor((y - oy) / res).astype(np.int64), 0, h - 1)
+    idx = row * w + col
+    order = np.lexsort((z, idx))            # by cell, then z: the last of a cell wins
+    idx_s = idx[order]
+    last = np.r_[idx_s[1:] != idx_s[:-1], True]
+    cells, pick = idx_s[last], order[last]
+    zc = z[pick].astype(np.float32)
+    better = zc > zbuf[cells]
+    cells, pick = cells[better], pick[better]
+    zbuf[cells] = zc[better]
+    if sub is not None:
+        s = sub[pick]
+        rgb[cells, 0], rgb[cells, 1], rgb[cells, 2] = s["red"], s["green"], s["blue"]
+    else:
+        rgb[cells] = 128
+
+
+def _relief_height_rows(zbuf, filled, w, r0, r1, z_floor):
+    import numpy as np
+    a, b = r0 * w, r1 * w
+    z = zbuf[a:b].astype(np.float64)
+    f = filled[a:b]
+    v = np.zeros(b - a, dtype=np.float64)
+    v[f] = np.clip(np.floor((z[f] - z_floor) / RELIEF_Z_STEP_M + 0.5) + 1.0, 1.0, 255.0)
+    return v.astype(np.uint8).reshape(r1 - r0, w)
 
 
 def _ortho_rows(rgb, filled, w, r0, r1):
@@ -297,7 +351,9 @@ def main(argv: List[str]) -> int:
         out = derive(args["ply"], args["out_dir"], z_floor=args["z_floor"],
                      clip_z=args["clip_z"], voxel_m=args["voxel_m"],
                      raster_max_px=args["raster_max_px"],
-                     chunk=int(args.get("chunk") or CHUNK_POINTS))
+                     chunk=int(args.get("chunk") or CHUNK_POINTS),
+                     relief_res_m=float(args.get("relief_res_m") or RELIEF_RES_M),
+                     relief_max_cells=int(args.get("relief_max_cells") or RELIEF_MAX_CELLS))
     except PlyError as exc:
         sys.stderr.write(f"bad PLY: {exc}\n")
         return EXIT_BAD_PLY
@@ -315,12 +371,14 @@ def main(argv: List[str]) -> int:
 
 async def derive_in_subprocess(ply_path: str, out_dir: str, *, z_floor: float, clip_z: float,
                                voxel_m: float, raster_max_px: int, mem_mb: int,
-                               timeout_s: float) -> Dict[str, Any]:
+                               timeout_s: float, relief_res_m: float = RELIEF_RES_M,
+                               relief_max_cells: int = RELIEF_MAX_CELLS) -> Dict[str, Any]:
     """derive() in a fresh interpreter: the event loop only waits on a pipe. Raises
     TopViewError (bad_output for a bad PLY, else top_view_failed: empty, crash/OOM, timeout)."""
     args = json.dumps({"ply": ply_path, "out_dir": out_dir, "z_floor": z_floor,
                        "clip_z": clip_z, "voxel_m": voxel_m, "raster_max_px": raster_max_px,
-                       "mem_mb": mem_mb})
+                       "mem_mb": mem_mb, "relief_res_m": relief_res_m,
+                       "relief_max_cells": relief_max_cells})
     env = dict(os.environ, OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1",
                MKL_NUM_THREADS="1")
     proc = await asyncio.create_subprocess_exec(

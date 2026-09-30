@@ -263,7 +263,7 @@ def build():
 def check_top_view(jid):
     """The stub uploaded only cloud.ply + meta.json (its SCENE); the API derived the top view
     (design.md §7.2): z_floor = median base z of the 4 frames (0.02, 0.02, 0, 0) = 0.01, so
-    clip_abs = 2.01; res = the stub's voxel_m 0.1; every floor cell filled; the box and the
+    clip_abs = 2.31; res = the stub's voxel_m 0.1; every floor cell filled; the box and the
     wall point win over the floor below them, the ceiling point is clipped away."""
     import io
     from PIL import Image
@@ -277,8 +277,8 @@ def check_top_view(jid):
     check(grid == {"resolution_m": 0.1, "width": 10, "height": 5, "z_scale": 0.01,
                    "z_offset": 0.0}, f"meta.json has the cloud's grid {grid}")
     check(abs(meta["origin"]["x"]) < 1e-9 and abs(meta["origin"]["y"]) < 1e-9
-          and abs(meta["z_floor"] - 0.01) < 1e-9 and abs(meta["clip_abs"] - 2.01) < 1e-9
-          and meta["clip_z"] == 2.0, f"origin, z_floor, clip from the manifest's poses {meta}")
+          and abs(meta["z_floor"] - 0.01) < 1e-9 and abs(meta["clip_abs"] - 2.31) < 1e-9
+          and meta["clip_z"] == 2.3, f"origin, z_floor, clip from the manifest's poses {meta}")
     imgs = {}
     for name in ("ortho.png", "height.png"):
         r = api("GET", f"/api/v1/maps/{MAP}/reconstruction/files/{name}?v={jid}")

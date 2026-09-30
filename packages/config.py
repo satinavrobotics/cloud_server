@@ -214,7 +214,10 @@ RECONSTRUCTION_QUEUE_TIMEOUT_S = int(os.getenv("RECONSTRUCTION_QUEUE_TIMEOUT_S",
 RECONSTRUCTION_MAX_INFLIGHT = int(os.getenv("RECONSTRUCTION_MAX_INFLIGHT", "1"))
 RECONSTRUCTION_VOXEL_M = float(os.getenv("RECONSTRUCTION_VOXEL_M", "0.05"))
 RECONSTRUCTION_MAX_DEPTH_M = float(os.getenv("RECONSTRUCTION_MAX_DEPTH_M", "10.0"))
-RECONSTRUCTION_CLIP_Z = float(os.getenv("RECONSTRUCTION_CLIP_Z", "2.0"))
+RECONSTRUCTION_CLIP_Z = float(os.getenv("RECONSTRUCTION_CLIP_Z", "2.3"))
+# The costmap-like relief grid next to the top view: cell size (doubled until it fits) and cap.
+RECONSTRUCTION_RELIEF_RES_M = float(os.getenv("RECONSTRUCTION_RELIEF_RES_M", "0.10"))
+RECONSTRUCTION_RELIEF_MAX_CELLS = int(os.getenv("RECONSTRUCTION_RELIEF_MAX_CELLS", "4000000"))
 # The top view (ortho.png, height.png) is derived by the API from cloud.ply in a child process
 # (packages/api/reconstruction_topview.py): its address-space cap, its time limit, and where the
 # PLY is downloaded to (empty = the system temp dir; needs ~200 MB free for a 10 M-point cloud).

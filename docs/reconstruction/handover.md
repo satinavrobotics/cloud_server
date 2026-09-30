@@ -78,7 +78,7 @@ is ~400 characters and must be used **byte for byte**):
     "crs": {"utm_zone": 34, "utm_north": true, "origin_e": 352397.33, "origin_n": 5262357.80}
   },
   "params": {
-    "voxel_m": 0.05, "max_depth_m": 10.0, "clip_z": 2.0,
+    "voxel_m": 0.05, "max_depth_m": 10.0, "clip_z": 2.3,
     "edge_rel": 0.05, "min_neighbours": 2,
     "max_voxels": 10000000, "raster_max_px": 4096
   },
@@ -525,7 +525,7 @@ surfaces is exactly the z depth (because `r_cam.z = 1`). Depth PNG: `round(t · 
 uint16, 0 for no hit or `t > 65.535`. RGB: the surface colour, JPEG quality 95. Render with the
 **same** pose the manifest carries (`pose3d` when present).
 
-Params: `voxel_m 0.05`, `max_depth_m 10`, `clip_z 2.0`, others default.
+Params: `voxel_m 0.05`, `max_depth_m 10`, `clip_z 2.3`, others default.
 
 ### 9.2 Expected output
 

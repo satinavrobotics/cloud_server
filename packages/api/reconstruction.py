@@ -106,12 +106,14 @@ FILES: Dict[str, Tuple[str, str]] = {
     "cloud": ("cloud.ply", "application/octet-stream"),
     "ortho": ("ortho.png", "image/png"),
     "height": ("height.png", "image/png"),
+    "relief_rgb": ("relief_rgb.png", "image/png"),
+    "relief_height": ("relief_height.png", "image/png"),
     "meta": ("meta.json", "application/json"),
 }
 FILE_BY_NAME = {f: (k, ct) for k, (f, ct) in FILES.items()}
 # what the service PUTs (handover §2.1, §7); ortho/height are derived here (§7.2)
 SERVICE_FILES = ("cloud", "meta")
-DERIVED_FILES = ("ortho", "height")
+DERIVED_FILES = ("ortho", "height", "relief_rgb", "relief_height")
 FINALIZING = "finalizing"
 HEARTBEAT_S = 15.0
 
@@ -176,7 +178,9 @@ class ReconConfig:
     max_inflight: int = 1
     voxel_m: float = 0.05
     max_depth_m: float = 10.0
-    clip_z: float = 2.0
+    clip_z: float = 2.3
+    relief_res_m: float = 0.10
+    relief_max_cells: int = 4_000_000
     topview_mem_mb: int = 1024
     topview_timeout_s: int = 600
     work_dir: Optional[str] = None
@@ -200,7 +204,10 @@ class ReconConfig:
             queue_timeout_s=c.RECONSTRUCTION_QUEUE_TIMEOUT_S,
             max_inflight=max(1, c.RECONSTRUCTION_MAX_INFLIGHT),
             voxel_m=c.RECONSTRUCTION_VOXEL_M, max_depth_m=c.RECONSTRUCTION_MAX_DEPTH_M,
-            clip_z=c.RECONSTRUCTION_CLIP_Z, topview_mem_mb=c.RECONSTRUCTION_TOPVIEW_MEM_MB,
+            clip_z=c.RECONSTRUCTION_CLIP_Z,
+            relief_res_m=c.RECONSTRUCTION_RELIEF_RES_M,
+            relief_max_cells=c.RECONSTRUCTION_RELIEF_MAX_CELLS,
+            topview_mem_mb=c.RECONSTRUCTION_TOPVIEW_MEM_MB,
             topview_timeout_s=c.RECONSTRUCTION_TOPVIEW_TIMEOUT_S,
             work_dir=c.RECONSTRUCTION_WORK_DIR)
 
@@ -1203,7 +1210,9 @@ class ReconstructionGateway:
 
     async def _derive_in_subprocess(self, ply: str, out_dir: str, **grid: Any) -> Dict[str, Any]:
         return await derive_in_subprocess(ply, out_dir, mem_mb=self.config.topview_mem_mb,
-                                          timeout_s=self.config.topview_timeout_s, **grid)
+                                          timeout_s=self.config.topview_timeout_s,
+                                          relief_res_m=self.config.relief_res_m,
+                                          relief_max_cells=self.config.relief_max_cells, **grid)
 
     async def _finalize(self, job: Job, attempt: int, result: Dict[str, Any], outputs: Any,
                         meta: Dict[str, Any]) -> None:
@@ -1248,6 +1257,8 @@ class ReconstructionGateway:
                 for name in DERIVED_FILES:
                     file, ct = FILES[name]
                     path = os.path.join(tmp, file)
+                    if name.startswith("relief_") and not os.path.exists(path):
+                        continue  # (a custom derive without the relief; the real one writes it)
                     await asyncio.to_thread(self.objects.upload_file, bucket, prefix + file,
                                             path, ct)
                     files[name] = {"key": prefix + file, "bytes": os.path.getsize(path),

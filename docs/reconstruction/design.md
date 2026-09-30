@@ -385,7 +385,7 @@ key `{job_id}/{attempt}/{file}`. On `finish` the gateway checks both objects (`s
 size matches, `meta.json` parses, the PLY header is the vertex layout and the size is exactly
 header + N × stride), copies `cloud.ply` server-side into the map bucket at
 `reconstruction/{job_id}/cloud.ply`, derives the top view from it (§7.2), writes `ortho.png`,
-`height.png` and the merged `meta.json` next to it, commits, then deletes the staging prefix.
+`height.png`, `relief_rgb.png`, `relief_height.png` and the merged `meta.json` next to it, commits, then deletes the staging prefix.
 
 Why not presigned PUTs straight into the map bucket:
 
@@ -516,7 +516,9 @@ built, compose only passes the API its `RECONSTRUCTION_*` settings, §12.1.)
 | `RECONSTRUCTION_JOB_TIMEOUT_S` | `3600` | Running → `failed` (`timeout`) |
 | `RECONSTRUCTION_QUEUE_TIMEOUT_S` | `1800` | Queued with the service down → `failed` |
 | `RECONSTRUCTION_MAX_INFLIGHT` | `1` | Jobs sent to the service at once |
-| `RECONSTRUCTION_VOXEL_M`, `_MAX_DEPTH_M`, `_CLIP_Z` | `0.05`, `10.0`, `2.0` | Default job parameters |
+| `RECONSTRUCTION_VOXEL_M`, `_MAX_DEPTH_M`, `_CLIP_Z` | `0.05`, `10.0`, `2.3` | Default job parameters |
+| `RECONSTRUCTION_RELIEF_RES_M` | `0.10` | Cell size of the relief grid (§7.2); doubled until it fits the cap |
+| `RECONSTRUCTION_RELIEF_MAX_CELLS` | `4000000` | Cap on relief width × height |
 | `RECONSTRUCTION_TOPVIEW_MEM_MB` | `1024` | Address-space cap (RLIMIT_AS) of the top-view child process |
 | `RECONSTRUCTION_TOPVIEW_TIMEOUT_S` | `600` | The child is killed after this → `failed` (`top_view_failed`) |
 | `RECONSTRUCTION_WORK_DIR` | unset (system temp) | Where `cloud.ply` is downloaded for the top view (~200 MB for 10 M points) |
@@ -537,7 +539,7 @@ cloud's. Parameters and limits:
 |---|---|---|
 | `voxel_m` | 0.05 | 0.02–0.5; coarsened ×1.5 and restarted when above `max_voxels` |
 | `max_depth_m` | 10.0 | 0.5–65; far LiDAR points are sparse and noisy |
-| `clip_z` | 2.0 | relative to the floor estimate (median base z); −5–20; used by the cloud's top view (§7.2) |
+| `clip_z` | 2.3 | relative to the floor estimate (median base z); −5–20; used by the cloud's top view (§7.2) |
 | `edge_rel` | 0.05 | flying-pixel filter |
 | `min_neighbours` | 2 | of 26 |
 | `max_voxels` | 10 M | memory bound |
@@ -573,7 +575,9 @@ derives the top view from `cloud.ply` itself (`packages/api/reconstruction_topvi
 |---|---|
 | `ortho.png` | RGBA 8-bit top view. Per cell the colour of the **highest** voxel **below** the clip height (floor + `clip_z`), so ceilings and tree tops don't hide the floor and walls. Alpha 0 = no data |
 | `height.png` | 16-bit grey. That voxel's z as `round((z − z_offset) / z_scale) + 1`; 0 = no data (`z_scale` 0.01 m) |
-| `meta.json` | the service's `meta.json` (frame, CRS, bounds, points, voxel) plus the grid below, written by the gateway |
+| `relief_rgb.png` | RGBA 8-bit, the **costmap-like relief** grid (coarser, see below). RGB = colour of the highest voxel below the clip height, alpha 255 where the cell has data, 0 where not (only 0/255) |
+| `relief_height.png` | 8-bit grey, same grid. `clamp(round((z − z_floor) / 0.02) + 1, 1, 255)`; 0 = no data |
+| `meta.json` | the service's `meta.json` (frame, CRS, bounds, points, voxel) plus the grid and the `relief` block below, written by the gateway |
 
 **Rules** (all inputs are the cloud's own; nothing is read from the service's `meta.json`):
 
@@ -599,6 +603,18 @@ derives the top view from `cloud.ply` itself (`packages/api/reconstruction_topvi
 - `meta.json` gains `resolution_m`, `origin {x, y}`, `width`, `height`, `z_floor`, `clip_z`,
   `clip_abs`, `z_offset`, `z_scale` (the gateway's values win over same-named service fields).
   `bounds3d` stays the service's (over all cloud points).
+- **Relief** (same child process, same rastered points, same `z_floor` and clip rule): a second
+  grid for drawing raised cells like the costmap relief. `relief_res_m` = `RECONSTRUCTION_RELIEF_RES_M`
+  (0.10), doubled (0.1 → 0.2 → 0.4 …) until `width × height ≤ RECONSTRUCTION_RELIEF_MAX_CELLS`
+  (4 M). Origin, column and row rules are exactly those of `ortho.png` (row 0 = +y edge,
+  `origin` = lower-left corner of the cell at row `height − 1`, column 0), with `res_m`. Per cell
+  the highest rastered voxel (z below `clip_abs`) wins; its colour goes to `relief_rgb.png`, its
+  height step to `relief_height.png`. **Two PNGs, not one RGBA with the height in alpha:**
+  browsers premultiply alpha when decoding into a canvas, which destroys the colour of
+  low-alpha pixels; so alpha is only 0/255 and the height is its own greyscale file.
+  `meta.json` gains `relief: {res_m, width, height, origin {x, y}, z_floor, z_step_m: 0.02,
+  clip_z, rows: "row 0 = +y edge (same as ortho.png)"}`. Results made before the relief existed
+  have neither file nor `relief` block; the status then omits `relief_rgb` / `relief_height`.
 - No rastered point (everything above the clip) → the job fails `top_view_failed` ("no cloud
   point below the clip height"); rebuild with a larger `clip_z`.
 
@@ -606,8 +622,8 @@ derives the top view from `cloud.ply` itself (`packages/api/reconstruction_topvi
 `finalizing`), and answers at once; a background task copies `cloud.ply`, downloads it to a temp
 file (`RECONSTRUCTION_WORK_DIR`), and runs `python packages/api/reconstruction_topview.py` as a
 **child process** (by path, so it does not import the API): two passes over the PLY in chunks
-of 1 M vertices (extent, then the per-cell winner), holding only the raster buffers (≤
-`raster_max_px`² cells: z float32 + RGB), PNGs written band by band (numpy + zlib, the "Up"
+of 1 M vertices (extent, then the per-cell winner for both grids), holding only the raster buffers (≤
+`raster_max_px`² cells plus ≤ 4 M relief cells: z float32 + RGB), PNGs written band by band (numpy + zlib, the "Up"
 filter). The child caps its own address space (`RECONSTRUCTION_TOPVIEW_MEM_MB`, RLIMIT_AS) and
 is killed after `RECONSTRUCTION_TOPVIEW_TIMEOUT_S`; the API's event loop only waits on a pipe,
 and all memory goes back when the child exits. Measured on this host, 10 M points (170 MB PLY):
@@ -618,7 +634,7 @@ over by the poll, which reads the service's `succeeded` and finalizes again.
 
 **When it fails** the job fails (`top_view_failed`; `bad_output` for a PLY cut short after its
 header; `error` for a MinIO error), and the previous result stays. Why not keep the 3D result
-without a top view: `succeeded` then always means all four files, so the client, the file
+without a top view: `succeeded` then always means all the files, so the client, the file
 routes and supersede need no "partial" state; the causes (a clip below every point, a PLY the
 service wrote wrongly, a crash) are fixed by a rebuild, not by keeping half a result.
 
@@ -629,7 +645,10 @@ A 200 m x 100 m map at 5 cm = 4000 x 2000 px, `ortho.png` ≈ 3–13 MB, `height
 (`?v={job_id}`, cached forever) → a `BitmapLayer` with the 4 map-frame corners: through the
 view's world→pixel projection for a local map; map frame → UTM (+ origin) → lat/lon with
 `utils/mapTransform.ts` for a geo map (four corners, because UTM is rotated against lat/lon).
-Optional "colour by height" from `height.png` on a canvas.
+Optional "colour by height" from `height.png` on a canvas. Since the relief: the client draws
+`relief_rgb.png` + `relief_height.png` (+ `meta.relief`) like its costmap relief (raised cells: a
+top face plus viewer-facing sides, oblique 2.5D), and falls back to `ortho.png` for results
+without the relief files.
 
 ---
 
@@ -660,7 +679,7 @@ CREATE TABLE map_reconstructions (
   params           jsonb NOT NULL DEFAULT '{}'::jsonb,
   inputs           jsonb,   -- {nodes_total, nodes_with_depth, frames, digest, nodes:[[id,x,y,yaw],…]}
   result           jsonb,   -- from the finish callback: {points, frames_used, frames_skipped, bounds3d, voxel_m, duration_s}
-  artifacts        jsonb,   -- {bucket, prefix, files:{cloud|ortho|height|meta:{key,bytes,sha256,content_type}}}
+  artifacts        jsonb,   -- {bucket, prefix, files:{cloud|ortho|height|relief_rgb|relief_height|meta:{key,bytes,sha256,content_type}}}
   error            jsonb    -- {reason, stage, message}
 );
 CREATE UNIQUE INDEX map_reconstructions_one_active
@@ -718,7 +737,7 @@ objects deleted.
 | `map-{id}/{node_id}/depth/{camera}.png` | graph-builder (R2) |
 | `recon-staging/{job_id}/{attempt}/{cloud.ply,meta.json}` | the service, via presigned PUT |
 | `map-{id}/reconstruction/{job_id}/cloud.ply` | the gateway (server-side copy) |
-| `map-{id}/reconstruction/{job_id}/{ortho.png,height.png,meta.json}` | the gateway (derived from `cloud.ply`, §7.2; `meta.json` = the service's + the grid) |
+| `map-{id}/reconstruction/{job_id}/{ortho.png,height.png,relief_rgb.png,relief_height.png,meta.json}` | the gateway (derived from `cloud.ply`, §7.2; `meta.json` = the service's + the grid) |
 
 The gateway creates `recon-staging` at start (with the 1-day expiry rule). It **never creates a
 map bucket**.
@@ -744,7 +763,7 @@ map bucket**.
 | GET | `/api/v1/maps/{map}/reconstruction` | Current result (+ `stale`) and the active or last failed job |
 | POST | `/api/v1/maps/{map}/reconstruction/cancel` | Cancel the active job |
 | DELETE | `/api/v1/maps/{map}/reconstruction` | Delete the current result (and cancel an active job). 204 |
-| GET | `/api/v1/maps/{map}/reconstruction/files/{name}` | `cloud.ply`, `ortho.png`, `height.png`, `meta.json`; streamed from the map bucket, `ETag` = job id, immutable cache with `?v=` |
+| GET | `/api/v1/maps/{map}/reconstruction/files/{name}` | `cloud.ply`, `ortho.png`, `height.png`, `relief_rgb.png`, `relief_height.png`, `meta.json`; streamed from the map bucket, `ETag` = job id, immutable cache with `?v=` |
 
 Errors: 404 `map_not_found`; 409 `map_deleting`; 409 `job_active` (body has the job); 409
 `no_depth`; 422 bad parameters or too many nodes; 503 `not_configured`. The service being down
@@ -758,7 +777,7 @@ Status body (`GET`):
   "map_name": "lab",
   "reconstruction": {
     "job_id": "1f7d…", "finished_at": "2026-10-19T17:02:41Z",
-    "params": {"voxel_m": 0.05, "max_depth_m": 10.0, "clip_z": 2.0},
+    "params": {"voxel_m": 0.05, "max_depth_m": 10.0, "clip_z": 2.3},
     "points": 2310455, "nodes_total": 450, "nodes_used": 412,
     "frames_skipped": {"no_valid_depth": 3},
     "bounds3d": {"min": [-12.35, -40.10, -1.2], "max": [79.65, 25.9, 6.3]},
@@ -767,6 +786,8 @@ Status body (`GET`):
       "cloud": {"name": "cloud.ply", "bytes": 39277735, "url": "/api/v1/maps/lab/reconstruction/files/cloud.ply?v=1f7d…"},
       "ortho": {"name": "ortho.png", "bytes": 4120334, "url": "…/files/ortho.png?v=1f7d…"},
       "height": {"name": "height.png", "bytes": 1893002, "url": "…/files/height.png?v=1f7d…"},
+      "relief_rgb": {"name": "relief_rgb.png", "bytes": 210311, "url": "…/files/relief_rgb.png?v=1f7d…"},
+      "relief_height": {"name": "relief_height.png", "bytes": 48120, "url": "…/files/relief_height.png?v=1f7d…"},
       "meta": {"name": "meta.json", "bytes": 612, "url": "…/files/meta.json?v=1f7d…"}
     }
   },

@@ -210,6 +210,92 @@ class TestDerive:
             assert tuple(o[r, 0]) == (j, 255 - j, 7, 255) and h[r, 0] == j + 1
 
 
+class TestRelief:
+    """relief_rgb.png + relief_height.png + meta relief block (design.md §7.2)."""
+
+    def _relief(self, tmp_path, points, **kw):
+        args = dict(z_floor=0.0, clip_z=2.0, voxel_m=0.05, raster_max_px=4096,
+                    relief_res_m=0.1)
+        args.update(kw)
+        path = write(tmp_path, ply_bytes(points))
+        out = tmp_path / "out"
+        out.mkdir(exist_ok=True)
+        grid = tv.derive(path, str(out), **args)
+        return (grid, png(out / "relief_rgb.png"), png(out / "relief_height.png"),
+                png(out / "ortho.png"))
+
+    def test_scene_rules_and_meta(self, np, tmp_path):
+        grid, rgb, hgt, ortho = self._relief(tmp_path, SCENE)
+        r = grid["relief"]
+        assert r["res_m"] == pytest.approx(0.1) and r["z_step_m"] == 0.02
+        assert r["z_floor"] == 0.0 and r["clip_z"] == 2.0
+        assert r["rows"] == "row 0 = +y edge (same as ortho.png)"
+        assert (r["width"], r["height"]) == (rgb.size[0], rgb.size[1]) == hgt.size
+        assert rgb.mode == "RGBA" and hgt.mode == "L"
+        c, rw = rgb, np.array(rgb)
+        h = np.array(hgt).astype(np.int64)
+        res, ox, oy = r["res_m"], r["origin"]["x"], r["origin"]["y"]
+
+        def cell(x, y):
+            return (r["height"] - 1 - math.floor((y - oy) / res), math.floor((x - ox) / res))
+
+        # box top (z 0.5) beats the floor: step round(0.5 / 0.02) + 1 = 26
+        row, col = cell(0.75, 0.45)
+        assert tuple(rw[row, col]) == (40, 40, 200, 255) and h[row, col] == 26
+        # floor cell: step 1
+        row, col = cell(1.25, 0.15)
+        assert tuple(rw[row, col]) == (128, 128, 128, 255) and h[row, col] == 1
+        # wall column: highest voxel below the clip (z 1.9), not the 2.8 m part
+        row, col = cell(2.05, 0.55)
+        assert tuple(rw[row, col]) == (200, 40, 40, 255) and h[row, col] == 96
+        # the ceiling (2.8 > clip) does not show: floor colour at its cell
+        row, col = cell(1.05, 0.95)
+        assert tuple(rw[row, col][:3]) == (128, 128, 128) or rw[row, col][3] == 0
+
+    def test_no_data_and_alpha_only_0_255(self, np, tmp_path):
+        pts = [(0.05, 0.05, 0.1, 9, 8, 7), (0.95, 0.95, 0.3, 1, 2, 3)]
+        grid, rgb, hgt, _ = self._relief(tmp_path, pts)
+        rw, h = np.array(rgb), np.array(hgt)
+        assert set(np.unique(rw[..., 3])) == {0, 255}
+        empty = rw[..., 3] == 0
+        assert empty.any() and (h[empty] == 0).all() and (rw[empty][:, :3] == 0).all()
+        assert ((h > 0) == ~empty).all() and (~empty).sum() == 2
+
+    def test_orientation_matches_ortho(self, np, tmp_path):
+        pts = [(0.05, 0.05, 0.1, 255, 0, 0), (0.05, 0.85, 0.1, 0, 255, 0)]
+        grid, rgb, _, ortho = self._relief(tmp_path, pts, voxel_m=0.1)
+        assert grid["relief"]["res_m"] == pytest.approx(grid["resolution_m"])
+        assert grid["relief"]["origin"] == grid["origin"]
+        assert np.array_equal(np.array(rgb), np.array(ortho))
+        rw = np.array(rgb)
+        assert tuple(rw[0, 0]) == (0, 255, 0, 255)          # row 0 = +y edge
+        assert tuple(rw[-1, 0]) == (255, 0, 0, 255)
+
+    def test_height_step_clamped_and_floor_relative(self, np, tmp_path):
+        pts = [(0.05, 0.05, -0.5, 1, 1, 1), (0.15, 0.05, 0.0, 1, 1, 1),
+               (0.25, 0.05, 1.0, 1, 1, 1), (0.35, 0.05, 6.0, 1, 1, 1)]
+        _, _, hgt, _ = self._relief(tmp_path, pts, z_floor=0.0, clip_z=10.0)
+        assert list(np.array(hgt)[-1, :4]) == [1, 1, 51, 255]
+
+    def test_auto_coarsening(self, np, tmp_path):
+        pts = [(x * 0.1, y * 0.1, 0.0, 5, 5, 5) for x in range(40) for y in range(40)]
+        # extent 3.9 m: 0.1 -> 40x40 = 1600 cells, 0.2 -> 20x20 = 400, 0.4 -> 10x10 = 100
+        grid, rgb, hgt, _ = self._relief(tmp_path, pts, relief_max_cells=500)
+        r = grid["relief"]
+        assert r["res_m"] == pytest.approx(0.2) and (r["width"], r["height"]) == (20, 20)
+        assert rgb.size == hgt.size == (20, 20)
+        grid, rgb, _, _ = self._relief(tmp_path, pts, relief_max_cells=399)
+        assert grid["relief"]["res_m"] == pytest.approx(0.4) and rgb.size == (10, 10)
+        grid, _, _, _ = self._relief(tmp_path, pts, relief_max_cells=4_000_000)
+        assert grid["relief"]["res_m"] == pytest.approx(0.1)
+
+    def test_chunked_equals_unchunked(self, np, tmp_path):
+        a = self._relief(tmp_path, SCENE)
+        b = self._relief(tmp_path, SCENE, chunk=7)
+        assert np.array_equal(np.array(a[1]), np.array(b[1]))
+        assert np.array_equal(np.array(a[2]), np.array(b[2]))
+
+
 class TestSubprocess:
     async def test_runs_in_a_child_and_maps_errors(self, np, tmp_path):
         out = tmp_path / "out"
@@ -220,6 +306,9 @@ class TestSubprocess:
         grid = await tv.derive_in_subprocess(path, str(out), **kw)
         assert (grid["width"], grid["height"]) == (21, 10)
         assert os.path.getsize(out / "ortho.png") > 0 and os.path.getsize(out / "height.png") > 0
+        assert os.path.getsize(out / "relief_rgb.png") > 0
+        assert os.path.getsize(out / "relief_height.png") > 0
+        assert grid["relief"]["res_m"] == pytest.approx(0.1)
         bad = write(tmp_path, b"ply\nformat ascii 1.0\nend_header\n", "bad.ply")
         with pytest.raises(tv.TopViewError) as exc:
             await tv.derive_in_subprocess(bad, str(out), **kw)

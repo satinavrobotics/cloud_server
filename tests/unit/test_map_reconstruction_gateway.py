@@ -293,6 +293,7 @@ class World:
             node("n3", 2.0, 0.0, 0.0, depth=False)])}
         self.reads = 0
         self.derived = []          # the grid params of each top-view derivation
+        self.relief = True         # the derivation also writes the relief files
         self.derive_error = None   # raise this from the derivation
         self.gw = rc.ReconstructionGateway(
             self.repo, self._depth_nodes, self.objects, FakePresigner(), self.client, config,
@@ -305,7 +306,10 @@ class World:
         self.derived.append(grid)
         if self.derive_error is not None:
             raise self.derive_error
-        for name in ("ortho.png", "height.png"):
+        names = ["ortho.png", "height.png"]
+        if getattr(self, "relief", True):
+            names += ["relief_rgb.png", "relief_height.png"]
+        for name in names:
             with open(pathlib.Path(out_dir) / name, "wb") as f:
                 f.write(b"\x89PNG-" + name[:5].encode())
         return {"resolution_m": 0.05, "origin": {"x": -1.0, "y": -2.0}, "width": 3,
@@ -371,7 +375,7 @@ class TestHelpers:
 
     def test_params(self):
         p = rc.job_params(CFG, {"voxel_m": 0.1})
-        assert p["voxel_m"] == 0.1 and p["max_depth_m"] == 10.0 and p["clip_z"] == 2.0
+        assert p["voxel_m"] == 0.1 and p["max_depth_m"] == 10.0 and p["clip_z"] == 2.3
         assert p["max_voxels"] == 10_000_000 and p["raster_max_px"] == 4096
         for bad in ({"voxel_m": 0.01}, {"max_depth_m": 70}, {"clip_z": -6}, {"other": 1}, [1]):
             with pytest.raises(HTTPException) as exc:
@@ -660,12 +664,14 @@ class TestCallbacks:
         done = await w.succeed()
         # z_floor: median over the frames' base z (n2 pose3d z 0.05, n1 without pose3d -> 0)
         assert done.inputs["z_floor"] == pytest.approx(0.025)
-        assert w.derived == [{"z_floor": pytest.approx(0.025), "clip_z": 2.0, "voxel_m": 0.05,
+        assert w.derived == [{"z_floor": pytest.approx(0.025), "clip_z": 2.3, "voxel_m": 0.05,
                               "raster_max_px": 4096}]
         prefix = rc.result_prefix(done.job_id)
         files = done.artifacts["files"]
-        assert set(files) == {"cloud", "ortho", "height", "meta"}
-        for name, file in (("ortho", "ortho.png"), ("height", "height.png")):
+        assert set(files) == {"cloud", "ortho", "height", "relief_rgb", "relief_height", "meta"}
+        for name, file in (("ortho", "ortho.png"), ("height", "height.png"),
+                           ("relief_rgb", "relief_rgb.png"),
+                           ("relief_height", "relief_height.png")):
             data = w.objects.objects[("map-lab", prefix + file)]
             assert files[name] == {"key": prefix + file, "bytes": len(data),
                                    "sha256": hashlib.sha256(data).hexdigest(),
@@ -674,13 +680,30 @@ class TestCallbacks:
         assert meta["version"] == 1  # the service's fields ...
         assert meta["resolution_m"] == 0.05 and meta["origin"] == {"x": -1.0, "y": -2.0}
         assert (meta["width"], meta["height"], meta["z_scale"]) == (3, 4, 0.01)  # ... + grid
-        assert meta["clip_abs"] == pytest.approx(2.025) and "top_view" not in meta
+        assert meta["clip_abs"] == pytest.approx(2.325) and "top_view" not in meta
         assert files["meta"]["bytes"] == len(w.objects.objects[("map-lab",
                                                                 prefix + "meta.json")])
         assert done.result["top_view"]["cells_filled"] == 2
         status = (await w.gw.status("lab"))["reconstruction"]
-        assert set(status["files"]) == {"cloud", "ortho", "height", "meta"}
+        assert set(status["files"]) == {"cloud", "ortho", "height", "relief_rgb",
+                                        "relief_height", "meta"}
         assert status["files"]["height"]["url"].endswith(f"height.png?v={done.job_id}")
+        assert status["files"]["relief_rgb"]["url"].endswith(
+            f"relief_rgb.png?v={done.job_id}")
+        info = await w.gw.open_file("lab", "relief_height.png")
+        assert info["key"] == prefix + "relief_height.png" and info["file"] == "relief_height.png"
+
+    async def test_results_without_relief_files_omit_them(self):
+        """Results made before the relief (or a derivation without it): no keys, no error."""
+        w = World()
+        w.relief = False
+        done = await w.succeed()
+        assert set(done.artifacts["files"]) == {"cloud", "ortho", "height", "meta"}
+        status = (await w.gw.status("lab"))["reconstruction"]
+        assert set(status["files"]) == {"cloud", "ortho", "height", "meta"}
+        with pytest.raises(HTTPException) as exc:
+            await w.gw.open_file("lab", "relief_rgb.png")
+        assert exc.value.status_code == 404
 
     async def test_top_view_uses_the_job_params_and_the_voxel_the_service_used(self):
         w = World()
