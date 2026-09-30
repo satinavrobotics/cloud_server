@@ -831,11 +831,42 @@ untouched.
 
 **Rules** (`packages/api/mapping_switch.py`, `maps.py`):
 - *Start* (opening a mapping session; resume) = open the session, then start each service in
-  its `services` (today `topo`). It runs **inside the session's transaction**: when the start
-  fails (robot has no registered orchestrator or does not answer: 502; timeout: 504; the
-  orchestrator has no such service: 409; orchestrator error: 502) nothing is committed: no
-  session, no event, the map state is as before (a `replace` keeps the old session). A service
-  that already runs is fine.
+  its `services` (today `topo`). **The orchestrator call is never made inside a DB transaction**
+  (first version: it was, holding the session/map/robot row locks for up to the 30 s start
+  timeout, and mission-dispatch and other writers blocked on them). The errors are the same
+  as before (robot has no registered orchestrator or does not answer: 502; timeout: 504; the
+  orchestrator has no such service: 409; orchestrator error: 502; a service that already
+  runs is fine); what differs is how the state is kept consistent, under the robot's lock
+  (`MappingSwitch.lock`, so two starts for one robot serialize, as before):
+  1. *Open (no `replace`):* transaction 1 = validate, insert the session, map -> `mapping`,
+     `MAP.SESSION_STARTED`; commit; the start call; then the response. When the start fails,
+     transaction 2 closes the session again: `MAP.SESSION_FINISHED` (so every STARTED has its
+     FINISHED; the events are the trace of the failed attempt), the map returns to the state it
+     had (a `draft` stays `draft`, not `ready`), the robot's `session` is pushed again, and the
+     502/504/409 is raised. If transaction 2 itself fails it is logged and the session stays
+     open without a service: the user can finish it (the original error is still raised).
+  2. *Open with `replace` (a session is open):* **start first.** The replaced session cannot be
+     reopened cleanly (its `paused_at` and run epoch were reset by the finish, its map's state
+     and `open_session_id` moved on, and there is no "reopened" event), so nothing is committed
+     until the services run: a validation-only transaction (the whole start, rolled back at the
+     end, so 404/409 such as "robot offline" still come before the orchestrator's errors), the
+     start call (the old session is still the open one; a service it already ran is simply
+     `already_running`), then the real transaction (finish old + open new). A failed start
+     changes nothing at all: no session, no event, the old one stays open. If the real
+     transaction fails after the start (a race), the services this call started are stopped
+     again. Then the replaced session's services the new one does not run are stopped, as before.
+  3. *Resume:* transaction 1 = the resume (`MAP.SESSION_RESUMED`), commit, the start call; a
+     failed start pauses the session again in transaction 2 (`MAP.SESSION_PAUSED`, map
+     `paused`), then the 502/504/409. A no-op resume (already running) starts the service
+     again if it is not running and changes nothing when that fails. The "robot offline" 409
+     stays inside transaction 1 (no call).
+  Nodes: while the service is not running no node comes, so a failed start has no nodes to
+  attribute. The only nodes that can arrive in the short window between commit and compensation
+  are from a service already left running by an earlier session; they are stored as ordinary
+  nodes of a session that is then closed (as any session's nodes are), and the map is not
+  corrupted. With `replace` the new service may start a moment before the new session exists;
+  a node in that gap is dropped and reported as `MAP.INGEST_REJECTED` (the old session still
+  gates it), as any node with no open session.
 - *Pause* = stop the service, *resume* = start it, *finish* = stop it, *replace* stops what the
   new session does not run. The stop is after the commit and **best effort**: an offline robot's
   session is closed/paused anyway and the response says `robot_notified: false` plus a
@@ -851,8 +882,10 @@ untouched.
   orchestrator, cached 5 s per robot; robots that are offline or have no registered
   orchestrator are not asked. Shapes are kept (see packages/api/README.md); `online` now means
   "the service runs", `status` is `on` when it runs and the session captures, `unreachable`
-  when the orchestrator did not answer, `nodes_sent` is the session's `node_count` (null on the
-  robot views).
+  when the orchestrator did not answer, `nodes_sent` is the session's `node_count`, also on the
+  robot views (`GET /robots[/{r}]`): the robot's `session` view now carries `node_count`, read by the one
+  open-sessions query the views already make (no per-robot query); null without an open mapping
+  session.
 - *Removed:* `mapping/set` publishing (API and mission-dispatch: after a run change the session
   is unplaced and graph-builder drops its nodes), the state subscription/cache and the M3
   alias, `POST /robots/{r}/mapping/off` (force-off), the re-publish on every broker connect, and

@@ -240,7 +240,7 @@ nodes_sent, since, stamp, received_at, source: "orchestrator", orchestrator_serv
 `online` = the service runs; `on` = it runs and the robot's open mapping session is unpaused and
 placed; `off` = it does not, or the session is paused / not placed; `unreachable` = the
 orchestrator did not answer (`error` says why). `since` = the service's start time,
-`nodes_sent` = the session's `node_count` (null on the robot views). `mapping_services`:
+`nodes_sent` = the session's `node_count` (also on the robot views, from the open-session query they already make; null without an open mapping session). `mapping_services`:
 `{service: running | not_running | not_available}`; `not_available` = robot offline / no
 orchestrator / it has no such service / it did not answer.
 

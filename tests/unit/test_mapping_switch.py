@@ -4,14 +4,17 @@
 - packages/api/mapping_switch.py: service name resolution (`topomap` real / `sim_topomap` sim),
   start (order, already running, failure -> HTTP errors, rollback of a partial start), stop
   (best effort, offline), the state views and their cache;
-- packages/api/maps.py: opening a session starts the services inside its transaction (a failed
-  start leaves nothing behind), pause / finish stop them after the commit (a failed stop still
-  closes the session), resume starts them again, replace keeps what the new session runs;
+- packages/api/maps.py: the orchestrator is never called inside a DB transaction: opening a
+  session commits, then starts the services (a failed start closes the session again, paired
+  events, a draft map back to draft), replace starts first (a failed start changes nothing),
+  resume commits then starts (a failed start pauses again), pause / finish stop them after the
+  commit (a failed stop still closes the session), replace keeps what the new session runs;
 - the routes and the robot view fill `mapping_state` / `mapping_services` from the orchestrator.
 
 The in-memory store is the M1 one with robot locks (tests/unit/test_maps_m2.py ShimDb).
 """
 import asyncio
+import contextlib
 import json
 import os
 from types import SimpleNamespace
@@ -45,9 +48,13 @@ class FakeOrch:
         self.reachable = reachable
         self.fail = fail or {}        # (op, name) -> OrchestratorError
         self.calls = []
+        self.db = None                # set by prepare(): the DB whose transactions must be closed
+        self.delay = 0.0
 
     def _enter(self, op, name=None):
         self.calls.append((op, name))
+        if self.db is not None:
+            assert self.db.open_tx == 0, f"orchestrator {op} inside a DB transaction"
         if not self.reachable:
             raise oc.OrchestratorError(oc.UNREACHABLE, "orchestrator at 10.0.0.5:8080 is not "
                                                        "reachable (ConnectError)")
@@ -72,6 +79,8 @@ class FakeClient:
 
     async def start(self, name):
         self.orch._enter("start", name)
+        if self.orch.delay:
+            await asyncio.sleep(self.orch.delay)
         if name not in self.orch.services:
             raise oc.OrchestratorError(oc.HTTP, f"Service '{name}' not found", status=404)
         if self.orch.services[name]:
@@ -102,9 +111,23 @@ def add_robot(db, name="r1", online=True, address=True):
     db.robots[name] = robot(name, online, address)
 
 
+class TxTracking(ShimDb):
+    """ShimDb that counts the open transactions (a FakeOrch call inside one fails)."""
+    open_tx = 0
+
+    @contextlib.asynccontextmanager
+    async def store(self, _db, _publisher_id):
+        self.open_tx += 1
+        try:
+            async with super().store(_db, _publisher_id) as store:
+                yield store
+        finally:
+            self.open_tx -= 1
+
+
 @pytest.fixture
 def db():
-    d = ShimDb()
+    d = TxTracking()
     with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow", m1.Clock()):
         yield d
 
@@ -382,6 +405,7 @@ def prepare(db, orch=None, **switch_kw):
     db.add_map("yard", type="local", status={"state": "draft"})
     add_robot(db)
     orch = orch or FakeOrch()
+    orch.db = db
     switch = make_switch({"r1": orch}, **switch_kw)
     switch.on_session = AsyncMock()
     switch.on_state = AsyncMock()
@@ -424,9 +448,50 @@ class TestStartSession:
             await start(db, switch)
         assert err.value.status_code == status
         assert "Could not start mapping service 'topo'" in err.value.detail
-        assert db.open_session("r1") == [] and db.events == []
-        assert db.maps["yard"]["status"]["state"] == "draft"
-        switch.on_session.assert_not_awaited()
+        # committed, then closed again: the STARTED event has its FINISHED, nothing is left open
+        assert db.open_session("r1") == []
+        assert db.codes() == ["MAP.SESSION_STARTED", "MAP.SESSION_FINISHED"]
+        assert db.maps["yard"]["status"] == {"state": "draft", "open_session_id": None}
+        [closed] = db.sessions
+        assert closed["ended_at"] is not None
+        switch.on_state.assert_not_awaited()
+
+    async def test_the_start_runs_outside_every_transaction(self, db):
+        orch, switch = prepare(db)
+        await start(db, switch)                       # FakeOrch asserts open_tx == 0
+        assert ("start", "topomap") in orch.calls
+
+    async def test_a_failed_start_of_a_ready_map_leaves_it_ready(self, db):
+        orch, switch = prepare(db, FakeOrch(reachable=False))
+        db.maps["yard"]["status"] = {"state": "ready"}
+        with pytest.raises(HTTPException):
+            await start(db, switch)
+        assert db.maps["yard"]["status"]["state"] == "ready" and db.open_session("r1") == []
+
+    async def test_the_robots_starts_serialize(self, db):
+        orch, switch = prepare(db)
+        orch.delay = 0.05
+        db.add_map("lot", type="local", status={"state": "draft"})
+        first = asyncio.ensure_future(start(db, switch))
+        await asyncio.sleep(0.01)                     # first is inside its (slow) start
+        second = asyncio.ensure_future(maps.start_session(
+            None, "lot", {"robot": "r1"}, m1.PUB, "op", switch=switch))
+        ok, refused = await asyncio.gather(first, second, return_exceptions=True)
+        assert isinstance(ok, dict) and isinstance(refused, HTTPException)
+        assert refused.status_code == 409 and "already has an open" in refused.detail
+        assert [s["map_name"] for s in db.open_session("r1")] == ["yard"]
+
+    async def test_a_failed_close_still_raises_the_start_error(self, db):
+        orch, switch = prepare(db, FakeOrch(reachable=False))
+        real = maps._finish_in
+
+        async def broken(*args, **kw):
+            raise RuntimeError("db down")
+
+        with patch.object(maps, "_finish_in", broken):
+            with pytest.raises(HTTPException) as err:
+                await start(db, switch)
+        assert err.value.status_code == 502
 
     async def test_no_registered_orchestrator_is_a_502(self, db):
         db.add_map("yard", type="local", status={"state": "draft"})
@@ -463,12 +528,70 @@ class TestStartSession:
         orch, switch = prepare(db)
         db.add_map("lot", type="local", status={"state": "draft"})
         await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        events = list(db.codes())
         orch.fail[("start", "topomap")] = oc.OrchestratorError(oc.HTTP, "x", status=500)
         orch.services["topomap"] = False
         with pytest.raises(HTTPException):
             await start(db, switch, replace=True)
         [old] = db.open_session("r1")
         assert old["map_name"] == "lot" and old["ended_at"] is None
+        # start first: no session, no event, no map state change (nothing to compensate)
+        assert db.codes() == events and len(db.sessions) == 1
+        assert db.maps["yard"]["status"]["state"] == "draft"
+        assert db.maps["lot"]["status"]["state"] == "mapping"
+
+    async def test_replace_starts_before_it_commits(self, db):
+        orch, switch = prepare(db)
+        db.add_map("lot", type="local", status={"state": "draft"})
+        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        await maps.session_action(None, "lot", db.open_session("r1")[0]["session_id"], "pause",
+                                  m1.PUB, switch=switch)
+        seen = []
+
+        class Spy(list):
+            def append(self, call):
+                seen.append((call, [s["map_name"] for s in db.open_session("r1")]))
+                super().append(call)
+
+        orch.calls = Spy(orch.calls)
+        out = await start(db, switch, replace=True)
+        assert (("start", "topomap"), ["lot"]) in seen   # the old session was still the open one
+        assert out["session"]["map_name"] == "yard"
+        assert [s["map_name"] for s in db.open_session("r1")] == ["yard"]
+
+    async def test_replace_that_fails_to_commit_stops_what_it_started(self, db):
+        orch, switch = prepare(db)
+        db.add_map("lot", type="local", status={"state": "draft"})
+        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        await maps.session_action(None, "lot", db.open_session("r1")[0]["session_id"], "pause",
+                                  m1.PUB, switch=switch)
+        assert orch.services["topomap"] is False
+        real = maps._open_tx
+        state = {"n": 0}
+
+        async def flaky(*args, **kw):
+            state["n"] += 1
+            if not kw.get("dry_run") and state["n"] == 2:
+                raise HTTPException(409, "changed meanwhile")
+            return await real(*args, **kw)
+
+        with patch.object(maps, "_open_tx", flaky):
+            with pytest.raises(HTTPException) as err:
+                await start(db, switch, replace=True)
+        assert err.value.status_code == 409
+        assert ("start", "topomap") in orch.calls
+        assert orch.services["topomap"] is False        # started, then stopped again
+        assert [s["map_name"] for s in db.open_session("r1")] == ["lot"]
+
+    async def test_replace_validation_errors_come_before_the_orchestrator(self, db):
+        orch, switch = prepare(db)
+        db.add_map("lot", type="local", status={"state": "draft"})
+        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        db.robots["r1"].status.online = False
+        orch.calls.clear()
+        with pytest.raises(HTTPException) as err:
+            await start(db, switch, replace=True)
+        assert err.value.status_code == 409 and orch.calls == []
 
     async def test_replace_keeps_the_service_the_new_session_runs(self, db):
         orch, switch = prepare(db)
@@ -563,7 +686,27 @@ class TestSessionActions:
         [s] = db.open_session("r1")
         assert s["paused_at"] is not None
         assert db.maps["yard"]["status"]["state"] == "paused"
-        assert db.codes()[-1] == "MAP.SESSION_PAUSED"
+        # resumed, then paused again: the events pair up
+        assert db.codes()[-3:] == ["MAP.SESSION_PAUSED", "MAP.SESSION_RESUMED",
+                                   "MAP.SESSION_PAUSED"]
+
+    async def test_resume_starts_outside_the_transaction(self, db):
+        orch, switch = prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        await self.act(db, switch, sid, "pause")
+        await self.act(db, switch, sid, "resume")     # FakeOrch asserts open_tx == 0
+        assert orch.services["topomap"] is True
+
+    async def test_a_failed_noop_resume_changes_nothing(self, db):
+        orch, switch = prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        orch.services["topomap"] = False
+        orch.fail[("start", "topomap")] = oc.OrchestratorError(oc.TIMEOUT, "timed out")
+        events = list(db.codes())
+        with pytest.raises(HTTPException) as err:
+            await self.act(db, switch, sid, "resume")
+        assert err.value.status_code == 504 and db.codes() == events
+        assert db.open_session("r1")[0]["paused_at"] is None
 
     async def test_resume_of_an_offline_robot_is_409_without_calling_it(self, db):
         orch, switch = prepare(db)
@@ -668,15 +811,18 @@ class TestViews:
         svc.database.get_object = AsyncMock(return_value=robots[0])
         svc.database.list_objects = AsyncMock(return_value=robots)
         sessions = {"r1": {"session_id": "s1", "map": "yard", "purpose": "mapping",
-                           "state": "mapping", "aligned": True}}
+                           "state": "mapping", "aligned": True, "node_count": 7}}
         with patch.object(main, "service", svc), \
                 patch.object(maps, "robot_sessions", AsyncMock(return_value=sessions)):
             one = await main.get_robot("r1")
             many = await main.list_robots()
         assert one["mapping_state"]["status"] == "on" and one["name"] == "r1"
         assert one["mapping_state"]["session_id"] == "s1" and one["session"]["map"] == "yard"
+        assert one["mapping_state"]["nodes_sent"] == 7      # the open session's node count
         assert one["mapping_services"] == {"topo": "running", "grid": "not_available"}
         by_name = {r["name"]: r for r in many}
+        assert by_name["r1"]["mapping_state"]["nodes_sent"] == 7
+        assert by_name["r2"]["mapping_state"]["nodes_sent"] is None   # no open session
         assert by_name["r2"]["mapping_state"]["status"] == "off"
         assert by_name["r2"]["mapping_services"]["topo"] == "not_running"
         assert by_name["r3"]["mapping_state"] is None

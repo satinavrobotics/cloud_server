@@ -356,7 +356,10 @@ def robot_session_view(row: Optional[Mapping[str, Any]]) -> Optional[Dict[str, A
     return {"session_id": str(row["session_id"]), "map": row["map_name"],
             "purpose": purpose_of(row), "state": session_state(row), "aligned": placed,
             "map_T_session": transform_of(row.get("map_t_session")) if placed else None,
-            "unplaced_reason": (placement or {}).get("unplaced_reason") if not placed else None}
+            "unplaced_reason": (placement or {}).get("unplaced_reason") if not placed else None,
+            # the session's stored node count (what the session views show); it feeds
+            # `mapping_state.nodes_sent` of the robot views at no extra query
+            "node_count": int(row.get("node_count") or 0)}
 
 
 def by_robot(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Mapping[str, Any]]:

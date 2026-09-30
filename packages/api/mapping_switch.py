@@ -5,9 +5,9 @@ of maps M3/U5).
 A mapping session's `services` (packages/utils/map_sessions.py, today only `topo`) are the
 orchestrator services that capture for it:
 
-- opening a mapping session STARTS them (packages/api/maps.py does it inside the session's
-  transaction, so a failed start leaves no session behind), resuming a paused one starts them
-  again;
+- opening a mapping session STARTS them (packages/api/maps.py calls start() OUTSIDE any DB
+  transaction: after the commit, closing the session again when the start fails; with `replace`
+  before it), resuming a paused one starts them again (re-paused when the start fails);
 - pausing or finishing STOPS them, best effort: an offline robot still has its session closed,
   and the response says the service was not stopped (`robot_notified: false`, `mapping_warning`);
 - nodes are gated on the server only (graph-builder drops a node with no open, unpaused, placed
