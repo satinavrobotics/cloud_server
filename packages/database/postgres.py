@@ -414,7 +414,9 @@ class PostgresDatabase:
                         all_clauses.append(query_map[param].format(value_str))
         if all_clauses:
             query += " WHERE " + " AND ".join(all_clauses)
-        query += extra_clause + ";"
+        # Deterministic order (heap order changes on every UPDATE). A query-map
+        # clause such as most_recent brings its own ORDER BY; keep that one.
+        query += (extra_clause or " ORDER BY name") + ";"
 
         try:
             async with self._pool.connection() as conn:
