@@ -49,7 +49,8 @@ async def test_list_robots_is_ordered_by_name():
 
 async def test_most_recent_keeps_its_own_ordering():
     queries = []
-    params = MissionQueryParamsV1(most_recent=3)
+    params = MissionQueryParamsV1(state=None, started_after=None, started_before=None,
+                                     robot=None, most_recent=3)
     await _db(queries).list_objects(api_objects.MissionObjectV1, params)
     assert "ORDER BY name" not in queries[0]
     assert "start_timestamp" in queries[0]
