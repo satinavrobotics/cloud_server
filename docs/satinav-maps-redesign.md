@@ -193,9 +193,9 @@ Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.ARCHI
 
 ## 8. Robot side (this phase only)
 
-- **Mapping switch over MQTT** (built in M3, §13.3). `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to the retained `{prefix}/{robot}/mapping/set` (`{enabled, session_id, map}`) and publishes the retained `{prefix}/{robot}/mapping/state` (`online`, `enabled`, `session_id`, `map`, `nodes_sent`, `since`, with a last will `online: false`). `{prefix}` is the VDA5050 prefix (`uagv/v2/RobotCompany`), `{robot}` the VDA5050 serial number. It already has an MQTT connection, so no orchestrator or VDA5050 change is needed. The contract is written down once, in `packages/api/mapping_control.py` (and the table in §13.3).
+- **Mapping switch over MQTT** (built in M3, §13.3; **replaced by the orchestrator switch, §14.15**). `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to the retained `{prefix}/{robot}/mapping/set` (`{enabled, session_id, map}`) and publishes the retained `{prefix}/{robot}/mapping/state` (`online`, `enabled`, `session_id`, `map`, `nodes_sent`, `since`, with a last will `online: false`). `{prefix}` is the VDA5050 prefix (`uagv/v2/RobotCompany`), `{robot}` the VDA5050 serial number. It already has an MQTT connection, so no orchestrator or VDA5050 change is needed. The contract is written down once, in `packages/api/mapping_control.py` (and the table in §13.3).
 - **No session tagging for now** (decided 2026-09-28). The server resolves the session from the robot name. Tagging would only catch a late node from a finished session (e.g. re-sent after an MQTT reconnect) landing in the robot's next session; graph-builder already rejects a mismatching `session_id` if one is ever sent, so it can be added later without a server change.
-- **Starting the topomap service itself:** the session-start call reports whether the mapping service is running (`mapping_service`). As built (M3) this comes from the robot's retained `mapping/state` (online, with a last will), not from the orchestrator proxy: it is exactly the process that must be up, and it needs no HTTP hop to the robot. If it isn't running, the session still starts and the client tells the user to start it; nothing is started automatically (Q3, decided).
+- **Starting the topomap service itself** (superseded: §14.15, the API now starts it): the session-start call reports whether the mapping service is running (`mapping_service`). As built (M3) this comes from the robot's retained `mapping/state` (online, with a last will), not from the orchestrator proxy: it is exactly the process that must be up, and it needs no HTTP hop to the robot. If it isn't running, the session still starts and the client tells the user to start it; nothing is started automatically (Q3, decided).
 - **No map download, no relocalization.**
 
 ---
@@ -814,6 +814,55 @@ A robot's map is only its open session (§14.2). Removed:
 Unchanged: the mission's own `map_id` / waypoint `map_id` (the map a mission's waypoints are on), `POST /map/load`, `PUT /maps/{id}/datum`, graph-builder (comments only; not rebuilt).
 
 Tests: `tests/unit/test_maps_u6.py` (model, 410, removals, migration SQL), `test_maps_use_consumers.py` (the refusals), `test_planner_map_resolution.py`, `test_map_delete.py`; `tests/integration/maps/checks_m2.py` drives ingest by `start_session` / `finish` instead of the shim. `mapsu6.sh --dry-run` runs the unit tests and the migration (up, idempotent re-run, down, up) on a throwaway Postgres restored from production's schema.
+
+### 14.15 The switch goes through the orchestrator (2026-09-30, user decision)
+
+**What changed.** The robot no longer follows a retained `mapping/set` and no longer publishes
+`mapping/{service}/state`. The API starts and stops the session's mapping services on the
+robot's `satibot_orchestrator` (`POST /services/{name}/start|stop`, the same address the
+`/api/v1/orchestration/{robot}/*` proxy uses) and reads their state from it
+(`GET /services/{name}/status`). **Why:** a simpler robot (no switch node, no last-will
+plumbing, no two-topic alias), and the server already gates the nodes: graph-builder drops a
+node with no open, unpaused, placed mapping session (`MAP.INGEST_REJECTED`). So the switch only
+decides whether the service *runs*; what is *kept* stays the session's business. Supersedes
+§8's "mapping switch over MQTT", M3 (§13.3) and the topics of U5 (§14.5, §14.12); the
+session model, placement and U6 (the session is the only notion of a robot's map) are
+untouched.
+
+**Rules** (`packages/api/mapping_switch.py`, `maps.py`):
+- *Start* (opening a mapping session; resume) = open the session, then start each service in
+  its `services` (today `topo`). It runs **inside the session's transaction**: when the start
+  fails (robot has no registered orchestrator or does not answer: 502; timeout: 504; the
+  orchestrator has no such service: 409; orchestrator error: 502) nothing is committed: no
+  session, no event, the map state is as before (a `replace` keeps the old session). A service
+  that already runs is fine.
+- *Pause* = stop the service, *resume* = start it, *finish* = stop it, *replace* stops what the
+  new session does not run. The stop is after the commit and **best effort**: an offline robot's
+  session is closed/paused anyway and the response says `robot_notified: false` plus a
+  `mapping_warning`; a repeated pause/finish retries the stop. A finish of an old session never
+  stops a service another open session of the robot runs.
+- *Place* does not touch the services: a session that is not placed has its service running and
+  its nodes rejected (`session_unplaced`) until it is placed, as before, but without a switch.
+- *Names:* `topo` is `topomap` on the real robot and `sim_topomap` in the sim (the sim's
+  orchestrator config cannot change). `packages/config.py::MAPPING_SERVICE_CANDIDATES` is an
+  ordered candidate list per session service (`MAPPING_SERVICE_TOPO=topomap,sim_topomap`,
+  `_GRID=grid`); the first one the robot's orchestrator lists is used.
+- *State* the client shows (`mapping_state`, `mapping_service`, `mapping_services`) comes from the
+  orchestrator, cached 5 s per robot; robots that are offline or have no registered
+  orchestrator are not asked. Shapes are kept (see packages/api/README.md); `online` now means
+  "the service runs", `status` is `on` when it runs and the session captures, `unreachable`
+  when the orchestrator did not answer, `nodes_sent` is the session's `node_count` (null on the
+  robot views).
+- *Removed:* `mapping/set` publishing (API and mission-dispatch: after a run change the session
+  is unplaced and graph-builder drops its nodes), the state subscription/cache and the M3
+  alias, `POST /robots/{r}/mapping/off` (force-off), the re-publish on every broker connect, and
+  `packages/api/mapping_control.py`. A one-time cleanup clears the retained topics on the broker
+  (`~/pg-cutover/scripts/mapsorch.sh`).
+
+**Not done (open):** nothing reconciles running services with sessions after an API restart, an
+orchestrator restart or a robot reboot (the old retained message did); a service that keeps
+running for a closed session captures nothing that is kept. `grid` has no orchestrator service
+yet (the default name `grid` is a placeholder).
 
 ---
 
