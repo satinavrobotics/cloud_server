@@ -599,6 +599,18 @@ async def list_map_sessions(map_id: str, limit: Optional[int] = None,
         service.database, map_id, limit, before))
 
 
+@app.get("/api/v1/maps/{map_id}/sessions/{session_id}/placement-suggestions")
+async def map_session_placement_suggestions(map_id: str, session_id: str):
+    """"Last position on this map" for an unplaced session (maps §14.3): {map_id, session_id,
+    suggestions: [{source: "last_position", basis: unplace_snapshot | state_history |
+    finished_session, map_T_session, pose, robot_pose, at, from_session_id}]}, at most one.
+    Accept it with POST .../place (`pose` + the live `robot_pose`, optional `source`).
+    Empty for a placed session or a geo map; 404 unknown map/session; 409 finished session."""
+    _require_service()
+    return await _site_call("placement suggestions", maps.placement_suggestions(
+        service.database, map_id, session_id))
+
+
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/place")
 async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     """Place the session's robot on a local map (maps §14.3) `{pose: {x, y, yaw}, robot_pose:

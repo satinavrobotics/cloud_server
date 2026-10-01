@@ -23,6 +23,7 @@ import asyncio
 import datetime
 import json
 import logging
+import math
 import re
 import requests
 import time
@@ -903,6 +904,20 @@ class Robot:
         self.info(f"New robot run ({evidence}): unplacing its open map session")
         patch = {"unplaced_reason": map_sessions.UNPLACED_RUN_CHANGED,
                  "unplaced_at": now.isoformat(), "unplaced_evidence": evidence}
+        # Where the robot last was, in the OLD run's frame: the pose in memory is still the old
+        # run's (both callers run before _on_client_message stores the new message's pose), and
+        # the unplace keeps map_t_session -- together they give the "last position" placement
+        # suggestion (map_sessions.last_position_suggestion).
+        pose = self._robot_object.status.pose if self._robot_object is not None else None
+        if pose is not None:
+            try:
+                last = {"x": float(pose.x), "y": float(pose.y), "theta": float(pose.theta)}
+            except (TypeError, ValueError):
+                last = None
+            if last is not None and all(math.isfinite(v) for v in last.values()):
+                patch["last_robot_pose"] = last
+        if self._run_epoch is not None:
+            patch["old_run_id"] = str(self._run_epoch)
         try:
             async with self._database.connection() as conn:
                 async with conn.cursor() as cursor:

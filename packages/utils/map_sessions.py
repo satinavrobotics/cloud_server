@@ -47,6 +47,7 @@ STILL_ANGULAR_RADPS = 0.01
 SOURCE_USER = "user"          # POST .../place or `placement` on start
 SOURCE_SESSION = "session"    # carried over from the robot's previous session (replace, same run)
 SOURCE_DATUM = "datum"        # a geo session re-placed from the robot's datum (U3)
+SOURCE_LAST_POSITION = "last_position"  # suggested from where the robot last was on this map
 UNPLACED_RUN_CHANGED = "run_changed"
 
 SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "purpose", "services",
@@ -105,6 +106,60 @@ def placement_transform(pose: Mapping[str, Any], robot_pose: Mapping[str, Any]
     p_robot = {"tx": float(robot_pose["x"]), "ty": float(robot_pose["y"]),
                "yaw": float(robot_pose["theta"])}
     return compose(p_map, map_geo.invert_transform(p_robot))
+
+
+def _finite_pose(pose: Any, yaw_key: str) -> Optional[Tuple[float, float, float]]:
+    try:
+        vals = (float(pose["x"]), float(pose["y"]), float(pose[yaw_key]))
+    except (TypeError, ValueError, KeyError):
+        return None
+    return vals if all(math.isfinite(v) for v in vals) else None
+
+
+def last_position_suggestion(old_map_t_session: Any, last_robot_pose: Any,
+                             run_start_pose: Any = None) -> Optional[Dict[str, Any]]:
+    """"Last position on this map" placement suggestion for an unplaced session.
+
+    `old_map_t_session` {tx, ty, yaw}: the session's (or an earlier one's) placement in the run
+    the robot was last seen in; `last_robot_pose` {x, y, theta}: its pose in THAT run frame.
+    `run_start_pose` {x, y, theta}: the robot's first pose in its CURRENT run frame (None: the
+    odometry origin 0, 0, 0 -- a restarted robot starts there). The robot is assumed not to
+    have moved between its last pose and the start of the new run.
+
+    Returns {map_T_session, pose, robot_pose}: `pose` = the last pose in the map frame,
+    `robot_pose` = run_start_pose, `map_T_session` = placement_transform(pose, robot_pose), so
+    it holds however far the robot drove since the restart (the client shows map_T_session
+    applied to the live pose). None when an input is missing or not finite."""
+    last = _finite_pose(last_robot_pose, "theta")
+    if last is None or not isinstance(old_map_t_session, Mapping):
+        return None
+    try:
+        old = {k: float(old_map_t_session[k]) for k in ("tx", "ty", "yaw")}
+    except (TypeError, ValueError, KeyError):
+        return None
+    if not all(math.isfinite(v) for v in old.values()):
+        return None
+    start = (_finite_pose(run_start_pose, "theta") if run_start_pose is not None
+             else (0.0, 0.0, 0.0))
+    if start is None:
+        return None
+    x, y, yaw = map_geo.apply_pose(old, *last)
+    pose = {"x": x, "y": y, "yaw": yaw}
+    robot_pose = {"x": start[0], "y": start[1], "theta": start[2]}
+    return {"map_T_session": placement_transform(pose, robot_pose), "pose": pose,
+            "robot_pose": robot_pose}
+
+
+# robot_state_ts rows (run frame x, y, yaw; about one per 5 s, kept 30 days). Params of both:
+# robot_name, start, start, end, end (a NULL bound is open; start inclusive, end exclusive).
+_STATE_POSE_SELECT = (
+    "SELECT ts, x, y, yaw FROM robot_state_ts WHERE robot_name = %s "
+    "AND (%s::timestamptz IS NULL OR ts >= %s) AND (%s::timestamptz IS NULL OR ts < %s) "
+    "AND x IS NOT NULL AND y IS NOT NULL AND yaw IS NOT NULL ")
+STATE_POSE_LAST_SQL = _STATE_POSE_SELECT + "ORDER BY ts DESC LIMIT 1"
+STATE_POSE_FIRST_SQL = _STATE_POSE_SELECT + "ORDER BY ts ASC LIMIT 1"
+# When the robot's current run epoch began and why (run_changed: a real run reset).
+RUN_START_SQL = "SELECT started_at, reason FROM robot_run_epochs WHERE robot_name = %s"
 
 
 def yaw_difference(a: float, b: float) -> float:

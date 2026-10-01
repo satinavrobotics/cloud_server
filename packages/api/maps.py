@@ -208,9 +208,18 @@ class PlaceRequest(pydantic.BaseModel):
     """POST .../sessions/{sid}/place, and `placement` on start."""
     pose: MapPose
     robot_pose: RobotPose
+    # Optional: "last_position" when the user accepted a placement suggestion (recorded in
+    # placement.source; the pose and robot_pose are what counts). Absent: a manual placement.
+    source: Optional[str] = None
 
     class Config:
         extra = pydantic.Extra.forbid
+
+    @pydantic.validator("source")
+    def _source(cls, value):  # noqa: N805
+        if value is not None and value != ms.SOURCE_LAST_POSITION:
+            raise ValueError(f"source must be {ms.SOURCE_LAST_POSITION!r} when given")
+        return value
 
 
 class StartSessionRequest(pydantic.BaseModel):
@@ -442,6 +451,38 @@ class SqlStore:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Run epoch of %s not readable (%s); no placement is reused",
                            name, exc)
+            return None
+        return (row[0], row[1]) if row is not None else None
+
+    async def robot_state_pose(self, name: str, start: Optional[datetime.datetime] = None,
+                               end: Optional[datetime.datetime] = None, first: bool = False
+                               ) -> Optional[Dict[str, Any]]:
+        """The robot's last (`first`: earliest) recorded pose {ts, x, y, theta} (run frame)
+        in [start, end) from robot_state_ts; None when there is none or the table cannot be
+        read. In a savepoint: a missing table never aborts the caller's transaction."""
+        try:
+            async with self.conn.transaction():
+                await self.cursor.execute(
+                    ms.STATE_POSE_FIRST_SQL if first else ms.STATE_POSE_LAST_SQL,
+                    (name, start, start, end, end))
+                row = await self.cursor.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("robot_state_ts of %s not readable (%s); no state-history "
+                           "placement suggestion", name, exc)
+            return None
+        if row is None:
+            return None
+        return {"ts": row[0], "x": row[1], "y": row[2], "theta": row[3]}
+
+    async def robot_run_start(self, name: str) -> Optional[Tuple[Any, Any]]:
+        """(started_at, reason) of the robot's current run epoch (robot_run_epochs); None
+        without a row or when it cannot be read. In a savepoint."""
+        try:
+            async with self.conn.transaction():
+                await self.cursor.execute(ms.RUN_START_SQL, (name,))
+                row = await self.cursor.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Run epoch of %s not readable (%s)", name, exc)
             return None
         return (row[0], row[1]) if row is not None else None
 
@@ -760,6 +801,124 @@ async def session_history(db: Any, name: str, limit: Optional[int] = None,
     items = [session_dict(r) for r in rows[:limit]]
     return {"map_id": name, "count": total, "items": items,
             "next_before": items[-1]["session_id"] if more and items else None}
+
+
+def _parse_ts(value: Any) -> Optional[datetime.datetime]:
+    if isinstance(value, datetime.datetime):
+        return value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)
+    if isinstance(value, str):
+        try:
+            ts = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return ts if ts.tzinfo else ts.replace(tzinfo=datetime.timezone.utc)
+    return None
+
+
+async def _run_start_pose(store: Any, robot_name: str, lower: Optional[datetime.datetime]
+                          ) -> Optional[Dict[str, Any]]:
+    """The robot's first recorded pose at or after `lower` (when its current run began), in
+    the run frame; None when unknown (the caller then assumes the odometry origin)."""
+    if lower is None:
+        return None
+    return await store.robot_state_pose(robot_name, start=lower, first=True)
+
+
+def _suggestion(basis: str, found: Mapping[str, Any], at: Any, from_session_id: Any
+                ) -> Dict[str, Any]:
+    return {"source": ms.SOURCE_LAST_POSITION, "basis": basis,
+            "map_T_session": found["map_T_session"], "pose": found["pose"],
+            "robot_pose": found["robot_pose"],
+            "at": _iso(at), "from_session_id": str(from_session_id)}
+
+
+async def placement_suggestions(db: Any, map_name: str, session_id: str) -> Dict[str, Any]:
+    """GET /api/v1/maps/{id}/sessions/{sid}/placement-suggestions: "last position on this map"
+    for an UNPLACED session (the robot restarted: run_changed). At most one suggestion, the
+    first source that works:
+
+    - `unplace_snapshot`: the dispatcher stored the robot's last pose (old run frame) in
+      placement.last_robot_pose when it unplaced the session; with the session's own
+      map_t_session (kept by the unplace) that is where the robot stood on the map;
+    - `state_history`: a session unplaced before that was stored: the robot's last
+      robot_state_ts row before placement.unplaced_at (robot clock vs server clock: a skew of a
+      few seconds can shift the cut), with the session's own map_t_session;
+    - `finished_session`: the robot's most recent finished session on this map that ended
+      placed: its last robot_state_ts row while it ran, with that session's map_t_session.
+
+    The suggestion's map_T_session pairs the last map pose with the robot's FIRST pose in its
+    current run (robot_pose; the odometry origin when unknown), so it stays right when the
+    robot drove since the restart. Accepting is the ordinary POST .../place with `pose` and
+    the live robot pose. 404 unknown map/session; 409 finished session; a geo map or a placed
+    session: no suggestions."""
+    try:
+        sid = str(uuid.UUID(str(session_id)))
+    except ValueError:
+        raise HTTPException(404, f"Did not find session \"{session_id}\"") from None
+    out: Dict[str, Any] = {"map_id": map_name, "session_id": sid, "suggestions": []}
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            row = await store.lock_map(map_name)
+            if row is None:
+                raise HTTPException(404, f"Did not find \"map\" with name \"{map_name}\"")
+            session = await store.lock_session(sid)
+            if session is None or session["map_name"] != map_name:
+                raise HTTPException(404, f"Did not find session \"{sid}\" on map "
+                                         f"\"{map_name}\"")
+            if session["ended_at"] is not None:
+                raise HTTPException(409, f"Session {sid} is finished")
+            if row.type == "geo" or ms.is_placed(session):
+                return out
+            robot_name = session["robot_name"]
+            placement = session.get("placement") or {}
+            unplaced_at = _parse_ts(placement.get("unplaced_at"))
+            epoch = await store.robot_run_start(robot_name)
+            epoch_start = (_parse_ts(epoch[0]) if epoch is not None and epoch[1] == "run_changed"
+                           else None)
+
+            # a. the dispatcher's snapshot
+            found = None
+            if session.get("map_t_session") is not None:
+                lower = unplaced_at or epoch_start
+                start = await _run_start_pose(store, robot_name, lower)
+                last = placement.get("last_robot_pose")
+                if last is not None:
+                    found = ms.last_position_suggestion(session["map_t_session"], last, start)
+                    if found is not None:
+                        out["suggestions"].append(_suggestion(
+                            "unplace_snapshot", found, placement.get("unplaced_at"), sid))
+                        return out
+                # b. the robot's recorded history before the unplace
+                if last is None and unplaced_at is not None:
+                    seen = await store.robot_state_pose(robot_name, end=unplaced_at)
+                    if seen is not None:
+                        found = ms.last_position_suggestion(session["map_t_session"], seen,
+                                                            start)
+                        if found is not None:
+                            out["suggestions"].append(_suggestion(
+                                "state_history", found, seen["ts"], sid))
+                            return out
+            # c. the robot's last finished session on this map that ended placed
+            for old in await store.sessions_page(map_name, 50, None):
+                if (old["robot_name"] != robot_name or old["ended_at"] is None
+                        or not ms.is_placed(old) or old.get("map_t_session") is None
+                        or str(old["session_id"]) == sid):
+                    continue
+                ended = _parse_ts(old["ended_at"])
+                seen = await store.robot_state_pose(
+                    robot_name, start=_parse_ts(old["started_at"]), end=ended)
+                if seen is None:
+                    continue
+                lower = max((t for t in (ended, epoch_start) if t is not None), default=None)
+                start = await _run_start_pose(store, robot_name, lower)
+                found = ms.last_position_suggestion(old["map_t_session"], seen, start)
+                if found is not None:
+                    out["suggestions"].append(_suggestion(
+                        "finished_session", found, seen["ts"], old["session_id"]))
+                break
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    return out
 
 
 async def _archive_or_restore(db: Any, name: str, archive: bool, publisher_id: uuid.UUID,
@@ -1401,7 +1560,7 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                 raise HTTPException(409, f"Robot '{robot.name}' is offline")
             await check_robot_still(store, robot, req.robot_pose.dict())
             old = session.get("map_t_session") if ms.is_placed(session) else None
-            placement = _placement_record(req, ms.SOURCE_USER, actor, now)
+            placement = _placement_record(req, req.source or ms.SOURCE_USER, actor, now)
             transform = ms.placement_transform(placement["pose"], placement["robot_pose"])
             session.update(map_t_session=transform, aligned=True, placement=placement)
             await store.update_session(session_id, map_t_session=transform, aligned=True,
