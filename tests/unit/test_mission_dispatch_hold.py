@@ -202,3 +202,120 @@ async def test_on_client_message_does_not_touch_an_already_running_mission():
     assert mission.status.state == mission_object.MissionStateV1.RUNNING
     if r._robot_online_task is not None:
         r._robot_online_task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Readiness error types -> fixed hold reasons
+# ---------------------------------------------------------------------------
+BASE_REASON = "Robot base is not responding"
+NAV_REASON = "Robot navigation is not ready"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("error_type,reason", [
+    ("robotBaseNotReadyError", BASE_REASON),
+    ("navigationNotReadyError", NAV_REASON),
+    ("poseHealthNotReadyError", NAV_REASON),
+    ("tfChainNotReadyError", NAV_REASON),
+])
+async def test_dispatch_hold_reason_per_readiness_type(error_type, reason):
+    r, _ = _make_robot(online=True)
+    r._robot_object.status.errors = {error_type: "x"}
+    assert r._dispatch_hold_reason() == reason
+
+
+@pytest.mark.unit
+async def test_base_reason_differs_from_nav_and_wins_when_both_present():
+    r, _ = _make_robot(online=True)
+    r._robot_object.status.errors = {"tfChainNotReadyError": "x"}
+    nav = r._dispatch_hold_reason()
+    r._robot_object.status.errors = {
+        "tfChainNotReadyError": "x", "robotBaseNotReadyError": "y"}
+    assert r._dispatch_hold_reason() == BASE_REASON != nav
+
+
+@pytest.mark.unit
+async def test_held_reason_stable_while_description_varies_and_releases():
+    r, db = _make_robot(online=True)
+    mission = _make_mission()
+    r._missions[mission.name] = mission
+    r._robot_object.status.errors = {
+        "robotBaseNotReadyError": "Robot base not responding (no /esp32/odom for 4 s)"}
+    await r._try_start_mission()
+    assert mission.status.held_reason == BASE_REASON
+    writes = len(_mission_status_writes(db))
+    assert writes == 1
+
+    for secs in (5, 6, 7):
+        r._robot_object.status.errors = {
+            "robotBaseNotReadyError":
+                f"Robot base not responding (no /esp32/odom for {secs} s)"}
+        await r._try_start_mission()
+    assert mission.status.held_reason == BASE_REASON
+    assert len(_mission_status_writes(db)) == writes
+
+    # type changes: reason updates with one more write each time
+    r._robot_object.status.errors = {"tfChainNotReadyError": "x"}
+    await r._try_start_mission()
+    assert mission.status.held_reason == NAV_REASON
+    assert len(_mission_status_writes(db)) == writes + 1
+    r._robot_object.status.errors = {"robotBaseNotReadyError": "x"}
+    await r._try_start_mission()
+    assert mission.status.held_reason == BASE_REASON
+    assert len(_mission_status_writes(db)) == writes + 2
+
+    # error disappears -> released and dispatched
+    r._robot_object.status.errors = {}
+    await r._try_start_mission()
+    assert mission.status.held is False
+    assert mission.status.state == mission_object.MissionStateV1.RUNNING
+    r._cancel_mission_timeout()
+
+
+# ---------------------------------------------------------------------------
+# get_mission_errors: FATAL without references
+# ---------------------------------------------------------------------------
+def _base_error(level, secs=4):
+    return types.VDA5050Error(
+        errorType="robotBaseNotReadyError", errorReferences=[],
+        errorDescription=f"Robot base not responding (no /esp32/odom for {secs} s)",
+        errorLevel=level)
+
+
+@pytest.mark.unit
+async def test_fatal_base_error_without_references_sets_failure_reason():
+    r, _ = _make_robot(online=True)
+    mission = _make_mission()
+    mission.status.state = mission_object.MissionStateV1.RUNNING
+    r._current_mission = mission
+    state = _build_state([_base_error(types.VDA5050ErrorLevel.FATAL)])
+    assert r.get_mission_errors(state) is True
+    assert "Robot base not responding" in mission.status.failure_reason
+
+
+@pytest.mark.unit
+async def test_warning_base_error_does_not_fail_or_set_reason():
+    r, _ = _make_robot(online=True)
+    mission = _make_mission()
+    r._current_mission = mission
+    state = _build_state([_base_error(types.VDA5050ErrorLevel.WARNING)])
+    assert r.get_mission_errors(state) is False
+    assert not mission.status.failure_reason
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("level", [types.VDA5050ErrorLevel.WARNING,
+                                   types.VDA5050ErrorLevel.FATAL])
+async def test_idle_robot_base_error_keeps_pending_mission_held(level):
+    r, db = _make_robot(online=False)
+    mission = _make_mission()
+    r._missions[mission.name] = mission
+    await r._try_start_mission()
+    r._robot_object.status.online = True
+    await r._on_client_message(_build_state([_base_error(level)]))
+    assert mission.status.state == mission_object.MissionStateV1.PENDING
+    assert mission.status.held is True
+    assert mission.status.held_reason == BASE_REASON
+    r._mqtt_client.publish.assert_not_called()
+    if r._robot_online_task is not None:
+        r._robot_online_task.cancel()

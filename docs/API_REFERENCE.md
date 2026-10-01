@@ -533,6 +533,13 @@ robot reporting one should be badged FAULT by clients (see
 reports is treated as a non-fault warning by clients. Empty by default —
 nothing is FAULT until an operator opts specific error types in here.
 
+Separate from FAULT classification, mission-dispatch holds a PENDING mission
+(`held`/`held_reason`) while the robot reports one of these standing readiness
+`errorType`s: `robotBaseNotReadyError` ("Robot base is not responding");
+`navigationNotReadyError`, `poseHealthNotReadyError`, `tfChainNotReadyError`
+("Robot navigation is not ready"). The reason is a fixed string, and the hold
+releases when the error disappears from the robot's state.
+
 **Response:** Same shape as `GET /api/v1/settings`, reflecting the update.
 
 **Backend Service:** Mission Dispatcher Database (Postgres)

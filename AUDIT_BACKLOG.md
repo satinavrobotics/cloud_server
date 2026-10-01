@@ -274,6 +274,7 @@ IDLE / cancel; the queue stays blocked until `MAX_ORDER_MISMATCHES` rescues it.
 
 ### C9. `get_mission_errors()` trusts any FATAL error — **medium** (from `docs/BACKLOG.md`)
 Still open: a lingering FATAL from an unrelated order can fail a fresh mission.
+A FATAL `robotBaseNotReadyError` (no references) now gets a `failure_reason`; the lingering-FATAL attribution issue remains.
 
 ### C10. Unvalidated spec writes — **low/medium**
 `update_robot` / `update_mission` accept a raw `dict` and `setattr` arbitrary spec
