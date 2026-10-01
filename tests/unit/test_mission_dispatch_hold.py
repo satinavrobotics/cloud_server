@@ -218,14 +218,14 @@ NAV_REASON = "Robot navigation is not ready"
     ("poseHealthNotReadyError", NAV_REASON),
     ("tfChainNotReadyError", NAV_REASON),
 ])
-def test_dispatch_hold_reason_per_readiness_type(error_type, reason):
+async def test_dispatch_hold_reason_per_readiness_type(error_type, reason):
     r, _ = _make_robot(online=True)
     r._robot_object.status.errors = {error_type: "x"}
     assert r._dispatch_hold_reason() == reason
 
 
 @pytest.mark.unit
-def test_base_reason_differs_from_nav_and_wins_when_both_present():
+async def test_base_reason_differs_from_nav_and_wins_when_both_present():
     r, _ = _make_robot(online=True)
     r._robot_object.status.errors = {"tfChainNotReadyError": "x"}
     nav = r._dispatch_hold_reason()
@@ -283,7 +283,7 @@ def _base_error(level, secs=4):
 
 
 @pytest.mark.unit
-def test_fatal_base_error_without_references_sets_failure_reason():
+async def test_fatal_base_error_without_references_sets_failure_reason():
     r, _ = _make_robot(online=True)
     mission = _make_mission()
     mission.status.state = mission_object.MissionStateV1.RUNNING
@@ -294,7 +294,7 @@ def test_fatal_base_error_without_references_sets_failure_reason():
 
 
 @pytest.mark.unit
-def test_warning_base_error_does_not_fail_or_set_reason():
+async def test_warning_base_error_does_not_fail_or_set_reason():
     r, _ = _make_robot(online=True)
     mission = _make_mission()
     r._current_mission = mission
