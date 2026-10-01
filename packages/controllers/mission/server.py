@@ -154,10 +154,15 @@ def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str,
     }
 
 
-# VDA5050 error types that mean "this robot's mission can't make forward progress
-# right now" — mirrors sati-client's utils/robotStatus.ts NAVIGATION_READINESS_ERROR_TYPES
-# so client and server agree on the same definition of "nav ready".
-NAVIGATION_READINESS_ERROR_TYPES = {"navigationNotReadyError", "poseHealthNotReadyError"}
+# VDA5050 readiness errorType -> fixed hold reason (never the description: it carries a
+# changing counter). Nav keys mirror sati-client's utils/robotStatus.ts; base is server-side.
+_NAV_NOT_READY = "Robot navigation is not ready"
+READINESS_HOLD_REASONS = {
+    "robotBaseNotReadyError": "Robot base is not responding",
+    "navigationNotReadyError": _NAV_NOT_READY,
+    "poseHealthNotReadyError": _NAV_NOT_READY,
+    "tfChainNotReadyError": _NAV_NOT_READY,
+}
 
 
 class Robot:
@@ -352,8 +357,10 @@ class Robot:
         human-readable reason dispatch should be withheld."""
         if self._robot_object is None or not self._robot_object.status.online:
             return "Robot is offline"
-        if NAVIGATION_READINESS_ERROR_TYPES & self._robot_object.status.errors.keys():
-            return "Robot navigation is not ready"
+        errors = self._robot_object.status.errors
+        for error_type, reason in READINESS_HOLD_REASONS.items():
+            if error_type in errors:
+                return reason
         return None
 
     def _has_outstanding_cancel(self) -> bool:
@@ -1834,6 +1841,7 @@ class Robot:
 
     def get_mission_errors(self, message: types.VDA5050State):
         fatal_errors = False
+        reason_set = False
         if len(message.errors) == 0:
             return False
         for error in message.errors:
@@ -1858,6 +1866,12 @@ class Robot:
                             = error.errorDescription
                         self._current_mission.status.failure_reason = "\n".join(
                             error.errorDescription for error in message.errors)
+                        reason_set = True
+        # FATAL without node/action references still needs a reason.
+        if fatal_errors and not reason_set and self._current_mission is not None:
+            self._current_mission.status.failure_reason = "\n".join(
+                e.errorDescription for e in message.errors
+                if e.errorLevel == types.VDA5050ErrorLevel.FATAL)
         return fatal_errors
 
     def update_mission_from_behavior_tree(self):
