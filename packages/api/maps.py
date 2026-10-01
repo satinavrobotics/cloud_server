@@ -930,11 +930,8 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
         raise HTTPException(404, f"Did not find \"robot\" with name \"{robot_name}\"")
     if not robot.status.online:
         raise HTTPException(409, f"Robot '{robot_name}' is offline")
-    mine = await store.open_sessions_of_robot(robot_name)
-    if mine:
-        raise HTTPException(409, f"Robot '{robot_name}' already has an open "
-                                 f"{ms.purpose_of(mine[0])} session on map "
-                                 f"'{mine[0]['map_name']}' (pass replace: true to end it)")
+    # _open_tx already resolved the robot's open session (refused it, or replaced/finished it)
+    # before calling us, so the robot has none here; no need to check again.
     if purpose == ms.OPERATE and row.state == DRAFT:
         raise HTTPException(409, f"Map '{map_name}' is a draft without data; there is nothing "
                                  "to use yet (start mapping it)")
