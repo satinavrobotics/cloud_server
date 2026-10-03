@@ -63,3 +63,15 @@ async def test_a_failing_handler_is_logged_and_the_loop_goes_on():
     await asyncio.wait_for(Robot.run(robot), timeout=2)
     assert handled == ["a", "b"]
     assert len(warnings) == 1 and "handler bug" in warnings[0]
+
+
+def test_datum_changed_ignores_jitter_but_not_moves_frame_or_bearing():
+    from packages.controllers.mission.server import _datum_changed
+    from cloud_common.objects.robot import RobotDatumV1 as D
+    base = D(latitude=47.0, longitude=19.0, bearing_deg=359.9)
+    assert _datum_changed(None, base)
+    assert _datum_changed(D(), base)                      # no previous position
+    assert not _datum_changed(base, D(latitude=47.000005, longitude=19.0, bearing_deg=0.1))
+    assert _datum_changed(base, D(latitude=47.0001, longitude=19.0, bearing_deg=359.9))
+    assert _datum_changed(base, D(latitude=47.0, longitude=19.0, bearing_deg=5.0))
+    assert _datum_changed(base, D(latitude=47.0, longitude=19.0, bearing_deg=359.9, frame="utm"))

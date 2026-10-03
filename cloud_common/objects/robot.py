@@ -197,6 +197,14 @@ class RobotSpecV1(pydantic.BaseModel):
         default_factory=RobotDatumV1,
         description="GPS origin last reported by the robot via its MQTT datum topic."
     )
+    datum_changed_at: Optional[datetime.datetime] = pydantic.Field(
+        None, description="When the datum last CHANGED (position moved more than ~1 m, or frame "
+                          "or bearing differ), not when it was last received: retained "
+                          "re-deliveries and reconnect republishes do not refresh it. None = "
+                          "unknown (a datum stored before this field existed and not changed since).")
+    datum_stamp: Optional[datetime.datetime] = pydantic.Field(
+        None, description="The publisher's own timestamp of the datum message, if the payload "
+                          "carried one. Informational.")
     ip_address: Optional[str] = pydantic.Field(
         None, description="IPv4 address of the robot, updated on each startup.")
     entrypoint_port: Optional[int] = pydantic.Field(

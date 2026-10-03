@@ -67,7 +67,7 @@ async def test_datum_write_keeps_a_concurrent_level_change():
     await r._process_datum_message(types.RobotDatum(latitude=47.5, longitude=19.0,
                                                     bearing_deg=12.0))
 
-    assert db.writes == [("fields", "r1", ["datum"])]
+    assert db.writes == [("fields", "r1", ["datum", "datum_changed_at"])]
     assert db.spec["telemetry_recording"] == "full"       # survived the datum write
     assert db.spec["labels"] == ["ops"]
     assert db.spec["datum"] == {"latitude": 47.5, "longitude": 19.0, "bearing_deg": 12.0,
@@ -162,3 +162,43 @@ async def test_update_spec_fields_rejects_unknown_keys_and_skips_empty():
         await db.update_spec_fields(api_objects.RobotObjectV1, "r1", {"bogus": 1}, "pub")
     await db.update_spec_fields(api_objects.RobotObjectV1, "r1", {}, "pub")
     assert log == []
+
+
+async def _datum(r, db, **kw):
+    db.writes.clear()
+    await r._process_datum_message(types.RobotDatum(**{"latitude": 47.5, "longitude": 19.0, **kw}))
+
+
+async def test_datum_changed_at_moves_only_when_the_datum_changes():
+    cached = api_objects.RobotObjectV1(name="r1", status={})
+    db = StoreDB(cached)
+    r = _robot(db)
+    r._robot_object = cached
+
+    await _datum(r, db)                                   # first datum: a change
+    first = db.spec["datum_changed_at"]
+    assert first is not None and "datum_stamp" not in db.spec or db.spec["datum_stamp"] is None
+
+    await _datum(r, db, longitude=19.0000050)             # ~0.4 m jitter: not a change
+    assert "datum_changed_at" not in db.writes[0][2]
+    assert db.spec["datum_changed_at"] == first
+
+    await _datum(r, db, longitude=19.0001)                # ~7.6 m: a change
+    assert db.spec["datum_changed_at"] != first
+    second = db.spec["datum_changed_at"]
+
+    await _datum(r, db, longitude=19.0001, frame="utm")   # same place, new frame: a change
+    assert db.spec["datum_changed_at"] != second
+    api_objects.RobotObjectV1(name="r1", status={}, **db.spec)   # still loads
+
+
+async def test_datum_stamp_is_stored_when_sent_and_ignored_when_garbage():
+    cached = api_objects.RobotObjectV1(name="r1", status={})
+    db = StoreDB(cached)
+    r = _robot(db)
+    r._robot_object = cached
+
+    await _datum(r, db, stamp="2026-10-03T10:00:00Z")
+    assert db.spec["datum_stamp"].startswith("2026-10-03T10:00:00")
+    await _datum(r, db, stamp="not a time")               # the datum itself is still accepted
+    assert db.spec["datum_stamp"].startswith("2026-10-03T10:00:00")

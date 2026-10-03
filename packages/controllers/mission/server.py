@@ -81,6 +81,30 @@ STALE_STATE_GRACE_S = 30.0
 RUN_CHECK_RETRY_S = 30.0
 
 
+# A datum that moves less than this is GNSS jitter, not a change (map-location plan A).
+DATUM_CHANGE_THRESHOLD_M = 1.0
+DATUM_BEARING_THRESHOLD_DEG = 0.5
+
+
+def _datum_changed(old: Optional[robot_object.RobotDatumV1],
+                   new: robot_object.RobotDatumV1) -> bool:
+    """Did the datum change materially? Position beyond ~1 m, a different frame, or a
+    different bearing. No previous position counts as a change."""
+    if old is None or old.latitude is None or old.longitude is None:
+        return True
+    if new.latitude is None or new.longitude is None:
+        return True
+    if old.frame != new.frame:
+        return True
+    mean_lat = math.radians((old.latitude + new.latitude) / 2.0)
+    d_north = math.radians(new.latitude - old.latitude) * 6371000.0
+    d_east = math.radians(new.longitude - old.longitude) * 6371000.0 * math.cos(mean_lat)
+    if math.hypot(d_north, d_east) > DATUM_CHANGE_THRESHOLD_M:
+        return True
+    d_bearing = abs((new.bearing_deg - old.bearing_deg + 180.0) % 360.0 - 180.0)
+    return d_bearing > DATUM_BEARING_THRESHOLD_DEG
+
+
 class RouteRefused(Exception):
     """A route node that must not be sent (maps §14): its waypoints are on a map the robot is
     not placed on, not using, or its session could not be read. The node fails."""
@@ -876,12 +900,22 @@ class Robot:
         datum_* fields) comes from its first mapping session (doc Q1, packages/api/maps.py);
         seeding from the robot's assigned map gave local maps a datum, and wrote a mapless
         sentinel's row with whichever robot sent a datum first."""
-        self._robot_object.datum = robot_object.RobotDatumV1(**msg.dict())
+        old = self._robot_object.datum
+        new = robot_object.RobotDatumV1(**msg.dict())
+        self._robot_object.datum = new
         # Only the datum (robots send it every few seconds): writing the cached full spec
         # back would revert any spec change committed since the cache was filled.
+        fields: Dict[str, Any] = {"datum": json.loads(new.json())}
+        # Freshness (map-location plan A): keyed on CHANGE time, not receive time, because
+        # retained re-deliveries and reconnect republishes would make an old datum look fresh.
+        if _datum_changed(old, new):
+            self._robot_object.datum_changed_at = datetime.datetime.now(datetime.timezone.utc)
+            fields["datum_changed_at"] = self._robot_object.datum_changed_at.isoformat()
+        if msg.stamp is not None:
+            self._robot_object.datum_stamp = msg.stamp
+            fields["datum_stamp"] = msg.stamp.isoformat()
         await self._database.update_spec_fields(
-            api_objects.RobotObjectV1, self._name,
-            {"datum": json.loads(self._robot_object.datum.json())}, self._writer_id()
+            api_objects.RobotObjectV1, self._name, fields, self._writer_id()
         )
         epoch = getattr(self._robot_server, "mqtt_epoch", 0)
         trusted = self._datum_epoch == epoch

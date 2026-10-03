@@ -19,6 +19,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # This repository implements data types and logic specified in the VDA5050 protocol, which is
 # specified here https://github.com/VDA5050/VDA5050/blob/main/VDA5050_EN.md
+import datetime
 import enum
 import math
 from typing import List, Optional
@@ -669,6 +670,18 @@ class RobotDatum(pydantic.BaseModel):
     utm_north: Optional[bool] = None
     utm_easting: Optional[float] = None
     utm_northing: Optional[float] = None
+    # Publisher's timestamp (ISO 8601 or unix seconds), when sent. Unparseable -> None, never
+    # a rejected datum.
+    stamp: Optional[datetime.datetime] = None
 
     _normalize_frame = pydantic.validator("frame", pre=True, allow_reuse=True)(
         common.normalize_datum_frame)
+
+    @pydantic.validator("stamp", pre=True)
+    def _lenient_stamp(cls, v):  # pylint: disable=no-self-argument
+        if v is None:
+            return None
+        try:
+            return pydantic.parse_obj_as(datetime.datetime, v)
+        except (ValueError, TypeError, pydantic.ValidationError):
+            return None

@@ -252,6 +252,8 @@ Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are
 
 **Legacy node poses (done in M2, `tools/maps_m2_legacy_nodes.py`, §13.2).** Nodes in ArangoDB are **not** rewritten in M1. A geo map's frame is UTM grid metres from the origin, but a migrated map's legacy nodes are in its old datum frame. For a `utm` datum with bearing 0 the two are the same. For an `enu` datum they differ by the grid convergence at the datum (−1.445° for `map`, i.e. about 2.5 cm per metre from the origin) and by the UTM scale factor. M2 must either rewrite those nodes into the map frame (rotate by the convergence; also store `robot_pose`), or give the legacy session the real transform (`map_geo.session_transform(geo, datum)`) instead of identity. Until then the old display path (`POST /map/load` `transform`, from the `datum_*` fields) places them exactly as before.
 
+**Datum freshness (map-location plan A).** `RobotSpecV1` gains `datum_changed_at` (when the robot's datum last *changed*: moved more than about 1 m, or a different frame or bearing; set in `_process_datum_message`) and `datum_stamp` (the publisher's own timestamp, only when the payload has a `stamp`). Change time, not receive time, because the VDA5050 client republishes the datum on every MQTT reconnect and the broker re-delivers retained messages after a server restart; receive time would make an old datum look fresh. A datum stored before the field existed has `datum_changed_at = null` (unknown) until it changes. Both are informational: the client shows "unchanged N ago" and flags a datum without `frame` as legacy; nothing is dimmed or rejected by age. Spec is jsonb with Pydantic defaults, so no Alembic migration.
+
 ## 13. Plan
 
 | Step | Content | Repos |
