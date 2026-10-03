@@ -48,10 +48,10 @@ class ApproxLocationV1(pydantic.BaseModel):
     """A hint of where a `local` map is on the Earth (WGS84), for pins and distance sorting.
     Never a datum: nothing places, aligns or moves a map from it. Geo maps carry none (their
     location is the datum/`geo` origin)."""
-    latitude: float = pydantic.Field(..., ge=-90.0, le=90.0, description="WGS84 latitude (degrees).")
-    longitude: float = pydantic.Field(..., ge=-180.0, le=180.0, description="WGS84 longitude (degrees).")
-    accuracy_m: Optional[float] = pydantic.Field(
-        None, ge=0.0, description="Rough radius of uncertainty in metres, if known.")
+    latitude: common.Latitude = pydantic.Field(..., description="WGS84 latitude (degrees).")
+    longitude: common.Longitude = pydantic.Field(..., description="WGS84 longitude (degrees).")
+    accuracy_m: Optional[common.AccuracyM] = pydantic.Field(
+        None, description="Rough radius of uncertainty in metres, if known.")
     source: ApproxLocationSourceV1 = pydantic.Field(
         "manual", description="'manual' (typed or picked by an operator) or 'robot' (suggested "
                               "from a robot's approximate position).")
@@ -62,7 +62,7 @@ class ApproxLocationV1(pydantic.BaseModel):
 def has_real_datum(latitude: Optional[float], longitude: Optional[float]) -> bool:
     """A datum that anchors a map: both coordinates set and not the (0, 0) placeholder."""
     return (latitude is not None and longitude is not None
-            and not (latitude == 0.0 and longitude == 0.0))
+            and not common.is_null_island(latitude, longitude))
 
 
 class MapSpecV1(pydantic.BaseModel):

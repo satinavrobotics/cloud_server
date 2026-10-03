@@ -1,5 +1,5 @@
 """Does a robot's orchestrator hold a stored map for a cloud map? (relocalization, D2;
-docs/satinav-maps-redesign.md section 12.D)
+docs/satinav-maps-redesign.md ## 16)
 
 Asks GET /maps/list?cloud_map_id=X on the robot's orchestrator, cached RELOC_MAP_HELD_TTL_S
 seconds per (robot, map), never raises, modelled on packages/api/mapping_switch.py. A row with

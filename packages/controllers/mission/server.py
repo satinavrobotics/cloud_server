@@ -45,6 +45,7 @@ import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
 from packages.utils import map_geo, map_sessions, metrics
 import cloud_common.objects as api_objects
+import cloud_common.objects.common as common_objects
 import cloud_common.objects.mission as mission_object
 import cloud_common.objects.robot as robot_object
 from cloud_common.objects.detection_results import DetectedObject
@@ -86,6 +87,14 @@ DATUM_CHANGE_THRESHOLD_M = 1.0
 DATUM_BEARING_THRESHOLD_DEG = 0.5
 
 
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Equirectangular distance in metres (fine for the metres-to-kilometres of GNSS jitter)."""
+    mean_lat = math.radians((lat1 + lat2) / 2.0)
+    d_north = math.radians(lat2 - lat1) * 6371000.0
+    d_east = math.radians(lon2 - lon1) * 6371000.0 * math.cos(mean_lat)
+    return math.hypot(d_north, d_east)
+
+
 def _datum_changed(old: Optional[robot_object.RobotDatumV1],
                    new: robot_object.RobotDatumV1) -> bool:
     """Did the datum change materially? Position beyond ~1 m, a different frame, or a
@@ -96,33 +105,42 @@ def _datum_changed(old: Optional[robot_object.RobotDatumV1],
         return True
     if old.frame != new.frame:
         return True
-    mean_lat = math.radians((old.latitude + new.latitude) / 2.0)
-    d_north = math.radians(new.latitude - old.latitude) * 6371000.0
-    d_east = math.radians(new.longitude - old.longitude) * 6371000.0 * math.cos(mean_lat)
-    if math.hypot(d_north, d_east) > DATUM_CHANGE_THRESHOLD_M:
+    if _distance_m(old.latitude, old.longitude, new.latitude, new.longitude) \
+            > DATUM_CHANGE_THRESHOLD_M:
         return True
     d_bearing = abs((new.bearing_deg - old.bearing_deg + 180.0) % 360.0 - 180.0)
     return d_bearing > DATUM_BEARING_THRESHOLD_DEG
 
 
-# Approximate position (map-location plan B): a move below this, with accuracy and source
-# unchanged, is not worth a status write.
+# Approximate position (map-location plan B): a move below this, with source and fix quality
+# unchanged and accuracy within APPROX_ACCURACY_REL_TOL, is not worth a status write, unless
+# the stored copy is older than APPROX_POSITION_REFRESH_S (a parked robot must not look stale).
 APPROX_POSITION_THRESHOLD_M = 5.0
+APPROX_ACCURACY_REL_TOL = 0.2
+APPROX_POSITION_REFRESH_S = 300.0
 
 
 def _approx_position_changed(old: Optional[robot_object.RobotApproxPositionV1],
-                             new: types.RobotApproxPosition) -> bool:
-    """Is a new approximate position worth storing? No previous one, a different accuracy or
-    source, or a move beyond the threshold."""
+                             new: types.RobotApproxPosition,
+                             now: Optional[datetime.datetime] = None) -> bool:
+    """Is a new approximate position worth storing? No previous one, a different source or fix
+    quality, an accuracy that moved by APPROX_ACCURACY_REL_TOL or more, a move beyond the
+    threshold, or a stored copy older than APPROX_POSITION_REFRESH_S."""
     if old is None:
         return True
-    if old.source != new.source or old.accuracy_m != new.accuracy_m \
-            or old.fix_quality != new.fix_quality:
+    if old.source != new.source or old.fix_quality != new.fix_quality:
         return True
-    mean_lat = math.radians((old.latitude + new.latitude) / 2.0)
-    d_north = math.radians(new.latitude - old.latitude) * 6371000.0
-    d_east = math.radians(new.longitude - old.longitude) * 6371000.0 * math.cos(mean_lat)
-    return math.hypot(d_north, d_east) >= APPROX_POSITION_THRESHOLD_M
+    if (old.accuracy_m is None) != (new.accuracy_m is None):
+        return True
+    if old.accuracy_m is not None and abs(new.accuracy_m - old.accuracy_m) \
+            >= APPROX_ACCURACY_REL_TOL * max(old.accuracy_m, new.accuracy_m, 1e-9):
+        return True
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if old.stored_at is None or (now - old.stored_at).total_seconds() \
+            >= APPROX_POSITION_REFRESH_S:
+        return True
+    return _distance_m(old.latitude, old.longitude, new.latitude, new.longitude) \
+        >= APPROX_POSITION_THRESHOLD_M
 
 
 class RouteRefused(Exception):
@@ -928,6 +946,10 @@ class Robot:
         sentinel's row with whichever robot sent a datum first."""
         old = self._robot_object.datum
         new = robot_object.RobotDatumV1(**msg.dict())
+        # Robots republish the same datum every few seconds: nothing to write when it and its
+        # publisher stamp are as stored (the geo re-placement below still runs each time).
+        unchanged = new == old and (msg.stamp is None
+                                    or msg.stamp == self._robot_object.datum_stamp)
         self._robot_object.datum = new
         # Only the datum (robots send it every few seconds): writing the cached full spec
         # back would revert any spec change committed since the cache was filled.
@@ -940,9 +962,10 @@ class Robot:
         if msg.stamp is not None:
             self._robot_object.datum_stamp = msg.stamp
             fields["datum_stamp"] = msg.stamp.isoformat()
-        await self._database.update_spec_fields(
-            api_objects.RobotObjectV1, self._name, fields, self._writer_id()
-        )
+        if not unchanged:
+            await self._database.update_spec_fields(
+                api_objects.RobotObjectV1, self._name, fields, self._writer_id()
+            )
         epoch = getattr(self._robot_server, "mqtt_epoch", 0)
         trusted = self._datum_epoch == epoch
         self._datum_epoch = epoch
@@ -953,7 +976,7 @@ class Robot:
 
         Telemetry only: it never reaches _replace_geo_session and never touches the datum or
         the spec. (0, 0) is the "no fix" sentinel and is rejected."""
-        if msg.latitude == 0.0 and msg.longitude == 0.0:
+        if common_objects.is_null_island(msg.latitude, msg.longitude):
             self.warning("Ignoring approx_position at (0, 0)")
             return
         robot = self._robot_object
@@ -962,7 +985,7 @@ class Robot:
         if not _approx_position_changed(robot.status.approx_position, msg):
             return
         robot.status.approx_position = robot_object.RobotApproxPositionV1(
-            **msg.dict(), received_at=datetime.datetime.now(datetime.timezone.utc))
+            **msg.dict(), stored_at=datetime.datetime.now(datetime.timezone.utc))
         await self._database.update_status(
             api_objects.RobotObjectV1, robot.name, robot.status, self._writer_id())
 

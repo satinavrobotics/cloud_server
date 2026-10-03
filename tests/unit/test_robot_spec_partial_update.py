@@ -177,7 +177,8 @@ async def test_datum_changed_at_moves_only_when_the_datum_changes():
 
     await _datum(r, db)                                   # first datum: a change
     first = db.spec["datum_changed_at"]
-    assert first is not None and "datum_stamp" not in db.spec or db.spec["datum_stamp"] is None
+    assert first is not None
+    assert "datum_stamp" not in db.spec or db.spec["datum_stamp"] is None
 
     await _datum(r, db, longitude=19.0000050)             # ~0.4 m jitter: not a change
     assert "datum_changed_at" not in db.writes[0][2]
@@ -202,3 +203,32 @@ async def test_datum_stamp_is_stored_when_sent_and_ignored_when_garbage():
     assert db.spec["datum_stamp"].startswith("2026-10-03T10:00:00")
     await _datum(r, db, stamp="not a time")               # the datum itself is still accepted
     assert db.spec["datum_stamp"].startswith("2026-10-03T10:00:00")
+
+
+async def test_an_identical_datum_message_writes_nothing():
+    cached = api_objects.RobotObjectV1(name="r1", status={})
+    db = StoreDB(cached)
+    r = _robot(db)
+    r._robot_object = cached
+
+    await _datum(r, db, stamp="2026-10-03T10:00:00Z")
+    assert len(db.writes) == 1
+    await _datum(r, db, stamp="2026-10-03T10:00:00Z")     # a republish: same datum, same stamp
+    assert db.writes == []
+    await _datum(r, db)                                   # no stamp sent: still nothing new
+    assert db.writes == []
+    await _datum(r, db, stamp="2026-10-03T10:00:05Z")     # a newer stamp is stored
+    assert len(db.writes) == 1
+    assert db.spec["datum_stamp"].startswith("2026-10-03T10:00:05")
+
+
+def test_datum_and_approx_stamps_are_utc():
+    import datetime
+    for cls, kw in ((types.RobotDatum, {"latitude": 1.0, "longitude": 2.0}),
+                    (types.RobotApproxPosition, {"latitude": 1.0, "longitude": 2.0})):
+        naive = cls(**kw, stamp="2026-10-03T10:00:00")
+        assert naive.stamp.utcoffset() == datetime.timedelta(0)
+        offset = cls(**kw, stamp="2026-10-03T12:00:00+02:00")
+        assert offset.stamp == datetime.datetime(2026, 10, 3, 10, tzinfo=datetime.timezone.utc)
+        assert offset.stamp.utcoffset() == datetime.timedelta(0)
+        assert cls(**kw, stamp="garbage").stamp is None

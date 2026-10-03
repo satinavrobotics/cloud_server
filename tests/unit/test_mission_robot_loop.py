@@ -100,13 +100,47 @@ def test_approx_position_payload_validation():
 def test_approx_position_changed_threshold():
     from packages.controllers.mission.server import _approx_position_changed
     import cloud_common.objects.robot as ro
+    import datetime
     old = ro.RobotApproxPositionV1(latitude=47.0, longitude=19.0, accuracy_m=2.0,
-                                   fix_quality="rtk", source="gnss")
+                                   fix_quality="rtk", source="gnss",
+                                   stored_at=datetime.datetime.now(datetime.timezone.utc))
     assert _approx_position_changed(None, _approx())
     assert not _approx_position_changed(old, _approx(latitude=47.00002))     # ~2 m
     assert _approx_position_changed(old, _approx(latitude=47.0001))          # ~11 m
     assert _approx_position_changed(old, _approx(accuracy_m=5.0))
     assert _approx_position_changed(old, _approx(source="manual"))
+
+
+def test_approx_position_tolerates_accuracy_jitter_but_refreshes_when_stale():
+    import datetime
+    from packages.controllers.mission.server import _approx_position_changed
+    import cloud_common.objects.robot as ro
+    now = datetime.datetime(2026, 10, 3, 12, 0, tzinfo=datetime.timezone.utc)
+
+    def stored(age_s=10, **kw):
+        base = dict(latitude=47.0, longitude=19.0, accuracy_m=2.0, fix_quality="rtk",
+                    source="gnss", stored_at=now - datetime.timedelta(seconds=age_s))
+        return ro.RobotApproxPositionV1(**{**base, **kw})
+
+    assert not _approx_position_changed(stored(), _approx(accuracy_m=2.1), now)   # 5 %
+    assert not _approx_position_changed(stored(), _approx(accuracy_m=1.7), now)   # 15 %
+    assert _approx_position_changed(stored(), _approx(accuracy_m=2.6), now)       # 30 %
+    assert _approx_position_changed(stored(), _approx(accuracy_m=None), now)
+    assert _approx_position_changed(stored(accuracy_m=None), _approx(), now)
+    assert not _approx_position_changed(stored(accuracy_m=None), _approx(accuracy_m=None), now)
+    # A parked robot: nothing changed, but the stored copy ages out.
+    assert not _approx_position_changed(stored(age_s=299), _approx(), now)
+    assert _approx_position_changed(stored(age_s=301), _approx(), now)
+    assert _approx_position_changed(stored(stored_at=None), _approx(), now)
+
+
+def test_approx_position_reads_the_old_received_at_name():
+    import datetime
+    import cloud_common.objects.robot as ro
+    stamp = "2026-10-03T10:00:00+00:00"
+    old = ro.RobotApproxPositionV1(latitude=1.0, longitude=2.0, received_at=stamp)
+    assert old.stored_at == datetime.datetime(2026, 10, 3, 10, tzinfo=datetime.timezone.utc)
+    assert "received_at" not in old.dict()
 
 
 def _approx_robot():
@@ -121,7 +155,7 @@ async def test_approx_position_is_stored_in_status_only():
     await robot._process_approx_position_message(_approx())
     pos = robot._robot_object.status.approx_position
     assert (pos.latitude, pos.longitude, pos.source) == (47.0, 19.0, "gnss")
-    assert pos.received_at is not None
+    assert pos.stored_at is not None
     robot._database.update_status.assert_awaited_once()
     robot._database.update_spec_fields.assert_not_called()
     robot._database.update_spec.assert_not_called()

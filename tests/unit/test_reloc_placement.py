@@ -1,4 +1,4 @@
-"""Relocalization on local maps, server side (D2; docs/satinav-maps-redesign.md section 12.D).
+"""Relocalization on local maps, server side (D2; docs/satinav-maps-redesign.md ## 16).
 
 - the orchestrator save call gets cloud_map_id / cloud_session_id (orchestrator proxy);
 - OrchestratorMaps.held: cached, never raising ("does the orchestrator hold this map?");

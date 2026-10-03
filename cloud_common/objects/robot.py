@@ -138,17 +138,25 @@ class RobotDatumV1(pydantic.BaseModel):
 class RobotApproxPositionV1(pydantic.BaseModel):
     """Approximate WGS84 position reported by the robot on its MQTT approx_position topic.
     Telemetry for display only: never a datum, never used for placement."""
-    latitude: float = pydantic.Field(..., description="WGS84 latitude.")
-    longitude: float = pydantic.Field(..., description="WGS84 longitude.")
-    accuracy_m: Optional[float] = pydantic.Field(
+    latitude: common.Latitude = pydantic.Field(..., description="WGS84 latitude.")
+    longitude: common.Longitude = pydantic.Field(..., description="WGS84 longitude.")
+    accuracy_m: Optional[common.AccuracyM] = pydantic.Field(
         None, description="Horizontal accuracy radius in metres, if the robot sent one.")
     fix_quality: Optional[str] = pydantic.Field(
         None, description="GNSS fix quality as reported by the robot (free text).")
     source: str = pydantic.Field("gnss", description="Where the position comes from.")
     stamp: Optional[datetime.datetime] = pydantic.Field(
         None, description="The publisher's own timestamp, if the payload carried one.")
-    received_at: Optional[datetime.datetime] = pydantic.Field(
-        None, description="When the server last stored this position.")
+    stored_at: Optional[datetime.datetime] = pydantic.Field(
+        None, description="When the server last stored this position (server clock). Rows "
+                          "written before the rename carry `received_at`, read as this.")
+
+    @pydantic.root_validator(pre=True)
+    def _legacy_received_at(cls, values):  # noqa: N805
+        if isinstance(values, dict) and "stored_at" not in values and "received_at" in values:
+            values = {k: v for k, v in values.items() if k != "received_at"} | {
+                "stored_at": values["received_at"]}
+        return values
 
 
 class RobotStatusV1(pydantic.BaseModel):

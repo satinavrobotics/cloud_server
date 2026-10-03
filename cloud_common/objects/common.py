@@ -16,6 +16,7 @@ limitations under the License.
 
 SPDX-License-Identifier: Apache-2.0
 """
+import datetime
 import enum
 from typing import Any, Literal
 
@@ -46,6 +47,33 @@ def normalize_datum_frame(value: Any) -> Any:
     if value is None or value == "":
         return "enu"
     return value.strip().lower() if isinstance(value, str) else value
+
+
+# WGS84 coordinate types shared by every model that carries a position (map approx location,
+# its PUT body, the robot's approx_position topic and the status copy of it).
+Latitude = pydantic.confloat(ge=-90.0, le=90.0)
+Longitude = pydantic.confloat(ge=-180.0, le=180.0)
+AccuracyM = pydantic.confloat(ge=0.0)
+
+
+def is_null_island(latitude: Any, longitude: Any) -> bool:
+    """(0, 0): the "no location / no fix" placeholder, never a real position."""
+    return latitude is not None and longitude is not None \
+        and latitude == 0.0 and longitude == 0.0
+
+
+def lenient_utc_stamp(value: Any) -> Any:
+    """Pre-validator body for a publisher's timestamp (ISO 8601 or unix seconds): unparseable
+    -> None (never a rejected message); naive -> taken as UTC; aware -> converted to UTC."""
+    if value is None:
+        return None
+    try:
+        stamp = pydantic.parse_obj_as(datetime.datetime, value)
+    except (ValueError, TypeError, pydantic.ValidationError):
+        return None
+    if stamp.tzinfo is None:
+        return stamp.replace(tzinfo=datetime.timezone.utc)
+    return stamp.astimezone(datetime.timezone.utc)
 
 
 def telemetry_recording_field(scope: str) -> Any:

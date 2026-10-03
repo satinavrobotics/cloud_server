@@ -43,6 +43,7 @@ from cloud_common.objects.mission import (
     EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
     MissionStatusV1)
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
+from cloud_common.objects import common as common_objects
 from cloud_common.objects.map import MapObjectV1
 from cloud_common.objects.settings import SettingsObjectV1, SettingsSpecV1, GLOBAL_SETTINGS_NAME
 from cloud_common.objects.site import SiteObjectV1
@@ -720,9 +721,10 @@ async def update_map_datum(map_id: str, request: UpdateDatumRequest):
 
 class ApproxLocationRequest(BaseModel):
     """Request model for setting a local map's approximate location (a hint, not a datum)."""
-    latitude: float = Field(..., ge=-90.0, le=90.0, description="WGS84 latitude in degrees")
-    longitude: float = Field(..., ge=-180.0, le=180.0, description="WGS84 longitude in degrees")
-    accuracy_m: Optional[float] = Field(None, ge=0.0, description="Rough uncertainty radius in metres")
+    latitude: common_objects.Latitude = Field(..., description="WGS84 latitude in degrees")
+    longitude: common_objects.Longitude = Field(..., description="WGS84 longitude in degrees")
+    accuracy_m: Optional[common_objects.AccuracyM] = Field(
+        None, description="Rough uncertainty radius in metres")
     source: Literal["manual", "robot"] = Field(
         "manual", description="'manual' (operator) or 'robot' (suggested from a robot's position)")
 
