@@ -10,6 +10,12 @@ Orchestrator routes used (satibot_orchestrator/app/routers/services.py):
   GET  /services/{name}/status     -> {name, ..., state: {running, pid, started_at, dead_nodes}}
   POST /services/{name}/start      -> {success, message, pid}   404 unknown, 409 already running
   POST /services/{name}/stop       -> {success, message}        404 unknown OR not running
+  GET  /maps/list?cloud_map_id=X   -> [{name, ..., meta: {cloud_map_id, cloud_session_id, ...},
+                                        valid}]  valid = directory and map.bin exist
+                                        (404 on an older orchestrator)
+  POST /maps/{name}/save           body {cloud_map_id, cloud_session_id, ...}: the cloud ids are
+                                   added by the orchestrator proxy (packages/api/
+                                   orchestrator_proxy.py) to the client's save call
 """
 
 import logging
@@ -77,12 +83,13 @@ class OrchestratorClient:
                 NO_ADDRESS, f"robot '{self.robot_name}' has no registered orchestrator IP/port")
         return f"http://{self.address[0]}:{self.address[1]}"
 
-    async def _call(self, method: str, path: str, timeout: float) -> Any:
+    async def _call(self, method: str, path: str, timeout: float,
+                    params: Optional[Dict[str, str]] = None) -> Any:
         url = f"{self.base_url}{path}"
         where = f"{self.address[0]}:{self.address[1]}"
         try:
             async with self._http_factory(timeout=timeout) as http:
-                resp = await http.request(method, url)
+                resp = await http.request(method, url, params=params)
         except httpx.TimeoutException:
             raise OrchestratorError(TIMEOUT, f"orchestrator at {where} timed out") from None
         except httpx.HTTPError as exc:
@@ -108,3 +115,9 @@ class OrchestratorClient:
 
     async def stop(self, name: str) -> Dict[str, Any]:
         return await self._call("POST", f"/services/{name}/stop", ORCHESTRATOR_STOP_TIMEOUT_S)
+
+    async def list_maps(self, cloud_map_id: str) -> List[Dict[str, Any]]:
+        """The stored maps linked to this cloud map (GET /maps/list?cloud_map_id=X)."""
+        body = await self._call("GET", "/maps/list", ORCHESTRATOR_QUERY_TIMEOUT_S,
+                                params={"cloud_map_id": cloud_map_id})
+        return body if isinstance(body, list) else []

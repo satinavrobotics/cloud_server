@@ -27,6 +27,7 @@ from packages.utils.service_utils import (
     configure_service_logging, DependencyHealthChecker
 )
 from packages.utils.fastapi_helpers import add_error_handlers
+from packages.utils import map_sessions as ms
 from packages.config import (
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
     URL_MISSION_PLANNER, URL_LIVEKIT,
@@ -605,10 +606,13 @@ async def map_session_placement_suggestions(map_id: str, session_id: str):
     suggestions: [{source: "last_position", basis: unplace_snapshot | state_history |
     finished_session, map_T_session, pose, robot_pose, at, from_session_id}]}, at most one.
     Accept it with POST .../place (`pose` + the live `robot_pose`, optional `source`).
-    Empty for a placed session or a geo map; 404 unknown map/session; 409 finished session."""
+    Empty for a placed session or a geo map; 404 unknown map/session; 409 finished session.
+    Plus `reloc`: null, or {available, known, source: "orchestrator"} for an unplaced local-map
+    session: `available` true = the robot's orchestrator holds a stored map for this map, so no
+    manual initial position is needed (POST .../place with {"source": "reloc"})."""
     _require_service()
     return await _site_call("placement suggestions", maps.placement_suggestions(
-        service.database, map_id, session_id))
+        service.database, map_id, session_id, holder=service.orchestrator_maps))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/place")
@@ -617,11 +621,13 @@ async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     {x, y, theta}}`: `pose` in the map frame, `robot_pose` = the robot's own pose the user saw.
     The robot must stand still (409 while it drives or when it moved by more than 0.02 m /
     0.5 deg). 409 on a finished session, a geo map, an already placed mapping session. From
-    then on graph-builder keeps the session's nodes (the services are not touched)."""
+    then on graph-builder keeps the session's nodes (the services are not touched).
+    `{"source": "reloc"}` (no poses): the robot relocalises itself on the stored map its
+    orchestrator holds; identity placement, no still check; 409 when it does not hold the map."""
     _require_service()
     return await _site_call("place map session", maps.place_session(
         service.database, map_id, session_id, body, uuid.uuid4(), recording.request_actor(),
-        switch=service.mapping_switch))
+        switch=service.mapping_switch, holder=service.orchestrator_maps))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
@@ -1355,6 +1361,9 @@ async def _robot_views(robots: List[RobotObjectV1],
         data["mapping_state"] = snap.state(session) if snap else None
         data["mapping_services"] = snap.mapping_services() if snap else None
         data["session"] = session
+        data["localization_warning"] = ms.reloc_degraded(
+            (session or {}).get("placement_source"), robot.status.position_initialized,
+            robot.status.localization_score)
         out.append(data)
     return out
 

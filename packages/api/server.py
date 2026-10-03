@@ -39,7 +39,9 @@ from packages.config import (
 from packages.api.map_delete import MapDeleter
 from packages.api import maps, reconstruction
 from packages.api.mapping_switch import MappingSwitch
+from packages.api.orchestrator_maps import OrchestratorMaps
 from packages.utils import map_geo
+from packages.utils import map_sessions
 
 
 def map_datum_transform(spec: MapSpecV1) -> Optional[Dict[str, Any]]:
@@ -632,6 +634,8 @@ class ApiDelegationService:
         # The mapping switch: a session's mapping services are started / stopped on the
         # robot's orchestrator, their state read from it (packages/api/mapping_switch.py).
         self.mapping_switch = MappingSwitch()
+        # Does the robot's orchestrator hold a stored map for a cloud map? (relocalization, D2)
+        self.orchestrator_maps = OrchestratorMaps()
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)
@@ -2158,6 +2162,7 @@ class ApiDelegationService:
                     continue
 
                 # Build WebSocket message
+                session_view = await self._robot_session(robot.name)
                 message = {
                     "type": "robot_update",
                     "robot_name": robot.name,
@@ -2177,10 +2182,17 @@ class ApiDelegationService:
                         } if hasattr(robot.status, 'pose') else None,
                         "recording_state": robot.status.recording_state if hasattr(robot.status, 'recording_state') else None,
                         "nav_reasoning": robot.status.nav_reasoning if hasattr(robot.status, 'nav_reasoning') else None,
+                        "position_initialized": getattr(robot.status, 'position_initialized', None),
+                        "localization_score": getattr(robot.status, 'localization_score', None),
                         "errors": robot.status.errors if hasattr(robot.status, 'errors') else {},
                     },
                     # Maps §14: the robot's open session (derived; null = mapless).
-                    "session": await self._robot_session(robot.name),
+                    "session": session_view,
+                    # D2: why a placed reloc session's localization is degraded, else null.
+                    "localization_warning": map_sessions.reloc_degraded(
+                        (session_view or {}).get("placement_source"),
+                        getattr(robot.status, 'position_initialized', None),
+                        getattr(robot.status, 'localization_score', None)),
                 }
 
                 # Broadcast to all WebSocket clients subscribed to this robot

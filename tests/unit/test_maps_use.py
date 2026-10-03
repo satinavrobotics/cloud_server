@@ -144,7 +144,7 @@ class TestRobotView:
         assert v == {"session_id": str(self.SID), "map": "shed", "purpose": "mapping",
                      "state": "mapping", "aligned": True,
                      "map_T_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.1},
-                     "unplaced_reason": None, "node_count": 0}
+                     "unplaced_reason": None, "placement_source": None, "node_count": 0}
         assert ms.robot_session_view({**self._s(node_count=7)})["node_count"] == 7
         v = ms.robot_session_view({**self._s(purpose="operate", aligned=False,
                                              placement={"unplaced_reason": "run_changed"})})

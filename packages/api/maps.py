@@ -206,10 +206,13 @@ class RobotPose(pydantic.BaseModel):
 
 class PlaceRequest(pydantic.BaseModel):
     """POST .../sessions/{sid}/place, and `placement` on start."""
-    pose: MapPose
-    robot_pose: RobotPose
+    pose: Optional[MapPose] = None
+    robot_pose: Optional[RobotPose] = None
     # Optional: "last_position" when the user accepted a placement suggestion (recorded in
     # placement.source; the pose and robot_pose are what counts). Absent: a manual placement.
+    # "reloc" (POST .../place only): the robot relocalises itself on the stored map its
+    # orchestrator holds; no pose or robot_pose is needed (the server records the robot's pose
+    # and places with ms.reloc_map_t_session(), the identity).
     source: Optional[str] = None
 
     class Config:
@@ -217,9 +220,18 @@ class PlaceRequest(pydantic.BaseModel):
 
     @pydantic.validator("source")
     def _source(cls, value):  # noqa: N805
-        if value is not None and value != ms.SOURCE_LAST_POSITION:
-            raise ValueError(f"source must be {ms.SOURCE_LAST_POSITION!r} when given")
+        if value is not None and value not in (ms.SOURCE_LAST_POSITION, ms.SOURCE_RELOC):
+            raise ValueError(f"source must be {ms.SOURCE_LAST_POSITION!r} or "
+                             f"{ms.SOURCE_RELOC!r} when given")
         return value
+
+    @pydantic.root_validator(skip_on_failure=True)
+    def _poses(cls, values):  # noqa: N805
+        if values.get("source") != ms.SOURCE_RELOC and (
+                values.get("pose") is None or values.get("robot_pose") is None):
+            raise ValueError("pose and robot_pose are required (except for source "
+                             f"{ms.SOURCE_RELOC!r})")
+        return values
 
 
 class StartSessionRequest(pydantic.BaseModel):
@@ -832,7 +844,58 @@ def _suggestion(basis: str, found: Mapping[str, Any], at: Any, from_session_id: 
             "at": _iso(at), "from_session_id": str(from_session_id)}
 
 
-async def placement_suggestions(db: Any, map_name: str, session_id: str) -> Dict[str, Any]:
+async def _reloc_held(db: Any, holder: Optional[Any], map_name: str, session_id: str
+                      ) -> Optional[bool]:
+    """Whether the orchestrator of the session's robot holds a stored map for `map_name`
+    (fresh read); None when unknown (no holder, unknown session/robot, not reachable). Own short
+    transaction, never raises."""
+    if holder is None:
+        return None
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            mine = [s for s in await store.sessions(map_name)
+                    if str(s["session_id"]) == str(session_id)]
+            robot = await store.robot(mine[0]["robot_name"]) if mine else None
+        if robot is None:
+            return None
+        return await holder.held(robot, map_name, fresh=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("Stored map of session %s not readable", session_id)
+        return None
+
+
+async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id: str
+                       ) -> Optional[Dict[str, Any]]:
+    """`reloc` of the placement-suggestions answer: {available, known, source} for an unplaced,
+    open session on a local map, else None. `available`: the robot's orchestrator holds a
+    stored map for this cloud map, so no manual initial position is needed (place it with
+    `source: "reloc"`); `known` false: the orchestrator could not be asked (then `available` is
+    false: manual placement). Never raises."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            row = await store.lock_map(map_name)
+            mine = [s for s in await store.sessions(map_name)
+                    if str(s["session_id"]) == str(session_id)]
+        if (row is None or row.type != "local" or not mine or mine[0]["ended_at"] is not None
+                or ms.is_placed(mine[0])):
+            return None
+        held = await _reloc_held(db, holder, map_name, session_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Reloc status of session %s not readable", session_id)
+        return None
+    return {"available": held is True, "known": held is not None, "source": "orchestrator"}
+
+
+async def placement_suggestions(db: Any, map_name: str, session_id: str,
+                                holder: Optional[Any] = None) -> Dict[str, Any]:
+    """The placement suggestions (_placement_suggestions) plus `reloc` (reloc_status): null, or
+    {available, known, source}; with `available` the client skips the manual placement."""
+    out = await _placement_suggestions(db, map_name, session_id)
+    out["reloc"] = await reloc_status(db, holder, map_name, session_id)
+    return out
+
+
+async def _placement_suggestions(db: Any, map_name: str, session_id: str) -> Dict[str, Any]:
     """GET /api/v1/maps/{id}/sessions/{sid}/placement-suggestions: "last position on this map"
     for an UNPLACED session (the robot restarted: run_changed). At most one suggestion, the
     first source that works:
@@ -1105,6 +1168,11 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
             raise HTTPException(422, [{"loc": ["body", "placement"], "type": "value_error",
                                        "msg": "a geo map is placed by the robot's datum; "
                                               "placement is for local maps"}])
+        if req.placement.source == ms.SOURCE_RELOC:
+            raise HTTPException(422, [{"loc": ["body", "placement", "source"],
+                                       "type": "value_error",
+                                       "msg": "a reloc placement is made with POST .../place "
+                                              "after the session started"}])
         await check_robot_still(store, robot, req.placement.robot_pose.dict())
         placement = _placement_record(req.placement, ms.SOURCE_USER, actor, now)
     carried = carried if carried is not None and ms.is_placed(carried) else None
@@ -1522,20 +1590,32 @@ async def _repause(db: Any, switch: Optional[Any], session: Mapping[str, Any],
 
 async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                         publisher_id: uuid.UUID, actor: Optional[str] = None,
-                        switch: Optional[Any] = None) -> Dict[str, Any]:
+                        switch: Optional[Any] = None,
+                        holder: Optional[Any] = None) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/sessions/{sid}/place `{pose: {x, y, yaw}, robot_pose: {x, y,
     theta}}`: put the robot on a local map. Sets map_T_session, aligned (placed) and
     placement; MAP.SESSION_PLACED (from then on graph-builder keeps the session's nodes; the
     services are not touched). 404 unknown map/session; 409: finished, geo map (placed
     by its datum), an already placed MAPPING session (re-placing would split its nodes;
     alignment after the fact is M6), the robot offline, driving or moved (Q-U7). An operate
-    session can be re-placed at any time (a correction)."""
+    session can be re-placed at any time (a correction).
+
+    `source: "reloc"` (body `{source: "reloc"}`, no poses): the robot relocalises on a stored
+    map its orchestrator holds (`holder`: packages/api/orchestrator_maps.py). Placed with
+    ms.reloc_map_t_session() (identity, D0 assumption); the robot-still check is skipped.
+    Refused 409 when the session is already placed, the robot is offline or reports its position
+    as not initialized / a low localization score, or the orchestrator does not (or cannot be
+    asked to) hold the map; the manual placement path is unchanged."""
     req = parse_body(PlaceRequest, data)
     try:
         uuid.UUID(str(session_id))
     except ValueError:
         raise HTTPException(404, f"Did not find session \"{session_id}\"") from None
     now = _utcnow()
+    reloc = req.source == ms.SOURCE_RELOC
+    held: Optional[bool] = None
+    if reloc:  # the orchestrator is never called inside a DB transaction
+        held = await _reloc_held(db, holder, map_name, session_id)
     try:
         async with open_store(db, publisher_id) as store:
             row = await _lock_alive_map(store, map_name)
@@ -1558,10 +1638,28 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                                          f"\"{session['robot_name']}\"")
             if not robot.status.online:
                 raise HTTPException(409, f"Robot '{robot.name}' is offline")
-            await check_robot_still(store, robot, req.robot_pose.dict())
+            if reloc:
+                if ms.is_placed(session):
+                    raise HTTPException(409, f"Session {session_id} is already placed")
+                if held is not True:
+                    raise HTTPException(
+                        409, f"Robot '{robot.name}' does not hold a stored map for map "
+                             f"'{map_name}' (or its orchestrator could not be asked); place it "
+                             "manually")
+                why = ms.reloc_degraded(ms.SOURCE_RELOC, robot.status.position_initialized,
+                                        robot.status.localization_score)
+                if why is not None:
+                    raise HTTPException(409, f"Robot '{robot.name}' is not relocalised: {why}")
+                at = robot.status.pose
+                req.robot_pose = RobotPose(x=at.x, y=at.y, theta=at.theta)
+                req.pose = MapPose(x=at.x, y=at.y, yaw=at.theta)
+                transform = ms.reloc_map_t_session()
+            else:
+                await check_robot_still(store, robot, req.robot_pose.dict())
             old = session.get("map_t_session") if ms.is_placed(session) else None
             placement = _placement_record(req, req.source or ms.SOURCE_USER, actor, now)
-            transform = ms.placement_transform(placement["pose"], placement["robot_pose"])
+            if not reloc:
+                transform = ms.placement_transform(placement["pose"], placement["robot_pose"])
             session.update(map_t_session=transform, aligned=True, placement=placement)
             await store.update_session(session_id, map_t_session=transform, aligned=True,
                                        placement=placement)
