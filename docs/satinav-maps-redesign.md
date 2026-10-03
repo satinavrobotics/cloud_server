@@ -254,6 +254,8 @@ Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are
 
 **Datum freshness (map-location plan A).** `RobotSpecV1` gains `datum_changed_at` (when the robot's datum last *changed*: moved more than about 1 m, or a different frame or bearing; set in `_process_datum_message`) and `datum_stamp` (the publisher's own timestamp, only when the payload has a `stamp`). Change time, not receive time, because the VDA5050 client republishes the datum on every MQTT reconnect and the broker re-delivers retained messages after a server restart; receive time would make an old datum look fresh. A datum stored before the field existed has `datum_changed_at = null` (unknown) until it changes. Both are informational: the client shows "unchanged N ago" and flags a datum without `frame` as legacy; nothing is dimmed or rejected by age. Spec is jsonb with Pydantic defaults, so no Alembic migration.
 
+**Approximate position (map-location plan B).** `RobotStatusV1.approx_position` (`latitude`, `longitude`, `accuracy_m`, `fix_quality`, `source`, `stamp`, `received_at`) holds the position from the robot's `{prefix}/{robot}/approx_position` topic. It is robot *status*, not spec, and is telemetry only: `_process_approx_position_message` never calls `_replace_geo_session` and never touches the datum. (0, 0) and out-of-range coordinates are rejected; a move under 5 m with unchanged accuracy, fix quality and source is not written. `received_at` is the server's time of the last stored write (not refreshed by skipped ones). Status is jsonb with Pydantic defaults, so no Alembic migration.
+
 ## 13. Plan
 
 | Step | Content | Repos |

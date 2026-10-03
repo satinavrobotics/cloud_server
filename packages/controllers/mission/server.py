@@ -105,6 +105,26 @@ def _datum_changed(old: Optional[robot_object.RobotDatumV1],
     return d_bearing > DATUM_BEARING_THRESHOLD_DEG
 
 
+# Approximate position (map-location plan B): a move below this, with accuracy and source
+# unchanged, is not worth a status write.
+APPROX_POSITION_THRESHOLD_M = 5.0
+
+
+def _approx_position_changed(old: Optional[robot_object.RobotApproxPositionV1],
+                             new: types.RobotApproxPosition) -> bool:
+    """Is a new approximate position worth storing? No previous one, a different accuracy or
+    source, or a move beyond the threshold."""
+    if old is None:
+        return True
+    if old.source != new.source or old.accuracy_m != new.accuracy_m \
+            or old.fix_quality != new.fix_quality:
+        return True
+    mean_lat = math.radians((old.latitude + new.latitude) / 2.0)
+    d_north = math.radians(new.latitude - old.latitude) * 6371000.0
+    d_east = math.radians(new.longitude - old.longitude) * 6371000.0 * math.cos(mean_lat)
+    return math.hypot(d_north, d_east) >= APPROX_POSITION_THRESHOLD_M
+
+
 class RouteRefused(Exception):
     """A route node that must not be sent (maps §14): its waypoints are on a map the robot is
     not placed on, not using, or its session could not be read. The node fails."""
@@ -132,6 +152,7 @@ RobotMessage = Union[api_objects.RobotObjectV1,
                      types.VDA5050State,
                      types.VDA5050Factsheet,
                      types.RobotDatum,
+                     types.RobotApproxPosition,
                      types.VDA5050Connection,
                      WaitElapsed]
 
@@ -156,6 +177,11 @@ class ClientFactsheetMessage(ClientMessage):
 class ClientDatumMessage(ClientMessage):
     name: str
     payload: types.RobotDatum
+
+
+class ClientApproxPositionMessage(ClientMessage):
+    name: str
+    payload: types.RobotApproxPosition
 
 
 class ClientConnectionMessage(ClientMessage):
@@ -921,6 +947,24 @@ class Robot:
         trusted = self._datum_epoch == epoch
         self._datum_epoch = epoch
         await self._replace_geo_session(map_geo.robot_datum(self._robot_object.datum), trusted)
+
+    async def _process_approx_position_message(self, msg: types.RobotApproxPosition) -> None:
+        """Store the robot's approximate position in its status (map-location plan B).
+
+        Telemetry only: it never reaches _replace_geo_session and never touches the datum or
+        the spec. (0, 0) is the "no fix" sentinel and is rejected."""
+        if msg.latitude == 0.0 and msg.longitude == 0.0:
+            self.warning("Ignoring approx_position at (0, 0)")
+            return
+        robot = self._robot_object
+        if robot is None or robot.lifecycle is api_objects.object.ObjectLifecycleV1.DELETED:
+            return
+        if not _approx_position_changed(robot.status.approx_position, msg):
+            return
+        robot.status.approx_position = robot_object.RobotApproxPositionV1(
+            **msg.dict(), received_at=datetime.datetime.now(datetime.timezone.utc))
+        await self._database.update_status(
+            api_objects.RobotObjectV1, robot.name, robot.status, self._writer_id())
 
     # --- maps §14 U3: run changes and geo re-placement -----------------------------------------
 
@@ -2152,6 +2196,8 @@ class Robot:
                     self._record("on_factsheet", self._name, message)
                 elif isinstance(message, types.RobotDatum):
                     await self._process_datum_message(message)
+                elif isinstance(message, types.RobotApproxPosition):
+                    await self._process_approx_position_message(message)
                 elif isinstance(message, types.VDA5050Connection):
                     await self._on_connection_message(message)
                 elif isinstance(message, WaitElapsed):
@@ -2457,6 +2503,7 @@ class RobotServer:
         client.subscribe(f"{self._mqtt_prefix}/+/state")
         client.subscribe(f"{self._mqtt_prefix}/+/factsheet")
         client.subscribe(f"{self._mqtt_prefix}/+/datum")
+        client.subscribe(f"{self._mqtt_prefix}/+/approx_position")
         client.subscribe(f"{self._mqtt_prefix}/+/connection")
 
     def _mqtt_on_message(self, client, userdata, msg):
@@ -2464,6 +2511,7 @@ class RobotServer:
         factsheet_match = re.match(
             f"{self._mqtt_prefix}/(.*)/factsheet", msg.topic)
         datum_match = re.match(f"{self._mqtt_prefix}/(.*)/datum", msg.topic)
+        approx_match = re.match(f"{self._mqtt_prefix}/(.*)/approx_position", msg.topic)
         connection_match = re.match(f"{self._mqtt_prefix}/(.*)/connection", msg.topic)
         try:
             if state_match:
@@ -2481,6 +2529,10 @@ class RobotServer:
                 pl = msg.payload
                 self._enqueue(self._mqtt_messages, ClientDatumMessage(name=robot,
                                                                       payload=json.loads(pl)))
+            elif approx_match:
+                robot = approx_match.groups()[0]
+                self._enqueue(self._mqtt_messages, ClientApproxPositionMessage(
+                    name=robot, payload=json.loads(msg.payload)))
             elif connection_match:
                 robot = connection_match.groups()[0]
                 self._enqueue(self._mqtt_messages, ClientConnectionMessage(
@@ -2510,6 +2562,7 @@ class RobotServer:
         client.register_callback(f"{self._mqtt_prefix}/+/state", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/factsheet", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/datum", self._mqtt_on_message)
+        client.register_callback(f"{self._mqtt_prefix}/+/approx_position", self._mqtt_on_message)
         client.register_callback(f"{self._mqtt_prefix}/+/connection", self._mqtt_on_message)
         if hasattr(client, "add_connect_listener"):
             client.add_connect_listener(self._mqtt_connected)

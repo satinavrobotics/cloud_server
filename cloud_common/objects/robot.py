@@ -135,6 +135,22 @@ class RobotDatumV1(pydantic.BaseModel):
         common.normalize_datum_frame)
 
 
+class RobotApproxPositionV1(pydantic.BaseModel):
+    """Approximate WGS84 position reported by the robot on its MQTT approx_position topic.
+    Telemetry for display only: never a datum, never used for placement."""
+    latitude: float = pydantic.Field(..., description="WGS84 latitude.")
+    longitude: float = pydantic.Field(..., description="WGS84 longitude.")
+    accuracy_m: Optional[float] = pydantic.Field(
+        None, description="Horizontal accuracy radius in metres, if the robot sent one.")
+    fix_quality: Optional[str] = pydantic.Field(
+        None, description="GNSS fix quality as reported by the robot (free text).")
+    source: str = pydantic.Field("gnss", description="Where the position comes from.")
+    stamp: Optional[datetime.datetime] = pydantic.Field(
+        None, description="The publisher's own timestamp, if the payload carried one.")
+    received_at: Optional[datetime.datetime] = pydantic.Field(
+        None, description="When the server last stored this position.")
+
+
 class RobotStatusV1(pydantic.BaseModel):
     """Represents the status of the robot."""
     pose: common.Pose2D = common.Pose2D()
@@ -156,6 +172,9 @@ class RobotStatusV1(pydantic.BaseModel):
                           "narrates via the VDA5050 state information[] array "
                           "(infoType='navReasoning'). Level-triggered: holds the most "
                           "recent line until the robot replaces it. None if never reported.")
+    approx_position: Optional[RobotApproxPositionV1] = pydantic.Field(
+        None, description="Approximate position from the robot's MQTT approx_position topic. "
+                          "Telemetry for display only; never a datum. None if never reported.")
 
 
 class RobotSpecV1(pydantic.BaseModel):

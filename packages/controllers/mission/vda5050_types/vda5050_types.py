@@ -685,3 +685,26 @@ class RobotDatum(pydantic.BaseModel):
             return pydantic.parse_obj_as(datetime.datetime, v)
         except (ValueError, TypeError, pydantic.ValidationError):
             return None
+
+
+class RobotApproxPosition(pydantic.BaseModel):
+    """Approximate WGS84 position published by the robot on its /{robot_name}/approx_position
+    MQTT topic (map-location plan B). Telemetry only: never a datum, never used for placement.
+    """
+    latitude: float = pydantic.Field(..., ge=-90.0, le=90.0)
+    longitude: float = pydantic.Field(..., ge=-180.0, le=180.0)
+    accuracy_m: Optional[float] = pydantic.Field(None, ge=0.0)
+    fix_quality: Optional[str] = None
+    source: str = "gnss"
+    # Publisher's timestamp (ISO 8601 or unix seconds), when sent. Unparseable -> None, never
+    # a rejected message.
+    stamp: Optional[datetime.datetime] = None
+
+    @pydantic.validator("stamp", pre=True)
+    def _lenient_stamp(cls, v):  # pylint: disable=no-self-argument
+        if v is None:
+            return None
+        try:
+            return pydantic.parse_obj_as(datetime.datetime, v)
+        except (ValueError, TypeError, pydantic.ValidationError):
+            return None

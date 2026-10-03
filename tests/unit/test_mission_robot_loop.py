@@ -75,3 +75,99 @@ def test_datum_changed_ignores_jitter_but_not_moves_frame_or_bearing():
     assert _datum_changed(base, D(latitude=47.0001, longitude=19.0, bearing_deg=359.9))
     assert _datum_changed(base, D(latitude=47.0, longitude=19.0, bearing_deg=5.0))
     assert _datum_changed(base, D(latitude=47.0, longitude=19.0, bearing_deg=359.9, frame="utm"))
+
+
+# --- approximate position (map-location plan B) ---------------------------------------------
+
+def _approx(**kw):
+    from packages.controllers.mission.vda5050_types import RobotApproxPosition
+    base = dict(latitude=47.0, longitude=19.0, accuracy_m=2.0, fix_quality="rtk", source="gnss")
+    base.update(kw)
+    return RobotApproxPosition(**base)
+
+
+def test_approx_position_payload_validation():
+    import pydantic
+    from packages.controllers.mission.vda5050_types import RobotApproxPosition
+    assert _approx(stamp="not a time").stamp is None
+    assert _approx(stamp=1700000000).stamp is not None
+    assert RobotApproxPosition(latitude=1, longitude=2).source == "gnss"
+    for bad in (dict(latitude=91), dict(longitude=-181), dict(accuracy_m=-1)):
+        with pytest.raises(pydantic.ValidationError):
+            _approx(**bad)
+
+
+def test_approx_position_changed_threshold():
+    from packages.controllers.mission.server import _approx_position_changed
+    import cloud_common.objects.robot as ro
+    old = ro.RobotApproxPositionV1(latitude=47.0, longitude=19.0, accuracy_m=2.0,
+                                   fix_quality="rtk", source="gnss")
+    assert _approx_position_changed(None, _approx())
+    assert not _approx_position_changed(old, _approx(latitude=47.00002))     # ~2 m
+    assert _approx_position_changed(old, _approx(latitude=47.0001))          # ~11 m
+    assert _approx_position_changed(old, _approx(accuracy_m=5.0))
+    assert _approx_position_changed(old, _approx(source="manual"))
+
+
+def _approx_robot():
+    robot, _ = _robot()
+    robot._robot_object = api_objects.RobotObjectV1(name="r1", status={})
+    robot._replace_geo_session = AsyncMock()
+    return robot
+
+
+async def test_approx_position_is_stored_in_status_only():
+    robot = _approx_robot()
+    await robot._process_approx_position_message(_approx())
+    pos = robot._robot_object.status.approx_position
+    assert (pos.latitude, pos.longitude, pos.source) == (47.0, 19.0, "gnss")
+    assert pos.received_at is not None
+    robot._database.update_status.assert_awaited_once()
+    robot._database.update_spec_fields.assert_not_called()
+    robot._database.update_spec.assert_not_called()
+    robot._replace_geo_session.assert_not_called()
+    assert robot._robot_object.spec.datum.latitude is None
+
+
+async def test_approx_position_skips_small_moves_and_rejects_zero():
+    robot = _approx_robot()
+    await robot._process_approx_position_message(_approx())
+    await robot._process_approx_position_message(_approx(latitude=47.00001))
+    assert robot._database.update_status.await_count == 1
+    await robot._process_approx_position_message(_approx(latitude=47.001))
+    assert robot._database.update_status.await_count == 2
+    await robot._process_approx_position_message(_approx(latitude=0.0, longitude=0.0))
+    assert robot._database.update_status.await_count == 2
+    assert robot._robot_object.status.approx_position.latitude == 47.001
+
+
+async def test_approx_position_reaches_the_handler_through_the_loop():
+    robot = _approx_robot()
+    seen = []
+
+    async def handler(msg):
+        seen.append(msg)
+        robot._alive = False
+    robot._process_approx_position_message = handler
+    await robot._messages.put(_approx())
+    await asyncio.wait_for(Robot.run(robot), timeout=2)
+    assert len(seen) == 1
+
+
+def test_mqtt_on_message_routes_approx_position_topic():
+    import json
+    from packages.controllers.mission.server import ClientApproxPositionMessage, RobotServer
+    server = MagicMock()
+    server._mqtt_prefix = "uagv/v2/sati"
+    queued = []
+    server._enqueue = lambda q, obj: queued.append(obj)
+    msg = MagicMock(topic="uagv/v2/sati/r1/approx_position",
+                    payload=json.dumps({"latitude": 47.0, "longitude": 19.0}))
+    RobotServer._mqtt_on_message(server, None, None, msg)
+    assert len(queued) == 1 and isinstance(queued[0], ClientApproxPositionMessage)
+    assert queued[0].name == "r1" and queued[0].payload.latitude == 47.0
+    server.warning.assert_not_called()
+    # out of range -> warned, not queued
+    msg.payload = json.dumps({"latitude": 99, "longitude": 19.0})
+    RobotServer._mqtt_on_message(server, None, None, msg)
+    assert len(queued) == 1 and server.warning.called
