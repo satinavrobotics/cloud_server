@@ -23,9 +23,13 @@ API through the robot's orchestrator: packages/api/mapping_switch.py.)
 
 import datetime
 import math
+import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from packages.config import RELOC_DEGRADED_SCORE
+try:
+    from packages.config import RELOC_DEGRADED_SCORE
+except ImportError:  # service images that do not ship packages/config.py (mission-dispatch)
+    RELOC_DEGRADED_SCORE = float(os.getenv("RELOC_DEGRADED_SCORE", "0.3"))
 from packages.utils import geo, map_geo
 
 MAPPING, OPERATE = "mapping", "operate"
