@@ -159,6 +159,12 @@ class RobotStatusV1(pydantic.BaseModel):
     factsheet: RobotTypeIdentifierV1 = RobotTypeIdentifierV1()
     online: bool = False
     battery_level: float = 0.0
+    position_initialized: Optional[bool] = pydantic.Field(
+        None, description="VDA5050 agvPosition.positionInitialized as last reported; None if "
+                          "never reported.")
+    localization_score: Optional[float] = pydantic.Field(
+        None, description="VDA5050 agvPosition.localizationScore (0..1) as last reported; None "
+                          "if the robot does not send one.")
     state: RobotStateV1 = RobotStateV1.IDLE
     info_messages: Optional[Dict] = pydantic.Field(
         None, description="Data collected from the mission client.")

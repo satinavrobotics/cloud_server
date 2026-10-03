@@ -48,7 +48,13 @@ SOURCE_USER = "user"          # POST .../place or `placement` on start
 SOURCE_SESSION = "session"    # carried over from the robot's previous session (replace, same run)
 SOURCE_DATUM = "datum"        # a geo session re-placed from the robot's datum (U3)
 SOURCE_LAST_POSITION = "last_position"  # suggested from where the robot last was on this map
+SOURCE_RELOC = "reloc"        # the robot relocalised on a stored map it holds (no manual pose)
 UNPLACED_RUN_CHANGED = "run_changed"
+
+# A placed `reloc` session counts as degraded (robot state `localization_warning`) when the robot
+# reports positionInitialized false or a localizationScore below this. NOTE: the VDA5050 client's
+# score is today a GNSS-sigma stopgap (1 - deviationRange/0.5), not a map-matching score.
+RELOC_DEGRADED_SCORE = 0.3
 
 SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "purpose", "services",
                    "placement", "started_at", "paused_at", "ended_at", "datum",
@@ -106,6 +112,29 @@ def placement_transform(pose: Mapping[str, Any], robot_pose: Mapping[str, Any]
     p_robot = {"tx": float(robot_pose["x"]), "ty": float(robot_pose["y"]),
                "yaw": float(robot_pose["theta"])}
     return compose(p_map, map_geo.invert_transform(p_robot))
+
+
+# D0 ASSUMPTION (to be confirmed by the navstack team): the session frame equals Odin's map frame
+# for a map built in that session, so a `reloc` placement is the identity. Change it HERE (or make
+# the robot report it) if D0 turns out otherwise.
+def reloc_map_t_session() -> Dict[str, float]:
+    """map_T_session of a robot-reported (`reloc`) placement: identity (see the D0 note)."""
+    return {"tx": 0.0, "ty": 0.0, "yaw": 0.0}
+
+
+def reloc_degraded(placement_source: Optional[str], position_initialized: Optional[bool],
+                   localization_score: Optional[float],
+                   threshold: float = RELOC_DEGRADED_SCORE) -> Optional[str]:
+    """Why a placed `reloc` session's localization is degraded, or None (healthy, not a reloc
+    session, or nothing reported)."""
+    if placement_source != SOURCE_RELOC:
+        return None
+    if position_initialized is False:
+        return "the robot reports its position as not initialized"
+    if localization_score is not None and localization_score < threshold:
+        return (f"the robot's localization score {localization_score:.2f} is below "
+                f"{threshold:.2f}")
+    return None
 
 
 def _finite_pose(pose: Any, yaw_key: str) -> Optional[Tuple[float, float, float]]:
@@ -412,6 +441,7 @@ def robot_session_view(row: Optional[Mapping[str, Any]]) -> Optional[Dict[str, A
             "purpose": purpose_of(row), "state": session_state(row), "aligned": placed,
             "map_T_session": transform_of(row.get("map_t_session")) if placed else None,
             "unplaced_reason": (placement or {}).get("unplaced_reason") if not placed else None,
+            "placement_source": (placement or {}).get("source") if placed else None,
             # the session's stored node count (what the session views show); it feeds
             # `mapping_state.nodes_sent` of the robot views at no extra query
             "node_count": int(row.get("node_count") or 0)}

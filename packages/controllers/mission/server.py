@@ -1233,6 +1233,10 @@ class Robot:
                 self._robot_object.status.pose.y = message.agvPosition.y
                 self._robot_object.status.pose.theta = message.agvPosition.theta
                 self._robot_object.status.pose.map_id = message.agvPosition.mapId
+                self._robot_object.status.position_initialized = \
+                    message.agvPosition.positionInitialized
+                self._robot_object.status.localization_score = \
+                    message.agvPosition.localizationScore
             if message.batteryState:
                 self._robot_object.status.battery_level = message.batteryState.batteryCharge
                 if message.batteryState.charging and not self._robot_object.status.state.running:

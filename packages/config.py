@@ -120,6 +120,9 @@ ORCHESTRATOR_START_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_START_TIMEOUT_S", "
 ORCHESTRATOR_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_STOP_TIMEOUT_S", "15.0"))
 # How long a fetched mapping service state is reused for the robot views (seconds).
 MAPPING_STATE_TTL_S = float(os.getenv("MAPPING_STATE_TTL_S", "5.0"))
+# How long "does this robot's orchestrator hold a stored map for cloud map X" is reused
+# (packages/api/orchestrator_maps.py; relocalization, docs/satinav-maps-redesign.md section 12.D).
+RELOC_MAP_HELD_TTL_S = float(os.getenv("RELOC_MAP_HELD_TTL_S", "15.0"))
 
 # ==================== Phase 0 telemetry ingest (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).

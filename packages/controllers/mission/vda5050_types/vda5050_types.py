@@ -268,6 +268,7 @@ class VDA5050AgvPosition(pydantic.BaseModel):
     theta: float
     mapId: str = ""
     deviationRange: float = 0.0
+    localizationScore: Optional[float] = None
 
 
 class VDA5050Velocity(pydantic.BaseModel):
