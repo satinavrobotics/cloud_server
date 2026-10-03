@@ -438,3 +438,17 @@ mission-dispatch now keeps VDA5050 `physicalParameters.heightMax` as `factsheet.
 -1 until sent) and the client raises the robot by it (2.5D map view), but the ROS client only
 sends length and width, so every robot is drawn 0.35 m tall. Add `heightMax` to the factsheet the
 robot publishes (and to the `factsheet_data` of its registration in `create_robot`).
+
+## F. Asked for by the client redesign (2026-10-03) — deferred
+
+Client side: `../sati-client/docs/AUDIT_BACKLOG.md` section **AB**.
+
+### F1. No fleet-wide insights/events stream — **low**
+The Workbench layout's Events tab can only show client-side sources (mission status changes,
+mission failures, nav-supervisor transitions); agent-orchestrator insights are per robot
+(`AgentModal`). A fleet-wide `/api/agent/…` listing or WebSocket would let Events and the
+Utilities → Insights tile work without a selected robot.
+
+### F2. Robot status has no timestamp — **low**
+The Workbench Diagnostics tab lists faults and not-ready robots, but `robot.status` carries no
+"since" time, so every row shows "now". Add the time the error / readiness state began.

@@ -3,6 +3,29 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## LiveKit: the client was on LiveKit Cloud, the robots on the self-hosted SFU (2026-10-03)
+
+**Symptom:** The LiveKit room showed only client laptops; formidable-peacock (and
+masked-frigatebird) never appeared, so no robot video or teleop.
+
+**Cause:** sati-client picked its LiveKit backend from `EXPO_PUBLIC_LIVEKIT_BACKEND` and
+defaulted to `cloud` when it was unset (also through `scripts/start-dev.sh`, which printed
+"LiveKit backend: cloud"). Every robot's `sati_livekit_bridge` gets its token from the
+self-hosted token service (`http://100.85.3.47:8008/api/createToken`, room
+`admin@satinavrobotics.com`) and joins `livekit-sfu` (`ws://100.85.3.47:7880`). Different
+servers, so never the same room. Separately, formidable-peacock's orchestrator `livekit` service
+was stopped at 14:52 UTC (and stopped/started every few minutes before that; cause unknown), and
+masked-frigatebird's Go bridge had been dead since 2026-10-01 ~18:02 UTC with nothing restarting it.
+
+**Fix:** sati-client `0a8b988`: selfhost is the default (cloud only with
+`EXPO_PUBLIC_LIVEKIT_BACKEND=cloud`), start-dev.sh exports selfhost, a test guards the default.
+formidable-peacock's `livekit` service was started again (joined 14:54:44 UTC).
+
+**Still open:** why formidable-peacock's `livekit` service keeps being stopped; its video needs
+`odin_driver` or `navstack_sati_odin` for images; masked-frigatebird needs a clean `sim_livekit`
+start and the bridge launch should respawn (or exit with) its Go process. Check who is in the room
+with `docker logs sati_livekit_sfu | grep -E "participant (active|closing)"`.
+
 ## Mission dispatch: a fresh mission can complete instantly off the previous
 mission's terminal waypoint sequence id (2026-09-14)
 
