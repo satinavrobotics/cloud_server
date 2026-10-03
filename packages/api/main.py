@@ -718,6 +718,30 @@ async def update_map_datum(map_id: str, request: UpdateDatumRequest):
     return result
 
 
+class ApproxLocationRequest(BaseModel):
+    """Request model for setting a local map's approximate location (a hint, not a datum)."""
+    latitude: float = Field(..., ge=-90.0, le=90.0, description="WGS84 latitude in degrees")
+    longitude: float = Field(..., ge=-180.0, le=180.0, description="WGS84 longitude in degrees")
+    accuracy_m: Optional[float] = Field(None, ge=0.0, description="Rough uncertainty radius in metres")
+    source: Literal["manual", "robot"] = Field(
+        "manual", description="'manual' (operator) or 'robot' (suggested from a robot's position)")
+
+
+@app.put("/api/v1/maps/{map_id}/approx_location")
+async def update_map_approx_location(map_id: str, request: ApproxLocationRequest):
+    """Set the approximate location of a local map (pins, distance sort; never placement).
+    404 unknown map, 409 on a geo map (its location is its datum/transform), 422 on (0, 0)."""
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    await service.ensure_map_not_deleting(map_id)
+    result = await service.update_map_approx_location(
+        map_id, request.latitude, request.longitude,
+        accuracy_m=request.accuracy_m, source=request.source)
+    if not result.get("success"):
+        raise HTTPException(status_code=404, detail=result.get("error"))
+    return result
+
+
 @app.delete("/api/v1/maps/{map_id}", status_code=202)
 async def delete_map(map_id: str):
     """

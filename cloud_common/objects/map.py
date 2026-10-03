@@ -41,6 +41,24 @@ class MapGeoV1(pydantic.BaseModel):
     origin_n: float = pydantic.Field(..., description="UTM northing of the map origin (m).")
 
 
+ApproxLocationSourceV1 = Literal["manual", "robot"]
+
+
+class ApproxLocationV1(pydantic.BaseModel):
+    """A hint of where a `local` map is on the Earth (WGS84), for pins and distance sorting.
+    Never a datum: nothing places, aligns or moves a map from it. Geo maps carry none (their
+    location is the datum/`geo` origin)."""
+    latitude: float = pydantic.Field(..., ge=-90.0, le=90.0, description="WGS84 latitude (degrees).")
+    longitude: float = pydantic.Field(..., ge=-180.0, le=180.0, description="WGS84 longitude (degrees).")
+    accuracy_m: Optional[float] = pydantic.Field(
+        None, ge=0.0, description="Rough radius of uncertainty in metres, if known.")
+    source: ApproxLocationSourceV1 = pydantic.Field(
+        "manual", description="'manual' (typed or picked by an operator) or 'robot' (suggested "
+                              "from a robot's approximate position).")
+    set_at: datetime.datetime = pydantic.Field(
+        ..., description="When the server stored it (UTC).")
+
+
 def has_real_datum(latitude: Optional[float], longitude: Optional[float]) -> bool:
     """A datum that anchors a map: both coordinates set and not the (0, 0) placeholder."""
     return (latitude is not None and longitude is not None
@@ -85,6 +103,10 @@ class MapSpecV1(pydantic.BaseModel):
         None, description="Exact UTM easting of a 'utm' datum, when the robot reported it.")
     datum_utm_northing: Optional[float] = pydantic.Field(
         None, description="Exact UTM northing of a 'utm' datum, when the robot reported it.")
+
+    approx_location: Optional[ApproxLocationV1] = pydantic.Field(
+        None, description="Approximate WGS84 location of a 'local' map (a hint, never a datum). "
+                          "None on geo maps and until set.")
 
     _normalize_frame = pydantic.validator("datum_frame", pre=True, allow_reuse=True)(
         common.normalize_datum_frame)
