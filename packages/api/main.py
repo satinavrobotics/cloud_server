@@ -1398,9 +1398,7 @@ async def _robot_views(robots: List[RobotObjectV1],
         data["mapping_state"] = snap.state(session) if snap else None
         data["mapping_services"] = snap.mapping_services() if snap else None
         data["session"] = session
-        data["localization_warning"] = ms.reloc_degraded(
-            (session or {}).get("placement_source"), robot.status.position_initialized,
-            robot.status.localization_score)
+        data["localization_warning"] = ms.localization_warning(session, robot.status)
         out.append(data)
     return out
 

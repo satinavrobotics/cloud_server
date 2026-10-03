@@ -361,9 +361,25 @@ class FakeStore:
         self.pending_events = []
         self.pending_notifies = []
 
-    async def lock_map(self, name):
+    def _map(self, name):
         row = self.db.maps.get(name)
         return maps.MapRow(name, row["lifecycle"], row["spec"], row["status"]) if row else None
+
+    async def lock_map(self, name):
+        self.db.locks.append(("map", name))
+        return self._map(name)
+
+    async def get_map(self, name):
+        return self._map(name)
+
+    async def session(self, session_id):
+        return self._find_session(session_id)
+
+    def _find_session(self, session_id):
+        for s in self.db.sessions:
+            if str(s["session_id"]) == str(session_id):
+                return dict(s)
+        return None
 
     async def map_names(self):
         return list(self.db.maps)
@@ -419,10 +435,8 @@ class FakeStore:
                 if s["robot_name"] == robot_name and s["ended_at"] is None]
 
     async def lock_session(self, session_id):
-        for s in self.db.sessions:
-            if str(s["session_id"]) == str(session_id):
-                return dict(s)
-        return None
+        self.db.locks.append(("session", str(session_id)))
+        return self._find_session(session_id)
 
     async def insert_session(self, session):
         if any(s["robot_name"] == session["robot_name"] and s["ended_at"] is None
@@ -444,6 +458,7 @@ class FakeDb:
         self.maps = {}
         self.robots = {}
         self.sessions = []
+        self.locks = []           # (kind, name) of every FOR UPDATE read
         self.events = []
         self.notifies = []
         self.state_msgs = {}

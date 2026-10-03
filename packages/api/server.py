@@ -2230,10 +2230,8 @@ class ApiDelegationService:
                     # Maps §14: the robot's open session (derived; null = mapless).
                     "session": session_view,
                     # D2: why a placed reloc session's localization is degraded, else null.
-                    "localization_warning": map_sessions.reloc_degraded(
-                        (session_view or {}).get("placement_source"),
-                        getattr(robot.status, 'position_initialized', None),
-                        getattr(robot.status, 'localization_score', None)),
+                    "localization_warning": map_sessions.localization_warning(
+                        session_view, robot.status),
                 }
 
                 # Broadcast to all WebSocket clients subscribed to this robot

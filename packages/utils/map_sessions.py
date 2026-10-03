@@ -25,6 +25,7 @@ import datetime
 import math
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from packages.config import RELOC_DEGRADED_SCORE
 from packages.utils import geo, map_geo
 
 MAPPING, OPERATE = "mapping", "operate"
@@ -52,9 +53,10 @@ SOURCE_RELOC = "reloc"        # the robot relocalised on a stored map it holds (
 UNPLACED_RUN_CHANGED = "run_changed"
 
 # A placed `reloc` session counts as degraded (robot state `localization_warning`) when the robot
-# reports positionInitialized false or a localizationScore below this. NOTE: the VDA5050 client's
-# score is today a GNSS-sigma stopgap (1 - deviationRange/0.5), not a map-matching score.
-RELOC_DEGRADED_SCORE = 0.3
+# reports positionInitialized false or a localizationScore below RELOC_DEGRADED_SCORE
+# (packages/config.py, env). NOTE: the VDA5050 client's score is today a GNSS-sigma stopgap
+# (1 - deviationRange/0.5), not a map-matching score. Placement itself is refused only for
+# positionInitialized false; the score is a warning.
 
 SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "purpose", "services",
                    "placement", "started_at", "paused_at", "ended_at", "datum",
@@ -120,6 +122,25 @@ def placement_transform(pose: Mapping[str, Any], robot_pose: Mapping[str, Any]
 def reloc_map_t_session() -> Dict[str, float]:
     """map_T_session of a robot-reported (`reloc`) placement: identity (see the D0 note)."""
     return {"tx": 0.0, "ty": 0.0, "yaw": 0.0}
+
+
+def reloc_placement(robot_pose: Mapping[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """(pose, map_T_session) of a `reloc` placement of a robot at `robot_pose` {x, y, theta}
+    (its run frame): the map pose is the robot pose carried through reloc_map_t_session(), so
+    the stored pose and transform agree whatever D0 turns out to be."""
+    transform = reloc_map_t_session()
+    at = compose(transform, {"tx": float(robot_pose["x"]), "ty": float(robot_pose["y"]),
+                             "yaw": float(robot_pose["theta"])})
+    return {"x": at["tx"], "y": at["ty"], "yaw": at["yaw"]}, transform
+
+
+def localization_warning(session_view: Optional[Mapping[str, Any]], status: Any
+                         ) -> Optional[str]:
+    """`localization_warning` of a robot view: why the placed reloc session of `session_view`
+    (robot_session_view, or None) is degraded given the robot `status`, else None."""
+    return reloc_degraded((session_view or {}).get("placement_source"),
+                          getattr(status, "position_initialized", None),
+                          getattr(status, "localization_score", None))
 
 
 def reloc_degraded(placement_source: Optional[str], position_initialized: Optional[bool],

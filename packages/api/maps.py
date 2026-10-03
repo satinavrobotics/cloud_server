@@ -212,7 +212,7 @@ class PlaceRequest(pydantic.BaseModel):
     # placement.source; the pose and robot_pose are what counts). Absent: a manual placement.
     # "reloc" (POST .../place only): the robot relocalises itself on the stored map its
     # orchestrator holds; no pose or robot_pose is needed (the server records the robot's pose
-    # and places with ms.reloc_map_t_session(), the identity).
+    # and places with ms.reloc_placement(): the identity, D0 assumption).
     source: Optional[str] = None
 
     class Config:
@@ -365,6 +365,14 @@ class SqlStore:
         await self.cursor.execute(
             f"SELECT name, lifecycle, spec, status FROM {MAP_TABLE} WHERE name = %s "
             "AND lifecycle <> 'DELETED' FOR UPDATE", (name,))
+        row = await self.cursor.fetchone()
+        return MapRow(*row) if row is not None else None
+
+    async def get_map(self, name: str) -> Optional[MapRow]:
+        """The map row without a lock (read endpoints must not queue behind writers)."""
+        await self.cursor.execute(
+            f"SELECT name, lifecycle, spec, status FROM {MAP_TABLE} WHERE name = %s "
+            "AND lifecycle <> 'DELETED'", (name,))
         row = await self.cursor.fetchone()
         return MapRow(*row) if row is not None else None
 
@@ -534,6 +542,14 @@ class SqlStore:
     async def open_sessions(self) -> List[Dict[str, Any]]:
         return await self._sessions("ended_at IS NULL", ())
 
+    async def session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """One session by id, without a lock."""
+        await self.cursor.execute(
+            f"SELECT {', '.join(SESSION_COLUMNS)} FROM {SESSIONS_TABLE} "
+            "WHERE session_id = %s", (uuid.UUID(str(session_id)),))
+        row = await self.cursor.fetchone()
+        return dict(zip(SESSION_COLUMNS, row)) if row is not None else None
+
     async def lock_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         await self.cursor.execute(
             f"SELECT {', '.join(SESSION_COLUMNS)} FROM {SESSIONS_TABLE} "
@@ -598,7 +614,10 @@ _SCHEMA_ERRORS = (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn)
 # --- helpers -----------------------------------------------------------------------------------
 
 async def _lock_alive_map(store: Any, name: str) -> MapRow:
-    row = await store.lock_map(name)
+    return _alive(await store.lock_map(name), name)
+
+
+def _alive(row: Optional[MapRow], name: str) -> MapRow:
     if row is None:
         raise HTTPException(404, f"Did not find \"map\" with name \"{name}\"")
     if row.lifecycle == DELETING:
@@ -844,24 +863,48 @@ def _suggestion(basis: str, found: Mapping[str, Any], at: Any, from_session_id: 
             "at": _iso(at), "from_session_id": str(from_session_id)}
 
 
-async def _reloc_held(db: Any, holder: Optional[Any], map_name: str, session_id: str
-                      ) -> Optional[bool]:
-    """Whether the orchestrator of the session's robot holds a stored map for `map_name`
-    (fresh read); None when unknown (no holder, unknown session/robot, not reachable). Own short
-    transaction, never raises."""
-    if holder is None:
-        return None
-    try:
-        async with open_store(db, uuid.uuid4()) as store:
-            mine = [s for s in await store.sessions(map_name)
-                    if str(s["session_id"]) == str(session_id)]
-            robot = await store.robot(mine[0]["robot_name"]) if mine else None
-        if robot is None:
-            return None
-        return await holder.held(robot, map_name, fresh=True)
-    except Exception:  # noqa: BLE001
-        logger.exception("Stored map of session %s not readable", session_id)
-        return None
+async def _reloc_inputs(db: Any, map_name: str, session_id: str
+                        ) -> Tuple[Optional[MapRow], Optional[Dict[str, Any]],
+                                   Optional[RobotObjectV1]]:
+    """(map row, session, its robot) for the reloc reads: one short transaction, no row lock
+    (these run on GET paths and before the orchestrator is asked). None for what is missing."""
+    async with open_store(db, uuid.uuid4()) as store:
+        row = await store.get_map(map_name)
+        session = await store.session(session_id) if row is not None else None
+        if session is not None and session["map_name"] != map_name:
+            session = None
+        robot = await store.robot(session["robot_name"]) if session is not None else None
+    return row, session, robot
+
+
+def _placement_refusals(map_name: str, session_id: str, session: Optional[Mapping[str, Any]],
+                        row: MapRow, robot: Optional[RobotObjectV1], reloc: bool) -> None:
+    """The 404/409 refusals of POST .../place that need no orchestrator answer, in the order
+    they apply. Run once before the (slow) orchestrator read of a `reloc` placement and again
+    inside the transaction."""
+    if session is None or session["map_name"] != map_name:
+        raise HTTPException(404, f"Did not find session \"{session_id}\" on map "
+                                 f"\"{map_name}\"")
+    if session["ended_at"] is not None:
+        raise HTTPException(409, f"Session {session_id} is finished")
+    if row.type == "geo":
+        raise HTTPException(409, f"Map '{map_name}' is a geo map: its sessions are "
+                                 "placed by the robot's datum")
+    if ms.purpose_of(session) == ms.MAPPING and ms.is_placed(session):
+        raise HTTPException(409, f"Mapping session {session_id} is already placed; "
+                                 "re-placing it would split its nodes (finish it and "
+                                 "start a new session to continue from elsewhere)")
+    if robot is None:
+        raise HTTPException(404, f"Did not find \"robot\" with name "
+                                 f"\"{session['robot_name']}\"")
+    if not robot.status.online:
+        raise HTTPException(409, f"Robot '{robot.name}' is offline")
+    if reloc:
+        if ms.is_placed(session):
+            raise HTTPException(409, f"Session {session_id} is already placed")
+        if robot.status.position_initialized is False:
+            raise HTTPException(409, f"Robot '{robot.name}' is not relocalised: it reports its "
+                                     "position as not initialized")
 
 
 async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id: str
@@ -870,16 +913,16 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
     open session on a local map, else None. `available`: the robot's orchestrator holds a
     stored map for this cloud map, so no manual initial position is needed (place it with
     `source: "reloc"`); `known` false: the orchestrator could not be asked (then `available` is
-    false: manual placement). Never raises."""
+    false: manual placement). A GET: no row locks and the cached held read (place_session asks
+    afresh). Never raises."""
     try:
-        async with open_store(db, uuid.uuid4()) as store:
-            row = await store.lock_map(map_name)
-            mine = [s for s in await store.sessions(map_name)
-                    if str(s["session_id"]) == str(session_id)]
-        if (row is None or row.type != "local" or not mine or mine[0]["ended_at"] is not None
-                or ms.is_placed(mine[0])):
+        row, session, robot = await _reloc_inputs(db, map_name, session_id)
+        if (row is None or row.type != "local" or session is None
+                or session["ended_at"] is not None or ms.is_placed(session)):
             return None
-        held = await _reloc_held(db, holder, map_name, session_id)
+        held = None
+        if holder is not None and robot is not None:
+            held = await holder.held(robot, map_name)
     except Exception:  # noqa: BLE001
         logger.exception("Reloc status of session %s not readable", session_id)
         return None
@@ -889,13 +932,13 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
 async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: str
                     ) -> Dict[str, Any]:
     """GET /api/v1/maps/{id}/reloc?robot=: the same {available, known, source} as `reloc` of the
-    placement suggestions, before any session exists (cached read). 404 unknown map. A geo map
-    is placed by the datum, not relocalised: {available: false, known: true}. An unknown or
-    offline robot, no holder or an orchestrator that cannot be asked: known false."""
+    placement suggestions, before any session exists (cached read, no row lock). 404 unknown
+    map. A geo map is placed by the datum, not relocalised: {available: false, known: true}. An
+    unknown or offline robot, no holder or an orchestrator that cannot be asked: known false."""
     robot = None
     try:
         async with open_store(db, uuid.uuid4()) as store:
-            row = await store.lock_map(map_name)
+            row = await store.get_map(map_name)
             if row is None:
                 raise HTTPException(404, f"Did not find \"map\" with name \"{map_name}\"")
             if row.type == "geo":
@@ -1628,10 +1671,11 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
 
     `source: "reloc"` (body `{source: "reloc"}`, no poses): the robot relocalises on a stored
     map its orchestrator holds (`holder`: packages/api/orchestrator_maps.py). Placed with
-    ms.reloc_map_t_session() (identity, D0 assumption); the robot-still check is skipped.
+    ms.reloc_placement() (identity, D0 assumption); the robot-still check is skipped.
     Refused 409 when the session is already placed, the robot is offline or reports its position
-    as not initialized / a low localization score, or the orchestrator does not (or cannot be
-    asked to) hold the map; the manual placement path is unchanged."""
+    as not initialized, or the orchestrator does not (or cannot be asked to) hold the map. A low
+    localization score does not refuse: it shows as `localization_warning` on the robot view. The
+    manual placement path is unchanged."""
     req = parse_body(PlaceRequest, data)
     try:
         uuid.UUID(str(session_id))
@@ -1640,46 +1684,35 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
     now = _utcnow()
     reloc = req.source == ms.SOURCE_RELOC
     held: Optional[bool] = None
-    if reloc:  # the orchestrator is never called inside a DB transaction
-        held = await _reloc_held(db, holder, map_name, session_id)
+    if reloc:
+        # Cheap refusals first (offline, already placed, ...): the orchestrator read is slow,
+        # and it is never made inside a DB transaction.
+        try:
+            row, session, robot = await _reloc_inputs(db, map_name, session_id)
+        except _SCHEMA_ERRORS as exc:
+            raise _undefined_table(exc) from exc
+        _placement_refusals(map_name, session_id, session, _alive(row, map_name), robot, True)
+        if holder is not None:
+            try:
+                held = await holder.held(robot, map_name, fresh=True)
+            except Exception:  # noqa: BLE001
+                logger.exception("Stored map of session %s not readable", session_id)
     try:
         async with open_store(db, publisher_id) as store:
             row = await _lock_alive_map(store, map_name)
             session = await store.lock_session(session_id)
-            if session is None or session["map_name"] != map_name:
-                raise HTTPException(404, f"Did not find session \"{session_id}\" on map "
-                                         f"\"{map_name}\"")
-            if session["ended_at"] is not None:
-                raise HTTPException(409, f"Session {session_id} is finished")
-            if row.type == "geo":
-                raise HTTPException(409, f"Map '{map_name}' is a geo map: its sessions are "
-                                         "placed by the robot's datum")
-            if ms.purpose_of(session) == ms.MAPPING and ms.is_placed(session):
-                raise HTTPException(409, f"Mapping session {session_id} is already placed; "
-                                         "re-placing it would split its nodes (finish it and "
-                                         "start a new session to continue from elsewhere)")
-            robot = await store.robot(session["robot_name"])
-            if robot is None:
-                raise HTTPException(404, f"Did not find \"robot\" with name "
-                                         f"\"{session['robot_name']}\"")
-            if not robot.status.online:
-                raise HTTPException(409, f"Robot '{robot.name}' is offline")
+            robot = await store.robot(session["robot_name"]) if session is not None else None
+            _placement_refusals(map_name, session_id, session, row, robot, reloc)
             if reloc:
-                if ms.is_placed(session):
-                    raise HTTPException(409, f"Session {session_id} is already placed")
                 if held is not True:
                     raise HTTPException(
                         409, f"Robot '{robot.name}' does not hold a stored map for map "
                              f"'{map_name}' (or its orchestrator could not be asked); place it "
                              "manually")
-                why = ms.reloc_degraded(ms.SOURCE_RELOC, robot.status.position_initialized,
-                                        robot.status.localization_score)
-                if why is not None:
-                    raise HTTPException(409, f"Robot '{robot.name}' is not relocalised: {why}")
                 at = robot.status.pose
                 req.robot_pose = RobotPose(x=at.x, y=at.y, theta=at.theta)
-                req.pose = MapPose(x=at.x, y=at.y, yaw=at.theta)
-                transform = ms.reloc_map_t_session()
+                pose, transform = ms.reloc_placement(req.robot_pose.dict())
+                req.pose = MapPose(**pose)
             else:
                 await check_robot_still(store, robot, req.robot_pose.dict())
             old = session.get("map_t_session") if ms.is_placed(session) else None

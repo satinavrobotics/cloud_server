@@ -39,8 +39,11 @@ def with_cloud_ids(method: str, path: str, body: bytes,
         return body
     if not isinstance(data, dict):
         return body
-    data.setdefault("cloud_map_id", session.get("map_name"))
-    data.setdefault("cloud_session_id", str(session["session_id"]))
+    # An explicit null counts as not sent.
+    if data.get("cloud_map_id") is None:
+        data["cloud_map_id"] = session.get("map_name")
+    if data.get("cloud_session_id") is None:
+        data["cloud_session_id"] = str(session["session_id"])
     return json.dumps(data).encode()
 
 
@@ -112,10 +115,10 @@ async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Orchestrator request timed out")
 
-    if request.method == "POST" and _SAVE_PATH.match(path):
+    if request.method != "GET" and path.startswith("maps/"):
         held = getattr(service, "orchestrator_maps", None)
         if held is not None:
-            held.invalidate(robot_name)  # the stored map changed: ask again
+            held.invalidate(robot_name)  # a stored map may have changed: ask again
     return Response(
         content=resp.content,
         status_code=resp.status_code,
