@@ -179,6 +179,82 @@ Load a topological map from the graph database.
 
 ---
 
+### Map Location and Relocalization
+
+Details: `docs/satinav-maps-redesign.md` §12 and §16.
+
+#### `PUT /api/v1/maps/{map_id}/approx_location`
+
+Set the approximate location of a `local` map (map pins, distance sorting). A hint only: placement, alignment and sessions never read it.
+
+**Request Body:**
+```json
+{
+  "latitude": 47.4979,
+  "longitude": 19.0402,
+  "accuracy_m": 25,
+  "source": "manual"
+}
+```
+
+`accuracy_m` is optional; `source` is `manual` (default) or `robot`. The server sets `set_at`.
+
+**Response:**
+```json
+{
+  "success": true,
+  "map_id": "warehouse_floor_1",
+  "approx_location": {"latitude": 47.4979, "longitude": 19.0402, "accuracy_m": 25.0, "source": "manual", "set_at": "2026-10-01T12:00:00+00:00"}
+}
+```
+
+**Errors:** 404 unknown map; 409 geo map (its location is its datum, see `transform` in the map summary); 422 for (0, 0) or out-of-range values. `GET /api/v1/maps` and `GET /api/v1/maps/{map_id}` return the stored `approx_location` unchanged.
+
+#### `GET /api/v1/maps/{map_id}/reloc?robot={robot_name}`
+
+Does the robot's orchestrator hold a stored map for this map, so it can relocalize itself without a manual initial position? Works before any session exists. The answer is cached for `RELOC_MAP_HELD_TTL_S` (15 s).
+
+**Response:**
+```json
+{"available": true, "known": true, "source": "orchestrator"}
+```
+
+- `available: true`: no manual initial position needed; place with `POST /api/v1/maps/{map_id}/sessions/{session_id}/place` and `{"source": "reloc"}`.
+- `known: false`: the orchestrator could not be asked (unknown or offline robot, no orchestrator address, unreachable or error); `available` is then `false`.
+- A geo map is placed by its datum: `{"available": false, "known": true, "source": "orchestrator"}`.
+- 404 unknown map.
+
+`GET /api/v1/maps/{map_id}/sessions/{session_id}/placement-suggestions` carries the same object as `reloc` (`null` for a geo map or a placed or finished session).
+
+#### `POST /api/v1/maps/{map_id}/sessions/{session_id}/place` with `source: "reloc"`
+
+`source` is `last_position` (accepting a suggestion, with `pose` and `robot_pose`) or `reloc`. With `reloc` the body is just:
+```json
+{"source": "reloc"}
+```
+The robot relocalizes itself on the stored map its orchestrator holds. The server places the session with the identity `map_T_session` (assumption D0: the session frame equals the robot's map frame for a map built in that session) and records the robot's current pose. The robot-still check is skipped.
+
+**Errors:** 404 unknown map, session or robot; 409 session finished or already placed, geo map, robot offline, robot reports `position_initialized: false`, or the orchestrator does not hold the map (a fresh check is made, an unknown answer counts as not held); 422 on a bad body. `reloc` is not accepted when starting a session (422): start the session, then place it. A low localization score never refuses a placement; it shows as `localization_warning` (below).
+
+#### Robot view additions
+
+`GET /api/v1/robots[/{robot_name}]` and the WebSocket `robot_update`:
+
+- `status.position_initialized` (boolean or `null`) and `status.localization_score` (0..1 or `null`): VDA5050 `agvPosition` as last reported.
+- `status.approx_position`: `{latitude, longitude, accuracy_m?, fix_quality?, source, stamp?, stored_at}` or `null`, from the robot's MQTT `approx_position` topic. Display only, never used for placement.
+- `session.placement_source`: how a placed session was placed (`user`, `last_position`, `reloc`, `session` or `datum`), else `null`.
+- `localization_warning`: a reason string, or `null`. Set only for a placed `reloc` session when the robot reports `position_initialized: false` or a `localization_score` below `RELOC_DEGRADED_SCORE` (default 0.3). Informational: the session stays placed. The score is provisional: the robot's current value is a GNSS-sigma stopgap, not a map-matching score.
+
+The robot spec also has `datum_changed_at` and `datum_stamp` (see `docs/MQTT_MISSION_INTEGRATION.md`).
+
+#### Orchestrator proxy and map links
+
+`POST /api/v1/orchestration/{robot}/maps/{name}/save` adds `cloud_map_id` (the open mapping session's map) and `cloud_session_id` to the body when the robot has an open mapping session and the caller did not send them (an explicit `null` counts as not sent). This links the saved map to the cloud map for `reloc`. After any proxied non-GET `maps/*` call the cached held-map answer for that robot is dropped.
+
+**Environment variables:** `RELOC_MAP_HELD_TTL_S` (default 15), `RELOC_DEGRADED_SCORE` (default 0.3).
+
+---
+
 ### Image Operations
 
 #### `GET /api/v1/images/{map_id}/{node_id}`
@@ -1069,6 +1145,17 @@ interface RobotObject {
     };
     online: boolean;
     battery_level: number;  // 0-100
+    position_initialized?: boolean | null;  // VDA5050 agvPosition.positionInitialized
+    localization_score?: number | null;     // 0..1, informational (provisional)
+    approx_position?: {                      // from MQTT approx_position, display only
+      latitude: number;
+      longitude: number;
+      accuracy_m?: number;
+      fix_quality?: string;
+      source: string;       // 'gnss'
+      stamp?: string;
+      stored_at?: string;   // server time of the last stored write
+    } | null;
     state: 'IDLE' | 'ON_TASK' | 'CHARGING' | 'MAP_DEPLOYMENT' | 'TELEOP';
     info_messages?: object;
     errors: object;

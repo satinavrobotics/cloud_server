@@ -271,6 +271,27 @@ Session objects gain `purpose`, `services` (mapping) and `placement`; `state` is
 orchestrator (above); an operate session runs none. `MAP.SESSION_STARTED/FINISHED` payloads
 carry `purpose`.
 
+#### Map location and relocalization (docs/satinav-maps-redesign.md §12, §16)
+
+| Method | Path | Does |
+|---|---|---|
+| PUT | `/api/v1/maps/{id}/approx_location` | `{latitude, longitude, accuracy_m?, source?: "manual"\|"robot"}` sets a local map's approximate location (a hint for pins and sorting; never read by placement); the server stamps `set_at`. 404 unknown map, 409 geo map, 422 for (0, 0) or out of range. |
+| GET | `/api/v1/maps/{id}/reloc?robot=` | `{available, known, source: "orchestrator"}`: does the robot's orchestrator hold a stored map for this map (cached `RELOC_MAP_HELD_TTL_S`, 15 s)? Geo map: `{false, true}`. Unknown or offline robot, or an orchestrator that cannot be asked: `known: false`. 404 unknown map. |
+| GET | `.../sessions/{sid}/placement-suggestions` | gains `reloc`: the same object for an unplaced local-map session, else `null`. |
+| POST | `.../sessions/{sid}/place` | `source` is `last_position` or `reloc`. `{"source": "reloc"}` (no poses): the robot relocalizes itself on its stored map; identity `map_T_session` (assumption D0, `map_sessions.reloc_map_t_session()`), the robot's current pose is recorded, the still check is skipped. 409 when already placed, the robot is offline or reports `position_initialized: false`, or the orchestrator does not hold the map (fresh check; unknown counts as not held). Not accepted on session start (422). |
+
+The robot view (`GET /robots[/{r}]`, WS `robot_update`) gains `status.position_initialized`,
+`status.localization_score`, `status.approx_position` (from the robot's retained MQTT
+`{prefix}/{robot}/approx_position`; display only, never a datum, never used for placement; writes are
+suppressed under 5 m movement with unchanged fix quality, source and accuracy within 20 %, and
+refreshed after about 300 s), `session.placement_source` and a top-level `localization_warning`
+(null, or a reason for a placed `reloc` session whose robot reports `position_initialized: false` or
+a `localization_score` below `RELOC_DEGRADED_SCORE`, default 0.3). The warning is informational and
+the session stays placed; the score is provisional (a GNSS-sigma stopgap on the robot). The
+orchestrator proxy adds `cloud_map_id` and `cloud_session_id` to a proxied
+`POST /orchestration/{robot}/maps/{name}/save` while the robot has an open mapping session (ids the
+caller sent are kept). Env: `RELOC_MAP_HELD_TTL_S`, `RELOC_DEGRADED_SCORE`.
+
 #### 3D reconstruction (R3)
 
 `docs/reconstruction/design.md` §6, §8, §9 (logic: `packages/api/reconstruction.py`). The work

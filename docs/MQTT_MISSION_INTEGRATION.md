@@ -85,6 +85,49 @@ Mission Planner Service ←→ MQTT Broker ←→ VisNav Nav2 Node
   - Waypoint is completed
   - Error or obstacle is encountered
 
+## Robot Position Topics (mission dispatch)
+
+These are read by the Mission Dispatch service (not the Mission Planner). `{prefix}` is the VDA5050 prefix (`uagv/v2/RobotCompany`), `{robot}` the VDA5050 serial number.
+
+### Datum Topic
+
+**Topic**: `{prefix}/{robot}/datum` (retained)
+
+**Direction**: Robot → Mission Dispatch
+
+**Message Format** (JSON): `latitude`, `longitude`, `bearing_deg` (default 0), `frame` (`utm` | `enu`), for `utm` also `utm_zone`, `utm_north`, `utm_easting`, `utm_northing`, and an optional `stamp`.
+
+- `stamp` (ISO 8601 or unix seconds) is the publisher's own timestamp. An unparseable value is read as absent; the datum is never rejected for it. It is stored as `spec.datum_stamp` (informational).
+- `spec.datum_changed_at` is when the datum last *changed* (moved more than about 1 m, or a different frame or bearing), set by the server. It is not the receive time: robots republish the datum on every MQTT reconnect and the broker re-delivers retained messages. `null` = unknown (a datum stored before the field existed and not changed since).
+- A **legacy datum** is one without `frame`: it is read as `enu`. Clients flag it as legacy.
+- Robot-side requirement: when the robot's `datum_topic` setting is empty, its fallback must **not** publish on the datum topic. Only a real datum goes there.
+
+### Approximate Position Topic
+
+**Topic**: `{prefix}/{robot}/approx_position` (retained, QoS 1)
+
+**Direction**: Robot → Mission Dispatch
+
+**Message Format** (JSON):
+```json
+{
+  "latitude": 47.4979,
+  "longitude": 19.0402,
+  "accuracy_m": 3.5,
+  "fix_quality": "rtk_float",
+  "source": "gnss",
+  "stamp": "2026-10-01T12:00:00Z"
+}
+```
+
+`latitude` and `longitude` are required; `accuracy_m` (>= 0), `fix_quality` (free text) and `stamp` are optional; `source` defaults to `gnss`.
+
+Rules:
+- Latitude outside -90..90, longitude outside -180..180, or (0, 0) (the "no fix" placeholder) is rejected.
+- Written to robot **status** as `status.approx_position` `{latitude, longitude, accuracy_m, fix_quality, source, stamp, stored_at}`. `stored_at` is the server's time of the last stored write (older rows carry `received_at`, still read as `stored_at`).
+- Write suppression: a message is not stored when the move is under 5 m, source and fix quality are unchanged and accuracy changed by less than 20 %. It is stored anyway when the stored copy is older than about 300 s, so a parked robot does not look stale.
+- Telemetry for display only. It is never written to the spec, never a datum, and never used for placement.
+
 ## Configuration
 
 ### Docker Compose (Recommended)
