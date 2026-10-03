@@ -252,6 +252,8 @@ Done by the M1 migration (`20260928_01_map_sessions`, idempotent: typed maps are
 
 **Legacy node poses (done in M2, `tools/maps_m2_legacy_nodes.py`, §13.2).** Nodes in ArangoDB are **not** rewritten in M1. A geo map's frame is UTM grid metres from the origin, but a migrated map's legacy nodes are in its old datum frame. For a `utm` datum with bearing 0 the two are the same. For an `enu` datum they differ by the grid convergence at the datum (−1.445° for `map`, i.e. about 2.5 cm per metre from the origin) and by the UTM scale factor. M2 must either rewrite those nodes into the map frame (rotate by the convergence; also store `robot_pose`), or give the legacy session the real transform (`map_geo.session_transform(geo, datum)`) instead of identity. Until then the old display path (`POST /map/load` `transform`, from the `datum_*` fields) places them exactly as before.
 
+**Approximate location (local maps, added after M1).** `spec.approx_location {latitude, longitude, accuracy_m?, source, set_at}` (`source` = `manual` or `robot`; `set_at` stamped by the server) is a hint of where a `local` map is on the Earth, for map pins and distance sorting. It is not a datum: placement, alignment and sessions never read it, and no migration is needed (absent = `null`). `PUT /api/v1/maps/{id}/approx_location` sets it: 404 unknown map, 409 on a `geo` map (effective type), 422 for (0, 0) or out-of-range values. Geo maps store nothing: clients derive their location from `MapSummary.transform`. `GET /maps` and `GET /maps/{id}` return the field unchanged. See `map-location-and-reloc-plan.md` item C.
+
 ## 13. Plan
 
 | Step | Content | Repos |

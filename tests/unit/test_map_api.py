@@ -723,3 +723,126 @@ class TestMissionPlannerGpsNavigation:
 
         assert abs(result["target"]["x"] - 1000.0) < 0.01
         assert abs(result["target"]["y"]) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# ApiDelegationService.update_map_approx_location
+# ---------------------------------------------------------------------------
+
+def _approx_service(map_obj, mock_db, mock_graph):
+    from packages.api.server import ApiDelegationService
+    db = AsyncMock()
+    if isinstance(map_obj, Exception):
+        db.get_object = AsyncMock(side_effect=map_obj)
+    else:
+        db.get_object = AsyncMock(return_value=map_obj)
+    db.update_spec = AsyncMock()
+    mock_db.return_value = db
+    mock_graph.return_value = Mock()
+    return ApiDelegationService(arango_password="x", postgres_password="x"), db
+
+
+@pytest.mark.unit
+class TestApiDelegationApproxLocation:
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_sets_on_local_map(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        local = MapObjectV1(name="hall", type="local", description="hall")
+        svc, db = _approx_service(local, mock_db, mock_graph)
+        result = await svc.update_map_approx_location(
+            "hall", 47.5, 19.04, accuracy_m=30.0, source="robot")
+
+        assert result["success"] is True
+        assert result["approx_location"]["latitude"] == 47.5
+        spec = db.update_spec.call_args[0][2]
+        assert spec.approx_location.source == "robot"
+        assert spec.approx_location.accuracy_m == 30.0
+        assert spec.approx_location.set_at is not None
+        assert spec.description == "hall" and spec.type == "local"
+        assert spec.datum_latitude is None  # never becomes a datum
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_geo_map_rejected_409(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        from fastapi import HTTPException
+        svc, db = _approx_service(_make_map_obj(), mock_db, mock_graph)  # real datum: effective geo
+        with pytest.raises(HTTPException) as exc:
+            await svc.update_map_approx_location("site_a", 47.5, 19.04)
+        assert exc.value.status_code == 409
+        db.update_spec.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_not_found_and_null_island(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        from fastapi import HTTPException
+        svc, db = _approx_service(Exception("nope"), mock_db, mock_graph)
+        assert (await svc.update_map_approx_location("ghost", 1.0, 2.0))["success"] is False
+        with pytest.raises(HTTPException) as exc:
+            await svc.update_map_approx_location("ghost", 0.0, 0.0)
+        assert exc.value.status_code == 422
+        db.update_spec.assert_not_called()
+
+
+@pytest.mark.unit
+class TestApproxLocationPassThrough:
+
+    def test_filter_maps_and_map_view_keep_field(self):
+        import datetime
+        from cloud_common.objects.map import ApproxLocationV1
+        loc = ApproxLocationV1(latitude=47.5, longitude=19.0, set_at=datetime.datetime(
+            2026, 10, 3, tzinfo=datetime.timezone.utc))
+        m = MapObjectV1(name="hall", type="local", approx_location=loc, status=MapStatusV1())
+        plain = MapObjectV1(name="yard", type="local", status=MapStatusV1())
+        views = {v["name"]: v for v in maps.filter_maps([m, plain])}
+        assert views["hall"]["approx_location"]["latitude"] == 47.5
+        assert views["hall"]["approx_location"]["source"] == "manual"
+        assert views["yard"]["approx_location"] is None
+        assert maps.map_view(m)["approx_location"]["longitude"] == 19.0
+
+    @pytest.mark.asyncio
+    async def test_route_404_on_unknown_map(self):
+        from fastapi import HTTPException
+        from packages.api import main
+        svc = Mock()
+        svc.ensure_map_not_deleting = AsyncMock()
+        svc.update_map_approx_location = AsyncMock(
+            return_value={"success": False, "error": "Map 'x' not found"})
+        with patch.object(main, "service", svc):
+            with pytest.raises(HTTPException) as exc:
+                await main.update_map_approx_location(
+                    "x", main.ApproxLocationRequest(latitude=1.0, longitude=2.0))
+        assert exc.value.status_code == 404
+
+    def test_request_validation(self):
+        from pydantic import ValidationError
+        from packages.api import main
+        with pytest.raises(ValidationError):
+            main.ApproxLocationRequest(latitude=95.0, longitude=0.0)
+        with pytest.raises(ValidationError):
+            main.ApproxLocationRequest(latitude=1.0, longitude=1.0, source="gps")
+        assert main.ApproxLocationRequest(latitude=1.0, longitude=1.0).source == "manual"

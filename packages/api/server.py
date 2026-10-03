@@ -24,7 +24,8 @@ from packages.api.diagnostics import DiagnosticsService
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.map import (
-    MapGeoV1, MapObjectV1, MapSpecV1, MapStatusV1, effective_state, effective_type)
+    ApproxLocationV1, MapGeoV1, MapObjectV1, MapSpecV1, MapStatusV1, effective_state,
+    effective_type, has_real_datum)
 from cloud_common.objects.mission import MissionObjectV1
 from cloud_common.objects.settings import SettingsObjectV1
 from cloud_common.objects.site import SiteObjectV1
@@ -1111,6 +1112,46 @@ class ApiDelegationService:
             "datum_utm_easting": new_spec.datum_utm_easting,
             "datum_utm_northing": new_spec.datum_utm_northing,
         }
+
+    async def update_map_approx_location(
+        self,
+        map_id: str,
+        latitude: float,
+        longitude: float,
+        accuracy_m: Optional[float] = None,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        """Set a local map's approximate location. A hint only: it is never read by placement,
+        alignment or the datum, so this touches no node and no session.
+
+        Geo maps are refused (409): their location is the datum / `spec.geo` origin, which the
+        client already has as `MapSummary.transform`; a second stored value could disagree.
+        (0, 0) is refused (422): it is the "no datum" placeholder (`has_real_datum`).
+        `set_at` is stamped here, not taken from the caller.
+        """
+        import uuid as _uuid
+        if not has_real_datum(latitude, longitude):
+            raise HTTPException(
+                status_code=422,
+                detail="(0, 0) is the 'no location' placeholder, not a location")
+        try:
+            map_obj = await self.database.get_object(MapObjectV1, map_id)
+        except Exception:
+            return {"success": False, "error": f"Map '{map_id}' not found"}
+        if effective_type(map_obj.spec) == "geo":
+            raise HTTPException(
+                status_code=409,
+                detail=(f"Map '{map_id}' is a geo map: its location is its datum and is not "
+                        "stored as an approximate location."))
+        approx = ApproxLocationV1(
+            latitude=latitude, longitude=longitude, accuracy_m=accuracy_m, source=source,
+            set_at=datetime.now(timezone.utc))
+        new_spec = MapSpecV1(**{**map_obj.spec.dict(), "approx_location": approx})
+        await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
+        self.logger.info(
+            f"Updated approx location for map '{map_id}': ({latitude}, {longitude}, "
+            f"accuracy_m={accuracy_m}, source={source})")
+        return {"success": True, "map_id": map_id, "approx_location": approx.dict()}
 
     async def update_node(
         self,

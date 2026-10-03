@@ -1,5 +1,6 @@
 """Unit tests for cloud_common/objects/map.py — MapObjectV1 model."""
 
+import json
 import pytest
 
 from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1, MapQueryParamsV1
