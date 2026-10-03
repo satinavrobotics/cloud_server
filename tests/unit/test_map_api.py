@@ -737,6 +737,7 @@ def _approx_service(map_obj, mock_db, mock_graph):
     else:
         db.get_object = AsyncMock(return_value=map_obj)
     db.update_spec = AsyncMock()
+    db.update_spec_fields = AsyncMock()
     mock_db.return_value = db
     mock_graph.return_value = Mock()
     return ApiDelegationService(arango_password="x", postgres_password="x"), db
@@ -763,12 +764,14 @@ class TestApiDelegationApproxLocation:
 
         assert result["success"] is True
         assert result["approx_location"]["latitude"] == 47.5
-        spec = db.update_spec.call_args[0][2]
-        assert spec.approx_location.source == "robot"
-        assert spec.approx_location.accuracy_m == 30.0
-        assert spec.approx_location.set_at is not None
-        assert spec.description == "hall" and spec.type == "local"
-        assert spec.datum_latitude is None  # never becomes a datum
+        # Only the approx_location key is written, never the whole cached spec.
+        db.update_spec.assert_not_called()
+        cls, name, fields, _ = db.update_spec_fields.call_args[0]
+        assert (cls, name, set(fields)) == (MapObjectV1, "hall", {"approx_location"})
+        loc = fields["approx_location"]
+        assert loc["source"] == "robot" and loc["accuracy_m"] == 30.0
+        assert isinstance(loc["set_at"], str)           # JSON, ready for `spec || patch`
+        assert "datum_latitude" not in fields           # never becomes a datum
 
     @pytest.mark.asyncio
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
@@ -786,7 +789,7 @@ class TestApiDelegationApproxLocation:
         with pytest.raises(HTTPException) as exc:
             await svc.update_map_approx_location("site_a", 47.5, 19.04)
         assert exc.value.status_code == 409
-        db.update_spec.assert_not_called()
+        db.update_spec_fields.assert_not_called()
 
     @pytest.mark.asyncio
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
@@ -796,16 +799,64 @@ class TestApiDelegationApproxLocation:
     @patch('packages.api.server.PostgresDatabase')
     @patch('packages.api.server.MissionPlannerClient')
     @patch('packages.api.server.LiveKitClient')
-    async def test_not_found_and_null_island(
+    async def test_unknown_map_is_404_not_found(
         self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
     ):
         from fastapi import HTTPException
-        svc, db = _approx_service(Exception("nope"), mock_db, mock_graph)
+        svc, db = _approx_service(HTTPException(404, "Did not find"), mock_db, mock_graph)
         assert (await svc.update_map_approx_location("ghost", 1.0, 2.0))["success"] is False
+        db.update_spec_fields.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_unknown_map_beats_null_island(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        # An unknown map with (0, 0) is a not-found (404 at the route), not a 422.
+        from fastapi import HTTPException
+        svc, db = _approx_service(HTTPException(404, "Did not find"), mock_db, mock_graph)
+        assert (await svc.update_map_approx_location("ghost", 0.0, 0.0))["success"] is False
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_null_island_on_a_known_map_is_422(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        from fastapi import HTTPException
+        local = MapObjectV1(name="hall", type="local", description="hall")
+        svc, db = _approx_service(local, mock_db, mock_graph)
         with pytest.raises(HTTPException) as exc:
-            await svc.update_map_approx_location("ghost", 0.0, 0.0)
+            await svc.update_map_approx_location("hall", 0.0, 0.0)
         assert exc.value.status_code == 422
-        db.update_spec.assert_not_called()
+        db.update_spec_fields.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.RosbagDatabaseService')
+    @patch('packages.topomap_dbs.client.ModelDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.api.server.LiveKitClient')
+    async def test_a_database_error_is_not_reported_as_not_found(
+        self, mock_lk, mock_mp, mock_db, mock_graph, mock_model, mock_rosbag, mock_image
+    ):
+        svc, db = _approx_service(RuntimeError("connection lost"), mock_db, mock_graph)
+        with pytest.raises(RuntimeError):
+            await svc.update_map_approx_location("hall", 1.0, 2.0)
+        db.update_spec_fields.assert_not_called()
 
 
 @pytest.mark.unit
@@ -846,3 +897,29 @@ class TestApproxLocationPassThrough:
         with pytest.raises(ValidationError):
             main.ApproxLocationRequest(latitude=1.0, longitude=1.0, source="gps")
         assert main.ApproxLocationRequest(latitude=1.0, longitude=1.0).source == "manual"
+
+
+@pytest.mark.unit
+class TestSharedPositionTypes:
+    """One set of range types and one null-island check for every model with a position."""
+
+    def test_is_null_island(self):
+        from cloud_common.objects.common import is_null_island
+        assert is_null_island(0.0, 0.0) and is_null_island(0, 0)
+        assert not is_null_island(0.0, 1.0) and not is_null_island(None, 0.0)
+
+    @pytest.mark.parametrize("bad", [dict(latitude=91.0), dict(longitude=-181.0),
+                                     dict(accuracy_m=-1.0)])
+    def test_every_model_enforces_the_same_ranges(self, bad):
+        import datetime
+        import pydantic
+        from cloud_common.objects.map import ApproxLocationV1
+        from cloud_common.objects.robot import RobotApproxPositionV1
+        from packages.api import main
+        from packages.controllers.mission.vda5050_types import RobotApproxPosition
+        kw = {**dict(latitude=1.0, longitude=2.0), **bad}
+        for model, extra in ((ApproxLocationV1, {"set_at": datetime.datetime.now(
+                datetime.timezone.utc)}), (RobotApproxPositionV1, {}),
+                (RobotApproxPosition, {}), (main.ApproxLocationRequest, {})):
+            with pytest.raises(pydantic.ValidationError):
+                model(**kw, **extra)

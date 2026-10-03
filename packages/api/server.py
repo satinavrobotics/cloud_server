@@ -1131,17 +1131,20 @@ class ApiDelegationService:
         Geo maps are refused (409): their location is the datum / `spec.geo` origin, which the
         client already has as `MapSummary.transform`; a second stored value could disagree.
         (0, 0) is refused (422): it is the "no datum" placeholder (`has_real_datum`).
-        `set_at` is stamped here, not taken from the caller.
+        `set_at` is stamped here, not taken from the caller. Unknown map: 404 (checked before the
+        (0, 0) 422, so a typo'd map id is not reported as a bad location).
         """
         import uuid as _uuid
+        try:
+            map_obj = await self.database.get_object(MapObjectV1, map_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            return {"success": False, "error": f"Map '{map_id}' not found"}
         if not has_real_datum(latitude, longitude):
             raise HTTPException(
                 status_code=422,
                 detail="(0, 0) is the 'no location' placeholder, not a location")
-        try:
-            map_obj = await self.database.get_object(MapObjectV1, map_id)
-        except Exception:
-            return {"success": False, "error": f"Map '{map_id}' not found"}
         if effective_type(map_obj.spec) == "geo":
             raise HTTPException(
                 status_code=409,
@@ -1150,8 +1153,10 @@ class ApiDelegationService:
         approx = ApproxLocationV1(
             latitude=latitude, longitude=longitude, accuracy_m=accuracy_m, source=source,
             set_at=datetime.now(timezone.utc))
-        new_spec = MapSpecV1(**{**map_obj.spec.dict(), "approx_location": approx})
-        await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
+        # Only this key: writing the whole cached spec back would revert a spec change (a
+        # datum PUT, a session's geo origin) committed since the read.
+        await self.database.update_spec_fields(
+            MapObjectV1, map_id, {"approx_location": json.loads(approx.json())}, _uuid.uuid4())
         self.logger.info(
             f"Updated approx location for map '{map_id}': ({latitude}, {longitude}, "
             f"accuracy_m={accuracy_m}, source={source})")
