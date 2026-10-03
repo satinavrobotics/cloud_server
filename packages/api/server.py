@@ -1097,7 +1097,10 @@ class ApiDelegationService:
         if is_geo and new_spec.geo is not None:
             new_datum = map_geo.map_datum(new_spec)
             if new_datum is not None:
-                new_spec = new_spec.copy(update={"geo": MapGeoV1(**map_geo.geo_from_datum(new_datum))})
+                # The datum's bearing is the map frame's rotation against the grid (plus the grid
+                # convergence for an 'enu' datum), so geo and the display transform agree.
+                block = map_geo.geo_of_datum_frame(new_datum)
+                new_spec = new_spec.copy(update={"geo": MapGeoV1(**block)})
         await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
         self.logger.info(
             f"Updated datum for map '{map_id}': "

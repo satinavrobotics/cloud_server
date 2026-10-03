@@ -1,7 +1,10 @@
 """Map frames for typed maps and mapping sessions (docs/satinav-maps-redesign.md §2-§3, M1).
 
 A `geo` map's frame is UTM grid metres in one zone fixed per map, relative to the map origin
-(`geo.origin_e`, `geo.origin_n`). A mapping session records the robot's datum for that run and
+(`geo.origin_e`, `geo.origin_n`) and rotated by `geo.bearing_deg` (the angle of the map's +X axis
+from grid east, CCW; 0 for every map whose origin came from a session, set only when a local map
+is converted to geo and keeps its own coordinates): UTM = origin + R(bearing) (x, y). A mapping
+session records the robot's datum for that run and
 `map_T_session` = {tx, ty, yaw}: a robot-frame point p maps to R(yaw) p + (tx, ty) in the map
 frame (metres, radians, counter-clockwise).
 
@@ -81,6 +84,19 @@ def geo_from_datum(datum: Mapping[str, Any]) -> Dict[str, Any]:
     return {"utm_zone": int(zone), "utm_north": bool(north), "origin_e": e, "origin_n": n}
 
 
+def geo_of_datum_frame(datum: Mapping[str, Any]) -> Dict[str, Any]:
+    """The `geo` block whose frame is the datum's own frame: origin at the datum, rotated by its
+    bearing (plus, for an 'enu' datum, the grid convergence there: its +X is true east). Used
+    where a map's display datum (datum_*) describes the frame, so the two agree."""
+    block = geo_from_datum(datum)
+    bearing = math.radians(float(datum.get("bearing_deg") or 0.0))
+    if geo.normalize_frame(datum.get("frame")) == geo.FRAME_ENU:
+        bearing += grid_convergence_rad(float(datum["latitude"]), float(datum["longitude"]),
+                                        block["utm_zone"], block["utm_north"])
+    block["bearing_deg"] = math.degrees(normalize_yaw(bearing))
+    return block
+
+
 def classify(spec: Mapping[str, Any]) -> Tuple[str, Optional[Dict[str, Any]]]:
     """(type, geo) of a pre-M1 map from its datum_* fields (doc §12): 'geo' with the datum's UTM
     point as origin if it has a real datum, else ('local', None)."""
@@ -96,8 +112,118 @@ def normalize_yaw(yaw: float) -> float:
     return math.pi if wrapped == -math.pi else wrapped
 
 
+def geo_bearing_rad(map_geo: Optional[Mapping[str, Any]]) -> float:
+    """The map frame's rotation against the UTM grid (radians); 0 when absent."""
+    return math.radians(float((map_geo or {}).get("bearing_deg") or 0.0))
+
+
+def grid_to_map(map_geo: Mapping[str, Any], de: float, dn: float) -> Tuple[float, float]:
+    """UTM offsets from the map origin (grid east, grid north) -> map (x, y): R(-bearing)."""
+    b = geo_bearing_rad(map_geo)
+    c, s = math.cos(b), math.sin(b)
+    return c * de + s * dn, -s * de + c * dn
+
+
+def map_to_grid(map_geo: Mapping[str, Any], x: float, y: float) -> Tuple[float, float]:
+    """Map (x, y) -> UTM offsets from the map origin: R(bearing)."""
+    b = geo_bearing_rad(map_geo)
+    c, s = math.cos(b), math.sin(b)
+    return c * x - s * y, s * x + c * y
+
+
+def latlon_to_map(map_geo: Mapping[str, Any], lat: float, lon: float) -> Tuple[float, float]:
+    """WGS84 -> the geo map's frame (exact UTM in the map's zone, then the map's rotation)."""
+    e, n = geo.latlon_to_utm(lat, lon, int(map_geo["utm_zone"]), bool(map_geo["utm_north"]))
+    return grid_to_map(map_geo, e - float(map_geo["origin_e"]), n - float(map_geo["origin_n"]))
+
+
+def map_to_latlon(map_geo: Mapping[str, Any], x: float, y: float) -> Tuple[float, float]:
+    """The geo map's frame -> WGS84 (lat, lon); inverse of latlon_to_map."""
+    de, dn = map_to_grid(map_geo, x, y)
+    return geo.utm_to_latlon(float(map_geo["origin_e"]) + de, float(map_geo["origin_n"]) + dn,
+                             int(map_geo["utm_zone"]), bool(map_geo["utm_north"]))
+
+
+def grid_convergence_rad(lat: float, lon: float, zone: int, north: bool) -> float:
+    """Angle of true east in the UTM grid of `zone` at (lat, lon), CCW (radians): a bearing
+    measured from true east plus this is the same direction measured from grid east."""
+    e0, n0 = geo.latlon_to_utm(lat, lon, zone, north)
+    e1, n1 = geo.latlon_to_utm(*geo.enu_to_latlon(_YAW_PROBE_M, 0.0, lat, lon), zone, north)
+    return math.atan2(n1 - n0, e1 - e0)
+
+
+# UTM is defined between 80 deg S and 84 deg N; a zone is accepted for an anchor up to one zone
+# width from its central meridian (the projection stays exact to ~1 mm there).
+UTM_LAT_MIN, UTM_LAT_MAX = -80.0, 84.0
+MAX_ZONE_OFFSET_DEG = 6.0
+
+
+def zone_offset_deg(lon: float, zone: int) -> float:
+    """|longitude - the zone's central meridian| in degrees, wrapped to [0, 180]."""
+    d = (lon - (zone * 6.0 - 183.0) + 180.0) % 360.0 - 180.0
+    return abs(d)
+
+
+def geo_from_anchor(latitude: float, longitude: float, anchor_x: float = 0.0,
+                    anchor_y: float = 0.0, bearing_deg: float = 0.0, frame: Optional[str] = None,
+                    utm_zone: Optional[int] = None, utm_north: Optional[bool] = None
+                    ) -> Dict[str, Any]:
+    """The `geo` block that puts the map-frame point (anchor_x, anchor_y) at (latitude,
+    longitude) with the map's +X axis at `bearing_deg` from east (CCW): from grid east for
+    frame 'utm' (the default), from true east at the anchor for 'enu'. The map's coordinates are
+    not touched: the origin is wherever (0, 0) lands. Zone: `utm_zone` or the anchor
+    longitude's; hemisphere: `utm_north` or the anchor's. Raises ValueError for an anchor
+    outside UTM (80 S .. 84 N), a zone more than MAX_ZONE_OFFSET_DEG from the anchor, or a
+    non-finite input."""
+    values = (latitude, longitude, anchor_x, anchor_y, bearing_deg)
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values):
+        raise ValueError("latitude, longitude, anchor and bearing must be finite numbers")
+    if not UTM_LAT_MIN <= latitude <= UTM_LAT_MAX:
+        raise ValueError(f"latitude {latitude} is outside UTM ({UTM_LAT_MIN} .. {UTM_LAT_MAX})")
+    if not -180.0 <= longitude <= 180.0:
+        raise ValueError(f"longitude {longitude} is outside -180 .. 180")
+    zone = int(utm_zone) if utm_zone is not None else geo.utm_zone_from_longitude(longitude)
+    if not 1 <= zone <= 60:
+        raise ValueError(f"UTM zone {zone} is outside 1 .. 60")
+    if zone_offset_deg(longitude, zone) > MAX_ZONE_OFFSET_DEG:
+        raise ValueError(f"UTM zone {zone} is too far from longitude {longitude} (more than "
+                         f"{MAX_ZONE_OFFSET_DEG:g} deg from its central meridian)")
+    north = bool(utm_north) if utm_north is not None else latitude >= 0.0
+    bearing = math.radians(float(bearing_deg))
+    if geo.normalize_frame(frame or geo.FRAME_UTM) == geo.FRAME_ENU:  # None = utm here
+        bearing += grid_convergence_rad(latitude, longitude, zone, north)
+    bearing = normalize_yaw(bearing)
+    ea, na = geo.latlon_to_utm(latitude, longitude, zone, north)
+    c, s = math.cos(bearing), math.sin(bearing)
+    origin_e = ea - (c * anchor_x - s * anchor_y)
+    origin_n = na - (s * anchor_x + c * anchor_y)
+    return {"utm_zone": zone, "utm_north": north, "origin_e": origin_e, "origin_n": origin_n,
+            "bearing_deg": math.degrees(bearing)}
+
+
+def former_datum_of(map_geo: Mapping[str, Any]) -> Dict[str, Any]:
+    """A geo block as `former_datum` (without `converted_at`): the origin's WGS84 position plus
+    the block itself, so a conversion back with the same anchor restores the frame."""
+    lat, lon = map_to_latlon(map_geo, 0.0, 0.0)
+    return {"latitude": lat, "longitude": lon,
+            "bearing_deg": float(map_geo.get("bearing_deg") or 0.0),
+            "utm_zone": int(map_geo["utm_zone"]), "utm_north": bool(map_geo["utm_north"]),
+            "origin_e": float(map_geo["origin_e"]), "origin_n": float(map_geo["origin_n"])}
+
+
 def session_transform(map_geo: Mapping[str, Any], datum: Mapping[str, Any]) -> Dict[str, float]:
-    """map_T_session of a session on a geo map (see the module docstring)."""
+    """map_T_session of a session on a geo map (see the module docstring): the run frame in
+    UTM offsets from the map origin, then the map's own rotation (`bearing_deg`)."""
+    grid = _session_grid_transform(map_geo, datum)
+    if not geo_bearing_rad(map_geo):
+        return grid
+    x, y = grid_to_map(map_geo, grid["tx"], grid["ty"])
+    return {"tx": x, "ty": y, "yaw": normalize_yaw(grid["yaw"] - geo_bearing_rad(map_geo))}
+
+
+def _session_grid_transform(map_geo: Mapping[str, Any], datum: Mapping[str, Any]
+                            ) -> Dict[str, float]:
+    """The run frame in UTM grid offsets from the map origin (no map rotation)."""
     zone, north = int(map_geo["utm_zone"]), bool(map_geo["utm_north"])
     oe, on = float(map_geo["origin_e"]), float(map_geo["origin_n"])
     bearing = float(datum.get("bearing_deg") or 0.0)

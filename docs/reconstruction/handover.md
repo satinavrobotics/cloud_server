@@ -123,6 +123,9 @@ Fields:
   stamp. When present it **replaces** `pose` for that camera (§5).
 - `nodes` is sorted by capture time. Only frames with depth are included.
 - `map.crs` is `null` for a local map. It is copied into the outputs and not used for math.
+  A map converted from local to geo (maps §17) is rotated against the UTM grid: its `crs` then
+  also has `bearing_deg` (the map's +X axis from grid east, CCW; map (x, y) -> UTM = origin +
+  R(bearing) (x, y)). The key is absent when the rotation is 0, i.e. for every other map.
 - `params` are the cloud's defaults (tuned indoors). The service owns the real defaults: it may
   use other values per map (e.g. outdoor, from `map.type` or the extent of the poses) and must
   report what it used in `meta.json`.

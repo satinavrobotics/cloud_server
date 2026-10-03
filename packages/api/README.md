@@ -280,6 +280,14 @@ carry `purpose`.
 | GET | `.../sessions/{sid}/placement-suggestions` | gains `reloc`: the same object for an unplaced local-map session, else `null`. |
 | POST | `.../sessions/{sid}/place` | `source` is `last_position` or `reloc`. `{"source": "reloc"}` (no poses): the robot relocalizes itself on its stored map; identity `map_T_session` (assumption D0, `map_sessions.reloc_map_t_session()`), the robot's current pose is recorded, the still check is skipped. 409 when already placed, the robot is offline or reports `position_initialized: false`, or the orchestrator does not hold the map (fresh check; unknown counts as not held). Not accepted on session start (422). |
 
+#### Map type conversion (docs/satinav-maps-redesign.md §17)
+
+| Method | Path | Does |
+|---|---|---|
+| POST | `/api/v1/maps/{id}/type` | `{"type": "local"}` or `{"type": "geo", latitude, longitude, bearing_deg?: 0, frame?: "utm"\|"enu", anchor?: {x, y}, utm_zone?, utm_north?}` → `{map_id, changed, old_type, type, map, operating: [{robot, session_id, aligned}], warnings: [..]}`. Nothing moves: map-frame coordinates stay. To geo: the map point `anchor` (default the origin) is at (latitude, longitude), +X at `bearing_deg` from east, CCW (grid east for `utm`, true east at the anchor for `enu`); stored as `geo.bearing_deg` plus the matching `datum_*` (a `utm` datum at the origin with `datum_bearing_deg`). To local: `geo` and `datum_*` cleared, the old georeference kept as `former_datum {latitude, longitude, bearing_deg, utm_zone, utm_north, origin_e, origin_n, converted_at}` (the frame's origin), the old origin set as `approx_location`. 404 unknown map; 409 deleting, already that type, an open (or paused) mapping session; 422 body (range, (0, 0), outside UTM 80 S..84 N, a zone more than 6 deg from the anchor). Open operate sessions keep their placement; to geo, a placed one gets the robot's current datum stamped as its `datum`. `MAP.TYPE_CHANGED`. |
+| GET | `.../sessions/{sid}/placement-suggestions` | on a **geo** map, an unplaced session gets `{source: "datum", basis: "robot_datum", map_T_session, pose, robot_pose, datum, at (robot datum_changed_at), datum_after_unplace: true\|false\|null}` when the robot's datum is in the map's zone. |
+| POST | `.../sessions/{sid}/place` | `{"source": "datum"}` (no poses, geo maps only): place an unplaced geo session from the robot's current datum (stores it as the session's `datum`). 409: a local map, a placed session, no usable datum, robot offline. Any other placement on a geo map stays 409. |
+
 The robot view (`GET /robots[/{r}]`, WS `robot_update`) gains `status.position_initialized`,
 `status.localization_score`, `status.approx_position` (from the robot's retained MQTT
 `{prefix}/{robot}/approx_position`; display only, never a datum, never used for placement; writes are

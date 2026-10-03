@@ -9,6 +9,7 @@
     POST   /api/v1/maps/{id}/sessions/{sid}/pause|resume|finish   session_action()
     POST   /api/v1/maps/{id}/sessions/{sid}/place        place_session()
     POST   /api/v1/maps/{id}/archive|restore             archive_map() / restore_map()
+    POST   /api/v1/maps/{id}/type                        convert_map_type() geo <-> local
     DELETE /api/v1/maps/{id}                             refuse_open_session() guards it
 
 The old map routes POST /map/load and PUT /maps/{id}/datum are unchanged. The old "assign map"
@@ -73,6 +74,13 @@ cleanly reopened: a failed start leaves everything, events included, as it was.
 Pause and finish STOP them after the commit, best effort: an offline robot's session is closed
 anyway and the response says `robot_notified: false` with a `mapping_warning`. The session
 still gates the nodes (graph-builder drops a node with no open, unpaused, placed session).
+
+Type conversion (convert_map_type, docs/satinav-maps-redesign.md §17): geo -> local drops the
+georeference, local -> geo adds one ({latitude, longitude} of a map-frame `anchor`, plus the
+map's rotation against the grid, stored as geo.bearing_deg). The map-frame coordinates never
+change, so nodes, edges, reconstruction results, every session's map_T_session and stored mission
+waypoints stay valid. Refused (409) while the map has an open (or paused) mapping session; open
+operate sessions keep their placement.
 """
 
 import asyncio
@@ -91,7 +99,7 @@ from fastapi import HTTPException
 
 from cloud_common.objects.map import (
     MAP_STATES, MAP_TYPES, MapObjectV1, MapSpecV1, MapStatusV1, effective_state,
-    effective_type,
+    effective_type, has_real_datum,
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
@@ -204,6 +212,11 @@ class RobotPose(pydantic.BaseModel):
     _check = pydantic.validator("x", "y", "theta", allow_reuse=True)(_finite)
 
 
+PLACE_SOURCES = (ms.SOURCE_LAST_POSITION, ms.SOURCE_RELOC, ms.SOURCE_DATUM)
+# Placed by the server from what the robot reports: no pose / robot_pose in the body.
+POSELESS_SOURCES = (ms.SOURCE_RELOC, ms.SOURCE_DATUM)
+
+
 class PlaceRequest(pydantic.BaseModel):
     """POST .../sessions/{sid}/place, and `placement` on start."""
     pose: Optional[MapPose] = None
@@ -213,6 +226,8 @@ class PlaceRequest(pydantic.BaseModel):
     # "reloc" (POST .../place only): the robot relocalises itself on the stored map its
     # orchestrator holds; no pose or robot_pose is needed (the server records the robot's pose
     # and places with ms.reloc_placement(): the identity, D0 assumption).
+    # "datum" (POST .../place only, geo maps): place an unplaced geo session from the robot's
+    # CURRENT GNSS datum (what the dispatcher does when a new datum arrives); no poses.
     source: Optional[str] = None
 
     class Config:
@@ -220,17 +235,17 @@ class PlaceRequest(pydantic.BaseModel):
 
     @pydantic.validator("source")
     def _source(cls, value):  # noqa: N805
-        if value is not None and value not in (ms.SOURCE_LAST_POSITION, ms.SOURCE_RELOC):
-            raise ValueError(f"source must be {ms.SOURCE_LAST_POSITION!r} or "
-                             f"{ms.SOURCE_RELOC!r} when given")
+        if value is not None and value not in PLACE_SOURCES:
+            raise ValueError("source must be one of "
+                             f"{', '.join(map(repr, PLACE_SOURCES))} when given")
         return value
 
     @pydantic.root_validator(skip_on_failure=True)
     def _poses(cls, values):  # noqa: N805
-        if values.get("source") != ms.SOURCE_RELOC and (
+        if values.get("source") not in POSELESS_SOURCES and (
                 values.get("pose") is None or values.get("robot_pose") is None):
             raise ValueError("pose and robot_pose are required (except for source "
-                             f"{ms.SOURCE_RELOC!r})")
+                             f"{ms.SOURCE_RELOC!r} or {ms.SOURCE_DATUM!r})")
         return values
 
 
@@ -877,19 +892,64 @@ async def _reloc_inputs(db: Any, map_name: str, session_id: str
     return row, session, robot
 
 
+def datum_placement(map_geo_block: Optional[Mapping[str, Any]], robot: Optional[RobotObjectV1]
+                    ) -> Optional[Dict[str, Any]]:
+    """Where the robot's CURRENT GNSS datum puts its run frame on a geo map: {map_T_session,
+    datum, robot_pose (its pose now, run frame), pose (that pose in the map frame)}, or None
+    when the datum cannot place it (no datum, another UTM zone, no map origin). The map's
+    rotation (geo.bearing_deg, a local map converted to geo) is included."""
+    if robot is None:
+        return None
+    datum = map_geo.robot_datum(robot.datum)
+    transform = ms.geo_transform_for(map_geo_block, "geo", datum)
+    if transform is None:
+        return None
+    at = robot.status.pose
+    rx, ry, rt = (float(at.x), float(at.y), float(at.theta)) if at is not None else (0.0, 0.0, 0.0)
+    x, y, yaw = map_geo.apply_pose(transform, rx, ry, rt)
+    return {"map_T_session": transform, "datum": datum,
+            "robot_pose": {"x": rx, "y": ry, "theta": rt}, "pose": {"x": x, "y": y, "yaw": yaw}}
+
+
+def datum_suggestion(map_geo_block: Optional[Mapping[str, Any]], robot: Optional[RobotObjectV1],
+                     session: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """The placement suggestion of an unplaced session on a GEO map: the robot's current datum
+    (accept with POST .../place {"source": "datum"}). `datum_after_unplace`: whether the datum
+    changed after the session was unplaced (true: it is the new run's; false: it may be the
+    previous run's, e.g. not re-sent yet, or a fixed sim anchor that never changes; null:
+    unknown). `at`: when the robot's datum last changed (null: unknown)."""
+    found = datum_placement(map_geo_block, robot)
+    if found is None:
+        return None
+    changed_at = _parse_ts(getattr(robot, "datum_changed_at", None))
+    unplaced_at = _parse_ts((session.get("placement") or {}).get("unplaced_at"))
+    after = None if changed_at is None or unplaced_at is None else changed_at >= unplaced_at
+    return {"source": ms.SOURCE_DATUM, "basis": "robot_datum", **found,
+            "at": _iso(changed_at), "datum_after_unplace": after}
+
+
 def _placement_refusals(map_name: str, session_id: str, session: Optional[Mapping[str, Any]],
-                        row: MapRow, robot: Optional[RobotObjectV1], reloc: bool) -> None:
+                        row: MapRow, robot: Optional[RobotObjectV1], reloc: bool,
+                        source: Optional[str] = None) -> None:
     """The 404/409 refusals of POST .../place that need no orchestrator answer, in the order
     they apply. Run once before the (slow) orchestrator read of a `reloc` placement and again
-    inside the transaction."""
+    inside the transaction. `source` "datum": the geo-map placement from the robot's datum."""
     if session is None or session["map_name"] != map_name:
         raise HTTPException(404, f"Did not find session \"{session_id}\" on map "
                                  f"\"{map_name}\"")
     if session["ended_at"] is not None:
         raise HTTPException(409, f"Session {session_id} is finished")
-    if row.type == "geo":
+    by_datum = source == ms.SOURCE_DATUM
+    if row.type == "geo" and not by_datum:
         raise HTTPException(409, f"Map '{map_name}' is a geo map: its sessions are "
-                                 "placed by the robot's datum")
+                                 "placed by the robot's datum (source \"datum\")")
+    if row.type != "geo" and by_datum:
+        raise HTTPException(409, f"Map '{map_name}' is a local map: it has no georeference "
+                                 "to place a robot by its datum; place it by hand or by "
+                                 "relocalization")
+    if by_datum and ms.is_placed(session):
+        raise HTTPException(409, f"Session {session_id} is already placed (a placed geo "
+                                 "session follows the robot's datum by itself)")
     if ms.purpose_of(session) == ms.MAPPING and ms.is_placed(session):
         raise HTTPException(409, f"Mapping session {session_id} is already placed; "
                                  "re-placing it would split its nodes (finish it and "
@@ -981,8 +1041,9 @@ async def _placement_suggestions(db: Any, map_name: str, session_id: str) -> Dic
     The suggestion's map_T_session pairs the last map pose with the robot's FIRST pose in its
     current run (robot_pose; the odometry origin when unknown), so it stays right when the
     robot drove since the restart. Accepting is the ordinary POST .../place with `pose` and
-    the live robot pose. 404 unknown map/session; 409 finished session; a geo map or a placed
-    session: no suggestions."""
+    the live robot pose. 404 unknown map/session; 409 finished session; a placed session: no
+    suggestions. A GEO map instead offers the robot's current datum (datum_suggestion, source
+    "datum"; accepted with POST .../place {"source": "datum"}), or nothing without one."""
     try:
         sid = str(uuid.UUID(str(session_id)))
     except ValueError:
@@ -999,9 +1060,16 @@ async def _placement_suggestions(db: Any, map_name: str, session_id: str) -> Dic
                                          f"\"{map_name}\"")
             if session["ended_at"] is not None:
                 raise HTTPException(409, f"Session {sid} is finished")
-            if row.type == "geo" or ms.is_placed(session):
+            if ms.is_placed(session):
                 return out
             robot_name = session["robot_name"]
+            if row.type == "geo":
+                # A geo session is placed by the robot's datum: offer the current one.
+                found = datum_suggestion(row.spec.get("geo"), await store.robot(robot_name),
+                                         session)
+                if found is not None:
+                    out["suggestions"].append(found)
+                return out
             placement = session.get("placement") or {}
             unplaced_at = _parse_ts(placement.get("unplaced_at"))
             epoch = await store.robot_run_start(robot_name)
@@ -1091,6 +1159,228 @@ async def restore_map(db: Any, name: str, publisher_id: uuid.UUID,
     return await _archive_or_restore(db, name, False, publisher_id, actor)
 
 
+# --- type conversion (geo <-> local) -----------------------------------------------------------
+
+class MapPoint(pydantic.BaseModel):
+    """A point in the map frame (metres)."""
+    x: float = 0.0
+    y: float = 0.0
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+    _check = pydantic.validator("x", "y", allow_reuse=True)(_finite)
+
+
+GEO_FIELDS = ("latitude", "longitude", "bearing_deg", "frame", "anchor", "utm_zone", "utm_north")
+
+
+class ConvertTypeRequest(pydantic.BaseModel):
+    """POST /api/v1/maps/{id}/type. `{"type": "local"}`, or `{"type": "geo", latitude, longitude,
+    bearing_deg?, frame?, anchor?, utm_zone?, utm_north?}`: the map-frame point `anchor`
+    (default the origin) is at (latitude, longitude) and the map's +X axis points `bearing_deg`
+    from east, counter-clockwise (the datum_bearing_deg convention): from UTM grid east for
+    frame "utm" (default), from true east at the anchor for "enu"."""
+    type: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    bearing_deg: Optional[float] = None
+    frame: Optional[str] = None
+    anchor: Optional[MapPoint] = None
+    utm_zone: Optional[int] = None
+    utm_north: Optional[bool] = None
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+    @pydantic.validator("type")
+    def _type(cls, value):  # noqa: N805
+        if value not in MAP_TYPES:
+            raise ValueError(f"type must be one of {', '.join(MAP_TYPES)}")
+        return value
+
+    @pydantic.validator("latitude", "longitude", "bearing_deg")
+    def _finite_or_none(cls, value):  # noqa: N805
+        if value is not None and not math.isfinite(value):
+            raise ValueError("must be a finite number")
+        return value
+
+    @pydantic.validator("frame")
+    def _frame(cls, value):  # noqa: N805
+        if value is not None and value not in ("utm", "enu"):
+            raise ValueError("frame must be 'utm' or 'enu'")
+        return value
+
+    @pydantic.validator("utm_zone")
+    def _zone(cls, value):  # noqa: N805
+        if value is not None and not 1 <= value <= 60:
+            raise ValueError("utm_zone must be 1 .. 60")
+        return value
+
+    @pydantic.root_validator(skip_on_failure=True)
+    def _fields(cls, values):  # noqa: N805
+        given = [k for k in GEO_FIELDS if values.get(k) is not None]
+        if values["type"] == "local":
+            if given:
+                raise ValueError(f"{', '.join(given)}: only for a conversion to geo")
+            return values
+        lat, lon = values.get("latitude"), values.get("longitude")
+        if lat is None or lon is None:
+            raise ValueError("latitude and longitude are required for a conversion to geo")
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            raise ValueError("latitude must be -90 .. 90 and longitude -180 .. 180")
+        if not has_real_datum(lat, lon):
+            raise ValueError("(0, 0) is the 'no location' placeholder, not a location")
+        return values
+
+
+def _former_datum(row: MapRow, now: datetime.datetime) -> Optional[Dict[str, Any]]:
+    """What a geo map's georeference becomes on its way to local (`former_datum`): its geo
+    block, or for a geo map without one (a draft whose first session never came) its legacy
+    datum_*; None without either."""
+    block = row.spec.get("geo")
+    if not block:
+        datum = map_geo.map_datum(row.spec)
+        if datum is None:
+            return None
+        block = map_geo.geo_of_datum_frame(datum)
+    out = map_geo.former_datum_of(block)
+    out["converted_at"] = now.isoformat()
+    return out
+
+
+LOCAL_DATUM_PATCH = {"datum_latitude": None, "datum_longitude": None, "datum_bearing_deg": 0.0,
+                     "datum_frame": "enu", "datum_utm_zone": None, "datum_utm_north": None,
+                     "datum_utm_easting": None, "datum_utm_northing": None}
+
+
+def plan_type_change(row: MapRow, req: ConvertTypeRequest, now: datetime.datetime
+                     ) -> Dict[str, Any]:
+    """The spec patch of a conversion (pure). Map-frame coordinates are never touched:
+    - to local: type, no `geo`, no datum_*, `former_datum` = the old georeference, and the
+      old origin as the map's `approx_location` (a hint for pins and sorting);
+    - to geo: `geo` from the anchor (map_geo.geo_from_anchor: zone, origin, bearing_deg), the
+      datum_* = that origin as a 'utm' datum with the map's rotation (what the client's
+      `transform` and the planner's legacy path read), no approx_location / former_datum.
+    422 for an anchor that cannot be georeferenced (outside UTM, a zone too far away)."""
+    if req.type == "local":
+        former = _former_datum(row, now)
+        patch: Dict[str, Any] = {"type": "local", "geo": None, **LOCAL_DATUM_PATCH,
+                                 "former_datum": former}
+        if former is not None:
+            patch["approx_location"] = {"latitude": former["latitude"],
+                                        "longitude": former["longitude"], "accuracy_m": None,
+                                        "source": "manual", "set_at": now.isoformat()}
+        return patch
+    anchor = req.anchor or MapPoint()
+    try:
+        block = map_geo.geo_from_anchor(
+            req.latitude, req.longitude, anchor.x, anchor.y, req.bearing_deg or 0.0,
+            frame=req.frame, utm_zone=req.utm_zone, utm_north=req.utm_north)
+    except ValueError as exc:
+        raise HTTPException(422, [{"loc": ["body"], "type": "value_error",
+                                   "msg": str(exc)}]) from exc
+    return {"type": "geo", "geo": block, **origin_as_legacy_datum(block),
+            "approx_location": None, "former_datum": None}
+
+
+def _conversion_notes(new_type: str, sessions: List[Mapping[str, Any]],
+                      datums: Mapping[str, Optional[Dict[str, Any]]]) -> List[str]:
+    """What the conversion means for the robots using the map (the response's `warnings`)."""
+    notes: List[str] = []
+    for s in sorted(sessions, key=lambda x: str(x["robot_name"])):
+        robot = s["robot_name"]
+        has_datum = datums.get(robot) is not None
+        if ms.is_placed(s):
+            notes.append(f"{robot} keeps its placement (the map frame did not move)"
+                         + (": after its next restart it is placed by its GNSS datum"
+                            if new_type == "geo" and has_datum else "")
+                         + ("; it has no GNSS datum, so after its next restart it cannot be "
+                            "placed on this geo map (convert it back or stop using it)"
+                            if new_type == "geo" and not has_datum else ""))
+        elif new_type == "geo":
+            notes.append(f"{robot} is not placed: "
+                         + ("place it from its GNSS datum (placement suggestion "
+                            "source \"datum\")" if has_datum else
+                            "it has no GNSS datum, so it cannot be placed on a geo map"))
+        else:
+            notes.append(f"{robot} is not placed: place it by hand or by relocalization")
+    if new_type == "geo":
+        notes.append("Robots without a GNSS datum cannot start a session on this map now "
+                     "(a geo map is placed by the robot's datum)")
+    else:
+        notes.append("The map is no longer georeferenced: no street tiles, no GPS goals; "
+                     "robots are placed by hand or by relocalization")
+    return notes
+
+
+async def convert_map_type(db: Any, name: str, data: Any, publisher_id: uuid.UUID,
+                           actor: Optional[str] = None) -> Dict[str, Any]:
+    """POST /api/v1/maps/{id}/type: convert geo <-> local (ConvertTypeRequest). Nothing moves:
+    the map-frame coordinates of nodes, edges, reconstruction results, sessions and missions
+    stay valid. One transaction (map row locked, so it serialises with session starts):
+
+    - 404 unknown map; 409 deleting, already of that type, or an open (or paused) MAPPING
+      session (its nodes would land in a frame whose meaning changes under them); 422 body;
+    - open OPERATE sessions stay open and keep map_T_session (it is in map-frame terms). To
+      geo: a placed session gets the robot's current datum stamped as its `datum`, so the
+      dispatcher does not re-derive it from the very same datum (it does from the next
+      different one, as on any geo map); an unplaced one is placed from the datum later
+      (the dispatcher, or POST .../place {"source": "datum"}). To local: nothing to do (a
+      local session ignores datums);
+    - MAP.TYPE_CHANGED (source api).
+    The response: {map_id, changed, old_type, type, map (as GET /maps lists it), operating:
+    [{robot, session_id, aligned}], warnings: [..]}."""
+    req = parse_body(ConvertTypeRequest, data)
+    now = _utcnow()
+    try:
+        async with open_store(db, publisher_id) as store:
+            row = await _lock_alive_map(store, name)
+            old_type = row.type
+            if req.type == old_type:
+                raise HTTPException(409, f"Map '{name}' is already a {old_type} map")
+            open_sessions = [s for s in await store.sessions(name) if s["ended_at"] is None]
+            mapping = [s for s in open_sessions if ms.purpose_of(s) == ms.MAPPING]
+            if mapping or row.state in OPEN_STATES:
+                who = _robots_phrase(mapping) if mapping else "a robot"
+                raise HTTPException(409, f"Map '{name}' has an open mapping session "
+                                         f"({who}); finish it before converting the map "
+                                         "(nodes arriving meanwhile would land in a frame "
+                                         "whose meaning changed)")
+            old_geo = row.spec.get("geo")
+            patch = plan_type_change(row, req, now)
+            await store.update_map(row, spec=patch)
+            row.spec.update(patch)
+            datums: Dict[str, Optional[Dict[str, Any]]] = {}
+            for s in open_sessions:
+                robot = await store.robot(s["robot_name"])
+                datum = map_geo.robot_datum(robot.datum) if robot is not None else None
+                if req.type == "geo" and ms.geo_transform_for(patch["geo"], "geo",
+                                                              datum) is None:
+                    datum = None  # none, or in another zone: cannot place it on this map
+                datums[s["robot_name"]] = datum
+                if req.type == "geo" and ms.is_placed(s) and datum is not None:
+                    locked = await store.lock_session(str(s["session_id"]))
+                    if locked is not None and locked["ended_at"] is None and ms.is_placed(locked):
+                        await store.update_session(str(s["session_id"]), datum=datum)
+            operating = [{"robot": s["robot_name"], "session_id": str(s["session_id"]),
+                          "aligned": s.get("aligned")}
+                         for s in sorted(open_sessions, key=lambda x: str(x["robot_name"]))]
+            await store.emit(Event(
+                EventCode.MAP_TYPE_CHANGED, now, source=Source.API,
+                discriminator=f"map:{name}:type:{req.type}:{now.isoformat()}",
+                payload={"map_name": name, "old_type": old_type, "new_type": req.type,
+                         "geo": patch.get("geo"), "old_geo": old_geo,
+                         "operating": [o["robot"] for o in operating], "actor": actor}))
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    obj = MapObjectV1(name=name, lifecycle=ObjectLifecycleV1[row.lifecycle], status=row.status,
+                      **row.spec)
+    return {"map_id": name, "changed": True, "old_type": old_type, "type": req.type,
+            "map": map_view(obj), "operating": operating,
+            "warnings": _conversion_notes(req.type, open_sessions, datums)}
+
+
 REFUSE_OPEN_SESSION_SQL = (f"SELECT robot_name, purpose FROM {SESSIONS_TABLE} "
                            "WHERE map_name = %s AND ended_at IS NULL ORDER BY robot_name")
 LOCK_MAP_SQL = f"SELECT 1 FROM {MAP_TABLE} WHERE name = %s FOR UPDATE"
@@ -1168,12 +1458,14 @@ def plan_session(row: MapRow, robot: RobotObjectV1, previous: List[Dict[str, Any
 
 
 def origin_as_legacy_datum(geo: Mapping[str, Any]) -> Dict[str, Any]:
-    """The map's datum_* fields for a geo map origin: a 'utm' datum at the origin, bearing 0,
-    i.e. exactly the map frame, for the old client/planner (map/load `transform`)."""
+    """The map's datum_* fields for a geo map origin: a 'utm' datum at the origin with the map's
+    rotation as its bearing (0 unless the map was converted from local), i.e. exactly the map
+    frame, for the client and the planner (map/load and graph `transform`)."""
     from packages.utils import geo as geo_mod
     lat, lon = geo_mod.utm_to_latlon(geo["origin_e"], geo["origin_n"], geo["utm_zone"],
                                      geo["utm_north"])
-    return {"datum_latitude": lat, "datum_longitude": lon, "datum_bearing_deg": 0.0,
+    return {"datum_latitude": lat, "datum_longitude": lon,
+            "datum_bearing_deg": float(geo.get("bearing_deg") or 0.0),
             "datum_frame": "utm", "datum_utm_zone": geo["utm_zone"],
             "datum_utm_north": geo["utm_north"], "datum_utm_easting": geo["origin_e"],
             "datum_utm_northing": geo["origin_n"]}
@@ -1237,11 +1529,12 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
             raise HTTPException(422, [{"loc": ["body", "placement"], "type": "value_error",
                                        "msg": "a geo map is placed by the robot's datum; "
                                               "placement is for local maps"}])
-        if req.placement.source == ms.SOURCE_RELOC:
+        if req.placement.source in POSELESS_SOURCES:
             raise HTTPException(422, [{"loc": ["body", "placement", "source"],
                                        "type": "value_error",
-                                       "msg": "a reloc placement is made with POST .../place "
-                                              "after the session started"}])
+                                       "msg": f"a {req.placement.source} placement is made "
+                                              "with POST .../place after the session "
+                                              "started"}])
         await check_robot_still(store, robot, req.placement.robot_pose.dict())
         placement = _placement_record(req.placement, ms.SOURCE_USER, actor, now)
     carried = carried if carried is not None and ms.is_placed(carried) else None
@@ -1702,8 +1995,19 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
             row = await _lock_alive_map(store, map_name)
             session = await store.lock_session(session_id)
             robot = await store.robot(session["robot_name"]) if session is not None else None
-            _placement_refusals(map_name, session_id, session, row, robot, reloc)
-            if reloc:
+            _placement_refusals(map_name, session_id, session, row, robot, reloc, req.source)
+            by_datum = req.source == ms.SOURCE_DATUM
+            from_datum = None
+            if by_datum:
+                from_datum = datum_placement(row.spec.get("geo"), robot)
+                if from_datum is None:
+                    raise HTTPException(
+                        409, f"Robot '{robot.name}' has no GNSS datum that places it on map "
+                             f"'{map_name}' (none, or in another UTM zone than the map's)")
+                req.robot_pose = RobotPose(**from_datum["robot_pose"])
+                req.pose = MapPose(**from_datum["pose"])
+                transform = from_datum["map_T_session"]
+            elif reloc:
                 if held is not True:
                     raise HTTPException(
                         409, f"Robot '{robot.name}' does not hold a stored map for map "
@@ -1717,11 +2021,16 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                 await check_robot_still(store, robot, req.robot_pose.dict())
             old = session.get("map_t_session") if ms.is_placed(session) else None
             placement = _placement_record(req, req.source or ms.SOURCE_USER, actor, now)
-            if not reloc:
+            if not reloc and not by_datum:
                 transform = ms.placement_transform(placement["pose"], placement["robot_pose"])
-            session.update(map_t_session=transform, aligned=True, placement=placement)
-            await store.update_session(session_id, map_t_session=transform, aligned=True,
-                                       placement=placement)
+            fields: Dict[str, Any] = {"map_t_session": transform, "aligned": True,
+                                      "placement": placement}
+            if from_datum is not None:
+                # The session's datum is what the dispatcher compares the next datum with.
+                placement["datum"] = from_datum["datum"]
+                fields["datum"] = from_datum["datum"]
+            session.update(fields)
+            await store.update_session(session_id, **fields)
             await store.emit(_placed_event(session, now, old))
             map_state = row.state
     except _SCHEMA_ERRORS as exc:

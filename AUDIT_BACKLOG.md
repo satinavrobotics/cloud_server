@@ -452,3 +452,35 @@ Utilities → Insights tile work without a selected robot.
 ### F2. Robot status has no timestamp — **low**
 The Workbench Diagnostics tab lists faults and not-ready robots, but `robot.status` carries no
 "since" time, so every row shows "now". Add the time the error / readiness state began.
+
+## G. Map type conversion geo ↔ local (2026-10-03) — built, not deployed
+
+Design: `docs/satinav-maps-redesign.md` §17. Client side: `../sati-client/docs/AUDIT_BACKLOG.md` **AB8**.
+Branch `feat/map-type-convert`. Tests: `tests/unit/test_map_type_convert.py`,
+`tests/integration/maps/run_type.sh` (throwaway Postgres, `checks_type.py`).
+
+### G1. Deploy steps — **needs the user's go-ahead**
+No Alembic migration. Rebuild and restart from the same commit, in this order:
+mission-dispatch, graph-builder-service, mission-planner-service, then api-delegation-service
+(only the new API can create a rotated geo map; old consumers ignore `geo.bearing_deg`). Then
+the client. Rollback: convert any rotated geo map back (local, or geo with bearing 0) before
+going back to the previous images.
+
+### G2. Geo maps still need a GNSS datum to be used — **open question**
+After local → geo, robots without a datum cannot start a session on the map, and a hand-placed
+session of such a robot cannot be placed again after its next restart (a geo map is placed by
+the datum only, Q-U8). Options: accept manual / reloc placement on geo maps too, or keep "convert
+back to local" as the answer.
+
+### G3. Limits — **low**
+- The georeference is as good as the user's anchor; nothing checks it against GNSS. A robot
+  placed by hand and later by its datum shows the anchor error as a jump at its next restart.
+- `POST .../place {"source": "datum"}` trusts the robot's stored datum; when
+  `datum_after_unplace` is false it may be the previous run's (the client says so).
+- A placed session of a robot whose first datum arrives only after the conversion is
+  re-derived from that datum (the dispatcher treats a session without a datum as changed).
+- Reconstruction results made before a conversion keep their old `crs` in `meta.json`
+  (informational; the external service does no math with it). The service gets
+  `crs.bearing_deg` for rotated maps (absent at 0).
+- `PUT /maps/{id}/datum` on an empty geo map now also sets `geo.bearing_deg` from the datum
+  (an `enu` datum: its grid convergence), so the frame and the display transform agree.

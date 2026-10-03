@@ -34,11 +34,32 @@ MapStateV1 = Literal["draft", "mapping", "paused", "ready", "archived"]
 
 class MapGeoV1(pydantic.BaseModel):
     """Where a `geo` map sits on the Earth: map x/y are UTM metres in this one zone, relative to
-    (origin_e, origin_n). Set from the first mapping session's datum (doc Q1), never changed."""
+    (origin_e, origin_n), rotated by `bearing_deg`. Set from the first mapping session's datum
+    (doc Q1, bearing 0), or by converting a local map to geo (POST /maps/{id}/type, which keeps
+    the map's coordinates and puts the anchor and rotation here)."""
     utm_zone: int = pydantic.Field(..., ge=1, le=60, description="UTM zone of the map frame.")
     utm_north: bool = pydantic.Field(..., description="UTM hemisphere (True = north).")
     origin_e: float = pydantic.Field(..., description="UTM easting of the map origin (m).")
     origin_n: float = pydantic.Field(..., description="UTM northing of the map origin (m).")
+    bearing_deg: float = pydantic.Field(
+        0.0, description="Angle of the map's +X axis from UTM grid east, counter-clockwise "
+                         "(degrees): map (x, y) -> UTM = origin + R(bearing) (x, y). 0 for a "
+                         "map whose origin came from a session; a local map converted to geo "
+                         "keeps its coordinates and gets its rotation here.")
+
+
+class FormerDatumV1(pydantic.BaseModel):
+    """The georeference a map had before it was converted from geo to local (POST
+    /maps/{id}/type), kept so converting back can offer it: the WGS84 position of the map
+    frame's origin (0, 0), and the frame's UTM zone, origin and rotation."""
+    latitude: float
+    longitude: float
+    bearing_deg: float = 0.0
+    utm_zone: int = pydantic.Field(..., ge=1, le=60)
+    utm_north: bool
+    origin_e: float
+    origin_n: float
+    converted_at: Optional[datetime.datetime] = None
 
 
 ApproxLocationSourceV1 = Literal["manual", "robot"]
@@ -107,6 +128,9 @@ class MapSpecV1(pydantic.BaseModel):
     approx_location: Optional[ApproxLocationV1] = pydantic.Field(
         None, description="Approximate WGS84 location of a 'local' map (a hint, never a datum). "
                           "None on geo maps and until set.")
+    former_datum: Optional[FormerDatumV1] = pydantic.Field(
+        None, description="The georeference of a map converted from geo to local (a hint for "
+                          "converting it back). None on geo maps and on maps never converted.")
 
     _normalize_frame = pydantic.validator("datum_frame", pre=True, allow_reuse=True)(
         common.normalize_datum_frame)

@@ -412,6 +412,7 @@ async def root():
                 "session_action": "POST /api/v1/maps/{map_id}/sessions/{session_id}/"
                                   "{pause|resume|finish}",
                 "archive": "POST /api/v1/maps/{map_id}/archive",
+                "convert_type": "POST /api/v1/maps/{map_id}/type",
                 "restore": "POST /api/v1/maps/{map_id}/restore",
                 "delete": "DELETE /api/v1/maps/{map_id}",
             },
@@ -607,7 +608,10 @@ async def map_session_placement_suggestions(map_id: str, session_id: str):
     suggestions: [{source: "last_position", basis: unplace_snapshot | state_history |
     finished_session, map_T_session, pose, robot_pose, at, from_session_id}]}, at most one.
     Accept it with POST .../place (`pose` + the live `robot_pose`, optional `source`).
-    Empty for a placed session or a geo map; 404 unknown map/session; 409 finished session.
+    Empty for a placed session; on a GEO map the one suggestion is the robot's current datum
+    ({source: "datum", basis: "robot_datum", map_T_session, pose, robot_pose, at,
+    datum_after_unplace}; accept with POST .../place {"source": "datum"}), or none without a
+    usable datum. 404 unknown map/session; 409 finished session.
     Plus `reloc`: null, or {available, known, source: "orchestrator"} for an unplaced local-map
     session: `available` true = the robot's orchestrator holds a stored map for this map, so no
     manual initial position is needed (POST .../place with {"source": "reloc"})."""
@@ -635,7 +639,10 @@ async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     0.5 deg). 409 on a finished session, a geo map, an already placed mapping session. From
     then on graph-builder keeps the session's nodes (the services are not touched).
     `{"source": "reloc"}` (no poses): the robot relocalises itself on the stored map its
-    orchestrator holds; identity placement, no still check; 409 when it does not hold the map."""
+    orchestrator holds; identity placement, no still check; 409 when it does not hold the map.
+    `{"source": "datum"}` (no poses, GEO maps only): place an unplaced geo session from the
+    robot's current GNSS datum (409 when it has none in the map's UTM zone, or the session is
+    placed). Other sources on a geo map: 409 (placed by the datum)."""
     _require_service()
     return await _site_call("place map session", maps.place_session(
         service.database, map_id, session_id, body, uuid.uuid4(), recording.request_actor(),
@@ -666,6 +673,22 @@ async def archive_map(map_id: str):
     _require_service()
     return await _site_call("archive map", maps.archive_map(
         service.database, map_id, uuid.uuid4(), recording.request_actor()))
+
+
+@app.post("/api/v1/maps/{map_id}/type")
+async def convert_map_type(map_id: str, body: Dict[str, Any]):
+    """Convert a map geo <-> local (docs/satinav-maps-redesign.md §17). Nothing moves: map-frame
+    coordinates (nodes, edges, reconstruction, sessions' map_T_session, mission waypoints) stay
+    valid. `{"type": "local"}` drops the georeference (kept as `former_datum`); `{"type": "geo",
+    latitude, longitude, bearing_deg?, frame?, anchor?: {x, y}, utm_zone?, utm_north?}` puts the
+    map-frame `anchor` (default the origin) at (latitude, longitude) with the map's +X axis
+    `bearing_deg` from east, CCW (grid east for frame "utm", the default; true east for "enu").
+    404 unknown map; 409 deleting, already of that type, or an open mapping session; 422 body.
+    Open operate sessions keep their placement (`warnings` says what that means per robot).
+    MAP.TYPE_CHANGED."""
+    _require_service()
+    return await _site_call("convert map type", maps.convert_map_type(
+        service.database, map_id, body, uuid.uuid4(), recording.request_actor()))
 
 
 @app.post("/api/v1/maps/{map_id}/restore")

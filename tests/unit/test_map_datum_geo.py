@@ -1,6 +1,7 @@
 """PUT /maps/{id}/datum on geo maps: origin (spec.geo) fixed once there is data; kept in step
 otherwise."""
 
+import math
 import os
 
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
@@ -73,9 +74,26 @@ async def test_empty_geo_map_moves_its_origin_with_the_datum():
     result = await svc.update_map_datum("yard", **NEW)
     assert result["success"] is True
     spec = svc.database.update_spec.call_args[0][2]
-    expected = map_geo.geo_from_datum(map_geo.map_datum(spec))
+    # NEW has no frame: an 'enu' datum, whose +X is true east: the grid convergence (maps §17)
+    expected = dict(map_geo.geo_from_datum(map_geo.map_datum(spec)), bearing_deg=math.degrees(
+        map_geo.grid_convergence_rad(47.6, 19.1, 34, True)))
     assert spec.geo.dict() == pytest.approx(expected)
     assert spec.geo.origin_e != GEO["origin_e"]  # the origin followed the datum
+
+
+async def test_empty_geo_map_takes_the_datum_bearing_as_its_rotation():
+    """The display transform (datum_*, bearing) and the geo frame agree (maps §17): a utm datum's
+    bearing is the map's rotation against the grid; an enu one's plus the grid convergence."""
+    svc = make_service(geo_map())
+    await svc.update_map_datum("yard", **dict(NEW, datum_bearing_deg=30.0, datum_frame="utm"))
+    spec = svc.database.update_spec.call_args[0][2]
+    assert spec.geo.bearing_deg == pytest.approx(30.0)
+    svc = make_service(geo_map())
+    await svc.update_map_datum("yard", **dict(NEW, datum_bearing_deg=30.0, datum_frame="enu"))
+    spec = svc.database.update_spec.call_args[0][2]
+    conv = math.degrees(map_geo.grid_convergence_rad(
+        spec.datum_latitude, spec.datum_longitude, spec.geo.utm_zone, spec.geo.utm_north))
+    assert spec.geo.bearing_deg == pytest.approx(30.0 + conv)
 
 
 async def test_empty_geo_map_without_origin_stays_without():

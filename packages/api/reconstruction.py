@@ -345,14 +345,21 @@ def stale_reason(old_nodes: Optional[Sequence[Sequence[Any]]],
 
 
 def map_crs(spec: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    """The manifest's `map.crs`: the geo map's UTM zone and origin; None for a local map."""
+    """The manifest's `map.crs`: the geo map's UTM zone and origin; None for a local map. A map
+    converted from local to geo is rotated against the grid: then `bearing_deg` (map +X from
+    grid east, CCW) is added; it is left out at 0 so the contract is unchanged for every map
+    whose frame is the plain grid (docs/reconstruction/handover.md)."""
     spec = spec or {}
     geo = spec.get("geo") if spec.get("type") == "geo" else None
     if not isinstance(geo, Mapping) or geo.get("utm_zone") is None:
         return None
-    return {"utm_zone": int(geo["utm_zone"]), "utm_north": bool(geo.get("utm_north", True)),
-            "origin_e": float(geo.get("origin_e") or 0.0),
-            "origin_n": float(geo.get("origin_n") or 0.0)}
+    crs = {"utm_zone": int(geo["utm_zone"]), "utm_north": bool(geo.get("utm_north", True)),
+           "origin_e": float(geo.get("origin_e") or 0.0),
+           "origin_n": float(geo.get("origin_n") or 0.0)}
+    bearing = float(geo.get("bearing_deg") or 0.0)
+    if bearing:
+        crs["bearing_deg"] = bearing
+    return crs
 
 
 def rgb_key(node_id: str, camera: str) -> str:

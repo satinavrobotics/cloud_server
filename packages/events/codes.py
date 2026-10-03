@@ -55,6 +55,7 @@ class EventCode(str, enum.Enum):
     MAP_SESSION_REALIGNED = "MAP.SESSION_REALIGNED"
     MAP_SESSION_PLACED = "MAP.SESSION_PLACED"
     MAP_SESSION_UNPLACED = "MAP.SESSION_UNPLACED"
+    MAP_TYPE_CHANGED = "MAP.TYPE_CHANGED"
     MAP_RECONSTRUCTION_STARTED = "MAP.RECONSTRUCTION_STARTED"
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
@@ -153,6 +154,9 @@ CODES: Dict[EventCode, CodeMeta] = {
     # from the new datum is MAP.SESSION_REALIGNED with source dispatch.
     _C.MAP_SESSION_PLACED: CodeMeta(_S.INFO, True, schemas.MapSessionPlaced, _A),
     _C.MAP_SESSION_UNPLACED: CodeMeta(_S.WARNING, True, schemas.MapSessionUnplaced, _D),
+    # A map converted geo <-> local (POST /api/v1/maps/{id}/type, packages/api/maps.py). No robot;
+    # discriminator `map:<name>:type:<new type>:<ts>`.
+    _C.MAP_TYPE_CHANGED: CodeMeta(_S.INFO, True, schemas.MapTypeChanged, _A),
     # 3D reconstruction (docs/reconstruction/design.md §9.3). No robot; discriminator
     # `map:<name>:reconstruction:<job_id>:<state>`. STARTED on the job's first progress
     # callback; FAILED also for a cancel (reason cancelled / map_deleting).

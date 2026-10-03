@@ -322,7 +322,9 @@ class TestPlaceReloc:
         with pytest.raises(Exception):
             maps.PlaceRequest()
         with pytest.raises(Exception):
-            maps.PlaceRequest(source="datum")
+            maps.PlaceRequest(source="session")
+        # maps §17: a geo session placed from the robot's datum needs no poses either
+        assert maps.PlaceRequest(source="datum").pose is None
 
     async def test_identity_placement_without_the_still_check(self, db):
         h = FakeHolder(True)

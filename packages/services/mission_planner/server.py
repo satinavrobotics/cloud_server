@@ -17,7 +17,7 @@ from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import map_geo
 from packages.utils import map_sessions
-from packages.utils.geo import gps_to_local, latlon_to_utm
+from packages.utils.geo import gps_to_local
 DatabaseClient = PostgresDatabase
 import uuid
 from cloud_common.objects import mission as mission_object
@@ -194,8 +194,10 @@ class MissionPlannerService:
             map_obj = None
         if map_obj is not None and map_obj.geo is not None and map_obj.type != "local":
             g = map_obj.geo
-            e, n = latlon_to_utm(lat, lon, g.utm_zone, g.utm_north)
-            return e - g.origin_e, n - g.origin_n, f"utm zone {g.utm_zone} map origin"
+            # Exact UTM in the map's zone, then the map's own rotation (a local map converted
+            # to geo keeps its coordinates and is rotated against the grid: geo.bearing_deg).
+            x, y = map_geo.latlon_to_map(g.dict(), lat, lon)
+            return x, y, f"utm zone {g.utm_zone} map origin"
         datum = await self._get_map_datum(map_id)
         if datum is None:
             return None

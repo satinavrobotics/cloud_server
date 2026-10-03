@@ -308,9 +308,12 @@ class TestAccepting:
         _robot(db)
         s = _unplaced(db)
         body = {"pose": {"x": 1.0, "y": 2.0, "yaw": 0.3},
-                "robot_pose": {"x": 0.0, "y": 0.0, "theta": 0.0}, "source": "datum"}
+                "robot_pose": {"x": 0.0, "y": 0.0, "theta": 0.0}, "source": "session"}
         assert await _status(maps.place_session(None, "shed", str(s["session_id"]), body,
                                                 m1.PUB)) == 422
+        # "datum" is a source since maps §17, for geo maps only: a local map refuses it
+        assert await _status(maps.place_session(None, "shed", str(s["session_id"]),
+                                                dict(body, source="datum"), m1.PUB)) == 409
 
 
 # --- the dispatcher -------------------------------------------------------------------------------

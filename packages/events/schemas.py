@@ -212,6 +212,19 @@ class MapLifecycle(Payload):
     actor: Optional[str] = None
 
 
+class MapTypeChanged(Payload):
+    """MAP.TYPE_CHANGED (packages/api/maps.py): the map was converted geo <-> local. Map-frame
+    coordinates are unchanged; `geo` / `old_geo` are the georeference after / before (null on a
+    local map), `operating` the robots whose open sessions kept their placement."""
+    map_name: str
+    old_type: str
+    new_type: str
+    geo: Optional[Dict[str, Any]] = None
+    old_geo: Optional[Dict[str, Any]] = None
+    operating: List[str] = []
+    actor: Optional[str] = None
+
+
 class MapSession(Payload):
     """MAP.SESSION_STARTED / _PAUSED / _RESUMED / _FINISHED (packages/api/maps.py)."""
     map_name: str
