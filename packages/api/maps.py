@@ -886,6 +886,32 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
     return {"available": held is True, "known": held is not None, "source": "orchestrator"}
 
 
+async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: str
+                    ) -> Dict[str, Any]:
+    """GET /api/v1/maps/{id}/reloc?robot=: the same {available, known, source} as `reloc` of the
+    placement suggestions, before any session exists (cached read). 404 unknown map. A geo map
+    is placed by the datum, not relocalised: {available: false, known: true}. An unknown or
+    offline robot, no holder or an orchestrator that cannot be asked: known false."""
+    robot = None
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            row = await store.lock_map(map_name)
+            if row is None:
+                raise HTTPException(404, f"Did not find \"map\" with name \"{map_name}\"")
+            if row.type == "geo":
+                return {"available": False, "known": True, "source": "orchestrator"}
+            robot = await store.robot(robot_name)
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    held: Optional[bool] = None
+    if robot is not None and holder is not None:
+        try:
+            held = await holder.held(robot, map_name)
+        except Exception:  # noqa: BLE001
+            logger.exception("Stored map of robot %s not readable", robot_name)
+    return {"available": held is True, "known": held is not None, "source": "orchestrator"}
+
+
 async def placement_suggestions(db: Any, map_name: str, session_id: str,
                                 holder: Optional[Any] = None) -> Dict[str, Any]:
     """The placement suggestions (_placement_suggestions) plus `reloc` (reloc_status): null, or

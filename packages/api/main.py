@@ -615,6 +615,17 @@ async def map_session_placement_suggestions(map_id: str, session_id: str):
         service.database, map_id, session_id, holder=service.orchestrator_maps))
 
 
+@app.get("/api/v1/maps/{map_id}/reloc")
+async def map_reloc(map_id: str, robot: str):
+    """Does the robot's orchestrator hold a stored map for this map (relocalization)? Before any
+    session exists: {available, known, source: "orchestrator"}; `available` true = no manual
+    initial position needed, `known` false = could not be asked (then available is false: robot
+    unknown/offline, orchestrator unreachable). Geo map: {false, true}. 404 unknown map."""
+    _require_service()
+    return await _site_call("map reloc", maps.map_reloc(
+        service.database, service.orchestrator_maps, map_id, robot))
+
+
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/place")
 async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     """Place the session's robot on a local map (maps §14.3) `{pose: {x, y, yaw}, robot_pose:

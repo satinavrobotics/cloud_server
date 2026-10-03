@@ -315,6 +315,52 @@ class TestRelocStatus:
         assert out["reloc"] is None and out["suggestions"] == []
 
 
+class TestMapReloc:
+    async def test_available_and_cached_read(self, db):
+        _robot(db)
+        db.add_map("shed", type="local", status={"state": "ready"})
+        h = FakeHolder(True)
+        out = await maps.map_reloc(None, h, "shed", "r1")
+        assert out == {"available": True, "known": True, "source": "orchestrator"}
+        assert h.calls == [("r1", "shed", False)]
+
+    @pytest.mark.parametrize("answer,known", [(False, True), (None, False)])
+    async def test_not_held_or_unknown(self, db, answer, known):
+        _robot(db)
+        db.add_map("shed", type="local", status={"state": "ready"})
+        out = await maps.map_reloc(None, FakeHolder(answer), "shed", "r1")
+        assert out == {"available": False, "known": known, "source": "orchestrator"}
+
+    async def test_unknown_robot_or_no_holder_is_unknown(self, db):
+        _robot(db)
+        db.add_map("shed", type="local", status={"state": "ready"})
+        h = FakeHolder(True)
+        assert (await maps.map_reloc(None, h, "shed", "ghost"))["known"] is False
+        assert h.calls == []
+        assert (await maps.map_reloc(None, None, "shed", "r1"))["known"] is False
+
+    async def test_holder_that_raises_is_unknown(self, db):
+        _robot(db)
+        db.add_map("shed", type="local", status={"state": "ready"})
+
+        class Boom:
+            async def held(self, *a, **k):
+                raise RuntimeError("x")
+        out = await maps.map_reloc(None, Boom(), "shed", "r1")
+        assert out == {"available": False, "known": False, "source": "orchestrator"}
+
+    async def test_geo_map_and_unknown_map(self, db):
+        from packages.utils import map_geo
+        _robot(db)
+        db.add_map("geo1", type="geo", status={"state": "ready"},
+                   geo=map_geo.geo_from_datum(m1.UTM_DATUM))
+        h = FakeHolder(True)
+        assert await maps.map_reloc(None, h, "geo1", "r1") == {
+            "available": False, "known": True, "source": "orchestrator"}
+        assert h.calls == []
+        assert await _status(maps.map_reloc(None, h, "nomap", "r1")) == 404
+
+
 # --- 6. degraded ------------------------------------------------------------------------------------------
 
 class TestDegraded:
