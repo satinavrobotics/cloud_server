@@ -460,6 +460,31 @@ class TestState:
         again = await switch.snapshot(r, fresh=True)
         assert again is not await switch.snapshot(r, fresh=True)
 
+    async def test_concurrent_reads_share_one_fetch(self):
+        orch = FakeOrch()
+        orch.delay = 0.05
+        orig = FakeClient.list_services
+
+        async def slow_list(client):
+            await asyncio.sleep(orch.delay)
+            return await orig(client)
+
+        switch = make_switch({"r1": orch})
+        r = robot()
+        with patch.object(FakeClient, "list_services", slow_list):
+            snaps = await asyncio.gather(*(switch.snapshot(r) for _ in range(5)))
+        assert all(s is snaps[0] for s in snaps) and len(ops(orch, "list")) == 1
+
+    async def test_a_read_in_flight_during_a_switch_is_not_cached(self):
+        orch = FakeOrch()
+        switch = make_switch({"r1": orch})
+        r = robot()
+        task = asyncio.ensure_future(switch.snapshot(r))
+        await asyncio.sleep(0)               # the read has started
+        switch.invalidate("r1")              # a switch happened meanwhile
+        await task
+        assert "r1" not in switch._cache
+
     async def test_snapshots_of_many_robots(self):
         orchs = {"a": FakeOrch(running=["topomap"]), "b": FakeOrch()}
         found = await make_switch(orchs).snapshots([robot("a"), robot("b")])

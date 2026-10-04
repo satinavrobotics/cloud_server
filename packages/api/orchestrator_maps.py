@@ -23,7 +23,7 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from packages.api import orchestrator_client as oc
-from packages.api.mapping_switch import pick_service
+from packages.api.orchestrator_services import pick_service
 from packages.config import RELOC_MAP_HELD_TTL_S, RELOC_SERVICE_CANDIDATES
 
 logger = logging.getLogger("ApiDelegationService.orchestrator_maps")

@@ -69,7 +69,7 @@ from fastapi import HTTPException
 
 from packages.api import maps
 from packages.api import orchestrator_client as oc
-from packages.api.mapping_switch import pick_service
+from packages.api.orchestrator_services import pick_service
 from packages.config import (
     RELOC_JOB_POLL_S, RELOC_JOB_SETTLE_S, RELOC_JOB_TIMEOUT_S, RELOC_SERVICE_CANDIDATES,
 )

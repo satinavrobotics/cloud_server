@@ -47,6 +47,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequ
 from fastapi import HTTPException
 
 from packages.api import orchestrator_client as oc
+from packages.api.orchestrator_services import pick_service
 from packages.config import MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S
 from packages.utils.map_sessions import KNOWN_SERVICES, TOPO
 
@@ -67,14 +68,6 @@ STOPPED, ALREADY_STOPPED, FAILED = "stopped", "already_stopped", "failed"
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
-
-
-def pick_service(listed: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
-    """The first candidate the orchestrator lists (config order), or None."""
-    for name in candidates:
-        if name in listed:
-            return name
-    return None
 
 
 def candidates_of(service: str) -> List[str]:
@@ -185,6 +178,7 @@ class MappingSwitch:
         self.ttl = ttl
         self._clock = clock
         self._cache: Dict[str, tuple] = {}     # robot -> (expires, Snapshot)
+        self._inflight: Dict[str, "asyncio.Task[Snapshot]"] = {}   # robot -> the read in progress
         self._locks: Dict[str, asyncio.Lock] = {}
         # Maps §14: async fn(robot, session view or None) pushing the robot's `session` after a
         # session change through the API (set by ApiDelegationService).
@@ -208,6 +202,7 @@ class MappingSwitch:
 
     def invalidate(self, robot_name: str) -> None:
         self._cache.pop(robot_name, None)
+        self._inflight.pop(robot_name, None)  # its answer may predate the change: not cached
 
     # --- SLAM map (never raises) ---------------------------------------------------------------
 
@@ -449,8 +444,23 @@ class MappingSwitch:
         hit = self._cache.get(name)
         if hit is not None and not fresh and hit[0] > self._clock():
             return hit[1]
-        snap = await self._fetch(robot)
-        self._cache[name] = (self._clock() + self.ttl, snap)
+        task = self._inflight.get(name)
+        if task is None:
+            task = asyncio.ensure_future(self._load(robot, name))
+            self._inflight[name] = task
+        # shield: one caller being cancelled must not cancel the read the others wait on
+        return await asyncio.shield(task)
+
+    async def _load(self, robot: Any, name: str) -> Snapshot:
+        task = asyncio.current_task()
+        try:
+            snap = await self._fetch(robot)
+        finally:
+            current = self._inflight.get(name) is task
+            if current:
+                del self._inflight[name]
+        if current:  # not invalidated meanwhile
+            self._cache[name] = (self._clock() + self.ttl, snap)
         return snap
 
     async def _fetch(self, robot: Any) -> Snapshot:
