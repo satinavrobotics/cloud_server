@@ -275,6 +275,13 @@ LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
 LIVEKIT_SERVER_URL = os.getenv("LIVEKIT_SERVER_URL", "ws://localhost:7880")
 LIVEKIT_TTL = int(os.getenv("LIVEKIT_TTL", "36000"))
+# Self-hosted SFU (docker_compose/livekit_sfu.env). The API service uses this pair only to
+# remove a deleted robot's participant (packages/api/livekit_admin.py); unset = that step is
+# skipped. The admin URL is the SFU's HTTP port as seen from the API service (host network).
+LIVEKIT_SFU_API_KEY = os.getenv("LIVEKIT_SFU_API_KEY") or None
+LIVEKIT_SFU_API_SECRET = os.getenv("LIVEKIT_SFU_API_SECRET") or None
+LIVEKIT_SFU_ADMIN_URL = os.getenv("LIVEKIT_SFU_ADMIN_URL", "http://localhost:7880")
+LIVEKIT_ADMIN_TIMEOUT = float(os.getenv("LIVEKIT_ADMIN_TIMEOUT", "3"))  # seconds per request
 
 # ==================== Agent Orchestrator ====================
 # LLM-based fleet triage service. ANTHROPIC_API_KEY is intentionally optional:

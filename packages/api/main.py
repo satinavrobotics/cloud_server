@@ -23,6 +23,7 @@ import uvicorn
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, sites
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
+from packages.api.robot_delete import RobotDeleter
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
     configure_service_logging, DependencyHealthChecker
@@ -1820,22 +1821,35 @@ async def update_robot(robot_name: str, robot_data: dict):
 
 
 @app.delete("/api/v1/robots/{robot_name}")
-async def delete_robot(robot_name: str):
+async def delete_robot(robot_name: str, delete_telemetry: bool = False,
+                       delete_rosbags: bool = False):
     """
-    Delete a robot (proxy to Mission Dispatcher database).
+    Delete a robot.
 
-    Removes the robot from the database.
+    Always: closes the robot's open map session and removes its site assignments, run epoch,
+    latest-state row and the robot itself. History (telemetry tables, events, mission runs)
+    and rosbags are kept unless `delete_telemetry` / `delete_rosbags` are true.
+
+    200 `{success, message, deleted: {telemetry, rosbags, sessions_closed}}`; 404 unknown robot;
+    409 `ROBOT_HAS_ACTIVE_MISSION` (ON_TASK or a pending/running mission; nothing is changed);
+    500 any other failure. The robot can be registered again afterwards like a new one.
     """
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        await service.database.set_lifecycle(RobotObjectV1, robot_name, ObjectLifecycleV1.DELETED, uuid.uuid4())
-        return {"success": True, "message": f"Robot {robot_name} deleted"}
+        return await RobotDeleter(service.database, service.mapping_switch).delete(
+            robot_name, delete_telemetry=delete_telemetry, delete_rosbags=delete_rosbags,
+            actor=recording.request_actor(), rosbag_deleter=_delete_rosbags_of)
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Failed to delete robot: {str(e)}")
+        logging.exception("Failed to delete robot %s", robot_name)
+        raise HTTPException(status_code=500, detail=f"Failed to delete robot: {str(e)}")
+
+
+async def _delete_rosbags_of(robot_name: str) -> Dict[str, Any]:
+    return await service.delete_robot_bags(robot_name=robot_name)
 
 
 # Maps U6: the deprecated "assign map" is gone. 410 for one release so an old client gets a

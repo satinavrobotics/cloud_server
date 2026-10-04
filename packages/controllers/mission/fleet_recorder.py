@@ -577,7 +577,14 @@ class FleetRecorder:
 
     @_guarded
     def on_robot_deleted(self, robot_object: Any) -> None:
-        """A DELETED robot object from the watcher: drop its recording level."""
+        """A DELETED robot object from the watcher: drop its recording level and every
+        in-memory trace of it (detectors, last row, open run), so a robot registered again
+        under the same name starts like a first-ever one."""
+        name = getattr(robot_object, "name", None)
+        if name:
+            self._tracks.pop(name, None)
+            self._latest_rows.pop(name, None)
+            self._runs.pop(name, None)
         self.policy.apply_robot_object(robot_object)
 
     @_guarded

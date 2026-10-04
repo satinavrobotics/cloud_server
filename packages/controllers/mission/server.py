@@ -331,7 +331,22 @@ class Robot:
                 self._robot_server.telemetry_env)
         # To calculate the durition of a robot state
         self._cur_robot_state_timestamp = datetime.datetime.now()
-        asyncio.get_event_loop().create_task(self.run())
+        self._run_task: Optional[asyncio.Task[Any]] = \
+            asyncio.get_event_loop().create_task(self.run())
+
+    def shutdown(self):
+        """Tear this controller down (the robot row is gone): stop its message loop and every
+        timer it owns, so nothing of it outlives the robot or leaks into a robot registered
+        again under the same name (that one gets a brand-new Robot). Idempotent."""
+        self._alive = False
+        for task in (self._robot_online_task, self._mission_timeout_task, self._wait_task,
+                     self._run_task):
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+        self._robot_online_task = None
+        self._mission_timeout_task = None
+        self._wait_task = None
+        self._run_task = None
 
     async def _try_start_mission(self):
         # Schedule a new mission if we aren't doing anything and there is one in the queue
@@ -2631,6 +2646,11 @@ class RobotServer:
             # Ignore deleted robot object
             if robot.lifecycle == \
                     api_objects.object.ObjectLifecycleV1.DELETED:
+                # The row is hard-deleted (DELETE /api/v1/robots/{name} writes DELETED
+                # directly): drop the live controller too, or it would keep its stale mission
+                # queue, run epoch and timers and take over a robot registered again under
+                # this name.
+                self.remove_robot(getattr(robot, "name", None))
                 if self.fleet_recorder is not None:
                     self.fleet_recorder.on_robot_deleted(robot)
                 continue
@@ -2784,13 +2804,20 @@ class RobotServer:
             tasks.append(self._watch_site_assignments())
         await asyncio.gather(*tasks)
 
+    def remove_robot(self, robot_name: Optional[str]) -> None:
+        """Forget the in-memory controller of `robot_name` (no database access). A no-op for
+        an unknown name."""
+        robot = self._robots.pop(robot_name, None) if robot_name else None
+        if robot is not None:
+            robot.shutdown()
+
     async def delete_robot(self, robot_name: str):
-        robot = self._robots[robot_name]
+        robot = self._robots.get(robot_name)
         if robot is not None:
             properties = robot.robot_object
             if properties is not None:
                 await self._database.set_lifecycle(api_objects.RobotObjectV1, properties.name, api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
-                del self._robots[properties.name]
+                self._robots.pop(properties.name, None)
 
     async def delete_pending_mission(self, mission: api_objects.MissionObjectV1) -> bool:
         if mission.lifecycle == \

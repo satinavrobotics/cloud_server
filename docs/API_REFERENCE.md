@@ -572,18 +572,39 @@ Update robot specification.
 
 #### `DELETE /api/v1/robots/{robot_name}`
 
-Delete a robot.
+Delete a robot. Always closes the robot's open map session and removes its site assignments,
+run epoch, latest-state row and the robot itself; the name can then be registered again
+(`POST /api/v1/robots`) like a new robot. History is kept unless asked for.
+
+**Query parameters** (both boolean, default `false`):
+- `delete_telemetry`: also delete the robot's rows in `robot_state_ts`, `diagnostics_ts`,
+  `fleet_events`, `mission_runs` and `mission_trajectory`.
+- `delete_rosbags`: also delete the robot's rosbags from MinIO.
+
+**LiveKit:** after the robot is deleted, the API makes a best-effort call to the self-hosted
+LiveKit SFU (server API, `LIVEKIT_SFU_API_KEY`/`LIVEKIT_SFU_API_SECRET`, optionally
+`LIVEKIT_SFU_ADMIN_URL`, default `http://localhost:7880`) to remove the robot's participant
+(identity or name equal to the robot name, or `dev_<name>`) from every room, so dashboards stop
+showing a ghost card. Skipped (logged) when the key pair is not configured; any LiveKit error or
+timeout (`LIVEKIT_ADMIN_TIMEOUT`, 3 s) is logged and ignored and never changes the response.
+This only disconnects the participant: a robot that is still running reconnects with its token
+unless it is stopped.
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Robot carter02 deleted"
+  "message": "Robot carter02 deleted",
+  "deleted": {"telemetry": false, "rosbags": false, "sessions_closed": 1}
 }
 ```
 
-**Error Response:**
-- `404 Not Found`: Robot not found
+**Error Responses:**
+- `404 Not Found`: Robot not found (or already deleted)
+- `409 Conflict`: the robot has an active mission (state `ON_TASK`, or a pending/running
+  mission); nothing is changed. `detail` is
+  `{"code": "ROBOT_HAS_ACTIVE_MISSION", "message": "...", "robot": "carter02", "mission": "<name or null>"}`
+- `500 Internal Server Error`: any other failure
 
 ---
 
