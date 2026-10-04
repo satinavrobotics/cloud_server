@@ -50,6 +50,12 @@ class FakeOrch:
         self.calls = []
         self.db = None                # set by prepare(): the DB whose transactions must be closed
         self.delay = 0.0
+        # SLAM (GET/POST /maps/...): the running driver and the maps that already have a file
+        self.slam = {"active": False, "map": None}
+        self.slam_files = set()
+        self.slam_log = []            # (op, onboard map, body or None)
+        self.slam_save_gate = None    # an asyncio.Event a save waits for
+        self.slam_save_tx = []        # open DB transactions when a save arrived
 
     def _enter(self, op, name=None):
         self.calls.append((op, name))
@@ -94,6 +100,73 @@ class FakeClient:
             raise oc.OrchestratorError(oc.HTTP, "not currently running", status=404)
         self.orch.services[name] = False
         return {"success": True}
+
+
+async def _slam(self, op, onboard=None, body=None, check_tx=True):
+    self.calls.append((op, onboard))
+    self.slam_log.append((op, onboard, body))
+    if op == "slam_save":
+        self.slam_save_tx.append(self.db.open_tx if self.db is not None else 0)
+    elif check_tx and self.db is not None:
+        assert self.db.open_tx == 0, f"orchestrator {op} inside a DB transaction"
+    if not self.reachable:
+        raise oc.OrchestratorError(oc.UNREACHABLE, "orchestrator at 10.0.0.5:8080 is not "
+                                                   "reachable (ConnectError)")
+    if (op, onboard) in self.fail:
+        raise self.fail[(op, onboard)]
+
+
+def _http(status, detail):
+    return oc.OrchestratorError(oc.HTTP, detail, status=status)
+
+
+async def _slam_start(self, onboard, overwrite=False):
+    await self.orch._slam("slam_start", onboard, {"overwrite": overwrite})
+    o = self.orch
+    if o.slam["active"]:
+        raise _http(409, "a mapping session/driver is already running (stop it first)")
+    if onboard in o.slam_files and not overwrite:
+        raise _http(409, f"Map '{onboard}' already has a map file; pass overwrite=true to "
+                         "replace it")
+    o.slam = {"active": True, "map": onboard}
+    return {"active": True}
+
+
+async def _slam_save(self, onboard, cloud_map_id, cloud_session_id, stop_after=True):
+    body = {"cloud_map_id": cloud_map_id, "cloud_session_id": cloud_session_id,
+            "stop_after": stop_after}
+    o = self.orch
+    await o._slam("slam_save", onboard, body)
+    if o.slam_save_gate is not None:
+        await o.slam_save_gate.wait()
+    if not o.slam["active"]:
+        raise _http(409, "No mapping session is running")
+    if o.slam["map"] != onboard:
+        raise _http(409, f"Running session is mapping '{o.slam['map']}', not '{onboard}'")
+    o.slam_files.add(onboard)
+    if stop_after:
+        o.slam = {"active": False, "map": None}
+    return {"name": onboard}
+
+
+async def _slam_stop(self):
+    await self.orch._slam("slam_stop")
+    if not self.orch.slam["active"]:
+        raise _http(404, "No mapping session is running")
+    self.orch.slam = {"active": False, "map": None}
+    return {"success": True}
+
+
+async def _slam_state(self):
+    await self.orch._slam("slam_state", check_tx=False)
+    return {"active": self.orch.slam["active"], "map": self.orch.slam["map"], "pid": 9}
+
+
+FakeOrch._slam = _slam
+FakeClient.start_slam = _slam_start
+FakeClient.save_slam = _slam_save
+FakeClient.stop_slam = _slam_stop
+FakeClient.slam_state = _slam_state
 
 
 def make_switch(orchs, **kw):
@@ -769,6 +842,219 @@ class TestSessionActions:
 
 # --- summary, routes, robot view -------------------------------------------------------------------------
 
+# --- SLAM map ----------------------------------------------------------------------------------------
+
+def slam_prepare(db, **kw):
+    orch, switch = prepare(db, **kw)
+    db.maps["yard"]["spec"]["slam_map"] = True
+    switch.on_slam_done = MagicMock()
+    return orch, switch
+
+
+def slam_ops(orch):
+    return [(op, name) for op, name, _ in orch.slam_log if op != "slam_state"]
+
+
+class TestSlam:
+    async def test_start_ok_after_the_topomap_and_outside_a_transaction(self, db):
+        orch, switch = slam_prepare(db)
+        out = await start(db, switch)
+        assert "slam_warning" not in out
+        assert orch.slam == {"active": True, "map": "cloud-yard"}
+        assert orch.slam_log[-1] == ("slam_start", "cloud-yard", {"overwrite": False})
+        calls = [c for c in orch.calls if c[0] in ("start", "slam_start")]
+        assert calls == [("start", "topomap"), ("slam_start", "cloud-yard")]
+        # SLAM is no session service
+        assert out["mapping_switch"] == {"topo": "started"}
+        assert out["mapping_services"] == {"topo": "running", "grid": "not_available"}
+
+    async def test_a_run_already_recording_this_map_is_fine(self, db):
+        orch, switch = slam_prepare(db)
+        orch.slam = {"active": True, "map": "cloud-yard"}
+        out = await start(db, switch)
+        assert "slam_warning" not in out
+        assert not [c for c in slam_ops(orch) if c[0] == "slam_start"]
+
+    async def test_existing_map_file_is_a_warning_and_nothing_to_save_later(self, db):
+        orch, switch = slam_prepare(db)
+        orch.slam_files.add("cloud-yard")
+        out = await start(db, switch)
+        assert out["slam_warning"] == "SLAM map already exists, not re-recorded"
+        assert db.open_session("r1") and orch.slam["active"] is False
+        sid = out["session"]["session_id"]
+        fin = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert fin["map_state"] == "ready" and "slam_warning" not in fin
+        assert ("slam_stop", None) not in slam_ops(orch)   # nothing to save, no stop
+
+    async def test_another_run_active_is_a_warning_and_is_left_alone(self, db):
+        orch, switch = slam_prepare(db)
+        orch.slam = {"active": True, "map": "somebody-else"}
+        out = await start(db, switch)
+        assert "already running" in out["slam_warning"] and db.open_session("r1")
+        sid = out["session"]["session_id"]
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert orch.slam == {"active": True, "map": "somebody-else"}
+        assert ("slam_stop", None) not in slam_ops(orch)
+
+    @pytest.mark.parametrize("error", [
+        oc.OrchestratorError(oc.UNREACHABLE, "not reachable"),
+        oc.OrchestratorError(oc.TIMEOUT, "timed out"),
+        oc.OrchestratorError(oc.HTTP, "boom", status=500),
+    ])
+    async def test_start_failures_only_warn(self, db, error):
+        orch, switch = slam_prepare(db)
+        orch.fail[("slam_start", "cloud-yard")] = error
+        out = await start(db, switch)
+        assert out["slam_warning"] and "'yard'" in out["slam_warning"]
+        assert db.open_session("r1") and orch.services["topomap"] is True
+        assert db.codes() == ["MAP.SESSION_STARTED"]       # nothing rolled back
+
+    async def test_switch_start_never_raises(self, db):
+        orch, switch = slam_prepare(db)
+        orch.reachable = False
+        res = await switch.start_slam(db.robots["r1"], "yard")
+        assert res.status == "failed" and "not reachable" in res.warning
+        res = await make_switch({"r1": orch}).start_slam(robot(address=False), "yard")
+        assert res.status == "failed"
+
+        class Broken:
+            async def slam_state(self):
+                raise RuntimeError("bug")
+
+        res = await MappingSwitch(client_factory=lambda r: Broken()).start_slam(robot(), "yard")
+        assert res.status == "failed" and "bug" in res.warning
+
+    async def test_flag_unset_does_nothing(self, db):
+        orch, switch = prepare(db)                    # slam_map unset
+        sid = (await start(db, switch))["session"]["session_id"]
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert orch.slam_log == []
+
+    async def test_geo_map_does_nothing(self, db):
+        db.add_map("geo1", type="geo", slam_map=True)    # cannot be created, but stored
+        assert await maps._slam_wanted(None, "geo1") is False
+        db.add_map("loc", type="local", slam_map=True)
+        assert await maps._slam_wanted(None, "loc") is True
+        db.add_map("old", type="local")
+        assert await maps._slam_wanted(None, "old") is False
+
+    async def test_operate_sessions_never_record(self, db):
+        orch, switch = slam_prepare(db)
+        db.maps["yard"]["status"] = {"state": "ready"}
+        out = await start(db, switch, purpose="operate")
+        await maps.session_action(None, "yard", out["session"]["session_id"], "finish",
+                                  m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert orch.slam_log == [] and "slam_warning" not in out
+
+    async def test_pause_and_resume_do_not_touch_slam(self, db):
+        orch, switch = slam_prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        orch.slam_log.clear()
+        await maps.session_action(None, "yard", sid, "pause", m1.PUB, switch=switch)
+        await maps.session_action(None, "yard", sid, "resume", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert orch.slam_log == [] and orch.slam["active"] is True
+
+    async def test_finish_saves_in_the_background_with_the_exact_body(self, db):
+        orch, switch = slam_prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        orch.slam_save_gate = asyncio.Event()
+        out = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        # the request is answered while the save is still running
+        assert out["map_state"] == "ready" and "slam_warning" not in out
+        await asyncio.sleep(0)
+        assert switch.slam_save_pending("r1")
+        orch.slam_save_gate.set()
+        await switch.wait_slam_saves()
+        saves = [b for op, name, b in orch.slam_log if op == "slam_save"]
+        assert saves == [{"cloud_map_id": "yard", "cloud_session_id": sid, "stop_after": True}]
+        assert orch.slam == {"active": False, "map": None} and "cloud-yard" in orch.slam_files
+        assert not switch.slam_save_pending("r1")
+        switch.on_slam_done.assert_called_with("r1")
+
+    async def test_a_start_is_refused_while_the_save_is_pending(self, db):
+        orch, switch = slam_prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        orch.slam_save_gate = asyncio.Event()
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await asyncio.sleep(0)
+        out = await start(db, switch)
+        assert "still being saved" in out["slam_warning"] and db.open_session("r1")
+        orch.slam_save_gate.set()
+        await switch.wait_slam_saves()
+
+    async def test_save_failure_stops_the_driver_and_warns(self, db):
+        orch, switch = slam_prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        orch.fail[("slam_save", "cloud-yard")] = oc.OrchestratorError(oc.HTTP, "driver refused",
+                                                                      status=502)
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert ("slam_stop", None) in slam_ops(orch)
+        assert orch.slam["active"] is False
+        # the result a caller of save_slam sees
+        orch.slam = {"active": True, "map": "cloud-yard"}
+        res = await switch.save_slam(db.robots["r1"], "yard", sid)
+        assert res.status == "failed" and "driver refused" in res.warning
+        assert orch.slam["active"] is False
+
+    async def test_save_failure_leaves_a_foreign_run_alone(self, db):
+        orch, switch = slam_prepare(db)
+        orch.slam = {"active": True, "map": "other"}
+        orch.fail[("slam_save", "cloud-yard")] = oc.OrchestratorError(oc.TIMEOUT, "slow")
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "failed" and orch.slam == {"active": True, "map": "other"}
+
+    async def test_unreachable_save_never_raises(self, db):
+        orch, switch = slam_prepare(db)
+        orch.reachable = False
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "failed" and res.warning
+
+    async def test_finish_of_an_offline_robot_warns_without_a_save(self, db):
+        orch, switch = slam_prepare(db)
+        sid = (await start(db, switch))["session"]["session_id"]
+        db.robots["r1"].status.online = False
+        out = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        assert "not saved" in out["slam_warning"]
+        assert not [b for op, _, b in orch.slam_log if op == "slam_save"]
+
+    async def test_replace_saves_the_old_map_before_starting_the_new(self, db):
+        orch, switch = slam_prepare(db)
+        db.add_map("lot", type="local", slam_map=True, status={"state": "draft"})
+        lot = await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        assert orch.slam["map"] == "cloud-lot"
+        out = await start(db, switch, replace=True)
+        order = [c for c in slam_ops(orch) if c[0] in ("slam_start", "slam_save")]
+        assert order == [("slam_start", "cloud-lot"), ("slam_save", "cloud-lot"),
+                         ("slam_start", "cloud-yard")]
+        saved = [b for op, _, b in orch.slam_log if op == "slam_save"]
+        assert saved == [{"cloud_map_id": "lot", "cloud_session_id":
+                          lot["session"]["session_id"], "stop_after": True}]
+        assert orch.slam == {"active": True, "map": "cloud-yard"}
+        assert "slam_warning" not in out
+        assert orch.slam_save_tx == [0]               # not inside a DB transaction
+
+    async def test_replace_with_a_failing_save_still_starts_and_warns(self, db):
+        orch, switch = slam_prepare(db)
+        db.add_map("lot", type="local", slam_map=True, status={"state": "draft"})
+        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        orch.fail[("slam_save", "cloud-lot")] = oc.OrchestratorError(oc.HTTP, "x", status=500)
+        out = await start(db, switch, replace=True)
+        assert "'lot' not saved" in out["slam_warning"]
+        assert out["session"]["map_name"] == "yard"
+
+    async def test_without_a_switch_nothing_happens(self, db):
+        db.add_map("yard", type="local", slam_map=True, status={"state": "draft"})
+        add_robot(db)
+        out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB)
+        assert "slam_warning" not in out
+
+
 class TestViews:
     async def test_summary_mapping_state(self, db):
         orch, switch = prepare(db)
@@ -797,6 +1083,7 @@ class TestViews:
         svc.database = None
         svc.mapping_switch = switch
         svc.graph_db.get_map_stats.return_value = {"node_count": 0}
+        svc.reloc_jobs.active_for.return_value = None
         with patch.object(main, "service", svc):
             out = await main.start_map_session("yard", {"robot": "r1"})
             sid = out["session"]["session_id"]

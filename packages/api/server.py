@@ -41,6 +41,7 @@ from packages.api.map_delete import MapDeleter
 from packages.api import maps, reconstruction
 from packages.api.mapping_switch import MappingSwitch
 from packages.api.orchestrator_maps import OrchestratorMaps
+from packages.api.reloc_job import RelocJobs
 from packages.utils import map_geo
 from packages.utils import map_sessions
 
@@ -637,6 +638,11 @@ class ApiDelegationService:
         self.mapping_switch = MappingSwitch()
         # Does the robot's orchestrator hold a stored map for a cloud map? (relocalization, D2)
         self.orchestrator_maps = OrchestratorMaps()
+        # Reloc jobs the API runs on a robot (in memory: lost when the API restarts;
+        # packages/api/reloc_job.py)
+        self.reloc_jobs = RelocJobs()
+        # a SLAM save / stop changes the robot's stored maps: forget the held-map answers
+        self.mapping_switch.on_slam_done = self.orchestrator_maps.invalidate
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)
@@ -861,7 +867,8 @@ class ApiDelegationService:
                         existing = None
                     if isinstance(existing, MapObjectV1) and existing.type is not None:
                         new_spec = MapSpecV1(**{**map_obj.spec.dict(), "type": existing.type,
-                                                "geo": existing.geo})
+                                                "geo": existing.geo,
+                                                "slam_map": existing.slam_map})
                     await self.database.update_spec(
                         MapObjectV1, actual_map_id, new_spec, _uuid.uuid4()
                     )

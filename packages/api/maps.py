@@ -7,7 +7,8 @@
     POST   /api/v1/maps/{id}/sessions                    start_session()
     GET    /api/v1/maps/{id}/sessions?limit=&before=     session_history()
     POST   /api/v1/maps/{id}/sessions/{sid}/pause|resume|finish   session_action()
-    POST   /api/v1/maps/{id}/sessions/{sid}/place        place_session()
+    POST   /api/v1/maps/{id}/sessions/{sid}/place        place_session() (202 + a reloc job)
+    GET|DELETE /api/v1/maps/{id}/sessions/{sid}/reloc-job  packages/api/reloc_job.py
     POST   /api/v1/maps/{id}/archive|restore             archive_map() / restore_map()
     POST   /api/v1/maps/{id}/type                        convert_map_type() geo <-> local
     DELETE /api/v1/maps/{id}                             refuse_open_session() guards it
@@ -75,6 +76,14 @@ Pause and finish STOP them after the commit, best effort: an offline robot's ses
 anyway and the response says `robot_notified: false` with a `mapping_warning`. The session
 still gates the nodes (graph-builder drops a node with no open, unpaused, placed session).
 
+SLAM maps (`slam_map` on a local map, set at creation, immutable, cleared by converting to geo):
+a MAPPING session on such a map also records a SLAM map on the robot's orchestrator, named
+onboard_map_name(map). Right after the topomap started (outside any transaction, under the
+robot's lock) the server calls start_slam; finishing the session saves it in a BACKGROUND task
+(~150 s; packages/api/mapping_switch.py). Replace saves the replaced session's SLAM map first
+(awaited), then starts the new one. A SLAM failure never fails or undoes a session: the
+response carries `slam_warning`. Pause / resume / operate sessions never touch SLAM.
+
 Type conversion (convert_map_type, docs/satinav-maps-redesign.md §17): geo -> local drops the
 georeference, local -> geo adds one ({latitude, longitude} of a map-frame `anchor`, plus the
 map's rotation against the grid, stored as geo.bearing_deg). The map-frame coordinates never
@@ -104,6 +113,7 @@ from cloud_common.objects.map import (
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
 from packages.api.mapping_switch import Snapshot, StopResult
+from packages.api.orchestrator_client import onboard_map_name  # noqa: F401 - re-exported
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.utils import map_geo
@@ -155,6 +165,7 @@ class CreateMapRequest(pydantic.BaseModel):
     name: str
     type: str
     description: Optional[str] = None
+    slam_map: bool = False
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -172,6 +183,12 @@ class CreateMapRequest(pydantic.BaseModel):
     def _type(cls, value):  # noqa: N805
         if value not in MAP_TYPES:
             raise ValueError(f"type must be one of {', '.join(MAP_TYPES)}")
+        return value
+
+    @pydantic.validator("slam_map")
+    def _slam_map(cls, value, values):  # noqa: N805
+        if value and values.get("type") not in (None, "local"):
+            raise ValueError("slam_map is only for local maps")
         return value
 
 
@@ -217,6 +234,15 @@ PLACE_SOURCES = (ms.SOURCE_LAST_POSITION, ms.SOURCE_RELOC, ms.SOURCE_DATUM)
 POSELESS_SOURCES = (ms.SOURCE_RELOC, ms.SOURCE_DATUM)
 
 
+class RelocOptions(pydantic.BaseModel):
+    """`reloc` of POST .../place with source "reloc": `init_pose` {x, y, yaw} in the cloud MAP
+    frame = relocalize with Odin assisted by that pose (else Odin alone)."""
+    init_pose: Optional[MapPose] = None
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+
 class PlaceRequest(pydantic.BaseModel):
     """POST .../sessions/{sid}/place, and `placement` on start."""
     pose: Optional[MapPose] = None
@@ -229,6 +255,8 @@ class PlaceRequest(pydantic.BaseModel):
     # "datum" (POST .../place only, geo maps): place an unplaced geo session from the robot's
     # CURRENT GNSS datum (what the dispatcher does when a new datum arrives); no poses.
     source: Optional[str] = None
+    # "reloc" only: {init_pose: {x, y, yaw}} (cloud map frame) = relocalize assisted by it.
+    reloc: Optional[RelocOptions] = None
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -242,6 +270,8 @@ class PlaceRequest(pydantic.BaseModel):
 
     @pydantic.root_validator(skip_on_failure=True)
     def _poses(cls, values):  # noqa: N805
+        if values.get("reloc") is not None and values.get("source") != ms.SOURCE_RELOC:
+            raise ValueError(f"reloc is only for source {ms.SOURCE_RELOC!r}")
         if values.get("source") not in POSELESS_SOURCES and (
                 values.get("pose") is None or values.get("robot_pose") is None):
             raise ValueError("pose and robot_pose are required (except for source "
@@ -703,7 +733,8 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
         if nodes:
             raise HTTPException(409, f"ArangoDB already has {nodes} nodes for map "
                                      f"'{req.name}' (no Postgres row); choose another name")
-    spec = json.loads(MapSpecV1(description=req.description, type=req.type).json())
+    spec = json.loads(MapSpecV1(description=req.description, type=req.type,
+                                        slam_map=req.slam_map).json())
     status = json.loads(MapStatusV1(state=DRAFT).json())
     now = _utcnow()
     async with open_store(db, publisher_id) as store:
@@ -930,10 +961,12 @@ def datum_suggestion(map_geo_block: Optional[Mapping[str, Any]], robot: Optional
 
 def _placement_refusals(map_name: str, session_id: str, session: Optional[Mapping[str, Any]],
                         row: MapRow, robot: Optional[RobotObjectV1], reloc: bool,
-                        source: Optional[str] = None) -> None:
+                        source: Optional[str] = None, check_initialized: bool = True) -> None:
     """The 404/409 refusals of POST .../place that need no orchestrator answer, in the order
     they apply. Run once before the (slow) orchestrator read of a `reloc` placement and again
-    inside the transaction. `source` "datum": the geo-map placement from the robot's datum."""
+    inside the transaction. `source` "datum": the geo-map placement from the robot's datum.
+    `check_initialized` false: a relocalization job does not refuse a robot whose position is
+    not initialized (that is what it is about to fix)."""
     if session is None or session["map_name"] != map_name:
         raise HTTPException(404, f"Did not find session \"{session_id}\" on map "
                                  f"\"{map_name}\"")
@@ -962,19 +995,73 @@ def _placement_refusals(map_name: str, session_id: str, session: Optional[Mappin
     if reloc:
         if ms.is_placed(session):
             raise HTTPException(409, f"Session {session_id} is already placed")
-        if robot.status.position_initialized is False:
+        if check_initialized and robot.status.position_initialized is False:
             raise HTTPException(409, f"Robot '{robot.name}' is not relocalised: it reports its "
                                      "position as not initialized")
 
 
-async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id: str
+async def _start_blockers(db: Any, robot: RobotObjectV1, switch: Optional[Any],
+                          reloc_jobs: Optional[Any]) -> Optional[str]:
+    """Why a reloc job could not start for this robot right now although its orchestrator is
+    capable (the same refusals RelocJobs.start makes with 409): another job runs, a SLAM save is
+    pending, the robot drives, or it has an open mapping session. None when nothing is in the
+    way or when it cannot be read (the job's own refusals still guard). Never raises."""
+    try:
+        if reloc_jobs is not None and reloc_jobs.active_for(robot.name) is not None:
+            return f"relocalization is already running for robot '{robot.name}'"
+        if switch is not None and switch.slam_save_pending(robot.name):
+            return f"robot '{robot.name}' is still saving a SLAM map"
+        async with open_store(db, uuid.uuid4()) as store:
+            try:
+                await ensure_not_driving(store, robot)
+            except HTTPException as exc:
+                return str(exc.detail)
+            open_sessions = await store.open_sessions_of_robot(robot.name)
+        mapping = [s for s in open_sessions if ms.purpose_of(s) == ms.MAPPING]
+        if mapping:
+            return (f"robot '{robot.name}' has an open mapping session "
+                    f"({mapping[0]['map_name']}): finish it first")
+    except Exception:  # noqa: BLE001
+        logger.exception("Reloc blockers of robot %s not readable", robot.name)
+    return None
+
+
+async def _can_start(holder: Optional[Any], robot: Optional[RobotObjectV1], map_name: str,
+                     held: Optional[bool], fresh: bool = False, db: Any = None,
+                     switch: Optional[Any] = None, reloc_jobs: Optional[Any] = None,
+                     blockers: bool = False) -> Tuple[bool, Optional[str]]:
+    """(can_start, can_start_reason) for the reloc reads and place_session: whether the API can
+    start relocalization (the holder's reloc_capability). With `blockers` the refusals of a job
+    start (_start_blockers: driving, an open mapping session, a running job, a pending SLAM
+    save) count too, so the client is never offered a mode the server refuses. Never raises."""
+    ask = getattr(holder, "reloc_capability", None)
+    if ask is None or robot is None:
+        return False, ("the robot is unknown" if robot is None
+                       else "relocalization cannot be started from here")
+    try:
+        can, why = await ask(robot, map_name, fresh=fresh, held=held)
+    except Exception:  # noqa: BLE001
+        logger.exception("Reloc capability of robot %s not readable", robot.name)
+        return False, "the robot's relocalization capability could not be read"
+    if can and blockers:
+        blocked = await _start_blockers(db, robot, switch, reloc_jobs)
+        if blocked is not None:
+            return False, blocked
+    return bool(can), (None if can else (why or "not available"))
+
+
+async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id: str,
+                       switch: Optional[Any] = None, reloc_jobs: Optional[Any] = None
                        ) -> Optional[Dict[str, Any]]:
     """`reloc` of the placement-suggestions answer: {available, known, source} for an unplaced,
     open session on a local map, else None. `available`: the robot's orchestrator holds a
     stored map for this cloud map, so no manual initial position is needed (place it with
     `source: "reloc"`); `known` false: the orchestrator could not be asked (then `available` is
-    false: manual placement). A GET: no row locks and the cached held read (place_session asks
-    afresh). Never raises."""
+    false: manual placement). `can_start` / `can_start_reason` (additive): the API can start
+    relocalization on the robot (source "reloc" then answers 202 with a job; see reloc_job.py),
+    else why not (also: the robot drives, has an open mapping session, a job runs, a SLAM save
+    is pending). A GET: no row locks and the cached held read (place_session asks afresh).
+    Never raises."""
     try:
         row, session, robot = await _reloc_inputs(db, map_name, session_id)
         if (row is None or row.type != "local" or session is None
@@ -983,13 +1070,17 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
         held = None
         if holder is not None and robot is not None:
             held = await holder.held(robot, map_name)
+        can, why = await _can_start(holder, robot, map_name, held, db=db, switch=switch,
+                                    reloc_jobs=reloc_jobs, blockers=True)
     except Exception:  # noqa: BLE001
         logger.exception("Reloc status of session %s not readable", session_id)
         return None
-    return {"available": held is True, "known": held is not None, "source": "orchestrator"}
+    return {"available": held is True, "known": held is not None, "source": "orchestrator",
+            "can_start": can, "can_start_reason": why}
 
 
-async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: str
+async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: str,
+                    switch: Optional[Any] = None, reloc_jobs: Optional[Any] = None
                     ) -> Dict[str, Any]:
     """GET /api/v1/maps/{id}/reloc?robot=: the same {available, known, source} as `reloc` of the
     placement suggestions, before any session exists (cached read, no row lock). 404 unknown
@@ -1002,7 +1093,9 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
             if row is None:
                 raise HTTPException(404, f"Did not find \"map\" with name \"{map_name}\"")
             if row.type == "geo":
-                return {"available": False, "known": True, "source": "orchestrator"}
+                return {"available": False, "known": True, "source": "orchestrator",
+                        "can_start": False,
+                        "can_start_reason": "a geo map is placed by its datum, not relocalized"}
             robot = await store.robot(robot_name)
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
@@ -1012,15 +1105,19 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
             held = await holder.held(robot, map_name)
         except Exception:  # noqa: BLE001
             logger.exception("Stored map of robot %s not readable", robot_name)
-    return {"available": held is True, "known": held is not None, "source": "orchestrator"}
+    can, why = await _can_start(holder, robot, map_name, held, db=db, switch=switch,
+                                reloc_jobs=reloc_jobs, blockers=True)
+    return {"available": held is True, "known": held is not None, "source": "orchestrator",
+            "can_start": can, "can_start_reason": why}
 
 
 async def placement_suggestions(db: Any, map_name: str, session_id: str,
-                                holder: Optional[Any] = None) -> Dict[str, Any]:
+                                holder: Optional[Any] = None, switch: Optional[Any] = None,
+                                reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
     """The placement suggestions (_placement_suggestions) plus `reloc` (reloc_status): null, or
     {available, known, source}; with `available` the client skips the manual placement."""
     out = await _placement_suggestions(db, map_name, session_id)
-    out["reloc"] = await reloc_status(db, holder, map_name, session_id)
+    out["reloc"] = await reloc_status(db, holder, map_name, session_id, switch, reloc_jobs)
     return out
 
 
@@ -1281,11 +1378,12 @@ def plan_type_change(row: MapRow, req: ConvertTypeRequest, now: datetime.datetim
         raise HTTPException(422, [{"loc": ["body"], "type": "value_error",
                                    "msg": str(exc)}]) from exc
     return {"type": "geo", "geo": block, **origin_as_legacy_datum(block),
-            "approx_location": None, "former_datum": None}
+            "approx_location": None, "former_datum": None, "slam_map": False}
 
 
 def _conversion_notes(new_type: str, sessions: List[Mapping[str, Any]],
-                      datums: Mapping[str, Optional[Dict[str, Any]]]) -> List[str]:
+                      datums: Mapping[str, Optional[Dict[str, Any]]],
+                      slam_cleared: bool = False) -> List[str]:
     """What the conversion means for the robots using the map (the response's `warnings`)."""
     notes: List[str] = []
     for s in sorted(sessions, key=lambda x: str(x["robot_name"])):
@@ -1305,6 +1403,9 @@ def _conversion_notes(new_type: str, sessions: List[Mapping[str, Any]],
                             "it has no GNSS datum, so it cannot be placed on a geo map"))
         else:
             notes.append(f"{robot} is not placed: place it by hand or by relocalization")
+    if slam_cleared:
+        notes.append("This map no longer records a SLAM map (only local maps do); a SLAM map "
+                     "already saved on a robot is kept there")
     if new_type == "geo":
         notes.append("Robots without a GNSS datum cannot start a session on this map now "
                      "(a geo map is placed by the robot's datum)")
@@ -1348,6 +1449,7 @@ async def convert_map_type(db: Any, name: str, data: Any, publisher_id: uuid.UUI
                                          "(nodes arriving meanwhile would land in a frame "
                                          "whose meaning changed)")
             old_geo = row.spec.get("geo")
+            slam_cleared = bool(row.spec.get("slam_map")) and req.type == "geo"
             patch = plan_type_change(row, req, now)
             await store.update_map(row, spec=patch)
             row.spec.update(patch)
@@ -1378,7 +1480,7 @@ async def convert_map_type(db: Any, name: str, data: Any, publisher_id: uuid.UUI
                       **row.spec)
     return {"map_id": name, "changed": True, "old_type": old_type, "type": req.type,
             "map": map_view(obj), "operating": operating,
-            "warnings": _conversion_notes(req.type, open_sessions, datums)}
+            "warnings": _conversion_notes(req.type, open_sessions, datums, slam_cleared)}
 
 
 REFUSE_OPEN_SESSION_SQL = (f"SELECT robot_name, purpose FROM {SESSIONS_TABLE} "
@@ -1475,17 +1577,22 @@ async def check_robot_still(store: Any, robot: RobotObjectV1,
                             robot_pose: Mapping[str, Any]) -> None:
     """409 unless the robot stands still where the user saw it (decision Q-U7): no active
     order, no velocity, and its pose now within sensor noise of `robot_pose`."""
+    await ensure_not_driving(store, robot)
+    pose = robot.status.pose
+    moved = ms.pose_moved(robot_pose, {"x": pose.x, "y": pose.y, "theta": pose.theta})
+    if moved is not None:
+        raise HTTPException(409, f"Robot '{robot.name}' moved: {moved}; keep it still and "
+                                 "place it again")
+
+
+async def ensure_not_driving(store: Any, robot: RobotObjectV1) -> None:
+    """409 while the robot drives (an active order, or a velocity in its last state)."""
     state = robot.status.state.value if robot.status.state is not None else None
     mission_open = (await store.robot_mission_open(robot.name)
                     if state in ("ON_TASK", "MAP_DEPLOYMENT") else None)
     reason = ms.driving_reason(state, await store.robot_state_msg(robot.name), mission_open)
     if reason is not None:
         raise HTTPException(409, f"Robot '{robot.name}' is driving ({reason}); stop it and "
-                                 "place it again")
-    pose = robot.status.pose
-    moved = ms.pose_moved(robot_pose, {"x": pose.x, "y": pose.y, "theta": pose.theta})
-    if moved is not None:
-        raise HTTPException(409, f"Robot '{robot.name}' moved: {moved}; keep it still and "
                                  "place it again")
 
 
@@ -1746,6 +1853,62 @@ class OpenSessionCache:
         self._until = float("-inf")
 
 
+async def _slam_wanted(db: Any, map_name: str) -> bool:
+    """Whether `map_name` is a local map recording a SLAM map (read from its row, in a
+    transaction of its own that is closed before any orchestrator call). False on any error."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            row = await store.get_map(map_name)
+        return (row is not None and row.type == "local"
+                and bool(row.spec.get("slam_map")))
+    except Exception:  # noqa: BLE001
+        logger.exception("slam_map of map %s not readable; SLAM is skipped", map_name)
+        return False
+
+
+def _slam_session(session: Mapping[str, Any]) -> bool:
+    return ms.purpose_of(session) == ms.MAPPING
+
+
+async def _start_slam(db: Any, switch: Any, session: Mapping[str, Any],
+                      robot: Optional[RobotObjectV1]) -> Optional[str]:
+    """After the topomap of the new MAPPING `session` started: start the map's SLAM recording
+    when the map asks for it. The warning (or None); never raises, never blocks the session."""
+    if switch is None or not _slam_session(session):
+        return None
+    try:
+        if not await _slam_wanted(db, session["map_name"]):
+            return None
+        if robot is None:
+            return "SLAM map not recorded: robot not found"
+        return (await switch.start_slam(robot, session["map_name"])).warning
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("SLAM start for map %s failed", session["map_name"])
+        return f"SLAM map not recorded: {exc}"
+
+
+async def _save_slam(db: Any, switch: Any, session: Mapping[str, Any],
+                     robot: Optional[RobotObjectV1], wait: bool) -> Optional[str]:
+    """After a MAPPING `session` ended: save the map's SLAM map (the map is read now). `wait`
+    awaits the save (replace: the driver must be free for the new session), otherwise it runs in
+    the background and only an immediate problem (robot gone / offline) is returned."""
+    if switch is None or not _slam_session(session):
+        return None
+    try:
+        if not await _slam_wanted(db, session["map_name"]):
+            return None
+        if robot is None or not robot.status.online:
+            return (f"SLAM map of '{session['map_name']}' not saved: robot "
+                    f"'{session['robot_name']}' is not reachable")
+        task = switch.schedule_slam_save(robot, session["map_name"], session["session_id"])
+        if wait:
+            return (await asyncio.shield(task)).warning
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("SLAM save for map %s failed", session["map_name"])
+        return f"SLAM map not saved: {exc}"
+
+
 def _robot_lock(switch: Optional[Any], robot_name: str) -> Any:
     """The switch's per-robot lock (serialises starts and stops of one robot's services), or a
     no-op without a switch."""
@@ -1754,8 +1917,8 @@ def _robot_lock(switch: Optional[Any], robot_name: str) -> Any:
 
 async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UUID,
                         actor: Optional[str] = None, switch: Optional[Any] = None,
-                        arango_node_count: Optional[Callable[[str], int]] = None
-                        ) -> Dict[str, Any]:
+                        arango_node_count: Optional[Callable[[str], int]] = None,
+                        reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/sessions `{robot, purpose?, services?, placement?, replace?}`
     (rules: module docstring). With `replace` the robot's open session (any map, any purpose)
     is finished in the same transaction; a refused start keeps it. A mapping session's
@@ -1764,9 +1927,16 @@ async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UU
     with `replace`, before it (a failed start: 502/504/409, nothing changed, the replaced session
     stays open); afterwards the replaced session's services that the new one does not run are
     stopped (best effort). The response:
-    {map_id, map_state, changed, session, replaced_session} + notify_robot's keys."""
+    {map_id, map_state, changed, session, replaced_session} + notify_robot's keys.
+    A MAPPING session is refused (409) while a relocalization job (`reloc_jobs`) runs for the
+    robot: its SLAM driver would be in the way (the job fails when it sees a new mapping session
+    anyway)."""
     req = parse_body(StartSessionRequest, data)
     async with _robot_lock(switch, req.robot):
+        if (reloc_jobs is not None and req.purpose == ms.MAPPING
+                and reloc_jobs.active_for(req.robot) is not None):
+            raise HTTPException(409, f"Robot '{req.robot}' is relocalizing: wait for the "
+                                     "relocalization job to finish or cancel it")
         return await _start_session(db, map_name, req, publisher_id, actor, switch,
                                     arango_node_count)
 
@@ -1866,13 +2036,23 @@ async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UU
             raise
     session, replaced, robot = opened.session, opened.replaced, opened.robot
     stopped: Optional[StopResult] = None
+    slam_warnings: List[str] = []
     if replaced is not None:
+        # the old SLAM map is saved (awaited) before the new one starts: one driver per robot
+        old = await _save_slam(db, switch, replaced, robot, wait=True)
+        if old:
+            slam_warnings.append(old)
         stopped = await stop_services(db, switch, robot, replaced)
+    new = await _start_slam(db, switch, session, robot)
+    if new:
+        slam_warnings.append(new)
     out = {"map_id": map_name, "map_state": opened.map_state, "changed": True,
            "session": session_dict(session),
            "replaced_session": session_dict(replaced) if replaced else None}
     out.update(await notify_robot(switch, db, req.robot, with_service=True, started=started,
                                   stopped=stopped))
+    if slam_warnings:
+        out["slam_warning"] = "; ".join(slam_warnings)
     return out
 
 
@@ -1953,7 +2133,8 @@ async def _repause(db: Any, switch: Optional[Any], session: Mapping[str, Any],
 async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                         publisher_id: uuid.UUID, actor: Optional[str] = None,
                         switch: Optional[Any] = None,
-                        holder: Optional[Any] = None) -> Dict[str, Any]:
+                        holder: Optional[Any] = None,
+                        reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/sessions/{sid}/place `{pose: {x, y, yaw}, robot_pose: {x, y,
     theta}}`: put the robot on a local map. Sets map_T_session, aligned (placed) and
     placement; MAP.SESSION_PLACED (from then on graph-builder keeps the session's nodes; the
@@ -1968,7 +2149,19 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
     Refused 409 when the session is already placed, the robot is offline or reports its position
     as not initialized, or the orchestrator does not (or cannot be asked to) hold the map. A low
     localization score does not refuse: it shows as `localization_warning` on the robot view. The
-    manual placement path is unchanged."""
+    manual placement path is unchanged.
+
+    When the holder says relocalization can be STARTED for this robot and map (`reloc.can_start`,
+    OrchestratorMaps.reloc_capability) and `reloc_jobs` (packages/api/reloc_job.py) is given,
+    `source: "reloc"` does not place at once: it starts a job and returns `{..., "session":
+    <unplaced>, "reloc_job": {id, state, step, started_at, deadline, mode}}` (the route answers
+    202; poll GET .../reloc-job, DELETE cancels). `{"source": "reloc", "reloc": {"init_pose":
+    {x, y, yaw}}}` (cloud map frame) relocalizes assisted by that pose; it needs a job (409 when
+    `can_start` is false). Without `can_start` a bare `source: "reloc"` is the check-only
+    placement described above, unchanged. When the orchestrator could start it but the robot
+    drives, has an open mapping session, a job runs or a SLAM save is pending, the answer is
+    409 (the same reasons the reads give as `can_start_reason`): a bare reloc on an unplaced
+    MAPPING session is therefore refused, never placed by the check-only path."""
     req = parse_body(PlaceRequest, data)
     try:
         uuid.UUID(str(session_id))
@@ -1976,20 +2169,45 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
         raise HTTPException(404, f"Did not find session \"{session_id}\"") from None
     now = _utcnow()
     reloc = req.source == ms.SOURCE_RELOC
+    init_pose = req.reloc.init_pose if req.reloc is not None else None
     held: Optional[bool] = None
+    capable = False
     if reloc:
         # Cheap refusals first (offline, already placed, ...): the orchestrator read is slow,
-        # and it is never made inside a DB transaction.
+        # and it is never made inside a DB transaction. The "position not initialized" refusal
+        # waits until we know whether a job (which fixes exactly that) can run.
+        has_capability = getattr(holder, "reloc_capability", None) is not None
         try:
             row, session, robot = await _reloc_inputs(db, map_name, session_id)
         except _SCHEMA_ERRORS as exc:
             raise _undefined_table(exc) from exc
-        _placement_refusals(map_name, session_id, session, _alive(row, map_name), robot, True)
+        _placement_refusals(map_name, session_id, session, _alive(row, map_name), robot, True,
+                            check_initialized=not has_capability and init_pose is None)
         if holder is not None:
             try:
                 held = await holder.held(robot, map_name, fresh=True)
             except Exception:  # noqa: BLE001
                 logger.exception("Stored map of session %s not readable", session_id)
+        why = None
+        if has_capability:
+            capable, why = await _can_start(holder, robot, map_name, held, fresh=True)
+        if init_pose is not None and not (capable and reloc_jobs is not None):
+            raise HTTPException(
+                409, f"Relocalization with an initial pose cannot be started for robot "
+                     f"'{robot.name}': {why or 'not available'}")
+        if capable and reloc_jobs is not None:
+            blocked = await _start_blockers(db, robot, switch, reloc_jobs)
+            if blocked is not None:  # the reads said so too (can_start false + this reason)
+                raise HTTPException(409, f"Relocalization cannot be started for robot "
+                                         f"'{robot.name}': {blocked}")
+            job = await reloc_jobs.start(
+                db, switch, map_name, str(session_id), robot.name,
+                init_pose.dict() if init_pose is not None else None, actor, publisher_id)
+            return {"map_id": map_name, "map_state": row.state, "changed": False,
+                    "session": session_dict(session), "reloc_job": job.view()}
+        if has_capability and robot.status.position_initialized is False and init_pose is None:
+            raise HTTPException(409, f"Robot '{robot.name}' is not relocalised: it reports its "
+                                     "position as not initialized")
     try:
         async with open_store(db, publisher_id) as store:
             row = await _lock_alive_map(store, map_name)
@@ -2041,6 +2259,71 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
     return out
 
 
+async def unplace_session(db: Any, map_name: str, session_id: str, publisher_id: uuid.UUID,
+                          actor: Optional[str] = None,
+                          reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
+    """POST /api/v1/maps/{id}/sessions/{sid}/unplace: mark a placed OPERATE session on a LOCAL
+    map as not placed (aligned = false, placement.unplaced_reason = "manual"; the old
+    map_T_session and the robot's last pose are kept, so the "last position" suggestion works).
+    MAP.SESSION_UNPLACED.
+
+    PURPOSE: a developer / test hook and a "my placement looks wrong, redo it" action. The
+    system unplaces by itself when the robot's run changes (the dispatcher); this exists so the
+    placement and relocalization flows can be re-run without restarting robot services. It is
+    not a normal part of using a map.
+
+    404 unknown map/session; 409: finished, a MAPPING session (graph-builder drops an unplaced
+    session's nodes: that would lose the map being built), a geo map (the datum re-places it at
+    once, so it is pointless), or a relocalization job runs for the session. Unplacing an
+    unplaced session changes nothing (`changed: false`)."""
+    try:
+        uuid.UUID(str(session_id))
+    except ValueError:
+        raise HTTPException(404, f"Did not find session \"{session_id}\"") from None
+    now = _utcnow()
+    try:
+        async with open_store(db, publisher_id) as store:
+            row = await _lock_alive_map(store, map_name)
+            session = await store.lock_session(session_id)
+            if session is None or session["map_name"] != map_name:
+                raise HTTPException(404, f"Did not find session \"{session_id}\" on map "
+                                         f"\"{map_name}\"")
+            if session["ended_at"] is not None:
+                raise HTTPException(409, f"Session {session_id} is finished")
+            if ms.purpose_of(session) == ms.MAPPING:
+                raise HTTPException(409, f"Session {session_id} is a mapping session: "
+                                         "unplacing it would drop the nodes of the map being "
+                                         "built")
+            if row.type == "geo":
+                raise HTTPException(409, f"Map '{map_name}' is a geo map: its sessions follow "
+                                         "the robot's datum and are placed again at once")
+            if (reloc_jobs is not None
+                    and reloc_jobs.active_for(session["robot_name"]) is not None):
+                raise HTTPException(409, f"A relocalization job is running for session "
+                                         f"{session_id}; cancel it first")
+            if not ms.is_placed(session):
+                return _unchanged(map_name, row.state, session)
+            old = session.get("map_t_session")
+            placement = ms.unplaced_placement(session.get("placement"), ms.UNPLACED_MANUAL,
+                                              now)
+            placement["actor"] = actor
+            session.update({"aligned": False, "placement": placement})
+            await store.update_session(session_id, aligned=False, placement=placement)
+            await store.emit(Event(
+                EventCode.MAP_SESSION_UNPLACED, now, robot_name=session["robot_name"],
+                source=Source.API,
+                discriminator=f"session:{session_id}:unplaced:{now.isoformat()}",
+                payload={"map_name": map_name, "session_id": str(session_id),
+                         "purpose": ms.purpose_of(session), "reason": ms.UNPLACED_MANUAL,
+                         "actor": actor,
+                         "old_map_T_session": dict(old) if old else None}))
+            map_state = row.state
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    return {"map_id": map_name, "map_state": map_state, "changed": True,
+            "session": session_dict(session)}
+
+
 async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          publisher_id: uuid.UUID, actor: Optional[str] = None,
                          switch: Optional[Any] = None) -> Dict[str, Any]:
@@ -2075,8 +2358,13 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                 raise
         if action != "resume":
             stopped = await stop_services(db, switch, robot, session)
+        slam_warning = None
+        if action == "finish" and out["changed"]:
+            slam_warning = await _save_slam(db, switch, session, robot, wait=False)
         out.update(await notify_robot(switch, db, out["session"]["robot_name"], started=started,
                                       stopped=stopped))
+        if slam_warning:
+            out["slam_warning"] = slam_warning
     return out
 
 

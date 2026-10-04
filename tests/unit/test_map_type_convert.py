@@ -290,6 +290,24 @@ class TestConvert:
         assert out["map"]["geo"]["bearing_deg"] == pytest.approx(15.0)
         assert out["warnings"][-1].startswith("Robots without a GNSS datum")
 
+    async def test_to_geo_clears_slam_map_and_says_so(self, db):
+        db.add_map("shed", type="local", slam_map=True)
+        out = await _convert(db, "shed", type="geo", latitude=47.4795, longitude=19.0325)
+        assert _spec(db, "shed")["slam_map"] is False
+        assert out["map"]["slam_map"] is False
+        assert any("SLAM" in w for w in out["warnings"])
+
+    async def test_to_geo_without_slam_map_has_no_slam_note(self, db):
+        db.add_map("shed", type="local")
+        out = await _convert(db, "shed", type="geo", latitude=47.4795, longitude=19.0325)
+        assert not any("SLAM" in w for w in out["warnings"])
+
+    async def test_to_local_leaves_slam_map_false(self, db):
+        _geo_map(db)
+        out = await _convert(db, type="local")
+        assert out["map"]["slam_map"] is False
+        assert not any("SLAM" in w for w in out["warnings"])
+
     @pytest.mark.parametrize("body,status", [
         ({"type": "plane"}, 422),
         ({"type": "local", "latitude": 47.0}, 422),

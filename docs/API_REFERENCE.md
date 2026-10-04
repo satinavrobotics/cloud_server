@@ -216,12 +216,13 @@ Does the robot's orchestrator hold a stored map for this map, so it can relocali
 
 **Response:**
 ```json
-{"available": true, "known": true, "source": "orchestrator"}
+{"available": true, "known": true, "source": "orchestrator", "can_start": true, "can_start_reason": null}
 ```
 
+- `can_start` / `can_start_reason` (additive): `true` when the API can START relocalization on the robot: it is online, its orchestrator answers and lists a relocalization service (`RELOC_SERVICE_CANDIDATES`, default `odin_reloc`; the sim has none) and holds the map. Otherwise `false` with a readable reason. See "Starting relocalization" below.
 - `available: true`: no manual initial position needed; place with `POST /api/v1/maps/{map_id}/sessions/{session_id}/place` and `{"source": "reloc"}`.
 - `known: false`: the orchestrator could not be asked (unknown or offline robot, no orchestrator address, unreachable or error); `available` is then `false`.
-- A geo map is placed by its datum: `{"available": false, "known": true, "source": "orchestrator"}`.
+- A geo map is placed by its datum: `{"available": false, "known": true, "source": "orchestrator", "can_start": false, "can_start_reason": "..."}`.
 - 404 unknown map.
 
 `GET /api/v1/maps/{map_id}/sessions/{session_id}/placement-suggestions` carries the same object as `reloc` (`null` for a geo map or a placed or finished session).
@@ -235,6 +236,29 @@ Does the robot's orchestrator hold a stored map for this map, so it can relocali
 The robot relocalizes itself on the stored map its orchestrator holds. The server places the session with the identity `map_T_session` (assumption D0: the session frame equals the robot's map frame for a map built in that session) and records the robot's current pose. The robot-still check is skipped.
 
 **Errors:** 404 unknown map, session or robot; 409 session finished or already placed, geo map, robot offline, robot reports `position_initialized: false`, or the orchestrator does not hold the map (a fresh check is made, an unknown answer counts as not held); 422 on a bad body. `reloc` is not accepted when starting a session (422): start the session, then place it. A low localization score never refuses a placement; it shows as `localization_warning` (below).
+
+This is the **check-only** behaviour, and it is exactly what happens while `reloc.can_start` is `false` and no `init_pose` is sent (200, identity placement, no call to the robot).
+
+#### Starting relocalization (three modes)
+
+1. **Manual placement**: unchanged (`pose` + `robot_pose`, or `source: "last_position"`).
+2. **Odin alone**: `{"source": "reloc"}` while `reloc.can_start` is `true`.
+3. **Odin assisted by a pose**: `{"source": "reloc", "reloc": {"init_pose": {"x": 2.0, "y": -1.0, "yaw": 0.5}}}` (cloud map frame, metres / radians CCW). Needs `can_start`: **409** otherwise (no robot call).
+
+With `can_start` the answer is **202** and a background job:
+```json
+{"map_id": "shed", "map_state": "ready", "changed": false, "session": {"...": "unplaced"},
+ "reloc_job": {"id": "…", "state": "preparing", "step": "checking", "mode": "odin",
+               "started_at": "2026-10-04T10:00:00+00:00", "deadline": "2026-10-04T10:01:30+00:00"}}
+```
+`mode` is `odin` or `assisted`. The job: re-checks, finds the stored map on the robot, `PATCH /maps/{name}` `init_pos` (`null` for `odin`: this also clears a stale seed and drops a hand-set value; `[x, y, 0, qx, qy, qz, qw]` from the yaw for `assisted`), `PUT /robot/config/map`, stops (if running) and starts the relocalization service, then waits for the robot to report `position_initialized: true` (`RELOC_JOB_TIMEOUT_S`, default 90 s, from the start of the job), and finally places the session (identity `map_T_session`, `placement.source: "reloc"`, plus `placement.init_pose` for `assisted`; `MAP.SESSION_PLACED`). The robot's pose is read when it reports itself initialized.
+
+- `GET /api/v1/maps/{map_id}/sessions/{session_id}/reloc-job` returns `{id, state, step, mode, started_at, deadline, error?, position_initialized?, localization_score?}`; `state` is `preparing`, `starting`, `waiting`, `placed`, `failed` or `cancelled`. 404 when there is no job (jobs are kept **in memory** and are lost when the API restarts; a lost job's robot-side service keeps running and nothing is placed).
+- `POST /api/v1/maps/{map_id}/sessions/{session_id}/unplace` is a **developer/test hook** (also usable as "redo my placement"): it marks a placed operate session on a local map as unplaced (`placement.unplaced_reason: "manual"`, the old `map_T_session` is kept) and emits `MAP.SESSION_UNPLACED`. The system unplaces by itself when the robot's run changes. 409 on a finished or mapping session, a geo map, or while a relocalization job runs; an already unplaced session returns `changed: false`.
+- `DELETE` on the same URL cancels a running job: the previous `init_pos` and current map are restored on the robot; the relocalization service is **not** stopped. 409 when it has finished.
+- **409 (at the POST)**: robot offline, **driving**, has an open **mapping session**, another reloc job or a pending SLAM save for the robot, the map not held, or `init_pose` without `can_start`. A robot that reports `position_initialized: false` is *not* refused (the job is about to fix that).
+- **`failed`** (`error` says why): the orchestrator's 409 / 502 / 504 are spelled out (for example "another service is probably holding the Odin USB device"); a failed PATCH / PUT / start restores the previous `init_pos` and current map (best effort); the robot going offline, or the session finished, replaced or placed meanwhile, fails the job with no placement; on **timeout** the relocalization service is left running and nothing is restored.
+- The frame is the D0 assumption (identity), kept in `map_sessions.reloc_map_t_session()` / `reloc_bin_pose()`; see docs/satinav-maps-redesign.md section 16 for the open questions (a map saved by a later session, the robot's frame after a reloc-mode driver start).
 
 #### Robot view additions
 
@@ -251,7 +275,7 @@ The robot spec also has `datum_changed_at` and `datum_stamp` (see `docs/MQTT_MIS
 
 `POST /api/v1/orchestration/{robot}/maps/{name}/save` adds `cloud_map_id` (the open mapping session's map) and `cloud_session_id` to the body when the robot has an open mapping session and the caller did not send them (an explicit `null` counts as not sent). This links the saved map to the cloud map for `reloc`. After any proxied non-GET `maps/*` call the cached held-map answer for that robot is dropped.
 
-**Environment variables:** `RELOC_MAP_HELD_TTL_S` (default 15), `RELOC_DEGRADED_SCORE` (default 0.3).
+**Environment variables:** `RELOC_MAP_HELD_TTL_S` (default 15), `RELOC_DEGRADED_SCORE` (default 0.3), `RELOC_SERVICE_CANDIDATES` (default `odin_reloc`), `RELOC_JOB_TIMEOUT_S` (default 90), `RELOC_JOB_POLL_S` (default 1), `RELOC_JOB_SETTLE_S` (default 5).
 
 ---
 
@@ -2205,3 +2229,9 @@ Save this as `index.html` and open in a browser to see a working fleet managemen
 For questions or issues, please refer to the service logs or contact the backend development team.
 
 
+
+#### SLAM maps: `slam_map` on `POST /api/v1/maps`
+
+`POST /api/v1/maps` accepts `slam_map: bool` (default `false`); `true` only with `type: "local"` (else 422, `loc` `["body","slam_map"]`). Map views and lists return `slam_map`. It cannot be changed afterwards (not in `PATCH`), and `POST /api/v1/maps/{id}/type` to `geo` clears it (a note is added to `warnings`).
+
+A mapping session on such a map also records a SLAM map on the robot's orchestrator under the name `cloud-<map>` (`POST /maps/cloud-<map>/mapping/start`, saved in the background after `.../finish`). The session responses (`POST .../sessions`, `.../finish`) carry `slam_warning` (string) only when something went wrong; the session itself is never failed or rolled back for it. `mapping_warning` stays the topomap's.

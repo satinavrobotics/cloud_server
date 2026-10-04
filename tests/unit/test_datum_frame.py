@@ -103,6 +103,8 @@ class TestDispatchDatumMessage:
         db = _Db(MapObjectV1(name="site_a", datum_latitude=1.0, datum_longitude=2.0))
         r = _robot(db)
         await r._process_datum_message(types.RobotDatum(**UTM_WIRE))
+        # A changed datum also stamps its change time (map-location plan A freshness).
+        assert db.robot_fields.pop("datum_changed_at") == r._robot_object.datum_changed_at.isoformat()
         assert db.robot_fields == {"datum": UTM_WIRE}
         assert r._robot_object.datum.frame == "utm"
         assert db.map_specs == []  # the map already had a datum: not re-seeded
@@ -113,6 +115,7 @@ class TestDispatchDatumMessage:
         db = _Db(MapObjectV1(name="site_a", description="yard"))
         r = _robot(db)
         await r._process_datum_message(types.RobotDatum(**UTM_WIRE))
+        assert db.robot_fields.pop("datum_changed_at")  # change-time stamp, see above
         assert db.robot_fields == {"datum": UTM_WIRE}
         assert db.map_specs == []
         legacy = _Db(MapObjectV1(name="site_a"))

@@ -18,6 +18,14 @@ class TestMapSpecV1:
         assert spec.datum_latitude is None
         assert spec.datum_longitude is None
         assert spec.datum_bearing_deg == 0.0
+        assert spec.slam_map is False
+
+    def test_old_row_without_slam_map_reads_false(self):
+        """A spec stored before `slam_map` existed (no key in the JSONB) reads False."""
+        row = {"description": "old", "type": "local", "datum_bearing_deg": 0.0}
+        assert MapSpecV1(**row).slam_map is False
+        assert MapObjectV1(name="old", **row).slam_map is False
+        assert MapObjectV1(name="new", type="local", slam_map=True).slam_map is True
 
     def test_full_datum(self):
         spec = MapSpecV1(

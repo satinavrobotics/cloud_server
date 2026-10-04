@@ -157,7 +157,8 @@ getRobotImage('warehouse_floor_1', '1001');
 - `POST /api/v1/map/load` - Load map
 - `PUT /api/v1/maps/{map_id}/approx_location` - Set a local map's approximate location
 - `GET /api/v1/maps/{map_id}/reloc?robot={name}` - Can the robot relocalize on this map without a manual initial position?
-- `POST /api/v1/maps/{map_id}/sessions/{session_id}/place` - Place a session (`{"source": "reloc"}` to relocalize)
+- `POST /api/v1/maps/{map_id}/sessions/{session_id}/place` - Place a session (`{"source": "reloc"}` to relocalize; 202 + a job when `reloc.can_start`, optional `reloc.init_pose`)
+- `GET|DELETE /api/v1/maps/{map_id}/sessions/{session_id}/reloc-job` - Status / cancel of that relocalization job
 
 ### Images
 - `GET /api/v1/images/{map_id}/{node_id}` - Get node image

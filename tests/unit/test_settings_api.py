@@ -83,8 +83,8 @@ class TestGetSettingsRoute:
         with patch.object(main, "service", svc):
             with pytest.raises(HTTPException) as exc:
                 await main.get_settings()
-        # get_settings' own except-Exception wraps everything else as a 500.
-        assert exc.value.status_code == 500
+        # get_settings re-raises an HTTPException as is (only other exceptions become a 500).
+        assert exc.value.status_code == 503
 
 
 class TestUpdateSettingsRoute:

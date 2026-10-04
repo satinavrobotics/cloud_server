@@ -879,6 +879,14 @@ untouched.
   session is closed/paused anyway and the response says `robot_notified: false` plus a
   `mapping_warning`; a repeated pause/finish retries the stop. A finish of an old session never
   stops a service another open session of the robot runs.
+- *SLAM map* (`slam_map` on a local map; created with the map, immutable, cleared when the map
+  becomes geo): not a session service. A mapping session's start calls the orchestrator's
+  `POST /maps/cloud-<map>/mapping/start {overwrite: false}` after the topomap started (409 "already
+  has a map file" = warning "SLAM map already exists, not re-recorded"); finish saves in a background
+  task (`POST /maps/cloud-<map>/save {cloud_map_id, cloud_session_id, stop_after: true}`, a per-robot
+  SLAM lock refuses a following start meanwhile; a failed save stops the driver); replace saves the
+  old map (awaited) before starting the new. Only `slam_warning` reports failures; pause/resume and
+  operate never touch it. A persistent status indicator and a save-outcome event are not built.
 - *Place* does not touch the services: a session that is not placed has its service running and
   its nodes rejected (`session_unplaced`) until it is placed, as before, but without a switch.
 - *Names:* `topo` is `topomap` on the real robot and `sim_topomap` in the sim (the sim's
@@ -933,6 +941,31 @@ A local-map session on a robot whose orchestrator holds the map is placed withou
 - **Robot status.** `positionInitialized` and `localizationScore` of `agvPosition` are stored as `status.position_initialized` (bool or null) and `status.localization_score` (float or null); both are in `GET /robots[/{r}]` under `status` and in the WebSocket `robot_update` `status`. `status.pose` is unchanged. Note: the VDA5050 client's score is a GNSS-sigma stopgap (`1 - deviationRange/0.5`), not a map-matching score.
 - **Degraded.** A placed `reloc` session (the robot `session` view has `placement_source`) is degraded when `position_initialized` is false or `localization_score` is below `RELOC_DEGRADED_SCORE` (env, `packages/config.py`, default 0.3). The robot view (REST and WebSocket) then has `localization_warning: <reason>`, else `null`. **The session is not unplaced**: unplacing would make graph-builder drop its nodes, and `positionInitialized` flaps; a warning leaves the decision to the operator. Revisit once the score is a real map-matching score.
 - **Before a session.** `GET /api/v1/maps/{id}/reloc?robot=<name>` returns the same `{available, known, source: "orchestrator"}` from the cached held-map read (no session needed). 404 unknown map; a geo map returns `{available: false, known: true}` (placed by its datum); an unknown or offline robot, or an orchestrator that cannot be asked, gives `known: false`.
+
+### 16.1 Starting relocalization from the API (three modes, 2026-10-04)
+
+Until now the server only *checked* that the robot had relocalized by itself. It can now *start* it. Three modes:
+
+1. **Manual placement**: unchanged.
+2. **`source: "reloc"`, no initial pose**: the robot relocalizes on its stored map with Odin alone.
+3. **`source: "reloc"` with `reloc: {"init_pose": {x, y, yaw}}`** (cloud map frame): Odin assisted by that pose.
+
+Modes 2 and 3 are one mechanism: the robot-side reloc service (config `RELOC_SERVICE_CANDIDATES`, default `odin_reloc`) is (re)started on the chosen `map.bin`; the only difference is whether `init_pos` is in the stored map's `meta.yaml`.
+
+**Capability.** `reloc.can_start` (bool) and `reloc.can_start_reason` (str or null) are added to `GET /maps/{id}/reloc` and to `reloc` of placement-suggestions (`OrchestratorMaps.reloc_capability`, cached like `held()`): true iff the robot is online, its orchestrator answers and lists a reloc service, and holds the map. The sim's orchestrator has no reloc service, so there it is false and there is no fake job. When false, a bare `source: "reloc"` keeps today's check-only behaviour exactly (200, identity, no robot calls, `position_initialized: false` refuses); `source: "reloc"` **with** `init_pose` is a 409.
+
+**The job** (`packages/api/reloc_job.py`; `POST .../place` answers **202** `{..., session, reloc_job: {id, state, step, started_at, deadline, mode}}`; `GET|DELETE .../sessions/{sid}/reloc-job`). Same discipline as the mapping switch: per-robot lock (then the SLAM lock) around the calls that change the robot, never inside a DB transaction, never raising after the 202.
+
+- Cheap 409s at the POST (reads only): robot offline, driving, an open mapping session on the robot, another reloc job or a pending SLAM save for the robot. The existing "position_initialized is false" refusal does **not** apply to jobs.
+- Steps: fresh `GET /maps/list?cloud_map_id` (the onboard map name) and `GET /maps/{name}` (previous `init_pos`) + `GET /robot/config/map` (previous current map); `PATCH /maps/{name}` `init_pos` (mode 3: `[x, y, 0, qx, qy, qz, qw]` from the yaw, in the map.bin frame via `reloc_bin_pose()`; mode 2: `null`, which also clears a stale seed and **drops a hand-set `init_pos`**); `PUT /robot/config/map`; stop (if running) and start the service; poll the stored robot status (`position_initialized`, `localization_score`) until true or `RELOC_JOB_TIMEOUT_S` (90 s, counted from the job's start); then ONE transaction re-checks the session is still open and unplaced and writes `map_t_session` / `aligned` / `placement` (source `reloc`; `init_pose` for mode 3) with `MAP.SESSION_PLACED`.
+- Failure: a failed PATCH / PUT / start restores the previous `init_pos` and current map (best effort, what could not be restored is in `error`); the orchestrator's 409 / 502 / 504 are turned into readable text (a 409 on start: probably the Odin USB group is busy). **Timeout: state `failed`, the reloc service is left running** (it may still localize) and nothing is restored. Robot offline mid-job, or the session finished / replaced / placed meanwhile: `failed`, no placement. `DELETE` cancels and restores the previous values (it does not stop the service).
+- The robot's pose and run are the ones read **after** `position_initialized` is true (the placement transaction). Open question: whether restarting the driver changes the robot's run (odometry frame); the job does not fail merely because the run changed.
+- A `position_initialized: true` that was already stored before the restart is stale: the job believes a true again only after it saw the flag drop or after `RELOC_JOB_SETTLE_S` (5 s).
+- The registry is **in memory**: jobs are lost when the API restarts (GET 404; the robot-side service keeps running; no placement is made).
+
+**Frame (D0, one place).** `map_sessions.reloc_map_t_session()` (the robot's pose to the map, used by `reloc_placement()`) and its inverse `reloc_bin_pose()` (the user's init pose to the `map.bin` frame) are both the identity today, and no other code decides the frame, so a later fix changes those two functions only. **Assumptions, to confirm with the navstack team:** (1) the session frame equals Odin's map frame; (2) the `map.bin` the robot relocalizes on may have been saved by a **non-first** mapping session, whose `map_T_session` is not the identity; the proposal is `map_T_binSession`, the placement of the session named by the stored map's `meta.cloud_session_id`; (3) which frame the robot reports its pose in after a reloc-mode driver start is unconfirmed.
+
+**Not done:** starting a mapping session while a reloc job runs is not refused (the SLAM start would 409 on the USB group); persistence of jobs; stopping the service on cancel.
 
 ---
 

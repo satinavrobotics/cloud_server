@@ -15,6 +15,7 @@ import os
 from datetime import datetime
 
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 import uvicorn
@@ -578,17 +579,24 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     change). `services` (mapping only, default ["topo"]); `placement` {pose: {x, y, yaw},
     robot_pose: {x, y, theta}} puts the robot on a LOCAL map (422 on a geo map, which is placed
     by the robot's datum); `replace: true` finishes the robot's open session in the same
-    transaction. Errors: packages/api/maps.py (module docstring). A mapping session's services
-    are started on the robot's orchestrator inside the transaction: when that fails (502 robot or
-    orchestrator unreachable / not registered, 504 timeout, 409 no such service there) nothing is
-    committed. The response: {map_id, map_state, changed, session, replaced_session,
+    transaction. Errors: packages/api/maps.py (module docstring). 409 also while a
+    relocalization job runs for the robot (mapping sessions only). A mapping session's services
+    are started on the robot's orchestrator OUTSIDE any transaction, AFTER the commit
+    (commit-then-start): when the start fails (502 robot or orchestrator unreachable / not
+    registered, 504 timeout, 409 no such service there) the new session is closed again
+    (compensating close: its SESSION_STARTED gets a SESSION_FINISHED, the map's state is
+    restored; best effort, a session that could not be closed stays open for a manual finish)
+    and the error is returned. `replace` differs: the services start BEFORE the commit (after a
+    validation-only dry run), so a failed start changes nothing and the replaced session stays
+    open; if the commit then fails the started services are stopped again. The response: {map_id, map_state, changed, session, replaced_session,
     robot_notified, mapping_switch, mapping_service, mapping_services, mapping_state} (+
     `mapping_warning` when the replaced session's service could not be stopped). The session is
     the robot's map (maps §14.2; robots have no current_map since U6)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
-        switch=service.mapping_switch, arango_node_count=_arango_node_count))
+        switch=service.mapping_switch, arango_node_count=_arango_node_count,
+        reloc_jobs=service.reloc_jobs))
 
 
 @app.get("/api/v1/maps/{map_id}/sessions")
@@ -617,7 +625,8 @@ async def map_session_placement_suggestions(map_id: str, session_id: str):
     manual initial position is needed (POST .../place with {"source": "reloc"})."""
     _require_service()
     return await _site_call("placement suggestions", maps.placement_suggestions(
-        service.database, map_id, session_id, holder=service.orchestrator_maps))
+        service.database, map_id, session_id, holder=service.orchestrator_maps,
+        switch=service.mapping_switch, reloc_jobs=service.reloc_jobs))
 
 
 @app.get("/api/v1/maps/{map_id}/reloc")
@@ -628,7 +637,8 @@ async def map_reloc(map_id: str, robot: str):
     unknown/offline, orchestrator unreachable). Geo map: {false, true}. 404 unknown map."""
     _require_service()
     return await _site_call("map reloc", maps.map_reloc(
-        service.database, service.orchestrator_maps, map_id, robot))
+        service.database, service.orchestrator_maps, map_id, robot,
+        switch=service.mapping_switch, reloc_jobs=service.reloc_jobs))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/place")
@@ -642,11 +652,70 @@ async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     orchestrator holds; identity placement, no still check; 409 when it does not hold the map.
     `{"source": "datum"}` (no poses, GEO maps only): place an unplaced geo session from the
     robot's current GNSS datum (409 when it has none in the map's UTM zone, or the session is
-    placed). Other sources on a geo map: 409 (placed by the datum)."""
+    placed). Other sources on a geo map: 409 (placed by the datum).
+    When the robot's orchestrator can start relocalization (`reloc.can_start` of the reloc
+    reads), `{"source": "reloc"}` answers **202** `{..., "session", "reloc_job": {id, state, step,
+    started_at, deadline, mode}}` and relocalizes in the background (mode "odin": Odin alone;
+    "assisted": `{"source": "reloc", "reloc": {"init_pose": {x, y, yaw}}}`, cloud map frame):
+    poll GET .../reloc-job, cancel with DELETE .../reloc-job. The 202 body is
+    `{map_id, map_state, changed: false, session: <still unplaced>, reloc_job: {id, state, step,
+    mode, started_at, deadline}}` (`deadline` is an estimate until the job waits for the robot).
+    `can_start` (the reloc reads, `can_start_reason`) is false, with the reason, while the robot
+    drives, has an open mapping session, another job runs or a SLAM save is pending, so a client
+    that honours it is never refused; place answers 409 with the same reasons (a bare reloc on an
+    unplaced MAPPING session is refused that way), and 409 for an `init_pose` without
+    `can_start`. Without `can_start` because the orchestrator cannot do it, the bare reloc
+    placement is the check-only 200 as before. Jobs live in this process only (single API
+    worker)."""
     _require_service()
-    return await _site_call("place map session", maps.place_session(
+    out = await _site_call("place map session", maps.place_session(
         service.database, map_id, session_id, body, uuid.uuid4(), recording.request_actor(),
-        switch=service.mapping_switch, holder=service.orchestrator_maps))
+        switch=service.mapping_switch, holder=service.orchestrator_maps,
+        reloc_jobs=service.reloc_jobs))
+    if "reloc_job" in out:
+        return JSONResponse(status_code=202, content=jsonable_encoder(out))
+    return out
+
+
+def _reloc_job_of(map_id: str, session_id: str):
+    job = service.reloc_jobs.latest(map_id, session_id)
+    if job is None:
+        raise HTTPException(404, f"No relocalization job for session \"{session_id}\" on map "
+                                 f"\"{map_id}\" (jobs are kept in memory and are lost when the "
+                                 "API restarts)")
+    return job
+
+
+@app.get("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job")
+async def get_reloc_job(map_id: str, session_id: str):
+    """The session's latest relocalization job: {id, state: preparing | starting | waiting |
+    placed | failed | cancelled, step, mode: odin | assisted, started_at, deadline, error?,
+    position_initialized?, localization_score?}. 404 when there is none (also after an API
+    restart: the registry is in memory)."""
+    _require_service()
+    return _reloc_job_of(map_id, session_id).view()
+
+
+@app.delete("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job")
+async def cancel_reloc_job(map_id: str, session_id: str):
+    """Cancel the session's running relocalization job: the previous `init_pos` and current map
+    are restored on the robot (the relocalization service is NOT stopped). Returns the job.
+    404 no job; 409 it has finished."""
+    _require_service()
+    return (await service.reloc_jobs.cancel(_reloc_job_of(map_id, session_id))).view()
+
+
+@app.post("/api/v1/maps/{map_id}/sessions/{session_id}/unplace")
+async def unplace_map_session(map_id: str, session_id: str):
+    """Mark a placed OPERATE session on a LOCAL map as not placed (the old placement is kept for
+    "last position"). PURPOSE: a developer / test hook, and "redo my placement": the system
+    unplaces by itself when the robot's run changes; this lets the place and relocalization flows
+    be re-run without restarting robot services. 409 on a finished or mapping session, a geo map,
+    or while a relocalization job runs; an already unplaced session answers `changed: false`."""
+    _require_service()
+    return await _site_call("unplace map session", maps.unplace_session(
+        service.database, map_id, session_id, uuid.uuid4(), recording.request_actor(),
+        reloc_jobs=service.reloc_jobs))
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
@@ -655,9 +724,10 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     makes the map `ready`; finishing an operate session is "Stop using" (the map state does
     not change). pause/resume: mapping sessions only (409 on operate). Repeating an action
     that is already in effect changes nothing in the session (a repeated pause/finish retries
-    the stop, a repeated resume the start). Resume starts the session's mapping services on the
-    robot's orchestrator inside the transaction (502/504/409 when that fails: the session stays
-    paused); pause/finish stop them after the commit, best effort: when the robot is offline the
+    the stop, a repeated resume the start). Resume commits, then starts the session's mapping
+    services on the robot's orchestrator (outside any transaction): when that fails (502/504/409)
+    the session is paused again (compensation, best effort) and the error is returned;
+    pause/finish stop them after the commit, best effort: when the robot is offline the
     session is closed anyway and the response has `robot_notified: false` and `mapping_warning`.
     The response adds `robot_notified`, `mapping_switch` and `mapping_state`."""
     _require_service()

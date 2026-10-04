@@ -165,7 +165,7 @@ bookkeeping. All additions are new keys; nothing was removed or renamed.
 
 | Method | Path | Does |
 |---|---|---|
-| POST | `/api/v1/maps` | `{name, type, description?}` → 201, a `draft` map. 409 if the name exists, collides with another map's image bucket (case/`_` vs `-`), or ArangoDB already has nodes under it. 422 on a bad name (1-59 of `A-Za-z0-9_-`, alphanumeric at both ends; not `GEO`/`LOCAL`) or type. |
+| POST | `/api/v1/maps` | `{name, type, description?, slam_map?}` → 201, a `draft` map (`slam_map`, default false, only for `type: local`: 422 `["body","slam_map"]` otherwise; immutable; map views return it; converting to geo clears it). 409 if the name exists, collides with another map's image bucket (case/`_` vs `-`), or ArangoDB already has nodes under it. 422 on a bad name (1-59 of `A-Za-z0-9_-`, alphanumeric at both ends; not `GEO`/`LOCAL`) or type. |
 | GET | `/api/v1/maps?type=&state=&include_archived=` | Same `{maps, count}` body as before. Archived maps only with `include_archived=true` or `state=archived`. |
 | GET | `/api/v1/maps/{id}` | As before plus `type`, `geo`, `state`, `open_session_id`, `grid_version` and `sessions: {count, open, unaligned, items}` (newest first, at most 50). |
 | PATCH | `/api/v1/maps/{id}` | `{description}`. Renaming is not supported (422): the name keys the map in Postgres, ArangoDB and MinIO. |
@@ -215,19 +215,33 @@ the server: graph-builder drops a node with no open, unpaused, placed mapping se
 `topo` is `topomap` on the real robot and `sim_topomap` in the sim
 (`packages/config.py::MAPPING_SERVICE_CANDIDATES`, env `MAPPING_SERVICE_TOPO`).
 
-- `POST .../sessions` (mapping) starts the services **inside the transaction**: if that fails
-  nothing is opened. 502 the robot has no registered orchestrator / it does not answer / it
-  reports an error, 504 timeout, 409 the orchestrator has no such service. The `detail` says
+- `POST .../sessions` (mapping) **commits first, then starts** the services (outside any
+  transaction, under the robot's lock): if the start fails the new session is closed again
+  (compensating close, best effort) and the error is returned, so nothing stays open. With
+  `replace` it is the other way round: the services start *before* the commit (after a dry run),
+  so a failed start changes nothing and the replaced session stays open. Errors: 502 the robot has
+  no registered orchestrator / it does not answer / it reports an error, 504 timeout, 409 the
+  orchestrator has no such service, 409 a relocalization job runs for the robot. The `detail` says
   which ("Could not start mapping service 'topo' on robot 'r1': ...").
-- `.../resume` starts them (same errors; the session stays paused), `.../pause` and `.../finish`
+- `.../resume` commits, then starts them (same errors; the session is paused again), `.../pause` and `.../finish`
   stop them after the commit, best effort: on an offline robot the session is paused / closed
   anyway and the response has `robot_notified: false` and `mapping_warning`.
 - `.../place` does not touch the services.
+- **SLAM map** (a `local` map created with `slam_map: true`): a *mapping* session also records a
+  SLAM map on the robot, named `onboard_map_name(map)` = `cloud-<map>`. After the topomap started
+  (outside any transaction, under the robot's lock) the API calls `POST /maps/{onboard}/mapping/start`
+  `{"overwrite": false}`; `.../finish` answers at once and saves in a background task
+  (`POST /maps/{onboard}/save` `{cloud_map_id, cloud_session_id, stop_after: true}`, up to
+  `ORCHESTRATOR_SAVE_TIMEOUT_S`, default 180 s; a failed save stops the driver); `replace` saves the
+  replaced session's map first (awaited), then starts the new one. Failures never fail a session:
+  `slam_warning` says what (existing map file: "SLAM map already exists, not re-recorded"). Pause,
+  resume and operate sessions never touch SLAM. The background outcome is only logged.
 
 | Where | Field |
 |---|---|
 | `POST .../sessions` | `robot_notified` (bool: false only when a service of the *replaced* session could not be stopped), `mapping_switch` (`{service: started \| already_running \| stopped \| already_stopped \| failed}`), `mapping_service` (`"running"` \| `"not_running"`: the topo service), `mapping_services`, `mapping_state`, `mapping_warning` (only with `robot_notified: false`) |
 | `POST .../sessions/{sid}/pause\|resume\|finish` | `robot_notified`, `mapping_switch`, `mapping_state`, `mapping_warning` |
+| `POST .../sessions` and `.../finish` | `slam_warning` (only when a SLAM map step went wrong; see "SLAM map" above) |
 | `POST .../sessions/{sid}/place` | `robot_notified`, `mapping_state` |
 | `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service`, `sessions.mapping_services` (of the open session's robot; null without an open session) |
 | `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state`, `mapping_services` per robot |
@@ -276,9 +290,12 @@ carry `purpose`.
 | Method | Path | Does |
 |---|---|---|
 | PUT | `/api/v1/maps/{id}/approx_location` | `{latitude, longitude, accuracy_m?, source?: "manual"\|"robot"}` sets a local map's approximate location (a hint for pins and sorting; never read by placement); the server stamps `set_at`. 404 unknown map, 409 geo map, 422 for (0, 0) or out of range. |
-| GET | `/api/v1/maps/{id}/reloc?robot=` | `{available, known, source: "orchestrator"}`: does the robot's orchestrator hold a stored map for this map (cached `RELOC_MAP_HELD_TTL_S`, 15 s)? Geo map: `{false, true}`. Unknown or offline robot, or an orchestrator that cannot be asked: `known: false`. 404 unknown map. |
+| GET | `/api/v1/maps/{id}/reloc?robot=` | `{available, known, source: "orchestrator", can_start, can_start_reason}` (`can_start`: the API can start relocalization: robot online, orchestrator lists a `RELOC_SERVICE_CANDIDATES` service and holds the map, and the server would not refuse the start: the robot is not driving, has no open mapping session, no job runs, no SLAM save is pending; else false + a reason in `can_start_reason`): does the robot's orchestrator hold a stored map for this map (cached `RELOC_MAP_HELD_TTL_S`, 15 s)? Geo map: `{false, true}`. Unknown or offline robot, or an orchestrator that cannot be asked: `known: false`. 404 unknown map. |
 | GET | `.../sessions/{sid}/placement-suggestions` | gains `reloc`: the same object for an unplaced local-map session, else `null`. |
-| POST | `.../sessions/{sid}/place` | `source` is `last_position` or `reloc`. `{"source": "reloc"}` (no poses): the robot relocalizes itself on its stored map; identity `map_T_session` (assumption D0, `map_sessions.reloc_map_t_session()`), the robot's current pose is recorded, the still check is skipped. 409 when already placed, the robot is offline or reports `position_initialized: false`, or the orchestrator does not hold the map (fresh check; unknown counts as not held). Not accepted on session start (422). |
+| POST | `.../sessions/{sid}/place` | `source` is `last_position` or `reloc`. `{"source": "reloc"}` (no poses): the robot relocalizes itself on its stored map; identity `map_T_session` (assumption D0, `map_sessions.reloc_map_t_session()`), the robot's current pose is recorded, the still check is skipped. 409 when already placed, the robot is offline or reports `position_initialized: false`, or the orchestrator does not hold the map (fresh check; unknown counts as not held). Not accepted on session start (422). **When `reloc.can_start` is true** it answers **202** `{map_id, map_state, changed: false, session: <still unplaced>, reloc_job: {id, state, step, mode: "odin"\|"assisted", started_at, deadline}}` (`deadline` is an estimate until the job starts waiting for the robot, then it is `RELOC_JOB_TIMEOUT_S` from that moment) and runs a job (`packages/api/reloc_job.py`): PATCH `init_pos` (null, or the body's `reloc: {init_pose: {x, y, yaw}}` in the cloud map frame), PUT the current map, restart the reloc service, wait for `position_initialized` (`RELOC_JOB_TIMEOUT_S`, 90 s), place in one transaction. 409 (the same reasons `can_start_reason` gives, so a bare reloc on an unplaced MAPPING session is refused) when the robot drives, has an open mapping session, another job / a pending SLAM save exists, or `init_pose` is sent while `can_start` is false; `POST .../sessions` for a mapping session is 409 while a job runs; `position_initialized: false` does not refuse a job. With `can_start` false the call is the check-only one above. |
+| GET | `.../sessions/{sid}/reloc-job` | `{id, state: preparing\|starting\|waiting\|placed\|failed\|cancelled, step, mode, started_at, deadline, error?, position_initialized?, localization_score?}`; 404 none. The registry is **in memory** (lost on API restart) and so are the per-robot locks and pending SLAM saves: run the API with a **single worker** (multiple workers would not see each other's jobs, locks or saves). |
+| DELETE | `.../sessions/{sid}/reloc-job` | cancel: restores the previous `init_pos` and current map (the service is not stopped, but restarted if the job had stopped it); every failure but a timeout restores them too; 409 when finished. |
+| POST | `.../sessions/{sid}/unplace` | **Dev/test hook** (also "redo my placement"): marks a placed OPERATE session on a LOCAL map as unplaced (`aligned: false`, `placement.unplaced_reason: "manual"`, `placement.actor`; the old `map_T_session` and placement are kept). Emits `MAP.SESSION_UNPLACED` (`reason: manual`). The system itself unplaces when the robot's run changes; this lets the place/relocalization flows be re-run without restarting robot services. 409: finished or mapping session, geo map, a relocalization job running for the robot. Already unplaced: `changed: false`. |
 
 #### Map type conversion (docs/satinav-maps-redesign.md §17)
 
@@ -298,7 +315,7 @@ a `localization_score` below `RELOC_DEGRADED_SCORE`, default 0.3). The warning i
 the session stays placed; the score is provisional (a GNSS-sigma stopgap on the robot). The
 orchestrator proxy adds `cloud_map_id` and `cloud_session_id` to a proxied
 `POST /orchestration/{robot}/maps/{name}/save` while the robot has an open mapping session (ids the
-caller sent are kept). Env: `RELOC_MAP_HELD_TTL_S`, `RELOC_DEGRADED_SCORE`.
+caller sent are kept). Env: `RELOC_MAP_HELD_TTL_S`, `RELOC_DEGRADED_SCORE`, `RELOC_SERVICE_CANDIDATES`, `RELOC_JOB_TIMEOUT_S`, `RELOC_JOB_POLL_S`, `RELOC_JOB_SETTLE_S`.
 
 #### 3D reconstruction (R3)
 

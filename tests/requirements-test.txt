@@ -52,5 +52,5 @@ livekit-api==1.2.1
 
 # Core alignment
 fastapi==0.109.1
-pydantic>=2.0.0,<3.0.0
+pydantic>=1.10,<2  # v1 only: the services use v1 idioms (see CLAUDE.md)
 uvicorn==0.17.6

@@ -55,6 +55,7 @@ SOURCE_DATUM = "datum"        # a geo session re-placed from the robot's datum (
 SOURCE_LAST_POSITION = "last_position"  # suggested from where the robot last was on this map
 SOURCE_RELOC = "reloc"        # the robot relocalised on a stored map it holds (no manual pose)
 UNPLACED_RUN_CHANGED = "run_changed"
+UNPLACED_MANUAL = "manual"  # POST .../unplace (a DEV/TEST and "redo my placement" hook)
 
 # A placed `reloc` session counts as degraded (robot state `localization_warning`) when the robot
 # reports positionInitialized false or a localizationScore below RELOC_DEGRADED_SCORE
@@ -123,9 +124,38 @@ def placement_transform(pose: Mapping[str, Any], robot_pose: Mapping[str, Any]
 # D0 ASSUMPTION (to be confirmed by the navstack team): the session frame equals Odin's map frame
 # for a map built in that session, so a `reloc` placement is the identity. Change it HERE (or make
 # the robot report it) if D0 turns out otherwise.
+#
+# TODO(D0): the identity is only right when (1) the session frame IS the Odin map frame and (2) the
+# map.bin the robot relocalizes on was recorded in the map's FIRST session (map_T_session of that
+# session is the identity). A map.bin saved by a LATER mapping session lives in that session's
+# frame, whose map_T_session is not the identity; the proposal is map_T_binSession, the placement
+# of the session named by the stored map's meta.cloud_session_id (the robot's pose in a reloc-mode
+# driver start is then in the bin's frame). It is also unconfirmed which frame the robot's pose is
+# in after a reloc-mode driver (re)start. ONE place decides it: this function for the pose the
+# robot reports, reloc_bin_pose() below for a pose the user gives (the init pose); they are
+# inverses of each other and both identity today (docs/satinav-maps-redesign.md section 16).
 def reloc_map_t_session() -> Dict[str, float]:
     """map_T_session of a robot-reported (`reloc`) placement: identity (see the D0 note)."""
     return {"tx": 0.0, "ty": 0.0, "yaw": 0.0}
+
+
+def reloc_bin_pose(pose: Mapping[str, Any]) -> Dict[str, float]:
+    """A pose `{x, y, yaw}` in the cloud MAP frame (the user's initial pose) in the frame of the
+    stored `map.bin` (the Odin map frame; what the orchestrator's `init_pos` must be in). The
+    inverse of reloc_map_t_session(): identity today (D0 assumption and TODO above), so a later
+    fix changes this function and reloc_map_t_session() only."""
+    inverse = map_geo.invert_transform(reloc_map_t_session())
+    at = compose(inverse, {"tx": float(pose["x"]), "ty": float(pose["y"]),
+                           "yaw": float(pose["yaw"])})
+    return {"x": at["tx"], "y": at["ty"], "yaw": at["yaw"]}
+
+
+def init_pos_vector(pose: Mapping[str, Any]) -> list:
+    """The orchestrator's `init_pos` `[x, y, z, qx, qy, qz, qw]` for a planar pose `{x, y, yaw}`
+    already in the map.bin frame (z = 0, a rotation about z)."""
+    yaw = float(pose["yaw"])
+    return [float(pose["x"]), float(pose["y"]), 0.0, 0.0, 0.0,
+            math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
 
 
 def reloc_placement(robot_pose: Mapping[str, Any]) -> Tuple[Dict[str, float], Dict[str, float]]:

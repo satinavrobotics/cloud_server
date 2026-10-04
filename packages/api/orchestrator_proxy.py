@@ -16,22 +16,33 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from cloud_common.objects.robot import RobotObjectV1
 
-from packages.api.orchestrator_client import orchestrator_address
+from packages.api.orchestrator_client import cloud_link, onboard_map_name, orchestrator_address
+from packages.config import ORCHESTRATOR_SAVE_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
 
 _SAVE_PATH = re.compile(r"^maps/[^/]+/save/?$")
+DEFAULT_TIMEOUT_S = 60.0
+# RFC 7230 6.1: meaningful for one connection only, never forwarded (plus host / content-length,
+# which httpx sets for the new request)
+_HOP_BY_HOP = frozenset({"host", "content-length", "connection", "keep-alive",
+                         "proxy-authenticate", "proxy-authorization", "te", "trailer",
+                         "trailers", "transfer-encoding", "upgrade"})
 
 
 def with_cloud_ids(method: str, path: str, body: bytes,
                    session: Optional[Mapping[str, Any]]) -> bytes:
-    """The body of a proxied `POST maps/{name}/save` with the robot's open mapping session's
+    """The body of a proxied `POST maps/{onboard}/save` with the robot's open mapping session's
     `cloud_map_id` (its map) and `cloud_session_id` added, so the orchestrator links the map it
-    saves to the cloud map (relocalization, D2). Ids the caller sent are kept. Any other call,
-    no mapping session, or a body that is not a JSON object: returned unchanged."""
+    saves to the cloud map (relocalization, D2). Only for the session's OWN map, i.e. `{onboard}`
+    is onboard_map_name(session map): saving some other stored map must not be linked to the
+    session. Ids the caller sent are kept. Any other call, no (open: that is what the caller
+    reads) mapping session, or a body that is not a JSON object: returned unchanged."""
     if method != "POST" or not _SAVE_PATH.match(path) or session is None:
         return body
-    if session.get("purpose", "mapping") != "mapping" or session.get("ended_at") is not None:
+    if session.get("purpose", "mapping") != "mapping" or not session.get("map_name"):
+        return body
+    if path.rstrip("/") != f"maps/{onboard_map_name(session['map_name'])}/save":
         return body
     try:
         data = json.loads(body) if body.strip() else {}
@@ -40,10 +51,10 @@ def with_cloud_ids(method: str, path: str, body: bytes,
     if not isinstance(data, dict):
         return body
     # An explicit null counts as not sent.
-    if data.get("cloud_map_id") is None:
-        data["cloud_map_id"] = session.get("map_name")
-    if data.get("cloud_session_id") is None:
-        data["cloud_session_id"] = str(session["session_id"])
+    link = cloud_link(session.get("map_name"), session["session_id"])
+    for key, value in link.items():
+        if data.get(key) is None:
+            data[key] = value
     return json.dumps(data).encode()
 
 
@@ -71,8 +82,11 @@ async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
 
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
+    except HTTPException:
+        raise  # the database's own 404 "Did not find robot"
+    except Exception:  # noqa: BLE001
+        logger.exception("Robot %s not readable for the orchestrator proxy", robot_name)
+        raise HTTPException(status_code=503, detail="The fleet database could not be read")
 
     address = orchestrator_address(robot)
 
@@ -93,13 +107,13 @@ async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
     if request.method == "POST" and _SAVE_PATH.match(path):
         body = with_cloud_ids(request.method, path, body,
                               await _open_mapping_session(service, robot_name))
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in ("host", "content-length")
-    }
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+    # a SLAM save takes minutes (the orchestrator answers when it is done)
+    saving = request.method == "POST" and bool(_SAVE_PATH.match(path))
+    timeout = ORCHESTRATOR_SAVE_TIMEOUT_S if saving else DEFAULT_TIMEOUT_S
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.request(
                 method=request.method,
                 url=target,
@@ -114,11 +128,20 @@ async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
         )
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Orchestrator request timed out")
-
-    if request.method != "GET" and path.startswith("maps/"):
-        held = getattr(service, "orchestrator_maps", None)
-        if held is not None:
-            held.invalidate(robot_name)  # a stored map may have changed: ask again
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502,
+                            detail=f"Orchestrator request failed: {exc.__class__.__name__}")
+    finally:
+        # also after a timeout / failure: the call may have applied on the robot
+        if request.method != "GET":
+            if path.startswith("maps/"):
+                held = getattr(service, "orchestrator_maps", None)
+                if held is not None:
+                    held.invalidate(robot_name)  # a stored map may have changed: ask again
+            if path.startswith("services/"):
+                switch = getattr(service, "mapping_switch", None)
+                if switch is not None:
+                    switch.invalidate(robot_name)  # a mapping service may have started / stopped
     return Response(
         content=resp.content,
         status_code=resp.status_code,

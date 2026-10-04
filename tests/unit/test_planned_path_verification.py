@@ -70,6 +70,7 @@ class TestPlannedPathVerification:
         
         # Mock robot status
         mock_robot = MagicMock()
+        mock_robot.name = "test_robot"
         mock_robot.status.pose.x = 0.0
         mock_robot.status.pose.y = 0.0
         mock_db_instance.get_object.return_value = mock_robot
@@ -87,6 +88,11 @@ class TestPlannedPathVerification:
         mock_graph_client.return_value = mock_graph_instance
         
         service = MissionPlannerService()
+        # Maps U6: the map and the robot's position come from its open, placed session
+        # (identity map_T_session), not from any robot/map row.
+        service._open_session = AsyncMock(return_value={
+            "session_id": "s1", "map_name": "yard", "aligned": True,
+            "map_t_session": {"tx": 0.0, "ty": 0.0, "yaw": 0.0}})
         
         # 2. Execute
         result = await service.plan_and_execute_mission(

@@ -118,6 +118,8 @@ MAPPING_SERVICE_CANDIDATES = {
 ORCHESTRATOR_QUERY_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_QUERY_TIMEOUT_S", "3.0"))
 ORCHESTRATOR_START_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_START_TIMEOUT_S", "30.0"))
 ORCHESTRATOR_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_STOP_TIMEOUT_S", "15.0"))
+# POST /maps/{name}/save drives the SLAM driver's save_map (~150 s on a robot).
+ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "180.0"))
 # How long a fetched mapping service state is reused for the robot views (seconds).
 MAPPING_STATE_TTL_S = float(os.getenv("MAPPING_STATE_TTL_S", "5.0"))
 # How long "does this robot's orchestrator hold a stored map for cloud map X" is reused
@@ -126,6 +128,17 @@ RELOC_MAP_HELD_TTL_S = float(os.getenv("RELOC_MAP_HELD_TTL_S", "15.0"))
 # A placed `reloc` session is flagged (robot view `localization_warning`) when the robot's
 # localizationScore is below this. A warning only: it never refuses a placement.
 RELOC_DEGRADED_SCORE = float(os.getenv("RELOC_DEGRADED_SCORE", "0.3"))
+# Starting relocalization from the API (packages/api/reloc_job.py, docs/satinav-maps-redesign.md
+# ## 16): the orchestrator service that relocalizes the robot on its stored map (first candidate
+# the robot's orchestrator lists is used; comma-separated). `RELOC_JOB_TIMEOUT_S`: how long a job
+# waits for the robot to report `position_initialized`; `RELOC_JOB_POLL_S`: how often the stored
+# robot status is read; `RELOC_JOB_SETTLE_S`: when the robot already reported
+# `position_initialized: true` BEFORE the restart (a stale value), the job waits this long after
+# the restart before it believes a true again (unless it saw the flag drop first).
+RELOC_SERVICE_CANDIDATES = _candidates("RELOC_SERVICE_CANDIDATES", "odin_reloc")
+RELOC_JOB_TIMEOUT_S = float(os.getenv("RELOC_JOB_TIMEOUT_S", "90.0"))
+RELOC_JOB_POLL_S = float(os.getenv("RELOC_JOB_POLL_S", "1.0"))
+RELOC_JOB_SETTLE_S = float(os.getenv("RELOC_JOB_SETTLE_S", "5.0"))
 
 # ==================== Phase 0 telemetry ingest (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).

@@ -125,6 +125,11 @@ class MapSpecV1(pydantic.BaseModel):
     datum_utm_northing: Optional[float] = pydantic.Field(
         None, description="Exact UTM northing of a 'utm' datum, when the robot reported it.")
 
+    slam_map: bool = pydantic.Field(
+        False, description="A 'local' map whose mapping sessions also record a SLAM map on the "
+                           "robot's orchestrator (packages/api/mapping_switch.py). Set at "
+                           "creation, immutable, cleared when the map is converted to geo. "
+                           "Rows written before it existed read False.")
     approx_location: Optional[ApproxLocationV1] = pydantic.Field(
         None, description="Approximate WGS84 location of a 'local' map (a hint, never a datum). "
                           "None on geo maps and until set.")

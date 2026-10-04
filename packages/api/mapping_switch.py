@@ -25,6 +25,16 @@ the orchestrator (GET /services/{name}/status), cached MAPPING_STATE_TTL_S secon
 session captures (mapping, unpaused, placed), "off" it does not, "unreachable" the orchestrator
 did not answer. null: the robot is offline, has no registered orchestrator address, or the
 robot's orchestrator has no such service (`mapping_services` says "not_available").
+
+SLAM maps (a local map with `slam_map`, docs/satinav-maps-redesign.md 14.15): besides the
+topomap, a mapping session records a SLAM map on the robot, under onboard_map_name(map). It is
+not a session service (never in KNOWN_SERVICES / MAPPING_SERVICE_CANDIDATES): start_slam() after
+the topomap started, save_slam() after the session finished, both best effort, never raising,
+never blocking or undoing the session; what went wrong is a `warning` the caller returns as
+`slam_warning`. Saving takes ~150 s, so a finish saves in a background task (schedule_slam_save)
+that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
+refuses while a save is pending. Pause / resume never touch SLAM. The outcome of a background
+save is logged (no event code exists for it) and `on_slam_done(robot)` is called.
 """
 
 import asyncio
@@ -44,6 +54,11 @@ logger = logging.getLogger("ApiDelegationService.mapping_switch")
 
 RUNNING, NOT_RUNNING, NOT_AVAILABLE = "running", "not_running", "not_available"
 SOURCE = "orchestrator"
+
+# results of start_slam() / save_slam()
+SLAM_STARTED, SLAM_ALREADY_RUNNING, SLAM_EXISTS = "started", "already_running", "exists"
+SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
+    "saved", "nothing_to_save", "failed", "busy")
 
 # results per service of start() / stop()
 STARTED, ALREADY_RUNNING = "started", "already_running"
@@ -131,6 +146,18 @@ class StopResult:
         return self.warning is None
 
 
+@dataclass
+class SlamResult:
+    """start_slam() / save_slam(): what happened (SLAM_*); `warning` is set when the caller
+    should tell the operator something went wrong (never for already_running / nothing_to_save)."""
+    status: str
+    warning: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.warning is None
+
+
 def _refuse(status: int, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail=message)
 
@@ -167,6 +194,11 @@ class MappingSwitch:
         # mapping service after a switch by the API (set by ApiDelegationService).
         self.on_state: Optional[
             Callable[[str, str, Optional[Dict[str, Any]]], Awaitable[None]]] = None
+        # fn(robot name) after a SLAM save / stop changed the robot's stored maps (set by
+        # ApiDelegationService: forgets OrchestratorMaps' held-map answers).
+        self.on_slam_done: Optional[Callable[[str], None]] = None
+        self._slam_locks: Dict[str, asyncio.Lock] = {}
+        self._slam_tasks: Dict[str, "asyncio.Task[SlamResult]"] = {}  # pending saves
 
     def lock(self, robot_name: str) -> asyncio.Lock:
         lock = self._locks.get(robot_name)
@@ -176,6 +208,142 @@ class MappingSwitch:
 
     def invalidate(self, robot_name: str) -> None:
         self._cache.pop(robot_name, None)
+
+    # --- SLAM map (never raises) ---------------------------------------------------------------
+
+    def slam_lock(self, robot_name: str) -> asyncio.Lock:
+        lock = self._slam_locks.get(robot_name)
+        if lock is None:
+            lock = self._slam_locks[robot_name] = asyncio.Lock()
+        return lock
+
+    def slam_save_pending(self, robot_name: str) -> bool:
+        task = self._slam_tasks.get(robot_name)
+        return task is not None and not task.done()
+
+    async def wait_slam_saves(self, robot_name: Optional[str] = None) -> None:
+        """Wait for the pending background save(s) (of one robot, or all). Never raises."""
+        tasks = [t for n, t in list(self._slam_tasks.items())
+                 if robot_name is None or n == robot_name]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _slam_done(self, robot_name: str) -> None:
+        self.invalidate(robot_name)
+        if self.on_slam_done is not None:
+            try:
+                self.on_slam_done(robot_name)
+            except Exception:  # noqa: BLE001
+                logger.exception("SLAM follow-up for %s failed", robot_name)
+
+    async def start_slam(self, robot: Any, map_name: str) -> SlamResult:
+        """Start the SLAM recording of cloud map `map_name` on the robot, `overwrite` false. A
+        run that already records this map is fine; an existing map file is kept (not
+        re-recorded). Refused while the robot's previous SLAM save is pending. Call it after the
+        topomap started, outside any DB transaction, under the robot's lock."""
+        name = getattr(robot, "name", "?")
+        onboard = oc.onboard_map_name(map_name)
+        if self.slam_save_pending(name):
+            return SlamResult(SLAM_BUSY, f"SLAM map of robot '{name}' is still being saved; "
+                                         f"'{map_name}' is not recorded")
+        try:
+            async with self.slam_lock(name):
+                client = self._client_factory(robot)
+                try:
+                    state = await client.slam_state()
+                    if state.get("active") and state.get("map") == onboard:
+                        return SlamResult(SLAM_ALREADY_RUNNING)
+                except oc.OrchestratorError:
+                    pass  # an older orchestrator or a blip: the start call says
+                try:
+                    await client.start_slam(onboard, overwrite=False)
+                except oc.OrchestratorError as exc:
+                    return self._slam_start_failed(name, map_name, exc)
+                logger.info("SLAM recording of map %s started on %s (%s)", map_name, name,
+                            onboard)
+                return SlamResult(SLAM_STARTED)
+        except Exception as exc:  # noqa: BLE001 - never blocks a session
+            logger.exception("SLAM start on %s failed", name)
+            return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not recorded: {exc}")
+        finally:
+            self._slam_done(name)
+
+    @staticmethod
+    def _slam_start_failed(name: str, map_name: str, exc: oc.OrchestratorError) -> SlamResult:
+        detail = (exc.detail or "").lower()
+        if exc.kind == oc.HTTP and exc.status == 409 and "already has a map file" in detail:
+            return SlamResult(SLAM_EXISTS, "SLAM map already exists, not re-recorded")
+        return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not recorded on robot "
+                                       f"'{name}': {exc.detail}")
+
+    async def save_slam(self, robot: Any, map_name: str, session_id: Any) -> SlamResult:
+        """Save the SLAM map the robot records for `map_name` and stop the driver, awaiting the
+        robot's SLAM lock (so after a pending save). The cloud ids go to the orchestrator
+        (oc.cloud_link). No SLAM run of this map: nothing to save (no warning), a foreign run is
+        never touched. A failed save releases the driver (best effort). Never raises."""
+        name = getattr(robot, "name", "?")
+        onboard = oc.onboard_map_name(map_name)
+        try:
+            async with self.slam_lock(name):
+                client = self._client_factory(robot)
+                try:
+                    await client.save_slam(onboard, map_name, session_id, stop_after=True)
+                    logger.info("SLAM map %s of %s saved (%s)", map_name, name, onboard)
+                    return SlamResult(SLAM_SAVED)
+                except oc.OrchestratorError as exc:
+                    if exc.kind == oc.HTTP and exc.status == 409:
+                        # no session running / the driver maps another map: not ours
+                        logger.info("SLAM map %s on %s: nothing to save (%s)", map_name, name,
+                                    exc.detail)
+                        return SlamResult(SLAM_NOTHING_TO_SAVE)
+                    await self._release_driver(client, name, onboard)
+                    return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not saved on "
+                                                   f"robot '{name}': {exc.detail}")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("SLAM save on %s failed", name)
+            return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not saved: {exc}")
+        finally:
+            self._slam_done(name)
+
+    async def _release_driver(self, client: oc.OrchestratorClient, name: str,
+                              onboard: str) -> None:
+        """After a failed save: stop the driver if it is ours. Best effort."""
+        try:
+            try:
+                state = await client.slam_state()
+                if state.get("active") and state.get("map") != onboard:
+                    return  # somebody else's run
+            except oc.OrchestratorError:
+                pass
+            await client.stop_slam()
+        except oc.OrchestratorError as exc:
+            logger.warning("SLAM driver of %s not stopped after a failed save: %s", name,
+                           exc.detail)
+        except Exception:  # noqa: BLE001
+            logger.exception("SLAM driver of %s not stopped after a failed save", name)
+
+    def schedule_slam_save(self, robot: Any, map_name: str,
+                           session_id: Any) -> "asyncio.Task[SlamResult]":
+        """save_slam() as a background task (registered per robot, so a following start_slam
+        refuses meanwhile); its outcome is logged. Needs a running event loop."""
+        name = getattr(robot, "name", "?")
+
+        async def run() -> SlamResult:
+            result = await self.save_slam(robot, map_name, session_id)
+            if result.warning:
+                logger.warning("Background SLAM save of map %s (session %s): %s", map_name,
+                               session_id, result.warning)
+            else:
+                logger.info("Background SLAM save of map %s (session %s): %s", map_name,
+                            session_id, result.status)
+            return result
+
+        task = asyncio.ensure_future(run())
+        self._slam_tasks[name] = task
+        task.add_done_callback(
+            lambda t, n=name: self._slam_tasks.pop(n, None) if self._slam_tasks.get(n) is t
+            else None)
+        return task
 
     # --- name resolution -----------------------------------------------------------------------
 

@@ -923,3 +923,51 @@ class TestSharedPositionTypes:
                 (RobotApproxPosition, {}), (main.ApproxLocationRequest, {})):
             with pytest.raises(pydantic.ValidationError):
                 model(**kw, **extra)
+
+
+# ---------------------------------------------------------------------------
+# slam_map on create
+# ---------------------------------------------------------------------------
+
+class TestCreateSlamMap:
+    @pytest.fixture
+    def db(self):
+        from tests.unit import test_maps_m1 as m1
+        from tests.unit.test_maps_m2 import ShimDb
+        d = ShimDb()
+        with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow", m1.Clock()):
+            yield d
+
+    async def _create(self, body):
+        return await maps.create_map(None, body, uuid.uuid4())
+
+    async def test_local_with_slam_map(self, db):
+        out = await self._create({"name": "yard", "type": "local", "slam_map": True})
+        assert out["slam_map"] is True
+        assert db.maps["yard"]["spec"]["slam_map"] is True
+
+    async def test_default_is_false(self, db):
+        out = await self._create({"name": "yard", "type": "local"})
+        assert out["slam_map"] is False and db.maps["yard"]["spec"]["slam_map"] is False
+
+    async def test_geo_with_slam_map_is_422_on_the_field(self, db):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as err:
+            await self._create({"name": "yard", "type": "geo", "slam_map": True})
+        assert err.value.status_code == 422
+        assert err.value.detail[0]["loc"] == ["body", "slam_map"]
+        assert "yard" not in db.maps
+
+    async def test_geo_with_slam_map_false_is_fine(self, db):
+        out = await self._create({"name": "yard", "type": "geo", "slam_map": False})
+        assert out["slam_map"] is False
+
+    async def test_not_patchable(self, db):
+        from fastapi import HTTPException
+        await self._create({"name": "yard", "type": "local"})
+        with pytest.raises(HTTPException) as err:
+            await maps.patch_map(None, "yard", {"slam_map": True}, uuid.uuid4())
+        assert err.value.status_code == 422
+
+    def test_onboard_name(self):
+        assert maps.onboard_map_name("yard") == "cloud-yard"

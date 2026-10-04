@@ -8,6 +8,8 @@ in this pass, the rest are verified against the code but deliberately deferred.
 Client-side findings from the same audit are in that file's section **AA**.
 `docs/BACKLOG.md` remains the place for incident write-ups; this file is the audit
 punch list.
+Open refactors and gaps from the SLAM-toggle / relocalization work (2026-10-04) are
+listed in `docs/RELOC_FOLLOWUPS.md`.
 
 > Status: unit suite **555 passed / 0 failed** (was 537 passed / **18 failed** at the
 > start of the pass). Integration/e2e suites were not run (they need the Docker

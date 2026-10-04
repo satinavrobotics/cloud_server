@@ -31,6 +31,10 @@ from tests.unit.test_placement_suggestion import (  # noqa: E402,F401
 
 pytestmark = pytest.mark.unit
 
+# `can_start` / `can_start_reason` were added to every reloc read (additive; reloc_job.py). The
+# FakeHolder below cannot start anything, so it is always this:
+NO_START = {"can_start": False, "can_start_reason": "relocalization cannot be started from here"}
+
 
 def _robot(db, name="r1", online=True, address=True, **status):
     extra = {"ip_address": "10.0.0.5", "entrypoint_port": 8080} if address else {}
@@ -57,32 +61,34 @@ SESSION = {"session_id": "6f1c0c2e-0000-4000-8000-000000000001", "map_name": "sh
 
 class TestSaveBody:
     def test_ids_are_added(self):
-        out = json.loads(with_cloud_ids("POST", "maps/lab/save", b'{"stop_after": true}',
+        out = json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", b'{"stop_after": true}',
                                         SESSION))
         assert out == {"stop_after": True, "cloud_map_id": "shed",
                        "cloud_session_id": SESSION["session_id"]}
 
     def test_empty_body(self):
-        out = json.loads(with_cloud_ids("POST", "maps/lab/save", b"", SESSION))
+        out = json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", b"", SESSION))
         assert out["cloud_map_id"] == "shed"
 
     def test_ids_the_caller_sent_are_kept(self):
         body = json.dumps({"cloud_map_id": "x", "cloud_session_id": "y"}).encode()
-        assert json.loads(with_cloud_ids("POST", "maps/lab/save", body, SESSION)) == {
+        assert json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", body, SESSION)) == {
             "cloud_map_id": "x", "cloud_session_id": "y"}
 
     def test_explicit_null_ids_count_as_unset(self):
         body = json.dumps({"cloud_map_id": None, "cloud_session_id": None}).encode()
-        assert json.loads(with_cloud_ids("POST", "maps/lab/save", body, SESSION)) == {
+        assert json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", body, SESSION)) == {
             "cloud_map_id": "shed", "cloud_session_id": SESSION["session_id"]}
 
     @pytest.mark.parametrize("method,path,body,session", [
-        ("GET", "maps/lab/save", b"", SESSION),
+        ("GET", "maps/cloud-shed/save", b"", SESSION),
         ("POST", "maps/lab/mapping/start", b"{}", SESSION),
-        ("POST", "maps/lab/save", b"{}", None),
-        ("POST", "maps/lab/save", b"{}", {**SESSION, "purpose": "operate"}),
-        ("POST", "maps/lab/save", b"not json", SESSION),
-        ("POST", "maps/lab/save", b"[1]", SESSION),
+        ("POST", "maps/cloud-shed/save", b"{}", None),
+        ("POST", "maps/cloud-shed/save", b"{}", {**SESSION, "purpose": "operate"}),
+        ("POST", "maps/cloud-other/save", b"{}", SESSION),      # not the session's own map
+        ("POST", "maps/lab/save", b"{}", SESSION),
+        ("POST", "maps/cloud-shed/save", b"not json", SESSION),
+        ("POST", "maps/cloud-shed/save", b"[1]", SESSION),
     ])
     def test_everything_else_is_unchanged(self, method, path, body, session):
         assert with_cloud_ids(method, path, body, session) == body
@@ -247,7 +253,7 @@ class TestHeldCaching:
 
 class TestProxyInvalidation:
     @pytest.mark.parametrize("method,path,invalidated", [
-        ("POST", "maps/lab/save", True), ("DELETE", "maps/lab", True),
+        ("POST", "maps/cloud-shed/save", True), ("DELETE", "maps/lab", True),
         ("PUT", "maps/lab/rename", True), ("POST", "maps/lab/load", True),
         ("GET", "maps/list", False), ("POST", "processes/x/start", False)])
     async def test_non_get_maps_calls_drop_the_held_cache(self, method, path, invalidated):
@@ -456,7 +462,8 @@ class TestRelocStatus:
         s = _unplaced(db)
         h = FakeHolder(True)
         out = await maps.placement_suggestions(None, "shed", str(s["session_id"]), holder=h)
-        assert out["reloc"] == {"available": True, "known": True, "source": "orchestrator"}
+        assert out["reloc"] == {"available": True, "known": True, "source": "orchestrator",
+                                **NO_START}
         assert h.calls == [("r1", "shed", False)]      # a GET: the cached read
 
     @pytest.mark.parametrize("answer,known", [(False, True), (None, False)])
@@ -465,7 +472,8 @@ class TestRelocStatus:
         s = _unplaced(db)
         out = await maps.placement_suggestions(None, "shed", str(s["session_id"]),
                                                holder=FakeHolder(answer))
-        assert out["reloc"] == {"available": False, "known": known, "source": "orchestrator"}
+        assert out["reloc"] == {"available": False, "known": known, "source": "orchestrator",
+                                **NO_START}
 
     async def test_no_holder_is_unknown(self, db):
         _robot(db)
@@ -507,7 +515,7 @@ class TestMapReloc:
         db.add_map("shed", type="local", status={"state": "ready"})
         h = FakeHolder(True)
         out = await maps.map_reloc(None, h, "shed", "r1")
-        assert out == {"available": True, "known": True, "source": "orchestrator"}
+        assert out == {"available": True, "known": True, "source": "orchestrator", **NO_START}
         assert h.calls == [("r1", "shed", False)]
 
     @pytest.mark.parametrize("answer,known", [(False, True), (None, False)])
@@ -515,7 +523,7 @@ class TestMapReloc:
         _robot(db)
         db.add_map("shed", type="local", status={"state": "ready"})
         out = await maps.map_reloc(None, FakeHolder(answer), "shed", "r1")
-        assert out == {"available": False, "known": known, "source": "orchestrator"}
+        assert out == {"available": False, "known": known, "source": "orchestrator", **NO_START}
 
     async def test_unknown_robot_or_no_holder_is_unknown(self, db):
         _robot(db)
@@ -533,7 +541,8 @@ class TestMapReloc:
             async def held(self, *a, **k):
                 raise RuntimeError("x")
         out = await maps.map_reloc(None, Boom(), "shed", "r1")
-        assert out == {"available": False, "known": False, "source": "orchestrator"}
+        assert out == {"available": False, "known": False, "source": "orchestrator",
+                       **NO_START}
 
     async def test_geo_map_and_unknown_map(self, db):
         from packages.utils import map_geo
@@ -542,7 +551,8 @@ class TestMapReloc:
                    geo=map_geo.geo_from_datum(m1.UTM_DATUM))
         h = FakeHolder(True)
         assert await maps.map_reloc(None, h, "geo1", "r1") == {
-            "available": False, "known": True, "source": "orchestrator"}
+            "available": False, "known": True, "source": "orchestrator", "can_start": False,
+            "can_start_reason": "a geo map is placed by its datum, not relocalized"}
         assert h.calls == []
         assert await _status(maps.map_reloc(None, h, "nomap", "r1")) == 404
 
