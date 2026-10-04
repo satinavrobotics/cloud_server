@@ -25,8 +25,22 @@ State of the feature: unit suite green (2596 passed). Live-verified on the sim s
 ## B. Known gaps / future work
 
 - **Jobs lost on API restart.** `RelocJobs` is in memory, one job per robot. A restart
-  mid-job leaves `odin_reloc` running on the robot and the client sees 404 on
-  `GET .../reloc-job`. Persist jobs, or on startup reconcile against the orchestrator.
+  mid-job leaves the robot as the job last left it (possibly a mode-3 `init_pos` patch, a
+  changed `current_map`, a restarted `odin_reloc`) and the client sees 404 on
+  `GET .../reloc-job`. Decision: NOT fixed by an on-startup reconcile, because it would be
+  unprincipled and could not restore anything:
+  - `odin_reloc` is normally running on a robot (the job itself restarts it, it does not
+    stop it: `was_running` -> restart on rollback). "Running with no job" is the normal
+    state and cannot be told apart from a cloud-started reloc, so stopping it would break
+    healthy or operator-started localization.
+  - The rollback needs the job's `_Undo` (original `init_pos`, `current_map`, onboard map
+    name). That lives only in the dead process, so even a correct decision could not
+    restore the robot. Doing it right means persisting `_Undo` per robot (DB doc written
+    before each robot-changing call, cleared on finish), plus a startup sweep. That is a
+    feature, not a small fix; do it only if stale `init_pos`/`current_map` after a
+    mid-job restart proves to matter.
+  - Until then: the client should treat 404 on `GET .../reloc-job` for a session it was
+    tracking as "interrupted, check the robot / place again" (no client change made yet).
 - **D0: identity transform.** `utils/map_sessions.py:124-165` assumes the session frame equals
   Odin's map frame. `reloc_map_t_session()` is the single place to change
   (marked `TODO(D0)`). Needs navstack-team confirmation.
