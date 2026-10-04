@@ -56,6 +56,8 @@ class FakeOrch:
         self.slam_log = []            # (op, onboard map, body or None)
         self.slam_save_gate = None    # an asyncio.Event a save waits for
         self.slam_save_tx = []        # open DB transactions when a save arrived
+        self.slam_saving = False      # what GET /maps/mapping reports as `saving`
+        self.slam_reports_saving = True   # False: an older orchestrator without the field
 
     def _enter(self, op, name=None):
         self.calls.append((op, name))
@@ -159,7 +161,10 @@ async def _slam_stop(self):
 
 async def _slam_state(self):
     await self.orch._slam("slam_state", check_tx=False)
-    return {"active": self.orch.slam["active"], "map": self.orch.slam["map"], "pid": 9}
+    out = {"active": self.orch.slam["active"], "map": self.orch.slam["map"], "pid": 9}
+    if self.orch.slam_reports_saving:
+        out["saving"] = self.orch.slam_saving
+    return out
 
 
 FakeOrch._slam = _slam
@@ -878,6 +883,81 @@ def slam_prepare(db, **kw):
 
 def slam_ops(orch):
     return [(op, name) for op, name, _ in orch.slam_log if op != "slam_state"]
+
+
+class TestSlamReconcile:
+    """A save lost (robot offline at finish / API restart) is recovered from derived state."""
+
+    async def lost(self, db, **kw):
+        orch, switch = slam_prepare(db, **kw)
+        sid = (await start(db, switch))["session"]["session_id"]
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB)   # no switch: no save
+        assert orch.slam == {"active": True, "map": "cloud-yard"}
+        return orch, switch, sid
+
+    async def test_saves_the_lost_map_with_the_newest_ended_session(self, db):
+        orch, switch, sid = await self.lost(db)
+        assert await switch.reconcile_slam_saves(db, [db.robots["r1"]]) == ["r1"]
+        await switch.wait_slam_saves()
+        saved = [b for op, _, b in orch.slam_log if op == "slam_save"]
+        assert saved == [{"cloud_map_id": "yard", "cloud_session_id": sid, "stop_after": True}]
+        assert orch.slam["active"] is False
+
+    @pytest.mark.parametrize("change", ["saving", "no_field", "open_session", "no_slam_map",
+                                        "other_map", "idle", "no_address"])
+    async def test_skips_when_a_save_is_not_provably_lost(self, db, change):
+        orch, switch, _ = await self.lost(db)
+        if change == "saving":
+            orch.slam_saving = True            # a POST is in flight
+        elif change == "no_field":
+            orch.slam_reports_saving = False   # older orchestrator: unknown is not safe
+        elif change == "open_session":
+            await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB)
+        elif change == "no_slam_map":
+            db.maps["yard"]["spec"]["slam_map"] = False
+        elif change == "other_map":
+            orch.slam = {"active": True, "map": "somebody-else"}
+        elif change == "idle":
+            orch.slam = {"active": False, "map": None}
+        elif change == "no_address":
+            db.robots["r1"] = robot("r1", address=False)
+        assert await switch.reconcile_slam_saves(db, [db.robots["r1"]]) == []
+        await switch.wait_slam_saves()
+        assert not [op for op, _, _ in orch.slam_log if op == "slam_save"]
+
+    async def test_one_robot_failing_does_not_block_the_others(self, db):
+        orch, switch, _ = await self.lost(db)
+        add_robot(db, "r2")
+        bad = FakeOrch(reachable=False)
+        switch._client_factory = lambda r: FakeClient({"r1": orch, "r2": bad}[r.name])
+        found = await switch.reconcile_slam_saves(db, [db.robots["r2"], db.robots["r1"]])
+        assert found == ["r1"]
+        with patch.object(maps, "open_store", side_effect=RuntimeError("db down")):
+            assert await switch.reconcile_slam_saves(db, [db.robots["r1"]]) == []  # no raise
+        await switch.wait_slam_saves()
+
+
+class TestSlamReconcileStartup:
+    @pytest.mark.parametrize("leader", [True, False])
+    async def test_only_the_lock_holder_reconciles_and_the_lock_is_released(self, leader):
+        conn = MagicMock(closed=False)
+        conn.execute = AsyncMock(return_value=MagicMock(fetchone=AsyncMock(return_value=(leader,))))
+        conn.close = AsyncMock()
+        database = MagicMock(dedicated_connection=AsyncMock(return_value=conn))
+        switch = MappingSwitch()
+        switch.reconcile_slam_saves = AsyncMock(return_value=[])
+        list_robots = AsyncMock(return_value=[])
+        switch.start_slam_reconcile(database, list_robots)
+        await switch._reconcile_task
+        assert switch.reconcile_slam_saves.await_count == int(leader)
+        conn.close.assert_awaited_once()
+
+    async def test_never_raises(self):
+        database = MagicMock(dedicated_connection=AsyncMock(side_effect=OSError("down")))
+        switch = MappingSwitch()
+        switch.start_slam_reconcile(database, AsyncMock())
+        await switch._reconcile_task
+        await switch.stop_slam_reconcile()
 
 
 class TestSlam:

@@ -35,23 +35,31 @@ never blocking or undoing the session; what went wrong is a `warning` the caller
 that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
 refuses while a save is pending. Pause / resume never touch SLAM. The outcome of a background
 save is logged (no event code exists for it) and `on_slam_done(robot)` is called.
+
+A save lost to an offline robot at finish or an API restart is recovered by reconcile_slam_saves()
+at API startup (start_slam_reconcile; no robot-online hook exists): derived, nothing persisted.
+It needs an orchestrator that reports `saving` in GET /maps/mapping (one that does not: skipped).
 """
 
 import asyncio
 import datetime
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
 from fastapi import HTTPException
 
 from packages.api import orchestrator_client as oc
+from packages.api.entrypoint import advisory_lock_key
 from packages.api.orchestrator_services import pick_service
 from packages.config import MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S
 from packages.utils.map_sessions import KNOWN_SERVICES, TOPO
 
 logger = logging.getLogger("ApiDelegationService.mapping_switch")
+
+RECONCILE_LOCK = "slam_save_reconcile"   # advisory lock: one worker reconciles at startup
 
 RUNNING, NOT_RUNNING, NOT_AVAILABLE = "running", "not_running", "not_available"
 SOURCE = "orchestrator"
@@ -193,6 +201,7 @@ class MappingSwitch:
         self.on_slam_done: Optional[Callable[[str], None]] = None
         self._slam_locks: Dict[str, asyncio.Lock] = {}
         self._slam_tasks: Dict[str, "asyncio.Task[SlamResult]"] = {}  # pending saves
+        self._reconcile_task: Optional["asyncio.Task[None]"] = None
 
     def lock(self, robot_name: str) -> asyncio.Lock:
         lock = self._locks.get(robot_name)
@@ -339,6 +348,87 @@ class MappingSwitch:
             lambda t, n=name: self._slam_tasks.pop(n, None) if self._slam_tasks.get(n) is t
             else None)
         return task
+
+    # --- recovering a lost save ----------------------------------------------------------------
+
+    async def reconcile_slam_saves(self, db: Any, robots: Sequence[Any]) -> List[str]:
+        """Schedule the SLAM save a robot still owes: its orchestrator's driver records
+        `cloud-<map>`, reports `saving` false (an older one without `saving`: unknown, skipped),
+        the robot has no open session and the cloud map has `slam_map`; the session is the map's
+        newest one, which must be an ended mapping session. Returns the robots scheduled. Never
+        raises; one robot failing does not stop the others."""
+        done: List[str] = []
+        for robot in robots:
+            name = getattr(robot, "name", "?")
+            try:
+                if await self._reconcile_slam(db, robot):
+                    done.append(name)
+            except oc.OrchestratorError as exc:
+                logger.info("SLAM reconcile of %s: orchestrator not asked / no answer: %s", name,
+                            exc.detail)
+            except Exception:  # noqa: BLE001
+                logger.exception("SLAM reconcile of %s failed", name)
+        return done
+
+    async def _reconcile_slam(self, db: Any, robot: Any) -> bool:
+        from packages.api import maps  # maps imports this module
+        name = getattr(robot, "name", "?")
+        prefix = oc.onboard_map_name("")
+        if oc.orchestrator_address(robot) is None or self.slam_save_pending(name):
+            return False
+        state = await self._client_factory(robot).slam_state()
+        onboard = str(state.get("map") or "")
+        if (not state.get("active") or state.get("saving") is not False
+                or not onboard.startswith(prefix)):
+            return False
+        map_name = onboard[len(prefix):]
+        async with maps.open_store(db, uuid.uuid4()) as store:
+            if await store.open_sessions_of_robot(name):
+                return False
+            newest = await store.sessions_page(map_name, 1, None)
+        if (not newest or newest[0].get("ended_at") is None or not maps._slam_session(newest[0])
+                or not await maps._slam_wanted(db, map_name)):
+            return False
+        logger.warning("SLAM map %s on %s was never saved; saving it (session %s)", map_name,
+                       name, newest[0]["session_id"])
+        self.schedule_slam_save(robot, map_name, newest[0]["session_id"])
+        return True
+
+    def start_slam_reconcile(self, db: Any,
+                             list_robots: Callable[[], Awaitable[Sequence[Any]]]) -> None:
+        """reconcile_slam_saves() of every robot in the background, for startup; one worker per
+        cluster (advisory lock, held until its saves are done). Never raises."""
+        async def run() -> None:
+            conn = None
+            try:
+                conn = await db.dedicated_connection()
+                cur = await conn.execute("SELECT pg_try_advisory_lock(%s)",
+                                         (advisory_lock_key(RECONCILE_LOCK),))
+                if not (await cur.fetchone())[0]:
+                    return
+                if await self.reconcile_slam_saves(db, await list_robots()):
+                    await self.wait_slam_saves()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the API must start regardless
+                logger.exception("Could not reconcile pending SLAM saves")
+            finally:
+                if conn is not None:
+                    try:
+                        await conn.close()  # releases the advisory lock
+                    except Exception:  # noqa: BLE001
+                        pass
+        try:
+            self._reconcile_task = asyncio.get_running_loop().create_task(
+                run(), name="api.mapping_switch.slam_reconcile")
+        except Exception:  # noqa: BLE001
+            logger.exception("Could not start the SLAM save reconcile")
+
+    async def stop_slam_reconcile(self) -> None:
+        task, self._reconcile_task = self._reconcile_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     # --- name resolution -----------------------------------------------------------------------
 

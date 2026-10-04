@@ -320,6 +320,9 @@ async def lifespan(app: FastAPI):
     # 3D reconstruction dispatcher (R3); only when the service is configured, one leader per
     # cluster (advisory lock).
     service.reconstruction.start_dispatcher()
+    # SLAM saves lost to an offline robot / a restart (R6); one worker per cluster.
+    service.mapping_switch.start_slam_reconcile(
+        service.database, lambda: service.database.list_objects(RobotObjectV1))
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -337,6 +340,7 @@ async def lifespan(app: FastAPI):
         service.stop_watchers()
         await service.map_deleter.stop()
         await service.reconstruction.stop()
+        await service.mapping_switch.stop_slam_reconcile()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
