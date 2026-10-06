@@ -413,6 +413,7 @@ class TestConvert:
     async def test_route(self, db):
         db.add_map("shed", type="local")
         svc = MagicMock()
+        svc.reloc_jobs.active_for_map.return_value = None
         with patch.object(main, "service", svc):
             out = await main.convert_map_type("shed", {"type": "geo", "latitude": 47.0,
                                                        "longitude": 19.0})

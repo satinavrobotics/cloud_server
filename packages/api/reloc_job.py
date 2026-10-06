@@ -188,6 +188,12 @@ class RelocJobs:
                 return job
         return None
 
+    def active_for_map(self, map_name: str) -> Optional[RelocJob]:
+        for job in self._jobs.values():
+            if job.map_name == map_name and job.state in ACTIVE:
+                return job
+        return None
+
     def get(self, job_id: str) -> Optional[RelocJob]:
         return self._jobs.get(job_id)
 
@@ -452,15 +458,21 @@ class RelocJobs:
             robot = await store.robot(job.robot_name)
             session = await store.session(job.session_id)
             mine = await store.open_sessions_of_robot(job.robot_name)
+            map_row = await store.get_map(job.map_name)
         if robot is None or not robot.status.online:
             raise _Fail(f"robot '{job.robot_name}' is offline")
-        self._check_session(job, session)
+        self._check_session(job, session, map_row)
         if any(ms.purpose_of(s) == ms.MAPPING for s in mine):
             raise _Fail("a mapping session was opened on the robot")
         return robot
 
     @staticmethod
-    def _check_session(job: RelocJob, session: Optional[Dict[str, Any]]) -> None:
+    def _check_session(job: RelocJob, session: Optional[Dict[str, Any]],
+                       map_row: Any = None) -> None:
+        """The session is still open and unplaced, and the map is still a local map (a
+        conversion to geo meanwhile would make the identity placement wrong)."""
+        if map_row is not None and map_row.type != "local":
+            raise _Fail(f"map '{job.map_name}' is no longer a local map")
         if session is None or session["map_name"] != job.map_name:
             raise _Fail("the session no longer exists")
         if session["ended_at"] is not None:
@@ -478,9 +490,10 @@ class RelocJobs:
                 robot = await store.robot(job.robot_name)
                 session = await store.session(job.session_id)
                 mine = await store.open_sessions_of_robot(job.robot_name)
+                map_row = await store.get_map(job.map_name)
             if robot is None or not robot.status.online:
                 raise _Fail(f"robot '{job.robot_name}' went offline during relocalization")
-            self._check_session(job, session)
+            self._check_session(job, session, map_row)
             if any(ms.purpose_of(s) == ms.MAPPING for s in mine):
                 raise _Fail("a mapping session was opened on the robot")
             initialized = robot.status.position_initialized
@@ -523,10 +536,10 @@ class RelocJobs:
         now = maps._utcnow()
         try:
             async with maps.open_store(db, job.publisher_id) as store:
-                await maps._lock_alive_map(store, job.map_name)
+                map_row = await maps._lock_alive_map(store, job.map_name)
                 session = await store.lock_session(job.session_id)
                 robot = await store.robot(job.robot_name)
-                self._check_session(job, session)
+                self._check_session(job, session, map_row)
                 if robot is None or not robot.status.online:
                     raise _Fail(f"robot '{job.robot_name}' went offline")
                 at = robot.status.pose

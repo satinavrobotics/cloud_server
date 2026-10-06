@@ -328,6 +328,25 @@ class TestCapability:
 
 # --- 2. mode 2: Odin alone -----------------------------------------------------------------------------
 
+class TestConvertBlockedWhileRelocalizing:
+    async def test_convert_refused_while_a_job_runs_then_allowed(self, env):
+        _robot(env.db)
+        s = _unplaced(env.db)
+        env.block = asyncio.Event()           # the poll hangs: the job stays active
+        await env.place(s["session_id"])
+        await asyncio.sleep(0)
+        assert env.jobs.active_for_map("shed") is not None
+        assert env.jobs.active_for_map("other") is None
+        body = {"type": "geo", "latitude": 47.0, "longitude": 19.0}
+        with pytest.raises(HTTPException) as err:
+            await maps.convert_map_type(None, "shed", body, m1.PUB, reloc_jobs=env.jobs)
+        assert err.value.status_code == 409
+        assert "A relocalization is running on map" in err.value.detail
+        assert env.db.maps["shed"]["spec"]["type"] == "local"
+        await env.jobs.cancel(env.jobs.active_for_map("shed"))
+        assert env.jobs.active_for_map("shed") is None
+
+
 class TestModeOdin:
     async def test_happy_path(self, env):
         _robot(env.db, position_initialized=False)
@@ -722,6 +741,28 @@ class TestFailures:
         _, job = await env.run(s["session_id"])
         assert job.state == rj.FAILED and "placed meanwhile" in job.error
         assert env.db.events == []
+
+    async def test_map_converted_to_geo_mid_job_fails_with_no_placement(self, env):
+        _robot(env.db)
+        s = _unplaced(env.db)
+
+        def hook(e):
+            e.db.maps["shed"]["spec"]["type"] = "geo"
+        env.on_sleep = hook
+        _, job = await env.run(s["session_id"])
+        assert job.state == rj.FAILED and "no longer a local map" in job.error
+        assert env.db.sessions[-1]["aligned"] is False and env.db.events == []
+
+    async def test_map_converted_just_before_the_placement_fails(self, env):
+        _robot(env.db)
+        s = _unplaced(env.db)
+        rj.RelocJobs._check_session(
+            SimpleNamespace(map_name="shed"), dict(s, ended_at=None, aligned=False),
+            SimpleNamespace(type="local"))
+        with pytest.raises(rj._Fail, match="no longer a local map"):
+            rj.RelocJobs._check_session(
+                SimpleNamespace(map_name="shed"), dict(s, ended_at=None, aligned=False),
+                SimpleNamespace(type="geo"))
 
     async def test_session_closed_between_the_last_poll_and_the_placement(self, env):
         _robot(env.db)

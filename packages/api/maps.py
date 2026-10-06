@@ -76,7 +76,8 @@ Pause and finish STOP them after the commit, best effort: an offline robot's ses
 anyway and the response says `robot_notified: false` with a `mapping_warning`. The session
 still gates the nodes (graph-builder drops a node with no open, unpaused, placed session).
 
-SLAM maps (`slam_map` on a local map, set at creation, immutable, cleared by converting to geo):
+SLAM maps (`slam_map` on a local map, set at creation or changed with PATCH while no mapping
+session is open and no save is pending, cleared by converting to geo):
 a MAPPING session on such a map also records a SLAM map on the robot's orchestrator, named
 onboard_map_name(map). Right after the topomap started (outside any transaction, under the
 robot's lock) the server calls start_slam; finishing the session saves it in a BACKGROUND task
@@ -194,6 +195,7 @@ class CreateMapRequest(pydantic.BaseModel):
 
 class PatchMapRequest(pydantic.BaseModel):
     description: Optional[str] = None
+    slam_map: Optional[bool] = None   # a LOCAL map only, no open session / pending save (409)
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -785,14 +787,58 @@ def apply_graph_counts(views: List[Dict[str, Any]], map_stats: Callable[[str], M
     return views
 
 
-async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID) -> Dict[str, Any]:
+async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID,
+                    switch: Optional[Any] = None, actor: Optional[str] = None) -> Dict[str, Any]:
+    """PATCH /api/v1/maps/{id}: `description` and `slam_map` (bool). The name is not changeable.
+
+    `slam_map` (turn the SLAM recording of a LOCAL map on or off after creation) is refused with
+    409 for a geo map, while the map has an open (or paused) mapping session, and while a SLAM
+    save is pending on a robot that has sessions on this map (`switch`); a null `slam_map` is
+    422. Only the flag changes: turning it OFF never touches the map recorded on a robot (the
+    onboard map `cloud-<map>` stays listed in its orchestrator, and a SLAM-driver run that is
+    still unsaved is exactly what the pending-save refusal covers); turning it ON again later
+    keeps an existing onboard map file ("SLAM map already exists, not re-recorded"), so the
+    next mapping session does not overwrite it. A real change emits MAP.SLAM_CHANGED. The
+    response is the map view, as before."""
     req = parse_body(PatchMapRequest, data)
     changes = req.dict(exclude_unset=True)
-    async with open_store(db, publisher_id) as store:
-        row = await _lock_alive_map(store, name)
-        if changes:
-            await store.update_map(row, spec=changes)
-            row.spec.update(changes)
+    if "slam_map" in changes and changes["slam_map"] is None:
+        raise HTTPException(422, [{"loc": ["body", "slam_map"], "type": "type_error.none",
+                                   "msg": "slam_map must be true or false"}])
+    now = _utcnow()
+    try:
+        async with open_store(db, publisher_id) as store:
+            row = await _lock_alive_map(store, name)
+            if "slam_map" in changes:
+                if row.type != "local":
+                    raise HTTPException(409, f"Map '{name}' is a geo map: SLAM maps are only "
+                                             "for local maps")
+                sessions = await store.sessions(name)
+                mapping = [s for s in sessions
+                           if s["ended_at"] is None and ms.purpose_of(s) == ms.MAPPING]
+                if mapping or row.state in OPEN_STATES:
+                    who = _robots_phrase(mapping) if mapping else "a robot"
+                    raise HTTPException(409, f"Map '{name}' has an open mapping session "
+                                             f"({who}); finish it before changing slam_map")
+                if switch is not None:
+                    for robot in sorted({str(s["robot_name"]) for s in sessions}):
+                        if switch.slam_save_pending(robot):
+                            raise HTTPException(409, f"Robot '{robot}' is still saving a SLAM "
+                                                     f"map of '{name}'; try again when it is "
+                                                     "done")
+                if bool(row.spec.get("slam_map")) == changes["slam_map"]:
+                    del changes["slam_map"]   # no change, no event
+                else:
+                    await store.emit(Event(
+                        EventCode.MAP_SLAM_CHANGED, now, source=Source.API,
+                        discriminator=f"map:{name}:slam:{changes['slam_map']}:{now.isoformat()}",
+                        payload={"map_name": name, "slam_map": changes["slam_map"],
+                                 "actor": actor}))
+            if changes:
+                await store.update_map(row, spec=changes)
+                row.spec.update(changes)
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
     return map_view(MapObjectV1(name=name, status=row.status, **row.spec))
 
 
@@ -1416,13 +1462,16 @@ def _conversion_notes(new_type: str, sessions: List[Mapping[str, Any]],
 
 
 async def convert_map_type(db: Any, name: str, data: Any, publisher_id: uuid.UUID,
-                           actor: Optional[str] = None) -> Dict[str, Any]:
+                           actor: Optional[str] = None,
+                           reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/type: convert geo <-> local (ConvertTypeRequest). Nothing moves:
     the map-frame coordinates of nodes, edges, reconstruction results, sessions and missions
     stay valid. One transaction (map row locked, so it serialises with session starts):
 
     - 404 unknown map; 409 deleting, already of that type, or an open (or paused) MAPPING
-      session (its nodes would land in a frame whose meaning changes under them); 422 body;
+      session (its nodes would land in a frame whose meaning changes under them) or a running
+      relocalization job (`reloc_jobs`) of this map (it would place a session with the
+      identity transform on a map that is no longer local); 422 body;
     - open OPERATE sessions stay open and keep map_T_session (it is in map-frame terms). To
       geo: a placed session gets the robot's current datum stamped as its `datum`, so the
       dispatcher does not re-derive it from the very same datum (it does from the next
@@ -1448,6 +1497,9 @@ async def convert_map_type(db: Any, name: str, data: Any, publisher_id: uuid.UUI
                                          f"({who}); finish it before converting the map "
                                          "(nodes arriving meanwhile would land in a frame "
                                          "whose meaning changed)")
+            if reloc_jobs is not None and reloc_jobs.active_for_map(name) is not None:
+                raise HTTPException(409, f"A relocalization is running on map '{name}'; wait "
+                                         "for it to finish or cancel it before converting")
             old_geo = row.spec.get("geo")
             slam_cleared = bool(row.spec.get("slam_map")) and req.type == "geo"
             patch = plan_type_change(row, req, now)

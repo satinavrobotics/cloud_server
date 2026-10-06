@@ -175,7 +175,7 @@ This redesign builds on it: geo maps store UTM directly, so converting for displ
 | POST | `/api/v1/maps` | Create `{name, type, description?}` → `draft` |
 | GET | `/api/v1/maps?type=&state=` | List, archived excluded by default |
 | GET | `/api/v1/maps/{id}` | Spec, status, sessions summary, grid version |
-| PATCH | `/api/v1/maps/{id}` | Rename, description |
+| PATCH | `/api/v1/maps/{id}` | Description, `slam_map` (local maps; see §14.15). No rename |
 | GET | `/api/v1/maps/{id}/graph` | Nodes and edges (replaces `POST /map/load` as the read path) |
 | POST | `/api/v1/maps/{id}/sessions` | Start a session `{robot}`: robot must be online, geo needs a datum; turns robot-side mapping on |
 | POST | `/api/v1/maps/{id}/sessions/{sid}/pause` · `/resume` · `/finish` | Session control; finishing with no other open session → `ready` |
@@ -879,14 +879,24 @@ untouched.
   session is closed/paused anyway and the response says `robot_notified: false` plus a
   `mapping_warning`; a repeated pause/finish retries the stop. A finish of an old session never
   stops a service another open session of the robot runs.
-- *SLAM map* (`slam_map` on a local map; created with the map, immutable, cleared when the map
-  becomes geo): not a session service. A mapping session's start calls the orchestrator's
+- *SLAM map* (`slam_map` on a local map; set at creation and switchable later with `PATCH /maps/{id}`
+  `{"slam_map": bool}` (below); cleared when the map becomes geo): not a session service. A mapping session's start calls the orchestrator's
   `POST /maps/cloud-<map>/mapping/start {overwrite: false}` after the topomap started (409 "already
   has a map file" = warning "SLAM map already exists, not re-recorded"); finish saves in a background
   task (`POST /maps/cloud-<map>/save {cloud_map_id, cloud_session_id, stop_after: true}`, a per-robot
   SLAM lock refuses a following start meanwhile; a failed save stops the driver); replace saves the
   old map (awaited) before starting the new. Only `slam_warning` reports failures; pause/resume and
   operate never touch it. A persistent status indicator and a save-outcome event are not built.
+  **Changing it later** (`PATCH /maps/{id}`, `slam_map: bool`): only on a LOCAL map (geo: 409), only
+  with no open/paused mapping session on the map (409) and no SLAM save pending on a robot that has
+  sessions on the map (409), because the flag is read at session start and again at finish/replace
+  and the reconcile (`_slam_wanted`): flipping it in between would start a recording that is never
+  saved (or save none). Only the flag changes (`MAP.SLAM_CHANGED`); turning it OFF never deletes or
+  hides the onboard map `cloud-<map>`, which stays listed on the robot's orchestrator (nothing is
+  orphaned: the cloud keeps no link other than the name). Turning it ON again keeps an existing
+  onboard map file ("SLAM map already exists, not re-recorded", `overwrite: false`), so the next
+  mapping session does not overwrite it. Why it was immutable before: nothing more than the
+  flag being read at several points; the guards above close that.
 - *Place* does not touch the services: a session that is not placed has its service running and
   its nodes rejected (`session_unplaced`) until it is placed, as before, but without a switch.
 - *Names:* `topo` is `topomap` on the real robot and `sim_topomap` in the sim (the sim's
@@ -988,7 +998,7 @@ Modes 2 and 3 are one mechanism: the robot-side reloc service (config `RELOC_SER
 - `{"type": "local"}`: `type` local, `geo` and `datum_*` cleared, `former_datum` = the old georeference (`{latitude, longitude}` of the frame's origin, `bearing_deg`, `utm_zone`, `utm_north`, `origin_e`, `origin_n`, `converted_at`), and the old origin as the map's `approx_location` (source `manual`), so the map keeps its pin and distance sort.
 - `{"type": "geo", latitude, longitude, bearing_deg?, frame?, anchor?: {x, y}, utm_zone?, utm_north?}`: the map point `anchor` (default the origin) is at (latitude, longitude); `bearing_deg` from grid east (`frame` `utm`, default) or from true east at the anchor (`enu`; the grid convergence there is added). Zone: the anchor's own unless given (a neighbour zone up to 6° from its central meridian is accepted). `approx_location` and `former_datum` are cleared. Converting back with `former_datum` (anchor = origin, or any map point and its lat/lon through the former frame, as the client does) restores the frame: unit and integration tests show identical lng/lat for every node (0 difference in the integration run).
 - 404 unknown map; 409 deleting, already that type, or an **open or paused mapping session** (its nodes would land in a frame whose meaning changed under them; finish it first); 422 a bad body (ranges, (0, 0), outside UTM 80° S–84° N, a zone too far away, unknown keys).
-- One transaction with the map row locked (it serialises with session starts). `MAP.TYPE_CHANGED` (source api; payload `old_type`, `new_type`, `geo`, `old_geo`, `operating`, `actor`). The response lists the operating robots and `warnings` that say per robot what the change means. Archived and draft maps can be converted.
+- One transaction with the map row locked (it serialises with session starts). `MAP.TYPE_CHANGED` (source api; payload `old_type`, `new_type`, `geo`, `old_geo`, `operating`, `actor`). The response lists the operating robots and `warnings` that say per robot what the change means. Archived and draft maps can be converted. A conversion is also refused (409, "A relocalization is running on map ...") while a relocalization job of that map is active, and a job whose map turned geo meanwhile fails ("no longer a local map") instead of placing the session with the identity transform.
 
 **Open operate sessions** stay open and keep `map_T_session` (it is in map-frame terms):
 

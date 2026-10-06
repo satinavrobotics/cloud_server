@@ -962,12 +962,12 @@ class TestCreateSlamMap:
         out = await self._create({"name": "yard", "type": "geo", "slam_map": False})
         assert out["slam_map"] is False
 
-    async def test_not_patchable(self, db):
-        from fastapi import HTTPException
+    async def test_patchable_while_idle(self, db):
+        # since the PATCH rule (tests/unit/test_map_slam_patch.py) slam_map can change on an
+        # idle local map
         await self._create({"name": "yard", "type": "local"})
-        with pytest.raises(HTTPException) as err:
-            await maps.patch_map(None, "yard", {"slam_map": True}, uuid.uuid4())
-        assert err.value.status_code == 422
+        out = await maps.patch_map(None, "yard", {"slam_map": True}, uuid.uuid4())
+        assert out["slam_map"] is True
 
     def test_onboard_name(self):
         assert maps.onboard_map_name("yard") == "cloud-yard"

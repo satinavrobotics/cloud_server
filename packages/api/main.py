@@ -556,10 +556,13 @@ async def get_map(map_id: str):
 
 @app.patch("/api/v1/maps/{map_id}")
 async def patch_map(map_id: str, body: Dict[str, Any]):
-    """Change a map's `description` (maps redesign M1). A map cannot be renamed (422)."""
+    """Change a map's `description` and, on a local map, `slam_map` (bool; 409 for a geo map,
+    an open mapping session or a pending SLAM save; MAP.SLAM_CHANGED). A map cannot be renamed
+    (422). Returns the map view."""
     _require_service()
-    return await _site_call("update map", maps.patch_map(service.database, map_id, body,
-                                                         uuid.uuid4()))
+    return await _site_call("update map", maps.patch_map(
+        service.database, map_id, body, uuid.uuid4(), service.mapping_switch,
+        recording.request_actor()))
 
 
 @app.get("/api/v1/maps/{map_id}/graph")
@@ -763,7 +766,8 @@ async def convert_map_type(map_id: str, body: Dict[str, Any]):
     MAP.TYPE_CHANGED."""
     _require_service()
     return await _site_call("convert map type", maps.convert_map_type(
-        service.database, map_id, body, uuid.uuid4(), recording.request_actor()))
+        service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
+        service.reloc_jobs))
 
 
 @app.post("/api/v1/maps/{map_id}/restore")

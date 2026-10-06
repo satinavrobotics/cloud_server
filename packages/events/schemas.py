@@ -212,6 +212,14 @@ class MapLifecycle(Payload):
     actor: Optional[str] = None
 
 
+class MapSlamChanged(Payload):
+    """MAP.SLAM_CHANGED (packages/api/maps.py): `slam_map` of a local map was switched; the
+    value after the change."""
+    map_name: str
+    slam_map: bool
+    actor: Optional[str] = None
+
+
 class MapTypeChanged(Payload):
     """MAP.TYPE_CHANGED (packages/api/maps.py): the map was converted geo <-> local. Map-frame
     coordinates are unchanged; `geo` / `old_geo` are the georeference after / before (null on a

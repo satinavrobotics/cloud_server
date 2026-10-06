@@ -86,6 +86,7 @@ VALID_PAYLOADS = {
                                  "geo": {"utm_zone": 34, "utm_north": True, "origin_e": 1.0,
                                          "origin_n": 2.0, "bearing_deg": 10.0},
                                  "old_geo": None, "operating": ["r1"], "actor": None},
+    EventCode.MAP_SLAM_CHANGED: {"map_name": "lab", "slam_map": True, "actor": None},
     EventCode.MAP_RECONSTRUCTION_STARTED: {"map_name": "lab", "job_id": "j1",
                                            "params": {"voxel_m": 0.05}, "nodes_with_depth": 412,
                                            "attempt": 1},
