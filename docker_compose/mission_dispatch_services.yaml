@@ -82,7 +82,7 @@ services:
               "--postgres-user", "${POSTGRES_DATABASE_USERNAME}",
               "--postgres-password", "${POSTGRES_DATABASE_PASSWORD}"]
     network_mode: "host"
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
       mosquitto:
         condition: service_started
@@ -156,11 +156,16 @@ services:
       - RADIUS_THRESHOLD=${GRAPH_BUILDER_RADIUS_THRESHOLD:-2.0}
       - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
     network_mode: "host"
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
-      - mosquitto
-      - arangodb
-      - minio
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      arangodb:
+        condition: service_started
+      minio:
+        condition: service_started
 
   # Create Mission Planner Service
   mission-planner-service:
@@ -195,10 +200,14 @@ services:
       - MQTT_PORT=${MQTT_PORT_TCP:-1883}
       - MQTT_KEEPALIVE=${MQTT_KEEPALIVE:-60}
     network_mode: "host"
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
-      - mosquitto
-      - arangodb
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      arangodb:
+        condition: service_started
 
   # Create LiveKit Service
   livekit-service:
@@ -219,7 +228,7 @@ services:
       - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     network_mode: "host"
-    restart: on-failure
+    restart: unless-stopped
 
 
   # Self-hosted LiveKit SFU (Tailscale-only): live robot video for the dashboard.
@@ -299,7 +308,7 @@ services:
       - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     network_mode: "host"
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
       - mosquitto
 
@@ -347,13 +356,22 @@ services:
       - path: livekit_sfu.env
         required: false
     network_mode: "host"
-    restart: on-failure
+    restart: unless-stopped
     depends_on:
-      - arangodb
-      - minio
-      - mission-planner-service
-      - livekit-service
-      - graph-builder-service
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      arangodb:
+        condition: service_started
+      minio:
+        condition: service_started
+      mission-planner-service:
+        condition: service_started
+      livekit-service:
+        condition: service_started
+      graph-builder-service:
+        condition: service_started
 
 volumes:
   arango_data:
