@@ -897,6 +897,16 @@ untouched.
   onboard map file ("SLAM map already exists, not re-recorded", `overwrite: false`), so the next
   mapping session does not overwrite it. Why it was immutable before: nothing more than the
   flag being read at several points; the guards above close that.
+  *Orphaned driver:* a driver recording `cloud-<X>` for a cloud map X that no longer exists
+  (deleted) would keep the orchestrator from stopping it through `/services` ("unsaved map would be
+  lost"). `MappingSwitch.stop_orphan_slam` sends `POST /maps/mapping/stop` when, read fresh under
+  the robot's switch lock then SLAM lock: the robot is online with an orchestrator address, GET
+  /maps/mapping says `active`, `saving` is exactly `false`, the map is `cloud-<X>`, no save is
+  pending, the robot has no open session, and map X has no row (a row in any lifecycle, archived,
+  draft or DELETING, keeps the driver). It runs in the reconcile pass (at API startup and every
+  `SLAM_RECONCILE_INTERVAL_S`, default 300 s, 0 = startup only; one worker per cluster) and after a
+  map delete finished (`MapDeleter` `after_delete`, in the background saga; the 202 response is
+  unchanged). Best effort, logged at WARNING, never raises.
 - *Place* does not touch the services: a session that is not placed has its service running and
   its nodes rejected (`session_unplaced`) until it is placed, as before, but without a switch.
 - *Names:* `topo` is `topomap` on the real robot and `sim_topomap` in the sim (the sim's
@@ -972,6 +982,8 @@ Modes 2 and 3 are one mechanism: the robot-side reloc service (config `RELOC_SER
 - The robot's pose and run are the ones read **after** `position_initialized` is true (the placement transaction). Open question: whether restarting the driver changes the robot's run (odometry frame); the job does not fail merely because the run changed.
 - A `position_initialized: true` that was already stored before the restart is stale: the job believes a true again only after it saw the flag drop or after `RELOC_JOB_SETTLE_S` (5 s).
 - The registry is **in memory**: jobs are lost when the API restarts (GET 404; the robot-side service keeps running; no placement is made).
+
+**Endpoint mode (2026-10-07; preferred).** The real robot orchestrator has no `odin_reloc` service: it relocalizes with `POST /maps/{name}/relocalize` (starts `odin_driver_gpu` in relocalization mode on the stored map, passing its `meta.yaml` `init_pos`) and stops with `POST /maps/mapping/stop`. An orchestrator offers this when its `GET /maps/mapping` reports `mode` and `relocalizing` (older ones do not; `RELOC_FORCE_SERVICE=true` turns the endpoint path off, e.g. for the sim whose endpoint is a stub). **can_start** = robot online AND has an orchestrator address AND the map is held (`/maps/list`) AND (the endpoint is offered OR a `RELOC_SERVICE_CANDIDATES` service is listed); the two small reads run first and `/services` is asked only when the endpoint is not offered. Job steps in endpoint mode: `PATCH init_pos` as above; no `current_map` is read or set (the endpoint ignores it); a SLAM session on the robot fails the job (never stopped), an earlier cloud relocalization (`cloud-*` map) is stopped; `POST /maps/{onboard}/relocalize`; poll the stored status as above, and additionally fail ("the Odin driver stopped") when `GET /maps/mapping` reports no session twice in a row. Failure and cancel restore `init_pos` and stop the session (`POST /maps/mapping/stop`) only if the job started it; a timeout leaves it running. Unverified without the robot: that the Odin SDK relocalizes from the passed `init_pos`, and "started" vs. "relocalized" (the driver may exit on a bad map while the process lives).
 
 **Frame (D0, one place).** `map_sessions.reloc_map_t_session()` (the robot's pose to the map, used by `reloc_placement()`) and its inverse `reloc_bin_pose()` (the user's init pose to the `map.bin` frame) are both the identity today, and no other code decides the frame, so a later fix changes those two functions only. **Assumptions, to confirm with the navstack team:** (1) the session frame equals Odin's map frame; (2) the `map.bin` the robot relocalizes on may have been saved by a **non-first** mapping session, whose `map_T_session` is not the identity; the proposal is `map_T_binSession`, the placement of the session named by the stored map's `meta.cloud_session_id`; (3) which frame the robot reports its pose in after a reloc-mode driver start is unconfirmed.
 

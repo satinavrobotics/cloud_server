@@ -113,13 +113,17 @@ class MapDeleter:
                  sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
                  now: Callable[[], datetime.datetime] = _utcnow,
                  on_mark: Optional[Callable[[Any, str], Awaitable[Any]]] = None,
-                 after_mark: Optional[Callable[[str, Any], Awaitable[Any]]] = None):
+                 after_mark: Optional[Callable[[str, Any], Awaitable[Any]]] = None,
+                 after_delete: Optional[Callable[[str], Awaitable[Any]]] = None):
         self._db = db
         # 3D reconstruction (R3): `on_mark(cursor, map_id)` runs in request()'s transaction
         # after the mark (cancels the map's active job); `after_mark(map_id, its result)` after
         # the commit (service cancel, events). An after_mark failure never fails the delete.
         self._on_mark = on_mark
         self._after_mark = after_mark
+        # `after_delete(map_id)` once the row is gone (robots' SLAM drivers of the map are
+        # stopped); best effort, a failure only logs.
+        self._after_delete = after_delete
         self._steps = (("graph_db", delete_graph), ("image_db", delete_images))
         self.max_attempts = max(1, int(max_attempts))
         self._backoff_s = backoff_s
@@ -263,6 +267,7 @@ class MapDeleter:
             error = await self._attempt(map_id)
             if error is None:
                 await self._finish(map_id, status)
+                await self._notify_deleted(map_id)
                 return
             total = int(status.get("delete_attempts") or 0) + 1
             requested_at = _parse_ts(status.get("delete_requested_at")) or self._now()
@@ -311,6 +316,14 @@ class MapDeleter:
             if removed:
                 await self._emit_deleted(conn, map_id, status)
         logger.info("Map %s deleted", map_id)
+
+    async def _notify_deleted(self, map_id: str) -> None:
+        if self._after_delete is None:
+            return
+        try:
+            await self._after_delete(map_id)
+        except Exception:  # noqa: BLE001 - the map is deleted either way
+            logger.exception("Map %s: after-delete hook failed", map_id)
 
     async def _emit_deleted(self, conn: Any, map_id: str, status: Dict[str, Any]) -> None:
         """MAP.DELETED in the finishing transaction, in a savepoint (never fails the delete)."""

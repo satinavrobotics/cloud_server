@@ -37,8 +37,11 @@ refuses while a save is pending. Pause / resume never touch SLAM. The outcome of
 save is logged (no event code exists for it) and `on_slam_done(robot)` is called.
 
 A save lost to an offline robot at finish or an API restart is recovered by reconcile_slam_saves()
-at API startup (start_slam_reconcile; no robot-online hook exists): derived, nothing persisted.
-It needs an orchestrator that reports `saving` in GET /maps/mapping (one that does not: skipped).
+at API startup and then every SLAM_RECONCILE_INTERVAL_S (start_slam_reconcile; online robots only):
+derived, nothing persisted. It needs an orchestrator that reports `saving` in GET /maps/mapping
+(one that does not: skipped). The same pass (and the end of a map delete) stops a driver that
+records `cloud-<X>` for a cloud map X that no longer exists (stop_orphan_slam; the orchestrator
+refuses to stop the driver through /services while such a session is active).
 """
 
 import asyncio
@@ -476,7 +479,11 @@ class MappingSwitch:
         async with maps.open_store(db, uuid.uuid4()) as store:
             if await store.open_sessions_of_robot(name):
                 return False
-            newest = await store.sessions_page(map_name, 1, None)
+            gone = await store.get_map(map_name) is None
+            newest = [] if gone else await store.sessions_page(map_name, 1, None)
+        if gone:  # the cloud map was deleted: nobody will ever save or want this recording
+            await self.stop_orphan_slam(db, robot, map_name)
+            return False
         if (not newest or newest[0].get("ended_at") is None or not maps._slam_session(newest[0])
                 or not await maps._slam_wanted(db, map_name)):
             return False
@@ -485,11 +492,58 @@ class MappingSwitch:
         self.schedule_slam_save(robot, map_name, newest[0]["session_id"])
         return True
 
+    async def stop_orphan_slam(self, db: Any, robot: Any,
+                               map_name: Optional[str] = None) -> bool:
+        """Stop the SLAM mapping session of `robot` when it records the cloud map `cloud-<X>`
+        (X == map_name when given) although X no longer exists in the cloud (deleted/unknown;
+        a map that exists, even archived or draft, is never orphaned), `saving` is reported as
+        False (unknown / True: left alone), no save is pending and the robot has no open
+        session. Takes the robot's switch lock, then its SLAM lock; the DB is read in closed
+        transactions, never during the orchestrator call. Returns True when a stop was sent
+        successfully. Never raises (failures are logged at WARNING)."""
+        from packages.api import maps  # maps imports this module
+        name = getattr(robot, "name", "?")
+        try:
+            if oc.orchestrator_address(robot) is None or self.slam_save_pending(name):
+                return False
+            prefix = oc.onboard_map_name("")
+            async with self.lock(name), self.slam_lock(name):
+                client = self._client_factory(robot)
+                state = await client.slam_state()
+                onboard = str(state.get("map") or "")
+                if (not state.get("active") or state.get("saving") is not False
+                        or not onboard.startswith(prefix)):
+                    return False
+                cloud_map = onboard[len(prefix):]
+                if map_name is not None and cloud_map != map_name:
+                    return False
+                async with maps.open_store(db, uuid.uuid4()) as store:
+                    if await store.open_sessions_of_robot(name):
+                        return False
+                    if await store.get_map(cloud_map) is not None:
+                        return False
+                logger.warning("SLAM mapping of deleted map %s still active on %s; stopping it",
+                               cloud_map, name)
+                await client.stop_slam()
+            self.invalidate(name)
+            self._slam_done(name)
+            return True
+        except oc.OrchestratorError as exc:
+            if exc.kind == oc.HTTP and exc.status == 404:
+                return False  # already stopped
+            logger.warning("SLAM mapping of deleted map %s on %s not stopped: %s",
+                           map_name or "?", name, exc.detail)
+        except Exception:  # noqa: BLE001
+            logger.exception("Orphan SLAM stop on %s failed", name)
+        return False
+
     def start_slam_reconcile(self, db: Any,
-                             list_robots: Callable[[], Awaitable[Sequence[Any]]]) -> None:
-        """reconcile_slam_saves() of every robot in the background, for startup; one worker per
-        cluster (advisory lock, held until its saves are done). Never raises."""
-        async def run() -> None:
+                             list_robots: Callable[[], Awaitable[Sequence[Any]]],
+                             interval_s: Optional[float] = None) -> None:
+        """reconcile_slam_saves() of every robot in the background: once, at startup, or every
+        `interval_s` seconds when given; one worker per cluster per round (advisory lock, held
+        until its saves are done, taken anew each round). Never raises."""
+        async def once() -> None:
             conn = None
             try:
                 conn = await db.dedicated_connection()
@@ -497,7 +551,9 @@ class MappingSwitch:
                                          (advisory_lock_key(RECONCILE_LOCK),))
                 if not (await cur.fetchone())[0]:
                     return
-                if await self.reconcile_slam_saves(db, await list_robots()):
+                robots = [r for r in await list_robots()
+                          if getattr(getattr(r, "status", None), "online", True) is not False]
+                if await self.reconcile_slam_saves(db, robots):
                     await self.wait_slam_saves()
             except asyncio.CancelledError:
                 raise
@@ -509,6 +565,12 @@ class MappingSwitch:
                         await conn.close()  # releases the advisory lock
                     except Exception:  # noqa: BLE001
                         pass
+
+        async def run() -> None:
+            await once()
+            while interval_s:
+                await asyncio.sleep(interval_s)
+                await once()
         try:
             self._reconcile_task = asyncio.get_running_loop().create_task(
                 run(), name="api.mapping_switch.slam_reconcile")

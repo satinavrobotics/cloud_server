@@ -31,6 +31,7 @@ from packages.utils.service_utils import (
 from packages.utils.fastapi_helpers import add_error_handlers
 from packages.utils import map_sessions as ms
 from packages.config import (
+    SLAM_RECONCILE_INTERVAL_S,
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
     URL_MISSION_PLANNER, URL_LIVEKIT,
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
@@ -322,7 +323,8 @@ async def lifespan(app: FastAPI):
     service.reconstruction.start_dispatcher()
     # SLAM saves lost to an offline robot / a restart (R6); one worker per cluster.
     service.mapping_switch.start_slam_reconcile(
-        service.database, lambda: service.database.list_objects(RobotObjectV1))
+        service.database, lambda: service.database.list_objects(RobotObjectV1),
+        interval_s=SLAM_RECONCILE_INTERVAL_S)
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)

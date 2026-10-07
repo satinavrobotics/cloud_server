@@ -147,6 +147,10 @@ RELOC_SERVICE_CANDIDATES = _candidates("RELOC_SERVICE_CANDIDATES", "odin_reloc")
 RELOC_JOB_TIMEOUT_S = float(os.getenv("RELOC_JOB_TIMEOUT_S", "90.0"))
 RELOC_JOB_POLL_S = float(os.getenv("RELOC_JOB_POLL_S", "1.0"))
 RELOC_JOB_SETTLE_S = float(os.getenv("RELOC_JOB_SETTLE_S", "5.0"))
+# Relocalization normally uses the orchestrator's POST /maps/{name}/relocalize when it offers it
+# (GET /maps/mapping reports `mode`/`relocalizing`). Set true to always use the reloc SERVICE
+# (RELOC_SERVICE_CANDIDATES) instead, e.g. in a simulation whose relocalize endpoint is a stub.
+RELOC_FORCE_SERVICE = os.getenv("RELOC_FORCE_SERVICE", "false").lower() in ("1", "true", "yes")
 
 # ==================== Phase 0 telemetry ingest (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).
@@ -205,6 +209,8 @@ FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
 MAP_DELETE_MAX_ATTEMPTS = int(os.getenv("MAP_DELETE_MAX_ATTEMPTS", "5"))
 MAP_DELETE_BACKOFF_S = float(os.getenv("MAP_DELETE_BACKOFF_S", "2.0"))
 MAP_DELETE_BACKOFF_MAX_S = float(os.getenv("MAP_DELETE_BACKOFF_MAX_S", "60.0"))
+# Seconds between SLAM reconcile passes (lost saves, drivers of deleted maps); 0 = startup only.
+SLAM_RECONCILE_INTERVAL_S = float(os.getenv("SLAM_RECONCILE_INTERVAL_S", "300"))
 # F3 Idempotency-Key (packages/api/idempotency.py): how long a key is remembered, how long an
 # unfinished request holds its key before a retry may take it over (longer than any guarded
 # route can take), and how often a worker purges expired keys (seconds).
