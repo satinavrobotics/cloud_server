@@ -1302,6 +1302,69 @@ class TestEndpointMode:
         assert done.state == rj.CANCELLED
         assert env.orch.mapping["mode"] is None and env.orch.init_pos == prev
 
+    async def test_the_same_map_already_relocalizing_is_restarted(self, eenv):
+        env = eenv
+        _robot(env.db, position_initialized=False)
+        env.orch.mapping.update(mode="relocalization", relocalizing=ONBOARD)
+        s = _unplaced(env.db)
+        env.on_sleep = _localized_after(1)
+        _, job = await env.run(s["session_id"])
+        assert job.state == rj.PLACED
+        ops = env.orch.ops()
+        assert ops.index("stop_mapping") < ops.index("relocalize")
+
+    async def test_cancel_never_stops_a_slam_session_started_meanwhile(self, eenv):
+        env = eenv
+        _robot(env.db)
+        prev = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        env.orch.init_pos = prev
+        s = _unplaced(env.db)
+        started = asyncio.Event()
+
+        def hook(e):    # the relocalization driver is replaced by a SLAM recording (proxy call)
+            e.orch.mapping = {"active": True, "map": "cloud-x", "pid": 7, "saving": False,
+                              "mode": "slam", "relocalizing": None}
+            started.set()
+        env.on_sleep = hook
+        env.block = asyncio.Event()
+        await env.place(s["session_id"], ASSISTED)
+        job = env.jobs.latest("shed", str(s["session_id"]))
+        await asyncio.wait_for(started.wait(), 2)
+        done = await env.jobs.cancel(job)
+        assert done.state == rj.CANCELLED
+        assert "stop_mapping" not in env.orch.ops()
+        assert env.orch.mapping["mode"] == "slam" and env.orch.init_pos == prev
+
+    async def test_a_blip_reading_the_mapping_state_does_not_switch_to_the_service(self, eenv):
+        env = eenv
+        _robot(env.db, position_initialized=False)
+        s = _unplaced(env.db)
+        env.on_sleep = _localized_after(1)
+        real = EndpointClient.mapping_state
+        n = {"calls": 0}
+
+        async def flaky(self):
+            n["calls"] += 1
+            if n["calls"] == 1:
+                raise oc.OrchestratorError(oc.TIMEOUT, "timed out")
+            return await real(self)
+        with patch.object(EndpointClient, "mapping_state", flaky):
+            _, job = await env.run(s["session_id"])
+        assert job.state == rj.PLACED and "relocalize" in env.orch.ops()
+        assert "start" not in env.orch.ops() and "set_config_map" not in env.orch.ops()
+
+    async def test_an_unreadable_mapping_state_fails_instead_of_guessing_the_service(self, eenv):
+        env = eenv
+        _robot(env.db)
+        s = _unplaced(env.db)
+
+        async def down(self):
+            raise oc.OrchestratorError(oc.TIMEOUT, "timed out")
+        with patch.object(EndpointClient, "mapping_state", down):
+            _, job = await env.run(s["session_id"])
+        assert job.state == rj.FAILED and "mapping state" in job.error
+        assert "start" not in env.orch.ops() and "relocalize" not in env.orch.ops()
+
     async def test_an_older_orchestrator_uses_the_service(self, env):
         class Old(RelocClient):
             async def mapping_state(self):

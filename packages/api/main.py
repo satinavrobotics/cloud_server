@@ -709,7 +709,8 @@ async def get_reloc_job(map_id: str, session_id: str):
 @app.delete("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job")
 async def cancel_reloc_job(map_id: str, session_id: str):
     """Cancel the session's running relocalization job: the previous `init_pos` and current map
-    are restored on the robot (the relocalization service is NOT stopped). Returns the job.
+    are restored on the robot (the legacy relocalization service is NOT stopped; an endpoint-mode
+    relocalization session the job started IS stopped, unless a SLAM session replaced it). Returns the job.
     404 no job; 409 it has finished."""
     _require_service()
     return (await service.reloc_jobs.cancel(_reloc_job_of(map_id, session_id))).view()

@@ -354,7 +354,8 @@ class RelocJobs:
         if undo.session_started:   # endpoint mode: the relocalization session this job started
             undo.session_started = False
             try:
-                await client.stop_mapping()
+                if await self._still_ours(client, undo.onboard):
+                    await client.stop_mapping()
             except oc.OrchestratorError as exc:
                 if not (exc.kind == oc.HTTP and exc.status == 404):  # 404: not running
                     problems.append(describe_error(exc, "relocalization not stopped"))
@@ -394,6 +395,24 @@ class RelocJobs:
         for problem in problems:
             logger.warning("Reloc job %s rollback: %s", job.id, problem)
         return "; ".join(problems) if problems else None
+
+    @staticmethod
+    async def _still_ours(client: oc.OrchestratorClient, onboard: Optional[str]) -> bool:
+        """Whether the driver session on the robot may still be the relocalization this job started:
+        False when the robot now runs a SLAM mapping session (someone started one through the
+        orchestrator proxy meanwhile: stopping it would lose the unsaved map) or relocalizes
+        another map. An unreadable state counts as ours (the orchestrator itself refuses to stop a
+        session it cannot identify)."""
+        try:
+            state = await client.mapping_state()
+        except Exception:  # noqa: BLE001
+            return True
+        if not isinstance(state, dict):
+            return True
+        if state.get("active") or state.get("mode") == "slam":
+            return False
+        current = state.get("relocalizing")
+        return not (state.get("mode") == "relocalization" and current not in (None, onboard))
 
     async def _prepare(self, job: RelocJob, db: Any, switch: Optional[Any],
                        client: oc.OrchestratorClient, undo: _Undo,
@@ -489,10 +508,18 @@ class RelocJobs:
         """Whether the job relocalizes through POST /maps/{name}/relocalize (else the service)."""
         if self.force_service:
             return False
-        try:
-            return oc.supports_relocalize(await client.mapping_state())
-        except Exception:  # noqa: BLE001 - an older / unreadable orchestrator: the service path
-            return False
+        for attempt in range(2):
+            try:
+                return oc.supports_relocalize(await client.mapping_state())
+            except oc.OrchestratorError as exc:
+                if exc.kind == oc.HTTP and exc.status in (404, 405):   # no such route: older
+                    return False
+                if attempt == 0:   # a blip (the query timeout is short): once more, not the
+                    continue       # other path, which a newer orchestrator may not even have
+                raise _Fail(describe_error(exc, "could not read the robot's mapping state"))
+            except Exception:  # noqa: BLE001 - an unreadable answer: the service path
+                return False
+        return False
 
     async def _start_endpoint(self, job: RelocJob, client: oc.OrchestratorClient, undo: _Undo,
                               onboard: str) -> None:
