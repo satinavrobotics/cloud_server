@@ -25,6 +25,7 @@ services:
       - | 
         sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" 
     network_mode: "host"
+    restart: unless-stopped
     volumes:
     - type: bind
       source: ../packages/utils/mosquitto.sh
@@ -50,6 +51,7 @@ services:
       - TS_TUNE_MAX_CONNS=100
       - TIMESCALEDB_TELEMETRY=off
     network_mode: "host"
+    restart: unless-stopped
     volumes:
       - pgdata17:/home/postgres/pgdata      # PGDATA is /home/postgres/pgdata/data
     healthcheck:
@@ -93,6 +95,7 @@ services:
     environment:
       - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
     network_mode: "host"
+    restart: unless-stopped
     volumes:
       - arango_data:/var/lib/arangodb3
 
@@ -105,6 +108,7 @@ services:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
     network_mode: "host"
+    restart: unless-stopped
     volumes:
       - /media/satiadmin/data0/minio_data:/data
 
