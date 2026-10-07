@@ -20,7 +20,11 @@ Orchestrator routes used (satibot_orchestrator/app/routers/services.py):
   POST /maps/{name}/mapping/start  body {overwrite}: starts the SLAM driver recording that map;
                                    409 "already has a map file" / "already running"
   POST /maps/mapping/stop          stops the driver (404 none running)
-  GET  /maps/mapping               -> {active, map, pid}
+  GET  /maps/mapping               -> {active, map, pid, saving, mode: "slam"|"relocalization"|
+                                       null, relocalizing: name|null}  (the last two: newer
+                                       orchestrators only; supports_relocalize())
+  POST /maps/{name}/relocalize     starts the driver in relocalization mode on that stored map
+                                   (init_pos of its meta.yaml is the initial pose); 409 driver runs
   GET  /maps/{name}                -> the map's metadata {name, description, init_pos, ...}
   PATCH /maps/{name}               body {init_pos: [x,y,z,qx,qy,qz,qw] | null, ...}: omitted
                                    fields unchanged, explicit null init_pos clears it (relocalization,
@@ -202,3 +206,25 @@ class OrchestratorClient:
         """GET /maps/mapping -> {active, map, pid}."""
         body = await self._call("GET", "/maps/mapping", ORCHESTRATOR_QUERY_TIMEOUT_S)
         return body if isinstance(body, dict) else {}
+
+    # --- relocalization through the orchestrator (packages/api/reloc_job.py) ---------------------
+
+    async def relocalize(self, onboard_map: str) -> Dict[str, Any]:
+        """POST /maps/{onboard}/relocalize. "Started" is not "relocalized": the robot's status
+        says when it is. 404 no such map, 409 a driver / another odin_usb service runs."""
+        return await self._call("POST", f"/maps/{onboard_map}/relocalize",
+                                ORCHESTRATOR_START_TIMEOUT_S)
+
+    async def stop_mapping(self) -> Dict[str, Any]:
+        """POST /maps/mapping/stop: ends a SLAM or a relocalization session (404: none runs)."""
+        return await self.stop_slam()
+
+    async def mapping_state(self) -> Dict[str, Any]:
+        """GET /maps/mapping, including `mode` / `relocalizing` on a newer orchestrator."""
+        return await self.slam_state()
+
+
+def supports_relocalize(state: Any) -> bool:
+    """Whether a GET /maps/mapping answer is from an orchestrator that can relocalize: it reports
+    `mode` and `relocalizing` (older ones answer {active, map, pid} only)."""
+    return isinstance(state, dict) and "mode" in state and "relocalizing" in state
