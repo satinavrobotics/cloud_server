@@ -138,12 +138,23 @@ class PostgresWatcher:
                 connection = await psycopg.AsyncConnection.connect(self._auth,
                                                                    autocommit=True)
                 connected = True
-            except psycopg.OperationalError:
+            except (psycopg.OperationalError, OSError) as err:
                 self._logger.warning(
-                    "Watcher not connect to Postgres, retry in %ss",
-                    WATCHER_POSTGRES_RECONNECT_PERIOD)
-                time.sleep(WATCHER_POSTGRES_RECONNECT_PERIOD)
+                    "Watcher could not connect to Postgres (%s), retry in %ss",
+                    err, WATCHER_POSTGRES_RECONNECT_PERIOD)
+                # Not time.sleep: that blocked the whole event loop (every watcher, the
+                # MQTT message handler, the API) for the length of the outage.
+                await asyncio.sleep(WATCHER_POSTGRES_RECONNECT_PERIOD)
+        self._logger.info("Watcher connected to Postgres")
         return connection
+
+    async def _close_connection(self) -> None:
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                await connection.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
 
     async def watch(self) -> AsyncGenerator[objects.ApiObject, None]:
         self._connection = await self._get_connection()
@@ -236,9 +247,15 @@ class PostgresWatcher:
                         "Watcher for %s received no notification in %ss; "
                         "reconnecting and resyncing.",
                         self._object_class.table_name(), WATCHER_NOTIFY_TIMEOUT_S)
+                    await self._close_connection()
                     self._connection = await self._get_connection()
 
-            except Exception:  # pylint: disable=broad-except
+            except Exception as err:  # pylint: disable=broad-except
+                self._logger.warning("Watcher for %s lost its connection (%s: %s); "
+                                     "reconnecting and resyncing.",
+                                     self._object_class.table_name(),
+                                     type(err).__name__, err)
+                await self._close_connection()
                 self._connection = await self._get_connection()
                 continue
 
@@ -320,7 +337,14 @@ class PostgresDatabase:
         retries = 0
         while True:
             try:
-                pool = AsyncConnectionPool(self._auth, min_size=2, max_size=10, open=False)
+                pool_kwargs: Dict[str, Any] = {}
+                # Validate a connection when it is handed out, so a pool that outlived a
+                # Postgres restart does not give callers dead connections (psycopg_pool>=3.2).
+                check = getattr(AsyncConnectionPool, "check_connection", None)
+                if check is not None:
+                    pool_kwargs["check"] = check
+                pool = AsyncConnectionPool(self._auth, min_size=2, max_size=10, open=False,
+                                           **pool_kwargs)
                 await pool.open(wait=True)
                 async with pool.connection() as conn:
                     await initialize_database(conn)

@@ -11,6 +11,10 @@ import paho.mqtt.client as mqtt_client
 # reconnection silently stalls (observed with the websockets transport).
 _RECONNECT_WATCHDOG_INTERVAL_SEC = 15
 _RECONNECT_STALL_THRESHOLD_SEC = 30
+# paho's own reconnect backoff bounds (seconds). Without reconnect_delay_set paho
+# uses 1..120s; cap lower so a service recovers soon after the broker is back.
+_RECONNECT_MIN_DELAY_SEC = 1
+_RECONNECT_MAX_DELAY_SEC = 15
 
 class MQTTClient:
     """
@@ -80,17 +84,31 @@ class MQTTClient:
         self._connect_listeners.append(listener)
 
     def connect(self):
-        """Connect to the MQTT broker and start the background thread loop."""
+        """Start the background network loop and connect to the broker.
+
+        Uses connect_async() so a broker that is down at startup is not fatal: the loop
+        thread keeps retrying with backoff until it comes up, and on_connect then
+        subscribes the registered topics. (A blocking connect() raising here used to leave
+        the client permanently unconnected with no loop thread and no retry.)
+        """
         try:
             self.logger.info(f"Connecting to MQTT broker at {self.broker}:{self.port}...")
-            # connect() handles the initial connection blocking call
-            self.client.connect(self.broker, self.port, self.keepalive)
-            # loop_start() spins up a background thread that automatically handles reconnects
+            self.client.reconnect_delay_set(
+                min_delay=_RECONNECT_MIN_DELAY_SEC, max_delay=_RECONNECT_MAX_DELAY_SEC)
+            # Counts as disconnected from now on, so the watchdog also covers a client that
+            # has never connected.
+            self._disconnected_since = time.monotonic()
+            self.client.connect_async(self.broker, self.port, self.keepalive)
+            # loop_start() spins up a background thread that connects and reconnects
             self.client.loop_start()
-            if not self._watchdog_thread.is_alive():
-                self._watchdog_thread.start()
         except Exception as e:
             self.logger.error(f"Failed to initiate MQTT connection: {e}")
+        # The watchdog runs regardless of how the initial attempt went.
+        if not self._watchdog_thread.is_alive():
+            try:
+                self._watchdog_thread.start()
+            except RuntimeError:  # already started (connect() called twice)
+                pass
 
     def _reconnect_watchdog(self):
         """
@@ -110,6 +128,7 @@ class MQTTClient:
                     f"over {_RECONNECT_STALL_THRESHOLD_SEC}s; forcing reconnect attempt.")
                 try:
                     self.client.reconnect()
+                    self._disconnected_since = time.monotonic()  # next forced attempt after the threshold again
                 except Exception as e:
                     self.logger.error(f"Forced MQTT reconnect attempt failed: {e}")
 
@@ -142,13 +161,15 @@ class MQTTClient:
         else:
             self._connected = False
             self._disconnected_since = self._disconnected_since or time.monotonic()
-            self.logger.error(f"MQTT connection failed with code {rc}")
+            self.logger.error(f"MQTT connection to {self.broker}:{self.port} failed with code {rc}")
 
     def _on_disconnect(self, client, userdata, rc):
         self._connected = False
         self._disconnected_since = time.monotonic()
         if rc != 0:
-            self.logger.warning(f"Unexpected disconnect from MQTT broker (code: {rc})")
+            self.logger.warning(
+                f"Unexpected disconnect from MQTT broker {self.broker}:{self.port} "
+                f"(code: {rc}); reconnecting with backoff")
         else:
             self.logger.info("Disconnected from MQTT broker")
 
