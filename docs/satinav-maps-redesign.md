@@ -897,6 +897,16 @@ untouched.
   onboard map file ("SLAM map already exists, not re-recorded", `overwrite: false`), so the next
   mapping session does not overwrite it. Why it was immutable before: nothing more than the
   flag being read at several points; the guards above close that.
+  *Orphaned driver:* a driver recording `cloud-<X>` for a cloud map X that no longer exists
+  (deleted) would keep the orchestrator from stopping it through `/services` ("unsaved map would be
+  lost"). `MappingSwitch.stop_orphan_slam` sends `POST /maps/mapping/stop` when, read fresh under
+  the robot's switch lock then SLAM lock: the robot is online with an orchestrator address, GET
+  /maps/mapping says `active`, `saving` is exactly `false`, the map is `cloud-<X>`, no save is
+  pending, the robot has no open session, and map X has no row (a row in any lifecycle, archived,
+  draft or DELETING, keeps the driver). It runs in the reconcile pass (at API startup and every
+  `SLAM_RECONCILE_INTERVAL_S`, default 300 s, 0 = startup only; one worker per cluster) and after a
+  map delete finished (`MapDeleter` `after_delete`, in the background saga; the 202 response is
+  unchanged). Best effort, logged at WARNING, never raises.
 - *Place* does not touch the services: a session that is not placed has its service running and
   its nodes rejected (`session_unplaced`) until it is placed, as before, but without a switch.
 - *Names:* `topo` is `topomap` on the real robot and `sim_topomap` in the sim (the sim's

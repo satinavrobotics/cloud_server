@@ -617,7 +617,8 @@ class ApiDelegationService:
             max_attempts=MAP_DELETE_MAX_ATTEMPTS, backoff_s=MAP_DELETE_BACKOFF_S,
             backoff_max_s=MAP_DELETE_BACKOFF_MAX_S,
             on_mark=reconstruction.mark_map_deleting,
-            after_mark=self.reconstruction.after_map_delete_marked)
+            after_mark=self.reconstruction.after_map_delete_marked,
+            after_delete=self._stop_slam_of_deleted_map)
 
         # Configuration
         self.default_map_id = default_map_id
@@ -1221,6 +1222,14 @@ class ApiDelegationService:
                 "success": False,
                 "error": str(e)
             }
+
+    async def _stop_slam_of_deleted_map(self, map_id: str) -> None:
+        """After a map delete: stop the SLAM mapping of `cloud-<map>` on every online robot
+        that records it (best effort; MappingSwitch.stop_orphan_slam never raises)."""
+        robots = [r for r in await self.database.list_objects(RobotObjectV1)
+                  if getattr(getattr(r, "status", None), "online", True) is not False]
+        await asyncio.gather(*(self.mapping_switch.stop_orphan_slam(self.database, r, map_id)
+                               for r in robots))
 
     async def delete_map(self, map_id: str) -> Dict[str, Any]:
         """Mark the map DELETING and start its ArangoDB/MinIO cleanup in the background

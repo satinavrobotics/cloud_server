@@ -235,7 +235,7 @@ the server: graph-builder drops a node with no open, unpaused, placed mapping se
   `ORCHESTRATOR_SAVE_TIMEOUT_S`, default 180 s; a failed save stops the driver); `replace` saves the
   replaced session's map first (awaited), then starts the new one. Failures never fail a session:
   `slam_warning` says what (existing map file: "SLAM map already exists, not re-recorded"). Pause,
-  resume and operate sessions never touch SLAM. The background outcome is only logged.
+  resume and operate sessions never touch SLAM. The background outcome is only logged. A driver still recording `cloud-<X>` after map X was deleted (nothing saved, `saving` false, no open session) is stopped by the API at the end of the map delete and by a reconcile pass every `SLAM_RECONCILE_INTERVAL_S` (300 s); the delete response is unchanged.
 
 | Where | Field |
 |---|---|
