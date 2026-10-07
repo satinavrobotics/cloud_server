@@ -937,6 +937,92 @@ class TestSlamReconcile:
         await switch.wait_slam_saves()
 
 
+class TestOrphanSlam:
+    """A driver recording `cloud-<X>` for a deleted cloud map X is stopped."""
+
+    async def orphan(self, db, **kw):
+        orch, switch = slam_prepare(db, **kw)
+        orch.slam = {"active": True, "map": "cloud-gone"}   # no map `gone` in the cloud
+        return orch, switch
+
+    async def test_reconcile_stops_the_driver_of_a_missing_map(self, db):
+        orch, switch = await self.orphan(db)
+        assert await switch.reconcile_slam_saves(db, [db.robots["r1"]]) == []
+        assert [op for op, _, _ in orch.slam_log if op == "slam_stop"] == ["slam_stop"]
+        assert not [1 for op, _, _ in orch.slam_log if op == "slam_save"]
+        assert orch.slam["active"] is False
+        switch.on_slam_done.assert_called_once_with("r1")
+
+    async def test_stop_helper_stops_by_map_name(self, db):
+        orch, switch = await self.orphan(db)
+        assert await switch.stop_orphan_slam(db, db.robots["r1"], "other") is False
+        assert orch.slam["active"] is True
+        assert await switch.stop_orphan_slam(db, db.robots["r1"], "gone") is True
+        assert orch.slam["active"] is False
+
+    @pytest.mark.parametrize("change", ["map_exists", "archived", "saving", "no_field",
+                                        "open_session", "save_pending", "idle", "foreign",
+                                        "no_address"])
+    async def test_not_stopped(self, db, change):
+        orch, switch = await self.orphan(db)
+        if change == "map_exists":
+            orch.slam = {"active": True, "map": "cloud-yard"}
+        elif change == "archived":
+            db.maps["yard"]["lifecycle"] = "ARCHIVED"
+            orch.slam = {"active": True, "map": "cloud-yard"}
+        elif change == "saving":
+            orch.slam_saving = True
+        elif change == "no_field":
+            orch.slam_reports_saving = False
+        elif change == "open_session":
+            await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB)
+        elif change == "save_pending":
+            task = MagicMock()
+            task.done.return_value = False
+            switch._slam_tasks["r1"] = task
+        elif change == "idle":
+            orch.slam = {"active": False, "map": None}
+        elif change == "foreign":
+            orch.slam = {"active": True, "map": "somebody-else"}
+        elif change == "no_address":
+            db.robots["r1"] = robot("r1", address=False)
+        before = orch.slam["active"]
+        assert await switch.stop_orphan_slam(db, db.robots["r1"]) is False
+        assert not [1 for op, _, _ in orch.slam_log if op == "slam_stop"]
+        assert orch.slam["active"] is before
+
+    async def test_orchestrator_error_is_swallowed(self, db, caplog):
+        orch, switch = await self.orphan(db)
+        orch.fail[("slam_stop", None)] = oc.OrchestratorError(oc.UNREACHABLE, "down")
+        with caplog.at_level("WARNING"):
+            assert await switch.stop_orphan_slam(db, db.robots["r1"], "gone") is False
+        assert "gone" in caplog.text and "r1" in caplog.text
+        orch.reachable = False
+        assert await switch.stop_orphan_slam(db, db.robots["r1"]) is False
+        with patch.object(maps, "open_store", side_effect=RuntimeError("db down")):
+            assert await switch.stop_orphan_slam(db, db.robots["r1"]) is False
+
+
+class TestSlamReconcilePeriodic:
+    async def test_runs_again_every_interval_and_skips_offline_robots(self):
+        conn = MagicMock(closed=False)
+        conn.execute = AsyncMock(return_value=MagicMock(fetchone=AsyncMock(return_value=(True,))))
+        conn.close = AsyncMock()
+        database = MagicMock(dedicated_connection=AsyncMock(return_value=conn))
+        switch = MappingSwitch()
+        switch.reconcile_slam_saves = AsyncMock(return_value=[])
+        robots = [robot("on"), robot("off", online=False)]
+        switch.start_slam_reconcile(database, AsyncMock(return_value=robots), interval_s=0.01)
+        for _ in range(100):
+            if switch.reconcile_slam_saves.await_count >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await switch.stop_slam_reconcile()
+        assert switch.reconcile_slam_saves.await_count >= 2
+        assert [r.name for r in switch.reconcile_slam_saves.await_args[0][1]] == ["on"]
+        assert conn.close.await_count >= 2   # the lock is released every round
+
+
 class TestSlamReconcileStartup:
     @pytest.mark.parametrize("leader", [True, False])
     async def test_only_the_lock_holder_reconciles_and_the_lock_is_released(self, leader):

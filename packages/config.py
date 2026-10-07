@@ -197,6 +197,8 @@ FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
 MAP_DELETE_MAX_ATTEMPTS = int(os.getenv("MAP_DELETE_MAX_ATTEMPTS", "5"))
 MAP_DELETE_BACKOFF_S = float(os.getenv("MAP_DELETE_BACKOFF_S", "2.0"))
 MAP_DELETE_BACKOFF_MAX_S = float(os.getenv("MAP_DELETE_BACKOFF_MAX_S", "60.0"))
+# Seconds between SLAM reconcile passes (lost saves, drivers of deleted maps); 0 = startup only.
+SLAM_RECONCILE_INTERVAL_S = float(os.getenv("SLAM_RECONCILE_INTERVAL_S", "300"))
 # F3 Idempotency-Key (packages/api/idempotency.py): how long a key is remembered, how long an
 # unfinished request holds its key before a retry may take it over (longer than any guarded
 # route can take), and how often a worker purges expired keys (seconds).
