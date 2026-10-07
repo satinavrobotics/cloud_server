@@ -70,7 +70,7 @@ class TestPlanRealign:
 
 def row_for(s: ingest.OpenSession):
     return (s.session_id, s.map_name, s.paused, s.map_t_session, s.map_lifecycle, s.map_state,
-            s.session_datum, s.robot_datum, s.map_geo, s.map_type)
+            s.session_datum, s.robot_datum, s.map_geo, s.map_type, s.purpose, s.aligned)
 
 
 class FakeDb:
@@ -122,10 +122,10 @@ class TestResolver:
         assert (await res.resolve("r1")).reason == ingest.DATUM_CHANGED
         assert db.cas == 0
 
-    async def test_paused_session_is_not_realigned(self):
-        db = FakeDb(session(paused=True))
+    async def test_unplaced_session_is_not_realigned(self):
+        db = FakeDb(session(aligned=False))
         res = ingest.SessionResolver(db.fetch, ttl=0, realign=db.realign)
-        assert (await res.resolve("r1")).reason == ingest.SESSION_PAUSED
+        assert (await res.resolve("r1")).reason == ingest.SESSION_UNPLACED
         assert db.cas == 0
 
     async def test_realign_failure_keeps_rejection(self):

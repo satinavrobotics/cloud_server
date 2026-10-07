@@ -260,14 +260,11 @@ async def ingest():
                                 (uuid.UUID(s["session_id"]),))[0][0] == 1 or None)
     check(bool(count), "session node_count = 1")
 
-    # 3. pause: dropped within ~1 s
+    # 3. pause: nodes still go to the map (the open session decides)
     await maps.session_action(db, MAP, s["session_id"], "pause", PUB)
     time.sleep(1.2)
     _send(m, base + 3, 11.0, 0.0)
-    ev = _wait(lambda: _events("session_paused"))
-    check(bool(ev), f"paused -> MAP.INGEST_REJECTED session_paused {ev and ev[-1]}")
-    time.sleep(1.0)
-    check(not _node_by_seq(base + 3), "paused: node not stored")
+    check(bool(_wait(lambda: _node_by_seq(base + 3))), "paused session: node still stored")
 
     # 4. resume
     await maps.session_action(db, MAP, s["session_id"], "resume", PUB)
@@ -277,7 +274,7 @@ async def ingest():
 
     # 5. a payload session_id that is not the open session
     _send(m, base + 5, 13.0, 0.0, session_id=str(uuid.uuid4()))
-    check(bool(_wait(lambda: _events("session_mismatch"))), "foreign session_id rejected")
+    check(bool(_wait(lambda: _node_by_seq(base + 5))), "foreign session_id accepted")
 
     # 6. finishing the session; data dropped again
     out = await maps.session_action(db, MAP, s["session_id"], "finish", PUB, "m2it")

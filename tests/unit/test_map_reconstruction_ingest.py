@@ -167,7 +167,7 @@ class TestDepthIngest:
         assert service.stats["depth_saved"] == 0
 
     async def test_rejected_depth(self):
-        service = _service(_row(paused=True))
+        service = _service(_row(lifecycle="DELETING"))
         await service._handle_depth_upload(dict(DEPTH))
         assert service.depth_buffer == {} and service.stats["depth_rejected"] == 1
         event = service._write_event.await_args.args[0]

@@ -2,13 +2,10 @@
 
 - packages/api/orchestrator_client.py: the orchestrator's routes, error kinds, the address;
 - packages/api/mapping_switch.py: service name resolution (`topomap` real / `sim_topomap` sim),
-  start (order, already running, failure -> HTTP errors, rollback of a partial start), stop
-  (best effort, offline), the state views and their cache;
-- packages/api/maps.py: the orchestrator is never called inside a DB transaction: opening a
-  session commits, then starts the services (a failed start closes the session again, paired
-  events, a draft map back to draft), replace starts first (a failed start changes nothing),
-  resume commits then starts (a failed start pauses again), pause / finish stop them after the
-  commit (a failed stop still closes the session), replace keeps what the new session runs;
+  the state views and their cache (read only);
+- packages/api/maps.py: sessions never start or stop a robot service (the user starts the
+  topomap from the orchestrator; graph-builder takes nodes into the open session's map); only
+  SLAM is driven, outside every DB transaction;
 - the routes and the robot view fill `mapping_state` / `mapping_services` from the orchestrator.
 
 The in-memory store is the M1 one with robot locks (tests/unit/test_maps_m2.py ShimDb).
@@ -281,107 +278,18 @@ class TestResolution:
     async def test_first_candidate_the_orchestrator_lists(self, listed, expected):
         orch = FakeOrch(services=listed)
         switch = make_switch({"r1": orch})
-        assert await switch.start(robot(), ["topo"]) == {"topo": "started"}
-        assert ops(orch, "start") == [("start", expected)]
+        client = switch._client_factory(robot())
+        assert await switch.resolve(client, ["topo"]) == {"topo": expected}
 
-    async def test_no_candidate_listed_is_a_409_naming_the_candidates(self):
+    async def test_no_candidate_listed_resolves_to_none(self):
         switch = make_switch({"r1": FakeOrch(services=["something"])})
-        with pytest.raises(HTTPException) as err:
-            await switch.start(robot(), ["topo"])
-        assert err.value.status_code == 409
-        assert "topomap, sim_topomap" in err.value.detail and "'topo'" in err.value.detail
+        client = switch._client_factory(robot())
+        assert await switch.resolve(client, ["topo"]) == {"topo": None}
 
     def test_candidates_come_from_config(self):
         from packages import config
         assert config.MAPPING_SERVICE_CANDIDATES["topo"][:2] == ["topomap", "sim_topomap"]
 
-
-# --- start ---------------------------------------------------------------------------------------
-
-class TestStart:
-    async def test_lists_then_starts(self):
-        orch = FakeOrch()
-        switch = make_switch({"r1": orch})
-        assert await switch.start(robot(), ["topo"]) == {"topo": "started"}
-        assert orch.calls == [("list", None), ("start", "topomap")]
-        assert orch.services["topomap"] is True
-
-    async def test_already_running_is_fine(self):
-        orch = FakeOrch(running=["topomap"])
-        assert await make_switch({"r1": orch}).start(robot(), ["topo"]) == {
-            "topo": "already_running"}
-
-    @pytest.mark.parametrize("error,status,words", [
-        (oc.OrchestratorError(oc.UNREACHABLE, "orchestrator at 10.0.0.5:8080 is not reachable "
-                                              "(ConnectError)"), 502, "not reachable"),
-        (oc.OrchestratorError(oc.TIMEOUT, "orchestrator at 10.0.0.5:8080 timed out"), 504,
-         "timed out"),
-        (oc.OrchestratorError(oc.HTTP, "entrypoint failed", status=500), 502,
-         "answered 500: entrypoint failed"),
-        (oc.OrchestratorError(oc.HTTP, "Service 'topomap' not found", status=404), 502,
-         "answered 404"),
-    ])
-    async def test_failed_start_is_a_clear_http_error(self, error, status, words):
-        orch = FakeOrch(fail={("start", "topomap"): error})
-        with pytest.raises(HTTPException) as err:
-            await make_switch({"r1": orch}).start(robot(), ["topo"])
-        assert err.value.status_code == status
-        assert "Could not start mapping service 'topo' on robot 'r1'" in err.value.detail
-        assert words in err.value.detail
-
-    async def test_unreachable_before_anything_started(self):
-        orch = FakeOrch(reachable=False)
-        with pytest.raises(HTTPException) as err:
-            await make_switch({"r1": orch}).start(robot(), ["topo"])
-        assert err.value.status_code == 502 and ops(orch, "start") == []
-
-    async def test_no_registered_address(self):
-        # the real client refuses without an address
-        switch = MappingSwitch()
-        with pytest.raises(HTTPException) as err:
-            await switch.start(robot(address=False), ["topo"])
-        assert err.value.status_code == 502 and "no registered orchestrator" in err.value.detail
-
-    async def test_a_partial_start_is_stopped_again(self):
-        orch = FakeOrch(services=["topomap", "grid"],
-                        fail={("start", "grid"): oc.OrchestratorError(oc.HTTP, "boom", status=500)})
-        with pytest.raises(HTTPException):
-            await make_switch({"r1": orch}).start(robot(), ["topo", "grid"])
-        assert ops(orch, "start", "stop") == [("start", "topomap"), ("start", "grid"),
-                                              ("stop", "topomap")]
-        assert orch.services["topomap"] is False
-
-
-# --- stop ----------------------------------------------------------------------------------------
-
-class TestStop:
-    async def test_stops(self):
-        orch = FakeOrch(running=["topomap"])
-        result = await make_switch({"r1": orch}).stop(robot(), ["topo"])
-        assert result.ok and result.services == {"topo": "stopped"}
-        assert orch.services["topomap"] is False
-
-    async def test_not_running_is_fine(self):
-        result = await make_switch({"r1": FakeOrch()}).stop(robot(), ["topo"])
-        assert result.ok and result.services == {"topo": "already_stopped"}
-
-    async def test_offline_robot_is_a_warning_never_an_exception(self):
-        result = await make_switch({"r1": FakeOrch(reachable=False)}).stop(robot(), ["topo"])
-        assert not result.ok and result.services == {"topo": "failed"}
-        assert "'r1'" in result.warning and "not reachable" in result.warning
-
-    async def test_a_failed_stop_is_a_warning(self):
-        orch = FakeOrch(running=["topomap"], fail={
-            ("stop", "topomap"): oc.OrchestratorError(oc.HTTP, "kill failed", status=500)})
-        result = await make_switch({"r1": orch}).stop(robot(), ["topo"])
-        assert not result.ok and "kill failed" in result.warning
-
-    async def test_no_address(self):
-        result = await MappingSwitch().stop(robot(address=False), ["topo"])
-        assert not result.ok and "no registered orchestrator" in result.warning
-
-
-# --- state ---------------------------------------------------------------------------------------
 
 def open_session(**kw):
     return {"session_id": "s1", "map": "yard", "purpose": "mapping", "state": "mapping",
@@ -404,11 +312,11 @@ class TestState:
         assert snap.mapping_service() == "running"
         assert snap.mapping_services() == {"topo": "running", "grid": "not_available"}
 
-    async def test_running_but_paused_or_unplaced_is_off(self):
+    async def test_running_but_unplaced_is_off_paused_is_on(self):
         snap = await self.snap(FakeOrch(running=["topomap"]))
-        assert snap.state(open_session(state="paused"))["status"] == "off"
+        assert snap.state(open_session(state="paused"))["status"] == "on"  # still captures
         assert snap.state(open_session(aligned=False))["status"] == "off"
-        assert snap.state(open_session(state="paused"))["online"] is True
+        assert snap.state(open_session(aligned=False))["online"] is True
 
     async def test_stopped_service(self):
         snap = await self.snap(FakeOrch())
@@ -421,9 +329,10 @@ class TestState:
         state = (await self.snap(FakeOrch(running=["topomap"]))).state(None)
         assert state["status"] == "on" and state["session_id"] is None and state["map"] is None
 
-    async def test_an_operate_session_is_not_a_mapping_session(self):
-        state = (await self.snap(FakeOrch())).state(open_session(purpose="operate"))
-        assert state["session_id"] is None
+    async def test_an_operate_session_is_reported_too(self):
+        state = (await self.snap(FakeOrch(running=["topomap"]))).state(
+            open_session(purpose="operate", state="operating"))
+        assert state["session_id"] == "s1" and state["status"] == "on"
 
     async def test_unreachable_orchestrator(self):
         snap = await self.snap(FakeOrch(reachable=False))
@@ -460,7 +369,8 @@ class TestState:
         assert await switch.snapshot(r) is first and len(ops(orch, "list")) == 1
         now[0] = 6.0
         assert await switch.snapshot(r) is not first and len(ops(orch, "list")) == 2
-        await switch.start(r, ["topo"])          # a switch invalidates the cache
+        orch.services["topomap"] = True            # the user starts it
+        switch.invalidate("r1")
         assert (await switch.snapshot(r)).mapping_service() == "running"
         again = await switch.snapshot(r, fresh=True)
         assert again is not await switch.snapshot(r, fresh=True)
@@ -520,88 +430,58 @@ async def start(db, switch, **body):
                                     switch=switch)
 
 
-class TestStartSession:
-    async def test_opening_starts_the_service_after_the_session_exists(self, db):
+class TestNoServiceSwitching:
+    """Sessions never start or stop a service on the robot (the user starts the topomap from
+    its orchestrator); only SLAM is driven (TestSlam)."""
+
+    async def act(self, db, switch, sid, action, map_name="yard"):
+        return await maps.session_action(None, map_name, sid, action, m1.PUB, switch=switch)
+
+    async def test_open_pause_resume_finish_never_start_or_stop_a_service(self, db):
         orch, switch = prepare(db)
         out = await start(db, switch)
-        assert orch.services["topomap"] is True and db.open_session("r1")
-        assert out["robot_notified"] is True
-        assert out["mapping_switch"] == {"topo": "started"}
-        assert out["mapping_service"] == "running"
-        assert out["mapping_services"] == {"topo": "running", "grid": "not_available"}
-        assert out["mapping_state"]["service"] == "topo"
-        assert out["mapping_state"]["session_id"] == out["session"]["session_id"]
-        assert out["mapping_state"]["status"] == "on"
-        assert "mapping_warning" not in out
-        assert db.codes() == ["MAP.SESSION_STARTED"]
-        switch.on_session.assert_awaited_once()
-        switch.on_state.assert_awaited_once()
+        sid = out["session"]["session_id"]
+        assert out["robot_notified"] is True and "mapping_switch" not in out
+        assert "mapping_warning" not in out and orch.services["topomap"] is False
+        for action in ("pause", "resume", "finish"):
+            out = await self.act(db, switch, sid, action)
+            assert out["robot_notified"] is True and "mapping_switch" not in out
+            assert "mapping_warning" not in out
+        assert ops(orch, "start", "stop") == []
+        assert db.codes() == ["MAP.SESSION_STARTED", "MAP.SESSION_PAUSED",
+                              "MAP.SESSION_RESUMED", "MAP.SESSION_FINISHED"]
+        assert out["map_state"] == "ready"
 
-    @pytest.mark.parametrize("orch,status", [
-        (FakeOrch(reachable=False), 502),
-        (FakeOrch(services=["nothing"]), 409),
-        (FakeOrch(fail={("start", "topomap"): oc.OrchestratorError(oc.TIMEOUT, "timed out")}),
-         504),
-        (FakeOrch(fail={("start", "topomap"): oc.OrchestratorError(oc.HTTP, "x", status=500)}),
-         502),
-    ])
-    async def test_a_failed_start_leaves_no_session(self, db, orch, status):
+    async def test_a_running_topomap_is_left_running(self, db):
+        orch, switch = prepare(db, FakeOrch(running=["topomap"]))
+        sid = (await start(db, switch))["session"]["session_id"]
+        await self.act(db, switch, sid, "finish")
+        assert orch.services["topomap"] is True and ops(orch, "start", "stop") == []
+
+    @pytest.mark.parametrize("orch", [FakeOrch(reachable=False),
+                                      FakeOrch(services=["nothing"])])
+    async def test_an_unreachable_or_serviceless_orchestrator_does_not_fail_a_session(
+            self, db, orch):
         _, switch = prepare(db, orch)
-        with pytest.raises(HTTPException) as err:
-            await start(db, switch)
-        assert err.value.status_code == status
-        assert "Could not start mapping service 'topo'" in err.value.detail
-        # committed, then closed again: the STARTED event has its FINISHED, nothing is left open
-        assert db.open_session("r1") == []
-        assert db.codes() == ["MAP.SESSION_STARTED", "MAP.SESSION_FINISHED"]
-        assert db.maps["yard"]["status"] == {"state": "draft", "open_session_id": None}
-        [closed] = db.sessions
-        assert closed["ended_at"] is not None
-        switch.on_state.assert_not_awaited()
+        out = await start(db, switch)
+        assert db.open_session("r1") and out["robot_notified"] is True
+        await self.act(db, switch, out["session"]["session_id"], "finish")
+        assert ops(orch, "start", "stop") == []
 
-    async def test_the_start_runs_outside_every_transaction(self, db):
+    async def test_resume_of_an_offline_robot_is_allowed(self, db):
         orch, switch = prepare(db)
-        await start(db, switch)                       # FakeOrch asserts open_tx == 0
-        assert ("start", "topomap") in orch.calls
+        sid = (await start(db, switch))["session"]["session_id"]
+        await self.act(db, switch, sid, "pause")
+        db.robots["r1"].status.online = False
+        out = await self.act(db, switch, sid, "resume")
+        assert out["changed"] is True and out["session"]["state"] == "mapping"
 
-    async def test_a_failed_start_of_a_ready_map_leaves_it_ready(self, db):
-        orch, switch = prepare(db, FakeOrch(reachable=False))
-        db.maps["yard"]["status"] = {"state": "ready"}
-        with pytest.raises(HTTPException):
-            await start(db, switch)
-        assert db.maps["yard"]["status"]["state"] == "ready" and db.open_session("r1") == []
-
-    async def test_the_robots_starts_serialize(self, db):
+    async def test_replace_closes_the_old_session_without_service_calls(self, db):
         orch, switch = prepare(db)
-        orch.delay = 0.05
-        db.add_map("lot", type="local", status={"state": "draft"})
-        first = asyncio.ensure_future(start(db, switch))
-        await asyncio.sleep(0.01)                     # first is inside its (slow) start
-        second = asyncio.ensure_future(maps.start_session(
-            None, "lot", {"robot": "r1"}, m1.PUB, "op", switch=switch))
-        ok, refused = await asyncio.gather(first, second, return_exceptions=True)
-        assert isinstance(ok, dict) and isinstance(refused, HTTPException)
-        assert refused.status_code == 409 and "already has an open" in refused.detail
-        assert [s["map_name"] for s in db.open_session("r1")] == ["yard"]
-
-    async def test_a_failed_close_still_raises_the_start_error(self, db):
-        orch, switch = prepare(db, FakeOrch(reachable=False))
-        real = maps._finish_in
-
-        async def broken(*args, **kw):
-            raise RuntimeError("db down")
-
-        with patch.object(maps, "_finish_in", broken):
-            with pytest.raises(HTTPException) as err:
-                await start(db, switch)
-        assert err.value.status_code == 502
-
-    async def test_no_registered_orchestrator_is_a_502(self, db):
-        db.add_map("yard", type="local", status={"state": "draft"})
-        add_robot(db, address=False)
-        with pytest.raises(HTTPException) as err:
-            await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, switch=MappingSwitch())
-        assert err.value.status_code == 502 and db.open_session("r1") == []
+        first = (await start(db, switch))["session"]["session_id"]
+        out = await start(db, switch, replace=True)
+        assert out["replaced_session"]["session_id"] == first
+        assert ops(orch, "start", "stop") == []
 
     async def test_operate_session_touches_no_service(self, db):
         db.add_map("yard", type="local", status={"state": "ready"})
@@ -610,8 +490,9 @@ class TestStartSession:
         switch = make_switch({"r1": orch})
         out = await maps.start_session(None, "yard", {"robot": "r1", "purpose": "operate"},
                                        m1.PUB, switch=switch)
+        await maps.session_action(None, "yard", out["session"]["session_id"], "finish", m1.PUB,
+                                  switch=switch)
         assert ops(orch, "start", "stop") == [] and "mapping_switch" not in out
-        assert out["robot_notified"] is True
 
     async def test_without_a_switch_the_response_is_unchanged(self, db):
         db.add_map("yard", type="local", status={"state": "draft"})
@@ -626,228 +507,6 @@ class TestStartSession:
         with pytest.raises(HTTPException) as err:
             await start(db, make_switch({"r1": orch}))
         assert err.value.status_code == 409 and orch.calls == []
-
-    async def test_replace_failure_keeps_the_old_session_and_its_service(self, db):
-        orch, switch = prepare(db)
-        db.add_map("lot", type="local", status={"state": "draft"})
-        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
-        events = list(db.codes())
-        orch.fail[("start", "topomap")] = oc.OrchestratorError(oc.HTTP, "x", status=500)
-        orch.services["topomap"] = False
-        with pytest.raises(HTTPException):
-            await start(db, switch, replace=True)
-        [old] = db.open_session("r1")
-        assert old["map_name"] == "lot" and old["ended_at"] is None
-        # start first: no session, no event, no map state change (nothing to compensate)
-        assert db.codes() == events and len(db.sessions) == 1
-        assert db.maps["yard"]["status"]["state"] == "draft"
-        assert db.maps["lot"]["status"]["state"] == "mapping"
-
-    async def test_replace_starts_before_it_commits(self, db):
-        orch, switch = prepare(db)
-        db.add_map("lot", type="local", status={"state": "draft"})
-        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
-        await maps.session_action(None, "lot", db.open_session("r1")[0]["session_id"], "pause",
-                                  m1.PUB, switch=switch)
-        seen = []
-
-        class Spy(list):
-            def append(self, call):
-                seen.append((call, [s["map_name"] for s in db.open_session("r1")]))
-                super().append(call)
-
-        orch.calls = Spy(orch.calls)
-        out = await start(db, switch, replace=True)
-        assert (("start", "topomap"), ["lot"]) in seen   # the old session was still the open one
-        assert out["session"]["map_name"] == "yard"
-        assert [s["map_name"] for s in db.open_session("r1")] == ["yard"]
-
-    async def test_replace_that_fails_to_commit_stops_what_it_started(self, db):
-        orch, switch = prepare(db)
-        db.add_map("lot", type="local", status={"state": "draft"})
-        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
-        await maps.session_action(None, "lot", db.open_session("r1")[0]["session_id"], "pause",
-                                  m1.PUB, switch=switch)
-        assert orch.services["topomap"] is False
-        real = maps._open_tx
-        state = {"n": 0}
-
-        async def flaky(*args, **kw):
-            state["n"] += 1
-            if not kw.get("dry_run") and state["n"] == 2:
-                raise HTTPException(409, "changed meanwhile")
-            return await real(*args, **kw)
-
-        with patch.object(maps, "_open_tx", flaky):
-            with pytest.raises(HTTPException) as err:
-                await start(db, switch, replace=True)
-        assert err.value.status_code == 409
-        assert ("start", "topomap") in orch.calls
-        assert orch.services["topomap"] is False        # started, then stopped again
-        assert [s["map_name"] for s in db.open_session("r1")] == ["lot"]
-
-    async def test_replace_validation_errors_come_before_the_orchestrator(self, db):
-        orch, switch = prepare(db)
-        db.add_map("lot", type="local", status={"state": "draft"})
-        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
-        db.robots["r1"].status.online = False
-        orch.calls.clear()
-        with pytest.raises(HTTPException) as err:
-            await start(db, switch, replace=True)
-        assert err.value.status_code == 409 and orch.calls == []
-
-    async def test_replace_keeps_the_service_the_new_session_runs(self, db):
-        orch, switch = prepare(db)
-        db.add_map("lot", type="local", status={"state": "draft"})
-        await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
-        orch.calls.clear()
-        out = await start(db, switch, replace=True)
-        assert out["replaced_session"]["map_name"] == "lot"
-        assert orch.services["topomap"] is True          # never stopped
-        assert ("stop", "topomap") not in orch.calls
-        assert out["robot_notified"] is True
-
-    async def test_replace_with_operate_stops_the_replaced_mapping_service(self, db):
-        orch, switch = prepare(db)
-        db.add_map("lot", type="local", status={"state": "ready"})
-        await start(db, switch)
-        out = await maps.start_session(None, "lot", {"robot": "r1", "purpose": "operate",
-                                                     "replace": True}, m1.PUB, switch=switch)
-        assert orch.services["topomap"] is False
-        assert out["mapping_switch"] == {"topo": "stopped"}
-
-
-class TestSessionActions:
-    async def act(self, db, switch, sid, action, map_name="yard"):
-        return await maps.session_action(None, map_name, sid, action, m1.PUB, switch=switch)
-
-    async def test_pause_stops_resume_starts_finish_stops(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        out = await self.act(db, switch, sid, "pause")
-        assert orch.services["topomap"] is False and out["robot_notified"] is True
-        assert out["mapping_switch"] == {"topo": "stopped"}
-        assert out["session"]["state"] == "paused"
-        assert out["mapping_state"]["status"] == "off"
-        out = await self.act(db, switch, sid, "resume")
-        assert orch.services["topomap"] is True and out["mapping_switch"] == {"topo": "started"}
-        assert out["mapping_state"]["status"] == "on"
-        out = await self.act(db, switch, sid, "finish")
-        assert orch.services["topomap"] is False and out["map_state"] == "ready"
-        assert [c for c in orch.calls if c[0] in ("start", "stop")] == [
-            ("start", "topomap"), ("stop", "topomap"), ("start", "topomap"),
-            ("stop", "topomap")]
-
-    async def test_a_paused_session_means_a_stopped_service(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        await self.act(db, switch, sid, "pause")
-        snap = await switch.snapshot(db.robots["r1"], fresh=True)
-        assert snap.mapping_service() == "not_running"
-        assert snap.state({"session_id": sid, "map": "yard", "state": "paused",
-                           "aligned": True})["status"] == "off"
-
-    async def test_finish_of_an_offline_robot_closes_the_session_and_says_so(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        orch.reachable = False
-        out = await self.act(db, switch, sid, "finish")
-        assert out["changed"] is True and out["session"]["state"] == "finished"
-        assert out["map_state"] == "ready" and db.open_session("r1") == []
-        assert out["robot_notified"] is False
-        assert "could not be stopped" in out["mapping_warning"] and "'r1'" in out["mapping_warning"]
-        assert out["mapping_switch"] == {"topo": "failed"}
-        assert out["mapping_state"]["status"] == "unreachable"
-        assert "MAP.SESSION_FINISHED" in db.codes()
-
-    async def test_pause_of_an_offline_robot_pauses_and_warns(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        orch.reachable = False
-        out = await self.act(db, switch, sid, "pause")
-        assert out["session"]["state"] == "paused" and out["robot_notified"] is False
-        assert out["mapping_warning"]
-
-    async def test_a_repeat_retries_the_stop(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        orch.reachable = False
-        await self.act(db, switch, sid, "finish")
-        orch.reachable = True
-        out = await self.act(db, switch, sid, "finish")
-        assert out["changed"] is False and out["robot_notified"] is True
-        assert orch.services["topomap"] is False
-
-    async def test_a_failed_resume_start_keeps_the_session_paused(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        await self.act(db, switch, sid, "pause")
-        orch.reachable = False
-        with pytest.raises(HTTPException) as err:
-            await self.act(db, switch, sid, "resume")
-        assert err.value.status_code == 502
-        [s] = db.open_session("r1")
-        assert s["paused_at"] is not None
-        assert db.maps["yard"]["status"]["state"] == "paused"
-        # resumed, then paused again: the events pair up
-        assert db.codes()[-3:] == ["MAP.SESSION_PAUSED", "MAP.SESSION_RESUMED",
-                                   "MAP.SESSION_PAUSED"]
-
-    async def test_resume_starts_outside_the_transaction(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        await self.act(db, switch, sid, "pause")
-        await self.act(db, switch, sid, "resume")     # FakeOrch asserts open_tx == 0
-        assert orch.services["topomap"] is True
-
-    async def test_a_failed_noop_resume_changes_nothing(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        orch.services["topomap"] = False
-        orch.fail[("start", "topomap")] = oc.OrchestratorError(oc.TIMEOUT, "timed out")
-        events = list(db.codes())
-        with pytest.raises(HTTPException) as err:
-            await self.act(db, switch, sid, "resume")
-        assert err.value.status_code == 504 and db.codes() == events
-        assert db.open_session("r1")[0]["paused_at"] is None
-
-    async def test_resume_of_an_offline_robot_is_409_without_calling_it(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        await self.act(db, switch, sid, "pause")
-        db.robots["r1"].status.online = False
-        orch.calls.clear()
-        with pytest.raises(HTTPException) as err:
-            await self.act(db, switch, sid, "resume")
-        assert err.value.status_code == 409 and orch.calls == []
-
-    async def test_noop_resume_makes_sure_the_service_runs(self, db):
-        orch, switch = prepare(db)
-        sid = (await start(db, switch))["session"]["session_id"]
-        orch.services["topomap"] = False            # it died meanwhile
-        out = await self.act(db, switch, sid, "resume")
-        assert out["changed"] is False and orch.services["topomap"] is True
-
-    async def test_finishing_an_old_session_never_stops_the_current_ones_service(self, db):
-        orch, switch = prepare(db)
-        db.add_map("old", type="local")
-        old = db.add_session("old", "r1", "live", ended=True)
-        await start(db, switch)
-        orch.calls.clear()
-        out = await self.act(db, switch, str(old["session_id"]), "finish", "old")
-        assert out["changed"] is False and orch.services["topomap"] is True
-        assert ops(orch, "stop") == []
-
-    async def test_operate_session_finish_stops_nothing(self, db):
-        db.add_map("yard", type="local", status={"state": "ready"})
-        add_robot(db)
-        orch = FakeOrch(running=["topomap"])
-        switch = make_switch({"r1": orch})
-        out = await maps.start_session(None, "yard", {"robot": "r1", "purpose": "operate"},
-                                       m1.PUB, switch=switch)
-        await maps.session_action(None, "yard", out["session"]["session_id"], "finish", m1.PUB,
-                                  switch=switch)
-        assert ops(orch, "stop") == []
 
     async def test_place_leaves_the_services_alone(self, db):
         orch, switch = prepare(db)
@@ -968,10 +627,9 @@ class TestSlam:
         assert orch.slam == {"active": True, "map": "cloud-yard"}
         assert orch.slam_log[-1] == ("slam_start", "cloud-yard", {"overwrite": False})
         calls = [c for c in orch.calls if c[0] in ("start", "slam_start")]
-        assert calls == [("start", "topomap"), ("slam_start", "cloud-yard")]
-        # SLAM is no session service
-        assert out["mapping_switch"] == {"topo": "started"}
-        assert out["mapping_services"] == {"topo": "running", "grid": "not_available"}
+        assert calls == [("slam_start", "cloud-yard")]   # no topomap start any more
+        assert "mapping_switch" not in out
+        assert out["mapping_services"] == {"topo": "not_running", "grid": "not_available"}
 
     async def test_a_run_already_recording_this_map_is_fine(self, db):
         orch, switch = slam_prepare(db)
@@ -1013,7 +671,7 @@ class TestSlam:
         orch.fail[("slam_start", "cloud-yard")] = error
         out = await start(db, switch)
         assert out["slam_warning"] and "'yard'" in out["slam_warning"]
-        assert db.open_session("r1") and orch.services["topomap"] is True
+        assert db.open_session("r1") and orch.services["topomap"] is False
         assert db.codes() == ["MAP.SESSION_STARTED"]       # nothing rolled back
 
     async def test_switch_start_never_raises(self, db):
@@ -1166,6 +824,10 @@ class TestViews:
         out = await maps.session_summary(None, "yard", switch)
         assert out["mapping_state"] is None and out["mapping_services"] is None
         await start(db, switch)
+        out = await maps.session_summary(None, "yard", switch)
+        assert out["mapping_state"]["status"] == "off"   # the user has not started the topomap
+        orch.services["topomap"] = True
+        switch.invalidate("r1")
         out = await maps.session_summary(None, "yard", switch)
         assert out["mapping_state"]["status"] == "on"
         assert out["mapping_state"]["session_id"] == out["open"]["session_id"]

@@ -1,23 +1,20 @@
-"""Ingest by mapping session (docs/satinav-maps-redesign.md §6, maps redesign M2).
+"""Ingest into the robot's open session's map (docs/satinav-maps-redesign.md §6, §14).
 
 graph-builder no longer writes to the robot's old `current_map` (removed in U6) or a
-`"default"` map. Every node and image from a robot goes to the robot's **open mapping
-session** (`map_sessions`, one per robot at most) or is dropped:
+`"default"` map. If the topomap runs on a robot (the user starts it from the robot's
+orchestrator; the API never switches it), every node and image from that robot goes to the map
+of the robot's **open session** (`map_sessions`, one per robot at most) using that session's
+map_T_session, whatever the session's purpose (`mapping` | `operate`), whether it is paused,
+and whatever state the map is in. A `session_id` in the payload is not checked (the robot does
+not know cloud sessions; a different one is only logged at debug). Otherwise it is dropped:
 
     reason            when
-    no_session        the robot has no open session
-    not_mapping_session  its open session is an `operate` session (maps §14: the robot uses
-                      the map and adds nothing)
-    session_paused    its session is paused
-    map_not_mapping   the session's map is not `mapping` (draft/ready/archived: defensive, the
-                      API keeps the two in step)
+    no_session        the robot has no open session (no current map)
     map_deleting      the map is being deleted (object lifecycle DELETING)
     map_missing       the session names a map without a Postgres row
-    session_unplaced  its mapping session is not placed (maps §14: a local map that already
-                      has nodes, until the user places the robot; any session after the
-                      robot's run frame reset, until it is placed again)
-    session_mismatch  the payload carries a `session_id` that is not the open session (robot-side
-                      tagging is M3; a payload without `session_id` is accepted)
+    session_unplaced  its session is not placed (maps §14: no transform yet, until the robot is
+                      placed on the map; any session after the robot's run frame reset, until it
+                      is placed again)
     datum_changed     geo session: the robot's current datum is not the one the session was
                       started with (a new robot run: its frame moved) and cannot be used to
                       re-anchor the session (see below: a datum in another UTM zone, a map
@@ -77,20 +74,15 @@ logger = logging.getLogger("GraphBuilderService.ingest")
 
 SESSION_CACHE_TTL_S = 1.0
 REJECT_EVENT_INTERVAL_S = 60.0
-ACCEPTING_STATES = ("mapping",)
 
 NO_SESSION = "no_session"
-NOT_MAPPING_SESSION = "not_mapping_session"
 SESSION_UNPLACED = "session_unplaced"
-SESSION_PAUSED = "session_paused"
-MAP_NOT_MAPPING = "map_not_mapping"
 MAP_DELETING = "map_deleting"
 MAP_MISSING = "map_missing"
-SESSION_MISMATCH = "session_mismatch"
 DATUM_CHANGED = "datum_changed"
 LOOKUP_FAILED = "lookup_failed"
-REASONS = (NO_SESSION, NOT_MAPPING_SESSION, SESSION_PAUSED, MAP_NOT_MAPPING, MAP_DELETING,
-           MAP_MISSING, SESSION_UNPLACED, SESSION_MISMATCH, DATUM_CHANGED, LOOKUP_FAILED)
+REASONS = (NO_SESSION, MAP_DELETING, MAP_MISSING, SESSION_UNPLACED, DATUM_CHANGED,
+           LOOKUP_FAILED)
 
 # One row per robot at most (partial unique index map_sessions_one_open_per_robot).
 OPEN_SESSION_SQL = (
@@ -158,7 +150,8 @@ class Resolution:
 
 def decide(robot_name: str, session: Optional[OpenSession],
            payload_session_id: Any = None) -> Resolution:
-    """The ingest rule (pure): see the module docstring."""
+    """The ingest rule (pure): see the module docstring. The session's purpose, pause flag, the
+    map's state and a differing payload session_id do not reject."""
     psid = str(payload_session_id) if payload_session_id not in (None, "") else None
     if session is None:
         return Resolution(robot_name, None, NO_SESSION, psid)
@@ -166,21 +159,16 @@ def decide(robot_name: str, session: Optional[OpenSession],
         reason = MAP_MISSING
     elif session.map_lifecycle == "DELETING":
         reason = MAP_DELETING
-    elif session.purpose != map_sessions.MAPPING:
-        reason = NOT_MAPPING_SESSION
-    elif session.paused or session.map_state == "paused":
-        reason = SESSION_PAUSED
-    elif session.map_state not in ACCEPTING_STATES:
-        reason = MAP_NOT_MAPPING
     elif not session.aligned:
         reason = SESSION_UNPLACED
-    elif psid is not None and psid != session.session_id:
-        reason = SESSION_MISMATCH
     elif (session.session_datum is not None and session.robot_datum is not None
           and not same_datum(session.session_datum, session.robot_datum)):
         reason = DATUM_CHANGED
     else:
         reason = None
+    if reason is None and psid is not None and psid != session.session_id:
+        logger.debug("Payload session_id %s of %s differs from its open session %s: accepted",
+                     psid, robot_name, session.session_id)
     return Resolution(robot_name, session, reason, psid)
 
 

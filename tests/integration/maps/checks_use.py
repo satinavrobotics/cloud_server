@@ -157,8 +157,8 @@ async def scenario():
     r2d._run_detector.on_connection("ONLINE", 1)
     await r2d._on_run_changed(r2d._run_detector.on_connection("ONLINE", 1))
     gb = query(ingest.OPEN_SESSION_SQL, (r2,))[0]
-    check(ingest.decide(r2, ingest.OpenSession.from_row(gb)).reason in (
-        ingest.SESSION_UNPLACED, ingest.NOT_MAPPING_SESSION), "graph-builder rejects it")
+    check(ingest.decide(r2, ingest.OpenSession.from_row(gb)).reason == ingest.SESSION_UNPLACED,
+          "graph-builder rejects it until it is placed")
     new = {**UTM_DATUM, "utm_easting": UTM_DATUM["utm_easting"] + 25.0}
     import packages.controllers.mission.vda5050_types as types
     await r2d._process_datum_message(types.RobotDatum(**new))

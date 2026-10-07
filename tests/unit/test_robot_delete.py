@@ -68,7 +68,6 @@ class FakeDb:
 
 def install(db, monkeypatch):
     finish = AsyncMock()
-    stop = AsyncMock()
 
     class Store:
         cursor = FakeCursor(db)
@@ -93,13 +92,12 @@ def install(db, monkeypatch):
 
     monkeypatch.setattr(maps, "open_store", open_store)
     monkeypatch.setattr(maps, "_finish_in", finish)
-    monkeypatch.setattr(maps, "stop_services", stop)
-    return finish, stop
+    return finish
 
 
 async def test_idle_delete_defaults_keep_history(monkeypatch):
     db = FakeDb(sessions=[{"session_id": "s1", "map_name": "m", "ended_at": None}])
-    finish, stop = install(db, monkeypatch)
+    finish = install(db, monkeypatch)
     out = await RobotDeleter(db).delete("r1")
     assert out == {"success": True, "message": "Robot r1 deleted",
                    "deleted": {"telemetry": False, "rosbags": False, "sessions_closed": 1}}
@@ -151,7 +149,7 @@ async def test_rosbag_failure_is_500_and_keeps_robot(monkeypatch):
 async def test_active_mission_is_409_and_mutates_nothing(monkeypatch, state, mission):
     db = FakeDb(robot_state=state, active_mission=mission,
                 sessions=[{"session_id": "s1", "map_name": "m", "ended_at": None}])
-    finish, _ = install(db, monkeypatch)
+    finish = install(db, monkeypatch)
     with pytest.raises(HTTPException) as exc:
         await RobotDeleter(db).delete("r1", delete_telemetry=True, delete_rosbags=True,
                                       rosbag_deleter=AsyncMock())
