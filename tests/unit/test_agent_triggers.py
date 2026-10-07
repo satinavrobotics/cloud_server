@@ -166,6 +166,18 @@ class TestBattery:
         curr = {"batteryState": {"batteryCharge": 10.0}}
         assert _types(detect_events(None, curr, battery_low_threshold=20.0)) == {"battery_low"}
 
+    def test_battery_unknown_does_not_fire_low_battery(self):
+        unknown = {"errorType": "BATTERY_UNKNOWN", "errorLevel": "WARNING"}
+        curr = {"batteryState": {"batteryCharge": 0.0}, "errors": [unknown]}
+        events = detect_events(None, curr, battery_low_threshold=20.0)
+        assert "battery_low" not in _types(events)
+
+    def test_real_low_reading_fires_after_unknown_clears(self):
+        unknown = {"errorType": "BATTERY_UNKNOWN", "errorLevel": "WARNING"}
+        prev = {"batteryState": {"batteryCharge": 0.0}, "errors": [unknown]}
+        curr = {"batteryState": {"batteryCharge": 10.0}}
+        assert _types(detect_events(prev, curr, battery_low_threshold=20.0)) == {"battery_low"}
+
 
 @pytest.mark.unit
 class TestMultipleAndSeverity:

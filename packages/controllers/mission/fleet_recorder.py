@@ -47,6 +47,7 @@ import re
 import uuid
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
+from packages.controllers.mission import battery
 from packages.events import causes, detectors
 from packages.events.codes import EventCode
 from packages.events.emit import Event, emit
@@ -272,7 +273,9 @@ class _Track:
         if not isinstance(active, bool):
             charge = (state_msg.get("batteryState") or {}).get("batteryCharge")
             active = None
-            if isinstance(charge, (int, float)):
+            unknown = any(e.get("errorType") == battery.BATTERY_UNKNOWN_ERROR_TYPE
+                          for e in state_msg.get("errors") or [])
+            if isinstance(charge, (int, float)) and not unknown:
                 if charge <= BATTERY_LOW_PCT:
                     active = True
                 elif charge >= BATTERY_OK_PCT:
@@ -642,7 +645,7 @@ class FleetRecorder:
                                   "description": e.errorDescription}
                             for key, e in current.items()}
 
-        if message.batteryState is not None:
+        if message.batteryState is not None and not battery.battery_unknown(message.errors):
             charge = message.batteryState.batteryCharge
             transition = track.battery.update(charge)
             if transition is detectors.Transition.ENTERED:
@@ -724,7 +727,9 @@ class FleetRecorder:
             "run_id": self._ctx.run_for(track.robot_name, ts),
             "x": pos.x if pos else None, "y": pos.y if pos else None,
             "yaw": pos.theta if pos else None, "map_id": pos.mapId if pos else None,
-            "battery": message.batteryState.batteryCharge if message.batteryState else None,
+            "battery": (message.batteryState.batteryCharge
+                        if message.batteryState and not battery.battery_unknown(message.errors)
+                        else None),
             "state": robot_state, "order_id": message.orderId or None,
             "last_node": message.lastNodeId or None, "driving": message.driving,
         })

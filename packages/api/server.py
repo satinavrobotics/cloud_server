@@ -2235,6 +2235,7 @@ class ApiDelegationService:
                     "status": {
                         "online": robot.status.online if hasattr(robot.status, 'online') else False,
                         "battery_level": robot.status.battery_level if hasattr(robot.status, 'battery_level') else 0,
+                        "battery_unknown": getattr(robot.status, 'battery_unknown', False),
                         "state": robot.status.state.value if hasattr(robot.status, 'state') else "IDLE",
                         "pose": {
                             "x": robot.status.pose.x if hasattr(robot.status, 'pose') else 0,

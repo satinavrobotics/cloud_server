@@ -167,6 +167,9 @@ class RobotStatusV1(pydantic.BaseModel):
     factsheet: RobotTypeIdentifierV1 = RobotTypeIdentifierV1()
     online: bool = False
     battery_level: float = 0.0
+    battery_unknown: bool = pydantic.Field(
+        False, description="True when the robot reports no usable charge reading; "
+                           "battery_level (0.0) is then meaningless.")
     position_initialized: Optional[bool] = pydantic.Field(
         None, description="VDA5050 agvPosition.positionInitialized as last reported; None if "
                           "never reported.")
@@ -283,8 +286,11 @@ class RobotObjectV1(RobotSpecV1, object.ApiObject):
     @staticmethod
     def get_query_map() -> Dict:
         return {
-            "min_battery": "(status->'battery_level')::float >= {}",
-            "max_battery": "(status->'battery_level')::float <= {}",
+            # A robot with no battery reading reports 0.0; keep it out of both ranges.
+            "min_battery": "(status->'battery_level')::float >= {} "
+                           "AND COALESCE((status->>'battery_unknown')::boolean, false) = false",
+            "max_battery": "(status->'battery_level')::float <= {} "
+                           "AND COALESCE((status->>'battery_unknown')::boolean, false) = false",
             "names": "name IN {}",
             "state": "status->>'state' = '{}'",
             "online": "status->>'online' = '{}'",

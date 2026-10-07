@@ -112,6 +112,9 @@ def _battery(state: Dict[str, Any]) -> Optional[float]:
     bs = state.get("batteryState") or {}
     if not isinstance(bs, dict):
         return None
+    # 0.0 + BATTERY_UNKNOWN means "no sensor", not an empty battery.
+    if any(e.get("errorType") == "BATTERY_UNKNOWN" for e in _errors(state)):
+        return None
     charge = bs.get("batteryCharge")
     try:
         return float(charge)

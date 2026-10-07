@@ -35,6 +35,7 @@ from collections import OrderedDict
 import pydantic
 
 from packages.utils.mqtt_client import MQTTClient
+from packages.controllers.mission import battery
 from packages.controllers.mission import behavior_tree
 from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
@@ -1277,6 +1278,8 @@ class Robot:
                     message.agvPosition.localizationScore
             if message.batteryState:
                 self._robot_object.status.battery_level = message.batteryState.batteryCharge
+                self._robot_object.status.battery_unknown = battery.battery_unknown(
+                    message.errors)
                 if message.batteryState.charging and not self._robot_object.status.state.running:
                     self._set_robot_state(
                         robot_object.RobotStateV1.CHARGING)
@@ -1290,6 +1293,7 @@ class Robot:
                 request_map = (not self._robot_object.status.pose.map_id
                                and self._robot_object.status.state.can_deploy_map)
                 send_charging_mission = (self._robot_object.battery.recommended_minimum
+                                         and not self._robot_object.status.battery_unknown
                                          and (self._robot_object.status.battery_level <=
                                               self._robot_object.battery.recommended_minimum)
                                          and not self._robot_object.status.state.running
