@@ -111,8 +111,6 @@ class RobotDeleter:
                      rosbag_deleter: Optional[Callable[[str], Awaitable[Dict[str, Any]]]] = None
                      ) -> Dict[str, Any]:
         robot, closed = await self._close_and_clear(robot_name, delete_telemetry, actor)
-        for session in closed:  # best effort: stops the mapping services on the robot
-            await maps.stop_services(self.db, self.switch, robot, session)
         if delete_rosbags:
             result = await rosbag_deleter(robot_name) if rosbag_deleter else {"success": False}
             if not result.get("success"):

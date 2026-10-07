@@ -2,16 +2,10 @@
 orchestrator (docs/satinav-maps-redesign.md section 15; replaces the MQTT `mapping/set` switch
 of maps M3/U5).
 
-A mapping session's `services` (packages/utils/map_sessions.py, today only `topo`) are the
-orchestrator services that capture for it:
-
-- opening a mapping session STARTS them (packages/api/maps.py calls start() OUTSIDE any DB
-  transaction: after the commit, closing the session again when the start fails; with `replace`
-  before it), resuming a paused one starts them again (re-paused when the start fails);
-- pausing or finishing STOPS them, best effort: an offline robot still has its session closed,
-  and the response says the service was not stopped (`robot_notified: false`, `mapping_warning`);
-- nodes are gated on the server only (graph-builder drops a node with no open, unpaused, placed
-  session): a service that keeps running for a closed session captures nothing that is kept.
+The API only READS the robot's services here and never starts or stops one for a session: the
+user starts the topomap from the robot's orchestrator, and graph-builder puts its nodes into the
+map of the robot's open session (any purpose, paused or not) while that session is placed. Only
+SLAM (below) is driven by the API.
 
 Orchestrator service names differ between the real robot (`topomap`) and the sim
 (`sim_topomap`): packages/config.py::MAPPING_SERVICE_CANDIDATES lists candidates per session
@@ -22,7 +16,7 @@ the orchestrator (GET /services/{name}/status), cached MAPPING_STATE_TTL_S secon
 `mapping_state` keeps the M3 shape:
 {online, service, enabled, session_id, map, nodes_sent, since, stamp, received_at, source:
 "orchestrator", orchestrator_service, status}. `status`: "on" the service runs and the robot's
-session captures (mapping, unpaused, placed), "off" it does not, "unreachable" the orchestrator
+open session (if any) is placed, "off" it does not, "unreachable" the orchestrator
 did not answer. null: the robot is offline, has no registered orchestrator address, or the
 robot's orchestrator has no such service (`mapping_services` says "not_available").
 
@@ -52,8 +46,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
-from fastapi import HTTPException
-
 from packages.api import orchestrator_client as oc
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.orchestrator_services import pick_service
@@ -77,10 +69,6 @@ SOURCE = "orchestrator"
 SLAM_STARTED, SLAM_ALREADY_RUNNING, SLAM_EXISTS = "started", "already_running", "exists"
 SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
     "saved", "nothing_to_save", "failed", "busy")
-
-# results per service of start() / stop()
-STARTED, ALREADY_RUNNING = "started", "already_running"
-STOPPED, ALREADY_STOPPED, FAILED = "stopped", "already_stopped", "failed"
 
 
 def _utcnow() -> datetime.datetime:
@@ -122,8 +110,7 @@ class Snapshot:
         if self.reachable is None:
             return None
         stamp = self.at.isoformat()
-        mine = session if session is not None and session.get("purpose", "mapping") == "mapping" \
-            else None
+        mine = session
         base = {"service": service, "session_id": str(mine["session_id"]) if mine else None,
                 "map": (mine.get("map") or mine.get("map_name")) if mine else None,
                 "nodes_sent": mine.get("node_count") if mine else None,
@@ -135,25 +122,13 @@ class Snapshot:
         if info is None:
             return None
         running = bool(info["running"])
-        capturing = running and (mine is None or (mine.get("state") == "mapping"
-                                                  and mine.get("aligned") is True))
+        capturing = running and (mine is None or mine.get("aligned") is True)
         started = info.get("started_at") if running else None
         return {**base, "online": running, "enabled": capturing,
                 "since": started.isoformat() if isinstance(started, datetime.datetime)
                 else started,
                 "status": "on" if capturing else "off",
                 "orchestrator_service": info["orchestrator"]}
-
-
-@dataclass
-class StopResult:
-    """stop(): per session service what happened; `warning` is set when anything failed."""
-    services: Dict[str, str] = field(default_factory=dict)
-    warning: Optional[str] = None
-
-    @property
-    def ok(self) -> bool:
-        return self.warning is None
 
 
 @dataclass
@@ -185,22 +160,6 @@ class _SaveFailed(Exception):
 def _looks_slow(error: str) -> bool:
     low = error.lower()
     return any(w in low for w in ("in time", "timed out", "timeout", "did not finish"))
-
-
-def _refuse(status: int, message: str) -> HTTPException:
-    return HTTPException(status_code=status, detail=message)
-
-
-def _start_error(robot_name: str, service: str, exc: oc.OrchestratorError) -> HTTPException:
-    what = f"Could not start mapping service '{service}' on robot '{robot_name}'"
-    if exc.kind == oc.NO_ADDRESS:
-        return _refuse(502, f"{what}: the robot has no registered orchestrator address "
-                            "(the orchestrator must register with the server)")
-    if exc.kind == oc.UNREACHABLE:
-        return _refuse(502, f"{what}: {exc.detail}")
-    if exc.kind == oc.TIMEOUT:
-        return _refuse(504, f"{what}: {exc.detail}")
-    return _refuse(502, f"{what}: the orchestrator answered {exc.status}: {exc.detail}")
 
 
 class MappingSwitch:
@@ -591,91 +550,6 @@ class MappingSwitch:
         orchestrator lists. Raises OrchestratorError."""
         listed = [str(s.get("name")) for s in await client.list_services()]
         return {svc: pick_service(listed, candidates_of(svc)) for svc in services}
-
-    # --- start / stop --------------------------------------------------------------------------
-
-    async def start(self, robot: Any, services: Sequence[str]) -> Dict[str, str]:
-        """Start each session service on the robot's orchestrator (one that already runs is
-        fine). Raises HTTPException (502 unreachable / no address / orchestrator error, 504
-        timeout, 409 the orchestrator has no such service); services this call started are
-        stopped again then. Returns {service: started | already_running}."""
-        name = getattr(robot, "name", "?")
-        client = self._client_factory(robot)
-        results: Dict[str, str] = {}
-        started: List[str] = []
-        try:
-            try:
-                names = await self.resolve(client, services)
-            except oc.OrchestratorError as exc:
-                raise _start_error(name, services[0] if services else "?", exc) from None
-            for svc in services:
-                orch = names[svc]
-                if orch is None:
-                    raise _refuse(409, f"Could not start mapping service '{svc}' on robot "
-                                       f"'{name}': its orchestrator has no such service "
-                                       f"(looked for {', '.join(candidates_of(svc))})")
-                try:
-                    await client.start(orch)
-                    results[svc] = STARTED
-                    started.append(svc)
-                except oc.OrchestratorError as exc:
-                    if exc.kind == oc.HTTP and exc.status == 409:
-                        results[svc] = ALREADY_RUNNING  # the orchestrator: already running
-                    else:
-                        raise _start_error(name, svc, exc) from None
-                logger.info("Mapping service %s (%s) on %s: %s", svc, orch, name, results[svc])
-        except HTTPException:
-            for svc in started:  # do not leave half a session running
-                try:
-                    await client.stop(names[svc])
-                except oc.OrchestratorError as exc:
-                    logger.warning("Rollback: mapping service %s on %s not stopped: %s",
-                                   svc, name, exc.detail)
-            self.invalidate(name)
-            raise
-        self.invalidate(name)
-        return results
-
-    async def stop(self, robot: Any, services: Sequence[str]) -> StopResult:
-        """Stop each session service, best effort; never raises. A service that is not running
-        is fine. The result carries a `warning` when the robot's orchestrator could not be
-        reached or a stop failed (the caller closes its session anyway)."""
-        name = getattr(robot, "name", "?")
-        result = StopResult()
-        if robot is None or not services:
-            return result
-        client = self._client_factory(robot)
-        failures: List[str] = []
-        try:
-            names = await self.resolve(client, services)
-        except oc.OrchestratorError as exc:
-            for svc in services:
-                result.services[svc] = FAILED
-            result.warning = (f"mapping service(s) {', '.join(services)} on robot '{name}' "
-                              f"could not be stopped: {exc.detail}")
-            logger.warning(result.warning)
-            self.invalidate(name)
-            return result
-        for svc in services:
-            orch = names[svc]
-            if orch is None:
-                result.services[svc] = ALREADY_STOPPED  # nothing by that name runs there
-                continue
-            try:
-                await client.stop(orch)
-                result.services[svc] = STOPPED
-            except oc.OrchestratorError as exc:
-                if exc.kind == oc.HTTP and exc.status == 404:
-                    result.services[svc] = ALREADY_STOPPED  # "not currently running"
-                else:
-                    result.services[svc] = FAILED
-                    failures.append(f"{svc}: {exc.detail}")
-        if failures:
-            result.warning = (f"mapping service could not be stopped on robot '{name}' "
-                              f"({'; '.join(failures)})")
-            logger.warning(result.warning)
-        self.invalidate(name)
-        return result
 
     # --- state ---------------------------------------------------------------------------------
 

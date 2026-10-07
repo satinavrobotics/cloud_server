@@ -592,13 +592,7 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     transaction. Errors: packages/api/maps.py (module docstring). 409 also while a
     relocalization job runs for the robot (mapping sessions only). A mapping session's services
     are started on the robot's orchestrator OUTSIDE any transaction, AFTER the commit
-    (commit-then-start): when the start fails (502 robot or orchestrator unreachable / not
-    registered, 504 timeout, 409 no such service there) the new session is closed again
-    (compensating close: its SESSION_STARTED gets a SESSION_FINISHED, the map's state is
-    restored; best effort, a session that could not be closed stays open for a manual finish)
-    and the error is returned. `replace` differs: the services start BEFORE the commit (after a
-    validation-only dry run), so a failed start changes nothing and the replaced session stays
-    open; if the commit then fails the started services are stopped again. The response: {map_id, map_state, changed, session, replaced_session,
+    No robot service is started or stopped (maps §14.16). The response: {map_id, map_state, changed, session, replaced_session,
     robot_notified, mapping_switch, mapping_service, mapping_services, mapping_state} (+
     `mapping_warning` when the replaced session's service could not be stopped). The session is
     the robot's map (maps §14.2; robots have no current_map since U6)."""
@@ -734,13 +728,8 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     """`pause`, `resume` or `finish` a session. Finishing the map's only open mapping session
     makes the map `ready`; finishing an operate session is "Stop using" (the map state does
     not change). pause/resume: mapping sessions only (409 on operate). Repeating an action
-    that is already in effect changes nothing in the session (a repeated pause/finish retries
-    the stop, a repeated resume the start). Resume commits, then starts the session's mapping
-    services on the robot's orchestrator (outside any transaction): when that fails (502/504/409)
-    the session is paused again (compensation, best effort) and the error is returned;
-    pause/finish stop them after the commit, best effort: when the robot is offline the
-    session is closed anyway and the response has `robot_notified: false` and `mapping_warning`.
-    The response adds `robot_notified`, `mapping_switch` and `mapping_state`."""
+    that is already in effect changes nothing in the session (no robot service is started or stopped). The response adds
+    `robot_notified` (always true) and `mapping_state`."""
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),

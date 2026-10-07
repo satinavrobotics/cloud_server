@@ -81,15 +81,21 @@ class TestDecide:
     @pytest.mark.parametrize("kw,reason", [
         ({"map_lifecycle": None}, ingest.MAP_MISSING),
         ({"map_lifecycle": "DELETING"}, ingest.MAP_DELETING),
-        ({"paused": True}, ingest.SESSION_PAUSED),
-        ({"map_state": "paused"}, ingest.SESSION_PAUSED),
-        ({"map_state": "ready"}, ingest.MAP_NOT_MAPPING),
-        ({"map_state": "archived"}, ingest.MAP_NOT_MAPPING),
-        ({"map_state": "draft"}, ingest.MAP_NOT_MAPPING),
+        ({"aligned": False}, ingest.SESSION_UNPLACED),
     ])
     def test_rejections(self, kw, reason):
         r = ingest.decide("r1", _session(**kw))
         assert not r.accepted and r.reason == reason
+
+    @pytest.mark.parametrize("kw", [
+        {"purpose": "operate"}, {"purpose": "operate", "map_state": "ready"},
+        {"paused": True}, {"map_state": "paused"}, {"map_state": "ready"},
+        {"map_state": "archived"}, {"map_state": "draft"},
+    ])
+    def test_any_session_state_is_accepted(self, kw):
+        """The robot's one open session decides, whatever its purpose, pause flag or map state."""
+        r = ingest.decide("r1", _session(**kw))
+        assert r.accepted and r.map_name == "yard"
 
     def test_no_session(self):
         assert ingest.decide("r1", None).reason == ingest.NO_SESSION
@@ -97,8 +103,8 @@ class TestDecide:
     def test_payload_session_id(self):
         assert ingest.decide("r1", _session(), "s1").accepted
         assert ingest.decide("r1", _session(), "").accepted  # untagged (pre-M3 robot)
-        r = ingest.decide("r1", _session(), "other")
-        assert r.reason == ingest.SESSION_MISMATCH and r.payload_session_id == "other"
+        r = ingest.decide("r1", _session(), "other")  # the robot does not know cloud sessions
+        assert r.accepted and r.payload_session_id == "other"
 
     def test_datum_changed(self):
         same = _session(session_datum=dict(ENU_DATUM), robot_datum=dict(ENU_DATUM))
@@ -138,8 +144,11 @@ class TestSessionResolver:
         assert (await res.resolve("r1")).accepted and calls == ["r1"]  # cached
         rows[0] = (*m1_row[:2], True, *m1_row[3:])  # paused through the API
         now[0] = 1.0
-        assert (await res.resolve("r1")).reason == ingest.SESSION_PAUSED  # seen within 1 s
+        assert (await res.resolve("r1")).accepted  # a paused session still takes nodes
         assert calls == ["r1", "r1"]
+        rows[0] = None  # session finished through the API
+        now[0] = 2.0
+        assert (await res.resolve("r1")).reason == ingest.NO_SESSION  # seen within 1 s
 
     async def test_failed_lookup_is_not_cached(self):
         fetch = AsyncMock(side_effect=[RuntimeError("pg down"), None])
@@ -248,8 +257,6 @@ class TestIngestService:
 
     @pytest.mark.parametrize("row,reason", [
         (None, "no_session"),
-        (_row(paused=True), "session_paused"),
-        (_row(state="ready"), "map_not_mapping"),
         (_row(lifecycle="DELETING"), "map_deleting"),
         (_row(lifecycle=None), "map_missing"),
     ])
@@ -271,13 +278,25 @@ class TestIngestService:
         assert service._write_event.await_count == 1
         assert service.rejects.dropped == {"nodes": 2, "images": 2, "depth": 0}
 
-    async def test_payload_session_id_must_match(self):
+    async def test_payload_session_id_is_not_checked(self):
         service = _gb(_row())
         await service._handle_node_update({**NODE, "session_id": "s-other"})
-        service.graph_db.add_node.assert_not_called()
-        assert service._write_event.await_args.args[0].payload["reason"] == "session_mismatch"
-        await service._handle_node_update({**NODE, "session_id": "s1"})
         service.graph_db.add_node.assert_called_once()
+        service._write_event.assert_not_awaited()
+
+    @pytest.mark.parametrize("kw", [{"paused": True}, {"state": "ready"}, {"state": "paused"}])
+    async def test_paused_or_not_mapping_map_still_takes_nodes(self, kw):
+        service = _gb(_row(**kw))
+        await service._handle_node_update(dict(NODE))
+        service.graph_db.add_node.assert_called_once()
+        service._count_nodes.assert_awaited_once_with("s1")
+        service._write_event.assert_not_awaited()
+
+    async def test_operate_session_takes_nodes(self):
+        service = _gb(_row() + ("operate", True))
+        await service._handle_node_update(dict(NODE))
+        service.graph_db.add_node.assert_called_once()
+        service._write_event.assert_not_awaited()
 
     async def test_mission_without_register_map_still_suppresses_ingest(self):
         mission = Mock(register_map=False)
@@ -329,7 +348,7 @@ class TestIngestService:
         assert ("r1", 7) in service.image_buffer
 
     async def test_rejected_image(self):
-        service = _gb(_row(paused=True))
+        service = _gb(_row(lifecycle="DELETING"))
         await service._handle_image_upload(dict(IMAGE))
         assert service.image_buffer == {} and service.stats["images_rejected"] == 1
         assert service._write_event.await_args.args[0].payload["dropped_images"] == 1

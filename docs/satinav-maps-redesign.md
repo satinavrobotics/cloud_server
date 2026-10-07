@@ -160,7 +160,7 @@ This redesign builds on it: geo maps store UTM directly, so converting for displ
 
 ## 6. Ingest (graph-builder)
 
-- Resolve the robot's **open session**, not `current_map`. No open session, or session paused → drop the node and image. Count the drops and emit a rate-limited `MAP.INGEST_REJECTED` event, so nothing is lost silently.
+- Resolve the robot's **open session**, not `current_map`. No open session → drop the node and image. **Superseded (2026-10-07, user decision, §14.16):** the open session of any purpose, paused or not, takes the data. Count the drops and emit a rate-limited `MAP.INGEST_REJECTED` event, so nothing is lost silently.
 - The silent `"default"` map is removed.
 - Nodes and images resolve the session the same way (fixes the payload-vs-DB split).
 - Convert the pose with `map_T_session`; store both poses.
@@ -303,9 +303,8 @@ graph-builder, dispatch, planner; with 2e0b63a).
   one query (`map_sessions` ⋈ `mapobjectv1` ⋈ `robotobjectv1`), cached 1 s per robot, so a
   pause/finish takes effect within ~1 s without a second LISTEN connection. Nodes **and** images
   go to the session's map; the payload `map_id` is ignored (images used to land in `default`).
-  Dropped, with a reason: `no_session`, `session_paused`, `map_not_mapping`, `map_deleting`,
-  `map_missing`, `session_mismatch` (a payload `session_id` that is not the open one; untagged
-  payloads are accepted until M3), `datum_changed` (a session whose robot datum changed since
+  Dropped, with a reason: `no_session`, `map_deleting`, `map_missing`, `session_unplaced`,
+  `datum_changed` (a session whose robot datum changed since
   it started and cannot be re-anchored: a local map, or a datum in another UTM zone; on a geo
   map a restart is re-anchored, see §13.4),
   `lookup_failed`. The images buffered for a dropped node are dropped with it. The silent
@@ -927,10 +926,36 @@ untouched.
   `packages/api/mapping_control.py`. A one-time cleanup clears the retained topics on the broker
   (`~/pg-cutover/scripts/mapsorch.sh`).
 
+**Superseded by §14.16:** the API no longer starts or stops the topomap for a session.
+
 **Not done (open):** nothing reconciles running services with sessions after an API restart, an
 orchestrator restart or a robot reboot (the old retained message did); a service that keeps
 running for a closed session captures nothing that is kept. `grid` has no orchestrator service
 yet (the default name `grid` is a placeholder).
+
+---
+
+### 14.16 No mapping gating, no topomap switching (2026-10-07, user decision)
+
+If the topomap runs on a robot, the user started it from the robot's orchestrator, and its nodes
+and images go into the robot's **current map**: the map of the robot's one open session
+(`map_sessions`), converted with that session's `map_T_session`. graph-builder `decide()` now
+rejects only: `no_session` (no current map), `map_missing`, `map_deleting`,
+`session_unplaced` (no transform yet: placing the robot fixes it), `datum_changed` (geo realign
+logic unchanged) and `lookup_failed`. It no longer looks at the session's `purpose` (operate
+sessions add nodes too), `paused_at`, the map's state, or a payload `session_id` (the robot does
+not know cloud sessions; a differing one is logged at debug). `node_count` still increments.
+The retired reasons `not_mapping_session`, `session_paused`, `map_not_mapping`,
+`session_mismatch` are only found in old `MAP.INGEST_REJECTED` events. A draft map cannot have
+an operate session (409), so no state transition is needed.
+
+The API never starts or stops a robot service for a session: open / pause / resume / finish /
+replace, robot delete and the orphan paths make no `POST /services/{name}/start|stop` call
+(`MappingSwitch.start/stop`, `StopResult`, the compensation of a failed start and the resume
+409 for an offline robot are gone). Response fields stay: `mapping_state`, `mapping_service`,
+`mapping_services` are still READ from the orchestrator; `robot_notified` is always true;
+`mapping_warning` and `mapping_switch` are no longer returned; `services` in the session start
+body is accepted and ignored. SLAM recording (`slam_map` maps) is unchanged.
 
 ---
 

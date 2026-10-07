@@ -302,11 +302,11 @@ class MapDeleted(Payload):
 
 class MapIngestRejected(Payload):
     """MAP.INGEST_REJECTED (packages/services/graph_builder/ingest.py): robot data dropped by
-    graph-builder because it had no session to go to. Rate-limited per robot and reason:
+    graph-builder because it had no (usable) open session to go to. Older events may carry the retired reasons
+    not_mapping_session, session_paused, map_not_mapping, session_mismatch. Rate-limited per robot and reason:
     `dropped_nodes` / `dropped_images` count every drop since `since` (the first drop not yet
-    reported). `reason`: no_session, not_mapping_session (an operate session), session_paused,
-    map_not_mapping, map_deleting, session_unplaced (maps §14: not placed yet),
-    map_missing, session_mismatch, datum_changed (not re-anchorable: local map, other UTM
+    reported). `reason`: no_session, map_deleting, session_unplaced (maps §14: not placed yet),
+    map_missing, datum_changed (not re-anchorable: local map, other UTM
     zone), lookup_failed. `dropped_depth` (3D reconstruction R2): depth images dropped (absent
     on events written before R2)."""
     reason: str
