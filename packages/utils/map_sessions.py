@@ -34,11 +34,15 @@ from packages.utils import geo, map_geo
 
 MAPPING, OPERATE = "mapping", "operate"
 PURPOSES = (MAPPING, OPERATE)
-TOPO, GRID = "topo", "grid"
-# Mapping services a session can switch on (§14.5). `grid` is reserved for sati_grid_mapping,
+TOPO, GRID, SLAM = "topo", "grid", "slam"
+# Orchestrator services a session can switch on (§14.5). `grid` is reserved for sati_grid_mapping,
 # which does not exist yet: accepted, and robots that do not run it ignore it.
-KNOWN_SERVICES = (TOPO, GRID)
-DEFAULT_SERVICES = (TOPO,)
+ORCHESTRATOR_SERVICES = (TOPO, GRID)
+# What a session's `services` may name: the orchestrator services plus `slam`, the SLAM map
+# recording (§14.15; not an orchestrator service: driven by the SLAM calls of mapping_switch).
+KNOWN_SERVICES = (TOPO, GRID, SLAM)
+DEFAULT_SERVICES = (TOPO,)  # when the request omits `services` (+ SLAM on a slam_map map)
+SERVICE_LABELS = {TOPO: "Topomap", GRID: "Grid map", SLAM: "SLAM map"}
 
 # The robot must stand still while it is placed (decision Q-U7). These are sensor noise, not a
 # movement allowance: the pose shown to the user and the pose at confirm may differ by this much.

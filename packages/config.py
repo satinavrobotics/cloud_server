@@ -100,7 +100,7 @@ MQTT_DEPTH_TOPIC = os.getenv("MQTT_DEPTH_TOPIC", "robot/depth_upload")
 MQTT_VDA5050_PREFIX = os.getenv("MQTT_VDA5050_PREFIX", "uagv/v2/RobotCompany")
 
 # ==================== Mapping switch through the robot's orchestrator ====================
-# A mapping session's services (packages/utils/map_sessions.py::KNOWN_SERVICES) are started and
+# A mapping session's services (packages/utils/map_sessions.py::ORCHESTRATOR_SERVICES) are started and
 # stopped on the robot's satibot_orchestrator (packages/api/mapping_switch.py). The orchestrator
 # names them differently on the real robot and in the sim: per session service, an ordered list
 # of candidate orchestrator service names; the first one the robot's orchestrator lists is used.

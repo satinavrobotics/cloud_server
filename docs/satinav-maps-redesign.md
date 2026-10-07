@@ -879,7 +879,10 @@ untouched.
   `mapping_warning`; a repeated pause/finish retries the stop. A finish of an old session never
   stops a service another open session of the robot runs.
 - *SLAM map* (`slam_map` on a local map; set at creation and switchable later with `PATCH /maps/{id}`
-  `{"slam_map": bool}` (below); cleared when the map becomes geo): not a session service. A mapping session's start calls the orchestrator's
+  `{"slam_map": bool}` (below); cleared when the map becomes geo): chosen **per session** since 2026-10-08: `"slam"` in the
+  session's `services` (omitted = topo, plus slam on a slam_map map; explicit lists incl. `[]` are exact; `slam` on a plain local map sets
+  `slam_map`, on a geo map 400); resume starts it again, finish saves it for sessions with `slam` (older ones: slam_map map and the robot
+  records it). Not an orchestrator service. A mapping session's start with `slam` calls the orchestrator's
   `POST /maps/cloud-<map>/mapping/start {overwrite: false}` after the topomap started (409 "already
   has a map file" = warning "SLAM map already exists, not re-recorded"); finish saves in a background
   task (`POST /maps/cloud-<map>/save {cloud_map_id, cloud_session_id, stop_after: true}`, a per-robot

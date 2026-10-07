@@ -586,7 +586,8 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     redesign M1, §14). `purpose`: "mapping" (default: the robot adds data; the map goes to
     `mapping` and graph-builder stores the robot's nodes and images in it) or "operate" (the
     robot uses the map for missions and display and adds nothing; the map state does not
-    change). `services` (mapping only, default ["topo"]); `placement` {pose: {x, y, yaw},
+    change). `services` (mapping only: "topo" | "grid" | "slam"; omitted = ["topo"] plus "slam" on a
+    slam_map map; [] starts nothing; "slam" on a geo map: 400); `placement` {pose: {x, y, yaw},
     robot_pose: {x, y, theta}} puts the robot on a LOCAL map (422 on a geo map, which is placed
     by the robot's datum); `replace: true` finishes the robot's open session in the same
     transaction. Errors: packages/api/maps.py (module docstring). 409 also while a

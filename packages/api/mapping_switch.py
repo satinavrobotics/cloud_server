@@ -31,7 +31,7 @@ robot's orchestrator has no such service (`mapping_services` says "not_available
 
 SLAM maps (a local map with `slam_map`, docs/satinav-maps-redesign.md 14.15): besides the
 topomap, a mapping session records a SLAM map on the robot, under onboard_map_name(map). It is
-not a session service (never in KNOWN_SERVICES / MAPPING_SERVICE_CANDIDATES): start_slam() after
+not an orchestrator service (never in ORCHESTRATOR_SERVICES / MAPPING_SERVICE_CANDIDATES): start_slam() after
 the topomap started, save_slam() after the session finished, both best effort, never raising,
 never blocking or undoing the session; what went wrong is a `warning` the caller returns as
 `slam_warning`. Saving takes minutes (a background save on the orchestrator, polled; a save that timed out is retried and the driver is never stopped after a failed save), so a finish saves in a background task (schedule_slam_save)
@@ -63,7 +63,7 @@ from packages.config import (
     MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_SAVE_POLL_S,
     ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S,
 )
-from packages.utils.map_sessions import KNOWN_SERVICES, TOPO
+from packages.utils.map_sessions import ORCHESTRATOR_SERVICES, TOPO
 
 logger = logging.getLogger("ApiDelegationService.mapping_switch")
 
@@ -111,7 +111,7 @@ class Snapshot:
         return RUNNING if info["running"] else NOT_RUNNING
 
     def mapping_services(self) -> Dict[str, str]:
-        return {name: self.availability(name) for name in KNOWN_SERVICES}
+        return {name: self.availability(name) for name in ORCHESTRATOR_SERVICES}
 
     def mapping_service(self) -> str:
         """The topomap: running | not_running (M3 `mapping_service`)."""
@@ -152,6 +152,7 @@ class SlamResult:
     status: str
     warning: Optional[str] = None
     driver: Optional[str] = None   # the orchestrator service that records (its answer), if named
+    reason: Optional[str] = None   # a failed start: the bare reason (the orchestrator's message)
 
     @property
     def ok(self) -> bool:
@@ -227,8 +228,8 @@ def slam_start_action(result: SlamResult) -> Dict[str, Any]:
         return robot_action(service, RESTART, True, label)
     if result.status == SLAM_ALREADY_RUNNING:
         return robot_action(service, START, True, "SLAM recording already running")
-    return robot_action(service, RESTART, False,
-                        f"Could not start SLAM recording: {result.warning}", result.warning)
+    return robot_action(service, RESTART, False, result.warning or "SLAM recording not started",
+                        result.reason or result.warning)
 
 
 def slam_save_action(result: Optional[SlamResult] = None, detail: Optional[str] = None,
@@ -350,8 +351,8 @@ class MappingSwitch:
         name = getattr(robot, "name", "?")
         onboard = oc.onboard_map_name(map_name)
         if self.slam_save_pending(name):
-            return SlamResult(SLAM_BUSY, f"SLAM map of robot '{name}' is still being saved; "
-                                         f"'{map_name}' is not recorded")
+            reason = f"robot '{name}' is still saving its previous SLAM map"
+            return SlamResult(SLAM_BUSY, f"SLAM recording not started: {reason}", reason=reason)
         try:
             async with self.slam_lock(name):
                 client = self._client_factory(robot)
@@ -374,7 +375,7 @@ class MappingSwitch:
                 return SlamResult(SLAM_STARTED, driver=driver)
         except Exception as exc:  # noqa: BLE001 - never blocks a session
             logger.exception("SLAM start on %s failed", name)
-            return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not recorded: {exc}")
+            return SlamResult(SLAM_FAILED, f"SLAM recording not started: {exc}", reason=str(exc))
         finally:
             self._slam_done(name)
 
@@ -383,8 +384,8 @@ class MappingSwitch:
         detail = (exc.detail or "").lower()
         if exc.kind == oc.HTTP and exc.status == 409 and "already has a map file" in detail:
             return SlamResult(SLAM_EXISTS, "SLAM map already exists, not re-recorded")
-        return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not recorded on robot "
-                                       f"'{name}': {exc.detail}")
+        return SlamResult(SLAM_FAILED, f"SLAM recording not started: {exc.detail}",
+                          reason=exc.detail)
 
     async def save_slam(self, robot: Any, map_name: str, session_id: Any) -> SlamResult:
         """Save the SLAM map the robot records for `map_name` (the driver is stopped by the
@@ -489,6 +490,16 @@ class MappingSwitch:
         except oc.OrchestratorError:
             return False
         return st.get("status") == "saving" and st.get("map") in (None, onboard)
+
+    async def slam_records(self, robot: Any, map_name: str) -> bool:
+        """Whether the robot's SLAM driver is recording cloud map `map_name` right now (its
+        orchestrator says so). False on any error. Decides whether a session that did not ask
+        for `slam` (opened before the option existed) still has a SLAM map to save."""
+        try:
+            state = await self._client_factory(robot).slam_state()
+            return bool(state.get("active")) and state.get("map") == oc.onboard_map_name(map_name)
+        except Exception:  # noqa: BLE001
+            return False
 
     def slam_driver(self, robot_name: str) -> Optional[str]:
         """The SLAM driver service last seen for the robot (from start_slam), or None."""
@@ -793,7 +804,7 @@ class MappingSwitch:
             return Snapshot(reachable=None)
         client = self._client_factory(robot)
         try:
-            names = await self.resolve(client, KNOWN_SERVICES)
+            names = await self.resolve(client, ORCHESTRATOR_SERVICES)
             services: Dict[str, Optional[Dict[str, Any]]] = {}
             for svc, orch in names.items():
                 if orch is None:

@@ -224,7 +224,6 @@ class TestStartMatrix:
         ({"purpose": "watch"}, "purpose"),
         ({"purpose": "operate", "services": ["topo"]}, "services"),
         ({"services": ["lidar"]}, "services"),
-        ({"services": []}, "services"),
         ({"placement": {"pose": {"x": 1, "y": 2}}}, "placement"),
         ({"replace": "maybe"}, "replace")])
     async def test_422(self, db, body, loc):
