@@ -230,11 +230,13 @@ class TestStillnessInTheApi:
         _robot(db, state="ON_TASK")
         db.state_msgs["r1"] = dict(STILL)
         db.missions_open["r1"] = True
-        code, detail = await _status(_start(db, purpose="operate", placement=_place_body()))
-        assert code == 409 and "active order" in detail
-        db.missions_open["r1"] = False
         out = await _start(db, purpose="operate", placement=_place_body())
         assert out["session"]["aligned"] is True
+        assert any("active order" in w for w in out["warnings"])    # a warning, no refusal
+        await maps.session_action(None, "shed", out["session"]["session_id"], "finish", PUB)
+        db.missions_open["r1"] = False
+        out = await _start(db, purpose="operate", placement=_place_body())
+        assert out["session"]["aligned"] is True and "warnings" not in out
 
 
 # --- placement reuse: pure ----------------------------------------------------------------------

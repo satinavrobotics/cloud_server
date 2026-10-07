@@ -650,8 +650,7 @@ async def map_reloc(map_id: str, robot: str):
 async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     """Place the session's robot on a local map (maps §14.3) `{pose: {x, y, yaw}, robot_pose:
     {x, y, theta}}`: `pose` in the map frame, `robot_pose` = the robot's own pose the user saw.
-    The robot must stand still (409 while it drives or when it moved by more than 0.02 m /
-    0.5 deg). 409 on a finished session, a geo map, an already placed mapping session. From
+    A robot that drives or moved by more than 0.02 m / 0.5 deg is placed anyway, with `warnings`. 409 on a finished session or a geo map. From
     then on graph-builder keeps the session's nodes (the services are not touched).
     `{"source": "reloc"}` (no poses): the robot relocalises itself on the stored map its
     orchestrator holds; identity placement, no still check; 409 when it does not hold the map.
@@ -665,12 +664,12 @@ async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     poll GET .../reloc-job, cancel with DELETE .../reloc-job. The 202 body is
     `{map_id, map_state, changed: false, session: <still unplaced>, reloc_job: {id, state, step,
     mode, started_at, deadline}}` (`deadline` is an estimate until the job waits for the robot).
-    `can_start` (the reloc reads, `can_start_reason`) is false, with the reason, while the robot
-    drives, has an open mapping session, another job runs or a SLAM save is pending, so a client
-    that honours it is never refused; place answers 409 with the same reasons (a bare reloc on an
-    unplaced MAPPING session is refused that way), and 409 for an `init_pose` without
-    `can_start`. Without `can_start` because the orchestrator cannot do it, the bare reloc
-    placement is the check-only 200 as before. Jobs live in this process only (single API
+    `can_start` (the reloc reads) is true whenever the robot exists; `warning` (= `can_start_reason`)
+    is a non-blocking text on what may make the job fail (offline, no orchestrator, no stored map,
+    another job, a pending SLAM save: place answers 409 for the last two). The job proposes the
+    placement (state `confirming`) and places on POST .../reloc-job/confirm (or by itself after
+    RELOC_CONFIRM_TIMEOUT_S); POST .../reloc-job/edit ends it for manual placement. A manual place
+    never refuses a driving or moved robot: the answer carries `warnings`. Jobs live in this process only (single API
     worker)."""
     _require_service()
     out = await _site_call("place map session", maps.place_session(
@@ -694,8 +693,10 @@ def _reloc_job_of(map_id: str, session_id: str):
 @app.get("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job")
 async def get_reloc_job(map_id: str, session_id: str):
     """The session's latest relocalization job: {id, state: preparing | starting | waiting |
-    placed | failed | cancelled, step, mode: odin | assisted, started_at, deadline, error?,
-    position_initialized?, localization_score?}. 404 when there is none (also after an API
+    confirming | placed | failed | cancelled | edit, step, mode: odin | assisted, started_at,
+    deadline, error?, warnings?, position_initialized?, localization_score?, proposal? {map_T_session,
+    pose, robot_pose, localization_score, confirm_deadline}, confirm_deadline?, auto_confirmed?}
+    (see packages/api/README.md). 404 when there is none (also after an API
     restart: the registry is in memory)."""
     _require_service()
     return _reloc_job_of(map_id, session_id).view()
@@ -711,13 +712,32 @@ async def cancel_reloc_job(map_id: str, session_id: str):
     return (await service.reloc_jobs.cancel(_reloc_job_of(map_id, session_id))).view()
 
 
+@app.post("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job/confirm")
+async def confirm_reloc_job(map_id: str, session_id: str):
+    """Confirm the proposal of the session's `confirming` relocalization job: the session is placed
+    (identity map_T_session, source reloc, MAP.SESSION_PLACED) and the job ends `placed`. Returns
+    the job. 404 no job; 409 the job is not `confirming` (or was decided already)."""
+    _require_service()
+    return (await service.reloc_jobs.confirm(_reloc_job_of(map_id, session_id))).view()
+
+
+@app.post("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job/edit")
+async def edit_reloc_job(map_id: str, session_id: str):
+    """Reject the proposal of the `confirming` job to place by hand: the job ends `edit` (nothing
+    is placed and nothing is rolled back: the relocalization driver keeps running). Returns the
+    job with its `proposal` so the client can open manual placement prefilled. 404 no job; 409 not
+    `confirming`."""
+    _require_service()
+    return (await service.reloc_jobs.edit(_reloc_job_of(map_id, session_id))).view()
+
+
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/unplace")
 async def unplace_map_session(map_id: str, session_id: str):
     """Mark a placed OPERATE session on a LOCAL map as not placed (the old placement is kept for
     "last position"). PURPOSE: a developer / test hook, and "redo my placement": the system
     unplaces by itself when the robot's run changes; this lets the place and relocalization flows
-    be re-run without restarting robot services. 409 on a finished or mapping session, a geo map,
-    or while a relocalization job runs; an already unplaced session answers `changed: false`."""
+    be re-run without restarting robot services. 409 on a finished session, a geo map,
+    or while a relocalization job runs (a mapping session is unplaced with a `warnings` entry); an already unplaced session answers `changed: false`."""
     _require_service()
     return await _site_call("unplace map session", maps.unplace_session(
         service.database, map_id, session_id, uuid.uuid4(), recording.request_actor(),

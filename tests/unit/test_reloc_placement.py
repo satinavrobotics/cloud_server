@@ -33,7 +33,8 @@ pytestmark = pytest.mark.unit
 
 # `can_start` / `can_start_reason` were added to every reloc read (additive; reloc_job.py). The
 # FakeHolder below cannot start anything, so it is always this:
-NO_START = {"can_start": False, "can_start_reason": "relocalization cannot be started from here"}
+NO_START = {"can_start": False, "can_start_reason": "relocalization cannot be started from here",
+            "warning": "relocalization cannot be started from here"}
 
 
 def _robot(db, name="r1", online=True, address=True, **status):
@@ -344,19 +345,21 @@ class TestPlaceReloc:
 
     async def test_the_still_check_is_not_called(self, db):
         async def boom(*a, **k):
-            raise AssertionError("check_robot_still must not run for reloc")
+            raise AssertionError("placement_warnings must not run for reloc")
         from unittest.mock import patch
-        with patch.object(maps, "check_robot_still", boom):
+        with patch.object(maps, "placement_warnings", boom):
             out, _ = await self._place(db, FakeHolder(True))
         assert out["session"]["aligned"] is True
 
-    async def test_manual_placement_still_checks_the_robot(self, db):
+    async def test_manual_placement_of_a_moved_robot_succeeds_with_a_warning(self, db):
         _robot(db)
         s = _unplaced(db)
         body = {"pose": {"x": 1.0, "y": 2.0, "yaw": 0.3},
                 "robot_pose": {"x": 5.0, "y": 0.0, "theta": 0.0}}
-        assert await _status(maps.place_session(None, "shed", str(s["session_id"]), body,
-                                                m1.PUB, holder=FakeHolder(True))) == 409
+        out = await maps.place_session(None, "shed", str(s["session_id"]), body, m1.PUB,
+                                       holder=FakeHolder(True))
+        assert out["session"]["aligned"] is True
+        assert any("moved" in w for w in out["warnings"])
 
     @pytest.mark.parametrize("answer", [False, None])
     async def test_not_held_or_unknown_is_refused(self, db, answer):
@@ -552,7 +555,8 @@ class TestMapReloc:
         h = FakeHolder(True)
         assert await maps.map_reloc(None, h, "geo1", "r1") == {
             "available": False, "known": True, "source": "orchestrator", "can_start": False,
-            "can_start_reason": "a geo map is placed by its datum, not relocalized"}
+            "can_start_reason": "a geo map is placed by its datum, not relocalized",
+            "warning": "a geo map is placed by its datum, not relocalized"}
         assert h.calls == []
         assert await _status(maps.map_reloc(None, h, "nomap", "r1")) == 404
 

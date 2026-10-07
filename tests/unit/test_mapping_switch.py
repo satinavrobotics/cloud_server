@@ -711,11 +711,11 @@ class TestServiceSwitching:
         orch, switch = prepare(db)
         sid = (await start(db, switch))["session"]["session_id"]
         orch.calls.clear()
-        # the first session of an empty local map is placed already: 409, and no service call
-        with pytest.raises(HTTPException):
-            await maps.place_session(None, "yard", sid, {
-                "pose": {"x": 0, "y": 0, "yaw": 0},
-                "robot_pose": {"x": 0, "y": 0, "theta": 0}}, m1.PUB, switch=switch)
+        # the first session of an empty local map is placed already; re-placing it by hand is
+        # allowed (with a warning) and makes no service call
+        await maps.place_session(None, "yard", sid, {
+            "pose": {"x": 0, "y": 0, "yaw": 0},
+            "robot_pose": {"x": 0, "y": 0, "theta": 0}}, m1.PUB, switch=switch)
         assert ops(orch, "start", "stop") == []
 
     async def test_unknown_action_and_session(self, db):

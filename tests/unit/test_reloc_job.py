@@ -105,7 +105,16 @@ class RelocClient:
 
     async def get_map(self, name):
         self.o.enter("get_map", name)
+        if not self.o.rows:     # no stored map at all: the robot does not know it
+            raise _http(404, f"map '{name}' not found")
         return {"name": name, "init_pos": self.o.init_pos}
+
+    async def mapping_state(self):    # an older orchestrator: no such route
+        raise _http(404, "no such route")
+
+    async def relocalize(self, name):
+        self.o.enter("relocalize", name)
+        raise _http(404, "no such route")
 
     async def patch_map(self, name, body):
         self.o.enter("patch_map", (name, body))
@@ -134,6 +143,11 @@ class RelocClient:
             raise _http(409, "already running")
         self.o.services[name] = True
         return {"success": True}
+
+
+async def _get_map_any(self, name):
+    self.o.enter("get_map", name)
+    return {"name": name, "init_pos": self.o.init_pos}
 
 
 class _NoMappingOrch:
@@ -200,8 +214,8 @@ def env():
         await (e.block.wait() if e.block is not None else asyncio.sleep(0))
 
     jobs = rj.RelocJobs(client_factory=lambda robot: RelocClient(orch), clock=lambda: now[0],
-                        sleep=sleep, timeout=90.0, poll=1.0, settle=5.0,
-                        candidates=["odin_reloc"])
+                        sleep=sleep, timeout=90.0, poll=1.0, settle=5.0, confirm_timeout=0.0,
+                        candidates=["odin_reloc"])   # 0: the job confirms by itself at once
     e = Env(d, orch, CapHolder(), jobs, _switch(), now)
     with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow", m1.Clock()):
         yield e
@@ -265,22 +279,26 @@ class TestCapability:
         (dict(), dict(held=False), "does not hold"),
         (dict(), dict(fail=oc.OrchestratorError(oc.UNREACHABLE, "no route")), "no route"),
     ])
-    async def test_cannot_start(self, robot, kw, words):
+    async def test_can_always_start_what_is_wrong_is_only_a_warning(self, robot, kw, words):
         can, why = await _real_holder(**kw).reloc_capability(_plain_robot(**robot), "shed")
-        assert can is False and words in why
+        assert can is True and words in why
 
-    async def test_unknown_held_cannot_start(self):
+    async def test_unknown_robot_cannot_start(self):
+        assert await _real_holder().reloc_capability(None, "shed") == (
+            False, "the robot is unknown")
+
+    async def test_unknown_held_is_a_warning(self):
         class Holder(OrchestratorMaps):
             async def held(self, robot, cloud_map_id, fresh=False):
                 return None
         h = Holder(client_factory=_CapOrch().client)
         can, why = await h.reloc_capability(_plain_robot(), "shed")
-        assert can is False and "could not be asked" in why
+        assert can is True and "could not be asked" in why
 
     async def test_a_held_answer_the_caller_has_is_not_asked_again(self):
         h = _real_holder()
         assert await h.reloc_capability(_plain_robot(), "shed", held=False) == (
-            False, "the robot does not hold a stored map for 'shed'")
+            True, "the robot does not hold a stored map for 'shed'")
 
     async def test_the_services_read_is_cached_and_invalidated(self):
         calls = []
@@ -308,11 +326,12 @@ class TestCapability:
         holder = _real_holder()
         out = await maps.placement_suggestions(None, "shed", str(s["session_id"]), holder=holder)
         assert out["reloc"] == {"available": True, "known": True, "source": "orchestrator",
-                                "can_start": True, "can_start_reason": None}
+                                "can_start": True, "can_start_reason": None, "warning": None}
         out = await maps.map_reloc(None, holder, "shed", "r1")
         assert out["can_start"] is True and out["can_start_reason"] is None
         out = await maps.map_reloc(None, _real_holder(services=("topomap",)), "shed", "r1")
-        assert out["can_start"] is False and "relocalization service" in out["can_start_reason"]
+        assert out["can_start"] is True and "relocalization service" in out["can_start_reason"]
+        assert out["warning"] == out["can_start_reason"]
         assert out["available"] is True    # the held map did not change
 
     async def test_unknown_robot_cannot_start(self, env):
@@ -362,12 +381,14 @@ class TestModeOdin:
         # the calls, in order; the stale init_pos is cleared (null), the map is selected, the
         # service is started (it was not running)
         assert env.orch.calls == [
-            ("list_maps", "shed"), ("get_map", ONBOARD), ("get_config_map", None),
-            ("patch_map", (ONBOARD, {"init_pos": None})), ("set_config_map", ONBOARD),
-            ("list_services", None), ("start", "odin_reloc")]
+            ("list_maps", "shed"), ("get_map", ONBOARD),
+            ("patch_map", (ONBOARD, {"init_pos": None})), ("get_config_map", None),
+            ("set_config_map", ONBOARD), ("list_services", None), ("start", "odin_reloc")]
         v = env.jobs.latest("shed", str(s["session_id"])).view()
         assert (v["state"], v["step"], v["position_initialized"], v["localization_score"]) == (
             "placed", "done", True, 0.9)
+        assert v["auto_confirmed"] is True and v["proposal"]["map_T_session"] == (
+            ms.reloc_map_t_session())
         assert env.sleeps == 3
         # placed with the identity, at the robot's pose read when it was initialized
         row = env.db.sessions[-1]
@@ -504,13 +525,16 @@ class TestRefusals:
         s = _unplaced(env.db)
         await self._refused(env, s["session_id"])
 
-    async def test_driving(self, env):
+    async def test_driving_no_longer_refuses(self, env):
         _robot(env.db)
         env.db.state_msgs["r1"] = {"driving": True}
         s = _unplaced(env.db)
-        await self._refused(env, s["session_id"])
+        env.on_sleep = _localized_after(1)
+        out, job = await env.run(s["session_id"])
+        assert out["reloc_job"]["state"] == "preparing" and job.state == rj.PLACED
 
-    async def test_mapping_session_open(self, env):
+    async def test_mapping_session_open_still_refuses(self, env):
+        # user decision 2026-10-08: no reloc while the robot's open session is a mapping one
         _robot(env.db)
         s = _unplaced(env.db, purpose="mapping")
         await self._refused(env, s["session_id"])
@@ -666,16 +690,31 @@ class TestFailures:
         job = await self._failed(env)
         assert "could not start service 'odin_reloc'" in job.error and words in job.error
 
-    async def test_no_reloc_service_on_the_robot(self, env):
+    async def test_no_reloc_service_on_the_robot_tries_the_endpoint_and_reports_its_answer(
+            self, env):
         env.orch.services = {"topomap": False}
         job = await self._failed(env)
+        # not a gate: the endpoint was asked; its 404 plus the missing service are the error
+        assert "could not start relocalization" in job.error and "404" in job.error
         assert "no relocalization service" in job.error and "odin_reloc" in job.error
+        assert ("relocalize", ONBOARD) in env.orch.calls
         assert env.orch.current_map == "old-map" and env.orch.init_pos is None
 
-    async def test_map_vanished_from_the_robot(self, env):
-        env.orch.rows = []
+    async def test_no_tagged_map_is_not_a_gate_the_robot_answers(self, env):
+        env.orch.rows = []     # no stored map tagged for the cloud map
         job = await self._failed(env)
-        assert "does not hold" in job.error and "patch_map" not in env.orch.ops()
+        assert "could not read stored map 'cloud-shed'" in job.error and "404" in job.error
+        assert "patch_map" not in env.orch.ops()
+        assert any("does not list a stored map" in w for w in job.view()["warnings"])
+
+    async def test_no_tagged_map_but_the_robot_has_it_still_relocalizes(self, env):
+        _robot(env.db)
+        env.orch.rows = []     # untagged, yet the default name exists on the robot
+        s = _unplaced(env.db)
+        env.on_sleep = _localized_after(1)
+        with patch.object(RelocClient, "get_map", _get_map_any):
+            _, job = await env.run(s["session_id"])
+        assert job.state == rj.PLACED and ("get_map", ONBOARD) in env.orch.calls
 
     async def test_rollback_that_fails_is_reported(self, env):
         env.orch.fail["start"] = _http(409, "busy")
@@ -952,33 +991,49 @@ class TestCanStartBlockers:
         reloc = await self._read(env, s)
         assert reloc["can_start"] is True and reloc["can_start_reason"] is None
 
-    async def test_driving(self, env):
+    async def test_driving_is_no_blocker(self, env):
         _robot(env.db)
         env.db.state_msgs["r1"] = {"driving": True}
         s = _unplaced(env.db)
         reloc = await self._read(env, s)
-        assert reloc["can_start"] is False and "driving" in reloc["can_start_reason"]
+        assert reloc["can_start"] is True and reloc["can_start_reason"] is None
         out = await maps.map_reloc(None, env.holder, "shed", "r1", env.switch, env.jobs)
-        assert out["can_start"] is False
+        assert out["can_start"] is True and out["warning"] is None
 
-    async def test_open_mapping_session(self, env):
+    async def test_open_mapping_session_is_not_offered(self, env):
         _robot(env.db)
         s = _unplaced(env.db, purpose="mapping")
         reloc = await self._read(env, s)
         assert reloc["can_start"] is False and "mapping session" in reloc["can_start_reason"]
+        assert reloc["warning"] == reloc["can_start_reason"]
         assert await _status(env.place(s["session_id"])) == 409
         assert env.orch.calls == []
 
-    async def test_active_job(self, env):
+    async def test_can_start_with_the_warning_text_whenever_the_robot_exists(self, env):
+        _robot(env.db, online=False)
+        env.holder = CapHolder(held=None, can=True)
+        env.holder.reason = None
+
+        async def cap(robot, cloud_map_id, fresh=False, held=None):
+            return True, "the robot's orchestrator could not be asked for its stored maps"
+        env.holder.reloc_capability = cap
+        s = _unplaced(env.db)
+        reloc = await self._read(env, s)
+        assert reloc["can_start"] is True
+        assert reloc["warning"] == reloc["can_start_reason"] and "could not be asked" in (
+            reloc["warning"])
+
+    async def test_active_job_is_a_warning_and_the_second_post_is_409(self, env):
         _robot(env.db)
         s = _unplaced(env.db)
         env.block = asyncio.Event()
         await env.place(s["session_id"])
         reloc = await self._read(env, s)
-        assert reloc["can_start"] is False and "already running" in reloc["can_start_reason"]
+        assert reloc["can_start"] is True and "already running" in reloc["warning"]
+        assert await _status(env.place(s["session_id"])) == 409
         await env.jobs.cancel(env.jobs.active_for("r1"))
 
-    async def test_pending_slam_save(self, env):
+    async def test_pending_slam_save_is_a_warning(self, env):
         _robot(env.db)
         s = _unplaced(env.db)
 
@@ -987,7 +1042,8 @@ class TestCanStartBlockers:
                 return True
         env.switch = _switch(Switch)
         reloc = await self._read(env, s)
-        assert reloc["can_start"] is False and "SLAM" in reloc["can_start_reason"]
+        assert reloc["can_start"] is True and "SLAM" in reloc["warning"]
+        assert await _status(env.place(s["session_id"])) == 409
 
     async def test_without_a_registry_a_running_job_is_not_a_blocker(self, env):
         _robot(env.db)
@@ -1228,13 +1284,53 @@ class TestEndpointMode:
         assert "stop_mapping" not in env.orch.ops() and "relocalize" not in env.orch.ops()
         assert env.orch.init_pos == [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]   # restored
 
-    async def test_a_relocalization_not_started_by_the_cloud_is_not_stopped(self, eenv):
+    async def test_a_relocalization_not_started_by_the_cloud_is_stopped_with_a_warning(
+            self, eenv):
         env = eenv
         _robot(env.db)
         env.orch.mapping.update(mode="relocalization", relocalizing="by-hand")
         s = _unplaced(env.db)
+        env.on_sleep = _localized_after(1)
         _, job = await env.run(s["session_id"])
-        assert job.state == rj.FAILED and "not started by the cloud" in job.error
+        assert job.state == rj.PLACED
+        assert "stop_mapping" in env.orch.ops() and "relocalize" in env.orch.ops()
+        assert any("not started by the cloud" in w for w in job.view()["warnings"])
+
+    async def test_relocalize_404_falls_back_to_the_service(self, eenv):
+        env = eenv
+        _robot(env.db)
+        env.orch.services = {"odin_reloc": False}
+
+        async def nope(self, name):
+            self.o.enter("relocalize", name)
+            raise _http(405, "method not allowed")
+        s = _unplaced(env.db)
+        env.on_sleep = _localized_after(1)
+        with patch.object(EndpointClient, "relocalize", nope):
+            _, job = await env.run(s["session_id"])
+        assert job.state == rj.PLACED
+        assert ("start", "odin_reloc") in env.orch.calls and env.orch.current_map == ONBOARD
+
+    async def test_relocalize_404_without_a_service_fails_with_the_answer(self, eenv):
+        env = eenv
+        _robot(env.db)
+
+        async def nope(self, name):
+            self.o.enter("relocalize", name)
+            raise _http(404, "no such route")
+        s = _unplaced(env.db)
+        with patch.object(EndpointClient, "relocalize", nope):
+            _, job = await env.run(s["session_id"])
+        assert job.state == rj.FAILED and "404" in job.error
+        assert env.orch.current_map == "old-map"        # what the fallback changed is restored
+
+    async def test_a_slam_session_recording_still_fails_and_is_not_stopped(self, eenv):
+        env = eenv
+        _robot(env.db)
+        env.orch.mapping.update(mode="slam", active=True)
+        s = _unplaced(env.db)
+        _, job = await env.run(s["session_id"])
+        assert job.state == rj.FAILED and "SLAM" in job.error
         assert "stop_mapping" not in env.orch.ops()
 
     async def test_relocalize_409_is_not_stopped_on_rollback(self, eenv):
@@ -1445,11 +1541,11 @@ class TestEndpointCapability:
         assert o.calls.index("list_services") > o.calls.index("list_maps")
         assert o.calls.index("list_services") > o.calls.index("mapping_state")
 
-    async def test_not_held_never_asks_services(self):
+    async def test_not_held_is_a_warning_next_to_the_other_findings(self):
         o = _EpCap(held=False, mapping="old")
         can, why = await OrchestratorMaps(client_factory=o.client).reloc_capability(
             _plain_robot(), "shed")
-        assert can is False and "does not hold" in why and "list_services" not in o.calls
+        assert can is True and "does not hold" in why
 
     async def test_old_orchestrator_falls_back_to_the_service(self):
         o = _EpCap(mapping="old")
@@ -1465,14 +1561,14 @@ class TestEndpointCapability:
         o = _EpCap(mapping="old", services=("topomap",))
         can, why = await OrchestratorMaps(client_factory=o.client).reloc_capability(
             _plain_robot(), "shed")
-        assert can is False and "no relocalization service" in why and "older orchestrator" in why
+        assert can is True and "no relocalization service" in why and "older orchestrator" in why
 
     async def test_endpoint_unreadable_and_no_service(self):
         o = _EpCap(mapping=oc.OrchestratorError(oc.UNREACHABLE, "no route"),
                    services_fail=oc.OrchestratorError(oc.UNREACHABLE, "no route"))
         can, why = await OrchestratorMaps(client_factory=o.client).reloc_capability(
             _plain_robot(), "shed")
-        assert can is False and "no route" in why
+        assert can is True and "no route" in why
 
     async def test_endpoint_answer_is_cached_and_invalidated(self):
         o = _EpCap()

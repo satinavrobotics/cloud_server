@@ -147,6 +147,9 @@ RELOC_SERVICE_CANDIDATES = _candidates("RELOC_SERVICE_CANDIDATES", "odin_reloc")
 RELOC_JOB_TIMEOUT_S = float(os.getenv("RELOC_JOB_TIMEOUT_S", "90.0"))
 RELOC_JOB_POLL_S = float(os.getenv("RELOC_JOB_POLL_S", "1.0"))
 RELOC_JOB_SETTLE_S = float(os.getenv("RELOC_JOB_SETTLE_S", "5.0"))
+# After the robot reports itself localized the job proposes the placement and waits this long for
+# the user to confirm or edit it; then the server confirms by itself (RELOC_CONFIRM_TIMEOUT_S).
+RELOC_CONFIRM_TIMEOUT_S = float(os.getenv("RELOC_CONFIRM_TIMEOUT_S", "30.0"))
 # Relocalization normally uses the orchestrator's POST /maps/{name}/relocalize when it offers it
 # (GET /maps/mapping reports `mode`/`relocalizing`). Set true to always use the reloc SERVICE
 # (RELOC_SERVICE_CANDIDATES) instead, e.g. in a simulation whose relocalize endpoint is a stub.

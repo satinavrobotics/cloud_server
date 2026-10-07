@@ -323,9 +323,10 @@ class TestPlacement:
         x, y, yaw = map_geo.apply_pose(placed["map_T_session"], 2.0, 3.0, 0.25)
         assert (x, y, yaw) == pytest.approx((10.0, -4.0, 1.0))
         assert db.codes()[-1] == "MAP.SESSION_PLACED"
-        # a placed mapping session is not re-placed (its nodes would split)
-        code, _ = await _status(maps.place_session(None, "shed", s["session_id"], body, PUB))
-        assert code == 409
+        # a placed mapping session can be re-placed by hand, with a warning (nodes would split)
+        out = await maps.place_session(None, "shed", s["session_id"], body, PUB)
+        assert out["session"]["aligned"] is True
+        assert any("splits its nodes" in w for w in out["warnings"])
 
     async def test_placement_on_start(self, db):
         _local_with_nodes(db)
@@ -350,7 +351,6 @@ class TestPlacement:
         assert db.events[-1]["payload"]["old_map_T_session"]["tx"] == pytest.approx(5.0)
 
     @pytest.mark.parametrize("case,code", [
-        ("driving_state", 409), ("driving_msg", 409), ("moved", 409), ("turned", 409),
         ("offline", 409), ("finished", 409), ("geo", 409), ("unknown", 404),
         ("other_map", 404), ("bad_body", 422)])
     async def test_place_refusals(self, db, case, code):
@@ -382,12 +382,34 @@ class TestPlacement:
         got, _ = await _status(maps.place_session(None, map_name, sid, body, PUB))
         assert got == code and db.sessions == before
 
-    async def test_start_with_placement_refused_while_driving(self, db):
+    @pytest.mark.parametrize("case,word", [
+        ("driving_state", "active order"), ("driving_msg", "driving"), ("moved", "moved"),
+        ("turned", "moved")])
+    async def test_manual_place_while_driving_or_moved_succeeds_with_a_warning(
+            self, db, case, word):
+        _local_with_nodes(db)
+        db.add_map("g", type="geo", geo=GEO, status={"state": "ready"})
+        _robot(db, **UTM_DATUM)
+        sid = (await _start(db, "shed", purpose="operate"))["session"]["session_id"]
+        if case == "driving_state":
+            _robot(db, state="ON_TASK", **UTM_DATUM)
+        elif case == "driving_msg":
+            db.state_msgs["r1"] = {"velocity": {"vx": 0.3, "vy": 0.0, "omega": 0.0}}
+        elif case == "moved":
+            _robot(db, pose=(0.05, 0.0, 0.0), **UTM_DATUM)
+        else:
+            _robot(db, pose=(0.0, 0.0, math.radians(1.0)), **UTM_DATUM)
+        out = await maps.place_session(None, "shed", sid, _place_body(), PUB)
+        assert out["session"]["aligned"] is True
+        assert any(word in w for w in out["warnings"])
+
+    async def test_start_with_placement_while_driving_succeeds_with_a_warning(self, db):
         _local_with_nodes(db)
         _robot(db)
         db.state_msgs["r1"] = {"driving": True}
-        code, detail = await _status(_start(db, purpose="operate", placement=_place_body()))
-        assert code == 409 and "driving" in detail and db.sessions[-1]["robot_name"] == "r0"
+        out = await _start(db, purpose="operate", placement=_place_body())
+        assert out["session"]["aligned"] is True
+        assert any("driving" in w for w in out["warnings"])
 
 
 class TestOperateLifecycle:

@@ -69,9 +69,10 @@ class TestUnplace:
 
 
 class TestRefusals:
-    async def test_a_mapping_session_is_refused(self, db):
+    async def test_a_mapping_session_is_unplaced_with_a_warning(self, db):
         s = _placed(db, purpose="mapping")
-        assert await _status(_unplace(db, s)) == 409
+        out = await _unplace(db, s)
+        assert out["changed"] is True and any("mapping session" in w for w in out["warnings"])
 
     async def test_a_finished_session_is_refused(self, db):
         s = _placed(db)
