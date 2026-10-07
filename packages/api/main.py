@@ -592,9 +592,10 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     transaction. Errors: packages/api/maps.py (module docstring). 409 also while a
     relocalization job runs for the robot (mapping sessions only). A mapping session's services
     are started on the robot's orchestrator OUTSIDE any transaction, AFTER the commit
-    No robot service is started or stopped (maps §14.16). The response: {map_id, map_state, changed, session, replaced_session,
-    robot_notified, mapping_switch, mapping_service, mapping_services, mapping_state} (+
-    `mapping_warning` when the replaced session's service could not be stopped). The session is
+    (a failed start never fails or undoes the session: it is reported in `robot_actions`, maps
+    §14.16). The response: {map_id, map_state, changed, session, replaced_session,
+    robot_actions, robot_notified, mapping_service, mapping_services, mapping_state} (+
+    `mapping_warning` when a robot action failed, `slam_warning`). The session is
     the robot's map (maps §14.2; robots have no current_map since U6)."""
     _require_service()
     return await _site_call("start map session", maps.start_session(
@@ -728,8 +729,11 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     """`pause`, `resume` or `finish` a session. Finishing the map's only open mapping session
     makes the map `ready`; finishing an operate session is "Stop using" (the map state does
     not change). pause/resume: mapping sessions only (409 on operate). Repeating an action
-    that is already in effect changes nothing in the session (no robot service is started or stopped). The response adds
-    `robot_notified` (always true) and `mapping_state`."""
+    that is already in effect changes nothing in the session (a repeated pause/finish retries the
+    stop, a repeated resume the start). After the commit resume starts the session's mapping
+    services on the robot's orchestrator, pause/finish stop them; a failure never fails or undoes
+    the action. The response adds `robot_actions` (what was done on the robot), `robot_notified`
+    (false when one failed), `mapping_warning` and `mapping_state`."""
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
@@ -1830,7 +1834,8 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
     latest-state row and the robot itself. History (telemetry tables, events, mission runs)
     and rosbags are kept unless `delete_telemetry` / `delete_rosbags` are true.
 
-    200 `{success, message, deleted: {telemetry, rosbags, sessions_closed}}`; 404 unknown robot;
+    200 `{success, message, deleted: {telemetry, rosbags, sessions_closed}, robot_actions}`
+    (the mapping services stopped on the robot, best effort); 404 unknown robot;
     409 `ROBOT_HAS_ACTIVE_MISSION` (ON_TASK or a pending/running mission; nothing is changed);
     500 any other failure. The robot can be registered again afterwards like a new one.
     """

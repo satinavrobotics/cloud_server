@@ -926,7 +926,7 @@ untouched.
   `packages/api/mapping_control.py`. A one-time cleanup clears the retained topics on the broker
   (`~/pg-cutover/scripts/mapsorch.sh`).
 
-**Superseded by §14.16:** the API no longer starts or stops the topomap for a session.
+**Partly superseded by §14.16:** the ingest gating is gone; the API still starts/stops the topomap for a session, but a failure only reports (no 502/504/409, no compensation).
 
 **Not done (open):** nothing reconciles running services with sessions after an API restart, an
 orchestrator restart or a robot reboot (the old retained message did); a service that keeps
@@ -935,7 +935,7 @@ yet (the default name `grid` is a placeholder).
 
 ---
 
-### 14.16 No mapping gating, no topomap switching (2026-10-07, user decision)
+### 14.16 No mapping gating; topomap switching that only reports (2026-10-07, user decisions)
 
 If the topomap runs on a robot, the user started it from the robot's orchestrator, and its nodes
 and images go into the robot's **current map**: the map of the robot's one open session
@@ -949,13 +949,22 @@ The retired reasons `not_mapping_session`, `session_paused`, `map_not_mapping`,
 `session_mismatch` are only found in old `MAP.INGEST_REJECTED` events. A draft map cannot have
 an operate session (409), so no state transition is needed.
 
-The API never starts or stops a robot service for a session: open / pause / resume / finish /
-replace, robot delete and the orphan paths make no `POST /services/{name}/start|stop` call
-(`MappingSwitch.start/stop`, `StopResult`, the compensation of a failed start and the resume
-409 for an offline robot are gone). Response fields stay: `mapping_state`, `mapping_service`,
-`mapping_services` are still READ from the orchestrator; `robot_notified` is always true;
-`mapping_warning` and `mapping_switch` are no longer returned; `services` in the session start
-body is accepted and ignored. SLAM recording (`slam_map` maps) is unchanged.
+**Switching restored, never blocking (same day, second decision).** Opening a mapping session
+(`replace` included) starts the session's `services` on the robot's orchestrator (`topo` ->
+`topomap` / `sim_topomap`), resume starts them, pause and finish stop them (unless another open,
+unpaused mapping session of the robot runs them), robot delete stops them: `MappingSwitch.start/stop`
+as before, after the commit and outside every transaction. What is gone is everything that made it
+block: a failed start is no 502/504/409, the new session is not closed again (`_close_unstarted`),
+a resumed one not paused again (`_repause`), `replace` no longer starts before it commits
+(`_unstart`), and resume of an offline robot is allowed. The change always commits; failures are
+only reported. Every robot-side action is returned in the new response field `robot_actions`
+(`[{service, action: start|stop|restart|save, ok, label, detail}]`, SLAM included: the driver
+`restart` for a `slam_map` mapping session, the `save` on finish and, awaited, on replace), documented
+in `packages/api/README.md`. `robot_notified` is false and `mapping_warning` the joined failure labels
+when one failed; `mapping_switch` is gone; `slam_warning` is kept. The SLAM background save ends
+minutes after the response: the events `MAP.SLAM_SAVE_DONE` / `MAP.SLAM_SAVE_FAILED` report it.
+`mapping_state`, `mapping_service`, `mapping_services` are READ from the orchestrator as before.
+Ingest is unchanged (any open placed session; no mapping-session gating).
 
 ---
 

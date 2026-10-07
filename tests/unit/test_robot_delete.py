@@ -327,3 +327,40 @@ def test_livekit_admin_token_is_hs256_with_grant():
     pad = lambda x: x + "=" * (-len(x) % 4)
     claims = json.loads(base64.urlsafe_b64decode(pad(t.split(".")[1])))
     assert claims["iss"] == "k" and claims["video"] == {"roomList": True}
+
+
+async def test_delete_stops_the_sessions_services_and_reports_robot_actions(monkeypatch):
+    db = FakeDb(sessions=[{"session_id": "s1", "map_name": "m", "ended_at": None,
+                           "paused_at": None, "robot_name": "r1"}])
+    finish = install(db, monkeypatch)
+    finish.side_effect = lambda *a, **k: db.sessions.clear()   # closed: no longer open
+    switch = MagicMock()
+    switch.stop = AsyncMock(return_value=[{"service": "topomap", "action": "stop", "ok": True,
+                                           "label": "Topomap service stopped",
+                                           "detail": None}])
+    out = await RobotDeleter(db, switch).delete("r1")
+    switch.stop.assert_awaited_once()
+    assert switch.stop.await_args.args[1] == ["topo"]
+    assert out["robot_actions"] == [{"service": "topomap", "action": "stop", "ok": True,
+                                     "label": "Topomap service stopped", "detail": None}]
+    assert out["deleted"]["sessions_closed"] == 1
+
+
+async def test_a_failed_service_stop_never_blocks_the_delete(monkeypatch):
+    db = FakeDb(sessions=[{"session_id": "s1", "map_name": "m", "ended_at": None,
+                           "paused_at": None, "robot_name": "r1"}])
+    finish = install(db, monkeypatch)
+    finish.side_effect = lambda *a, **k: db.sessions.clear()
+    switch = MagicMock()
+    switch.stop = AsyncMock(return_value=[{"service": "topomap", "action": "stop", "ok": False,
+                                           "label": "Could not stop topomap: down",
+                                           "detail": "down"}])
+    out = await RobotDeleter(db, switch).delete("r1")
+    assert out["success"] is True and out["robot_actions"][0]["ok"] is False
+    assert db.lifecycle_calls == [(RobotObjectV1, "r1", ObjectLifecycleV1.DELETED)]
+
+
+async def test_no_switch_no_robot_actions(monkeypatch):
+    db = FakeDb()
+    install(db, monkeypatch)
+    assert "robot_actions" not in await RobotDeleter(db).delete("r1")

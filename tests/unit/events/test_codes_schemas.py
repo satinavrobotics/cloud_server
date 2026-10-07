@@ -87,6 +87,11 @@ VALID_PAYLOADS = {
                                          "origin_n": 2.0, "bearing_deg": 10.0},
                                  "old_geo": None, "operating": ["r1"], "actor": None},
     EventCode.MAP_SLAM_CHANGED: {"map_name": "lab", "slam_map": True, "actor": None},
+    EventCode.MAP_SLAM_SAVE_DONE: {"map_name": "lab", "session_id": "s1", "status": "saved",
+                                   "label": "SLAM map saved"},
+    EventCode.MAP_SLAM_SAVE_FAILED: {"map_name": "lab", "session_id": "s1", "status": "failed",
+                                     "label": "SLAM map not saved: timeout",
+                                     "detail": "the save did not finish in time"},
     EventCode.MAP_RECONSTRUCTION_STARTED: {"map_name": "lab", "job_id": "j1",
                                            "params": {"voxel_m": 0.05}, "nodes_with_depth": 412,
                                            "attempt": 1},
@@ -166,3 +171,11 @@ def test_module_switch_controls_default_mode():
     schemas.set_strict_validation(True)
     with pytest.raises(schemas.InvalidPayloadError):
         schemas.validate_payload(schemas.RosNode, {})
+
+
+def test_slam_save_codes():
+    assert meta_for(EventCode.MAP_SLAM_SAVE_DONE).severity is Severity.INFO
+    assert meta_for(EventCode.MAP_SLAM_SAVE_FAILED).severity is Severity.WARNING
+    assert meta_for(EventCode.MAP_SLAM_SAVE_FAILED).payload_model is schemas.MapSlamSave
+    with pytest.raises(schemas.InvalidPayloadError):   # session_id, status and label are required
+        schemas.validate_payload(schemas.MapSlamSave, {"map_name": "lab"})

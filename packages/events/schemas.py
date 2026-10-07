@@ -220,6 +220,17 @@ class MapSlamChanged(Payload):
     actor: Optional[str] = None
 
 
+class MapSlamSave(Payload):
+    """MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED (packages/api/maps.py): the background SLAM map
+    save of a finished mapping session ended. `status`: saved | failed; `detail` the failure text
+    (null when saved); `label` a short text for a notification."""
+    map_name: str
+    session_id: str
+    status: str
+    label: str
+    detail: Optional[str] = None
+
+
 class MapTypeChanged(Payload):
     """MAP.TYPE_CHANGED (packages/api/maps.py): the map was converted geo <-> local. Map-frame
     coordinates are unchanged; `geo` / `old_geo` are the georeference after / before (null on a

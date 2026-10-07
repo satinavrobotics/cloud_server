@@ -2,10 +2,19 @@
 orchestrator (docs/satinav-maps-redesign.md section 15; replaces the MQTT `mapping/set` switch
 of maps M3/U5).
 
-The API only READS the robot's services here and never starts or stops one for a session: the
-user starts the topomap from the robot's orchestrator, and graph-builder puts its nodes into the
-map of the robot's open session (any purpose, paused or not) while that session is placed. Only
-SLAM (below) is driven by the API.
+A mapping session's `services` (packages/utils/map_sessions.py, today only `topo`) are the
+orchestrator services that capture for it (maps §14.16):
+
+- opening a mapping session STARTS them (packages/api/maps.py calls start() OUTSIDE any DB
+  transaction, after the commit), resuming a paused one starts them again;
+- pausing or finishing STOPS them (unless another open, unpaused mapping session of the robot
+  runs them); deleting a robot stops them too;
+- the switching NEVER blocks or undoes the user's action: start() / stop() never raise, a failure
+  (robot offline, orchestrator unreachable, no such service, an error answer) is only REPORTED.
+  Every call, and every SLAM call, becomes one entry of the response's `robot_actions`
+  (robot_action()): {service, action: start|stop|restart|save, ok, label, detail};
+- nodes are gated on the server only (graph-builder puts them into the open session's map, any
+  purpose): a service that keeps running for a closed session captures nothing that is kept.
 
 Orchestrator service names differ between the real robot (`topomap`) and the sim
 (`sim_topomap`): packages/config.py::MAPPING_SERVICE_CANDIDATES lists candidates per session
@@ -28,7 +37,8 @@ never blocking or undoing the session; what went wrong is a `warning` the caller
 `slam_warning`. Saving takes minutes (a background save on the orchestrator, polled; a save that timed out is retried and the driver is never stopped after a failed save), so a finish saves in a background task (schedule_slam_save)
 that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
 refuses while a save is pending. Pause / resume never touch SLAM. The outcome of a background
-save is logged (no event code exists for it) and `on_slam_done(robot)` is called.
+save is logged, reported as MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED (the `on_result` callback
+of schedule_slam_save) and `on_slam_done(robot)` is called.
 
 A save lost to an offline robot at finish or an API restart is recovered by reconcile_slam_saves()
 at API startup and then every SLAM_RECONCILE_INTERVAL_S (start_slam_reconcile; online robots only):
@@ -69,6 +79,10 @@ SOURCE = "orchestrator"
 SLAM_STARTED, SLAM_ALREADY_RUNNING, SLAM_EXISTS = "started", "already_running", "exists"
 SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
     "saved", "nothing_to_save", "failed", "busy")
+
+# the `action` of a robot action
+START, STOP, RESTART, SAVE = "start", "stop", "restart", "save"
+SLAM_SERVICE = "SLAM recording"   # `service` of a SLAM action when the driver's name is unknown
 
 
 def _utcnow() -> datetime.datetime:
@@ -137,6 +151,7 @@ class SlamResult:
     should tell the operator something went wrong (never for already_running / nothing_to_save)."""
     status: str
     warning: Optional[str] = None
+    driver: Optional[str] = None   # the orchestrator service that records (its answer), if named
 
     @property
     def ok(self) -> bool:
@@ -160,6 +175,97 @@ class _SaveFailed(Exception):
 def _looks_slow(error: str) -> bool:
     low = error.lower()
     return any(w in low for w in ("in time", "timed out", "timeout", "did not finish"))
+
+
+# --- robot actions (the response's `robot_actions`) --------------------------------------------
+
+_UPPER = {"gpu", "cpu", "usb", "slam", "lidar", "imu", "gnss", "rtk"}
+
+
+def pretty_service(name: str) -> str:
+    """`odin_driver_gpu` -> `Odin driver GPU`; `topomap` / `sim_topomap` -> `Topomap`."""
+    if name in (TOPO, *MAPPING_SERVICE_CANDIDATES.get(TOPO, ())):
+        return "Topomap"
+    words = [w.upper() if w.lower() in _UPPER else w
+             for w in name.replace("-", "_").split("_") if w]
+    text = " ".join(words)
+    return text[:1].upper() + text[1:]
+
+
+def robot_action(service: str, action: str, ok: bool, label: str,
+                 detail: Optional[str] = None) -> Dict[str, Any]:
+    """One entry of `robot_actions`: what the API did on the robot's orchestrator for a session
+    change. `service`: the orchestrator service (or the SLAM driver); `action`: start | stop |
+    restart | save; `ok`; `label`: short text for a notification; `detail`: the orchestrator's
+    error text (null when ok)."""
+    return {"service": service, "action": action, "ok": bool(ok), "label": label,
+            "detail": detail}
+
+
+def service_action(service: str, action: str, outcome: str,
+                   detail: Optional[str] = None) -> Dict[str, Any]:
+    """The robot action of one start/stop of an orchestrator service. `outcome`: done |
+    already (already running / not running) | failed."""
+    name = pretty_service(service)
+    if outcome == "failed":
+        return robot_action(service, action, False,
+                            f"Could not {action} {service}: {detail}" if detail
+                            else f"Could not {action} {service}", detail)
+    if outcome == "already":
+        verb = "already running" if action == START else "was not running"
+    else:
+        verb = {START: "started", STOP: "stopped"}[action]
+    return robot_action(service, action, True, f"{name} service {verb}")
+
+
+def slam_start_action(result: SlamResult) -> Dict[str, Any]:
+    """The robot action of start_slam(): the orchestrator restarts its driver in SLAM mode."""
+    service = result.driver or SLAM_SERVICE
+    if result.status == SLAM_STARTED:
+        label = (f"{pretty_service(result.driver)} restarted for SLAM mapping" if result.driver
+                 else "SLAM recording started")
+        return robot_action(service, RESTART, True, label)
+    if result.status == SLAM_ALREADY_RUNNING:
+        return robot_action(service, START, True, "SLAM recording already running")
+    return robot_action(service, RESTART, False,
+                        f"Could not start SLAM recording: {result.warning}", result.warning)
+
+
+def slam_save_action(result: Optional[SlamResult] = None, detail: Optional[str] = None,
+                     driver: Optional[str] = None) -> Dict[str, Any]:
+    """The robot action of a SLAM save. Background save (`result` None): ok = the save was
+    started, or `detail` says what stopped it. Awaited save (replace): ok = it succeeded."""
+    service = driver or SLAM_SERVICE
+    if result is None:
+        if detail is None:
+            return robot_action(service, SAVE, True, "SLAM map save started")
+        return robot_action(service, SAVE, False, f"SLAM map not saved: {detail}", detail)
+    if result.status == SLAM_SAVED:
+        return robot_action(service, SAVE, True, "SLAM map saved")
+    if result.status == SLAM_NOTHING_TO_SAVE:
+        return robot_action(service, SAVE, True, "No SLAM map to save")
+    return robot_action(service, SAVE, False, f"SLAM map not saved: {result.warning}",
+                        result.warning)
+
+
+def _driver_of(answer: Any) -> Optional[str]:
+    """The orchestrator service that records the SLAM map, from its answer when it names one."""
+    if isinstance(answer, dict):
+        for key in ("driver_service", "driver", "service"):
+            value = answer.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _reason(exc: oc.OrchestratorError) -> str:
+    """The orchestrator's (or the transport's) text of a failed call."""
+    if exc.kind == oc.NO_ADDRESS:
+        return ("the robot has no registered orchestrator address (the orchestrator must "
+                "register with the server)")
+    if exc.kind == oc.HTTP and exc.status:
+        return f"the orchestrator answered {exc.status}: {exc.detail}"
+    return str(exc.detail)
 
 
 class MappingSwitch:
@@ -196,6 +302,7 @@ class MappingSwitch:
         self.on_slam_done: Optional[Callable[[str], None]] = None
         self._slam_locks: Dict[str, asyncio.Lock] = {}
         self._slam_tasks: Dict[str, "asyncio.Task[SlamResult]"] = {}  # pending saves
+        self._slam_drivers: Dict[str, str] = {}   # robot -> the SLAM driver service last seen
         self._reconcile_task: Optional["asyncio.Task[None]"] = None
 
     def lock(self, robot_name: str) -> asyncio.Lock:
@@ -251,16 +358,20 @@ class MappingSwitch:
                 try:
                     state = await client.slam_state()
                     if state.get("active") and state.get("map") == onboard:
-                        return SlamResult(SLAM_ALREADY_RUNNING)
+                        return SlamResult(SLAM_ALREADY_RUNNING, driver=_driver_of(state)
+                                          or self._slam_drivers.get(name))
                 except oc.OrchestratorError:
                     pass  # an older orchestrator or a blip: the start call says
                 try:
-                    await client.start_slam(onboard, overwrite=False)
+                    answer = await client.start_slam(onboard, overwrite=False)
                 except oc.OrchestratorError as exc:
                     return self._slam_start_failed(name, map_name, exc)
                 logger.info("SLAM recording of map %s started on %s (%s)", map_name, name,
                             onboard)
-                return SlamResult(SLAM_STARTED)
+                driver = _driver_of(answer)
+                if driver:
+                    self._slam_drivers[name] = driver
+                return SlamResult(SLAM_STARTED, driver=driver)
         except Exception as exc:  # noqa: BLE001 - never blocks a session
             logger.exception("SLAM start on %s failed", name)
             return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not recorded: {exc}")
@@ -379,10 +490,16 @@ class MappingSwitch:
             return False
         return st.get("status") == "saving" and st.get("map") in (None, onboard)
 
-    def schedule_slam_save(self, robot: Any, map_name: str,
-                           session_id: Any) -> "asyncio.Task[SlamResult]":
+    def slam_driver(self, robot_name: str) -> Optional[str]:
+        """The SLAM driver service last seen for the robot (from start_slam), or None."""
+        return self._slam_drivers.get(robot_name)
+
+    def schedule_slam_save(self, robot: Any, map_name: str, session_id: Any,
+                           on_result: Optional[Callable[[SlamResult], Awaitable[None]]] = None
+                           ) -> "asyncio.Task[SlamResult]":
         """save_slam() as a background task (registered per robot, so a following start_slam
-        refuses meanwhile); its outcome is logged. Needs a running event loop."""
+        refuses meanwhile); its outcome is logged and passed to `on_result` (the caller emits
+        MAP.SLAM_SAVE_DONE / _FAILED; its failure is only logged). Needs a running event loop."""
         name = getattr(robot, "name", "?")
 
         async def run() -> SlamResult:
@@ -393,6 +510,11 @@ class MappingSwitch:
             else:
                 logger.info("Background SLAM save of map %s (session %s): %s", map_name,
                             session_id, result.status)
+            if on_result is not None:
+                try:
+                    await on_result(result)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Outcome of the SLAM save of map %s not reported", map_name)
             return result
 
         task = asyncio.ensure_future(run())
@@ -448,7 +570,8 @@ class MappingSwitch:
             return False
         logger.warning("SLAM map %s on %s was never saved; saving it (session %s)", map_name,
                        name, newest[0]["session_id"])
-        self.schedule_slam_save(robot, map_name, newest[0]["session_id"])
+        self.schedule_slam_save(robot, map_name, newest[0]["session_id"],
+                                on_result=maps.slam_save_reporter(db, newest[0]))
         return True
 
     async def stop_orphan_slam(self, db: Any, robot: Any,
@@ -550,6 +673,89 @@ class MappingSwitch:
         orchestrator lists. Raises OrchestratorError."""
         listed = [str(s.get("name")) for s in await client.list_services()]
         return {svc: pick_service(listed, candidates_of(svc)) for svc in services}
+
+    # --- start / stop --------------------------------------------------------------------------
+
+    async def start(self, robot: Any, services: Sequence[str]) -> List[Dict[str, Any]]:
+        """Start each session service on the robot's orchestrator (one that already runs is
+        fine). NEVER raises and never undoes anything: returns one robot action per service,
+        `ok` false (with the orchestrator's text in `detail`) where it failed."""
+        name = getattr(robot, "name", "?")
+        actions: List[Dict[str, Any]] = []
+        if robot is None or not services:
+            return actions
+        try:
+            client = self._client_factory(robot)
+            try:
+                names = await self.resolve(client, services)
+            except oc.OrchestratorError as exc:
+                return [service_action(candidates_of(svc)[0], START, "failed", _reason(exc))
+                        for svc in services]
+            for svc in services:
+                orch = names[svc]
+                if orch is None:
+                    actions.append(service_action(
+                        candidates_of(svc)[0], START, "failed",
+                        f"the robot's orchestrator has no such service (looked for "
+                        f"{', '.join(candidates_of(svc))})"))
+                    continue
+                try:
+                    await client.start(orch)
+                    actions.append(service_action(orch, START, "done"))
+                except oc.OrchestratorError as exc:
+                    if exc.kind == oc.HTTP and exc.status == 409:  # already running
+                        actions.append(service_action(orch, START, "already"))
+                    else:
+                        actions.append(service_action(orch, START, "failed", _reason(exc)))
+                logger.info("Mapping service %s (%s) on %s: %s", svc, orch, name,
+                            actions[-1]["label"])
+        except Exception as exc:  # noqa: BLE001 - never blocks a session
+            logger.exception("Mapping services %s on %s not started", list(services), name)
+            done = {a["service"] for a in actions}
+            actions += [service_action(candidates_of(s)[0], START, "failed", str(exc))
+                        for s in services if candidates_of(s)[0] not in done]
+        finally:
+            self.invalidate(name)
+        return actions
+
+    async def stop(self, robot: Any, services: Sequence[str]) -> List[Dict[str, Any]]:
+        """Stop each session service. NEVER raises; one robot action per service. A service that
+        is not running is fine (ok true)."""
+        name = getattr(robot, "name", "?")
+        actions: List[Dict[str, Any]] = []
+        if robot is None or not services:
+            return actions
+        try:
+            client = self._client_factory(robot)
+            try:
+                names = await self.resolve(client, services)
+            except oc.OrchestratorError as exc:
+                return [service_action(candidates_of(svc)[0], STOP, "failed", _reason(exc))
+                        for svc in services]
+            for svc in services:
+                orch = names[svc]
+                if orch is None:  # nothing by that name exists there: nothing runs
+                    actions.append(service_action(candidates_of(svc)[0], STOP, "already"))
+                    continue
+                try:
+                    await client.stop(orch)
+                    actions.append(service_action(orch, STOP, "done"))
+                except oc.OrchestratorError as exc:
+                    if exc.kind == oc.HTTP and exc.status == 404:  # "not currently running"
+                        actions.append(service_action(orch, STOP, "already"))
+                    else:
+                        actions.append(service_action(orch, STOP, "failed", _reason(exc)))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Mapping services %s on %s not stopped", list(services), name)
+            done = {a["service"] for a in actions}
+            actions += [service_action(candidates_of(s)[0], STOP, "failed", str(exc))
+                        for s in services if candidates_of(s)[0] not in done]
+        finally:
+            self.invalidate(name)
+        for a in actions:
+            if not a["ok"]:
+                logger.warning("Mapping service %s on %s: %s", a["service"], name, a["label"])
+        return actions
 
     # --- state ---------------------------------------------------------------------------------
 

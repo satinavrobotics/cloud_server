@@ -57,6 +57,8 @@ class EventCode(str, enum.Enum):
     MAP_SESSION_UNPLACED = "MAP.SESSION_UNPLACED"
     MAP_TYPE_CHANGED = "MAP.TYPE_CHANGED"
     MAP_SLAM_CHANGED = "MAP.SLAM_CHANGED"
+    MAP_SLAM_SAVE_DONE = "MAP.SLAM_SAVE_DONE"
+    MAP_SLAM_SAVE_FAILED = "MAP.SLAM_SAVE_FAILED"
     MAP_RECONSTRUCTION_STARTED = "MAP.RECONSTRUCTION_STARTED"
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
@@ -161,6 +163,11 @@ CODES: Dict[EventCode, CodeMeta] = {
     # slam_map of a local map switched on/off (PATCH /api/v1/maps/{id}, packages/api/maps.py).
     # No robot; discriminator `map:<name>:slam:<bool>:<ts>`.
     _C.MAP_SLAM_CHANGED: CodeMeta(_S.INFO, True, schemas.MapSlamChanged, _A),
+    # The BACKGROUND SLAM save of a finished mapping session ended (minutes after the finish
+    # response, packages/api/mapping_switch.py). Robot set; discriminator
+    # `session:<id>:slam_save:<ts>`. FAILED: the map may still complete on the robot (see detail).
+    _C.MAP_SLAM_SAVE_DONE: CodeMeta(_S.INFO, True, schemas.MapSlamSave, _A),
+    _C.MAP_SLAM_SAVE_FAILED: CodeMeta(_S.WARNING, True, schemas.MapSlamSave, _A),
     # 3D reconstruction (docs/reconstruction/design.md §9.3). No robot; discriminator
     # `map:<name>:reconstruction:<job_id>:<state>`. STARTED on the job's first progress
     # callback; FAILED also for a cancel (reason cancelled / map_deleting).

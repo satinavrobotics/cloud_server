@@ -210,25 +210,25 @@ A mapping session's `services` (today `topo`) are started and stopped on the rob
 `satibot_orchestrator` (`POST /services/{name}/start|stop`; the address is the robot's registered
 `ip_address` / `entrypoint_port`, as for `/api/v1/orchestration/{robot}/*`), and their state is
 read from it (`GET /services/{name}/status`, cached 5 s). Nothing is sent over MQTT any more
-(the retained `mapping/set` and `mapping/.../state` topics are gone). Nodes are still gated on
-the server: graph-builder drops a node with no open, unpaused, placed mapping session.
+(the retained `mapping/set` and `mapping/.../state` topics are gone). Nodes are gated on
+the server only: graph-builder puts them into the open session's map (any purpose, paused or not)
+while that session is placed.
 `topo` is `topomap` on the real robot and `sim_topomap` in the sim
 (`packages/config.py::MAPPING_SERVICE_CANDIDATES`, env `MAPPING_SERVICE_TOPO`).
 
 - `POST .../sessions` (mapping) **commits first, then starts** the services (outside any
-  transaction, under the robot's lock): if the start fails the new session is closed again
-  (compensating close, best effort) and the error is returned, so nothing stays open. With
-  `replace` it is the other way round: the services start *before* the commit (after a dry run),
-  so a failed start changes nothing and the replaced session stays open. Errors: 502 the robot has
-  no registered orchestrator / it does not answer / it reports an error, 504 timeout, 409 the
-  orchestrator has no such service, 409 a relocalization job runs for the robot. The `detail` says
-  which ("Could not start mapping service 'topo' on robot 'r1': ...").
-- `.../resume` commits, then starts them (same errors; the session is paused again), `.../pause` and `.../finish`
-  stop them after the commit, best effort: on an offline robot the session is paused / closed
-  anyway and the response has `robot_notified: false` and `mapping_warning`.
-- `.../place` does not touch the services.
+  transaction, under the robot's lock). `.../resume` starts them again, `.../pause` and
+  `.../finish` stop them (a service another open, unpaused mapping session of the robot runs is
+  kept), `DELETE /api/v1/robots/{r}` stops those of the sessions it closes. **Switching never
+  blocks or undoes the user's action** (2026-10-07): there is no 502 / 504 / 409 from a failed
+  start, the session is neither closed nor paused again, the change always commits; a failure
+  (robot offline, no registered orchestrator, orchestrator unreachable / error / timeout, no such
+  service) is only reported in `robot_actions`. Resume of an offline robot is allowed. 409 for a
+  running relocalization job is unchanged (a validation, not a switch). A repeated
+  pause/finish retries the stop, a repeated resume the start (`changed: false`).
+- `.../place` does not touch the services; operate sessions never start or stop one.
 - **SLAM map** (a `local` map created with `slam_map: true`): a *mapping* session also records a
-  SLAM map on the robot, named `onboard_map_name(map)` = `cloud-<map>`. After the topomap started
+  SLAM map on the robot, named `onboard_map_name(map)` = `cloud-<map>`. After the topomap start
   (outside any transaction, under the robot's lock) the API calls `POST /maps/{onboard}/mapping/start`
   `{"overwrite": false}`; `.../finish` answers at once and saves in a background task
   (`POST /maps/{onboard}/save?background=true` `{cloud_map_id, cloud_session_id, stop_after: true}`,
@@ -237,17 +237,44 @@ the server: graph-builder drops a node with no open, unpaused, placed mapping se
   `ORCHESTRATOR_SAVE_RETRY_S` while `late_save_sec` > 0; a failed save never stops the driver); `replace` saves the
   replaced session's map first (awaited), then starts the new one. Failures never fail a session:
   `slam_warning` says what (existing map file: "SLAM map already exists, not re-recorded"). Pause,
-  resume and operate sessions never touch SLAM. The background outcome is only logged. A driver still recording `cloud-<X>` after map X was deleted (nothing saved, `saving` false, no open session) is stopped by the API at the end of the map delete and by a reconcile pass every `SLAM_RECONCILE_INTERVAL_S` (300 s); the delete response is unchanged.
+  resume and operate sessions never touch SLAM. The background outcome (minutes after the finish response) is the event `MAP.SLAM_SAVE_DONE` / `MAP.SLAM_SAVE_FAILED` (robot set; payload `{map_name, session_id, status: "saved"\|"failed", label, detail}`), also logged; `nothing to save` emits none. A driver still recording `cloud-<X>` after map X was deleted (nothing saved, `saving` false, no open session) is stopped by the API at the end of the map delete and by a reconcile pass every `SLAM_RECONCILE_INTERVAL_S` (300 s); the delete response is unchanged.
 
 | Where | Field |
 |---|---|
-| `POST .../sessions` | `robot_notified` (bool: false only when a service of the *replaced* session could not be stopped), `mapping_switch` (`{service: started \| already_running \| stopped \| already_stopped \| failed}`), `mapping_service` (`"running"` \| `"not_running"`: the topo service), `mapping_services`, `mapping_state`, `mapping_warning` (only with `robot_notified: false`) |
-| `POST .../sessions/{sid}/pause\|resume\|finish` | `robot_notified`, `mapping_switch`, `mapping_state`, `mapping_warning` |
-| `POST .../sessions` and `.../finish` | `slam_warning` (only when a SLAM map step went wrong; see "SLAM map" above) |
+| `POST .../sessions`, `.../sessions/{sid}/pause\|resume\|finish` | `robot_actions` (below), `robot_notified` (bool: false when any robot action failed), `mapping_warning` (only then: the failed actions' `label`s joined with `; `), `mapping_state`; start only: `mapping_service` (`"running"` \| `"not_running"`: the topo service), `mapping_services`. `mapping_switch` is gone. |
+| `DELETE /api/v1/robots/{r}` | `robot_actions` (the services stopped for the sessions it closed; `[]` if none) next to `success`, `message`, `deleted` |
+| `POST .../sessions` and `.../finish` | `slam_warning` (only when a SLAM map step went wrong; see "SLAM map" above; kept next to the matching `robot_actions` entry) |
 | `POST .../sessions/{sid}/place` | `robot_notified`, `mapping_state` |
 | `GET /api/v1/maps/{id}` | `sessions.mapping_state`, `sessions.mapping_service`, `sessions.mapping_services` (of the open session's robot; null without an open session) |
 | `GET /api/v1/robots`, `GET /api/v1/robots/{r}` | `mapping_state`, `mapping_services` per robot |
 | `WS /ws/robot/{r}` | `{type: "mapping_state_update", robot_name, timestamp, mapping_state, service, service_state}` after a service was started / stopped **through the API** (not on every change on the robot: poll `GET /robots/{r}`) |
+
+**`robot_actions`** (always present, possibly `[]`, on `POST .../sessions` (also `replace`), `.../pause`, `.../resume`, `.../finish` and `DELETE /api/v1/robots/{r}`; absent from other responses and when the server runs without a mapping switch). Every robot-side call the API made for the change, in the order it made them, each
+
+```json
+{"service": "topomap", "action": "start", "ok": true,
+ "label": "Topomap service started", "detail": null}
+```
+
+| Field | Meaning |
+|---|---|
+| `service` | The orchestrator service name that was addressed (`topomap` on the real robot, `sim_topomap` in the sim; the name the orchestrator listed). For SLAM: the driver service when the orchestrator names it in its answer (e.g. `odin_driver_gpu`), else the fixed `"SLAM recording"`. If the orchestrator has no such service, the first candidate name. |
+| `action` | `"start"` \| `"stop"` \| `"restart"` (SLAM: the orchestrator restarts its driver in SLAM mode) \| `"save"` (SLAM map save) |
+| `ok` | `true`: done (also "already running" on start and "was not running" on stop); `false`: failed. A failure never fails the response. |
+| `label` | Short text for a notification (English). Success: `"Topomap service started"`, `"Topomap service stopped"`, `"Topomap service already running"`, `"Topomap service was not running"`, `"Odin driver GPU restarted for SLAM mapping"` (`"SLAM recording started"` without a driver name), `"SLAM recording already running"`, `"SLAM map save started"` (finish: the save runs in the background), `"SLAM map saved"` / `"No SLAM map to save"` (replace: the old session's save is awaited). Failure: `"Could not start topomap: <detail>"`, `"Could not stop topomap: <detail>"`, `"Could not start SLAM recording: <detail>"`, `"SLAM map not saved: <detail>"`. |
+| `detail` | The orchestrator's (or transport's) error text; `null` when `ok`. |
+
+What each endpoint lists: **start** (mapping): for `replace` first the replaced session's SLAM `save` (awaited) and `stop` of its services the new session does not run, then `start` of each service of the new session, then, on a `slam_map` map, SLAM `restart`; operate session: `[]` (or the `stop` of a replaced mapping session's services). **pause / finish**: `stop` per service (`[]` when another open mapping session of the robot still runs it, or for an operate session); finish on a `slam_map` map adds `save` (`ok: true` = the background save was started, `false` = the robot is gone/offline). **resume**: `start` per service. Pause / resume never list SLAM. The end of the background save is not in the response: it arrives as the event `MAP.SLAM_SAVE_DONE` / `MAP.SLAM_SAVE_FAILED`.
+
+Example, failed start (the session is open and `mapping`; HTTP 201):
+
+```json
+{"session": {"state": "mapping", "...": "..."}, "robot_notified": false,
+ "mapping_warning": "Could not start topomap: orchestrator at 10.0.0.5:8080 is not reachable (ConnectError)",
+ "robot_actions": [{"service": "topomap", "action": "start", "ok": false,
+   "label": "Could not start topomap: orchestrator at 10.0.0.5:8080 is not reachable (ConnectError)",
+   "detail": "orchestrator at 10.0.0.5:8080 is not reachable (ConnectError)"}]}
+```
 | ~~`POST /api/v1/robots/{r}/mapping/off`~~ | removed (404); there is no retained state to force |
 
 `mapping_state`: null (robot offline, no registered orchestrator, or its orchestrator has no

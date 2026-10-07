@@ -111,6 +111,9 @@ class RobotDeleter:
                      rosbag_deleter: Optional[Callable[[str], Awaitable[Dict[str, Any]]]] = None
                      ) -> Dict[str, Any]:
         robot, closed = await self._close_and_clear(robot_name, delete_telemetry, actor)
+        actions: list = []
+        for session in closed:  # best effort, never blocks the delete: stops the robot's services
+            actions += await maps.stop_services(self.db, self.switch, robot, session)
         if delete_rosbags:
             result = await rosbag_deleter(robot_name) if rosbag_deleter else {"success": False}
             if not result.get("success"):
@@ -127,7 +130,10 @@ class RobotDeleter:
         except Exception:  # noqa: BLE001
             logger.exception("Late cleanup of robot %s failed (the robot itself is deleted)",
                              robot_name)
-        return {"success": True, "message": f"Robot {robot_name} deleted",
-                "deleted": {"telemetry": bool(delete_telemetry),
-                            "rosbags": bool(delete_rosbags),
-                            "sessions_closed": len(closed)}}
+        out = {"success": True, "message": f"Robot {robot_name} deleted",
+               "deleted": {"telemetry": bool(delete_telemetry),
+                           "rosbags": bool(delete_rosbags),
+                           "sessions_closed": len(closed)}}
+        if self.switch is not None:  # what was done on the robot (maps §14.16); [] if nothing
+            out["robot_actions"] = actions
+        return out
