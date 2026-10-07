@@ -16,11 +16,21 @@ Orchestrator routes used (satibot_orchestrator/app/routers/services.py):
   POST /maps/{name}/save           body {cloud_map_id, cloud_session_id, stop_after, ...}: the
                                    cloud ids are added by the orchestrator proxy (packages/api/
                                    orchestrator_proxy.py) to the client's save call, and sent by
-                                   save_slam() (both via cloud_link())
+                                   start_slam_save() (both via cloud_link()). Synchronous, it
+                                   answers 504 after the orchestrator's save timeout; with
+                                   ?background=true: 202 {started, map} at once, or a 4xx (409 no
+                                   session / wrong map / save running / cloud_map_id held; 503
+                                   driver not up yet; 502 driver refused / "Map transfer already
+                                   in progress")
+  GET  /maps/mapping/save          -> {map, status: saving|done|failed, error, meta, started_at,
+                                        finished_at}
   POST /maps/{name}/mapping/start  body {overwrite}: starts the SLAM driver recording that map;
                                    409 "already has a map file" / "already running"
-  POST /maps/mapping/stop          stops the driver (404 none running)
-  GET  /maps/mapping               -> {active, map, pid}
+  POST /maps/mapping/stop          stops the driver (404 none running; 409 while a timed-out save
+                                   may still complete (`late_save_sec` > 0) unless ?force=true,
+                                   which loses that map)
+  GET  /maps/mapping               -> {active, map, pid, saving, mode, relocalizing, late_save_sec}
+                                   (older orchestrators lack late_save_sec: read it as 0)
   GET  /maps/{name}                -> the map's metadata {name, description, init_pos, ...}
   PATCH /maps/{name}               body {init_pos: [x,y,z,qx,qy,qz,qw] | null, ...}: omitted
                                    fields unchanged, explicit null init_pos clears it (relocalization,
@@ -30,7 +40,7 @@ Orchestrator routes used (satibot_orchestrator/app/routers/services.py):
 
 SLAM maps (docs/satinav-maps-redesign.md 14.15): a local map with `slam_map` is recorded on the
 robot under onboard_map_name(map); the orchestrator reserves some names, so the server's maps
-get a prefix. start_slam / save_slam / stop_slam / slam_state raise OrchestratorError like the
+get a prefix. start_slam / start_slam_save / slam_save_status / stop_slam / slam_state raise OrchestratorError like the
 rest; packages/api/mapping_switch.py wraps them into results that never raise.
 """
 
@@ -40,8 +50,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from packages.config import (
-    ORCHESTRATOR_QUERY_TIMEOUT_S, ORCHESTRATOR_SAVE_TIMEOUT_S, ORCHESTRATOR_START_TIMEOUT_S,
-    ORCHESTRATOR_STOP_TIMEOUT_S,
+    ORCHESTRATOR_QUERY_TIMEOUT_S, ORCHESTRATOR_START_TIMEOUT_S, ORCHESTRATOR_STOP_TIMEOUT_S,
 )
 
 logger = logging.getLogger("ApiDelegationService.orchestrator_client")
@@ -187,18 +196,36 @@ class OrchestratorClient:
         return await self._call("POST", f"/maps/{onboard_map}/mapping/start",
                                 ORCHESTRATOR_START_TIMEOUT_S, json_body={"overwrite": overwrite})
 
-    async def save_slam(self, onboard_map: str, cloud_map_id: str, cloud_session_id: Any,
-                        stop_after: bool = True) -> Dict[str, Any]:
-        """POST /maps/{onboard}/save with the cloud ids; slow (the driver's save_map)."""
+    async def start_slam_save(self, onboard_map: str, cloud_map_id: str, cloud_session_id: Any,
+                              stop_after: bool = True) -> Dict[str, Any]:
+        """POST /maps/{onboard}/save?background=true with the cloud ids: 202 {started, map} at
+        once (the driver saves meanwhile, see slam_save_status) or a 4xx right away."""
         body = {**cloud_link(cloud_map_id, cloud_session_id), "stop_after": stop_after}
-        return await self._call("POST", f"/maps/{onboard_map}/save",
-                                ORCHESTRATOR_SAVE_TIMEOUT_S, json_body=body)
+        return await self._call("POST", f"/maps/{onboard_map}/save", ORCHESTRATOR_START_TIMEOUT_S,
+                                params={"background": "true"}, json_body=body)
 
-    async def stop_slam(self) -> Dict[str, Any]:
-        """POST /maps/mapping/stop; 404 when no mapping session runs."""
-        return await self._call("POST", "/maps/mapping/stop", ORCHESTRATOR_STOP_TIMEOUT_S)
+    async def slam_save_status(self) -> Dict[str, Any]:
+        """GET /maps/mapping/save -> {map, status: saving|done|failed, error, meta, ...}."""
+        body = await self._call("GET", "/maps/mapping/save", ORCHESTRATOR_QUERY_TIMEOUT_S)
+        return body if isinstance(body, dict) else {}
+
+    async def stop_slam(self, force: bool = False) -> Dict[str, Any]:
+        """POST /maps/mapping/stop; 404 when no mapping session runs, 409 while a timed-out save
+        may still complete. `force` (?force=true) stops anyway and loses that map: only after the
+        user confirmed."""
+        return await self._call("POST", "/maps/mapping/stop", ORCHESTRATOR_STOP_TIMEOUT_S,
+                                params={"force": "true"} if force else None)
 
     async def slam_state(self) -> Dict[str, Any]:
-        """GET /maps/mapping -> {active, map, pid}."""
+        """GET /maps/mapping -> {active, map, pid, saving, mode, relocalizing, late_save_sec}."""
         body = await self._call("GET", "/maps/mapping", ORCHESTRATOR_QUERY_TIMEOUT_S)
         return body if isinstance(body, dict) else {}
+
+
+def late_save_sec(state: Dict[str, Any]) -> float:
+    """Seconds left in which a save that timed out may still complete (0: none, or an older
+    orchestrator without the field)."""
+    try:
+        return max(0.0, float(state.get("late_save_sec") or 0))
+    except (TypeError, ValueError):
+        return 0.0

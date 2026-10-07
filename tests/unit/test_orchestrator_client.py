@@ -12,7 +12,6 @@ import pytest  # noqa: E402
 
 from packages.api import orchestrator_client as oc  # noqa: E402
 from packages.api.orchestrator_proxy import with_cloud_ids  # noqa: E402
-from packages.config import ORCHESTRATOR_SAVE_TIMEOUT_S  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -49,30 +48,41 @@ async def test_start_slam_sends_overwrite_false():
     assert seen == [("POST", "/maps/cloud-yard/mapping/start", {"overwrite": False})]
 
 
-async def test_save_slam_body_and_long_timeout():
-    seen, timeouts = [], []
-
-    def handler(request):
-        seen.append((request.method, request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"name": "cloud-yard"})
-
-    await client_for(handler, timeouts).save_slam("cloud-yard", "yard", "S1")
-    assert seen == [("POST", "/maps/cloud-yard/save",
-                     {"cloud_map_id": "yard", "cloud_session_id": "S1", "stop_after": True})]
-    assert timeouts == [ORCHESTRATOR_SAVE_TIMEOUT_S] and ORCHESTRATOR_SAVE_TIMEOUT_S >= 180
-
-
-async def test_stop_and_state():
+async def test_start_slam_save_is_a_background_save():
     seen = []
 
     def handler(request):
-        seen.append((request.method, request.url.path, request.content))
-        return httpx.Response(200, json={"active": True, "map": "cloud-yard", "pid": 7})
+        seen.append((request.method, request.url.path, dict(request.url.params),
+                     json.loads(request.content)))
+        return httpx.Response(202, json={"started": True, "map": "cloud-yard"})
+
+    out = await client_for(handler).start_slam_save("cloud-yard", "yard", "S1")
+    assert out == {"started": True, "map": "cloud-yard"}
+    assert seen == [("POST", "/maps/cloud-yard/save", {"background": "true"},
+                     {"cloud_map_id": "yard", "cloud_session_id": "S1", "stop_after": True})]
+
+
+async def test_save_status_state_and_stop():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params), request.content))
+        return httpx.Response(200, json={"active": True, "map": "cloud-yard", "pid": 7,
+                                         "status": "saving"})
 
     client = client_for(handler)
     assert (await client.slam_state())["map"] == "cloud-yard"
+    assert (await client.slam_save_status())["status"] == "saving"
     await client.stop_slam()
-    assert seen == [("GET", "/maps/mapping", b""), ("POST", "/maps/mapping/stop", b"")]
+    await client.stop_slam(force=True)
+    assert seen == [("GET", "/maps/mapping", {}, b""), ("GET", "/maps/mapping/save", {}, b""),
+                    ("POST", "/maps/mapping/stop", {}, b""),
+                    ("POST", "/maps/mapping/stop", {"force": "true"}, b"")]
+
+
+def test_late_save_sec_defaults_to_zero():
+    assert oc.late_save_sec({"late_save_sec": 42}) == 42
+    assert oc.late_save_sec({}) == 0 and oc.late_save_sec({"late_save_sec": None}) == 0
 
 
 async def test_existing_calls_send_no_body():
@@ -106,7 +116,7 @@ async def test_unreachable_timeout_and_no_address():
         await client_for(refuse).slam_state()
     assert err.value.kind == oc.UNREACHABLE
     with pytest.raises(oc.OrchestratorError) as err:
-        await client_for(slow).save_slam("cloud-x", "x", "S")
+        await client_for(slow).start_slam_save("cloud-x", "x", "S")
     assert err.value.kind == oc.TIMEOUT
     with pytest.raises(oc.OrchestratorError) as err:
         await oc.OrchestratorClient(SimpleNamespace(name="r")).stop_slam()

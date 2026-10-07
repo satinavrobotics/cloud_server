@@ -231,8 +231,10 @@ the server: graph-builder drops a node with no open, unpaused, placed mapping se
   SLAM map on the robot, named `onboard_map_name(map)` = `cloud-<map>`. After the topomap started
   (outside any transaction, under the robot's lock) the API calls `POST /maps/{onboard}/mapping/start`
   `{"overwrite": false}`; `.../finish` answers at once and saves in a background task
-  (`POST /maps/{onboard}/save` `{cloud_map_id, cloud_session_id, stop_after: true}`, up to
-  `ORCHESTRATOR_SAVE_TIMEOUT_S`, default 180 s; a failed save stops the driver); `replace` saves the
+  (`POST /maps/{onboard}/save?background=true` `{cloud_map_id, cloud_session_id, stop_after: true}`,
+  then `GET /maps/mapping/save` every `ORCHESTRATOR_SAVE_POLL_S` for up to
+  `ORCHESTRATOR_SAVE_POLL_TOTAL_S` (660 s); a save that did not finish in time is retried every
+  `ORCHESTRATOR_SAVE_RETRY_S` while `late_save_sec` > 0; a failed save never stops the driver); `replace` saves the
   replaced session's map first (awaited), then starts the new one. Failures never fail a session:
   `slam_warning` says what (existing map file: "SLAM map already exists, not re-recorded"). Pause,
   resume and operate sessions never touch SLAM. The background outcome is only logged.

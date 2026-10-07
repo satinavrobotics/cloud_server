@@ -118,8 +118,16 @@ MAPPING_SERVICE_CANDIDATES = {
 ORCHESTRATOR_QUERY_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_QUERY_TIMEOUT_S", "3.0"))
 ORCHESTRATOR_START_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_START_TIMEOUT_S", "30.0"))
 ORCHESTRATOR_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_STOP_TIMEOUT_S", "15.0"))
-# POST /maps/{name}/save drives the SLAM driver's save_map (~150 s on a robot).
-ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "180.0"))
+# A synchronous POST /maps/{name}/save (the orchestrator proxy) waits for the driver's save_map:
+# the orchestrator gives up after 600 s (mapping.save_timeout_sec), so a little longer.
+ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "660.0"))
+# A background save (POST .../save?background=true) is polled (GET /maps/mapping/save) every
+# SAVE_POLL_S for at most SAVE_POLL_TOTAL_S (600 s timeout plus margin) per attempt. After a save
+# that did not finish in time the driver is never stopped: the save is retried every
+# SAVE_RETRY_S while the orchestrator reports late_save_sec > 0.
+ORCHESTRATOR_SAVE_POLL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_S", "3.0"))
+ORCHESTRATOR_SAVE_POLL_TOTAL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_TOTAL_S", "660.0"))
+ORCHESTRATOR_SAVE_RETRY_S = float(os.getenv("ORCHESTRATOR_SAVE_RETRY_S", "30.0"))
 # How long a fetched mapping service state is reused for the robot views (seconds).
 MAPPING_STATE_TTL_S = float(os.getenv("MAPPING_STATE_TTL_S", "5.0"))
 # How long "does this robot's orchestrator hold a stored map for cloud map X" is reused

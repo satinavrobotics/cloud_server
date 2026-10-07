@@ -31,7 +31,7 @@ topomap, a mapping session records a SLAM map on the robot, under onboard_map_na
 not a session service (never in KNOWN_SERVICES / MAPPING_SERVICE_CANDIDATES): start_slam() after
 the topomap started, save_slam() after the session finished, both best effort, never raising,
 never blocking or undoing the session; what went wrong is a `warning` the caller returns as
-`slam_warning`. Saving takes ~150 s, so a finish saves in a background task (schedule_slam_save)
+`slam_warning`. Saving takes minutes (a background save on the orchestrator, polled; a save that timed out is retried and the driver is never stopped after a failed save), so a finish saves in a background task (schedule_slam_save)
 that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
 refuses while a save is pending. Pause / resume never touch SLAM. The outcome of a background
 save is logged (no event code exists for it) and `on_slam_done(robot)` is called.
@@ -54,11 +54,17 @@ from fastapi import HTTPException
 from packages.api import orchestrator_client as oc
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.orchestrator_services import pick_service
-from packages.config import MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S
+from packages.config import (
+    MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_SAVE_POLL_S,
+    ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S,
+)
 from packages.utils.map_sessions import KNOWN_SERVICES, TOPO
 
 logger = logging.getLogger("ApiDelegationService.mapping_switch")
 
+SAVE_START_TRIES = 5      # a 503 (driver not up yet) is retried this often
+SAVE_POLL_ERRORS = 5      # consecutive failed status reads that end a poll
+SAVE_MAX_ATTEMPTS = 30    # saves started per save_slam() (a late window is ~300 s, retry 30 s)
 RECONCILE_LOCK = "slam_save_reconcile"   # advisory lock: one worker reconciles at startup
 
 RUNNING, NOT_RUNNING, NOT_AVAILABLE = "running", "not_running", "not_available"
@@ -159,6 +165,25 @@ class SlamResult:
         return self.warning is None
 
 
+class _NothingToSave(Exception):
+    """The orchestrator has no session / a session of another map to save."""
+
+
+class _SaveFailed(Exception):
+    """One save attempt failed; `slow`: it did not finish in time (the driver may be still
+    busy), not a refusal."""
+
+    def __init__(self, detail: str, slow: bool = False):
+        super().__init__(detail)
+        self.detail = detail
+        self.slow = slow
+
+
+def _looks_slow(error: str) -> bool:
+    low = error.lower()
+    return any(w in low for w in ("in time", "timed out", "timeout", "did not finish"))
+
+
 def _refuse(status: int, message: str) -> HTTPException:
     return HTTPException(status_code=status, detail=message)
 
@@ -181,8 +206,16 @@ class MappingSwitch:
     def __init__(self, client_factory: Callable[[Any], oc.OrchestratorClient] =
                  oc.OrchestratorClient,
                  ttl: float = MAPPING_STATE_TTL_S,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                 save_poll_s: float = ORCHESTRATOR_SAVE_POLL_S,
+                 save_poll_total_s: float = ORCHESTRATOR_SAVE_POLL_TOTAL_S,
+                 save_retry_s: float = ORCHESTRATOR_SAVE_RETRY_S):
         self._client_factory = client_factory
+        self._sleep = sleep
+        self._save_poll_s = save_poll_s
+        self._save_poll_total_s = save_poll_total_s
+        self._save_retry_s = save_retry_s
         self.ttl = ttl
         self._clock = clock
         self._cache: Dict[str, tuple] = {}     # robot -> (expires, Snapshot)
@@ -281,50 +314,108 @@ class MappingSwitch:
                                        f"'{name}': {exc.detail}")
 
     async def save_slam(self, robot: Any, map_name: str, session_id: Any) -> SlamResult:
-        """Save the SLAM map the robot records for `map_name` and stop the driver, awaiting the
-        robot's SLAM lock (so after a pending save). The cloud ids go to the orchestrator
-        (oc.cloud_link). No SLAM run of this map: nothing to save (no warning), a foreign run is
-        never touched. A failed save releases the driver (best effort). Never raises."""
+        """Save the SLAM map the robot records for `map_name` (the driver is stopped by the
+        orchestrator after a successful save, `stop_after`), awaiting the robot's SLAM lock (so
+        after a pending save). The save runs in the background on the orchestrator and is polled
+        (_save_attempt); one that did not finish in time is retried while the orchestrator says it
+        may still complete (`late_save_sec`). The cloud ids go to the orchestrator (oc.cloud_link).
+        No SLAM run of this map: nothing to save (no warning), a foreign run is never touched. A
+        failed save NEVER stops the driver (that would lose a save still under way). Never
+        raises."""
         name = getattr(robot, "name", "?")
         onboard = oc.onboard_map_name(map_name)
         try:
             async with self.slam_lock(name):
                 client = self._client_factory(robot)
-                try:
-                    await client.save_slam(onboard, map_name, session_id, stop_after=True)
-                    logger.info("SLAM map %s of %s saved (%s)", map_name, name, onboard)
-                    return SlamResult(SLAM_SAVED)
-                except oc.OrchestratorError as exc:
-                    if exc.kind == oc.HTTP and exc.status == 409:
-                        # no session running / the driver maps another map: not ours
+                graced = False
+                for _ in range(SAVE_MAX_ATTEMPTS):
+                    try:
+                        await self._save_attempt(client, onboard, map_name, session_id)
+                        logger.info("SLAM map %s of %s saved (%s)", map_name, name, onboard)
+                        return SlamResult(SLAM_SAVED)
+                    except _NothingToSave as exc:
                         logger.info("SLAM map %s on %s: nothing to save (%s)", map_name, name,
-                                    exc.detail)
+                                    exc)
                         return SlamResult(SLAM_NOTHING_TO_SAVE)
-                    await self._release_driver(client, name, onboard)
-                    return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not saved on "
-                                                   f"robot '{name}': {exc.detail}")
+                    except _SaveFailed as exc:
+                        late = await self._late_save_sec(client)
+                        # a first "did not finish in time" is retried once even when the
+                        # orchestrator's window is already over
+                        retry = late > 0 or (exc.slow and not graced)
+                        graced = graced or exc.slow
+                        if not retry:
+                            return SlamResult(SLAM_FAILED, self._save_warning(
+                                map_name, name, exc.detail, exc.slow))
+                        logger.warning("SLAM save of %s on %s not finished (%s); the driver is "
+                                       "left running, retrying in %.0f s (late window %.0f s)",
+                                       map_name, name, exc.detail, self._save_retry_s, late)
+                        await self._sleep(self._save_retry_s)
+                return SlamResult(SLAM_FAILED, self._save_warning(
+                    map_name, name, "gave up retrying", True))
         except Exception as exc:  # noqa: BLE001
             logger.exception("SLAM save on %s failed", name)
             return SlamResult(SLAM_FAILED, f"SLAM map of '{map_name}' not saved: {exc}")
         finally:
             self._slam_done(name)
 
-    async def _release_driver(self, client: oc.OrchestratorClient, name: str,
-                              onboard: str) -> None:
-        """After a failed save: stop the driver if it is ours. Best effort."""
+    @staticmethod
+    def _save_warning(map_name: str, robot_name: str, detail: str, may_complete: bool) -> str:
+        msg = f"SLAM map of '{map_name}' not saved on robot '{robot_name}': {detail}"
+        if may_complete:
+            msg += " (the driver was left running; the save may still complete)"
+        return msg
+
+    async def _late_save_sec(self, client: oc.OrchestratorClient) -> float:
         try:
+            return oc.late_save_sec(await client.slam_state())
+        except oc.OrchestratorError:
+            return 0.0
+
+    async def _save_attempt(self, client: oc.OrchestratorClient, onboard: str, map_name: str,
+                            session_id: Any) -> None:
+        """Start one background save and poll it until it is done. Raises _NothingToSave (409: no
+        session / another map) or _SaveFailed."""
+        for tries in range(SAVE_START_TRIES):
             try:
-                state = await client.slam_state()
-                if state.get("active") and state.get("map") != onboard:
-                    return  # somebody else's run
-            except oc.OrchestratorError:
-                pass
-            await client.stop_slam()
-        except oc.OrchestratorError as exc:
-            logger.warning("SLAM driver of %s not stopped after a failed save: %s", name,
-                           exc.detail)
-        except Exception:  # noqa: BLE001
-            logger.exception("SLAM driver of %s not stopped after a failed save", name)
+                await client.start_slam_save(onboard, map_name, session_id, stop_after=True)
+                break
+            except oc.OrchestratorError as exc:
+                if exc.kind != oc.HTTP:
+                    raise _SaveFailed(exc.detail, slow=exc.kind == oc.TIMEOUT)
+                if exc.status == 409:
+                    if await self._save_running(client, onboard):
+                        break  # a save of this map is already under way: wait for it
+                    raise _NothingToSave(exc.detail)
+                if exc.status == 503 and tries + 1 < SAVE_START_TRIES:
+                    await self._sleep(self._save_poll_s)  # the driver is not up yet
+                    continue
+                raise _SaveFailed(exc.detail, slow="already in progress" in exc.detail.lower())
+        waited, errors = 0.0, 0
+        while waited <= self._save_poll_total_s:
+            try:
+                st = await client.slam_save_status()
+                errors = 0
+            except oc.OrchestratorError as exc:
+                errors += 1
+                if errors >= SAVE_POLL_ERRORS:
+                    raise _SaveFailed(exc.detail)
+                st = {}
+            if st.get("status") == "done":
+                return
+            if st.get("status") == "failed":
+                error = str(st.get("error") or "the orchestrator reported a failed save")
+                raise _SaveFailed(error, slow=_looks_slow(error))
+            await self._sleep(self._save_poll_s)
+            waited += self._save_poll_s
+        raise _SaveFailed("the save did not finish in time", slow=True)
+
+    @staticmethod
+    async def _save_running(client: oc.OrchestratorClient, onboard: str) -> bool:
+        try:
+            st = await client.slam_save_status()
+        except oc.OrchestratorError:
+            return False
+        return st.get("status") == "saving" and st.get("map") in (None, onboard)
 
     def schedule_slam_save(self, robot: Any, map_name: str,
                            session_id: Any) -> "asyncio.Task[SlamResult]":

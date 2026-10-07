@@ -58,6 +58,10 @@ class FakeOrch:
         self.slam_save_tx = []        # open DB transactions when a save arrived
         self.slam_saving = False      # what GET /maps/mapping reports as `saving`
         self.slam_reports_saving = True   # False: an older orchestrator without the field
+        self.save_results = []        # per started save: {"status": "done"|"failed", error, late}
+        self.save_status = None       # what GET /maps/mapping/save reports
+        self.late_save_sec = 0        # what GET /maps/mapping reports (when it reports saving)
+        self.busy_starts = 0          # starts answered 502 "Map transfer already in progress"
 
     def _enter(self, op, name=None):
         self.calls.append((op, name))
@@ -135,26 +139,45 @@ async def _slam_start(self, onboard, overwrite=False):
 
 
 async def _slam_save(self, onboard, cloud_map_id, cloud_session_id, stop_after=True):
+    """POST .../save?background=true: validates, then runs the save per the orchestrator's
+    `save_results` script (default: done at once)."""
     body = {"cloud_map_id": cloud_map_id, "cloud_session_id": cloud_session_id,
             "stop_after": stop_after}
     o = self.orch
     await o._slam("slam_save", onboard, body)
     if o.slam_save_gate is not None:
         await o.slam_save_gate.wait()
+    if o.busy_starts:
+        o.busy_starts -= 1
+        raise _http(502, "Map transfer already in progress")
     if not o.slam["active"]:
         raise _http(409, "No mapping session is running")
     if o.slam["map"] != onboard:
         raise _http(409, f"Running session is mapping '{o.slam['map']}', not '{onboard}'")
-    o.slam_files.add(onboard)
-    if stop_after:
-        o.slam = {"active": False, "map": None}
-    return {"name": onboard}
+    outcome = o.save_results.pop(0) if o.save_results else {"status": "done"}
+    if outcome["status"] == "done":
+        o.slam_files.add(onboard)
+        if stop_after:
+            o.slam = {"active": False, "map": None}
+        o.late_save_sec = 0
+    else:
+        o.late_save_sec = outcome.get("late", 0)
+    o.save_status = {"map": onboard, "status": outcome["status"],
+                     "error": outcome.get("error")}
+    return {"started": True, "map": onboard}
 
 
-async def _slam_stop(self):
+async def _slam_save_status(self):
+    await self.orch._slam("slam_save_status", check_tx=False)
+    return dict(self.orch.save_status or {"map": None, "status": "failed", "error": "none"})
+
+
+async def _slam_stop(self, force=False):
     await self.orch._slam("slam_stop")
     if not self.orch.slam["active"]:
         raise _http(404, "No mapping session is running")
+    if self.orch.late_save_sec > 0 and not force:
+        raise _http(409, "a save may still complete; pass ?force=true to stop anyway")
     self.orch.slam = {"active": False, "map": None}
     return {"success": True}
 
@@ -164,18 +187,26 @@ async def _slam_state(self):
     out = {"active": self.orch.slam["active"], "map": self.orch.slam["map"], "pid": 9}
     if self.orch.slam_reports_saving:
         out["saving"] = self.orch.slam_saving
+    if self.orch.slam_reports_saving:
+        out["late_save_sec"] = self.orch.late_save_sec
     return out
 
 
 FakeOrch._slam = _slam
 FakeClient.start_slam = _slam_start
-FakeClient.save_slam = _slam_save
+FakeClient.start_slam_save = _slam_save
+FakeClient.slam_save_status = _slam_save_status
 FakeClient.stop_slam = _slam_stop
 FakeClient.slam_state = _slam_state
 
 
+async def _no_sleep(_seconds):
+    await asyncio.sleep(0)
+
+
 def make_switch(orchs, **kw):
     """A MappingSwitch whose robots' orchestrators are `orchs` {robot name: FakeOrch}."""
+    kw.setdefault("sleep", _no_sleep)
     return MappingSwitch(client_factory=lambda robot: FakeClient(orchs[robot.name]), **kw)
 
 
@@ -1092,25 +1123,92 @@ class TestSlam:
         orch.slam_save_gate.set()
         await switch.wait_slam_saves()
 
-    async def test_save_failure_stops_the_driver_and_warns(self, db):
+    async def test_save_failure_never_stops_the_driver_and_warns(self, db):
         orch, switch = slam_prepare(db)
         sid = (await start(db, switch))["session"]["session_id"]
         orch.fail[("slam_save", "cloud-yard")] = oc.OrchestratorError(oc.HTTP, "driver refused",
                                                                       status=502)
         await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
         await switch.wait_slam_saves()
-        assert ("slam_stop", None) in slam_ops(orch)
-        assert orch.slam["active"] is False
+        assert ("slam_stop", None) not in slam_ops(orch)
+        assert orch.slam == {"active": True, "map": "cloud-yard"}
         # the result a caller of save_slam sees
-        orch.slam = {"active": True, "map": "cloud-yard"}
         res = await switch.save_slam(db.robots["r1"], "yard", sid)
         assert res.status == "failed" and "driver refused" in res.warning
+        assert orch.slam["active"] is True and ("slam_stop", None) not in slam_ops(orch)
+
+    async def test_save_polls_until_done(self, db):
+        orch, switch = slam_prepare(db)
+        await start(db, switch)
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "saved" and "cloud-yard" in orch.slam_files
+        assert orch.slam["active"] is False
+        assert ("slam_save_status", None) in slam_ops(orch)
+
+    async def test_a_save_that_failed_in_time_is_retried_without_a_stop(self, db):
+        orch, switch = slam_prepare(db)
+        await start(db, switch)
+        orch.save_results = [{"status": "failed", "late": 200,
+                              "error": "Map save did not finish in time"}]
+        orch.busy_starts = 0
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "saved" and "cloud-yard" in orch.slam_files
+        assert [op for op, _ in slam_ops(orch) if op == "slam_save"] == ["slam_save"] * 2
+        assert ("slam_stop", None) not in slam_ops(orch)
+
+    async def test_retry_while_the_driver_is_busy_then_succeeds(self, db):
+        orch, switch = slam_prepare(db)
+        await start(db, switch)
+        orch.save_results = [{"status": "failed", "late": 100, "error": "timed out"}]
+        orch.late_save_sec = 100
+        orig = FakeClient.start_slam_save
+        calls = {"n": 0}
+
+        async def start_save(client, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                client.orch.busy_starts = 2   # the retries meet "transfer already in progress"
+            return await orig(client, *a, **kw)
+
+        FakeClient.start_slam_save = start_save
+        try:
+            res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        finally:
+            FakeClient.start_slam_save = orig
+        assert res.status == "saved" and ("slam_stop", None) not in slam_ops(orch)
+
+    async def test_a_timed_out_save_with_a_closed_window_fails_and_leaves_the_driver(self, db):
+        orch, switch = slam_prepare(db)
+        await start(db, switch)
+        orch.save_results = [{"status": "failed", "late": 0, "error": "did not finish in time"}] * 2
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "failed" and "may still complete" in res.warning
+        assert orch.slam["active"] is True and ("slam_stop", None) not in slam_ops(orch)
+
+    async def test_older_orchestrator_without_late_save_sec_counts_as_zero(self, db):
+        orch, switch = slam_prepare(db)
+        await start(db, switch)
+        orch.slam_reports_saving = False
+        orch.save_results = [{"status": "failed", "error": "driver refused"}]
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "failed" and orch.slam["active"] is True
+
+    async def test_stop_answers_409_during_the_late_window_until_forced(self, db):
+        orch, switch = slam_prepare(db)
+        await start(db, switch)
+        orch.late_save_sec = 120
+        client = FakeClient(orch)
+        with pytest.raises(oc.OrchestratorError) as err:
+            await client.stop_slam()
+        assert err.value.status == 409 and "force" in err.value.detail
+        assert orch.slam["active"] is True
+        await client.stop_slam(force=True)          # only after the user confirmed
         assert orch.slam["active"] is False
 
     async def test_save_failure_leaves_a_foreign_run_alone(self, db):
         orch, switch = slam_prepare(db)
         orch.slam = {"active": True, "map": "other"}
-        orch.fail[("slam_save", "cloud-yard")] = oc.OrchestratorError(oc.TIMEOUT, "slow")
+        orch.fail[("slam_save", "cloud-yard")] = oc.OrchestratorError(oc.UNREACHABLE, "gone")
         res = await switch.save_slam(db.robots["r1"], "yard", "S")
         assert res.status == "failed" and orch.slam == {"active": True, "map": "other"}
 

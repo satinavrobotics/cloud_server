@@ -81,7 +81,7 @@ session is open and no save is pending, cleared by converting to geo):
 a MAPPING session on such a map also records a SLAM map on the robot's orchestrator, named
 onboard_map_name(map). Right after the topomap started (outside any transaction, under the
 robot's lock) the server calls start_slam; finishing the session saves it in a BACKGROUND task
-(~150 s; packages/api/mapping_switch.py). Replace saves the replaced session's SLAM map first
+(minutes: background save, polled; packages/api/mapping_switch.py). Replace saves the replaced session's SLAM map first
 (awaited), then starts the new one. A SLAM failure never fails or undoes a session: the
 response carries `slam_warning`. Pause / resume / operate sessions never touch SLAM.
 
