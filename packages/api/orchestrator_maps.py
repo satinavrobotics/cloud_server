@@ -12,9 +12,12 @@ registered orchestrator address, unreachable, an older orchestrator without the 
 other error). Callers treat None like False: manual placement.
 
 reloc_capability() answers "can the API start relocalization for this robot and map" (the
-`can_start` of the reloc reads, packages/api/reloc_job.py): the robot is online, its
-orchestrator answers and lists a service from config RELOC_SERVICE_CANDIDATES (cached like
-held()), and the map is held. Never raises; the sim's orchestrator has no such service.
+`can_start` of the reloc reads, packages/api/reloc_job.py): the robot is online, has an
+orchestrator address, the map is held (the small /maps/list read), AND the orchestrator can
+relocalize: either it offers POST /maps/{name}/relocalize (its GET /maps/mapping reports `mode`
+and `relocalizing`; preferred, and the heavy /services read is then not needed at all) or, as a
+fallback, it lists a service from config RELOC_SERVICE_CANDIDATES (cached like held()).
+Never raises.
 """
 
 import asyncio
@@ -24,7 +27,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from packages.api import orchestrator_client as oc
 from packages.api.orchestrator_services import pick_service
-from packages.config import RELOC_MAP_HELD_TTL_S, RELOC_SERVICE_CANDIDATES
+from packages.config import RELOC_FORCE_SERVICE, RELOC_MAP_HELD_TTL_S, RELOC_SERVICE_CANDIDATES
 
 logger = logging.getLogger("ApiDelegationService.orchestrator_maps")
 
@@ -49,6 +52,8 @@ class OrchestratorMaps:
         self._inflight: Dict[Tuple[str, str], "asyncio.Task[Optional[bool]]"] = {}
         # robot -> (until, orchestrator reloc service name or None, why not or None)
         self._services: Dict[str, Tuple[float, Optional[str], Optional[str]]] = {}
+        # robot -> (until, whether the orchestrator offers POST /maps/{name}/relocalize or None)
+        self._endpoint: Dict[str, Tuple[float, Optional[bool]]] = {}
 
     def invalidate(self, robot_name: str) -> None:
         """Forget what is known about the robot's stored maps (a call that changes them)."""
@@ -57,6 +62,7 @@ class OrchestratorMaps:
         for key in [k for k in self._inflight if k[0] == robot_name]:
             self._inflight.pop(key, None)  # a read that started before must not be shared
         self._services.pop(robot_name, None)
+        self._endpoint.pop(robot_name, None)
 
     def _prune(self, now: float) -> None:
         for key in [k for k, (until, _) in self._cache.items() if until <= now]:
@@ -106,6 +112,34 @@ class OrchestratorMaps:
         self._services[name] = (self._clock() + ttl, found, why)
         return found, why
 
+    async def reloc_endpoint(self, robot: Any, fresh: bool = False) -> Optional[bool]:
+        """Whether the robot's orchestrator offers POST /maps/{name}/relocalize: True when its
+        GET /maps/mapping reports `mode` / `relocalizing`, False when it answers without them
+        (older orchestrator) or RELOC_FORCE_SERVICE is set, None when it could not be asked.
+        Cached like held() (an unknown only `unknown_ttl`). Never raises."""
+        if RELOC_FORCE_SERVICE:
+            return False
+        name = key_name(robot)
+        hit = self._endpoint.get(name)
+        if hit is not None and not fresh and hit[0] > self._clock():
+            return hit[1]
+        answer: Optional[bool] = None
+        ttl = self.unknown_ttl
+        try:
+            answer = oc.supports_relocalize(await self._client_factory(robot).mapping_state())
+            ttl = self.ttl
+        except oc.OrchestratorError as exc:
+            if exc.kind == oc.HTTP and exc.status == 404:
+                answer, ttl = False, self.ttl   # no such route: an older orchestrator
+            else:
+                logger.info("Mapping state of %s not readable: %s", name, exc.detail)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Mapping state of %s unreadable: %s", name, exc)
+        self._endpoint[name] = (self._clock() + ttl, answer)
+        return answer
+
     async def reloc_capability(self, robot: Any, cloud_map_id: str, fresh: bool = False,
                                held: Optional[bool] = None) -> Tuple[bool, Optional[str]]:
         """(can_start, can_start_reason): whether relocalization can be STARTED from the API for
@@ -119,15 +153,24 @@ class OrchestratorMaps:
                 return False, f"robot '{key_name(robot)}' is offline"
             if oc.orchestrator_address(robot) is None:
                 return False, f"robot '{key_name(robot)}' has no registered orchestrator"
-            service, why = await self.reloc_service(robot, fresh=fresh)
-            if service is None:
-                return False, why
+            # The two small reads first (/maps/list, /maps/mapping), together; the heavy
+            # /services read only when the endpoint path is not available.
             if held is None:
-                held = await self.held(robot, cloud_map_id, fresh=fresh)
+                held, endpoint = await asyncio.gather(
+                    self.held(robot, cloud_map_id, fresh=fresh),
+                    self.reloc_endpoint(robot, fresh=fresh))
+            else:
+                endpoint = await self.reloc_endpoint(robot, fresh=fresh)
             if held is None:
                 return False, "the robot's orchestrator could not be asked for its stored maps"
             if held is False:
                 return False, f"the robot does not hold a stored map for '{cloud_map_id}'"
+            if endpoint is not True:
+                service, why = await self.reloc_service(robot, fresh=fresh)
+                if service is None:
+                    if endpoint is False and not RELOC_FORCE_SERVICE:
+                        why = f"{why}, and it cannot relocalize by itself (older orchestrator)"
+                    return False, why
             return True, None
         except asyncio.CancelledError:
             raise

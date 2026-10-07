@@ -139,6 +139,10 @@ RELOC_SERVICE_CANDIDATES = _candidates("RELOC_SERVICE_CANDIDATES", "odin_reloc")
 RELOC_JOB_TIMEOUT_S = float(os.getenv("RELOC_JOB_TIMEOUT_S", "90.0"))
 RELOC_JOB_POLL_S = float(os.getenv("RELOC_JOB_POLL_S", "1.0"))
 RELOC_JOB_SETTLE_S = float(os.getenv("RELOC_JOB_SETTLE_S", "5.0"))
+# Relocalization normally uses the orchestrator's POST /maps/{name}/relocalize when it offers it
+# (GET /maps/mapping reports `mode`/`relocalizing`). Set true to always use the reloc SERVICE
+# (RELOC_SERVICE_CANDIDATES) instead, e.g. in a simulation whose relocalize endpoint is a stub.
+RELOC_FORCE_SERVICE = os.getenv("RELOC_FORCE_SERVICE", "false").lower() in ("1", "true", "yes")
 
 # ==================== Phase 0 telemetry ingest (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).
