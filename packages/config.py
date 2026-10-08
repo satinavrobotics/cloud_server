@@ -300,6 +300,12 @@ LIVEKIT_SFU_API_SECRET = os.getenv("LIVEKIT_SFU_API_SECRET") or None
 LIVEKIT_SFU_ADMIN_URL = os.getenv("LIVEKIT_SFU_ADMIN_URL", "http://localhost:7880")
 LIVEKIT_ADMIN_TIMEOUT = float(os.getenv("LIVEKIT_ADMIN_TIMEOUT", "3"))  # seconds per request
 
+# ==================== Offline missions (VDA5050 orders) ====================
+# What mission-dispatch decides in advance for each node of an order (allowedDeviationXY/Theta,
+# nodePolicy, timeout paused while offline, reroute-cancel dwell, blocked-node exclusion time)
+# is read by packages/controllers/mission/order_policy.py: its image has no config.py.
+# The planner and the API read BLOCKED_NODE_MATCH_RADIUS_M in packages/utils/blocked_nodes.py.
+
 # ==================== Agent Orchestrator ====================
 # LLM-based fleet triage service. ANTHROPIC_API_KEY is intentionally optional:
 # when unset the orchestrator runs in degraded (non-LLM) mode and emits

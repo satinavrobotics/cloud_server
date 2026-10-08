@@ -18,7 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 """
 import datetime
 import enum
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import pydantic
 
@@ -129,12 +129,20 @@ class Pose2D(pydantic.BaseModel):
         description="The rotation of the pose in radians", default=0.0)
     map_id: str = pydantic.Field(
         description="The ID of the map this pose is associated with", default="")
-    allowedDeviationXY: float = pydantic.Field(
-        description="Allowed coordinate deviation radius",
-        default=0.1)
-    allowedDeviationTheta: float = pydantic.Field(
-        description="Allowed theta deviation radians",
-        default=0.0)
+    allowedDeviationXY: Optional[float] = pydantic.Field(
+        description="Allowed coordinate deviation radius in metres. Unset (or 0): the "
+                    "dispatcher's policy, tight on the last node, wider on nodes driven "
+                    "through.",
+        default=None)
+    allowedDeviationTheta: Optional[float] = pydantic.Field(
+        description="Allowed theta deviation radians. Unset (or 0): the dispatcher's "
+                    "policy.",
+        default=None)
+    node_id: Optional[str] = pydantic.Field(
+        description="The topological graph node this waypoint was taken from, if any "
+                    "(set by the planner). Lets a node the robot reports blocked be kept "
+                    "out of new routes.",
+        default=None)
 
 
 def handle_response(response):

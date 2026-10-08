@@ -63,6 +63,9 @@ class EventCode(str, enum.Enum):
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
     MISSION_ORDER_CHURN = "MISSION.ORDER_CHURN"
+    MISSION_NODE_SKIPPED = "MISSION.NODE_SKIPPED"
+    MISSION_NODE_NOTE = "MISSION.NODE_NOTE"
+    MISSION_FRAME_OFFSET_SUSPECTED = "MISSION.FRAME_OFFSET_SUSPECTED"
 
 
 class Severity(str, enum.Enum):
@@ -178,6 +181,13 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MAP_RECONSTRUCTION_FAILED: CodeMeta(_S.WARNING, True, schemas.ReconstructionFailed, _R),
     # The dispatcher stopped a mission whose order kept being re-issued (Robot._bump_order_rev).
     _C.MISSION_ORDER_CHURN: CodeMeta(_S.ERROR, True, schemas.OrderChurn, _D),
+    # The robot skipped a blocked node its nodePolicy allowed it to skip, or reported an
+    # advisory note on a node (moved by an offset, seen blocked, not yet observed); the run's
+    # node offsets all point one way (Robot._process_node_reports).
+    _C.MISSION_NODE_SKIPPED: CodeMeta(_S.WARNING, True, schemas.NodeSkipped, _D),
+    _C.MISSION_NODE_NOTE: CodeMeta(_S.INFO, True, schemas.NodeNote, _D),
+    _C.MISSION_FRAME_OFFSET_SUSPECTED: CodeMeta(_S.WARNING, True, schemas.FrameOffsetSuspected,
+                                                _D),
 }
 
 

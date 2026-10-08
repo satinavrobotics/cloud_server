@@ -468,11 +468,11 @@ def test_task_status_reflects_the_reached_index_even_on_a_non_zero_first_reach()
     just in steady-state increments."""
     r, _ = _make_robot()
     mission = _arm_running_mission(r)  # mission_tree[0], node name "0", 2 waypoints
-    # task_status only updates for "user-defined" waypoints (allowedDeviationXY == 0,
-    # per update_mission_node_state's own comment) -- _make_mission's default (0.1)
-    # would skip that branch entirely, so set it explicitly for this test.
+    # task_status no longer depends on allowedDeviationXY (it once updated only for
+    # waypoints with 0); kept at 0 as this test was written.
     for wp in mission.mission_tree[0].route.waypoints:
         wp.allowedDeviationXY = 0.0
+
 
     # last_node_seq_id=4 -> idx = 4 // 2 - 1 = 1, the *second* waypoint, reported as
     # the very first progress this mission has ever registered.

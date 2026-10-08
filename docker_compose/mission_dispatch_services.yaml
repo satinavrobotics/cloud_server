@@ -81,6 +81,22 @@ services:
               "--postgres-db", "${POSTGRES_DATABASE_NAME}",
               "--postgres-user", "${POSTGRES_DATABASE_USERNAME}",
               "--postgres-password", "${POSTGRES_DATABASE_PASSWORD}"]
+    # What the dispatcher decides in advance for each node of an order (offline missions;
+    # packages/controllers/mission/order_policy.py). Unset keys take the module's defaults.
+    environment:
+      - ROUTE_DEVIATION_XY_PASS_M=${ROUTE_DEVIATION_XY_PASS_M:-0.35}
+      - ROUTE_DEVIATION_XY_FINAL_M=${ROUTE_DEVIATION_XY_FINAL_M:-0.1}
+      - ROUTE_START_DEVIATION_XY_M=${ROUTE_START_DEVIATION_XY_M:-0.35}
+      - ROUTE_DEVIATION_THETA_PASS_RAD=${ROUTE_DEVIATION_THETA_PASS_RAD:-3.1416}
+      - ROUTE_DEVIATION_THETA_FINAL_RAD=${ROUTE_DEVIATION_THETA_FINAL_RAD:-0.785}
+      - ROUTE_DEVIATION_ZERO_IS_UNSET=${ROUTE_DEVIATION_ZERO_IS_UNSET:-true}
+      - ROUTE_DEVIATION_XY_LEGACY_DEFAULT_M=${ROUTE_DEVIATION_XY_LEGACY_DEFAULT_M:-0.1}
+
+      - VDA5050_NODE_POLICY_MODE=${VDA5050_NODE_POLICY_MODE:-factsheet}
+      - NODE_POLICY_MAX_WAIT_S=${NODE_POLICY_MAX_WAIT_S:-10}
+      - MISSION_TIMEOUT_PAUSE_OFFLINE=${MISSION_TIMEOUT_PAUSE_OFFLINE:-true}
+      - BLOCKED_NODE_EXCLUSION_MIN=${BLOCKED_NODE_EXCLUSION_MIN:-10}
+      - ORDER_CANCEL_MIN_DWELL_S=${ORDER_CANCEL_MIN_DWELL_S:-2}
     network_mode: "host"
     restart: unless-stopped
     depends_on:

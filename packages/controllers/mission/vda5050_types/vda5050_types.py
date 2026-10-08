@@ -22,11 +22,14 @@ SPDX-License-Identifier: Apache-2.0
 import datetime
 import enum
 import math
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import pydantic
 
 from cloud_common.objects import mission, robot, common
+from packages.controllers.mission import order_ids
+from packages.controllers.mission.order_policy import NodePolicyMode, OrderPolicy, \
+    current as current_order_policy
 
 
 # Tell pylint to ignore the invalid names. We must use camelCase names because they are specified
@@ -49,9 +52,10 @@ class VDA5050EdgeState(pydantic.BaseModel):
 
 
 class VDA5050ActionParameter(pydantic.BaseModel):
-    """Action parameters"""
+    """Action parameters. VDA5050 allows any JSON value; nodePolicy sends typed ones
+    (bool, number), mission actions send strings (see from_mission_action)."""
     key: str
-    value: Optional[str] = None
+    value: Any = None
 
 
 class VDA5050ActionBlockingType(str, enum.Enum):
@@ -90,6 +94,11 @@ class NVActionType(str, enum.Enum):
     GET_OBJECTS = "get_objects"
 
 
+# A non-blocking order action on a route node carrying what the robot may do there on its
+# own (skippable, maxWaitS, corridorWidth); VDA5050 2.0 has no node field for it.
+NODE_POLICY_ACTION_TYPE = "nodePolicy"
+
+
 class VDA5050ActionStatus(str, enum.Enum):
     """Action status describe at which stage of the actions lifecycle the action is"""
     # Action is waiting for trigger
@@ -124,8 +133,27 @@ class VDA5050Action(pydantic.BaseModel):
         return VDA5050Action(
             actionType=action.action_type,
             actionId=f"{node_id}-n{mission_node_id}",
-            actionParameters=[VDA5050ActionParameter(key=k, value=v)
-                              for k, v in action.action_parameters.items()])
+            # Strings, as robots have always received them (the coercion the field
+            # applied when it was Optional[str]).
+            actionParameters=[VDA5050ActionParameter(
+                key=k, value=pydantic.parse_obj_as(Optional[str], v))
+                for k, v in action.action_parameters.items()])
+
+    @classmethod
+    def node_policy(cls, node_id: str, max_wait_s: float, skippable: bool = False,
+                    corridor_width_m: Optional[float] = None) -> "VDA5050Action":
+        """The nodePolicy action of node `node_id`: non-blocking, so the robot drives
+        through it. corridorWidth is sent only when known."""
+        params = [VDA5050ActionParameter(key="skippable", value=bool(skippable)),
+                  VDA5050ActionParameter(key="maxWaitS", value=float(max_wait_s))]
+        if corridor_width_m is not None:
+            params.append(VDA5050ActionParameter(key="corridorWidth",
+                                                 value=float(corridor_width_m)))
+        return VDA5050Action(
+            actionType=NODE_POLICY_ACTION_TYPE,
+            actionId=order_ids.node_policy_action_id(node_id),
+            blockingType=VDA5050ActionBlockingType.NONE,
+            actionParameters=params)
 
     @property
     def param_dict(self):
@@ -173,25 +201,38 @@ class VDA5050Node(pydantic.BaseModel):
 
     @classmethod
     def from_pose2d(cls, pose: common.Pose2D, mission_id: str, sequence: int,
-                    mission_node_id: int) -> "VDA5050Node":
+                    mission_node_id: int, final: bool = False,
+                    policy: Optional[OrderPolicy] = None) -> "VDA5050Node":
+        """A route node. Its allowed deviation is the waypoint's own when set, else the
+        order policy's: tight on the last node, wider on a node the robot drives through."""
+        policy = policy or current_order_policy()
         return VDA5050Node(
             nodeId=f"{mission_id}-n{mission_node_id}-s{sequence}",
             sequenceId=sequence,
             nodePosition=VDA5050NodePosition(
                 x=pose.x, y=pose.y, theta=pose.theta, mapId=pose.map_id,
-                allowedDeviationXY=pose.allowedDeviationXY,
-                allowedDeviationTheta=pose.allowedDeviationTheta))
+                allowedDeviationXY=policy.deviation_xy(pose.allowedDeviationXY, final),
+                allowedDeviationTheta=policy.deviation_theta(pose.allowedDeviationTheta,
+                                                             final)))
 
     @classmethod
     def from_robot(cls, robot_object: robot.RobotObjectV1, mission_id: str,
-                   mission_node_id: int = 0, sequence: int = 0) -> "VDA5050Node":
+                   mission_node_id: int = 0, sequence: int = 0, final: bool = False,
+                   policy: Optional[OrderPolicy] = None) -> "VDA5050Node":
+        """The start node, at the robot's pose. Wide enough that the robot does not try to
+        re-reach where it stands, unless it carries the order's actions (`final`)."""
+        policy = policy or current_order_policy()
         return VDA5050Node(
             nodeId=f"{mission_id}-n{mission_node_id}-s{sequence}",
             sequenceId=sequence,
-            nodePosition={
-                "x": robot_object.status.pose.x,
-                "y": robot_object.status.pose.y,
-                "theta": robot_object.status.pose.theta})
+            nodePosition=VDA5050NodePosition(
+                x=robot_object.status.pose.x,
+                y=robot_object.status.pose.y,
+                theta=robot_object.status.pose.theta,
+                allowedDeviationXY=policy.deviation_xy_final_m if final
+                else policy.deviation_xy_start_m,
+                allowedDeviationTheta=policy.deviation_theta_final_rad if final
+                else policy.deviation_theta_pass_rad))
 
     @classmethod
     def from_move(cls, robot_object: robot.RobotObjectV1, move: mission.MissionMoveNodeV1,
@@ -231,10 +272,14 @@ class VDA5050Node(pydantic.BaseModel):
             theta = theta + move.rotation
 
         # Create and return a new VDA5050Node with the updated position and orientation
+        policy = current_order_policy()
         return VDA5050Node(
             nodeId=f"{mission_id}-n{mission_node_id}-s{sequence}",
             sequenceId=sequence,
-            nodePosition={"x": x, "y": y, "theta": theta})
+            nodePosition=VDA5050NodePosition(
+                x=x, y=y, theta=theta,
+                allowedDeviationXY=policy.deviation_xy_final_m,
+                allowedDeviationTheta=policy.deviation_theta_final_rad))
 
 
 class VDA5050Edge(pydantic.BaseModel):
@@ -379,16 +424,29 @@ class VDA5050Order(pydantic.BaseModel):
     def from_route(cls, route: mission.MissionRouteNodeV1,
                    robot_object: robot.RobotObjectV1,
                    mission_id: str,
-                   mission_node_id: int) -> "VDA5050Order":
+                   mission_node_id: int,
+                   node_policy: bool = False,
+                   policy: Optional[OrderPolicy] = None) -> "VDA5050Order":
+        """The order of a route node. With `node_policy`, every node the robot drives
+        through (not the start node, not the last one) carries a nodePolicy action: how
+        long to hold at it when it is blocked. Nothing is skippable yet (that needs graph
+        metadata on which nodes a route does not depend on)."""
+        policy = policy or current_order_policy()
         # Create an initial node from the robots current position
         nodes = [VDA5050Node.from_robot(
-            robot_object, mission_id, mission_node_id)]
+            robot_object, mission_id, mission_node_id, policy=policy)]
         edges = []
         # Add each pose in the route as a node
         if route is not None:
-            nodes += [VDA5050Node.from_pose2d(pose2d, mission_id,
-                                              j * 2 + 2, mission_node_id) for j, pose2d
-                      in enumerate(route.waypoints)]
+            last = len(route.waypoints) - 1
+            for j, pose2d in enumerate(route.waypoints):
+                node = VDA5050Node.from_pose2d(pose2d, mission_id, j * 2 + 2,
+                                               mission_node_id, final=j == last,
+                                               policy=policy)
+                if node_policy and j != last:
+                    node.actions.append(VDA5050Action.node_policy(
+                        node.nodeId, max_wait_s=policy.node_policy_max_wait_s))
+                nodes.append(node)
             edges += [VDA5050Edge.from_mission_order(mission_id,
                                                      e * 2 + 1, mission_node_id)
                       for e in range(route.size)]
@@ -422,9 +480,10 @@ class VDA5050Order(pydantic.BaseModel):
                     robot_object: robot.RobotObjectV1,
                     mission_id: str,
                     mission_node_id: int) -> "VDA5050Order":
-        # Create an initial node from the robots current position
+        # Create an initial node from the robots current position; it carries the action,
+        # so it gets the tight tolerance of a node where position matters.
         nodes = [VDA5050Node.from_robot(
-            robot_object, mission_id, mission_node_id)]
+            robot_object, mission_id, mission_node_id, final=action is not None)]
         # Attach the actions to a vda5050 node
         if action is not None:
             nodes[0].actions += [VDA5050Action.from_mission_action(action,

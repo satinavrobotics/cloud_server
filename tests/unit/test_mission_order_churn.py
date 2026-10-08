@@ -30,6 +30,16 @@ from tests.unit.test_mission_lifecycle_fixes import (
     _rerouted, _route, _start, _state, _tree, _xs)
 
 
+@pytest.fixture(autouse=True)
+def _no_cancel_dwell(monkeypatch):
+    """These tests exercise the cancel/resend flow right after dispatch; the reroute-cancel
+    dwell (a robot that has not yet reported the order just sent) is covered in
+    test_offline_missions.py."""
+    from packages.controllers.mission import order_policy
+    monkeypatch.setattr(order_policy, "_current",
+                        order_policy.OrderPolicy(cancel_min_dwell_s=0.0))
+
+
 class _Clock:
     def __init__(self):
         self.t = 1000.0

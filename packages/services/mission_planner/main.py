@@ -59,6 +59,7 @@ class PlanRequest(BaseModel):
     map_id: Optional[str] = Field(None, description="Map to plan on; without it the robot's open session map, else 400")
     robot_x: Optional[float] = Field(None, description="The robot's x in its own run frame, if newer than the stored robot row")
     robot_y: Optional[float] = Field(None, description="The robot's y in its own run frame, if newer than the stored robot row")
+    ignore_exclusions: bool = Field(False, description="Plan through graph nodes a robot reported blocked recently (normally avoided)")
 
 
 class PlanResponse(BaseModel):
@@ -73,6 +74,7 @@ class PlanResponse(BaseModel):
     end_node_id: Optional[str] = None
     error: Optional[str] = None
     failed_at: Optional[str] = None
+    blocked_nodes: Optional[list] = Field(None, description="With failed_at 'blocked_nodes': the blocked graph nodes that made planning fail (on the goal, or on the shortest path with no detour around them)")
 
 
 class NavigationResponse(BaseModel):
@@ -277,6 +279,7 @@ async def plan_only(request: PlanRequest):
             target_lon=request.target_lon,
             map_id=request.map_id,
             robot_pose=robot_pose,
+            ignore_exclusions=request.ignore_exclusions,
         )
         if result.get("failed_at") == "map_resolution":
             raise HTTPException(status_code=400, detail=result.get("error"))
@@ -293,6 +296,7 @@ async def plan_only(request: PlanRequest):
             end_node_id=result.get("end_node_id"),
             error=result.get("error"),
             failed_at=result.get("failed_at"),
+            blocked_nodes=result.get("blocked_nodes"),
         )
     except HTTPException:
         raise

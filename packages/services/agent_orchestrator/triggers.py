@@ -90,7 +90,10 @@ def _edge_blocked_detail(err: Dict[str, Any]) -> str:
 def _failed_action_ids(state: Dict[str, Any]) -> set:
     out = set()
     for a in state.get("actionStates", []) or []:
-        if isinstance(a, dict) and a.get("actionStatus") == "FAILED":
+        # A nodePolicy is not something the robot does: it is FAILED with every waiting
+        # action when an order is cancelled (each reroute), which is no failure.
+        if isinstance(a, dict) and a.get("actionStatus") == "FAILED" and \
+                a.get("actionType") != "nodePolicy":
             aid = a.get("actionId")
             if aid is not None:
                 out.add(aid)
@@ -157,6 +160,11 @@ def detect_events(
         # event type (not a generic error) so the agent can recommend a reroute.
         if str(err.get("errorType", "")) == "edgeBlocked":
             events.append(FiredEvent("edge_blocked", "warning", _edge_blocked_detail(err)))
+            continue
+        # A skipped node is the robot doing what its nodePolicy allowed: worth knowing,
+        # not an error.
+        if str(err.get("errorType", "")) == "nodeSkipped":
+            events.append(FiredEvent("node_skipped", "info", _edge_blocked_detail(err)))
             continue
         level = str(err.get("errorLevel", "")).upper()
         severity = "critical" if level == "FATAL" else "warning"
