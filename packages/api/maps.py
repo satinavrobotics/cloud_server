@@ -1051,9 +1051,7 @@ def _placement_refusals(map_name: str, session_id: str, session: Optional[Mappin
                                  f"\"{session['robot_name']}\"")
     if not robot.status.online:
         raise HTTPException(409, f"Robot '{robot.name}' is offline")
-    if reloc:
-        if ms.is_placed(session):
-            raise HTTPException(409, f"Session {session_id} is already placed")
+    if reloc:   # a placed session may be relocalized again, like "Place again" by hand
         if check_initialized and robot.status.position_initialized is False:
             raise HTTPException(409, f"Robot '{robot.name}' is not relocalised: it reports its "
                                      "position as not initialized")
@@ -1150,7 +1148,7 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
     try:
         row, session, robot = await _reloc_inputs(db, map_name, session_id)
         if (row is None or row.type != "local" or session is None
-                or session["ended_at"] is not None or ms.is_placed(session)):
+                or session["ended_at"] is not None):
             return None
         held = None
         if holder is not None and robot is not None:
@@ -2243,8 +2241,8 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
     `source: "reloc"` (body `{source: "reloc"}`, no poses): the robot relocalises on a stored
     map its orchestrator holds (`holder`: packages/api/orchestrator_maps.py). Placed with
     ms.reloc_placement() (identity, D0 assumption); the robot-still check is skipped.
-    Refused 409 when the session is already placed, the robot is offline or reports its position
-    as not initialized, or the orchestrator does not (or cannot be asked to) hold the map. A low
+    A placed session may be relocalized again (as it may be placed again by hand). Refused 409
+    when the robot is offline or reports its position as not initialized, or the orchestrator does not (or cannot be asked to) hold the map. A low
     localization score does not refuse: it shows as `localization_warning` on the robot view. The
     manual placement path is unchanged.
 

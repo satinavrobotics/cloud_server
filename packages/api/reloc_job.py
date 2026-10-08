@@ -10,7 +10,7 @@ it answers 202 with a job and runs these steps in the background:
                 ms.reloc_bin_pose(); mode "odin": null, which also clears a stale seed and drops a
                 hand-set value), PUT /robot/config/map, stop (if running) + start the reloc service
     waiting     polls the stored robot status for `position_initialized` (+ `localization_score`)
-    placed      ONE transaction: the session is still open and unplaced -> map_T_session /
+    placed      ONE transaction: the session is still open and not re-placed by anyone else -> map_T_session /
                 aligned / placement (source "reloc", `init_pose` for mode "assisted"), MAP.SESSION_PLACED
     failed / cancelled
 
@@ -109,6 +109,14 @@ MAX_FINISHED_JOBS = 50
 DRIVER_GONE_POLLS = 2
 
 
+def _placement_at(session: Optional[Dict[str, Any]]) -> Optional[str]:
+    """When the session was placed (`placement.at`), None when it is not placed."""
+    if session is None or not ms.is_placed(session):
+        return None
+    at = (session.get("placement") or {}).get("at")
+    return str(at) if at is not None else "placed"
+
+
 class _Fail(Exception):
     """A step failed: the job's error text; `rollback` restores what the job changed on the robot
     (init_pos, current_map, a stopped service); False only for a timeout."""
@@ -160,6 +168,9 @@ class RelocJob:
     confirm_deadline_mono: float = 0.0
     decision: Optional[str] = None      # set once: confirm | edit (auto-confirm sets confirm)
     auto_confirmed: bool = False
+    # the session's placement when the job started (`placement.at`, None: unplaced): a placed
+    # session may be relocalized again; only a placement made by someone else meanwhile fails it
+    placement_at: Optional[str] = None
     wake: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     task: Optional["asyncio.Future[None]"] = field(default=None, repr=False)
 
@@ -272,6 +283,7 @@ class RelocJobs:
             if not robot.status.online:
                 raise HTTPException(409, f"Robot '{robot_name}' is offline")
             open_sessions = await store.open_sessions_of_robot(robot_name)
+            session = await store.session(session_id)
         mapping = [s for s in open_sessions if ms.purpose_of(s) == ms.MAPPING]
         if mapping:     # user decision 2026-10-08: no reloc while mapping
             raise HTTPException(409, f"Robot '{robot_name}' has an open mapping session "
@@ -291,7 +303,8 @@ class RelocJobs:
             init_pose=dict(init_pose) if init_pose else None, actor=actor,
             publisher_id=publisher_id, started_at=now.isoformat(),
             deadline=(now + datetime.timedelta(seconds=self.timeout)).isoformat(),
-            deadline_mono=self._clock() + self.timeout)  # both restarted when WAITING begins
+            deadline_mono=self._clock() + self.timeout,  # both restarted when WAITING begins
+            placement_at=_placement_at(session))
         self._prune()
         self._jobs[job.id] = job
         job.task = asyncio.ensure_future(self._run(job, db, switch, robot))
@@ -704,7 +717,7 @@ class RelocJobs:
 
     async def _recheck(self, job: RelocJob, db: Any, switch: Optional[Any]) -> Any:
         """After the locks: the robot is still there and online, no SLAM save, the session still
-        open and unplaced. (A driving robot or an open mapping session no longer fail the job.)
+        open and not re-placed by anyone else. (A driving robot or an open mapping session no longer fail the job.)
         Returns the robot."""
         if switch is not None and switch.slam_save_pending(job.robot_name):
             raise _Fail("the robot started saving a SLAM map")
@@ -723,7 +736,8 @@ class RelocJobs:
     @staticmethod
     def _check_session(job: RelocJob, session: Optional[Dict[str, Any]],
                        map_row: Any = None) -> None:
-        """The session is still open and unplaced, and the map is still a local map (a
+        """The session is still open and not placed by anyone else since the job started (a
+        session placed before it may be relocalized again), and the map is still a local map (a
         conversion to geo meanwhile would make the identity placement wrong)."""
         if map_row is not None and map_row.type != "local":
             raise _Fail(f"map '{job.map_name}' is no longer a local map")
@@ -731,7 +745,7 @@ class RelocJobs:
             raise _Fail("the session no longer exists")
         if session["ended_at"] is not None:
             raise _Fail("the session was finished meanwhile")
-        if ms.is_placed(session):
+        if ms.is_placed(session) and _placement_at(session) != job.placement_at:
             raise _Fail("the session was placed meanwhile")
 
     async def _wait(self, job: RelocJob, db: Any, baseline: Dict[str, Any],

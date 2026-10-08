@@ -624,10 +624,24 @@ class TestRefusals:
         s = _unplaced(env.db)
         assert await _status(env.place(s["session_id"], ASSISTED, reloc_jobs=None)) == 409
 
-    async def test_already_placed_and_geo_and_finished_are_refused_before_anything(self, env):
-        _robot(env.db)
+    async def test_a_placed_session_is_relocalized_again(self, env):
+        _robot(env.db, position_initialized=True)
         s = _unplaced(env.db, aligned=True)
-        await self._refused(env, s["session_id"])
+        env.on_sleep = _localized_after(1)
+        _, job = await env.run(s["session_id"])
+        assert job.state == rj.PLACED, job.error
+        placed = next(x for x in env.db.sessions if str(x["session_id"]) == str(s["session_id"]))
+        assert placed["placement"]["source"] == ms.SOURCE_RELOC and placed["aligned"] is True
+
+    async def test_a_placement_by_someone_else_meanwhile_fails_the_job(self):
+        job = SimpleNamespace(map_name="shed", placement_at=None)
+        session = {"map_name": "shed", "ended_at": None, "aligned": True,
+                   "map_t_session": {"tx": 0, "ty": 0, "yaw": 0},
+                   "placement": {"at": "2026-10-08T21:00:00+00:00"}}
+        with pytest.raises(rj._Fail, match="placed meanwhile"):
+            rj.RelocJobs._check_session(job, session)
+        job.placement_at = "2026-10-08T21:00:00+00:00"     # placed before the job: fine
+        rj.RelocJobs._check_session(job, session)
 
     async def test_position_not_initialized_does_not_refuse_a_job(self, env):
         _robot(env.db, position_initialized=False)

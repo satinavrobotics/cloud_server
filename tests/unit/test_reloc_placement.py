@@ -381,11 +381,13 @@ class TestPlaceReloc:
         assert await _status(maps.place_session(None, "shed", str(s["session_id"]), RELOC,
                                                 m1.PUB, holder=FakeHolder(True))) == 409
 
-    async def test_already_placed_is_refused(self, db):
-        _robot(db)
+    async def test_an_already_placed_session_is_relocalized_again(self, db):
+        _robot(db, position_initialized=True)
         s = _unplaced(db, aligned=True)
-        assert await _status(maps.place_session(None, "shed", str(s["session_id"]), RELOC,
-                                                m1.PUB, holder=FakeHolder(True))) == 409
+        h = FakeHolder(True)
+        out = await maps.place_session(None, "shed", str(s["session_id"]), RELOC, m1.PUB, holder=h)
+        assert out["session"]["placement"]["source"] == ms.SOURCE_RELOC
+        assert h.calls   # the orchestrator is asked like for an unplaced session
 
     async def test_an_uninitialized_position_is_refused(self, db):
         _robot(db, position_initialized=False)
@@ -406,14 +408,6 @@ class TestPlaceReloc:
     async def test_cheap_refusals_come_before_the_orchestrator_is_asked(self, db, kw):
         _robot(db, **kw)
         s = _unplaced(db)
-        h = FakeHolder(True)
-        assert await _status(maps.place_session(None, "shed", str(s["session_id"]), RELOC,
-                                                m1.PUB, holder=h)) == 409
-        assert h.calls == []
-
-    async def test_an_already_placed_session_does_not_ask_the_orchestrator(self, db):
-        _robot(db)
-        s = _unplaced(db, aligned=True)
         h = FakeHolder(True)
         assert await _status(maps.place_session(None, "shed", str(s["session_id"]), RELOC,
                                                 m1.PUB, holder=h)) == 409
@@ -485,12 +479,12 @@ class TestRelocStatus:
         out = await maps.placement_suggestions(None, "shed", str(s["session_id"]))
         assert out["reloc"]["available"] is False and out["reloc"]["known"] is False
 
-    async def test_placed_or_geo_has_none(self, db):
+    async def test_a_placed_session_has_a_reloc_status_too(self, db):
         _robot(db)
         s = _unplaced(db, aligned=True)
         out = await maps.placement_suggestions(None, "shed", str(s["session_id"]),
                                                holder=FakeHolder(True))
-        assert out["reloc"] is None and out["suggestions"] == []
+        assert out["reloc"]["available"] is True and out["suggestions"] == []
 
 
 class TestRelocReadsDoNotLock:
