@@ -16,6 +16,7 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
+from packages.utils import blocked_nodes
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -509,8 +510,9 @@ class MissionPlannerService:
                     y=y,
                     theta=theta,
                     map_id=node.get('map_id', query_map_id),
-                    allowedDeviationXY=0.2,
-                    allowedDeviationTheta=0.785
+                    # Tolerances are left to the dispatcher's order policy (tight on
+                    # the last node, wider on nodes driven through).
+                    node_id=str(node_id),
                 )
                 poses.append(pose)
 
@@ -626,6 +628,66 @@ class MissionPlannerService:
             self.logger.error(f"Failed to submit mission: {e}")
             return False, f"Failed to submit mission: {str(e)}"
 
+    async def _active_blocked_nodes(self, map_id: str) -> List[Dict[str, Any]]:
+        """The map's graph nodes a robot reported blocked whose exclusion has not expired.
+        Unreadable: none (logged), so planning still works without the table."""
+        try:
+            return await blocked_nodes.fetch_active(self.database, map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Blocked graph nodes of map {map_id} not readable ({err}); "
+                                "planning without them")
+            return []
+
+    def _path_avoiding(self, start_node_id: Union[int, str], end_node_id: Union[int, str],
+                       map_id: str, blocked: List[Dict[str, Any]]
+                       ) -> Tuple[Optional[List[str]], Optional[str], List[Dict[str, Any]]]:
+        """The shortest path that passes none of the `blocked` rows' graph nodes (the robot's
+        own start node excepted): (path, None, []). On failure (None, error, rows): `rows`
+        are the blocked rows that made it fail (on the goal, or on the plain shortest path
+        when no detour exists), empty when there is no path at all.
+
+        The graph's own shortest path is used unless it passes a blocked node, so a block
+        elsewhere on the map does not change a route; only then are the edges searched."""
+        start, end = str(start_node_id), str(end_node_id)
+        try:
+            plain = self.graph_db.shortest_path(start, end, map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            return None, f"Failed to find path: {err}", []
+        if not plain:
+            return None, f"No path found from node {start} to node {end}", []
+        plain = [str(p) for p in plain]
+        synthetic = any(blocked_nodes.position_of(str(b["graph_node_id"])) for b in blocked)
+        nodes = self.graph_db.get_all_nodes(map_id) if synthetic else None
+        xy_of = {str(n.get("node_id", n.get("_key"))): blocked_nodes.node_xy(n)
+                 for n in nodes or []}
+        on_path = blocked_nodes.rows_hit(blocked, [(n, xy_of.get(n)) for n in plain[1:]])
+        if not on_path:
+            return plain, None, []
+
+        def until(rows: List[Dict[str, Any]]) -> str:
+            return max(str(r.get("expires_at")) for r in rows)
+
+        def names(rows: List[Dict[str, Any]]) -> str:
+            return ", ".join(sorted({str(r["graph_node_id"]) for r in rows}))
+
+        on_goal = blocked_nodes.rows_hit(on_path, [(end, xy_of.get(end))]) \
+            if end != start else []
+        if on_goal:
+            return None, (f"The goal node {end} was reported blocked (until "
+                          f"{until(on_goal)}); choose another goal or plan with "
+                          "ignore_exclusions"), on_goal
+        excluded = blocked_nodes.excluded_node_ids(blocked, nodes)
+        excluded.discard(start)
+        self.logger.info(f"Planning around blocked graph node(s) {names(on_path)}")
+        edges = self.graph_db.get_edges(map_id)
+        path = blocked_nodes.shortest_path_avoiding(edges, start, end, excluded) \
+            if edges else None
+        if path is None:
+            return None, (f"No route avoids the blocked graph node(s) {names(on_path)} "
+                          f"(blocked until {until(on_path)}); wait, clear the block, or "
+                          "plan with ignore_exclusions"), on_path
+        return path, None, []
+
     async def plan_route(
         self,
         robot_name: str,
@@ -635,9 +697,13 @@ class MissionPlannerService:
         target_lon: Optional[float] = None,
         map_id: Optional[str] = None,
         robot_pose: Optional[Tuple[float, float]] = None,
+        ignore_exclusions: bool = False,
     ) -> Dict[str, Any]:
         """
-        Plan a route for a robot without creating a mission:
+        Plan a route for a robot without creating a mission. The path avoids the graph nodes
+        a robot reported blocked recently (blocked_graph_nodes) unless `ignore_exclusions`;
+        when every path goes through one, it fails with failed_at "blocked_nodes" and the
+        rows in `blocked_nodes` (never a silent route through them).
         0. (Optional) Convert GPS coords to local frame using the map datum
         1. Find closest node to robot (from `robot_pose`, the robot's x/y in its own run
            frame, when given, else from the stored robot row)
@@ -727,7 +793,18 @@ class MissionPlannerService:
             f"Step 3: Finding path from node {start_node['node_id']} "
             f"to node {end_node['node_id']}"
         )
-        path, error = await self.find_path(start_node['node_id'], end_node['node_id'], map_id)
+        blocked = [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
+        if blocked:
+            path, error, blocking = self._path_avoiding(
+                start_node['node_id'], end_node['node_id'], map_id, blocked)
+            if error and blocking:
+                result["error"] = error
+                result["failed_at"] = "blocked_nodes"
+                result["blocked_nodes"] = blocking
+                return result
+        else:
+            path, error = await self.find_path(start_node['node_id'], end_node['node_id'],
+                                               map_id)
         if error:
             result["error"] = error
             result["failed_at"] = "find_path"

@@ -27,6 +27,16 @@ State = mission_object.MissionStateV1
 CANCEL = types.VDA5050InstantActionType.CANCEL_ORDER
 
 
+@pytest.fixture(autouse=True)
+def _no_cancel_dwell(monkeypatch):
+    """These tests exercise the cancel/resend flow right after dispatch; the reroute-cancel
+    dwell (a robot that has not yet reported the order just sent) is covered in
+    test_offline_missions.py."""
+    from packages.controllers.mission import order_policy
+    monkeypatch.setattr(order_policy, "_current",
+                        order_policy.OrderPolicy(cancel_min_dwell_s=0.0))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ from typing import Optional
 # (orders, nodes, and node references in robot errors) goes through these.
 _ORDER_SUFFIX = re.compile(r"-n(\d+)$")
 _NODE_SUFFIX = re.compile(r"-n(\d+)(?:-s(\d+))?$")
+_POLICY_SUFFIX = "-policy"
 
 
 def run_prefix(name: str, run_id: Optional[str], order_rev: int = 0) -> str:
@@ -73,9 +74,23 @@ def is_order_of(prefix: str, order_id: str) -> bool:
     return order_prefix(order_id) == prefix
 
 
+def node_policy_action_id(node_id: str) -> str:
+    """The actionId of the nodePolicy action on node ``node_id``: unique per run, revision,
+    order and node, and the same on every resend of the order."""
+    return node_id + _POLICY_SUFFIX
+
+
+def node_of_reference(reference: str) -> str:
+    """The node id a node or action reference names: a nodePolicy actionId names its
+    node; anything else is returned as it is."""
+    return reference[:-len(_POLICY_SUFFIX)] if reference.endswith(_POLICY_SUFFIX) \
+        else reference
+
+
 def node_index(node_id: str) -> Optional[int]:
-    """The mission_tree index encoded in a node id we generated, else None."""
-    match = _NODE_SUFFIX.search(node_id)
+    """The mission_tree index encoded in a node id we generated (or in a nodePolicy
+    actionId), else None."""
+    match = _NODE_SUFFIX.search(node_of_reference(node_id))
     return int(match.group(1)) if match else None
 
 

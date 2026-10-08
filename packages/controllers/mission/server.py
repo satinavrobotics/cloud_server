@@ -41,13 +41,14 @@ from packages.controllers.mission import battery
 from packages.controllers.mission import behavior_tree
 from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
+from packages.controllers.mission import order_policy
 from packages.controllers.mission import planner_client
 from packages.controllers.mission import run_change
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit as emit_event
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
-from packages.utils import map_geo, map_sessions, metrics
+from packages.utils import blocked_nodes, map_geo, map_sessions, metrics
 import cloud_common.objects as api_objects
 import cloud_common.objects.common as common_objects
 import cloud_common.objects.mission as mission_object
@@ -85,6 +86,20 @@ STALE_STATE_GRACE_S = 30.0
 # Maps §14.13: a run-epoch check that failed (database) is retried after this long.
 RUN_CHECK_RETRY_S = 30.0
 
+
+# The robot skipped a blocked node its nodePolicy allowed it to skip (a WARNING with the
+# nodeId). Reports of these types never fail a mission, even if a robot sends them FATAL.
+NODE_SKIPPED = "nodeSkipped"
+ADVISORY_ERROR_TYPES = frozenset({NODE_SKIPPED})
+# Per-node notes (informations with a nodeId reference) kept on a mission, newest first.
+MISSION_NODE_NOTES_MAX = 50
+# Skipped nodes kept on a mission (oldest dropped first).
+MISSION_SKIPPED_NODES_MAX = 100
+# Node offsets that suggest a frame error: at least this many, mostly one way
+# (|mean vector| / mean length), and on average at least this far.
+OFFSET_SUSPECT_MIN_N = 5
+OFFSET_SUSPECT_CONSISTENCY = 0.8
+OFFSET_SUSPECT_MIN_M = 0.2
 
 # A datum that moves less than this is GNSS jitter, not a change (map-location plan A).
 DATUM_CHANGE_THRESHOLD_M = 1.0
@@ -257,7 +272,11 @@ NEW_REVISION = "revision"
 
 
 def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
-    return hashlib.sha1(route.json(sort_keys=True).encode()).hexdigest()[:16]
+    # Unset optional waypoint fields are left out, so adding one to Pose2D does not
+    # change the digest of a route stored before it existed (a mission in flight at
+    # deploy would otherwise read as rerouted and its progress be ignored).
+    return hashlib.sha1(
+        route.json(sort_keys=True, exclude_none=True).encode()).hexdigest()[:16]
 
 
 class Robot:
@@ -273,6 +292,13 @@ class Robot:
     # (base * 2^resends, capped), not on every state message. See _resend_due().
     ORDER_RESEND_BASE_S = 1.0
     ORDER_RESEND_MAX_S = 8.0
+    # At most this many identical resends of one order the robot has not adopted; the
+    # mission then fails after MAX_ORDER_MISMATCHES state messages as before.
+    ORDER_MAX_RESENDS = 3
+    # A "canceled" about the current order while the robot still lists nodes is read as
+    # left over from the previous order while it drives, or this soon after the order
+    # went out; otherwise as the robot dropping the order (see update_mission_state).
+    CANCELED_LEFTOVER_GRACE_S = 10.0
     # More new order revisions than this for one run within the window is churn: the
     # mission is failed instead of re-issued once more. See _bump_order_rev().
     ORDER_CHURN_MAX_REVISIONS = 5
@@ -329,6 +355,12 @@ class Robot:
         self._mqtt_client = client
         self._robot_online_task: Optional[asyncio.Task[Any]] = None
         self._mission_timeout_task: Optional[asyncio.Task[Any]] = None
+        # The running timeout (mission, budget s, monotonic start), and one paused while
+        # the robot is offline (mission, s left). See _pause_mission_timeout().
+        self._timeout_budget: Optional[Tuple[str, float, float]] = None
+        self._timeout_paused: Optional[Tuple[str, float]] = None
+        # The frame the last route was converted into (see _route_in_robot_frame).
+        self._last_route_frame: Optional[Dict[str, Any]] = None
         self._robot_server = server
         self._alive = True
         # VDA5050 headerIds count per topic; see _next_header_id().
@@ -337,7 +369,8 @@ class Robot:
         # orderId never carries two contents (see _send_order). What it was built from
         # is stored with the mission (status.sent_order).
         self._sent_order: Optional[types.VDA5050Order] = None
-        self._order_sent_at = 0.0  # monotonic
+        self._order_sent_at = 0.0  # monotonic, last send (resends too)
+        self._order_first_sent_at = 0.0  # monotonic, first send of _sent_order
         self._order_resends = 0
         # An orderId an earlier dispatcher process may have sent with content this one
         # does not know: it is not sent again; the next send moves to a new revision.
@@ -357,6 +390,15 @@ class Robot:
         self._process_tag = uuid.uuid4().hex[:4]
         # The orderId of the robot's last state message.
         self._robot_order_id: Optional[str] = None
+        # A reroute's cancel held back until the robot has adopted the order version just
+        # sent (see _replace_cancel_must_wait).
+        self._deferred_replace_cancel = False
+        # The orderId the robot dropped for a blocked node (None: not known, e.g. after a
+        # restart): a "canceled" about it keeps the block (see update_mission_state).
+        self._blocked_order_id: Optional[str] = None
+        # Node reports of the current run already taken, by (kind, nodeId, infoType): the
+        # robot repeats them in every state. A note's entry is the note (for last_seen).
+        self._node_reports_seen: Dict[Tuple[str, str, str], Any] = {}
         # Monotonic times of the current run's recent order revisions (churn breaker).
         self._order_revisions: Deque[float] = deque()
         self._current_behavior_tree: Optional[behavior_tree.MissionBehaviorTree] = None
@@ -438,6 +480,9 @@ class Robot:
             self._order_revisions.clear()
             self._resume_pending = False
             self._pending_send = None
+            self._deferred_replace_cancel = False
+            self._blocked_order_id = None
+            self._node_reports_seen.clear()
 
         # Cant start a new mission if there is no mission
         if self._current_mission is None:
@@ -642,6 +687,22 @@ class Robot:
                    (not current_run_only or
                     self._cancel_purposes.get(action_id, (None, None))[1] == run)
                    for action_id, a in self._current_instant_actions.items())
+
+    def _replace_cancel_must_wait(self) -> bool:
+        """Whether a reroute's cancelOrder must wait: the order version just sent has not
+        been reported by the robot yet, and ORDER_CANCEL_MIN_DWELL_S has not passed since it
+        went out (2026-10-08: order versions cancelled right after they were sent)."""
+        if self._sent_order is None or self._robot_order_id == self._sent_order.orderId:
+            return False
+        # From the first send: resends of the same order do not restart the dwell.
+        return time.monotonic() - self._order_first_sent_at < \
+            order_policy.current().cancel_min_dwell_s
+
+    async def _cancel_current_order(self, purpose: CancelPurpose, note: str):
+        """Send a cancelOrder for the robot's current order of this mission."""
+        action_id = self._action_id(f"{self._order_prefix()}-instantaction")
+        self.mission_info(f"{note} {action_id}")
+        await self._send_cancel_order(action_id, purpose)
 
     async def _send_cancel_order(self, action_id: str,
                                  purpose: Optional[CancelPurpose] = None):
@@ -895,6 +956,7 @@ class Robot:
                     return
                 self._sent_order = order
                 self._order_resends = 0
+                self._order_first_sent_at = time.monotonic()
 
             order.headerId = self._next_header_id("order")
             order.timestamp = datetime.datetime.now().isoformat()
@@ -904,6 +966,18 @@ class Robot:
                 f"{self._mqtt_prefix}/{self._name}/order", order.json())
             self.set_mission_node_state(f"{mission_node.name}",
                                         mission_object.MissionStateV1.RUNNING)
+
+    def _sends_node_policy(self) -> bool:
+        """Whether route orders to this robot carry nodePolicy actions: per
+        VDA5050_NODE_POLICY_MODE, by default only to a robot whose factsheet lists the
+        action (one that does not know it may reject the order)."""
+        mode = order_policy.current().node_policy_mode
+        if mode == order_policy.NodePolicyMode.ON:
+            return True
+        if mode != order_policy.NodePolicyMode.FACTSHEET or self._robot_object is None:
+            return False
+        return any(a.action_type == types.NODE_POLICY_ACTION_TYPE
+                   for a in self._robot_object.status.factsheet.custom_actions or [])
 
     async def _build_order(self, mission_node: mission_object.MissionNodeV1, idx: int,
                            waypoint_offset: int) \
@@ -924,10 +998,13 @@ class Robot:
             except RouteRefused as err:
                 self._refuse_route_node(mission_node, str(err))
                 return None
+            record.frame = self._last_route_frame
             self.mission_info(f"Sending mission route node {mission_node.name}"
                               f"{f' from waypoint {offset}' if offset else ''}")
             return types.VDA5050Order.from_route(route, self._robot_object,
-                                                 self._order_prefix(), idx), record
+                                                 self._order_prefix(), idx,
+                                                 node_policy=self._sends_node_policy()), \
+                record
         record = mission_object.MissionSentOrderV1(order_id=order_id)
         if mission_node.type == mission_object.MissionNodeType.MOVE and \
                 mission_node.move is not None:
@@ -1047,8 +1124,10 @@ class Robot:
                         self._note_replaced_route(n)
                         n.route = new_node.route
                         changed.append(str(n.name))
-                        # Waypoint progress was counted on the old route.
+                        # Waypoint progress was counted on the old route, and so were
+                        # the robot's reports on its nodes.
                         mission.status.task_status.pop(str(n.name), None)
+                        self._drop_node_reports(str(n.name))
                         if mission.status.node_status[str(n.name)].state is \
                                 mission_object.MissionStateV1.RUNNING:
                             # Cancel current node
@@ -1169,6 +1248,10 @@ class Robot:
                     await self._robot_server.delete_pending_mission(message)
                     return
 
+                if self._current_mission.needs_canceled and self._timeout_paused is not None:
+                    # The robot is offline, so the cancelOrder may not be answered: the
+                    # timeout is the backstop that ends the mission and frees the queue.
+                    self._resume_mission_timeout()
                 if self._current_mission.needs_canceled or cancel_node_from_api:
                     # One cancel at a time. This branch runs on *every* change event
                     # for the running mission -- including the watcher echo of each
@@ -1182,12 +1265,21 @@ class Robot:
                     if self._has_outstanding_cancel(current_run_only=True):
                         self.debug("cancelOrder already outstanding; not sending another")
                         return
+                    if not self._current_mission.needs_canceled and \
+                            self._replace_cancel_must_wait():
+                        # Never cancel an order version the robot has not even seen: the
+                        # cancel goes out once it reports it, or after the dwell. The
+                        # route sent then is the newest (it is read when the order is
+                        # built).
+                        self._deferred_replace_cancel = True
+                        self.mission_info("Reroute: waiting for the robot to take the order "
+                                          "just sent before cancelling it")
+                        return
+                    self._deferred_replace_cancel = False
                     self.info("Cancelling current node...")
-                    action_id = self._action_id(f"{self._order_prefix()}-instantaction")
-                    self.mission_info(f"Send cancel order action {action_id}")
-                    await self._send_cancel_order(
-                        action_id, CancelPurpose.MISSION if self._current_mission.needs_canceled
-                        else CancelPurpose.REPLACE)
+                    await self._cancel_current_order(
+                        CancelPurpose.MISSION if self._current_mission.needs_canceled
+                        else CancelPurpose.REPLACE, "Send cancel order action")
                 return
 
             self.info(f"Update a PENDING mission [{message.name}]")
@@ -1294,6 +1386,7 @@ class Robot:
                 await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
                 return
             self._robot_object.status.online = False
+            self._pause_mission_timeout()
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
                 await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
         except asyncio.CancelledError:
@@ -1304,10 +1397,12 @@ class Robot:
         updated_instant_action_ids = []
         finished_instant_actions = []
         for action_state in message.actionStates[::-1]:
-            # Iterate through all the appended instant actions
+            # Only instant actions; order actions (e.g. nodePolicy) may be listed in any
+            # position, and stopping at the first one would hide a cancelOrder ack
+            # behind it.
             if action_state.actionType not in (types.VDA5050InstantActionType.values() +
                                                types.NVInstantActionType.values()):
-                break
+                continue
             if action_state.actionId in self._current_instant_actions.keys():
                 if action_state.actionStatus == types.VDA5050ActionStatus.FINISHED:
                     # Update current instant aciton dict
@@ -1644,8 +1739,12 @@ class Robot:
         ("robot is not using map X"; since U6 there is no map/datum fallback, and 'GEO' /
         'LOCAL' are not maps), or when the session could not be read. Waypoints without a map
         (mapless missions: already robot frame) are sent as they are. The stored mission is
-        not changed."""
+        not changed.
+
+        What was applied is left in `_last_route_frame` (MissionSentOrderV1.frame) and
+        logged, so node offsets the robot reports can be read in the map frame."""
         names = {wp.map_id for wp in route.waypoints if wp.map_id}
+        self._last_route_frame = {"applied": "none", "map_id_sent": ""}
         if not names:
             return route
         session = await self._read_open_session()
@@ -1661,6 +1760,14 @@ class Robot:
             t = session["map_t_session"]
             if not map_geo.is_identity(t):
                 inverse[name] = map_geo.invert_transform(t)
+        self._last_route_frame = {
+            "applied": "inverse" if inverse else "identity",
+            "map_name": session["map_name"], "session_id": session.get("session_id"),
+            "map_t_session": session["map_t_session"],
+            # The nodes keep the map's name as mapId although their positions are in the
+            # robot's session frame (the robot team is asked which frame they expect).
+            "map_id_sent": ", ".join(sorted(names))}
+        self.mission_info(f"Order frame: {self._last_route_frame}")
         if not inverse:
             return route
         converted = route.copy(deep=True)
@@ -1758,6 +1865,10 @@ class Robot:
                             "Timeout error occurred: \n %s", timeout_err)
             if not self._robot_object.status.online:
                 self.info("Robot Online")
+            # Any state means the robot is back, whatever the online flag says (a watcher
+            # row read before the offline write landed can have set it again).
+            if self._timeout_paused is not None:
+                self._resume_mission_timeout()
             self._robot_object.status.online = True
             # Single pass over the VDA5050 information[] array. Each infoType is an
             # independent slot keyed by type (last entry wins on the rare duplicate),
@@ -1859,6 +1970,14 @@ class Robot:
         if self._resume_pending and await self._resume_from_state(message):
             return
 
+        if self._deferred_replace_cancel and not self._replace_cancel_must_wait():
+            self._deferred_replace_cancel = False
+            if not self._has_outstanding_cancel(current_run_only=True) and \
+                    not self._current_mission.needs_canceled:
+                await self._cancel_current_order(CancelPurpose.REPLACE,
+                                                 "Reroute: send cancel order action")
+                return
+
         # A send the current node is owed goes out once no cancelOrder of ours is in
         # flight; this state still describes the robot before it.
         if self._pending_send is not None and not self._has_outstanding_cancel():
@@ -1903,8 +2022,9 @@ class Robot:
                 await self.get_next_mission()
                 return
             # The robot takes a moment to adopt an order: send it again only with
-            # back-off, not on every state message.
-            if self._resend_due():
+            # back-off, not on every state message, and only a few times (the same
+            # order again and again is noise to a robot that has rejected it).
+            if self._resend_due() and self._order_resends < self.ORDER_MAX_RESENDS:
                 await self._send_order()
             return
         self._order_mismatch_count = 0
@@ -2108,7 +2228,7 @@ class Robot:
                         action_type=action.actionType,
                         action_description=action.actionDescription,
                         action_parameters=[
-                            robot_object.CustomActionParameterV1(key=param.key, value=param.value or "")
+                            robot_object.CustomActionParameterV1(key=param.key, value="" if param.value is None else str(param.value))
                             for param in action.actionParameters
                         ],
                         blocking_type=action.blockingType.value,
@@ -2186,6 +2306,9 @@ class Robot:
         status.run_id = uuid.uuid4().hex[:8]
         status.order_rev = 0
         status.sent_order = None
+        status.skipped_nodes = []
+        status.node_notes = []
+        status.offset_summary = None
         try:
             await self._database.update_status(
                 api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id())
@@ -2197,6 +2320,9 @@ class Robot:
         self._order_mismatch_count = 0
         self._order_revisions.clear()
         self._pending_send = None
+        self._deferred_replace_cancel = False
+        self._blocked_order_id = None
+        self._node_reports_seen.clear()
         self.last_node_seq_id = -1
         self.mission_info(f"Starting pass {status.passes_completed + 1}"
                           f"{'' if mission.repeat == 0 else f' of {mission.repeat}'}"
@@ -2279,18 +2405,21 @@ class Robot:
         else:
             await self._try_start_mission()
 
-    def _arm_mission_timeout(self):
-        """(Re)start the mission timeout watchdog for the current mission.
+    def _arm_mission_timeout(self, remaining_s: Optional[float] = None):
+        """(Re)start the mission timeout watchdog for the current mission, with the
+        mission's whole timeout or, resuming one paused while the robot was offline, what
+        was left of it.
 
         Any previously scheduled timeout is cancelled first. Used both on initial
         dispatch and when resuming after an edgeBlocked condition clears."""
         self._cancel_mission_timeout()
         if self._current_mission is None or self._current_mission.timeout is None:
             return  # no time limit set: only the robot's report (or a cancel) ends it
+        budget = self._current_mission.timeout.total_seconds() if remaining_s is None \
+            else remaining_s
+        self._timeout_budget = (self._current_mission.name, budget, time.monotonic())
         self._mission_timeout_task = asyncio.get_event_loop().create_task(
-            self._wait_mission_timeout(
-                self._current_mission.timeout.total_seconds(),
-                self._current_mission.name))
+            self._wait_mission_timeout(budget, self._current_mission.name))
 
     def _cancel_mission_timeout(self):
         """Cancel the mission timeout watchdog (e.g. while the mission is blocked and
@@ -2298,6 +2427,35 @@ class Robot:
         if self._mission_timeout_task is not None:
             self._mission_timeout_task.cancel()
             self._mission_timeout_task = None
+        self._timeout_budget = None
+        self._timeout_paused = None
+
+    def _pause_mission_timeout(self):
+        """The robot went offline: stop the mission timeout and keep what is left of it.
+        A robot carries a released route out on its own, so time offline is not a stall;
+        failing it would also send a cancelOrder the robot cannot receive."""
+        if not order_policy.current().timeout_pause_offline or \
+                self._mission_timeout_task is None or self._timeout_budget is None:
+            return
+        if self._current_mission is not None and self._current_mission.needs_canceled:
+            return  # the backstop of a cancel the offline robot cannot answer
+        name, budget, started = self._timeout_budget
+        remaining = max(budget - (time.monotonic() - started), 0.0)
+        self._cancel_mission_timeout()
+        self._timeout_paused = (name, remaining)
+        self.mission_info(f"Robot offline: mission timeout paused ({remaining:.0f} s left)")
+
+    def _resume_mission_timeout(self):
+        """The robot is back: run the rest of a timeout paused while it was offline."""
+        paused, self._timeout_paused = self._timeout_paused, None
+        if paused is None or self._current_mission is None:
+            return
+        name, remaining = paused
+        if name != self._current_mission.name or self._current_mission.status.state.done \
+                or self._current_mission.status.blocked:
+            return
+        self._arm_mission_timeout(remaining)
+        self.mission_info(f"Robot online: mission timeout resumed ({remaining:.0f} s left)")
 
     async def _wait_mission_timeout(self, timeout: float, name: str):
         await asyncio.sleep(timeout)
@@ -2457,14 +2615,16 @@ class Robot:
                 current_mission_node.move is not None and \
                 current_order_node_id == 1 * 2 + 2:
             node_state = mission_object.MissionStateV1.COMPLETED
-        # TODO(Nico): fix the action states index
         elif current_mission_node.type == mission_object.MissionNodeType.ACTION:
-            if message.actionStates[0].actionStatus == types.VDA5050ActionStatus.FINISHED:
+            action_state = self._order_action_state(message, mission_node_index)
+            if action_state is None:
+                pass
+            elif action_state.actionStatus == types.VDA5050ActionStatus.FINISHED:
                 node_state = mission_object.MissionStateV1.COMPLETED
-            elif message.actionStates[0].actionStatus == types.VDA5050ActionStatus.FAILED:
+            elif action_state.actionStatus == types.VDA5050ActionStatus.FAILED:
                 node_state = mission_object.MissionStateV1.FAILED
             # Check if this is a teleop action node
-            elif message.actionStates[0].actionType == types.NVActionType.PAUSE_ORDER and \
+            elif action_state.actionType == types.NVActionType.PAUSE_ORDER and \
                 self._robot_object is not None and \
                     self._robot_object.status.state != robot_object.RobotStateV1.TELEOP:
                 self._set_robot_state(robot_object.RobotStateV1.TELEOP)
@@ -2484,6 +2644,256 @@ class Robot:
         self.set_mission_node_state(str(current_mission_node.name), node_state)
         return node_state
 
+    @staticmethod
+    def _edge_blocked_error(message: types.VDA5050State) -> Optional[types.VDA5050Error]:
+        """The edgeBlocked error the robot reports, if any."""
+        return next((e for e in message.errors if e.errorType == "edgeBlocked"), None)
+
+    def _order_action_state(self, message: types.VDA5050State, node_idx: int) \
+            -> Optional[types.VDA5050ActionState]:
+        """The state of the action an action order of mission node `node_idx` carries.
+        Matched by actionId ("{order}-s0-n{idx}", see VDA5050Order.from_action), so
+        another action listed first (an order action of the previous route, an instant
+        action) does not complete or fail the node. A robot reporting other ids (legacy)
+        falls back to the first entry that is neither a nodePolicy nor an instant action;
+        None when there is none."""
+        expected = f"{message.orderId}-s0-n{node_idx}"
+        match = next((s for s in message.actionStates if s.actionId == expected), None)
+        if match is not None:
+            return match
+        skip = set(types.VDA5050InstantActionType.values() +
+                   types.NVInstantActionType.values()) | {types.NODE_POLICY_ACTION_TYPE}
+        return next((s for s in message.actionStates if s.actionType not in skip), None)
+
+    def _resolve_node_ref(self, node_id: str) -> Optional[Dict[str, Any]]:
+        """What a nodeId the robot reported names in the current run: its order, mission
+        node, waypoint index and graph node, as far as known; None for a node that is not
+        of this run (any revision). The waypoint index is only known for the order last
+        built (its offset is recorded); the graph node comes from the waypoint's node_id,
+        else from planned_path for a mission with a single route node."""
+        mission = self._current_mission
+        if mission is None:
+            return None
+        node_id = order_ids.node_of_reference(node_id)
+        order_id = order_ids.order_of_node(node_id)
+        if not self._is_order_of_run(order_id):
+            return None
+        idx = order_ids.node_index(node_id)
+        seq = order_ids.node_sequence(node_id)
+        ref: Dict[str, Any] = {"node_id": node_id, "order_id": order_id, "mission_node": None,
+                               "waypoint_index": None, "graph_node_id": None}
+        if idx is None or idx >= len(mission.mission_tree):
+            return ref
+        node = mission.mission_tree[idx]
+        if node.route is not None and not self._order_route_is_current(order_id, node):
+            return None  # about a route a reroute has replaced
+        ref["mission_node"] = str(node.name)
+        if seq is None or seq < 2 or node.route is None or \
+                self._sent_order_record(order_id) is None:
+            return ref
+        index = self._waypoint_offset(order_id) + seq // 2 - 1
+        if index >= len(node.route.waypoints):
+            return ref
+        ref["waypoint_index"] = index
+        graph_node = node.route.waypoints[index].node_id
+        routes = [n for n in mission.mission_tree if n.route is not None]
+        if graph_node is None and len(routes) == 1 and mission.planned_path and \
+                index < len(mission.planned_path):
+            graph_node = str(mission.planned_path[index])
+        ref["graph_node_id"] = graph_node
+        return ref
+
+    def _exclude_blocked_node(self, node_ref: str, source: str, reason: Optional[str]) -> None:
+        """Keep the graph node of a waypoint the robot reported blocked out of new routes
+        for BLOCKED_NODE_EXCLUSION_MIN (blocked_graph_nodes, read by the planner), for every
+        robot on the map. Best effort: a waypoint on no map is skipped, and a failed write
+        only logs. When the waypoint's graph node is not known, its position is kept out."""
+        ref = self._resolve_node_ref(node_ref)
+        if ref is None or ref["waypoint_index"] is None:
+            return
+        node = next(n for n in self._current_mission.mission_tree
+                    if str(n.name) == ref["mission_node"])
+        index = ref["waypoint_index"]
+        waypoint = node.route.waypoints[index]
+        if not waypoint.map_id:
+            return
+        previous = node.route.waypoints[index - 1].node_id if index > 0 else None
+        graph_node = ref["graph_node_id"] or blocked_nodes.synthetic_id(waypoint.x, waypoint.y)
+        params = blocked_nodes.upsert_params(
+            waypoint.map_id, graph_node, source,
+            order_policy.current().blocked_node_exclusion_min * 60.0,
+            edge_from=previous, edge_to=ref["graph_node_id"], robot_name=self._name,
+            mission_name=str(self._current_mission.name), vda_node_id=ref["node_id"],
+            reason=reason, x=waypoint.x, y=waypoint.y)
+        self.mission_info(f"Keeping graph node {graph_node} on map {waypoint.map_id} out of "
+                          f"new routes for {order_policy.current().blocked_node_exclusion_min:g}"
+                          f" min ({source})")
+        asyncio.ensure_future(self._write_blocked_node(params))
+
+    async def _write_blocked_node(self, params: Tuple[Any, ...]) -> None:
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(blocked_nodes.UPSERT_SQL, params)
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Could not store blocked graph node {params[1]} ({err}); new "
+                         "routes may still go through it")
+
+    def _process_node_reports(self, message: types.VDA5050State) -> None:
+        """Keep what the robot reports about single nodes on the mission: nodes it skipped
+        (nodeSkipped WARNING) and advisory notes (informations with a nodeId reference:
+        node moved by an offset, seen blocked, area not observed). Neither changes the
+        mission or sends anything; after a reconnect the first state carries everything
+        that happened offline, so each report is kept once."""
+        mission = self._current_mission
+        if mission is None:
+            return
+        status = mission.status
+        now = datetime.datetime.now()
+        changed = False
+        seen = self._node_reports_seen
+        for error in message.errors:
+            if error.errorType != NODE_SKIPPED:
+                continue
+            for ref_value in (r.referenceValue for r in error.errorReferences
+                              if r.referenceKey in ("nodeId", "node_id")):
+                key = (NODE_SKIPPED, order_ids.node_of_reference(ref_value), "")
+                if key in seen:
+                    continue
+                ref = self._resolve_node_ref(ref_value)
+                seen[key] = None
+                if ref is None or any(s.node_id == ref["node_id"] and
+                                      s.order_id == ref["order_id"]
+                                      for s in status.skipped_nodes):
+                    continue
+                if error.errorLevel == types.VDA5050ErrorLevel.FATAL:
+                    self.warning(f"[{mission.name}] nodeSkipped reported as FATAL; read as "
+                                 "a warning")
+                skipped = mission_object.MissionSkippedNodeV1(
+                    **ref, description=error.errorDescription, first_seen=now)
+                status.skipped_nodes.append(skipped)
+                del status.skipped_nodes[:-MISSION_SKIPPED_NODES_MAX]
+                changed = True
+                self.mission_info(f"Robot skipped node {ref['node_id']} (waypoint "
+                                  f"{ref['waypoint_index']}): {error.errorDescription}")
+                self._record("node_skipped", self._name, mission, skipped, self._event_ts)
+        for info in message.information or []:
+            if info.infoType == "missionStatus":
+                continue
+            refs = {r.referenceKey: r.referenceValue for r in info.infoReferences}
+            node_ref = refs.get("nodeId") or refs.get("node_id")
+            if not node_ref:
+                continue
+            key = ("note", order_ids.node_of_reference(node_ref), info.infoType)
+            if key in seen:
+                # Again (also after the cap dropped it): only last_seen moves, stored with
+                # the mission's next status write.
+                if seen[key] is not None:
+                    seen[key].last_seen = now
+                continue
+            ref = self._resolve_node_ref(node_ref)
+            seen[key] = None
+            if ref is None:
+                continue
+            # Kept before this process started (the status is stored).
+            existing = next((n for n in status.node_notes
+                             if n.node_id == ref["node_id"] and n.order_id == ref["order_id"]
+                             and n.info_type == info.infoType), None)
+            if existing is not None:
+                seen[key] = existing
+                existing.last_seen = now
+                continue
+            offset = self._note_offset(refs)
+            note = mission_object.MissionNodeNoteV1(
+                **ref, info_type=info.infoType, description=info.infoDescription,
+                offset=offset, offset_map=self._offset_in_map(offset, ref["order_id"]),
+                first_seen=now, last_seen=now)
+            seen[key] = note
+            status.node_notes.insert(0, note)
+            del status.node_notes[MISSION_NODE_NOTES_MAX:]
+            changed = True
+            self.mission_info(f"Robot note on node {ref['node_id']} ({info.infoType}): "
+                              f"{info.infoDescription}")
+            self._record("node_note", self._name, mission, note, self._event_ts)
+            if note.offset_map is not None:
+                self._update_offset_summary()
+        if changed:
+            asyncio.ensure_future(self._database.update_status(
+                api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id()))
+
+    def _drop_node_reports(self, mission_node: str) -> None:
+        """A reroute replaced `mission_node`'s route: its waypoint indices and graph nodes
+        named the old route, so the robot's reports on it are dropped (the offset summary
+        is taken again from the notes left)."""
+        status = self._current_mission.status
+        status.skipped_nodes = [s for s in status.skipped_nodes
+                                if s.mission_node != mission_node]
+        notes = [n for n in status.node_notes if n.mission_node != mission_node]
+        if len(notes) != len(status.node_notes):
+            status.node_notes = notes
+            status.offset_summary = None
+            self._update_offset_summary()
+
+    @staticmethod
+    def _note_offset(refs: Dict[str, str]) -> Optional[Dict[str, float]]:
+        """The offset a note carries (offsetX/offsetY[/offsetTheta] references), if any;
+        None for one that is not a finite number."""
+        try:
+            if "offsetX" not in refs or "offsetY" not in refs:
+                return None
+            offset = {"dx": float(refs["offsetX"]), "dy": float(refs["offsetY"]),
+                      "dtheta": float(refs.get("offsetTheta", 0.0))}
+        except ValueError:
+            return None
+        return offset if all(math.isfinite(v) for v in offset.values()) else None
+
+    def _offset_in_map(self, offset: Optional[Dict[str, float]],
+                       order_id: Optional[str]) -> Optional[Dict[str, float]]:
+        """An offset in the order's frame rotated into the map frame, by the transform the
+        order was sent with (MissionSentOrderV1.frame); as it is for an order sent without
+        one, None for an order whose frame is not recorded."""
+        if offset is None:
+            return None
+        record = self._sent_order_record(order_id)
+        frame = record.frame if record is not None else None
+        if frame is None:
+            return None
+        yaw = float((frame.get("map_t_session") or {}).get("yaw", 0.0)) \
+            if frame.get("applied") == "inverse" else 0.0
+        c, s = math.cos(yaw), math.sin(yaw)
+        return {"dx": c * offset["dx"] - s * offset["dy"],
+                "dy": s * offset["dx"] + c * offset["dy"]}
+
+    def _update_offset_summary(self) -> None:
+        """Take the run's node offsets together; when they all point the same way, warn
+        once per run: a frame error between graph and robot map, not node placement."""
+        mission = self._current_mission
+        status = mission.status
+        offsets = [n.offset_map for n in status.node_notes if n.offset_map is not None]
+        if not offsets:
+            return
+        n = len(offsets)
+        mean_dx = sum(o["dx"] for o in offsets) / n
+        mean_dy = sum(o["dy"] for o in offsets) / n
+        mean_norm = sum(math.hypot(o["dx"], o["dy"]) for o in offsets) / n
+        consistency = math.hypot(mean_dx, mean_dy) / mean_norm if mean_norm > 0 else 0.0
+        already = status.offset_summary is not None and \
+            status.offset_summary.suspected_frame_error
+        suspected = n >= OFFSET_SUSPECT_MIN_N and consistency >= OFFSET_SUSPECT_CONSISTENCY \
+            and math.hypot(mean_dx, mean_dy) >= OFFSET_SUSPECT_MIN_M
+        status.offset_summary = mission_object.MissionOffsetSummaryV1(
+            n=n, mean_dx=mean_dx, mean_dy=mean_dy, mean_norm=mean_norm,
+            consistency=consistency, suspected_frame_error=already or suspected)
+        if suspected and not already:
+            record = status.sent_order
+            frame = record.frame if record is not None else None
+            self.warning(f"[{mission.name}] {n} node offsets point the same way (mean "
+                         f"{mean_dx:+.2f}, {mean_dy:+.2f} m, consistency {consistency:.2f}): "
+                         f"likely a frame error; order frame {frame}")
+            self._record("frame_offset_suspected", self._name, mission,
+                         status.offset_summary,
+                         (frame or {}).get("map_t_session"), self._event_ts)
+
     def _handle_edge_blocked(self, message: types.VDA5050State) -> bool:
         """Detect a robot-reported ``edgeBlocked`` WARNING and record it as a
         non-terminal block on the current mission.
@@ -2502,8 +2912,7 @@ class Robot:
         if self._current_mission is None:
             return False
         status = self._current_mission.status
-        blocked_error = next(
-            (e for e in message.errors if e.errorType == "edgeBlocked"), None)
+        blocked_error = self._edge_blocked_error(message)
 
         if blocked_error is None:
             # No active block reported. If we had one recorded, the robot has
@@ -2528,12 +2937,21 @@ class Robot:
                     blocked_node_name = str(
                         self._current_mission.mission_tree[node_idx].name)
                 seq = order_ids.node_sequence(ref.referenceValue)
-                if seq is not None:
+                blocked_order = order_ids.order_of_node(ref.referenceValue)
+                route_node = self._current_mission.mission_tree[node_idx] \
+                    if blocked_node_name is not None else None
+                if seq is not None and (route_node is None or
+                                        self._order_route_is_current(blocked_order,
+                                                                     route_node)):
                     blocked_waypoint_index = seq // 2 - 1 + self._waypoint_offset(
-                        order_ids.order_of_node(ref.referenceValue))
+                        blocked_order)
 
+        # The order the robot reports the block on (a reroute's order can be blocked
+        # too, on the same node).
+        self._blocked_order_id = message.orderId
         # Idempotency: the idle robot re-emits this WARNING in every state message,
         # so only act (log + persist) when the block is new or its target changed.
+
         if (status.blocked and status.blocked_node == blocked_node_name and
                 status.blocked_edge == blocked_edge):
             return True
@@ -2547,6 +2965,13 @@ class Robot:
             status.node_status[blocked_node_name].error_msg = \
                 blocked_error.errorDescription
         self._record("edge_blocked", self._name, self._current_mission, self._event_ts)
+        # Routes planned from now on (this robot's reroute, other robots) avoid the node.
+        # The robot's per-node "seen blocked" notes are advisory and do not do this.
+        blocked_ref = next((r.referenceValue for r in blocked_error.errorReferences
+                            if r.referenceKey in ("nodeId", "node_id")), None)
+        if blocked_ref is not None:
+            self._exclude_blocked_node(blocked_ref, "edgeBlocked",
+                                       blocked_error.errorDescription)
 
         self.warning(
             f"Edge blocked: node={blocked_node_name} edge={blocked_edge} "
@@ -2567,6 +2992,7 @@ class Robot:
         """Clear a recorded edgeBlocked condition once the robot has resumed."""
         if not mission.status.blocked:
             return
+        self._blocked_order_id = None
         blocked_node = mission.status.blocked_node
         self._record("rerouted", self._name, mission, blocked_node,
                      mission.status.blocked_edge, self._event_ts)
@@ -2592,6 +3018,7 @@ class Robot:
         """errorTypes of FATAL errors that name no node or action."""
         return {e.errorType for e in message.errors
                 if e.errorLevel == types.VDA5050ErrorLevel.FATAL and
+                e.errorType not in ADVISORY_ERROR_TYPES and
                 not any(r.referenceKey in cls._NODE_REFERENCE_KEYS
                         for r in e.errorReferences)}
 
@@ -2619,8 +3046,9 @@ class Robot:
         if len(message.errors) == 0:
             return False
         for error in message.errors:
-            # Skip warnings
-            if error.errorLevel != types.VDA5050ErrorLevel.FATAL:
+            # Skip warnings, and reports that never fail a mission whatever their level
+            if error.errorLevel != types.VDA5050ErrorLevel.FATAL or \
+                    error.errorType in ADVISORY_ERROR_TYPES:
                 continue
             if error.errorType in self._stale_fatal_types and not any(
                     r.referenceKey in self._NODE_REFERENCE_KEYS
@@ -2631,12 +3059,8 @@ class Robot:
             for error_reference in error.errorReferences:
                 if error_reference.referenceKey in \
                         ["node_id", "nodeId", "action_id", "actionId"]:
-                    mission_node_id = \
-                        error_reference.referenceValue.rsplit(
-                            "-n")[-1].rsplit("-s")[0]
-                    try:
-                        mission_node = int(mission_node_id)
-                    except ValueError:
+                    mission_node = order_ids.node_index(error_reference.referenceValue)
+                    if mission_node is None:
                         continue
                     if self._current_mission is not None and \
                             mission_node < len(self._current_mission.mission_tree):
@@ -2701,6 +3125,10 @@ class Robot:
                 (self._current_behavior_tree is None):
             return
 
+        # Skipped nodes and per-node notes are kept whatever else the state says (also
+        # while blocked, and in the state that completes the order after a reconnect).
+        self._process_node_reports(message)
+
         # Check for missionStatus published inside the VDA5050 informations array.
         # The robot firmware embeds lifecycle events here instead of a separate topic.
         mission_status = next(
@@ -2725,6 +3153,26 @@ class Robot:
         if mission_status == "canceled":
             if self._current_mission.needs_canceled:
                 self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+            elif self._edge_blocked_error(message) is not None:
+                # The robot dropped its order because a node is blocked: resending the
+                # same route would drive it straight back there (2026-10-08). Record the
+                # block and wait for a reroute.
+                self._handle_edge_blocked(message)
+            elif self._current_mission.status.blocked:
+                # The order dropped for the block, now without the error, keeps the block
+                # until a reroute (clearing it here resent the route on the next
+                # "canceled"). Only the reroute's own order being canceled ends it.
+                if self._blocked_order_id is not None and \
+                        message.orderId != self._blocked_order_id and \
+                        message.orderId == self._current_order_id():
+                    self._clear_block(self._current_mission)
+            elif (message.nodeStates or message.edgeStates) and \
+                    (message.driving or time.monotonic() - self._order_first_sent_at <
+                     self.CANCELED_LEFTOVER_GRACE_S):
+                # Still executing: a "canceled" left over from the previous order, not
+                # about this one.
+                pass
+
             elif not self._has_outstanding_cancel() and self._pending_send is None and \
                     message.orderId == self._current_order_id():
                 # The robot dropped the current order without a cancel of ours (one in
@@ -3013,6 +3461,9 @@ class Robot:
         self._current_mission.status.state = state
         self._current_mission.status.node_status["root"].state = state
         if state.done:
+            # A reroute's held cancel is about this mission's order only.
+            self._deferred_replace_cancel = False
+
             # Terminal mission states are set here directly (e.g. on timeout or
             # cancel-before-ack), bypassing the leaf-node updates that normally
             # come from robot feedback (see update_mission_node_state). Propagate
@@ -3142,8 +3593,10 @@ class RobotServer:
             databae_url: The url where the database REST API is hosted
         """
         self._logger = logging.getLogger("Isaac Mission Dispatch")
+        self._logger.info("Order policy: %s", order_policy.current().json())
 
         # Save parameters to use later
+
         self._mqtt_prefix = mqtt_prefix
 
         # Connect to the db

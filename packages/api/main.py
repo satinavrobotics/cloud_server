@@ -10,7 +10,7 @@ import logging
 import uuid
 import argparse
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, List, Literal
+from typing import Optional, Dict, Any, List, Literal, Tuple
 import os
 from datetime import datetime
 
@@ -31,6 +31,7 @@ from packages.utils.service_utils import (
 )
 from packages.utils.fastapi_helpers import add_error_handlers
 from packages.utils import map_sessions as ms
+from packages.utils import blocked_nodes
 from packages.config import (
     SLAM_RECONCILE_INTERVAL_S,
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
@@ -45,7 +46,7 @@ from packages.config import (
 from cloud_common.objects.robot import (
     FACTSHEET_PHYSICAL_FIELDS, CustomActionV1, RobotObjectV1, RobotStatusV1)
 from cloud_common.objects.mission import (
-    EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
+    DISPATCHER_OWNED_STATUS_FIELDS, EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
     MissionStatusV1)
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects import common as common_objects
@@ -581,6 +582,62 @@ async def get_map_graph(map_id: str):
     effects), with type/geo/state and the legacy datum `transform`."""
     _require_service()
     return await _site_call("read map graph", service.get_map_graph(map_id))
+
+
+@app.get("/api/v1/maps/{map_id}/blocked-nodes")
+async def list_blocked_nodes(map_id: str):
+    """The map's graph nodes a robot reported blocked whose exclusion has not expired: the
+    planner leaves them out of new routes, and a reroute through one is refused (409) unless
+    forced. `graph_node_id` "@x,y" is a position whose graph node was not known. If the
+    table is not readable (as for the planner and the reroute check, which then go on
+    without it): an empty list with `error`."""
+    _require_service()
+    try:
+        rows = await blocked_nodes.fetch_active(service.database, map_id)
+    except Exception as err:  # pylint: disable=broad-except
+        logging.warning("Blocked graph nodes of map %s not readable: %s", map_id, err)
+        return {"map_id": map_id, "blocked_nodes": [],
+                "error": "Blocked graph nodes not readable"}
+    return {"map_id": map_id, "blocked_nodes": rows}
+
+
+@app.delete("/api/v1/maps/{map_id}/blocked-nodes/{graph_node_id}")
+async def clear_blocked_node(map_id: str, graph_node_id: str):
+    """Clear one blocked graph node (the operator knows it is passable again). 404 if the
+    node is not blocked on the map (no row, or its exclusion had expired)."""
+    _require_service()
+    async with service.database.connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(blocked_nodes.DELETE_SQL, (map_id, graph_node_id))
+            row = await cursor.fetchone()
+    if row is None or not row[0]:
+        raise HTTPException(status_code=404,
+                            detail=f"Graph node {graph_node_id} is not blocked on map {map_id}")
+    return {"map_id": map_id, "graph_node_id": graph_node_id, "cleared": True}
+
+
+async def _reroute_through_blocked(reroute: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The active blocked-node rows a reroute's waypoints go through, by the planner's rule
+    (blocked_nodes.row_blocks): each route's first waypoint, where the robot starts, is
+    never blocked."""
+    rows_by_map: Dict[str, List[Dict[str, Any]]] = {}
+    hits: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for route in reroute.values():
+        waypoints = route.waypoints if hasattr(route, "waypoints") else \
+            (route or {}).get("waypoints") or []
+        waypoints = [wp if isinstance(wp, dict) else wp.dict() for wp in waypoints]
+        by_map: Dict[str, List[Dict[str, Any]]] = {}
+        for wp in waypoints[1:]:
+            if wp.get("map_id"):
+                by_map.setdefault(wp["map_id"], []).append(wp)
+        for map_id, wps in by_map.items():
+            if map_id not in rows_by_map:
+                rows_by_map[map_id] = await blocked_nodes.fetch_active(service.database,
+                                                                       map_id)
+            points = blocked_nodes.route_points(wps, skip_first=False)
+            for row in blocked_nodes.rows_hit(rows_by_map[map_id], points):
+                hits[(map_id, str(row["graph_node_id"]))] = row
+    return list(hits.values())
 
 
 def _arango_node_count(name: str) -> int:
@@ -2315,7 +2372,7 @@ async def update_mission(mission_name: str, mission_data: dict):
             edits = {}
             reroute = None
             for key, value in mission_data.items():
-                if key in ("status", "name", "lifecycle"):
+                if key in ("status", "name", "lifecycle", "force"):
                     continue
                 if key == "update_nodes":
                     # A reroute, meant for a running mission; applied below, after any edit.
@@ -2350,6 +2407,23 @@ async def update_mission(mission_name: str, mission_data: dict):
                     mission.status.node_status = {
                         name: mission.status.node_status.get(name, MissionNodeStatusV1())
                         for name in node_names}
+            if reroute and not mission_data.get("force"):
+                # A route through a node a robot just reported blocked would send the robot
+                # straight back to it (2026-10-08); the operator can force it.
+                try:
+                    through = await _reroute_through_blocked(reroute)
+                except Exception as err:  # pylint: disable=broad-except
+                    logging.warning("Blocked graph nodes not readable (%s); reroute not "
+                                    "checked against them", err)
+                    through = []
+                if through:
+                    raise HTTPException(status_code=409, detail={
+                        "code": "ROUTE_THROUGH_BLOCKED_NODES",
+                        "message": "The new route goes through graph node(s) a robot reported "
+                                   "blocked: " + ", ".join(
+                                       str(r["graph_node_id"]) for r in through) +
+                                   ". Send force: true to reroute anyway.",
+                        "blocked_nodes": through})
             if reroute:
                 # Fold the new routes into mission_tree (validated, planned_path cleared,
                 # route_rev bumped) instead of storing the request: the row is what the
@@ -2364,11 +2438,11 @@ async def update_mission(mission_name: str, mission_data: dict):
         # Update status if provided
         if "status" in mission_data:
             new_status = mission.get_status_class()(**mission_data["status"])
-            # run_id / order_rev belong to the dispatcher: they name the VDA5050
-            # orders it has already sent, so a caller's copy of the status (stale, or
-            # simply without them) must not blank or change them.
-            new_status.run_id = mission.status.run_id
-            new_status.order_rev = mission.status.order_rev
+            # Dispatcher-owned fields (run_id / order_rev name the VDA5050 orders it has
+            # already sent; the robot's reports of the run): a caller's copy of the status
+            # (stale, or simply without them) must not blank or change them.
+            for field in DISPATCHER_OWNED_STATUS_FIELDS:
+                setattr(new_status, field, getattr(mission.status, field))
             mission.status = new_status
             await service.database.update_status(MissionObjectV1, mission.name, mission.status, publisher_id)
 

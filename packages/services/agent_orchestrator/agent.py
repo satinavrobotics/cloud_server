@@ -33,7 +33,10 @@ VDA5050 quick reference:
 - An error with errorType "edgeBlocked" (WARNING) means a path edge is impassable
   after the robot's local retries; the robot has stopped and is waiting IDLE for a
   new route. It will not reroute itself. The operator should send a new order/route
-  that avoids the blocked edge (referenced by errorReferences nodeId/edgeId).
+  that avoids the blocked edge (referenced by errorReferences nodeId/edgeId). The
+  planner already keeps the blocked node out of new routes for about 10 minutes.
+- An error with errorType "nodeSkipped" (WARNING) means the robot found a node blocked
+  and skipped it, as the server allowed for that node; the mission carries on.
 - safetyState.eStop != "NONE" means emergency stop engaged; fieldViolation
   means the robot entered a protective field.
 - operatingMode: AUTOMATIC is normal; MANUAL/SERVICE/TEACHIN mean a human or

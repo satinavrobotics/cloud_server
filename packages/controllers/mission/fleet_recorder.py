@@ -1053,6 +1053,39 @@ class FleetRecorder:
         }, discriminator=f"{mission.name}|{mission.status.run_id}|{mission.status.order_rev}")
 
     @_guarded
+    def node_skipped(self, robot_name: str, mission: Any, skipped: Any,
+                     ts: Optional[datetime.datetime] = None) -> None:
+        self._event(EventCode.MISSION_NODE_SKIPPED, robot_name, ts or self._clock(), {
+            "mission_name": mission.name, "node_id": skipped.node_id,
+            "waypoint_index": skipped.waypoint_index, "graph_node_id": skipped.graph_node_id,
+            "detail": skipped.description,
+        }, discriminator=f"{mission.name}|{mission.status.run_id}|{skipped.node_id}")
+
+    @_guarded
+    def node_note(self, robot_name: str, mission: Any, note: Any,
+                  ts: Optional[datetime.datetime] = None) -> None:
+        self._event(EventCode.MISSION_NODE_NOTE, robot_name, ts or self._clock(), {
+            "mission_name": mission.name, "node_id": note.node_id,
+            "info_type": note.info_type, "waypoint_index": note.waypoint_index,
+            "graph_node_id": note.graph_node_id, "offset_map": note.offset_map,
+            "detail": note.description,
+        }, discriminator=f"{mission.name}|{mission.status.run_id}|{note.node_id}|"
+                         f"{note.info_type}")
+
+    @_guarded
+    def frame_offset_suspected(self, robot_name: str, mission: Any, summary: Any,
+                               map_t_session: Optional[Dict[str, Any]],
+                               ts: Optional[datetime.datetime] = None) -> None:
+        self._event(EventCode.MISSION_FRAME_OFFSET_SUSPECTED, robot_name,
+                    ts or self._clock(), {
+                        "mission_name": mission.name, "n": summary.n,
+                        "mean_dx": summary.mean_dx, "mean_dy": summary.mean_dy,
+                        "consistency": summary.consistency, "map_t_session": map_t_session,
+                        "detail": "node offsets all point the same way: a frame error "
+                                  "between the graph and the robot's map is likely",
+                    }, discriminator=f"{mission.name}|{mission.status.run_id}")
+
+    @_guarded
     def rerouted(self, robot_name: str, mission: Any, blocked_node: Optional[str],
                  blocked_edge: Optional[str], ts: Optional[datetime.datetime] = None) -> None:
         self._event(EventCode.MISSION_REROUTED, robot_name, ts or self._clock(), {

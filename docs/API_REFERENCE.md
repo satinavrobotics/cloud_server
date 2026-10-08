@@ -848,6 +848,28 @@ order and resending the node with the new route. Other spec fields: `kind` (`"go
 planner go-to, else `null`), `goal` (`{x, y, map_id, node_id?}` of a go-to), `created_at`
 (set when the row is created); all server-owned.
 
+A reroute whose waypoints go through a graph node a robot reported blocked recently (see
+[Blocked graph nodes](#blocked-graph-nodes)) is refused with `409`
+`{"error": "HTTP Error", "detail": {"code": "ROUTE_THROUGH_BLOCKED_NODES", "message": ...,
+"blocked_nodes": [...]}, "status_code": 409, "path": ...}`; add `"force": true` to the body to
+reroute anyway. The check uses the planner's rule, so a route the planner returned passes it:
+each route's first waypoint (where the robot starts) is never blocked; a waypoint with a
+`node_id` matches a row of that graph node, or a position row (`"@x,y"`) within
+`BLOCKED_NODE_MATCH_RADIUS_M` (0.5 m); a waypoint without `node_id` matches by lying within
+that radius of where the row's node was reported.
+
+Waypoint tolerances: `allowedDeviationXY` / `allowedDeviationTheta` left out (or 0) mean the
+dispatcher's policy: 0.35 m / heading free on nodes the robot drives through, 0.1 m / 0.785 rad
+on the last node and on nodes with actions. A positive value is sent as given. A waypoint may
+carry `node_id`, the graph node it was taken from (the planner sets it).
+
+Status fields the dispatcher owns (an API status update keeps them): `skipped_nodes` (nodes the
+robot skipped as their nodePolicy allowed: `node_id`, `mission_node`, `waypoint_index`,
+`graph_node_id`, `description`), `node_notes` (the robot's advisory per-node notes, newest
+first, at most 50: `info_type` such as `nodeOffset`, `offset`, `offset_map`), and
+`offset_summary` (`n`, `mean_dx`, `mean_dy`, `consistency`, `suspected_frame_error`: node
+offsets that all point the same way suggest a frame error between graph and robot map).
+
 **Request Body:**
 ```json
 {
@@ -896,6 +918,27 @@ Cancel an active mission.
 
 **Error Response:**
 - `400 Bad Request`: Mission cannot be cancelled (already completed/failed)
+
+#### Blocked graph nodes
+
+When a robot reports `edgeBlocked`, the dispatcher keeps the blocked waypoint's graph node out of
+new routes for `BLOCKED_NODE_EXCLUSION_MIN` (10) minutes, for every robot on the map. The
+planner keeps its usual shortest path unless that path goes through an active row, and then
+plans around it; when the goal is blocked, or no route avoids the rows, it fails with
+`failed_at: "blocked_nodes"` and, in `blocked_nodes`, the rows that made it fail (the planner's
+`POST /api/v1/plan` takes `ignore_exclusions: true` to plan through them). A goal with no path
+at all is still `failed_at: "find_path"`.
+
+`GET /api/v1/maps/{map_id}/blocked-nodes` returns `{"map_id", "blocked_nodes": [{"map_name",
+"graph_node_id", "edge_from", "edge_to", "source", "robot_name", "mission_name", "vda_node_id",
+"reason", "x", "y", "created_at", "expires_at"}]}`. `graph_node_id` `"@x,y"` is a position
+(map frame) whose graph node was not known; `map_name` is the waypoints' `map_id`;
+`created_at` is when the current block began (a report on an expired row starts a new one). If
+the table is not readable the list is empty and the body carries `error` (the planner and the
+reroute check also go on without it).
+
+`DELETE /api/v1/maps/{map_id}/blocked-nodes/{graph_node_id}` clears one (`404` if it is not
+blocked: no row, or its exclusion had already expired). URL-encode the id (`%40x%2Cy`).
 
 #### Run legs
 

@@ -381,6 +381,55 @@ class MissionSentOrderV1(pydantic.BaseModel):
     waypoint_offset: int = pydantic.Field(
         0, description="Index in the route of the order's first waypoint: an order sent \
                         after progress was made leaves the waypoints already reached out.")
+    frame: Optional[Dict[str, Any]] = pydantic.Field(
+        None, description="The frame the order's node positions were sent in: {map_name, \
+                           session_id, map_t_session, applied ('inverse' | 'identity' | \
+                           'none'), map_id_sent}. Lets node offsets the robot reports be read \
+                           in the map frame, and a frame error be told from node placement.")
+
+
+class MissionSkippedNodeV1(pydantic.BaseModel):
+    """A node the robot found blocked and skipped (its nodePolicy allowed it)."""
+    node_id: str = pydantic.Field(..., description="The VDA5050 nodeId the robot reported.")
+    order_id: Optional[str] = pydantic.Field(None, description="The order the node belongs to.")
+    mission_node: Optional[str] = pydantic.Field(
+        None, description="Name of the mission_tree route node.")
+    waypoint_index: Optional[int] = pydantic.Field(
+        None, description="Index of the skipped waypoint in that route node, if known.")
+    graph_node_id: Optional[str] = pydantic.Field(
+        None, description="The graph node the waypoint was taken from, if known.")
+    description: str = pydantic.Field("", description="What the robot said.")
+    first_seen: Optional[datetime.datetime] = None
+
+
+class MissionNodeNoteV1(pydantic.BaseModel):
+    """An advisory per-node note the robot reported (informations with a nodeId reference):
+    node moved by an offset, node seen blocked, area not yet observed. Never re-routed on."""
+    node_id: str
+    order_id: Optional[str] = None
+    info_type: str
+    description: str = ""
+    mission_node: Optional[str] = None
+    waypoint_index: Optional[int] = None
+    graph_node_id: Optional[str] = None
+    offset: Optional[Dict[str, float]] = pydantic.Field(
+        None, description="The offset the robot moved the node by, as sent (dx, dy, dtheta; \
+                           order frame).")
+    offset_map: Optional[Dict[str, float]] = pydantic.Field(
+        None, description="The same offset rotated into the map frame (dx, dy).")
+    first_seen: Optional[datetime.datetime] = None
+    last_seen: Optional[datetime.datetime] = None
+
+
+class MissionOffsetSummaryV1(pydantic.BaseModel):
+    """The node offsets of a run taken together (map frame). Offsets that all point the
+    same way (consistency near 1) suggest a frame error rather than node placement."""
+    n: int = 0
+    mean_dx: float = 0.0
+    mean_dy: float = 0.0
+    mean_norm: float = 0.0
+    consistency: float = 0.0
+    suspected_frame_error: bool = False
 
 
 class MissionStatusV1(pydantic.BaseModel):
@@ -450,9 +499,21 @@ class MissionStatusV1(pydantic.BaseModel):
     sent_order: Optional[MissionSentOrderV1] = pydantic.Field(
         None, description="Dispatcher-owned: what the last order built for this run was made \
                            from, stored before it is sent. Never set it from the API.")
+    skipped_nodes: List[MissionSkippedNodeV1] = pydantic.Field(
+        [], description="Dispatcher-owned: nodes the robot skipped in this run (nodeSkipped).")
+    node_notes: List[MissionNodeNoteV1] = pydantic.Field(
+        [], description="Dispatcher-owned: the newest advisory per-node notes of this run.")
+    offset_summary: Optional[MissionOffsetSummaryV1] = pydantic.Field(
+        None, description="Dispatcher-owned: the run's node offsets taken together.")
 
     class Config:
         use_enum_value = True
+
+
+# MissionStatusV1 fields only the dispatcher writes; an API status update keeps them.
+DISPATCHER_OWNED_STATUS_FIELDS = (
+    "run_id", "order_rev", "passes_completed", "applied_route_rev", "sent_order",
+    "skipped_nodes", "node_notes", "offset_summary")
 
 
 class MissionQueryParamsV1(pydantic.BaseModel):

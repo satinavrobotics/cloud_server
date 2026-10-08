@@ -96,6 +96,34 @@ class OrderChurn(Payload):
     detail: Optional[str] = None
 
 
+class NodeSkipped(Payload):
+    mission_name: str
+    node_id: str
+    waypoint_index: Optional[int] = None
+    graph_node_id: Optional[str] = None
+    detail: Optional[str] = None
+
+
+class NodeNote(Payload):
+    mission_name: str
+    node_id: str
+    info_type: str
+    waypoint_index: Optional[int] = None
+    graph_node_id: Optional[str] = None
+    offset_map: Optional[Dict[str, float]] = None
+    detail: Optional[str] = None
+
+
+class FrameOffsetSuspected(Payload):
+    mission_name: str
+    n: int
+    mean_dx: float
+    mean_dy: float
+    consistency: float
+    map_t_session: Optional[Dict[str, Any]] = None
+    detail: Optional[str] = None
+
+
 class CancelRequested(Payload):
     mission_name: str
     actor: str
