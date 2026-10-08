@@ -713,6 +713,16 @@ async def map_reloc(map_id: str, robot: str):
         switch=service.mapping_switch, reloc_jobs=service.reloc_jobs))
 
 
+@app.get("/api/v1/robots/{robot_name}/stored-maps")
+async def robot_stored_maps(robot_name: str):
+    """The cloud maps the robot holds onboard as stored SLAM maps (it can relocalize on them):
+    {known, maps: [{cloud_map_id, name, valid, saved_at, size_bytes}]}. `known` false = robot
+    offline / no orchestrator / not askable (maps []). One cached read. 404 unknown robot."""
+    _require_service()
+    return await _site_call("robot stored maps", maps.robot_stored_maps(
+        service.database, service.orchestrator_maps, robot_name))
+
+
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/place")
 async def place_map_session(map_id: str, session_id: str, body: Dict[str, Any]):
     """Place the session's robot on a local map (maps §14.3) `{pose: {x, y, yaw}, robot_pose:

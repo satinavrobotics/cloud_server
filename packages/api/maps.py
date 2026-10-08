@@ -1196,6 +1196,27 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
             "localization_api": await _localization_api(holder, robot)}
 
 
+async def robot_stored_maps(db: Any, holder: Optional[Any], robot_name: str) -> Dict[str, Any]:
+    """GET /api/v1/robots/{robot}/stored-maps: {known, maps: [{cloud_map_id, name, valid,
+    saved_at, size_bytes}]}, the cloud maps the robot's orchestrator holds as stored SLAM maps
+    (one cached /maps/list read). `known` false (maps []): robot offline, no orchestrator or
+    not askable. 404 unknown robot."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            robot = await store.robot(robot_name)
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    if robot is None:
+        raise HTTPException(404, f"Did not find \"robot\" with name \"{robot_name}\"")
+    found = None
+    if holder is not None:
+        try:
+            found = await holder.stored(robot)
+        except Exception:  # noqa: BLE001
+            logger.exception("Stored maps of robot %s not readable", robot_name)
+    return {"known": found is not None, "maps": found or []}
+
+
 async def placement_suggestions(db: Any, map_name: str, session_id: str,
                                 holder: Optional[Any] = None, switch: Optional[Any] = None,
                                 reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:

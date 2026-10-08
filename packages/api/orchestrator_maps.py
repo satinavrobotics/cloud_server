@@ -55,6 +55,8 @@ class OrchestratorMaps:
         self._services: Dict[str, Tuple[float, Optional[str], Optional[str]]] = {}
         # robot -> (until, whether the orchestrator offers POST /maps/{name}/relocalize or None)
         self._endpoint: Dict[str, Tuple[float, Optional[bool]]] = {}
+        # robot -> (until, the cloud maps it holds as stored maps, or None = unknown)
+        self._stored: Dict[str, Tuple[float, Optional[list]]] = {}
 
     def invalidate(self, robot_name: str) -> None:
         """Forget what is known about the robot's stored maps (a call that changes them)."""
@@ -64,6 +66,7 @@ class OrchestratorMaps:
             self._inflight.pop(key, None)  # a read that started before must not be shared
         self._services.pop(robot_name, None)
         self._endpoint.pop(robot_name, None)
+        self._stored.pop(robot_name, None)
 
     def _prune(self, now: float) -> None:
         for key in [k for k, (until, _) in self._cache.items() if until <= now]:
@@ -83,6 +86,46 @@ class OrchestratorMaps:
             task.add_done_callback(lambda t, k=key: self._done(k, t))
         # shield: one caller being cancelled must not cancel the read the others wait on
         return await asyncio.shield(task)
+
+    async def stored(self, robot: Any, fresh: bool = False) -> Optional[list]:
+        """The cloud maps the robot holds as valid stored maps, from ONE GET /maps/list:
+        [{cloud_map_id, name, valid, saved_at, size_bytes}] (a map counts like in held(): tagged
+        with `cloud_map_id`, else named `cloud-<id>`), or None when unknown (robot offline, no
+        orchestrator address, unreachable, any error). Cached like held(). Never raises."""
+        name = key_name(robot)
+        hit = self._stored.get(name)
+        if hit is not None and not fresh and hit[0] > self._clock():
+            return hit[1]
+        out: Optional[list] = None
+        ttl = self.unknown_ttl
+        status = getattr(robot, "status", None)
+        if oc.orchestrator_address(robot) is not None and not (
+                status is not None and getattr(status, "online", True) is False):
+            try:
+                rows = await self._client_factory(robot).list_maps(None)
+                out, seen = [], set()
+                for r in rows:
+                    cid = row_cloud_map_id(r)
+                    if cid is None or r.get("valid") is not True:
+                        continue
+                    entry = {"cloud_map_id": cid, "name": r.get("name"), "valid": True,
+                             "saved_at": r.get("modified_at"), "size_bytes": r.get("size_bytes")}
+                    # tagged rows win over a same-id untagged `cloud-<id>` row
+                    tagged = (r.get("meta") or {}).get("cloud_map_id") == cid
+                    if cid in seen and not tagged:
+                        continue
+                    out = [e for e in out if e["cloud_map_id"] != cid] + [entry]
+                    seen.add(cid)
+                ttl = self.ttl
+            except oc.OrchestratorError as exc:
+                logger.info("Stored maps of %s not readable: %s", name, exc.detail)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Stored maps of %s unreadable: %s", name, exc)
+                out = None
+        self._stored[name] = (self._clock() + ttl, out)
+        return out
 
     async def reloc_service(self, robot: Any, fresh: bool = False
                             ) -> Tuple[Optional[str], Optional[str]]:
@@ -223,15 +266,14 @@ class OrchestratorMaps:
             client = self._client_factory(robot)
             rows = await client.list_maps(cloud_map_id)
             if any(isinstance(r, dict) and r.get("valid") is True
-                   and (r.get("meta") or {}).get("cloud_map_id") == cloud_map_id
+                   and row_cloud_map_id(r, tagged_only=True) == cloud_map_id
                    for r in rows):
                 return True
             # No tagged map: the reloc job then tries the name the cloud gives the map
             # (reloc_job._prepare), so a valid stored map of that name counts too.
-            onboard = oc.onboard_map_name(cloud_map_id)
             rows = await client.list_maps(None)
-            return any(isinstance(r, dict) and r.get("valid") is True and r.get("name") == onboard
-                       for r in rows)
+            return any(isinstance(r, dict) and r.get("valid") is True
+                       and row_cloud_map_id(r) == cloud_map_id for r in rows)
         except oc.OrchestratorError as exc:
             logger.info("Stored maps of %s not readable: %s", key_name(robot), exc.detail)
             return None
@@ -244,3 +286,18 @@ class OrchestratorMaps:
 
 def key_name(robot: Any) -> str:
     return getattr(robot, "name", "?")
+
+
+def row_cloud_map_id(row: Any, tagged_only: bool = False) -> Optional[str]:
+    """The cloud map a /maps/list row stands for: its meta `cloud_map_id`, else (unless
+    `tagged_only`) the id of its `cloud-<id>` name (oc.onboard_map_name); None for any other."""
+    if not isinstance(row, dict):
+        return None
+    tagged = (row.get("meta") or {}).get("cloud_map_id")
+    if tagged:
+        return str(tagged)
+    prefix = oc.onboard_map_name("")
+    name = row.get("name")
+    if not tagged_only and isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix):
+        return name[len(prefix):]
+    return None
