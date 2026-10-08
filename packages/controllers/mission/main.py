@@ -72,6 +72,11 @@ if __name__ == "__main__":
                         help="JSONL file for events the database could not take yet "
                              "(also $FLEET_SPILL_PATH)")
 
+    parser.add_argument("--mission_planner_url",
+                        default=os.getenv("MISSION_PLANNER_URL", "http://localhost:8005"),
+                        help="Mission planner service, used to replan a go-to as it starts "
+                             "(also $MISSION_PLANNER_URL)")
+
     args = parser.parse_known_args()[0]
     logger = logging.getLogger("Isaac Mission Dispatch")
     logger.setLevel(args.log_level)

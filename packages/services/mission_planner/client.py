@@ -94,6 +94,32 @@ class MissionPlannerClient:
 
         return result
 
+    async def plan(
+        self,
+        robot_name: str,
+        target_x: Optional[float] = None,
+        target_y: Optional[float] = None,
+        map_id: Optional[str] = None,
+        robot_x: Optional[float] = None,
+        robot_y: Optional[float] = None,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Plan a route from the robot's position to (target_x, target_y) in the map frame,
+        without creating a mission. `robot_x`/`robot_y` (the robot's own run frame) replace
+        the stored robot position. Returns the planner's PlanResponse: `waypoints`,
+        `planned_path`, `goal`, or `success: false` with `error`. Raises on HTTP errors.
+        """
+        payload: Dict[str, Any] = {"robot_name": robot_name}
+        for key, value in (("target_x", target_x), ("target_y", target_y), ("map_id", map_id),
+                           ("robot_x", robot_x), ("robot_y", robot_y)):
+            if value is not None:
+                payload[key] = value
+        response = await self._client.post(
+            "/api/v1/plan", json=payload, **({"timeout": timeout} if timeout else {}))
+        response.raise_for_status()
+        return response.json()
+
     async def get_mission_plan(self, mission_id: str, map_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Get mission plan for a specific mission.

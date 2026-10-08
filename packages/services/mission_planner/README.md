@@ -14,6 +14,17 @@ This service handles the complete workflow for planning navigation missions:
 
 ## API Endpoints
 
+### POST /api/v1/plan
+
+Plans a route and returns it; no mission is created. Body: `robot_name`, a goal
+(`target_x`/`target_y` or `target_lat`/`target_lon`), optional `map_id`, optional
+`robot_x`/`robot_y` (the robot's position in its own run frame, newer than the stored robot row).
+Returns `{success, waypoints (Pose2D, map frame), planned_path (node ids), goal: {x, y, map_id,
+node_id}, map_id, start_node_id, end_node_id, error, failed_at}`; the same 400/409 as navigate.
+The mission dispatcher calls it when a go-to (`kind: "goto"`) starts, to replan from the robot's
+pose. A first path node that is behind the robot (the robot is closer to the second node than the
+first node is) is dropped, in `/plan` and in `/navigate` alike.
+
 ### POST /api/v1/navigate
 
 Plan and execute a navigation mission.
@@ -35,7 +46,7 @@ Plan and execute a navigation mission.
   "success": true,
   "robot_name": "robot_1",
   "target": {"x": 10.5, "y": 20.3},
-  "mission_name": "nav_robot_1_20240101_120000",
+  "mission_name": "nav_robot_1_20240101_120000_a1b2",
   "start_node_id": 42,
   "end_node_id": 87,
   "path": [42, 43, 56, 72, 87],
@@ -43,7 +54,7 @@ Plan and execute a navigation mission.
   "waypoints_count": 5,
   "robot_position": {"x": 5.2, "y": 8.1},
   "target_node_position": {"x": 10.4, "y": 20.1},
-  "message": "Mission 'nav_robot_1_20240101_120000' planned and submitted successfully"
+  "message": "Mission 'nav_robot_1_20240101_120000_a1b2' planned and submitted successfully"
 }
 ```
 

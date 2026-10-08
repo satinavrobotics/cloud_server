@@ -11,6 +11,7 @@ This service handles mission planning by:
 
 import logging
 import datetime
+import math
 from typing import Optional, Dict, Any, List, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
@@ -161,7 +162,9 @@ class MissionPlannerService:
             return None
 
     async def _robot_xy_in_map(self, robot: robot_object.RobotObjectV1,
-                               map_id: str) -> Tuple[float, float]:
+                               map_id: str,
+                               pose_xy: Optional[Tuple[float, float]] = None
+                               ) -> Tuple[float, float]:
         """The robot's position (robot.status.pose, its own run frame) in the map's frame, for
         comparing it with node poses (maps redesign M2: nodes are stored in the map frame).
 
@@ -169,7 +172,9 @@ class MissionPlannerService:
         RobotNotPlacedError when the robot has no open session on the map ("not using") or
         that session is not placed. Since U6 there is no map/datum fallback; a session lookup
         that fails raises."""
-        x, y = robot.status.pose.x, robot.status.pose.y
+        # `pose_xy`: a position the caller knows is newer than the stored robot row (the
+        # dispatcher's, when it replans a go-to as it starts).
+        x, y = pose_xy if pose_xy is not None else (robot.status.pose.x, robot.status.pose.y)
         name = getattr(robot, "name", None)
         session = await self._open_session(name) if isinstance(name, str) else None
         if session is None or session["map_name"] != map_id:
@@ -231,7 +236,8 @@ class MissionPlannerService:
     async def find_closest_node_to_robot(
         self,
         robot_name: str,
-        map_id: Optional[str] = None
+        map_id: Optional[str] = None,
+        pose_xy: Optional[Tuple[float, float]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """
         Find the closest graph node to the robot's current position.
@@ -259,7 +265,7 @@ class MissionPlannerService:
 
             # The robot's position, in the map frame
             try:
-                robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id)
+                robot_x, robot_y = await self._robot_xy_in_map(robot, query_map_id, pose_xy)
             except RobotNotPlacedError as e:
                 return None, f"{NOT_PLACED_PREFIX}{e}"
 
@@ -514,6 +520,12 @@ class MissionPlannerService:
 
         return poses, None
 
+    @staticmethod
+    def new_goto_name(robot_name: str) -> str:
+        """`nav_<robot>_<YYYYmmdd_HHMMSS>_<4 hex>`: two go-tos in one second get two names."""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"nav_{robot_name}_{timestamp}_{uuid.uuid4().hex[:4]}"
+
     def create_mission(
         self,
         robot_name: str,
@@ -523,9 +535,13 @@ class MissionPlannerService:
         planned_path: Optional[List[str]] = None,
         mode: mission_object.MissionMode = mission_object.MissionMode.MAPPED,
         register_map: bool = True,
+        goal: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[mission_object.MissionObjectV1], Optional[str]]:
         """
         Create a mission object with waypoints.
+
+        With a `goal` it is a go-to: kind "goto", which the dispatcher replans from the
+        robot's position when the mission starts.
 
         Args:
             robot_name: Name of the robot
@@ -542,8 +558,7 @@ class MissionPlannerService:
 
         # Generate mission name if not provided
         if not mission_name:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            mission_name = f"nav_{robot_name}_{timestamp}"
+            mission_name = self.new_goto_name(robot_name)
 
         self.logger.info(f"Creating mission '{mission_name}' for robot '{robot_name}' "
                         f"with {len(waypoints)} waypoints")
@@ -568,6 +583,8 @@ class MissionPlannerService:
                 planned_path=planned_path,
                 mode=mode,
                 register_map=register_map,
+                kind="goto" if goal else None,
+                goal=goal,
             )
 
             # Create mission object
@@ -609,26 +626,28 @@ class MissionPlannerService:
             self.logger.error(f"Failed to submit mission: {e}")
             return False, f"Failed to submit mission: {str(e)}"
 
-    async def plan_and_execute_mission(
+    async def plan_route(
         self,
         robot_name: str,
         target_x: Optional[float] = None,
         target_y: Optional[float] = None,
         target_lat: Optional[float] = None,
         target_lon: Optional[float] = None,
-        mission_name: Optional[str] = None,
-        timeout_seconds: int = 300,
         map_id: Optional[str] = None,
-        register_map: bool = True,
+        robot_pose: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
         """
-        Complete mission planning workflow:
-        1. (Optional) Convert GPS coords to local frame using the map datum
-        2. Find closest node to robot
-        3. Find closest node to target
-        4. Find path between nodes
-        5. Create mission with waypoints
-        6. Submit mission to dispatcher
+        Plan a route for a robot without creating a mission:
+        0. (Optional) Convert GPS coords to local frame using the map datum
+        1. Find closest node to robot (from `robot_pose`, the robot's x/y in its own run
+           frame, when given, else from the stored robot row)
+        2. Find closest node to target
+        3. Find path between nodes
+        4. Get the poses of the path nodes
+
+        On success the result carries `waypoints` (Pose2D list, in the map frame), `path` (node
+        ids), `map_id`, `goal` and the fields the navigate response reports; on failure
+        `error` and `failed_at`.
         """
         result = {
             "success": False,
@@ -675,7 +694,8 @@ class MissionPlannerService:
 
         # Step 1: Find closest node to robot
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")
-        start_node, error = await self.find_closest_node_to_robot(robot_name, map_id)
+        start_node, error = await self.find_closest_node_to_robot(
+            robot_name, map_id, pose_xy=robot_pose)
         if error:
             not_placed = error.startswith(NOT_PLACED_PREFIX)
             result["error"] = error[len(NOT_PLACED_PREFIX):] if not_placed else error
@@ -724,7 +744,66 @@ class MissionPlannerService:
             result["failed_at"] = "get_waypoints"
             return result
 
+        # H5: the nearest node can be behind the robot (it has already driven past it
+        # towards the next one). Starting the route at that node sends the robot back to
+        # it first, so drop it. Only the first node is considered, and only when the robot
+        # is closer to the second node than the first node is -- the simple test that never
+        # drops a node the robot still has to pass. Deliberately not a projection onto the
+        # first edge: that would need a node of its own for the robot's position.
+        robot_xy = None
+        if len(waypoints) >= 2:
+            try:
+                robot = await self.get_robot_status(robot_name)
+                robot_xy = await self._robot_xy_in_map(robot, map_id, robot_pose) \
+                    if robot else None
+            except Exception as err:  # pylint: disable=broad-except
+                self.logger.warning(f"Robot position for the first-node test unavailable: {err}")
+        if robot_xy is not None:
+            rx, ry = robot_xy
+            first, second = waypoints[0], waypoints[1]
+            if math.hypot(second.x - rx, second.y - ry) < \
+                    math.hypot(second.x - first.x, second.y - first.y):
+                self.logger.info(f"First path node {path[0]} is behind the robot; "
+                                 "starting the route at the next one")
+                waypoints, path = waypoints[1:], path[1:]
+                result["path"] = path
+                result["path_length"] = len(path)
+
         result["waypoints_count"] = len(waypoints)
+        result["waypoints"] = waypoints
+        result["map_id"] = map_id
+        result["goal"] = {"x": target_x, "y": target_y, "map_id": map_id,
+                          "node_id": result.get("end_node_id")}
+        result["success"] = True
+        return result
+
+    async def plan_and_execute_mission(
+        self,
+        robot_name: str,
+        target_x: Optional[float] = None,
+        target_y: Optional[float] = None,
+        target_lat: Optional[float] = None,
+        target_lon: Optional[float] = None,
+        mission_name: Optional[str] = None,
+        timeout_seconds: int = 300,
+        map_id: Optional[str] = None,
+        register_map: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Complete mission planning workflow: plan_route (steps 0-4), then
+        5. Create the go-to mission with the waypoints
+        6. Submit mission to dispatcher
+        """
+        result = await self.plan_route(
+            robot_name, target_x=target_x, target_y=target_y, target_lat=target_lat,
+            target_lon=target_lon, map_id=map_id)
+        if not result.get("success"):
+            return result
+        result["success"] = False
+        waypoints = result.pop("waypoints")
+        path = result["path"]
+        goal = result.pop("goal")
+        map_id = result.pop("map_id")
 
         # Step 5: Create mission
         self.logger.info("Step 5: Creating mission")
@@ -735,6 +814,7 @@ class MissionPlannerService:
             timeout_seconds=timeout_seconds,
             planned_path=path,
             register_map=register_map,
+            goal=goal,
         )
         if error:
             result["error"] = error

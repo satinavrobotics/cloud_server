@@ -49,6 +49,32 @@ class NavigationRequest(BaseModel):
     register_map: bool = Field(True, description="Whether the graph builder should record topology during this mission")
 
 
+class PlanRequest(BaseModel):
+    """Request model for a plan without a mission (the dispatcher replans a go-to as it starts)."""
+    robot_name: str = Field(..., description="Name of the robot to plan for")
+    target_x: Optional[float] = Field(None, description="Goal x in the map frame, metres")
+    target_y: Optional[float] = Field(None, description="Goal y in the map frame, metres")
+    target_lat: Optional[float] = Field(None, description="Goal WGS84 latitude in degrees")
+    target_lon: Optional[float] = Field(None, description="Goal WGS84 longitude in degrees")
+    map_id: Optional[str] = Field(None, description="Map to plan on; without it the robot's open session map, else 400")
+    robot_x: Optional[float] = Field(None, description="The robot's x in its own run frame, if newer than the stored robot row")
+    robot_y: Optional[float] = Field(None, description="The robot's y in its own run frame, if newer than the stored robot row")
+
+
+class PlanResponse(BaseModel):
+    """A planned route: what a go-to mission's route node and planned_path would hold."""
+    success: bool
+    robot_name: str
+    waypoints: Optional[list] = Field(None, description="Pose2D waypoints in the map frame")
+    planned_path: Optional[list] = Field(None, description="Topological node ids of the route")
+    goal: Optional[Dict[str, Any]] = Field(None, description="{x, y, map_id, node_id}")
+    map_id: Optional[str] = None
+    start_node_id: Optional[str] = None
+    end_node_id: Optional[str] = None
+    error: Optional[str] = None
+    failed_at: Optional[str] = None
+
+
 class NavigationResponse(BaseModel):
     """Response model for navigation command."""
     success: bool = Field(..., description="Whether the mission was planned and submitted successfully")
@@ -223,6 +249,58 @@ async def navigate(request: NavigationRequest):
         raise HTTPException(status_code=500, detail=f"Navigation request failed: {str(e)}")
 
 
+@app.post("/api/v1/plan", response_model=PlanResponse)
+async def plan_only(request: PlanRequest):
+    """
+    Plan a route from the robot's position to a goal and return it; no mission is created.
+
+    The same planning as POST /api/v1/navigate (including dropping a first node that is
+    behind the robot). `robot_x`/`robot_y` replace the stored robot position when given.
+    A planning failure is `success: false` with `error`/`failed_at` (200), except the same
+    400 (no map) and 409 (robot not placed) as navigate.
+    """
+    has_xy = request.target_x is not None and request.target_y is not None
+    has_gps = request.target_lat is not None and request.target_lon is not None
+    if not has_xy and not has_gps:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either (target_x, target_y) or (target_lat, target_lon).",
+        )
+    robot_pose = (request.robot_x, request.robot_y) \
+        if request.robot_x is not None and request.robot_y is not None else None
+    try:
+        result = await service.plan_route(
+            robot_name=request.robot_name,
+            target_x=request.target_x,
+            target_y=request.target_y,
+            target_lat=request.target_lat,
+            target_lon=request.target_lon,
+            map_id=request.map_id,
+            robot_pose=robot_pose,
+        )
+        if result.get("failed_at") == "map_resolution":
+            raise HTTPException(status_code=400, detail=result.get("error"))
+        if result.get("failed_at") == "robot_not_placed":
+            raise HTTPException(status_code=409, detail=result.get("error"))
+        return PlanResponse(
+            success=bool(result.get("success")),
+            robot_name=request.robot_name,
+            waypoints=[w.dict() for w in result.get("waypoints") or []] or None,
+            planned_path=result.get("path"),
+            goal=result.get("goal"),
+            map_id=result.get("map_id"),
+            start_node_id=result.get("start_node_id"),
+            end_node_id=result.get("end_node_id"),
+            error=result.get("error"),
+            failed_at=result.get("failed_at"),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Plan request failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Plan request failed: {str(e)}")
+
+
 @app.get("/api/v1/missions/{mission_id}/plan", response_model=NavigationPlanResponse)
 async def get_mission_plan(mission_id: str, map_id: Optional[str] = None):
     """
@@ -285,6 +363,7 @@ async def root():
         description="Plans navigation missions by querying graph database and submitting to Mission Dispatcher",
         endpoints={
             "navigate": "POST /api/v1/navigate",
+            "plan": "POST /api/v1/plan",
             "mission_plan": "GET /api/v1/missions/{mission_id}/plan",
             "health": "GET /health",
             "stats": "GET /stats"

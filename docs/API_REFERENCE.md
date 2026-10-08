@@ -264,6 +264,7 @@ With `can_start` the answer is **202** and a background job:
 
 `GET /api/v1/robots[/{robot_name}]` and the WebSocket `robot_update`:
 
+- `current_mission` (the running mission's name or `null`) and `queued_missions` (names of the PENDING missions, in dispatch order), derived from the mission rows.
 - `status.position_initialized` (boolean or `null`) and `status.localization_score` (0..1 or `null`): VDA5050 `agvPosition` as last reported.
 - `status.approx_position`: `{latitude, longitude, accuracy_m?, fix_quality?, source, stamp?, stored_at}` or `null`, from the robot's MQTT `approx_position` topic. Display only, never used for placement.
 - `session.placement_source`: how a placed session was placed (`user`, `last_position`, `reloc`, `session` or `datum`), else `null`.
@@ -343,9 +344,23 @@ Request navigation for a robot to a target location.
 ```json
 {
   "success": true,
-  "mission_name": "delivery_mission_001"
+  "mission_name": "delivery_mission_001",
+  "state": "PENDING",
+  "queued_behind": "patrol_loop"
 }
 ```
+
+`state` is the created mission's state when the request was answered (`PENDING` while it
+waits). `queued_behind` is the name of the mission directly ahead of it in the robot's queue
+(the go-to starts when that one has finished), or `null`; both are `null` on a failure or when
+the queue could not be read. A request is never refused because the robot is busy. The
+auto-generated name is `nav_<robot>_<YYYYmmdd_HHMMSS>_<4 hex>`, so two requests in one second
+get two missions. The go-to mission has `kind: "goto"` and `goal: {x, y, map_id, node_id}`: the
+dispatcher replans its route from the robot's pose when it starts, so a go-to that waited
+behind another mission does not drive back to where the robot was when it was submitted (the
+stored plan is used if the planner cannot be reached). Send an `Idempotency-Key` header and a
+repeated submit returns the first answer (`Idempotent-Replayed: true`) without a second
+mission; without the header every request makes its own.
 
 **Error Response:**
 ```json
@@ -824,7 +839,14 @@ of a mission that has already run is a new mission. A new `mission_tree` gets it
 `status.node_status` entries created and the dropped ones removed. The dispatcher applies
 the edit to a queued (or held, not yet dispatched) mission; once the mission has been
 dispatched a late edit is ignored. `update_nodes` (a reroute of a running mission) is not
-an edit and is not restricted this way.
+an edit and is not restricted this way: `{"update_nodes": {"<route node>": {"waypoints": [...]}}}`
+is validated (the node must exist, be a route node, and not be finished), folded into the
+stored `mission_tree`, clears `planned_path` and bumps the spec's `route_rev`; the request itself
+is not stored, and the response is the updated mission. The dispatcher acts on a reroute once per
+`route_rev` (`status.applied_route_rev` is the revision it has acted on), cancelling the running
+order and resending the node with the new route. Other spec fields: `kind` (`"goto"` for a
+planner go-to, else `null`), `goal` (`{x, y, map_id, node_id?}` of a go-to), `created_at`
+(set when the row is created); all server-owned.
 
 **Request Body:**
 ```json

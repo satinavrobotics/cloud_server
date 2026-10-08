@@ -608,7 +608,9 @@ class TestWebSocketLocalizationWarning:
         import asyncio
         from unittest.mock import AsyncMock, MagicMock
         from packages.api.server import ApiDelegationService
+        from packages.api.mission_index import RobotMissionIndex
         svc = object.__new__(ApiDelegationService)
+        svc.mission_index = RobotMissionIndex()
         svc._running = True
         svc._robot_changes = asyncio.Queue()
         svc.telemetry = None

@@ -438,9 +438,33 @@ Request navigation for a robot (proxy to mission planner).
 ```json
 {
   "success": true,
-  "mission_name": "delivery_mission_001"
+  "mission_name": "delivery_mission_001",
+  "state": "PENDING",
+  "queued_behind": "patrol_loop"
 }
 ```
+
+`state` is the created mission's state when the request was answered (`PENDING` while it
+waits). `queued_behind` is the name of the mission directly ahead of it in the robot's queue
+(the go-to starts when that one has finished), or `null`; both are `null` on a failure or when
+the queue could not be read. A request is never refused because the robot is busy. The
+auto-generated name is `nav_<robot>_<YYYYmmdd_HHMMSS>_<4 hex>`, so two requests in one second
+get two missions. The go-to mission has `kind: "goto"` and `goal: {x, y, map_id, node_id}`: the
+dispatcher replans its route from the robot's pose when it starts, so a go-to that waited
+behind another mission does not drive back to where the robot was when it was submitted (the
+stored plan is used if the planner cannot be reached). Send an `Idempotency-Key` header and a
+repeated submit returns the first answer (`Idempotent-Replayed: true`) without a second
+mission; without the header every request makes its own.
+
+#### Missions: reroute, queue views
+
+`PUT /api/v1/missions/{name}` with `update_nodes` (a reroute) is folded into `mission_tree`
+(validated; `planned_path` cleared; spec `route_rev` + 1) and the response is the updated mission;
+the request is not stored. The dispatcher acts once per `route_rev` (`status.applied_route_rev`).
+`task_status[node]` is the index of the last waypoint of a route node the robot reached,
+for every waypoint (planner go-tos included). The robot view (`GET /robots[/{r}]`, WS
+`robot_update`) carries `current_mission` (the RUNNING mission's name or `null`) and
+`queued_missions` (PENDING names in dispatch order: started first, then by `created_at`).
 
 ### Status Operations
 

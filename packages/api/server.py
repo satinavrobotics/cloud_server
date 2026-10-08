@@ -18,6 +18,7 @@ from fastapi import WebSocket, WebSocketDisconnect, HTTPException
 
 from packages.topomap_dbs.client import TopomapDatabaseClient
 from packages.services.mission_planner.client import MissionPlannerClient
+from packages.api.mission_index import RobotMissionIndex
 from packages.services.livekit.client import LiveKitClient
 from packages.database.postgres import PostgresDatabase
 from packages.api.diagnostics import DiagnosticsService
@@ -647,6 +648,9 @@ class ApiDelegationService:
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)
+        # Each robot's running and queued missions, derived from the mission rows the mission
+        # watcher sees (robot_update's current_mission / queued_missions).
+        self.mission_index = RobotMissionIndex()
 
         # WebSocket proxy manager (new implementation)
         self.ws_proxy = WebSocketProxyManager(
@@ -1747,7 +1751,8 @@ class ApiDelegationService:
 
         if not mission_name:
             ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            mission_name = f"nav_{robot_name}_{ts}"
+            # The suffix keeps two submissions in one second apart.
+            mission_name = f"nav_{robot_name}_{ts}_{uuid.uuid4().hex[:4]}"
 
         try:
             parsed = [Pose2D(**wp) for wp in waypoints]
@@ -1780,6 +1785,7 @@ class ApiDelegationService:
                 },
             )
             await self.database.create_object(mission, self._publisher_id)
+            self.mission_index.update(mission)   # our own writes are not watched
             self.logger.info(f"Mapless mission '{mission_name}' submitted for robot '{robot_name}'")
             return {
                 "success": True,
@@ -2254,6 +2260,8 @@ class ApiDelegationService:
                     },
                     # Maps §14: the robot's open session (derived; null = mapless).
                     "session": session_view,
+                    # Which mission the robot is on and which wait for it (from mission rows).
+                    **self.mission_index.view(robot.name),
                     # D2: why a placed reloc session's localization is degraded, else null.
                     "localization_warning": map_sessions.localization_warning(
                         session_view, robot.status),
@@ -2277,6 +2285,7 @@ class ApiDelegationService:
         while self._running:
             try:
                 mission = await self._mission_changes.get()
+                self.mission_index.update(mission)
 
                 # Ignore deleted missions
                 if mission.lifecycle == ObjectLifecycleV1.DELETED:

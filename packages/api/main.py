@@ -23,6 +23,7 @@ import uvicorn
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, sites
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
+from packages.api.mission_index import mission_ahead
 from packages.api.robot_delete import RobotDeleter
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -107,6 +108,12 @@ class NavigationResponse(BaseModel):
     """Response model for navigation."""
     success: bool
     mission_name: Optional[str] = None
+    state: Optional[str] = Field(
+        None, description="The created mission's state when the request was answered "
+                          "(PENDING while it waits, RUNNING once the robot has it)")
+    queued_behind: Optional[str] = Field(
+        None, description="Name of the mission ahead of it in the robot's queue, if any: "
+                          "the go-to starts when that one has finished")
     error: Optional[str] = None
     failed_at: Optional[str] = None
 
@@ -1429,7 +1436,26 @@ async def navigate(request: NavigationRequest):
         timeout_seconds=request.timeout_seconds,
     )
 
-    return NavigationResponse(**result)
+    response = NavigationResponse(**result)
+    if response.success and response.mission_name:
+        response.state, response.queued_behind = await _mission_queue_position(
+            request.robot_name, response.mission_name)
+    return response
+
+
+async def _mission_queue_position(robot_name: str, mission_name: str):
+    """(state, queued_behind) of a mission just created for `robot_name`. Read from the
+    mission rows; a failure to read them only leaves the answer without these two."""
+    try:
+        missions = await service.database.list_objects(
+            MissionObjectV1, query_params=[("robot", robot_name)])
+        mine = next((m for m in missions if m.name == mission_name), None)
+        state = mine.status.state.value if mine is not None else None
+        return state, mission_ahead(missions, mission_name)
+    except Exception as err:  # pylint: disable=broad-except
+        logging.getLogger("ApiDelegationService").warning(
+            f"Queue position of {mission_name} unavailable: {err}")
+        return None, None
 
 
 @app.post("/api/v1/navigate/waypoints", response_model=DirectWaypointsResponse)
@@ -1519,6 +1545,10 @@ async def _robot_views(robots: List[RobotObjectV1],
         data["mapping_services"] = snap.mapping_services() if snap else None
         data["session"] = session
         data["localization_warning"] = ms.localization_warning(session, robot.status)
+        # The mission the robot is on and the ones waiting for it (derived from mission rows).
+        index = getattr(service, "mission_index", None)
+        data.update(index.view(robot.name) if index is not None
+                    else {"current_mission": None, "queued_missions": []})
         out.append(data)
     return out
 

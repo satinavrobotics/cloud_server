@@ -39,6 +39,7 @@ from packages.controllers.mission import battery
 from packages.controllers.mission import behavior_tree
 from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import order_ids
+from packages.controllers.mission import planner_client
 from packages.controllers.mission import run_change
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit as emit_event
@@ -405,6 +406,7 @@ class Robot:
                 api_objects.MissionObjectV1, self._current_mission.name,
                 self._current_mission.status, self._mission_writer_id()))
         await self._settle_route_rev()
+        await self._replan_goto()
         # The run id must exist (and be persisted) before the first order goes out.
         if not await self._assign_run_id():
             return
@@ -434,6 +436,55 @@ class Robot:
             return
         self._arm_mission_timeout()
         await self._send_order()
+
+    async def _replan_goto(self):
+        """A go-to was planned when it was submitted, from where the robot stood then; when it
+        waited behind another mission the robot is elsewhere by now, and the stored route
+        would first drive it back there. Replan it from the robot's current pose just before
+        its first order, and store the new route.
+
+        Never blocks the mission: the planner being down, slow, or unable to plan only logs a
+        warning, and the stored plan is used. Only a go-to (kind "goto" with a goal) that has
+        not started yet is replanned."""
+        mission = self._current_mission
+        goal = mission.goal
+        if mission.kind != "goto" or not isinstance(goal, dict) or \
+                mission.status.start_timestamp is not None or self._robot_object is None:
+            return
+        planner = getattr(self._robot_server, "mission_planner", None)
+        route_node = next((n for n in mission.mission_tree
+                           if n.type == mission_object.MissionNodeType.ROUTE), None)
+        if planner is None or route_node is None or goal.get("x") is None or \
+                goal.get("y") is None:
+            return
+        pose = self._robot_object.status.pose
+        try:
+            plan = await planner.plan(
+                robot_name=self._name, target_x=goal["x"], target_y=goal["y"],
+                map_id=goal.get("map_id"), robot_x=pose.x, robot_y=pose.y)
+            if not plan.get("success") or not plan.get("waypoints"):
+                raise RuntimeError(plan.get("error") or "the planner returned no route")
+            route = mission_object.MissionRouteNodeV1(waypoints=plan["waypoints"])
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not replan the go-to ({err}); "
+                         "using the route stored when it was submitted")
+            return
+        route_node.route = route
+        mission.planned_path = plan.get("planned_path")
+        # The new route is the one being sent: a reroute revision the dispatcher has
+        # already applied, so the row coming back does not reroute it again.
+        mission.route_rev += 1
+        mission.status.applied_route_rev = mission.route_rev
+        self.mission_info(f"Replanned the go-to from the robot's pose "
+                          f"({pose.x:.2f}, {pose.y:.2f}): {len(route.waypoints)} waypoints")
+        try:
+            await self._database.update_spec_fields(
+                api_objects.MissionObjectV1, mission.name,
+                {"mission_tree": json.loads(mission.spec.json())["mission_tree"],
+                 "planned_path": mission.planned_path, "route_rev": mission.route_rev},
+                self._mission_writer_id())
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not store the replanned route ({err})")
 
     async def _settle_route_rev(self):
         """The tree this mission is about to be sent from is the stored one, so every reroute
@@ -2640,7 +2691,8 @@ class RobotServer:
                  mission_ctrl_url: Optional[str] = None, push_telemetry: bool = False,
                  telemetry_env: str = "DEV", disable_request_factsheet: bool = False,
                  disable_fleet_recording: bool = False,
-                 fleet_spill_path: str = fleet_recorder.DEFAULT_SPILL_PATH):
+                 fleet_spill_path: str = fleet_recorder.DEFAULT_SPILL_PATH,
+                 mission_planner_url: Optional[str] = None):
         """Initializes a RobotServer object by starting threads for mqtt and for the robot/mission
         database watchers
         Args:
@@ -2701,6 +2753,9 @@ class RobotServer:
 
         # The robot objects
         self._robots: Dict[str, Robot] = {}
+
+        # Plan-only access to the mission planner (Robot._replan_goto)
+        self.mission_planner = planner_client.PlannerClient(mission_planner_url)
 
         # Mission control
         self.mission_ctrl_url = mission_ctrl_url
