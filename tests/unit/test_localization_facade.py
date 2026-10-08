@@ -78,8 +78,6 @@ class FakeRobot:
             new = {"mode": body["mode"], "map": body.get("map")}
             want, extra = body.get("topomap"), {}
             if self.topomap is not None:
-                if want and new["mode"] == "odometry":
-                    return R(422, json={"detail": "topomap needs slam or relocalization"})
                 if self.topomap and new != self.intent and want is not False:
                     return R(409, json={"detail": "the topomap runs: send topomap:false"})
                 if want is None:
@@ -564,16 +562,26 @@ class TestTopomapOnTheMappingApi:
         assert _puts(fake) == [{"mode": "relocalization", "map": "cloud-yard", "topomap": True}]
         assert _labels(out) == [("topomap", "start", True)]
 
-    async def test_odometry_is_a_failed_action_never_a_refused_session(self):
+    async def test_odometry_is_switched_too_and_a_refusal_never_refuses_the_session(self):
         fake = FakeRobot(intent={"mode": "odometry", "map": None}, topomap=False)
         d, switch = _session_env(fake, slam_map=False)
         with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow",
                                                                        m1.Clock()):
             out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op",
                                            switch=switch)
+        assert _puts(fake) == [{"mode": "odometry", "topomap": True}]
+        assert _labels(out) == [("topomap", "start", True)] and fake.topomap is True
+
+        fake = FakeRobot(intent={"mode": "odometry", "map": None}, topomap=False)
+        fake.put_error = (422, "topomap needs slam or relocalization")   # an older robot
+        d, switch = _session_env(fake, slam_map=False)
+        with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow",
+                                                                       m1.Clock()):
+            out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op",
+                                           switch=switch)
         assert _labels(out) == [("topomap", "start", False)]
-        assert "odometry" in out["robot_actions"][0]["detail"]
-        assert out["session"]["ended_at"] is None and not _puts(fake)
+        assert "topomap needs slam" in out["robot_actions"][0]["detail"]
+        assert out["session"]["ended_at"] is None
 
     async def test_the_robots_refusal_is_the_detail(self):
         fake = FakeRobot(intent={"mode": "slam", "map": None}, topomap=False)

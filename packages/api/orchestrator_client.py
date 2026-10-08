@@ -55,8 +55,8 @@ localization mode is set in-process, nothing restarts:
                                    503 VDA state unreadable, 502 the device refused the map, 504 not
                                    localized within the timeout (wait=true only); leaving `slam`
                                    DISCARDS the unsaved map. `topomap` true|false starts/stops the
-                                   topomap (slam or relocalization only, 422 with odometry; 409 when
-                                   its driver / navstack is not up, and a mode or map change while it
+                                   topomap, in any mode (older orchestrators: 422 with odometry); 409
+                                   when its driver / navstack is not up, and a mode or map change while it
                                    runs is 409 unless the same PUT sends false; /services refuses to
                                    start it). Answers {mode, map, applied, localized, message,
                                    topomap: started|already_running|stopped|running|off}

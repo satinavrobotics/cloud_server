@@ -294,9 +294,8 @@ orchestrator did not answer (`error` says why). `since` = the service's start ti
 (the client lists these as the mapping choices); `not_available` = robot offline / no
 orchestrator / it has no such service / it did not answer. On a robot with the orchestrator's
 mapping API (`GET /localization` reports `topomap`) `topo` is that flag and the topomap is
-switched with `PUT /localization {topomap}` on the robot's current mode: it runs only in `slam` or
-`relocalization`, so a session opened while the robot is in odometry gets a failed `topomap`
-robot action (the session still opens). `slam` = the localization facade's mode (an older robot:
+switched with `PUT /localization {topomap}` on the robot's current mode, whichever it is (a
+refusal by the robot is a failed `topomap` robot action; the session still opens). `slam` = the localization facade's mode (an older robot:
 its `GET /maps/mapping` driver).
 
 #### Operate sessions and placement (maps §14, U1)

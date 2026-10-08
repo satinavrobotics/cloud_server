@@ -18,9 +18,9 @@ orchestrator services that capture for it (maps §14.16):
 
 MAPPING API: a robot whose GET /localization reports `topomap` (the orchestrator has
 mapping.topomap_service) runs the topomap as part of its localization: it is started / stopped
-with PUT /localization {mode, map, topomap: true|false} on the current mode (slam or
-relocalization only: it needs a map frame; /services refuses it), and its state is that `topomap`
-flag. Which mapping services a robot offers is what its orchestrator reports: the topomap there,
+with PUT /localization {mode, map, topomap: true|false} on the current mode, whichever it is
+(/services refuses it; what the robot refuses is the robot action's detail), and its state is that
+`topomap` flag. Which mapping services a robot offers is what its orchestrator reports: the topomap there,
 `slam` wherever the localization facade (or the older GET /maps/mapping) answers.
 
 Robots without the mapping API (older orchestrators, the sim) start the topomap as an
@@ -103,7 +103,6 @@ SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
 START, STOP, RESTART, SAVE = "start", "stop", "restart", "save"
 SLAM_SERVICE = "SLAM recording"   # `service` of a SLAM action when the driver's name is unknown
 TOPOMAP_SERVICE = "topomap"       # `service` of a topomap switched through the mapping API
-MAP_FRAME_MODES = ("slam", "relocalization")   # the modes the mapping API runs the topomap in
 
 
 def _utcnow() -> datetime.datetime:
@@ -809,11 +808,9 @@ class MappingSwitch:
         if bool(loc.get("topomap")) == on:
             return service_action(TOPOMAP_SERVICE, action, "already")
         mode = loc.get("mode")
-        if mode not in MAP_FRAME_MODES:
-            return service_action(
-                TOPOMAP_SERVICE, action, "failed",
-                f"the robot is in {mode or 'no'} localization mode; the topomap runs only in "
-                f"SLAM or relocalized on a stored map")
+        if not mode:   # the PUT names a mode; the robot has none stored to keep
+            return service_action(TOPOMAP_SERVICE, action, "failed",
+                                  "the robot has no stored localization mode")
         try:
             answer = await client.put_localization(mode, loc.get("map"), topomap=on)
         except oc.OrchestratorError as exc:
