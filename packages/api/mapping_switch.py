@@ -16,12 +16,22 @@ orchestrator services that capture for it (maps §14.16):
 - nodes are gated on the server only (graph-builder puts them into the open session's map, any
   purpose): a service that keeps running for a closed session captures nothing that is kept.
 
-Orchestrator service names differ between the real robot (`topomap`) and the sim
+MAPPING API: a robot whose GET /localization reports `topomap` (the orchestrator has
+mapping.topomap_service) runs the topomap as part of its localization: it is started / stopped
+with PUT /localization {mode, map, topomap: true|false} on the current mode (slam or
+relocalization only: it needs a map frame; /services refuses it), and its state is that `topomap`
+flag. Which mapping services a robot offers is what its orchestrator reports: the topomap there,
+`slam` wherever the localization facade (or the older GET /maps/mapping) answers.
+
+Robots without the mapping API (older orchestrators, the sim) start the topomap as an
+orchestrator service, and the names differ between the real robot (`topomap`) and the sim
 (`sim_topomap`): packages/config.py::MAPPING_SERVICE_CANDIDATES lists candidates per session
 service, and the first one the robot's orchestrator lists is used.
 
 The state the client shows (`mapping_state`, `mapping_service`, `mapping_services`) is read from
-the orchestrator (GET /services/{name}/status), cached MAPPING_STATE_TTL_S seconds per robot.
+the orchestrator (GET /localization, else GET /services/{name}/status and GET /maps/mapping),
+cached MAPPING_STATE_TTL_S seconds per robot. `mapping_services` names every service a session
+may ask for (topo, grid, slam): running | not_running | not_available.
 `mapping_state` keeps the M3 shape:
 {online, service, enabled, session_id, map, nodes_sent, since, stamp, received_at, source:
 "orchestrator", orchestrator_service, status}. `status`: "on" the service runs and the robot's
@@ -39,8 +49,9 @@ reconcile_slam_saves() / stop_orphan_slam() leave facade robots alone. Older rob
 
 SLAM maps (a local map with `slam_map`, docs/satinav-maps-redesign.md 14.15): besides the
 topomap, a mapping session records a SLAM map on the robot, under onboard_map_name(map). It is
-not an orchestrator service (never in ORCHESTRATOR_SERVICES / MAPPING_SERVICE_CANDIDATES): start_slam() after
-the topomap started, save_slam() after the session finished, both best effort, never raising,
+not an orchestrator service (never in ORCHESTRATOR_SERVICES / MAPPING_SERVICE_CANDIDATES): start_slam() before
+the topomap starts (on the mapping API the topomap needs the slam mode first), save_slam() after
+the session finished and its topomap stopped (a mode change is refused while the topomap runs), both best effort, never raising,
 never blocking or undoing the session; what went wrong is a `warning` the caller returns as
 `slam_warning`. Saving takes minutes (a background save on the orchestrator, polled; a save that timed out is retried and the driver is never stopped after a failed save), so a finish saves in a background task (schedule_slam_save)
 that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
@@ -71,7 +82,7 @@ from packages.config import (
     MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_SAVE_POLL_S,
     ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S,
 )
-from packages.utils.map_sessions import ORCHESTRATOR_SERVICES, TOPO
+from packages.utils.map_sessions import KNOWN_SERVICES, ORCHESTRATOR_SERVICES, SLAM, TOPO
 
 logger = logging.getLogger("ApiDelegationService.mapping_switch")
 
@@ -91,6 +102,8 @@ SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
 # the `action` of a robot action
 START, STOP, RESTART, SAVE = "start", "stop", "restart", "save"
 SLAM_SERVICE = "SLAM recording"   # `service` of a SLAM action when the driver's name is unknown
+TOPOMAP_SERVICE = "topomap"       # `service` of a topomap switched through the mapping API
+MAP_FRAME_MODES = ("slam", "relocalization")   # the modes the mapping API runs the topomap in
 
 
 def _utcnow() -> datetime.datetime:
@@ -105,8 +118,8 @@ def candidates_of(service: str) -> List[str]:
 class Snapshot:
     """What one robot's orchestrator said about the mapping services.
     `reachable`: True answered, False did not, None not asked (robot offline / no address).
-    `services`: session service -> {orchestrator, running, pid, started_at} or None (the
-    orchestrator has no such service)."""
+    `services`: session service (topo, grid, slam) -> {orchestrator, running, pid, started_at}
+    or None / absent (the robot does not offer it)."""
     reachable: Optional[bool]
     services: Dict[str, Optional[Dict[str, Any]]] = field(default_factory=dict)
     error: Optional[str] = None
@@ -119,7 +132,8 @@ class Snapshot:
         return RUNNING if info["running"] else NOT_RUNNING
 
     def mapping_services(self) -> Dict[str, str]:
-        return {name: self.availability(name) for name in ORCHESTRATOR_SERVICES}
+        """Every service a session may ask for, as the robot offers it."""
+        return {name: self.availability(name) for name in KNOWN_SERVICES}
 
     def mapping_service(self) -> str:
         """The topomap: running | not_running (M3 `mapping_service`)."""
@@ -778,85 +792,98 @@ class MappingSwitch:
 
     # --- start / stop --------------------------------------------------------------------------
 
+    async def _mapping_api(self, client: oc.OrchestratorClient) -> Optional[Dict[str, Any]]:
+        """GET /localization of a robot with the mapping API (its answer has `topomap`), else
+        None (no facade, or a facade without a topomap service). Raises OrchestratorError."""
+        if not await oc.facade_available(client):
+            return None
+        loc = await client.get_localization()
+        return loc if "topomap" in loc else None
+
+    @staticmethod
+    async def _switch_topomap(client: oc.OrchestratorClient, loc: Mapping[str, Any],
+                              on: bool) -> Dict[str, Any]:
+        """Start / stop the topomap through the mapping API (PUT /localization on the current
+        mode and map, `topomap` on / off): one robot action, never raises."""
+        action = START if on else STOP
+        if bool(loc.get("topomap")) == on:
+            return service_action(TOPOMAP_SERVICE, action, "already")
+        mode = loc.get("mode")
+        if mode not in MAP_FRAME_MODES:
+            return service_action(
+                TOPOMAP_SERVICE, action, "failed",
+                f"the robot is in {mode or 'no'} localization mode; the topomap runs only in "
+                f"SLAM or relocalized on a stored map")
+        try:
+            answer = await client.put_localization(mode, loc.get("map"), topomap=on)
+        except oc.OrchestratorError as exc:
+            return service_action(TOPOMAP_SERVICE, action, "failed", _reason(exc))
+        already = answer.get("topomap") in ("already_running", "off")
+        return service_action(TOPOMAP_SERVICE, action, "already" if already else "done")
+
     async def start(self, robot: Any, services: Sequence[str]) -> List[Dict[str, Any]]:
         """Start each session service on the robot's orchestrator (one that already runs is
         fine). NEVER raises and never undoes anything: returns one robot action per service,
         `ok` false (with the orchestrator's text in `detail`) where it failed."""
+        return await self._switch(robot, services, START)
+
+    async def stop(self, robot: Any, services: Sequence[str]) -> List[Dict[str, Any]]:
+        """Stop each session service. NEVER raises; one robot action per service. A service that
+        is not running is fine (ok true)."""
+        return await self._switch(robot, services, STOP)
+
+    async def _switch(self, robot: Any, services: Sequence[str],
+                      action: str) -> List[Dict[str, Any]]:
+        """start() / stop(): the topomap through the mapping API where the robot has it, every
+        other service (and the topomap of a robot without it) through /services."""
         name = getattr(robot, "name", "?")
+        on = action == START
         actions: List[Dict[str, Any]] = []
         if robot is None or not services:
             return actions
         try:
             client = self._client_factory(robot)
+            rest = list(services)
             try:
-                names = await self.resolve(client, services)
+                loc = await self._mapping_api(client) if TOPO in rest else None
+                if loc is not None:
+                    actions.append(await self._switch_topomap(client, loc, on))
+                    rest.remove(TOPO)
+                names = await self.resolve(client, rest) if rest else {}
             except oc.OrchestratorError as exc:
-                return [service_action(candidates_of(svc)[0], START, "failed", _reason(exc))
-                        for svc in services]
-            for svc in services:
+                return actions + [service_action(candidates_of(svc)[0], action, "failed",
+                                                 _reason(exc)) for svc in rest]
+            for svc in rest:
                 orch = names[svc]
-                if orch is None:
+                if orch is None and on:
                     actions.append(service_action(
                         candidates_of(svc)[0], START, "failed",
                         f"the robot's orchestrator has no such service (looked for "
                         f"{', '.join(candidates_of(svc))})"))
                     continue
-                try:
-                    await client.start(orch)
-                    actions.append(service_action(orch, START, "done"))
-                except oc.OrchestratorError as exc:
-                    if exc.kind == oc.HTTP and exc.status == 409:  # already running
-                        actions.append(service_action(orch, START, "already"))
-                    else:
-                        actions.append(service_action(orch, START, "failed", _reason(exc)))
-                logger.info("Mapping service %s (%s) on %s: %s", svc, orch, name,
-                            actions[-1]["label"])
-        except Exception as exc:  # noqa: BLE001 - never blocks a session
-            logger.exception("Mapping services %s on %s not started", list(services), name)
-            done = {a["service"] for a in actions}
-            actions += [service_action(candidates_of(s)[0], START, "failed", str(exc))
-                        for s in services if candidates_of(s)[0] not in done]
-        finally:
-            self.invalidate(name)
-        return actions
-
-    async def stop(self, robot: Any, services: Sequence[str]) -> List[Dict[str, Any]]:
-        """Stop each session service. NEVER raises; one robot action per service. A service that
-        is not running is fine (ok true)."""
-        name = getattr(robot, "name", "?")
-        actions: List[Dict[str, Any]] = []
-        if robot is None or not services:
-            return actions
-        try:
-            client = self._client_factory(robot)
-            try:
-                names = await self.resolve(client, services)
-            except oc.OrchestratorError as exc:
-                return [service_action(candidates_of(svc)[0], STOP, "failed", _reason(exc))
-                        for svc in services]
-            for svc in services:
-                orch = names[svc]
-                if orch is None:  # nothing by that name exists there: nothing runs
+                if orch is None:  # stop: nothing by that name exists there, so nothing runs
                     actions.append(service_action(candidates_of(svc)[0], STOP, "already"))
                     continue
                 try:
-                    await client.stop(orch)
-                    actions.append(service_action(orch, STOP, "done"))
+                    await (client.start(orch) if on else client.stop(orch))
+                    actions.append(service_action(orch, action, "done"))
                 except oc.OrchestratorError as exc:
-                    if exc.kind == oc.HTTP and exc.status == 404:  # "not currently running"
-                        actions.append(service_action(orch, STOP, "already"))
+                    # start: 409 already running; stop: 404 "not currently running"
+                    if exc.kind == oc.HTTP and exc.status == (409 if on else 404):
+                        actions.append(service_action(orch, action, "already"))
                     else:
-                        actions.append(service_action(orch, STOP, "failed", _reason(exc)))
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Mapping services %s on %s not stopped", list(services), name)
+                        actions.append(service_action(orch, action, "failed", _reason(exc)))
+        except Exception as exc:  # noqa: BLE001 - never blocks a session
+            logger.exception("Mapping services %s on %s not switched (%s)", list(services), name,
+                             action)
             done = {a["service"] for a in actions}
-            actions += [service_action(candidates_of(s)[0], STOP, "failed", str(exc))
+            actions += [service_action(candidates_of(s)[0], action, "failed", str(exc))
                         for s in services if candidates_of(s)[0] not in done]
         finally:
             self.invalidate(name)
         for a in actions:
-            if not a["ok"]:
-                logger.warning("Mapping service %s on %s: %s", a["service"], name, a["label"])
+            log = logger.info if a["ok"] else logger.warning
+            log("Mapping service %s on %s: %s", a["service"], name, a["label"])
         return actions
 
     # --- state ---------------------------------------------------------------------------------
@@ -895,9 +922,21 @@ class MappingSwitch:
             return Snapshot(reachable=None)
         client = self._client_factory(robot)
         try:
-            names = await self.resolve(client, ORCHESTRATOR_SERVICES)
             services: Dict[str, Optional[Dict[str, Any]]] = {}
-            for svc, orch in names.items():
+            facade = await oc.facade_available(client)
+            loc = await client.get_localization() if facade else {}
+            if facade:   # the facade switches the SLAM mode
+                services[SLAM] = {"orchestrator": "localization",
+                                  "running": loc.get("mode") == "slam",
+                                  "pid": None, "started_at": None}
+            else:        # an older robot: its SLAM driver, if it has one
+                services[SLAM] = await self._old_slam(client)
+            if "topomap" in loc:   # the mapping API
+                services[TOPO] = {"orchestrator": TOPOMAP_SERVICE,
+                                  "running": bool(loc["topomap"]), "pid": None,
+                                  "started_at": None}
+            rest = [s for s in ORCHESTRATOR_SERVICES if s not in services]
+            for svc, orch in (await self.resolve(client, rest)).items():
                 if orch is None:
                     services[svc] = None
                     continue
@@ -910,6 +949,18 @@ class MappingSwitch:
         except Exception as exc:  # noqa: BLE001 - a view never fails on a malformed answer
             logger.warning("Mapping state of %s unreadable: %s", getattr(robot, "name", "?"), exc)
             return Snapshot(reachable=False, error=str(exc))
+
+    @staticmethod
+    async def _old_slam(client: oc.OrchestratorClient) -> Optional[Dict[str, Any]]:
+        """The SLAM driver of a robot without the facade (GET /maps/mapping), None when it has
+        none (404: mapping not configured) or the answer is unreadable."""
+        try:
+            st = await client.slam_state()
+        except oc.OrchestratorError:
+            return None
+        return {"orchestrator": _driver_of(st) or SLAM_SERVICE,
+                "running": bool(st.get("active")) and st.get("mode") in (None, "slam"),
+                "pid": st.get("pid"), "started_at": None}
 
     async def snapshots(self, robots: Sequence[Any]) -> Dict[str, Snapshot]:
         """snapshot() of many robots, in parallel."""

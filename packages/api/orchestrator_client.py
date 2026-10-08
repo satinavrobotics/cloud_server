@@ -46,13 +46,20 @@ Orchestrator routes used (satibot_orchestrator/app/routers/services.py):
 LOCALIZATION FACADE (satibot_orchestrator app/routers/localization.py; newer robots): the robot's
 localization mode is set in-process, nothing restarts:
   GET  /localization               -> the STORED intent {mode: odometry|slam|relocalization|null,
-                                       map}; the live truth is the VDA5050 state (positionInitialized,
+                                       map}, plus `topomap`: bool (the uploader runs now) on a robot
+                                       with the MAPPING API (mapping.topomap_service configured); the
+                                       live truth is the VDA5050 state (positionInitialized,
                                        agvPosition.mapId = the map NAME once localized)
-  PUT  /localization?wait=         body {mode, map (relocalization only)}: 409 a VDA5050 order is
-                                   active / a save runs / driver without runtime_mode_switch, 503 VDA
-                                   state unreadable, 502 the device refused the map, 504 not localized
-                                   within the timeout (wait=true only); leaving `slam` DISCARDS the
-                                   unsaved map. Answers {mode, map, applied, localized, message}
+  PUT  /localization?wait=         body {mode, map (relocalization only), topomap?}: 409 a VDA5050
+                                   order is active / a save runs / driver without runtime_mode_switch,
+                                   503 VDA state unreadable, 502 the device refused the map, 504 not
+                                   localized within the timeout (wait=true only); leaving `slam`
+                                   DISCARDS the unsaved map. `topomap` true|false starts/stops the
+                                   topomap (slam or relocalization only, 422 with odometry; 409 when
+                                   its driver / navstack is not up, and a mode or map change while it
+                                   runs is 409 unless the same PUT sends false; /services refuses to
+                                   start it). Answers {mode, map, applied, localized, message,
+                                   topomap: started|already_running|stopped|running|off}
   POST /localization/save          body {name, description, cloud_map_id, cloud_session_id}
                                    ?background=true: 202; starts and stops nothing
   GET  /localization/save          -> {map, status: saving|done|failed, error, meta, ...}; 404 none
@@ -312,12 +319,16 @@ class OrchestratorClient:
         return body if isinstance(body, dict) else {}
 
     async def put_localization(self, mode: str, map_name: Optional[str] = None,
-                               wait: bool = False) -> Dict[str, Any]:
-        """PUT /localization?wait= {mode, map}. A switch takes 4-8 s (a relocalization with
-        `wait` up to the robot's own timeout, then 504): the timeout is the start timeout."""
+                               wait: bool = False,
+                               topomap: Optional[bool] = None) -> Dict[str, Any]:
+        """PUT /localization?wait= {mode, map, topomap}. A switch takes 4-8 s (a relocalization
+        with `wait` up to the robot's own timeout, then 504): the timeout is the start timeout.
+        `topomap` (None: left as it is) starts / stops the topomap uploader (mapping API)."""
         body: Dict[str, Any] = {"mode": mode}
         if map_name:
             body["map"] = map_name
+        if topomap is not None:
+            body["topomap"] = topomap
         out = await self._facade_call("PUT", "/localization", ORCHESTRATOR_START_TIMEOUT_S,
                                       params={"wait": "true" if wait else "false"},
                                       json_body=body)

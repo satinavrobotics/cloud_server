@@ -1845,19 +1845,23 @@ async def start_services(switch: Optional[Any], session: Mapping[str, Any],
 
 
 async def stop_services(db: Any, switch: Optional[Any], robot: Optional[RobotObjectV1],
-                        session: Mapping[str, Any]) -> List[Dict[str, Any]]:
+                        session: Mapping[str, Any], keep: bool = True) -> List[Dict[str, Any]]:
     """After a session change committed: stop the mapping services of `session` (paused or
-    finished) unless the robot's open mapping session still runs them. The robot actions; never
+    finished) unless (`keep`) the robot's open mapping session still runs them. A replaced
+    session's are always stopped (`keep` false): the new session starts its own after the SLAM
+    switch, and the robot refuses a mode change while its topomap runs. The robot actions; never
     raises; [] when there was nothing to stop."""
     services = _services_of(session)
     if switch is None or not services:
         return []
     try:
-        async with open_store(db, uuid.uuid4()) as store:
-            mine = await store.open_sessions_of_robot(session["robot_name"])
-        keep = {s for o in mine if ms.purpose_of(o) == ms.MAPPING and o["paused_at"] is None
-                for s in _services_of(o)}
-        services = [s for s in services if s not in keep]
+        if keep:
+            async with open_store(db, uuid.uuid4()) as store:
+                mine = await store.open_sessions_of_robot(session["robot_name"])
+            running = {s for o in mine
+                       if ms.purpose_of(o) == ms.MAPPING and o["paused_at"] is None
+                       for s in _services_of(o)}
+            services = [s for s in services if s not in running]
         if not services:
             return []
         if robot is None:
@@ -2017,7 +2021,7 @@ def _slam_session(session: Mapping[str, Any]) -> bool:
 async def _start_slam(db: Any, switch: Any, session: Mapping[str, Any],
                       robot: Optional[RobotObjectV1]
                       ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """After the topomap of the MAPPING `session` started (session start, resume): start the
+    """Before the topomap of the MAPPING `session` starts (session start, resume): start the
     map's SLAM recording when the session asked for it (`slam` in its services). (the warning,
     the robot action), both None when it did not; never raises, never blocks the session."""
     if switch is None or not _slam_session(session) or ms.SLAM not in _session_services(session):
@@ -2187,19 +2191,21 @@ async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UU
     slam_warnings: List[str] = []
     actions: List[Dict[str, Any]] = []
     if replaced is not None:
-        # the old SLAM map is saved (awaited) before the new one starts: one driver per robot
+        # the old topomap stops first (no mode change while it runs), then the old SLAM map is
+        # saved (awaited) before the new one starts: one driver per robot
+        actions += await stop_services(db, switch, robot, replaced, keep=False)
         old, old_action = await _save_slam(db, switch, replaced, robot, wait=True)
         if old:
             slam_warnings.append(old)
         if old_action:
             actions.append(old_action)
-        actions += await stop_services(db, switch, robot, replaced)
-    actions += await start_services(switch, session, robot)
+    # SLAM before the topomap: on the mapping API the topomap needs the slam mode
     new, new_action = await _start_slam(db, switch, session, robot)
     if new:
         slam_warnings.append(new)
     if new_action:
         actions.append(new_action)
+    actions += await start_services(switch, session, robot)
     out = {"map_id": map_name, "map_state": opened.map_state, "changed": True,
            "session": session_dict(session),
            "replaced_session": session_dict(replaced) if replaced else None}
@@ -2443,10 +2449,9 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                                                     publisher_id, actor, switch)
         slam_warning = None
         if action == "resume":
-            actions = await start_services(switch, session, robot)
             slam_warning, slam_action = await _start_slam(db, switch, session, robot)
-            if slam_action:
-                actions.append(slam_action)
+            actions = [slam_action] if slam_action else []
+            actions += await start_services(switch, session, robot)
         else:
             actions = await stop_services(db, switch, robot, session)
         if action == "finish" and out["changed"]:

@@ -41,9 +41,10 @@ class FakeRobot:
     """One robot's orchestrator over HTTP. `facade` False: an older orchestrator (404 on
     /localization, the deprecated /maps/... calls instead)."""
 
-    def __init__(self, facade=True, intent=None):
+    def __init__(self, facade=True, intent=None, topomap=None):
         self.facade = facade
         self.intent = dict(intent or {"mode": None, "map": None})
+        self.topomap = topomap        # None: no mapping API, else whether the topomap runs
         self.log = []                 # (method, path, query, body)
         self.put_error = None         # (status, detail) for the next PUT /localization
         self.applied = True
@@ -69,13 +70,28 @@ class FakeRobot:
             if not self.facade:
                 return R(404, json={"detail": "Not Found"})
             if method == "GET":
-                return R(200, json=self.intent)
+                return R(200, json={**self.intent, **({} if self.topomap is None
+                                                      else {"topomap": self.topomap})})
             if self.put_error:
                 status, detail = self.put_error
                 return R(status, json={"detail": detail})
-            self.intent = {"mode": body["mode"], "map": body.get("map")}
+            new = {"mode": body["mode"], "map": body.get("map")}
+            want, extra = body.get("topomap"), {}
+            if self.topomap is not None:
+                if want and new["mode"] == "odometry":
+                    return R(422, json={"detail": "topomap needs slam or relocalization"})
+                if self.topomap and new != self.intent and want is not False:
+                    return R(409, json={"detail": "the topomap runs: send topomap:false"})
+                if want is None:
+                    extra["topomap"] = "running" if self.topomap else "off"
+                elif want == self.topomap:
+                    extra["topomap"] = "already_running" if want else "off"
+                else:
+                    extra["topomap"] = "started" if want else "stopped"
+                    self.topomap = want
+            self.intent = new
             return R(200, json={**self.intent, "applied": self.applied, "localized": None,
-                                "message": "ok"})
+                                "message": "ok", **extra})
         if path == "/localization/save":
             if method == "POST":
                 if self.save_error:
@@ -145,6 +161,25 @@ async def _no_sleep(_s):
 
 def _slam_switch(fake):
     return MappingSwitch(client_factory=fake.client, sleep=_no_sleep)
+
+
+def _session_env(fake, slam_map=True):
+    """A TxDb with map `yard` (a SLAM map unless `slam_map` is False) and robot r1 on `fake`."""
+    d = TxDb()
+    d.add_map("yard", type="local", status={"state": "draft"})
+    d.maps["yard"]["spec"]["slam_map"] = slam_map
+    d.robots["r1"] = _plain_robot()
+    switch = _slam_switch(fake)
+    switch.on_session, switch.on_state = AsyncMock(), AsyncMock()
+    return d, switch
+
+
+def _puts(fake):
+    return [body for _m, _p, _q, body in fake.calls("PUT", "/localization")]
+
+
+def _labels(out):
+    return [(a["service"], a["action"], a["ok"]) for a in out["robot_actions"]]
 
 
 # --- capability probe ----------------------------------------------------------------------------
@@ -481,3 +516,74 @@ class TestProxyIds:
     def test_another_map_is_left_alone(self):
         body = json.dumps({"name": "other"}).encode()
         assert proxy.with_cloud_ids("POST", "localization/save", body, self.SESSION) == body
+
+
+# --- the topomap on the mapping API --------------------------------------------------------------
+
+class TestTopomapOnTheMappingApi:
+    async def test_the_view_is_what_the_robot_reports(self):
+        fake = FakeRobot(intent={"mode": "slam", "map": None}, topomap=True)
+        snap = await _slam_switch(fake).snapshot(_plain_robot(), fresh=True)
+        assert snap.mapping_services() == {"topo": "running", "grid": "not_available",
+                                           "slam": "running"}
+        assert snap.state(None)["status"] == "on"
+        assert not [c for c in fake.log if c[1].startswith("/services/topomap")]
+
+    async def test_a_facade_without_it_reports_slam_and_the_topomap_service(self):
+        snap = await _slam_switch(FakeRobot()).snapshot(_plain_robot(), fresh=True)
+        assert snap.mapping_services() == {"topo": "not_running", "grid": "not_available",
+                                           "slam": "not_running"}
+
+    async def test_a_slam_session_switches_slam_then_the_topomap_and_back(self):
+        fake = FakeRobot(intent={"mode": "odometry", "map": None}, topomap=False)
+        d, switch = _session_env(fake)
+        with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow",
+                                                                       m1.Clock()):
+            out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op",
+                                           switch=switch)
+            assert _puts(fake) == [{"mode": "slam"}, {"mode": "slam", "topomap": True}]
+            assert _labels(out) == [("SLAM recording", "restart", True),
+                                    ("topomap", "start", True)]
+            assert out["mapping_services"]["topo"] == "running"
+            sid = out["session"]["session_id"]
+            out = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+            await switch.wait_slam_saves()
+        # the topomap stops before the save; the save switches back to odometry
+        assert _puts(fake)[2:] == [{"mode": "slam", "topomap": False}, {"mode": "odometry"}]
+        assert fake.topomap is False and fake.intent["mode"] == "odometry"
+        assert d.codes()[-1] == "MAP.SLAM_SAVE_DONE"
+        assert not [c for c in fake.log if c[1].startswith("/services/topomap")]
+
+    async def test_a_relocalized_robot_keeps_its_map(self):
+        fake = FakeRobot(intent={"mode": "relocalization", "map": "cloud-yard"}, topomap=False)
+        d, switch = _session_env(fake, slam_map=False)
+        with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow",
+                                                                       m1.Clock()):
+            out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op",
+                                           switch=switch)
+        assert _puts(fake) == [{"mode": "relocalization", "map": "cloud-yard", "topomap": True}]
+        assert _labels(out) == [("topomap", "start", True)]
+
+    async def test_odometry_is_a_failed_action_never_a_refused_session(self):
+        fake = FakeRobot(intent={"mode": "odometry", "map": None}, topomap=False)
+        d, switch = _session_env(fake, slam_map=False)
+        with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow",
+                                                                       m1.Clock()):
+            out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op",
+                                           switch=switch)
+        assert _labels(out) == [("topomap", "start", False)]
+        assert "odometry" in out["robot_actions"][0]["detail"]
+        assert out["session"]["ended_at"] is None and not _puts(fake)
+
+    async def test_the_robots_refusal_is_the_detail(self):
+        fake = FakeRobot(intent={"mode": "slam", "map": None}, topomap=False)
+        fake.put_error = (409, "navstack not running")
+        actions = await _slam_switch(fake).start(_plain_robot(), ["topo"])
+        assert [(a["ok"], a["detail"]) for a in actions] == [
+            (False, "the orchestrator answered 409: navstack not running")]
+
+    async def test_already_in_the_wanted_state_is_ok_without_a_call(self):
+        fake = FakeRobot(intent={"mode": "slam", "map": None}, topomap=False)
+        actions = await _slam_switch(fake).stop(_plain_robot(), ["topo"])
+        assert actions[0]["ok"] and actions[0]["label"] == "Topomap service was not running"
+        assert not _puts(fake)
