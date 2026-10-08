@@ -326,13 +326,36 @@ class TestCapability:
         holder = _real_holder()
         out = await maps.placement_suggestions(None, "shed", str(s["session_id"]), holder=holder)
         assert out["reloc"] == {"available": True, "known": True, "source": "orchestrator",
-                                "can_start": True, "can_start_reason": None, "warning": None}
+                                "can_start": True, "can_start_reason": None, "warning": None,
+                                "localization_api": False}
         out = await maps.map_reloc(None, holder, "shed", "r1")
         assert out["can_start"] is True and out["can_start_reason"] is None
         out = await maps.map_reloc(None, _real_holder(services=("topomap",)), "shed", "r1")
         assert out["can_start"] is True and "relocalization service" in out["can_start_reason"]
         assert out["warning"] == out["can_start_reason"]
         assert out["available"] is True    # the held map did not change
+
+    async def test_localization_api_flag(self, env):
+        _robot(env.db)
+        env.db.add_map("shed", type="local", status={"state": "ready"})
+        env.db.add_map("geo1", type="geo", status={"state": "ready"})
+
+        def holder(facade):
+            class C:
+                async def facade(self):
+                    return facade
+
+                async def list_services(self):
+                    return [{"name": "odin_reloc"}]
+
+                async def list_maps(self, cloud_map_id):
+                    return []
+            return OrchestratorMaps(client_factory=lambda robot: C())
+
+        assert (await maps.map_reloc(None, holder(True), "shed", "r1"))["localization_api"] is True
+        assert (await maps.map_reloc(None, holder(False), "shed", "r1"))["localization_api"] is False
+        assert (await maps.map_reloc(None, holder(True), "geo1", "r1"))["localization_api"] is False
+        assert (await maps.map_reloc(None, holder(True), "shed", "ghost"))["localization_api"] is False
 
     async def test_unknown_robot_cannot_start(self, env):
         env.db.add_map("shed", type="local", status={"state": "ready"})

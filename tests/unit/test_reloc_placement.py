@@ -34,7 +34,8 @@ pytestmark = pytest.mark.unit
 # `can_start` / `can_start_reason` were added to every reloc read (additive; reloc_job.py). The
 # FakeHolder below cannot start anything, so it is always this:
 NO_START = {"can_start": False, "can_start_reason": "relocalization cannot be started from here",
-            "warning": "relocalization cannot be started from here"}
+            "warning": "relocalization cannot be started from here",
+            "localization_api": False}
 
 
 def _robot(db, name="r1", online=True, address=True, **status):
@@ -556,7 +557,8 @@ class TestMapReloc:
         assert await maps.map_reloc(None, h, "geo1", "r1") == {
             "available": False, "known": True, "source": "orchestrator", "can_start": False,
             "can_start_reason": "a geo map is placed by its datum, not relocalized",
-            "warning": "a geo map is placed by its datum, not relocalized"}
+            "warning": "a geo map is placed by its datum, not relocalized",
+            "localization_api": False}
         assert h.calls == []
         assert await _status(maps.map_reloc(None, h, "nomap", "r1")) == 404
 

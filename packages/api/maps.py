@@ -1112,6 +1112,18 @@ async def _can_start(holder: Optional[Any], robot: Optional[RobotObjectV1], map_
 _GEO_RELOC = "a geo map is placed by its datum, not relocalized"
 
 
+async def _localization_api(holder: Optional[Any], robot: Optional[Any]) -> bool:
+    """`localization_api` of the reloc reads: the robot has the localization facade. False when
+    unknown (no holder, an older holder, offline). Never raises."""
+    ask = getattr(holder, "localization_api", None)
+    if ask is None or robot is None:
+        return False
+    try:
+        return (await ask(robot)) is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id: str,
                        switch: Optional[Any] = None, reloc_jobs: Optional[Any] = None
                        ) -> Optional[Dict[str, Any]]:
@@ -1139,7 +1151,8 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
         logger.exception("Reloc status of session %s not readable", session_id)
         return None
     return {"available": held is True, "known": held is not None, "source": "orchestrator",
-            "can_start": can, "can_start_reason": why, "warning": why}
+            "can_start": can, "can_start_reason": why, "warning": why,
+            "localization_api": await _localization_api(holder, robot)}
 
 
 async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: str,
@@ -1158,7 +1171,7 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
             if row.type == "geo":
                 return {"available": False, "known": True, "source": "orchestrator",
                         "can_start": False, "warning": _GEO_RELOC,
-                        "can_start_reason": _GEO_RELOC}
+                        "can_start_reason": _GEO_RELOC, "localization_api": False}
             robot = await store.robot(robot_name)
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
@@ -1171,7 +1184,8 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
     can, why = await _can_start(holder, robot, map_name, held, db=db, switch=switch,
                                 reloc_jobs=reloc_jobs, blockers=True)
     return {"available": held is True, "known": held is not None, "source": "orchestrator",
-            "can_start": can, "can_start_reason": why, "warning": why}
+            "can_start": can, "can_start_reason": why, "warning": why,
+            "localization_api": await _localization_api(holder, robot)}
 
 
 async def placement_suggestions(db: Any, map_name: str, session_id: str,

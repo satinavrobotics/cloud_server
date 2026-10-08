@@ -146,6 +146,17 @@ class OrchestratorMaps:
         self._endpoint[name] = (self._clock() + ttl, answer)
         return answer
 
+    async def localization_api(self, robot: Any) -> bool:
+        """Whether the robot's orchestrator has the localization facade (GET /localization): the
+        cloud then switches the mode in-process (nothing restarts). Only a positive probe counts;
+        cached like reloc_endpoint (oc.facade_available caches per robot too). Never raises."""
+        if RELOC_FORCE_SERVICE:
+            return False
+        try:
+            return await oc.facade_available(self._client_factory(robot))
+        except Exception:  # noqa: BLE001
+            return False
+
     async def reloc_capability(self, robot: Any, cloud_map_id: str, fresh: bool = False,
                                held: Optional[bool] = None) -> Tuple[bool, Optional[str]]:
         """(can_start, warning): relocalization can ALWAYS be started from the API for a robot
