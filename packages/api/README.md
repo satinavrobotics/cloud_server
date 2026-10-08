@@ -227,6 +227,12 @@ while that session is placed.
   running relocalization job is unchanged (a validation, not a switch). A repeated
   pause/finish retries the stop, a repeated resume the start (`changed: false`).
 - `.../place` does not touch the services; operate sessions never start or stop one.
+- **Localization facade** (robots whose orchestrator answers `GET /localization`; probed and cached 60 s per robot, a 404 means an older robot and the calls below, written for it, are used): SLAM
+  recording is a mode switch, not a process. Start = `PUT /localization {"mode":"slam"}` (the stored intent before it is kept in memory); finish saves with
+  `POST /localization/save?background=true {name: "cloud-<map>", cloud_map_id, cloud_session_id}`, polls `GET /localization/save`, emits
+  `MAP.SLAM_SAVE_DONE`/`_FAILED`, then PUTs the previous intent back (`odometry` when unknown). A failed save leaves the robot in slam (leaving it would discard the unsaved
+  map; the warning says so); a refused switch-back (e.g. 409 order active) makes the save's robot action `ok: false` ("SLAM map saved, but ...") and is in the event label. The robot does not name the map it records, so the lost-save reconcile and the orphan stop do not act on facade robots. Relocalization jobs
+  `PUT /localization {"mode":"relocalization","map":"<onboard name>"}?wait=false`, then wait for the VDA5050 state (`position_initialized` and `pose.map_id` == the onboard map name); cancel/failure PUT the previous intent back. The robot's refusal text (409 "order active: cancel it first", 502, 503, 504) is the job's `error`.
 - **SLAM map** (`"slam"` in a mapping session's `services`; the user chooses it per session): a *mapping* session that has `slam` in its `services` also records a
   SLAM map on the robot, named `onboard_map_name(map)` = `cloud-<map>`. After the topomap start
   (outside any transaction, under the robot's lock) the API calls `POST /maps/{onboard}/mapping/start`

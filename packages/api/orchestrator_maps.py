@@ -16,7 +16,8 @@ reloc_capability() answers (can_start, warning) for the reloc reads (packages/ap
 fail: the robot is offline / has no orchestrator address, the map is not held (the small
 /maps/list read), or the orchestrator cannot relocalize: either it offers POST /maps/{name}/relocalize (its GET /maps/mapping reports `mode`
 and `relocalizing`; preferred, and the heavy /services read is then not needed at all) or, as a
-fallback, it lists a service from config RELOC_SERVICE_CANDIDATES (cached like held()).
+fallback, it lists a service from config RELOC_SERVICE_CANDIDATES (cached like held()). A
+robot with the localization facade (GET /localization, PUT /localization) needs neither.
 Never raises.
 """
 
@@ -113,8 +114,9 @@ class OrchestratorMaps:
         return found, why
 
     async def reloc_endpoint(self, robot: Any, fresh: bool = False) -> Optional[bool]:
-        """Whether the robot's orchestrator offers POST /maps/{name}/relocalize: True when its
-        GET /maps/mapping reports `mode` / `relocalizing`, False when it answers without them
+        """Whether the robot's orchestrator can relocalize by itself: True when it has the
+        localization facade (PUT /localization) or, an older one, offers POST /maps/{name}/relocalize
+        (its GET /maps/mapping reports `mode` / `relocalizing`), False when it answers without them
         (older orchestrator) or RELOC_FORCE_SERVICE is set, None when it could not be asked.
         Cached like held() (an unknown only `unknown_ttl`). Never raises."""
         if RELOC_FORCE_SERVICE:
@@ -126,7 +128,11 @@ class OrchestratorMaps:
         answer: Optional[bool] = None
         ttl = self.unknown_ttl
         try:
-            answer = oc.supports_relocalize(await self._client_factory(robot).mapping_state())
+            client = self._client_factory(robot)
+            if await oc.facade_available(client):   # PUT /localization relocalizes
+                answer = True
+            else:
+                answer = oc.supports_relocalize(await client.mapping_state())
             ttl = self.ttl
         except oc.OrchestratorError as exc:
             if exc.kind == oc.HTTP and exc.status == 404:

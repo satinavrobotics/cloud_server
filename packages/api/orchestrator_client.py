@@ -43,6 +43,22 @@ Orchestrator routes used (satibot_orchestrator/app/routers/services.py):
   GET  /robot/config/map           -> {current_map}
   PUT  /robot/config/map           body {current_map: name | null}; 404 no such map
 
+LOCALIZATION FACADE (satibot_orchestrator app/routers/localization.py; newer robots): the robot's
+localization mode is set in-process, nothing restarts:
+  GET  /localization               -> the STORED intent {mode: odometry|slam|relocalization|null,
+                                       map}; the live truth is the VDA5050 state (positionInitialized,
+                                       agvPosition.mapId = the map NAME once localized)
+  PUT  /localization?wait=         body {mode, map (relocalization only)}: 409 a VDA5050 order is
+                                   active / a save runs / driver without runtime_mode_switch, 503 VDA
+                                   state unreadable, 502 the device refused the map, 504 not localized
+                                   within the timeout (wait=true only); leaving `slam` DISCARDS the
+                                   unsaved map. Answers {mode, map, applied, localized, message}
+  POST /localization/save          body {name, description, cloud_map_id, cloud_session_id}
+                                   ?background=true: 202; starts and stops nothing
+  GET  /localization/save          -> {map, status: saving|done|failed, error, meta, ...}; 404 none
+facade() probes GET /localization (200: facade; 404: an older robot, the deprecated /maps/... calls
+above are used), cached FACADE_TTL_S per robot address; callers use `facade_available(client)`.
+
 SLAM maps (docs/satinav-maps-redesign.md 14.15): a local map with `slam_map` is recorded on the
 robot under onboard_map_name(map); the orchestrator reserves some names, so the server's maps
 get a prefix. start_slam / start_slam_save / slam_save_status / stop_slam / slam_state raise OrchestratorError like the
@@ -50,6 +66,7 @@ rest; packages/api/mapping_switch.py wraps them into results that never raise.
 """
 
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
@@ -65,6 +82,18 @@ NO_ADDRESS = "no_address"      # the robot has no registered ip / port
 UNREACHABLE = "unreachable"    # connection refused / no route / network error
 TIMEOUT = "timeout"
 HTTP = "http"                  # the orchestrator answered with an error status
+
+
+FACADE_TTL_S = 60.0
+# (robot name, ip, port) -> (valid until, has the localization facade)
+_facade_cache: Dict[Tuple[str, str, int], Tuple[float, bool]] = {}
+_facade_clock: Callable[[], float] = time.monotonic
+
+
+def clear_facade_cache(robot_name: Optional[str] = None) -> None:
+    """Forget what is known about which robots offer the localization facade."""
+    for key in [k for k in _facade_cache if robot_name is None or k[0] == robot_name]:
+        _facade_cache.pop(key, None)
 
 
 class OrchestratorError(Exception):
@@ -234,6 +263,78 @@ class OrchestratorClient:
         return await self._call("POST", f"/maps/{onboard_map}/relocalize",
                                 ORCHESTRATOR_START_TIMEOUT_S)
 
+    # --- the localization facade (see the module docstring) ------------------------------------
+
+    def _facade_key(self) -> Optional[Tuple[str, str, int]]:
+        return None if self.address is None else (self.robot_name, *self.address)
+
+    async def facade(self, fresh: bool = False) -> Optional[bool]:
+        """Whether the robot's orchestrator has the localization facade: True (GET /localization
+        answered), False (404: an older orchestrator), None (could not be asked: not cached).
+        Cached FACADE_TTL_S per (robot, address); a facade call that answers 404 or cannot reach
+        the robot drops the entry."""
+        key = self._facade_key()
+        if key is None:
+            return None
+        hit = _facade_cache.get(key)
+        if hit is not None and not fresh and hit[0] > _facade_clock():
+            return hit[1]
+        try:
+            await self._call("GET", "/localization", ORCHESTRATOR_QUERY_TIMEOUT_S)
+            answer = True
+        except OrchestratorError as exc:
+            if exc.kind == HTTP and exc.status in (404, 405):
+                answer = False
+            else:
+                logger.info("Localization facade of %s not probed: %s", self.robot_name,
+                            exc.detail)
+                return None
+        _facade_cache[key] = (_facade_clock() + FACADE_TTL_S, answer)
+        return answer
+
+    async def _facade_call(self, method: str, path: str, timeout: float,
+                           params: Optional[Dict[str, str]] = None,
+                           json_body: Optional[Dict[str, Any]] = None) -> Any:
+        try:
+            return await self._call(method, path, timeout, params=params, json_body=json_body)
+        except OrchestratorError as exc:
+            if exc.kind in (UNREACHABLE, TIMEOUT) or (exc.kind == HTTP and exc.status == 404
+                                                      and path == "/localization"):
+                key = self._facade_key()
+                if key is not None:
+                    _facade_cache.pop(key, None)   # re-probe next time
+            raise
+
+    async def get_localization(self) -> Dict[str, Any]:
+        """GET /localization -> the stored intent {mode, map} (both null if never set)."""
+        body = await self._facade_call("GET", "/localization", ORCHESTRATOR_QUERY_TIMEOUT_S)
+        return body if isinstance(body, dict) else {}
+
+    async def put_localization(self, mode: str, map_name: Optional[str] = None,
+                               wait: bool = False) -> Dict[str, Any]:
+        """PUT /localization?wait= {mode, map}. A switch takes 4-8 s (a relocalization with
+        `wait` up to the robot's own timeout, then 504): the timeout is the start timeout."""
+        body: Dict[str, Any] = {"mode": mode}
+        if map_name:
+            body["map"] = map_name
+        out = await self._facade_call("PUT", "/localization", ORCHESTRATOR_START_TIMEOUT_S,
+                                      params={"wait": "true" if wait else "false"},
+                                      json_body=body)
+        return out if isinstance(out, dict) else {}
+
+    async def save_localization(self, name: str, cloud_map_id: str,
+                                cloud_session_id: Any) -> Dict[str, Any]:
+        """POST /localization/save?background=true with the cloud ids: 202 at once, or a 4xx
+        (409 not in slam / a save runs / cloud_map_id held, 503, 502)."""
+        body = {"name": name, **cloud_link(cloud_map_id, cloud_session_id)}
+        return await self._call("POST", "/localization/save", ORCHESTRATOR_START_TIMEOUT_S,
+                                params={"background": "true"}, json_body=body)
+
+    async def localization_save_status(self) -> Dict[str, Any]:
+        """GET /localization/save -> {map, status: saving|done|failed, error, meta, ...}."""
+        body = await self._call("GET", "/localization/save", ORCHESTRATOR_QUERY_TIMEOUT_S)
+        return body if isinstance(body, dict) else {}
+
     async def stop_mapping(self) -> Dict[str, Any]:
         """POST /maps/mapping/stop: ends a SLAM or a relocalization session (404: none runs)."""
         return await self.stop_slam()
@@ -256,3 +357,23 @@ def supports_relocalize(state: Any) -> bool:
     """Whether a GET /maps/mapping answer is from an orchestrator that can relocalize: it reports
     `mode` and `relocalizing` (older ones answer {active, map, pid} only)."""
     return isinstance(state, dict) and "mode" in state and "relocalizing" in state
+
+
+async def facade_available(client: Any) -> bool:
+    """Whether `client` talks to an orchestrator with the localization facade. A client without
+    the probe (a test double of an older robot) or an unknown answer count as no: the deprecated
+    /maps/... calls then say what is wrong."""
+    probe = getattr(client, "facade", None)
+    if probe is None:
+        return False
+    try:
+        return (await probe()) is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def intent_label(intent: Any) -> str:
+    """A stored intent {mode, map} as text."""
+    if not isinstance(intent, dict) or not intent.get("mode"):
+        return "no stored mode"
+    return f"{intent['mode']} on '{intent['map']}'" if intent.get("map") else str(intent["mode"])

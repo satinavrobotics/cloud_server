@@ -31,6 +31,17 @@ GET /maps/mapping and fails the job when the driver is gone (mode null) twice in
 and cancel restore init_pos and stop the session via POST /maps/mapping/stop, only when the job
 started it; a TIMEOUT leaves it running. Otherwise the service path below is unchanged.
 
+LOCALIZATION FACADE (robots whose orchestrator has GET /localization, oc.facade_available; probed in
+`preparing`): `starting` is: PATCH init_pos (as above), read the stored intent (GET /localization; a
+`slam` intent fails the job "finish it first": leaving slam would discard the unsaved map), then
+PUT /localization {mode: relocalization, map: <onboard>} with wait=false (the robot switches
+in-process). The robot's own refusal is the job's error text (409 "order active: cancel it first",
+502 map refused, 503 VDA state unreadable). `waiting` does not poll the orchestrator: it watches the
+robot's stored VDA5050 state, `position_initialized` true AND `pose.map_id` == the onboard map name
+(the robot reports the map name once LOCALIZED), so no stale-flag handling is needed. Rollback and
+cancel PUT the intent read before back (odometry when none), unless the intent is no longer ours.
+A TIMEOUT leaves the robot relocalizing. Older robots: the paths above, unchanged.
+
 Failure: EVERY failure but a timeout restores what the job changed on the robot: the previous
 `init_pos` and `current_map`, and the reloc service if the job stopped it (it is stopped and
 started again so it runs on the restored map); best effort, what could not be restored is in
@@ -121,6 +132,8 @@ class _Undo:
     was_running: bool = False      # the reloc service ran before the job
     stopped: bool = False          # the job stopped (or tried to stop) it: restart on rollback
     session_started: bool = False  # endpoint mode: the job started a relocalization session
+    prev_intent: Optional[Dict[str, Any]] = None   # facade: the stored intent before the job
+    facade: bool = False           # facade: session_started means "the job PUT the intent"
     endpoint_error: Optional[str] = None   # the orchestrator's 404 / 405 on the endpoint
 
 
@@ -391,7 +404,12 @@ class RelocJobs:
         stopped, restarted so it runs on the restored map); best effort. Returns a
         sentence for what could not be restored, else None. Idempotent."""
         problems: List[str] = []
-        if undo.session_started:   # endpoint mode: the relocalization session this job started
+        if undo.session_started and undo.facade:   # PUT the previous intent back
+            undo.session_started = False
+            problem = await self._restore_intent(client, undo)
+            if problem:
+                problems.append(problem)
+        elif undo.session_started:   # endpoint mode: the relocalization session this job started
             undo.session_started = False
             try:
                 if await self._still_ours(client, undo.onboard):
@@ -437,6 +455,28 @@ class RelocJobs:
         return "; ".join(problems) if problems else None
 
     @staticmethod
+    async def _restore_intent(client: oc.OrchestratorClient, undo: _Undo) -> Optional[str]:
+        """Facade rollback: PUT the stored intent from before the job back (odometry when there
+        was none; a slam intent never gets here), unless the robot's intent is not the job's any
+        more (someone changed it meanwhile). A problem sentence, else None."""
+        try:
+            now = await client.get_localization()
+            if not (now.get("mode") == "relocalization" and now.get("map") == undo.onboard):
+                return None
+        except Exception:  # noqa: BLE001 - unreadable: try the restore anyway
+            pass
+        prev = undo.prev_intent or {}
+        mode = prev.get("mode") or "odometry"
+        try:
+            await client.put_localization(mode, prev.get("map") if mode == "relocalization"
+                                          else None)
+        except oc.OrchestratorError as exc:
+            return describe_error(exc, f"localization not restored to {mode}")
+        except Exception as exc:  # noqa: BLE001
+            return f"localization not restored to {mode}: {exc}"
+        return None
+
+    @staticmethod
     async def _still_ours(client: oc.OrchestratorClient, onboard: Optional[str]) -> bool:
         """Whether the driver session on the robot may still be the relocalization this job started:
         False when the robot now runs a SLAM mapping session (someone started one through the
@@ -478,7 +518,8 @@ class RelocJobs:
         else:
             onboard = str(row["name"])
         undo.onboard = onboard
-        endpoint = await self._endpoint_available(client)
+        facade = await oc.facade_available(client)
+        endpoint = False if facade else await self._endpoint_available(client)
         try:
             info = await client.get_map(onboard)
             undo.init_pos = info.get("init_pos")
@@ -499,6 +540,11 @@ class RelocJobs:
         except oc.OrchestratorError as exc:
             raise _Fail(describe_error(exc, f"could not set the initial pose of '{onboard}'"))
 
+        if facade:
+            await self._start_facade(job, client, undo, onboard)
+            baseline["facade"], baseline["onboard"] = True, onboard
+            self._start_waiting(job, baseline)
+            return
         if endpoint:
             if await self._start_endpoint(job, client, undo, onboard):
                 baseline["endpoint"] = True
@@ -506,6 +552,27 @@ class RelocJobs:
                 return
             # the orchestrator has no such route (404 / 405): the service path
         await self._start_service(job, client, undo, baseline, onboard, endpoint)
+
+    async def _start_facade(self, job: RelocJob, client: oc.OrchestratorClient, undo: _Undo,
+                            onboard: str) -> None:
+        """Facade mode: remember the stored intent, then PUT relocalization on the map (no wait:
+        the job's waiting step watches the VDA5050 state). The robot's refusal is the error."""
+        self._enter(job, STARTING, "starting_relocalization")
+        try:
+            prev = await client.get_localization()
+        except oc.OrchestratorError as exc:
+            raise _Fail(describe_error(exc, "could not read the robot's localization"))
+        if prev.get("mode") == "slam":
+            raise _Fail("a SLAM mapping session is active on the robot (409); finish it first")
+        undo.prev_intent = {"mode": prev.get("mode"), "map": prev.get("map")}
+        undo.facade = True
+        undo.session_started = True    # before the call: a timed-out call may have applied
+        try:
+            await client.put_localization("relocalization", onboard, wait=False)
+        except oc.OrchestratorError as exc:
+            if exc.kind == oc.HTTP and exc.status != 504:   # refused: nothing was changed
+                undo.session_started = False
+            raise _Fail(describe_error(exc, f"could not start relocalization on '{onboard}'"))
 
     def _start_waiting(self, job: RelocJob, baseline: Dict[str, Any]) -> None:
         baseline["started"] = self._clock()
@@ -671,7 +738,8 @@ class RelocJobs:
                     client: Optional[oc.OrchestratorClient] = None) -> Any:
         """(f) poll the stored robot status until `position_initialized` or the deadline.
         Returns the robot as last read."""
-        stale = bool(baseline.get("initialized"))
+        facade_map = (baseline.get("onboard") if baseline.get("facade") else None)
+        stale = bool(baseline.get("initialized")) and facade_map is None
         settled_at = baseline.get("started", self._clock()) + self.settle
         saw_drop = False
         gone = 0
@@ -689,7 +757,11 @@ class RelocJobs:
             initialized = robot.status.position_initialized
             job.position_initialized = initialized
             job.localization_score = robot.status.localization_score
-            if initialized is not True:
+            if facade_map is not None:
+                # LOCALIZED on THIS map: the robot reports the map name only then
+                if initialized is True and robot.status.pose.map_id == facade_map:
+                    return robot
+            elif initialized is not True:
                 saw_drop = True
             elif not stale or saw_drop or self._clock() >= settled_at:
                 return robot
@@ -700,12 +772,14 @@ class RelocJobs:
                                 "(no mapping/relocalization session is running any more; see "
                                 "the driver logs)")
             if self._clock() >= job.deadline_mono:
-                what = ("the relocalization session" if baseline.get("endpoint")
-                        else "the relocalization service")
+                left = ("the robot is left relocalizing" if facade_map is not None
+                        else "the relocalization session is left running on the robot"
+                        if baseline.get("endpoint")
+                        else "the relocalization service is left running on the robot")
                 raise _Fail(
                     f"the robot did not report a localized position within "
-                    f"{self.timeout:g} s; {what} is left running on the "
-                    "robot (it may still localize: place again later)", rollback=False)
+                    f"{self.timeout:g} s; {left} "
+                    "(it may still localize: place again later)", rollback=False)
             await self._sleep(self.poll)
 
     @staticmethod
