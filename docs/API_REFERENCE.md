@@ -897,6 +897,43 @@ Cancel an active mission.
 **Error Response:**
 - `400 Bad Request`: Mission cannot be cancelled (already completed/failed)
 
+#### Run legs
+
+A leg is one robot move from one topomap node to the next. mission-dispatch records one row per
+leg in `run_legs` from the robot's VDA5050 state (each change of `lastNodeId`), at every
+recording level except `off` (legs are kept like events, indefinitely). The run's
+`summary_metrics` is filled from them when the run ends.
+
+**`GET /api/v1/runs/{run_id}/legs`** -- the run's legs in order: `{"run_id", "items": [leg...]}`
+(empty when none were recorded). 404 for an unknown run. A leg:
+
+| Field | Meaning |
+|---|---|
+| `seq` | 1-based leg order in the run (events carry it as `payload.leg_seq`) |
+| `pass_index` | 0-based repeat pass; `order_rev` the order revision it ended in (a reroute resends the order, the leg is one leg across it) |
+| `from_vda_node`, `to_vda_node` | VDA node ids (`<mission>-r<run>[v<rev>]-n<tree node>-s<seq>`); `from_vda_node` is the implied start node when the robot never reported it |
+| `from_topomap_node`, `to_topomap_node` | Topomap node ids, or `null`: only a mission whose `planned_path` lines up one-to-one with its route waypoints (planner go-tos) has them; a rerouted or hand-made route has none. The first leg of a pass has no `from_topomap_node` |
+| `map_id` | Map of the route |
+| `started_at`, `ended_at` | Robot clock (VDA5050 header time). `received_started_at`, `received_ended_at`: dispatcher clock |
+| `duration_s`, `stopped_s` | Leg time; part of it the robot reported `driving: false` |
+| `straight_m`, `planned_m` | Map-frame distance between the two waypoints (`null` for a leg that starts at the robot's own position) |
+| `expected_s` | `d / speed_max + speed_max / acceleration_max + abs(delta heading) / angular_speed_max` from the robot's factsheet; a term whose limit is unknown (-1) is dropped, `null` when nothing is known or the start has no pose |
+| `recoveries`, `recovery_s`, `blocks` | Counts from `NAV.RECOVERY_ENTERED/EXITED`, `NAV.GOAL_BLOCKED`, `MISSION.EDGE_BLOCKED` events tagged with the leg; filled when the run ends (events arriving later are not counted) |
+
+**`GET /api/v1/missions/{name}/legs`** -- legs of all non-archived runs of the mission and its
+`-rerun-<n>` reruns grouped by leg identity (`from` -> `to`: the topomap node ids, else the
+run-independent VDA tail `n<tree node>-s<seq>`; `topomap` says which). `{"mission", "runs",
+"legs", "truncated", "items": [{from, to, topomap, count, runs, median_s, p90_s, expected_s,
+ratio, recoveries, recovery_s, blocks}]}`, slowest median first. `ratio` = `median_s /
+expected_s`; `p90_s` is linearly interpolated. 404 when the mission has no run.
+
+`GET /api/v1/runs/{run_id}` also returns `run.planned_path` (the mission's planned path when the
+run started) and, once the run has ended, `run.summary_metrics`: `leg_count`, `duration_s`,
+`distance_m`, `time_moving_s`, `time_stopped_s` (rest of the run: non-driving time and time
+outside any leg), `time_recovery_s` (overlaps stopped time), `recovery_count`, `block_count`,
+`expected_s`, `actual_vs_expected` (time of the legs that have an expected time over their
+expected sum), `pass_durations_s` (`[{pass, legs, duration_s}]`).
+
 ---
 
 ### Detection Results

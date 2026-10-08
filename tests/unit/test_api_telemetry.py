@@ -348,10 +348,46 @@ class TestWriterTerm:
         await flush(tel)
         rows = sorted(server.db.events.values(), key=lambda r: r["ts"])
         assert [r["code"] for r in rows] == ["NAV.RECOVERY_ENTERED", "NAV.RECOVERY_EXITED"]
-        assert json.loads(rows[1]["payload"]) == {"cause": "FROZEN", "duration_s": 5.0}
+        assert json.loads(rows[1]["payload"]) == {"cause": "FROZEN", "duration_s": 5.0,
+                                                   "leg_seq": None}
         assert server.db.timeseries == {tables.ROBOT_STATE_TABLE: [], tables.DIAGNOSTICS_TABLE: []}
         assert "nav_supervisor" in server.db.latest["r1"]
         assert set(server.db.latest["r1"]) == {"nav_supervisor"}  # only the API's column
+
+    async def test_recovery_and_blocked_goal_events_carry_the_dispatch_leg(self, tmp_path):
+        """Dispatch keeps the leg the run is on in robot_latest.state_msg._dispatch.leg_seq; the
+        nav events the API raises are tagged with it (and with the run)."""
+        server = LockServer()
+        set_level(server.db, "events_only")
+        run_id = uuid.uuid4()
+        server.db.latest["r1"] = {"active_run_id": run_id,
+                                  "state_msg": {"_dispatch": {"leg_seq": 4}}}
+        tel = make_telemetry(server, tmp_path)
+        await tel.election.step()
+        stamp = lambda s: {"sec": int(epoch(s)), "nanosec": 0}  # noqa: E731
+        tel.on_nav_supervisor("r1", {"state": "DRIVE", "blocked_pending": False,
+                                     "stamp": stamp(0)})
+        tel.on_nav_supervisor("r1", {"state": "RECOVER", "last_drive_cause": "FROZEN",
+                                     "blocked_pending": True, "stamp": stamp(2)})
+        tel.on_nav_supervisor("r1", {"state": "DRIVE", "stamp": stamp(7)})
+        await flush(tel)
+        rows = {r["code"]: r for r in server.db.events.values()}
+        assert set(rows) == {"NAV.RECOVERY_ENTERED", "NAV.RECOVERY_EXITED", "NAV.GOAL_BLOCKED"}
+        for row in rows.values():
+            assert json.loads(row["payload"])["leg_seq"] == 4 and row["run_id"] == run_id
+
+    async def test_no_leg_tag_outside_a_run(self, tmp_path):
+        server = LockServer()
+        set_level(server.db, "events_only")
+        server.db.latest["r1"] = {"state_msg": {"_dispatch": {"leg_seq": 4}}}   # stale
+        tel = make_telemetry(server, tmp_path)
+        await tel.election.step()
+        stamp = lambda s: {"sec": int(epoch(s)), "nanosec": 0}  # noqa: E731
+        tel.on_nav_supervisor("r1", {"state": "DRIVE", "stamp": stamp(0)})
+        tel.on_nav_supervisor("r1", {"state": "RECOVER", "stamp": stamp(2)})
+        await flush(tel)
+        (row,) = server.db.events.values()
+        assert json.loads(row["payload"])["leg_seq"] is None
 
     async def test_event_context_from_dispatch_columns(self, tmp_path):
         server = LockServer()

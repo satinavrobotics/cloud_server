@@ -72,6 +72,7 @@ from packages.api import recording
 from packages.events import ids
 from packages.events.codes import EventCode, Severity
 from packages.events.schemas import RecordingLevel, RecordingScope, RunOutcome
+from packages.utils import run_legs
 from packages.telemetry_ingest.policy import (
     ASSIGNMENTS_TABLE, DEFAULT_LEVEL, ROBOT_TABLE, SITE_TABLE, PolicySources, load_sources,
     parse_level,
@@ -389,7 +390,7 @@ async def list_events(db: Any, *, robot: Optional[str] = None, site: Optional[st
 
 
 async def _fetch_run(cur: Any, run_id: uuid.UUID) -> Sequence[Any]:
-    await cur.execute(f"SELECT {_RUN_SELECT}, mission_tree FROM mission_runs "
+    await cur.execute(f"SELECT {_RUN_SELECT}, mission_tree, planned_path FROM mission_runs "
                       "WHERE run_id = %s", (run_id,))
     row = await cur.fetchone()
     if row is None:
@@ -408,8 +409,58 @@ async def get_run(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
         events = await cur.fetchall()
     run = run_dict(row[:len(RUN_COLUMNS)])
     run["mission_tree"] = row[len(RUN_COLUMNS)]
+    run["planned_path"] = row[len(RUN_COLUMNS) + 1]
     return {"run": run, "events": [event_dict(e) for e in events[:max_events]],
             "events_truncated": len(events) > max_events}
+
+
+# --- legs --------------------------------------------------------------------------------------
+
+LEG_COLUMNS = ("run_id", "seq", "mission_name", "robot_name", "pass_index", "order_rev",
+               "from_vda_node", "to_vda_node", "from_topomap_node", "to_topomap_node", "map_id",
+               "started_at", "ended_at", "received_started_at", "received_ended_at",
+               "duration_s", "stopped_s", "straight_m", "planned_m", "expected_s",
+               "recoveries", "recovery_s", "blocks")
+_LEG_SELECT = ", ".join(LEG_COLUMNS)
+# The legs a mission aggregate looks at: every run of the mission and of its reruns.
+MISSION_LEGS_MAX = 200000
+
+
+def leg_dict(values: Sequence[Any]) -> Dict[str, Any]:
+    return _row(LEG_COLUMNS, values)
+
+
+async def run_legs_list(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
+    """The legs of one run in order (`seq`). 404 if the run is unknown; a run that has no
+    legs (never recorded, level off) answers an empty list."""
+    async with read_cursor(db) as cur:
+        await _fetch_run(cur, run_id)
+        await cur.execute(f"SELECT {_LEG_SELECT} FROM run_legs WHERE run_id = %s "
+                          "ORDER BY seq", (run_id,))
+        rows = await cur.fetchall()
+    return {"run_id": str(run_id), "items": [leg_dict(r) for r in rows]}
+
+
+async def mission_legs(db: Any, mission: str, *, include_archived: bool = False
+                       ) -> Dict[str, Any]:
+    """Legs of every run of `mission` (and its `-rerun-<n>` reruns) grouped by leg identity
+    (topomap node pair, else run-independent VDA node tail): count, median / p90 duration,
+    expected time, ratio and recoveries. 404 if the mission has no run at all."""
+    check_mission(mission)
+    where = _MISSION_FILTER + ("" if include_archived else " AND archived_at IS NULL")
+    async with read_cursor(db) as cur:
+        await cur.execute(f"SELECT run_id FROM mission_runs WHERE {where}",
+                          (mission, mission, mission))
+        run_ids = [r[0] for r in await cur.fetchall()]
+        if not run_ids:
+            raise HTTPException(404, f"Did not find \"mission\" with runs named \"{mission}\"")
+        await cur.execute(f"SELECT {_LEG_SELECT} FROM run_legs WHERE run_id = ANY(%s) "
+                          "LIMIT %s", (run_ids, MISSION_LEGS_MAX + 1))
+        rows = await cur.fetchall()
+    legs = [dict(zip(LEG_COLUMNS, r)) for r in rows[:MISSION_LEGS_MAX]]
+    return {"mission": mission, "runs": len(run_ids), "legs": len(legs),
+            "truncated": len(rows) > MISSION_LEGS_MAX,
+            "items": run_legs.aggregate(legs)}
 
 
 # --- recording level history (pure) ------------------------------------------------------------

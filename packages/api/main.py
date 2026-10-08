@@ -2126,6 +2126,24 @@ async def get_run_timeline(run_id: uuid.UUID):
                             fleet_reads.run_timeline(service.database, run_id))
 
 
+@app.get("/api/v1/runs/{run_id}/legs")
+async def get_run_legs(run_id: uuid.UUID):
+    """The legs of one run in order: each robot move from one topomap node to the next, with
+    robot-clock start/end, duration, distances, expected time, recoveries and blocks.
+    `{"run_id", "items": [leg...]}`; empty when the run recorded none. 404 if unknown."""
+    _require_service()
+    return await _site_call("get run legs", fleet_reads.run_legs_list(service.database, run_id))
+
+
+@app.get("/api/v1/missions/{name}/legs")
+async def get_mission_legs(name: str):
+    """Legs of all (non-archived) runs of the mission and its reruns, aggregated per leg
+    identity (topomap node pair, else the VDA node tail): count, median and p90 duration,
+    expected time, ratio and recoveries. 404 if the mission has no run."""
+    _require_service()
+    return await _site_call("get mission legs", fleet_reads.mission_legs(service.database, name))
+
+
 @app.get("/api/v1/events")
 async def list_events(
     robot: Optional[str] = Query(None, description="Robot name"),

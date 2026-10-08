@@ -398,12 +398,13 @@ class TestLists:
 
         def respond(sql, params):
             if "FROM mission_runs" in sql:
-                return [run_row(run_id, t(0), t(1), archived=t(5)) + (tree,)]
+                return [run_row(run_id, t(0), t(1), archived=t(5)) + (tree, ["a", "b"])]
             if "FROM fleet_events" in sql:
                 return ev
             return []
         body = (await get(FakeDb(respond), f"/api/v1/runs/{run_id}")).json()
-        assert body["run"]["run_id"] == str(run_id) and body["run"]["mission_tree"] == tree
+        assert body["run"]["run_id"] == str(run_id) and body["run"]["mission_tree"] == tree \
+            and body["run"]["planned_path"] == ["a", "b"]
         # archived runs are returned like any other (only the list hides them)
         assert body["run"]["archived_at"] == "2026-09-24T12:05:00+00:00"
         assert [e["code"] for e in body["events"]] == ["MISSION.RUN_STARTED"]

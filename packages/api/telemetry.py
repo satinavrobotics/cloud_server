@@ -23,6 +23,7 @@ at worst a second or so of diagnostics_ts rows can be written twice.
 """
 
 import asyncio
+import dataclasses
 import datetime
 import glob
 import logging
@@ -37,7 +38,7 @@ from packages.api.telemetry_detectors import (
     DEFAULT_THERMAL_HIGH_C, DEFAULT_THERMAL_OK_C, DiagnosticsDetector, NavSupervisorDetector,
     robot_ts, stamp_ts,
 )
-from packages.events.codes import Source
+from packages.events.codes import EventCode, Source
 from packages.telemetry_ingest import (
     IngestQueue, LatestRow, Metrics, RecordingPolicy, SpillFile, TelemetryWriter, create_pool,
     load_latest,
@@ -238,6 +239,11 @@ class WriterElection:
             pass
 
 
+# Events the nav_supervisor detector raises that say which leg of the run they happened on.
+LEG_TAGGED_CODES = frozenset({EventCode.NAV_RECOVERY_ENTERED, EventCode.NAV_RECOVERY_EXITED,
+                              EventCode.NAV_GOAL_BLOCKED})
+
+
 # --- event context -------------------------------------------------------------------------
 
 class LatestContext:
@@ -258,6 +264,14 @@ class LatestContext:
     def run_for(self, robot_name: str, ts: datetime.datetime) -> Optional[uuid.UUID]:
         row = self._rows.get(robot_name)
         return row.active_run_id if row is not None else None
+
+    def leg_for(self, robot_name: str) -> Optional[int]:
+        """run_legs.seq of the leg the robot's run is on: dispatch keeps it in the `_dispatch`
+        block of robot_latest.state_msg (refreshed with the rows). None outside a run."""
+        row = self._rows.get(robot_name)
+        own = (row.state_msg or {}).get("_dispatch") if row is not None else None
+        leg = own.get("leg_seq") if isinstance(own, Mapping) else None
+        return leg if isinstance(leg, int) and not isinstance(leg, bool) else None
 
     def site_for(self, robot_name: str, ts: datetime.datetime) -> Optional[str]:
         if self._policy is not None and self._policy.loaded:
@@ -610,7 +624,11 @@ class ApiTelemetry:
             stamp = supervisor.get("stamp") if isinstance(supervisor, Mapping) else None
             ts = stamp_ts(stamp, self._now())
             result = term.nav_detector(robot_name).update(ts, supervisor)
+            leg = term.ctx.leg_for(robot_name) if term.ctx.run_for(robot_name, ts) else None
             for event in result.events:
+                if leg is not None and event.code in LEG_TAGGED_CODES:
+                    # Which leg of the run this happened on (run_legs.seq).
+                    event = dataclasses.replace(event, payload={**event.payload, "leg_seq": leg})
                 term.queue.put_event(event, term.ctx)
             term.queue.put_latest(robot_name, nav_supervisor=result.latest)
         except Exception:  # noqa: BLE001
