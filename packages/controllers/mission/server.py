@@ -2285,8 +2285,8 @@ class Robot:
         Any previously scheduled timeout is cancelled first. Used both on initial
         dispatch and when resuming after an edgeBlocked condition clears."""
         self._cancel_mission_timeout()
-        if self._current_mission is None:
-            return
+        if self._current_mission is None or self._current_mission.timeout is None:
+            return  # no time limit set: only the robot's report (or a cancel) ends it
         self._mission_timeout_task = asyncio.get_event_loop().create_task(
             self._wait_mission_timeout(
                 self._current_mission.timeout.total_seconds(),

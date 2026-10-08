@@ -95,7 +95,7 @@ class TestMissionPlannerClientNavigate:
         assert call_kwargs["json"]["robot_name"] == "robot_1"
         assert call_kwargs["json"]["target_x"] == 10.0
         assert call_kwargs["json"]["target_y"] == 20.0
-        assert call_kwargs["json"]["timeout_seconds"] == 300
+        assert "timeout_seconds" not in call_kwargs["json"]  # no limit by default
 
     async def test_navigate_with_mission_name(self):
         """Test navigation request with custom mission name."""

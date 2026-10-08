@@ -1671,7 +1671,7 @@ class ApiDelegationService:
         target_lon: Optional[float] = None,
         map_id: Optional[str] = None,
         mission_name: Optional[str] = None,
-        timeout_seconds: int = 300,
+        timeout_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Request navigation (proxy to mission planner).
 
@@ -1724,7 +1724,7 @@ class ApiDelegationService:
         robot_name: str,
         waypoints: list,
         mission_name=None,
-        timeout_seconds: int = 300,
+        timeout_seconds: Optional[int] = None,
     ) -> dict:
         """
         Mapless mode: build and submit a waypoint mission directly to the database.
@@ -1769,7 +1769,7 @@ class ApiDelegationService:
                 lifecycle=ObjectLifecycleV1.ALIVE,
                 robot=robot_name,
                 mission_tree=mission_tree,
-                timeout=timedelta(seconds=timeout_seconds),
+                timeout=(timedelta(seconds=timeout_seconds) if timeout_seconds else None),
                 needs_canceled=False,
                 mode=MissionMode.MAPLESS,
                 status={

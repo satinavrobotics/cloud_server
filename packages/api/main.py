@@ -101,7 +101,7 @@ class NavigationRequest(BaseModel):
     target_lon: Optional[float] = Field(None, description="Target WGS84 longitude in degrees")
     map_id: Optional[str] = Field(None, description="Map ID to use for navigation (uses default if not provided)")
     mission_name: Optional[str] = Field(None, description="Optional mission name")
-    timeout_seconds: int = Field(300, description="Mission timeout in seconds")
+    timeout_seconds: Optional[int] = Field(None, description="Optional mission time limit in seconds; omitted or null = no limit")
 
 
 class NavigationResponse(BaseModel):
@@ -125,7 +125,7 @@ class DirectWaypointsRequest(BaseModel):
         ..., description="Ordered list of Pose2D waypoints. Required keys: x, y, theta, map_id. "
                          "Optional: latitude, longitude (WGS84 degrees).")
     mission_name: Optional[str] = Field(None, description="Optional mission name")
-    timeout_seconds: int = Field(300, description="Mission timeout in seconds")
+    timeout_seconds: Optional[int] = Field(None, description="Optional mission time limit in seconds; omitted or null = no limit")
 
 
 class DirectWaypointsResponse(BaseModel):

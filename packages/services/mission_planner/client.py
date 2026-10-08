@@ -46,7 +46,7 @@ class MissionPlannerClient:
         target_lon: Optional[float] = None,
         map_id: Optional[str] = None,
         mission_name: Optional[str] = None,
-        timeout_seconds: int = 300,
+        timeout_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Request a navigation mission.
@@ -57,8 +57,9 @@ class MissionPlannerClient:
         """
         payload: Dict[str, Any] = {
             "robot_name": robot_name,
-            "timeout_seconds": timeout_seconds,
         }
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
         if target_x is not None:
             payload["target_x"] = target_x
         if target_y is not None:

@@ -283,9 +283,11 @@ class MissionSpecV1(pydantic.BaseModel):
         description="The name of the robot that this mission is assigned to.")
     mission_tree: List[MissionNodeV1] = pydantic.Field(
         description="A list of nodes (tasks) for the robot to complete.")
-    timeout: datetime.timedelta = pydantic.Field(
-        datetime.timedelta(seconds=300),
-        description="How long the mission is allowed to run before giving up.")
+    timeout: Optional[datetime.timedelta] = pydantic.Field(
+        None,
+        description="Optional time limit: the cloud fails the mission after it has run this "
+                    "long. None (the default) means no limit; a mission then ends only when "
+                    "the robot reports success or failure, or it is canceled.")
     deadline: Optional[datetime.datetime] = pydantic.Field(
         None, description="When the mission must complete by before it is canceled.")
     needs_canceled: bool = pydantic.Field(

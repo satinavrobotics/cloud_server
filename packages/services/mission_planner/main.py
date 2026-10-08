@@ -45,7 +45,7 @@ class NavigationRequest(BaseModel):
     target_lon: Optional[float] = Field(None, description="Target WGS84 longitude in degrees")
     map_id: Optional[str] = Field(None, description="Map ID to use for navigation; without it the robot's current map, else 400")
     mission_name: Optional[str] = Field(None, description="Optional mission name (auto-generated if not provided)")
-    timeout_seconds: int = Field(300, description="Mission timeout in seconds", ge=1, le=3600)
+    timeout_seconds: Optional[int] = Field(None, description="Optional mission time limit in seconds; omitted or null = no limit", ge=1, le=3600)
     register_map: bool = Field(True, description="Whether the graph builder should record topology during this mission")
 
 
