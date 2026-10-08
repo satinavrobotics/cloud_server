@@ -99,8 +99,42 @@ class RobotTypeIdentifierV1(pydantic.BaseModel):
     height: float = pydantic.Field(
         -1, description="Height in metres (VDA5050 physicalParameters.heightMax); "
         "-1 until the robot has sent its factsheet.")
+    speed_min: float = pydantic.Field(
+        -1, description="Minimum controlled speed in m/s (VDA5050 physicalParameters.speedMin); "
+        "-1 until the robot has sent it.")
+    acceleration_max: float = pydantic.Field(
+        -1, description="Maximum acceleration in m/s^2 (VDA5050 physicalParameters.accelerationMax); "
+        "-1 until the robot has sent it.")
+    deceleration_max: float = pydantic.Field(
+        -1, description="Maximum deceleration in m/s^2 (VDA5050 physicalParameters.decelerationMax); "
+        "-1 until the robot has sent it.")
+    angular_speed_min: float = pydantic.Field(
+        -1, description="Minimum angular speed in rad/s (VDA5050 2.1 physicalParameters.angularSpeedMin); "
+        "-1 until the robot has sent it.")
+    angular_speed_max: float = pydantic.Field(
+        -1, description="Maximum angular speed in rad/s (VDA5050 2.1 physicalParameters.angularSpeedMax); "
+        "-1 until the robot has sent it.")
+    height_min: float = pydantic.Field(
+        -1, description="Minimum height in metres (VDA5050 physicalParameters.heightMin); "
+        "-1 until the robot has sent it.")
     custom_actions: List[CustomActionV1] = pydantic.Field(
         [], description="List of custom VDA5050 actions available on this robot")
+
+
+# Factsheet limits kept as reported: (RobotTypeIdentifierV1 field, VDA5050 physicalParameters
+# key, smallest valid value). A missing or smaller value keeps the stored one.
+FACTSHEET_PHYSICAL_FIELDS = (
+    ("speed_max", "speedMax", 1e-9),
+    ("speed_min", "speedMin", 0.0),
+    ("acceleration_max", "accelerationMax", 1e-9),
+    ("deceleration_max", "decelerationMax", 1e-9),
+    ("angular_speed_min", "angularSpeedMin", 0.0),
+    ("angular_speed_max", "angularSpeedMax", 1e-9),
+    ("length", "length", 1e-9),
+    ("width", "width", 1e-9),
+    ("height", "heightMax", 1e-9),
+    ("height_min", "heightMin", 0.0),
+)
 
 
 class RobotBatterySpecV1(pydantic.BaseModel):

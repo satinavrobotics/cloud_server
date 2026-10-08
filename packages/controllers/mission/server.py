@@ -1503,15 +1503,13 @@ class Robot:
     async def _on_client_factsheet(self, message: types.VDA5050Factsheet):
         if self._robot_object is not None:
             self._robot_object.status.factsheet.agv_class = message.typeSpecification.agvClass
-            self._robot_object.status.factsheet.speed_max = message.physicalParameters.speedMax
-            # Footprint in metres, both optional in VDA5050; a missing value stays "unknown" (-1).
+            # Speeds, accelerations and the footprint, all kept (run analysis derives expected
+            # leg times from them); a missing or nonsense value keeps the stored one (-1 = unknown).
             physical = message.physicalParameters
-            if physical.length is not None and physical.length > 0:
-                self._robot_object.status.factsheet.length = physical.length
-            if physical.width is not None and physical.width > 0:
-                self._robot_object.status.factsheet.width = physical.width
-            if physical.heightMax is not None and physical.heightMax > 0:
-                self._robot_object.status.factsheet.height = physical.heightMax
+            for field, key, minimum in robot_object.FACTSHEET_PHYSICAL_FIELDS:
+                value = getattr(physical, key, None)
+                if value is not None and value >= minimum:
+                    setattr(self._robot_object.status.factsheet, field, value)
 
             # Store custom actions from factsheet
             if message.actions:

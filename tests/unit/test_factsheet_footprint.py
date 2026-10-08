@@ -66,3 +66,35 @@ async def test_factsheet_stores_the_height_and_ignores_a_nonsense_one():
     assert r._robot_object.status.factsheet.height == 0.4
     await r._on_client_factsheet(_factsheet(heightMax=-1.0))
     assert r._robot_object.status.factsheet.height == 0.4
+
+
+async def test_factsheet_keeps_speed_and_acceleration_limits():
+    r, _ = _robot()
+    await r._on_client_factsheet(_factsheet(
+        speedMin=0.0, speedMax=1.2, accelerationMax=0.8, decelerationMax=1.5,
+        angularSpeedMin=0.0, angularSpeedMax=1.0, heightMin=0.1))
+    fs = r._robot_object.status.factsheet
+    assert (fs.speed_min, fs.speed_max) == (0.0, 1.2)
+    assert (fs.acceleration_max, fs.deceleration_max) == (0.8, 1.5)
+    assert (fs.angular_speed_min, fs.angular_speed_max) == (0.0, 1.0)
+    assert fs.height_min == 0.1
+
+
+async def test_factsheet_limits_stay_unknown_or_previous_when_missing_or_nonsense():
+    r, _ = _robot()
+    await r._on_client_factsheet(_factsheet())
+    fs = r._robot_object.status.factsheet
+    assert (fs.acceleration_max, fs.deceleration_max, fs.angular_speed_max) == (-1, -1, -1)
+    await r._on_client_factsheet(_factsheet(accelerationMax=0.8, angularSpeedMax=1.0))
+    await r._on_client_factsheet(_factsheet(accelerationMax=0.0, angularSpeedMax=-2.0))
+    fs = r._robot_object.status.factsheet
+    assert (fs.acceleration_max, fs.angular_speed_max) == (0.8, 1.0)
+
+
+def test_registration_factsheet_copies_valid_limits_only():
+    from packages.api.main import _apply_factsheet_limits
+    fs = api_objects.RobotObjectV1(name="r1", status={}).status.factsheet
+    _apply_factsheet_limits(fs, {"speed_max": 1.5, "acceleration_max": 0.7,
+                                 "angular_speed_max": "fast", "width": -1, "length": True})
+    assert (fs.speed_max, fs.acceleration_max) == (1.5, 0.7)
+    assert (fs.angular_speed_max, fs.width, fs.length) == (-1, -1, -1)

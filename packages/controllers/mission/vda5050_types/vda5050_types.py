@@ -547,6 +547,8 @@ class VDA5050PhysicalParameters(pydantic.BaseModel):
     """Describes physical properties of a robot"""
     speedMin: Optional[float] = None
     speedMax: float = 1
+    angularSpeedMin: Optional[float] = None  # VDA5050 2.1
+    angularSpeedMax: Optional[float] = None  # VDA5050 2.1
     accelerationMax: Optional[float] = None
     decelerationMax: Optional[float] = None
     heightMin: Optional[float] = None

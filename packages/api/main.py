@@ -41,7 +41,8 @@ from packages.config import (
     DEFAULT_MAP_ID, PORT_API_DELEGATION, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
     IDEMPOTENCY_TTL_S, IDEMPOTENCY_LEASE_S, IDEMPOTENCY_PURGE_INTERVAL_S,
 )
-from cloud_common.objects.robot import RobotObjectV1, RobotStatusV1, CustomActionV1
+from cloud_common.objects.robot import (
+    FACTSHEET_PHYSICAL_FIELDS, CustomActionV1, RobotObjectV1, RobotStatusV1)
 from cloud_common.objects.mission import (
     EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
     MissionStatusV1)
@@ -1704,6 +1705,15 @@ async def get_robot_nav_supervisor(robot_name: str):
     return cached
 
 
+def _apply_factsheet_limits(factsheet, data: dict) -> None:
+    """Copy the registration factsheet's limits (snake_case field names) that are present and
+    valid; anything else keeps the stored value (-1 = unknown)."""
+    for field, _key, minimum in FACTSHEET_PHYSICAL_FIELDS:
+        value = data.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= minimum:
+            setattr(factsheet, field, float(value))
+
+
 @app.post("/api/v1/robots", response_model=dict)
 async def create_robot(robot_data: dict):
     """
@@ -1752,10 +1762,7 @@ async def create_robot(robot_data: dict):
                 await service.database.update_spec(RobotObjectV1, robot.name, robot.spec, publisher_id)
             if factsheet_data:
                 robot.status.factsheet.agv_class = factsheet_data.get("agv_class", robot.status.factsheet.agv_class)
-                robot.status.factsheet.speed_max = factsheet_data.get("speed_max", robot.status.factsheet.speed_max)
-                robot.status.factsheet.length = factsheet_data.get("length", robot.status.factsheet.length)
-                robot.status.factsheet.width = factsheet_data.get("width", robot.status.factsheet.width)
-                robot.status.factsheet.height = factsheet_data.get("height", robot.status.factsheet.height)
+                _apply_factsheet_limits(robot.status.factsheet, factsheet_data)
                 robot.status.factsheet.custom_actions = [
                     CustomActionV1(**a) for a in factsheet_data.get("actions", [])
                 ]
@@ -1767,10 +1774,7 @@ async def create_robot(robot_data: dict):
             status = RobotStatusV1()
             if factsheet_data:
                 status.factsheet.agv_class = factsheet_data.get("agv_class", "")
-                status.factsheet.speed_max = factsheet_data.get("speed_max", -1)
-                status.factsheet.length = factsheet_data.get("length", -1)
-                status.factsheet.width = factsheet_data.get("width", -1)
-                status.factsheet.height = factsheet_data.get("height", -1)
+                _apply_factsheet_limits(status.factsheet, factsheet_data)
                 status.factsheet.custom_actions = [
                     CustomActionV1(**a) for a in factsheet_data.get("actions", [])
                 ]
