@@ -90,6 +90,11 @@ class MapSpecV1(pydantic.BaseModel):
     """Immutable properties of a map, including its GPS datum."""
     description: Optional[str] = pydantic.Field(
         None, description="Human-readable map name or label.")
+    display_name: Optional[str] = pydantic.Field(
+        None, max_length=80,
+        description="The name shown for the map. The map's `name` is its id (it keys the rows, "
+                    "ArangoDB nodes and MinIO bucket) and cannot change; this can. None: show "
+                    "the name.")
     type: Optional[MapTypeV1] = pydantic.Field(
         None, description="'local' (own metric frame) or 'geo' (UTM, anchored to the Earth). "
                           "None only on rows written before the M1 migration or by an old "

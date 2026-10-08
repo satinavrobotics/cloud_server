@@ -504,6 +504,19 @@ class WebSocketProxyManager:
             self.logger.info(f"Idle hold task cancelled for {connection_key}")
 
 
+def _with_utc_offset(stamp: Any) -> Any:
+    """A node's `created_at` (written by graph-builder as a naive `datetime.now().isoformat()`,
+    i.e. the server's local time) with that zone's offset, so a client in another time zone shows
+    the real capture time. Anything that is not such a string is returned as it is."""
+    if not isinstance(stamp, str):
+        return stamp
+    try:
+        parsed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return stamp
+    return stamp if parsed.tzinfo else parsed.astimezone().isoformat()
+
+
 class ApiDelegationService:
     """
     API Delegation Service - Central gateway for client requests.
@@ -937,7 +950,7 @@ class ApiDelegationService:
                 "x": x,
                 "y": y,
                 "theta": yaw,
-                "timestamp": node.get("created_at"),
+                "timestamp": _with_utc_offset(node.get("created_at")),
                 "metadata": node.get("metadata", {}),
                 # Maps §14.3: the session that recorded the node (null for untagged legacy
                 # nodes), to highlight one session in the history.
@@ -1385,10 +1398,12 @@ class ApiDelegationService:
         self,
         map_id: str,
         node_id: str,
-        image_id: Optional[str] = None
+        image_id: Optional[str] = None,
+        size: Optional[str] = None,
     ) -> Optional[bytes]:
         """
-        Retrieve an image from the image database.
+        Retrieve an image from the image database; `size` ("thumb" | "preview") a cached,
+        downscaled JPEG of it.
 
         Args:
             map_id: Map ID
@@ -1404,11 +1419,16 @@ class ApiDelegationService:
         self.logger.info(f"Retrieving image for node {node_id} in map {map_id}, image_id={image_id}")
 
         try:
-            result = self.image_db.get_image(
-                map_id=map_id,
-                node_id=node_id,
-                image_id=image_id
-            )
+            if size:
+                result = self.image_db.get_image_resized(
+                    map_id=map_id, node_id=node_id, image_id=image_id, size=size
+                )
+            else:
+                result = self.image_db.get_image(
+                    map_id=map_id,
+                    node_id=node_id,
+                    image_id=image_id
+                )
             if result:
                 self.logger.info(f"Successfully retrieved image for node {node_id}, size={len(result)} bytes")
             else:

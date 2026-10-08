@@ -615,7 +615,10 @@ class TestImageDatabaseServiceDeleteNodeImages:
         mock_obj1.object_name = "node_1/images/img_001.jpg"
         mock_obj2 = Mock()
         mock_obj2.object_name = "node_1/images/img_002.jpg"
-        mock_client.list_objects.return_value = [mock_obj1, mock_obj2]
+        mock_thumb = Mock()
+        mock_thumb.object_name = "node_1/thumbs/thumb/img_001.jpg.jpg"
+        by_prefix = {"node_1/images/": [mock_obj1, mock_obj2], "node_1/thumbs/": [mock_thumb]}
+        mock_client.list_objects.side_effect = lambda bucket, prefix, recursive: by_prefix[prefix]
         mock_client.remove_object.return_value = None
         mock_minio.return_value = mock_client
 
@@ -623,7 +626,8 @@ class TestImageDatabaseServiceDeleteNodeImages:
         result = service.delete_node_images(node_id="node_1", map_id="test_map")
 
         assert result is True
-        assert mock_client.remove_object.call_count == 2
+        # The cached downscaled variants go with the images.
+        assert mock_client.remove_object.call_count == 3
 
     @patch('packages.topomap_dbs.minio_base.Minio')
     def test_delete_node_images_bucket_not_exists(self, mock_minio):
@@ -885,3 +889,103 @@ class TestImageDatabaseServiceGetStats:
 
         # When list_maps fails, it returns [], so get_stats returns empty stats
         assert result == {'total_maps': 0, 'total_images': 0, 'total_nodes': 0, 'maps': []}
+
+
+def _jpeg(width, height):
+    import io
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), (200, 30, 30)).save(out, format="JPEG")
+    return out.getvalue()
+
+
+@pytest.mark.unit
+class TestImageDatabaseServiceResized:
+    """get_image_resized: made once, cached next to the original."""
+
+    @staticmethod
+    def _service(mock_minio, objects):
+        """A service whose fake bucket is the `objects` dict (name -> bytes)."""
+        from minio.error import S3Error
+
+        client = Mock()
+        client.list_buckets.return_value = []
+
+        def get_object(bucket, name):
+            if name not in objects:
+                raise S3Error(Mock(), "NoSuchKey", "missing", name, "req", "host")
+            resp = Mock()
+            resp.read.return_value = objects[name]
+            return resp
+
+        def put_object(bucket, name, data, length, content_type=None, metadata=None):
+            objects[name] = data.read()
+
+        client.get_object.side_effect = get_object
+        client.put_object.side_effect = put_object
+        mock_minio.return_value = client
+        return ImageDatabaseService(), client
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_resized_and_cached_beside_the_original(self, mock_minio):
+        import io
+        from PIL import Image
+
+        objects = {"n1/images/a.jpg": _jpeg(1280, 720)}
+        service, client = self._service(mock_minio, objects)
+
+        small = service.get_image_resized("a.jpg", "n1", "thumb", map_id="m")
+
+        assert max(Image.open(io.BytesIO(small)).size) == 160
+        assert "n1/thumbs/thumb/a.jpg.jpg" in objects
+        assert len(small) < len(objects["n1/images/a.jpg"])
+
+        # The second call is served from the cache: the original is not read again.
+        del objects["n1/images/a.jpg"]
+        assert service.get_image_resized("a.jpg", "n1", "thumb", map_id="m") == small
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_never_enlarges(self, mock_minio):
+        import io
+        from PIL import Image
+
+        objects = {"n1/images/a.jpg": _jpeg(100, 50)}
+        service, _ = self._service(mock_minio, objects)
+        small = service.get_image_resized("a.jpg", "n1", "preview", map_id="m")
+        assert Image.open(io.BytesIO(small)).size == (100, 50)
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_missing_image_is_none_and_undecodable_falls_back(self, mock_minio):
+        objects = {"n1/images/bad": b"not an image"}
+        service, _ = self._service(mock_minio, objects)
+        assert service.get_image_resized("nope", "n1", "thumb", map_id="m") is None
+        assert service.get_image_resized("bad", "n1", "thumb", map_id="m") == b"not an image"
+        assert "n1/thumbs/thumb/bad.jpg" not in objects
+
+    def test_sizes_and_key_stay_out_of_the_images_prefix(self):
+        assert ImageDatabaseService.SIZES == {"thumb": 160, "preview": 640}
+        assert "/images/" not in ImageDatabaseService.thumb_key("n", "i", "thumb")
+
+
+@pytest.mark.unit
+class TestImageDatabaseServiceFirstImage:
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_no_image_id_means_the_first_image(self, mock_minio):
+        objects = {"n1/images/b.jpg": _jpeg(40, 40), "n1/images/a.jpg": _jpeg(30, 30)}
+        service, client = TestImageDatabaseServiceResized._service(mock_minio, objects)
+        client.bucket_exists.return_value = True
+        client.list_objects.side_effect = lambda bucket, prefix, recursive: [
+            Mock(object_name=n) for n in sorted(objects) if n.startswith(prefix)]
+        assert service.first_image_id("n1", "m") == "a.jpg"
+        assert service.get_image(None, "n1", "m") == objects["n1/images/a.jpg"]
+        assert service.get_image_resized(None, "n1", "thumb", "m") is not None
+        assert "n1/thumbs/thumb/a.jpg.jpg" in objects
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_no_images_is_none(self, mock_minio):
+        service, client = TestImageDatabaseServiceResized._service(mock_minio, {})
+        client.bucket_exists.return_value = True
+        client.list_objects.return_value = []
+        assert service.get_image(None, "n1", "m") is None
+        assert service.get_image_resized(None, "n1", "thumb", "m") is None

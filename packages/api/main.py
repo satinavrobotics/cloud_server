@@ -567,9 +567,10 @@ async def get_map(map_id: str):
 
 @app.patch("/api/v1/maps/{map_id}")
 async def patch_map(map_id: str, body: Dict[str, Any]):
-    """Change a map's `description` and, on a local map, `slam_map` (bool; 409 for a geo map,
-    an open mapping session or a pending SLAM save; MAP.SLAM_CHANGED). A map cannot be renamed
-    (422). Returns the map view."""
+    """Change a map's `description`, its `display_name` (the name shown for it; null clears) and,
+    on a local map, `slam_map` (bool; 409 for a geo map, an open mapping session or a pending
+    SLAM save; MAP.SLAM_CHANGED). A map cannot be renamed (422; its name keys its data). Returns
+    the map view."""
     _require_service()
     return await _site_call("update map", maps.patch_map(
         service.database, map_id, body, uuid.uuid4(), service.mapping_switch,
@@ -1218,7 +1219,12 @@ async def get_image_metadata(map_id: str, node_id: str, image_id: str):
 
 
 @app.get("/api/v1/images/{map_id}/{node_id}")
-async def get_image(map_id: str, node_id: str, image_id: Optional[str] = None):
+async def get_image(
+    map_id: str,
+    node_id: str,
+    image_id: Optional[str] = None,
+    size: Optional[Literal["thumb", "preview"]] = None,
+):
     """
     Retrieve an image from the image database.
 
@@ -1226,6 +1232,8 @@ async def get_image(map_id: str, node_id: str, image_id: Optional[str] = None):
         map_id: Map ID (path parameter)
         node_id: Node ID (path parameter)
         image_id: Image ID (optional query parameter - gets first image if not provided)
+        size: "thumb" (160 px) or "preview" (640 px) longest side: a downscaled JPEG, made once
+            and cached in MinIO next to the original; omitted = the original.
 
     Returns:
         Image data as binary response
@@ -1237,7 +1245,8 @@ async def get_image(map_id: str, node_id: str, image_id: Optional[str] = None):
         image_data = await service.get_image(
             map_id=map_id,
             node_id=node_id,
-            image_id=image_id
+            image_id=image_id,
+            size=size,
         )
 
         if image_data is None:

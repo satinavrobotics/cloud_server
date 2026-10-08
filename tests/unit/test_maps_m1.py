@@ -1023,3 +1023,30 @@ class TestRoutes:
                                             datum_longitude=19.0)
         spec = svc.database.update_spec.call_args[0][2]
         assert spec.type == "local" and spec.geo is None and spec.datum_latitude == 47.0
+
+
+class TestPatchMapDisplayName:
+    async def test_set_trim_and_clear(self, fdb):
+        fdb.add_map("yard", type="local")
+        out = await maps.patch_map(None, "yard", {"display_name": "  Back yard "}, PUB)
+        assert out["display_name"] == "Back yard" and out["name"] == "yard"
+        assert fdb.maps["yard"]["spec"]["display_name"] == "Back yard"
+        out = await maps.patch_map(None, "yard", {"display_name": "  "}, PUB)
+        assert out["display_name"] is None and fdb.maps["yard"]["spec"]["display_name"] is None
+
+    async def test_too_long_and_name_still_refused(self, fdb):
+        fdb.add_map("yard", type="local")
+        with pytest.raises(HTTPException) as e:
+            await maps.patch_map(None, "yard", {"display_name": "x" * 81}, PUB)
+        assert e.value.status_code == 422
+        with pytest.raises(HTTPException) as e:
+            await maps.patch_map(None, "yard", {"name": "other"}, PUB)
+        assert e.value.status_code == 422 and "display_name" in e.value.detail[0]["msg"]
+
+
+def test_node_created_at_gets_the_server_offset():
+    from packages.api.server import _with_utc_offset
+
+    assert _with_utc_offset("2026-10-08T14:03:00")[-6] in "+-"   # "+HH:MM"
+    assert _with_utc_offset("2026-10-08T14:03:00+02:00") == "2026-10-08T14:03:00+02:00"
+    assert _with_utc_offset(None) is None and _with_utc_offset("garbage") == "garbage"

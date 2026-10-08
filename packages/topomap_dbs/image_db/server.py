@@ -136,15 +136,24 @@ class ImageDatabaseService(MinIOService):
             self.logger.error(f"Failed to store depth {camera} for node {node_id}: {e}")
             return False
 
+    def first_image_id(self, node_id: str, map_id: Optional[str] = None) -> Optional[str]:
+        """The node's first image (by id), for requests that name none; None without images."""
+        ids = sorted(self.list_node_images(node_id=node_id, map_id=map_id))
+        return ids[0] if ids else None
+
     def get_image(
         self,
-        image_id: str,
+        image_id: Optional[str],
         node_id: str,
         map_id: Optional[str] = None,
     ) -> Optional[bytes]:
-        """Retrieve an image from MinIO. Returns bytes or None if not found."""
+        """Retrieve an image from MinIO (the node's first one without an `image_id`). Returns
+        bytes or None if not found."""
         try:
             map_id = map_id or self.default_map_id
+            image_id = image_id or self.first_image_id(node_id, map_id)
+            if image_id is None:
+                return None
             bucket_name = self._bucket_name(map_id)
             object_name = f"{node_id}/images/{image_id}"
 
@@ -290,6 +299,72 @@ class ImageDatabaseService(MinIOService):
             self.logger.error(f"Failed to get metadata for image {image_id}: {e}")
             return None
 
+    # ==================== Downscaled variants ====================
+
+    # `size` option of the image route -> longest side in pixels. The resized JPEG is cached in
+    # the map's bucket next to the original, under `{node}/thumbs/{size}/{image_id}.jpg` (not
+    # under `images/`, so it never shows up as a photo and is not counted as one).
+    SIZES = {"thumb": 160, "preview": 640}
+
+    @staticmethod
+    def thumb_key(node_id: str, image_id: str, size: str) -> str:
+        return f"{node_id}/thumbs/{size}/{image_id}.jpg"
+
+    @staticmethod
+    def _resize_jpeg(data: bytes, max_px: int) -> Optional[bytes]:
+        """`data` scaled to fit max_px x max_px as a JPEG; None when it cannot be decoded.
+        Never enlarges."""
+        try:
+            from PIL import Image, ImageOps
+
+            with Image.open(io.BytesIO(data)) as img:
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((max_px, max_px))
+                out = io.BytesIO()
+                img.convert("RGB").save(out, format="JPEG", quality=80, optimize=True)
+                return out.getvalue()
+        except Exception:
+            return None
+
+    def get_image_resized(
+        self,
+        image_id: Optional[str],
+        node_id: str,
+        size: str,
+        map_id: Optional[str] = None,
+    ) -> Optional[bytes]:
+        """A downscaled JPEG (`size` is a key of SIZES) of an image: the cached one, else made
+        from the original and cached. Falls back to the original when it cannot be resized;
+        None when the image does not exist."""
+        map_id = map_id or self.default_map_id
+        image_id = image_id or self.first_image_id(node_id, map_id)
+        if image_id is None:
+            return None
+        bucket_name = self._bucket_name(map_id)
+        key = self.thumb_key(node_id, image_id, size)
+        try:
+            response = self.client.get_object(bucket_name, key)
+            try:
+                return response.read()
+            finally:
+                response.close()
+                response.release_conn()
+        except Exception:
+            pass  # not cached yet
+        original = self.get_image(image_id=image_id, node_id=node_id, map_id=map_id)
+        if original is None:
+            return None
+        small = self._resize_jpeg(original, self.SIZES[size])
+        if small is None:
+            return original
+        try:
+            self.client.put_object(
+                bucket_name, key, io.BytesIO(small), length=len(small), content_type="image/jpeg"
+            )
+        except Exception as e:
+            self.logger.warning(f"Could not cache {key}: {e}")
+        return small
+
     def delete_node_images(self, node_id: str, map_id: Optional[str] = None) -> bool:
         """Delete all images for a specific node. Returns True if successful."""
         try:
@@ -299,8 +374,11 @@ class ImageDatabaseService(MinIOService):
             if not self.client.bucket_exists(bucket_name):
                 return False
 
-            prefix = f"{node_id}/images/"
-            objects = list(self.client.list_objects(bucket_name, prefix=prefix, recursive=True))
+            objects = [
+                obj
+                for sub in ("images", "thumbs")
+                for obj in self.client.list_objects(bucket_name, prefix=f"{node_id}/{sub}/", recursive=True)
+            ]
             for obj in objects:
                 self.client.remove_object(bucket_name, obj.object_name)
 

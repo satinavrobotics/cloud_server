@@ -168,7 +168,7 @@ bookkeeping. All additions are new keys; nothing was removed or renamed.
 | POST | `/api/v1/maps` | `{name, type, description?, slam_map?}` → 201, a `draft` map (`slam_map`, default false, only for `type: local`: 422 `["body","slam_map"]` otherwise; immutable; map views return it; converting to geo clears it). 409 if the name exists, collides with another map's image bucket (case/`_` vs `-`), or ArangoDB already has nodes under it. 422 on a bad name (1-59 of `A-Za-z0-9_-`, alphanumeric at both ends; not `GEO`/`LOCAL`) or type. |
 | GET | `/api/v1/maps?type=&state=&include_archived=` | Same `{maps, count}` body as before. Archived maps only with `include_archived=true` or `state=archived`. |
 | GET | `/api/v1/maps/{id}` | As before plus `type`, `geo`, `state`, `open_session_id`, `grid_version` and `sessions: {count, open, unaligned, items}` (newest first, at most 50). |
-| PATCH | `/api/v1/maps/{id}` | `{description?, slam_map?: bool}` → the map view. `slam_map` only on a local map (409 geo), with no open/paused mapping session (409) and no SLAM save pending for the map's robots (409); `null` is 422; only the flag changes (an onboard SLAM map stays on the robot; turning it on again does not overwrite it); `MAP.SLAM_CHANGED` on a real change. Renaming is not supported (422): the name keys the map in Postgres, ArangoDB and MinIO. |
+| PATCH | `/api/v1/maps/{id}` | `{description?, display_name?, slam_map?: bool}` → the map view. `display_name` (trimmed, at most 80 characters; "" or null clears) is the name shown for the map, stored in the map's spec JSON (no migration). `slam_map` only on a local map (409 geo), with no open/paused mapping session (409) and no SLAM save pending for the map's robots (409); `null` is 422; only the flag changes (an onboard SLAM map stays on the robot; turning it on again does not overwrite it); `MAP.SLAM_CHANGED` on a real change. Renaming is not supported (422): the name keys the map in Postgres, ArangoDB and MinIO; set `display_name` instead. |
 | GET | `/api/v1/maps/{id}/graph` | `{map_id, type, geo, state, node_count, edge_count, nodes, edges, transform}`; nodes/edges as in `POST /map/load`, without its side effects. |
 | POST | `/api/v1/maps/{id}/sessions` | `{robot}` → 201 `{map_id, map_state, changed, session}`. The robot must exist (404) and be online (409), and have no other open session (409). One open session per map for now (409). A geo map needs the robot's datum (409); its first session sets the map origin from it. The map goes to `mapping`. |
 | POST | `/api/v1/maps/{id}/sessions/{sid}/pause` · `resume` · `finish` | Map → `paused` / `mapping` / `ready`. Repeating an action already in effect returns `changed: false`; pause/resume of a finished session is 409. |
@@ -419,8 +419,11 @@ ws.onmessage = (event) => {
 
 ### Image Operations
 
-#### `GET /api/v1/images/{image_id}?node_id={node_id}&map_id={map_id}`
-Retrieve an image from the image database.
+#### `GET /api/v1/images/{map_id}/{node_id}?image_id={image_id}&size={thumb|preview}`
+Retrieve a node's image from the image database (its first image without `image_id`).
+`size=thumb` (160 px) or `size=preview` (640 px, longest side) returns a downscaled JPEG, made
+once and cached in MinIO at `{node}/thumbs/{size}/{image_id}.jpg` (outside `images/`, so it is
+never listed or counted as a photo; deleted with the node's images); omitted: the original.
 
 **Parameters:**
 - `image_id` (path): Image ID

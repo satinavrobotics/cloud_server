@@ -201,10 +201,18 @@ class CreateMapRequest(pydantic.BaseModel):
 
 class PatchMapRequest(pydantic.BaseModel):
     description: Optional[str] = None
+    display_name: Optional[str] = None   # shown instead of the (unchangeable) name; ""/null clears
     slam_map: Optional[bool] = None   # a LOCAL map only, no open session / pending save (409)
 
     class Config:
         extra = pydantic.Extra.forbid
+
+    @pydantic.validator("display_name")
+    def _display_name(cls, value):  # noqa: N805 - pydantic v1 validator
+        value = (value or "").strip()
+        if len(value) > 80:
+            raise ValueError("display_name must be at most 80 characters")
+        return value or None
 
 
 def _finite(cls, value: float) -> float:  # noqa: N805 - a pydantic v1 validator
@@ -339,7 +347,8 @@ def parse_body(model: Any, data: Any) -> Any:
     if model is PatchMapRequest and "name" in data:
         raise HTTPException(422, [{"loc": ["body", "name"], "type": "value_error",
                                    "msg": "a map cannot be renamed (the name keys its data in "
-                                          "Postgres, ArangoDB and MinIO)"}])
+                                          "Postgres, ArangoDB and MinIO); set display_name "
+                                          "instead"}])
     try:
         return model(**data)
     except pydantic.ValidationError as exc:
@@ -796,7 +805,8 @@ def apply_graph_counts(views: List[Dict[str, Any]], map_stats: Callable[[str], M
 
 async def patch_map(db: Any, name: str, data: Any, publisher_id: uuid.UUID,
                     switch: Optional[Any] = None, actor: Optional[str] = None) -> Dict[str, Any]:
-    """PATCH /api/v1/maps/{id}: `description` and `slam_map` (bool). The name is not changeable.
+    """PATCH /api/v1/maps/{id}: `description`, `display_name` and `slam_map` (bool). The name is
+    not changeable (it keys the data); `display_name` is the name shown for it (null clears).
 
     `slam_map` (turn the SLAM recording of a LOCAL map on or off after creation) is refused with
     409 for a geo map, while the map has an open (or paused) mapping session, and while a SLAM
