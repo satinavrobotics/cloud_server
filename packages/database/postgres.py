@@ -156,6 +156,19 @@ class PostgresWatcher:
             except Exception:  # pylint: disable=broad-except
                 pass
 
+    @staticmethod
+    def resync_query(object_class: objects.ApiObjectType) -> str:
+        """The SELECT of a (re)sync. The order is the order the watcher's consumer sees the
+        objects in, so for missions it is the dispatch order: a mission that already
+        started (a resume after a restart) first, then by creation. Without an ORDER BY the
+        heap order is arbitrary and changes on every UPDATE, and a restarted dispatcher
+        dispatched a PENDING mission ahead of the RUNNING one."""
+        query = f"SELECT * FROM {object_class.table_name()}"
+        if object_class is MissionObjectV1:
+            query += (" ORDER BY (status->>'start_timestamp') ASC NULLS LAST,"
+                      " (spec->>'created_at') ASC NULLS LAST, name")
+        return query + ";"
+
     async def watch(self) -> AsyncGenerator[objects.ApiObject, None]:
         self._connection = await self._get_connection()
         while True:
@@ -164,7 +177,7 @@ class PostgresWatcher:
                     await cursor.execute(f"LISTEN {self._object_class.table_name()};")
 
                     # Return the value of all known objects in the db
-                    query = f"SELECT * FROM {self._object_class.table_name()};"
+                    query = self.resync_query(self._object_class)
                     await cursor.execute(query)
                     values = await cursor.fetchall()
                     objs = [self._object_class(name=name,
@@ -480,6 +493,9 @@ class PostgresDatabase:
 
     async def create_object(self, obj: objects.ApiObject, publisher_id: uuid.UUID,
                             before_commit: Optional[SpecHook] = None):
+        if isinstance(obj, MissionObjectV1) and obj.created_at is None:
+            # The queue order of a restarted dispatcher (PostgresWatcher.resync_query).
+            obj.created_at = datetime.datetime.now(datetime.timezone.utc)
         try:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cursor:

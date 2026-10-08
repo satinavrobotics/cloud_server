@@ -543,6 +543,10 @@ async def test_api_reroute_of_a_running_mission_is_not_treated_as_an_edit():
             {"x": 1.0, "y": 1.0, "theta": 0.0}]}}})
 
     db.update_spec.assert_awaited_once()
+    spec = db.update_spec.await_args.args[2]
+    assert spec.update_nodes is None            # the request itself is never stored
+    assert spec.route_rev == 1
+    assert [(w.x, w.y) for w in spec.mission_tree[1].route.waypoints] == [(1.0, 1.0)]
 
 
 # ---------------------------------------------------------------------------
@@ -606,9 +610,10 @@ async def test_a_reroute_of_a_dispatched_mission_is_not_reported_as_an_ignored_e
     r, _ = _make_robot()
     m = await _start(r, _mission())
     echo = _mission()
-    echo.update_nodes = {"a": mission_object.MissionRouteNodeV1(waypoints=[
-        {"x": 9.0, "y": 9.0, "theta": 0.0}])}
-    m.mission_tree[1].route = echo.update_nodes["a"]      # what the dispatcher did
+    echo.mission_tree[1].route = mission_object.MissionRouteNodeV1(waypoints=[
+        {"x": 9.0, "y": 9.0, "theta": 0.0}])
+    echo.planned_path = None
+    echo.route_rev = 1
 
     r._apply_spec_edit(m, echo, dispatched=True)
 

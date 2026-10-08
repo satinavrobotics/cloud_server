@@ -2265,13 +2265,20 @@ async def update_mission(mission_name: str, mission_data: dict):
         if "status" not in mission_data or len(mission_data) > 1:
             # This is a spec update
             edits = {}
+            reroute = None
             for key, value in mission_data.items():
                 if key in ("status", "name", "lifecycle"):
                     continue
-                if key in EDITABLE_SPEC_FIELDS:
+                if key == "update_nodes":
+                    # A reroute, meant for a running mission; applied below, after any edit.
+                    reroute = value
+                elif key in EDITABLE_SPEC_FIELDS:
                     edits[key] = value
+                elif key in ("route_rev", "kind", "goal", "created_at"):
+                    # Server-owned (route_rev is bumped by a reroute, the others are set when
+                    # the mission is created); a caller's copy must not change them.
+                    continue
                 else:
-                    # e.g. update_nodes (a reroute), which is meant for a running mission
                     setattr(mission, key, value)
             if edits:
                 # Only a mission that has not started can be edited: once its orders are
@@ -2295,6 +2302,12 @@ async def update_mission(mission_name: str, mission_data: dict):
                     mission.status.node_status = {
                         name: mission.status.node_status.get(name, MissionNodeStatusV1())
                         for name in node_names}
+            if reroute:
+                # Fold the new routes into mission_tree (validated, planned_path cleared,
+                # route_rev bumped) instead of storing the request: the row is what the
+                # dispatcher resumes from, and a stored request would be re-applied on
+                # every delivery of the row. The dispatcher acts once per route_rev.
+                await mission.update(reroute)
             await service.database.update_spec(MissionObjectV1, mission.name, mission.spec, publisher_id)
             if "mission_tree" in edits:
                 await service.database.update_status(

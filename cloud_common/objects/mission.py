@@ -292,7 +292,21 @@ class MissionSpecV1(pydantic.BaseModel):
         False, description="Marker for whether the mission is requested to be canceled"
     )
     update_nodes: Optional[Dict[str, MissionRouteNodeV1]] = pydantic.Field(
-        None, description="Nodes need to be updated")
+        None, description="Deprecated, accepted for compatibility and never stored: a reroute "
+                          "(PUT /missions/{name} with update_nodes) is folded into mission_tree "
+                          "and announced by route_rev.")
+    route_rev: int = pydantic.Field(
+        0, description="Revision of the mission's routes. Bumped by the API every time a "
+                       "reroute rewrites mission_tree; the dispatcher acts on a reroute only "
+                       "while this is above status.applied_route_rev.")
+    kind: Optional[str] = pydantic.Field(
+        None, description="What the mission is: \"goto\" for a planner go-to, null otherwise. "
+                          "The dispatcher replans a go-to from the robot's pose when it starts.")
+    goal: Optional[Dict[str, Any]] = pydantic.Field(
+        None, description="Where a go-to goes: {x, y, map_id} (and node_id when known).")
+    created_at: Optional[datetime.datetime] = pydantic.Field(
+        None, description="When the mission row was created (set by the database layer); "
+                          "orders the queue of a dispatcher that restarts.")
     planned_path: Optional[List[str]] = pydantic.Field(
         None, description="The sequence of topological node IDs for this mission"
     )
@@ -408,6 +422,10 @@ class MissionStatusV1(pydantic.BaseModel):
     passes_completed: int = pydantic.Field(
         0, description="Dispatcher-owned count of the passes of a repeating mission that have \
                         finished so far (see the spec's repeat). Never set it from the API.")
+    applied_route_rev: int = pydantic.Field(
+        0, description="Dispatcher-owned: the spec's route_rev the dispatcher has acted on, so "
+                       "a reroute is applied once however often the row is delivered. Never "
+                       "set it from the API.")
     order_rev: int = pydantic.Field(
         0, description="Dispatcher-owned revision of this run's orders. Bumped when a \
                         cancelled node is resent with new content (an operator route \
@@ -493,18 +511,33 @@ class MissionObjectV1(MissionSpecV1, object.ApiObject):
         if self.status.state.done:
             raise common.ICSUsageError(
                 f"Mission {self.name} is finished with status {self.status.state}.")
+        # Parse first: a bad route must not leave the tree half rerouted.
+        update_nodes = {name: route if isinstance(route, MissionRouteNodeV1)
+                        else MissionRouteNodeV1(**route)
+                        for name, route in update_nodes.items()}
         current_node_names = [n.name for n in self.mission_tree]
         for node_name, _ in update_nodes.items():
             if node_name not in current_node_names:
                 raise common.ICSUsageError(
                     f"Node {node_name} does not exist in mission {self.name}")
-            elif self.status.state is MissionStateV1.RUNNING and \
+            if self.status.state is MissionStateV1.RUNNING and \
                     self.status.node_status[node_name].state.done:
                 raise common.ICSUsageError(
                     f"Mission node {node_name} is finished with status \
                         {self.status.node_status[node_name].state}.")
-        # Update when the nodes exist in the mission and the mission is in PENDING or RUNNING state
-        self.update_nodes = update_nodes
+            node = next(n for n in self.mission_tree if n.name == node_name)
+            if node.type is not MissionNodeType.ROUTE:
+                raise common.ICSUsageError(
+                    f"Mission node {node_name} is not a route node and cannot be rerouted")
+        # Fold the new routes into the tree. The tree is the single source of truth: the
+        # row is what the dispatcher resumes from, and route_rev tells it to act once.
+        # The old planned_path described the old route, so it goes.
+        for node_name, route in update_nodes.items():
+            for node in self.mission_tree:
+                if node.name == node_name:
+                    node.route = route
+        self.planned_path = None
+        self.route_rev += 1
         return update_nodes
 
     @staticmethod

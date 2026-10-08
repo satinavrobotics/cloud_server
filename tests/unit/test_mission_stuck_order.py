@@ -168,6 +168,7 @@ async def test_running_mission_cancel_is_not_reissued_on_every_change_event():
     mission.needs_canceled = True
     r._missions["m1"] = mission
     r._current_mission = mission
+    r._current_behavior_tree = MagicMock()     # dispatched: its order is on the robot
 
     def echo():
         # The watcher echo of a mission the operator cancelled via the API.

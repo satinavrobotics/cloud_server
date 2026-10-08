@@ -356,9 +356,17 @@ class Robot:
         self._run_task = None
 
     async def _try_start_mission(self):
-        # Schedule a new mission if we aren't doing anything and there is one in the queue
-        if self._current_mission is None and self._missions:
-            self._current_mission = next(iter(self._missions.values()))
+        # Nothing is picked before the robot is known: a restarted dispatcher sees its
+        # missions in an arbitrary order and the robot row after them, and the first mission
+        # to arrive must not take the slot of one that was already running.
+        if self._current_mission is None and self._missions and \
+                self._robot_object is not None and \
+                self._robot_object.lifecycle is api_objects.object.ObjectLifecycleV1.ALIVE:
+            # Schedule a new mission if we aren't doing anything and there is one in the
+            # queue: a mission that already started (a resume after a restart) goes first.
+            self._current_mission = next(
+                (m for m in self._missions.values() if m.status.start_timestamp is not None),
+                next(iter(self._missions.values())))
             # Fresh mission, fresh mismatch budget -- the previous mission's leftover
             # count must not shorten this one's grace period.
             self._order_mismatch_count = 0
@@ -373,19 +381,7 @@ class Robot:
             return
         # Skip missions that were already canceled before they started
         if self._current_mission.needs_canceled:
-            self.mission_info("Mission already flagged for cancel before dispatch — canceling immediately")
-            # A mission that was already running before a dispatcher restart still has a
-            # RUNNING run row (startup reconciliation leaves it for us to resume): adopt it
-            # so it is closed too, instead of staying RUNNING forever (observed 2026-09-25).
-            resumed = self._current_mission.status.start_timestamp is not None
-            if resumed:
-                self._record("run_started", self._name, self._current_mission,
-                             self._robot_object)
-            self._set_mission_state(mission_object.MissionStateV1.CANCELED)
-            if resumed:
-                self._record("run_finished", self._name, self._current_mission,
-                             self._robot_object)
-            await self.get_next_mission()
+            await self._cancel_before_dispatch()
             return
         # Withhold dispatch while the robot can't actually receive an order — offline
         # or not navigation-ready. The mission stays PENDING; _on_client_message()
@@ -399,7 +395,7 @@ class Robot:
                 self.mission_info(f"Holding mission dispatch: {hold_reason}")
                 asyncio.ensure_future(self._database.update_status(
                     api_objects.MissionObjectV1, self._current_mission.name,
-                    self._current_mission.status, uuid.uuid4()))
+                    self._current_mission.status, self._mission_writer_id()))
             return
         if self._current_mission.status.held:
             self._current_mission.status.held = False
@@ -407,7 +403,8 @@ class Robot:
             self.mission_info("Robot ready — releasing held mission")
             asyncio.ensure_future(self._database.update_status(
                 api_objects.MissionObjectV1, self._current_mission.name,
-                self._current_mission.status, uuid.uuid4()))
+                self._current_mission.status, self._mission_writer_id()))
+        await self._settle_route_rev()
         # The run id must exist (and be persisted) before the first order goes out.
         if not await self._assign_run_id():
             return
@@ -428,8 +425,61 @@ class Robot:
         self._record("run_started", self._name, self._current_mission, self._robot_object,
                      session_map=session_map)
         self.update_mission_from_behavior_tree()
+        if self._current_mission.status.state.done:
+            # A resumed mission whose tree is already finished (every node done before the
+            # restart): record it and move on -- there is nothing left to send, and the
+            # next order would be a node that no longer runs.
+            self.mission_info("Mission already finished at resume; not sending an order")
+            await self.post_mission_completion()
+            return
         self._arm_mission_timeout()
         await self._send_order()
+
+    async def _settle_route_rev(self):
+        """The tree this mission is about to be sent from is the stored one, so every reroute
+        up to the spec's route_rev is in it: remember that (applied_route_rev), so the row is
+        not taken for a new reroute. A mission resumed after a restart may have been
+        rerouted while the robot still held the old route under the current order id; it
+        gets a new order revision, so the resent order is a new order for the robot."""
+        mission = self._current_mission
+        status = mission.status
+        # A node left CANCELED by a reroute that was in flight when the dispatcher stopped
+        # (older versions persisted it) is a node still to run, not a failed one.
+        if status.start_timestamp is not None and not mission.needs_canceled:
+            for node_state in status.node_status.values():
+                if node_state.state is mission_object.MissionStateV1.CANCELED:
+                    node_state.state = mission_object.MissionStateV1.PENDING
+        if mission.route_rev <= status.applied_route_rev:
+            return
+        status.applied_route_rev = mission.route_rev
+        if status.start_timestamp is None or status.run_id is None:
+            return  # persisted with the run id
+        status.order_rev += 1
+        try:
+            await self._persist_current_mission_status()
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not persist the applied route revision "
+                         f"({err})")
+        self.mission_info(f"Resuming a rerouted mission: route revision "
+                          f"{mission.route_rev}, order revision {status.order_rev}")
+
+    async def _cancel_before_dispatch(self):
+        """End the current mission as CANCELED without a cancelOrder: it was flagged for
+        cancel before any order of it went out (robot offline or not ready), so there is
+        nothing on the robot to cancel and no state message to wait for."""
+        self.mission_info("Mission flagged for cancel before dispatch -- canceling immediately")
+        # A mission that was already running before a dispatcher restart still has a
+        # RUNNING run row (startup reconciliation leaves it for us to resume): adopt it
+        # so it is closed too, instead of staying RUNNING forever (observed 2026-09-25).
+        resumed = self._current_mission.status.start_timestamp is not None
+        if resumed:
+            self._record("run_started", self._name, self._current_mission,
+                         self._robot_object)
+        self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+        if resumed:
+            self._record("run_finished", self._name, self._current_mission,
+                         self._robot_object)
+        await self.get_next_mission()
 
     def _record(self, hook: str, *args: Any, **kwargs: Any) -> None:
         """Phase 0 recording (fleet_recorder.FleetRecorder). The hooks only enqueue work and
@@ -517,7 +567,7 @@ class Robot:
     async def _persist_current_mission_status(self):
         await self._database.update_status(
             api_objects.MissionObjectV1, self._current_mission.name,
-            self._current_mission.status, uuid.uuid4())
+            self._current_mission.status, self._mission_writer_id())
 
     async def _assign_run_id(self) -> bool:
         """Give a mission that is about to be dispatched for the first time its run
@@ -661,19 +711,34 @@ class Robot:
             mission.lifecycle = message.lifecycle
             return cancel_current_node
 
-        # From POST /mission/{name}/update endpoint
-        if message.update_nodes:
-            self.info(
-                f"Update mission nodes: {list(message.update_nodes.keys())}")
-            for node_name, route in message.update_nodes.items():
+        # A reroute (PUT /missions/{name} with update_nodes): the API has already folded the
+        # new routes into the stored mission_tree and bumped route_rev. It is acted on once
+        # per revision -- status.applied_route_rev records which one -- however often the
+        # row is delivered (the periodic resync, an echo, a restart). A mission that is not
+        # dispatched yet takes the new tree through _apply_spec_edit instead.
+        if mission is self._current_mission and self._current_behavior_tree is not None and \
+                message.route_rev > mission.status.applied_route_rev:
+            changed = []
+            for new_node in message.mission_tree:
                 for n in mission.mission_tree:
-                    if n.name == node_name:
-                        n.route = route
-                        if mission.status.node_status[node_name].state is \
+                    if n.name == new_node.name and new_node.route is not None and \
+                            n.route != new_node.route:
+                        n.route = new_node.route
+                        changed.append(str(n.name))
+                        if mission.status.node_status[str(n.name)].state is \
                                 mission_object.MissionStateV1.RUNNING:
                             # Cancel current node
                             cancel_current_node = True
                         break
+            self.info(f"Reroute [{mission.name}] route_rev "
+                      f"{mission.status.applied_route_rev} -> {message.route_rev}: "
+                      f"nodes {changed}")
+            mission.planned_path = message.planned_path
+            mission.route_rev = message.route_rev
+            mission.status.applied_route_rev = message.route_rev
+            asyncio.ensure_future(self._database.update_status(
+                api_objects.MissionObjectV1, mission.name, mission.status,
+                self._mission_writer_id()))
         return cancel_current_node
 
     async def _on_mission_change(self, message: api_objects.MissionObjectV1):
@@ -728,6 +793,10 @@ class Robot:
                 return
             self.info(f"Received a new mission [{message.name}]")
             self._missions[message.name] = message
+            if message.status.start_timestamp is not None:
+                # Already started before a dispatcher restart: it resumes ahead of the
+                # missions that have not.
+                self._missions.move_to_end(message.name, last=False)
             if self._current_mission is None:
                 await self._try_start_mission()
         else:  # If we've seen this mission, update it
@@ -767,6 +836,15 @@ class Robot:
                     await self.get_next_mission()
                     return
 
+                if self._current_behavior_tree is None and \
+                        self._current_mission.needs_canceled:
+                    # Picked but never dispatched (robot offline or not ready, so held): no
+                    # order of ours is on the robot, so there is nothing for a cancelOrder to
+                    # cancel and no state message to wait for -- end it here.
+                    await self._cancel_before_dispatch()
+                    await self._robot_server.delete_pending_mission(message)
+                    return
+
                 if self._current_mission.needs_canceled or cancel_node_from_api:
                     # One cancel at a time. This branch runs on *every* change event
                     # for the running mission -- including the watcher echo of each
@@ -795,7 +873,7 @@ class Robot:
             # Cancel a queued mission
             elif message.needs_canceled:
                 self._missions[message.name].status.state = mission_object.MissionStateV1.CANCELED
-                await self._database.update_status(api_objects.MissionObjectV1, self._missions[message.name].name, self._missions[message.name].status, uuid.uuid4())
+                await self._database.update_status(api_objects.MissionObjectV1, self._missions[message.name].name, self._missions[message.name].status, self._mission_writer_id())
                 del self._missions[message.name]
 
     async def _on_robot_change(self, message: api_objects.RobotObjectV1):
@@ -1446,6 +1524,15 @@ class Robot:
                 not order_ids.is_order_of(self._order_prefix(), message.orderId):
             return
 
+        # A cancelOrder the robot just finished ends our order even when this state already
+        # carries another order id (it may have adopted a newer order, or dropped ours): the
+        # cancel was ours and must not be lost to the mismatch handling below, which would
+        # resend the order that was cancelled.
+        if any(a.actionType == types.VDA5050InstantActionType.CANCEL_ORDER
+               for a in finished_instant_actions):
+            if await self._finish_cancel_without_order_match():
+                return
+
         # If the order doesn't match, ignore it
         if not order_ids.is_order_of(self._order_prefix(), message.orderId):
             self._order_mismatch_count += 1
@@ -1488,6 +1575,8 @@ class Robot:
                 return
             self.mission_info(f"Resend the updated mission node {prev_child_node}: "
                               f"{self._current_behavior_tree.current_node.name}")
+            # The new order counts its sequence ids from 0 again.
+            self.last_node_seq_id = -1
             await self._send_order()
             self._updating_mission_from_api = False
 
@@ -1499,6 +1588,22 @@ class Robot:
 
         if self._current_mission.status.state.done:
             await self.post_mission_completion()
+
+    async def _finish_cancel_without_order_match(self) -> bool:
+        """A finished cancelOrder arrived on a state whose orderId is not our order's.
+        A cancel of the mission ends it; a cancel for a reroute lets the new route go out
+        (under a new order revision). Returns whether the message was fully handled."""
+        mission = self._current_mission
+        if mission.needs_canceled:
+            self._set_mission_state(mission_object.MissionStateV1.CANCELED)
+            await self.post_mission_completion()
+            return True
+        if not await self._bump_order_rev():
+            return False  # not persisted: the mismatch handling resends the same order
+        self.mission_info("Resend the rerouted mission node after the robot's cancel")
+        self.last_node_seq_id = -1
+        await self._send_order()
+        return True
 
     async def _on_client_factsheet(self, message: types.VDA5050Factsheet):
         if self._robot_object is not None:
@@ -1597,7 +1702,7 @@ class Robot:
         status.order_rev = 0
         try:
             await self._database.update_status(
-                api_objects.MissionObjectV1, mission.name, status, uuid.uuid4())
+                api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id())
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not persist the next pass ({err}); "
                          "finishing the mission instead")
@@ -1668,7 +1773,7 @@ class Robot:
                 final.status.passes_completed += 1
                 try:
                     await self._database.update_status(
-                        api_objects.MissionObjectV1, final.name, final.status, uuid.uuid4())
+                        api_objects.MissionObjectV1, final.name, final.status, self._mission_writer_id())
                 except Exception as err:  # pylint: disable=broad-except
                     self.warning(f"[{final.name}] Could not persist the pass count ({err})")
                 await self._chain_then_run(final)
@@ -1827,8 +1932,7 @@ class Robot:
             # - This means that (lastNodeSequenceId = 2) -> (idx = 0)
             idx = last_node_seq_id // 2 - 1
 
-            # For route nodes, task index corresponds to the last user-defined node reached
-            # We assume that user-defined nodes will allowedDeviationXY = 0
+            # For route nodes, task index corresponds to the last waypoint reached.
             # Because we pad by an additional node in the beginning, we want to ignore
             # that node, so we enforce that idx >= 0.
             #
@@ -1840,12 +1944,13 @@ class Robot:
             # route). sati-client's utils/missionRouteProgress.ts now reads this value as
             # the authoritative "which waypoint" signal (see AUDIT_BACKLOG Z9 item 5), so it
             # needs to be correct on every reach, not just steady-state increments.
+            # Every waypoint counts, whatever its allowed deviation: a planner go-to has
+            # waypoints with a 0.2 m tolerance and still needs its progress reported.
             if self.last_node_seq_id < last_node_seq_id and \
                     idx >= 0 and \
-                    idx < len(current_mission_node.route.waypoints) and \
-                    current_mission_node.route.waypoints[idx].allowedDeviationXY == 0:
+                    idx < len(current_mission_node.route.waypoints):
                 task_status[str(current_mission_node.name)] = idx
-                asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
+                asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
 
             if current_order_node_id == current_mission_node.route.size * 2 + 2:
                 node_state = mission_object.MissionStateV1.COMPLETED
@@ -1880,6 +1985,13 @@ class Robot:
         if self.get_mission_errors(message):
             self.warning("Fatal Errors present, failing mission")
             node_state = mission_object.MissionStateV1.FAILED
+        # A node whose order the robot cancelled for a reroute (the mission itself is not
+        # cancelled) is still to run, with its new route: it must not be recorded as
+        # CANCELED, which would read as FAILED if the dispatcher restarts before the resend.
+        # The caller sees the CANCELED and resends.
+        if node_state == mission_object.MissionStateV1.CANCELED and \
+                not self._current_mission.needs_canceled:
+            return node_state
         # Set mission node state based on update from robot client message
         self.set_mission_node_state(str(current_mission_node.name), node_state)
         return node_state
@@ -1959,7 +2071,7 @@ class Robot:
 
         asyncio.ensure_future(self._database.update_status(
             api_objects.MissionObjectV1, self._current_mission.name,
-            status, uuid.uuid4()))
+            status, self._mission_writer_id()))
         return True
 
     def _clear_block(self, mission: api_objects.MissionObjectV1):
@@ -1982,7 +2094,7 @@ class Robot:
         if mission is self._current_mission:
             self._arm_mission_timeout()
         asyncio.ensure_future(self._database.update_status(
-            api_objects.MissionObjectV1, mission.name, mission.status, uuid.uuid4()))
+            api_objects.MissionObjectV1, mission.name, mission.status, self._mission_writer_id()))
 
     _NODE_REFERENCE_KEYS = ("node_id", "nodeId", "action_id", "actionId")
 
@@ -2069,7 +2181,7 @@ class Robot:
         if not mission_state_updated and previous_mission_status != self._current_mission.status:
             self.info(
                 f"update mission node: {self._current_mission.status.current_node}")
-            asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
+            asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
 
     def update_robot_state(self, finished_instant_actions: List[types.VDA5050Action]):
         """ Update robot states after teleop is finished
@@ -2191,12 +2303,16 @@ class Robot:
         """Copy an operator's spec edit (PUT /missions/{name}) onto the mission this
         dispatcher already loaded. Only a mission that has not been dispatched yet can
         take one: a dispatched mission's orders are already with the robot."""
-        # A reroute rewrites a route of the dispatcher's copy of the tree only (the
-        # database keeps the original and the request in update_nodes), so on a
-        # dispatched mission a differing tree is expected and not an edit.
+        # A reroute rewrites routes of the stored tree (and clears planned_path) under a
+        # new route_rev that _update_mission_from_api has not applied yet, so on a
+        # dispatched mission such a difference is expected and not an edit.
+        reroute_pending = dispatched and message.route_rev > target.status.applied_route_rev
         changed = [field for field in EDITABLE_SPEC_FIELDS
                    if getattr(target, field) != getattr(message, field) and
-                   not (dispatched and field == "mission_tree" and message.update_nodes)]
+                   not (reroute_pending and field in ("mission_tree", "planned_path"))]
+        if not dispatched and target.route_rev != message.route_rev:
+            # A reroute before the first order: the copied tree is the one to send.
+            target.route_rev = message.route_rev
         if not changed:
             return
         if dispatched:
@@ -2341,6 +2457,14 @@ class Robot:
         writer = getattr(self._robot_server, "robot_writer_id", None)
         return writer if isinstance(writer, uuid.UUID) else uuid.uuid4()
 
+    def _mission_writer_id(self) -> uuid.UUID:
+        """Publisher id of every mission write this controller makes. The mission watcher of
+        the RobotServer skips notifications with it, so our own status writes do not come
+        back as mission changes (each used to echo, re-delivering the row to the handler
+        that had just written it; see the reroute loop of 2026-10)."""
+        writer = getattr(self._robot_server, "mission_writer_id", None)
+        return writer if isinstance(writer, uuid.UUID) else uuid.uuid4()
+
     def _reconcile_stale_state(self) -> None:
         """ON_TASK / MAP_DEPLOYMENT only ever mean "this controller is running a mission". With
         none current or queued they are stale: a state left in the database by an older
@@ -2452,7 +2576,7 @@ class Robot:
             self.mission_info("Mission duration: "
                               f"""{self._current_mission.status.end_timestamp -
                                    self._current_mission.status.start_timestamp}""")
-        asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, uuid.uuid4()))
+        asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
         return True
 
     def set_mission_node_state(self, node_name: str, state: mission_object.MissionStateV1):
@@ -2561,6 +2685,8 @@ class RobotServer:
         # Publisher id of the robot controllers' own robot-object writes (Robot._writer_id);
         # the robot watcher skips their notifications.
         self.robot_writer_id = uuid.uuid4()
+        # The same for the controllers' mission writes (Robot._mission_writer_id).
+        self.mission_writer_id = uuid.uuid4()
         self._mqtt_messages: asyncio.Queue = asyncio.Queue()
 
         # Maps §14 U3: bumped on every (re)connect to the broker; a robot's first datum in an
@@ -2835,7 +2961,8 @@ class RobotServer:
             except Exception as err:  # pylint: disable=broad-except
                 self.warning(f"Fleet recording failed to start: {err}")
         tasks = [
-            self._watch_changes(api_objects.MissionObjectV1, self._mission_changes),
+            self._watch_changes(api_objects.MissionObjectV1, self._mission_changes,
+                                self.mission_writer_id),
             self._watch_changes(api_objects.RobotObjectV1, self._robot_changes,
                                 self.robot_writer_id),
             self._handle_robot_changes(),
