@@ -21,6 +21,8 @@ SPDX-License-Identifier: Apache-2.0
 # specified here https://github.com/VDA5050/VDA5050/blob/main/VDA5050_EN.md
 import asyncio
 import datetime
+import enum
+import hashlib
 import json
 import logging
 import math
@@ -29,8 +31,8 @@ import requests
 import time
 import uuid
 import sys
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
-from collections import OrderedDict
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union, cast
+from collections import OrderedDict, deque
 
 import pydantic
 
@@ -233,7 +235,29 @@ READINESS_HOLD_REASONS = {
     "navigationNotReadyError": _NAV_NOT_READY,
     "poseHealthNotReadyError": _NAV_NOT_READY,
     "tfChainNotReadyError": _NAV_NOT_READY,
+    # The robot's rescue: an operator goal ended our order; nothing is dispatched until
+    # the operator hands the robot back (the robot then stops reporting it).
+    "operatorTakeover": "An operator has taken over the robot",
 }
+OPERATOR_TAKEOVER = "operatorTakeover"
+
+
+class CancelPurpose(str, enum.Enum):
+    """What a cancelOrder the dispatcher sends is for; it decides what its completion
+    means (Robot._act_on_resolved_cancels)."""
+    MISSION = "mission"  # the mission is being cancelled
+    REPLACE = "replace"  # the node's order makes way for a new revision (reroute, resume)
+    STOP = "stop"        # the robot must drop the mission's order (timeout, force cancel)
+    CLEAR = "clear"      # the robot must drop an order that is not the mission's (force
+                         # cancel of a stray order the mission waits behind)
+
+
+SEND_NODE = "send"
+NEW_REVISION = "revision"
+
+
+def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
+    return hashlib.sha1(route.json(sort_keys=True).encode()).hexdigest()[:16]
 
 
 class Robot:
@@ -245,6 +269,14 @@ class Robot:
     # Consecutive state messages whose orderId doesn't match the current mission
     # before we stop resending and fail the mission. See _on_client_message().
     MAX_ORDER_MISMATCHES = 40
+    # An order the robot has not adopted yet is sent again with exponential back-off
+    # (base * 2^resends, capped), not on every state message. See _resend_due().
+    ORDER_RESEND_BASE_S = 1.0
+    ORDER_RESEND_MAX_S = 8.0
+    # More new order revisions than this for one run within the window is churn: the
+    # mission is failed instead of re-issued once more. See _bump_order_rev().
+    ORDER_CHURN_MAX_REVISIONS = 5
+    ORDER_CHURN_WINDOW_S = 60.0
     # How many finished mission names to remember for re-queue suppression. Only
     # needs to outlive the watcher echo of our own terminal write, so this is
     # generous; it exists so a long-lived robot doesn't grow the set unboundedly.
@@ -299,7 +331,34 @@ class Robot:
         self._mission_timeout_task: Optional[asyncio.Task[Any]] = None
         self._robot_server = server
         self._alive = True
-        self._header_id = 0
+        # VDA5050 headerIds count per topic; see _next_header_id().
+        self._header_ids: Dict[str, int] = {}
+        # The last order published. Sending it again republishes it unchanged, so one
+        # orderId never carries two contents (see _send_order). What it was built from
+        # is stored with the mission (status.sent_order).
+        self._sent_order: Optional[types.VDA5050Order] = None
+        self._order_sent_at = 0.0  # monotonic
+        self._order_resends = 0
+        # An orderId an earlier dispatcher process may have sent with content this one
+        # does not know: it is not sent again; the next send moves to a new revision.
+        self._unknown_content_order_id: Optional[str] = None
+        # A mission resumed after a restart waits for the robot's first state message,
+        # which decides how it goes on (see _resume_from_state).
+        self._resume_pending = False
+        # The send the current node is owed, made once no cancelOrder of ours is in
+        # flight (see _flush_pending_send): SEND_NODE, or NEW_REVISION after the robot
+        # dropped the node's order to make way for new content.
+        self._pending_send: Optional[str] = None
+        # What each cancelOrder in flight is for, and the run it was sent in (see
+        # _act_on_resolved_cancels), and the ones the robot has just resolved.
+        self._cancel_purposes: Dict[str, Tuple[CancelPurpose, Optional[str]]] = {}
+        self._resolved_cancels: List[Tuple[CancelPurpose, Optional[str], bool]] = []
+        # Instant action ids carry it, so they never repeat an earlier process's.
+        self._process_tag = uuid.uuid4().hex[:4]
+        # The orderId of the robot's last state message.
+        self._robot_order_id: Optional[str] = None
+        # Monotonic times of the current run's recent order revisions (churn breaker).
+        self._order_revisions: Deque[float] = deque()
         self._current_behavior_tree: Optional[behavior_tree.MissionBehaviorTree] = None
         # The timer of the "wait" action node that is currently running, and the
         # key that its WaitElapsed message will carry (see WaitElapsed).
@@ -311,7 +370,6 @@ class Robot:
         # Missions whose spec edit was refused because they were already dispatched,
         # so the log says so once rather than on every status echo.
         self._ignored_spec_edits: Set[str] = set()
-        self._updating_mission_from_api: bool = False
         self._charging_mission_received: bool = False
         self.last_node_seq_id: int = -1
         # Timestamp of the robot state message being handled, for the events it causes
@@ -369,8 +427,17 @@ class Robot:
                 (m for m in self._missions.values() if m.status.start_timestamp is not None),
                 next(iter(self._missions.values())))
             # Fresh mission, fresh mismatch budget -- the previous mission's leftover
-            # count must not shorten this one's grace period.
+            # count must not shorten this one's grace period -- and nothing of the
+            # previous mission's orders.
             self._order_mismatch_count = 0
+            # Not dispatched until its own tree is built: the previous mission's tree
+            # made a held mission look dispatched (its state handling then sent orders).
+            self._current_behavior_tree = None
+            self._sent_order = None
+            self._unknown_content_order_id = None
+            self._order_revisions.clear()
+            self._resume_pending = False
+            self._pending_send = None
 
         # Cant start a new mission if there is no mission
         if self._current_mission is None:
@@ -405,6 +472,7 @@ class Robot:
             asyncio.ensure_future(self._database.update_status(
                 api_objects.MissionObjectV1, self._current_mission.name,
                 self._current_mission.status, self._mission_writer_id()))
+        resumed = self._current_mission.status.start_timestamp is not None
         await self._settle_route_rev()
         await self._replan_goto()
         # The run id must exist (and be persisted) before the first order goes out.
@@ -435,6 +503,13 @@ class Robot:
             await self.post_mission_completion()
             return
         self._arm_mission_timeout()
+        if resumed:
+            # This process does not know what the robot holds, nor what content went out
+            # under the current orderId: the robot's first state message decides.
+            self._resume_pending = True
+            self._unknown_content_order_id = self._current_order_id()
+            self.mission_info("Resumed; waiting for the robot's state before sending")
+            return
         await self._send_order()
 
     async def _replan_goto(self):
@@ -490,8 +565,9 @@ class Robot:
         """The tree this mission is about to be sent from is the stored one, so every reroute
         up to the spec's route_rev is in it: remember that (applied_route_rev), so the row is
         not taken for a new reroute. A mission resumed after a restart may have been
-        rerouted while the robot still held the old route under the current order id; it
-        gets a new order revision, so the resent order is a new order for the robot."""
+        rerouted while the robot still held the old route under the current order id; the
+        resume then does not adopt it (status.sent_order records the route it was built
+        from; see _resume_from_state)."""
         mission = self._current_mission
         status = mission.status
         # A node left CANCELED by a reroute that was in flight when the dispatcher stopped
@@ -503,16 +579,18 @@ class Robot:
         if mission.route_rev <= status.applied_route_rev:
             return
         status.applied_route_rev = mission.route_rev
+        # Waypoint progress was counted on the old routes.
+        for name, node_state in status.node_status.items():
+            if not node_state.state.done:
+                status.task_status.pop(name, None)
         if status.start_timestamp is None or status.run_id is None:
             return  # persisted with the run id
-        status.order_rev += 1
         try:
             await self._persist_current_mission_status()
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not persist the applied route revision "
                          f"({err})")
-        self.mission_info(f"Resuming a rerouted mission: route revision "
-                          f"{mission.route_rev}, order revision {status.order_rev}")
+        self.mission_info(f"Resuming a rerouted mission: route revision {mission.route_rev}")
 
     async def _cancel_before_dispatch(self):
         """End the current mission as CANCELED without a cancelOrder: it was flagged for
@@ -555,21 +633,46 @@ class Robot:
                 return reason
         return None
 
-    def _has_outstanding_cancel(self) -> bool:
+    def _has_outstanding_cancel(self, current_run_only: bool = False) -> bool:
         """True while a cancelOrder we sent has not yet been reported FINISHED (or
-        abandoned) -- see handle_instant_action() for how entries leave the dict."""
-        return any(a.actionType == types.VDA5050InstantActionType.CANCEL_ORDER
-                   for a in self._current_instant_actions.values())
+        abandoned) -- see handle_instant_action() for how entries leave the dict. With
+        `current_run_only`, only one sent in the current mission run counts."""
+        run = self._run_key()
+        return any(a.actionType == types.VDA5050InstantActionType.CANCEL_ORDER and
+                   (not current_run_only or
+                    self._cancel_purposes.get(action_id, (None, None))[1] == run)
+                   for action_id, a in self._current_instant_actions.items())
 
-    async def _send_cancel_order(self, action_id: str):
+    async def _send_cancel_order(self, action_id: str,
+                                 purpose: Optional[CancelPurpose] = None):
         """Send a VDA5050 cancelOrder and track it in _current_instant_actions, so
         _has_outstanding_cancel() sees it and handle_instant_action() resends it
-        until the robot reports it FINISHED (or it is abandoned)."""
+        until the robot reports it FINISHED (or it is abandoned). `purpose` (by default:
+        the mission's cancel if it is being cancelled, else a stop) and the current run
+        are kept with it, for what its completion means."""
+        if purpose is None:
+            purpose = CancelPurpose.MISSION if self._current_mission is not None and \
+                self._current_mission.needs_canceled else CancelPurpose.STOP
         instant_action = types.VDA5050Action(
             actionType=types.VDA5050InstantActionType.CANCEL_ORDER,
             actionId=action_id)
         await self._send_instant_action(instant_action)
         self._current_instant_actions[action_id] = instant_action
+        self._cancel_purposes[action_id] = (purpose, self._run_key())
+
+    def _run_key(self) -> Optional[str]:
+        """The current mission's run (one pass of it), None without a mission."""
+        mission = self._current_mission
+        return None if mission is None else f"{mission.name}|{mission.status.run_id}"
+
+    def _cancel_resolved(self, action: types.VDA5050Action, abandoned: bool = False):
+        """A cancelOrder of ours left _current_instant_actions: the robot finished or
+        rejected it, or it was abandoned unacknowledged. Queued for
+        _act_on_resolved_cancels."""
+        if action.actionType != types.VDA5050InstantActionType.CANCEL_ORDER:
+            return
+        purpose, run = self._cancel_purposes.pop(action.actionId, (CancelPurpose.STOP, None))
+        self._resolved_cancels.append((purpose, run, abandoned))
 
     async def _handle_force_cancel(self, message: api_objects.RobotObjectV1):
         """Operator escape hatch, independent of mission tracking (see
@@ -595,18 +698,35 @@ class Robot:
             self.info("Force-cancel requested, but a cancelOrder is already "
                       "outstanding; not sending another")
             return
-        action_id = f"force-cancel-instantaction-n{self._header_id}"
+        action_id = self._action_id("force-cancel-instantaction")
         self.info(f"Force-cancel requested: sending {action_id}")
-        await self._send_cancel_order(action_id)
+        # It ends the mission if it takes the mission's order: the robot is on it, or has
+        # not reported since one went out. A stray order the mission waits behind is
+        # just cleared.
+        on_mission = self._current_mission is not None and (
+            order_ids.is_order_of(self._order_prefix(), self._robot_order_id)
+            if self._robot_order_id is not None else self._sent_order is not None)
+        await self._send_cancel_order(
+            action_id, CancelPurpose.STOP if on_mission else CancelPurpose.CLEAR)
 
     async def _send_instant_action(self, instant_action: types.VDA5050Action):
         instant_actions = types.VDA5050InstantActions(
-            headerId=self._header_id,
+            headerId=self._next_header_id("instantActions"),
             timestamp=datetime.datetime.now().isoformat(),
             instantActions=[instant_action])
         self._mqtt_client.publish(f"{self._mqtt_prefix}/{self._name}/instantActions",
                                   instant_actions.json())
-        self._header_id += 1
+
+    def _next_header_id(self, topic: str) -> int:
+        """VDA5050: a headerId is defined per topic and incremented by one with each
+        message sent on that topic."""
+        header_id = self._header_ids.get(topic, 0)
+        self._header_ids[topic] = header_id + 1
+        return header_id
+
+    def _action_id(self, stem: str) -> str:
+        """A new instant action id: the stem and the headerId its message will carry."""
+        return f"{stem}-{self._process_tag}-n{self._header_ids.get('instantActions', 0)}"
 
     def _order_prefix(self) -> str:
         """Prefix of every order/node id generated for the current mission's run and
@@ -653,29 +773,79 @@ class Robot:
         resend, so a cancelled node that is resent with new content goes out under a
         new orderId (the robot still holds the cancelled order's id in its state).
 
-        A legacy mission (no run_id) keeps its ids. Returns False if the revision
-        could not be persisted; the caller must not resend and should retry.
+        Every new revision of a dispatched run goes through here, so this is where churn
+        is stopped: more than ORDER_CHURN_MAX_REVISIONS within ORDER_CHURN_WINDOW_S fails
+        the mission instead (2026-10-08: 854 revisions in 9 minutes). Callers bump only
+        once the robot holds no order of ours, so there is nothing left to cancel.
+
+        A legacy mission (running since before run ids existed) gets its run id here
+        instead: the new order needs an id the robot has not seen as much as any other.
+        Returns False if no new revision was made; the caller must not resend. It retries
+        later unless the mission is done.
         """
         status = self._current_mission.status
-        if status.run_id is None:
-            return True
-        status.order_rev += 1
+        now = time.monotonic()
+        while self._order_revisions and \
+                now - self._order_revisions[0] > self.ORDER_CHURN_WINDOW_S:
+            self._order_revisions.popleft()
+        if len(self._order_revisions) >= self.ORDER_CHURN_MAX_REVISIONS:
+            self._stop_order_churn(len(self._order_revisions) + 1)
+            return False
+        legacy = status.run_id is None
+        if legacy:
+            status.run_id = uuid.uuid4().hex[:8]
+        else:
+            status.order_rev += 1
         try:
             await self._persist_current_mission_status()
         except Exception as err:  # pylint: disable=broad-except
-            status.order_rev -= 1
+            if legacy:
+                status.run_id = None
+            else:
+                status.order_rev -= 1
             self.warning(f"[{self._current_mission.name}] Could not persist order "
                          f"revision ({err}); not resending yet")
             return False
-        self.mission_info(f"Order revision {status.order_rev}")
+        self._order_revisions.append(now)
+        self._unknown_content_order_id = None
+        self.mission_info(f"Run id {status.run_id} (was a legacy mission)" if legacy
+                          else f"Order revision {status.order_rev}")
         return True
 
-    async def _send_order(self):
+    def _stop_order_churn(self, revisions: int):
+        """Fail the current mission rather than re-issue its order once more, and raise
+        MISSION.ORDER_CHURN. The robot holds no order of ours at this point (see
+        _bump_order_rev); the next state message moves the queue on."""
+        mission = self._current_mission
+        window = self.ORDER_CHURN_WINDOW_S
+        mission.status.failure_reason = \
+            (f"Order re-issued {revisions} times within {window:.0f} s; stopped re-issuing "
+             "it (order churn)")
+        self.warning(f"[{mission.name}] {mission.status.failure_reason}")
+        self._pending_send = None
+        self._resume_pending = False
+        self._set_mission_state(mission_object.MissionStateV1.FAILED)
+        self._record("order_churn", self._name, mission, self._current_order_id(),
+                     revisions, window, self._event_ts)
+
+    async def _send_order(self, waypoint_offset: int = 0):
+        """Send the order of the current behavior-tree node. An order already sent under
+        the same orderId is republished unchanged; `waypoint_offset` (a resume) leaves the
+        route's first waypoints out of a newly built order."""
         if self._robot_object is None or self._robot_object.lifecycle \
             not in [api_objects.object.ObjectLifecycleV1.ALIVE,
                     api_objects.object.ObjectLifecycleV1.PENDING_DELETE]:
             return
         if self._current_mission is None or self._current_behavior_tree is None:
+            return
+        # A finished mission (e.g. failed for order churn), or one being cancelled, sends
+        # nothing more.
+        if self._current_mission.status.state.done or self._current_mission.needs_canceled:
+            return
+        # Never while a cancelOrder of ours is in flight: the robot would reject the order
+        # while it still runs one, or the cancel would take it. Owed until it resolves.
+        if self._has_outstanding_cancel():
+            self._pending_send = self._pending_send or SEND_NODE
             return
 
         if self._current_behavior_tree.current_node is None:
@@ -699,40 +869,140 @@ class Robot:
                 self._start_wait(mission_node)
                 return
 
-            if mission_node.type == mission_object.MissionNodeType.ROUTE and \
-                    mission_node.route is not None:
-                try:
-                    route = await self._route_in_robot_frame(mission_node.route)
-                except RouteRefused as err:
-                    self._refuse_route_node(mission_node, str(err))
+            # An earlier dispatcher process may have sent this orderId with content this
+            # one does not know (see _resume_from_state): move to a new revision instead.
+            if order_ids.order_id(self._order_prefix(), idx) == \
+                    self._unknown_content_order_id and not await self._bump_order_rev():
+                if not self._current_mission.status.state.done:
+                    self._pending_send = self._pending_send or SEND_NODE
+                return
+            order_id = order_ids.order_id(self._order_prefix(), idx)
+            if self._sent_order is not None and self._sent_order.orderId == order_id:
+                # Not adopted yet: the same order again, unchanged (its start node is not
+                # re-taken from where the robot stands now).
+                order = self._sent_order
+                self._order_resends += 1
+                self.mission_info(f"Resending order {order_id} ({self._order_resends})")
+            else:
+                built = await self._build_order(mission_node, idx, waypoint_offset)
+                if built is None:
                     return
-                order = types.VDA5050Order.from_route(route, self._robot_object,
-                                                      self._order_prefix(), idx)
-                self.mission_info("Sending mission route node "
-                                  f"{mission_node.name}")
+                order, record = built
+                # Stored before it goes out, so the robot's reports on it are read right,
+                # also by a dispatcher restarted meanwhile. Not stored: owed, not sent.
+                if not await self._persist_sent_order(record):
+                    self._pending_send = self._pending_send or SEND_NODE
+                    return
+                self._sent_order = order
+                self._order_resends = 0
 
-            elif mission_node.type == mission_object.MissionNodeType.MOVE and \
-                    mission_node.move is not None:
-                order = types.VDA5050Order.from_move(mission_node.move, self._robot_object,
-                                                     self._order_prefix(), idx)
-                self.mission_info("Sending mission move node "
-                                  f"{mission_node.name}")
-
-            elif mission_node.type == mission_object.MissionNodeType.ACTION and \
-                    mission_node.action is not None:
-                order = types.VDA5050Order.from_action(mission_node.action, self._robot_object,
-                                                       self._order_prefix(), idx)
-                self.mission_info("Sending mission action node "
-                                  f"{mission_node.name}")
-
-            order.headerId = self._header_id
-            self._header_id += 1
+            order.headerId = self._next_header_id("order")
             order.timestamp = datetime.datetime.now().isoformat()
+            self._order_sent_at = time.monotonic()
 
             self._mqtt_client.publish(
                 f"{self._mqtt_prefix}/{self._name}/order", order.json())
             self.set_mission_node_state(f"{mission_node.name}",
                                         mission_object.MissionStateV1.RUNNING)
+
+    async def _build_order(self, mission_node: mission_object.MissionNodeV1, idx: int,
+                           waypoint_offset: int) \
+            -> Optional[Tuple[types.VDA5050Order, mission_object.MissionSentOrderV1]]:
+        """A new order for `mission_node` and what it is built from, or None when there is
+        none to send. A route order leaves its first `waypoint_offset` waypoints out."""
+        order_id = order_ids.order_id(self._order_prefix(), idx)
+        if mission_node.type == mission_object.MissionNodeType.ROUTE and \
+                mission_node.route is not None:
+            route = mission_node.route
+            offset = min(max(waypoint_offset, 0), len(route.waypoints) - 1)
+            record = mission_object.MissionSentOrderV1(
+                order_id=order_id, route_digest=_route_digest(route), waypoint_offset=offset)
+            if offset:
+                route = route.copy(update={"waypoints": route.waypoints[offset:]})
+            try:
+                route = await self._route_in_robot_frame(route)
+            except RouteRefused as err:
+                self._refuse_route_node(mission_node, str(err))
+                return None
+            self.mission_info(f"Sending mission route node {mission_node.name}"
+                              f"{f' from waypoint {offset}' if offset else ''}")
+            return types.VDA5050Order.from_route(route, self._robot_object,
+                                                 self._order_prefix(), idx), record
+        record = mission_object.MissionSentOrderV1(order_id=order_id)
+        if mission_node.type == mission_object.MissionNodeType.MOVE and \
+                mission_node.move is not None:
+            self.mission_info(f"Sending mission move node {mission_node.name}")
+            return types.VDA5050Order.from_move(mission_node.move, self._robot_object,
+                                                self._order_prefix(), idx), record
+        if mission_node.type == mission_object.MissionNodeType.ACTION and \
+                mission_node.action is not None:
+            self.mission_info(f"Sending mission action node {mission_node.name}")
+            return types.VDA5050Order.from_action(mission_node.action, self._robot_object,
+                                                  self._order_prefix(), idx), record
+        return None
+
+    async def _persist_sent_order(self, record: mission_object.MissionSentOrderV1) -> bool:
+        """Store what the order about to be sent is built from. Returns False if it could
+        not be stored."""
+        status = self._current_mission.status
+        previous, status.sent_order = status.sent_order, record
+        try:
+            await self._persist_current_mission_status()
+        except Exception as err:  # pylint: disable=broad-except
+            status.sent_order = previous
+            self.warning(f"[{self._current_mission.name}] Could not persist the order "
+                         f"about to be sent ({err}); not sending it yet")
+            return False
+        return True
+
+    def _sent_order_record(self, order_id: Optional[str]) \
+            -> Optional[mission_object.MissionSentOrderV1]:
+        """What order `order_id` was built from, if it is the last one built."""
+        if self._current_mission is None or not order_id:
+            return None
+        record = self._current_mission.status.sent_order
+        return record if record is not None and record.order_id == order_id else None
+
+    def _waypoint_offset(self, order_id: Optional[str]) -> int:
+        """Index in its route node of the first waypoint of order `order_id`."""
+        record = self._sent_order_record(order_id)
+        return 0 if record is None else record.waypoint_offset
+
+    def _order_route_is_current(self, order_id: Optional[str],
+                                node: mission_object.MissionNodeV1) -> bool:
+        """Whether order `order_id` of route node `node` was built from the node's current
+        route, not one a reroute has replaced since. Not known (an order not recorded, or
+        recorded before records existed) counts as current."""
+        record = self._sent_order_record(order_id)
+        if record is None or record.route_digest is None or node.route is None:
+            return True
+        return record.route_digest == _route_digest(node.route)
+
+    def _current_order_id(self) -> Optional[str]:
+        """The orderId of the current behavior-tree node, if it is a leaf."""
+        node = self._current_behavior_tree.current_node \
+            if self._current_behavior_tree is not None else None
+        if not isinstance(node, behavior_tree.MissionLeafNode):
+            return None
+        return order_ids.order_id(self._order_prefix(), node.idx)
+
+    def _note_replaced_route(self, node: mission_object.MissionNodeV1):
+        """A reroute is about to replace `node`'s route. If the robot's order of the node is
+        not recorded (one adopted from before records existed), record it as built from
+        the route being replaced, so its progress is not taken for the new one's."""
+        current = self._current_order_id()
+        if current is None or self._current_leaf_node() is not node or \
+                self._sent_order_record(current) is not None or node.route is None:
+            return
+        self._current_mission.status.sent_order = mission_object.MissionSentOrderV1(
+            order_id=current, route_digest=_route_digest(node.route))
+
+    def _resend_due(self) -> bool:
+        """Whether an order the robot has not adopted may be sent again: after
+        ORDER_RESEND_BASE_S, doubling with each resend up to ORDER_RESEND_MAX_S."""
+        interval = min(self.ORDER_RESEND_BASE_S * 2 ** self._order_resends,
+                       self.ORDER_RESEND_MAX_S)
+        return time.monotonic() - self._order_sent_at >= interval
 
     def _refuse_route_node(self, mission_node: mission_object.MissionNodeV1, reason: str):
         """Maps §14: a route node whose map the robot is not placed on is not sent; it fails
@@ -774,8 +1044,11 @@ class Robot:
                 for n in mission.mission_tree:
                     if n.name == new_node.name and new_node.route is not None and \
                             n.route != new_node.route:
+                        self._note_replaced_route(n)
                         n.route = new_node.route
                         changed.append(str(n.name))
+                        # Waypoint progress was counted on the old route.
+                        mission.status.task_status.pop(str(n.name), None)
                         if mission.status.node_status[str(n.name)].state is \
                                 mission_object.MissionStateV1.RUNNING:
                             # Cancel current node
@@ -905,13 +1178,16 @@ class Robot:
                     # (23k+ distinct cancel actions observed for one mission, each
                     # rejected by the robot as "cancel already in progress"). The
                     # outstanding one is resent by handle_instant_action() anyway.
-                    if self._has_outstanding_cancel():
+                    # One of an earlier run (a timeout's) does not cancel this mission.
+                    if self._has_outstanding_cancel(current_run_only=True):
                         self.debug("cancelOrder already outstanding; not sending another")
                         return
                     self.info("Cancelling current node...")
-                    action_id = f"{self._order_prefix()}-instantaction-n{self._header_id}"
+                    action_id = self._action_id(f"{self._order_prefix()}-instantaction")
                     self.mission_info(f"Send cancel order action {action_id}")
-                    await self._send_cancel_order(action_id)
+                    await self._send_cancel_order(
+                        action_id, CancelPurpose.MISSION if self._current_mission.needs_canceled
+                        else CancelPurpose.REPLACE)
                 return
 
             self.info(f"Update a PENDING mission [{message.name}]")
@@ -933,13 +1209,13 @@ class Robot:
             self.info("Created robot")
             self._robot_object = message
 
-            self._header_id = 0
+            self._header_ids = {}
             self._robot_online_task = \
                 asyncio.get_event_loop().create_task(self._check_robot_online())
 
             if (not self._robot_server.disable_request_factsheet
                     and self._robot_object.status.factsheet.agv_class == ""):
-                action_id = f"instantaction-n{self._header_id}"
+                action_id = self._action_id("instantaction")
                 factsheet_action_type = types.VDA5050InstantActionType.FACTSHEET_REQUEST
                 instant_action = types.VDA5050Action(
                     actionType=factsheet_action_type, actionId=action_id)
@@ -978,7 +1254,7 @@ class Robot:
             # Re-request factsheet if not yet received (robot may have restarted MQTT)
             if (not self._robot_server.disable_request_factsheet and
                     self._robot_object.status.factsheet.agv_class == ""):
-                action_id = f"instantaction-n{self._header_id}"
+                action_id = self._action_id("instantaction")
                 factsheet_action_type = types.VDA5050InstantActionType.FACTSHEET_REQUEST
                 instant_action = types.VDA5050Action(
                     actionType=factsheet_action_type, actionId=action_id)
@@ -992,7 +1268,7 @@ class Robot:
                     self._robot_object.status.state != robot_object.RobotStateV1.TELEOP) or \
                     (not message.switch_teleop and
                      self._robot_object.status.state == robot_object.RobotStateV1.TELEOP):
-                action_id = f"instantaction-n{self._header_id}"
+                action_id = self._action_id("instantaction")
                 action_type = types.NVInstantActionType.START_TELEOP \
                     if message.switch_teleop else types.NVInstantActionType.STOP_TELEOP
                 instant_action = types.VDA5050Action(
@@ -1038,6 +1314,7 @@ class Robot:
                     finished_instant_actions.append(
                         self._current_instant_actions.pop(action_state.actionId))
                     self._instant_action_resends.pop(action_state.actionId, None)
+                    self._cancel_resolved(finished_instant_actions[-1])
                     self.mission_info(
                         f"Finished instant action:\n {finished_instant_actions[-1]}")
                 elif action_state.actionStatus == types.VDA5050ActionStatus.FAILED:
@@ -1050,6 +1327,7 @@ class Robot:
                     # after, so it counts as a completed cancel for the mission.
                     failed = self._current_instant_actions.pop(action_state.actionId)
                     self._instant_action_resends.pop(action_state.actionId, None)
+                    self._cancel_resolved(failed)
                     if failed.actionType == types.VDA5050InstantActionType.CANCEL_ORDER:
                         self.mission_info(
                             f"cancelOrder {action_state.actionId} reported FAILED "
@@ -1085,8 +1363,10 @@ class Robot:
                     f"Resend {instant_action.actionType} instant action "
                     f"({attempts}/{self.MAX_INSTANT_ACTION_RESENDS}).")
         for action_id in give_up:
-            self._current_instant_actions.pop(action_id, None)
+            abandoned = self._current_instant_actions.pop(action_id, None)
             self._instant_action_resends.pop(action_id, None)
+            if abandoned is not None:
+                self._cancel_resolved(abandoned, abandoned=True)
         return finished_instant_actions
     async def _process_datum_message(self, msg: types.RobotDatum) -> None:
         """Persist the robot's datum.
@@ -1551,10 +1831,15 @@ class Robot:
                     self.info(
                         "Updated object detector information in mission database.")
 
+        self._robot_order_id = message.orderId
         finished_instant_actions = await self.handle_instant_action(message)
         self.update_robot_state(finished_instant_actions)
 
         self._track_stale_fatal(message)
+
+        # What the cancelOrders the robot just resolved were for decides what follows.
+        if await self._act_on_resolved_cancels(message):
+            return
 
         # Make sure there is a mission to update
         if self._current_mission is None or self._current_behavior_tree is None:
@@ -1568,6 +1853,18 @@ class Robot:
             await self.get_next_mission()
             return
 
+        if await self._end_for_operator_takeover(message):
+            return
+
+        if self._resume_pending and await self._resume_from_state(message):
+            return
+
+        # A send the current node is owed goes out once no cancelOrder of ours is in
+        # flight; this state still describes the robot before it.
+        if self._pending_send is not None and not self._has_outstanding_cancel():
+            await self._flush_pending_send()
+            return
+
         # During a wait the robot has no order of ours to report (a mission or pass that
         # starts with one still has the previous order's id on its state), so a
         # mismatch is expected and must neither be counted nor trigger a resend.
@@ -1575,17 +1872,13 @@ class Robot:
                 not order_ids.is_order_of(self._order_prefix(), message.orderId):
             return
 
-        # A cancelOrder the robot just finished ends our order even when this state already
-        # carries another order id (it may have adopted a newer order, or dropped ours): the
-        # cancel was ours and must not be lost to the mismatch handling below, which would
-        # resend the order that was cancelled.
-        if any(a.actionType == types.VDA5050InstantActionType.CANCEL_ORDER
-               for a in finished_instant_actions):
-            if await self._finish_cancel_without_order_match():
-                return
-
         # If the order doesn't match, ignore it
         if not order_ids.is_order_of(self._order_prefix(), message.orderId):
+            if self._has_outstanding_cancel():
+                # Our cancelOrder is in flight: an order now would race it (the robot
+                # rejects it while it still runs one, or the cancel takes it). The
+                # cancel's completion decides what comes next.
+                return
             self._order_mismatch_count += 1
             self.info(f"[{self._current_mission.name}] Got message from another mission order: "
                       f"{message.orderId} "
@@ -1609,27 +1902,19 @@ class Robot:
                 self._set_robot_idle_after_mission()
                 await self.get_next_mission()
                 return
-            await self._send_order()
+            # The robot takes a moment to adopt an order: send it again only with
+            # back-off, not on every state message.
+            if self._resend_due():
+                await self._send_order()
             return
         self._order_mismatch_count = 0
 
         prev_child_node = self._current_behavior_tree.current_node.name
         self.update_mission_state(message, finished_instant_actions)
 
-        # Resend node requested by the user
-        if self._updating_mission_from_api:
-            # The robot cancelled this node's order to take the new content, and still
-            # holds its orderId; resending under the same id would be a different
-            # order with an id the robot has already seen. If the revision can't be
-            # persisted, leave the flag set and retry on the next state message.
-            if not await self._bump_order_rev():
-                return
-            self.mission_info(f"Resend the updated mission node {prev_child_node}: "
-                              f"{self._current_behavior_tree.current_node.name}")
-            # The new order counts its sequence ids from 0 again.
-            self.last_node_seq_id = -1
-            await self._send_order()
-            self._updating_mission_from_api = False
+        # The robot dropped the node's order on its own (see update_mission_state).
+        if self._pending_send is not None and not self._has_outstanding_cancel():
+            await self._flush_pending_send()
 
         # If current node is updated, then send a new order
         if prev_child_node != self._current_behavior_tree.current_node.name:
@@ -1640,21 +1925,170 @@ class Robot:
         if self._current_mission.status.state.done:
             await self.post_mission_completion()
 
-    async def _finish_cancel_without_order_match(self) -> bool:
-        """A finished cancelOrder arrived on a state whose orderId is not our order's.
-        A cancel of the mission ends it; a cancel for a reroute lets the new route go out
-        (under a new order revision). Returns whether the message was fully handled."""
+    async def _act_on_resolved_cancels(self, message: types.VDA5050State) -> bool:
+        """Act on the cancelOrders the robot has just finished or rejected, or that were
+        abandoned unacknowledged, by what each was for. Only a cancel sent in the current
+        run counts: one sent for an earlier mission or pass (a timeout's) says nothing
+        about this one. Returns whether the mission ended (the message is handled)."""
+        resolved, self._resolved_cancels = self._resolved_cancels, []
         mission = self._current_mission
-        if mission.needs_canceled:
-            self._set_mission_state(mission_object.MissionStateV1.CANCELED)
-            await self.post_mission_completion()
-            return True
-        if not await self._bump_order_rev():
-            return False  # not persisted: the mismatch handling resends the same order
-        self.mission_info("Resend the rerouted mission node after the robot's cancel")
-        self.last_node_seq_id = -1
-        await self._send_order()
+        for purpose, run, abandoned in resolved:
+            if mission is None or mission.status.state.done or run != self._run_key():
+                continue
+            if mission.needs_canceled or purpose is CancelPurpose.MISSION:
+                if abandoned:
+                    mission.status.failure_reason = \
+                        "The robot never confirmed the cancelOrder"
+                self._end_current_mission(mission_object.MissionStateV1.CANCELED)
+                await self.post_mission_completion()
+                return True
+            if purpose is CancelPurpose.CLEAR:
+                continue  # a stray order is gone; the mission's owed send follows
+            if purpose is CancelPurpose.STOP:
+                mission.status.failure_reason = \
+                    "The robot's order was cancelled by an operator force cancel"
+                self._end_current_mission(mission_object.MissionStateV1.CANCELED)
+                await self.post_mission_completion()
+                return True
+            if abandoned and (message.nodeStates or message.edgeStates):
+                # The robot still executes an order and never confirmed the cancel, so
+                # the new content cannot follow: say so rather than wait for the timeout.
+                # (Holding no order, it dropped ours whether it says so or not.)
+                mission.status.failure_reason = \
+                    "The robot never confirmed the cancelOrder; the new order was not sent"
+                self._end_current_mission(mission_object.MissionStateV1.FAILED)
+                await self.post_mission_completion()
+                return True
+            # The robot dropped the node's order to make way for new content.
+            self._pending_send = NEW_REVISION
+        return False
+
+    async def _end_for_operator_takeover(self, message: types.VDA5050State) -> bool:
+        """The robot reports operatorTakeover for an order of the current run: an
+        operator has the robot, so the mission is not re-sent (the robot-side cancel that
+        comes with it is not one to answer with a new revision). It is cancelled, saying
+        why; dispatch then waits until the operator hands the robot back (see
+        READINESS_HOLD_REASONS). Returns whether the mission ended."""
+        takeover = next((e for e in message.errors if e.errorType == OPERATOR_TAKEOVER), None)
+        if takeover is None:
+            return False
+        order_id = next((ref.referenceValue for ref in takeover.errorReferences
+                         if ref.referenceKey in ("orderId", "order_id")), message.orderId)
+        if not self._is_order_of_run(order_id):
+            return False
+        mission = self._current_mission
+        mission.status.failure_reason = \
+            "An operator took over the robot (operatorTakeover); the mission is not re-sent"
+        self.warning(f"[{mission.name}] Operator takeover of {order_id}: cancelling the "
+                     "mission")
+        self._pending_send = None
+        self._resume_pending = False
+        self._end_current_mission(mission_object.MissionStateV1.CANCELED)
+        await self.post_mission_completion()
         return True
+
+    def _is_order_of_run(self, order_id: Optional[str]) -> bool:
+        """Whether `order_id` is an order of the current run, of any revision."""
+        if not order_id:
+            return False
+        prefix = order_ids.order_prefix(order_id)
+        status = self._current_mission.status
+        name = str(self._current_mission.name)
+        return prefix is not None and any(
+            prefix == order_ids.run_prefix(name, status.run_id, rev)
+            for rev in range(status.order_rev + 1))
+
+    def _end_current_mission(self, state: mission_object.MissionStateV1):
+        """End the current mission, and its running leaf node, in `state`."""
+        node = self._current_behavior_tree.current_node \
+            if self._current_behavior_tree is not None else None
+        if isinstance(node, behavior_tree.MissionLeafNode):
+            self.set_mission_node_state(
+                str(self._current_mission.mission_tree[node.idx].name), state)
+        self._set_mission_state(state)
+
+    async def _flush_pending_send(self):
+        """Make the send the current node is owed (no cancelOrder of ours is in flight). A
+        new revision starts after the waypoints the robot has reached on the node's route.
+        What cannot be made yet (not persisted) stays owed for the next state message."""
+        kind, self._pending_send = self._pending_send, None
+        if kind == NEW_REVISION:
+            if not await self._bump_order_rev():
+                if self._current_mission.status.state.done:  # failed for order churn
+                    await self.post_mission_completion()
+                else:
+                    self._pending_send = kind
+                return
+            # The new order counts its sequence ids from 0 again.
+            self.last_node_seq_id = -1
+        await self._send_order(waypoint_offset=self._reached_waypoints())
+
+    async def _resume_from_state(self, message: types.VDA5050State) -> bool:
+        """The robot's first state after a dispatcher restart decides how a resumed mission
+        goes on (this process does not know what the robot holds):
+        - the robot is executing, or has finished, the current order, built from the
+          node's current route: carry on;
+        - it is executing anything else: cancel that first -- the cancel's completion
+          sends the node as a new revision;
+        - otherwise (idle, or holding the order dropped or on a replaced route): send the
+          node now as a new revision, from the waypoints not reached yet.
+        A cancel already under way (the mission's) decides instead. Returns whether the
+        message was fully handled."""
+        self._resume_pending = False
+        mission = self._current_mission
+        if mission.needs_canceled or self._has_outstanding_cancel():
+            return False
+        current = self._current_order_id()
+        executing = bool(message.nodeStates or message.edgeStates)
+        if current is not None and message.orderId == current and \
+                self._order_route_is_current(current, self._current_leaf_node()) and \
+                (executing or self._order_finished_on_robot(message)):
+            self.mission_info(f"Resume: the robot is on {current}; carrying on")
+            return False
+        if executing:
+            self.mission_info(f"Resume: the robot is executing {message.orderId}; "
+                              "cancelling it before sending")
+            await self._send_cancel_order(
+                self._action_id(f"{self._order_prefix()}-resume-cancel"),
+                CancelPurpose.REPLACE)
+            return True
+        self._pending_send = NEW_REVISION
+        await self._flush_pending_send()
+        return True
+
+    def _current_leaf_node(self) -> Optional[mission_object.MissionNodeV1]:
+        node = self._current_behavior_tree.current_node \
+            if self._current_behavior_tree is not None else None
+        if not isinstance(node, behavior_tree.MissionLeafNode):
+            return None
+        return self._current_mission.mission_tree[node.idx]
+
+    def _order_finished_on_robot(self, message: types.VDA5050State) -> bool:
+        """Whether the robot, holding the current order, reports having reached its last
+        node (a route or move: the rest of the state handling completes the node). An
+        action order counts as finished; its action states say how it went."""
+        node = self._current_leaf_node()
+        if node is None or node.type not in (mission_object.MissionNodeType.ROUTE,
+                                             mission_object.MissionNodeType.MOVE):
+            return True
+        if not order_ids.is_node_of(self._order_prefix(), message.lastNodeId):
+            return False
+        seq = order_ids.node_sequence(message.lastNodeId)
+        if seq is None:
+            seq = message.lastNodeSequenceId
+        if node.type is mission_object.MissionNodeType.MOVE:
+            return seq == 2
+        return seq == (len(node.route.waypoints) - self._waypoint_offset(message.orderId)) * 2
+
+    def _reached_waypoints(self) -> int:
+        """How many waypoints of the current route node the robot has reached (they are
+        recorded against the current route only; see update_mission_node_state)."""
+        node = self._current_behavior_tree.current_node
+        if not isinstance(node, behavior_tree.MissionLeafNode):
+            return 0
+        name = str(self._current_mission.mission_tree[node.idx].name)
+        reached = self._current_mission.status.task_status.get(name)
+        return 0 if reached is None else reached + 1
 
     async def _on_client_factsheet(self, message: types.VDA5050Factsheet):
         if self._robot_object is not None:
@@ -1751,6 +2185,7 @@ class Robot:
         status.held_reason = None
         status.run_id = uuid.uuid4().hex[:8]
         status.order_rev = 0
+        status.sent_order = None
         try:
             await self._database.update_status(
                 api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id())
@@ -1760,6 +2195,8 @@ class Robot:
             return False
         mission.status = status
         self._order_mismatch_count = 0
+        self._order_revisions.clear()
+        self._pending_send = None
         self.last_node_seq_id = -1
         self.mission_info(f"Starting pass {status.passes_completed + 1}"
                           f"{'' if mission.repeat == 0 else f' of {mission.repeat}'}"
@@ -1901,11 +2338,11 @@ class Robot:
             # mission is current, so a second one here would only be a duplicate.
             if not self._has_outstanding_cancel():
                 timeout_cancel_id = \
-                    f"{self._order_prefix()}-timeout-cancel-n{self._header_id}"
+                    self._action_id(f"{self._order_prefix()}-timeout-cancel")
                 self.mission_info(
                     f"Sending cancelOrder {timeout_cancel_id} so the robot "
                     "abandons the timed-out order")
-                await self._send_cancel_order(timeout_cancel_id)
+                await self._send_cancel_order(timeout_cancel_id, CancelPurpose.STOP)
             self._set_robot_idle_after_mission()
             await self.get_next_mission()
 
@@ -1981,7 +2418,10 @@ class Robot:
             # - We also pad by an additional node in the beginning that is not in our
             #   waypoints, so we subtract 1
             # - This means that (lastNodeSequenceId = 2) -> (idx = 0)
-            idx = last_node_seq_id // 2 - 1
+            # - An order that left out the waypoints already reached (a resume) starts
+            #   at waypoint `offset` of the route
+            offset = self._waypoint_offset(message.orderId)
+            idx = offset + last_node_seq_id // 2 - 1
 
             # For route nodes, task index corresponds to the last waypoint reached.
             # Because we pad by an additional node in the beginning, we want to ignore
@@ -1997,13 +2437,20 @@ class Robot:
             # needs to be correct on every reach, not just steady-state increments.
             # Every waypoint counts, whatever its allowed deviation: a planner go-to has
             # waypoints with a 0.2 m tolerance and still needs its progress reported.
-            if self.last_node_seq_id < last_node_seq_id and \
-                    idx >= 0 and \
+            # Only progress on the current route counts: an order the robot still drives
+            # while a reroute replaces it indexes the old one, and finishing it is not
+            # finishing the new one (the reroute's cancel then lets the new one go out).
+            route_current = self._order_route_is_current(message.orderId,
+                                                         current_mission_node)
+            if route_current and \
+                    self.last_node_seq_id < last_node_seq_id and \
+                    idx >= offset and \
                     idx < len(current_mission_node.route.waypoints):
                 task_status[str(current_mission_node.name)] = idx
                 asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
 
-            if current_order_node_id == current_mission_node.route.size * 2 + 2:
+            if route_current and \
+                    current_order_node_id == (current_mission_node.route.size - offset) * 2 + 2:
                 node_state = mission_object.MissionStateV1.COMPLETED
 
         elif current_mission_node.type == mission_object.MissionNodeType.MOVE and \
@@ -2022,11 +2469,8 @@ class Robot:
                     self._robot_object.status.state != robot_object.RobotStateV1.TELEOP:
                 self._set_robot_state(robot_object.RobotStateV1.TELEOP)
                 self.mission_info("Switch to teleop")
-        # Check if there is an instant order cancellation feedback
-        for finished_instant_action in finished_instant_actions:
-            if finished_instant_action.actionType == types.VDA5050InstantActionType.CANCEL_ORDER:
-                node_state = mission_object.MissionStateV1.CANCELED
-                break
+        # A finished cancelOrder of ours is acted on by what it was for, before this
+        # (_act_on_resolved_cancels).
 
         # Save last node sequence id. Stores the current order's value (0 while the
         # robot is still reporting a previous order's node) so the waypoint-advance
@@ -2036,13 +2480,6 @@ class Robot:
         if self.get_mission_errors(message):
             self.warning("Fatal Errors present, failing mission")
             node_state = mission_object.MissionStateV1.FAILED
-        # A node whose order the robot cancelled for a reroute (the mission itself is not
-        # cancelled) is still to run, with its new route: it must not be recorded as
-        # CANCELED, which would read as FAILED if the dispatcher restarts before the resend.
-        # The caller sees the CANCELED and resends.
-        if node_state == mission_object.MissionStateV1.CANCELED and \
-                not self._current_mission.needs_canceled:
-            return node_state
         # Set mission node state based on update from robot client message
         self.set_mission_node_state(str(current_mission_node.name), node_state)
         return node_state
@@ -2092,7 +2529,8 @@ class Robot:
                         self._current_mission.mission_tree[node_idx].name)
                 seq = order_ids.node_sequence(ref.referenceValue)
                 if seq is not None:
-                    blocked_waypoint_index = seq // 2 - 1
+                    blocked_waypoint_index = seq // 2 - 1 + self._waypoint_offset(
+                        order_ids.order_of_node(ref.referenceValue))
 
         # Idempotency: the idle robot re-emits this WARNING in every state message,
         # so only act (log + persist) when the block is new or its target changed.
@@ -2287,8 +2725,11 @@ class Robot:
         if mission_status == "canceled":
             if self._current_mission.needs_canceled:
                 self._set_mission_state(mission_object.MissionStateV1.CANCELED)
-            else:
-                self._updating_mission_from_api = True
+            elif not self._has_outstanding_cancel() and self._pending_send is None and \
+                    message.orderId == self._current_order_id():
+                # The robot dropped the current order without a cancel of ours (one in
+                # flight decides by its own completion): send the node as a new revision.
+                self._pending_send = NEW_REVISION
             return
 
         # A robot that has hit an impassable edge reports an edgeBlocked WARNING and
@@ -2308,15 +2749,7 @@ class Robot:
 
         # For "reached" (intermediate waypoint) and the no-info case, fall through
         # to the existing behavior-tree path so node-level tracking stays intact.
-        node_state = self.update_mission_node_state(
-            message, finished_instant_actions)
-        if node_state == mission_object.MissionStateV1.CANCELED:
-            if self._current_mission.needs_canceled:
-                self._set_mission_state(mission_object.MissionStateV1.CANCELED)
-            else:
-                self._updating_mission_from_api = True
-            return
-
+        self.update_mission_node_state(message, finished_instant_actions)
         self.update_mission_from_behavior_tree()
 
     def _leaf_node_count(self) -> int:
@@ -2345,6 +2778,10 @@ class Robot:
                 node.type in (mission_object.MissionNodeType.ROUTE,
                               mission_object.MissionNodeType.MOVE) and \
                 not order_ids.is_node_of(self._order_prefix(), message.lastNodeId):
+            return False
+        # A route the robot finished after a reroute replaced it is not the node's route.
+        if node.type is mission_object.MissionNodeType.ROUTE and \
+                not self._order_route_is_current(message.orderId, node):
             return False
         self.set_mission_node_state(str(node.name), mission_object.MissionStateV1.COMPLETED)
         return True

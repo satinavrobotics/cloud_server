@@ -943,6 +943,15 @@ class FleetRecorder:
                          f"{status.blocked_edge}")
 
     @_guarded
+    def order_churn(self, robot_name: str, mission: Any, order_id: Optional[str],
+                    revisions: int, window_s: float,
+                    ts: Optional[datetime.datetime] = None) -> None:
+        self._event(EventCode.MISSION_ORDER_CHURN, robot_name, ts or self._clock(), {
+            "mission_name": mission.name, "order_id": order_id, "revisions": revisions,
+            "window_s": window_s, "detail": mission.status.failure_reason,
+        }, discriminator=f"{mission.name}|{mission.status.run_id}|{mission.status.order_rev}")
+
+    @_guarded
     def rerouted(self, robot_name: str, mission: Any, blocked_node: Optional[str],
                  blocked_edge: Optional[str], ts: Optional[datetime.datetime] = None) -> None:
         self._event(EventCode.MISSION_REROUTED, robot_name, ts or self._clock(), {

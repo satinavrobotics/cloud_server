@@ -62,6 +62,7 @@ class EventCode(str, enum.Enum):
     MAP_RECONSTRUCTION_STARTED = "MAP.RECONSTRUCTION_STARTED"
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
+    MISSION_ORDER_CHURN = "MISSION.ORDER_CHURN"
 
 
 class Severity(str, enum.Enum):
@@ -175,6 +176,8 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MAP_RECONSTRUCTION_FINISHED: CodeMeta(_S.INFO, True, schemas.ReconstructionFinished,
                                              _R),
     _C.MAP_RECONSTRUCTION_FAILED: CodeMeta(_S.WARNING, True, schemas.ReconstructionFailed, _R),
+    # The dispatcher stopped a mission whose order kept being re-issued (Robot._bump_order_rev).
+    _C.MISSION_ORDER_CHURN: CodeMeta(_S.ERROR, True, schemas.OrderChurn, _D),
 }
 
 

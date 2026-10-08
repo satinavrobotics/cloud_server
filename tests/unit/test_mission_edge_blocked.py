@@ -221,12 +221,16 @@ async def test_finished_cancel_ends_blocked_mission():
     """Regression 2026-09-25: the edgeBlocked early return swallowed a finished
     cancelOrder, so a blocked mission could never be cancelled."""
     r, mission, state = _blocked_cancel_setup()
-    cancel = types.VDA5050Action(
-        actionType=types.VDA5050InstantActionType.CANCEL_ORDER, actionId="a1")
+    r.post_mission_completion = AsyncMock()
+    await r._send_cancel_order("a1")                     # the mission's cancel
+    r._cancel_resolved(r._current_instant_actions.pop("a1"))
 
-    r.update_mission_state(state, [cancel])
+    # Resolved cancels are acted on before any state handling (the edgeBlocked
+    # early return included), by what they were for.
+    assert await r._act_on_resolved_cancels(state)
 
     assert mission.status.state == mission_object.MissionStateV1.CANCELED
+    r.post_mission_completion.assert_awaited_once()
 
 
 @pytest.mark.unit

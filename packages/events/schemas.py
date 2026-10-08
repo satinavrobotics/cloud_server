@@ -87,6 +87,14 @@ class EdgeBlocked(Payload):
     detail: Optional[str] = None
 
 
+class OrderChurn(Payload):
+    mission_name: str
+    order_id: Optional[str] = None
+    revisions: int
+    window_s: float
+    detail: Optional[str] = None
+
+
 class CancelRequested(Payload):
     mission_name: str
     actor: str

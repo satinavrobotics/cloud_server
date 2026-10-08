@@ -184,6 +184,8 @@ async def test_resume_after_restart_sends_the_rerouted_waypoints():
     assert stored.status.applied_route_rev == 0
 
     await r._on_mission_change(stored)
+    assert _orders(r) == []                           # the robot's state decides
+    await r._on_client_message(_state("m1-rabcd1234-n1"))   # idle on the old route
 
     (order,) = _orders(r)
     assert _xs(order) == [9.0, 10.0]
@@ -279,13 +281,10 @@ async def test_a_node_cancelled_for_a_reroute_is_not_recorded_canceled():
     r, _ = _make_robot()
     m = await _start(r, _mission())
     await r._on_mission_change(_rerouted())
-    state = _state(_order_id(r), actions=[_cancel_done(r)])
-    finished = await r.handle_instant_action(state)
+    await r._on_client_message(_state(_order_id(r), actions=[_cancel_done(r)]))
 
-    node_state = r.update_mission_node_state(state, finished)
-
-    assert node_state == State.CANCELED               # the caller resends ...
-    assert m.status.node_status["a"].state == State.RUNNING     # ... and it is not recorded
+    assert m.status.node_status["a"].state == State.RUNNING     # not recorded CANCELED ...
+    assert len(_orders(r)) == 2                                  # ... but resent
     r._cancel_mission_timeout()
 
 
@@ -311,6 +310,7 @@ async def test_resume_with_a_node_left_canceled_by_a_reroute_is_not_failed():
     stored.status.node_status["a"].state = State.CANCELED     # what older versions persisted
 
     await r._on_mission_change(stored)
+    await r._on_client_message(_state("elsewhere-n0"))
 
     assert stored.status.state == State.RUNNING
     assert stored.status.failure_reason is None
@@ -356,6 +356,7 @@ async def test_a_resumed_mission_is_dispatched_before_a_pending_one():
     await r._try_start_mission()
 
     assert r._current_mission.name == "running"
+    await r._on_client_message(_state("elsewhere-n0"))
     assert _orders(r)[0]["orderId"].startswith("running-")
     r._cancel_mission_timeout()
 

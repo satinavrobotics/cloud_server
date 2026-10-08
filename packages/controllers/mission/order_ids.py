@@ -41,6 +41,18 @@ def run_prefix(name: str, run_id: Optional[str], order_rev: int = 0) -> str:
     return f"{prefix}v{order_rev}" if order_rev > 0 else prefix
 
 
+def order_id(prefix: str, node_idx: int) -> str:
+    """The order id of mission_tree node ``node_idx`` under ``prefix``."""
+    return f"{prefix}-n{node_idx}"
+
+
+def order_of_node(node_id: str) -> Optional[str]:
+    """The id of the order a node id we generated belongs to ("{prefix}-n{idx}"), else
+    None."""
+    match = _NODE_SUFFIX.search(node_id)
+    return node_id[:match.start()] + f"-n{match.group(1)}" if match else None
+
+
 def order_prefix(order_id: str) -> Optional[str]:
     """The prefix of an order id we generated ("{prefix}-n{idx}"), else None."""
     match = _ORDER_SUFFIX.search(order_id)

@@ -368,6 +368,19 @@ class MissionNodeStatusV1(pydantic.BaseModel):
     error_msg: Optional[str] = None
 
 
+class MissionSentOrderV1(pydantic.BaseModel):
+    """What an order the dispatcher sent was built from, so the robot's reports on it can
+    be read correctly, also by a dispatcher restarted since."""
+    order_id: str = pydantic.Field(..., description="The VDA5050 orderId.")
+    route_digest: Optional[str] = pydantic.Field(
+        None, description="Digest of the route node's route the order was built from; null \
+                           for other nodes. Progress on an order whose route a reroute has \
+                           replaced since does not count.")
+    waypoint_offset: int = pydantic.Field(
+        0, description="Index in the route of the order's first waypoint: an order sent \
+                        after progress was made leaves the waypoints already reached out.")
+
+
 class MissionStatusV1(pydantic.BaseModel):
     """Specifies the progress made on the mission so far."""
     state: MissionStateV1 = pydantic.Field(
@@ -432,6 +445,9 @@ class MissionStatusV1(pydantic.BaseModel):
                         update or edge-blocked reroute), so the resend carries a new \
                         orderId instead of reusing the cancelled order's. Never set it \
                         from the API.")
+    sent_order: Optional[MissionSentOrderV1] = pydantic.Field(
+        None, description="Dispatcher-owned: what the last order built for this run was made \
+                           from, stored before it is sent. Never set it from the API.")
 
     class Config:
         use_enum_value = True

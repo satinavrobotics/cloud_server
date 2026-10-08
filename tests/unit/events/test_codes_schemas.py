@@ -20,6 +20,8 @@ VALID_PAYLOADS = {
     EventCode.MISSION_REROUTED: {"mission_name": "m1", "blocked_edges": ["e1", "e2"]},
     EventCode.MISSION_EDGE_BLOCKED: {"mission_name": "m1", "edge_id": "e1"},
     EventCode.MISSION_CANCEL_REQUESTED: {"mission_name": "m1", "actor": "alice"},
+    EventCode.MISSION_ORDER_CHURN: {"mission_name": "m1", "order_id": "m1-r1v6-n1",
+                                    "revisions": 6, "window_s": 60.0},
     EventCode.ROBOT_STATE_CHANGED: {"old": "IDLE", "new": "ON_TASK"},
     EventCode.ROBOT_ONLINE: {"connection_state": "ONLINE"},
     EventCode.ROBOT_OFFLINE: {"connection_state": "CONNECTIONBROKEN"},

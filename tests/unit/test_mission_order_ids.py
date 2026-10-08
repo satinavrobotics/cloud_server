@@ -28,7 +28,7 @@ import pytest
 import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
 import packages.controllers.mission.vda5050_types as types
-from packages.controllers.mission import order_ids
+from packages.controllers.mission import order_ids, server
 from packages.controllers.mission.server import Robot
 from packages.database.postgres import PostgresDatabase
 
@@ -99,6 +99,13 @@ async def _dispatch(r, mission):
 
 def _published_order_ids(events):
     return [e[1] for e in events if e[0] == "publish"]
+
+
+def _executing(order_id):
+    """A state of a robot still executing `order_id`."""
+    state = _build_state(order_id=order_id)
+    state.nodeStates = [types.VDA5050NodeState(nodeId=f"{order_id}-s2", sequenceId=2)]
+    return state
 
 
 def _build_state(order_id="", last_node_id="", last_node_seq=0):
@@ -250,30 +257,67 @@ async def test_a_state_from_the_previous_run_fails_the_order_match():
 
 @pytest.mark.unit
 async def test_run_id_survives_a_dispatcher_restart():
-    """Resume of a RUNNING mission: same run id, same order id, nothing re-assigned."""
+    """Resume of a RUNNING mission: same run id, nothing re-assigned; the robot still on
+    the order is left on it -- nothing is sent."""
     r, _, events = _make_robot()
     mission = _make_mission(name="patrol", state=mission_object.MissionStateV1.RUNNING,
                             run_id="ab12cd34", started=True)
 
     await _dispatch(r, mission)
+    await r._on_client_message(_executing("patrol-rab12cd34-n0"))
 
     assert mission.status.run_id == "ab12cd34"
-    assert _published_order_ids(events) == ["patrol-rab12cd34-n0"]
-    # nothing was written ahead of the resend: the run id was already persisted
-    first_publish = events.index(("publish", "patrol-rab12cd34-n0"))
-    assert not [e for e in events[:first_publish] if e[0] == "persist"]
+    assert _published_order_ids(events) == []
+    assert not [e for e in events if e[0] == "persist"]
+
+
+@pytest.mark.unit
+async def test_a_resume_never_resends_an_order_id_an_earlier_process_sent():
+    """The robot is not on the order: it is sent again, but as a new revision -- what an
+    earlier process sent under the old id is not known, so the id is not reused."""
+    r, _, events = _make_robot()
+    mission = _make_mission(name="patrol", state=mission_object.MissionStateV1.RUNNING,
+                            run_id="ab12cd34", started=True)
+
+    await _dispatch(r, mission)
+    await r._on_client_message(_build_state(order_id="other-n0"))
+
+    assert mission.status.run_id == "ab12cd34"
+    assert _published_order_ids(events) == ["patrol-rab12cd34v1-n0"]
+    assert events.index(("persist", "ab12cd34", 1)) < \
+        events.index(("publish", "patrol-rab12cd34v1-n0"))
 
 
 @pytest.mark.unit
 async def test_mission_already_running_before_run_ids_existed_keeps_legacy_ids():
+    """... while the robot carries on with it; nothing is sent."""
     r, _, events = _make_robot()
     mission = _make_mission(name="patrol", state=mission_object.MissionStateV1.RUNNING,
                             started=True)
 
     await _dispatch(r, mission)
+    await r._on_client_message(_executing("patrol-n0"))
 
     assert mission.status.run_id is None
-    assert _published_order_ids(events) == ["patrol-n0"]
+    assert _published_order_ids(events) == []
+
+
+@pytest.mark.unit
+async def test_a_legacy_mission_that_must_be_resent_gets_a_run_id():
+    """Its order must go out again: under an id the robot has not seen, so it gets the run
+    id it never had (persisted first)."""
+    r, _, events = _make_robot()
+    mission = _make_mission(name="patrol", state=mission_object.MissionStateV1.RUNNING,
+                            started=True)
+
+    await _dispatch(r, mission)
+    await r._on_client_message(_build_state(order_id="other-n0"))
+
+    run_id = mission.status.run_id
+    assert run_id is not None
+    assert _published_order_ids(events) == [f"patrol-r{run_id}-n0"]
+    assert events.index(("persist", run_id, 0)) < \
+        events.index(("publish", f"patrol-r{run_id}-n0"))
 
 
 @pytest.mark.unit
@@ -364,11 +408,13 @@ async def test_legacy_mission_keeps_its_ids_across_a_resend():
     mission = _make_mission(name="patrol", state=mission_object.MissionStateV1.RUNNING,
                             started=True)
     await _dispatch(r, mission)
+    await r._on_client_message(_executing("patrol-n0"))      # carried on: legacy ids
 
-    assert await r._bump_order_rev()
+    assert await r._bump_order_rev()                          # a new revision is needed
     await r._send_order()
 
-    assert _published_order_ids(events) == ["patrol-n0", "patrol-n0"]
+    run_id = mission.status.run_id
+    assert _published_order_ids(events) == [f"patrol-r{run_id}-n0"]
     assert mission.status.order_rev == 0
 
 
@@ -380,7 +426,7 @@ async def _dispatched_then_node_cancelled_for_route_update():
     mission = _make_mission(name="patrol", state=mission_object.MissionStateV1.RUNNING)
     await _dispatch(r, mission)
     r.update_mission_state = MagicMock()
-    r._updating_mission_from_api = True
+    r._pending_send = server.NEW_REVISION
     return r, db, events, mission
 
 
@@ -392,7 +438,7 @@ async def test_state_handler_resends_a_cancelled_node_under_a_new_order_id():
     await r._on_client_message(_build_state(order_id=f"patrol-r{run_id}-n0"))
 
     assert _published_order_ids(events)[-1] == f"patrol-r{run_id}v1-n0"
-    assert r._updating_mission_from_api is False
+    assert r._pending_send is None
     assert events.index(("persist", run_id, 1)) < \
         events.index(("publish", f"patrol-r{run_id}v1-n0"))
 
@@ -409,14 +455,14 @@ async def test_state_handler_retries_the_resend_if_the_revision_cannot_be_persis
     await r._on_client_message(state)
 
     assert _published_order_ids(events) == sent_before      # nothing resent
-    assert r._updating_mission_from_api is True             # ... but still owed
+    assert r._pending_send == server.NEW_REVISION         # ... but still owed
     assert mission.status.order_rev == 0
 
     db.update_status = recorder                             # the database recovers
     await r._on_client_message(state)
 
     assert _published_order_ids(events)[-1] == f"patrol-r{run_id}v1-n0"
-    assert r._updating_mission_from_api is False
+    assert r._pending_send is None
 
 
 # ---------------------------------------------------------------------------
