@@ -72,6 +72,9 @@ def allows(level: RecordingLevel, table: str, code: Optional[str] = None) -> boo
     """§4.1 gate: may a row for `table` (and event `code`) be stored at `level`?"""
     if table == tables.LATEST_TABLE:
         return True
+    if table == tables.LEGS_TABLE:
+        # Legs behave like events: written at events_only and full, never at off.
+        return level in (RecordingLevel.FULL, RecordingLevel.EVENTS_ONLY)
     if table == tables.EVENTS_TABLE:
         if code is not None and str(getattr(code, "value", code)) in ALWAYS_RECORDED_CODES:
             return True

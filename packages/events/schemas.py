@@ -85,6 +85,7 @@ class EdgeBlocked(Payload):
     mission_name: Optional[str] = None
     edge_id: Optional[str] = None
     detail: Optional[str] = None
+    leg_seq: Optional[int] = None   # run_legs.seq of the leg in progress
 
 
 class OrderChurn(Payload):
@@ -149,16 +150,19 @@ class Rtk(Payload):
 
 class RecoveryEntered(Payload):
     cause: Optional[str] = None
+    leg_seq: Optional[int] = None   # run_legs.seq of the leg in progress
 
 
 class RecoveryExited(Payload):
     cause: Optional[str] = None
     duration_s: Optional[float] = None
+    leg_seq: Optional[int] = None   # run_legs.seq of the leg in progress
 
 
 class GoalBlocked(Payload):
     cause: str
     detail: Optional[str] = None
+    leg_seq: Optional[int] = None   # run_legs.seq of the leg in progress
 
 
 class Thermal(Payload):

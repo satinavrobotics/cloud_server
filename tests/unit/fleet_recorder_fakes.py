@@ -42,6 +42,7 @@ class FakeDB:
         self.runs = {}          # run_id -> row dict
         self.events = {}        # (event_id, ts) -> row dict
         self.trajectory = []    # dicts: mission_id, robot_name, ts, run_id
+        self.legs = {}          # (run_id, seq) -> row dict (run_legs)
         self.missions = {}      # name -> (lifecycle, robot, status dict)
         self.latest = []        # tuples in rehydrate SELECT_SQL column order
         self.health = {}        # recorder_health: process -> row dict
@@ -51,10 +52,14 @@ class FakeDB:
 
     # --- state helpers -------------------------------------------------------------------
     def snapshot(self):
-        return copy.deepcopy((self.runs, self.events, self.trajectory))
+        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs))
 
     def restore(self, snap):
-        self.runs, self.events, self.trajectory = snap
+        self.runs, self.events, self.trajectory, self.legs = snap
+
+    def legs_of(self, run_id=None):
+        return [r for _, r in sorted(self.legs.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
+                if run_id is None or r["run_id"] == run_id]
 
     def events_by_code(self, code=None):
         rows = sorted(self.events.values(), key=lambda r: (r["ts"], r["code"]))
@@ -125,6 +130,40 @@ class FakeDB:
                         end + datetime.timedelta(seconds=grace):
                     row["run_id"] = run_id
                     cursor.rowcount += 1
+        elif sql == fr.SET_PLANNED_PATH_SQL:
+            path, run_id = params
+            if run_id in self.runs:
+                self.runs[run_id]["planned_path"] = json.loads(path)
+                cursor.rowcount = 1
+        elif sql == fr.INSERT_LEG_SQL:
+            row = dict(zip(fr.LEG_COLUMNS, params))
+            assert row["started_at"].tzinfo is not None
+            if row["run_id"] not in self.runs:
+                raise RefusedError("run_legs_run_id_fkey")
+            row.update(recoveries=0, recovery_s=0.0, blocks=0)
+            if (row["run_id"], row["seq"]) not in self.legs:
+                self.legs[(row["run_id"], row["seq"])] = row
+                cursor.rowcount = 1
+        elif sql == fr.LEG_BASE_SQL:
+            cursor.results = [(max([s for (r, s) in self.legs if r == params[0]] or [0]),)]
+        elif sql == fr.LEG_EVENTS_SQL:
+            run_id = params[0]
+            for (r, seq), leg in self.legs.items():
+                if r != run_id:
+                    continue
+                mine = [e for e in self.events.values() if e["run_id"] == run_id
+                        and e["payload"].get("leg_seq") == seq]
+                leg["recoveries"] = sum(e["code"] == "NAV.RECOVERY_ENTERED" for e in mine)
+                leg["recovery_s"] = sum(e["payload"].get("duration_s") or 0.0 for e in mine
+                                        if e["code"] == "NAV.RECOVERY_EXITED")
+                leg["blocks"] = sum(e["code"] in ("NAV.GOAL_BLOCKED", "MISSION.EDGE_BLOCKED")
+                                    for e in mine)
+        elif sql == fr.RUN_LEGS_SQL:
+            cursor.results = [tuple(leg[f] for f in fr.RUN_LEG_FIELDS)
+                              for leg in self.legs_of(params[0])]
+        elif sql == fr.SET_SUMMARY_SQL:
+            summary, run_id = params
+            self.runs[run_id]["summary_metrics"] = json.loads(summary)
         elif sql == EVENT_INSERT_SQL:
             row = dict(zip(EVENT_COLUMNS, params))
             assert row["ts"].tzinfo is not None

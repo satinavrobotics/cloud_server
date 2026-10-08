@@ -13,6 +13,9 @@ EVENTS_TABLE = _EVENTS_TABLE  # "fleet_events"
 ROBOT_STATE_TABLE = "robot_state_ts"
 DIAGNOSTICS_TABLE = "diagnostics_ts"
 LATEST_TABLE = "robot_latest"
+# Mission/run analysis: one row per leg (a move between two topomap nodes), written by dispatch.
+# Not a hypertable and not swept: kept like events.
+LEGS_TABLE = "run_legs"
 
 # §3.4, dispatch-written.
 ROBOT_STATE_COLUMNS: Tuple[str, ...] = (

@@ -47,7 +47,7 @@ import re
 import uuid
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
-from packages.controllers.mission import battery
+from packages.controllers.mission import battery, leg_tracker
 from packages.events import causes, detectors
 from packages.events.codes import EventCode
 from packages.events.emit import Event, emit
@@ -58,6 +58,7 @@ from packages.telemetry_ingest import (
 from packages.telemetry_ingest import health, tables
 from packages.telemetry_ingest.policy import ASSIGNMENTS_CHANNEL, parse_assignment_payload
 from packages.telemetry_ingest.rehydrate import LatestRow
+from packages.utils import run_legs
 
 logger = logging.getLogger("Isaac Mission Dispatch.fleet_recorder")
 
@@ -129,6 +130,43 @@ ORPHAN_CANDIDATES_SQL = (
     "SELECT run_id, mission_name, robot_name, started_at, recording_level FROM mission_runs "
     "WHERE state = 'RUNNING' AND started_at < %s ORDER BY started_at"
 )
+SET_PLANNED_PATH_SQL = "UPDATE mission_runs SET planned_path = %s::jsonb WHERE run_id = %s"
+# Legs (run_legs, migration 20261004_01_run_legs).
+LEG_COLUMNS = (
+    "run_id", "seq", "mission_name", "robot_name", "pass_index", "order_rev", "from_vda_node",
+    "to_vda_node", "from_topomap_node", "to_topomap_node", "map_id", "started_at", "ended_at",
+    "received_started_at", "received_ended_at", "duration_s", "stopped_s", "straight_m",
+    "planned_m", "expected_s",
+)
+INSERT_LEG_SQL = (
+    f"INSERT INTO run_legs ({', '.join(LEG_COLUMNS)}) "
+    f"VALUES ({', '.join(['%s'] * len(LEG_COLUMNS))}) "
+    "ON CONFLICT (run_id, seq) DO NOTHING"
+)
+LEG_BASE_SQL = "SELECT COALESCE(max(seq), 0) FROM run_legs WHERE run_id = %s"
+# Fill recoveries / recovery time / blocks of a run's legs from the events that carry the leg.
+LEG_EVENTS_SQL = (
+    "UPDATE run_legs l SET recoveries = e.recoveries, recovery_s = e.recovery_s, "
+    "blocks = e.blocks FROM ("
+    "SELECT (payload->>'leg_seq')::int AS leg_seq, "
+    "count(*) FILTER (WHERE code = 'NAV.RECOVERY_ENTERED') AS recoveries, "
+    "COALESCE(sum((payload->>'duration_s')::float8) "
+    "FILTER (WHERE code = 'NAV.RECOVERY_EXITED'), 0) AS recovery_s, "
+    "count(*) FILTER (WHERE code IN ('NAV.GOAL_BLOCKED', 'MISSION.EDGE_BLOCKED')) AS blocks "
+    "FROM fleet_events WHERE run_id = %s AND payload->>'leg_seq' IS NOT NULL "
+    "AND code IN ('NAV.RECOVERY_ENTERED', 'NAV.RECOVERY_EXITED', 'NAV.GOAL_BLOCKED', "
+    "'MISSION.EDGE_BLOCKED') GROUP BY 1) e "
+    "WHERE l.run_id = %s AND l.seq = e.leg_seq"
+)
+RUN_LEGS_SQL = (
+    "SELECT seq, pass_index, started_at, ended_at, duration_s, stopped_s, straight_m, "
+    "planned_m, expected_s, recoveries, recovery_s, blocks FROM run_legs "
+    "WHERE run_id = %s ORDER BY seq"
+)
+RUN_LEG_FIELDS = ("seq", "pass_index", "started_at", "ended_at", "duration_s", "stopped_s",
+                  "straight_m", "planned_m", "expected_s", "recoveries", "recovery_s", "blocks")
+SET_SUMMARY_SQL = "UPDATE mission_runs SET summary_metrics = %s::jsonb WHERE run_id = %s"
+
 MISSION_SQL = f"SELECT lifecycle, spec->>'robot', status FROM {MISSION_TABLE} WHERE name = %s"
 TRAJECTORY_SQL = (
     "UPDATE mission_trajectory SET run_id = %s "
@@ -317,6 +355,11 @@ class RunInfo:
     sw_version: Optional[str]
     mission_tree: List[Any]
     resolved: bool = True
+    planned_path: Optional[List[str]] = None
+    tracker: leg_tracker.LegTracker = dataclasses.field(default_factory=leg_tracker.LegTracker)
+    # Legs already stored for an adopted run (a dispatcher restart): this process numbers its
+    # own legs after them.
+    leg_base: int = 0
 
 
 class _Context:
@@ -378,6 +421,7 @@ class _StartRun(_Op):
                     if row is not None:
                         info.run_id = uuid.UUID(str(row[0]))
                         info.started_at = to_utc(row[1])
+                        info.leg_base = await recorder._stored_leg_count(conn, info.run_id)
                         info.resolved = True
                         logger.info("Resumed run %s of mission %s", info.run_id, info.mission_name)
                         recorder._latest_changed(info.robot_name)
@@ -385,8 +429,36 @@ class _StartRun(_Op):
                 inserted = await recorder._insert_run(conn, info, None)
                 if inserted and self.with_events:
                     await recorder._emit_run_started(conn, info)
+                if inserted and info.planned_path:
+                    await recorder._store_planned_path(conn, info)
         info.resolved = True
         recorder._latest_changed(info.robot_name)
+
+
+class _WriteLeg(_Op):
+    """One completed leg. Runs in submission order after the run's start, so its run row
+    exists; the run id and the leg number are read when it runs (an adopted run is resolved
+    by then)."""
+
+    def __init__(self, run: RunInfo, leg: leg_tracker.Leg):
+        self.info = run
+        self.leg = leg
+
+    def describe(self) -> str:
+        return f"leg {self.leg.seq} of run {self.info.run_id} ({self.info.mission_name})"
+
+    async def run(self, recorder: "FleetRecorder") -> None:
+        info, leg = self.info, self.leg
+        async with recorder._pool.connection(timeout=OP_CONNECT_TIMEOUT_S) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(INSERT_LEG_SQL, (
+                        info.run_id, info.leg_base + leg.seq, info.mission_name,
+                        info.robot_name, leg.pass_index, leg.order_rev, leg.from_vda_node,
+                        leg.to_vda_node, leg.from_topomap_node, leg.to_topomap_node,
+                        leg.map_id or info.map_id, leg.started_at, leg.ended_at,
+                        leg.received_started_at, leg.received_ended_at, leg.duration_s,
+                        leg.stopped_s, leg.straight_m, leg.planned_m, leg.expected_s))
 
 
 class _FinishRun(_Op):
@@ -688,6 +760,31 @@ class FleetRecorder:
             self._put_latest(track)
 
     @_guarded
+    def on_leg_state(self, robot_name: str, message: Any, mission: Any, robot_object: Any = None,
+                     received_at: Optional[datetime.datetime] = None) -> None:
+        """A VDA5050 state message of the robot's current `mission`, BEFORE the dispatcher
+        processes it (so the last node of a mission that completes on this very message still
+        ends its leg). Records the legs it completes. Legs are written wherever events are
+        (events_only and full), never at off."""
+        run = self._runs.get(robot_name)
+        if run is None or mission is None or run.mission_name != mission.name:
+            return
+        if not self.policy.allows(tables.LEGS_TABLE, robot_name):
+            return
+        now = received_at or self._clock()
+        ts = parse_robot_ts(message.timestamp, now)
+        limits = robot_object.status.factsheet if robot_object is not None else None
+        for leg in run.tracker.observe(message=message, mission=mission, ts=ts, received=now,
+                                       limits=limits, default_map=run.map_id):
+            self._submit(_WriteLeg(run, leg))
+
+    def leg_seq(self, robot_name: str) -> Optional[int]:
+        """run_legs.seq of the leg the robot's run is on (what events are tagged with)."""
+        run = self._runs.get(robot_name)
+        current = run.tracker.current_seq if run is not None else None
+        return None if current is None else run.leg_base + current
+
+    @_guarded
     def on_robot_state(self, robot_name: str, old: Any, new: Any,
                        ts: Optional[datetime.datetime] = None) -> None:
         """The dispatcher changed the robot's RobotStateV1."""
@@ -737,6 +834,10 @@ class FleetRecorder:
     def _put_latest(self, track: _Track, **fields: Any) -> None:
         state_msg = dict(track.last_raw or {})
         state_msg[DISPATCH_KEY] = track.dispatch_state()
+        leg = self.leg_seq(track.robot_name)
+        if leg is not None:
+            # The API tags the nav events it raises (recovery, blocked goal) with this leg.
+            state_msg[DISPATCH_KEY]["leg_seq"] = leg
         fields.setdefault("active_run_id", self._ctx.run_for(track.robot_name, None))
         if track.sw.value is not None:
             fields.setdefault("sw_version", track.sw.value)
@@ -887,7 +988,7 @@ class FleetRecorder:
             map_id=map_id, site_id=self.policy.site_for(robot_name),
             sw_version=track.sw.value,
             mission_tree=[json.loads(node.json()) for node in mission.mission_tree],
-            resolved=fresh)
+            resolved=fresh, planned_path=list(mission.planned_path or []) or None)
         self._runs[robot_name] = run
         self._submit(_StartRun(run, adopt=not fresh))
 
@@ -938,7 +1039,7 @@ class FleetRecorder:
         status = mission.status
         self._event(EventCode.MISSION_EDGE_BLOCKED, robot_name, ts or self._clock(), {
             "mission_name": mission.name, "edge_id": status.blocked_edge,
-            "detail": status.block_reason,
+            "detail": status.block_reason, "leg_seq": self.leg_seq(robot_name),
         }, discriminator=f"{mission.name}|{status.run_id}|{status.blocked_node}|"
                          f"{status.blocked_edge}")
 
@@ -1030,6 +1131,51 @@ class FleetRecorder:
             await cursor.execute(INSERT_RUN_SQL, params)
             return cursor.rowcount == 1
 
+    async def _store_planned_path(self, conn: Any, info: RunInfo) -> None:
+        """Copy the mission's planned_path onto its run (its own savepoint: a database that
+        has not been migrated yet must not cost the run row)."""
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(SET_PLANNED_PATH_SQL, (
+                        json.dumps(info.planned_path), info.run_id))
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient(exc) or getattr(conn, "broken", False):
+                raise
+            logger.exception("Could not store the planned path of run %s", info.run_id)
+
+    async def _stored_leg_count(self, conn: Any, run_id: uuid.UUID) -> int:
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(LEG_BASE_SQL, (run_id,))
+                    row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient(exc) or getattr(conn, "broken", False):
+                raise
+            logger.exception("Could not count the stored legs of run %s", run_id)
+            return 0
+
+    async def _summarize_run(self, conn: Any, info: RunInfo, finish: _Finish) -> None:
+        """Fill the legs' recovery / block counts from the tagged events, then the run's
+        summary_metrics from its legs. A savepoint, so a problem here never costs the run."""
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(LEG_EVENTS_SQL, (info.run_id, info.run_id))
+                    await cursor.execute(RUN_LEGS_SQL, (info.run_id,))
+                    rows = await cursor.fetchall()
+                    legs = [dict(zip(RUN_LEG_FIELDS, row)) for row in rows]
+                    summary = run_legs.summarize(
+                        legs, max(0.0, (finish.ended_at - info.started_at).total_seconds()),
+                        finish.passes_completed)
+                    await cursor.execute(SET_SUMMARY_SQL, (json.dumps(summary), info.run_id))
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient(exc) or getattr(conn, "broken", False):
+                raise
+            logger.exception("Could not write the summary of run %s", info.run_id)
+
     async def _emit_run_started(self, conn: Any, info: RunInfo) -> None:
         if self._events_allowed(info.robot_name, EventCode.MISSION_RUN_STARTED):
             await emit(conn, Event(
@@ -1080,6 +1226,7 @@ class FleetRecorder:
                          "cause": finish.cause, "passes_completed": finish.passes_completed,
                          "duration_s": max(0.0, (finish.ended_at - info.started_at)
                                            .total_seconds())}))
+        await self._summarize_run(conn, info, finish)
         # mission_trajectory is written by graph-builder, keyed by mission name; tag this
         # run's rows. A savepoint, so a problem here never costs the run row.
         try:

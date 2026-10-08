@@ -2902,6 +2902,9 @@ class Robot:
         the recorded robot state and run are the ones this message led to. Events the
         dispatcher raises meanwhile carry the message's timestamp."""
         self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
+        # Legs first: the state that reaches a mission's last node also completes the mission.
+        self._record("on_leg_state", self._name, message, self._current_mission,
+                     self._robot_object)
         if not self._run_checked and time.monotonic() >= self._run_check_after:
             await self._check_run_continuity(message.headerId)
         evidence = self._run_detector.on_state(message.headerId)
