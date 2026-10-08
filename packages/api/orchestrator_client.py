@@ -190,10 +190,11 @@ class OrchestratorClient:
     async def stop(self, name: str) -> Dict[str, Any]:
         return await self._call("POST", f"/services/{name}/stop", ORCHESTRATOR_STOP_TIMEOUT_S)
 
-    async def list_maps(self, cloud_map_id: str) -> List[Dict[str, Any]]:
-        """The stored maps linked to this cloud map (GET /maps/list?cloud_map_id=X)."""
-        body = await self._call("GET", "/maps/list", ORCHESTRATOR_QUERY_TIMEOUT_S,
-                                params={"cloud_map_id": cloud_map_id})
+    async def list_maps(self, cloud_map_id: Optional[str]) -> List[Dict[str, Any]]:
+        """The stored maps linked to this cloud map (GET /maps/list?cloud_map_id=X); all stored
+        maps when `cloud_map_id` is None."""
+        params = {"cloud_map_id": cloud_map_id} if cloud_map_id is not None else None
+        body = await self._call("GET", "/maps/list", ORCHESTRATOR_QUERY_TIMEOUT_S, params=params)
         return body if isinstance(body, list) else []
 
     # --- stored maps and the robot's current map (relocalization, packages/api/reloc_job.py) ---

@@ -254,8 +254,11 @@ class _CapOrch:
                 return [{"name": n} for n in o.services]
 
             async def list_maps(self, cloud_map_id):
+                if cloud_map_id is None:   # all stored maps
+                    return [{"name": oc.onboard_map_name("shed"), "valid": True}] \
+                        if o.held == "named" else [{"name": "other", "valid": True}]
                 return [{"name": "n", "valid": True, "meta": {"cloud_map_id": cloud_map_id}}] \
-                    if o.held else []
+                    if o.held is True else []
         return C()
 
 
@@ -276,12 +279,20 @@ class TestCapability:
         (dict(online=False), {}, "offline"),
         (dict(address=False), {}, "no registered orchestrator"),
         (dict(), dict(services=("topomap", "sim_topomap")), "no relocalization service"),
-        (dict(), dict(held=False), "does not hold"),
         (dict(), dict(fail=oc.OrchestratorError(oc.UNREACHABLE, "no route")), "no route"),
     ])
     async def test_can_always_start_what_is_wrong_is_only_a_warning(self, robot, kw, words):
         can, why = await _real_holder(**kw).reloc_capability(_plain_robot(**robot), "shed")
         assert can is True and words in why
+
+    async def test_no_stored_map_on_the_robot_cannot_start(self):
+        can, why = await _real_holder(held=False).reloc_capability(_plain_robot(), "shed")
+        assert can is False and "does not hold a stored map for 'shed'" in why
+
+    async def test_a_map_named_for_the_cloud_map_counts_as_held(self):
+        h = _real_holder(held="named")
+        assert await h.held(_plain_robot(), "shed") is True
+        assert await h.reloc_capability(_plain_robot(), "shed") == (True, None)
 
     async def test_unknown_robot_cannot_start(self):
         assert await _real_holder().reloc_capability(None, "shed") == (
@@ -297,8 +308,8 @@ class TestCapability:
 
     async def test_a_held_answer_the_caller_has_is_not_asked_again(self):
         h = _real_holder()
-        assert await h.reloc_capability(_plain_robot(), "shed", held=False) == (
-            True, "the robot does not hold a stored map for 'shed'")
+        can, why = await h.reloc_capability(_plain_robot(), "shed", held=False)
+        assert can is False and "does not hold a stored map for 'shed'" in why
 
     async def test_the_services_read_is_cached_and_invalidated(self):
         calls = []
@@ -1564,11 +1575,11 @@ class TestEndpointCapability:
         assert o.calls.index("list_services") > o.calls.index("list_maps")
         assert o.calls.index("list_services") > o.calls.index("mapping_state")
 
-    async def test_not_held_is_a_warning_next_to_the_other_findings(self):
+    async def test_not_held_cannot_start(self):
         o = _EpCap(held=False, mapping="old")
         can, why = await OrchestratorMaps(client_factory=o.client).reloc_capability(
             _plain_robot(), "shed")
-        assert can is True and "does not hold" in why
+        assert can is False and "does not hold" in why
 
     async def test_old_orchestrator_falls_back_to_the_service(self):
         o = _EpCap(mapping="old")

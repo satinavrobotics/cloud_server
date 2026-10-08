@@ -159,13 +159,15 @@ class OrchestratorMaps:
 
     async def reloc_capability(self, robot: Any, cloud_map_id: str, fresh: bool = False,
                                held: Optional[bool] = None) -> Tuple[bool, Optional[str]]:
-        """(can_start, warning): relocalization can ALWAYS be started from the API for a robot
-        that exists (decision 2026-10-08), so `can_start` is False only for an unknown robot.
-        The second element is a NON-blocking warning: what is probably going to make the job
-        fail (the robot is offline, has no orchestrator address, no stored map is tagged for the
-        cloud map, the orchestrator cannot be asked, no relocalize endpoint and no reloc
-        service), else None. `held` = an answer of held() the caller already has (saves a
-        read). Never raises."""
+        """(can_start, reason): relocalization can be started from the API for a robot that
+        exists, EXCEPT when the robot's orchestrator answered that it holds no stored map for
+        the cloud map (neither tagged nor named `cloud-<map>`): then there is nothing to
+        relocalize on, a real impossibility (decision 2026-10-08), and `can_start` is False
+        with that reason. An unknown robot cannot start either. Otherwise the second element
+        is a NON-blocking warning: what may make the job fail (the robot is offline, has no
+        orchestrator address, the orchestrator cannot be asked, no relocalize endpoint and no
+        reloc service), else None. `held` = an answer of held() the caller already has (saves
+        a read). Never raises."""
         try:
             if robot is None:
                 return False, "the robot is unknown"
@@ -186,7 +188,8 @@ class OrchestratorMaps:
             if held is None:
                 warnings.append("the robot's orchestrator could not be asked for its stored maps")
             elif held is False:
-                warnings.append(f"the robot does not hold a stored map for '{cloud_map_id}'")
+                return False, (f"the robot does not hold a stored map for '{cloud_map_id}' "
+                               "to relocalize on (map it with SLAM first, or place it by hand)")
             if endpoint is not True:
                 service, why = await self.reloc_service(robot, fresh=fresh)
                 if service is None:
@@ -217,9 +220,17 @@ class OrchestratorMaps:
                 status is not None and getattr(status, "online", True) is False):
             return None
         try:
-            rows = await self._client_factory(robot).list_maps(cloud_map_id)
-            return any(isinstance(r, dict) and r.get("valid") is True
-                       and (r.get("meta") or {}).get("cloud_map_id") == cloud_map_id
+            client = self._client_factory(robot)
+            rows = await client.list_maps(cloud_map_id)
+            if any(isinstance(r, dict) and r.get("valid") is True
+                   and (r.get("meta") or {}).get("cloud_map_id") == cloud_map_id
+                   for r in rows):
+                return True
+            # No tagged map: the reloc job then tries the name the cloud gives the map
+            # (reloc_job._prepare), so a valid stored map of that name counts too.
+            onboard = oc.onboard_map_name(cloud_map_id)
+            rows = await client.list_maps(None)
+            return any(isinstance(r, dict) and r.get("valid") is True and r.get("name") == onboard
                        for r in rows)
         except oc.OrchestratorError as exc:
             logger.info("Stored maps of %s not readable: %s", key_name(robot), exc.detail)
