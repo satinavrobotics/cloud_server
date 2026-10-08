@@ -531,7 +531,7 @@ class MissionPlannerService:
         robot_name: str,
         waypoints: List[common.Pose2D],
         mission_name: Optional[str] = None,
-        timeout_seconds: int = 300,
+        timeout_seconds: Optional[int] = None,
         planned_path: Optional[List[str]] = None,
         mode: mission_object.MissionMode = mission_object.MissionMode.MAPPED,
         register_map: bool = True,
@@ -547,7 +547,7 @@ class MissionPlannerService:
             robot_name: Name of the robot
             waypoints: List of waypoints (Pose2D)
             mission_name: Optional mission name (auto-generated if not provided)
-            timeout_seconds: Mission timeout in seconds
+            timeout_seconds: Optional time limit in seconds; None = no limit
             planned_path: Optional list of node IDs forming the path
 
         Returns:
@@ -579,7 +579,7 @@ class MissionPlannerService:
             mission_spec = mission_object.MissionSpecV1(
                 robot=robot_name,
                 mission_tree=mission_tree,
-                timeout=datetime.timedelta(seconds=timeout_seconds),
+                timeout=(datetime.timedelta(seconds=timeout_seconds) if timeout_seconds else None),
                 planned_path=planned_path,
                 mode=mode,
                 register_map=register_map,
@@ -785,7 +785,7 @@ class MissionPlannerService:
         target_lat: Optional[float] = None,
         target_lon: Optional[float] = None,
         mission_name: Optional[str] = None,
-        timeout_seconds: int = 300,
+        timeout_seconds: Optional[int] = None,
         map_id: Optional[str] = None,
         register_map: bool = True,
     ) -> Dict[str, Any]:
@@ -843,7 +843,7 @@ class MissionPlannerService:
         goal_y: float,
         map_id: Optional[str] = None,
         mission_name: Optional[str] = None,
-        timeout_seconds: int = 300
+        timeout_seconds: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Alias for plan_and_execute_mission with robot_id parameter.

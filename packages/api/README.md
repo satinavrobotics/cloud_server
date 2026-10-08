@@ -434,6 +434,8 @@ Request navigation for a robot (proxy to mission planner).
 }
 ```
 
+`timeout_seconds` is optional. Omitted or `null` means no time limit (the default, and what "Go here" sends): the mission then ends only when the robot reports success or failure, or it is canceled.
+
 **Response:**
 ```json
 {

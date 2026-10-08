@@ -338,7 +338,7 @@ Request navigation for a robot to a target location.
 - `target_x` (float, required): Target X coordinate in meters
 - `target_y` (float, required): Target Y coordinate in meters
 - `mission_name` (string, optional): Custom mission name (auto-generated if not provided)
-- `timeout_seconds` (integer, optional): Mission timeout in seconds (default: 300)
+- `timeout_seconds` (integer, optional): Optional mission time limit in seconds (default: none, no limit; the mission then ends only when the robot reports success or failure, or it is canceled)
 
 **Response:**
 ```json
