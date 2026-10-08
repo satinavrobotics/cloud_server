@@ -277,6 +277,12 @@ class Robot:
         # mission's. Bounded in _on_client_message() so a robot that never adopts our
         # order fails the mission instead of spinning silently.
         self._order_mismatch_count: int = 0
+        # errorTypes of unreferenced FATAL errors the robot reported before it
+        # accepted the current mission's order (or while no mission ran). Such an
+        # error is a leftover of an earlier run (e.g. a safety reflex latched while
+        # the previous mission was cancelled), not a failure of this mission; it is
+        # ignored until the robot reports it gone once. See _track_stale_fatal().
+        self._stale_fatal_types: set = set()
         # Names of missions this controller has already run to a terminal state.
         # get_next_mission() drops a finished mission from _missions, but the object
         # stays ALIVE in the database, so our own terminal-status write echoes back
@@ -1419,6 +1425,8 @@ class Robot:
         finished_instant_actions = await self.handle_instant_action(message)
         self.update_robot_state(finished_instant_actions)
 
+        self._track_stale_fatal(message)
+
         # Make sure there is a mission to update
         if self._current_mission is None or self._current_behavior_tree is None:
             self._reconcile_stale_state()
@@ -1978,6 +1986,34 @@ class Robot:
         asyncio.ensure_future(self._database.update_status(
             api_objects.MissionObjectV1, mission.name, mission.status, uuid.uuid4()))
 
+    _NODE_REFERENCE_KEYS = ("node_id", "nodeId", "action_id", "actionId")
+
+    @classmethod
+    def _unreferenced_fatal_types(cls, message: types.VDA5050State) -> set:
+        """errorTypes of FATAL errors that name no node or action."""
+        return {e.errorType for e in message.errors
+                if e.errorLevel == types.VDA5050ErrorLevel.FATAL and
+                not any(r.referenceKey in cls._NODE_REFERENCE_KEYS
+                        for r in e.errorReferences)}
+
+    def _track_stale_fatal(self, message: types.VDA5050State):
+        """Remember unreferenced FATAL errors that predate the current order.
+
+        Until the robot reports an order of the current mission, whatever
+        unreferenced FATAL it still carries was there before this mission's order
+        (the robot reports errors until it clears them, and may echo our order id
+        a message or two before it does). Once the order is accepted, the set only
+        shrinks: an error type the robot has reported gone is no longer stale, so a
+        new error of that type fails the mission as usual.
+        """
+        present = self._unreferenced_fatal_types(message)
+        accepted = self._current_mission is not None and \
+            order_ids.is_order_of(self._order_prefix(), message.orderId)
+        if accepted:
+            self._stale_fatal_types &= present
+        else:
+            self._stale_fatal_types = present
+
     def get_mission_errors(self, message: types.VDA5050State):
         fatal_errors = False
         reason_set = False
@@ -1986,6 +2022,11 @@ class Robot:
         for error in message.errors:
             # Skip warnings
             if error.errorLevel != types.VDA5050ErrorLevel.FATAL:
+                continue
+            if error.errorType in self._stale_fatal_types and not any(
+                    r.referenceKey in self._NODE_REFERENCE_KEYS
+                    for r in error.errorReferences):
+                # Reported before this mission's order was accepted: not ours.
                 continue
             fatal_errors = True
             for error_reference in error.errorReferences:
@@ -2010,7 +2051,8 @@ class Robot:
         if fatal_errors and not reason_set and self._current_mission is not None:
             self._current_mission.status.failure_reason = "\n".join(
                 e.errorDescription for e in message.errors
-                if e.errorLevel == types.VDA5050ErrorLevel.FATAL)
+                if e.errorLevel == types.VDA5050ErrorLevel.FATAL and
+                e.errorType not in self._stale_fatal_types)
         return fatal_errors
 
     def update_mission_from_behavior_tree(self):
