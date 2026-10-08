@@ -21,7 +21,7 @@ from packages.config import ORCHESTRATOR_SAVE_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
 
-_SAVE_PATH = re.compile(r"^maps/[^/]+/save/?$")
+_SAVE_PATH = re.compile(r"^(maps/[^/]+|localization)/save/?$")
 DEFAULT_TIMEOUT_S = 60.0
 # RFC 7230 6.1: meaningful for one connection only, never forwarded (plus host / content-length,
 # which httpx sets for the new request)
@@ -32,7 +32,8 @@ _HOP_BY_HOP = frozenset({"host", "content-length", "connection", "keep-alive",
 
 def with_cloud_ids(method: str, path: str, body: bytes,
                    session: Optional[Mapping[str, Any]]) -> bytes:
-    """The body of a proxied `POST maps/{onboard}/save` with the robot's open mapping session's
+    """The body of a proxied `POST maps/{onboard}/save` (or `POST localization/save` with
+    `name` == {onboard}) with the robot's open mapping session's
     `cloud_map_id` (its map) and `cloud_session_id` added, so the orchestrator links the map it
     saves to the cloud map (relocalization, D2). Only for the session's OWN map, i.e. `{onboard}`
     is onboard_map_name(session map): saving some other stored map must not be linked to the
@@ -42,13 +43,17 @@ def with_cloud_ids(method: str, path: str, body: bytes,
         return body
     if session.get("purpose", "mapping") != "mapping" or not session.get("map_name"):
         return body
-    if path.rstrip("/") != f"maps/{onboard_map_name(session['map_name'])}/save":
+    onboard = onboard_map_name(session["map_name"])
+    facade = path.rstrip("/") == "localization/save"
+    if not facade and path.rstrip("/") != f"maps/{onboard}/save":
         return body
     try:
         data = json.loads(body) if body.strip() else {}
     except ValueError:
         return body
     if not isinstance(data, dict):
+        return body
+    if facade and data.get("name") != onboard:   # POST /localization/save names the map in the body
         return body
     # An explicit null counts as not sent.
     link = cloud_link(session.get("map_name"), session["session_id"])
