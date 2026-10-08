@@ -98,3 +98,21 @@ def test_registration_factsheet_copies_valid_limits_only():
                                  "angular_speed_max": "fast", "width": -1, "length": True})
     assert (fs.speed_max, fs.acceleration_max) == (1.5, 0.7)
     assert (fs.angular_speed_max, fs.width, fs.length) == (-1, -1, -1)
+
+
+async def test_factsheet_with_agv_geometry_is_accepted():
+    # The orchestrator's factsheet carries agvGeometry.envelopes2d; it used to fail validation
+    # (placeholder section with a required field) and the whole factsheet was dropped.
+    raw = {"headerId": 0, "timestamp": "2026-10-08T12:19:51.144Z", "version": "2.0.0",
+           "manufacturer": "Satinav Robotics", "serialNumber": "r1",
+           "typeSpecification": {"agvClass": "CARRIER"},
+           "physicalParameters": {"speedMax": 1.0, "length": 0.52, "width": 0.52},
+           "actions": [],
+           "agvGeometry": {"envelopes2d": [{"set": "footprint", "polygonPoints": [
+               {"x": -0.26, "y": -0.26}, {"x": 0.26, "y": 0.26}]}]}}
+    from packages.controllers.mission.server import ClientFactsheetMessage
+    message = ClientFactsheetMessage(name="r1", payload=raw).payload
+    r, _ = _robot()
+    await r._on_client_factsheet(message)
+    fs = r._robot_object.status.factsheet
+    assert (fs.length, fs.width, fs.speed_max) == (0.52, 0.52, 1.0)

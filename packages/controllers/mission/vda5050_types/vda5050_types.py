@@ -557,29 +557,33 @@ class VDA5050PhysicalParameters(pydantic.BaseModel):
     length: Optional[float] = None
 
 
-# # # # # # # # # # # # # # # # # # # #
-#                                     #
-# !TODO: PAVAN                        #
-# fill classes with correct fields    #
-# # # # # # # # # # # # # # # # # # # #
-class VDA5050ProtocolLimits(pydantic.BaseModel):
-    temporary: int
+class _UnmodelledSection(pydantic.BaseModel):
+    """A factsheet section the cloud does not read yet: any content is accepted and kept as is.
+    (These were placeholders with a required `temporary` field, which made every factsheet
+    carrying e.g. agvGeometry fail validation and be dropped whole.)"""
+
+    class Config:
+        extra = "allow"
 
 
-class VDA5050ProtocolFeatures(pydantic.BaseModel):
-    temporary: int
+class VDA5050ProtocolLimits(_UnmodelledSection):
+    pass
 
 
-class VDA5050AGVGeometry(pydantic.BaseModel):
-    temporary: int
+class VDA5050ProtocolFeatures(_UnmodelledSection):
+    pass
 
 
-class VDA5050LoadSpecification(pydantic.BaseModel):
-    temporary: int
+class VDA5050AGVGeometry(_UnmodelledSection):
+    pass
 
 
-class VDA5050LocalizationParameters(pydantic.BaseModel):
-    temporary: int
+class VDA5050LoadSpecification(_UnmodelledSection):
+    pass
+
+
+class VDA5050LocalizationParameters(_UnmodelledSection):
+    pass
 
 
 class VDA5050ActionDefinition(pydantic.BaseModel):
