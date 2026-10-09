@@ -202,7 +202,6 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
       - MINIO_SECURE=false
       - DISTANCE_THRESHOLD=${SIMILARITY_DISTANCE_THRESHOLD:-5.0}
-      - MISSION_DISPATCH_URL=http://localhost:${API_DELEGATION_PORT:-8000}
       - RADIUS_THRESHOLD=${GRAPH_BUILDER_RADIUS_THRESHOLD:-2.0}
       - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
     network_mode: "host"
@@ -376,11 +375,6 @@ services:
       - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
       - AGENT_MODEL=${AGENT_MODEL:-claude-haiku-4-5}
       - AGENT_BATTERY_LOW_THRESHOLD=${AGENT_BATTERY_LOW_THRESHOLD:-20.0}
-      # Required by packages/config.py at import time:
-      - ARANGO_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
-      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     network_mode: "host"
     restart: unless-stopped
     healthcheck:

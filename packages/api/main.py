@@ -34,11 +34,11 @@ from packages.utils.service_utils import (
 from packages.utils.fastapi_helpers import add_error_handlers
 from packages.utils import blocked_nodes
 from packages.config import (
-    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
-    URL_MISSION_PLANNER, URL_LIVEKIT,
-    MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
+    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, DATA_BASE_NAME,
+    URL_MISSION_PLANNER, URL_LIVEKIT, GRAPH_BUILDER_WS_URL, MISSION_DISPATCHER_WS_URL, MQTT_ENABLED,
+    MINIO_HOST, MINIO_PORT, MINIO_SECURE,
     MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE,
-    POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, POSTGRES_DATABASE_PASSWORD,
+    POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, postgres_database_password, require_secret,
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
     DEFAULT_MAP_ID, PORT_API_DELEGATION, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
     IDEMPOTENCY_TTL_S, IDEMPOTENCY_LEASE_S, IDEMPOTENCY_PURGE_INTERVAL_S,
@@ -292,32 +292,28 @@ async def lifespan(app: FastAPI):
     import asyncio
     global service, health_checker
 
-    graph_builder_ws_url = os.getenv("GRAPH_BUILDER_WS_URL", "ws://localhost:8004")
-    mission_dispatcher_ws_url = os.getenv("MISSION_DISPATCHER_WS_URL", None)
-    mqtt_enabled = os.getenv("MQTT_ENABLED", "true").lower() == "true"
-
     service = ApiDelegationService(
         arango_host=ARANGO_HOST,
         arango_port=ARANGO_PORT,
         arango_username=ARANGO_USERNAME,
-        arango_password=ARANGO_PASSWORD,
+        arango_password=require_secret("ARANGO_PASSWORD"),
         arango_database=DATA_BASE_NAME,
         minio_host=MINIO_HOST,
         minio_port=MINIO_PORT,
-        minio_access_key=MINIO_ACCESS_KEY,
-        minio_secret_key=MINIO_SECRET_KEY,
+        minio_access_key=require_secret("MINIO_ACCESS_KEY"),
+        minio_secret_key=require_secret("MINIO_SECRET_KEY"),
         minio_secure=MINIO_SECURE,
         mission_planner_url=URL_MISSION_PLANNER,
         livekit_url=URL_LIVEKIT,
         postgres_db=POSTGRES_DATABASE_NAME,
         postgres_user=POSTGRES_DATABASE_USERNAME,
-        postgres_password=POSTGRES_DATABASE_PASSWORD,
+        postgres_password=postgres_database_password(),
         postgres_host=POSTGRES_DATABASE_HOST,
         postgres_port=POSTGRES_DATABASE_PORT,
         default_map_id=DEFAULT_MAP_ID,
-        graph_builder_ws_url=graph_builder_ws_url,
-        mission_dispatcher_ws_url=mission_dispatcher_ws_url,
-        mqtt_enabled=mqtt_enabled,
+        graph_builder_ws_url=GRAPH_BUILDER_WS_URL,
+        mission_dispatcher_ws_url=MISSION_DISPATCHER_WS_URL,
+        mqtt_enabled=MQTT_ENABLED,
         mqtt_broker=MQTT_BROKER,
         mqtt_port=MQTT_PORT,
         mqtt_keepalive=MQTT_KEEPALIVE,

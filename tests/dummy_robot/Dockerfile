@@ -41,15 +41,6 @@ RUN touch /app/cloud_common/__init__.py && \
 # Set Python path
 ENV PYTHONPATH=/app
 
-# dummy_robot.py only imports packages.config for CAMERA_YAW_OFFSETS -- it never talks to
-# Arango/MinIO/Postgres itself, but packages/config.py raises at import time if these
-# credential vars are unset. Placeholders here satisfy that check without granting any real
-# access; override at runtime only if a future dummy-robot mode actually needs one of these.
-ENV ARANGO_PASSWORD=unused \
-    MINIO_ACCESS_KEY=unused \
-    MINIO_SECRET_KEY=unused \
-    POSTGRES_PASSWORD=unused
-
 # Run the dummy robot
 CMD ["python", "tests/dummy_robot/dummy_robot.py"]
 

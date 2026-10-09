@@ -48,6 +48,7 @@ import re
 import uuid
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
 
+from packages import config
 from packages.controllers.mission import battery, leg_tracker
 from packages.events import causes, detectors
 from packages.events.codes import EventCode
@@ -71,46 +72,45 @@ RUN_NAMESPACE = uuid.UUID("3f6c2a8e-91d4-4b57-a0e3-5d7b9c1e2f48")
 # outcome is then TIMEOUT rather than FAILED.
 MISSION_TIMEOUT_REASON = "Mission timed out"
 
-DEFAULT_SPILL_PATH = "/tmp/mission_dispatch/fleet_events_spill.jsonl"
-STATE_ROW_INTERVAL_S = 5.0
+DEFAULT_SPILL_PATH = config.DISPATCH_FLEET_SPILL_PATH
+STATE_ROW_INTERVAL_S = config.RECORDER_STATE_ROW_INTERVAL_S
 # robot_latest.state_msg (the serialised state message) is refreshed at most this often while
 # nothing discrete changed (driving, moving, order progress, errors, the dispatcher's own
 # fields); last_seen is merged on every state, and a sweep stores the newest state after
 # a quiet period.
-LATEST_STATE_MSG_INTERVAL_S = 5.0
-TRACK_ROW_INTERVAL_S = 1.0  # robot_track_ts: one row per second while a run is open
-BATTERY_LOW_PCT = 20.0
-BATTERY_OK_PCT = 25.0
-SWEEP_PERIOD_S = 1.0
+LATEST_STATE_MSG_INTERVAL_S = config.RECORDER_LATEST_STATE_MSG_INTERVAL_S
+TRACK_ROW_INTERVAL_S = config.RECORDER_TRACK_ROW_INTERVAL_S
+BATTERY_LOW_PCT = config.BATTERY_LOW_PCT
+BATTERY_OK_PCT = config.BATTERY_OK_PCT
+SWEEP_PERIOD_S = config.RECORDER_SWEEP_PERIOD_S
 # Health report (WP13): how often dispatch upserts its recorder_health row. Well inside the
-# API's staleness threshold (config.RECORDER_HEALTH_STALE_S, 60 s). This image has no
-# packages/config.py, hence a constant here.
-HEALTH_REPORT_PERIOD_S = 10.0
-HEALTH_CONNECT_TIMEOUT_S = 2.0
-HEALTH_WRITE_TIMEOUT_S = 5.0
+# API's staleness threshold (config.RECORDER_HEALTH_STALE_S, 60 s).
+HEALTH_REPORT_PERIOD_S = config.RECORDER_HEALTH_REPORT_PERIOD_S
+HEALTH_CONNECT_TIMEOUT_S = config.RECORDER_HEALTH_CONNECT_TIMEOUT_S
+HEALTH_WRITE_TIMEOUT_S = config.RECORDER_HEALTH_WRITE_TIMEOUT_S
 HEALTH_ROLE = "recorder"
 # The recording policy follows the robot, settings and site NOTIFYs and the assignment channel
 # directly (on_robot_object, on_settings_object, on_site_object, on_site_assignment: the value
 # is pushed, no reload). On top of that it is reloaded this often as a safety net for a
 # missed NOTIFY.
-POLICY_REFRESH_MAX_S = 60.0
-REHYDRATE_TIMEOUT_S = 10.0
-REHYDRATE_RETRY_S = 10.0
-REHYDRATE_ATTEMPTS = 30
-OP_CONNECT_TIMEOUT_S = 5.0
-OP_RETRY_DELAYS_S = (1.0, 2.0, 5.0, 10.0, 30.0)
-MAX_PENDING_OPS = 1000
+POLICY_REFRESH_MAX_S = config.RECORDER_POLICY_REFRESH_MAX_S
+REHYDRATE_TIMEOUT_S = config.RECORDER_REHYDRATE_TIMEOUT_S
+REHYDRATE_RETRY_S = config.RECORDER_REHYDRATE_RETRY_S
+REHYDRATE_ATTEMPTS = config.RECORDER_REHYDRATE_ATTEMPTS
+OP_CONNECT_TIMEOUT_S = config.RECORDER_OP_CONNECT_TIMEOUT_S
+OP_RETRY_DELAYS_S = config.RECORDER_OP_RETRY_DELAYS_S
+MAX_PENDING_OPS = config.RECORDER_MAX_PENDING_OPS
 # Run-lifecycle ops (start/finish of a run) are never dropped on a transient database error
 # (they retry forever, the delay capped at the last of OP_RETRY_DELAYS_S) and never evicted
 # from a full queue (telemetry-type ops, i.e. legs, go first). A lost finish would leave
 # mission_runs RUNNING and the mission undeletable.
 # Orphaned RUNNING runs are also settled periodically, not only at startup.
-RECONCILE_PERIOD_S = 600.0
+RECONCILE_PERIOD_S = config.RECORDER_RECONCILE_PERIOD_S
 # Runs younger than this are left alone by the periodic reconcile.
-RECONCILE_MIN_AGE_S = 60.0
+RECONCILE_MIN_AGE_S = config.RECORDER_RECONCILE_MIN_AGE_S
 # Trajectory rows logged this long after the run ended still belong to it (graph-builder
 # logs waypoints asynchronously from the robot's node updates).
-TRAJECTORY_GRACE_S = 5
+TRAJECTORY_GRACE_S = config.RECORDER_TRAJECTORY_GRACE_S
 
 # Key inside robot_latest.state_msg holding dispatch's own detector baselines (the rest of
 # state_msg is the robot's last VDA5050 state message, as received).

@@ -8,9 +8,35 @@ All services should import from this module to ensure consistency.
 Credentials (passwords, keys) are read exclusively from environment variables so that
 plaintext secrets never live in source code.  Set them via a root-level .env file
 (see .env.example) or via Docker / Kubernetes secrets.
+
+Importing this module never fails: a secret that is not set is None here, and the code that
+needs one asks for it with `require_secret(name)` (EnvironmentError naming the variable), so a
+service that never touches Arango/MinIO/Postgres does not have to be given their passwords.
+Every service image ships this file, mission-dispatch included.
 """
 
 import os
+
+
+def require_secret(name: str) -> str:
+    """The value of the credential environment variable `name`; EnvironmentError if unset/empty."""
+    value = os.getenv(name)
+    if not value:
+        raise EnvironmentError(
+            f"Required environment variable {name} is not set. "
+            "Check your .env file or deployment secrets."
+        )
+    return value
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.getenv(name, default).lower() in ("true", "1", "yes")
+
+
+def _env_floats(name: str, default: str) -> tuple:
+    """A comma-separated list of floats (e.g. back-off steps) as a tuple."""
+    return tuple(float(v) for v in os.getenv(name, default).split(",") if v.strip())
+
 
 # ==================== Service Ports ====================
 # Default ports for all microservices
@@ -27,13 +53,21 @@ PORT_POSTGRES = 5432
 PORT_MQTT = 1883
 
 # ==================== Service URLs ====================
-# Default URLs for service-to-service communication
-URL_GRAPH_BUILDER = f"http://localhost:{PORT_GRAPH_BUILDER}"
+# Default URLs for service-to-service communication; each is overridable by the env var
+# named here (docker_compose sets MISSION_PLANNER_URL and LIVEKIT_URL for the API). There is no
+# HTTP hop to mission-dispatch (PostgreSQL is the interface), hence no URL for it.
+URL_GRAPH_BUILDER = os.getenv("GRAPH_BUILDER_URL", f"http://localhost:{PORT_GRAPH_BUILDER}")
 URL_MISSION_PLANNER = os.getenv("MISSION_PLANNER_URL", f"http://localhost:{PORT_MISSION_PLANNER}")
-URL_LIVEKIT = f"http://localhost:{PORT_LIVEKIT}"
-URL_AGENT_ORCHESTRATOR = f"http://localhost:{PORT_AGENT_ORCHESTRATOR}"
-URL_API_DELEGATION = f"http://localhost:{PORT_API_DELEGATION}"
-URL_MISSION_DISPATCH = f"http://localhost:5000"
+URL_LIVEKIT = os.getenv("LIVEKIT_URL", f"http://localhost:{PORT_LIVEKIT}")
+URL_AGENT_ORCHESTRATOR = os.getenv("AGENT_ORCHESTRATOR_URL",
+                                   f"http://localhost:{PORT_AGENT_ORCHESTRATOR}")
+URL_API_DELEGATION = os.getenv("API_DELEGATION_URL", f"http://localhost:{PORT_API_DELEGATION}")
+# WebSocket backends the API proxies /ws/... to (packages/api/main.py). The dispatcher one is
+# unset unless given: mission-dispatch has no WebSocket endpoint.
+GRAPH_BUILDER_WS_URL = os.getenv("GRAPH_BUILDER_WS_URL", f"ws://localhost:{PORT_GRAPH_BUILDER}")
+MISSION_DISPATCHER_WS_URL = os.getenv("MISSION_DISPATCHER_WS_URL") or None
+# The API's MQTT bridge; "false" turns it off.
+MQTT_ENABLED = os.getenv("MQTT_ENABLED", "true").lower() == "true"
 
 # ==================== Spatial & Distance Thresholds ====================
 # All spatial thresholds in meters
@@ -55,6 +89,7 @@ GRAPH_NAME      = os.getenv("GRAPH_NAME", "topological_map")
 NODE_COLLECTION = os.getenv("NODE_COLLECTION", "map_nodes")
 EDGE_COLLECTION = os.getenv("EDGE_COLLECTION", "map_edges")
 
+# Secrets: None when unset (importing never fails); use require_secret("...") where one is needed.
 ARANGO_PASSWORD = os.getenv("ARANGO_PASSWORD")
 
 # MinIO
@@ -77,9 +112,18 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 # Falls back to the base POSTGRES_* names for local development via .env.
 POSTGRES_DATABASE_NAME     = os.getenv("POSTGRES_DATABASE_NAME", "mission")
 POSTGRES_DATABASE_USERNAME = os.getenv("POSTGRES_DATABASE_USERNAME", POSTGRES_USER)
-POSTGRES_DATABASE_PASSWORD = os.getenv("POSTGRES_DATABASE_PASSWORD", POSTGRES_PASSWORD)
 POSTGRES_DATABASE_HOST     = os.getenv("POSTGRES_DATABASE_HOST", POSTGRES_HOST)
 POSTGRES_DATABASE_PORT     = int(os.getenv("POSTGRES_DATABASE_PORT", str(POSTGRES_PORT)))
+# None when neither is set; a service that connects uses postgres_database_password() instead.
+POSTGRES_DATABASE_PASSWORD = os.getenv("POSTGRES_DATABASE_PASSWORD", POSTGRES_PASSWORD)
+
+
+def postgres_database_password() -> str:
+    """POSTGRES_DATABASE_PASSWORD, else POSTGRES_PASSWORD; EnvironmentError if neither is set.
+    Read when a connection is built, not at import."""
+    value = os.getenv("POSTGRES_DATABASE_PASSWORD")
+    return value if value is not None else require_secret("POSTGRES_PASSWORD")
+
 
 # Graph Builder specific
 IMAGE_BUFFER_TIMEOUT = float(os.getenv("IMAGE_BUFFER_TIMEOUT", "30.0"))
@@ -171,8 +215,7 @@ THERMAL_OK_C = float(os.getenv("THERMAL_OK_C", "78.0"))
 # packages/api/recorder_health.py: GET /api/v1/health/recording and the alert rules. The API's
 # elected telemetry writer evaluates them every RECORDER_HEALTH_EVAL_S, writes its own
 # `recorder_health` row, and emits SYSTEM.RECORDER_ALERT_RAISED / _CLEARED once per transition.
-# mission-dispatch reports every fleet_recorder.HEALTH_REPORT_PERIOD_S (10 s; its image has no
-# config.py).
+# mission-dispatch reports every RECORDER_HEALTH_REPORT_PERIOD_S (10 s).
 RECORDER_HEALTH_EVAL_S = float(os.getenv("RECORDER_HEALTH_EVAL_S", "5.0"))
 # report_stale: a process's row is older than this (seconds). Also applied when reading.
 RECORDER_HEALTH_STALE_S = float(os.getenv("RECORDER_HEALTH_STALE_S", "60.0"))
@@ -300,7 +343,7 @@ LIVEKIT_ADMIN_TIMEOUT = float(os.getenv("LIVEKIT_ADMIN_TIMEOUT", "3"))  # second
 # ==================== Offline missions (VDA5050 orders) ====================
 # What mission-dispatch decides in advance for each node of an order (allowedDeviationXY/Theta,
 # nodePolicy, timeout paused while offline, reroute-cancel dwell, blocked-node exclusion time)
-# is read by packages/controllers/mission/order_policy.py: its image has no config.py.
+# is read by packages/controllers/mission/order_policy.py (its own env keys, listed there).
 # The planner and the API read BLOCKED_NODE_MATCH_RADIUS_M in packages/utils/blocked_nodes.py.
 
 # ==================== Agent Orchestrator ====================
@@ -313,14 +356,137 @@ AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
 # local LiteLLM proxy in front of a free model like Gemini) for development.
 # Leave unset to talk to the real Anthropic API. See docker_compose/llm_proxy.yaml.
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL") or None
-# Battery state-of-charge (%) at or below which a low-battery event fires.
-AGENT_BATTERY_LOW_THRESHOLD = float(os.getenv("AGENT_BATTERY_LOW_THRESHOLD", "20.0"))
+# Battery state-of-charge (%) at or below which a low-battery event fires. One setting for the
+# fleet recorder (BATTERY.LOW, see DISPATCH_RECORDER below) and the agent; the agent's own env
+# name still overrides it for the agent alone.
+BATTERY_LOW_PCT = float(os.getenv("BATTERY_LOW_PCT", "20.0"))
+AGENT_BATTERY_LOW_THRESHOLD = float(os.getenv("AGENT_BATTERY_LOW_THRESHOLD", str(BATTERY_LOW_PCT)))
 
-# Validate required credentials at import time
-for _required_secret in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
-    if not os.getenv(_required_secret):
-        raise EnvironmentError(
-            f"Required environment variable {_required_secret} is not set. "
-            "Check your .env file or deployment secrets."
-        )
+# ==================== API: orchestrator proxy, mapping switch, caches ====================
+# packages/api/orchestrator_proxy.py: timeout of a proxied orchestrator request that is not a save.
+ORCHESTRATOR_PROXY_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_PROXY_TIMEOUT_S", "60.0"))
+# packages/api/orchestrator_maps.py: how long an "unknown" (None) answer is reused: just enough
+# that a burst of reads of an unreachable robot does not each wait for the timeout. A real
+# answer lives RELOC_MAP_HELD_TTL_S.
+ORCHESTRATOR_MAPS_UNKNOWN_TTL_S = float(os.getenv("ORCHESTRATOR_MAPS_UNKNOWN_TTL_S", "2.0"))
+# packages/api/mapping_switch.py save_slam(): a 503 (driver not up yet) is retried this often;
+# consecutive failed status reads that end a poll; saves started per save_slam() (one retry of a
+# save that ran out of time).
+SLAM_SAVE_START_TRIES = int(os.getenv("SLAM_SAVE_START_TRIES", "5"))
+SLAM_SAVE_POLL_ERRORS = int(os.getenv("SLAM_SAVE_POLL_ERRORS", "5"))
+SLAM_SAVE_MAX_ATTEMPTS = int(os.getenv("SLAM_SAVE_MAX_ATTEMPTS", "2"))
+# packages/api/reloc_job.py: finished relocalization jobs kept in memory (oldest dropped first).
+RELOC_MAX_FINISHED_JOBS = int(os.getenv("RELOC_MAX_FINISHED_JOBS", "50"))
+# packages/api/maps.py OpenSessionCache: robot_sessions() is reused this long (seconds). Changes
+# through the API invalidate it; changes by mission-dispatch show within this time.
+OPEN_SESSION_CACHE_TTL_S = float(os.getenv("OPEN_SESSION_CACHE_TTL_S", "1.0"))
 
+# ==================== PostgreSQL pool (packages/database/postgres.py) ====================
+POSTGRES_POOL_MIN_SIZE = int(os.getenv("POSTGRES_POOL_MIN_SIZE", "2"))
+POSTGRES_POOL_MAX_SIZE = int(os.getenv("POSTGRES_POOL_MAX_SIZE", "10"))
+# Seconds before trying to reconnect to the database: pool open, and the LISTEN/NOTIFY watcher.
+POSTGRES_RECONNECT_PERIOD = float(os.getenv("POSTGRES_RECONNECT_PERIOD", "0.5"))
+WATCHER_POSTGRES_RECONNECT_PERIOD = float(os.getenv("WATCHER_POSTGRES_RECONNECT_PERIOD", "0.1"))
+
+# ==================== mission-dispatch (packages/controllers/mission) ====================
+# Process defaults (its command line in docker_compose sets the MQTT and PostgreSQL ones).
+DISPATCH_DISABLE_FLEET_RECORDING = _env_bool("DISABLE_FLEET_RECORDING", "false")
+DISPATCH_FLEET_SPILL_PATH = os.getenv("FLEET_SPILL_PATH", "/tmp/mission_dispatch/fleet_events_spill.jsonl")
+
+# server.py: webhook calls (notify nodes, the charging hook) run in a worker thread; a notify
+# node's spec timeout is capped, its retries wait these seconds before the 2nd, 3rd and 4th
+# attempt. The charging hook (--mission_ctrl_url): per-request timeout and the least time
+# between two attempts for one robot.
+DISPATCH_NOTIFY_MAX_TIMEOUT_S = float(os.getenv("DISPATCH_NOTIFY_MAX_TIMEOUT_S", "30.0"))
+DISPATCH_NOTIFY_RETRY_BACKOFF_S = _env_floats("DISPATCH_NOTIFY_RETRY_BACKOFF_S", "1.0,2.0,4.0")
+DISPATCH_CHARGING_HOOK_TIMEOUT_S = float(os.getenv("DISPATCH_CHARGING_HOOK_TIMEOUT_S", "5.0"))
+DISPATCH_CHARGING_HOOK_RETRY_S = float(os.getenv("DISPATCH_CHARGING_HOOK_RETRY_S", "60.0"))
+# A handler that fails the same way on every state message logs its first occurrence, then at
+# most one count summary per interval; at most MAX_KINDS distinct kinds are tracked.
+DISPATCH_LOOP_ERROR_SUMMARY_INTERVAL_S = float(
+    os.getenv("DISPATCH_LOOP_ERROR_SUMMARY_INTERVAL_S", "60.0"))
+DISPATCH_LOOP_ERROR_MAX_KINDS = int(os.getenv("DISPATCH_LOOP_ERROR_MAX_KINDS", "32"))
+# The recording-only settings watcher's wait before re-watching after a failure; _watch_changes
+# (missions, robots) retries after the minimum, doubling up to the maximum.
+DISPATCH_SETTINGS_WATCH_RETRY_S = float(os.getenv("DISPATCH_SETTINGS_WATCH_RETRY_S", "5.0"))
+DISPATCH_WATCH_CHANGES_RETRY_MIN_S = float(os.getenv("DISPATCH_WATCH_CHANGES_RETRY_MIN_S", "1.0"))
+DISPATCH_WATCH_CHANGES_RETRY_MAX_S = float(os.getenv("DISPATCH_WATCH_CHANGES_RETRY_MAX_S", "30.0"))
+# An MQTT message from an unknown robot is looked up in the database once per this many seconds.
+DISPATCH_UNKNOWN_ROBOT_TTL_S = float(os.getenv("DISPATCH_UNKNOWN_ROBOT_TTL_S", "60.0"))
+# A robot state of ON_TASK with no mission is set back to IDLE only this long after the
+# robot's controller was created.
+DISPATCH_STALE_STATE_GRACE_S = float(os.getenv("DISPATCH_STALE_STATE_GRACE_S", "30.0"))
+# A failed run-epoch check is retried after RETRY_S; the check is given TIMEOUT_S.
+DISPATCH_RUN_CHECK_RETRY_S = float(os.getenv("DISPATCH_RUN_CHECK_RETRY_S", "30.0"))
+DISPATCH_RUN_CHECK_TIMEOUT_S = float(os.getenv("DISPATCH_RUN_CHECK_TIMEOUT_S", "5.0"))
+# A current mission whose start failed is started again at most every START_RETRY_S, and
+# failed after MAX_START_ATTEMPTS.
+DISPATCH_START_RETRY_S = float(os.getenv("DISPATCH_START_RETRY_S", "5.0"))
+DISPATCH_MAX_START_ATTEMPTS = int(os.getenv("DISPATCH_MAX_START_ATTEMPTS", "5"))
+# A failed status write is retried with this back-off (doubling, capped); a failure streak is
+# an error from the Nth failure on; a shutdown waits FLUSH_S for the queued writes.
+DISPATCH_STATUS_WRITE_RETRY_MIN_S = float(os.getenv("DISPATCH_STATUS_WRITE_RETRY_MIN_S", "0.5"))
+DISPATCH_STATUS_WRITE_RETRY_MAX_S = float(os.getenv("DISPATCH_STATUS_WRITE_RETRY_MAX_S", "10.0"))
+DISPATCH_STATUS_WRITE_ERROR_AFTER = int(os.getenv("DISPATCH_STATUS_WRITE_ERROR_AFTER", "5"))
+DISPATCH_STATUS_WRITE_FLUSH_S = float(os.getenv("DISPATCH_STATUS_WRITE_FLUSH_S", "3.0"))
+# Graceful shutdown steps (their sum must stay under lifecycle.SHUTDOWN_TIMEOUT_S).
+DISPATCH_SHUTDOWN_MQTT_S = float(os.getenv("DISPATCH_SHUTDOWN_MQTT_S", "1.5"))
+DISPATCH_SHUTDOWN_ROBOTS_S = float(
+    os.getenv("DISPATCH_SHUTDOWN_ROBOTS_S", str(DISPATCH_STATUS_WRITE_FLUSH_S + 1.0)))
+DISPATCH_SHUTDOWN_RECORDER_DRAIN_S = float(os.getenv("DISPATCH_SHUTDOWN_RECORDER_DRAIN_S", "2.5"))
+DISPATCH_SHUTDOWN_RECORDER_STOP_S = float(os.getenv("DISPATCH_SHUTDOWN_RECORDER_STOP_S", "2.0"))
+DISPATCH_SHUTDOWN_POOL_CLOSE_S = float(os.getenv("DISPATCH_SHUTDOWN_POOL_CLOSE_S", "1.5"))
+DISPATCH_SHUTDOWN_LOCK_S = float(os.getenv("DISPATCH_SHUTDOWN_LOCK_S", "1.0"))
+# The robot row is written at most this often for continuously changing fields.
+DISPATCH_ROBOT_STATUS_MIN_WRITE_S = float(os.getenv("DISPATCH_ROBOT_STATUS_MIN_WRITE_S", "1.0"))
+# A coalesced (replaced) state message is a warning the first time and then every N times.
+DISPATCH_STATE_COALESCED_WARN_EVERY = int(os.getenv("DISPATCH_STATE_COALESCED_WARN_EVERY", "100"))
+# Per-node notes and skipped nodes kept on a mission.
+DISPATCH_MISSION_NODE_NOTES_MAX = int(os.getenv("DISPATCH_MISSION_NODE_NOTES_MAX", "50"))
+DISPATCH_MISSION_SKIPPED_NODES_MAX = int(os.getenv("DISPATCH_MISSION_SKIPPED_NODES_MAX", "100"))
+# Node offsets that suggest a frame error: at least MIN_N, mostly one way, on average MIN_M far.
+DISPATCH_OFFSET_SUSPECT_MIN_N = int(os.getenv("DISPATCH_OFFSET_SUSPECT_MIN_N", "5"))
+DISPATCH_OFFSET_SUSPECT_CONSISTENCY = float(os.getenv("DISPATCH_OFFSET_SUSPECT_CONSISTENCY", "0.8"))
+DISPATCH_OFFSET_SUSPECT_MIN_M = float(os.getenv("DISPATCH_OFFSET_SUSPECT_MIN_M", "0.2"))
+# A datum that moves less than this is GNSS jitter, not a change.
+DISPATCH_DATUM_CHANGE_THRESHOLD_M = float(os.getenv("DISPATCH_DATUM_CHANGE_THRESHOLD_M", "1.0"))
+DISPATCH_DATUM_BEARING_THRESHOLD_DEG = float(
+    os.getenv("DISPATCH_DATUM_BEARING_THRESHOLD_DEG", "0.5"))
+# Approximate position: a smaller move (accuracy within REL_TOL) is not stored, unless the
+# stored copy is older than REFRESH_S.
+DISPATCH_APPROX_POSITION_THRESHOLD_M = float(
+    os.getenv("DISPATCH_APPROX_POSITION_THRESHOLD_M", "5.0"))
+DISPATCH_APPROX_ACCURACY_REL_TOL = float(os.getenv("DISPATCH_APPROX_ACCURACY_REL_TOL", "0.2"))
+DISPATCH_APPROX_POSITION_REFRESH_S = float(os.getenv("DISPATCH_APPROX_POSITION_REFRESH_S", "300.0"))
+# Robot controller: instant-action and order resend budgets (counts per state message or
+# seconds, see the comments in server.py::Robot), and how many finished missions are remembered.
+DISPATCH_MAX_INSTANT_ACTION_RESENDS = int(os.getenv("DISPATCH_MAX_INSTANT_ACTION_RESENDS", "20"))
+DISPATCH_MAX_ORDER_MISMATCHES = int(os.getenv("DISPATCH_MAX_ORDER_MISMATCHES", "40"))
+DISPATCH_MAX_FINISHED_MISSIONS_TRACKED = int(
+    os.getenv("DISPATCH_MAX_FINISHED_MISSIONS_TRACKED", "256"))
+
+# fleet_recorder.py (Phase 0 recording). Battery: BATTERY.LOW at or below BATTERY_LOW_PCT (the
+# agent's low threshold derives from the same setting), BATTERY.OK at or above BATTERY_OK_PCT.
+BATTERY_OK_PCT = float(os.getenv("BATTERY_OK_PCT", "25.0"))
+RECORDER_STATE_ROW_INTERVAL_S = float(os.getenv("RECORDER_STATE_ROW_INTERVAL_S", "5.0"))
+RECORDER_LATEST_STATE_MSG_INTERVAL_S = float(
+    os.getenv("RECORDER_LATEST_STATE_MSG_INTERVAL_S", "5.0"))
+RECORDER_TRACK_ROW_INTERVAL_S = float(os.getenv("RECORDER_TRACK_ROW_INTERVAL_S", "1.0"))
+RECORDER_SWEEP_PERIOD_S = float(os.getenv("RECORDER_SWEEP_PERIOD_S", "1.0"))
+# How often dispatch upserts its recorder_health row (well inside RECORDER_HEALTH_STALE_S).
+RECORDER_HEALTH_REPORT_PERIOD_S = float(os.getenv("RECORDER_HEALTH_REPORT_PERIOD_S", "10.0"))
+RECORDER_HEALTH_CONNECT_TIMEOUT_S = float(os.getenv("RECORDER_HEALTH_CONNECT_TIMEOUT_S", "2.0"))
+RECORDER_HEALTH_WRITE_TIMEOUT_S = float(os.getenv("RECORDER_HEALTH_WRITE_TIMEOUT_S", "5.0"))
+# The recording policy is also reloaded this often as a safety net for a missed NOTIFY.
+RECORDER_POLICY_REFRESH_MAX_S = float(os.getenv("RECORDER_POLICY_REFRESH_MAX_S", "60.0"))
+RECORDER_REHYDRATE_TIMEOUT_S = float(os.getenv("RECORDER_REHYDRATE_TIMEOUT_S", "10.0"))
+RECORDER_REHYDRATE_RETRY_S = float(os.getenv("RECORDER_REHYDRATE_RETRY_S", "10.0"))
+RECORDER_REHYDRATE_ATTEMPTS = int(os.getenv("RECORDER_REHYDRATE_ATTEMPTS", "30"))
+RECORDER_OP_CONNECT_TIMEOUT_S = float(os.getenv("RECORDER_OP_CONNECT_TIMEOUT_S", "5.0"))
+RECORDER_OP_RETRY_DELAYS_S = _env_floats("RECORDER_OP_RETRY_DELAYS_S", "1.0,2.0,5.0,10.0,30.0")
+RECORDER_MAX_PENDING_OPS = int(os.getenv("RECORDER_MAX_PENDING_OPS", "1000"))
+# Orphaned RUNNING runs are settled this often; runs younger than MIN_AGE_S are left alone.
+RECORDER_RECONCILE_PERIOD_S = float(os.getenv("RECORDER_RECONCILE_PERIOD_S", "600.0"))
+RECORDER_RECONCILE_MIN_AGE_S = float(os.getenv("RECORDER_RECONCILE_MIN_AGE_S", "60.0"))
+# Trajectory rows logged this long after the run ended still belong to it.
+RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))

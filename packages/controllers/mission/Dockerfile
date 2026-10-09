@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy cloud_common
 COPY cloud_common/ /app/cloud_common/
 
+# Shared defaults and env reads (never fails at import)
+COPY packages/config.py /app/packages/config.py
+
 # Copy database client (required by mission dispatch)
 COPY packages/database/postgres.py /app/packages/database/
 COPY packages/database/__init__.py /app/packages/database/

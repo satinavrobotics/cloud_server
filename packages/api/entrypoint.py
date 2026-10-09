@@ -44,11 +44,11 @@ MIGRATION_LOCK_KEY = advisory_lock_key(MIGRATION_LOCK_NAME)
 
 def _conninfo() -> str:
     from packages.config import (
-        POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_PASSWORD,
+        POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_NAME, postgres_database_password,
         POSTGRES_DATABASE_PORT, POSTGRES_DATABASE_USERNAME)
     return make_conninfo(
         dbname=POSTGRES_DATABASE_NAME, user=POSTGRES_DATABASE_USERNAME,
-        password=POSTGRES_DATABASE_PASSWORD, host=POSTGRES_DATABASE_HOST,
+        password=postgres_database_password(), host=POSTGRES_DATABASE_HOST,
         port=POSTGRES_DATABASE_PORT, application_name="api-migrations")
 
 

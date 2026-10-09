@@ -98,7 +98,6 @@ services:
       # all, so they need to be explicit here.
       - POSTGRES_DATABASE_USERNAME=${POSTGRES_DATABASE_USERNAME}
       - POSTGRES_DATABASE_NAME=${POSTGRES_DATABASE_NAME}
-      - MISSION_DISPATCH_URL=http://api-delegation-service:${API_DELEGATION_PORT:-8000}
 
   mission-planner-service:
     <<: *staging-limits
@@ -120,9 +119,8 @@ services:
       - POSTGRES_HOST=postgres
       - MISSION_PLANNER_URL=http://mission-planner-service:${MISSION_PLANNER_PORT:-8005}
       - GRAPH_BUILDER_WS_URL=ws://graph-builder-service:${GRAPH_BUILDER_PORT:-8004}
-      # LIVEKIT_URL deliberately left pointing at localhost -- livekit isn't started in
-      # staging, and packages/config.py doesn't currently read a LIVEKIT_URL override anyway
-      # (a pre-existing gap unrelated to this rehearsal). Fine to leave unreachable.
+      # LIVEKIT_URL deliberately left pointing at localhost (packages/config.py reads it) --
+      # livekit isn't started in staging. Fine to leave unreachable.
     ports:
       - "127.0.0.1:18000:8000"
 

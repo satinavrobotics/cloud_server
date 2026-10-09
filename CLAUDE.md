@@ -13,7 +13,7 @@ Known issues, deferred work and audit findings: `AUDIT_BACKLOG.md` (punch list) 
 There are two separate env files, with **different variable names**:
 
 - **Docker Compose** reads `docker_compose/.env` (the project dir is the directory of the first `-f` file). It expects `ARANGO_ROOT_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE_*`, `MQTT_PORT_TCP`, `MQTT_PORT_WEBSOCKET`, `MQTT_TRANSPORT`, and maps them into each service as `ARANGO_PASSWORD` / `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY`. Compose falls back to `openSesame` / `minioadmin` when the root variables are unset — set them.
-- **Running a service directly** (`python -m ...`, and the unit tests) reads the process environment: `packages/config.py` raises `EnvironmentError` at import if `ARANGO_PASSWORD`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` or `POSTGRES_PASSWORD` is missing. The repo-root `.env.example` documents these names.
+- **Running a service directly** (`python -m ...`, and the unit tests) reads the process environment: `packages/config.py` never fails at import (every image ships it, mission-dispatch included); the code that needs `ARANGO_PASSWORD`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` or `POSTGRES_PASSWORD` calls `config.require_secret(name)` / `postgres_database_password()` when it builds its client, and raises `EnvironmentError` naming the variable. The repo-root `.env.example` documents these names.
 
 Never commit real credentials to either file.
 

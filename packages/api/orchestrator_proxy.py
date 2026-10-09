@@ -18,14 +18,15 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from cloud_common.objects.robot import RobotObjectV1
 
 from packages.api.orchestrator_client import cloud_link, onboard_map_name, orchestrator_address
-from packages.config import MAPPING_SERVICE_CANDIDATES, ORCHESTRATOR_SAVE_TIMEOUT_S
+from packages.config import (MAPPING_SERVICE_CANDIDATES, ORCHESTRATOR_PROXY_TIMEOUT_S,
+                             ORCHESTRATOR_SAVE_TIMEOUT_S)
 
 logger = logging.getLogger(__name__)
 
 _SAVE_PATH = re.compile(r"^localization/save/?$")
 _LOCALIZATION_PATH = re.compile(r"^localization/?$")
 _SERVICE_PATH = re.compile(r"^services/([^/]+)/(start|stop)/?$")
-DEFAULT_TIMEOUT_S = 60.0
+DEFAULT_TIMEOUT_S = ORCHESTRATOR_PROXY_TIMEOUT_S
 # RFC 7230 6.1: meaningful for one connection only, never forwarded (plus host / content-length,
 # which httpx sets for the new request)
 _HOP_BY_HOP = frozenset({"host", "content-length", "connection", "keep-alive",

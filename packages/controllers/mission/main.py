@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 
+from packages import config
 from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import server as mission_server
 
@@ -29,29 +30,31 @@ LOGGING_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mqtt_host", default="localhost",
+    parser.add_argument("--mqtt_host", default=config.MQTT_HOST,
                         help="The hostname of the mqtt server to connect to")
-    parser.add_argument("--mqtt_port", default=1883, type=int,
+    parser.add_argument("--mqtt_port", default=config.MQTT_PORT, type=int,
                         help="The port of the mqtt server to connect to")
     parser.add_argument("--mqtt_transport", default="tcp", choices=("tcp", "websockets"),
                         help="Set transport mechanism as WebSockets or raw TCP")
     parser.add_argument("--mqtt_ws_path", default=None,
                         help="The path for the websocket if mqtt_transport is websockets")
-    parser.add_argument("--mqtt_prefix", default="uagv/v2/RobotCompany",
+    parser.add_argument("--mqtt_prefix", default=config.MQTT_VDA5050_PREFIX,
                         help="The prefix to add to all VDA5050 mqtt topics")
     parser.add_argument("--mqtt_username", default=None,
                         help="The Username to authenticate to MQTT broker")
     parser.add_argument("--mqtt_password", default=None,
                         help="The password to authenticate to MQTT broker")
-    parser.add_argument("--postgres-db", default="mission",
+    parser.add_argument("--postgres-db", default=config.POSTGRES_DATABASE_NAME,
                         help="The name of the postgres database")
-    parser.add_argument("--postgres-user", default="postgres",
+    parser.add_argument("--postgres-user", default=config.POSTGRES_DATABASE_USERNAME,
                         help="The username for the postgres database")
-    parser.add_argument("--postgres-password", default="postgres",
+    parser.add_argument("--postgres-password",
+                        default=os.getenv("POSTGRES_DATABASE_PASSWORD",
+                                          config.POSTGRES_PASSWORD or "postgres"),
                         help="The password for the postgres database")
-    parser.add_argument("--postgres-host", default="localhost",
+    parser.add_argument("--postgres-host", default=config.POSTGRES_DATABASE_HOST,
                         help="The hostname of the postgres database")
-    parser.add_argument("--postgres-port", default=5432, type=int,
+    parser.add_argument("--postgres-port", default=config.POSTGRES_DATABASE_PORT, type=int,
                         help="The port of the postgres database")
     parser.add_argument("--mission_ctrl_url", default=None,
                         help="The url where the mission control REST API is hosted")
@@ -63,17 +66,16 @@ if __name__ == "__main__":
     parser.add_argument("--disable_request_factsheet", action="store_true",
                         help="Disable factsheet pulling")
     parser.add_argument("--disable_fleet_recording", action="store_true",
-                        default=os.getenv("DISABLE_FLEET_RECORDING", "").lower()
-                        in ("1", "true", "yes"),
+                        default=config.DISPATCH_DISABLE_FLEET_RECORDING,
                         help="Do not write Phase 0 runs/events/telemetry (kill switch; "
                              "also $DISABLE_FLEET_RECORDING)")
     parser.add_argument("--fleet_spill_path",
-                        default=os.getenv("FLEET_SPILL_PATH", fleet_recorder.DEFAULT_SPILL_PATH),
+                        default=config.DISPATCH_FLEET_SPILL_PATH,
                         help="JSONL file for events the database could not take yet "
                              "(also $FLEET_SPILL_PATH)")
 
     parser.add_argument("--mission_planner_url",
-                        default=os.getenv("MISSION_PLANNER_URL", "http://localhost:8005"),
+                        default=config.URL_MISSION_PLANNER,
                         help="Mission planner service, used to replan a go-to as it starts "
                              "(also $MISSION_PLANNER_URL)")
 

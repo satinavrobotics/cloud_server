@@ -122,6 +122,7 @@ import json
 import logging
 import math
 import re
+import time
 import uuid
 from typing import (Any, AsyncIterator, Awaitable, Callable, Dict, List, Mapping, Optional,
                     Sequence, Tuple)
@@ -140,7 +141,8 @@ from packages.api.mapping_switch import (
     SLAM_FAILED, SLAM_SAVED, SLAM_SERVICE, Snapshot, SlamResult, action_name, robot_action,
     service_action, slam_save_action, slam_start_action, START, STOP)
 from packages.api.orchestrator_client import onboard_map_name  # noqa: F401 - re-exported
-from packages.config import RUN_CHANGE_RESTART_RETRY_S, RUN_CHANGE_RESTART_TRIES
+from packages.config import (
+    OPEN_SESSION_CACHE_TTL_S, RUN_CHANGE_RESTART_RETRY_S, RUN_CHANGE_RESTART_TRIES)
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.utils import map_geo
@@ -2094,8 +2096,8 @@ class OpenSessionCache:
     robot state message, and each carries the robot's `session`. Session changes through this
     API invalidate it; changes by mission-dispatch (unplace, re-place) show within `ttl`."""
 
-    def __init__(self, db: Any, ttl: float = 1.0, clock: Optional[Callable[[], float]] = None):
-        import time
+    def __init__(self, db: Any, ttl: float = OPEN_SESSION_CACHE_TTL_S,
+                 clock: Optional[Callable[[], float]] = None):
         self._db = db
         self.ttl = ttl
         self._clock = clock or time.monotonic

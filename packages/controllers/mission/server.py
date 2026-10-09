@@ -40,6 +40,7 @@ import psycopg
 import psycopg_pool
 import pydantic
 
+from packages import config
 from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import battery
 from packages.controllers.mission import behavior_tree
@@ -90,19 +91,19 @@ def initial_header_id(now: Optional[float] = None) -> int:
 # Webhook calls (notify nodes, the charging hook) run in a worker thread so a slow endpoint
 # never stalls the event loop shared by all robots. A notify node's spec timeout is capped;
 # its retries wait these seconds before the 2nd, 3rd and 4th attempt.
-NOTIFY_MAX_TIMEOUT_S = 30.0
-NOTIFY_RETRY_BACKOFF_S = (1.0, 2.0, 4.0)
+NOTIFY_MAX_TIMEOUT_S = config.DISPATCH_NOTIFY_MAX_TIMEOUT_S
+NOTIFY_RETRY_BACKOFF_S = config.DISPATCH_NOTIFY_RETRY_BACKOFF_S
 NOTIFY_RETRY_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 # The charging hook (--mission_ctrl_url): per-request timeout, and the least time between
 # two attempts for one robot (state messages arrive far more often than that).
-CHARGING_HOOK_TIMEOUT_S = 5.0
+CHARGING_HOOK_TIMEOUT_S = config.DISPATCH_CHARGING_HOOK_TIMEOUT_S
 # A handler that fails the same way on every state message would log at state rate: the
 # robot loop logs the first occurrence of each distinct exception (type + message) with its
 # traceback, then at most one count summary per this many seconds. At most
 # LOOP_ERROR_MAX_KINDS distinct kinds are tracked (the least recently logged is forgotten).
-LOOP_ERROR_SUMMARY_INTERVAL_S = 60.0
-LOOP_ERROR_MAX_KINDS = 32
-CHARGING_HOOK_RETRY_S = 60.0
+LOOP_ERROR_SUMMARY_INTERVAL_S = config.DISPATCH_LOOP_ERROR_SUMMARY_INTERVAL_S
+LOOP_ERROR_MAX_KINDS = config.DISPATCH_LOOP_ERROR_MAX_KINDS
+CHARGING_HOOK_RETRY_S = config.DISPATCH_CHARGING_HOOK_RETRY_S
 
 # Phase 0 tables dispatch will write (v2 §5.3). They come from the API's Alembic migration
 # (20260924_01_phase0_core; robot_track_ts: 20261009_01_robot_track), so on startup dispatch waits until they exist.
@@ -110,35 +111,35 @@ DISPATCH_REQUIRED_TABLES = ("mission_runs", "fleet_events", "robot_state_ts", "r
                             "robot_track_ts")
 
 # How long the recording-only settings watcher waits before re-watching after a failure
-SETTINGS_WATCH_RETRY_S = 5.0
+SETTINGS_WATCH_RETRY_S = config.DISPATCH_SETTINGS_WATCH_RETRY_S
 
 # _watch_changes (missions, robots) restarts its watch after a failure: first retry after
 # the minimum, doubling up to the maximum; a watch that delivered something starts over.
-WATCH_CHANGES_RETRY_MIN_S = 1.0
-WATCH_CHANGES_RETRY_MAX_S = 30.0
+WATCH_CHANGES_RETRY_MIN_S = config.DISPATCH_WATCH_CHANGES_RETRY_MIN_S
+WATCH_CHANGES_RETRY_MAX_S = config.DISPATCH_WATCH_CHANGES_RETRY_MAX_S
 
 # An MQTT message from a robot the dispatcher does not know is looked up in the database once
 # per this many seconds per name (and warned about once), not once per message.
-UNKNOWN_ROBOT_TTL_S = 60.0
+UNKNOWN_ROBOT_TTL_S = config.DISPATCH_UNKNOWN_ROBOT_TTL_S
 
 # A robot state of ON_TASK with no mission is set back to IDLE only this long after the robot's
 # controller was created (a dispatcher restart re-queues a running mission first).
-STALE_STATE_GRACE_S = 30.0
+STALE_STATE_GRACE_S = config.DISPATCH_STALE_STATE_GRACE_S
 # Maps §14.13: a run-epoch check that failed (database) is retried after this long.
-RUN_CHECK_RETRY_S = 30.0
+RUN_CHECK_RETRY_S = config.DISPATCH_RUN_CHECK_RETRY_S
 # The run-epoch check runs inline on the robot's state loop: it is given this long (a pool
 # stall can last 30 s), then it counts as failed and is retried after RUN_CHECK_RETRY_S.
-RUN_CHECK_TIMEOUT_S = 5.0
+RUN_CHECK_TIMEOUT_S = config.DISPATCH_RUN_CHECK_TIMEOUT_S
 # A current mission whose start failed (an exception before its tree existed) is started
 # again on a robot state message at most this often, and failed after this many attempts.
-START_RETRY_S = 5.0
-MAX_START_ATTEMPTS = 5
+START_RETRY_S = config.DISPATCH_START_RETRY_S
+MAX_START_ATTEMPTS = config.DISPATCH_MAX_START_ATTEMPTS
 # A failed status write (database restart, pool timeout) is retried with this back-off
 # (doubling, capped) until it lands, the row is gone or the controller is shut down. A
 # failure streak is a warning on its first failure and an error from the Nth on.
-STATUS_WRITE_RETRY_MIN_S = 0.5
-STATUS_WRITE_RETRY_MAX_S = 10.0
-STATUS_WRITE_ERROR_AFTER = 5
+STATUS_WRITE_RETRY_MIN_S = config.DISPATCH_STATUS_WRITE_RETRY_MIN_S
+STATUS_WRITE_RETRY_MAX_S = config.DISPATCH_STATUS_WRITE_RETRY_MAX_S
+STATUS_WRITE_ERROR_AFTER = config.DISPATCH_STATUS_WRITE_ERROR_AFTER
 # A status write failing with one of these is retried (the database or the network is
 # unavailable); anything else (a serialization TypeError, a DataError) cannot succeed on a
 # retry and is dropped after one logged attempt.
@@ -146,23 +147,23 @@ STATUS_WRITE_TRANSIENT_ERRORS = (psycopg.OperationalError, psycopg.InterfaceErro
                                  psycopg_pool.PoolTimeout, psycopg_pool.PoolClosed,
                                  OSError, asyncio.TimeoutError)
 # How long a shutdown waits for the queued status writes to land.
-STATUS_WRITE_FLUSH_S = 3.0
+STATUS_WRITE_FLUSH_S = config.DISPATCH_STATUS_WRITE_FLUSH_S
 # Graceful shutdown: each step is bounded on its own so a slow one cannot starve the next;
 # their sum stays under lifecycle.SHUTDOWN_TIMEOUT_S (which stop_grace_period must exceed).
-SHUTDOWN_MQTT_S = 1.5
-SHUTDOWN_ROBOTS_S = STATUS_WRITE_FLUSH_S + 1.0
-SHUTDOWN_RECORDER_DRAIN_S = 2.5
-SHUTDOWN_RECORDER_STOP_S = 2.0
-SHUTDOWN_POOL_CLOSE_S = 1.5
-SHUTDOWN_LOCK_S = 1.0
+SHUTDOWN_MQTT_S = config.DISPATCH_SHUTDOWN_MQTT_S
+SHUTDOWN_ROBOTS_S = config.DISPATCH_SHUTDOWN_ROBOTS_S
+SHUTDOWN_RECORDER_DRAIN_S = config.DISPATCH_SHUTDOWN_RECORDER_DRAIN_S
+SHUTDOWN_RECORDER_STOP_S = config.DISPATCH_SHUTDOWN_RECORDER_STOP_S
+SHUTDOWN_POOL_CLOSE_S = config.DISPATCH_SHUTDOWN_POOL_CLOSE_S
+SHUTDOWN_LOCK_S = config.DISPATCH_SHUTDOWN_LOCK_S
 # The robot row (jsonb status + NOTIFY to every listener) is written at most this often for
 # fields that change continuously (pose, battery, localization score, deviation range); a
 # discrete change (online, state, errors, map, recording, ...) is written at once, and the
 # newest continuous values always follow within this window (trailing write).
-ROBOT_STATUS_MIN_WRITE_S = 1.0
+ROBOT_STATUS_MIN_WRITE_S = config.DISPATCH_ROBOT_STATUS_MIN_WRITE_S
 # A newest-wins state message that replaced an unprocessed one is a warning the first time
 # and then every this many times (it means the robot's loop or the broker queue is behind).
-STATE_COALESCED_WARN_EVERY = 100
+STATE_COALESCED_WARN_EVERY = config.DISPATCH_STATE_COALESCED_WARN_EVERY
 # Failure reason of the missions of a robot that is deleted.
 ROBOT_DELETED_REASON = "Robot deleted"
 
@@ -177,18 +178,18 @@ ORDER_REJECTION_ERROR_TYPES = frozenset({
     "orderError", "orderUpdateError", "validationError", "noRouteError",
     "orderNotAccepted"})
 # Per-node notes (informations with a nodeId reference) kept on a mission, newest first.
-MISSION_NODE_NOTES_MAX = 50
+MISSION_NODE_NOTES_MAX = config.DISPATCH_MISSION_NODE_NOTES_MAX
 # Skipped nodes kept on a mission (oldest dropped first).
-MISSION_SKIPPED_NODES_MAX = 100
+MISSION_SKIPPED_NODES_MAX = config.DISPATCH_MISSION_SKIPPED_NODES_MAX
 # Node offsets that suggest a frame error: at least this many, mostly one way
 # (|mean vector| / mean length), and on average at least this far.
-OFFSET_SUSPECT_MIN_N = 5
-OFFSET_SUSPECT_CONSISTENCY = 0.8
-OFFSET_SUSPECT_MIN_M = 0.2
+OFFSET_SUSPECT_MIN_N = config.DISPATCH_OFFSET_SUSPECT_MIN_N
+OFFSET_SUSPECT_CONSISTENCY = config.DISPATCH_OFFSET_SUSPECT_CONSISTENCY
+OFFSET_SUSPECT_MIN_M = config.DISPATCH_OFFSET_SUSPECT_MIN_M
 
 # A datum that moves less than this is GNSS jitter, not a change (map-location plan A).
-DATUM_CHANGE_THRESHOLD_M = 1.0
-DATUM_BEARING_THRESHOLD_DEG = 0.5
+DATUM_CHANGE_THRESHOLD_M = config.DISPATCH_DATUM_CHANGE_THRESHOLD_M
+DATUM_BEARING_THRESHOLD_DEG = config.DISPATCH_DATUM_BEARING_THRESHOLD_DEG
 
 
 def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -219,9 +220,9 @@ def _datum_changed(old: Optional[robot_object.RobotDatumV1],
 # Approximate position (map-location plan B): a move below this, with source and fix quality
 # unchanged and accuracy within APPROX_ACCURACY_REL_TOL, is not worth a status write, unless
 # the stored copy is older than APPROX_POSITION_REFRESH_S (a parked robot must not look stale).
-APPROX_POSITION_THRESHOLD_M = 5.0
-APPROX_ACCURACY_REL_TOL = 0.2
-APPROX_POSITION_REFRESH_S = 300.0
+APPROX_POSITION_THRESHOLD_M = config.DISPATCH_APPROX_POSITION_THRESHOLD_M
+APPROX_ACCURACY_REL_TOL = config.DISPATCH_APPROX_ACCURACY_REL_TOL
+APPROX_POSITION_REFRESH_S = config.DISPATCH_APPROX_POSITION_REFRESH_S
 
 
 def _approx_position_changed(old: Optional[robot_object.RobotApproxPositionV1],
@@ -457,7 +458,7 @@ class Robot:
     # messages that lack it, with exponential back-off (base * 2^(resends-1), capped) so
     # a robot streaming state at 10 Hz does not burn the budget in seconds; give up after
     # this many attempts. See handle_instant_action().
-    MAX_INSTANT_ACTION_RESENDS = 20
+    MAX_INSTANT_ACTION_RESENDS = config.DISPATCH_MAX_INSTANT_ACTION_RESENDS
     # A cancel that only drops a dead mission's order (CancelPurpose.STOP) blocks the next
     # mission's send until it is acknowledged or abandoned: it gets a shorter budget.
     STOP_CANCEL_MAX_RESENDS = 6
@@ -465,7 +466,7 @@ class Robot:
     INSTANT_ACTION_RESEND_MAX_S = 8.0
     # Consecutive state messages whose orderId doesn't match the current mission
     # before we stop resending and fail the mission. See _on_client_message().
-    MAX_ORDER_MISMATCHES = 40
+    MAX_ORDER_MISMATCHES = config.DISPATCH_MAX_ORDER_MISMATCHES
     # An order the robot has not adopted yet is sent again with exponential back-off
     # (base * 2^resends, capped), not on every state message. See _resend_due().
     ORDER_RESEND_BASE_S = 1.0
@@ -489,7 +490,7 @@ class Robot:
     # How many finished mission names to remember for re-queue suppression. Only
     # needs to outlive the watcher echo of our own terminal write, so this is
     # generous; it exists so a long-lived robot doesn't grow the set unboundedly.
-    MAX_FINISHED_MISSIONS_TRACKED = 256
+    MAX_FINISHED_MISSIONS_TRACKED = config.DISPATCH_MAX_FINISHED_MISSIONS_TRACKED
 
     def __init__(self, name: str, db: PostgresDatabase, client: MQTTClient,
                  prefix: str, server: "RobotServer"):

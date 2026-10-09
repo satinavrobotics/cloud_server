@@ -4,9 +4,8 @@ route out on its own when it loses its connection mid-route (robot team, 2026-10
 how close counts as reached (allowedDeviationXY/Theta), and the nodePolicy action (how
 long to wait at a blocked node, whether it may be skipped).
 
-Settings are read from the environment once, at import. mission-dispatch's image has no
-packages/config.py (it needs credentials dispatch does not have), so the keys live here;
-config.py points at this module.
+Settings are read from the environment once, at import. the keys live here (not in
+packages/config.py); config.py points at this module.
 """
 import logging
 import math

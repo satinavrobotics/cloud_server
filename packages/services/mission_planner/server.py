@@ -84,12 +84,12 @@ class MissionPlannerService:
         self.logger = logging.getLogger("MissionPlanner")
 
         # Initialize clients
-        from packages.config import ARANGO_PASSWORD
+        from packages.config import require_secret
         self.graph_db = GraphDatabaseService(
             arango_host=arango_host,
             arango_port=arango_port,
             arango_username=arango_username,
-            arango_password=arango_password or ARANGO_PASSWORD or "openSesame",
+            arango_password=arango_password or require_secret("ARANGO_PASSWORD"),
             database_name=arango_database,
         )
         self._arango_host = arango_host

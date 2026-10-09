@@ -39,7 +39,7 @@ from cloud_common.objects.mission import MissionObjectV1, MissionQueryParamsV1, 
 from packages.topomap_dbs.client import TopomapDatabaseClient
 from packages.config import (
     MQTT_KEEPALIVE,
-    MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
+    MINIO_HOST, MINIO_PORT, MINIO_SECURE,
 )
 from packages.events.emit import Event, emit
 from packages.services.graph_builder import ingest
@@ -202,12 +202,12 @@ class GraphBuilderService:
         self.rejects = ingest.RejectLimiter(interval=reject_event_interval)
 
         # Initialize service clients
-        from packages.config import ARANGO_PASSWORD
+        from packages.config import require_secret
         self.topomap_db = TopomapDatabaseClient(
             arango_host=arango_host,
             arango_port=arango_port,
             arango_username=arango_username,
-            arango_password=arango_password or ARANGO_PASSWORD or "openSesame",
+            arango_password=arango_password or require_secret("ARANGO_PASSWORD"),
             arango_database=arango_database,
             minio_host=minio_host,
             minio_port=minio_port,

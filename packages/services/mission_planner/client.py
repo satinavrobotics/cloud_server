@@ -10,11 +10,7 @@ from typing import Optional, Dict, Any
 
 import httpx
 
-try:
-    from packages.config import URL_MISSION_PLANNER, TIMEOUT_HTTP_REQUEST
-except ImportError:
-    URL_MISSION_PLANNER = "http://localhost:8005"
-    TIMEOUT_HTTP_REQUEST = 30
+from packages.config import URL_MISSION_PLANNER, TIMEOUT_HTTP_REQUEST
 
 
 class MissionPlannerClient:

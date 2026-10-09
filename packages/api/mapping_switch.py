@@ -79,7 +79,7 @@ from packages.api import orchestrator_client as oc
 from packages.api.orchestrator_services import pick_service
 from packages.config import (
     MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_QUERY_TIMEOUT_S,
-    ORCHESTRATOR_SAVE_POLL_S,
+    ORCHESTRATOR_SAVE_POLL_S, SLAM_SAVE_MAX_ATTEMPTS, SLAM_SAVE_POLL_ERRORS, SLAM_SAVE_START_TRIES,
     ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S,
 )
 from packages.utils.map_sessions import KNOWN_SERVICES, ORCHESTRATOR_SERVICES, SLAM, TOPO
@@ -89,9 +89,9 @@ logger = logging.getLogger("ApiDelegationService.mapping_switch")
 # one snapshot read (GET /localization, GET /services, the status calls) as a whole
 SNAPSHOT_BUDGET_S = 3 * ORCHESTRATOR_QUERY_TIMEOUT_S
 
-SAVE_START_TRIES = 5      # a 503 (driver not up yet) is retried this often
-SAVE_POLL_ERRORS = 5      # consecutive failed status reads that end a poll
-SAVE_MAX_ATTEMPTS = 2     # saves started per save_slam(): one retry of a save that ran out of time
+SAVE_START_TRIES = SLAM_SAVE_START_TRIES      # a 503 (driver not up yet) is retried this often
+SAVE_POLL_ERRORS = SLAM_SAVE_POLL_ERRORS      # consecutive failed status reads that end a poll
+SAVE_MAX_ATTEMPTS = SLAM_SAVE_MAX_ATTEMPTS    # saves started per save_slam(): one retry of a save that ran out of time
 
 RUNNING, NOT_RUNNING, NOT_AVAILABLE = "running", "not_running", "not_available"
 SOURCE = "orchestrator"

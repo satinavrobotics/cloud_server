@@ -211,20 +211,36 @@ Original finding:
 suite therefore validates a different runtime from what ships (v1-style `class
 Config` only warns under v2). Align the test env to 1.9.0 (or migrate for real).
 
-### C2. `packages/config.py` is not the single source of truth it claims to be — **medium**
-Violators (grep-verified): `api/main.py:261-263` (`ws://localhost:8004`, direct
-`os.getenv` for `GRAPH_BUILDER_WS_URL` / `MISSION_DISPATCHER_WS_URL` /
-`MQTT_ENABLED`); `api/server.py:498-502`; `services/livekit/main.py` (port 8006,
-ttl 36000) and `client.py:26`; `mission_planner/client.py` (`timeout=5`, URL
-literal); ctor defaults in every `topomap_dbs/*/server.py`, `graph_builder/server.py`,
-`controllers/mission/main.py`, `utils/mqtt_client.py`. Mission-controller magic
-numbers (`MAX_INSTANT_ACTION_RESENDS=20`, `MAX_ORDER_MISMATCHES=40`,
-`MAX_FINISHED_MISSIONS_TRACKED=256`, notify retries) are *counts per state
-message*, so their real duration depends on the robot's state rate. Conversely,
-compose sets env vars nothing reads (`DISTANCE_THRESHOLD=5.0` in compose vs the
-3.0 graph-builder actually runs with; `KNN_K`, `RANGE_SEARCH_RADIUS`,
-`MISSION_PLANNER_URL`, `LIVEKIT_URL`, …). MinIO console default :9001 collides
-with mosquitto's websocket default :9001 under host networking.
+### C2. `packages/config.py` is not the single source of truth it claims to be — **medium** (mostly done)
+- ✅ DONE — config.py no longer raises at import: secrets are `None` when unset and the
+  clients that need them call `require_secret(name)` / `postgres_database_password()` at
+  construction (`TopomapDatabaseClient`, `ApiDelegationService`, the api / graph-builder /
+  planner mains, migrations, telemetry). The "Required by config at import time" env
+  placeholders (agent-orchestrator in compose, dummy_robot image) are gone.
+- ✅ DONE — mission-dispatch ships config.py; its CLI defaults (MQTT, PostgreSQL, planner
+  URL, spill path, kill switch), the tunables at the top of `controllers/mission/server.py`
+  and `fleet_recorder.py` (env names `DISPATCH_*` / `RECORDER_*`), `map_sessions`'s
+  `RELOC_DEGRADED_SCORE` and the PostgreSQL pool sizes / reconnect periods now come from
+  config.py with the same defaults. Production passes the postgres settings on the command
+  line (db `mission` = `POSTGRES_DATABASE_NAME`), so the effective values did not change.
+  `BATTERY_LOW_PCT` (20) is one setting for the recorder and the agent
+  (`AGENT_BATTERY_LOW_THRESHOLD` still overrides it for the agent); `BATTERY_OK_PCT` 25.
+- ✅ DONE — API constants (`ORCHESTRATOR_PROXY_TIMEOUT_S`, `ORCHESTRATOR_MAPS_UNKNOWN_TTL_S`,
+  `SLAM_SAVE_*`, `RELOC_MAX_FINISHED_JOBS`, `OPEN_SESSION_CACHE_TTL_S`), `GRAPH_BUILDER_WS_URL`,
+  `MISSION_DISPATCHER_WS_URL`, `MQTT_ENABLED`; every `URL_*` honours an env var
+  (`GRAPH_BUILDER_URL`, `MISSION_PLANNER_URL`, `LIVEKIT_URL`, `AGENT_ORCHESTRATOR_URL`,
+  `API_DELEGATION_URL`); `URL_MISSION_DISPATCH` (unused, port 5000) and the dead compose
+  `MISSION_DISPATCH_URL` are removed; the dead `try/except ImportError` config fallbacks in
+  `services/*/client.py` too.
+- Still open: ctor defaults in `topomap_dbs/*/server.py`, `graph_builder/server.py`,
+  `utils/mqtt_client.py`; `services/livekit/main.py` port/ttl; `order_policy.py`,
+  `lifecycle.py`, `leg_tracker.py`, `blocked_nodes.py` keep their own env reads / constants;
+  compose `DISTANCE_THRESHOLD` (5.0) / `RADIUS_THRESHOLD` / `KNN_K` / `RANGE_SEARCH_RADIUS`
+  are still not read by config.py (DISTANCE_THRESHOLD there is 3.0: making it read the env
+  would change graph-builder's effective value). `MAX_INSTANT_ACTION_RESENDS=20`,
+  `MAX_ORDER_MISMATCHES=40` are *counts per state message*, so their real duration depends
+  on the robot's state rate. MinIO console default :9001 collides with mosquitto's
+  websocket default :9001 under host networking.
 
 ### C3. Stale docs and tests — **medium**
 - ✅ DONE — **`CLAUDE.md`** rewritten to match the code (on the owner's request):

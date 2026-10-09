@@ -85,7 +85,8 @@ from fastapi import HTTPException
 
 from packages.api import maps
 from packages.api import orchestrator_client as oc
-from packages.config import RELOC_CONFIRM_TIMEOUT_S, RELOC_JOB_POLL_S, RELOC_JOB_TIMEOUT_S
+from packages.config import (
+    RELOC_CONFIRM_TIMEOUT_S, RELOC_JOB_POLL_S, RELOC_JOB_TIMEOUT_S, RELOC_MAX_FINISHED_JOBS)
 from packages.utils import map_sessions as ms
 
 logger = logging.getLogger("ApiDelegationService.reloc_job")
@@ -96,7 +97,7 @@ ACTIVE = (PREPARING, STARTING, WAITING, CONFIRMING)
 DECISION_CONFIRM, DECISION_EDIT = "confirm", "edit"
 # `mode`: Odin alone, or Odin assisted by the user's initial pose
 MODE_ODIN, MODE_ASSISTED = "odin", "assisted"
-MAX_FINISHED_JOBS = 50
+MAX_FINISHED_JOBS = RELOC_MAX_FINISHED_JOBS
 
 
 def _placement_at(session: Optional[Dict[str, Any]]) -> Optional[str]:

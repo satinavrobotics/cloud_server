@@ -21,8 +21,8 @@ from packages.utils.service_utils import (
 )
 from packages.utils.fastapi_helpers import add_error_handlers
 from packages.config import (
-    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
-    POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, POSTGRES_DATABASE_PASSWORD,
+    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, DATA_BASE_NAME,
+    POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, postgres_database_password, require_secret,
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
     KNN_K, RANGE_SEARCH_RADIUS,
     PORT_MISSION_PLANNER, DEFAULT_HOST, LOG_LEVEL_DEFAULT, TIMEOUT_HTTP_REQUEST_SHORT,
@@ -139,11 +139,11 @@ async def lifespan(app: FastAPI):
         arango_host=ARANGO_HOST,
         arango_port=ARANGO_PORT,
         arango_username=ARANGO_USERNAME,
-        arango_password=ARANGO_PASSWORD,
+        arango_password=require_secret("ARANGO_PASSWORD"),
         arango_database=DATA_BASE_NAME,
         postgres_db=POSTGRES_DATABASE_NAME,
         postgres_user=POSTGRES_DATABASE_USERNAME,
-        postgres_password=POSTGRES_DATABASE_PASSWORD,
+        postgres_password=postgres_database_password(),
         postgres_host=POSTGRES_DATABASE_HOST,
         postgres_port=POSTGRES_DATABASE_PORT,
         knn_k=KNN_K,

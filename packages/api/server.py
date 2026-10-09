@@ -32,9 +32,9 @@ from cloud_common.objects.settings import SettingsObjectV1
 from cloud_common.objects.site import SiteObjectV1
 from cloud_common.objects.object import ObjectLifecycleV1
 from packages.config import (
-    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
-    URL_MISSION_PLANNER, URL_LIVEKIT, URL_MISSION_DISPATCH,
-    MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
+    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, DATA_BASE_NAME,
+    URL_MISSION_PLANNER, URL_LIVEKIT, require_secret,
+    MINIO_HOST, MINIO_PORT, MINIO_SECURE,
     MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE, DEFAULT_MAP_ID,
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
 )
@@ -599,7 +599,7 @@ class ApiDelegationService:
             arango_host=arango_host,
             arango_port=arango_port,
             arango_username=arango_username,
-            arango_password=arango_password or ARANGO_PASSWORD or "openSesame",
+            arango_password=arango_password or require_secret("ARANGO_PASSWORD"),
             arango_database=arango_database,
             minio_host=minio_host,
             minio_port=minio_port,
@@ -629,7 +629,8 @@ class ApiDelegationService:
         # RECONSTRUCTION_SERVICE_URL/_SERVICE_KEY/_CALLBACK_SECRET are set.
         self.reconstruction = reconstruction.create_gateway(
             self.database, self.graph_db, self.image_db,
-            minio_access_key or MINIO_ACCESS_KEY, minio_secret_key or MINIO_SECRET_KEY)
+            minio_access_key or require_secret("MINIO_ACCESS_KEY"),
+            minio_secret_key or require_secret("MINIO_SECRET_KEY"))
 
         # WP11 F1: DELETE /maps/{id} marks the map DELETING; this cleans up in the background.
         # The mark also cancels the map's active reconstruction job (same transaction).

@@ -24,14 +24,13 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from packages.api import orchestrator_client as oc
-from packages.config import RELOC_MAP_HELD_TTL_S
+from packages.config import ORCHESTRATOR_MAPS_UNKNOWN_TTL_S, RELOC_MAP_HELD_TTL_S
 
 logger = logging.getLogger("ApiDelegationService.orchestrator_maps")
 
 
-# How long an "unknown" (None) answer is reused: just enough that a burst of reads of an
-# unreachable robot does not each wait for the timeout. A real answer lives RELOC_MAP_HELD_TTL_S.
-UNKNOWN_TTL_S = 2.0
+# How long an "unknown" (None) answer is reused (see config); a real answer lives RELOC_MAP_HELD_TTL_S.
+UNKNOWN_TTL_S = ORCHESTRATOR_MAPS_UNKNOWN_TTL_S
 
 
 class OrchestratorMaps:

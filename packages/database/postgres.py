@@ -34,13 +34,14 @@ from psycopg_pool import AsyncConnectionPool
 
 import traceback
 
+from packages import config
 from cloud_common import objects
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.mission import MissionObjectV1
 
 # How long to wait in seconds before trying to reconnect to the Postgres database
-POSTGRES_RECONNECT_PERIOD = 0.5
-WATCHER_POSTGRES_RECONNECT_PERIOD = 0.1
+POSTGRES_RECONNECT_PERIOD = config.POSTGRES_RECONNECT_PERIOD
+WATCHER_POSTGRES_RECONNECT_PERIOD = config.WATCHER_POSTGRES_RECONNECT_PERIOD
 # How long to wait before re-checking for tables that another service's migrations create
 REQUIRED_TABLES_RETRY_PERIOD = 5
 
@@ -388,7 +389,8 @@ class PostgresDatabase:
                 check = getattr(AsyncConnectionPool, "check_connection", None)
                 if check is not None:
                     pool_kwargs["check"] = check
-                pool = AsyncConnectionPool(self._auth, min_size=2, max_size=10, open=False,
+                pool = AsyncConnectionPool(self._auth, min_size=config.POSTGRES_POOL_MIN_SIZE,
+                                           max_size=config.POSTGRES_POOL_MAX_SIZE, open=False,
                                            **pool_kwargs)
                 await pool.open(wait=True)
                 async with pool.connection() as conn:

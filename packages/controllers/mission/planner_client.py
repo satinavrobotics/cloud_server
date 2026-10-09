@@ -1,20 +1,21 @@
 """Minimal client of the mission-planner service's plan-only endpoint, for the dispatcher.
 
-The dispatcher image ships neither packages/config.py nor httpx, so this is its own small
+The dispatcher image ships no httpx, so this is its own small
 client on `requests` (already a dependency), run in a thread so it never blocks the event
 loop. Only used to replan a go-to as it starts; every failure is the caller's to log and
 survive (see Robot._replan_goto)."""
 import asyncio
-import os
 from typing import Any, Dict, Optional
 
 import requests
 
-DEFAULT_URL = "http://localhost:8005"
+from packages.config import URL_MISSION_PLANNER
+
+DEFAULT_URL = URL_MISSION_PLANNER
 
 
 def default_url() -> str:
-    return os.getenv("MISSION_PLANNER_URL", DEFAULT_URL)
+    return URL_MISSION_PLANNER
 
 
 class PlannerClient:

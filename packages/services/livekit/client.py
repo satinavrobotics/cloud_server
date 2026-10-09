@@ -10,10 +10,7 @@ from typing import Optional, Dict, Any
 
 import httpx
 
-try:
-    from packages.config import TIMEOUT_HTTP_REQUEST
-except ImportError:
-    TIMEOUT_HTTP_REQUEST = 30
+from packages.config import TIMEOUT_HTTP_REQUEST
 
 
 class LiveKitClient:

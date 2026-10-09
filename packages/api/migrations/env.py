@@ -38,12 +38,12 @@ def include_object(obj, name, type_, reflected, compare_to):
 def database_url() -> URL:
     # Imported here so `alembic --help`/`history` work without the service environment.
     from packages.config import (
-        POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_PASSWORD,
+        POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_NAME, postgres_database_password,
         POSTGRES_DATABASE_PORT, POSTGRES_DATABASE_USERNAME)
     return URL.create(
         "postgresql+psycopg",
         username=POSTGRES_DATABASE_USERNAME,
-        password=POSTGRES_DATABASE_PASSWORD,
+        password=postgres_database_password(),
         host=POSTGRES_DATABASE_HOST,
         port=POSTGRES_DATABASE_PORT,
         database=POSTGRES_DATABASE_NAME,

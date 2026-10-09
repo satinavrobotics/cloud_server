@@ -12,9 +12,9 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from packages.config import (
-    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
-    MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
-    DEFAULT_MAP_ID, ROSBAG_PRESIGN_EXPIRY,
+    ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, DATA_BASE_NAME,
+    MINIO_HOST, MINIO_PORT, MINIO_SECURE,
+    DEFAULT_MAP_ID, ROSBAG_PRESIGN_EXPIRY, require_secret,
 )
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.topomap_dbs.image_db.server import ImageDatabaseService
@@ -47,13 +47,13 @@ class TopomapDatabaseClient:
         rosbag_presign_expiry: int = ROSBAG_PRESIGN_EXPIRY,
     ):
         self._logger = logging.getLogger("TopomapDatabaseClient")
-        _minio_access = minio_access_key or MINIO_ACCESS_KEY or "minioadmin"
-        _minio_secret = minio_secret_key or MINIO_SECRET_KEY or "minioadmin"
+        _minio_access = minio_access_key or require_secret("MINIO_ACCESS_KEY")
+        _minio_secret = minio_secret_key or require_secret("MINIO_SECRET_KEY")
         self.graph = GraphDatabaseService(
             arango_host=arango_host,
             arango_port=arango_port,
             arango_username=arango_username,
-            arango_password=arango_password or ARANGO_PASSWORD or "openSesame",
+            arango_password=arango_password or require_secret("ARANGO_PASSWORD"),
             database_name=arango_database,
         )
         self.image = ImageDatabaseService(
