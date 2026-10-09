@@ -1,6 +1,6 @@
 # SatiNav Maps: redesign
 
-**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.** **U6 (deployed 2026-09-29, `mapsu6.sh`; §14.14): `robot.current_map`, the `PUT /robots/{r}/map` shim (now 410), the `GEO`/`LOCAL` sentinels and the §14.6 fallbacks are gone; a robot's map is only its open session.** **Map type conversion geo ↔ local (§17): built 2026-10-03, not deployed.**
+**Status:** 2026-09-29. M0 (coordinate conversion, §5) deployed. M1 (map type/geo/state, `map_sessions`, migration of today's maps, the new map routes; §13.1) deployed 2026-09-28. **M2 deployed 2026-09-28** (`~/pg-cutover/scripts/mapsm2.sh`): graph-builder ingests by session, the `PUT /robots/{r}/map` shim, map frame vs robot frame for missions, legacy nodes rewritten into the map frame, `MAP.DELETED` / `MAP.INGEST_REJECTED` (§13.2). **M3 built, not deployed** (robot mapping switch over MQTT; §8, §13.3; deploy `~/pg-cutover/scripts/mapsm3.sh`, API only, plus a topomap rebuild on each robot). M4 (client Maps page, mapping bar, session start) built in sati-client. **§14 (using maps: operate sessions, placement, the map window) designed 2026-09-29; it revises M5-M7.** **U6 (deployed 2026-09-29, `mapsu6.sh`; §14.14): `robot.current_map`, the `PUT /robots/{r}/map` shim (now 410), the `GEO`/`LOCAL` sentinels and the §14.6 fallbacks are gone; a robot's map is only its open session.** **Map type conversion geo ↔ local (§17): built 2026-10-03; in `main` and part of the 2026-10-09 deploy (cloud `6b62d6b`).** **Since 2026-10-07/09 the ingest and switching rules of §14.16 are partly superseded by §14.17 (operate sessions add no data, `session_paused` is back); §14.17 is the current behaviour.** Sections written before U6 describe `robot.current_map` and the M3 MQTT switch in the present tense where they were true at the time; both are gone (U6 / §14.15).
 
 **Goal:** make a map a real, explicitly managed object: typed (`local` or `geo`), holding versioned contents (topo graph now, grid map later), with a lifecycle and explicit mapping sessions. The client shows every map through **one** map view.
 
@@ -193,7 +193,7 @@ Events: `MAP.CREATED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.ARCHI
 
 ## 8. Robot side (this phase only)
 
-- **Mapping switch over MQTT** (built in M3, §13.3; **replaced by the orchestrator switch, §14.15**). `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to the retained `{prefix}/{robot}/mapping/set` (`{enabled, session_id, map}`) and publishes the retained `{prefix}/{robot}/mapping/state` (`online`, `enabled`, `session_id`, `map`, `nodes_sent`, `since`, with a last will `online: false`). `{prefix}` is the VDA5050 prefix (`uagv/v2/RobotCompany`), `{robot}` the VDA5050 serial number. It already has an MQTT connection, so no orchestrator or VDA5050 change is needed. The contract is written down once, in `packages/api/mapping_control.py` (and the table in §13.3).
+- **Mapping switch over MQTT** (built in M3, §13.3; **replaced by the orchestrator switch, §14.15**). `sati_topo_mapping` (and later `sati_grid_mapping`) subscribes to the retained `{prefix}/{robot}/mapping/set` (`{enabled, session_id, map}`) and publishes the retained `{prefix}/{robot}/mapping/state` (`online`, `enabled`, `session_id`, `map`, `nodes_sent`, `since`, with a last will `online: false`). `{prefix}` is the VDA5050 prefix (`uagv/v2/RobotCompany`), `{robot}` the VDA5050 serial number. It already has an MQTT connection, so no orchestrator or VDA5050 change is needed. The contract was written down once, in `packages/api/mapping_control.py` (and the table in §13.3); that file is gone (removed with the MQTT switch, §14.15).
 - **No session tagging for now** (decided 2026-09-28). The server resolves the session from the robot name. Tagging would only catch a late node from a finished session (e.g. re-sent after an MQTT reconnect) landing in the robot's next session; graph-builder already rejects a mismatching `session_id` if one is ever sent, so it can be added later without a server change.
 - **Starting the topomap service itself** (superseded: §14.15, the API now starts it): the session-start call reports whether the mapping service is running (`mapping_service`). As built (M3) this comes from the robot's retained `mapping/state` (online, with a last will), not from the orchestrator proxy: it is exactly the process that must be up, and it needs no HTTP hop to the robot. If it isn't running, the session still starts and the client tells the user to start it; nothing is started automatically (Q3, decided).
 - **No map download, no relocalization.**
@@ -281,7 +281,7 @@ Code: `cloud_common/objects/map.py` (fields), `packages/utils/map_geo.py` (class
 - **Routes (§7):** `POST /maps` (draft), `GET /maps?type=&state=&include_archived=`, `GET /maps/{id}` (+ type/geo/state and a sessions summary), `PATCH /maps/{id}` (description only: the name keys Postgres, ArangoDB and MinIO, so rename is not in M1), `GET /maps/{id}/graph`, `POST /maps/{id}/sessions`, `.../sessions/{sid}/pause|resume|finish`, `/archive`, `/restore`; `DELETE /maps/{id}` refused while a session is open. Old routes unchanged.
 - **Events:** `MAP.CREATED`, `MAP.ARCHIVED`, `MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, written in the change's transaction (savepoint: a failed event write never fails the change). `MAP.DELETED` and `MAP.INGEST_REJECTED` are not in M1.
 - **Session start:** robot must exist and be online; a robot has at most one open session (index); **one open session per map** (API rule, not a constraint); geo needs the robot's current datum (`robot.datum`, not (0, 0)). The first session of a geo map without an origin sets `geo` from that datum (Q1) **and fills the map's `datum_*` fields (when unset) with the origin as a `utm` datum, bearing 0**, which is exactly the map frame, so the old client, planner and `POST /map/load` `transform` show a new geo map correctly. Local map: identity, `aligned` only for the map's first session (a migrated local map has its legacy session, so a new one starts unaligned).
-- **Not wired yet:** a session does not route robot data (graph-builder ingests by `current_map` until M2), so `session.node_count` stays 0 and pausing does not stop ingest; no MQTT to the robot (M3); no orchestrator check of the mapping service (M3/M4).
+- **Not wired yet (historical, at M1; wired in M2/M3):** a session does not route robot data (graph-builder ingests by `current_map` until M2), so `session.node_count` stays 0 and pausing does not stop ingest; no MQTT to the robot (M3); no orchestrator check of the mapping service (M3/M4).
 - **Legacy routes:** `POST /map/load` types the maps it registers (same rule as the migration) and never retypes an existing one. `PUT /maps/{id}/datum` updates the datum only (it does not retype a local map; revisit in M2). An archived map can still be assigned with `PUT /robots/{r}/map` (legacy path; goes away with the shims).
 - **Deploy:** API (routes + migration) and mission-dispatch. Dispatch because its datum auto-seed writes the whole map spec back and the old model would drop `type`/`geo`; the planner only reads maps and ignores unknown keys; graph-builder never reads map objects. Checked on the running images.
 - **Client (sati-client):** nothing to change for M1; all response changes are additive.
@@ -350,7 +350,7 @@ graph-builder, dispatch, planner; with 2e0b63a).
   identity, tags only. On production: `map`, 5 nodes, each moved by < 7 cm.
 - **`MAP.DELETED`**: when the background delete removes the row, in the same transaction
   (savepoint), once per delete.
-- **`robot.current_map` — remaining readers (for M4/M5):** the old client (mission mode
+- **`robot.current_map` — remaining readers (for M4/M5; historical, removed in U6, §14.14):** the old client (mission mode
   unassigned/geo/local/mapped and `register_map` in `CreateMissionOverlay`, per-waypoint `map_id`
   in `missionApi.toMissionWaypoint`, `RerouteMissionOverlay`, `MissionBuilder` map load, the map
   the UI opens on robot select in `useRobotSelection`, `MapSelectionPanel`, `MapPickerDropdown`,
@@ -371,13 +371,13 @@ graph-builder, dispatch, planner; with 2e0b63a).
 
 Code: robot `sati_topo_mapping/mapping_switch.py` (pure, unit-tested) + `topomap_node.py`, and
 `sati_mqtt_common` (subscribe with re-subscribe on reconnect, last will, on-connect hooks, publish
-with a wait); cloud `packages/api/mapping_control.py` (contract, publish, state cache),
+with a wait); cloud `packages/api/mapping_control.py` (contract, publish, state cache; since removed, §14.15),
 `packages/api/maps.py` (`notify_robot`, `sync_all_robots`), `packages/api/server.py` / `main.py`
 (wiring, routes, robot view), `packages/utils/mqtt_client.py` (connect listeners). Tests: robot
 `test/test_mapping_switch.py` (+ a live smoke against a test mosquitto: start-up, enable, pause,
 local override, finish, clean shutdown, restart picking up the retained set, kill -9 -> last will);
-cloud `tests/unit/test_maps_m3.py`, and the M3 step of `tests/integration/maps/run_m2.sh`
-(`checks_m3.py`). Deploy: `~/pg-cutover/scripts/mapsm3.sh` (API only, no migration).
+cloud `tests/unit/test_maps_m3.py` (since removed with the MQTT switch), and the M3 step of `tests/integration/maps/run_m2.sh`
+(`checks_m3.py`, since removed). Deploy: `~/pg-cutover/scripts/mapsm3.sh` (API only, no migration).
 
 **The contract** (`{prefix}` = VDA5050 prefix `uagv/v2/RobotCompany`, config
 `MQTT_VDA5050_PREFIX` / robot param `mqtt.control_prefix`; `{robot}` = robot name = VDA5050
@@ -475,7 +475,7 @@ counts per session. `since`: when `enabled` last flipped.
 M1–M4 built **making** maps: create, map with a robot, pause, finish, archive. They did not build **using** one:
 
 - The robot panel's "Assign" (`AssignMapModal`) either picks a mapless mode (`GEO`/`LOCAL`, the deprecated `PUT /robots/{r}/map`) or starts a mapping session. A finished (`ready`) map cannot be chosen for a robot, except by starting a new mapping session on it, which records more nodes.
-- What a robot "is on" is still `robot.current_map`, a free string that the shim writes. The dispatcher, the planner, the run recorder and the bag metadata read it, or they derive the transform from the map and the robot's datum without any session (`map_geo.robot_frame_in_map`).
+- *(Historical, before U6: removed in §14.14.)* What a robot "is on" was `robot.current_map`, a free string that the shim wrote. The dispatcher, the planner, the run recorder and the bag metadata read it, or they derive the transform from the map and the robot's datum without any session (`map_geo.robot_frame_in_map`).
 - A **local** map can't be reused after a robot restart. The robot's pose is in its odom frame, which resets to the robot's position at every navstack start (`agvPosition` from `/odom`, `mapId` always the literal `"map"`). `robot_frame_in_map` assumes identity for local maps, so after a restart every mission waypoint and the robot marker are off by wherever the robot was started. Nothing detects this. Local sessions store no datum, so graph-builder's `datum_changed` check never fires for them.
 - A later mapping session on a local map starts `unaligned` with identity. Its nodes land at wrong positions until the M6 alignment tool exists.
 - The client offers no choice of mapping service. The contract (`mapping/set`, `mapping/state`) has no service name. The only grid producers on the robot, `sati_map_builder` (an odom-frame `/map`) and a `slam_toolbox` wrapper, are in no bringup launch and upload nothing.
@@ -754,7 +754,7 @@ Deploy notes: open local sessions that are not aligned (later M1/M2 sessions on 
 
 ### 14.12 U5 as built
 
-Code: robot `sati_topo_mapping/mapping_switch.py` + `topomap_node.py` (sati_ros_navstack `main`); cloud `packages/api/mapping_control.py` (the per-service cache), `main.py` (robot view), `maps.py` (session summary), `server.py` (WS). `services` in `mapping/set` and "enabled only for an open, unpaused, placed mapping session; operate = the no-session payload" were already built in U1 (`map_sessions.set_payload`, published by the API and mission-dispatch). Tests: robot `test/test_mapping_switch.py` (pure Python); cloud `tests/unit/test_maps_u5.py`. Deploy: `~/pg-cutover/scripts/mapsu5.sh` (API only, no migration; **after `mapsu1.sh`**).
+Code: robot `sati_topo_mapping/mapping_switch.py` + `topomap_node.py` (sati_ros_navstack `main`); cloud `packages/api/mapping_control.py` (the per-service cache; removed in §14.15), `main.py` (robot view), `maps.py` (session summary), `server.py` (WS). `services` in `mapping/set` and "enabled only for an open, unpaused, placed mapping session; operate = the no-session payload" were already built in U1 (`map_sessions.set_payload`, published by the API and mission-dispatch). Tests: robot `test/test_mapping_switch.py` (pure Python); cloud `tests/unit/test_maps_u5.py` (since removed with the MQTT switch). Deploy: `~/pg-cutover/scripts/mapsu5.sh` (API only, no migration; **after `mapsu1.sh`**).
 
 **The contract** (adds to §13.3):
 
@@ -932,6 +932,8 @@ yet (the default name `grid` is a placeholder).
 
 ### 14.16 No mapping gating; topomap switching that only reports (2026-10-07, user decisions)
 
+> **Ingest part superseded by §14.17** (operate sessions add no data; a paused mapping session drops nodes with `session_paused`; the rejection list in the next paragraph and the "any open placed session" statements below are historical). The switching that never blocks, and `robot_actions`, still hold.
+
 If the topomap runs on a robot, the user started it from the robot's orchestrator, and its nodes
 and images go into the robot's **current map**: the map of the robot's one open session
 (`map_sessions`), converted with that session's `map_T_session`. graph-builder `decide()` now
@@ -1081,7 +1083,7 @@ Modes 2 and 3 are one mechanism: the robot-side reloc service (config `RELOC_SER
 
 ## 17. Converting a map geo ↔ local
 
-**Status:** built 2026-10-03 on branch `feat/map-type-convert` (cloud_server and sati-client), **not deployed**. Mainly for relocalization: onboard reloc (§16) works on local maps only, so a geo map a robot should relocalize on is converted to local; a local map is georeferenced so GNSS robots are placed by their datum (and street tiles show).
+**Status:** built 2026-10-03 on branch `feat/map-type-convert` (cloud_server and sati-client); merged to `main` and included in the 2026-10-09 deploy (cloud `6b62d6b`). Mainly for relocalization: onboard reloc (§16) works on local maps only, so a geo map a robot should relocalize on is converted to local; a local map is georeferenced so GNSS robots are placed by their datum (and street tiles show).
 
 **Rule: nothing moves.** The map frame's coordinates are never rewritten. Nodes, edges, node images, reconstruction results (`cloud.ply`, the top view, `pose3d_map`), every session's `map_T_session` and stored mission waypoints stay valid. Only what ties the frame to the Earth changes.
 

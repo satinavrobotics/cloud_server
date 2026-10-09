@@ -7,7 +7,7 @@ outputs only `cloud.ply` + `meta.json`, the cloud derives the top view (§7.2); 
 The spec for the external service's developer is [`handover.md`](handover.md).
 
 **Revision 2026-09-29 (user decision, R3b):** the service delivers only the 3D result,
-`cloud.ply` and `meta.json`. The 2.5D top view (`ortho.png`, `height.png`) is made by the
+`cloud.ply` and `meta.json`. The 2.5D top view (`ortho.png`, `height.png`, and the relief grid `relief_rgb.png` / `relief_height.png`) is made by the
 gateway from `cloud.ply` after `finish` (§7.2), so the service stays minimal and the top-view
 rules live where the client that draws them does.
 
@@ -71,7 +71,7 @@ client "Reconstruct" ─▶ POST /api/v1/maps/{map}/reconstruction ─▶ api-de
                             ├─ PUT cloud.ply, meta.json ──▶ MinIO presigned PUT (staging bucket)
                             └─ POST progress / finish / fail ──▶ gateway /internal/reconstruction/…
 gateway on finish: verify ─▶ copy cloud.ply → map-{id}/reconstruction/{job}/ ─▶ derive ortho.png +
-                   height.png from it (child process, §7.2) ─▶ store them + meta.json ─▶ row
+                   height.png + relief_rgb/relief_height.png from it (child process, §7.2) ─▶ store them + meta.json ─▶ row
                    succeeded ─▶ MAP.RECONSTRUCTION_FINISHED
 client polls GET …/reconstruction ─▶ loads ortho.png + meta.json ─▶ deck.gl BitmapLayer
 ```

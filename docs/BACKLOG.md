@@ -81,7 +81,9 @@ was a Nav2 waypoint-pruning artifact of the identical-waypoints test setup,
 not this bug, and does not indicate the fix is incomplete for the case it
 targets.)
 
-**Known risk not covered by this fix:** `get_mission_errors()` in the same
+**Known risk — fixed since (2026-10-09, `2be7831`):** `get_mission_errors()` now ignores a FATAL error whose references all belong to another run, revision or mission (`_is_foreign_error`, `packages/controllers/mission/server.py`), and unreferenced FATALs that predate the order (`_track_stale_fatal`). The text below is the original risk note.
+
+**Known risk not covered by this fix (original note):** `get_mission_errors()` in the same
 file treats *any* FATAL-level entry in the robot's `errors[]` array as
 belonging to the currently-tracked mission node, regardless of which order
 the error actually references. Since VDA5050 `errors[]` is a live snapshot

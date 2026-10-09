@@ -2,7 +2,7 @@
 
 Findings from the full `cloud_server` + `../sati-client` audit of 2026-09-18
 (inconsistencies, redundancies, improvement/optimisation opportunities,
-principledness). Same conventions as `../sati-client/AUDIT_BACKLOG.md`: each item
+principledness). Same conventions as `../sati-client/docs/AUDIT_BACKLOG.md`: each item
 has a severity and concrete pointers; ✅ DONE items were fixed, tested and committed
 in this pass, the rest are verified against the code but deliberately deferred.
 Client-side findings from the same audit are in that file's section **AA**.
@@ -19,7 +19,7 @@ listed in `docs/RELOC_FOLLOWUPS.md`.
 > `c5562fd` services · `e387736` stale tests · `17d7f5b` ops scripts · `b62dcc5` this
 > file · `f4a44b4` `CLAUDE.md`. Nothing pushed. The client half, its commits, and the
 > one item left open (UI bugs after starting a mission, which the client's mock
-> backend cannot reproduce) are in `../sati-client/AUDIT_BACKLOG.md` AA14 and its
+> backend cannot reproduce) are in `../sati-client/docs/AUDIT_BACKLOG.md` AA14 and its
 > session summary.
 
 ---
@@ -255,7 +255,8 @@ with mosquitto's websocket default :9001 under host networking.
 `robot_update` sends `pose` without `map_id`, which the client shallow-merges, so
 `pose.map_id` flips between the REST value and `undefined` every poll.
 
-### C5. `task_status` is never filled for planner-created missions — **medium**
+### C5. ✅ DONE — `task_status` is never filled for planner-created missions — **medium**
+**Fixed** (`packages/controllers/mission/server.py` ~3318-3343, `649290e`/audit rounds): every waypoint now counts whatever its allowed deviation (`task_status[node] = idx` on each reached waypoint); the `== 0` sentinel is gone. Covered by `tests/unit/test_mission_lifecycle_fixes.py` (progress for non-zero deviation). Original finding:
 It records a waypoint only when `allowedDeviationXY == 0`, but
 `mission_planner/server.py:375` emits `0.2` and the `Pose2D` default is `0.1`, so
 every `/api/v1/navigate` mission falls back to the client's pose-proximity
@@ -286,16 +287,19 @@ releases the queue). Original finding:
 On `PENDING_DELETE` it deletes the row and returns without `get_next_mission()` /
 IDLE / cancel; the queue stays blocked until `MAX_ORDER_MISMATCHES` rescues it.
 
-### C9. `get_mission_errors()` trusts any FATAL error — **medium** (from `docs/BACKLOG.md`)
-Still open: a lingering FATAL from an unrelated order can fail a fresh mission.
+### C9. ✅ DONE — `get_mission_errors()` trusts any FATAL error — **medium** (from `docs/BACKLOG.md`)
+**Fixed** (`2be7831`, mission dispatch audit rounds 1-3): `_is_foreign_error` (`controllers/mission/server.py` ~3776) ignores a FATAL whose generated ids all belong to another run, revision or mission (logged once per `_foreign_error_refs` key), and `_track_stale_fatal` ignores unreferenced FATALs that predate the order. Tests: `tests/unit/test_mission_order_rejection.py::test_fatal_with_foreign_node_does_not_fail_current_mission`. Original finding:
+A lingering FATAL from an unrelated order could fail a fresh mission.
 A FATAL `robotBaseNotReadyError` (no references) now gets a `failure_reason`; the lingering-FATAL attribution issue remains.
 
 ### C10. Unvalidated spec writes — **low/medium**
 `update_robot` / `update_mission` accept a raw `dict` and `setattr` arbitrary spec
 fields with no `validate_assignment`. `UpdateRobotMapRequest.map_id` is required,
 so the client's `assignRobotMap(name, null)` can only ever 422.
+*Status (2026-10-09):* the second half is moot: `UpdateRobotMapRequest` is gone and `PUT /robots/{r}/map` answers 410 (maps U6, `tests/unit/test_maps_u6.py`). The first half (raw dict + `setattr`, no field allowlist) is being fixed in the 2026-10-09 round 2; see I below.
 
-### C11. FATAL-error references parsed as node indexes, action ids included — **medium**
+### C11. FATAL-error references parsed as node indexes, action ids included — **medium** (mostly fixed)
+*Status (2026-10-09, verified in code only):* `get_mission_errors` now maps a nodePolicy `actionId` to its node (`order_ids.node_of_reference`/`node_index`) and skips references of another order (`order_ids.is_reference_of(...) is False`). Not verified: a `…-instantaction-n{headerId}` id that `order_ids` cannot attribute to an order (`is_reference_of` returns None) still goes through `node_index`; no test covers a failed instant action. Original finding:
 `get_mission_errors()` (`controllers/mission/server.py`, see also C9) parses
 `rsplit("-n")[-1].rsplit("-s")[0]` for `referenceKey in node_id/nodeId/action_id/
 actionId`, which reads the suffix of an *action* id as a `mission_tree` index. Instant-action
@@ -507,13 +511,14 @@ Utilities → Insights tile work without a selected robot.
 The Workbench Diagnostics tab lists faults and not-ready robots, but `robot.status` carries no
 "since" time, so every row shows "now". Add the time the error / readiness state began.
 
-## G. Map type conversion geo ↔ local (2026-10-03) — built, not deployed
+## G. Map type conversion geo ↔ local (2026-10-03) — built, deployed with `6b62d6b` (2026-10-09)
 
 Design: `docs/satinav-maps-redesign.md` §17. Client side: `../sati-client/docs/AUDIT_BACKLOG.md` **AB8**.
 Branch `feat/map-type-convert`. Tests: `tests/unit/test_map_type_convert.py`,
 `tests/integration/maps/run_type.sh` (throwaway Postgres, `checks_type.py`).
 
-### G1. Deploy steps — **needs the user's go-ahead**
+### G1. ✅ DONE — deploy steps
+*Merged to `main` (`d2d1904`, `abbf946`) and part of the 2026-10-09 deploy (`6b62d6b`); the steps below are the original plan.*
 No Alembic migration. Rebuild and restart from the same commit, in this order:
 mission-dispatch, graph-builder-service, mission-planner-service, then api-delegation-service
 (only the new API can create a rotated geo map; old consumers ignore `geo.bearing_deg`). Then
@@ -538,3 +543,115 @@ back to local" as the answer.
   `crs.bearing_deg` for rotated maps (absent at 0).
 - `PUT /maps/{id}/datum` on an empty geo map now also sets `geo.bearing_deg` from the datum
   (an `enu` datum: its grid convergence), so the frame and the display transform agree.
+
+---
+
+## I. Full audit 2026-10-09 (open)
+
+Findings of the fresh full audit of 2026-10-09 (cloud_server + sati-client) that were **not** fixed in rounds 1/2. Line
+numbers are approximate (as of that date); re-verify before citing. Client findings are in
+`../sati-client/docs/AUDIT_BACKLOG.md` section **AF**. Items listed there as fixed in parallel with this write-up
+(main.py field allowlists and status override, whole-status writes / clear-fault endpoint, the raw orchestrator proxy's
+SLAM rules, `/api/createToken` grants, config centralisation, healthchecks / `.dockerignore` / `:latest` pins /
+`check_health.sh`) are deliberately **not** repeated here. Each numbered point is referenced as `I<group>.<n>`.
+
+### I0. Status of this section
+- **Planned, next (not yet done):** `main.py` error contract: the same failure answers 400/404/500 by route,
+  `detail=str(e)` leaks internals, and `if service is None: 503` is repeated 55 times next to `_require_service()`.
+  One mapping from exception to status plus one `_require_service()` dependency. [medium]
+- **Accepted 2026-10-09: no users yet:** the LiveKit token and user are cached in browser storage (AsyncStorage /
+  localStorage), and an anonymous LiveKit user falls back to the admin room. Revisit before the first external user
+  (client side: AF in the client backlog).
+
+### I1. mission-dispatch
+
+1. [medium] MQTT intake is one serial loop; unknown-robot path awaits a DB get_object inline (server.py ~4904-4957) — slow DB stalls intake for all robots.
+2. [medium] Datum messages re-read the open session (JOIN) every time even when unchanged (server.py ~2058-2092, 2292).
+3. [medium] `_process_datum_message` dereferences `_robot_object.datum` with no None check (server.py ~2058); approx-position path guards it.
+4. [medium] PostgresWatcher reconnects every 60 s quiet timeout and re-yields every row → all missions/robots reprocessed + "Update a RUNNING mission" INFO log per minute (postgres.py ~191-300, server.py ~1662).
+5. [low/medium] `_foreign_error_refs` never cleared (server.py ~3819).
+6. [low/medium] `get_mission_errors` hard-codes node ref keys instead of `_NODE_REFERENCE_KEYS` (server.py ~3825; also 3485, 3510).
+7. [low/medium] `_fail_missions_of_deleted_robot` and queued-cancel branch mutate status.state directly, bypassing `_set_mission_state` (no failure category, recorder run_finished, events, `_remember_finished`) (server.py ~3229, ~1810).
+8. [low/medium] Watcher reconnect period fixed 100 ms with WARNING each time during DB outage (postgres.py ~43, 155-166).
+9. [low/medium] Four near-identical watch loops with two retry policies (`_watch_settings`, `_watch_sites`, `_watch_site_assignments`, `_watch_changes`).
+10. [low] `_start_wait` float(action_parameters["seconds"]) can raise on every state message without failing the mission (server.py ~4056).
+11. [low] Unused imports (fleet_recorder Iterable/RecordingLevel/ASSIGNMENTS_CHANNEL re-export used by server.py), duplicate `time` imports, inline PostgresDatabase re-import.
+12. [low] behavior_tree.py: `is_order` naming inverted; print() instead of logging; unknown node types/None constants silently dropped; node type sets enumerated in 3 places.
+13. [low] Naive local datetimes for mission timestamps vs aware UTC elsewhere (hidden by TZ=UTC). (Already noted in dispatch-audit follow-ups.)
+14. [low] getattr(..., default) fallbacks for test doubles (`_writer_id()` returns fresh uuid4 when missing → defeats echo suppression).
+15. [low] Per-state allocations in fleet_recorder.on_state; 5 re.match with formatted patterns per MQTT message on paho thread.
+16. [low] Notify/charging webhooks via `requests` in default executor; notify URL from mission spec = SSRF egress; `_charging_mission_received` never times out.
+17. [low] Conninfo strings built by hand with password (breaks on spaces/quotes); password as CLI arg (visible in ps). Use psycopg.conninfo.make_conninfo.
+18. [low] `_blocked_node_tasks` / `_run_header_task` not cancelled in shutdown(); `asyncio.get_event_loop()` inside coroutines.
+19. [low] Spliced/misplaced comment above `_finished_missions`/`_loop_errors` (server.py ~520); `_robot_online_task` TimerHandle-then-Task.
+
+### I2. API: maps / sessions
+
+1. [medium] Per-robot lock held across a whole awaited SLAM save on replace-start (maps.py ~2404, 2766; up to ~22 min). Server already has deferred start-after-save: make replace use wait=False + deferred start; then drop client nginx 240 s location + 504 recovery (sati-client nginx.conf ~128-152, utils/mapFinish.ts).
+2. [medium] robot_delete: rosbag delete failure after sessions closed leaves robot half-deleted (robot_delete.py ~135-151).
+3. [medium] MappingSwitch.forget() clears only _slam_state/_prev_intent; caches/locks/OrchestratorMaps caches leak per deleted robot (mapping_switch.py ~480).
+4. [medium] robot_actions `service` mixes ids and display text; failure labels use raw names, success labels pretty names (mapping_switch.py ~233-256, 846-861).
+5. [medium] Response key drift: robot_notified / mapping_warning / slam_warning / warnings / mapping_service (maps.py ~2060, README ~273).
+6. [medium] orchestrator_maps held()/stored() fetch /maps/list up to 3x with separate caches (orchestrator_maps.py ~67-137, 182-203).
+7. [medium] "no address/offline" guard copied 3x (orchestrator_maps.py ~112, 184; mapping_switch.py ~921); `cloud-<id>` prefix parsing twice (localization_view.py ~41, orchestrator_maps.py ~210).
+8. [medium] notify_robot re-reads session+robot and fresh snapshot after every session change (maps.py ~2022-2067, 2227-2244).
+9. [medium] Reloc jobs and inflight maps only in memory; API restart mid-reloc leaves intent changed, never rolled back (reloc_job.py ~243, 330).
+10. [low] Retry/slow decisions by matching orchestrator error text (mapping_switch.py ~213, 686).
+11. [low] Save poll budget counts sleep only, not call time (mapping_switch.py ~687-706).
+12. [low] `_prev_intent` recorded only after PUT slam succeeds (timeout case) / not on ALREADY_RUNNING (mapping_switch.py ~543-552).
+13. [low] reloc rollback runs twice on _Fail path (reloc_job.py ~395-414).
+14. [low] localization_view.intent_view handles "older orchestrators" though spec says no fallback (localization_view.py ~80); stale section header orchestrator_client.py ~175.
+15. [low] RESERVED_NAMES / load_map GEO/LOCAL shim (maps.py ~161, server.py ~809); README ~151 documents /map/load with GEO/LOCAL.
+16. [low] README says robot_actions "always present" — code adds it only when actions is not None (maps.py ~2061, robot_delete.py ~166).
+17. [low] `_watch_run_changes`: no per-robot dedupe of restart_after_run_change; missed run changes after API restart never reconciled (server.py ~2253).
+18. [low] slam_save_state.py survives missing table by per-call catch only.
+
+### I3. API core / database
+
+1. [medium] WebSocketManager.broadcast sends serially, no timeout; a stalled client blocks `_handle_robot_updates` for all robots; unbounded `_robot_changes` queue; no coalescing (server.py ~139-163, 2036).
+2. [medium] robot_update message built before checking subscribers; 60 s resync rebuilds all (server.py ~2285-2349).
+3. [medium] mission_update / robot_update payloads hand-built twice (main.py ~2700, server.py ~2379, 2311); dead hasattr guards; both omit task_status/node_status/held/held_reason (backlog C4).
+4. [medium] diagnostics.py per-robot caches keyed by MQTT topic name, never evicted, unknown names accepted (diagnostics.py ~62); diagnostics routes answer 200 null for unknown robots.
+5. [medium] list_missions returns all missions unpaginated with full trees; list_robots SELECT * (main.py ~2344).
+6. [medium] get_image without size calls blocking MinIO on the event loop; image errors swallowed → 404 (server.py ~1443-1453).
+7. [medium] get-or-create swallows DB errors as not-found (main.py ~1873, 1103).
+8. [low/medium] /stats exposes internal URLs; `/` route list stale (main.py ~396, server.py ~749).
+9. [low/medium] names_index duplicates PK index; mission_trajectory created in code and migration; trajectory index doesn't match fleet_reads filter; no retention (postgres.py ~92-101).
+10. [low/medium] cause codes seeded in migration and defined in events/causes.py separately.
+11. [low] Dead/duplicate routes: status projections, /map/load, archive/restore vs PATCH, PUT /robots/{r}/map (410, scheduled removal).
+12. [low] diagnostics `_schedule` discards run_coroutine_threadsafe future; WS handlers connect before validating target.
+13. [low] create_bag_upload_url accepts any robot_name; DELETE /rosbags/{robot} deletes prefixes without ownership check.
+14. [low] idempotency middleware buffers whole body uncapped.
+15. [low] postgres.py logs + print_exc + re-raise (triple logging); create_object logs full spec at INFO.
+
+### I4. Services / infra / tests
+
+1. [medium] DependencyHealthChecker timeout ineffective (ThreadPoolExecutor shutdown(wait=True)) (service_utils.py ~105-121).
+2. [medium] Arango failures swallowed into []/None (graph_db/server.py ~791, 840, 893) → planner says "no path" during outage.
+3. [medium] agent_orchestrator: Anthropic client no timeout/max_retries; unbounded to_thread summarize per event batch; anthropic unpinned.
+4. [medium] graph_builder: worker-thread race on session_to_global_map/stats; cleanup loop unguarded (server.py ~489, 541, 1367).
+5. [medium] graph_builder `_check_robot_exists` treats DB error as missing → may create duplicate; known_robots never invalidated (server.py ~1285-1312).
+6. [medium] MinIO list_buckets ×4 per client at construction, no HTTP timeouts; _delete_bucket lists all objects into memory (minio_base.py).
+7. [medium] mqtt_client: only first matching callback runs; loop_stop before disconnect; watchdog reconnect without lock (mqtt_client.py ~134-168).
+8. [medium] Test gaps: service_utils, MQTTClient routing/watchdog, graph_db (integration only), telemetry_sender, livekit main.
+9. [low/medium] Floating pins: minio, python-arango, requests, websockets, httpx; orphan requirements files (topomap_dbs/graph_db, database); uvicorn variants; Dockerfile.unit httpx<0.28 vs prod newest; tests/requirements-test.txt pydantic<2 contradicts CLAUDE.md. → one constraints.txt.
+10. [low/medium] livekit_sfu_tokens ROLE_GRANTS robot == operator; robot identity reuse can evict another robot.
+11. [low] graph_db INFO logs of 3 nodes per call with emoji; planner get_node per waypoint.
+12. [low] Per-client httpx.AsyncClient (no shared pool).
+13. [low] Copy-pasted service boilerplate (main.py argparse/logging/health), duplicate StatsResponse, duplicate UpdatePublisher (graph_builder/agent).
+14. [low] graph_builder create_task results not stored/cancelled (main.py ~125).
+15. [low] Containers run as root; python:3.10-slim not digest-pinned.
+16. [low] pytest.ini env_files needs pytest-dotenv; --showlocals noise; 84 unit tests unmarked.
+
+### I5. Cross-repo seam (server half; client half in the client backlog AF)
+
+1. [medium] No client caller for GET/DELETE /maps/{id}/blocked-nodes — operators can't see/clear blocked nodes.
+2. [medium] Live node_added lacks session_id/timestamp (graph_builder server.py ~993) → session highlight misses live nodes.
+3. [medium] Map list nests status.{state} but GET /maps/{id} returns flat; client normalizeMapSummary handles both; ~49 "older server" shims in client.
+4. [low] mapping_state_update pushed only for TOPO, never carries mapping_services.
+5. [low] Map display names: session.map is id only; client derives labels in two places (utils/mapLabels.ts ~16, utils/mapWindow.ts ~79).
+6. [low] Server routes without client caller: PUT /maps/{id}/datum, POST sessions/{sid}/unplace, POST /navigate/waypoints, GET /health/recording, /detection_results*, GET /base_models/{id}/download-url, GET /rosbags, /stats — mark robot/ops-only in README or drop.
+7. [low] Client deletes one robot's bags on one map by listing all + filtering + deleting one by one (mapApi.ts ~1089, 1121) — server lacks map filter.
+
+### I6. Observations from the 2026-10-09 deploy
+- graph-builder `/health` reports `mqtt_connected: false` although it is subscribed (see D5).

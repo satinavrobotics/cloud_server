@@ -23,7 +23,7 @@ service reading ArangoDB/MinIO itself): the pipeline stays; what changes is the 
 | `POST /maps/{map}/reconstruction` with settings only | `POST /jobs` with the whole manifest (§2.1): frames, map-frame poses, camera params, presigned GET URLs |
 | the service reads ArangoDB and MinIO with credentials | no credentials: only the manifest's URLs (a new input source) |
 | results kept by the service, fetched from it | results PUT to the presigned URLs, then the `finish` callback (§3, §7) |
-| `cloud.ply` + `meta.json` | the same: **only** `cloud.ply` + `meta.json` (§7). The cloud makes the 2.5D top view (`ortho.png`, `height.png`) itself from `cloud.ply` |
+| `cloud.ply` + `meta.json` | the same: **only** `cloud.ply` + `meta.json` (§7). The cloud makes the 2.5D top view (`ortho.png`, `height.png`, plus `relief_rgb.png` / `relief_height.png`) itself from `cloud.ply` |
 | no auth, no callbacks | bearer key on every call to the service; HMAC-token callbacks for progress / finish / fail (§2, §3) |
 | depth layout `depth_cameras`, `{cam}.json` | irrelevant to the service: camera params arrive in the manifest |
 
@@ -413,7 +413,8 @@ structured dtype `[('x','<f4'),('y','<f4'),('z','<f4'),('red','u1'),('green','u1
 
 ### 7.2 Top view
 
-Not the service's job: cloud_server derives `ortho.png` and `height.png` from `cloud.ply` (and
+Not the service's job: cloud_server derives `ortho.png`, `height.png` and the costmap-like relief grid
+(`relief_rgb.png`, `relief_height.png`, the `relief` block of `meta.json`; design.md §7.2) from `cloud.ply` (and
 the manifest's poses) after `finish`. `params.clip_z` and `params.raster_max_px` are for that
 step; the service accepts them and ignores them.
 
