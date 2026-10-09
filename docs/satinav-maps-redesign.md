@@ -882,11 +882,10 @@ untouched.
   `{"slam_map": bool}` (below); cleared when the map becomes geo): chosen **per session** since 2026-10-08: `"slam"` in the
   session's `services` (omitted = topo, plus slam on a slam_map map; explicit lists incl. `[]` are exact; `slam` on a plain local map sets
   `slam_map`, on a geo map 400); resume starts it again, finish saves it for sessions with `slam` (older ones: slam_map map and the robot
-  records it). Not an orchestrator service. A mapping session's start with `slam` calls the orchestrator's
-  `POST /maps/cloud-<map>/mapping/start {overwrite: false}` after the topomap started (409 "already
-  has a map file" = warning "SLAM map already exists, not re-recorded"); finish saves in a background
-  task (`POST /maps/cloud-<map>/save {cloud_map_id, cloud_session_id, stop_after: true}`, a per-robot
-  SLAM lock refuses a following start meanwhile; a failed save stops the driver); replace saves the
+  records it). Not an orchestrator service. A mapping session's start with `slam` PUTs `/localization {mode: slam}` after the
+  topomap started (an existing stored map `cloud-<map>`, GET /maps/{name} 200, = "SLAM map already exists, not re-recorded"; other errors of that read are reported); finish saves in a background
+  task (`POST /localization/save?background=true {name, cloud_map_id, cloud_session_id}`, polled; a per-robot
+  SLAM lock refuses a following start meanwhile; a failed save leaves the robot in slam, a good one PUTs the previous intent back); replace saves the
   old map (awaited) before starting the new. Only `slam_warning` reports failures; pause/resume and
   operate never touch it. A persistent status indicator and a save-outcome event are not built.
   **Changing it later** (`PATCH /maps/{id}`, `slam_map: bool`): only on a LOCAL map (geo: 409), only
@@ -896,19 +895,11 @@ untouched.
   saved (or save none). Only the flag changes (`MAP.SLAM_CHANGED`); turning it OFF never deletes or
   hides the onboard map `cloud-<map>`, which stays listed on the robot's orchestrator (nothing is
   orphaned: the cloud keeps no link other than the name). Turning it ON again keeps an existing
-  onboard map file ("SLAM map already exists, not re-recorded", `overwrite: false`), so the next
+  onboard map file ("SLAM map already exists, not re-recorded"), so the next
   mapping session does not overwrite it. Why it was immutable before: nothing more than the
   flag being read at several points; the guards above close that.
-  *Orphaned driver (removed 2026-10-09, stage 5: the facade does not name the recorded map):* a driver recording `cloud-<X>` for a cloud map X that no longer exists
-  (deleted) would keep the orchestrator from stopping it through `/services` ("unsaved map would be
-  lost"). `MappingSwitch.stop_orphan_slam` sends `POST /maps/mapping/stop` when, read fresh under
-  the robot's switch lock then SLAM lock: the robot is online with an orchestrator address, GET
-  /maps/mapping says `active`, `saving` is exactly `false`, the map is `cloud-<X>`, no save is
-  pending, the robot has no open session, and map X has no row (a row in any lifecycle, archived,
-  draft or DELETING, keeps the driver). It runs in the reconcile pass (at API startup and every
-  `SLAM_RECONCILE_INTERVAL_S`, default 300 s, 0 = startup only; one worker per cluster) and after a
-  map delete finished (`MapDeleter` `after_delete`, in the background saga; the 202 response is
-  unchanged). Best effort, logged at WARNING, never raises.
+  *Orphaned recording (2026-10-09, stage 5):* the former `MappingSwitch.stop_orphan_slam` (`POST /maps/mapping/stop`) and the reconcile pass are removed: the facade does not name the
+  recorded map. **Deleting a map no longer stops a robot that records SLAM for it**; the robot stays in slam mode until someone switches it (`PUT /localization`).
 - *Place* does not touch the services: a session that is not placed has its service running and
   its nodes rejected (`session_unplaced`) until it is placed, as before, but without a switch.
 - *Names:* `topo` is `topomap` on the real robot and `sim_topomap` in the sim (the sim's
