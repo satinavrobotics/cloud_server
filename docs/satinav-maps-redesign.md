@@ -939,7 +939,7 @@ and images go into the robot's **current map**: the map of the robot's one open 
 (`map_sessions`), converted with that session's `map_T_session`. graph-builder `decide()` now
 rejects only: `no_session` (no current map), `map_missing`, `map_deleting`,
 `session_unplaced` (no transform yet: placing the robot fixes it), `datum_changed` (geo realign
-logic unchanged) and `lookup_failed`. It no longer looks at the session's `purpose` (operate
+logic unchanged) and `lookup_failed` (later also `buffer_full`: an image, depth or costmap upload that would wait for its node found the upload buffer at its cap). It no longer looks at the session's `purpose` (operate
 sessions add nodes too), `paused_at`, the map's state, or a payload `session_id` (the robot does
 not know cloud sessions; a differing one is logged at debug). `node_count` still increments.
 The retired reasons `not_mapping_session`, `session_paused`, `map_not_mapping`,

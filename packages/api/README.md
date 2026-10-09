@@ -187,7 +187,7 @@ in the map of its open, unpaused, placed **mapping** session (node `pose` in the
 `robot_pose` and `session_id`) and drops everything else, reported as `MAP.INGEST_REJECTED` (at
 most one per robot and reason a minute, with the drop counts). `reason`: `no_session`,
 `map_deleting`, `map_missing`, `operate_session` (an operate session adds nothing, decision B
-2026-10-09), `session_paused`, `session_unplaced`, `datum_changed`, `lookup_failed`. A pause or finish takes effect within ~1 s. Not yet:
+2026-10-09), `session_paused`, `session_unplaced`, `datum_changed`, `lookup_failed`, `buffer_full` (an image, depth image or costmap layer that would wait for its node found graph-builder's upload buffer at its cap, `UPLOAD_BUFFER_MAX_BYTES` / `UPLOAD_BUFFER_MAX_ENTRIES`; never for nodes). A pause or finish takes effect within ~1 s. Not yet:
 alignment (M6), grid (M7). Events: `MAP.CREATED`, `MAP.ARCHIVED`,
 `MAP.RESTORED`, `MAP.SESSION_STARTED/PAUSED/RESUMED/FINISHED`, `MAP.DELETED` (background delete
 finished), `MAP.INGEST_REJECTED` (source `graph_builder`) in `fleet_events`. `POST /api/v1/maps`
