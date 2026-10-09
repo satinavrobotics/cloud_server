@@ -58,6 +58,11 @@ is resolved like an image and dropped with kind `depth` (`dropped_depth`). Its c
 parameters go onto the ArangoDB node as `depth.{camera}` (`depth_record`), with the robot's
 full 6-DoF pose at the depth stamp converted into the map frame (`pose3d_map`: x, y and yaw
 change with map_T_session; z, roll and pitch do not).
+
+Costmap (`robot/costmap_upload`): one occupancy PNG (u8, 0..100 occupied, 255 unknown) per node
+and layer, resolved like depth and dropped with kind `costmap` (`dropped_costmap`). Its record
+goes onto the node as `costmap.{layer}` (`costmap_record`), with the grid origin converted into
+the map frame (`origin_map`, and `origin_pose3d_map` when the robot sent `origin_pose3d`).
 """
 
 import dataclasses
@@ -320,6 +325,96 @@ def depth_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str
     return record
 
 
+# --- costmap (`robot/costmap_upload`) ----------------------------------------------------------
+
+COSTMAP_ENCODING = "u8_occ100_unknown255"
+COSTMAP_CONTENT_TYPE = "image/png"
+COSTMAP_DATA_KEY = "costmap_data"  # the only payload field not stored on the node (PNG: MinIO)
+
+
+class CostmapPayloadError(ValueError):
+    """A robot/costmap_upload message that cannot be stored (missing or malformed fields)."""
+
+
+def _finite(payload: Mapping[str, Any], name: str) -> float:
+    try:
+        value = float(payload[name])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CostmapPayloadError(f"{name}: {exc}") from exc
+    if not math.isfinite(value):
+        raise CostmapPayloadError(f"{name} is not finite")
+    return value
+
+
+def _positive_int(payload: Mapping[str, Any], name: str) -> int:
+    value = payload.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise CostmapPayloadError(f"{name} must be a positive integer")
+    return value
+
+
+def _costmap_origin(payload: Mapping[str, Any]) -> Dict[str, float]:
+    origin = payload.get("origin")
+    if not isinstance(origin, Mapping):
+        raise CostmapPayloadError("missing origin")
+    return {k: _finite(origin, k) for k in ("x", "y", "yaw")}
+
+
+def _costmap_pose3d(value: Any) -> Optional[Dict[str, float]]:
+    if value in (None, {}):
+        return None
+    try:
+        pose = _pose3d(value)
+    except DepthPayloadError as exc:
+        raise CostmapPayloadError(str(exc).replace("robot_pose3d", "origin_pose3d")) from exc
+    if not math.sqrt(sum(pose[k] ** 2 for k in ("qx", "qy", "qz", "qw"))):
+        raise CostmapPayloadError("origin_pose3d has a zero quaternion")
+    return pose
+
+
+def check_costmap_payload(payload: Mapping[str, Any]) -> None:
+    """Raise CostmapPayloadError unless `payload` is a storable robot/costmap_upload message.
+    Cheap: the PNG is neither decoded nor base64-validated here (that happens on save)."""
+    for key in ("session_node_id", "robot_name", "layer", COSTMAP_DATA_KEY):
+        if payload.get(key) in (None, ""):
+            raise CostmapPayloadError(f"missing {key}")
+    layer = str(payload["layer"])
+    if "/" in layer or layer in (".", ".."):
+        raise CostmapPayloadError(f"invalid layer {layer!r}")
+    encoding = payload.get("costmap_encoding", COSTMAP_ENCODING)
+    if encoding != COSTMAP_ENCODING:
+        raise CostmapPayloadError(f"unsupported costmap_encoding {encoding!r}")
+    content_type = payload.get("content_type", COSTMAP_CONTENT_TYPE)
+    if content_type != COSTMAP_CONTENT_TYPE:
+        raise CostmapPayloadError(f"unsupported content_type {content_type!r}")
+    _positive_int(payload, "width")
+    _positive_int(payload, "height")
+    if not _finite(payload, "resolution") > 0:
+        raise CostmapPayloadError("resolution must be > 0")
+    _costmap_origin(payload)
+    _costmap_pose3d(payload.get("origin_pose3d"))
+
+
+def costmap_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str, Any]:
+    """The node's `costmap.{layer}` value for an accepted costmap message: every field but the
+    PNG as sent, `origin_map` (the grid origin through the session's map_T_session, exactly as a
+    node pose), `origin_pose3d_map` when `origin_pose3d` was sent, and `session_id`."""
+    check_costmap_payload(payload)
+    record: Dict[str, Any] = {k: v for k, v in payload.items() if k != COSTMAP_DATA_KEY}
+    record["layer"] = str(payload["layer"])
+    record["costmap_encoding"] = COSTMAP_ENCODING
+    record["content_type"] = COSTMAP_CONTENT_TYPE
+    origin = _costmap_origin(payload)
+    x, y, yaw = map_pose(session.map_t_session, origin["x"], origin["y"], origin["yaw"])
+    record["origin_map"] = {"x": x, "y": y, "yaw": yaw}
+    pose = _costmap_pose3d(payload.get("origin_pose3d"))
+    if pose is not None:
+        record["origin_pose3d"] = pose
+        record["origin_pose3d_map"] = pose3d_map(session.map_t_session, pose)
+    record["session_id"] = session.session_id
+    return record
+
+
 class SessionResolver:
     """The robot's open session, cached per robot for `ttl` seconds.
 
@@ -395,6 +490,7 @@ class _Pending:
     nodes: int = 0
     images: int = 0
     depth: int = 0
+    costmap: int = 0
     map_name: Optional[str] = None
     map_state: Optional[str] = None
     session_id: Optional[str] = None
@@ -415,10 +511,11 @@ class RejectLimiter:
         self._wall = wall
         self._pending: Dict[Tuple[str, str], _Pending] = {}
         self._last_report: Dict[Tuple[str, str], float] = {}
-        self.dropped: Dict[str, int] = {"nodes": 0, "images": 0, "depth": 0}
+        self.dropped: Dict[str, int] = {"nodes": 0, "images": 0, "depth": 0,
+                                 "costmap": 0}
 
     def record(self, resolution: Resolution, kind: str) -> Optional[Event]:
-        """Count one dropped `kind` ('node' | 'image' | 'depth'); the event to write now, if
+        """Count one dropped `kind` ('node' | 'image' | 'depth' | 'costmap'); the event to write now, if
         any."""
         key = (resolution.robot_name, resolution.reason or LOOKUP_FAILED)
         pending = self._pending.get(key)
@@ -430,6 +527,9 @@ class RejectLimiter:
         elif kind == "depth":
             pending.depth += 1
             self.dropped["depth"] += 1
+        elif kind == "costmap":
+            pending.costmap += 1
+            self.dropped["costmap"] += 1
         else:
             pending.images += 1
             self.dropped["images"] += 1
@@ -459,6 +559,7 @@ class RejectLimiter:
                      payload={"reason": reason, "dropped_nodes": pending.nodes,
                               "dropped_images": pending.images,
                               "dropped_depth": pending.depth,
+                              "dropped_costmap": pending.costmap,
                               "since": pending.since.isoformat(),
                               "map_name": pending.map_name, "map_state": pending.map_state,
                               "session_id": pending.session_id,

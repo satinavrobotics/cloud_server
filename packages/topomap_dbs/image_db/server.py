@@ -138,6 +138,40 @@ class ImageDatabaseService(MinIOService):
             self.logger.error(f"Failed to store depth {camera} for node {node_id}: {e}")
             return False
 
+    # ==================== Costmap (`robot/costmap_upload`) ====================
+
+    @staticmethod
+    def costmap_key(node_id: str, layer: str) -> str:
+        """Object key of a node's costmap PNG: `{node_id}/costmap/{layer}.png`."""
+        return f"{node_id}/costmap/{layer}.png"
+
+    def store_costmap(
+        self,
+        png_data: bytes,
+        node_id: str,
+        layer: str,
+        map_id: str,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        """Store a node's occupancy costmap PNG for one layer. Returns True if successful."""
+        try:
+            if not self._ensure_map_bucket(map_id):
+                return False
+            meta = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
+            meta["node_id"] = str(node_id)
+            self.client.put_object(
+                self._bucket_name(map_id),
+                self.costmap_key(str(node_id), layer),
+                io.BytesIO(png_data),
+                length=len(png_data),
+                content_type="image/png",
+                metadata=meta,
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to store costmap {layer} for node {node_id}: {e}")
+            return False
+
     def first_image_id(self, node_id: str, map_id: Optional[str] = None) -> Optional[str]:
         """The node's first image (by id), for requests that name none; None without images."""
         ids = sorted(self.list_node_images(node_id=node_id, map_id=map_id))
@@ -440,8 +474,9 @@ class ImageDatabaseService(MinIOService):
     @classmethod
     def _count_node_objects(cls, names) -> tuple:
         """(images, depth images, node ids) of a map bucket's object names: images are
-        `{node}/images/{id}`, depth `{node}/depth/{camera}.png`; other prefixes (the
-        reconstruction) are not nodes."""
+        `{node}/images/{id}`, depth `{node}/depth/{camera}.png`; `{node}/costmap/{layer}.png`
+        is neither (and alone does not make a node); other prefixes (the reconstruction) are
+        not nodes."""
         images, depth, nodes = 0, 0, set()
         for name in names:
             parts = name.split("/")

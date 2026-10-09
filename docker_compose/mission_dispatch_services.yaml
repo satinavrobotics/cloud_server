@@ -176,6 +176,7 @@ services:
       - MQTT_PORT=${MQTT_PORT_TCP:-1883}
       - MQTT_TOPIC=${GRAPH_BUILDER_MQTT_TOPIC:-robot/node_update}
       - MQTT_IMAGE_TOPIC=${GRAPH_BUILDER_MQTT_IMAGE_TOPIC:-robot/image_upload}
+      - MQTT_COSTMAP_TOPIC=${GRAPH_BUILDER_MQTT_COSTMAP_TOPIC:-robot/costmap_upload}
       - ARANGO_HOST=localhost
       - ARANGO_PORT=${ARANGO_PORT:-8529}
       - ARANGO_USERNAME=root

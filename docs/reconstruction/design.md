@@ -523,6 +523,7 @@ built, compose only passes the API its `RECONSTRUCTION_*` settings, §12.1.)
 | `RECONSTRUCTION_TOPVIEW_TIMEOUT_S` | `600` | The child is killed after this → `failed` (`top_view_failed`) |
 | `RECONSTRUCTION_WORK_DIR` | unset (system temp) | Where `cloud.ply` is downloaded for the top view (~200 MB for 10 M points) |
 | `MQTT_DEPTH_TOPIC` | `robot/depth_upload` | R2 |
+| `MQTT_COSTMAP_TOPIC` | `robot/costmap_upload` | occupancy costmap per node and layer; empty = off |
 
 The three secrets are **not** added to the import-time required list (that would break every
 other service); the gateway refuses to start jobs (503 `not_configured`) when any is missing.
@@ -735,6 +736,7 @@ objects deleted.
 |---|---|
 | `map-{id}/{node_id}/images/{camera}` | graph-builder (today) |
 | `map-{id}/{node_id}/depth/{camera}.png` | graph-builder (R2) |
+| `map-{id}/{node_id}/costmap/{layer}.png` | graph-builder (`robot/costmap_upload`; u8 occupancy, 255 unknown) |
 | `recon-staging/{job_id}/{attempt}/{cloud.ply,meta.json}` | the service, via presigned PUT |
 | `map-{id}/reconstruction/{job_id}/cloud.ply` | the gateway (server-side copy) |
 | `map-{id}/reconstruction/{job_id}/{ortho.png,height.png,relief_rgb.png,relief_height.png,meta.json}` | the gateway (derived from `cloud.ply`, §7.2; `meta.json` = the service's + the grid) |

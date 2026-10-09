@@ -300,6 +300,41 @@ and, on the ArangoDB node, `depth.{camera}` = the camera block, scale, stamps, s
 `pose3d_map` (the pose in the map frame). A dropped one counts as `dropped_depth` in
 `MAP.INGEST_REJECTED`. Payload: `docs/reconstruction/design.md` §4.3, §5.
 
+### Costmap layers (`robot/costmap_upload`)
+
+`robot/costmap_upload` (`MQTT_COSTMAP_TOPIC`, default `robot/costmap_upload`, empty = not
+subscribed; subscribed at QoS 1): one message per node and layer with an occupancy PNG
+(u8: 0..100 = occupancy percent, 255 = unknown; the PNG is not decoded by graph-builder).
+
+```json
+{
+  "session_node_id": 7, "robot_name": "r1", "layer": "occupancy",
+  "costmap_data": "<base64 PNG>", "content_type": "image/png",
+  "costmap_encoding": "u8_occ100_unknown255",
+  "width": 200, "height": 200, "resolution": 0.05,
+  "origin": {"x": -5.0, "y": -5.0, "yaw": 0.0},
+  "origin_pose3d": {"x": 0, "y": 0, "z": 0, "qx": 0, "qy": 0, "qz": 0, "qw": 1},
+  "frame": "map", "source_frame": "odom",
+  "costmap_stamp_ms": 1727600000123, "keyframe_stamp_ms": 1727600000084,
+  "stamp_offset_ms": 39, "source_topic": "/local_costmap/costmap"
+}
+```
+
+Required: `session_node_id`, `robot_name`, `layer` (no `/`, not `.` or `..`), `costmap_data`,
+`width`/`height` (positive integers), `resolution` (finite, > 0), `origin` (`x`, `y`, `yaw`,
+finite). `content_type` and `costmap_encoding` default to, and must be, `image/png` and
+`u8_occ100_unknown255`. `origin_pose3d` is optional (7 finite fields, non-zero quaternion).
+The base64 is decoded strictly when saving. An invalid message is logged and counted in
+`errors` (no event).
+
+Resolved by session and buffered exactly like depth (per `(robot, node)` and layer, 30 s,
+overwritten per layer, dropped with a rejected node). Stored as `map-{id}/{node}/costmap/{layer}.png`
+(PNG first) and, on the ArangoDB node, `costmap.{layer}` = every field but `costmap_data`, plus
+`origin_map` (`x`, `y`, `yaw` through the session's map_T_session, as the node pose),
+`origin_pose3d_map` (when `origin_pose3d` was sent) and `session_id`; the robot-frame `origin` /
+`origin_pose3d` are kept as sent. A dropped one counts as `dropped_costmap` in
+`MAP.INGEST_REJECTED`; stats: `costmap_saved`, `costmap_rejected`, `buffered_costmap`.
+
 ## How It Works
 
 ### Node Processing Pipeline

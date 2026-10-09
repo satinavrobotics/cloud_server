@@ -146,6 +146,7 @@ class GraphBuilderService:
         session_cache_ttl: float = ingest.SESSION_CACHE_TTL_S,
         reject_event_interval: float = ingest.REJECT_EVENT_INTERVAL_S,
         mqtt_depth_topic: str = "robot/depth_upload",
+        mqtt_costmap_topic: str = "robot/costmap_upload",
     ):
         """
         Initialize the Graph Builder Service.
@@ -180,6 +181,7 @@ class GraphBuilderService:
         self.mqtt_topic = mqtt_topic
         self.mqtt_image_topic = mqtt_image_topic
         self.mqtt_depth_topic = mqtt_depth_topic
+        self.mqtt_costmap_topic = mqtt_costmap_topic
         self.radius_threshold = radius_threshold
         self.distance_threshold = distance_threshold
         self.image_buffer_timeout = image_buffer_timeout
@@ -230,6 +232,10 @@ class GraphBuilderService:
         # Depth buffer, the same shape (3D reconstruction R2): camera -> ({png, record,
         # session_id}, buffered at)
         self.depth_buffer: Dict[Tuple[str, int], Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
+        # Costmap buffer (robot/costmap_upload): layer -> ({layer, data, record, session_id},
+        # buffered at)
+        self.costmap_buffer: Dict[Tuple[str, int],
+                                  Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
 
         # Robot registration cache
         # Set of robot names that are known to exist in Mission Dispatch
@@ -251,6 +257,9 @@ class GraphBuilderService:
             "depth_saved": 0,
             "depth_rejected": 0,
             "buffered_depth": 0,
+            "costmap_saved": 0,
+            "costmap_rejected": 0,
+            "buffered_costmap": 0,
         }
 
         # WebSocket update publisher
@@ -266,6 +275,7 @@ class GraphBuilderService:
         self.logger.info(f"   Node topic: {mqtt_topic}")
         self.logger.info(f"   Image topic: {mqtt_image_topic}")
         self.logger.info(f"   Depth topic: {mqtt_depth_topic}")
+        self.logger.info(f"   Costmap topic: {mqtt_costmap_topic}")
         self.logger.info(f"   Radius threshold: {radius_threshold}m")
         self.logger.info(f"   Distance threshold: {distance_threshold}m")
         self.logger.info(f"   Image buffer timeout: {image_buffer_timeout}s")
@@ -305,6 +315,9 @@ class GraphBuilderService:
             if self.mqtt_depth_topic:
                 self.mqtt_client.register_callback(self.mqtt_depth_topic,
                                                    self._on_depth_upload_message)
+            if self.mqtt_costmap_topic:
+                self.mqtt_client.register_callback(self.mqtt_costmap_topic,
+                                                   self._on_costmap_upload_message, qos=1)
 
             # Connect and start background loop
             self.mqtt_client.connect()
@@ -376,9 +389,10 @@ class GraphBuilderService:
             self.logger.warning(f"Could not write {event.code.value}: {e}")
 
     async def _reject(self, resolution: "ingest.Resolution", kind: str, count: int = 1) -> None:
-        """Drop `count` nodes, images or depth images ('node' | 'image' | 'depth'): count them
-        and report when due."""
-        stat = {"node": "nodes_rejected", "depth": "depth_rejected"}.get(kind, "images_rejected")
+        """Drop `count` nodes, images, depth images or costmaps ('node' | 'image' | 'depth' |
+        'costmap'): count them and report when due."""
+        stat = {"node": "nodes_rejected", "depth": "depth_rejected",
+                "costmap": "costmap_rejected"}.get(kind, "images_rejected")
         self.stats[stat] += count
         if count:
             self.logger.info(
@@ -439,6 +453,12 @@ class GraphBuilderService:
         self.stats["buffered_depth"] -= len(cameras)
         return len(cameras)
 
+    def _pop_buffered_costmap(self, robot_name: str, session_node_id: Any) -> int:
+        """Discard the costmap layers buffered for a node that was dropped; how many."""
+        layers = self.costmap_buffer.pop((robot_name, session_node_id), None) or {}
+        self.stats["buffered_costmap"] -= len(layers)
+        return len(layers)
+
     async def _handle_node_update(self, payload: Dict[str, Any]):
         """
         Async handler for MQTT node update messages.
@@ -476,6 +496,8 @@ class GraphBuilderService:
                                self._pop_buffered_images(robot_name, session_node_id))
             await self._reject(resolution, "depth",
                                self._pop_buffered_depth(robot_name, session_node_id))
+            await self._reject(resolution, "costmap",
+                               self._pop_buffered_costmap(robot_name, session_node_id))
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
@@ -591,6 +613,9 @@ class GraphBuilderService:
         buffered_depth = self._get_buffered_depth(robot_name, session_node_id, session_id)
         if buffered_depth:
             self._save_depth(global_node_id, map_id, buffered_depth)
+        buffered_costmap = self._get_buffered_costmap(robot_name, session_node_id, session_id)
+        if buffered_costmap:
+            self._save_costmap(global_node_id, map_id, buffered_costmap)
 
         self.stats["nodes_processed"] += 1
         self.logger.info(
@@ -841,6 +866,118 @@ class GraphBuilderService:
                 self.stats["depth_saved"] += 1
             except Exception as e:
                 self.logger.error(f"Error saving depth {camera} of node {node_id}: {e}")
+                self.stats["errors"] += 1
+        return saved
+
+    # ==================== Costmap (robot/costmap_upload) ====================
+
+    def _on_costmap_upload_message(self, client, userdata, msg):
+        """robot/costmap_upload (paho thread): parse and hand to _handle_costmap_upload."""
+        try:
+            payload = json.loads(msg.payload.decode('utf-8'))
+            if self._event_loop is None:
+                self.logger.error("Costmap upload before the event loop was set; dropped")
+                self.stats["errors"] += 1
+                return
+            asyncio.run_coroutine_threadsafe(self._handle_costmap_upload(payload),
+                                             self._event_loop)
+        except Exception as e:
+            self.logger.error(f"Error processing costmap upload message: {e}")
+            self.stats["errors"] += 1
+
+    async def _handle_costmap_upload(self, payload: Dict[str, Any]):
+        """
+        Store one layer's occupancy costmap of a node, or buffer it until the node arrives
+        (same session gating and buffering as depth). A dropped one is counted as `costmap` in
+        MAP.INGEST_REJECTED. The node's `costmap.{layer}` carries the payload without the PNG
+        plus `origin_map` (and `origin_pose3d_map`) in the map frame. A malformed message is
+        only logged and counted in stats["errors"].
+        """
+        try:
+            try:
+                ingest.check_costmap_payload(payload)
+            except ingest.CostmapPayloadError as e:
+                self.logger.error(f"Invalid costmap upload: {e}")
+                self.stats["errors"] += 1
+                return
+            robot_name = payload['robot_name']
+            session_node_id = payload['session_node_id']
+            layer = str(payload['layer'])
+
+            resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+            if not resolution.accepted:
+                await self._reject(resolution, "costmap")
+                return
+            session = resolution.session
+            try:
+                record = ingest.costmap_record(payload, session)
+            except ingest.CostmapPayloadError as e:
+                self.logger.error(f"Invalid costmap upload: {e}")
+                self.stats["errors"] += 1
+                return
+            entry = {"layer": layer, "data": payload['costmap_data'], "record": record,
+                     "session_id": session.session_id}
+
+            node_key = (robot_name, session_node_id)
+            mapping = self.session_to_global_map.get(node_key)
+            if mapping and mapping[3] == session.session_id:
+                global_node_id, _, map_id, _ = mapping
+                await asyncio.to_thread(self._save_costmap, global_node_id, map_id, [entry])
+            else:
+                layers = self.costmap_buffer.setdefault(node_key, {})
+                if layer not in layers:
+                    self.stats["buffered_costmap"] += 1
+                layers[layer] = (entry, datetime.now())
+        except Exception as e:
+            self.logger.error(f"Error processing costmap upload message: {e}")
+            self.stats["errors"] += 1
+
+    def _get_buffered_costmap(self, robot_name: str, session_node_id: Any,
+                              session_id: Optional[str]) -> List[Dict[str, Any]]:
+        """Take the costmap layers buffered for a node: those of its session and younger than
+        the buffer timeout (the rest are discarded)."""
+        layers = self.costmap_buffer.pop((robot_name, session_node_id), None)
+        if not layers:
+            return []
+        now = datetime.now()
+        entries = []
+        for layer, (entry, at) in layers.items():
+            self.stats["buffered_costmap"] -= 1
+            age = (now - at).total_seconds()
+            if age > self.image_buffer_timeout:
+                self.logger.warning(f"Buffered costmap timed out: ({robot_name}, "
+                                    f"{session_node_id}, {layer}), age={age:.1f}s")
+            elif session_id is not None and entry.get("session_id") != session_id:
+                self.logger.warning(f"Buffered costmap of ({robot_name}, {session_node_id}, "
+                                    f"{layer}) is from another session; discarded")
+            else:
+                entries.append(entry)
+        return entries
+
+    def _save_costmap(self, node_id: str, map_id: str, entries: List[Dict[str, Any]]) -> int:
+        """Store each costmap PNG in MinIO, then its record on the node. How many were stored
+        (the PNG first: a node never names a costmap that does not exist)."""
+        saved = 0
+        for entry in entries:
+            layer = entry["layer"]
+            try:
+                data = entry["data"]
+                png = data if isinstance(data, bytes) else base64.b64decode(data, validate=True)
+                record = entry["record"]
+                if not self.image_db.store_costmap(
+                        png, str(node_id), layer, map_id,
+                        metadata={"layer": layer,
+                                  "costmap_stamp_ms": record.get("costmap_stamp_ms"),
+                                  "session_id": record.get("session_id")}):
+                    self.stats["errors"] += 1
+                    continue
+                if not self.graph_db.set_node_costmap(map_id, str(node_id), layer, record):
+                    self.stats["errors"] += 1
+                    continue
+                saved += 1
+                self.stats["costmap_saved"] += 1
+            except Exception as e:
+                self.logger.error(f"Error saving costmap {layer} of node {node_id}: {e}")
                 self.stats["errors"] += 1
         return saved
 
@@ -1244,6 +1381,8 @@ class GraphBuilderService:
                 self.stats["buffered_images"] -= len(self.image_buffer.pop(key))
             for key in [k for k in self.depth_buffer if k[0] == robot_name]:
                 self.stats["buffered_depth"] -= len(self.depth_buffer.pop(key))
+            for key in [k for k in self.costmap_buffer if k[0] == robot_name]:
+                self.stats["buffered_costmap"] -= len(self.costmap_buffer.pop(key))
 
             self.logger.info(
                 f"✅ Cleared {len(keys_to_remove)} session mappings and "
@@ -1406,6 +1545,15 @@ class GraphBuilderService:
                 self.stats["buffered_depth"] -= 1
             if not cameras:
                 del self.depth_buffer[node_key]
+
+        for node_key in list(self.costmap_buffer):
+            layers = self.costmap_buffer[node_key]
+            for layer in [c for c, (_, ts) in layers.items()
+                          if (now - ts).total_seconds() > threshold_seconds]:
+                del layers[layer]
+                self.stats["buffered_costmap"] -= 1
+            if not layers:
+                del self.costmap_buffer[node_key]
 
     # ==================== Service Management ====================
 

@@ -627,6 +627,27 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to set depth {camera} on node {node_id} in {map_id}: {e}")
             return False
 
+    SET_NODE_COSTMAP_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {costmap: MERGE(d.costmap || {}, {[@layer]: @record})} IN @@col "
+        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+
+    def set_node_costmap(self, map_id: str, node_id: Union[int, str], layer: str,
+                         record: Dict[str, Any]) -> bool:
+        """Set `costmap.{layer}` on a node (`robot/costmap_upload`), keeping the other layers.
+        False when the map or node does not exist."""
+        try:
+            name = f"nodes_{map_id}"
+            if not self.db.has_collection(name):
+                self.logger.error(f"Collection {name} doesn't exist")
+                return False
+            cursor = self.db.aql.execute(self.SET_NODE_COSTMAP_AQL, bind_vars={
+                "@col": name, "key": str(node_id), "layer": layer, "record": record})
+            return bool(list(cursor))
+        except Exception as e:
+            self.logger.error(f"Failed to set costmap {layer} on node {node_id} in {map_id}: {e}")
+            return False
+
     DEPTH_NODES_AQL = (
         "FOR d IN @@col FILTER d.depth != null "
         "RETURN {_key: d._key, node_id: d.node_id, pose: d.pose, depth: d.depth, "
