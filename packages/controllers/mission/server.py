@@ -1859,6 +1859,10 @@ class Robot:
                 self.debug(
                     "Robot is idle and delete request received, deleting robot.")
                 await self._delete_robot_object()
+                # Done: the object is DELETED; going on would re-request the factsheet,
+                # send teleop/instant actions and finally overwrite the DELETED lifecycle
+                # with the row's PENDING_DELETE.
+                return
 
             # Re-request factsheet if not yet received (robot may have restarted MQTT)
             if (not self._robot_server.disable_request_factsheet and
@@ -2555,21 +2559,31 @@ class Robot:
                         self.warning(f"Ignoring malformed getObjects result of action "
                                      f"{action_state.actionId}: {err}")
                         continue
+                    # Written inline (the result is rare and small) but a failure must not
+                    # abort the rest of this state message: the action is marked done only
+                    # once the write landed, so the next state message retries it.
+                    try:
+                        results_object = self._detection_results_object
+                        if results_object is None:
+                            results_object = api_objects.DetectionResultsObjectV1(
+                                name=self.robot_object.name)
+                            try:
+                                await self._database.create_object(
+                                    results_object, uuid.uuid4())
+                            except fastapi.HTTPException as err:
+                                # 400: the row exists (dispatcher restarted); update it below.
+                                if err.status_code != 400:
+                                    raise
+                            self._detection_results_object = results_object
+                        results_object.status.detected_objects = detected
+                        await self._database.update_status(
+                            api_objects.DetectionResultsObjectV1, results_object.name,
+                            results_object.status, uuid.uuid4())
+                    except Exception as err:  # pylint: disable=broad-except
+                        self.warning(f"Could not store the getObjects result of action "
+                                     f"{action_state.actionId}, will retry ({err})")
+                        continue
                     self._detection_actions_done.add(action_state.actionId)
-                    if self._detection_results_object is None:
-                        self._detection_results_object = api_objects.DetectionResultsObjectV1(
-                            name=self.robot_object.name)
-                        try:
-                            await self._database.create_object(
-                                self._detection_results_object, uuid.uuid4())
-                        except fastapi.HTTPException as err:
-                            # 400: the row exists (dispatcher restarted); update it below.
-                            if err.status_code != 400:
-                                raise
-                    self._detection_results_object.status.detected_objects = detected
-
-                    await self._database.update_status(
-                        api_objects.DetectionResultsObjectV1, self._detection_results_object.name, self._detection_results_object.status, uuid.uuid4())
                     self.info(
                         "Updated object detector information in mission database.")
 
