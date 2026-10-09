@@ -7,7 +7,7 @@ httpx>=0.27.0
 websockets>=12.0
 python-arango>=7.9.0
 minio>=7.2.0
-paho-mqtt>=1.6.1
+paho-mqtt==1.6.1
 alembic==1.13.3
 SQLAlchemy==2.0.36
 # 3D reconstruction: the top view (ortho/height) is derived from cloud.ply here (reconstruction_topview.py)

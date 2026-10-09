@@ -94,6 +94,8 @@ class MissionPlannerService:
         )
         self._arango_host = arango_host
         self._arango_port = arango_port
+        self._postgres_host = kwargs.get('postgres_host', 'localhost')
+        self._postgres_port = kwargs.get('postgres_port', 5432)
         self.database = PostgresDatabase(
             dbname=kwargs.get('postgres_db', 'mission'),
             user=kwargs.get('postgres_user', 'postgres'),
@@ -1121,7 +1123,7 @@ class MissionPlannerService:
         return {
             "service": "mission_planner",
             "graph_db_url": f"arangodb://{self._arango_host}:{self._arango_port}",
-            "database_url": self.database._url,
+            "database_url": f"postgresql://{self._postgres_host}:{self._postgres_port}",
             "default_map_id": self.default_map_id,
             "knn_k": self.knn_k,
             "range_search_radius": self.range_search_radius,
