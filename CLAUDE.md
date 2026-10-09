@@ -93,7 +93,7 @@ Self-hosted LiveKit is part of the main compose file (`docker_compose/mission_di
 ### Key Packages
 
 - `packages/config.py` — intended single source of truth for default ports, URLs, thresholds, and env-var reads. Import from here in all new code (existing violators are listed in `AUDIT_BACKLOG.md` C2).
-- `packages/api/main.py` — the FastAPI `app` and **all** REST + WebSocket routes (~65K).
+- `packages/api/main.py` — the FastAPI `app` and **all** REST + WebSocket routes (~120K).
 - `packages/api/server.py` — `ApiDelegationService` (the logic the routes call), plus `WebSocketManager` / `WebSocketProxyManager`. No routes here.
 - `packages/api/orchestrator_proxy.py` — reverse proxy to the per-robot orchestrator.
 - `packages/api/orchestrator_client.py`, `mapping_switch.py` — the API's own calls to a robot's orchestrator (start/stop/status of a session's mapping services).
