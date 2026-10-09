@@ -431,7 +431,16 @@ VDA5050 state (`relocalizationMapRejectedError`, `relocalizationNotReadyError`, 
 `positionInitialized`). The
 orchestrator proxy adds `cloud_map_id` and `cloud_session_id` to a proxied
 `POST /orchestration/{robot}/localization/save` naming `cloud-<map>` while the robot has an open mapping session on that map (ids the
-caller sent are kept). Env: `RELOC_MAP_HELD_TTL_S`, `RELOC_DEGRADED_SCORE`, `RELOC_JOB_TIMEOUT_S`, `RELOC_JOB_POLL_S`, `RELOC_CONFIRM_TIMEOUT_S`.
+caller sent are kept). The proxy refuses with **409** `{"detail": "..."}` (the detail names the
+server route to use) `PUT /localization`, `POST /localization/save` and `POST
+/services/{name}/start|stop` of a mapping service (`MAPPING_SERVICE_CANDIDATES`: topomap, grid)
+while the robot records SLAM for its mapping session, has a SLAM save pending, or a failed save
+(`slam_save.state` `failed`): pause/finish the session, or `POST /api/v1/robots/{r}/slam-save/retry|discard`.
+GETs and other services/calls (e.g. `localization/init_pos`) are still forwarded. Other
+mutations of `localization*` and `services/*` hold the robot's lock (the one session operations
+use) for the one forwarded call, and every mutation of `maps/`, `services/` or `localization*`
+ends in `ApiDelegationService.robot_changed()` (forgets the mapping snapshot and held-map
+answers; the reloc jobs call the same hook). Env: `RELOC_MAP_HELD_TTL_S`, `RELOC_DEGRADED_SCORE`, `RELOC_JOB_TIMEOUT_S`, `RELOC_JOB_POLL_S`, `RELOC_CONFIRM_TIMEOUT_S`.
 
 #### 3D reconstruction (R3)
 

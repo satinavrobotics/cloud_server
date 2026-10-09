@@ -419,6 +419,16 @@ class MappingSwitch:
         return {"map": st.get("map"), "state": st["state"], "detail": st.get("detail"),
                 "at": st.get("at")}
 
+    def slam_busy(self, robot_name: str) -> Optional[str]:
+        """Why the robot's SLAM state must not be changed behind the switch's back: `recording`
+        (it records a SLAM map for its mapping session), `saving` (a save is pending) or
+        `failed` (a failed save awaits retry / discard); None when none of them."""
+        if self.slam_save_pending(robot_name):
+            return SAVING
+        st = self._slam_state.get(robot_name)
+        return st.get("state") if st is not None and st.get("state") in (
+            RECORDING, SAVING, SAVE_FAILED) else None
+
     def slam_save_failed(self, robot_name: str) -> Optional[Dict[str, Any]]:
         """The robot's failed SLAM save {map, session_id, state, detail, at}, or None."""
         st = self._slam_state.get(robot_name)

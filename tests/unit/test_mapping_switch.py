@@ -1280,3 +1280,13 @@ class TestSaveFollowUp:
         switch.schedule_slam_save(robot(), "yard", "s1", on_result=on_result, track=False)
         await switch.wait_slam_saves()
         assert seen == [False]
+
+
+def test_slam_busy_reports_recording_saving_failed():
+    sw = MappingSwitch()
+    assert sw.slam_busy("r1") is None
+    for state in ("recording", "saving", "failed"):
+        sw._set_state_now("r1", state, "m", "s")
+        assert sw.slam_busy("r1") == state
+    sw._set_state_now("r1", None)
+    assert sw.slam_busy("r1") is None

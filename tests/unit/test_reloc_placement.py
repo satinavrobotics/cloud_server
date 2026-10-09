@@ -265,7 +265,7 @@ class TestProxyInvalidation:
         service = SimpleNamespace(
             database=MagicMock(get_object=AsyncMock(return_value=_robot(
                 type("D", (), {"robots": {}})()))),
-            orchestrator_maps=holder)
+            robot_changed=holder)
         request = MagicMock(method=method, headers={}, url=MagicMock(query=""))
         request.app.state.service = service
         request.body = AsyncMock(return_value=b"")
@@ -279,7 +279,7 @@ class TestProxyInvalidation:
         with patch.object(proxy.httpx, "AsyncClient", Client), \
                 patch.object(proxy, "_open_mapping_session", AsyncMock(return_value=None)):
             await proxy.proxy_to_orchestrator("r1", path, request)
-        assert holder.invalidate.called is invalidated
+        assert holder.called is invalidated
 
 
 # --- 3. position state in the robot status -----------------------------------------------------------

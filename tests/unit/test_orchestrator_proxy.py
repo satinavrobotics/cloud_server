@@ -1,5 +1,6 @@
 """packages/api/orchestrator_proxy.py: the save timeout, 502 / 503 mapping, cache invalidation,
 hop-by-hop headers."""
+import asyncio
 import os
 
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
@@ -61,6 +62,8 @@ def _service(robot_error=None):
             raise robot_error
         return ROBOT
     svc.database.get_object = get_object
+    svc.mapping_switch.slam_busy.return_value = None
+    svc.mapping_switch.lock.return_value = asyncio.Lock()
     return svc
 
 
@@ -128,25 +131,100 @@ async def test_caches_are_invalidated_even_when_the_call_fails(error):
         await proxy.proxy_to_orchestrator("r1", "maps/cloud-x/save", Req(svc))
     except HTTPException:
         pass
-    svc.orchestrator_maps.invalidate.assert_called_once_with("r1")
-    svc.mapping_switch.invalidate.assert_not_called()
+    svc.robot_changed.assert_called_once_with("r1")
 
 
-async def test_service_writes_invalidate_the_mapping_switch_cache():
+async def test_service_writes_call_robot_changed():
     svc = _service()
     await proxy.proxy_to_orchestrator("r1", "services/topomap/start", Req(svc))
-    svc.mapping_switch.invalidate.assert_called_once_with("r1")
+    svc.robot_changed.assert_called_once_with("r1")
     svc = _service()
     await proxy.proxy_to_orchestrator("r1", "services/topomap/status", Req(svc, method="GET"))
-    svc.mapping_switch.invalidate.assert_not_called()
+    svc.robot_changed.assert_not_called()
 
 
 @pytest.mark.parametrize("path", ["localization", "localization/save"])
-async def test_localization_writes_invalidate_both_caches(path):
+async def test_localization_writes_call_robot_changed(path):
     svc = _service()
     await proxy.proxy_to_orchestrator("r1", path, Req(svc))
-    svc.mapping_switch.invalidate.assert_called_once_with("r1")
-    svc.orchestrator_maps.invalidate.assert_called_once_with("r1")
+    svc.robot_changed.assert_called_once_with("r1")
     svc = _service()
     await proxy.proxy_to_orchestrator("r1", path, Req(svc, method="GET"))
-    svc.mapping_switch.invalidate.assert_not_called()
+    svc.robot_changed.assert_not_called()
+
+
+MODE_CHANGES = [("PUT", "localization"), ("POST", "localization/save"),
+                ("POST", "services/topomap/start"), ("POST", "services/sim_topomap/stop"),
+                ("POST", "services/grid/start")]
+
+
+@pytest.mark.parametrize("state", ["recording", "saving", "failed"])
+@pytest.mark.parametrize("method,path", MODE_CHANGES)
+async def test_mode_changes_are_refused_with_409_while_slam_is_busy(state, method, path):
+    svc = _service()
+    svc.mapping_switch.slam_busy.return_value = state
+    FakeClient.seen = {}
+    with pytest.raises(HTTPException) as err:
+        await proxy.proxy_to_orchestrator("r1", path, Req(svc, method=method))
+    assert err.value.status_code == 409
+    assert "r1" in err.value.detail and "Use the server" in err.value.detail
+    assert FakeClient.seen == {}              # never forwarded
+    assert not svc.mapping_switch.lock.return_value.locked()   # lock released
+
+
+async def test_409_names_the_server_route_of_each_state():
+    texts = {s: proxy.slam_conflict("PUT", "localization", s, "r1")
+             for s in ("recording", "saving", "failed")}
+    assert "pause or finish" in texts["recording"]
+    assert "MAP.SLAM_SAVE_DONE" in texts["saving"]
+    assert "slam-save/retry" in texts["failed"] and "slam-save/discard" in texts["failed"]
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "localization"), ("GET", "localization/save"), ("GET", "services/topomap/status"),
+    ("POST", "services/camera/start"), ("POST", "localization/init_pos"),
+    ("POST", "maps/list")])
+async def test_reads_and_unrelated_calls_pass_while_slam_is_busy(method, path):
+    svc = _service()
+    svc.mapping_switch.slam_busy.return_value = "recording"
+    FakeClient.seen = {}
+    resp = await proxy.proxy_to_orchestrator("r1", path, Req(svc, method=method))
+    assert resp.status_code == 200 and FakeClient.seen["url"].endswith(path)
+
+
+@pytest.mark.parametrize("method,path", MODE_CHANGES)
+async def test_mode_changes_pass_when_slam_is_idle(method, path):
+    svc = _service()
+    resp = await proxy.proxy_to_orchestrator("r1", path, Req(svc, method=method))
+    assert resp.status_code == 200
+
+
+async def test_mutations_hold_the_robot_lock_for_the_call_only():
+    svc = _service()
+    lock = svc.mapping_switch.lock.return_value
+    held = []
+
+    class Spy(FakeClient):
+        async def request(self, *a, **kw):
+            held.append(lock.locked())
+            return await super().request(*a, **kw)
+
+    with patch.object(proxy.httpx, "AsyncClient", Spy):
+        await proxy.proxy_to_orchestrator("r1", "services/topomap/start", Req(svc))
+        await proxy.proxy_to_orchestrator("r1", "localization", Req(svc, method="GET"))
+        await proxy.proxy_to_orchestrator("r1", "maps/list", Req(svc))
+    assert held == [True, False, False]
+    assert not lock.locked()
+    svc.mapping_switch.lock.assert_called_once_with("r1")
+
+
+async def test_a_mutation_waits_for_a_session_operation_holding_the_lock():
+    svc = _service()
+    lock = svc.mapping_switch.lock.return_value
+    await lock.acquire()
+    task = asyncio.ensure_future(
+        proxy.proxy_to_orchestrator("r1", "localization", Req(svc, method="PUT")))
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    lock.release()
+    assert (await task).status_code == 200

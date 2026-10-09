@@ -670,12 +670,8 @@ class ApiDelegationService:
         # a SLAM save / stop changes the robot's stored maps: forget the held-map answers
         self.mapping_switch.on_slam_done = self.orchestrator_maps.invalidate
 
-        def _reloc_changed(robot_name: str) -> None:
-            self.mapping_switch.invalidate(robot_name)
-            self.orchestrator_maps.invalidate(robot_name)
-
         # a reloc job's PUT /localization / init_pos change: as through the orchestrator proxy
-        self.reloc_jobs.on_robot_changed = _reloc_changed
+        self.reloc_jobs.on_robot_changed = self.robot_changed
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)
@@ -729,6 +725,12 @@ class ApiDelegationService:
 
     # ==================== Health Check ====================
     
+    def robot_changed(self, robot_name: str) -> None:
+        """Something changed on the robot's orchestrator (a reloc job's or a proxied call's
+        write): forget the cached mapping snapshot and the held-map answers."""
+        self.mapping_switch.invalidate(robot_name)
+        self.orchestrator_maps.invalidate(robot_name)
+
     def is_healthy(self) -> bool:
         """
         Check if the service and all dependencies are healthy.
