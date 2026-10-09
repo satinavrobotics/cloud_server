@@ -26,6 +26,7 @@ from packages.api import fleet_reads, maps, recorder_health, recording, run_admi
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.api.mission_index import mission_ahead
+from packages.api.pre_goto import queue_pre_goto
 from packages.api.robot_delete import RobotDeleter
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -2361,6 +2362,8 @@ async def create_mission(mission_data: dict):
     mission.status.run_id = None
     mission.status.order_rev = 0
     publisher_id = uuid.uuid4()
+    # The go-to to the topomap node nearest the first waypoint goes in first (never raises).
+    await queue_pre_goto(service, mission)
     await service.database.create_object(mission, publisher_id)
     return mission.dict()
 
