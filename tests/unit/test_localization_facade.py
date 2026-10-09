@@ -544,14 +544,15 @@ class TestTopomapOnTheMappingApi:
         assert snap.state(None)["status"] == "on"
         assert not [c for c in fake.log if c[1].startswith("/services/topomap")]
 
-    async def test_the_snapshot_keeps_the_body_and_cached_survives_invalidate(self):
+    async def test_the_snapshot_keeps_the_body_and_cached_is_dropped_by_invalidate(self):
         fake = FakeRobot(intent={"mode": "slam", "map": None}, topomap=False)
         switch = _slam_switch(fake)
         assert switch.cached("r1") is None
         snap = await switch.snapshot(_plain_robot(), fresh=True)
         assert snap.localization == {"mode": "slam", "map": None, "topomap": False}
-        switch.invalidate("r1")
         assert switch.cached("r1") is snap
+        switch.invalidate("r1")   # the pre-change snapshot is not served to the WS any more
+        assert switch.cached("r1") is None
 
     async def test_a_facade_without_it_reports_slam_and_the_topomap_service(self):
         snap = await _slam_switch(FakeRobot()).snapshot(_plain_robot(), fresh=True)
@@ -573,7 +574,8 @@ class TestTopomapOnTheMappingApi:
             out = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
             await switch.wait_slam_saves()
         # the topomap stops before the save; the save switches back to odometry
-        assert _puts(fake)[2:] == [{"mode": "slam", "topomap": False}, {"mode": "odometry"}]
+        assert _puts(fake)[2:] == [{"mode": "slam", "topomap": False},
+                                   {"mode": "odometry", "topomap": False}]
         assert fake.topomap is False and fake.intent["mode"] == "odometry"
         assert d.codes()[-1] == "MAP.SLAM_SAVE_DONE"
         assert not [c for c in fake.log if c[1].startswith("/services/topomap")]

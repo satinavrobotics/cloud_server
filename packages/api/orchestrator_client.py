@@ -48,6 +48,7 @@ packages/api/reloc_job.py wrap them into results that never raise.
 """
 
 import logging
+from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
@@ -96,6 +97,11 @@ def cloud_link(map_name: Any, session_id: Any) -> Dict[str, str]:
     cloud map's name, `cloud_session_id` the mapping session. The one place that decides it:
     the proxy's with_cloud_ids and save_slam both use it."""
     return {"cloud_map_id": map_name, "cloud_session_id": str(session_id)}
+
+
+def _seg(name: Any) -> str:
+    """One URL path segment: map and service names are quoted ("/", "?", "#", spaces, ...)."""
+    return quote(str(name), safe="")
 
 
 def _detail(resp: httpx.Response) -> str:
@@ -151,13 +157,13 @@ class OrchestratorClient:
         return body if isinstance(body, list) else []
 
     async def status(self, name: str) -> Dict[str, Any]:
-        return await self._call("GET", f"/services/{name}/status", ORCHESTRATOR_QUERY_TIMEOUT_S)
+        return await self._call("GET", f"/services/{_seg(name)}/status", ORCHESTRATOR_QUERY_TIMEOUT_S)
 
     async def start(self, name: str) -> Dict[str, Any]:
-        return await self._call("POST", f"/services/{name}/start", ORCHESTRATOR_START_TIMEOUT_S)
+        return await self._call("POST", f"/services/{_seg(name)}/start", ORCHESTRATOR_START_TIMEOUT_S)
 
     async def stop(self, name: str) -> Dict[str, Any]:
-        return await self._call("POST", f"/services/{name}/stop", ORCHESTRATOR_STOP_TIMEOUT_S)
+        return await self._call("POST", f"/services/{_seg(name)}/stop", ORCHESTRATOR_STOP_TIMEOUT_S)
 
     async def list_maps(self, cloud_map_id: Optional[str]) -> List[Dict[str, Any]]:
         """The stored maps linked to this cloud map (GET /maps/list?cloud_map_id=X); all stored
@@ -170,13 +176,13 @@ class OrchestratorClient:
 
     async def get_map(self, name: str) -> Dict[str, Any]:
         """GET /maps/{name}: the stored map's metadata (404: no such map)."""
-        body = await self._call("GET", f"/maps/{name}", ORCHESTRATOR_QUERY_TIMEOUT_S)
+        body = await self._call("GET", f"/maps/{_seg(name)}", ORCHESTRATOR_QUERY_TIMEOUT_S)
         return body if isinstance(body, dict) else {}
 
     async def patch_map(self, name: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """PATCH /maps/{name}: only the fields in `body` change; an explicit None `init_pos`
         clears it. 404 no such map, 409 invalid meta.yaml, 422 a bad value."""
-        out = await self._call("PATCH", f"/maps/{name}", ORCHESTRATOR_QUERY_TIMEOUT_S,
+        out = await self._call("PATCH", f"/maps/{_seg(name)}", ORCHESTRATOR_QUERY_TIMEOUT_S,
                                json_body=body)
         return out if isinstance(out, dict) else {}
 
@@ -240,10 +246,12 @@ def restore_target(prev: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
 
 
 async def restore_intent(client: Any, prev: Optional[Dict[str, Any]],
-                         expect: Optional[List[Tuple[str, Optional[str]]]] = None) -> bool:
+                         expect: Optional[List[Tuple[str, Optional[str]]]] = None,
+                         topomap: Optional[bool] = None) -> bool:
     """PUT back the intent from before a change (restore_target(prev)). With `expect`, only while
     the robot's intent is still one of those (mode, map) pairs, i.e. nobody changed it meanwhile
-    (an unreadable intent counts as still ours). True when it was put back, False when skipped.
+    (an unreadable intent counts as still ours). `topomap` False turns the topomap off in the same
+    PUT (the orchestrator refuses a mode change while it runs). True when it was put back, False when skipped.
     Raises OrchestratorError, or RuntimeError with the problem of a partial answer."""
     if expect is not None:
         try:
@@ -253,7 +261,7 @@ async def restore_intent(client: Any, prev: Optional[Dict[str, Any]],
         except Exception:  # noqa: BLE001 - unreadable: try the restore anyway
             pass
     mode, map_name = restore_target(prev)
-    problem = problem_of(await client.put_localization(mode, map_name))
+    problem = problem_of(await client.put_localization(mode, map_name, topomap=topomap))
     if problem:
         raise RuntimeError(problem)
     return True

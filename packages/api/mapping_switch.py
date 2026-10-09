@@ -65,12 +65,16 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequ
 from packages.api import orchestrator_client as oc
 from packages.api.orchestrator_services import pick_service
 from packages.config import (
-    MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_SAVE_POLL_S,
+    MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_QUERY_TIMEOUT_S,
+    ORCHESTRATOR_SAVE_POLL_S,
     ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S,
 )
 from packages.utils.map_sessions import KNOWN_SERVICES, ORCHESTRATOR_SERVICES, SLAM, TOPO
 
 logger = logging.getLogger("ApiDelegationService.mapping_switch")
+
+# one snapshot read (GET /localization, GET /services, the status calls) as a whole
+SNAPSHOT_BUDGET_S = 3 * ORCHESTRATOR_QUERY_TIMEOUT_S
 
 SAVE_START_TRIES = 5      # a 503 (driver not up yet) is retried this often
 SAVE_POLL_ERRORS = 5      # consecutive failed status reads that end a poll
@@ -95,7 +99,14 @@ def _utcnow() -> datetime.datetime:
 
 
 def candidates_of(service: str) -> List[str]:
-    return list(MAPPING_SERVICE_CANDIDATES.get(service, [service]))
+    """Orchestrator names a session service (topo, grid) may have there; KeyError for `slam`,
+    which is no orchestrator service (it is driven by start_slam / save_slam)."""
+    return list(MAPPING_SERVICE_CANDIDATES[service])
+
+
+def _action_name(service: str) -> str:
+    """The `service` of the robot action of a session service that was not switched."""
+    return TOPOMAP_SERVICE if service == TOPO else candidates_of(service)[0]
 
 
 @dataclass
@@ -278,8 +289,10 @@ class MappingSwitch:
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
                  save_poll_s: float = ORCHESTRATOR_SAVE_POLL_S,
                  save_poll_total_s: float = ORCHESTRATOR_SAVE_POLL_TOTAL_S,
-                 save_retry_s: float = ORCHESTRATOR_SAVE_RETRY_S):
+                 save_retry_s: float = ORCHESTRATOR_SAVE_RETRY_S,
+                 fetch_budget_s: float = SNAPSHOT_BUDGET_S):
         self._client_factory = client_factory
+        self.fetch_budget_s = fetch_budget_s
         self._sleep = sleep
         self._save_poll_s = save_poll_s
         self._save_poll_total_s = save_poll_total_s
@@ -287,7 +300,7 @@ class MappingSwitch:
         self.ttl = ttl
         self._clock = clock
         self._cache: Dict[str, tuple] = {}     # robot -> (expires, Snapshot)
-        self._last: Dict[str, Snapshot] = {}   # robot -> last snapshot read (kept by invalidate)
+        self._last: Dict[str, Snapshot] = {}   # robot -> last snapshot read (dropped by invalidate)
         self._inflight: Dict[str, "asyncio.Task[Snapshot]"] = {}   # robot -> the read in progress
         self._locks: Dict[str, asyncio.Lock] = {}
         # Maps §14: async fn(robot, session view or None) pushing the robot's `session` after a
@@ -314,6 +327,8 @@ class MappingSwitch:
 
     def invalidate(self, robot_name: str) -> None:
         self._cache.pop(robot_name, None)
+        # the last snapshot predates the change too: cached() must not keep serving it
+        self._last.pop(robot_name, None)
         self._inflight.pop(robot_name, None)  # its answer may predate the change: not cached
 
     # --- SLAM map (never raises) ---------------------------------------------------------------
@@ -370,8 +385,10 @@ class MappingSwitch:
         try:
             await client.get_map(onboard)
             return SlamResult(SLAM_EXISTS, "SLAM map already exists, not re-recorded")
-        except oc.OrchestratorError:
-            pass    # 404: no such map yet (the usual case); anything else: the PUT says
+        except oc.OrchestratorError as exc:
+            if not (exc.kind == oc.HTTP and exc.status == 404):
+                return self._slam_start_failed(name, map_name, exc)
+            # 404: no such map yet (the usual case)
         try:
             prev = await client.get_localization()
         except oc.OrchestratorError as exc:
@@ -406,7 +423,12 @@ class MappingSwitch:
         prev = self._prev_intent.get(name)
         mode, _ = oc.restore_target(prev)
         try:
-            await oc.restore_intent(client, prev)
+            # a mode change is refused while the topomap runs unless the same PUT turns it off
+            try:
+                has_topomap = "topomap" in await client.get_localization()
+            except oc.OrchestratorError:
+                has_topomap = False
+            await oc.restore_intent(client, prev, topomap=False if has_topomap else None)
         except oc.OrchestratorError as exc:
             return f"the robot was not switched back to {mode}: {_reason(exc)}"
         except Exception as exc:  # noqa: BLE001
@@ -590,7 +612,9 @@ class MappingSwitch:
             return service_action(TOPOMAP_SERVICE, action, "failed",
                                   "the robot has no stored localization mode")
         try:
-            answer = await client.put_localization(mode, loc.get("map"), topomap=on)
+            # the map only matters (and is only accepted) in relocalization, as in restore_target
+            map_name = loc.get("map") if mode == "relocalization" else None
+            answer = await client.put_localization(mode, map_name, topomap=on)
         except oc.OrchestratorError as exc:
             return service_action(TOPOMAP_SERVICE, action, "failed", _reason(exc))
         problem = oc.problem_of(answer)   # partial=ok: e.g. topomap "not_started"
@@ -617,6 +641,7 @@ class MappingSwitch:
         name = getattr(robot, "name", "?")
         on = action == START
         actions: List[Dict[str, Any]] = []
+        services = [s for s in services if s in ORCHESTRATOR_SERVICES]  # not slam
         if robot is None or not services:
             return actions
         try:
@@ -629,18 +654,18 @@ class MappingSwitch:
                     rest.remove(TOPO)
                 names = await self.resolve(client, rest) if rest else {}
             except oc.OrchestratorError as exc:
-                return actions + [service_action(candidates_of(svc)[0], action, "failed",
+                return actions + [service_action(_action_name(svc), action, "failed",
                                                  _reason(exc)) for svc in rest]
             for svc in rest:
                 orch = names[svc]
                 if orch is None and on:
                     actions.append(service_action(
-                        candidates_of(svc)[0], START, "failed",
+                        _action_name(svc), START, "failed",
                         f"the robot's orchestrator has no such service (looked for "
                         f"{', '.join(candidates_of(svc))})"))
                     continue
                 if orch is None:  # stop: nothing by that name exists there, so nothing runs
-                    actions.append(service_action(candidates_of(svc)[0], STOP, "already"))
+                    actions.append(service_action(_action_name(svc), STOP, "already"))
                     continue
                 try:
                     await (client.start(orch) if on else client.stop(orch))
@@ -655,8 +680,8 @@ class MappingSwitch:
             logger.exception("Mapping services %s on %s not switched (%s)", list(services), name,
                              action)
             done = {a["service"] for a in actions}
-            actions += [service_action(candidates_of(s)[0], action, "failed", str(exc))
-                        for s in services if candidates_of(s)[0] not in done]
+            actions += [service_action(_action_name(s), action, "failed", str(exc))
+                        for s in services if _action_name(s) not in done]
         finally:
             self.invalidate(name)
         for a in actions:
@@ -689,7 +714,10 @@ class MappingSwitch:
     async def _load(self, robot: Any, name: str) -> Snapshot:
         task = asyncio.current_task()
         try:
-            snap = await self._fetch(robot)
+            try:
+                snap = await asyncio.wait_for(self._fetch(robot), self.fetch_budget_s)
+            except asyncio.TimeoutError:
+                snap = Snapshot(reachable=False, error="the orchestrator did not answer in time")
         finally:
             current = self._inflight.get(name) is task
             if current:
@@ -716,11 +744,15 @@ class MappingSwitch:
                                   "running": bool(loc["topomap"]), "pid": None,
                                   "started_at": None}
             rest = [s for s in ORCHESTRATOR_SERVICES if s not in services]
-            for svc, orch in (await self.resolve(client, rest)).items():
+            resolved = await self.resolve(client, rest)
+            found = [(svc, orch) for svc, orch in resolved.items() if orch is not None]
+            for svc, orch in resolved.items():
                 if orch is None:
                     services[svc] = None
-                    continue
-                st = (await client.status(orch)).get("state") or {}
+            # one status call per service, concurrently (each has its own timeout)
+            statuses = await asyncio.gather(*(client.status(orch) for _, orch in found))
+            for (svc, orch), status in zip(found, statuses):
+                st = status.get("state") or {}
                 services[svc] = {"orchestrator": orch, "running": bool(st.get("running")),
                                  "pid": st.get("pid"), "started_at": st.get("started_at")}
             return Snapshot(reachable=True, services=services, localization=loc or None)

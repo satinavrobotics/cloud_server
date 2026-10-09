@@ -210,6 +210,17 @@ class RelocJobs:
         self.poll = poll
         self.confirm_timeout = confirm_timeout
         self._jobs: Dict[str, RelocJob] = {}
+        # fn(robot name) after a call that may have changed the robot's localization intent or
+        # stored maps (also a failed / timed-out one): set by ApiDelegationService to forget the
+        # cached mapping snapshot and held-map answers, as the orchestrator proxy does.
+        self.on_robot_changed: Optional[Callable[[str], None]] = None
+
+    def _changed(self, robot_name: str) -> None:
+        if self.on_robot_changed is not None:
+            try:
+                self.on_robot_changed(robot_name)
+            except Exception:  # noqa: BLE001
+                logger.exception("Cache invalidation for %s failed", robot_name)
 
     # --- registry ----------------------------------------------------------------------------
 
@@ -393,7 +404,10 @@ class RelocJobs:
         problems: List[str] = []
         if undo.intent_changed:   # PUT the previous intent back
             undo.intent_changed = False
-            problem = await self._restore_intent(client, undo)
+            try:
+                problem = await self._restore_intent(client, undo)
+            finally:
+                self._changed(job.robot_name)
             if problem:
                 problems.append(problem)
         if undo.init_pos_changed and undo.onboard is not None:
@@ -404,12 +418,13 @@ class RelocJobs:
                 problems.append(describe_error(exc, "initial pose not restored"))
             except Exception as exc:  # noqa: BLE001
                 problems.append(f"initial pose not restored: {exc}")
+            finally:
+                self._changed(job.robot_name)
         for problem in problems:
             logger.warning("Reloc job %s rollback: %s", job.id, problem)
         return "; ".join(problems) if problems else None
 
-    @staticmethod
-    async def _restore_intent(client: oc.OrchestratorClient, undo: _Undo) -> Optional[str]:
+    async def _restore_intent(self, client: oc.OrchestratorClient, undo: _Undo) -> Optional[str]:
         """Rollback: PUT the stored intent from before the job back (odometry when there
         was none; a slam intent never gets here), unless the robot's intent is not one the job
         left (someone changed it meanwhile). A problem sentence, else None."""
@@ -493,7 +508,10 @@ class RelocJobs:
             changed = undo.intent_changed
             undo.intent_changed = True    # before the call: a timed-out call may have applied
             try:
-                answer = await client.put_localization(mode, map_name, wait=False)
+                try:
+                    answer = await client.put_localization(mode, map_name, wait=False)
+                finally:
+                    self._changed(job.robot_name)
             except oc.OrchestratorError as exc:
                 # partial=ok: an error changed nothing, but a timed-out switch may still apply
                 if exc.kind == oc.HTTP and exc.status != 504 and not changed:

@@ -668,6 +668,13 @@ class ApiDelegationService:
         self.reloc_jobs = RelocJobs()
         # a SLAM save / stop changes the robot's stored maps: forget the held-map answers
         self.mapping_switch.on_slam_done = self.orchestrator_maps.invalidate
+
+        def _reloc_changed(robot_name: str) -> None:
+            self.mapping_switch.invalidate(robot_name)
+            self.orchestrator_maps.invalidate(robot_name)
+
+        # a reloc job's PUT /localization / init_pos change: as through the orchestrator proxy
+        self.reloc_jobs.on_robot_changed = _reloc_changed
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)

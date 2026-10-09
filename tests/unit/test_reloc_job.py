@@ -373,6 +373,20 @@ class TestModeOdin:
         assert env.db.codes() == [EventCode.MAP_SESSION_PLACED.value]
         assert env.orch.current_map == ONBOARD
 
+    async def test_every_localization_put_invalidates_the_robot_caches(self, env):
+        _robot(env.db, position_initialized=False)
+        s = _unplaced(env.db)
+        env.orch.intent = {"mode": "relocalization", "map": ONBOARD}   # forces the odometry hop
+        env.on_sleep = _localized_after(3)
+        changed = []
+        env.jobs.on_robot_changed = lambda name: changed.append(
+            (name, len(env.orch.puts())))
+        await env.place(s["session_id"], ASSISTED)
+        await env.jobs.wait_all()
+        # odometry hop, then relocalization: one invalidation after each PUT (not before)
+        assert env.orch.puts() == [("odometry", None), ("relocalization", ONBOARD)]
+        assert [c for c in changed if c[1] == 1] and [c for c in changed if c[1] == 2]
+
     async def test_no_orchestrator_call_inside_a_db_transaction(self, env):
         # the fake asserts it on every call; make sure the job really made calls and reads
         _robot(env.db)
@@ -641,6 +655,15 @@ class TestFailures:
         assert "could not set the initial pose" in job.error and "409" in job.error
         assert "put_localization" not in env.orch.ops()
         assert env.orch.init_pos == [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+
+    async def test_a_rollback_invalidates_too(self, env):
+        env.orch.init_pos = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        env.orch.fail["put_localization"] = _http(409, "a VDA5050 order is active")
+        changed = []
+        env.jobs.on_robot_changed = changed.append
+        await self._failed(env, ASSISTED)
+        assert changed and set(changed) == {"r1"}
+        assert env.orch.calls[-1][0] == "patch_map"
 
     async def test_put_refused_restores_the_init_pos_only(self, env):
         prev = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]
