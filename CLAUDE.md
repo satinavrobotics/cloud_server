@@ -27,7 +27,7 @@ docker compose -f docker_compose/mission_dispatch_services.yaml up
 docker compose -f docker_compose/mission_dispatch_services.yaml \
                -f docker_compose/mission_dispatch_services_dev_override.yaml up
 
-# Restart all services
+# Rebuild and recreate the changed services (build first; a failed build stops nothing)
 ./restart_services.sh
 
 # Check health of running services
@@ -81,7 +81,7 @@ All services use `network_mode: host` and communicate over localhost. Port assig
 
 There is **no** standalone graph-db, image-db or similarity service. `packages/topomap_dbs/{graph_db,image_db,model_db,rosbag_db}/server.py` are in-process libraries: services reach ArangoDB and MinIO directly through `TopomapDatabaseClient` (`packages/topomap_dbs/client.py`).
 
-Self-hosted LiveKit is part of the main compose file (`docker_compose/mission_dispatch_services.yaml`), so `restart_services.sh` rebuilds/restarts it with everything else (note: that restarts the SFU, dropping live video for a few seconds; reconnects are automatic): `livekit-sfu` (7880/7881 TCP, 50000-60000 UDP, Prometheus 6789, container `sati_livekit_sfu`) and `livekit-sfu-tokens` (8008, role-scoped tokens, `packages/services/livekit_sfu_tokens/`; operators get a `wss://` name from `tailscale serve` on 443 so the https dashboard works, via the operator-only `/api/operator/createToken`). Tailscale-only, settings in the gitignored `docker_compose/livekit_sfu.env` (optional for compose; without it just these two fail to start). See `docs/livekit_sfu/README.md`.
+Self-hosted LiveKit is part of the main compose file (`docker_compose/mission_dispatch_services.yaml`), so `restart_services.sh` (build first, then `up -d`: only changed containers are recreated) restarts it when its image or config changed (that drops live video for a few seconds; reconnects are automatic): `livekit-sfu` (7880/7881 TCP, 50000-60000 UDP, Prometheus 6789, container `sati_livekit_sfu`) and `livekit-sfu-tokens` (8008, role-scoped tokens, `packages/services/livekit_sfu_tokens/`; operators get a `wss://` name from `tailscale serve` on 443 so the https dashboard works, via the operator-only `/api/operator/createToken`). Tailscale-only, settings in the gitignored `docker_compose/livekit_sfu.env` (optional for compose; without it just these two fail to start). See `docs/livekit_sfu/README.md`.
 
 ### Data Flow
 
