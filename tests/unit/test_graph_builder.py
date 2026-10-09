@@ -95,7 +95,7 @@ class TestGraphBuilderGetStats:
     def test_get_stats_method(self, mock_topomap):
         """Test get_stats() method returns stats with MQTT status."""
         service = GraphBuilderService()
-        service._mqtt_connected = True
+        service.mqtt_client = Mock(connected=True)
         service.stats["nodes_processed"] = 10
 
         stats = service.get_stats()
@@ -149,19 +149,32 @@ class TestGraphBuilderMQTTConnection:
         service.mqtt_client.disconnect.assert_called_once()
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
-    def test_mqtt_connected_flag_set_after_connect(self, mock_topomap):
-        """Test that _mqtt_connected is False by default and can be set."""
+    def test_mqtt_connected_follows_the_client(self, mock_topomap):
+        """mqtt_connected is the MQTT client's live state, not a flag of its own."""
         service = GraphBuilderService()
-        assert service._mqtt_connected is False
+        service.mqtt_client = Mock(connected=False)
+        assert service.mqtt_connected is False
+        assert service.get_health_details()["mqtt_connected"] is False
+        service.mqtt_client.connected = True  # paho's on_connect
+        assert service.mqtt_connected is True
+        assert service.get_stats()["mqtt_connected"] is True
+        assert service.get_health_details()["mqtt_connected"] is True
+        service.mqtt_client.connected = False  # on_disconnect
+        assert service.mqtt_connected is False
 
-        service._mqtt_connected = True
-        assert service._mqtt_connected is True
+    @patch('packages.services.graph_builder.server.MQTTClient')
+    @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
+    def test_mqtt_connected_after_connect_mqtt(self, mock_topomap, mock_mqtt):
+        mock_mqtt.return_value = Mock(connected=True)
+        service = GraphBuilderService()
+        assert service.connect_mqtt()
+        assert service.mqtt_connected is True
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     def test_mqtt_connected_false_initially(self, mock_topomap):
-        """Test _mqtt_connected starts False."""
+        """No client yet: not connected."""
         service = GraphBuilderService()
-        assert service._mqtt_connected is False
+        assert service.mqtt_connected is False
 
     @patch('packages.services.graph_builder.server.TopomapDatabaseClient')
     def test_disconnect_mqtt_no_client(self, mock_topomap):
@@ -877,7 +890,7 @@ class TestGraphBuilderHealthChecks:
         mock_postgres.return_value.is_running.return_value = True
 
         service = GraphBuilderService()
-        service._mqtt_connected = True
+        service.mqtt_client = Mock(connected=True)
 
         assert service.is_healthy() is True
 
@@ -890,7 +903,7 @@ class TestGraphBuilderHealthChecks:
         mock_graph_instance.is_healthy.return_value = True
 
         service = GraphBuilderService()
-        service._mqtt_connected = False
+        service.mqtt_client = Mock(connected=False)
 
         assert service.is_healthy() is False
 
@@ -904,7 +917,7 @@ class TestGraphBuilderHealthChecks:
         mock_topomap.return_value.is_healthy.return_value = False
 
         service = GraphBuilderService()
-        service._mqtt_connected = True
+        service.mqtt_client = Mock(connected=True)
 
         assert service.is_healthy() is False
 
@@ -916,7 +929,7 @@ class TestGraphBuilderHealthChecks:
         mock_topomap.return_value.is_healthy.return_value = False
 
         service = GraphBuilderService()
-        service._mqtt_connected = True
+        service.mqtt_client = Mock(connected=True)
 
         assert service.is_healthy() is False
 
@@ -929,7 +942,7 @@ class TestGraphBuilderHealthChecks:
         mock_graph_instance.is_healthy.return_value = False
 
         service = GraphBuilderService()
-        service._mqtt_connected = True
+        service.mqtt_client = Mock(connected=True)
 
         details = service.get_health_details()
 
@@ -946,7 +959,7 @@ class TestGraphBuilderHealthChecks:
         mock_graph_instance.is_healthy.return_value = True
 
         service = GraphBuilderService()
-        service._mqtt_connected = False
+        service.mqtt_client = Mock(connected=False)
 
         details = service.get_health_details()
 

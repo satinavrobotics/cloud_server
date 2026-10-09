@@ -70,6 +70,7 @@ import datetime
 import json
 import logging
 import math
+import re
 import time
 import uuid as uuid_t
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -265,17 +266,21 @@ def pose3d_map(transform: Mapping[str, float], pose3d: Mapping[str, Any]) -> Dic
             "qw": cz * qw - sz * qz}
 
 
-def _pose3d(value: Any) -> Optional[Dict[str, float]]:
+def _pose3d(value: Any, name: str = "robot_pose3d",
+            error: Optional[type] = None) -> Optional[Dict[str, float]]:
+    """A sent 6-DoF pose (`name` in the messages) parsed to floats, or None when not sent.
+    Raises `error` (DepthPayloadError by default) when it is malformed."""
+    error = error or DepthPayloadError
     if value in (None, {}):
         return None
     if not isinstance(value, Mapping) or any(k not in value for k in POSE3D_KEYS):
-        raise DepthPayloadError(f"robot_pose3d needs {', '.join(POSE3D_KEYS)}")
+        raise error(f"{name} needs {', '.join(POSE3D_KEYS)}")
     try:
         pose = {k: float(value[k]) for k in POSE3D_KEYS}
     except (TypeError, ValueError) as exc:
-        raise DepthPayloadError(f"robot_pose3d: {exc}") from exc
+        raise error(f"{name}: {exc}") from exc
     if not all(math.isfinite(v) for v in pose.values()):
-        raise DepthPayloadError("robot_pose3d has a non-finite value")
+        raise error(f"{name} has a non-finite value")
     return pose
 
 
@@ -329,7 +334,12 @@ def depth_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str
 
 COSTMAP_ENCODING = "u8_occ100_unknown255"
 COSTMAP_CONTENT_TYPE = "image/png"
-COSTMAP_DATA_KEY = "costmap_data"  # the only payload field not stored on the node (PNG: MinIO)
+COSTMAP_DATA_KEY = "costmap_data"  # the PNG (MinIO), never stored on the node
+# A layer names a MinIO object (`{node}/costmap/{layer}.png`) and an ArangoDB attribute.
+COSTMAP_LAYER_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# Stored on the node as sent (None when absent); `source_topic` only when present.
+COSTMAP_PASSTHROUGH = ("frame", "source_frame", "costmap_stamp_ms", "keyframe_stamp_ms",
+                       "stamp_offset_ms")
 
 
 class CostmapPayloadError(ValueError):
@@ -337,9 +347,11 @@ class CostmapPayloadError(ValueError):
 
 
 def _finite(payload: Mapping[str, Any], name: str) -> float:
+    if payload.get(name) is None:
+        raise CostmapPayloadError(f"missing {name}")
     try:
         value = float(payload[name])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise CostmapPayloadError(f"{name}: {exc}") from exc
     if not math.isfinite(value):
         raise CostmapPayloadError(f"{name} is not finite")
@@ -363,55 +375,75 @@ def _costmap_origin(payload: Mapping[str, Any]) -> Dict[str, float]:
 def _costmap_pose3d(value: Any) -> Optional[Dict[str, float]]:
     if value in (None, {}):
         return None
-    try:
-        pose = _pose3d(value)
-    except DepthPayloadError as exc:
-        raise CostmapPayloadError(str(exc).replace("robot_pose3d", "origin_pose3d")) from exc
+    pose = _pose3d(value, "origin_pose3d", CostmapPayloadError)
     if not math.sqrt(sum(pose[k] ** 2 for k in ("qx", "qy", "qz", "qw"))):
         raise CostmapPayloadError("origin_pose3d has a zero quaternion")
     return pose
 
 
-def check_costmap_payload(payload: Mapping[str, Any]) -> None:
-    """Raise CostmapPayloadError unless `payload` is a storable robot/costmap_upload message.
+def _parse_costmap(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """The validated, parsed fields of a robot/costmap_upload message (layer, width, height,
+    resolution, origin, origin_pose3d or None); CostmapPayloadError when it is not storable.
     Cheap: the PNG is neither decoded nor base64-validated here (that happens on save)."""
     for key in ("session_node_id", "robot_name", "layer", COSTMAP_DATA_KEY):
         if payload.get(key) in (None, ""):
             raise CostmapPayloadError(f"missing {key}")
     layer = str(payload["layer"])
-    if "/" in layer or layer in (".", ".."):
-        raise CostmapPayloadError(f"invalid layer {layer!r}")
+    if not COSTMAP_LAYER_RE.fullmatch(layer):  # fullmatch: `$` alone admits a trailing \n
+        raise CostmapPayloadError(f"invalid layer {layer!r} (1-32 of A-Z a-z 0-9 _ -)")
     encoding = payload.get("costmap_encoding", COSTMAP_ENCODING)
     if encoding != COSTMAP_ENCODING:
         raise CostmapPayloadError(f"unsupported costmap_encoding {encoding!r}")
     content_type = payload.get("content_type", COSTMAP_CONTENT_TYPE)
     if content_type != COSTMAP_CONTENT_TYPE:
         raise CostmapPayloadError(f"unsupported content_type {content_type!r}")
-    _positive_int(payload, "width")
-    _positive_int(payload, "height")
-    if not _finite(payload, "resolution") > 0:
+    width = _positive_int(payload, "width")
+    height = _positive_int(payload, "height")
+    resolution = _finite(payload, "resolution")
+    if not resolution > 0:
         raise CostmapPayloadError("resolution must be > 0")
-    _costmap_origin(payload)
-    _costmap_pose3d(payload.get("origin_pose3d"))
+    return {"layer": layer, "width": width, "height": height, "resolution": resolution,
+            "origin": _costmap_origin(payload),
+            "origin_pose3d": _costmap_pose3d(payload.get("origin_pose3d"))}
+
+
+def check_costmap_payload(payload: Mapping[str, Any]) -> None:
+    """Raise CostmapPayloadError unless `payload` is a storable robot/costmap_upload message."""
+    _parse_costmap(payload)
 
 
 def costmap_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str, Any]:
-    """The node's `costmap.{layer}` value for an accepted costmap message: every field but the
-    PNG as sent, `origin_map` (the grid origin through the session's map_T_session, exactly as a
-    node pose), `origin_pose3d_map` when `origin_pose3d` was sent, and `session_id`."""
-    check_costmap_payload(payload)
-    record: Dict[str, Any] = {k: v for k, v in payload.items() if k != COSTMAP_DATA_KEY}
-    record["layer"] = str(payload["layer"])
-    record["costmap_encoding"] = COSTMAP_ENCODING
-    record["content_type"] = COSTMAP_CONTENT_TYPE
-    origin = _costmap_origin(payload)
+    """The node's `costmap.{layer}` value for an accepted costmap message (validated here too,
+    so it is safe to call directly; it cannot fail on a payload check_costmap_payload passed).
+
+    Only known fields are stored: layer, content_type, costmap_encoding, width, height,
+    resolution, origin and origin_pose3d (parsed), frame, source_frame, the three stamps (as
+    sent, None when absent), source_topic (as sent, only when present), `origin_map` (the grid
+    origin through the session's map_T_session, exactly as a node pose), `origin_pose3d_map`
+    when `origin_pose3d` was sent, and `session_id`."""
+    parsed = _parse_costmap(payload)
+    origin = parsed["origin"]
     x, y, yaw = map_pose(session.map_t_session, origin["x"], origin["y"], origin["yaw"])
-    record["origin_map"] = {"x": x, "y": y, "yaw": yaw}
-    pose = _costmap_pose3d(payload.get("origin_pose3d"))
+    record: Dict[str, Any] = {
+        "session_node_id": payload["session_node_id"],
+        "robot_name": payload["robot_name"],
+        "layer": parsed["layer"],
+        "content_type": COSTMAP_CONTENT_TYPE,
+        "costmap_encoding": COSTMAP_ENCODING,
+        "width": parsed["width"],
+        "height": parsed["height"],
+        "resolution": parsed["resolution"],
+        "origin": origin,
+        **{k: payload.get(k) for k in COSTMAP_PASSTHROUGH},
+        "origin_map": {"x": x, "y": y, "yaw": yaw},
+        "session_id": session.session_id,
+    }
+    if payload.get("source_topic") is not None:
+        record["source_topic"] = payload["source_topic"]
+    pose = parsed["origin_pose3d"]
     if pose is not None:
         record["origin_pose3d"] = pose
         record["origin_pose3d_map"] = pose3d_map(session.map_t_session, pose)
-    record["session_id"] = session.session_id
     return record
 
 

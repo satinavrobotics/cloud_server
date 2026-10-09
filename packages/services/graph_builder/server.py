@@ -17,12 +17,21 @@ goes to the mission's waypoint log).
 u16-mm depth PNG and its camera parameters per node and camera. It follows the image path
 (resolved by session, buffered until its node exists); the PNG goes to MinIO at
 `{node}/depth/{camera}.png` and the parameters onto the ArangoDB node as `depth.{camera}`.
+`robot/costmap_upload` (one occupancy PNG per node and layer) follows the same path.
+
+Uploads that arrive before their node are buffered (upload_buffer.NodeUploadBuffer). The node is
+processed in a worker thread; one lock (`_upload_lock`) makes the handlers' "node there? else
+buffer" and the worker's "node there now, take the buffer" atomic, so no upload is lost or
+stranded between them. Images need only the node's global id (they go to MinIO before the node
+is written); depth and costmap records go onto the ArangoDB node and so wait until `add_node`
+succeeded (`_stored_nodes`).
 """
 
 import logging
 import json
 import base64
 import asyncio
+import threading
 import uuid
 from typing import Dict, Any, Optional, List, Union, Set, Tuple
 from datetime import datetime, timezone as _dt_timezone
@@ -43,6 +52,7 @@ from packages.config import (
 )
 from packages.events.emit import Event, emit
 from packages.services.graph_builder import ingest
+from packages.services.graph_builder.upload_buffer import NodeUploadBuffer
 
 
 class UpdatePublisher:
@@ -218,24 +228,16 @@ class GraphBuilderService:
         self.graph_db = self.topomap_db.graph
         self.image_db = self.topomap_db.image
 
-        # MQTT client
+        # MQTT client (its live `connected` state is the health's mqtt_connected)
         self.mqtt_client: Optional[MQTTClient] = None
-        self._mqtt_connected = False
 
-        # Robot node counter to global node ID
+        # Robot node counter to global node ID (set before the node is written: enough for
+        # images, which go to MinIO only)
         # Key: (robot_name, session_node_id) -> (global_id, timestamp, map_name, session_id)
         self.session_to_global_map: Dict[Tuple[str, int], Tuple[str, datetime, str, str]] = {}
-
-        # Image buffer for out-of-order arrivals
-        # Key: (robot_name, session_node_id) -> {camera_name: (image_data, timestamp)}
-        self.image_buffer: Dict[Tuple[str, int], Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
-        # Depth buffer, the same shape (3D reconstruction R2): camera -> ({png, record,
-        # session_id}, buffered at)
-        self.depth_buffer: Dict[Tuple[str, int], Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
-        # Costmap buffer (robot/costmap_upload): layer -> ({layer, data, record, session_id},
-        # buffered at)
-        self.costmap_buffer: Dict[Tuple[str, int],
-                                  Dict[str, Tuple[Dict[str, Any], datetime]]] = {}
+        # Nodes whose ArangoDB document exists (add_node succeeded): depth and costmap records
+        # can be set on them. (robot_name, session_node_id) -> (global_id, map_name, session_id)
+        self._stored_nodes: Dict[Tuple[str, Any], Tuple[str, str, Optional[str]]] = {}
 
         # Robot registration cache
         # Set of robot names that are known to exist in Mission Dispatch
@@ -261,6 +263,19 @@ class GraphBuilderService:
             "costmap_rejected": 0,
             "buffered_costmap": 0,
         }
+
+        # Uploads that arrived before their node (module docstring). One lock for the three
+        # buffers, the mapping writes and _stored_nodes.
+        self._upload_lock = threading.RLock()
+        # camera -> image dict
+        self.image_buffer = NodeUploadBuffer("image", self.stats, "buffered_images",
+                                             lock=self._upload_lock, log=self.logger)
+        # camera -> {camera, data, record, session_id} (3D reconstruction R2)
+        self.depth_buffer = NodeUploadBuffer("depth", self.stats, "buffered_depth",
+                                             lock=self._upload_lock, log=self.logger)
+        # layer -> {layer, data, record, session_id} (robot/costmap_upload)
+        self.costmap_buffer = NodeUploadBuffer("costmap", self.stats, "buffered_costmap",
+                                               lock=self._upload_lock, log=self.logger)
 
         # WebSocket update publisher
         self.update_publisher = UpdatePublisher()
@@ -441,23 +456,23 @@ class GraphBuilderService:
             self.logger.error(f"Failed to look up active mission for '{robot_name}': {e}")
         return None, True
 
-    def _pop_buffered_images(self, robot_name: str, session_node_id: Any) -> int:
-        """Discard the images buffered for a node that was dropped; how many there were."""
-        cameras = self.image_buffer.pop((robot_name, session_node_id), None) or {}
-        self.stats["buffered_images"] -= len(cameras)
-        return len(cameras)
+    def _mapped_node(self, node_key: Tuple[str, Any],
+                     session_id: Optional[str]) -> Optional[Tuple[str, str]]:
+        """(global id, map) of a node already mapped in this session (its images can be
+        stored), else None. Call under _upload_lock."""
+        mapping = self.session_to_global_map.get(node_key)
+        if mapping and mapping[3] == session_id:
+            return mapping[0], mapping[2]
+        return None
 
-    def _pop_buffered_depth(self, robot_name: str, session_node_id: Any) -> int:
-        """Discard the depth images buffered for a node that was dropped; how many."""
-        cameras = self.depth_buffer.pop((robot_name, session_node_id), None) or {}
-        self.stats["buffered_depth"] -= len(cameras)
-        return len(cameras)
-
-    def _pop_buffered_costmap(self, robot_name: str, session_node_id: Any) -> int:
-        """Discard the costmap layers buffered for a node that was dropped; how many."""
-        layers = self.costmap_buffer.pop((robot_name, session_node_id), None) or {}
-        self.stats["buffered_costmap"] -= len(layers)
-        return len(layers)
+    def _stored_node(self, node_key: Tuple[str, Any],
+                     session_id: Optional[str]) -> Optional[Tuple[str, str]]:
+        """(global id, map) of a node of this session whose ArangoDB document exists (depth
+        and costmap records can be set on it), else None. Call under _upload_lock."""
+        stored = self._stored_nodes.get(node_key)
+        if stored and stored[2] == session_id:
+            return stored[0], stored[1]
+        return None
 
     async def _handle_node_update(self, payload: Dict[str, Any]):
         """
@@ -492,12 +507,10 @@ class GraphBuilderService:
         resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
         if not resolution.accepted:
             await self._reject(resolution, "node")
-            await self._reject(resolution, "image",
-                               self._pop_buffered_images(robot_name, session_node_id))
-            await self._reject(resolution, "depth",
-                               self._pop_buffered_depth(robot_name, session_node_id))
-            await self._reject(resolution, "costmap",
-                               self._pop_buffered_costmap(robot_name, session_node_id))
+            node_key = (robot_name, session_node_id)
+            await self._reject(resolution, "image", self.image_buffer.pop(node_key))
+            await self._reject(resolution, "depth", self.depth_buffer.pop(node_key))
+            await self._reject(resolution, "costmap", self.costmap_buffer.pop(node_key))
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
@@ -563,13 +576,16 @@ class GraphBuilderService:
 
         self.logger.info(f"📨 Received node update from {robot_name}, session_node_id={session_node_id}")
 
-        self._detect_and_clear_session_reset(robot_name, session_node_id)
-
         global_node_id = self._generate_global_node_id()
 
         session_key = (robot_name, session_node_id)
-        self.session_to_global_map[session_key] = (global_node_id, datetime.now(), map_id,
-                                                   session_id)
+        with self._upload_lock:
+            self._detect_and_clear_session_reset(robot_name, session_node_id)
+            # A re-sent node: its records wait for this node's document.
+            self._stored_nodes.pop(session_key, None)
+            self.session_to_global_map[session_key] = (global_node_id, datetime.now(), map_id,
+                                                       session_id)
+            buffered_images = self.image_buffer.take(session_key, self.image_buffer_timeout)
         self.stats["session_mappings"] += 1
 
         self.logger.info(f"🔑 Mapped ({robot_name}, {session_node_id}) -> {global_node_id}")
@@ -581,7 +597,6 @@ class GraphBuilderService:
             metadata['session_id'] = session_id
             metadata['robot_pose'] = {'x': rx, 'y': ry, 'yaw': ryaw}
 
-        buffered_images = self._get_buffered_images(robot_name, session_node_id)
         if buffered_images:
             self.logger.info(f"Found {len(buffered_images)} buffered images for node {global_node_id}")
             self._save_images(global_node_id, map_id, buffered_images)
@@ -606,14 +621,20 @@ class GraphBuilderService:
             self.stats["errors"] += 1
             return None
 
+        # Depth and costmap records go onto the node document: from now on they are stored
+        # directly; what was buffered until now is taken under the same lock.
+        with self._upload_lock:
+            self._stored_nodes[session_key] = (global_node_id, map_id, session_id)
+            buffered_depth = self.depth_buffer.take(session_key, self.image_buffer_timeout,
+                                                    session_id)
+            buffered_costmap = self.costmap_buffer.take(session_key, self.image_buffer_timeout,
+                                                        session_id)
+
         inserted = self.graph_db.add_edges_bulk(edges, map_id=map_id)
         self.stats["edges_created"] += inserted
 
-        # Depth needs the node document (its parameters go onto it): after add_node.
-        buffered_depth = self._get_buffered_depth(robot_name, session_node_id, session_id)
         if buffered_depth:
             self._save_depth(global_node_id, map_id, buffered_depth)
-        buffered_costmap = self._get_buffered_costmap(robot_name, session_node_id, session_id)
         if buffered_costmap:
             self._save_costmap(global_node_id, map_id, buffered_costmap)
 
@@ -735,23 +756,20 @@ class GraphBuilderService:
                 }
             }
 
+            # Node update already received in this session: save to the node's map. Else
+            # (the robot sends images first) buffer it until the node arrives.
             node_key = (robot_name, session_node_id)
-            mapping = self.session_to_global_map.get(node_key)
-            if mapping and mapping[3] == session.session_id:
-                # Node update already received in this session: save to the node's map.
-                global_node_id, _, map_id, _ = mapping
+            target = self.image_buffer.put_unless(
+                node_key, camera_name, image_dict,
+                lambda: self._mapped_node(node_key, session.session_id))
+            if target is not None:
+                global_node_id, map_id = target
                 saved_image_ids = await asyncio.to_thread(
                     self._save_images, global_node_id, map_id, [image_dict])
                 if saved_image_ids:
                     await self._publish_image_update(map_id, global_node_id, saved_image_ids)
             else:
-                # Node update not yet received (the robot sends images first): buffer it.
-                self.logger.debug(f"Buffering image for ({robot_name}, {session_node_id}, {camera_name})")
-                if node_key not in self.image_buffer:
-                    self.image_buffer[node_key] = {}
-                if camera_name not in self.image_buffer[node_key]:
-                    self.stats["buffered_images"] += 1
-                self.image_buffer[node_key][camera_name] = (image_dict, datetime.now())
+                self.logger.debug(f"Buffered image for ({robot_name}, {session_node_id}, {camera_name})")
 
         except Exception as e:
             self.logger.error(f"Error processing image upload message: {e}")
@@ -807,40 +825,14 @@ class GraphBuilderService:
                      "session_id": session.session_id}
 
             node_key = (robot_name, session_node_id)
-            mapping = self.session_to_global_map.get(node_key)
-            if mapping and mapping[3] == session.session_id:
-                global_node_id, _, map_id, _ = mapping
+            target = self.depth_buffer.put_unless(
+                node_key, camera, entry, lambda: self._stored_node(node_key, session.session_id))
+            if target is not None:
+                global_node_id, map_id = target
                 await asyncio.to_thread(self._save_depth, global_node_id, map_id, [entry])
-            else:
-                cameras = self.depth_buffer.setdefault(node_key, {})
-                if camera not in cameras:
-                    self.stats["buffered_depth"] += 1
-                cameras[camera] = (entry, datetime.now())
         except Exception as e:
             self.logger.error(f"Error processing depth upload message: {e}")
             self.stats["errors"] += 1
-
-    def _get_buffered_depth(self, robot_name: str, session_node_id: Any,
-                            session_id: Optional[str]) -> List[Dict[str, Any]]:
-        """Take the depth images buffered for a node: those of its session and younger than
-        the buffer timeout (the rest are discarded)."""
-        cameras = self.depth_buffer.pop((robot_name, session_node_id), None)
-        if not cameras:
-            return []
-        now = datetime.now()
-        entries = []
-        for camera, (entry, at) in cameras.items():
-            self.stats["buffered_depth"] -= 1
-            age = (now - at).total_seconds()
-            if age > self.image_buffer_timeout:
-                self.logger.warning(f"Buffered depth timed out: ({robot_name}, "
-                                    f"{session_node_id}, {camera}), age={age:.1f}s")
-            elif session_id is not None and entry.get("session_id") != session_id:
-                self.logger.warning(f"Buffered depth of ({robot_name}, {session_node_id}, "
-                                    f"{camera}) is from another session; discarded")
-            else:
-                entries.append(entry)
-        return entries
 
     def _save_depth(self, node_id: str, map_id: str, entries: List[Dict[str, Any]]) -> int:
         """Store each depth PNG in MinIO, then its parameters on the node. How many were
@@ -889,9 +881,10 @@ class GraphBuilderService:
         """
         Store one layer's occupancy costmap of a node, or buffer it until the node arrives
         (same session gating and buffering as depth). A dropped one is counted as `costmap` in
-        MAP.INGEST_REJECTED. The node's `costmap.{layer}` carries the payload without the PNG
-        plus `origin_map` (and `origin_pose3d_map`) in the map frame. A malformed message is
-        only logged and counted in stats["errors"].
+        MAP.INGEST_REJECTED. The node's `costmap.{layer}` is ingest.costmap_record (the known
+        fields, parsed, plus `origin_map` / `origin_pose3d_map` in the map frame). A malformed
+        message is only logged and counted in stats["errors"]: it is validated once, before the
+        session lookup (the record cannot fail on a validated payload).
         """
         try:
             try:
@@ -909,50 +902,19 @@ class GraphBuilderService:
                 await self._reject(resolution, "costmap")
                 return
             session = resolution.session
-            try:
-                record = ingest.costmap_record(payload, session)
-            except ingest.CostmapPayloadError as e:
-                self.logger.error(f"Invalid costmap upload: {e}")
-                self.stats["errors"] += 1
-                return
+            record = ingest.costmap_record(payload, session)
             entry = {"layer": layer, "data": payload['costmap_data'], "record": record,
                      "session_id": session.session_id}
 
             node_key = (robot_name, session_node_id)
-            mapping = self.session_to_global_map.get(node_key)
-            if mapping and mapping[3] == session.session_id:
-                global_node_id, _, map_id, _ = mapping
+            target = self.costmap_buffer.put_unless(
+                node_key, layer, entry, lambda: self._stored_node(node_key, session.session_id))
+            if target is not None:
+                global_node_id, map_id = target
                 await asyncio.to_thread(self._save_costmap, global_node_id, map_id, [entry])
-            else:
-                layers = self.costmap_buffer.setdefault(node_key, {})
-                if layer not in layers:
-                    self.stats["buffered_costmap"] += 1
-                layers[layer] = (entry, datetime.now())
         except Exception as e:
             self.logger.error(f"Error processing costmap upload message: {e}")
             self.stats["errors"] += 1
-
-    def _get_buffered_costmap(self, robot_name: str, session_node_id: Any,
-                              session_id: Optional[str]) -> List[Dict[str, Any]]:
-        """Take the costmap layers buffered for a node: those of its session and younger than
-        the buffer timeout (the rest are discarded)."""
-        layers = self.costmap_buffer.pop((robot_name, session_node_id), None)
-        if not layers:
-            return []
-        now = datetime.now()
-        entries = []
-        for layer, (entry, at) in layers.items():
-            self.stats["buffered_costmap"] -= 1
-            age = (now - at).total_seconds()
-            if age > self.image_buffer_timeout:
-                self.logger.warning(f"Buffered costmap timed out: ({robot_name}, "
-                                    f"{session_node_id}, {layer}), age={age:.1f}s")
-            elif session_id is not None and entry.get("session_id") != session_id:
-                self.logger.warning(f"Buffered costmap of ({robot_name}, {session_node_id}, "
-                                    f"{layer}) is from another session; discarded")
-            else:
-                entries.append(entry)
-        return entries
 
     def _save_costmap(self, node_id: str, map_id: str, entries: List[Dict[str, Any]]) -> int:
         """Store each costmap PNG in MinIO, then its record on the node. How many were stored
@@ -1346,7 +1308,7 @@ class GraphBuilderService:
 
         If a smaller session_node_id arrives than what we have seen before,
         it indicates the robot has restarted its topomap session.
-        Clear all old mappings and buffered images for this robot.
+        Clear all old mappings and buffered uploads for this robot. Call under _upload_lock.
 
         Args:
             robot_name: Name of the robot
@@ -1373,20 +1335,17 @@ class GraphBuilderService:
             ]
             for key in keys_to_remove:
                 del self.session_to_global_map[key]
+                self._stored_nodes.pop(key, None)
                 self.stats["session_mappings"] -= 1
 
-            # Clear buffered images for this robot
-            buffer_keys_to_remove = [k for k in self.image_buffer if k[0] == robot_name]
-            for key in buffer_keys_to_remove:
-                self.stats["buffered_images"] -= len(self.image_buffer.pop(key))
-            for key in [k for k in self.depth_buffer if k[0] == robot_name]:
-                self.stats["buffered_depth"] -= len(self.depth_buffer.pop(key))
-            for key in [k for k in self.costmap_buffer if k[0] == robot_name]:
-                self.stats["buffered_costmap"] -= len(self.costmap_buffer.pop(key))
+            # Clear buffered uploads for this robot
+            image_nodes = self.image_buffer.clear_robot(robot_name)
+            self.depth_buffer.clear_robot(robot_name)
+            self.costmap_buffer.clear_robot(robot_name)
 
             self.logger.info(
                 f"✅ Cleared {len(keys_to_remove)} session mappings and "
-                f"{len(buffer_keys_to_remove)} buffered images for {robot_name}"
+                f"{image_nodes} buffered images for {robot_name}"
             )
 
     def _generate_global_node_id(self) -> str:
@@ -1399,27 +1358,6 @@ class GraphBuilderService:
             Global node ID as string
         """
         return str(uuid.uuid4())
-
-    def _get_buffered_images(self, robot_name: str, session_node_id: int) -> List[Dict[str, Any]]:
-        """Retrieve and remove buffered images for a specific node (O(1) lookup)."""
-        node_key = (robot_name, session_node_id)
-        cameras = self.image_buffer.pop(node_key, None)
-        if not cameras:
-            return []
-
-        now = datetime.now()
-        buffered_images = []
-        for camera_name, (image_dict, buffer_time) in cameras.items():
-            age = (now - buffer_time).total_seconds()
-            if age <= self.image_buffer_timeout:
-                buffered_images.append(image_dict)
-            else:
-                self.logger.warning(
-                    f"Buffered image timed out: ({robot_name}, {session_node_id}, {camera_name}), age={age:.1f}s"
-                )
-            self.stats["buffered_images"] -= 1
-
-        return buffered_images
 
     async def _check_robot_exists(self, robot_name: str) -> bool:
         """
@@ -1512,48 +1450,22 @@ class GraphBuilderService:
         """
         now = datetime.now()
 
-        # Clean up old session mappings
-        old_mappings = []
-        for session_key, (global_id, timestamp, *_rest) in self.session_to_global_map.items():
-            age = (now - timestamp).total_seconds()
-            if age > threshold_seconds:
-                old_mappings.append(session_key)
+        with self._upload_lock:
+            # Clean up old session mappings
+            old_mappings = []
+            for session_key, (global_id, timestamp, *_rest) in self.session_to_global_map.items():
+                age = (now - timestamp).total_seconds()
+                if age > threshold_seconds:
+                    old_mappings.append(session_key)
 
-        for key in old_mappings:
-            del self.session_to_global_map[key]
-            self.logger.debug(f"Cleaned up old session mapping: {key}")
+            for key in old_mappings:
+                del self.session_to_global_map[key]
+                self._stored_nodes.pop(key, None)
+                self.logger.debug(f"Cleaned up old session mapping: {key}")
 
-        # Clean up old buffered images
-        old_node_keys = []
-        for node_key, cameras in self.image_buffer.items():
-            stale = [cam for cam, (_, ts) in cameras.items()
-                     if (now - ts).total_seconds() > threshold_seconds]
-            for cam in stale:
-                del cameras[cam]
-                self.stats["buffered_images"] -= 1
-                self.logger.debug(f"Cleaned up old buffered image: {node_key + (cam,)}")
-            if not cameras:
-                old_node_keys.append(node_key)
-        for key in old_node_keys:
-            del self.image_buffer[key]
-
-        for node_key in list(self.depth_buffer):
-            cameras = self.depth_buffer[node_key]
-            for cam in [c for c, (_, ts) in cameras.items()
-                        if (now - ts).total_seconds() > threshold_seconds]:
-                del cameras[cam]
-                self.stats["buffered_depth"] -= 1
-            if not cameras:
-                del self.depth_buffer[node_key]
-
-        for node_key in list(self.costmap_buffer):
-            layers = self.costmap_buffer[node_key]
-            for layer in [c for c, (_, ts) in layers.items()
-                          if (now - ts).total_seconds() > threshold_seconds]:
-                del layers[layer]
-                self.stats["buffered_costmap"] -= 1
-            if not layers:
-                del self.costmap_buffer[node_key]
+            # Clean up old buffered uploads
+            for buffer in (self.image_buffer, self.depth_buffer, self.costmap_buffer):
+                buffer.cleanup(threshold_seconds)
 
     # ==================== Service Management ====================
 
@@ -1566,9 +1478,14 @@ class GraphBuilderService:
         """
         return {
             **self.stats,
-            "mqtt_connected": self._mqtt_connected,
+            "mqtt_connected": self.mqtt_connected,
             "radius_threshold": self.radius_threshold
         }
+
+    @property
+    def mqtt_connected(self) -> bool:
+        """The MQTT client's live connection state (paho's on_connect / on_disconnect)."""
+        return bool(self.mqtt_client is not None and self.mqtt_client.connected)
     
     def is_healthy(self) -> bool:
         """
@@ -1578,7 +1495,7 @@ class GraphBuilderService:
             True if all dependencies are healthy
         """
         try:
-            return self._mqtt_connected and self.topomap_db.is_healthy() and self.database.is_running()
+            return self.mqtt_connected and self.topomap_db.is_healthy() and self.database.is_running()
         except Exception:
             return False
 
@@ -1598,13 +1515,13 @@ class GraphBuilderService:
                 pass
 
             return {
-                "mqtt_connected": self._mqtt_connected,
+                "mqtt_connected": self.mqtt_connected,
                 "image_db": image_db_healthy,
                 "graph_db": graph_db_healthy,
             }
         except Exception:
             return {
-                "mqtt_connected": self._mqtt_connected,
+                "mqtt_connected": self.mqtt_connected,
                 "image_db": False,
                 "graph_db": False,
             }

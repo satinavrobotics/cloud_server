@@ -320,7 +320,8 @@ subscribed; subscribed at QoS 1): one message per node and layer with an occupan
 }
 ```
 
-Required: `session_node_id`, `robot_name`, `layer` (no `/`, not `.` or `..`), `costmap_data`,
+Required: `session_node_id`, `robot_name`, `layer` (1-32 characters of `A-Z a-z 0-9 _ -`,
+it names the MinIO object and the node attribute), `costmap_data`,
 `width`/`height` (positive integers), `resolution` (finite, > 0), `origin` (`x`, `y`, `yaw`,
 finite). `content_type` and `costmap_encoding` default to, and must be, `image/png` and
 `u8_occ100_unknown255`. `origin_pose3d` is optional (7 finite fields, non-zero quaternion).
@@ -329,11 +330,17 @@ The base64 is decoded strictly when saving. An invalid message is logged and cou
 
 Resolved by session and buffered exactly like depth (per `(robot, node)` and layer, 30 s,
 overwritten per layer, dropped with a rejected node). Stored as `map-{id}/{node}/costmap/{layer}.png`
-(PNG first) and, on the ArangoDB node, `costmap.{layer}` = every field but `costmap_data`, plus
-`origin_map` (`x`, `y`, `yaw` through the session's map_T_session, as the node pose),
-`origin_pose3d_map` (when `origin_pose3d` was sent) and `session_id`; the robot-frame `origin` /
-`origin_pose3d` are kept as sent. A dropped one counts as `dropped_costmap` in
-`MAP.INGEST_REJECTED`; stats: `costmap_saved`, `costmap_rejected`, `buffered_costmap`.
+(PNG first) and, on the ArangoDB node, `costmap.{layer}` = only these fields (anything else in
+the message is not stored): `session_node_id`, `robot_name`, `layer`, `content_type`,
+`costmap_encoding`, `width`, `height`, `resolution`, `origin` and `origin_pose3d` (robot frame,
+parsed to numbers; `origin_pose3d` only when sent), `frame`, `source_frame`,
+`costmap_stamp_ms`, `keyframe_stamp_ms`, `stamp_offset_ms` (as sent, `null` when absent),
+`source_topic` (as sent, only when present), plus `origin_map` (`x`, `y`, `yaw` through the
+session's map_T_session, as the node pose), `origin_pose3d_map` (when `origin_pose3d` was sent)
+and `session_id`. A record is set only once its node's document exists: one that arrives while
+the node is still being written is buffered and stored with it. A dropped one counts as
+`dropped_costmap` in `MAP.INGEST_REJECTED`; stats: `costmap_saved`, `costmap_rejected`,
+`buffered_costmap`.
 
 ## How It Works
 

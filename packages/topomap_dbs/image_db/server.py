@@ -429,7 +429,8 @@ class ImageDatabaseService(MinIOService):
         return small
 
     def delete_node_images(self, node_id: str, map_id: Optional[str] = None) -> bool:
-        """Delete all images for a specific node. Returns True if successful."""
+        """Delete every stored object of a node: its images and their thumbnails, depth images
+        and costmap layers. Returns True if successful."""
         try:
             map_id = map_id or self.default_map_id
             bucket_name = self._bucket_name(map_id)
@@ -439,7 +440,7 @@ class ImageDatabaseService(MinIOService):
 
             objects = [
                 obj
-                for sub in ("images", "thumbs")
+                for sub in ("images", "thumbs", "depth", "costmap")
                 for obj in self.client.list_objects(bucket_name, prefix=f"{node_id}/{sub}/", recursive=True)
             ]
             for obj in objects:

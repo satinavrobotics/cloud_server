@@ -5,11 +5,13 @@
 - `origin_map` / `origin_pose3d_map` = map_T_session applied, exactly as the node pose;
 - rejected costmaps counted as `dropped_costmap` in MAP.INGEST_REJECTED.
 """
+import asyncio
 import base64
 import datetime
 import json
 import math
 import os
+import threading
 
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
     os.environ.setdefault(_k, "test")
@@ -54,7 +56,9 @@ async def _none():
 class TestPayload:
     @pytest.mark.parametrize("patch_", [
         {"costmap_data": None}, {"costmap_data": ""}, {"layer": ""}, {"layer": "a/b"},
-        {"layer": "."}, {"layer": ".."}, {"robot_name": None}, {"session_node_id": None},
+        {"layer": "."}, {"layer": ".."}, {"layer": "a.b"}, {"layer": "a b"},
+        {"layer": "x" * 33}, {"layer": "\u00e4"}, {"layer": "a\n"},
+        {"robot_name": None}, {"session_node_id": None},
         {"costmap_encoding": "f32"}, {"content_type": "image/jpeg"},
         {"width": 0}, {"width": -1}, {"width": 1.5}, {"width": "10"}, {"width": True},
         {"height": 0}, {"height": None},
@@ -78,6 +82,32 @@ class TestPayload:
         ingest.check_costmap_payload(p)
         ingest.check_costmap_payload({**p, "origin_pose3d": None})
 
+    @pytest.mark.parametrize("layer", ["occupancy", "x" * 32, "Inflated_2-b", "7"])
+    def test_valid_layers(self, layer):
+        ingest.check_costmap_payload({**COSTMAP, "layer": layer})
+
+    @pytest.mark.parametrize("patch_, message", [
+        ({"resolution": None}, "missing resolution"),
+        ({"origin": {"x": 1, "y": 2}}, "missing yaw"),
+        ({"origin_pose3d": {"x": 1}}, "origin_pose3d needs x, y, z, qx, qy, qz, qw"),
+        ({"origin_pose3d": {**COSTMAP["origin_pose3d"], "z": "up"}},
+         "origin_pose3d: could not convert string to float: 'up'"),
+        ({"origin_pose3d": {**COSTMAP["origin_pose3d"], "z": float("nan")}},
+         "origin_pose3d has a non-finite value"),
+        ({"origin_pose3d": {**COSTMAP["origin_pose3d"], "qw": 0.0}},
+         "origin_pose3d has a zero quaternion"),
+    ])
+    def test_messages(self, patch_, message):
+        with pytest.raises(ingest.CostmapPayloadError) as exc:
+            ingest.check_costmap_payload({**COSTMAP, **patch_})
+        assert str(exc.value) == message
+
+    def test_record_validates_when_called_directly(self):
+        session = ingest.OpenSession("s1", "yard", False, dict(map_geo.IDENTITY), "ALIVE",
+                                     "mapping")
+        with pytest.raises(ingest.CostmapPayloadError):
+            ingest.costmap_record({**COSTMAP, "layer": "a/b"}, session)
+
     def test_png_is_not_decoded_by_the_check(self):
         ingest.check_costmap_payload({**COSTMAP, "costmap_data": "!!not base64!!"})
 
@@ -93,6 +123,35 @@ class TestPayload:
         assert rec["origin_pose3d_map"]["z"] == 0.1
         assert rec["session_id"] == "s1" and rec["source_topic"] == "/local_costmap/costmap"
         assert rec["width"] == 200 and rec["resolution"] == 0.05
+        assert set(rec) == {
+            "session_node_id", "robot_name", "layer", "content_type", "costmap_encoding",
+            "width", "height", "resolution", "origin", "origin_pose3d", "frame",
+            "source_frame", "costmap_stamp_ms", "keyframe_stamp_ms", "stamp_offset_ms",
+            "source_topic", "origin_map", "origin_pose3d_map", "session_id"}
+        assert (rec["frame"], rec["source_frame"]) == ("map", "odom")
+        assert (rec["costmap_stamp_ms"], rec["keyframe_stamp_ms"], rec["stamp_offset_ms"]) \
+            == (1727600000123, 1727600000084, 39)
+
+    def test_record_stores_only_known_fields_parsed(self):
+        session = ingest.OpenSession("s1", "yard", False, dict(map_geo.IDENTITY), "ALIVE",
+                                     "mapping")
+        p = {k: v for k, v in COSTMAP.items()
+             if k not in ("frame", "source_frame", "costmap_stamp_ms", "keyframe_stamp_ms",
+                          "stamp_offset_ms", "source_topic", "content_type",
+                          "costmap_encoding")}
+        p.update({"origin": {"x": -5, "y": "2", "yaw": 0, "extra": 1}, "resolution": "0.1",
+                  "origin_pose3d": {**COSTMAP["origin_pose3d"], "qw": 1, "note": "x"},
+                  "debug_blob": "x" * 100, "map_id": "other", "session_id": "robot-side"})
+        rec = ingest.costmap_record(p, session)
+        assert "debug_blob" not in rec and "map_id" not in rec and "source_topic" not in rec
+        assert rec["session_id"] == "s1"
+        assert rec["origin"] == {"x": -5.0, "y": 2.0, "yaw": 0.0}
+        assert all(isinstance(v, float) for v in rec["origin"].values())
+        assert rec["resolution"] == 0.1 and isinstance(rec["resolution"], float)
+        assert "note" not in rec["origin_pose3d"] and rec["origin_pose3d"]["qw"] == 1.0
+        assert rec["frame"] is None and rec["costmap_stamp_ms"] is None
+        assert rec["content_type"] == "image/png"
+        assert rec["costmap_encoding"] == "u8_occ100_unknown255"
 
     def test_record_without_pose3d(self):
         session = ingest.OpenSession("s1", "yard", False, dict(map_geo.IDENTITY), "ALIVE",
@@ -333,3 +392,101 @@ class TestStores:
         stats = ImageDatabaseService().get_stats(map_id="yard")
         assert stats["node_count"] == 2 and stats["image_count"] == 2
         assert stats["depth_count"] == 1
+
+
+class _ArangoNodes:
+    """A graph_db stand-in whose add_node blocks until released, and whose record setters fail
+    (like ArangoDB) for a node document that does not exist yet."""
+
+    def __init__(self):
+        self.nodes = set()
+        self.records = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def add_node(self, **kw):
+        self.entered.set()
+        assert self.release.wait(10), "add_node was never released"
+        self.nodes.add(kw["node_id"])
+        return True
+
+    def set_record(self, map_id, node_id, sub, record):
+        if node_id not in self.nodes:
+            return False
+        self.records.append((node_id, sub))
+        return True
+
+
+class TestNodeRecordRace:
+    """An upload handled while _process_topology (worker thread) has mapped the node but not yet
+    written it: the record must wait for the node instead of failing against a missing
+    document (it used to be lost)."""
+
+    def _service(self, kind):
+        from tests.unit.test_map_reconstruction_ingest import DEPTH
+        service = _gb(_row())
+        fake = _ArangoNodes()
+        service.graph_db.add_node = Mock(side_effect=fake.add_node)
+        if kind == "costmap":
+            service.image_db.store_costmap = Mock(return_value=True)
+            service.graph_db.set_node_costmap = Mock(side_effect=fake.set_record)
+            return (service, fake, service._handle_costmap_upload, COSTMAP, "occupancy",
+                    "costmap_saved", service.costmap_buffer)
+        service.image_db.store_depth = Mock(return_value=True)
+        service.graph_db.set_node_depth = Mock(side_effect=fake.set_record)
+        return (service, fake, service._handle_depth_upload, DEPTH, "left", "depth_saved",
+                service.depth_buffer)
+
+    @pytest.mark.parametrize("kind", ["costmap", "depth"])
+    async def test_upload_between_mapping_and_add_node_is_stored_with_the_node(self, kind):
+        service, fake, upload, payload, sub, saved, buffer = self._service(kind)
+        node_task = asyncio.create_task(service._handle_node_update(dict(NODE)))
+        try:
+            assert await asyncio.to_thread(fake.entered.wait, 10)
+            # Paused inside add_node: the node is mapped but its document does not exist.
+            assert ("r1", 7) in service.session_to_global_map and not fake.nodes
+            await upload(dict(payload))
+            assert fake.records == [] and ("r1", 7) in buffer
+            assert service.stats["errors"] == 0
+        finally:
+            fake.release.set()
+        await asyncio.wait_for(node_task, 10)
+        node_id = service.graph_db.add_node.call_args.kwargs["node_id"]
+        assert fake.records == [(node_id, sub)]
+        assert service.stats[saved] == 1 and service.stats["errors"] == 0
+        assert len(buffer) == 0
+
+    @pytest.mark.parametrize("kind", ["costmap", "depth"])
+    async def test_upload_after_add_node_is_stored_directly(self, kind):
+        service, fake, upload, payload, sub, saved, buffer = self._service(kind)
+        fake.release.set()
+        await service._handle_node_update(dict(NODE))
+        await upload(dict(payload))
+        node_id = service.graph_db.add_node.call_args.kwargs["node_id"]
+        assert fake.records == [(node_id, sub)] and len(buffer) == 0
+        assert service.stats[saved] == 1
+
+    async def test_failed_add_node_never_takes_records_directly(self):
+        service, fake, upload, payload, sub, saved, buffer = self._service("costmap")
+        service.graph_db.add_node = Mock(return_value=False)
+        await service._handle_node_update(dict(NODE))
+        await upload(dict(payload))
+        assert fake.records == [] and ("r1", 7) in buffer
+
+    async def test_resent_node_waits_for_its_new_document(self):
+        service, fake, upload, payload, sub, saved, buffer = self._service("costmap")
+        fake.release.set()
+        await service._handle_node_update(dict(NODE))
+        first = service.graph_db.add_node.call_args.kwargs["node_id"]
+        fake.release.clear()
+        fake.entered.clear()
+        node_task = asyncio.create_task(service._handle_node_update(dict(NODE)))
+        try:
+            assert await asyncio.to_thread(fake.entered.wait, 10)
+            await upload(dict(payload))
+            assert fake.records == []  # not set on the first node's document either
+        finally:
+            fake.release.set()
+        await asyncio.wait_for(node_task, 10)
+        second = service.graph_db.add_node.call_args.kwargs["node_id"]
+        assert second != first and fake.records == [(second, sub)]

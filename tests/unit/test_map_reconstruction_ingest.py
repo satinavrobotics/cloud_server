@@ -106,6 +106,17 @@ class TestPayload:
         with pytest.raises(ingest.DepthPayloadError):
             ingest.check_depth_payload({**DEPTH, **patch_})
 
+    @pytest.mark.parametrize("pose, message", [
+        ({"x": 1}, "robot_pose3d needs x, y, z, qx, qy, qz, qw"),
+        ({**DEPTH["robot_pose3d"], "z": "up"},
+         "robot_pose3d: could not convert string to float: 'up'"),
+        ({**DEPTH["robot_pose3d"], "z": float("nan")}, "robot_pose3d has a non-finite value"),
+    ])
+    def test_pose3d_messages_name_robot_pose3d(self, pose, message):
+        with pytest.raises(ingest.DepthPayloadError) as exc:
+            ingest.check_depth_payload({**DEPTH, "robot_pose3d": pose})
+        assert str(exc.value) == message
+
     def test_record(self):
         session = ingest.OpenSession("s1", "yard", False,
                                      {"tx": 1.0, "ty": 0.0, "yaw": 0.0}, "ALIVE", "mapping")
