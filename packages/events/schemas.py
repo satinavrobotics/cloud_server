@@ -272,6 +272,23 @@ class MapSlamSave(Payload):
     detail: Optional[str] = None
 
 
+class MapSessionServicesRestarted(Payload):
+    """MAP.SESSION_SERVICES_RESTARTED / _RESTART_FAILED (packages/api/maps.py,
+    restart_session_services): the API started the services of the robot's open, unpaused
+    mapping session again. `reason`: run_changed (mission-dispatch saw a new robot run: a driver /
+    orchestrator restart killed them), slam_save_done / slam_save_failed (the robot's previous
+    SLAM save ended: a start deferred while it ran, or a topomap the switch back stopped),
+    slam_discarded (a failed save was discarded). `robot_actions`: what was done on the robot
+    ([{service, action, ok, label, detail}]); `ok` false when one failed; `slam_warning` the
+    SLAM start's warning, if any."""
+    map_name: str
+    session_id: str
+    reason: str
+    ok: bool
+    robot_actions: List[Dict[str, Any]] = []
+    slam_warning: Optional[str] = None
+
+
 class MapTypeChanged(Payload):
     """MAP.TYPE_CHANGED (packages/api/maps.py): the map was converted geo <-> local. Map-frame
     coordinates are unchanged; `geo` / `old_geo` are the georeference after / before (null on a
@@ -355,10 +372,11 @@ class MapDeleted(Payload):
 class MapIngestRejected(Payload):
     """MAP.INGEST_REJECTED (packages/services/graph_builder/ingest.py): robot data dropped by
     graph-builder because it had no (usable) open session to go to. Older events may carry the retired reasons
-    not_mapping_session, session_paused, map_not_mapping, session_mismatch. Rate-limited per robot and reason:
+    not_mapping_session, map_not_mapping, session_mismatch. Rate-limited per robot and reason:
     `dropped_nodes` / `dropped_images` count every drop since `since` (the first drop not yet
     reported). `reason`: no_session, map_deleting, session_unplaced (maps §14: not placed yet),
-    map_missing, datum_changed (not re-anchorable: local map, other UTM
+    operate_session (an operate session adds no data), session_paused (a paused mapping
+    session), map_missing, datum_changed (not re-anchorable: local map, other UTM
     zone), lookup_failed. `dropped_depth` (3D reconstruction R2): depth images dropped (absent
     on events written before R2)."""
     reason: str

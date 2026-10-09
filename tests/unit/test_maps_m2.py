@@ -88,14 +88,25 @@ class TestDecide:
         assert not r.accepted and r.reason == reason
 
     @pytest.mark.parametrize("kw", [
-        {"purpose": "operate"}, {"purpose": "operate", "map_state": "ready"},
-        {"paused": True}, {"map_state": "paused"}, {"map_state": "ready"},
+        {"map_state": "paused"}, {"map_state": "ready"},
         {"map_state": "archived"}, {"map_state": "draft"},
     ])
-    def test_any_session_state_is_accepted(self, kw):
-        """The robot's one open session decides, whatever its purpose, pause flag or map state."""
+    def test_any_map_state_is_accepted(self, kw):
+        """The robot's one open, unpaused mapping session decides, whatever the map state."""
         r = ingest.decide("r1", _session(**kw))
         assert r.accepted and r.map_name == "yard"
+
+    @pytest.mark.parametrize("kw,reason", [
+        ({"purpose": "operate"}, ingest.OPERATE_SESSION),
+        ({"purpose": "operate", "map_state": "ready"}, ingest.OPERATE_SESSION),
+        ({"purpose": "operate", "paused": True}, ingest.OPERATE_SESSION),
+        ({"paused": True}, ingest.SESSION_PAUSED),
+        ({"paused": True, "aligned": False}, ingest.SESSION_PAUSED),
+    ])
+    def test_operate_and_paused_sessions_add_nothing(self, kw, reason):
+        """Decision B (2026-10-09): only an unpaused MAPPING session takes data."""
+        r = ingest.decide("r1", _session(**kw))
+        assert not r.accepted and r.reason == reason and r.map_name == "yard"
 
     def test_no_session(self):
         assert ingest.decide("r1", None).reason == ingest.NO_SESSION
@@ -144,7 +155,7 @@ class TestSessionResolver:
         assert (await res.resolve("r1")).accepted and calls == ["r1"]  # cached
         rows[0] = (*m1_row[:2], True, *m1_row[3:])  # paused through the API
         now[0] = 1.0
-        assert (await res.resolve("r1")).accepted  # a paused session still takes nodes
+        assert (await res.resolve("r1")).reason == ingest.SESSION_PAUSED   # seen within 1 s
         assert calls == ["r1", "r1"]
         rows[0] = None  # session finished through the API
         now[0] = 2.0
@@ -284,19 +295,26 @@ class TestIngestService:
         service.graph_db.add_node.assert_called_once()
         service._write_event.assert_not_awaited()
 
-    @pytest.mark.parametrize("kw", [{"paused": True}, {"state": "ready"}, {"state": "paused"}])
-    async def test_paused_or_not_mapping_map_still_takes_nodes(self, kw):
+    @pytest.mark.parametrize("kw", [{"state": "ready"}, {"state": "paused"}])
+    async def test_a_map_not_in_mapping_state_still_takes_nodes(self, kw):
         service = _gb(_row(**kw))
         await service._handle_node_update(dict(NODE))
         service.graph_db.add_node.assert_called_once()
         service._count_nodes.assert_awaited_once_with("s1")
         service._write_event.assert_not_awaited()
 
-    async def test_operate_session_takes_nodes(self):
-        service = _gb(_row() + ("operate", True))
+    @pytest.mark.parametrize("row,reason", [
+        (_row() + (None, "local", "operate", True), "operate_session"),
+        (_row(paused=True), "session_paused"),
+    ])
+    async def test_operate_and_paused_sessions_drop_nodes(self, row, reason):
+        """Decision B: nothing is written to a map during an operate session (or a pause)."""
+        service = _gb(row)
         await service._handle_node_update(dict(NODE))
-        service.graph_db.add_node.assert_called_once()
-        service._write_event.assert_not_awaited()
+        service.graph_db.add_node.assert_not_called()
+        service._count_nodes.assert_not_awaited()
+        service._write_event.assert_awaited()
+        assert service._write_event.await_args.args[0].payload["reason"] == reason
 
     async def test_mission_without_register_map_still_suppresses_ingest(self):
         mission = Mock(register_map=False)

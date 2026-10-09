@@ -487,9 +487,9 @@ class TestIngestRules:
         base.update(kw)
         return ingest.OpenSession(**base)
 
-    def test_operate_is_accepted_and_unplaced_is_rejected(self):
+    def test_operate_is_rejected_and_unplaced_is_rejected(self):
         assert ingest.decide("r1", self._session(purpose="operate", map_state="ready")
-                             ).accepted
+                             ).reason == ingest.OPERATE_SESSION
         assert ingest.decide("r1", self._session(aligned=False)
                              ).reason == ingest.SESSION_UNPLACED
         assert ingest.decide("r1", self._session()).accepted
