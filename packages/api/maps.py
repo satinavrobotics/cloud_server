@@ -1095,8 +1095,7 @@ async def _can_start(holder: Optional[Any], robot: Optional[RobotObjectV1], map_
                      blockers: bool = False) -> Tuple[bool, Optional[str]]:
     """(can_start, warning) for the reloc reads and place_session. can_start is true whenever the
     robot exists (relocalization is always offered); the second element is a NON-blocking
-    warning (the holder's reloc_capability: offline, no orchestrator, no stored map tagged, no
-    relocalize endpoint ...; with `blockers` also a running job / pending SLAM save, which
+    warning (the holder's reloc_capability: offline, no orchestrator, stored maps unreadable; with `blockers` also a running job / pending SLAM save, which
     place_session still refuses with 409). Never raises."""
     ask = getattr(holder, "reloc_capability", None)
     if ask is None or robot is None:
@@ -1120,18 +1119,6 @@ async def _can_start(holder: Optional[Any], robot: Optional[RobotObjectV1], map_
 _GEO_RELOC = "a geo map is placed by its datum, not relocalized"
 
 
-async def _localization_api(holder: Optional[Any], robot: Optional[Any]) -> bool:
-    """`localization_api` of the reloc reads: the robot has the localization facade. False when
-    unknown (no holder, an older holder, offline). Never raises."""
-    ask = getattr(holder, "localization_api", None)
-    if ask is None or robot is None:
-        return False
-    try:
-        return (await ask(robot)) is True
-    except Exception:  # noqa: BLE001
-        return False
-
-
 async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id: str,
                        switch: Optional[Any] = None, reloc_jobs: Optional[Any] = None
                        ) -> Optional[Dict[str, Any]]:
@@ -1142,8 +1129,8 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
     false: manual placement). `can_start` (additive): true whenever the robot exists (source
     "reloc" then answers 202 with a job; see reloc_job.py); `warning` (= `can_start_reason`,
     kept for compatibility): a non-blocking text on what may make the job fail (robot offline,
-    no orchestrator, no stored map tagged for this map, no relocalize endpoint, another job
-    running, a SLAM save pending), else null. A GET: no row locks and the cached held read (place_session asks afresh).
+    no orchestrator, stored maps unreadable, another job running, a SLAM save pending), else
+    null. A GET: no row locks and the cached held read (place_session asks afresh).
     Never raises."""
     try:
         row, session, robot = await _reloc_inputs(db, map_name, session_id)
@@ -1159,8 +1146,7 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
         logger.exception("Reloc status of session %s not readable", session_id)
         return None
     return {"available": held is True, "known": held is not None, "source": "orchestrator",
-            "can_start": can, "can_start_reason": why, "warning": why,
-            "localization_api": await _localization_api(holder, robot)}
+            "can_start": can, "can_start_reason": why, "warning": why}
 
 
 async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: str,
@@ -1179,7 +1165,7 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
             if row.type == "geo":
                 return {"available": False, "known": True, "source": "orchestrator",
                         "can_start": False, "warning": _GEO_RELOC,
-                        "can_start_reason": _GEO_RELOC, "localization_api": False}
+                        "can_start_reason": _GEO_RELOC}
             robot = await store.robot(robot_name)
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
@@ -1192,8 +1178,7 @@ async def map_reloc(db: Any, holder: Optional[Any], map_name: str, robot_name: s
     can, why = await _can_start(holder, robot, map_name, held, db=db, switch=switch,
                                 reloc_jobs=reloc_jobs, blockers=True)
     return {"available": held is True, "known": held is not None, "source": "orchestrator",
-            "can_start": can, "can_start_reason": why, "warning": why,
-            "localization_api": await _localization_api(holder, robot)}
+            "can_start": can, "can_start_reason": why, "warning": why}
 
 
 async def robot_stored_maps(db: Any, holder: Optional[Any], robot_name: str) -> Dict[str, Any]:
@@ -2091,25 +2076,24 @@ async def _save_slam(db: Any, switch: Any, session: Mapping[str, Any],
     wanted."""
     if switch is None or not _slam_session(session):
         return None, None
-    driver = getattr(switch, "slam_driver", lambda _name: None)(session["robot_name"])
     try:
         if not await _slam_recorded(db, switch, session, robot):
             return None, None
         if robot is None or not robot.status.online:
             warning = (f"SLAM map of '{session['map_name']}' not saved: robot "
                        f"'{session['robot_name']}' is not reachable")
-            return warning, slam_save_action(detail=warning, driver=driver)
+            return warning, slam_save_action(detail=warning)
         task = switch.schedule_slam_save(
             robot, session["map_name"], session["session_id"],
             on_result=None if wait else slam_save_reporter(db, session))
         if wait:
             result = await asyncio.shield(task)
-            return result.warning, slam_save_action(result, driver=driver)
-        return None, slam_save_action(driver=driver)
+            return result.warning, slam_save_action(result)
+        return None, slam_save_action()
     except Exception as exc:  # noqa: BLE001
         logger.exception("SLAM save for map %s failed", session["map_name"])
         warning = f"SLAM map not saved: {exc}"
-        return warning, slam_save_action(detail=warning, driver=driver)
+        return warning, slam_save_action(detail=warning)
 
 
 def _robot_lock(switch: Optional[Any], robot_name: str) -> Any:

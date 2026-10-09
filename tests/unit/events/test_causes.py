@@ -25,6 +25,8 @@ RULE_CASES = {
     "rtk_lost": CauseInput(outcome="FAILED", nav_reasoning="Pausing: RTK lost, waiting for fix"),
     "no_gnss_fix": CauseInput(outcome="FAILED", nav_reasoning="GNSS no fix"),
     "localization_lost": CauseInput(outcome="FAILED", errors=[err("localizationLost")]),
+    "relocalization_map_rejected": CauseInput(
+        outcome="FAILED", errors=[err("relocalizationMapRejectedError", "map 'lab' refused")]),
     "recovery_exhausted": CauseInput(outcome="FAILED",
                                      nav_reasoning="Max recoveries reached, giving up"),
     "path_blocked": CauseInput(outcome="FAILED", errors=[err("edgeBlocked", "e12 blocked")]),
@@ -96,3 +98,8 @@ def test_seed_codes_are_unique_and_categorised():
     for c in CAUSE_CODES:
         assert c.title
         assert c.code == UNKNOWN or c.code.split(".")[0] == c.category
+
+
+@pytest.mark.parametrize("error_type", ["poseHealthNotReadyError", "relocalizationNotReadyError"])
+def test_localization_not_ready_types_are_localization_lost(error_type):
+    assert classify("FAILED", [err(error_type, "x")]) == "NAV.LOCALIZATION_LOST"

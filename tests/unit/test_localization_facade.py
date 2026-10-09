@@ -1,7 +1,7 @@
 """The cloud's robot localization calls on the orchestrator's localization facade
-(GET/PUT /localization, POST/GET /localization/save) with a fallback to the deprecated /maps/...
-calls of older robots: packages/api/orchestrator_client.py (probe), mapping_switch.py (SLAM),
-reloc_job.py (relocalization), orchestrator_maps.py (capability), orchestrator_proxy.py.
+(GET/PUT /localization, POST/GET /localization/save), the only localization routes it uses:
+packages/api/orchestrator_client.py, mapping_switch.py (SLAM), reloc_job.py (relocalization),
+orchestrator_maps.py (capability), orchestrator_proxy.py.
 
 The robot is a fake HTTP orchestrator behind an httpx.MockTransport, so the real client runs.
 """
@@ -37,28 +37,34 @@ pytestmark = pytest.mark.unit
 ONBOARD = "cloud-shed"
 
 
-class FakeRobot:
-    """One robot's orchestrator over HTTP. `facade` False: an older orchestrator (404 on
-    /localization, the deprecated /maps/... calls instead)."""
+# Orchestrator routes deprecated by the localization facade: the cloud never calls them.
+DEPRECATED = ("/maps/mapping", "/mapping/start", "/relocalize", "/robot/config/map")
 
-    def __init__(self, facade=True, intent=None, topomap=None):
-        self.facade = facade
+
+class FakeRobot:
+    """One robot's orchestrator over HTTP. The deprecated routes are not served (404)."""
+
+    def __init__(self, intent=None, topomap=None):
         self.intent = dict(intent or {"mode": None, "map": None})
         self.topomap = topomap        # None: no mapping API, else whether the topomap runs
         self.log = []                 # (method, path, query, body)
         self.put_error = None         # (status, detail) for the next PUT /localization
+        self.put_errors = []          # (status, detail) for the next PUTs, one each, first
+        self.put_problem = None       # a partial=ok answer's `problem`
         self.applied = True
         self.save_error = None        # (status, detail) for the POST save
         self.save_polls = ["saving", "done"]    # what successive GET /localization/save say
         self.save_failure = "lidar_save_map failed"
         self.maps = set()             # stored map names
         self.init_pos = None
-        self.old_slam = {"active": False, "map": None}
-        self.old_calls = []
         self.save_started = False
 
     def calls(self, method, path):
         return [c for c in self.log if c[0] == method and c[1] == path]
+
+    def deprecated_calls(self):
+        return [c for c in self.log if any(d in c[1] for d in DEPRECATED)
+                or (c[1].startswith("/maps/") and c[1].endswith("/save"))]
 
     def handler(self, request):
         path, method = request.url.path, request.method
@@ -67,13 +73,11 @@ class FakeRobot:
         self.log.append((method, path, query, body))
         R = httpx.Response
         if path == "/localization":
-            if not self.facade:
-                return R(404, json={"detail": "Not Found"})
             if method == "GET":
                 return R(200, json={**self.intent, **({} if self.topomap is None
                                                       else {"topomap": self.topomap})})
-            if self.put_error:
-                status, detail = self.put_error
+            if self.put_errors or self.put_error:
+                status, detail = self.put_errors.pop(0) if self.put_errors else self.put_error
                 return R(status, json={"detail": detail})
             new = {"mode": body["mode"], "map": body.get("map")}
             want, extra = body.get("topomap"), {}
@@ -89,7 +93,7 @@ class FakeRobot:
                     self.topomap = want
             self.intent = new
             return R(200, json={**self.intent, "applied": self.applied, "localized": None,
-                                "message": "ok", **extra})
+                                "message": "ok", "problem": self.put_problem, **extra})
         if path == "/localization/save":
             if method == "POST":
                 if self.save_error:
@@ -112,18 +116,8 @@ class FakeRobot:
         if path.startswith("/maps/list"):
             return R(200, json=[{"name": n, "valid": True, "meta": {"cloud_map_id": "shed"}}
                                 for n in self.maps])
-        if path == "/maps/mapping" and method == "GET":
-            return R(200, json={"active": self.old_slam["active"], "map": self.old_slam["map"],
-                                "saving": False, "late_save_sec": 0})
-        if path == "/maps/mapping/save":
-            return R(200, json={"map": ONBOARD, "status": "done", "error": None})
-        if path.endswith("/mapping/start"):
-            self.old_calls.append(("start", path))
-            self.old_slam = {"active": True, "map": path.split("/")[2]}
-            return R(200, json={"started": True})
-        if path.endswith("/save"):
-            self.old_calls.append(("save", path))
-            return R(202, json={"started": True, "map": path.split("/")[2]})
+        if any(d in path for d in DEPRECATED) or path.endswith("/save"):
+            return R(404, json={"detail": "Not Found"})
         if path.startswith("/maps/") and method == "GET":
             name = path.split("/")[2]
             if name in self.maps:
@@ -139,13 +133,6 @@ class FakeRobot:
             return httpx.AsyncClient(transport=httpx.MockTransport(self.handler),
                                      timeout=timeout)
         return oc.OrchestratorClient(robot, http_factory=factory)
-
-
-@pytest.fixture(autouse=True)
-def _fresh_probe_cache():
-    oc.clear_facade_cache()
-    yield
-    oc.clear_facade_cache()
 
 
 def _plain_robot():
@@ -180,49 +167,29 @@ def _labels(out):
     return [(a["service"], a["action"], a["ok"]) for a in out["robot_actions"]]
 
 
-# --- capability probe ----------------------------------------------------------------------------
+# --- relocalization capability --------------------------------------------------------------------
 
-class TestProbe:
-    async def test_facade_robot_is_probed_once_and_cached(self):
-        fake = FakeRobot()
-        client = fake.client(_plain_robot())
-        assert await client.facade() is True
-        assert await client.facade() is True
-        assert len(fake.calls("GET", "/localization")) == 1
-
-    async def test_404_is_an_older_robot(self):
-        fake = FakeRobot(facade=False)
-        assert await fake.client(_plain_robot()).facade() is False
-        assert await oc.facade_available(fake.client(_plain_robot())) is False
-
-    async def test_unreachable_is_unknown_and_not_cached(self):
-        def boom(request):
-            raise httpx.ConnectError("down")
-        client = oc.OrchestratorClient(
-            _plain_robot(), http_factory=lambda timeout: httpx.AsyncClient(
-                transport=httpx.MockTransport(boom), timeout=timeout))
-        assert await client.facade() is None
-        assert await oc.facade_available(client) is False
-
-    async def test_a_404_from_a_facade_call_forces_a_new_probe(self):
-        fake = FakeRobot()
-        client = fake.client(_plain_robot())
-        assert await client.facade() is True
-        fake.facade = False        # the robot was downgraded
-        with pytest.raises(oc.OrchestratorError):
-            await client.get_localization()
-        assert await client.facade() is False
-
-    async def test_a_client_without_the_probe_is_an_older_robot(self):
-        assert await oc.facade_available(object()) is False
-
-    async def test_reloc_capability_needs_no_service_on_a_facade_robot(self):
+class TestCapability:
+    async def test_reloc_capability_is_the_stored_map_only(self):
         fake = FakeRobot()
         fake.maps.add(ONBOARD)
         holder = OrchestratorMaps(client_factory=fake.client)
+        assert await holder.reloc_capability(_plain_robot(), "shed") == (True, None)
+        assert [c[1] for c in fake.log] == ["/maps/list"]     # no /services, no /maps/mapping
+
+    async def test_no_stored_map_cannot_start_and_an_unreadable_robot_warns(self):
+        fake = FakeRobot()
+        holder = OrchestratorMaps(client_factory=fake.client)
         can, why = await holder.reloc_capability(_plain_robot(), "shed")
-        assert (can, why) == (True, None)
-        assert not fake.calls("GET", "/services")
+        assert can is False and "does not hold a stored map" in why
+
+        def boom(request):
+            raise httpx.ConnectError("down")
+        down = OrchestratorMaps(client_factory=lambda robot: oc.OrchestratorClient(
+            robot, http_factory=lambda timeout: httpx.AsyncClient(
+                transport=httpx.MockTransport(boom), timeout=timeout)))
+        can, why = await down.reloc_capability(_plain_robot(), "shed")
+        assert can is True and "could not be asked" in why
 
 
 # --- the SLAM recording ----------------------------------------------------------------------------
@@ -233,8 +200,7 @@ class TestSlam:
         switch = _slam_switch(fake)
         res = await switch.start_slam(_plain_robot(), "shed")
         assert res.status == SLAM_STARTED and res.ok
-        assert fake.calls("PUT", "/localization")[0][2:] == ({"wait": "false"}, {"mode": "slam"})
-        assert not fake.old_calls
+        assert fake.calls("PUT", "/localization")[0][2:] == ({"wait": "false", "partial": "ok"}, {"mode": "slam"})
 
         res = await switch.save_slam(_plain_robot(), "shed", "sess-1")
         assert res.status == SLAM_SAVED and res.ok and res.notice is None
@@ -243,7 +209,27 @@ class TestSlam:
         assert post[3] == {"name": ONBOARD, "cloud_map_id": "shed", "cloud_session_id": "sess-1"}
         assert len(fake.calls("GET", "/localization/save")) == 2     # polled until done
         assert fake.intent == {"mode": "relocalization", "map": "lab"}
-        assert not fake.old_calls
+        assert not fake.deprecated_calls()
+
+    async def test_a_503_start_is_retried(self):
+        fake = FakeRobot()
+        fake.put_errors = [(503, "the Odin driver is starting")]
+        res = await _slam_switch(fake).start_slam(_plain_robot(), "shed")
+        assert res.status == SLAM_STARTED, res.warning
+        assert len(fake.calls("PUT", "/localization")) == 2
+
+    async def test_a_partial_problem_is_a_failed_start(self):
+        fake = FakeRobot()
+        fake.put_problem = {"status_code": 504, "detail": "driver started, no status"}
+        res = await _slam_switch(fake).start_slam(_plain_robot(), "shed")
+        assert res.status == SLAM_FAILED and "driver started, no status" in res.warning
+
+    @pytest.mark.parametrize("prev,target", [
+        (None, ("odometry", None)), ({"mode": "slam", "map": None}, ("odometry", None)),
+        ({"mode": "relocalization", "map": "lab"}, ("relocalization", "lab")),
+        ({"mode": "odometry", "map": "stray"}, ("odometry", None))])
+    def test_restore_target(self, prev, target):
+        assert oc.restore_target(prev) == target
 
     async def test_the_default_after_a_save_is_odometry(self):
         fake = FakeRobot()
@@ -322,26 +308,6 @@ class TestSlam:
         fake.intent = {"mode": "odometry", "map": None}
         assert await _slam_switch(fake).slam_records(_plain_robot(), "shed") is False
 
-    async def test_an_older_robot_keeps_the_old_calls(self):
-        fake = FakeRobot(facade=False)
-        switch = _slam_switch(fake)
-        res = await switch.start_slam(_plain_robot(), "shed")
-        assert res.status == SLAM_STARTED
-        assert fake.old_calls == [("start", f"/maps/{ONBOARD}/mapping/start")]
-        fake.old_slam = {"active": True, "map": ONBOARD}
-        res = await switch.save_slam(_plain_robot(), "shed", 1)
-        assert res.status == SLAM_SAVED
-        assert ("save", f"/maps/{ONBOARD}/save") in fake.old_calls
-        assert not fake.calls("PUT", "/localization")
-
-    async def test_the_orphan_stop_and_reconcile_leave_a_facade_robot_alone(self):
-        fake = FakeRobot(intent={"mode": "slam", "map": None})
-        switch = _slam_switch(fake)
-        assert await switch.stop_orphan_slam(None, _plain_robot(), "gone") is False
-        assert await switch._reconcile_slam(None, _plain_robot()) is False
-        assert not fake.calls("PUT", "/localization") and not fake.calls("POST",
-                                                                          "/maps/mapping/stop")
-
     async def test_the_save_outcome_is_the_event(self):
         d = TxDb()
         d.add_map("yard", type="local", status={"state": "draft"})
@@ -378,8 +344,7 @@ def renv():
         await (e.block.wait() if e.block is not None else asyncio.sleep(0))
 
     jobs = rj.RelocJobs(client_factory=fake.client, clock=lambda: now[0], sleep=sleep,
-                        timeout=90.0, poll=1.0, settle=5.0, confirm_timeout=0.0,
-                        candidates=["odin_reloc"])
+                        timeout=90.0, poll=1.0, confirm_timeout=0.0)
     e = Env(d, fake, CapHolder(), jobs, _switch(), now)
     with patch.object(maps, "open_store", d.store), patch.object(maps, "_utcnow", m1.Clock()):
         yield e
@@ -404,11 +369,11 @@ class TestRelocFacade:
         out, job = await renv.run(s["session_id"])
         assert job.state == rj.PLACED, job.error
         put = renv.orch.calls("PUT", "/localization")
-        assert [c[2:] for c in put] == [({"wait": "false"},
+        assert [c[2:] for c in put] == [({"wait": "false", "partial": "ok"},
                                          {"mode": "relocalization", "map": ONBOARD})]
         assert renv.sleeps >= 3          # initialized with another mapId did not count
-        assert not renv.orch.calls("GET", "/maps/mapping")
-        assert not renv.orch.calls("POST", f"/maps/{ONBOARD}/relocalize")
+        assert not renv.orch.deprecated_calls()
+        assert not renv.orch.calls("GET", "/services")
 
     async def test_initialized_on_another_map_is_not_localized(self, renv):
         _robot(renv.db)
@@ -453,6 +418,65 @@ class TestRelocFacade:
         assert job.state == rj.FAILED and "finish it first" in job.error
         assert not renv.orch.calls("PUT", "/localization")
 
+    async def test_stored_but_not_applied_fails_and_is_put_back(self, renv):
+        _robot(renv.db)
+        s = _unplaced(renv.db)
+        renv.orch.applied = False      # no driver runs: stored, nothing would relocalize
+        _, job = await renv.run(s["session_id"])
+        assert job.state == rj.FAILED and "could not start relocalization" in job.error
+        assert renv.orch.intent == {"mode": "odometry", "map": None}
+
+    async def test_a_partial_problem_fails_the_job(self, renv):
+        _robot(renv.db)
+        s = _unplaced(renv.db)
+        renv.orch.put_problem = {"status_code": 504, "detail": "driver started, no status"}
+        _, job = await renv.run(s["session_id"])
+        assert job.state == rj.FAILED and "driver started, no status" in job.error
+
+    ASSISTED = {"source": "reloc", "reloc": {"init_pose": {"x": 1.0, "y": 2.0, "yaw": 0.0}}}
+
+    def _put_bodies(self, renv):
+        return [c[3] for c in renv.orch.calls("PUT", "/localization")]
+
+    async def test_assisted_on_the_current_map_passes_through_odometry(self, renv):
+        _robot(renv.db)
+        s = _unplaced(renv.db)
+        renv.orch.intent = {"mode": "relocalization", "map": ONBOARD}
+        renv.on_sleep = _localized_on(ONBOARD, 2)
+        _, job = await renv.run(s["session_id"], self.ASSISTED)
+        assert job.state == rj.PLACED, job.error
+        assert self._put_bodies(renv) == [{"mode": "odometry"},
+                                          {"mode": "relocalization", "map": ONBOARD}]
+
+    async def test_assisted_on_another_map_or_odin_mode_is_one_switch(self, renv):
+        _robot(renv.db)
+        s = _unplaced(renv.db)
+        renv.orch.intent = {"mode": "relocalization", "map": ONBOARD}
+        renv.on_sleep = _localized_on(ONBOARD, 2)
+        _, job = await renv.run(s["session_id"])          # odin mode: the robot is already on it
+        assert job.state == rj.PLACED, job.error
+        assert self._put_bodies(renv) == [{"mode": "relocalization", "map": ONBOARD}]
+
+    async def test_a_failed_pass_through_restores_the_previous_map(self, renv):
+        _robot(renv.db)
+        s = _unplaced(renv.db)
+        renv.orch.intent = {"mode": "relocalization", "map": ONBOARD}
+        # odometry succeeds, the relocalization PUT is refused
+        calls = []
+        handler = renv.orch.handler
+
+        def second_put_refused(request):
+            if request.method == "PUT" and request.url.path == "/localization":
+                calls.append(1)
+                if len(calls) == 2:
+                    return httpx.Response(409, json={"detail": "order active"})
+            return handler(request)
+        renv.orch.handler = second_put_refused
+        _, job = await renv.run(s["session_id"], self.ASSISTED)
+        assert job.state == rj.FAILED and "order active" in job.error
+        # the job left odometry: the rollback puts the map it relocalized on before back
+        assert renv.orch.intent == {"mode": "relocalization", "map": ONBOARD}
+
     async def test_cancel_puts_the_previous_intent_back(self, renv):
         _robot(renv.db)
         s = _unplaced(renv.db)
@@ -490,17 +514,6 @@ class TestRelocFacade:
         assert renv.orch.intent == {"mode": "slam", "map": None}
         assert len(renv.orch.calls("PUT", "/localization")) == 1
 
-    async def test_an_older_robot_uses_the_old_path(self, renv):
-        renv.orch.facade = False
-        _robot(renv.db)
-        s = _unplaced(renv.db)
-        _, job = await renv.run(s["session_id"])
-        # no facade, no relocalize endpoint, no service: the old path's own error
-        assert job.state == rj.FAILED
-        assert not renv.orch.calls("PUT", "/localization")
-        assert renv.orch.calls("GET", "/services") or renv.orch.calls("GET", "/maps/mapping")
-
-
 # --- the proxy ---------------------------------------------------------------------------------------
 
 class TestProxyIds:
@@ -515,6 +528,10 @@ class TestProxyIds:
         body = json.dumps({"name": "other"}).encode()
         assert proxy.with_cloud_ids("POST", "localization/save", body, self.SESSION) == body
 
+    def test_the_deprecated_save_route_gets_no_ids(self):
+        body = json.dumps({}).encode()
+        assert proxy.with_cloud_ids("POST", f"maps/{ONBOARD}/save", body, self.SESSION) == body
+
 
 # --- the topomap on the mapping API --------------------------------------------------------------
 
@@ -526,6 +543,15 @@ class TestTopomapOnTheMappingApi:
                                            "slam": "running"}
         assert snap.state(None)["status"] == "on"
         assert not [c for c in fake.log if c[1].startswith("/services/topomap")]
+
+    async def test_the_snapshot_keeps_the_body_and_cached_survives_invalidate(self):
+        fake = FakeRobot(intent={"mode": "slam", "map": None}, topomap=False)
+        switch = _slam_switch(fake)
+        assert switch.cached("r1") is None
+        snap = await switch.snapshot(_plain_robot(), fresh=True)
+        assert snap.localization == {"mode": "slam", "map": None, "topomap": False}
+        switch.invalidate("r1")
+        assert switch.cached("r1") is snap
 
     async def test_a_facade_without_it_reports_slam_and_the_topomap_service(self):
         snap = await _slam_switch(FakeRobot()).snapshot(_plain_robot(), fresh=True)
@@ -540,7 +566,7 @@ class TestTopomapOnTheMappingApi:
             out = await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op",
                                            switch=switch)
             assert _puts(fake) == [{"mode": "slam"}, {"mode": "slam", "topomap": True}]
-            assert _labels(out) == [("SLAM recording", "restart", True),
+            assert _labels(out) == [("SLAM recording", "start", True),
                                     ("topomap", "start", True)]
             assert out["mapping_services"]["topo"] == "running"
             sid = out["session"]["session_id"]
@@ -551,6 +577,14 @@ class TestTopomapOnTheMappingApi:
         assert fake.topomap is False and fake.intent["mode"] == "odometry"
         assert d.codes()[-1] == "MAP.SLAM_SAVE_DONE"
         assert not [c for c in fake.log if c[1].startswith("/services/topomap")]
+        assert not fake.deprecated_calls()
+
+    async def test_a_topomap_not_started_after_the_switch_is_a_failed_action(self):
+        fake = FakeRobot(intent={"mode": "odometry", "map": None}, topomap=False)
+        fake.put_problem = {"status_code": 409, "detail": "device reports RELOCALIZING"}
+        loc = {"mode": "odometry", "map": None, "topomap": False}
+        action = await MappingSwitch._switch_topomap(fake.client(_plain_robot()), loc, True)
+        assert not action["ok"] and "RELOCALIZING" in action["detail"]
 
     async def test_a_relocalized_robot_keeps_its_map(self):
         fake = FakeRobot(intent={"mode": "relocalization", "map": "cloud-yard"}, topomap=False)

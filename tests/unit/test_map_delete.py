@@ -539,14 +539,3 @@ async def test_after_delete_hook_not_called_when_the_delete_fails():
     await _request_and_wait(deleter, "site_a")
     hook.assert_not_awaited()
 
-
-async def test_service_asks_online_robots_to_stop_the_slam_of_the_deleted_map():
-    from types import SimpleNamespace
-    from packages.api.server import ApiDelegationService
-    on = SimpleNamespace(name="on", status=SimpleNamespace(online=True))
-    off = SimpleNamespace(name="off", status=SimpleNamespace(online=False))
-    switch = MagicMock(stop_orphan_slam=AsyncMock(return_value=True))
-    svc = SimpleNamespace(database=MagicMock(list_objects=AsyncMock(return_value=[on, off])),
-                          mapping_switch=switch)
-    await ApiDelegationService._stop_slam_of_deleted_map(svc, "site_a")
-    switch.stop_orphan_slam.assert_awaited_once_with(svc.database, on, "site_a")

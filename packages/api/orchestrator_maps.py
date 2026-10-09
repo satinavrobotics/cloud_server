@@ -12,13 +12,10 @@ registered orchestrator address, unreachable, an older orchestrator without the 
 other error). Callers treat None like False: manual placement.
 
 reloc_capability() answers (can_start, warning) for the reloc reads (packages/api/reloc_job.py):
-`can_start` is true whenever the robot exists; `warning` says (non-blocking) what will probably
-fail: the robot is offline / has no orchestrator address, the map is not held (the small
-/maps/list read), or the orchestrator cannot relocalize: either it offers POST /maps/{name}/relocalize (its GET /maps/mapping reports `mode`
-and `relocalizing`; preferred, and the heavy /services read is then not needed at all) or, as a
-fallback, it lists a service from config RELOC_SERVICE_CANDIDATES (cached like held()). A
-robot with the localization facade (GET /localization, PUT /localization) needs neither.
-Never raises.
+`can_start` is true whenever the robot exists and does not answer that it holds no stored map for
+the cloud map; `warning` says (non-blocking) what will probably fail: the robot is offline / has
+no orchestrator address, or its stored maps could not be read. The robot relocalizes through its
+localization facade (PUT /localization), which every orchestrator has. Never raises.
 """
 
 import asyncio
@@ -27,8 +24,7 @@ import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from packages.api import orchestrator_client as oc
-from packages.api.orchestrator_services import pick_service
-from packages.config import RELOC_FORCE_SERVICE, RELOC_MAP_HELD_TTL_S, RELOC_SERVICE_CANDIDATES
+from packages.config import RELOC_MAP_HELD_TTL_S
 
 logger = logging.getLogger("ApiDelegationService.orchestrator_maps")
 
@@ -51,10 +47,6 @@ class OrchestratorMaps:
         self._cache: Dict[Tuple[str, str], Tuple[float, Optional[bool]]] = {}
         # One orchestrator call per (robot, map) at a time: concurrent callers share it.
         self._inflight: Dict[Tuple[str, str], "asyncio.Task[Optional[bool]]"] = {}
-        # robot -> (until, orchestrator reloc service name or None, why not or None)
-        self._services: Dict[str, Tuple[float, Optional[str], Optional[str]]] = {}
-        # robot -> (until, whether the orchestrator offers POST /maps/{name}/relocalize or None)
-        self._endpoint: Dict[str, Tuple[float, Optional[bool]]] = {}
         # robot -> (until, the cloud maps it holds as stored maps, or None = unknown)
         self._stored: Dict[str, Tuple[float, Optional[list]]] = {}
 
@@ -64,8 +56,6 @@ class OrchestratorMaps:
             self._cache.pop(key, None)
         for key in [k for k in self._inflight if k[0] == robot_name]:
             self._inflight.pop(key, None)  # a read that started before must not be shared
-        self._services.pop(robot_name, None)
-        self._endpoint.pop(robot_name, None)
         self._stored.pop(robot_name, None)
 
     def _prune(self, now: float) -> None:
@@ -127,79 +117,6 @@ class OrchestratorMaps:
         self._stored[name] = (self._clock() + ttl, out)
         return out
 
-    async def reloc_service(self, robot: Any, fresh: bool = False
-                            ) -> Tuple[Optional[str], Optional[str]]:
-        """(the orchestrator's reloc service name, None) or (None, why it is not available): the
-        first RELOC_SERVICE_CANDIDATES entry the robot's orchestrator lists. Cached like held()
-        (a failed ask only `unknown_ttl`). Never raises."""
-        name = key_name(robot)
-        hit = self._services.get(name)
-        if hit is not None and not fresh and hit[0] > self._clock():
-            return hit[1], hit[2]
-        found: Optional[str] = None
-        why: Optional[str] = None
-        ttl = self.ttl
-        try:
-            listed = [str(r.get("name")) for r in await self._client_factory(robot).list_services()
-                      if isinstance(r, dict)]
-            found = pick_service(listed, RELOC_SERVICE_CANDIDATES)
-            if found is None:
-                why = ("the robot's orchestrator has no relocalization service "
-                       f"(looked for {', '.join(RELOC_SERVICE_CANDIDATES)})")
-        except oc.OrchestratorError as exc:
-            why, ttl = f"the robot's orchestrator could not be asked: {exc.detail}", self.unknown_ttl
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Services of %s unreadable: %s", name, exc)
-            why, ttl = f"the robot's orchestrator could not be asked: {exc}", self.unknown_ttl
-        self._services[name] = (self._clock() + ttl, found, why)
-        return found, why
-
-    async def reloc_endpoint(self, robot: Any, fresh: bool = False) -> Optional[bool]:
-        """Whether the robot's orchestrator can relocalize by itself: True when it has the
-        localization facade (PUT /localization) or, an older one, offers POST /maps/{name}/relocalize
-        (its GET /maps/mapping reports `mode` / `relocalizing`), False when it answers without them
-        (older orchestrator) or RELOC_FORCE_SERVICE is set, None when it could not be asked.
-        Cached like held() (an unknown only `unknown_ttl`). Never raises."""
-        if RELOC_FORCE_SERVICE:
-            return False
-        name = key_name(robot)
-        hit = self._endpoint.get(name)
-        if hit is not None and not fresh and hit[0] > self._clock():
-            return hit[1]
-        answer: Optional[bool] = None
-        ttl = self.unknown_ttl
-        try:
-            client = self._client_factory(robot)
-            if await oc.facade_available(client):   # PUT /localization relocalizes
-                answer = True
-            else:
-                answer = oc.supports_relocalize(await client.mapping_state())
-            ttl = self.ttl
-        except oc.OrchestratorError as exc:
-            if exc.kind == oc.HTTP and exc.status == 404:
-                answer, ttl = False, self.ttl   # no such route: an older orchestrator
-            else:
-                logger.info("Mapping state of %s not readable: %s", name, exc.detail)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Mapping state of %s unreadable: %s", name, exc)
-        self._endpoint[name] = (self._clock() + ttl, answer)
-        return answer
-
-    async def localization_api(self, robot: Any) -> bool:
-        """Whether the robot's orchestrator has the localization facade (GET /localization): the
-        cloud then switches the mode in-process (nothing restarts). Only a positive probe counts;
-        cached like reloc_endpoint (oc.facade_available caches per robot too). Never raises."""
-        if RELOC_FORCE_SERVICE:
-            return False
-        try:
-            return await oc.facade_available(self._client_factory(robot))
-        except Exception:  # noqa: BLE001
-            return False
-
     async def reloc_capability(self, robot: Any, cloud_map_id: str, fresh: bool = False,
                                held: Optional[bool] = None) -> Tuple[bool, Optional[str]]:
         """(can_start, reason): relocalization can be started from the API for a robot that
@@ -208,9 +125,8 @@ class OrchestratorMaps:
         relocalize on, a real impossibility (decision 2026-10-08), and `can_start` is False
         with that reason. An unknown robot cannot start either. Otherwise the second element
         is a NON-blocking warning: what may make the job fail (the robot is offline, has no
-        orchestrator address, the orchestrator cannot be asked, no relocalize endpoint and no
-        reloc service), else None. `held` = an answer of held() the caller already has (saves
-        a read). Never raises."""
+        orchestrator address, its stored maps could not be read), else None. `held` = an
+        answer of held() the caller already has (saves a read). Never raises."""
         try:
             if robot is None:
                 return False, "the robot is unknown"
@@ -219,27 +135,14 @@ class OrchestratorMaps:
                 return True, f"robot '{key_name(robot)}' is offline"
             if oc.orchestrator_address(robot) is None:
                 return True, f"robot '{key_name(robot)}' has no registered orchestrator"
-            # The two small reads first (/maps/list, /maps/mapping), together; the heavy
-            # /services read only when the endpoint path is not available.
             if held is None:
-                held, endpoint = await asyncio.gather(
-                    self.held(robot, cloud_map_id, fresh=fresh),
-                    self.reloc_endpoint(robot, fresh=fresh))
-            else:
-                endpoint = await self.reloc_endpoint(robot, fresh=fresh)
-            warnings = []
-            if held is None:
-                warnings.append("the robot's orchestrator could not be asked for its stored maps")
-            elif held is False:
+                held = await self.held(robot, cloud_map_id, fresh=fresh)
+            if held is False:
                 return False, (f"the robot does not hold a stored map for '{cloud_map_id}' "
                                "to relocalize on (map it with SLAM first, or place it by hand)")
-            if endpoint is not True:
-                service, why = await self.reloc_service(robot, fresh=fresh)
-                if service is None:
-                    if endpoint is False and not RELOC_FORCE_SERVICE:
-                        why = f"{why}, and it cannot relocalize by itself (older orchestrator)"
-                    warnings.append(why)
-            return True, ("; ".join(warnings) if warnings else None)
+            if held is None:
+                return True, "the robot's orchestrator could not be asked for its stored maps"
+            return True, None
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

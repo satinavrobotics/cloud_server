@@ -899,7 +899,7 @@ untouched.
   onboard map file ("SLAM map already exists, not re-recorded", `overwrite: false`), so the next
   mapping session does not overwrite it. Why it was immutable before: nothing more than the
   flag being read at several points; the guards above close that.
-  *Orphaned driver:* a driver recording `cloud-<X>` for a cloud map X that no longer exists
+  *Orphaned driver (removed 2026-10-09, stage 5: the facade does not name the recorded map):* a driver recording `cloud-<X>` for a cloud map X that no longer exists
   (deleted) would keep the orchestrator from stopping it through `/services` ("unsaved map would be
   lost"). `MappingSwitch.stop_orphan_slam` sends `POST /maps/mapping/stop` when, read fresh under
   the robot's switch lock then SLAM lock: the robot is online with an orchestrator address, GET
@@ -1000,6 +1000,13 @@ A local-map session on a robot whose orchestrator holds the map is placed withou
 - **Before a session.** `GET /api/v1/maps/{id}/reloc?robot=<name>` returns the same `{available, known, source: "orchestrator"}` from the cached held-map read (no session needed). 404 unknown map; a geo map returns `{available: false, known: true}` (placed by its datum); an unknown or offline robot, or an orchestrator that cannot be asked, gives `known: false`.
 
 ### 16.1 Starting relocalization from the API (three modes, 2026-10-04)
+
+> **Superseded (2026-10-09, LOCALIZATION_STATUS_PLAN.md stage 5):** every robot's orchestrator has the
+> localization facade. The cloud relocalizes only with `PUT /localization` and records SLAM as a
+> mode of it (`/localization/save`); the reloc service, the `/maps/{name}/relocalize` endpoint mode,
+> `/robot/config/map`, the stale-flag settle, the SLAM reconcile pass and the orphan stop described
+> below are gone (`RELOC_SERVICE_CANDIDATES`, `RELOC_FORCE_SERVICE`, `RELOC_JOB_SETTLE_S`,
+> `SLAM_RECONCILE_INTERVAL_S` removed). Current behaviour: packages/api/README.md.
 
 Until now the server only *checked* that the robot had relocalized by itself. It can now *start* it. Three modes:
 

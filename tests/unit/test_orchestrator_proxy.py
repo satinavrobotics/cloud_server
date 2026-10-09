@@ -77,7 +77,7 @@ async def _none():
 
 
 async def test_save_uses_the_save_timeout():
-    await proxy.proxy_to_orchestrator("r1", "maps/cloud-x/save", Req(_service()))
+    await proxy.proxy_to_orchestrator("r1", "localization/save", Req(_service()))
     assert FakeClient.seen["timeout"] == ORCHESTRATOR_SAVE_TIMEOUT_S
     await proxy.proxy_to_orchestrator("r1", "maps/list", Req(_service()))
     assert FakeClient.seen["timeout"] == proxy.DEFAULT_TIMEOUT_S
@@ -138,4 +138,15 @@ async def test_service_writes_invalidate_the_mapping_switch_cache():
     svc.mapping_switch.invalidate.assert_called_once_with("r1")
     svc = _service()
     await proxy.proxy_to_orchestrator("r1", "services/topomap/status", Req(svc, method="GET"))
+    svc.mapping_switch.invalidate.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["localization", "localization/save"])
+async def test_localization_writes_invalidate_both_caches(path):
+    svc = _service()
+    await proxy.proxy_to_orchestrator("r1", path, Req(svc))
+    svc.mapping_switch.invalidate.assert_called_once_with("r1")
+    svc.orchestrator_maps.invalidate.assert_called_once_with("r1")
+    svc = _service()
+    await proxy.proxy_to_orchestrator("r1", path, Req(svc, method="GET"))
     svc.mapping_switch.invalidate.assert_not_called()

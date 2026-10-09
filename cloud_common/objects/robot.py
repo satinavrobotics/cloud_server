@@ -46,10 +46,6 @@ class RobotStateV1(enum.Enum):
         return self in (RobotStateV1.IDLE, RobotStateV1.ON_TASK,
                         RobotStateV1.MAP_DEPLOYMENT, RobotStateV1.TELEOP)
 
-    @property
-    def can_deploy_map(self):
-        return self in (RobotStateV1.IDLE, RobotStateV1.CHARGING)
-
 
 class RobotTeleopActionV1(enum.Enum):
     START = "START"

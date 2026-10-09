@@ -91,9 +91,10 @@ class TestConfirmation:
         assert done.state == rj.EDIT and done.step == "edit"
         assert done.view()["proposal"]["pose"] == {"x": 3.0, "y": 4.0, "yaw": 0.2}
         assert env.db.sessions[-1]["aligned"] is False and env.db.events == []
-        # the driver keeps running, init_pos and the selected map stay
-        assert env.orch.services["odin_reloc"] is True and env.orch.current_map == ONBOARD
-        assert "stop" not in env.orch.ops() and env.orch.ops().count("patch_map") == 1
+        # the robot keeps relocalizing on the map, init_pos stays
+        assert env.orch.intent == {"mode": "relocalization", "map": ONBOARD}
+        assert env.orch.puts() == [("relocalization", ONBOARD)]
+        assert env.orch.ops().count("patch_map") == 1
         assert env.jobs.active_for("r1") is None
         for again in (env.jobs.confirm, env.jobs.edit):
             with pytest.raises(HTTPException) as err:

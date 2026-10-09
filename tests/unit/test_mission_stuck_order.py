@@ -26,11 +26,13 @@ Covers:
   read as progress through the current route.
 """
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import cloud_common.objects as api_objects
 import cloud_common.objects.mission as mission_object
 import packages.controllers.mission.vda5050_types as types
+import packages.controllers.mission.server as server_module
 from packages.controllers.mission.server import Robot
 from packages.database.postgres import PostgresDatabase
 
@@ -75,8 +77,10 @@ def _build_state(order_id="", action_states=None, last_node_id="", last_node_seq
 # handle_instant_action: bounded resends
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
-async def test_unacknowledged_instant_action_is_abandoned_after_max_resends():
+async def test_unacknowledged_instant_action_is_abandoned_after_max_resends(monkeypatch):
     """The robot never echoes the action, so it must not be resent forever."""
+    now = [1000.0]
+    monkeypatch.setattr(server_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
     r, _ = _make_robot()
     r._send_instant_action = AsyncMock()
     action = types.VDA5050Action(
@@ -87,6 +91,7 @@ async def test_unacknowledged_instant_action_is_abandoned_after_max_resends():
     # rejected it outright would.
     for _ in range(Robot.MAX_INSTANT_ACTION_RESENDS + 5):
         await r.handle_instant_action(_build_state())
+        now[0] += Robot.INSTANT_ACTION_RESEND_MAX_S  # resends are backed off
 
     assert r._send_instant_action.await_count == Robot.MAX_INSTANT_ACTION_RESENDS
     assert "a1" not in r._current_instant_actions

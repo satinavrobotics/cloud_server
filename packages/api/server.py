@@ -39,12 +39,11 @@ from packages.config import (
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
 )
 from packages.api.map_delete import MapDeleter
-from packages.api import maps, reconstruction
+from packages.api import localization_view, maps, reconstruction
 from packages.api.mapping_switch import MappingSwitch
 from packages.api.orchestrator_maps import OrchestratorMaps
 from packages.api.reloc_job import RelocJobs
 from packages.utils import map_geo
-from packages.utils import map_sessions
 
 
 def map_datum_transform(spec: MapSpecV1) -> Optional[Dict[str, Any]]:
@@ -631,8 +630,7 @@ class ApiDelegationService:
             max_attempts=MAP_DELETE_MAX_ATTEMPTS, backoff_s=MAP_DELETE_BACKOFF_S,
             backoff_max_s=MAP_DELETE_BACKOFF_MAX_S,
             on_mark=reconstruction.mark_map_deleting,
-            after_mark=self.reconstruction.after_map_delete_marked,
-            after_delete=self._stop_slam_of_deleted_map)
+            after_mark=self.reconstruction.after_map_delete_marked)
 
         # Configuration
         self.default_map_id = default_map_id
@@ -1239,14 +1237,6 @@ class ApiDelegationService:
                 "success": False,
                 "error": str(e)
             }
-
-    async def _stop_slam_of_deleted_map(self, map_id: str) -> None:
-        """After a map delete: stop the SLAM mapping of `cloud-<map>` on every online robot
-        that records it (best effort; MappingSwitch.stop_orphan_slam never raises)."""
-        robots = [r for r in await self.database.list_objects(RobotObjectV1)
-                  if getattr(getattr(r, "status", None), "online", True) is not False]
-        await asyncio.gather(*(self.mapping_switch.stop_orphan_slam(self.database, r, map_id)
-                               for r in robots))
 
     async def delete_map(self, map_id: str) -> Dict[str, Any]:
         """Mark the map DELETING and start its ArangoDB/MinIO cleanup in the background
@@ -2254,6 +2244,11 @@ class ApiDelegationService:
 
                 # Build WebSocket message
                 session_view = await self._robot_session(robot.name)
+                # The intent as last read by the REST view: a state update never calls the robot
+                snap = self.mapping_switch.cached(robot.name)
+                localization = localization_view.build(
+                    robot.status, snap.localization if snap else None, snap.at if snap else None,
+                    snap.error if snap and snap.reachable is False else None)
                 message = {
                     "type": "robot_update",
                     "robot_name": robot.name,
@@ -2267,6 +2262,8 @@ class ApiDelegationService:
                             "x": robot.status.pose.x if hasattr(robot.status, 'pose') else 0,
                             "y": robot.status.pose.y if hasattr(robot.status, 'pose') else 0,
                             "theta": robot.status.pose.theta if hasattr(robot.status, 'pose') else 0,
+                            # VDA5050 agvPosition.mapId: the map name once localized on it
+                            "map_id": robot.status.pose.map_id if hasattr(robot.status, 'pose') else "",
                             "deviationRange": (
                                 (robot.status.info_messages or {}).get("deviation_range", 0.0)
                                 if hasattr(robot.status, 'info_messages') else 0.0
@@ -2282,9 +2279,11 @@ class ApiDelegationService:
                     "session": session_view,
                     # Which mission the robot is on and which wait for it (from mission rows).
                     **self.mission_index.view(robot.name),
-                    # D2: why a placed reloc session's localization is degraded, else null.
-                    "localization_warning": map_sessions.localization_warning(
-                        session_view, robot.status),
+                    # Intent / device / usable (packages/api/localization_view.py), and D2: why
+                    # a placed reloc session's localization is degraded, else null.
+                    "localization": localization,
+                    "localization_warning": localization_view.warning(
+                        session_view, robot.status, localization),
                 }
 
                 # Broadcast to all WebSocket clients subscribed to this robot

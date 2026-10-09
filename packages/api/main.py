@@ -22,6 +22,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, sites
+from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.api.mission_index import mission_ahead
 from packages.api.robot_delete import RobotDeleter
@@ -30,10 +31,8 @@ from packages.utils.service_utils import (
     configure_service_logging, DependencyHealthChecker
 )
 from packages.utils.fastapi_helpers import add_error_handlers
-from packages.utils import map_sessions as ms
 from packages.utils import blocked_nodes
 from packages.config import (
-    SLAM_RECONCILE_INTERVAL_S,
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, ARANGO_PASSWORD, DATA_BASE_NAME,
     URL_MISSION_PLANNER, URL_LIVEKIT,
     MINIO_HOST, MINIO_PORT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE,
@@ -330,10 +329,6 @@ async def lifespan(app: FastAPI):
     # 3D reconstruction dispatcher (R3); only when the service is configured, one leader per
     # cluster (advisory lock).
     service.reconstruction.start_dispatcher()
-    # SLAM saves lost to an offline robot / a restart (R6); one worker per cluster.
-    service.mapping_switch.start_slam_reconcile(
-        service.database, lambda: service.database.list_objects(RobotObjectV1),
-        interval_s=SLAM_RECONCILE_INTERVAL_S)
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -351,7 +346,6 @@ async def lifespan(app: FastAPI):
         service.stop_watchers()
         await service.map_deleter.stop()
         await service.reconstruction.stop()
-        await service.mapping_switch.stop_slam_reconcile()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
@@ -1610,7 +1604,9 @@ async def _robot_views(robots: List[RobotObjectV1],
     plus (maps §14) `session`: the robot's open session, derived from map_sessions and never
     stored on the robot: {session_id, map, purpose, state, aligned, map_T_session,
     unplaced_reason} or null (mapless). It is the robot's map (robot.current_map was removed in
-    maps U6; packages/utils/map_sessions.py::robot_session_view)."""
+    maps U6; packages/utils/map_sessions.py::robot_session_view);
+    plus `localization`: intent / device / usable and whether they agree
+    (packages/api/localization_view.py), and `localization_warning` for a placed reloc session."""
     snaps = await service.mapping_switch.snapshots(robots) if service else {}
     out = []
     for robot in robots:
@@ -1620,7 +1616,10 @@ async def _robot_views(robots: List[RobotObjectV1],
         data["mapping_state"] = snap.state(session) if snap else None
         data["mapping_services"] = snap.mapping_services() if snap else None
         data["session"] = session
-        data["localization_warning"] = ms.localization_warning(session, robot.status)
+        data["localization"] = lv.build(
+            robot.status, snap.localization if snap else None, snap.at if snap else None,
+            snap.error if snap and snap.reachable is False else None)
+        data["localization_warning"] = lv.warning(session, robot.status, data["localization"])
         # The mission the robot is on and the ones waiting for it (derived from mission rows).
         index = getattr(service, "mission_index", None)
         data.update(index.view(robot.name) if index is not None

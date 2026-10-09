@@ -118,13 +118,12 @@ MAPPING_SERVICE_CANDIDATES = {
 ORCHESTRATOR_QUERY_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_QUERY_TIMEOUT_S", "3.0"))
 ORCHESTRATOR_START_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_START_TIMEOUT_S", "30.0"))
 ORCHESTRATOR_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_STOP_TIMEOUT_S", "15.0"))
-# A synchronous POST /maps/{name}/save (the orchestrator proxy) waits for the driver's save_map:
+# A synchronous POST /localization/save (the orchestrator proxy) waits for the driver's save_map:
 # the orchestrator gives up after 600 s (mapping.save_timeout_sec), so a little longer.
 ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "660.0"))
-# A background save (POST .../save?background=true) is polled (GET /maps/mapping/save) every
-# SAVE_POLL_S for at most SAVE_POLL_TOTAL_S (600 s timeout plus margin) per attempt. After a save
-# that did not finish in time the driver is never stopped: the save is retried every
-# SAVE_RETRY_S while the orchestrator reports late_save_sec > 0.
+# A background save (POST /localization/save?background=true) is polled (GET /localization/save)
+# every SAVE_POLL_S for at most SAVE_POLL_TOTAL_S (600 s timeout plus margin) per attempt. A save
+# that did not finish in time is retried once, SAVE_RETRY_S later.
 ORCHESTRATOR_SAVE_POLL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_S", "3.0"))
 ORCHESTRATOR_SAVE_POLL_TOTAL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_TOTAL_S", "660.0"))
 ORCHESTRATOR_SAVE_RETRY_S = float(os.getenv("ORCHESTRATOR_SAVE_RETRY_S", "30.0"))
@@ -137,23 +136,13 @@ RELOC_MAP_HELD_TTL_S = float(os.getenv("RELOC_MAP_HELD_TTL_S", "15.0"))
 # localizationScore is below this. A warning only: it never refuses a placement.
 RELOC_DEGRADED_SCORE = float(os.getenv("RELOC_DEGRADED_SCORE", "0.3"))
 # Starting relocalization from the API (packages/api/reloc_job.py, docs/satinav-maps-redesign.md
-# ## 16): the orchestrator service that relocalizes the robot on its stored map (first candidate
-# the robot's orchestrator lists is used; comma-separated). `RELOC_JOB_TIMEOUT_S`: how long a job
-# waits for the robot to report `position_initialized`; `RELOC_JOB_POLL_S`: how often the stored
-# robot status is read; `RELOC_JOB_SETTLE_S`: when the robot already reported
-# `position_initialized: true` BEFORE the restart (a stale value), the job waits this long after
-# the restart before it believes a true again (unless it saw the flag drop first).
-RELOC_SERVICE_CANDIDATES = _candidates("RELOC_SERVICE_CANDIDATES", "odin_reloc")
+# ## 16): `RELOC_JOB_TIMEOUT_S`: how long a job waits for the robot to report itself localized on
+# the map; `RELOC_JOB_POLL_S`: how often the stored robot status is read.
 RELOC_JOB_TIMEOUT_S = float(os.getenv("RELOC_JOB_TIMEOUT_S", "90.0"))
 RELOC_JOB_POLL_S = float(os.getenv("RELOC_JOB_POLL_S", "1.0"))
-RELOC_JOB_SETTLE_S = float(os.getenv("RELOC_JOB_SETTLE_S", "5.0"))
 # After the robot reports itself localized the job proposes the placement and waits this long for
 # the user to confirm or edit it; then the server confirms by itself (RELOC_CONFIRM_TIMEOUT_S).
 RELOC_CONFIRM_TIMEOUT_S = float(os.getenv("RELOC_CONFIRM_TIMEOUT_S", "30.0"))
-# Relocalization normally uses the orchestrator's POST /maps/{name}/relocalize when it offers it
-# (GET /maps/mapping reports `mode`/`relocalizing`). Set true to always use the reloc SERVICE
-# (RELOC_SERVICE_CANDIDATES) instead, e.g. in a simulation whose relocalize endpoint is a stub.
-RELOC_FORCE_SERVICE = os.getenv("RELOC_FORCE_SERVICE", "false").lower() in ("1", "true", "yes")
 
 # ==================== Phase 0 telemetry ingest (API) ====================
 # docs/satinav-fleet-agent-phase0-v2.md §5.3 "api" items 2-4 (packages/api/telemetry.py).
@@ -212,8 +201,6 @@ FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
 MAP_DELETE_MAX_ATTEMPTS = int(os.getenv("MAP_DELETE_MAX_ATTEMPTS", "5"))
 MAP_DELETE_BACKOFF_S = float(os.getenv("MAP_DELETE_BACKOFF_S", "2.0"))
 MAP_DELETE_BACKOFF_MAX_S = float(os.getenv("MAP_DELETE_BACKOFF_MAX_S", "60.0"))
-# Seconds between SLAM reconcile passes (lost saves, drivers of deleted maps); 0 = startup only.
-SLAM_RECONCILE_INTERVAL_S = float(os.getenv("SLAM_RECONCILE_INTERVAL_S", "300"))
 # F3 Idempotency-Key (packages/api/idempotency.py): how long a key is remembered, how long an
 # unfinished request holds its key before a retry may take it over (longer than any guarded
 # route can take), and how often a worker purges expired keys (seconds).

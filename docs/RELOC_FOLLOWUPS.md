@@ -1,5 +1,9 @@
 # Relocalization / SLAM-toggle — follow-ups (point of reference)
 
+> **Historical (2026-10-09):** the reloc service path (`odin_reloc`, `current_map`), the stale-flag
+> settle and the endpoint mode were removed in stage 5 of LOCALIZATION_STATUS_PLAN.md; the job now
+> uses the orchestrator's localization facade only.
+
 Written 2026-10-04 at the end of the session that built the SLAM toggle, the three-mode
 relocalization (`packages/api/reloc_job.py`) and the manual unplace hook. Everything below
 is **deliberately not done**. Line numbers are as of commit `e2c4467` + the uncommitted

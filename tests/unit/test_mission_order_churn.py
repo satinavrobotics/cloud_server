@@ -559,7 +559,7 @@ async def test_R8_an_abandoned_reroute_cancel_fails_the_mission(clock):
     order_id = _order_id(r)
     for _ in range(r.MAX_INSTANT_ACTION_RESENDS + 5):
         await r._on_client_message(_busy(order_id))
-        clock.t += 1
+        clock.t += r.INSTANT_ACTION_RESEND_MAX_S  # resends are backed off
     assert not r._has_outstanding_cancel()
     # Not stuck: failed, saying why, and nothing more sent.
     assert m.status.state == State.FAILED
@@ -708,7 +708,7 @@ async def test_S3_unacked_reroute_cancel_on_a_robot_that_dropped_the_order(clock
     await r._on_mission_change(_rerouted())
     for _ in range(r.MAX_INSTANT_ACTION_RESENDS + 2):
         await r._on_client_message(_state(_order_id(r)))   # idle: nodeStates empty
-        clock.t += 1
+        clock.t += r.INSTANT_ACTION_RESEND_MAX_S  # resends are backed off
     assert m.status.state == State.RUNNING and len(_orders(r)) == 2, \
         (m.status.state, m.status.failure_reason)
     r._cancel_mission_timeout()
@@ -716,13 +716,14 @@ async def test_S3_unacked_reroute_cancel_on_a_robot_that_dropped_the_order(clock
 
 # S4: how long does an unacknowledged STOP of the previous mission hold the next one?
 @pytest.mark.unit
-async def test_S4_unacked_previous_stop_delays_next_mission():
+async def test_S4_unacked_previous_stop_delays_next_mission(clock):
     r, _ = _make_robot()
     a, b = await _timeout_a_then_b(r)
     n = 0
     while not _b_orders(r) and n < 100:
         await r._on_client_message(_busy(f"A-r{a.status.run_id}-n1"))
         n += 1
+        clock.t += r.INSTANT_ACTION_RESEND_MAX_S  # resends are backed off
     print("state messages before B went out:", n)
     assert _b_orders(r) and n <= r.MAX_INSTANT_ACTION_RESENDS + 1
     r._cancel_mission_timeout()

@@ -217,11 +217,21 @@ NAV_REASON = "Robot navigation is not ready"
     ("navigationNotReadyError", NAV_REASON),
     ("poseHealthNotReadyError", NAV_REASON),
     ("tfChainNotReadyError", NAV_REASON),
+    ("relocalizationNotReadyError", "Robot is relocalizing"),
+    ("relocalizationMapRejectedError", "Robot refused its relocalization map"),
 ])
 async def test_dispatch_hold_reason_per_readiness_type(error_type, reason):
     r, _ = _make_robot(online=True)
     r._robot_object.status.errors = {error_type: "x"}
     assert r._dispatch_hold_reason() == reason
+
+
+@pytest.mark.unit
+async def test_relocalization_reason_wins_over_pose_health():
+    r, _ = _make_robot(online=True)
+    r._robot_object.status.errors = {
+        "poseHealthNotReadyError": "x", "relocalizationNotReadyError": "relocalizing on 'lab'"}
+    assert r._dispatch_hold_reason() == "Robot is relocalizing"
 
 
 @pytest.mark.unit

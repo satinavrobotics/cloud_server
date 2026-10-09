@@ -47,6 +47,23 @@ def order_id(prefix: str, node_idx: int) -> str:
     return f"{prefix}-n{node_idx}"
 
 
+def node_id(prefix: str, node_idx: int, sequence: int) -> str:
+    """The node id of sequence ``sequence`` in the order of mission_tree node
+    ``node_idx`` under ``prefix``."""
+    return f"{order_id(prefix, node_idx)}-s{sequence}"
+
+
+def node_action_id(node: str, node_idx: int) -> str:
+    """The actionId of the mission action carried by node ``node``."""
+    return f"{node}-n{node_idx}"
+
+
+def order_action_id(order: str, node_idx: int) -> str:
+    """The actionId of the mission action an action order ("{prefix}-n{idx}") carries on
+    its start node (sequence 0)."""
+    return node_action_id(f"{order}-s0", node_idx)
+
+
 def order_of_node(node_id: str) -> Optional[str]:
     """The id of the order a node id we generated belongs to ("{prefix}-n{idx}"), else
     None."""

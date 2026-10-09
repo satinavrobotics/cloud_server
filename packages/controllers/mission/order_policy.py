@@ -9,14 +9,36 @@ packages/config.py (it needs credentials dispatch does not have), so the keys li
 config.py points at this module.
 """
 import logging
+import math
 import os
 from typing import Optional
 
 import pydantic
 
 
+_log = logging.getLogger(__name__)
+
+# The robot's own cap on nodePolicy maxWaitS: it rejects or clamps anything longer, so
+# the dispatcher never sends more.
+NODE_POLICY_MAX_WAIT_CAP_S = 120.0
+NODE_POLICY_MAX_WAIT_DEFAULT_S = 10.0
+
+
 def _float(name: str, default: float) -> float:
-    return float(os.getenv(name, str(default)))
+    """A finite, non-negative float from the environment. A malformed or out-of-range
+    value must not crash mission-dispatch at import: warn and use the default."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        _log.warning("Invalid %s %r (need a finite number >= 0); using %r", name, raw,
+                     default)
+        return default
+    return value
 
 
 def _optional_float(name: str, default: Optional[float]) -> Optional[float]:
@@ -24,11 +46,40 @@ def _optional_float(name: str, default: Optional[float]) -> Optional[float]:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return None if raw.strip().lower() in ("", "none", "off") else float(raw)
+    if raw.strip().lower() in ("", "none", "off"):
+        return None
+    return _float(name, default)
+
+
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
 
 
 def _bool(name: str, default: bool) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    text = raw.strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    # A typo must not silently flip a safety-relevant switch to False.
+    _log.warning("Invalid %s %r (one of %s); using %r", name, raw,
+                 ", ".join(_TRUE + _FALSE), default)
+    return default
+
+
+def clamp_max_wait_s(value: float) -> float:
+    """A nodePolicy maxWaitS the robot accepts: non-finite or negative falls back to the
+    default, above the robot's cap is clamped to it."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        return NODE_POLICY_MAX_WAIT_DEFAULT_S
+    return min(value, NODE_POLICY_MAX_WAIT_CAP_S)
 
 
 class NodePolicyMode:
@@ -55,7 +106,7 @@ class OrderPolicy(pydantic.BaseModel):
     deviation_xy_legacy_default_m: Optional[float] = 0.1
 
     node_policy_mode: str = NodePolicyMode.FACTSHEET
-    node_policy_max_wait_s: float = 10.0
+    node_policy_max_wait_s: float = NODE_POLICY_MAX_WAIT_DEFAULT_S
 
     # A mission's timeout does not run while its robot is offline: a route the robot
     # carries out on its own is not a stalled one.
@@ -72,11 +123,20 @@ class OrderPolicy(pydantic.BaseModel):
     def _known_node_policy_mode(cls, value):  # pylint: disable=no-self-argument
         mode = str(value).strip().lower()
         if mode not in NodePolicyMode.ALL:
-            logging.getLogger(__name__).warning(
+            _log.warning(
                 "Unknown VDA5050_NODE_POLICY_MODE %r (one of %s); using %r", value,
                 ", ".join(NodePolicyMode.ALL), NodePolicyMode.FACTSHEET)
             return NodePolicyMode.FACTSHEET
         return mode
+
+    @pydantic.validator("node_policy_max_wait_s", pre=True)
+    def _robot_acceptable_max_wait(cls, value):  # pylint: disable=no-self-argument
+        clamped = clamp_max_wait_s(value)
+        if clamped != value:
+            _log.warning(
+                "NODE_POLICY_MAX_WAIT_S %r is not in [0, %s]; using %r", value,
+                NODE_POLICY_MAX_WAIT_CAP_S, clamped)
+        return clamped
 
     def deviation_xy(self, value: Optional[float], final: bool) -> float:
         legacy = self.deviation_xy_legacy_default_m

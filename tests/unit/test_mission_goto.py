@@ -298,8 +298,10 @@ def test_the_index_forgets_finished_deleted_and_moved_missions():
 @pytest.mark.unit
 async def test_robot_update_carries_current_and_queued_missions():
     from packages.api.server import ApiDelegationService
+    from packages.api.mapping_switch import MappingSwitch
     svc = object.__new__(ApiDelegationService)
     svc.mission_index = RobotMissionIndex()
+    svc.mapping_switch = MappingSwitch()
     svc.mission_index.update(_row("now", state=State.RUNNING, started=_at(1)))
     svc.mission_index.update(_row("next", created=_at(2)))
     svc._running = True

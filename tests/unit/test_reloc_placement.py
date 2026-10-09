@@ -34,8 +34,7 @@ pytestmark = pytest.mark.unit
 # `can_start` / `can_start_reason` were added to every reloc read (additive; reloc_job.py). The
 # FakeHolder below cannot start anything, so it is always this:
 NO_START = {"can_start": False, "can_start_reason": "relocalization cannot be started from here",
-            "warning": "relocalization cannot be started from here",
-            "localization_api": False}
+            "warning": "relocalization cannot be started from here"}
 
 
 def _robot(db, name="r1", online=True, address=True, **status):
@@ -62,35 +61,35 @@ SESSION = {"session_id": "6f1c0c2e-0000-4000-8000-000000000001", "map_name": "sh
 
 
 class TestSaveBody:
-    def test_ids_are_added(self):
-        out = json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", b'{"stop_after": true}',
-                                        SESSION))
-        assert out == {"stop_after": True, "cloud_map_id": "shed",
-                       "cloud_session_id": SESSION["session_id"]}
+    """The proxied POST localization/save of the session's own map (named in the body)."""
+    PATH = "localization/save"
 
-    def test_empty_body(self):
-        out = json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", b"", SESSION))
-        assert out["cloud_map_id"] == "shed"
+    def _out(self, body):
+        return json.loads(with_cloud_ids("POST", self.PATH, json.dumps(body).encode(), SESSION))
+
+    def test_ids_are_added(self):
+        assert self._out({"name": "cloud-shed", "description": "d"}) == {
+            "name": "cloud-shed", "description": "d", "cloud_map_id": "shed",
+            "cloud_session_id": SESSION["session_id"]}
 
     def test_ids_the_caller_sent_are_kept(self):
-        body = json.dumps({"cloud_map_id": "x", "cloud_session_id": "y"}).encode()
-        assert json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", body, SESSION)) == {
-            "cloud_map_id": "x", "cloud_session_id": "y"}
+        assert self._out({"name": "cloud-shed", "cloud_map_id": "x", "cloud_session_id": "y"}) == {
+            "name": "cloud-shed", "cloud_map_id": "x", "cloud_session_id": "y"}
 
     def test_explicit_null_ids_count_as_unset(self):
-        body = json.dumps({"cloud_map_id": None, "cloud_session_id": None}).encode()
-        assert json.loads(with_cloud_ids("POST", "maps/cloud-shed/save", body, SESSION)) == {
-            "cloud_map_id": "shed", "cloud_session_id": SESSION["session_id"]}
+        assert self._out({"name": "cloud-shed", "cloud_map_id": None,
+                          "cloud_session_id": None}) == {
+            "name": "cloud-shed", "cloud_map_id": "shed", "cloud_session_id": SESSION["session_id"]}
 
     @pytest.mark.parametrize("method,path,body,session", [
-        ("GET", "maps/cloud-shed/save", b"", SESSION),
-        ("POST", "maps/lab/mapping/start", b"{}", SESSION),
-        ("POST", "maps/cloud-shed/save", b"{}", None),
-        ("POST", "maps/cloud-shed/save", b"{}", {**SESSION, "purpose": "operate"}),
-        ("POST", "maps/cloud-other/save", b"{}", SESSION),      # not the session's own map
-        ("POST", "maps/lab/save", b"{}", SESSION),
-        ("POST", "maps/cloud-shed/save", b"not json", SESSION),
-        ("POST", "maps/cloud-shed/save", b"[1]", SESSION),
+        ("GET", "localization/save", b"", SESSION),
+        ("POST", "maps/cloud-shed/save", b"{}", SESSION),       # the deprecated route
+        ("POST", "localization/save", b'{"name": "cloud-shed"}', None),
+        ("POST", "localization/save", b'{"name": "cloud-shed"}', {**SESSION, "purpose": "operate"}),
+        ("POST", "localization/save", b'{"name": "cloud-other"}', SESSION),  # not its own map
+        ("POST", "localization/save", b"", SESSION),            # no name: not its map
+        ("POST", "localization/save", b"not json", SESSION),
+        ("POST", "localization/save", b"[1]", SESSION),
     ])
     def test_everything_else_is_unchanged(self, method, path, body, session):
         assert with_cloud_ids(method, path, body, session) == body
@@ -288,7 +287,8 @@ class TestProxyInvalidation:
 class TestAgvPosition:
     def test_score_is_optional(self):
         p = types.VDA5050AgvPosition(x=1, y=2, theta=0)
-        assert p.localizationScore is None and p.positionInitialized is True
+        # a missing flag is unknown, not "initialized"
+        assert p.localizationScore is None and p.positionInitialized is None
         p = types.VDA5050AgvPosition(x=1, y=2, theta=0, positionInitialized=False,
                                      localizationScore=0.4)
         assert (p.positionInitialized, p.localizationScore) == (False, 0.4)
@@ -305,6 +305,23 @@ class TestAgvPosition:
         st = r._robot_object.status
         assert (st.position_initialized, st.localization_score) == (False, 0.25)
         assert (st.pose.x, st.pose.y, st.pose.theta, st.pose.map_id) == (1.0, 2.0, 0.5, "map")
+
+    async def test_a_state_without_position_clears_flag_and_score(self):
+        from tests.unit.test_maps_use_run_change import FakeDb, _robot as dispatcher_robot
+        r = dispatcher_robot(FakeDb([]))
+
+        def state(header, **kw):
+            return types.VDA5050State(
+                headerId=header, timestamp="2026-10-03T10:00:00Z", nodeStates=[],
+                edgeStates=[], batteryState=None, velocity=None, **kw)
+        await r._on_client_message(state(1, agvPosition=dict(
+            x=1.0, y=2.0, theta=0.5, mapId="lab", positionInitialized=True,
+            localizationScore=0.9)))
+        await r._on_client_message(state(2, agvPosition=None))
+        st = r._robot_object.status
+        assert (st.position_initialized, st.localization_score) == (None, None)
+        # the last known pose stays
+        assert (st.pose.x, st.pose.y, st.pose.map_id) == (1.0, 2.0, "lab")
 
     def test_defaults_are_unknown(self):
         st = RobotStatusV1()
@@ -551,8 +568,7 @@ class TestMapReloc:
         assert await maps.map_reloc(None, h, "geo1", "r1") == {
             "available": False, "known": True, "source": "orchestrator", "can_start": False,
             "can_start_reason": "a geo map is placed by its datum, not relocalized",
-            "warning": "a geo map is placed by its datum, not relocalized",
-            "localization_api": False}
+            "warning": "a geo map is placed by its datum, not relocalized"}
         assert h.calls == []
         assert await _status(maps.map_reloc(None, h, "nomap", "r1")) == 404
 
@@ -605,8 +621,10 @@ class TestWebSocketLocalizationWarning:
         from unittest.mock import AsyncMock, MagicMock
         from packages.api.server import ApiDelegationService
         from packages.api.mission_index import RobotMissionIndex
+        from packages.api.mapping_switch import MappingSwitch
         svc = object.__new__(ApiDelegationService)
         svc.mission_index = RobotMissionIndex()
+        svc.mapping_switch = MappingSwitch()
         svc._running = True
         svc._robot_changes = asyncio.Queue()
         svc.telemetry = None
@@ -629,6 +647,15 @@ class TestWebSocketLocalizationWarning:
             {"placement_source": "reloc"})
         assert msg["localization_warning"]
         assert msg["status"]["position_initialized"] is False
+
+    async def test_the_localization_block_and_map_id_are_sent(self):
+        status = RobotStatusV1(online=True, position_initialized=True)
+        status.pose.map_id = "cloud-shed"
+        msg = await self._broadcast(status, None)
+        assert msg["status"]["pose"]["map_id"] == "cloud-shed"
+        loc = msg["localization"]
+        assert (loc["device"]["state"], loc["device"]["cloud_map"]) == ("LOCALIZED", "shed")
+        assert loc["intent"] is None and loc["usable"] is True   # no snapshot read yet
 
     async def test_healthy_or_non_reloc_has_none(self):
         healthy = RobotStatusV1(online=True, position_initialized=True, localization_score=0.9)

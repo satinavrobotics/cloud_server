@@ -28,8 +28,8 @@ import pydantic
 
 from cloud_common.objects import mission, robot, common
 from packages.controllers.mission import order_ids
-from packages.controllers.mission.order_policy import NodePolicyMode, OrderPolicy, \
-    current as current_order_policy
+from packages.controllers.mission.order_policy import OrderPolicy, \
+    clamp_max_wait_s, current as current_order_policy
 
 
 # Tell pylint to ignore the invalid names. We must use camelCase names because they are specified
@@ -132,7 +132,7 @@ class VDA5050Action(pydantic.BaseModel):
                             node_id: str, mission_node_id: int) -> "VDA5050Action":
         return VDA5050Action(
             actionType=action.action_type,
-            actionId=f"{node_id}-n{mission_node_id}",
+            actionId=order_ids.node_action_id(node_id, mission_node_id),
             # Strings, as robots have always received them (the coercion the field
             # applied when it was Optional[str]).
             actionParameters=[VDA5050ActionParameter(
@@ -143,10 +143,17 @@ class VDA5050Action(pydantic.BaseModel):
     def node_policy(cls, node_id: str, max_wait_s: float, skippable: bool = False,
                     corridor_width_m: Optional[float] = None) -> "VDA5050Action":
         """The nodePolicy action of node `node_id`: non-blocking, so the robot drives
-        through it. corridorWidth is sent only when known."""
-        params = [VDA5050ActionParameter(key="skippable", value=bool(skippable)),
-                  VDA5050ActionParameter(key="maxWaitS", value=float(max_wait_s))]
-        if corridor_width_m is not None:
+        through it. corridorWidth is sent only when known. maxWaitS is clamped to what the
+        robot accepts."""
+        # Robot team: a missing corridorWidth means no skip, so never claim skippable
+        # without a usable one.
+        has_corridor = corridor_width_m is not None and math.isfinite(corridor_width_m) \
+            and corridor_width_m > 0
+        params = [VDA5050ActionParameter(key="skippable",
+                                         value=bool(skippable) and has_corridor),
+                  VDA5050ActionParameter(key="maxWaitS",
+                                         value=clamp_max_wait_s(max_wait_s))]
+        if has_corridor:
             params.append(VDA5050ActionParameter(key="corridorWidth",
                                                  value=float(corridor_width_m)))
         return VDA5050Action(
@@ -207,7 +214,7 @@ class VDA5050Node(pydantic.BaseModel):
         order policy's: tight on the last node, wider on a node the robot drives through."""
         policy = policy or current_order_policy()
         return VDA5050Node(
-            nodeId=f"{mission_id}-n{mission_node_id}-s{sequence}",
+            nodeId=order_ids.node_id(mission_id, mission_node_id, sequence),
             sequenceId=sequence,
             nodePosition=VDA5050NodePosition(
                 x=pose.x, y=pose.y, theta=pose.theta, mapId=pose.map_id,
@@ -223,7 +230,7 @@ class VDA5050Node(pydantic.BaseModel):
         re-reach where it stands, unless it carries the order's actions (`final`)."""
         policy = policy or current_order_policy()
         return VDA5050Node(
-            nodeId=f"{mission_id}-n{mission_node_id}-s{sequence}",
+            nodeId=order_ids.node_id(mission_id, mission_node_id, sequence),
             sequenceId=sequence,
             nodePosition=VDA5050NodePosition(
                 x=robot_object.status.pose.x,
@@ -231,6 +238,9 @@ class VDA5050Node(pydantic.BaseModel):
                 theta=robot_object.status.pose.theta,
                 allowedDeviationXY=policy.deviation_xy_final_m if final
                 else policy.deviation_xy_start_m,
+                # Heading stays free (pass value) even though this is the robot's own
+                # pose: the start node never carries a nodePolicy and the robot is
+                # already where it stands.
                 allowedDeviationTheta=policy.deviation_theta_final_rad if final
                 else policy.deviation_theta_pass_rad))
 
@@ -274,7 +284,7 @@ class VDA5050Node(pydantic.BaseModel):
         # Create and return a new VDA5050Node with the updated position and orientation
         policy = current_order_policy()
         return VDA5050Node(
-            nodeId=f"{mission_id}-n{mission_node_id}-s{sequence}",
+            nodeId=order_ids.node_id(mission_id, mission_node_id, sequence),
             sequenceId=sequence,
             nodePosition=VDA5050NodePosition(
                 x=x, y=y, theta=theta,
@@ -302,12 +312,13 @@ class VDA5050Edge(pydantic.BaseModel):
         return VDA5050Edge(
             edgeId=f"{mission_id}-e{sequence}",
             sequenceId=sequence,
-            startNodeId=f"{mission_id}-n{mission_node_id}-s{sequence - 1}",
-            endNodeId=f"{mission_id}-n{mission_node_id}-s{sequence + 1}")
+            startNodeId=order_ids.node_id(mission_id, mission_node_id, sequence - 1),
+            endNodeId=order_ids.node_id(mission_id, mission_node_id, sequence + 1))
 
 
 class VDA5050AgvPosition(pydantic.BaseModel):
-    positionInitialized: bool = True
+    # None = not reported (unknown), never "initialized": a missing flag must not read as localized
+    positionInitialized: Optional[bool] = None
     x: float
     y: float
     theta: float
@@ -451,7 +462,7 @@ class VDA5050Order(pydantic.BaseModel):
                                                      e * 2 + 1, mission_node_id)
                       for e in range(route.size)]
         return VDA5050Order(
-            orderId=f"{mission_id}-n{mission_node_id}",
+            orderId=order_ids.order_id(mission_id, mission_node_id),
             orderUpdateId=0,
             nodes=nodes,
             edges=edges)
@@ -470,7 +481,7 @@ class VDA5050Order(pydantic.BaseModel):
         edges += [VDA5050Edge.from_mission_order(
             mission_id, 1, mission_node_id)]
         return VDA5050Order(
-            orderId=f"{mission_id}-n{mission_node_id}",
+            orderId=order_ids.order_id(mission_id, mission_node_id),
             orderUpdateId=0,
             nodes=nodes,
             edges=edges)
@@ -490,7 +501,7 @@ class VDA5050Order(pydantic.BaseModel):
                                                                    nodes[0].nodeId,
                                                                    mission_node_id)]
         return VDA5050Order(
-            orderId=f"{mission_id}-n{mission_node_id}",
+            orderId=order_ids.order_id(mission_id, mission_node_id),
             orderUpdateId=0,
             nodes=nodes,
             edges=[])

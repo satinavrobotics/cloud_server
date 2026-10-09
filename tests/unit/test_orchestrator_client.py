@@ -1,5 +1,5 @@
-"""packages/api/orchestrator_client.py: the SLAM calls (body, path, timeout) over a MockTransport,
-the shared cloud-id helper and the onboard map name."""
+"""packages/api/orchestrator_client.py: the localization facade calls (body, path, query) over a
+MockTransport, the shared cloud-id helper and the onboard map name."""
 import json
 import os
 from types import SimpleNamespace
@@ -33,22 +33,12 @@ def test_onboard_name_and_cloud_link():
 
 def test_proxy_and_save_slam_share_the_cloud_link():
     session = {"purpose": "mapping", "ended_at": None, "map_name": "yard", "session_id": "S1"}
-    body = json.loads(with_cloud_ids("POST", "maps/cloud-yard/save", b"{}", session))
-    assert body == oc.cloud_link("yard", "S1")
+    body = json.loads(with_cloud_ids("POST", "localization/save", b'{"name": "cloud-yard"}',
+                                     session))
+    assert body == {"name": "cloud-yard", **oc.cloud_link("yard", "S1")}
 
 
-async def test_start_slam_sends_overwrite_false():
-    seen = []
-
-    def handler(request):
-        seen.append((request.method, request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"active": True})
-
-    await client_for(handler).start_slam("cloud-yard")
-    assert seen == [("POST", "/maps/cloud-yard/mapping/start", {"overwrite": False})]
-
-
-async def test_start_slam_save_is_a_background_save():
+async def test_save_is_a_background_save_with_the_cloud_ids():
     seen = []
 
     def handler(request):
@@ -56,33 +46,33 @@ async def test_start_slam_save_is_a_background_save():
                      json.loads(request.content)))
         return httpx.Response(202, json={"started": True, "map": "cloud-yard"})
 
-    out = await client_for(handler).start_slam_save("cloud-yard", "yard", "S1")
+    out = await client_for(handler).save_localization("cloud-yard", "yard", "S1")
     assert out == {"started": True, "map": "cloud-yard"}
-    assert seen == [("POST", "/maps/cloud-yard/save", {"background": "true"},
-                     {"cloud_map_id": "yard", "cloud_session_id": "S1", "stop_after": True})]
+    assert seen == [("POST", "/localization/save", {"background": "true"},
+                     {"name": "cloud-yard", "cloud_map_id": "yard", "cloud_session_id": "S1"})]
 
 
-async def test_save_status_state_and_stop():
+async def test_localization_reads_and_the_switch():
     seen = []
 
     def handler(request):
         seen.append((request.method, request.url.path, dict(request.url.params), request.content))
-        return httpx.Response(200, json={"active": True, "map": "cloud-yard", "pid": 7,
-                                         "status": "saving"})
+        return httpx.Response(200, json={"mode": "slam", "map": None, "status": "saving"})
 
     client = client_for(handler)
-    assert (await client.slam_state())["map"] == "cloud-yard"
-    assert (await client.slam_save_status())["status"] == "saving"
-    await client.stop_slam()
-    await client.stop_slam(force=True)
-    assert seen == [("GET", "/maps/mapping", {}, b""), ("GET", "/maps/mapping/save", {}, b""),
-                    ("POST", "/maps/mapping/stop", {}, b""),
-                    ("POST", "/maps/mapping/stop", {"force": "true"}, b"")]
+    assert (await client.get_localization())["mode"] == "slam"
+    assert (await client.localization_save_status())["status"] == "saving"
+    await client.put_localization("relocalization", "cloud-yard", topomap=False)
+    assert seen[:2] == [("GET", "/localization", {}, b""), ("GET", "/localization/save", {}, b"")]
+    method, path, params, body = seen[2]
+    assert (method, path, params) == ("PUT", "/localization", {"wait": "false", "partial": "ok"})
+    assert json.loads(body) == {"mode": "relocalization", "map": "cloud-yard", "topomap": False}
 
 
-def test_late_save_sec_defaults_to_zero():
-    assert oc.late_save_sec({"late_save_sec": 42}) == 42
-    assert oc.late_save_sec({}) == 0 and oc.late_save_sec({"late_save_sec": None}) == 0
+def test_problem_of_a_partial_answer():
+    assert oc.problem_of({"problem": {"status_code": 504, "detail": "late"}}) == "504: late"
+    assert oc.problem_of({"problem": "x"}) == "x"
+    assert oc.problem_of({"problem": None}) is None and oc.problem_of("x") is None
 
 
 async def test_existing_calls_send_no_body():
@@ -96,12 +86,12 @@ async def test_existing_calls_send_no_body():
     assert seen == [b""]
 
 
-@pytest.mark.parametrize("status,detail", [(409, "Map 'x' already has a map file"),
-                                           (404, "No mapping session is running")])
+@pytest.mark.parametrize("status,detail", [(409, "order active: cancel it first"),
+                                           (502, "MAP_LOAD_FAILED")])
 async def test_http_errors_keep_status_and_detail(status, detail):
     client = client_for(lambda r: httpx.Response(status, json={"detail": detail}))
     with pytest.raises(oc.OrchestratorError) as err:
-        await client.start_slam("cloud-x")
+        await client.put_localization("relocalization", "cloud-x")
     assert (err.value.kind, err.value.status, err.value.detail) == (oc.HTTP, status, detail)
 
 
@@ -113,11 +103,11 @@ async def test_unreachable_timeout_and_no_address():
         raise httpx.ReadTimeout("slow")
 
     with pytest.raises(oc.OrchestratorError) as err:
-        await client_for(refuse).slam_state()
+        await client_for(refuse).get_localization()
     assert err.value.kind == oc.UNREACHABLE
     with pytest.raises(oc.OrchestratorError) as err:
-        await client_for(slow).start_slam_save("cloud-x", "x", "S")
+        await client_for(slow).save_localization("cloud-x", "x", "S")
     assert err.value.kind == oc.TIMEOUT
     with pytest.raises(oc.OrchestratorError) as err:
-        await oc.OrchestratorClient(SimpleNamespace(name="r")).stop_slam()
+        await oc.OrchestratorClient(SimpleNamespace(name="r")).get_localization()
     assert err.value.kind == oc.NO_ADDRESS

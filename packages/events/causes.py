@@ -124,7 +124,10 @@ RULES: Tuple[Rule, ...] = (
     Rule("rtk_lost", "GNSS.RTK_LOST", lambda f: f.mentions(r"rtk[ _-]?(lost|float|drop)")),
     Rule("no_gnss_fix", "GNSS.NO_FIX", lambda f: f.mentions(r"(gnss|gps)[ _-]?(no[ _-]?fix|lost)")),
     Rule("localization_lost", "NAV.LOCALIZATION_LOST",
-         lambda f: f.mentions(r"locali[sz]ation[ _-]?(lost|fail)|lost[ _-]?locali[sz]ation")),
+         lambda f: bool(f.error_types & {"posehealthnotreadyerror", "relocalizationnotreadyerror"})
+         or f.mentions(r"locali[sz]ation[ _-]?(lost|fail)|lost[ _-]?locali[sz]ation")),
+    Rule("relocalization_map_rejected", "MAP.INVALID",
+         lambda f: "relocalizationmaprejectederror" in f.error_types),
     Rule("recovery_exhausted", "NAV.RECOVERY_EXHAUSTED",
          lambda f: f.mentions(r"recover\w*[ _-]?(exhausted|failed)|max[ _-]?recover")),
     Rule("path_blocked", "NAV.PATH_BLOCKED",

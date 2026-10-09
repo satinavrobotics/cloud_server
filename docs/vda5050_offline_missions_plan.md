@@ -297,3 +297,11 @@ Not done / deviations from the plan:
 - No fail-fast on an order-rejection error (the robot's error type for it is not agreed yet); the resend cap bounds the noise instead.
 - No auto-clear of an exclusion when a robot passes the node (`BLOCKED_NODE_CLEAR_ON_PASS`); expiry and the operator DELETE clear it.
 - The migration and the blocked-node SQL were checked once against a throwaway Postgres 14 (upgrade twice, upsert keeps the later expiry, expired rows ignored, delete, source check, downgrade). No integration run against ArangoDB, MQTT or the full stack.
+
+Review fixes, robot-team answers (2026-10-09; `tests/unit/test_dispatch_reconnect_resends.py`, `test_order_policy_validation.py`, `test_node_policy_reporting.py`):
+- Clean MQTT session: what the robot reports right after a reconnect is not evidence it ignored us. On an offline→online transition the order resend and mismatch budgets and the instant-action resend counts are reset, and both are due on the first state.
+- Instant actions (cancelOrder) are resent with back-off (`INSTANT_ACTION_RESEND_BASE_S` 1 s doubling to `_MAX_S` 8 s), no longer on every state message, so 20 attempts span minutes, not seconds.
+- `NODE_POLICY_MAX_WAIT_S` is clamped to the robot's cap of 120 s; negative/NaN/inf falls back to 10. A malformed float env value warns and uses the default instead of failing the import; booleans accept on/off spellings and warn on typos.
+- `skippable: true` is only sent with a usable `corridorWidth` (robot team: no corridor means no skip).
+- Order, node and action ids are built through `order_ids` (except the `from_mission` start node and edge ids). Heartbeat is a re-armed `call_later` handle instead of a task per state message; the blocked-node write task is kept referenced.
+- Checked, no change: a dispatcher restart cannot resend an orderId with other content (resume bumps `order_rev`, which is part of every id).

@@ -121,8 +121,7 @@ class MapDeleter:
         # the commit (service cancel, events). An after_mark failure never fails the delete.
         self._on_mark = on_mark
         self._after_mark = after_mark
-        # `after_delete(map_id)` once the row is gone (robots' SLAM drivers of the map are
-        # stopped); best effort, a failure only logs.
+        # `after_delete(map_id)` once the row is gone; best effort, a failure only logs.
         self._after_delete = after_delete
         self._steps = (("graph_db", delete_graph), ("image_db", delete_images))
         self.max_attempts = max(1, int(max_attempts))

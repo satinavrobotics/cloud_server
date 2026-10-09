@@ -247,6 +247,10 @@ def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str,
 _NAV_NOT_READY = "Robot navigation is not ready"
 READINESS_HOLD_REASONS = {
     "robotBaseNotReadyError": "Robot base is not responding",
+    # The Odin is relocalizing, or refused the map (its description names the map). Before
+    # the generic nav keys: a relocalizing robot usually reports poseHealthNotReadyError too.
+    "relocalizationMapRejectedError": "Robot refused its relocalization map",
+    "relocalizationNotReadyError": "Robot is relocalizing",
     "navigationNotReadyError": _NAV_NOT_READY,
     "poseHealthNotReadyError": _NAV_NOT_READY,
     "tfChainNotReadyError": _NAV_NOT_READY,
@@ -279,12 +283,23 @@ def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
         route.json(sort_keys=True, exclude_none=True).encode()).hexdigest()[:16]
 
 
+# Precomputed once: handle_instant_action() and _order_action_state() test every action
+# state of every robot state message against these.
+_INSTANT_ACTION_TYPES = frozenset(types.VDA5050InstantActionType.values() +
+                                  types.NVInstantActionType.values())
+_NON_NODE_ACTION_TYPES = _INSTANT_ACTION_TYPES | {types.NODE_POLICY_ACTION_TYPE}
+
+
 class Robot:
     """Manages the mission state of a particular robot"""
 
-    # An instant action the robot never reports FINISHED is resent on every state
-    # message; give up after this many attempts. See handle_instant_action().
+    # An instant action the robot never reports FINISHED is resent on the state
+    # messages that lack it, with exponential back-off (base * 2^(resends-1), capped) so
+    # a robot streaming state at 10 Hz does not burn the budget in seconds; give up after
+    # this many attempts. See handle_instant_action().
     MAX_INSTANT_ACTION_RESENDS = 20
+    INSTANT_ACTION_RESEND_BASE_S = 1.0
+    INSTANT_ACTION_RESEND_MAX_S = 8.0
     # Consecutive state messages whose orderId doesn't match the current mission
     # before we stop resending and fail the mission. See _on_client_message().
     MAX_ORDER_MISMATCHES = 40
@@ -332,6 +347,10 @@ class Robot:
         # running") is eventually abandoned instead of being resent on every state
         # message forever. See handle_instant_action().
         self._instant_action_resends: Dict[str, int] = {}
+        # Monotonic time of each outstanding action's last resend (back-off base).
+        self._instant_action_resent_at: Dict[str, float] = {}
+        # Blocked-node writes in flight; held so they are not garbage collected mid-write.
+        self._blocked_node_tasks: Set[asyncio.Task[Any]] = set()
         # Consecutive robot-state messages carrying an orderId that isn't the current
         # mission's. Bounded in _on_client_message() so a robot that never adopts our
         # order fails the mission instead of spinning silently.
@@ -353,7 +372,7 @@ class Robot:
         # MAX_FINISHED_MISSIONS_TRACKED.
         self._finished_missions: "OrderedDict[str, None]" = OrderedDict()
         self._mqtt_client = client
-        self._robot_online_task: Optional[asyncio.Task[Any]] = None
+        self._robot_online_task: Optional[Any] = None  # TimerHandle, then the offline Task
         self._mission_timeout_task: Optional[asyncio.Task[Any]] = None
         # The running timeout (mission, budget s, monotonic start), and one paused while
         # the robot is offline (mission, s left). See _pause_mission_timeout().
@@ -1302,8 +1321,7 @@ class Robot:
             self._robot_object = message
 
             self._header_ids = {}
-            self._robot_online_task = \
-                asyncio.get_event_loop().create_task(self._check_robot_online())
+            self._arm_online_watchdog()
 
             if (not self._robot_server.disable_request_factsheet
                     and self._robot_object.status.factsheet.agv_class == ""):
@@ -1374,11 +1392,27 @@ class Robot:
             # Robot object update
             self._robot_object = message
 
+    def _arm_online_watchdog(self) -> None:
+        """(Re)start the heartbeat timer: a timer handle re-armed per state message is far
+        cheaper than a task cancelled and created for each. When it fires without a state
+        having re-armed it, the robot is offline (_check_robot_online)."""
+        if self._robot_online_task is not None:
+            self._robot_online_task.cancel()
+        if self._robot_object is None:
+            return
+        loop = asyncio.get_event_loop()
+        self._robot_online_task = loop.call_later(
+            self._robot_object.heartbeat_timeout.total_seconds(), self._on_heartbeat_timeout)
+
+    def _on_heartbeat_timeout(self) -> None:
+        if self._alive:
+            self._robot_online_task = \
+                asyncio.get_event_loop().create_task(self._check_robot_online())
+
     async def _check_robot_online(self):
         if self._robot_object is None:
             return
         try:
-            await asyncio.sleep(self._robot_object.heartbeat_timeout.total_seconds())
             self.info("Robot Offline")
             self._robot_object.status.recording_state = None
             self._robot_object.status.nav_reasoning = None
@@ -1392,6 +1426,21 @@ class Robot:
         except asyncio.CancelledError:
             self.debug("Cancelled robot online check.")
 
+    def _reset_resend_budgets(self) -> None:
+        """The robot is back after being offline. Its clean MQTT session lost whatever we
+        sent meanwhile, so what it still reports is not evidence we were ignored: give the
+        order and the outstanding instant actions (a cancelOrder) a fresh budget, due on
+        the first state after the reconnect."""
+        self._order_resends = 0
+        self._order_mismatch_count = 0
+        self._order_sent_at = 0.0
+        self._instant_action_resends.clear()
+        self._instant_action_resent_at.clear()
+
+    def _forget_instant_action_resends(self, action_id: str) -> None:
+        self._instant_action_resends.pop(action_id, None)
+        self._instant_action_resent_at.pop(action_id, None)
+
     async def handle_instant_action(self, message: types.VDA5050State):
         # Handle instant actions
         updated_instant_action_ids = []
@@ -1400,15 +1449,14 @@ class Robot:
             # Only instant actions; order actions (e.g. nodePolicy) may be listed in any
             # position, and stopping at the first one would hide a cancelOrder ack
             # behind it.
-            if action_state.actionType not in (types.VDA5050InstantActionType.values() +
-                                               types.NVInstantActionType.values()):
+            if action_state.actionType not in _INSTANT_ACTION_TYPES:
                 continue
             if action_state.actionId in self._current_instant_actions.keys():
                 if action_state.actionStatus == types.VDA5050ActionStatus.FINISHED:
                     # Update current instant aciton dict
                     finished_instant_actions.append(
                         self._current_instant_actions.pop(action_state.actionId))
-                    self._instant_action_resends.pop(action_state.actionId, None)
+                    self._forget_instant_action_resends(action_state.actionId)
                     self._cancel_resolved(finished_instant_actions[-1])
                     self.mission_info(
                         f"Finished instant action:\n {finished_instant_actions[-1]}")
@@ -1421,7 +1469,7 @@ class Robot:
                     # this mission left running, which is the outcome a cancel was
                     # after, so it counts as a completed cancel for the mission.
                     failed = self._current_instant_actions.pop(action_state.actionId)
-                    self._instant_action_resends.pop(action_state.actionId, None)
+                    self._forget_instant_action_resends(action_state.actionId)
                     self._cancel_resolved(failed)
                     if failed.actionType == types.VDA5050InstantActionType.CANCEL_ORDER:
                         self.mission_info(
@@ -1439,11 +1487,19 @@ class Robot:
         # acknowledges one (it may reject the action outright, e.g. cancelOrder when it
         # has no active order) would otherwise be resent on every single state message
         # indefinitely -- previously observed as ~4.6M resends in 25 minutes. Give up
-        # after MAX_INSTANT_ACTION_RESENDS attempts.
+        # after MAX_INSTANT_ACTION_RESENDS attempts. Resends are spaced with back-off:
+        # state arrives many times a second, an ack a moment after a send.
         give_up: List[str] = []
+        now = time.monotonic()
         for action_id, instant_action in self._current_instant_actions.items():
             if action_id not in updated_instant_action_ids:
-                attempts = self._instant_action_resends.get(action_id, 0) + 1
+                resends = self._instant_action_resends.get(action_id, 0)
+                # The original send is not a resend: the first gap is the base.
+                interval = min(self.INSTANT_ACTION_RESEND_BASE_S * 2 ** max(resends - 1, 0),
+                               self.INSTANT_ACTION_RESEND_MAX_S)
+                if now - self._instant_action_resent_at.get(action_id, -math.inf) < interval:
+                    continue
+                attempts = resends + 1
                 if attempts > self.MAX_INSTANT_ACTION_RESENDS:
                     self.warning(
                         f"Abandoning {instant_action.actionType} instant action "
@@ -1452,6 +1508,7 @@ class Robot:
                     give_up.append(action_id)
                     continue
                 self._instant_action_resends[action_id] = attempts
+                self._instant_action_resent_at[action_id] = now
                 # Resend instant action
                 await self._send_instant_action(instant_action)
                 self.mission_info(
@@ -1459,7 +1516,7 @@ class Robot:
                     f"({attempts}/{self.MAX_INSTANT_ACTION_RESENDS}).")
         for action_id in give_up:
             abandoned = self._current_instant_actions.pop(action_id, None)
-            self._instant_action_resends.pop(action_id, None)
+            self._forget_instant_action_resends(action_id)
             if abandoned is not None:
                 self._cancel_resolved(abandoned, abandoned=True)
         return finished_instant_actions
@@ -1783,12 +1840,7 @@ class Robot:
         self.debug(f"[{message.orderId}] Got feedback")
         # If we have a robot, Update it with the details from the message
         if self._robot_object is not None:
-            # Check if the current task to verify if robot is online still exists
-            if self._robot_online_task is not None:
-                # Cancel to replace with another task to update the online checking time
-                self._robot_online_task.cancel()
-            self._robot_online_task = \
-                asyncio.get_event_loop().create_task(self._check_robot_online())
+            self._arm_online_watchdog()
             if message.agvPosition:
                 self._robot_object.status.pose.x = message.agvPosition.x
                 self._robot_object.status.pose.y = message.agvPosition.y
@@ -1798,6 +1850,11 @@ class Robot:
                     message.agvPosition.positionInitialized
                 self._robot_object.status.localization_score = \
                     message.agvPosition.localizationScore
+            else:
+                # No position in this state: the last flag and score are no longer current.
+                # The pose and map_id stay as the last known position.
+                self._robot_object.status.position_initialized = None
+                self._robot_object.status.localization_score = None
             if message.batteryState:
                 self._robot_object.status.battery_level = message.batteryState.batteryCharge
                 self._robot_object.status.battery_unknown = battery.battery_unknown(
@@ -1812,48 +1869,30 @@ class Robot:
                         robot_object.RobotStateV1.IDLE)
 
             if self._robot_server.mission_ctrl_url:
-                request_map = (not self._robot_object.status.pose.map_id
-                               and self._robot_object.status.state.can_deploy_map)
                 send_charging_mission = (self._robot_object.battery.recommended_minimum
                                          and not self._robot_object.status.battery_unknown
                                          and (self._robot_object.status.battery_level <=
                                               self._robot_object.battery.recommended_minimum)
                                          and not self._robot_object.status.state.running
                                          and not self._charging_mission_received)
-                if request_map or send_charging_mission:
+                if send_charging_mission:
                     # Check mission control health
                     try:
                         health_response = requests.get(
                             self._robot_server.mission_ctrl_url + "/api/v1/health")
                         if health_response.status_code == 200:
-                            # Send map request
-                            if request_map:
-                                response = requests.post(
-                                    self._robot_server.mission_ctrl_url + "/api/v1/push_map",
-                                    params={"robot_name": self._name})
-                                if response.status_code == 200:
-                                    self._set_robot_state(
-                                        robot_object.RobotStateV1.MAP_DEPLOYMENT)
-                                    logging.debug(
-                                        "Map loading request posted successfully for robot %s",
-                                        self._name)
-                                else:
-                                    logging.warning(
-                                        "Failed to post map loading request for robot %s ",
-                                        self._name)
-                            if send_charging_mission:
-                                response = requests.post(
-                                    self._robot_server.mission_ctrl_url+"/api/v1/mission/charging",
-                                    params={"robot_name": self._name})
-                                if response.status_code == 200:
-                                    logging.debug(
-                                        "Charging mission posted successfully for robot %s",
-                                        self._name)
-                                    self._charging_mission_received = True
-                                else:
-                                    logging.warning(
-                                        "Failed to post charging mission for robot %s ",
-                                        self._name)
+                            response = requests.post(
+                                self._robot_server.mission_ctrl_url+"/api/v1/mission/charging",
+                                params={"robot_name": self._name})
+                            if response.status_code == 200:
+                                logging.debug(
+                                    "Charging mission posted successfully for robot %s",
+                                    self._name)
+                                self._charging_mission_received = True
+                            else:
+                                logging.warning(
+                                    "Failed to post charging mission for robot %s ",
+                                    self._name)
                     except requests.exceptions.ConnectionError as err:
                         # Service doesn't exist, handle accordingly
                         logging.warning(
@@ -1865,6 +1904,7 @@ class Robot:
                             "Timeout error occurred: \n %s", timeout_err)
             if not self._robot_object.status.online:
                 self.info("Robot Online")
+                self._reset_resend_budgets()
             # Any state means the robot is back, whatever the online flag says (a watcher
             # row read before the offline write landed can have set it again).
             if self._timeout_paused is not None:
@@ -2657,13 +2697,12 @@ class Robot:
         action) does not complete or fail the node. A robot reporting other ids (legacy)
         falls back to the first entry that is neither a nodePolicy nor an instant action;
         None when there is none."""
-        expected = f"{message.orderId}-s0-n{node_idx}"
+        expected = order_ids.order_action_id(message.orderId, node_idx)
         match = next((s for s in message.actionStates if s.actionId == expected), None)
         if match is not None:
             return match
-        skip = set(types.VDA5050InstantActionType.values() +
-                   types.NVInstantActionType.values()) | {types.NODE_POLICY_ACTION_TYPE}
-        return next((s for s in message.actionStates if s.actionType not in skip), None)
+        return next((s for s in message.actionStates
+                     if s.actionType not in _NON_NODE_ACTION_TYPES), None)
 
     def _resolve_node_ref(self, node_id: str) -> Optional[Dict[str, Any]]:
         """What a nodeId the robot reported names in the current run: its order, mission
@@ -2728,7 +2767,11 @@ class Robot:
         self.mission_info(f"Keeping graph node {graph_node} on map {waypoint.map_id} out of "
                           f"new routes for {order_policy.current().blocked_node_exclusion_min:g}"
                           f" min ({source})")
-        asyncio.ensure_future(self._write_blocked_node(params))
+        # Already deduped by the caller (acted on only when the block is new or its target
+        # changed); the reference only keeps the task from being garbage collected.
+        task = asyncio.ensure_future(self._write_blocked_node(params))
+        self._blocked_node_tasks.add(task)
+        task.add_done_callback(self._blocked_node_tasks.discard)
 
     async def _write_blocked_node(self, params: Tuple[Any, ...]) -> None:
         try:

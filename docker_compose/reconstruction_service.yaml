@@ -1,0 +1,29 @@
+# 3D reconstruction service (docs/reconstruction/design.md §13, contract handover.md).
+# Its own compose project; the code lives in github.com/satinavrobotics/cloud_reconstruction (image built there).
+# Same host as the API: host networking, bound to 127.0.0.1:8009. The API's RECONSTRUCTION_SERVICE_URL points here and
+# it reads the same RECONSTRUCTION_SERVICE_KEY from .env.
+#
+#   docker compose -p recon -f reconstruction_service.yaml up -d
+#
+# Backend: RECON_BACKEND=auto (default) uses MapAnything when the weights are mounted at /models and falls back to raw
+# (sensor depth only) otherwise. The model child process takes the GPU only while a job runs (0 MiB when idle).
+# RECON_BACKEND=raw forces the no-GPU path. Weights: RECON_MODELS_DIR (README of the service: tools/fetch_model.py).
+services:
+  reconstruction-service:
+    image: ${RECON_IMAGE:-recon-service:1.0.1}
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    mem_limit: 12g
+    memswap_limit: 12g
+    environment:
+      - RECON_SERVICE_KEY=${RECONSTRUCTION_SERVICE_KEY:?set RECONSTRUCTION_SERVICE_KEY in .env}
+      - RECON_HOST=127.0.0.1
+      - RECON_PORT=8009
+      - RECON_BACKEND=${RECON_BACKEND:-auto}
+    volumes:
+      - recon-spool:/var/lib/recon/spool
+      - ${RECON_MODELS_DIR:-/home/satiadmin/satinavrobotics/cloud_reconstruction/models}:/models:ro
+
+volumes:
+  recon-spool:
