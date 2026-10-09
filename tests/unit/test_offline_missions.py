@@ -266,7 +266,7 @@ def test_pass_through_nodes_are_wide_and_the_last_node_is_tight():
         _route_of({"x": 1}, {"x": 2}, {"x": 3}), _robot_obj(), "m1", 1, policy=POLICY)
     xy = [p.allowedDeviationXY for p in _positions(order)]
     theta = [p.allowedDeviationTheta for p in _positions(order)]
-    assert xy == [POLICY.deviation_xy_start_m, 0.35, 0.35, 0.1]
+    assert xy == [POLICY.deviation_xy_start_m, 0.35, 0.35, 0.35]
     assert theta == [POLICY.deviation_theta_pass_rad, POLICY.deviation_theta_pass_rad,
                      POLICY.deviation_theta_pass_rad, POLICY.deviation_theta_final_rad]
 
@@ -290,7 +290,7 @@ def test_a_waypoints_own_tolerance_is_kept_and_zero_means_unset():
 def test_a_one_waypoint_route_and_a_resumed_routes_last_node_are_tight():
     order = types.VDA5050Order.from_route(_route_of({"x": 1}), _robot_obj(), "m1", 1,
                                           policy=POLICY)
-    assert order.nodes[-1].nodePosition.allowedDeviationXY == 0.1
+    assert order.nodes[-1].nodePosition.allowedDeviationXY == 0.35
 
 
 @pytest.mark.unit
@@ -298,10 +298,10 @@ def test_move_and_action_orders_get_the_tight_tolerance_where_position_matters()
     move = types.VDA5050Order.from_move(mission_object.MissionMoveNodeV1(distance=1.0),
                                         _robot_obj(), "m1", 1)
     assert move.nodes[0].nodePosition.allowedDeviationXY == 0.35
-    assert move.nodes[1].nodePosition.allowedDeviationXY == 0.1
+    assert move.nodes[1].nodePosition.allowedDeviationXY == 0.35
     action = types.VDA5050Order.from_action(
         mission_object.MissionActionNodeV1(action_type="dock_robot"), _robot_obj(), "m1", 1)
-    assert action.nodes[0].nodePosition.allowedDeviationXY == 0.1
+    assert action.nodes[0].nodePosition.allowedDeviationXY == 0.35
 
 
 @pytest.mark.unit
@@ -311,7 +311,7 @@ def test_the_order_policy_reads_the_environment(monkeypatch):
     monkeypatch.setenv("MISSION_TIMEOUT_PAUSE_OFFLINE", "false")
     p = order_policy.from_env()
     assert p.deviation_xy_pass_m == 0.4 and p.node_policy_mode == "on"
-    assert p.timeout_pause_offline is False and p.deviation_xy_final_m == 0.1
+    assert p.timeout_pause_offline is False and p.deviation_xy_final_m == 0.35
 
 
 @pytest.mark.unit

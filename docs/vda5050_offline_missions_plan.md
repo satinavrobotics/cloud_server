@@ -77,7 +77,7 @@ File:line references are against the tree on 2026-10-08. "Unverified" marks clai
   - Theta: pass-through gets π (heading free), final gets 0.785. Confirm with the robot team.
 - **Planner** (`mission_planner/server.py:507-514`): drop the hardcoded 0.2 / 0.785 and set `node_id`.
 - **Client** (`missionApi.ts:240-254`): stop sending the deviation fields; update `__tests__/services/missionApi.test.ts`.
-- **Config:** `ROUTE_DEVIATION_XY_PASS_M=0.35`, `ROUTE_DEVIATION_XY_FINAL_M=0.1`, `ROUTE_START_DEVIATION_XY_M=0.35`, `ROUTE_DEVIATION_THETA_PASS_RAD=3.1416`, `ROUTE_DEVIATION_THETA_FINAL_RAD=0.785`, `ROUTE_DEVIATION_ZERO_IS_UNSET=true`.
+- **Config:** `ROUTE_DEVIATION_XY_PASS_M=0.35`, `ROUTE_DEVIATION_XY_FINAL_M=0.35` (was 0.1 until 2026-10-09), `ROUTE_START_DEVIATION_XY_M=0.35`, `ROUTE_DEVIATION_THETA_PASS_RAD=3.1416`, `ROUTE_DEVIATION_THETA_FINAL_RAD=0.785`, `ROUTE_DEVIATION_ZERO_IS_UNSET=true`.
 - **Migration:** none (JSONB). Legacy 0.1/0.2 values on PENDING rows are respected; this is an accepted transitional cost.
 - **Tests:** new `tests/unit/test_vda5050_node_deviation.py`:
   - pass-through 0.35, final 0.1, start per config;

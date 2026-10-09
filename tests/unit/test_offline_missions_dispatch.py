@@ -341,7 +341,7 @@ def test_the_old_default_tolerance_of_stored_routes_reads_as_unset():
                       {"x": 3, "allowedDeviationXY": 0.1})
     policy = order_policy.OrderPolicy()
     order = types.VDA5050Order.from_route(route, _robot_obj(), "m1", 1, policy=policy)
-    assert [n.nodePosition.allowedDeviationXY for n in order.nodes[1:]] == [0.35, 0.35, 0.1]
+    assert [n.nodePosition.allowedDeviationXY for n in order.nodes[1:]] == [0.35, 0.35, 0.35]
     exact = order_policy.OrderPolicy(deviation_xy_legacy_default_m=None)
     order = types.VDA5050Order.from_route(route, _robot_obj(), "m1", 1, policy=exact)
     assert [n.nodePosition.allowedDeviationXY for n in order.nodes[1:]] == [0.1, 0.1, 0.1]

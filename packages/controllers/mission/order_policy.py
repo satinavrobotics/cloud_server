@@ -89,10 +89,12 @@ class NodePolicyMode:
 
 
 class OrderPolicy(pydantic.BaseModel):
-    # allowedDeviationXY (m): a node the robot drives through, the last node of an order
-    # and a node with actions, and the start node (the robot's own pose).
+    # allowedDeviationXY (m): a node the robot drives through, the last node of an order,
+    # and the start node (the robot's own pose). The final value is 0.35 because the robot
+    # counts its final position reached at 0.35-0.45 m and cannot honour tighter yet;
+    # precision at a node with actions should come from the action (e.g. dock).
     deviation_xy_pass_m: float = 0.35
-    deviation_xy_final_m: float = 0.1
+    deviation_xy_final_m: float = 0.35
     deviation_xy_start_m: float = 0.35
     # allowedDeviationTheta (rad): heading is free on a pass-through node.
     deviation_theta_pass_rad: float = 3.1416

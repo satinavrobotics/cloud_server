@@ -354,20 +354,35 @@ class ClientConnectionMessage(ClientMessage):
     retained: bool = False
 
 
+def _is_node_skipped_action(action_state: types.VDA5050ActionState) -> bool:
+    """An action the robot reports FAILED only because its node was skipped."""
+    return (action_state.actionStatus == types.VDA5050ActionStatus.FAILED and
+            (action_state.resultDescription or "").strip().lower().rstrip(".") ==
+            "node skipped")
+
+
 def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str, str]:
     """Mirror a VDA5050 state message's errors[] onto the RobotStatusV1.errors dict.
 
     Keyed by errorType (falling back to a positional key for the rare untyped
-    error) so distinct errors don't collide under a single value. A plain
+    error; a nodeSkipped also by its node, as one state can carry several) so distinct
+    errors don't collide under a single value. A plain
     snapshot, not an accumulating log: the robot re-sends its currently-active
     errors every state message, so the caller should overwrite status.errors
     with this each time rather than merge it — an error absent from a new
     message has genuinely cleared.
     """
-    return {
-        (error.errorType or f"error_{idx}"): error.errorDescription
-        for idx, error in enumerate(errors)
-    }
+    result: Dict[str, str] = {}
+    for idx, error in enumerate(errors):
+        key = error.errorType or f"error_{idx}"
+        if error.errorType == NODE_SKIPPED:
+            # Several nodes can be skipped in one state: one entry per node, not one
+            # that the last overwrites.
+            node_refs = [r.referenceValue for r in error.errorReferences
+                         if r.referenceKey in ("nodeId", "node_id")]
+            key = f"{key}:{node_refs[0]}" if node_refs else f"{key}:{idx}"
+        result[key] = error.errorDescription
+    return result
 
 
 # VDA5050 readiness errorType -> fixed hold reason (never the description: it carries a
@@ -617,6 +632,9 @@ class Robot:
         # Node reports of the current run already taken, by (kind, nodeId, infoType): the
         # robot repeats them in every state. A note's entry is the note (for last_seen).
         self._node_reports_seen: Dict[Tuple[str, str, str], Any] = {}
+        # Orders of the current run the robot reported failed or cancelled: never
+        # republished under the same orderId (a new revision follows instead).
+        self._dead_order_ids: Set[str] = set()
         # Monotonic times of the current run's recent order revisions (churn breaker).
         self._order_revisions: Deque[float] = deque()
         self._current_behavior_tree: Optional[behavior_tree.MissionBehaviorTree] = None
@@ -730,6 +748,7 @@ class Robot:
             self._deferred_replace_cancel = False
             self._blocked_order_id = None
             self._node_reports_seen.clear()
+            self._dead_order_ids.clear()
 
         # Cant start a new mission if there is no mission
         if self._current_mission is None:
@@ -1454,6 +1473,12 @@ class Robot:
                     self._pending_send = self._pending_send or SEND_NODE
                 return
             order_id = order_ids.order_id(self._order_prefix(), idx)
+            if self._sent_order is not None and self._sent_order.orderId == order_id \
+                    and order_id in self._dead_order_ids:
+                # The robot reported this order failed or cancelled: it would only
+                # reject the same id again, so the node goes out as a new revision.
+                self._pending_send = NEW_REVISION
+                return
             if self._sent_order is not None and self._sent_order.orderId == order_id:
                 # Not adopted yet: the same order again, unchanged (its start node is not
                 # re-taken from where the robot stands now).
@@ -2697,7 +2722,8 @@ class Robot:
             # The robot takes a moment to adopt an order: send it again only with
             # back-off, not on every state message, and only a few times (the same
             # order again and again is noise to a robot that has rejected it).
-            if self._resend_due() and self._order_resends < self.ORDER_MAX_RESENDS:
+            if self._resend_due() and self._order_resends < self.ORDER_MAX_RESENDS and \
+                    not self._robot_near_end_of_order(message):
                 await self._send_order()
             return
         self._order_mismatch_count = 0
@@ -2881,6 +2907,30 @@ class Robot:
             return seq == 2
         return seq == (len(node.route.waypoints) - self._waypoint_offset(message.orderId)) * 2
 
+    def _robot_near_end_of_order(self, message: types.VDA5050State) -> bool:
+        """Whether the robot reports being at the last or second-to-last node of our
+        current route/move order, or having finished it: republishing the order then
+        would only restart it for a robot that is nearly done. (An action order has no
+        such nodes.)"""
+        node = self._current_leaf_node()
+        if node is None or node.type not in (mission_object.MissionNodeType.ROUTE,
+                                             mission_object.MissionNodeType.MOVE):
+            return False
+        if message.orderId == self._current_order_id() and \
+                self._order_finished_on_robot(message):
+            return True
+        if not order_ids.is_node_of(self._order_prefix(), message.lastNodeId):
+            return False
+        seq = order_ids.node_sequence(message.lastNodeId)
+        if seq is None:
+            seq = message.lastNodeSequenceId
+        if node.type is mission_object.MissionNodeType.MOVE:
+            last = 2
+        else:
+            last = (len(node.route.waypoints) -
+                    self._waypoint_offset(self._current_order_id())) * 2
+        return seq >= last - 2 and seq > 0
+
     def _reached_waypoints(self) -> int:
         """How many waypoints of the current route node the robot has reached (they are
         recorded against the current route only; see update_mission_node_state)."""
@@ -3003,6 +3053,7 @@ class Robot:
         self._deferred_replace_cancel = False
         self._blocked_order_id = None
         self._node_reports_seen.clear()
+        self._dead_order_ids.clear()
         self.last_node_seq_id = -1
         self.mission_info(f"Starting pass {status.passes_completed + 1}"
                           f"{'' if mission.repeat == 0 else f' of {mission.repeat}'}"
@@ -3359,7 +3410,12 @@ class Robot:
             elif action_state.actionStatus == types.VDA5050ActionStatus.FINISHED:
                 node_state = mission_object.MissionStateV1.COMPLETED
             elif action_state.actionStatus == types.VDA5050ActionStatus.FAILED:
-                node_state = mission_object.MissionStateV1.FAILED
+                # A skipped node's pending actions are reported FAILED "node skipped":
+                # the node was skipped (see _process_node_reports), it did not fail.
+                if _is_node_skipped_action(action_state):
+                    node_state = mission_object.MissionStateV1.COMPLETED
+                else:
+                    node_state = mission_object.MissionStateV1.FAILED
             # Check if this is a teleop action node
             elif action_state.actionType == types.NVActionType.PAUSE_ORDER and \
                 self._robot_object is not None and \
@@ -3501,10 +3557,11 @@ class Robot:
                 if key in seen:
                     continue
                 ref = self._resolve_node_ref(ref_value)
+                if ref is None:
+                    continue  # not resolvable yet: taken once it is, not remembered now
                 seen[key] = None
-                if ref is None or any(s.node_id == ref["node_id"] and
-                                      s.order_id == ref["order_id"]
-                                      for s in status.skipped_nodes):
+                if any(s.node_id == ref["node_id"] and s.order_id == ref["order_id"]
+                       for s in status.skipped_nodes):
                     continue
                 if error.errorLevel == types.VDA5050ErrorLevel.FATAL:
                     self.warning(f"[{mission.name}] nodeSkipped reported as FATAL; read as "
@@ -3532,9 +3589,9 @@ class Robot:
                     seen[key].last_seen = now
                 continue
             ref = self._resolve_node_ref(node_ref)
-            seen[key] = None
             if ref is None:
                 continue
+            seen[key] = None
             # Kept before this process started (the status is stored).
             existing = next((n for n in status.node_notes
                              if n.node_id == ref["node_id"] and n.order_id == ref["order_id"]
@@ -3939,6 +3996,8 @@ class Robot:
         if mission_status == "failed":
             # Populate failure_reason from the errors array before transitioning.
             self.get_mission_errors(message)
+            if message.orderId:
+                self._dead_order_ids.add(message.orderId)
             self._set_failure_category(mission_object.MissionFailureCategoryV1.ROBOT_APP)
             self._set_mission_state(mission_object.MissionStateV1.FAILED)
             return
@@ -3969,6 +4028,7 @@ class Robot:
                     message.orderId == self._current_order_id():
                 # The robot dropped the current order without a cancel of ours (one in
                 # flight decides by its own completion): send the node as a new revision.
+                self._dead_order_ids.add(message.orderId)
                 self._pending_send = NEW_REVISION
             return
 
