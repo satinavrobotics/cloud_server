@@ -169,5 +169,5 @@ def test_vda5050_types_ids_unchanged():
     assert [n.nodeId for n in order.nodes] == [
         "m1-n3-s0", "m1-n3-s2", "m1-n3-s4", "m1-n3-s6"]
     assert [(e.edgeId, e.startNodeId, e.endNodeId) for e in order.edges] == [
-        ("m1-e1", "m1-n3-s0", "m1-n3-s2"), ("m1-e3", "m1-n3-s2", "m1-n3-s4"),
-        ("m1-e5", "m1-n3-s4", "m1-n3-s6")]
+        ("m1-n3-e1", "m1-n3-s0", "m1-n3-s2"), ("m1-n3-e3", "m1-n3-s2", "m1-n3-s4"),
+        ("m1-n3-e5", "m1-n3-s4", "m1-n3-s6")]

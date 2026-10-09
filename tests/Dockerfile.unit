@@ -1,0 +1,14 @@
+# Unit-test image on the production pins (Python 3.10, pydantic 1.9.0, psycopg 3.0.15, paho 1.6.1).
+# Build context: the repo root (see scripts/run_unit_tests_pinned.sh).
+FROM python:3.10-slim
+WORKDIR /repo
+COPY packages/controllers/mission/requirements.txt /tmp/mission-requirements.txt
+COPY packages/api/requirements.txt /tmp/api-requirements.txt
+# The mission and API pins agree on pydantic/psycopg; fastapi/uvicorn differ, so the API's
+# (the larger service) are installed after and win. httpx<0.28: starlette 0.35 TestClient (fastapi
+# 0.109) passes `app=` to it, which httpx 0.28 removed. The rest are what the unit tests import.
+RUN pip install --no-cache-dir -r /tmp/mission-requirements.txt \
+    && pip install --no-cache-dir -r /tmp/api-requirements.txt \
+    && pip install --no-cache-dir "pytest<9" "pytest-asyncio<0.24" pytest-mock pytest-timeout \
+       pytest-cov python-dotenv responses "httpx<0.28" "livekit-api==1.2.1" rtree
+ENV ARANGO_PASSWORD=x MINIO_ACCESS_KEY=x MINIO_SECRET_KEY=x POSTGRES_PASSWORD=x PYTHONPATH=/repo

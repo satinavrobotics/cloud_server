@@ -29,6 +29,8 @@ from typing import Optional
 _ORDER_SUFFIX = re.compile(r"-n(\d+)$")
 _NODE_SUFFIX = re.compile(r"-n(\d+)(?:-s(\d+))?$")
 _POLICY_SUFFIX = "-policy"
+# An order id, a node id, or an actionId of a node or of an order ("{node}-n{idx}").
+_REFERENCE = re.compile(r"^(.*?-n\d+)(?:-s\d+(?:-n\d+)?)?$")
 
 
 def run_prefix(name: str, run_id: Optional[str], order_rev: int = 0) -> str:
@@ -127,3 +129,17 @@ def is_node_of(prefix: str, node_id: str) -> bool:
     """
     match = _NODE_SUFFIX.search(node_id)
     return match is not None and node_id[:match.start()] == prefix
+
+
+def order_of_reference(reference: str) -> Optional[str]:
+    """The id of the order a reference in a robot error names -- an order id, a node id,
+    an actionId of ours or a nodePolicy actionId -- else None (not an id we generated)."""
+    match = _REFERENCE.match(node_of_reference(reference))
+    return match.group(1) if match else None
+
+
+def is_reference_of(prefix: str, reference: str) -> Optional[bool]:
+    """Whether ``reference`` (see order_of_reference) belongs to an order of exactly this
+    prefix: True/False for an id we generated, None for anything else."""
+    order = order_of_reference(reference)
+    return None if order is None else order_prefix(order) == prefix

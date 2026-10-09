@@ -318,7 +318,7 @@ The client simulator will simulate a set of robots that will do the following:
 - Report the updated mission status and robot position back to the server through VDA5050 feedback messages.
 - Optionally fail every $N^\text{th}$ mission where $N$ is configurable.
 
-**To run with bazel (self-build container):**
+**To run from the repo (the simulator the `tests/e2e/mission_dispatcher` suite drives in-process):**
 ```
 # Runs a simulation with two robots
 # First robot:
@@ -338,7 +338,7 @@ The client simulator will simulate a set of robots that will do the following:
 #   (A failure period of 3 means that the 3rd, 6th, 9th... missions will fail,
 #    and 1st, 2nd, 4th, 5th... will pass)
 
-bazel run packages/controllers/mission/tests:client -- --robots \
+python -m packages.controllers.mission.tests.client --robots \
     carter01,4,5 \
     carter02,9,9,3.14,3
 ```

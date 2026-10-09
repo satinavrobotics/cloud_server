@@ -37,7 +37,11 @@ docker compose -f docker_compose/mission_dispatch_services.yaml \
 ## Running Tests
 
 ```bash
-# Unit tests only (no Docker required)
+# Unit tests on the PRODUCTION PINS (Python 3.10, pydantic 1.9.0, psycopg 3.0.15, paho 1.6.1),
+# in a throw-away container (needs Docker, no network); args go to pytest. Use this to verify.
+./scripts/run_unit_tests_pinned.sh [pytest args...]
+
+# Unit tests on the host Python (no Docker; pydantic 2.x, so NOT proof of v1 compatibility)
 ./scripts/run_unit_tests.sh
 # Equivalent: pytest tests/unit -v -m unit --cov=packages --cov-report=term-missing
 
@@ -64,7 +68,7 @@ All services use `network_mode: host` and communicate over localhost. Port assig
 | Service | Port | Purpose |
 |---|---|---|
 | api-delegation-service | 8000 | Unified REST+WebSocket gateway (main entry point) |
-| mission-dispatch | — (no HTTP) | VDA5050 mission controller (MQTT↔PostgreSQL); a worker, not a web service |
+| mission-dispatch | — (no HTTP) | VDA5050 mission controller (MQTT↔PostgreSQL); a worker, not a web service; liveness = a heartbeat-file docker healthcheck, not acted on by plain compose |
 | graph-builder-service | 8004 | Subscribes to `robot/node_update` MQTT, builds the topomap |
 | mission-planner-service | 8005 | Path planning on the topological graph |
 | livekit-service | 8006 | Teleoperation video token service for **LiveKit Cloud** (caller-chosen grants; the pre-existing one) |
@@ -104,7 +108,7 @@ Self-hosted LiveKit is part of the main compose file (`docker_compose/mission_di
 
 ### Pydantic Version
 
-All services pin **Pydantic v1** (`==1.9.0`). Use v1 idioms (`@validator`, `class Config`, etc.) throughout. Do not introduce v2 syntax. Caveat: `tests/requirements-test.txt` currently installs Pydantic 2.x, so a green local unit run does not prove v1 compatibility (`AUDIT_BACKLOG.md` C1).
+All services pin **Pydantic v1** (`==1.9.0`). Use v1 idioms (`@validator`, `class Config`, etc.) throughout. Do not introduce v2 syntax. Caveat: the host-Python test env (`tests/requirements-test.txt`, Python 3.12) installs Pydantic 2.x (1.9.0 does not install there), so a green host run does not prove v1 compatibility; use `scripts/run_unit_tests_pinned.sh` (`tests/Dockerfile.unit`, Python 3.10 + the service pins) (`AUDIT_BACKLOG.md` C1).
 
 ## Individual Service Entry Points
 

@@ -84,3 +84,4 @@ if __name__ == "__main__":
     del args.log_level
     server = mission_server.RobotServer(**vars(args))
     server.run()
+    sys.exit(server.exit_code)

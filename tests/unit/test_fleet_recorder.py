@@ -159,12 +159,14 @@ async def test_finish_writes_whole_run_when_start_was_lost(tmp_path):
     rec, db, clock = make_recorder(tmp_path)
     mission, robot = _mission(), _robot()
     db.missions["m1"] = ("ALIVE", "r1", {"state": "FAILED"})
-    db.unavailable = True
+    refuse = [True]
+    db.fail = lambda sql, params: (RefusedError("refused")
+                                   if refuse[0] and sql == fr.INSERT_RUN_SQL else None)
     rec.run_started("r1", mission, robot)
-    await rec.run_pending_ops()                   # gives up after every retry
+    await rec.run_pending_ops()                   # refused (not transient): given up
     assert rec.op_failures == 1 and db.runs == {}
 
-    db.unavailable = False
+    refuse[0] = False
     clock.advance(10)
     mission.status.state = State.FAILED
     rec.run_finished("r1", mission, robot)
@@ -180,12 +182,14 @@ async def test_late_finish_does_not_recreate_a_deleted_missions_run(tmp_path):
     start was never written was still queued: the finish must not bring the run back."""
     rec, db, clock = make_recorder(tmp_path)
     mission, robot = _mission(), _robot()
-    db.unavailable = True
+    refuse = [True]
+    db.fail = lambda sql, params: (RefusedError("refused")
+                                   if refuse[0] and sql == fr.INSERT_RUN_SQL else None)
     rec.run_started("r1", mission, robot)
     await rec.run_pending_ops()
     assert db.runs == {}
 
-    db.unavailable = False
+    refuse[0] = False
     clock.advance(10)
     mission.status.state = State.COMPLETED
     rec.run_finished("r1", mission, robot)       # no missionobjectv1 row: deleted

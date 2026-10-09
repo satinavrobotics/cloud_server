@@ -109,8 +109,10 @@ async def test_header_ids_count_per_topic():
     await r._on_mission_change(_rerouted())                  # a cancelOrder
     await r._on_client_message(_state(_order_id(r), actions=[_cancel_done(r)]))
 
-    assert [o["headerId"] for o in _orders(r)] == [0, 1]
-    assert [a["headerId"] for a in _cancels(r)] == [0]
+    # Counted from the process's start value (see server.initial_header_id), by one.
+    start = r._header_start
+    assert [o["headerId"] for o in _orders(r)] == [start, start + 1]
+    assert [a["headerId"] for a in _cancels(r)] == [start]
     r._cancel_mission_timeout()
 
 

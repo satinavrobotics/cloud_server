@@ -16,6 +16,7 @@ continuity unknown, geo map, another map, unplaced end, replace from another map
 `placement_reusable` hint of GET /maps/{id}, the dispatcher's epoch writes (first sight, proof,
 no proof, run change, header persistence, start-up reset), and the migration text.
 """
+import asyncio
 import contextlib
 import datetime
 import importlib.util
@@ -88,6 +89,7 @@ class TestStaleOnTask:
         # and the next state message writes IDLE, not ON_TASK
         r._database.update_status.reset_mock()
         await r._on_client_message(_state_msg())
+        await r.flush_status_writes()   # the robot row is a queued write (W7/W9)
         written = r._database.update_status.call_args_list[-1].args[2]
         assert written.state == robot_object.RobotStateV1.IDLE
         # the only state change recorded is the real one
@@ -99,14 +101,44 @@ class TestStaleOnTask:
         row = r._robot_object.copy(deep=True)
         row.status.state = robot_object.RobotStateV1.ON_TASK
         row.switch_teleop = False
-        row.status.battery_level = 55.0
+        row.labels = ["new-label"]
         await r._on_robot_change(row)
         assert r._robot_object is row and row.status.state == robot_object.RobotStateV1.IDLE
-        assert r._robot_object.status.battery_level == 55.0
+        assert r._robot_object.labels == ["new-label"]
+
+    async def test_a_stale_echo_keeps_the_dispatcher_owned_status(self):
+        """R15: the robot row write is throttled, so an echo can predate online, errors,
+        pose and battery changes; none of them is adopted (no spurious 'Robot Online')."""
+        r = _dispatch_robot(state="IDLE")
+        stale = r._robot_object.copy(deep=True)      # read while the robot was online
+        r._robot_object.status.online = False        # went offline since
+        r._robot_object.status.errors = {"e": "x"}
+        r._robot_object.status.battery_level = 12.0
+        r._robot_object.status.pose.x = 3.0
+        r._robot_object.status.info_messages = {"k": 1}
+        stale.status.online = True
+        stale.status.errors = {}
+        stale.status.battery_level = 90.0
+        stale.status.pose.x = 0.0
+        stale.status.info_messages = None
+        await r._on_robot_change(stale)
+        status = r._robot_object.status
+        assert status.online is False and status.errors == {"e": "x"}
+        assert status.battery_level == 12.0 and status.pose.x == 3.0
+        assert status.info_messages == {"k": 1}
+        assert status.state == robot_object.RobotStateV1.IDLE
+
+    async def test_a_factsheet_written_through_the_api_is_adopted(self):
+        r = _dispatch_robot(state="IDLE")
+        row = r._robot_object.copy(deep=True)
+        row.status.factsheet.agv_class = "FORKLIFT"
+        await r._on_robot_change(row)
+        assert r._robot_object.status.factsheet.agv_class == "FORKLIFT"
 
     async def test_own_writes_carry_the_robot_watchers_publisher_id(self):
         r = _dispatch_robot()
         await r._on_client_message(_state_msg())
+        await r.flush_status_writes()   # the robot row is a queued write (W7/W9)
         ids = {c.args[3] for c in r._database.update_status.call_args_list
                if c.args[0] is api_objects.RobotObjectV1}
         assert ids == {r._robot_server.robot_writer_id}
@@ -141,11 +173,17 @@ class TestStaleOnTask:
         srv.stop = AsyncMock()
         srv._event_loop = MagicMock()
         srv._logger = MagicMock()
-        # The watcher fails at once, so _watch_changes stops after one get_watcher call;
-        # PostgresWatcher skips notifications whose publisher is this id.
-        with patch.object(asyncio, "run_coroutine_threadsafe"):
-            await srv._watch_changes(api_objects.RobotObjectV1, asyncio.Queue(),
-                                     srv.robot_writer_id)
+        # The watcher fails at once and _watch_changes retries after a short backoff; one
+        # get_watcher call is enough to see the id. PostgresWatcher skips notifications
+        # whose publisher is this id.
+        with patch.object(asyncio, "run_coroutine_threadsafe"), \
+                patch.object(dispatch_server, "WATCH_CHANGES_RETRY_MIN_S", 0.01):
+            task = asyncio.ensure_future(srv._watch_changes(
+                api_objects.RobotObjectV1, asyncio.Queue(), srv.robot_writer_id))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
         assert seen[api_objects.RobotObjectV1] == srv.robot_writer_id
 
     async def test_on_task_without_a_mission_is_reconciled_after_the_grace(self):
@@ -470,6 +508,7 @@ class TestDispatcherEpoch:
         await r._on_state_message(_state_msg(13))
         assert len(_epoch_writes(db, "SELECT epoch")) == 1
         await r._on_state_message(_state_msg(0))
+        await r._on_state_message(_state_msg(1))   # a drop is a restart once confirmed (run_change)
         new = _epoch_writes(db, NEW)
         assert len(new) == 2 and new[1][2] == "run_changed" and new[1][4] == 0
 
@@ -494,6 +533,7 @@ class TestDispatcherEpoch:
         assert _epoch_writes(db, HEADER) == []
         r._run_header_saved_at -= ms.RUN_HEADER_PERSIST_S + 1
         await r._on_state_message(_state_msg(3))
+        await asyncio.gather(*list(r._status_write_tasks))   # stored off the state loop
         assert _epoch_writes(db, HEADER) == [(3, "r1", r._run_epoch)]
 
     async def test_a_database_error_is_retried(self):

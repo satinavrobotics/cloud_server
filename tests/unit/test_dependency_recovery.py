@@ -164,6 +164,7 @@ async def test_object_watcher_reconnects_and_resyncs_after_connection_loss(monke
 
     monkeypatch.setattr(postgres.psycopg.AsyncConnection, "connect", connect)
     monkeypatch.setattr(postgres, "WATCHER_POSTGRES_RECONNECT_PERIOD", 0.01)
+    monkeypatch.setattr(postgres, "WATCHER_ERROR_BACKOFF_MIN_S", 0.01)
     w = postgres.PostgresWatcher("x", objects.RobotObjectV1, uuid.uuid4())
     gen = w.watch()
     task = asyncio.ensure_future(gen.__anext__())  # no objects: just drives the loop

@@ -152,3 +152,45 @@ async def test_teleop_released_after_a_mission_ended_returns_to_idle():
     r.update_robot_state([_action(types.NVInstantActionType.STOP_TELEOP)])
     assert r._robot_object.status.state == robot_object.RobotStateV1.IDLE
     assert r._current_mission is None
+
+
+# --- W11: edgeBlocked and teleop ---------------------------------------------------
+
+def _blocked_state(blocked):
+    errors = []
+    if blocked:
+        errors = [types.VDA5050Error(
+            errorType="edgeBlocked", errorLevel=types.VDA5050ErrorLevel.WARNING,
+            errorDescription="blocked",
+            errorReferences=[types.VDA5050ErrorReference(
+                referenceKey="nodeId", referenceValue="m1-n0-s4")])]
+    return types.VDA5050State(
+        headerId=1, timestamp="2026-01-01T00:00:00Z", version="2.0.0",
+        manufacturer="m", serialNumber="s", orderId="", orderUpdateId=0,
+        lastNodeId="", lastNodeSequenceId=0, nodeStates=[], edgeStates=[],
+        driving=False, operatingMode="AUTOMATIC",
+        batteryState={"batteryCharge": 50, "charging": False},
+        safetyState={"eStop": "NONE", "fieldViolation": False}, errors=errors)
+
+
+async def test_edge_blocked_and_clear_keep_teleop():
+    r, _ = _make_robot(TELEOP)
+    r._database.update_status = AsyncMock()
+    _with_mission(r)
+    r._handle_edge_blocked(_blocked_state(True))
+    assert r._current_mission.status.blocked is True
+    assert r._robot_object.status.state == TELEOP
+    r._handle_edge_blocked(_blocked_state(False))
+    assert r._current_mission.status.blocked is False
+    assert r._robot_object.status.state == TELEOP
+    r._cancel_mission_timeout()
+
+
+async def test_unacknowledged_start_teleop_is_not_minted_again():
+    r, sent = _make_robot()
+    for _ in range(3):
+        row = r._robot_object.copy(deep=True)
+        row.switch_teleop = True
+        await r._on_robot_change(row)
+    assert sent.count(types.NVInstantActionType.START_TELEOP.value) == 1
+    assert len(r._current_instant_actions) == 1

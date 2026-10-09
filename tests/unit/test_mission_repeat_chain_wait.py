@@ -478,7 +478,8 @@ def _api():
 
 def _db_for(existing):
     return SimpleNamespace(get_object=AsyncMock(return_value=existing),
-                           update_spec=AsyncMock(), update_status=AsyncMock())
+                           update_spec=AsyncMock(), update_spec_fields=AsyncMock(),
+                           update_status=AsyncMock())
 
 
 @pytest.mark.unit
@@ -492,9 +493,11 @@ async def test_api_edits_a_pending_mission_and_syncs_node_status():
         await api_main.update_mission("m1", {"mission_tree": new_tree, "repeat": 3,
                                              "then_run": "dock", "timeout": 500})
 
-    spec = db.update_spec.await_args.args[2]
-    assert spec.repeat == 3 and spec.then_run == "dock"
-    assert [n.name for n in spec.mission_tree] == ["root_sequence", "a", "pause", "b"]
+    db.update_spec.assert_not_awaited()         # a field patch, not the whole spec
+    fields = db.update_spec_fields.await_args.args[2]
+    assert set(fields) == {"mission_tree", "repeat", "then_run", "timeout"}
+    assert fields["repeat"] == 3 and fields["then_run"] == "dock"
+    assert [n["name"] for n in fields["mission_tree"]] == ["root_sequence", "a", "pause", "b"]
     status = db.update_status.await_args.args[2]
     assert set(status.node_status) == {"root", "root_sequence", "a", "pause", "b"}
 
@@ -512,7 +515,7 @@ async def test_api_refuses_to_edit_a_mission_that_has_started(state):
             await api_main.update_mission("m1", {"repeat": 2})
 
     assert err.value.status_code == 409
-    db.update_spec.assert_not_awaited()
+    db.update_spec_fields.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -528,7 +531,7 @@ async def test_api_rejects_an_invalid_edit_with_400():
             with pytest.raises(HTTPException) as err:
                 await api_main.update_mission("m1", bad)
             assert err.value.status_code == 400
-    db.update_spec.assert_not_awaited()
+    db.update_spec_fields.assert_not_awaited()
 
 
 @pytest.mark.unit
@@ -542,11 +545,11 @@ async def test_api_reroute_of_a_running_mission_is_not_treated_as_an_edit():
         await api_main.update_mission("m1", {"update_nodes": {"a": {"waypoints": [
             {"x": 1.0, "y": 1.0, "theta": 0.0}]}}})
 
-    db.update_spec.assert_awaited_once()
-    spec = db.update_spec.await_args.args[2]
-    assert spec.update_nodes is None            # the request itself is never stored
-    assert spec.route_rev == 1
-    assert [(w.x, w.y) for w in spec.mission_tree[1].route.waypoints] == [(1.0, 1.0)]
+    db.update_spec_fields.assert_awaited_once()
+    fields = db.update_spec_fields.await_args.args[2]
+    assert set(fields) == {"mission_tree", "planned_path", "route_rev"}  # nothing else
+    assert fields["route_rev"] == 1
+    assert [(w["x"], w["y"]) for w in fields["mission_tree"][1]["route"]["waypoints"]] == [(1.0, 1.0)]
 
 
 # ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@ def _robot():
         if len(warnings) >= MAX_WARNINGS:                # a hot loop: stop it, bounded
             robot._alive = False
     robot.warning = warning
+    robot.error = lambda message, exc_info=False: warning(message)
     return robot, warnings
 
 

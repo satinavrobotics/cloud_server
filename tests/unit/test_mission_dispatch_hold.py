@@ -52,6 +52,12 @@ def _build_state(errors=None):
         errors=errors or [], batteryState=None, agvPosition=None, velocity=None)
 
 
+async def _count_writes(r, db):
+    """Mission status writes so far, once the robot's queued ones have landed."""
+    await r.flush_status_writes()
+    return len(_mission_status_writes(db))
+
+
 def _mission_status_writes(db):
     return [c for c in db.update_status.call_args_list
             if c.args and c.args[0] is api_objects.MissionObjectV1]
@@ -108,7 +114,7 @@ async def test_try_start_mission_holds_when_offline():
     assert mission.status.held_reason == "Robot is offline"
     r._mqtt_client.publish.assert_not_called()
     assert r._mission_timeout_task is None
-    assert len(_mission_status_writes(db)) == 1
+    assert await _count_writes(r, db) == 1
 
 
 @pytest.mark.unit
@@ -118,19 +124,19 @@ async def test_held_hold_reason_change_writes_again_but_repeat_does_not():
     r._missions[mission.name] = mission
 
     await r._try_start_mission()
-    writes_after_first = len(_mission_status_writes(db))
+    writes_after_first = await _count_writes(r, db)
     assert writes_after_first == 1
 
     # Still offline, same reason: no redundant write.
     await r._try_start_mission()
-    assert len(_mission_status_writes(db)) == writes_after_first
+    assert await _count_writes(r, db) == writes_after_first
 
     # Reason changes (now online but nav-not-ready): one more write.
     r._robot_object.status.online = True
     r._robot_object.status.errors = {"poseHealthNotReadyError": "x"}
     await r._try_start_mission()
     assert mission.status.held_reason == "Robot navigation is not ready"
-    assert len(_mission_status_writes(db)) == writes_after_first + 1
+    assert await _count_writes(r, db) == writes_after_first + 1
 
 
 @pytest.mark.unit
@@ -253,7 +259,7 @@ async def test_held_reason_stable_while_description_varies_and_releases():
         "robotBaseNotReadyError": "Robot base not responding (no /esp32/odom for 4 s)"}
     await r._try_start_mission()
     assert mission.status.held_reason == BASE_REASON
-    writes = len(_mission_status_writes(db))
+    writes = await _count_writes(r, db)
     assert writes == 1
 
     for secs in (5, 6, 7):
@@ -262,17 +268,17 @@ async def test_held_reason_stable_while_description_varies_and_releases():
                 f"Robot base not responding (no /esp32/odom for {secs} s)"}
         await r._try_start_mission()
     assert mission.status.held_reason == BASE_REASON
-    assert len(_mission_status_writes(db)) == writes
+    assert await _count_writes(r, db) == writes
 
     # type changes: reason updates with one more write each time
     r._robot_object.status.errors = {"tfChainNotReadyError": "x"}
     await r._try_start_mission()
     assert mission.status.held_reason == NAV_REASON
-    assert len(_mission_status_writes(db)) == writes + 1
+    assert await _count_writes(r, db) == writes + 1
     r._robot_object.status.errors = {"robotBaseNotReadyError": "x"}
     await r._try_start_mission()
     assert mission.status.held_reason == BASE_REASON
-    assert len(_mission_status_writes(db)) == writes + 2
+    assert await _count_writes(r, db) == writes + 2
 
     # error disappears -> released and dispatched
     r._robot_object.status.errors = {}

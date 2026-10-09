@@ -351,10 +351,10 @@ class TestDispatcherSnapshot:
                          lambda p: (patches.append(json.loads(p[0])) or [], 1))])
         r = rc._robot(db)
         r._robot_object.status.pose.x = 4.0
-        for hid in (10, 11, 0):    # 0: the client restarted; its first pose is elsewhere
+        for hid in (10, 11, 0, 1):    # 0: the client restarted (1 confirms it); its first pose is elsewhere
             await r._on_state_message(types.VDA5050State(
                 headerId=hid, timestamp="", nodeStates=[], edgeStates=[], errors=[],
-                agvPosition={"x": 0.0 if hid == 0 else 4.0, "y": 0.0, "theta": 0.0,
+                agvPosition={"x": 0.0 if hid < 10 else 4.0, "y": 0.0, "theta": 0.0,
                              "positionInitialized": True, "mapId": "m"}))
         assert len(patches) == 1 and patches[0]["last_robot_pose"]["x"] == 4.0
 

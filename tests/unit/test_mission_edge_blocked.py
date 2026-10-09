@@ -64,6 +64,12 @@ def _make_robot():
     return r, db
 
 
+async def _count_writes(r, db):
+    """Mission status writes so far, once the robot's queued ones have landed."""
+    await r.flush_status_writes()
+    return len(_mission_status_writes(db))
+
+
 def _mission_status_writes(db):
     return [c for c in db.update_status.call_args_list
             if c.args and c.args[0] is api_objects.MissionObjectV1]
@@ -157,12 +163,12 @@ async def test_edge_blocked_is_idempotent_across_repeated_warnings():
     state = _build_state([_edge_blocked_error()])
 
     r._handle_edge_blocked(state)
-    writes_after_first = len(_mission_status_writes(db))
+    writes_after_first = await _count_writes(r, db)
     assert writes_after_first == 1
 
     # The idle robot re-emits the identical WARNING every tick; no new DB write.
     r._handle_edge_blocked(state)
-    assert len(_mission_status_writes(db)) == writes_after_first
+    assert await _count_writes(r, db) == writes_after_first
 
 
 @pytest.mark.unit

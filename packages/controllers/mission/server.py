@@ -28,18 +28,23 @@ import logging
 import math
 import re
 import requests
+import signal
 import time
+import time as _wall_time
 import uuid
-import sys
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union, cast
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
 from collections import OrderedDict, deque
 
+import fastapi
+import psycopg
+import psycopg_pool
 import pydantic
 
 from packages.utils.mqtt_client import MQTTClient
 from packages.controllers.mission import battery
 from packages.controllers.mission import behavior_tree
 from packages.controllers.mission import fleet_recorder
+from packages.controllers.mission import lifecycle
 from packages.controllers.mission import order_ids
 from packages.controllers.mission import order_policy
 from packages.controllers.mission import planner_client
@@ -67,30 +72,109 @@ except ModuleNotFoundError:
 module = importlib.import_module(module_name)
 TelemetrySender = getattr(module, "TelemetrySender")
 
-# How long to wait in seconds before trying to reconnect to the mqtt broker
-MQTT_RECONNECT_PERIOD = 0.5
+# Outgoing headerIds start at HEADER_ID_RATE per second since HEADER_ID_EPOCH (not at 0), so a
+# restarted dispatcher continues above the earlier process's (VDA5050: headerId counts up
+# per topic; a robot may drop a lower one). uint32 holds ~34 years of this from the epoch;
+# the dispatcher sends far less than HEADER_ID_RATE messages per second on one topic.
+HEADER_ID_EPOCH = 1767225600      # 2026-01-01T00:00:00Z
+HEADER_ID_RATE = 4
+HEADER_ID_MAX = 2 ** 32 - 1
+
+
+def initial_header_id(now: Optional[float] = None) -> int:
+    """Where a new process's headerIds start (see HEADER_ID_RATE)."""
+    seconds = (_wall_time.time() if now is None else now) - HEADER_ID_EPOCH
+    return min(max(int(seconds * HEADER_ID_RATE), 0), HEADER_ID_MAX)
+
+
+# Webhook calls (notify nodes, the charging hook) run in a worker thread so a slow endpoint
+# never stalls the event loop shared by all robots. A notify node's spec timeout is capped;
+# its retries wait these seconds before the 2nd, 3rd and 4th attempt.
+NOTIFY_MAX_TIMEOUT_S = 30.0
+NOTIFY_RETRY_BACKOFF_S = (1.0, 2.0, 4.0)
+NOTIFY_RETRY_STATUSES = (408, 425, 429, 500, 502, 503, 504)
+# The charging hook (--mission_ctrl_url): per-request timeout, and the least time between
+# two attempts for one robot (state messages arrive far more often than that).
+CHARGING_HOOK_TIMEOUT_S = 5.0
+# A handler that fails the same way on every state message would log at state rate: the
+# robot loop logs the first occurrence of each distinct exception (type + message) with its
+# traceback, then at most one count summary per this many seconds. At most
+# LOOP_ERROR_MAX_KINDS distinct kinds are tracked (the least recently logged is forgotten).
+LOOP_ERROR_SUMMARY_INTERVAL_S = 60.0
+LOOP_ERROR_MAX_KINDS = 32
+CHARGING_HOOK_RETRY_S = 60.0
 
 # Phase 0 tables dispatch will write (v2 §5.3). They come from the API's Alembic migration
 # (20260924_01_phase0_core), so on startup dispatch waits until they exist.
 DISPATCH_REQUIRED_TABLES = ("mission_runs", "fleet_events", "robot_state_ts", "robot_latest")
 
-# How long to wait in seconds before trying to reconnect to the mission database
-DATABASE_RECONNECT_PERIOD = 0.5
-
 # How long the recording-only settings watcher waits before re-watching after a failure
 SETTINGS_WATCH_RETRY_S = 5.0
+
+# _watch_changes (missions, robots) restarts its watch after a failure: first retry after
+# the minimum, doubling up to the maximum; a watch that delivered something starts over.
+WATCH_CHANGES_RETRY_MIN_S = 1.0
+WATCH_CHANGES_RETRY_MAX_S = 30.0
+
+# An MQTT message from a robot the dispatcher does not know is looked up in the database once
+# per this many seconds per name (and warned about once), not once per message.
+UNKNOWN_ROBOT_TTL_S = 60.0
 
 # A robot state of ON_TASK with no mission is set back to IDLE only this long after the robot's
 # controller was created (a dispatcher restart re-queues a running mission first).
 STALE_STATE_GRACE_S = 30.0
 # Maps §14.13: a run-epoch check that failed (database) is retried after this long.
 RUN_CHECK_RETRY_S = 30.0
+# The run-epoch check runs inline on the robot's state loop: it is given this long (a pool
+# stall can last 30 s), then it counts as failed and is retried after RUN_CHECK_RETRY_S.
+RUN_CHECK_TIMEOUT_S = 5.0
+# A current mission whose start failed (an exception before its tree existed) is started
+# again on a robot state message at most this often, and failed after this many attempts.
+START_RETRY_S = 5.0
+MAX_START_ATTEMPTS = 5
+# A failed status write (database restart, pool timeout) is retried with this back-off
+# (doubling, capped) until it lands, the row is gone or the controller is shut down. A
+# failure streak is a warning on its first failure and an error from the Nth on.
+STATUS_WRITE_RETRY_MIN_S = 0.5
+STATUS_WRITE_RETRY_MAX_S = 10.0
+STATUS_WRITE_ERROR_AFTER = 5
+# A status write failing with one of these is retried (the database or the network is
+# unavailable); anything else (a serialization TypeError, a DataError) cannot succeed on a
+# retry and is dropped after one logged attempt.
+STATUS_WRITE_TRANSIENT_ERRORS = (psycopg.OperationalError, psycopg.InterfaceError,
+                                 psycopg_pool.PoolTimeout, psycopg_pool.PoolClosed,
+                                 OSError, asyncio.TimeoutError)
+# How long a shutdown waits for the queued status writes to land.
+STATUS_WRITE_FLUSH_S = 3.0
+# Graceful shutdown: each step is bounded on its own so a slow one cannot starve the next;
+# their sum stays under lifecycle.SHUTDOWN_TIMEOUT_S (which stop_grace_period must exceed).
+SHUTDOWN_MQTT_S = 1.5
+SHUTDOWN_ROBOTS_S = STATUS_WRITE_FLUSH_S + 1.0
+SHUTDOWN_RECORDER_DRAIN_S = 2.5
+SHUTDOWN_RECORDER_STOP_S = 2.0
+SHUTDOWN_POOL_CLOSE_S = 1.5
+SHUTDOWN_LOCK_S = 1.0
+# The robot row (jsonb status + NOTIFY to every listener) is written at most this often for
+# fields that change continuously (pose, battery, localization score, deviation range); a
+# discrete change (online, state, errors, map, recording, ...) is written at once, and the
+# newest continuous values always follow within this window (trailing write).
+ROBOT_STATUS_MIN_WRITE_S = 1.0
+# A newest-wins state message that replaced an unprocessed one is a warning the first time
+# and then every this many times (it means the robot's loop or the broker queue is behind).
+STATE_COALESCED_WARN_EVERY = 100
+# Failure reason of the missions of a robot that is deleted.
+ROBOT_DELETED_REASON = "Robot deleted"
 
 
 # The robot skipped a blocked node its nodePolicy allowed it to skip (a WARNING with the
 # nodeId). Reports of these types never fail a mission, even if a robot sends them FATAL.
 NODE_SKIPPED = "nodeSkipped"
 ADVISORY_ERROR_TYPES = frozenset({NODE_SKIPPED})
+# VDA5050 errors by which a robot rejects an order it keeps not adopting (it goes on
+# reporting its old orderId). With a reference to our order they fail it at once.
+ORDER_REJECTION_ERROR_TYPES = frozenset({
+    "orderError", "orderUpdateError", "validationError", "noRouteError",
+    "orderNotAccepted"})
 # Per-node notes (informations with a nodeId reference) kept on a mission, newest first.
 MISSION_NODE_NOTES_MAX = 50
 # Skipped nodes kept on a mission (oldest dropped first).
@@ -184,6 +268,29 @@ class WaitElapsed(pydantic.BaseModel):
     key: Tuple[str, str, Optional[str], int, int]
 
 
+class NotifyDone(pydantic.BaseModel):
+    """Posted to a robot's own message queue when a "notify" node's task has finished, so the
+    next node's order (or the mission's completion) goes out on the message loop, as after a
+    wait. `key` is the notify's `_notify_key`: one that outlived its mission is dropped."""
+    key: Tuple[str, str, Optional[str], int, int]
+
+
+class ConnectionDelivery(pydantic.BaseModel):
+    """A connection message as the Robot gets it, with how the broker delivered it
+    (`retained`: from its retained store after a (re)subscribe, not a live publish)."""
+    connection: types.VDA5050Connection
+    retained: bool = False
+
+
+class MissionTimeoutElapsed(pydantic.BaseModel):
+    """Posted to a robot's own message queue when the mission timeout runs out, so the
+    failure and the start of the next mission run on the message loop, not inside the timer
+    task (which the next mission's own timer would otherwise cancel from under it). `token`
+    is the timer's `_timeout_budget`: a timer that was paused, re-armed or cancelled since is
+    recognised and dropped."""
+    token: Tuple[str, float, float]
+
+
 RobotMessage = Union[api_objects.RobotObjectV1,
                      api_objects.MissionObjectV1,
                      types.VDA5050State,
@@ -191,7 +298,10 @@ RobotMessage = Union[api_objects.RobotObjectV1,
                      types.RobotDatum,
                      types.RobotApproxPosition,
                      types.VDA5050Connection,
-                     WaitElapsed]
+                     ConnectionDelivery,
+                     WaitElapsed,
+                     NotifyDone,
+                     MissionTimeoutElapsed]
 
 
 class ClientMessage(pydantic.BaseModel):
@@ -204,6 +314,21 @@ class ClientMessage(pydantic.BaseModel):
 class ClientStatusMessage(ClientMessage):
     name: str
     payload: types.VDA5050State
+
+
+class RawStateMessage:
+    """A robot's state topic payload as received (bytes), parsed by the consumer of
+    RobotServer._mqtt_messages: a state that a newer one replaces in the queue is never
+    parsed, and the paho thread does not pay for pydantic at the robots' state rate."""
+
+    __slots__ = ("name", "payload")
+
+    def __init__(self, name: str, payload: Any):
+        self.name = name
+        self.payload = payload
+
+    def parse(self) -> "ClientStatusMessage":
+        return ClientStatusMessage(name=self.name, payload=json.loads(self.payload))
 
 
 class ClientFactsheetMessage(ClientMessage):
@@ -224,6 +349,7 @@ class ClientApproxPositionMessage(ClientMessage):
 class ClientConnectionMessage(ClientMessage):
     name: str
     payload: types.VDA5050Connection
+    retained: bool = False
 
 
 def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str, str]:
@@ -261,6 +387,33 @@ READINESS_HOLD_REASONS = {
 OPERATOR_TAKEOVER = "operatorTakeover"
 
 
+class _StatusRow:
+    """Write state of one database row (table, name): a lock that serializes every status
+    write of the row, the newest write requested but not yet started, and the task draining
+    it. `users` counts what still refers to the entry so it can be dropped. Every request
+    gets a sequence number when it is made; `written_seq` is the newest one that landed, so
+    a request older than it (it holds an older status object) is never written after it."""
+
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.pending: Optional[Tuple[Any, str, Any, uuid.UUID, int]] = None
+        self.seq = 0
+        self.written_seq = 0
+        self.task: Optional[asyncio.Task[Any]] = None
+        self.users = 0
+
+
+class _StateSlot:
+    """A VDA5050 state message waiting in a message queue. A newer state of the same robot
+    replaces `msg` in place (or empties it, when other messages were queued after it), so a
+    consumer that is behind handles the newest state once instead of replaying stale ones."""
+
+    __slots__ = ("msg",)
+
+    def __init__(self, msg: Any):
+        self.msg = msg
+
+
 class CancelPurpose(str, enum.Enum):
     """What a cancelOrder the dispatcher sends is for; it decides what its completion
     means (Robot._act_on_resolved_cancels)."""
@@ -270,6 +423,12 @@ class CancelPurpose(str, enum.Enum):
     CLEAR = "clear"      # the robot must drop an order that is not the mission's (force
                          # cancel of a stray order the mission waits behind)
 
+
+# What a cancelOrder needs the robot to be reporting (Robot._cancel_order).
+OURS_RUN = "run"
+OURS_SENT = "sent"
+OURS_DISPATCHER = "dispatcher"
+OURS_ANY = "any"
 
 SEND_NODE = "send"
 NEW_REVISION = "revision"
@@ -298,6 +457,9 @@ class Robot:
     # a robot streaming state at 10 Hz does not burn the budget in seconds; give up after
     # this many attempts. See handle_instant_action().
     MAX_INSTANT_ACTION_RESENDS = 20
+    # A cancel that only drops a dead mission's order (CancelPurpose.STOP) blocks the next
+    # mission's send until it is acknowledged or abandoned: it gets a shorter budget.
+    STOP_CANCEL_MAX_RESENDS = 6
     INSTANT_ACTION_RESEND_BASE_S = 1.0
     INSTANT_ACTION_RESEND_MAX_S = 8.0
     # Consecutive state messages whose orderId doesn't match the current mission
@@ -310,6 +472,11 @@ class Robot:
     # At most this many identical resends of one order the robot has not adopted; the
     # mission then fails after MAX_ORDER_MISMATCHES state messages as before.
     ORDER_MAX_RESENDS = 3
+    # The mismatch count alone is per state message, so a robot streaming state fast would
+    # reach MAX_ORDER_MISMATCHES before the resends above are through. The give-up also
+    # needs this long since the order was last (re)sent -- longer than the largest resend
+    # interval, so the schedule always completes first and the last send gets an answer.
+    ORDER_GIVE_UP_MIN_S = 10.0
     # A "canceled" about the current order while the robot still lists nodes is read as
     # left over from the previous order while it drives, or this soon after the order
     # went out; otherwise as the robot dropping the order (see update_mission_state).
@@ -332,11 +499,6 @@ class Robot:
         self._database = db
         self._robot_object: Optional[api_objects.RobotObjectV1] = None
         self._detection_results_object: Optional[api_objects.DetectionResultsObjectV1] = None
-        # Try to get existing detected objects.
-        # This will be awaited later or handled directly. In this legacy block, it was synchronous.
-        # Since PostgresDatabase methods are async, we can't await in __init__.
-        # For now, we initialize to None and will handle it appropriately.
-        self._detection_results_object = None
         self._missions: OrderedDict[str,
                                     api_objects.MissionObjectV1] = OrderedDict()
         self._current_mission: Optional[api_objects.MissionObjectV1] = None
@@ -351,10 +513,36 @@ class Robot:
         self._instant_action_resent_at: Dict[str, float] = {}
         # Blocked-node writes in flight; held so they are not garbage collected mid-write.
         self._blocked_node_tasks: Set[asyncio.Task[Any]] = set()
+        # Fire-and-forget tasks (the charging hook): referenced here so they are not garbage
+        # collected mid-flight; Robot.shutdown cancels what is left.
+        self._background_tasks: Set[asyncio.Task[Any]] = set()
+        # Robot-loop exceptions by (type, message) -> [repeats since last log, last log time]
+        self._loop_errors: Dict[Tuple[str, str], List[Any]] = {}
+        # Per-row status write serializers (see _queue_status_write) and their tasks.
+        self._status_rows: Dict[Tuple[str, str], _StatusRow] = {}
+        self._status_write_tasks: Set[asyncio.Task[Any]] = set()
+        self._status_flush_tasks: Set[asyncio.Task[Any]] = set()
+        # Robot-row write throttle (ROBOT_STATUS_MIN_WRITE_S): the discrete fields and the
+        # time of the last write from the state loop, and the trailing-write timer.
+        self._robot_written_sig: Optional[Tuple[Any, ...]] = None
+        self._robot_written_at: float = -math.inf
+        self._robot_write_timer: Optional[asyncio.TimerHandle] = None
+        # Newest-wins state queueing (send_message): the unprocessed state slot, and the
+        # slot that is the last item of _messages (None once anything else was queued after).
+        self._state_slot: Optional[_StateSlot] = None
+        self._queue_tail: Optional[_StateSlot] = None
+        self._states_coalesced = 0
         # Consecutive robot-state messages carrying an orderId that isn't the current
         # mission's. Bounded in _on_client_message() so a robot that never adopts our
         # order fails the mission instead of spinning silently.
         self._order_mismatch_count: int = 0
+        # Last malformed user_info payload and last unusable GET_OBJECTS result logged, and
+        # the GET_OBJECTS actionIds already processed (FINISHED actionStates stay listed).
+        self._bad_user_info: Optional[str] = None
+        self._detection_actions_done: Set[str] = set()
+        self._bad_detection_actions: Set[str] = set()
+        # Foreign error references (an earlier order's) already logged, once each.
+        self._foreign_error_refs: Set[str] = set()
         # errorTypes of unreferenced FATAL errors the robot reported before it
         # accepted the current mission's order (or while no mission ran). Such an
         # error is a leftover of an earlier run (e.g. a safety reflex latched while
@@ -378,12 +566,19 @@ class Robot:
         # the robot is offline (mission, s left). See _pause_mission_timeout().
         self._timeout_budget: Optional[Tuple[str, float, float]] = None
         self._timeout_paused: Optional[Tuple[str, float]] = None
+        # Start retries of a current mission whose start raised (see _retry_stalled_start).
+        self._start_attempts = 0
+        self._start_retry_at = 0.0  # monotonic
         # The frame the last route was converted into (see _route_in_robot_frame).
         self._last_route_frame: Optional[Dict[str, Any]] = None
         self._robot_server = server
         self._alive = True
         # VDA5050 headerIds count per topic; see _next_header_id().
         self._header_ids: Dict[str, int] = {}
+        self._header_start = initial_header_id()
+        # The header's manufacturer: the robot's own, once it has reported; until then the
+        # topic's (the prefix is "interface/version/manufacturer").
+        self._manufacturer = prefix.rsplit("/", 1)[-1] if "/" in prefix else ""
         # The last order published. Sending it again republishes it unchanged, so one
         # orderId never carries two contents (see _send_order). What it was built from
         # is stored with the mission (status.sent_order).
@@ -409,6 +604,8 @@ class Robot:
         self._process_tag = uuid.uuid4().hex[:4]
         # The orderId of the robot's last state message.
         self._robot_order_id: Optional[str] = None
+        # Whether that state message still listed nodes or edges: the robot is executing.
+        self._robot_executing = False
         # A reroute's cancel held back until the robot has adopted the order version just
         # sent (see _replace_cancel_must_wait).
         self._deferred_replace_cancel = False
@@ -432,6 +629,13 @@ class Robot:
         # so the log says so once rather than on every status echo.
         self._ignored_spec_edits: Set[str] = set()
         self._charging_mission_received: bool = False
+        self._charging_hook_busy: bool = False
+        self._charging_hook_next_at: float = 0.0
+        self._notify_in_flight: bool = False
+        self._notify_task: Optional[asyncio.Task[Any]] = None
+        # Same key shape as _wait_key, while a notify node runs (a mismatch is expected
+        # then, like during a wait) and until its NotifyDone is handled.
+        self._notify_key: Optional[Tuple[str, str, Optional[str], int, int]] = None
         self.last_node_seq_id: int = -1
         # Timestamp of the robot state message being handled, for the events it causes
         # (see _record); None outside that.
@@ -442,12 +646,17 @@ class Robot:
         # retained one of an older run).
         self._run_detector = run_change.RunChangeDetector()
         self._datum_epoch: Optional[int] = None
+        # The robot's connection went OFFLINE/CONNECTIONBROKEN and has not been ONLINE since;
+        # and the pose before a state-header drop that awaits confirmation (run_change.py).
+        self._connection_down: bool = False
+        self._pre_drop_pose: Any = None
         # For _reconcile_stale_state's grace period.
         self._created_at = time.monotonic()
         # Maps §14.13: the robot's run epoch (robot_run_epochs). `_run_checked`: the first
         # state message of this process decided it (continuity proved, or a new epoch);
         # `_run_header_saved_at`: when the last state headerId was stored (monotonic).
         self._run_checked = False
+        self._run_header_task: Optional["asyncio.Task[Any]"] = None  # single-flight header persist
         self._run_check_after = 0.0  # monotonic; a failed check is retried after RUN_CHECK_RETRY_S
         self._run_epoch: Optional[uuid.UUID] = None
         self._run_header_saved_at: Optional[float] = None
@@ -466,10 +675,26 @@ class Robot:
         timer it owns, so nothing of it outlives the robot or leaks into a robot registered
         again under the same name (that one gets a brand-new Robot). Idempotent."""
         self._alive = False
+        # Queued status writes (a mission's final state above all) get a bounded chance to
+        # land, then are cancelled; no retries once shut down.
+        if self._status_write_tasks:
+            try:
+                flush = asyncio.get_running_loop().create_task(
+                    self.flush_status_writes(STATUS_WRITE_FLUSH_S))
+            except RuntimeError:
+                flush = None
+                for task in list(self._status_write_tasks):
+                    task.cancel()
+            if flush is not None:
+                self._status_flush_tasks.add(flush)
+                flush.add_done_callback(self._status_flush_tasks.discard)
         for task in (self._robot_online_task, self._mission_timeout_task, self._wait_task,
-                     self._run_task):
+                     self._run_task, self._robot_write_timer, self._notify_task,
+                     *self._background_tasks):
             if task is not None and task is not asyncio.current_task():
                 task.cancel()
+        self._notify_task = None
+        self._robot_write_timer = None
         self._robot_online_task = None
         self._mission_timeout_task = None
         self._wait_task = None
@@ -491,6 +716,7 @@ class Robot:
             # count must not shorten this one's grace period -- and nothing of the
             # previous mission's orders.
             self._order_mismatch_count = 0
+            self._start_attempts = 0
             # Not dispatched until its own tree is built: the previous mission's tree
             # made a held mission look dispatched (its state handling then sent orders).
             self._current_behavior_tree = None
@@ -525,17 +751,13 @@ class Robot:
                 self._current_mission.status.held = True
                 self._current_mission.status.held_reason = hold_reason
                 self.mission_info(f"Holding mission dispatch: {hold_reason}")
-                asyncio.ensure_future(self._database.update_status(
-                    api_objects.MissionObjectV1, self._current_mission.name,
-                    self._current_mission.status, self._mission_writer_id()))
+                self._queue_status_write(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id())
             return
         if self._current_mission.status.held:
             self._current_mission.status.held = False
             self._current_mission.status.held_reason = None
             self.mission_info("Robot ready — releasing held mission")
-            asyncio.ensure_future(self._database.update_status(
-                api_objects.MissionObjectV1, self._current_mission.name,
-                self._current_mission.status, self._mission_writer_id()))
+            self._queue_status_write(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id())
         resumed = self._current_mission.status.start_timestamp is not None
         await self._settle_route_rev()
         await self._replan_goto()
@@ -566,7 +788,11 @@ class Robot:
             self.mission_info("Mission already finished at resume; not sending an order")
             await self.post_mission_completion()
             return
-        self._arm_mission_timeout()
+        # A resume gets what is left of the timeout, not a fresh one (a crash loop would
+        # extend the mission for ever). Time the robot spent offline before the restart
+        # is not persisted, so it counts as elapsed.
+        self._arm_mission_timeout(
+            self._remaining_timeout_s(self._current_mission) if resumed else None)
         if resumed:
             # This process does not know what the robot holds, nor what content went out
             # under the current orderId: the robot's first state message decides.
@@ -575,6 +801,42 @@ class Robot:
             self.mission_info("Resumed; waiting for the robot's state before sending")
             return
         await self._send_order()
+
+    async def _retry_stalled_start(self):
+        """Start again a current mission whose start did not get as far as its tree (an
+        exception in _try_start_mission is swallowed by the message loop and left it so),
+        and pick up a queued mission when the robot has none. At most every START_RETRY_S;
+        a mission whose start keeps raising is failed after MAX_START_ATTEMPTS."""
+        mission = self._current_mission
+        if mission is None:
+            if not self._missions:
+                return
+        elif self._current_behavior_tree is not None or mission.status.held or \
+                mission.status.state.done:
+            return
+        now = time.monotonic()
+        if now < self._start_retry_at:
+            return
+        self._start_retry_at = now + START_RETRY_S
+        try:
+            await self._try_start_mission()
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # pylint: disable=broad-except
+            self._start_attempts += 1
+            self.warning(f"Could not start the mission (attempt {self._start_attempts} of "
+                         f"{MAX_START_ATTEMPTS}): {err}")
+            mission = self._current_mission
+            if mission is not None and self._start_attempts >= MAX_START_ATTEMPTS:
+                mission.status.failure_reason = f"Could not start the mission: {err}"
+                self._set_mission_state(mission_object.MissionStateV1.FAILED)
+                try:
+                    await self.post_mission_completion()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as next_err:  # pylint: disable=broad-except
+                    # The next mission's start failing too is for its own retries.
+                    self.warning(f"Could not move on after the failed start: {next_err}")
 
     async def _replan_goto(self):
         """A go-to was planned when it was submitted, from where the robot stood then; when it
@@ -656,23 +918,123 @@ class Robot:
                          f"({err})")
         self.mission_info(f"Resuming a rerouted mission: route revision {mission.route_rev}")
 
-    async def _cancel_before_dispatch(self):
-        """End the current mission as CANCELED without a cancelOrder: it was flagged for
-        cancel before any order of it went out (robot offline or not ready), so there is
-        nothing on the robot to cancel and no state message to wait for."""
+    def _order_may_be_on_robot(self) -> bool:
+        """Whether an order of the current mission may have gone out before (a run id is
+        persisted before the first send; a start timestamp survives a dispatcher restart)."""
+        status = self._current_mission.status
+        return status.start_timestamp is not None or status.run_id is not None or \
+            status.order_rev > 0
+
+    def _robot_runs_our_order(self) -> bool:
+        """Whether the robot's last state reported an order of the current run (any
+        revision) that it still executes. An order the dispatcher did not issue (the
+        robot's own offline mission) never counts."""
+        return self._current_mission is not None and self._robot_executing and \
+            self._is_order_of_run(self._robot_order_id)
+
+    def _robot_runs_dispatcher_order(self) -> bool:
+        """Whether the robot's last state reported an order with an id a dispatcher generates
+        (any mission, run or revision) that it still executes: not the robot's own."""
+        return self._robot_executing and self._robot_order_id is not None and \
+            order_ids.order_prefix(self._robot_order_id) is not None
+
+    def _robot_may_hold_our_order(self) -> bool:
+        """Whether the robot may hold an order of this run: it runs one, or an order went
+        out and the robot is not demonstrably executing something else (an order it has
+        not reported yet, or one it dropped). An order that is not the run's, and that the
+        robot executes, is not ours (an earlier run's, a dispatcher's other mission, the
+        robot's own)."""
+        if self._robot_runs_our_order():
+            return True
+        return self._current_mission is not None and self._sent_order is not None and \
+            not self._robot_executing
+
+    async def _cancel_order(self, purpose: CancelPurpose, tag: str, note: str, *,
+                            ours: str = OURS_RUN, current_run_only: bool = False) -> bool:
+        """The one place a cancelOrder of the current mission is sent. Returns whether it was.
+
+        One cancel at a time: nothing is sent while one is outstanding (with
+        `current_run_only`, only one of this run counts: a mission cancel is not held back
+        by an earlier run's timeout cancel). `ours` is what the robot must be reporting:
+        - OURS_RUN: an order of this run, any revision, that it executes. The default, for
+          a mission that ends on a state the robot reported (failed, mismatch, churn): a
+          robot idle, or on an order the dispatcher did not issue (its own offline
+          mission), or on another run's, is left alone.
+        - OURS_SENT: OURS_RUN, or an order of the run went out and the robot is not
+          executing another (_robot_may_hold_our_order). For the timeout and a deleted
+          robot, which cancelled whenever an order had been sent: the order may be one the
+          robot has not reported yet, and a cancel to an idle robot only draws noOrderToCancel.
+        - OURS_DISPATCHER: any order a dispatcher generated (the resume after a restart:
+          the robot may hold an earlier run's order of the same mission), never the robot's
+          own.
+        - OURS_ANY: no check, for a caller that decided already: an order just sent that
+          the robot has not reported yet, or the operator's force cancel.
+        The action id is "{prefix}-{tag}-cancel" (without a mission: "{tag}-cancel")."""
+        if self._has_outstanding_cancel(current_run_only=current_run_only):
+            return False
+        if ours == OURS_RUN and not self._robot_runs_our_order():
+            return False
+        if ours == OURS_SENT and not self._robot_may_hold_our_order():
+            return False
+        if ours == OURS_DISPATCHER and not self._robot_runs_dispatcher_order():
+            return False
+        stem = f"{tag}-cancel" if self._current_mission is None \
+            else f"{self._order_prefix()}-{tag}-cancel"
+        action_id = self._action_id(stem)
+        self.mission_info(f"{note} {action_id}")
+        await self._send_cancel_order(action_id, purpose)
+        return True
+
+    async def _stop_our_order(self, why: str) -> None:
+        """A mission ends without the robot's say (failed, mismatch, churn): drop its order from
+        the robot if it still runs one of this run, as the timeout does. One cancel at a
+        time; a foreign order is left alone."""
+        await self._cancel_order(
+            CancelPurpose.STOP, why,
+            f"Mission ended ({why}) while the robot runs {self._robot_order_id}: "
+            "sending cancelOrder")
+
+    async def _cancel_before_dispatch(self) -> bool:
+        """End the current mission as CANCELED when it is flagged for cancel and its tree
+        is not built. Returns whether it ended.
+
+        Never dispatched (robot offline or not ready): nothing is on the robot, so it ends
+        at once without a cancelOrder. A mission whose order may be on the robot (it started
+        before a dispatcher restart, or was held after it started) is cancelled as a running
+        one is: a cancelOrder (purpose MISSION) once the robot's state shows it runs an
+        order of this run, and the mission ends on its confirmation
+        (_act_on_resolved_cancels). Until the robot has reported (just restarted) or while
+        it is offline, the mission stays pending: a blind cancel could take the robot's own
+        offline mission, and a CANCELED mission with the order still running misleads the
+        next one. The robot's next state message retries (_on_client_message)."""
+        mission = self._current_mission
+        if self._order_may_be_on_robot():
+            if self._has_outstanding_cancel(current_run_only=True):
+                return False
+            unknown = self._robot_order_id is None
+            if unknown or self._robot_runs_our_order():
+                if unknown or self._robot_object is None or \
+                        not self._robot_object.status.online:
+                    self.mission_info("Mission flagged for cancel: waiting for the robot's "
+                                      "state before cancelling its order")
+                    return False
+                self._record("run_started", self._name, mission, self._robot_object)
+                await self._cancel_order(
+                    CancelPurpose.MISSION, "mission", "Mission flagged for cancel after its "
+                    "order went out: send cancel order action", current_run_only=True)
+                return False
         self.mission_info("Mission flagged for cancel before dispatch -- canceling immediately")
         # A mission that was already running before a dispatcher restart still has a
         # RUNNING run row (startup reconciliation leaves it for us to resume): adopt it
         # so it is closed too, instead of staying RUNNING forever (observed 2026-09-25).
-        resumed = self._current_mission.status.start_timestamp is not None
+        resumed = mission.status.start_timestamp is not None
         if resumed:
-            self._record("run_started", self._name, self._current_mission,
-                         self._robot_object)
+            self._record("run_started", self._name, mission, self._robot_object)
         self._set_mission_state(mission_object.MissionStateV1.CANCELED)
         if resumed:
-            self._record("run_finished", self._name, self._current_mission,
-                         self._robot_object)
+            self._record("run_finished", self._name, mission, self._robot_object)
         await self.get_next_mission()
+        return True
 
     def _record(self, hook: str, *args: Any, **kwargs: Any) -> None:
         """Phase 0 recording (fleet_recorder.FleetRecorder). The hooks only enqueue work and
@@ -716,12 +1078,6 @@ class Robot:
         # From the first send: resends of the same order do not restart the dwell.
         return time.monotonic() - self._order_first_sent_at < \
             order_policy.current().cancel_min_dwell_s
-
-    async def _cancel_current_order(self, purpose: CancelPurpose, note: str):
-        """Send a cancelOrder for the robot's current order of this mission."""
-        action_id = self._action_id(f"{self._order_prefix()}-instantaction")
-        self.mission_info(f"{note} {action_id}")
-        await self._send_cancel_order(action_id, purpose)
 
     async def _send_cancel_order(self, action_id: str,
                                  purpose: Optional[CancelPurpose] = None):
@@ -774,25 +1130,24 @@ class Robot:
         await self._database.update_spec_fields(
             api_objects.RobotObjectV1, message.name, {"needs_order_cancel": False},
             uuid.uuid4())
-        if self._has_outstanding_cancel():
-            self.info("Force-cancel requested, but a cancelOrder is already "
-                      "outstanding; not sending another")
-            return
-        action_id = self._action_id("force-cancel-instantaction")
-        self.info(f"Force-cancel requested: sending {action_id}")
         # It ends the mission if it takes the mission's order: the robot is on it, or has
         # not reported since one went out. A stray order the mission waits behind is
-        # just cleared.
+        # just cleared. Blind on purpose (OURS_ANY): the operator's escape hatch clears
+        # whatever the robot holds, the robot's own order included.
         on_mission = self._current_mission is not None and (
             order_ids.is_order_of(self._order_prefix(), self._robot_order_id)
             if self._robot_order_id is not None else self._sent_order is not None)
-        await self._send_cancel_order(
-            action_id, CancelPurpose.STOP if on_mission else CancelPurpose.CLEAR)
+        if not await self._cancel_order(
+                CancelPurpose.STOP if on_mission else CancelPurpose.CLEAR, "force",
+                "Force-cancel requested: sending", ours=OURS_ANY):
+            self.info("Force-cancel requested, but a cancelOrder is already "
+                      "outstanding; not sending another")
 
     async def _send_instant_action(self, instant_action: types.VDA5050Action):
         instant_actions = types.VDA5050InstantActions(
             headerId=self._next_header_id("instantActions"),
-            timestamp=datetime.datetime.now().isoformat(),
+            timestamp=types.utc_timestamp(),
+            manufacturer=self._manufacturer, serialNumber=self._name,
             instantActions=[instant_action])
         self._mqtt_client.publish(f"{self._mqtt_prefix}/{self._name}/instantActions",
                                   instant_actions.json())
@@ -800,13 +1155,13 @@ class Robot:
     def _next_header_id(self, topic: str) -> int:
         """VDA5050: a headerId is defined per topic and incremented by one with each
         message sent on that topic."""
-        header_id = self._header_ids.get(topic, 0)
+        header_id = self._header_ids.get(topic, self._header_start)
         self._header_ids[topic] = header_id + 1
         return header_id
 
     def _action_id(self, stem: str) -> str:
         """A new instant action id: the stem and the headerId its message will carry."""
-        return f"{stem}-{self._process_tag}-n{self._header_ids.get('instantActions', 0)}"
+        return f"{stem}-{self._process_tag}-n{self._header_ids.get('instantActions', self._header_start)}"
 
     def _order_prefix(self) -> str:
         """Prefix of every order/node id generated for the current mission's run and
@@ -816,9 +1171,141 @@ class Robot:
                                     status.run_id, status.order_rev)
 
     async def _persist_current_mission_status(self):
-        await self._database.update_status(
+        await self._write_status(
             api_objects.MissionObjectV1, self._current_mission.name,
             self._current_mission.status, self._mission_writer_id())
+
+    def _status_row(self, key: Tuple[str, str]) -> "_StatusRow":
+        row = self._status_rows.get(key)
+        if row is None:
+            row = self._status_rows[key] = _StatusRow()
+        row.users += 1
+        return row
+
+    def _status_row_release(self, key: Tuple[str, str], row: "_StatusRow") -> None:
+        row.users -= 1
+        if row.users <= 0 and self._status_rows.get(key) is row:
+            del self._status_rows[key]
+
+    async def _write_status(self, object_class, name: str, status, writer_id: uuid.UUID):
+        """Awaited status write that keeps its failure for the caller, but takes the row's
+        lock first so it cannot commit out of order with a queued write of the same row
+        (each write serializes the shared, mutable status when it starts)."""
+        key = (object_class.table_name(), str(name))
+        if object_class is api_objects.RobotObjectV1:
+            self._robot_written_sig = None      # the next state message writes the row again
+        row = self._status_row(key)
+        row.seq += 1
+        seq = row.seq
+        try:
+            async with row.lock:
+                if row.written_seq > seq:
+                    return   # a newer request of this row has landed meanwhile
+                await self._database.update_status(object_class, name, status, writer_id)
+                row.written_seq = max(row.written_seq, seq)
+        finally:
+            self._status_row_release(key, row)
+
+    def _queue_status_write(self, object_class, name: str, status, writer_id: uuid.UUID) -> None:
+        """Fire-and-forget status write that is neither lost nor reordered. At most one write
+        per row is in flight; a request made meanwhile replaces the one waiting (every write
+        stores the whole status, read when the write starts, so the newest is enough and the
+        row's commits stay in order). A failed write is retried with a capped back-off until
+        it lands, the row is gone (HTTP 404/400) or the controller is shut down."""
+        if not self._alive:
+            return
+        key = (object_class.table_name(), str(name))
+        if object_class is api_objects.RobotObjectV1:
+            self._robot_written_sig = None      # the next state message writes the row again
+        row = self._status_row(key)
+        row.seq += 1
+        row.pending = (object_class, name, status, writer_id, row.seq)
+        if row.task is not None:
+            self._status_row_release(key, row)
+            return
+        row.task = asyncio.ensure_future(self._status_write_loop(key, row))
+        self._status_write_tasks.add(row.task)
+        row.task.add_done_callback(self._status_write_done)
+
+    def _status_write_done(self, task: "asyncio.Task[Any]") -> None:
+        self._status_write_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self.error(f"Status write task failed: {task.exception()!r}")
+
+    async def _status_write_loop(self, key: Tuple[str, str], row: "_StatusRow") -> None:
+        failures = 0
+        backoff = STATUS_WRITE_RETRY_MIN_S
+        try:
+            while row.pending is not None:
+                request = row.pending
+                row.pending = None
+                object_class, name, status, writer_id, seq = request
+                try:
+                    async with row.lock:
+                        if seq < row.written_seq:
+                            # An awaited write requested after this one landed meanwhile
+                            # (with a newer status object): this one is stale.
+                            continue
+                        await self._database.update_status(
+                            object_class, name, status, writer_id)
+                        row.written_seq = max(row.written_seq, seq)
+                except asyncio.CancelledError:
+                    raise
+                except fastapi.HTTPException as err:
+                    # 404/400: the row is gone, writing it again cannot succeed.
+                    self.warning(f"Status of {key[0]} {name} not stored, the row is gone "
+                                 f"({err.status_code})")
+                    row.pending = None
+                    return
+                except Exception as err:  # pylint: disable=broad-except
+                    if not isinstance(err, STATUS_WRITE_TRANSIENT_ERRORS):
+                        # A programming error: retrying cannot help, and would pin this row.
+                        self.error(f"Status of {key[0]} {name} not stored, dropped (not a "
+                                   f"database failure): {err!r}", exc_info=True)
+                        continue
+                    failures += 1
+                    if row.pending is None:
+                        row.pending = request
+                    if not self._alive:
+                        # Shut down: the write was tried once; no more retries.
+                        self.warning(f"Status of {key[0]} {name} not stored at shutdown: "
+                                     f"{err!r}")
+                        row.pending = None
+                        return
+                    text = f"Could not store the status of {key[0]} {name} " \
+                           f"(failure {failures}): {err!r}; retrying in {backoff:g}s"
+                    if failures >= STATUS_WRITE_ERROR_AFTER:
+                        self.error(text)
+                    elif failures == 1:
+                        self.warning(text)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, STATUS_WRITE_RETRY_MAX_S)
+                    continue
+                if failures:
+                    self.info(f"Status of {key[0]} {name} stored after {failures} failure(s)")
+                failures = 0
+                backoff = STATUS_WRITE_RETRY_MIN_S
+        finally:
+            row.task = None
+            self._status_row_release(key, row)
+
+    async def wait_shutdown_flush(self) -> None:
+        """After shutdown(): wait for the bounded status-write flush it started (graceful
+        shutdown awaits this before the database pools close)."""
+        flushes = list(self._status_flush_tasks)
+        if flushes:
+            await asyncio.wait(flushes)
+
+    async def flush_status_writes(self, timeout_s: float = STATUS_WRITE_FLUSH_S) -> None:
+        """Give the queued status writes a bounded chance to land (graceful shutdown), then
+        cancel what is left."""
+        tasks = list(self._status_write_tasks)
+        if not tasks:
+            return
+        _, pending = await asyncio.wait(tasks, timeout=timeout_s)
+        for task in pending:
+            self.warning("Status write dropped at shutdown")
+            task.cancel()
 
     async def _assign_run_id(self) -> bool:
         """Give a mission that is about to be dispatched for the first time its run
@@ -870,6 +1357,7 @@ class Robot:
             self._order_revisions.popleft()
         if len(self._order_revisions) >= self.ORDER_CHURN_MAX_REVISIONS:
             self._stop_order_churn(len(self._order_revisions) + 1)
+            await self._stop_our_order("churn")  # nothing to do unless it still runs one
             return False
         legacy = status.run_id is None
         if legacy:
@@ -939,7 +1427,14 @@ class Robot:
             # Notify node does not send an order to robot, everything is handled in Dispatch
             if mission_node.type == mission_object.MissionNodeType.NOTIFY and \
                     mission_node.notify is not None:
-                self._process_notify_node(mission_node)
+                if self._notify_task is None or self._notify_task.done():
+                    # Marked before the task runs: a state message in between must not
+                    # count a mismatch either.
+                    self._notify_key = self._node_key(mission_node)
+                    # A task, not an await: this robot's message loop (state handling, the
+                    # online watchdog, a cancel) must keep running while the webhook retries.
+                    self._notify_task = asyncio.ensure_future(
+                        self._process_notify_node(mission_node))
                 return
 
             # A wait is a timer the dispatcher runs itself; the robot has no order for it.
@@ -978,7 +1473,9 @@ class Robot:
                 self._order_first_sent_at = time.monotonic()
 
             order.headerId = self._next_header_id("order")
-            order.timestamp = datetime.datetime.now().isoformat()
+            order.timestamp = types.utc_timestamp()
+            order.manufacturer = self._manufacturer
+            order.serialNumber = self._name
             self._order_sent_at = time.monotonic()
 
             self._mqtt_client.publish(
@@ -1158,9 +1655,7 @@ class Robot:
             mission.planned_path = message.planned_path
             mission.route_rev = message.route_rev
             mission.status.applied_route_rev = message.route_rev
-            asyncio.ensure_future(self._database.update_status(
-                api_objects.MissionObjectV1, mission.name, mission.status,
-                self._mission_writer_id()))
+            self._queue_status_write(api_objects.MissionObjectV1, mission.name, mission.status, self._mission_writer_id())
         return cancel_current_node
 
     async def _on_mission_change(self, message: api_objects.MissionObjectV1):
@@ -1260,11 +1755,11 @@ class Robot:
 
                 if self._current_behavior_tree is None and \
                         self._current_mission.needs_canceled:
-                    # Picked but never dispatched (robot offline or not ready, so held): no
-                    # order of ours is on the robot, so there is nothing for a cancelOrder to
-                    # cancel and no state message to wait for -- end it here.
-                    await self._cancel_before_dispatch()
-                    await self._robot_server.delete_pending_mission(message)
+                    # Picked but its tree is not built (held, or resumed after a restart):
+                    # ends here unless an order of it may be on the robot, which is then
+                    # cancelled first (see _cancel_before_dispatch).
+                    if await self._cancel_before_dispatch():
+                        await self._robot_server.delete_pending_mission(message)
                     return
 
                 if self._current_mission.needs_canceled and self._timeout_paused is not None:
@@ -1296,9 +1791,13 @@ class Robot:
                         return
                     self._deferred_replace_cancel = False
                     self.info("Cancelling current node...")
-                    await self._cancel_current_order(
+                    # Not checked against the robot's state: the order may be one it has
+                    # not reported yet (guarded above by the outstanding cancel).
+                    await self._cancel_order(
                         CancelPurpose.MISSION if self._current_mission.needs_canceled
-                        else CancelPurpose.REPLACE, "Send cancel order action")
+                        else CancelPurpose.REPLACE,
+                        "mission" if self._current_mission.needs_canceled else "replace",
+                        "Send cancel order action", ours=OURS_ANY, current_run_only=True)
                 return
 
             self.info(f"Update a PENDING mission [{message.name}]")
@@ -1311,7 +1810,9 @@ class Robot:
             # Cancel a queued mission
             elif message.needs_canceled:
                 self._missions[message.name].status.state = mission_object.MissionStateV1.CANCELED
-                await self._database.update_status(api_objects.MissionObjectV1, self._missions[message.name].name, self._missions[message.name].status, self._mission_writer_id())
+                self._missions[message.name].status.failure_category = \
+                    mission_object.MissionFailureCategoryV1.CANCELED
+                await self._write_status(api_objects.MissionObjectV1, self._missions[message.name].name, self._missions[message.name].status, self._mission_writer_id())
                 del self._missions[message.name]
 
     async def _on_robot_change(self, message: api_objects.RobotObjectV1):
@@ -1320,7 +1821,6 @@ class Robot:
             self.info("Created robot")
             self._robot_object = message
 
-            self._header_ids = {}
             self._arm_online_watchdog()
 
             if (not self._robot_server.disable_request_factsheet
@@ -1337,24 +1837,22 @@ class Robot:
             await self._handle_force_cancel(message)
             await self._try_start_mission()
         else:
-            # The robot's `status.state` is this controller's: only _set_robot_state changes
-            # it (and records ROBOT.STATE_CHANGED). The row a watcher notification carries is
-            # read when the notification is handled, so it can predate a state write still in
-            # flight (_set_robot_state writes with ensure_future) -- adopting it silently put a
-            # finished mission's ON_TASK back after ON_TASK -> IDLE, and every later state
-            # message then wrote that ON_TASK again (masked-frigatebird, 2026-09-29: ON_TASK
-            # with no mission for hours, placement refused as "driving"). Spec and the other
-            # status fields still come from the row.
-            message.status.state = self._robot_object.status.state
+            # The row a watcher notification carries is read when the notification is
+            # handled, and the controller's own status writes are queued and throttled
+            # (_queue_status_write, >= 1 s apart), so the row can predate them. Its `status`
+            # is the controller's: adopting it re-adopted a stale `online` (a spurious
+            # "Robot Online" and budget reset on an offline robot), `errors`, pose, battery
+            # and the finished mission's ON_TASK (masked-frigatebird, 2026-09-29: ON_TASK with
+            # no mission for hours, placement refused as "driving"). So the spec and lifecycle
+            # come from the row, the status stays the one in memory -- except the factsheet,
+            # which the API also writes (PUT /robots with factsheet data).
+            status = self._robot_object.status
+            if message.status.factsheet.agv_class or not status.factsheet.agv_class:
+                status.factsheet = message.status.factsheet
+            message.status = status
             # Delete robot update
             if message.lifecycle == api_objects.object.ObjectLifecycleV1.PENDING_DELETE:
-                if message.status.state == api_objects.robot.RobotStateV1.ON_TASK:
-                    # Set mission to failure
-                    self._set_mission_state(
-                        mission_object.MissionStateV1.FAILED)
-                    if self._current_mission is not None:
-                        self._record("run_finished", self._name, self._current_mission,
-                                     self._robot_object)
+                # (the missions are failed in _delete_robot_object)
                 # Set the state of the robot to DELETE for RobotServer to delete
                 # on the server and database side.
                 self.debug(
@@ -1381,11 +1879,15 @@ class Robot:
                 action_id = self._action_id("instantaction")
                 action_type = types.NVInstantActionType.START_TELEOP \
                     if message.switch_teleop else types.NVInstantActionType.STOP_TELEOP
-                instant_action = types.VDA5050Action(
-                    actionType=action_type, actionId=action_id)
-                self.mission_info(f"Sending {action_type.value} action.")
-                await self._send_instant_action(instant_action)
-                self._current_instant_actions[action_id] = instant_action
+                # One outstanding action of a type at a time: handle_instant_action()
+                # resends it until the robot answers (or it is abandoned).
+                if not any(a.actionType == action_type
+                           for a in self._current_instant_actions.values()):
+                    instant_action = types.VDA5050Action(
+                        actionType=action_type, actionId=action_id)
+                    self.mission_info(f"Sending {action_type.value} action.")
+                    await self._send_instant_action(instant_action)
+                    self._current_instant_actions[action_id] = instant_action
 
             await self._handle_force_cancel(message)
 
@@ -1416,13 +1918,15 @@ class Robot:
             self.info("Robot Offline")
             self._robot_object.status.recording_state = None
             self._robot_object.status.nav_reasoning = None
+            # Queued, not awaited: the offline marker is latest-wins and a failed write is
+            # retried (an awaited failure here would be an unobserved task exception).
             if not self._robot_object.status.online:
-                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
+                self._queue_status_write(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
                 return
             self._robot_object.status.online = False
             self._pause_mission_timeout()
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
-                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
+                self._queue_status_write(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
         except asyncio.CancelledError:
             self.debug("Cancelled robot online check.")
 
@@ -1467,7 +1971,16 @@ class Robot:
                     # loop. A FAILED cancelOrder specifically means "no order to
                     # cancel" (VDA5050 noOrderToCancel) -- the robot has nothing of
                     # this mission left running, which is the outcome a cancel was
-                    # after, so it counts as a completed cancel for the mission.
+                    # after, so it counts as a completed cancel for the mission. A
+                    # FAILED while the robot still runs the order is not that (above).
+                    if self._failed_cancel_leaves_our_order(
+                            self._current_instant_actions[action_state.actionId],
+                            action_state, message):
+                        # Not "no order to cancel": the robot still runs it. Stays
+                        # outstanding, so it is resent within the resend budget.
+                        self.debug(f"cancelOrder {action_state.actionId} reported FAILED "
+                                   f"but the robot still runs {message.orderId}")
+                        continue
                     failed = self._current_instant_actions.pop(action_state.actionId)
                     self._forget_instant_action_resends(action_state.actionId)
                     self._cancel_resolved(failed)
@@ -1500,11 +2013,13 @@ class Robot:
                 if now - self._instant_action_resent_at.get(action_id, -math.inf) < interval:
                     continue
                 attempts = resends + 1
-                if attempts > self.MAX_INSTANT_ACTION_RESENDS:
+                limit = self.MAX_INSTANT_ACTION_RESENDS
+                if self._cancel_purposes.get(action_id, (None, None))[0] is CancelPurpose.STOP:
+                    limit = min(limit, self.STOP_CANCEL_MAX_RESENDS)
+                if attempts > limit:
                     self.warning(
                         f"Abandoning {instant_action.actionType} instant action "
-                        f"{action_id} -- unacknowledged after "
-                        f"{self.MAX_INSTANT_ACTION_RESENDS} resends")
+                        f"{action_id} -- unacknowledged after {limit} resends")
                     give_up.append(action_id)
                     continue
                 self._instant_action_resends[action_id] = attempts
@@ -1513,13 +2028,32 @@ class Robot:
                 await self._send_instant_action(instant_action)
                 self.mission_info(
                     f"Resend {instant_action.actionType} instant action "
-                    f"({attempts}/{self.MAX_INSTANT_ACTION_RESENDS}).")
+                    f"({attempts}/{limit}).")
         for action_id in give_up:
             abandoned = self._current_instant_actions.pop(action_id, None)
             self._forget_instant_action_resends(action_id)
             if abandoned is not None:
                 self._cancel_resolved(abandoned, abandoned=True)
         return finished_instant_actions
+    def _failed_cancel_leaves_our_order(self, action: types.VDA5050Action,
+                                        action_state: types.VDA5050ActionState,
+                                        message: types.VDA5050State) -> bool:
+        """Whether a cancelOrder the robot answered FAILED left the order it was for
+        running: the robot still lists nodes or edges, the order is the one the cancel was
+        for (the current run's; a CLEAR is for whatever order the robot holds), and it did
+        not say noOrderToCancel. Otherwise there is nothing left to cancel."""
+        if action.actionType != types.VDA5050InstantActionType.CANCEL_ORDER or \
+                not (message.nodeStates or message.edgeStates):
+            return False
+        if action_state.resultDescription == "noOrderToCancel" or any(
+                e.errorType == "noOrderToCancel" for e in message.errors):
+            return False
+        purpose, run = self._cancel_purposes.get(action.actionId, (CancelPurpose.STOP, None))
+        if purpose is CancelPurpose.CLEAR:
+            return True
+        return self._current_mission is not None and run == self._run_key() and \
+            self._is_order_of_run(message.orderId)
+
     async def _process_datum_message(self, msg: types.RobotDatum) -> None:
         """Persist the robot's datum.
 
@@ -1569,13 +2103,24 @@ class Robot:
             return
         robot.status.approx_position = robot_object.RobotApproxPositionV1(
             **msg.dict(), stored_at=datetime.datetime.now(datetime.timezone.utc))
-        await self._database.update_status(
-            api_objects.RobotObjectV1, robot.name, robot.status, self._writer_id())
+        await self._write_status(api_objects.RobotObjectV1, robot.name, robot.status, self._writer_id())
 
     # --- maps §14 U3: run changes and geo re-placement -----------------------------------------
 
-    async def _on_connection_message(self, message: types.VDA5050Connection) -> None:
-        evidence = self._run_detector.on_connection(message.connectionState, message.headerId)
+    async def _on_connection_message(self, message: types.VDA5050Connection,
+                                     retained: bool = False) -> None:
+        state = getattr(message.connectionState, "value", message.connectionState)
+        self._manufacturer = message.manufacturer or self._manufacturer
+        if state in ("OFFLINE", "CONNECTIONBROKEN"):
+            self._connection_down = True
+        evidence = self._run_detector.on_connection(message.connectionState, message.headerId,
+                                                    retained)
+        if state == "ONLINE" and self._connection_down:
+            # The robot reconnected (its clean MQTT session lost what we sent meanwhile),
+            # possibly within the heartbeat timeout, so the offline->online path in
+            # _on_client_message never ran: whatever the budgets spent is no evidence.
+            self._connection_down = False
+            self._reset_resend_budgets()
         if evidence is not None:
             await self._on_run_changed(evidence)
 
@@ -1586,6 +2131,8 @@ class Robot:
         session is re-placed by the next datum (_replace_geo_session). Never raises."""
         now = datetime.datetime.now(datetime.timezone.utc)
         self.info(f"New robot run ({evidence}): unplacing its open map session")
+        # A robot that restarted never got what we sent: fresh resend budgets.
+        self._reset_resend_budgets()
         patch = {"unplaced_reason": map_sessions.UNPLACED_RUN_CHANGED,
                  "unplaced_at": now.isoformat(), "unplaced_evidence": evidence}
         # Where the robot last was, in the OLD run's frame: the pose in memory is still the old
@@ -1593,6 +2140,9 @@ class Robot:
         # the unplace keeps map_t_session -- together they give the "last position" placement
         # suggestion (map_sessions.last_position_suggestion).
         pose = self._robot_object.status.pose if self._robot_object is not None else None
+        if evidence.get("signal") == "state_header_reset" and self._pre_drop_pose is not None:
+            pose = self._pre_drop_pose   # the drop was confirmed a state later (run_change.py)
+        self._pre_drop_pose = None
         if pose is not None:
             try:
                 last = {"x": float(pose.x), "y": float(pose.y), "theta": float(pose.theta)}
@@ -1641,37 +2191,42 @@ class Robot:
         except (TypeError, ValueError):
             return
         try:
-            async with self._database.connection() as conn:
-                async with conn.cursor() as cursor:
-                    await cursor.execute(map_sessions.RUN_EPOCH_READ_SQL, (self._name,))
-                    row = await cursor.fetchone()
-                    if row is not None and row[0] is not None and \
-                            map_sessions.run_continues(row[2], row[3], hid):
-                        epoch = row[0] if isinstance(row[0], uuid.UUID) else uuid.UUID(str(row[0]))
-                        await cursor.execute(map_sessions.RUN_EPOCH_CONFIRM_SQL,
-                                             (hid, self._name, epoch))
-                        self.info(f"Robot run continues across the dispatcher restart (state "
-                                  f"headerId {row[2]} -> {hid}): run epoch kept")
-                    else:
-                        epoch = uuid.uuid4()
-                        reason = (map_sessions.REASON_FIRST_SEEN if row is None
-                                  else map_sessions.REASON_DISPATCHER_RESTART)
-                        evidence = {"state_header_id": hid,
-                                    "last_state_header_id": row[2] if row else None,
-                                    "elapsed_s": (round(float(row[3]), 1)
-                                                  if row and row[3] is not None else None)}
-                        await cursor.execute(map_sessions.RUN_EPOCH_NEW_SQL, (
-                            self._name, epoch, reason, json.dumps(evidence), hid))
-                        self.info(f"New run epoch ({reason}, {evidence}): placements of "
-                                  "finished sessions are not reused")
+            epoch = await asyncio.wait_for(self._run_epoch_check(hid), RUN_CHECK_TIMEOUT_S)
         except Exception as err:  # pylint: disable=broad-except
-            self.warning(f"Run epoch not checked ({err}); placements are not reused (retry in "
-                         f"{RUN_CHECK_RETRY_S:.0f} s)")
+            self.warning(f"Run epoch not checked ({err!r}); placements are not reused (retry "
+                         f"in {RUN_CHECK_RETRY_S:.0f} s)")
             self._run_check_after = time.monotonic() + RUN_CHECK_RETRY_S
             return
         self._run_checked = True
         self._run_epoch = epoch
         self._run_header_saved_at = time.monotonic()
+
+    async def _run_epoch_check(self, hid: int) -> uuid.UUID:
+        """The database half of _check_run_continuity: the epoch to use."""
+        async with self._database.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(map_sessions.RUN_EPOCH_READ_SQL, (self._name,))
+                row = await cursor.fetchone()
+                if row is not None and row[0] is not None and \
+                        map_sessions.run_continues(row[2], row[3], hid):
+                    epoch = row[0] if isinstance(row[0], uuid.UUID) else uuid.UUID(str(row[0]))
+                    await cursor.execute(map_sessions.RUN_EPOCH_CONFIRM_SQL,
+                                         (hid, self._name, epoch))
+                    self.info(f"Robot run continues across the dispatcher restart (state "
+                              f"headerId {row[2]} -> {hid}): run epoch kept")
+                else:
+                    epoch = uuid.uuid4()
+                    reason = (map_sessions.REASON_FIRST_SEEN if row is None
+                              else map_sessions.REASON_DISPATCHER_RESTART)
+                    evidence = {"state_header_id": hid,
+                                "last_state_header_id": row[2] if row else None,
+                                "elapsed_s": (round(float(row[3]), 1)
+                                              if row and row[3] is not None else None)}
+                    await cursor.execute(map_sessions.RUN_EPOCH_NEW_SQL, (
+                        self._name, epoch, reason, json.dumps(evidence), hid))
+                    self.info(f"New run epoch ({reason}, {evidence}): placements of "
+                              "finished sessions are not reused")
+        return epoch
 
     async def _persist_run_header(self, header_id: Any) -> None:
         """Store the robot's state headerId every RUN_HEADER_PERSIST_S (the baseline a later
@@ -1686,12 +2241,24 @@ class Robot:
             hid = int(header_id)
         except (TypeError, ValueError):
             return
+        if self._run_header_task is not None and not self._run_header_task.done():
+            return      # single-flight: the one in flight is stuck or slow, the next window retries
         self._run_header_saved_at = now
+        # Off the state loop (a pool stall must not stop the robot's handling); tracked with
+        # the status writes so a shutdown flushes/cancels it.
+        task = self._run_header_task = asyncio.ensure_future(
+            self._store_run_header(hid, self._run_epoch))
+        self._status_write_tasks.add(task)
+        task.add_done_callback(self._status_write_done)
+
+    async def _store_run_header(self, hid: int, epoch: uuid.UUID) -> None:
         try:
             async with self._database.connection() as conn:
                 async with conn.cursor() as cursor:
                     await cursor.execute(map_sessions.RUN_EPOCH_HEADER_SQL,
-                                         (hid, self._name, self._run_epoch))
+                                         (hid, self._name, epoch))
+        except asyncio.CancelledError:
+            raise
         except Exception as err:  # pylint: disable=broad-except
             self.debug(f"Run header not stored: {err}")
 
@@ -1837,7 +2404,12 @@ class Robot:
         return converted
 
     async def _on_client_message(self, message: types.VDA5050State):
-        self.debug(f"[{message.orderId}] Got feedback")
+        self.debug("[%s] Got feedback", message.orderId)
+        self._manufacturer = message.manufacturer or self._manufacturer
+        # First, so that every decision on this message (a held mission's start, a cancel
+        # before dispatch) sees the robot as this message reports it, not the previous one.
+        self._robot_order_id = message.orderId
+        self._robot_executing = bool(message.nodeStates or message.edgeStates)
         # If we have a robot, Update it with the details from the message
         if self._robot_object is not None:
             self._arm_online_watchdog()
@@ -1875,33 +2447,14 @@ class Robot:
                                               self._robot_object.battery.recommended_minimum)
                                          and not self._robot_object.status.state.running
                                          and not self._charging_mission_received)
-                if send_charging_mission:
-                    # Check mission control health
-                    try:
-                        health_response = requests.get(
-                            self._robot_server.mission_ctrl_url + "/api/v1/health")
-                        if health_response.status_code == 200:
-                            response = requests.post(
-                                self._robot_server.mission_ctrl_url+"/api/v1/mission/charging",
-                                params={"robot_name": self._name})
-                            if response.status_code == 200:
-                                logging.debug(
-                                    "Charging mission posted successfully for robot %s",
-                                    self._name)
-                                self._charging_mission_received = True
-                            else:
-                                logging.warning(
-                                    "Failed to post charging mission for robot %s ",
-                                    self._name)
-                    except requests.exceptions.ConnectionError as err:
-                        # Service doesn't exist, handle accordingly
-                        logging.warning(
-                            "Connection error occurred: \n %s", err)
-                    except requests.exceptions.HTTPError as http_err:
-                        logging.warning("HTTP error occurred: \n %s", http_err)
-                    except requests.exceptions.Timeout as timeout_err:
-                        logging.warning(
-                            "Timeout error occurred: \n %s", timeout_err)
+                if send_charging_mission and not self._charging_hook_busy and \
+                        time.monotonic() >= self._charging_hook_next_at:
+                    # Off the event loop, and at most one attempt per backoff window.
+                    self._charging_hook_busy = True
+                    self._charging_hook_next_at = time.monotonic() + CHARGING_HOOK_RETRY_S
+                    task = asyncio.ensure_future(self._post_charging_mission())
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
             if not self._robot_object.status.online:
                 self.info("Robot Online")
                 self._reset_resend_budgets()
@@ -1917,8 +2470,17 @@ class Robot:
                 i.infoType: i.infoDescription for i in (message.information or [])}
 
             if "user_info" in info_by_type:
-                self._robot_object.status.info_messages = \
-                    json.loads(info_by_type["user_info"])
+                raw_info = info_by_type["user_info"]
+                try:
+                    parsed_info = json.loads(raw_info)
+                    if not isinstance(parsed_info, dict):
+                        raise ValueError("user_info is not a JSON object")
+                    self._robot_object.status.info_messages = parsed_info
+                except ValueError as err:
+                    # Malformed robot data must not stall the mission on every state.
+                    if raw_info != self._bad_user_info:
+                        self._bad_user_info = raw_info
+                        self.warning(f"Ignoring malformed user_info ({err}): {raw_info[:200]!r}")
 
             # deviation_range is a server-tracked value kept alongside the user_info
             # payload. Write it *after* the user_info replacement above so it is not
@@ -1956,33 +2518,53 @@ class Robot:
             # not-yet-dispatched PENDING mission).
             if self._current_mission is not None and self._current_mission.status.held:
                 await self._try_start_mission()
+            else:
+                await self._retry_stalled_start()
             # Update robot unique ID
             self._robot_object.status.hardware_version = \
                 robot_object.RobotHardwareVersionV1(manufacturer=message.manufacturer,
                                                     serial_number=message.serialNumber)
             if self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
-                await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
+                self._store_robot_status()
 
             # Update object detection results if necessary
+            listed = {a.actionId for a in message.actionStates}
+            # A finished action stays listed: forget only those the robot stopped listing.
+            self._detection_actions_done &= listed
+            self._bad_detection_actions &= listed
             for action_state in message.actionStates:
                 if (action_state.actionStatus == types.VDA5050ActionStatus.FINISHED and
                         action_state.actionType == types.NVActionType.GET_OBJECTS and
                         self.robot_object is not None):
+                    if action_state.actionId in self._detection_actions_done or \
+                            action_state.actionId in self._bad_detection_actions:
+                        continue
+                    try:
+                        detected = [DetectedObject(**item) for item in json.loads(
+                            action_state.resultDescription)]
+                    except (TypeError, ValueError) as err:
+                        self._bad_detection_actions.add(action_state.actionId)
+                        self.warning(f"Ignoring malformed getObjects result of action "
+                                     f"{action_state.actionId}: {err}")
+                        continue
+                    self._detection_actions_done.add(action_state.actionId)
                     if self._detection_results_object is None:
                         self._detection_results_object = api_objects.DetectionResultsObjectV1(
                             name=self.robot_object.name)
-                        await self._database.create_object(
-                            self._detection_results_object, uuid.uuid4())
-                    self._detection_results_object.status.detected_objects = \
-                        [DetectedObject(**item) for item in json.loads(
-                            action_state.resultDescription)]
+                        try:
+                            await self._database.create_object(
+                                self._detection_results_object, uuid.uuid4())
+                        except fastapi.HTTPException as err:
+                            # 400: the row exists (dispatcher restarted); update it below.
+                            if err.status_code != 400:
+                                raise
+                    self._detection_results_object.status.detected_objects = detected
 
                     await self._database.update_status(
                         api_objects.DetectionResultsObjectV1, self._detection_results_object.name, self._detection_results_object.status, uuid.uuid4())
                     self.info(
                         "Updated object detector information in mission database.")
 
-        self._robot_order_id = message.orderId
         finished_instant_actions = await self.handle_instant_action(message)
         self.update_robot_state(finished_instant_actions)
 
@@ -1990,6 +2572,14 @@ class Robot:
 
         # What the cancelOrders the robot just resolved were for decides what follows.
         if await self._act_on_resolved_cancels(message):
+            return
+
+        # A cancelled mission whose tree is not built (see _cancel_before_dispatch) is
+        # waiting for this state to know what the robot holds.
+        if self._current_mission is not None and self._current_behavior_tree is None and \
+                self._current_mission.needs_canceled and \
+                not self._current_mission.status.state.done:
+            await self._cancel_before_dispatch()
             return
 
         # Make sure there is a mission to update
@@ -2014,8 +2604,9 @@ class Robot:
             self._deferred_replace_cancel = False
             if not self._has_outstanding_cancel(current_run_only=True) and \
                     not self._current_mission.needs_canceled:
-                await self._cancel_current_order(CancelPurpose.REPLACE,
-                                                 "Reroute: send cancel order action")
+                await self._cancel_order(CancelPurpose.REPLACE, "replace",
+                                         "Reroute: send cancel order action",
+                                         ours=OURS_ANY, current_run_only=True)
                 return
 
         # A send the current node is owed goes out once no cancelOrder of ours is in
@@ -2024,10 +2615,10 @@ class Robot:
             await self._flush_pending_send()
             return
 
-        # During a wait the robot has no order of ours to report (a mission or pass that
+        # During a wait (or a notify) the robot has no order of ours to report (a mission or pass that
         # starts with one still has the previous order's id on its state), so a
         # mismatch is expected and must neither be counted nor trigger a resend.
-        if self._wait_key is not None and \
+        if (self._wait_key is not None or self._notify_key is not None) and \
                 not order_ids.is_order_of(self._order_prefix(), message.orderId):
             return
 
@@ -2037,6 +2628,22 @@ class Robot:
                 # Our cancelOrder is in flight: an order now would race it (the robot
                 # rejects it while it still runs one, or the cancel takes it). The
                 # cancel's completion decides what comes next.
+                return
+            rejection = self._order_rejection(message)
+            if rejection:
+                reasons = "; ".join(e.errorDescription for e in rejection)
+                self.warning(f"[{self._current_mission.name}] Robot rejected the dispatched "
+                             f"order: {reasons} -- failing mission")
+                self._current_mission.status.failure_reason = \
+                    f"Robot rejected the dispatched order: {reasons}"
+                self._set_failure_category(mission_object.MissionFailureCategoryV1.ROBOT_APP)
+                node_name = str(self._current_behavior_tree.current_node.name)
+                if node_name in self._current_mission.status.node_status:
+                    self._current_mission.status.node_status[node_name].error_msg = reasons
+                self._set_mission_state(mission_object.MissionStateV1.FAILED)
+                self._order_mismatch_count = 0
+                self._set_robot_idle_after_mission()
+                await self.get_next_mission()
                 return
             self._order_mismatch_count += 1
             self.info(f"[{self._current_mission.name}] Got message from another mission order: "
@@ -2048,7 +2655,8 @@ class Robot:
             # reported ON_TASK while it sits still, with nothing surfaced to the
             # operator. Fail the mission instead so the state is visible and the queue
             # can move on.
-            if self._order_mismatch_count >= self.MAX_ORDER_MISMATCHES:
+            if self._order_mismatch_count >= self.MAX_ORDER_MISMATCHES and \
+                    time.monotonic() - self._order_sent_at >= self.ORDER_GIVE_UP_MIN_S:
                 self.warning(
                     f"[{self._current_mission.name}] Robot never adopted our order after "
                     f"{self.MAX_ORDER_MISMATCHES} state messages (still reporting "
@@ -2056,8 +2664,10 @@ class Robot:
                 self._current_mission.status.failure_reason = \
                     ("Robot did not accept the dispatched order "
                      f"(still reporting {message.orderId})")
+                self._set_failure_category(mission_object.MissionFailureCategoryV1.ROBOT_APP)
                 self._set_mission_state(mission_object.MissionStateV1.FAILED)
                 self._order_mismatch_count = 0
+                await self._stop_our_order("mismatch")
                 self._set_robot_idle_after_mission()
                 await self.get_next_mission()
                 return
@@ -2071,6 +2681,11 @@ class Robot:
 
         prev_child_node = self._current_behavior_tree.current_node.name
         self.update_mission_state(message, finished_instant_actions)
+
+        # Failed (a FATAL error, a failed node) while the robot still runs the order: it
+        # must drop it, or it keeps driving and rejects the next mission's order.
+        if self._current_mission.status.state == mission_object.MissionStateV1.FAILED:
+            await self._stop_our_order("failed")
 
         # The robot dropped the node's order on its own (see update_mission_state).
         if self._pending_send is not None and not self._has_outstanding_cancel():
@@ -2099,6 +2714,9 @@ class Robot:
                 if abandoned:
                     mission.status.failure_reason = \
                         "The robot never confirmed the cancelOrder"
+                    if self._robot_runs_our_order():
+                        mission.status.failure_reason += \
+                            f"; it still reports its order {self._robot_order_id}"
                 self._end_current_mission(mission_object.MissionStateV1.CANCELED)
                 await self.post_mission_completion()
                 return True
@@ -2205,13 +2823,13 @@ class Robot:
                 (executing or self._order_finished_on_robot(message)):
             self.mission_info(f"Resume: the robot is on {current}; carrying on")
             return False
-        if executing:
-            self.mission_info(f"Resume: the robot is executing {message.orderId}; "
-                              "cancelling it before sending")
-            await self._send_cancel_order(
-                self._action_id(f"{self._order_prefix()}-resume-cancel"),
-                CancelPurpose.REPLACE)
+        if await self._cancel_order(
+                CancelPurpose.REPLACE, "resume",
+                f"Resume: the robot is executing {message.orderId}; cancelling it before "
+                "sending", ours=OURS_DISPATCHER):
             return True
+        # (Executing an order of its own: not ours to cancel; the node goes out now and the
+        # robot's answer to it says whether it takes it.)
         self._pending_send = NEW_REVISION
         await self._flush_pending_send()
         return True
@@ -2261,8 +2879,8 @@ class Robot:
                 if value is not None and value >= minimum:
                     setattr(self._robot_object.status.factsheet, field, value)
 
-            # Store custom actions from factsheet
-            if message.actions:
+            # Store custom actions from factsheet (an empty list clears what was stored)
+            if message.actions is not None:
                 self._robot_object.status.factsheet.custom_actions = [
                     robot_object.CustomActionV1(
                         action_type=action.actionType,
@@ -2278,7 +2896,7 @@ class Robot:
                 ]
                 self.info(f"Stored {len(message.actions)} custom actions from factsheet")
 
-            await self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
+            await self._write_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
 
     async def post_mission_completion(self):
         # Delete a completed/failure mission
@@ -2350,8 +2968,7 @@ class Robot:
         status.node_notes = []
         status.offset_summary = None
         try:
-            await self._database.update_status(
-                api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id())
+            await self._write_status(api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id())
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not persist the next pass ({err}); "
                          "finishing the mission instead")
@@ -2419,15 +3036,17 @@ class Robot:
         if self._current_mission.status.state == mission_object.MissionStateV1.COMPLETED and \
                 not self._current_mission.needs_canceled and \
                 self._current_mission.lifecycle is api_objects.object.ObjectLifecycleV1.ALIVE:
-            if self._will_run_another_pass() and await self._start_next_pass():
-                return
+            if self._will_run_another_pass():
+                if await self._start_next_pass():
+                    return
+                # No pass follows after all: the robot is not on task any more.
+                self._set_robot_idle_after_mission()
             if self._current_mission.status.state == mission_object.MissionStateV1.COMPLETED:
                 # The last pass is a finished pass too: "lap 3 / 3" reads passes_completed.
                 final = self._current_mission
                 final.status.passes_completed += 1
                 try:
-                    await self._database.update_status(
-                        api_objects.MissionObjectV1, final.name, final.status, self._mission_writer_id())
+                    await self._write_status(api_objects.MissionObjectV1, final.name, final.status, self._mission_writer_id())
                 except Exception as err:  # pylint: disable=broad-except
                     self.warning(f"[{final.name}] Could not persist the pass count ({err})")
                 await self._chain_then_run(final)
@@ -2445,6 +3064,17 @@ class Robot:
         else:
             await self._try_start_mission()
 
+    @staticmethod
+    def _remaining_timeout_s(mission: api_objects.MissionObjectV1) -> Optional[float]:
+        """What is left of `mission`'s timeout since its start_timestamp (written as a naive
+        local datetime.now(); an aware one is compared in its own zone), or None to use the
+        whole timeout (no start, or no timeout)."""
+        started = mission.status.start_timestamp
+        if started is None or mission.timeout is None:
+            return None
+        now = datetime.datetime.now(started.tzinfo) if started.tzinfo else datetime.datetime.now()
+        return max(mission.timeout.total_seconds() - (now - started).total_seconds(), 0.0)
+
     def _arm_mission_timeout(self, remaining_s: Optional[float] = None):
         """(Re)start the mission timeout watchdog for the current mission, with the
         mission's whole timeout or, resuming one paused while the robot was offline, what
@@ -2459,7 +3089,7 @@ class Robot:
             else remaining_s
         self._timeout_budget = (self._current_mission.name, budget, time.monotonic())
         self._mission_timeout_task = asyncio.get_event_loop().create_task(
-            self._wait_mission_timeout(budget, self._current_mission.name))
+            self._run_mission_timer(budget, self._timeout_budget))
 
     def _cancel_mission_timeout(self):
         """Cancel the mission timeout watchdog (e.g. while the mission is blocked and
@@ -2497,9 +3127,21 @@ class Robot:
         self._arm_mission_timeout(remaining)
         self.mission_info(f"Robot online: mission timeout resumed ({remaining:.0f} s left)")
 
-    async def _wait_mission_timeout(self, timeout: float, name: str):
+    async def _run_mission_timer(self, timeout: float, token: Tuple[str, float, float]):
         await asyncio.sleep(timeout)
-        # Check to see if the mission that launched this thread is still running
+        await self.send_message(MissionTimeoutElapsed(token=token))
+
+    async def _on_mission_timeout_elapsed(self, message: MissionTimeoutElapsed):
+        """The timer ran out: handled here on the message loop (see MissionTimeoutElapsed)."""
+        if self._timeout_budget != message.token:
+            return
+        await self._fail_mission_on_timeout(message.token[0])
+
+    async def _fail_mission_on_timeout(self, name: str):
+        """End mission `name` if it is still the current, RUNNING one: FAILED as a timeout, or
+        CANCELED if it is being cancelled or deleted. The robot is told to drop its order and
+        the queue moves on."""
+        # Check to see if the mission that launched this timer is still running
         if (self._current_mission is None) or (self._robot_object is None):
             return
 
@@ -2510,14 +3152,15 @@ class Robot:
             # cancelled on block; this guards the rare cancel/fire race.)
             if self._current_mission.status.blocked:
                 return
-            # In case there is no response from the client
-            if await self._robot_server.delete_pending_mission(self._current_mission):
-                return
-            if self._current_mission.needs_canceled:
+            # In case there is no response from the client. A mission deleted while it
+            # ran ends like a cancelled one (its order dropped, the queue moves on).
+            deleted = await self._robot_server.delete_pending_mission(self._current_mission)
+            if deleted or self._current_mission.needs_canceled:
                 self._set_mission_state(mission_object.MissionStateV1.CANCELED)
             else:
                 self._current_mission.status.failure_reason = \
                     fleet_recorder.MISSION_TIMEOUT_REASON
+                self._set_failure_category(mission_object.MissionFailureCategoryV1.TIMEOUT)
                 self._set_mission_state(mission_object.MissionStateV1.FAILED)
             # Tell the robot to actually abandon its order before moving on — without
             # this, a robot that never finished the order (e.g. stuck retrying/stalled
@@ -2530,22 +3173,53 @@ class Robot:
             # the same way after MAX_ORDER_MISMATCHES — observed in practice as a
             # "zombie order" a rerun could not recover from short of manually
             # publishing a cancelOrder or restarting the robot's VDA5050 client.
-            # One cancel at a time, same as the explicit-cancel path: on the
-            # needs_canceled route a cancelOrder is usually already outstanding, and
-            # handle_instant_action() keeps resending that one regardless of which
-            # mission is current, so a second one here would only be a duplicate.
-            if not self._has_outstanding_cancel():
-                timeout_cancel_id = \
-                    self._action_id(f"{self._order_prefix()}-timeout-cancel")
-                self.mission_info(
-                    f"Sending cancelOrder {timeout_cancel_id} so the robot "
-                    "abandons the timed-out order")
-                await self._send_cancel_order(timeout_cancel_id, CancelPurpose.STOP)
+            # That order is the run's own, which the robot reports under its id, or one
+            # not reported yet; the robot's own order is left alone (see _cancel_order,
+            # OURS_SENT). One cancel at a time, as on the explicit-cancel path (a
+            # cancelOrder is usually already outstanding there, and
+            # handle_instant_action() keeps resending it whichever mission is current).
+            await self._cancel_order(
+                CancelPurpose.STOP, "timeout", "Sending cancelOrder so the robot abandons "
+                "the timed-out order", ours=OURS_SENT)
             self._set_robot_idle_after_mission()
             await self.get_next_mission()
 
+    async def _fail_missions_of_deleted_robot(self):
+        """The robot is being deleted: its current mission and every queued one fail with
+        ROBOT_DELETED_REASON (none can run any more); the current order is cancelled if
+        there is one and the robot can hear it."""
+        current = self._current_mission
+        if current is not None and not current.status.state.done:
+            if current.status.failure_reason is None:
+                current.status.failure_reason = ROBOT_DELETED_REASON
+            if self._robot_object is not None and self._robot_object.status.online:
+                try:
+                    await self._cancel_order(
+                        CancelPurpose.STOP, "deleted", "Robot deleted: sending cancelOrder",
+                        ours=OURS_SENT)
+                except Exception as err:  # pylint: disable=broad-except
+                    self.warning(f"Could not cancel the order of a deleted robot: {err}")
+            self._set_mission_state(mission_object.MissionStateV1.FAILED)
+            if self._current_behavior_tree is not None:
+                self._record("run_finished", self._name, current, self._robot_object)
+        for mission in list(self._missions.values()):
+            if mission is current or mission.status.state.done:
+                continue
+            mission.status.failure_reason = ROBOT_DELETED_REASON
+            mission.status.state = mission_object.MissionStateV1.FAILED
+            mission.status.end_timestamp = datetime.datetime.now()
+            for node_state in mission.status.node_status.values():
+                if not node_state.state.done:
+                    node_state.state = mission_object.MissionStateV1.FAILED
+            try:
+                await self._write_status(api_objects.MissionObjectV1, mission.name, mission.status,
+                    self._mission_writer_id())
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"[{mission.name}] Could not persist the failure ({err})")
+
     async def _delete_robot_object(self):
         if self._robot_object is not None:
+            await self._fail_missions_of_deleted_robot()
             self._robot_object.lifecycle = api_objects.object.ObjectLifecycleV1.DELETED
             self._alive = False
             if self._robot_online_task is not None:
@@ -2645,7 +3319,7 @@ class Robot:
                     idx >= offset and \
                     idx < len(current_mission_node.route.waypoints):
                 task_status[str(current_mission_node.name)] = idx
-                asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
+                self._queue_status_write(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id())
 
             if route_current and \
                     current_order_node_id == (current_mission_node.route.size - offset) * 2 + 2:
@@ -2861,8 +3535,7 @@ class Robot:
             if note.offset_map is not None:
                 self._update_offset_summary()
         if changed:
-            asyncio.ensure_future(self._database.update_status(
-                api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id()))
+            self._queue_status_write(api_objects.MissionObjectV1, mission.name, status, self._mission_writer_id())
 
     def _drop_node_reports(self, mission_node: str) -> None:
         """A reroute replaced `mission_node`'s route: its waypoint indices and graph nodes
@@ -3023,12 +3696,10 @@ class Robot:
 
         # The robot has stopped and is IDLE; reflect that and stop the timeout from
         # failing a mission that is legitimately waiting for an operator reroute.
-        self._set_robot_state(robot_object.RobotStateV1.IDLE)
+        self._set_robot_state_unless_teleop(robot_object.RobotStateV1.IDLE)
         self._cancel_mission_timeout()
 
-        asyncio.ensure_future(self._database.update_status(
-            api_objects.MissionObjectV1, self._current_mission.name,
-            status, self._mission_writer_id()))
+        self._queue_status_write(api_objects.MissionObjectV1, self._current_mission.name, status, self._mission_writer_id())
         return True
 
     def _clear_block(self, mission: api_objects.MissionObjectV1):
@@ -3048,13 +3719,48 @@ class Robot:
             mission.status.node_status[blocked_node].error_msg = None
         self.mission_info("Edge block cleared; mission resuming")
         # Robot is moving again; restore ON_TASK and re-arm the mission timeout.
-        self._set_robot_state(robot_object.RobotStateV1.ON_TASK)
+        self._set_robot_state_unless_teleop(robot_object.RobotStateV1.ON_TASK)
         if mission is self._current_mission:
             self._arm_mission_timeout()
-        asyncio.ensure_future(self._database.update_status(
-            api_objects.MissionObjectV1, mission.name, mission.status, self._mission_writer_id()))
+        self._queue_status_write(api_objects.MissionObjectV1, mission.name, mission.status, self._mission_writer_id())
 
     _NODE_REFERENCE_KEYS = ("node_id", "nodeId", "action_id", "actionId")
+    _ORDER_REFERENCE_KEYS = _NODE_REFERENCE_KEYS + ("order_id", "orderId")
+
+    def _order_rejection(self, message: types.VDA5050State) -> List[types.VDA5050Error]:
+        """Errors in which the robot rejects the order we are waiting for it to adopt:
+        rejection-type or FATAL errors that reference that order or one of its nodes or
+        actions."""
+        pending = self._current_order_id()
+        found = []
+        for error in message.errors:
+            if error.errorType in ADVISORY_ERROR_TYPES or not (
+                    error.errorLevel == types.VDA5050ErrorLevel.FATAL or
+                    error.errorType in ORDER_REJECTION_ERROR_TYPES):
+                continue
+            for ref in error.errorReferences:
+                if ref.referenceKey not in self._ORDER_REFERENCE_KEYS:
+                    continue
+                if pending is not None:
+                    ours = order_ids.order_of_reference(ref.referenceValue) == pending
+                else:
+                    ours = order_ids.is_reference_of(
+                        self._order_prefix(), ref.referenceValue) is True
+                if ours:
+                    found.append(error)
+                    break
+        return found
+
+    def _is_foreign_error(self, error: types.VDA5050Error) -> bool:
+        """Whether every id the error references that we generated belongs to another run,
+        revision or mission than the current order's (and at least one such id exists).
+        Ids we did not generate (robot-own, unparseable) do not make an error foreign."""
+        prefix = self._order_prefix()
+        verdicts = [order_ids.is_reference_of(prefix, r.referenceValue)
+                    for r in error.errorReferences
+                    if r.referenceKey in self._ORDER_REFERENCE_KEYS]
+        verdicts = [v for v in verdicts if v is not None]
+        return bool(verdicts) and not any(verdicts)
 
     @classmethod
     def _unreferenced_fatal_types(cls, message: types.VDA5050State) -> set:
@@ -3085,7 +3791,7 @@ class Robot:
 
     def get_mission_errors(self, message: types.VDA5050State):
         fatal_errors = False
-        reason_set = False
+        counted: List[types.VDA5050Error] = []
         if len(message.errors) == 0:
             return False
         for error in message.errors:
@@ -3098,6 +3804,16 @@ class Robot:
                     for r in error.errorReferences):
                 # Reported before this mission's order was accepted: not ours.
                 continue
+            if self._current_mission is not None and self._is_foreign_error(error):
+                # Left over from an earlier run, revision or cancelled order.
+                key = f"{error.errorType}:" + ",".join(
+                    r.referenceValue for r in error.errorReferences)
+                if key not in self._foreign_error_refs:
+                    self._foreign_error_refs.add(key)
+                    self.info(f"Ignoring FATAL error of an earlier order: "
+                              f"{error.errorDescription} ({key})")
+                continue
+            counted.append(error)
             fatal_errors = True
             for error_reference in error.errorReferences:
                 if error_reference.referenceKey in \
@@ -3105,28 +3821,36 @@ class Robot:
                     mission_node = order_ids.node_index(error_reference.referenceValue)
                     if mission_node is None:
                         continue
+                    if self._current_mission is not None and order_ids.is_reference_of(
+                            self._order_prefix(), error_reference.referenceValue) is False:
+                        continue  # another order's node: not this mission's node
                     if self._current_mission is not None and \
                             mission_node < len(self._current_mission.mission_tree):
                         (self._current_mission.status.node_status[
                             str(self._current_mission.mission_tree[mission_node].name)].error_msg) \
                             = error.errorDescription
-                        self._current_mission.status.failure_reason = "\n".join(
-                            error.errorDescription for error in message.errors)
-                        reason_set = True
-        # FATAL without node/action references still needs a reason.
-        if fatal_errors and not reason_set and self._current_mission is not None:
+        # The reason names every counted FATAL, with or without node/action references.
+        if fatal_errors and self._current_mission is not None:
             self._current_mission.status.failure_reason = "\n".join(
-                e.errorDescription for e in message.errors
-                if e.errorLevel == types.VDA5050ErrorLevel.FATAL and
-                e.errorType not in self._stale_fatal_types)
+                e.errorDescription for e in counted)
+            self._set_failure_category(mission_object.MissionFailureCategoryV1.ROBOT_APP)
         return fatal_errors
+
+    def _mission_progress_signature(self) -> Tuple[Any, ...]:
+        """What a behavior tree update can change in the mission status besides what
+        _set_mission_state reports: the current node and the node states (post_tick is the
+        tree's only write). Cheaper than a deep copy and a model comparison per state
+        message; a field the tree starts writing must be added here."""
+        status = self._current_mission.status
+        return (status.current_node, status.state,
+                tuple(node.state for node in status.node_status.values()))
 
     def update_mission_from_behavior_tree(self):
         # update mission state from behavior tree
         if self._current_behavior_tree is None or self._current_mission is None:
             return
         # Record the old status and store the new status
-        previous_mission_status = self._current_mission.status.copy(deep=True)
+        previous_signature = self._mission_progress_signature()
         # Update mission status
         self._current_behavior_tree.update()
         self._current_mission.status.current_node = self._current_behavior_tree.current_node.idx
@@ -3134,10 +3858,11 @@ class Robot:
             self._current_behavior_tree.status)
         mission_state_updated = self._set_mission_state(current_state)
         # In case mission node status get updated but mission state remains the same
-        if not mission_state_updated and previous_mission_status != self._current_mission.status:
+        if not mission_state_updated and \
+                previous_signature != self._mission_progress_signature():
             self.info(
                 f"update mission node: {self._current_mission.status.current_node}")
-            asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
+            self._queue_status_write(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id())
 
     def update_robot_state(self, finished_instant_actions: List[types.VDA5050Action]):
         """ Update robot states after teleop is finished
@@ -3191,6 +3916,7 @@ class Robot:
         if mission_status == "failed":
             # Populate failure_reason from the errors array before transitioning.
             self.get_mission_errors(message)
+            self._set_failure_category(mission_object.MissionFailureCategoryV1.ROBOT_APP)
             self._set_mission_state(mission_object.MissionStateV1.FAILED)
             return
         if mission_status == "canceled":
@@ -3309,13 +4035,19 @@ class Robot:
                 for name in names}
         self.info(f"Applied an edit of {changed} to mission [{target.name}]")
 
+    def _node_key(self, mission_node: mission_object.MissionNodeV1
+                  ) -> Tuple[str, str, Optional[str], int, int]:
+        """Identifies one pass of a node the dispatcher runs itself (wait, notify)."""
+        status = self._current_mission.status
+        return (str(self._current_mission.name), str(mission_node.name),
+                status.run_id, status.order_rev, status.passes_completed)
+
     def _start_wait(self, mission_node: mission_object.MissionNodeV1):
         """Start the timer of a "wait" action node. No order goes to the robot."""
         assert self._current_mission is not None and mission_node.action is not None
         status = self._current_mission.status
         seconds = float(mission_node.action.action_parameters["seconds"])
-        key = (str(self._current_mission.name), str(mission_node.name),
-               status.run_id, status.order_rev, status.passes_completed)
+        key = self._node_key(mission_node)
         # _send_order() runs again for a node whenever the robot's state does not match
         # yet; the timer already running for this node must not be restarted by that.
         if self._wait_key == key:
@@ -3325,17 +4057,24 @@ class Robot:
         self.mission_info(f"Waiting {seconds:g}s at node {mission_node.name}")
         self.set_mission_node_state(str(mission_node.name),
                                     mission_object.MissionStateV1.RUNNING)
-        asyncio.ensure_future(self._persist_current_mission_status())
+        self._queue_status_write(
+            api_objects.MissionObjectV1, self._current_mission.name,
+            self._current_mission.status, self._mission_writer_id())
         self._wait_task = asyncio.get_event_loop().create_task(
             self._run_wait_timer(seconds, self._wait_key))
 
     async def _run_wait_timer(self, seconds: float,
                               key: Tuple[str, str, Optional[str], int, int]):
         await asyncio.sleep(seconds)
-        await self._messages.put(WaitElapsed(key=key))
+        await self.send_message(WaitElapsed(key=key))
 
     def _cancel_wait(self):
-        """Drop the running wait, if any. Safe from any path that leaves the mission."""
+        """Drop the running wait (and notify task), if any. Safe from any path that leaves
+        the mission."""
+        if self._notify_task is not None and self._notify_task is not asyncio.current_task():
+            self._notify_task.cancel()
+        self._notify_task = None
+        self._notify_key = None
         if self._wait_task is not None and self._wait_task is not asyncio.current_task():
             self._wait_task.cancel()
         self._wait_task = None
@@ -3349,6 +4088,20 @@ class Robot:
         self._wait_key = None
         node_name = message.key[1]
         self.set_mission_node_state(node_name, mission_object.MissionStateV1.COMPLETED)
+        await self._advance_after_node()
+
+    async def _on_notify_done(self, message: NotifyDone):
+        """A notify node ended (its node state is set): go on as after a wait."""
+        if self._current_mission is None or self._notify_key != message.key or \
+                self._current_behavior_tree is None:
+            return
+        self._notify_task = None
+        self._notify_key = None
+        await self._advance_after_node()
+
+    async def _advance_after_node(self):
+        """A node the dispatcher ran itself (wait, notify) ended: the mission is complete, or
+        the next node's order goes out."""
         prev_child_node = self._current_behavior_tree.current_node.name
         self.update_mission_from_behavior_tree()
         if self._current_mission.status.state.done:
@@ -3364,6 +4117,14 @@ class Robot:
             # of warnings a second (seen in the unit tests: 55+ GB of captured log records
             # before the host's OOM killer stepped in). Let the task end instead.
             message = await self._messages.get()
+            if isinstance(message, _StateSlot):
+                if self._state_slot is message:
+                    self._state_slot = None
+                if self._queue_tail is message:
+                    self._queue_tail = None
+                message = message.msg
+                if message is None:
+                    continue    # replaced by a newer state queued later (send_message)
             try:
                 # If this is a robot object
                 if isinstance(message, api_objects.RobotObjectV1):
@@ -3379,14 +4140,40 @@ class Robot:
                     await self._process_datum_message(message)
                 elif isinstance(message, types.RobotApproxPosition):
                     await self._process_approx_position_message(message)
+                elif isinstance(message, ConnectionDelivery):
+                    await self._on_connection_message(message.connection, message.retained)
                 elif isinstance(message, types.VDA5050Connection):
                     await self._on_connection_message(message)
                 elif isinstance(message, WaitElapsed):
                     await self._on_wait_elapsed(message)
+                elif isinstance(message, NotifyDone):
+                    await self._on_notify_done(message)
+                elif isinstance(message, MissionTimeoutElapsed):
+                    await self._on_mission_timeout_elapsed(message)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                self.warning(f"Unhandled exception in robot message loop: {e}")
+            except Exception as e:  # pylint: disable=broad-except
+                self._log_loop_error(e)
+
+    def _log_loop_error(self, err: Exception) -> None:
+        """An exception that escaped a message handler: the first of each kind is logged at
+        error with its traceback, repeats only as a count every LOOP_ERROR_SUMMARY_INTERVAL_S."""
+        now = time.monotonic()
+        key = (type(err).__name__, str(err))
+        entry = self._loop_errors.get(key)
+        if entry is None:
+            if len(self._loop_errors) >= LOOP_ERROR_MAX_KINDS:
+                oldest = min(self._loop_errors, key=lambda k: self._loop_errors[k][1])
+                del self._loop_errors[oldest]
+            self._loop_errors[key] = [0, now]
+            self.error(f"Unhandled exception in robot message loop: {err!r}", exc_info=err)
+            return
+        entry[0] += 1
+        if now - entry[1] >= LOOP_ERROR_SUMMARY_INTERVAL_S:
+            self.error(f"Unhandled exception in robot message loop repeated {entry[0]} more "
+                       f"time(s) in the last {now - entry[1]:.0f}s: {err!r}")
+            entry[0] = 0
+            entry[1] = now
 
     async def _on_state_message(self, message: types.VDA5050State):
         """A robot state message: dispatch handles it, then it is recorded -- afterwards, so
@@ -3398,7 +4185,13 @@ class Robot:
                      self._robot_object)
         if not self._run_checked and time.monotonic() >= self._run_check_after:
             await self._check_run_continuity(message.headerId)
+        was_pending = self._run_detector.pending_state_drop is not None
         evidence = self._run_detector.on_state(message.headerId)
+        if self._run_detector.pending_state_drop is not None and not was_pending:
+            # The pose in memory is still the old run's (this message's is stored below).
+            # (a copy: the pose is updated in place by every state message)
+            self._pre_drop_pose = self._robot_object.status.pose.copy() \
+                if self._robot_object is not None else None
         if evidence is not None:
             await self._on_run_changed(evidence)
         else:
@@ -3410,11 +4203,68 @@ class Robot:
             self._record("on_state", self._name, message, self._robot_object)
 
     async def send_message(self, message):
+        """Queue a message for the loop in run(). Only the newest state message of the robot
+        is kept: VDA5050 state is cumulative (full actionStates list, node progress, errors),
+        so a loop that is behind handles the newest state instead of replaying stale ones.
+        A state replaces the unprocessed one in place when nothing else was queued after it;
+        otherwise its predecessor is emptied and the new state is queued at its own place, so
+        the order relative to connection, order and timer messages is kept."""
+        if isinstance(message, types.VDA5050State):
+            slot = self._state_slot
+            if slot is not None:
+                self._states_coalesced += 1
+                if self._states_coalesced % STATE_COALESCED_WARN_EVERY == 1:
+                    self.warning(f"Robot state message loop is behind: unprocessed state "
+                                 f"replaced by a newer one ({self._states_coalesced} so far)")
+                if self._queue_tail is slot:
+                    slot.msg = message
+                    return
+                slot.msg = None
+            slot = self._state_slot = self._queue_tail = _StateSlot(message)
+            await self._messages.put(slot)
+            return
+        self._queue_tail = None
         await self._messages.put(message)
 
-    def info(self, message: str):
-        self._logger.info(
-            "[Isaac Mission Dispatch] | INFO: [%s] %s", self._name, message)
+    def _robot_status_signature(self) -> Tuple[Any, ...]:
+        """The robot row's discrete fields, i.e. everything a state message changes except
+        the continuously changing pose, battery level, localization score and deviation."""
+        status = self._robot_object.status
+        info = status.info_messages
+        if info:
+            info = {k: v for k, v in info.items() if k != "deviation_range"}
+        return (status.online, status.state, status.errors, status.position_initialized,
+                status.pose.map_id, status.battery_unknown, status.recording_state,
+                status.nav_reasoning, info, status.hardware_version.manufacturer,
+                status.hardware_version.serial_number)
+
+    def _store_robot_status(self) -> None:
+        """Write the robot row after a state message, off the state loop (the status write
+        queue). A discrete change goes out at once; if only continuous fields changed, at
+        most every ROBOT_STATUS_MIN_WRITE_S, with a trailing write of the newest values so
+        the last state before a quiet period is always stored."""
+        signature = self._robot_status_signature()
+        now = time.monotonic()
+        waited = now - self._robot_written_at
+        if signature != self._robot_written_sig or waited >= ROBOT_STATUS_MIN_WRITE_S:
+            self._write_robot_status(signature, now)
+        elif self._robot_write_timer is None and self._alive:
+            self._robot_write_timer = asyncio.get_event_loop().call_later(
+                ROBOT_STATUS_MIN_WRITE_S - waited, self._robot_trailing_write)
+
+    def _write_robot_status(self, signature: Tuple[Any, ...], now: float) -> None:
+        if self._robot_write_timer is not None:
+            self._robot_write_timer.cancel()
+            self._robot_write_timer = None
+        self._queue_status_write(api_objects.RobotObjectV1, self._robot_object.name,
+                                 self._robot_object.status, self._writer_id())
+        self._robot_written_sig, self._robot_written_at = signature, now
+
+    def _robot_trailing_write(self) -> None:
+        self._robot_write_timer = None
+        if self._alive and self._robot_object is not None and \
+                self._robot_object.lifecycle is not api_objects.object.ObjectLifecycleV1.DELETED:
+            self._write_robot_status(self._robot_status_signature(), time.monotonic())
 
     def mission_info(self, message: str):
         if self._current_mission is not None:
@@ -3424,13 +4274,25 @@ class Robot:
         self._logger.info("[Isaac Mission Dispatch] | INFO: [%s] [%s] %s",
                           self._name, mission, message)
 
-    def debug(self, message: str):
-        self._logger.debug(
-            "[Isaac Mission Dispatch] | DEBUG: [%s] %s", self._name, message)
+    def debug(self, message: str, *args):
+        """(`args` are %-formatted into `message` only when DEBUG is enabled: per-state calls
+        pass them instead of building an f-string that is thrown away.)"""
+        if self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "[Isaac Mission Dispatch] | DEBUG: [%s] %s", self._name,
+                message % args if args else message)
 
     def warning(self, message: str):
         self._logger.warning(
             "[Isaac Mission Dispatch] | WARNING: [%s] %s", self._name, message)
+
+    def error(self, message: str, exc_info: Any = False):
+        self._logger.error(
+            "[Isaac Mission Dispatch] | ERROR: [%s] %s", self._name, message, exc_info=exc_info)
+
+    def info(self, message: str):
+        self._logger.info(
+            "[Isaac Mission Dispatch] | INFO: [%s] %s", self._name, message)
 
     def _writer_id(self) -> uuid.UUID:
         """Publisher id of this controller's robot-object writes: the robot watcher of the
@@ -3482,7 +4344,16 @@ class Robot:
         self._record("on_robot_state", self._name, self._robot_object.status.state, state,
                      self._event_ts)
         self._robot_object.status.state = state
-        asyncio.ensure_future(self._database.update_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id()))
+        self._queue_status_write(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
+
+    def _set_robot_state_unless_teleop(self, state: robot_object.RobotStateV1):
+        """_set_robot_state, except that a teleoperated robot stays TELEOP: only a
+        teleop instant action leaves it, and the dispatcher only sends stopTeleop while
+        it believes the robot is in TELEOP."""
+        if self._robot_object is not None and \
+                self._robot_object.status.state == robot_object.RobotStateV1.TELEOP:
+            return
+        self._set_robot_state(state)
 
     def _set_robot_idle_after_mission(self):
         """The robot's state once a mission has ended -- unless it is teleoperated.
@@ -3491,14 +4362,19 @@ class Robot:
         teleop: the robot may still be paused by a pause_order or startTeleop, and only
         stopTeleop releases it. Dropping TELEOP here would make the dispatcher believe
         the robot is free, so it would never send that stopTeleop."""
-        if self._robot_object is not None and \
-                self._robot_object.status.state == robot_object.RobotStateV1.TELEOP:
-            return
-        self._set_robot_state(robot_object.RobotStateV1.IDLE)
+        self._set_robot_state_unless_teleop(robot_object.RobotStateV1.IDLE)
+
+    def _set_failure_category(self, category: mission_object.MissionFailureCategoryV1):
+        """Name the cause of the current mission's failure/cancel; the first one set wins."""
+        status = self._current_mission.status if self._current_mission is not None else None
+        if status is not None and status.failure_category is None:
+            status.failure_category = category
 
     def _set_mission_state(self, state: mission_object.MissionStateV1):
         if self._current_mission is None or state == self._current_mission.status.state:
             return False
+        if state == mission_object.MissionStateV1.CANCELED:
+            self._set_failure_category(mission_object.MissionFailureCategoryV1.CANCELED)
         self.mission_info(
             f"Mission state: {self._current_mission.status.state} -> {state}")
         self._current_mission.status.state = state
@@ -3520,9 +4396,7 @@ class Robot:
             if self._current_mission.status.start_timestamp is None:
                 self._current_mission.status.start_timestamp = datetime.datetime.now()
                 # A teleoperated (paused) robot stays TELEOP until stopTeleop.
-                if self._robot_object is None or \
-                        self._robot_object.status.state != robot_object.RobotStateV1.TELEOP:
-                    self._set_robot_state(robot_object.RobotStateV1.ON_TASK)
+                self._set_robot_state_unless_teleop(robot_object.RobotStateV1.ON_TASK)
                 self.mission_info(
                     f"Mission started at {self._current_mission.status.start_timestamp}")
         elif state.done:
@@ -3561,7 +4435,7 @@ class Robot:
             self.mission_info("Mission duration: "
                               f"""{self._current_mission.status.end_timestamp -
                                    self._current_mission.status.start_timestamp}""")
-        asyncio.ensure_future(self._database.update_status(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id()))
+        self._queue_status_write(api_objects.MissionObjectV1, self._current_mission.name, self._current_mission.status, self._mission_writer_id())
         return True
 
     def set_mission_node_state(self, node_name: str, state: mission_object.MissionStateV1):
@@ -3576,33 +4450,97 @@ class Robot:
             self._record("node_failed", self._name, self._current_mission, node_name,
                          self._event_ts)
 
-    def _process_notify_node(self, mission_node):
-        self.set_mission_node_state(f"{mission_node.name}",
-                                    mission_object.MissionStateV1.RUNNING)
-        retries = 0
-        while retries <= 3:
-            response = requests.post(url=mission_node.notify.url,
-                                     json=mission_node.notify.json_data,
-                                     timeout=mission_node.notify.timeout)
-            if response.status_code == 200:
-                self.set_mission_node_state(f"{mission_node.name}",
-                                            mission_object.MissionStateV1.COMPLETED)
-                break
-            elif response.status_code in [408, 425, 429, 500, 502, 503, 504]:
-                self.mission_info(
-                    f"Notify: {response.status_code} received, retrying")
-                retries += 1
-            else:
-                self.set_mission_node_state(f"{mission_node.name}",
-                                            mission_object.MissionStateV1.FAILED)
-                break
-        if retries > 3:
-            self.set_mission_node_state(f"{mission_node.name}",
-                                        mission_object.MissionStateV1.FAILED)
+    def _post_notify(self, notify) -> int:
+        """One notify request (blocking; runs in a worker thread). The HTTP status."""
+        timeout = NOTIFY_MAX_TIMEOUT_S if not notify.timeout else \
+            min(float(notify.timeout), NOTIFY_MAX_TIMEOUT_S)
+        return requests.post(url=notify.url, json=notify.json_data, timeout=timeout).status_code
 
-        # Since Notify does not send an order, there is no feedback from robot, so we
-        # need to trigger update here
-        self.update_mission_from_behavior_tree()
+    async def _process_notify_node(self, mission_node):
+        """Run a notify node as a task (_notify_task): POST its webhook in a worker thread,
+        retrying transient failures with back-off. Its writes are synchronous and happen
+        only after an await returns, so they cannot interleave with the message loop
+        mid-update. Cancelled with the mission (_cancel_wait); if the mission is cancelled,
+        finished or replaced meanwhile, nothing is written afterwards."""
+        if self._notify_in_flight:
+            return
+        mission = self._current_mission
+        tree = self._current_behavior_tree
+        name = f"{mission_node.name}"
+
+        def stale() -> bool:
+            return self._current_mission is not mission or \
+                self._current_behavior_tree is not tree or \
+                mission.status.state.done or mission.needs_canceled
+
+        self._notify_in_flight = True
+        finished = False
+        key = self._notify_key
+        try:
+            self.set_mission_node_state(name, mission_object.MissionStateV1.RUNNING)
+            final = mission_object.MissionStateV1.FAILED
+            reason = None
+            for attempt in range(len(NOTIFY_RETRY_BACKOFF_S) + 1):
+                if attempt:
+                    await asyncio.sleep(NOTIFY_RETRY_BACKOFF_S[attempt - 1])
+                    if stale():
+                        return
+                try:
+                    status = await asyncio.get_event_loop().run_in_executor(
+                        None, self._post_notify, mission_node.notify)
+                except Exception as err:  # pylint: disable=broad-except
+                    reason = f"Notify request failed: {type(err).__name__}: {err}"
+                    status = None
+                else:
+                    reason = f"Notify: HTTP {status}"
+                if stale():
+                    return
+                if status == 200:
+                    final = mission_object.MissionStateV1.COMPLETED
+                    reason = None
+                    break
+                if status is not None and status not in NOTIFY_RETRY_STATUSES:
+                    break
+                self.mission_info(f"{reason}, "
+                                  f"{'retrying' if attempt < len(NOTIFY_RETRY_BACKOFF_S) else 'giving up'}")
+            if final == mission_object.MissionStateV1.FAILED:
+                mission.status.node_status[name].error_msg = reason
+            self.set_mission_node_state(name, final)
+            finished = True
+        finally:
+            self._notify_in_flight = False
+            if not finished and self._notify_key == key:
+                self._notify_key = None   # dropped as stale: nothing more is coming
+
+        # Since Notify does not send an order, there is no feedback from robot: the message
+        # loop goes on from here (NotifyDone), as after a wait.
+        await self.send_message(NotifyDone(key=key))
+
+    def _charging_hook_request(self) -> bool:
+        """Ask mission control for a charging mission (blocking; runs in a worker thread).
+        Whether it was accepted."""
+        base = self._robot_server.mission_ctrl_url
+        if requests.get(base + "/api/v1/health", timeout=CHARGING_HOOK_TIMEOUT_S).status_code != 200:
+            return False
+        response = requests.post(base + "/api/v1/mission/charging",
+                                 params={"robot_name": self._name},
+                                 timeout=CHARGING_HOOK_TIMEOUT_S)
+        if response.status_code != 200:
+            self.warning("Failed to post charging mission")
+            return False
+        return True
+
+    async def _post_charging_mission(self):
+        try:
+            if await asyncio.get_event_loop().run_in_executor(None, self._charging_hook_request):
+                self.debug("Charging mission posted successfully")
+                self._charging_mission_received = True
+        except requests.exceptions.RequestException as err:
+            self.warning(f"Charging mission request failed: {err}")
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Charging mission request error: {err}")
+        finally:
+            self._charging_hook_busy = False
 
     @property
     def robot_object(self) -> Optional[robot_object.RobotObjectV1]:
@@ -3676,16 +4614,27 @@ class RobotServer:
         # The same for the controllers' mission writes (Robot._mission_writer_id).
         self.mission_writer_id = uuid.uuid4()
         self._mqtt_messages: asyncio.Queue = asyncio.Queue()
+        # Per robot, the state message still waiting in _mqtt_messages (newest wins, see
+        # _enqueue_now); dropped when another message of the robot is queued after it.
+        self._state_slots: Dict[str, _StateSlot] = {}
 
         # Maps §14 U3: bumped on every (re)connect to the broker; a robot's first datum in an
         # epoch may be a retained re-delivery (Robot._process_datum_message).
         self.mqtt_epoch = 0
 
-        # Connect to MQTT
-        self._mqtt_client = self._connect_to_mqtt(
-            mqtt_host, mqtt_port, mqtt_transport, mqtt_ws_path,
-            mqtt_username, mqtt_password
-        )
+        # Connect to MQTT in _run(), after the leader lock: a second instance shares the fixed
+        # client id and would fight over the session and double-publish orders.
+        self._mqtt_client: Optional[MQTTClient] = None
+        self._mqtt_args = (mqtt_host, mqtt_port, mqtt_transport, mqtt_ws_path,
+                           mqtt_username, mqtt_password)
+        self._leader = lifecycle.LeaderLock(self._database.dedicated_connection)
+        self._heartbeat = lifecycle.Heartbeat(
+            self._database.ping,
+            lambda: self._mqtt_client is not None
+            and getattr(self._mqtt_client, "connected", False))
+        self._main_task: Optional[asyncio.Task] = None
+        self._shutdown_done = False
+        self.exit_code = 0
 
         # The robot objects
         self._robots: Dict[str, Robot] = {}
@@ -3700,14 +4649,26 @@ class RobotServer:
         self.telemetry_env = telemetry_env
 
     def _enqueue(self, queue, obj):
-        asyncio.run_coroutine_threadsafe(queue.put(obj), self._event_loop)
+        """From the paho thread: hand over to the event loop, never block."""
+        self._event_loop.call_soon_threadsafe(self._enqueue_now, queue, obj)
 
-    def _mqtt_on_connect(self, client, userdata, flags, rc):
-        client.subscribe(f"{self._mqtt_prefix}/+/state")
-        client.subscribe(f"{self._mqtt_prefix}/+/factsheet")
-        client.subscribe(f"{self._mqtt_prefix}/+/datum")
-        client.subscribe(f"{self._mqtt_prefix}/+/approx_position")
-        client.subscribe(f"{self._mqtt_prefix}/+/connection")
+    def _enqueue_now(self, queue, obj) -> None:
+        """On the event loop. A robot's state message replaces its own still-queued one
+        (state is cumulative; the queue cannot grow while the consumer is behind). Anything
+        else is queued as is, and ends the robot's open state slot so order is kept."""
+        if queue is not self._mqtt_messages or not hasattr(obj, "name"):
+            queue.put_nowait(obj)
+            return
+        if isinstance(obj, (ClientStatusMessage, RawStateMessage)):
+            slot = self._state_slots.get(obj.name)
+            if slot is not None:
+                slot.msg = obj
+                return
+            slot = self._state_slots[obj.name] = _StateSlot(obj)
+            queue.put_nowait(slot)
+            return
+        self._state_slots.pop(obj.name, None)
+        queue.put_nowait(obj)
 
     def _mqtt_on_message(self, client, userdata, msg):
         state_match = re.match(f"{self._mqtt_prefix}/(.*)/state", msg.topic)
@@ -3720,8 +4681,7 @@ class RobotServer:
             if state_match:
                 robot = state_match.groups()[0]
                 pl = msg.payload
-                self._enqueue(self._mqtt_messages, ClientStatusMessage(name=robot,
-                                                                       payload=json.loads(pl)))
+                self._enqueue(self._mqtt_messages, RawStateMessage(robot, pl))
             elif factsheet_match:
                 robot = factsheet_match.groups()[0]
                 pl = msg.payload
@@ -3739,7 +4699,8 @@ class RobotServer:
             elif connection_match:
                 robot = connection_match.groups()[0]
                 self._enqueue(self._mqtt_messages, ClientConnectionMessage(
-                    name=robot, payload=json.loads(msg.payload)))
+                    name=robot, payload=json.loads(msg.payload),
+                    retained=bool(getattr(msg, "retain", False))))
             else:
                 self.warning(
                     f"Got message from unrecognized topic \"{msg.topic}\"")
@@ -3783,47 +4744,55 @@ class RobotServer:
 
     async def _watch_changes(self, object_class: Any, queue: asyncio.Queue,
                              publisher_id: Optional[uuid.UUID] = None):
-        """`publisher_id`: notifications of writes with this id are skipped (our own)."""
+        """`publisher_id`: notifications of writes with this id are skipped (our own).
+        A failed watch is restarted with a capped exponential backoff, like the recording
+        watchers: the process must not exit over a watcher error (nothing here needs it)."""
+        publisher_id = publisher_id or uuid.uuid4()
+        delay = WATCH_CHANGES_RETRY_MIN_S
         while True:
             try:
-                publisher_id = publisher_id or uuid.uuid4()
                 watcher_instance = await self._database.get_watcher(object_class, publisher_id)
                 with watcher_instance:
                     async for update in watcher_instance.watch():
+                        delay = WATCH_CHANGES_RETRY_MIN_S
                         self.debug(f"Watch object update: {object_class.get_alias()}")
                         await queue.put(update)
-            except Exception as err:
-                self.warning(f"Exit: {err}")
-                if hasattr(self._mqtt_client, 'disconnect'):
-                    self._mqtt_client.disconnect()
-                elif hasattr(self._mqtt_client, 'loop_stop'):
-                    self._mqtt_client.loop_stop()
-                asyncio.run_coroutine_threadsafe(self.stop(), self._event_loop)
-                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                self.error(f"Watcher for {object_class.get_alias()} failed, restarting in "
+                           f"{delay}s: {err}", exc_info=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, WATCH_CHANGES_RETRY_MAX_S)
 
     async def _handle_robot_changes(self):
         while True:
             robot = await self._robot_changes.get()
-            # Ignore deleted robot object
-            if robot.lifecycle == \
-                    api_objects.object.ObjectLifecycleV1.DELETED:
-                # The row is hard-deleted (DELETE /api/v1/robots/{name} writes DELETED
-                # directly): drop the live controller too, or it would keep its stale mission
-                # queue, run epoch and timers and take over a robot registered again under
-                # this name.
-                self.remove_robot(getattr(robot, "name", None))
-                if self.fleet_recorder is not None:
-                    self.fleet_recorder.on_robot_deleted(robot)
-                continue
-            # Robots being deleted may not have a name
-            if hasattr(robot, "name"):
-                if robot.name not in self._robots:
-                    self.debug(f"Got robot from database {robot.name}")
-                    self._robots[robot.name] = Robot(robot.name, self._database,
-                                                     self._mqtt_client, self._mqtt_prefix, self)
-                if self.fleet_recorder is not None:
-                    self.fleet_recorder.on_robot_object(robot)
-                await self._robots[robot.name].send_message(robot)
+            try:
+                await self._process_robot_change(robot)
+            except Exception:  # pylint: disable=broad-except
+                self.error(f"Robot change {getattr(robot, 'name', None)!r} failed",
+                           exc_info=True)
+
+    async def _process_robot_change(self, robot):
+        self._unknown_robots_cache().pop(getattr(robot, "name", None), None)
+        # Ignore deleted robot object
+        if robot.lifecycle == \
+                api_objects.object.ObjectLifecycleV1.DELETED:
+            # The row is hard-deleted (DELETE /api/v1/robots/{name} writes DELETED
+            # directly): drop the live controller too, or it would keep its stale mission
+            # queue, run epoch and timers and take over a robot registered again under
+            # this name.
+            self.remove_robot(getattr(robot, "name", None))
+            if self.fleet_recorder is not None:
+                self.fleet_recorder.on_robot_deleted(robot)
+            return
+        # Robots being deleted may not have a name
+        if hasattr(robot, "name"):
+            controller = self._get_or_create_robot(robot.name)
+            if self.fleet_recorder is not None:
+                self.fleet_recorder.on_robot_object(robot)
+            await controller.send_message(robot)
 
     async def _watch_settings(self):
         """Recording only (WP8): feed settings NOTIFYs (the global recording level) to the
@@ -3882,51 +4851,102 @@ class RobotServer:
     async def _handle_mission_changes(self):
         while True:
             mission = await self._mission_changes.get()
+            try:
+                await self._process_mission_change(mission)
+            except Exception:  # pylint: disable=broad-except
+                self.error(f"Mission change {getattr(mission, 'name', None)!r} failed",
+                           exc_info=True)
 
-            # Ignore deleted mission object
-            if mission.lifecycle == \
-                    api_objects.object.ObjectLifecycleV1.DELETED:
-                continue
+    async def _process_mission_change(self, mission):
+        # Ignore deleted mission object
+        if mission.lifecycle == \
+                api_objects.object.ObjectLifecycleV1.DELETED:
+            return
 
-            # Ignore missions that are already done
-            if mission.status.state.done:
-                # Delete completed mission
-                await self.delete_pending_mission(mission)
-                continue
+        # Ignore missions that are already done
+        if mission.status.state.done:
+            # Delete completed mission
+            await self.delete_pending_mission(mission)
+            return
 
-            # Put the mission into the queue for the correct robot object
-            if mission.robot not in self._robots:
-                self.debug(f"Got new mission from database {mission.name}")
-                self._robots[mission.robot] = Robot(mission.robot, self._database,
-                                                    self._mqtt_client, self._mqtt_prefix, self)
-            await self._robots[mission.robot].send_message(mission)
+        # Put the mission into the queue for the correct robot object
+        await self._get_or_create_robot(mission.robot).send_message(mission)
+
+    def _get_or_create_robot(self, name: str) -> "Robot":
+        """The controller of robot `name`, created if there is none. The one place that
+        creates controllers: call it *after* any await, never create one from a check made
+        before it -- a concurrent handler (resync overlapping the first MQTT states) may have
+        created it meanwhile, and a second Robot would orphan the first with its run task,
+        timers and mission queue."""
+        controller = self._robots.get(name)
+        if controller is None:
+            self.debug(f"Creating controller for robot {name}")
+            controller = self._robots[name] = Robot(
+                name, self._database, self._mqtt_client, self._mqtt_prefix, self)
+        return controller
+
+    def _unknown_robots_cache(self) -> Dict[str, float]:
+        """name -> monotonic time until which an MQTT message from that unknown robot is
+        dropped without a database lookup (UNKNOWN_ROBOT_TTL_S). Created on first use."""
+        cache = getattr(self, "_unknown_robots", None)
+        if cache is None:
+            cache = self._unknown_robots = {}
+        return cache
 
     async def _handle_mqtt_messages(self):
         while True:
             message = await self._mqtt_messages.get()
-            if isinstance(message, ClientConnectionMessage):
-                # Recording (ROBOT.ONLINE/OFFLINE), and maps §14 U3: a new robot run unplaces
-                # its map session (Robot._on_connection_message). Unknown robots are ignored.
-                if self.fleet_recorder is not None and (
-                        message.name in self._robots or self.fleet_recorder.knows(message.name)):
-                    self.fleet_recorder.on_connection(message.name, message.payload)
-                if message.name in self._robots:
-                    await self._robots[message.name].send_message(message.payload)
-                continue
-            if message.name not in self._robots:
-                # Try to get the robot from the database
+            if isinstance(message, _StateSlot):
+                if self._state_slots.get(message.msg.name) is message:
+                    del self._state_slots[message.msg.name]
+                message = message.msg
+            if isinstance(message, RawStateMessage):
                 try:
-                    robot = await self._database.get_object(api_objects.RobotObjectV1, message.name)
-                    self.debug(f"Got robot from database on MQTT message: {message.name}")
-                    self._robots[message.name] = Robot(message.name, self._database,
-                                                       self._mqtt_client, self._mqtt_prefix, self)
-                    # Send the robot object to the robot handler
-                    await self._robots[message.name].send_message(robot)
-                except Exception as e:
-                    self.warning(
-                        f"Ignoring MQTT message from unknown robot \"{message.name}\": {e}")
+                    message = message.parse()
+                except pydantic.ValidationError as e:
+                    self.warning(f"Validation error from client message:\n{e.errors()}")
                     continue
-            await self._robots[message.name].send_message(message.payload)
+                except Exception as e:  # pylint: disable=broad-except
+                    self.warning(f"Error processing MQTT message: {e}")
+                    continue
+            try:
+                await self._process_mqtt_message(message)
+            except Exception:  # pylint: disable=broad-except
+                self.error(f"MQTT message from {getattr(message, 'name', None)!r} failed",
+                           exc_info=True)
+
+    async def _process_mqtt_message(self, message):
+        if isinstance(message, ClientConnectionMessage):
+            # Recording (ROBOT.ONLINE/OFFLINE), and maps §14 U3: a new robot run unplaces
+            # its map session (Robot._on_connection_message). Unknown robots are ignored.
+            if self.fleet_recorder is not None and (
+                    message.name in self._robots or self.fleet_recorder.knows(message.name)):
+                self.fleet_recorder.on_connection(message.name, message.payload)
+            if message.name in self._robots:
+                await self._robots[message.name].send_message(
+                    ConnectionDelivery(connection=message.payload, retained=message.retained))
+            return
+        if message.name not in self._robots:
+            unknown = self._unknown_robots_cache()
+            now = time.monotonic()
+            if unknown.get(message.name, 0.0) > now:
+                return      # looked up (and warned about) within the last TTL
+            # Try to get the robot from the database
+            try:
+                robot = await self._database.get_object(api_objects.RobotObjectV1, message.name)
+                self.debug(f"Got robot from database on MQTT message: {message.name}")
+                # Re-checked after the await: another handler may have created it meanwhile.
+                controller = self._get_or_create_robot(message.name)
+                unknown.pop(message.name, None)
+                # Send the robot object to the robot handler
+                await controller.send_message(robot)
+            except Exception as e:  # pylint: disable=broad-except
+                unknown[message.name] = now + UNKNOWN_ROBOT_TTL_S
+                self.warning(
+                    f"Ignoring MQTT message from unknown robot \"{message.name}\" "
+                    f"(next lookup in {UNKNOWN_ROBOT_TTL_S:g}s): {e}")
+                return
+        await self._robots[message.name].send_message(message.payload)
 
     async def _unverify_run_epochs(self) -> None:
         """Maps §14.13: at start, before any robot message is handled, no robot's run is known
@@ -3941,6 +4961,8 @@ class RobotServer:
             self.warning(f"Run epochs not reset ({err}); placements may not be reused")
 
     async def _run(self):
+        await self._leader.acquire()
+        self._mqtt_client = self._connect_to_mqtt(*self._mqtt_args)
         await self._database.async_init()
         await self._unverify_run_epochs()
         if self.fleet_recorder is not None:
@@ -3958,7 +4980,9 @@ class RobotServer:
                                 self.robot_writer_id),
             self._handle_robot_changes(),
             self._handle_mission_changes(),
-            self._handle_mqtt_messages()
+            self._handle_mqtt_messages(),
+            self._heartbeat.run(),
+            self._leader.watch(),
         ]
         if self.fleet_recorder is not None:
             tasks.append(self._watch_settings())
@@ -3978,8 +5002,21 @@ class RobotServer:
         if robot is not None:
             properties = robot.robot_object
             if properties is not None:
-                await self._database.set_lifecycle(api_objects.RobotObjectV1, properties.name, api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
-                self._robots.pop(properties.name, None)
+                try:
+                    await self._database.set_lifecycle(
+                        api_objects.RobotObjectV1, properties.name,
+                        api_objects.object.ObjectLifecycleV1.DELETED, uuid.uuid4())
+                except Exception as err:  # pylint: disable=broad-except
+                    # The row stays PENDING_DELETE. The controller is dropped all the same
+                    # (the caller already stopped it): keeping it would leave a zombie with
+                    # a dead run loop. The next resync / robot message creates a fresh
+                    # controller from the row, and that one deletes again.
+                    self.warning(f"Could not delete robot {properties.name} ({err}); "
+                                 "it is retried when the row is next delivered")
+                finally:
+                    if self._robots.get(properties.name) is robot:
+                        del self._robots[properties.name]
+                    robot.shutdown()
 
     async def delete_pending_mission(self, mission: api_objects.MissionObjectV1) -> bool:
         if mission.lifecycle == \
@@ -3990,9 +5027,88 @@ class RobotServer:
         return False
 
     def run(self):
-        # Start threads and corroutines
-        # self._mqtt_client.loop_start() handles loop internally now
-        self._event_loop.run_until_complete(self._run())
+        """Runs until SIGTERM/SIGINT (clean exit, code 0), a failure, or loss of the leader
+        lock (exit_code 1: docker restarts us). Always shuts down cleanly first."""
+        loop = self._event_loop
+        self._main_task = loop.create_task(self._run())
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self._request_shutdown)
+            except (NotImplementedError, RuntimeError):  # pragma: no cover
+                pass
+        try:
+            loop.run_until_complete(self._main_task)
+        except asyncio.CancelledError:
+            self.info("Shutdown requested")
+        except lifecycle.LeaderLockLost as err:
+            self.warning(f"{err}; exiting so that docker restarts the dispatcher")
+            self.exit_code = 1
+        except BaseException:
+            self.exit_code = 1
+            raise
+        finally:
+            loop.run_until_complete(self.graceful_shutdown())
+
+    def _request_shutdown(self):
+        self.info("Signal received, shutting down")
+        if self._main_task is not None:
+            self._main_task.cancel()
+
+    async def graceful_shutdown(self, timeout_s: float = lifecycle.SHUTDOWN_TIMEOUT_S):
+        """In order, each step bounded on its own (a slow one cannot starve the rest): stop
+        accepting work (MQTT disconnect), shut the robots down and let their final status
+        writes land, drain the recorder's queued run writes, stop the recorder and close its
+        pool, close the database pool, release the leader lock; `timeout_s` overall.
+        Idempotent; never raises."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        step = self._shutdown_step
+
+        async def steps():
+            if self._mqtt_client is not None:
+                await step("MQTT disconnect", self._mqtt_client.disconnect,
+                           SHUTDOWN_MQTT_S)
+            await step("robots shutdown", self._shutdown_robots, SHUTDOWN_ROBOTS_S)
+            if self.fleet_recorder is not None:
+                await step("recorder drain", lambda: self.fleet_recorder.drain(
+                    SHUTDOWN_RECORDER_DRAIN_S), SHUTDOWN_RECORDER_DRAIN_S + 0.5)
+                await step("fleet recorder stop", self.fleet_recorder.stop,
+                           SHUTDOWN_RECORDER_STOP_S)
+                await step("recorder pool close", self.fleet_recorder.close,
+                           SHUTDOWN_POOL_CLOSE_S)
+            await step("database close", self._database.close_pool, SHUTDOWN_POOL_CLOSE_S)
+            await step("leader lock release", self._leader.release, SHUTDOWN_LOCK_S)
+
+        try:
+            await asyncio.wait_for(steps(), timeout_s)
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Shutdown incomplete after {timeout_s}s: {err!r}")
+
+    async def _shutdown_robots(self):
+        """Shut every controller down (timers, notify/charging tasks, message loop) and wait
+        for the bounded flush of their queued status writes (a mission's final state above
+        all) that Robot.shutdown() starts: it must land before the pools close."""
+        robots = list(self._robots.values())
+        for robot in robots:
+            try:
+                robot.shutdown()
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Shutdown: robot {getattr(robot, 'name', '?')} failed: {err}")
+        await asyncio.gather(*(r.wait_shutdown_flush() for r in robots),
+                             return_exceptions=True)
+
+    async def _shutdown_step(self, what: str, fn, timeout_s: Optional[float] = None):
+        try:
+            result = fn()
+            if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                await asyncio.wait_for(result, timeout_s)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            self.warning(f"Shutdown: {what} did not finish within {timeout_s}s")
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Shutdown: {what} failed: {err}")
 
     def info(self, message: str):
         self._logger.info("[Isaac Mission Dispatch] | INFO: %s", message)
@@ -4002,3 +5118,6 @@ class RobotServer:
 
     def warning(self, message: str):
         self._logger.warning("[Isaac Mission Dispatch] | WARNING: %s", message)
+
+    def error(self, message: str, exc_info: bool = False):
+        self._logger.error("[Isaac Mission Dispatch] | ERROR: %s", message, exc_info=exc_info)

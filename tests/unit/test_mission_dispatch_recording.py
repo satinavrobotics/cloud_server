@@ -162,6 +162,19 @@ async def test_resumed_mission_cancelled_before_redispatch_closes_its_run(tmp_pa
     mission.needs_canceled = True
     restarted._missions[mission.name] = mission
     await restarted._try_start_mission()
+    # The robot still runs the order: it is cancelled first, and the run closes when the
+    # robot confirms.
+    order_id = f"{restarted._order_prefix()}-n0"
+    busy = types.VDA5050State(
+        headerId=1, timestamp=T0.isoformat(), orderId=order_id, nodeStates=[
+            types.VDA5050NodeState(nodeId=f"{order_id}-s2", sequenceId=2)],
+        edgeStates=[], batteryState=None, agvPosition=None, velocity=None)
+    await restarted._on_client_message(busy)
+    (action,) = restarted._current_instant_actions.values()
+    done = busy.copy(update={"actionStates": [types.VDA5050ActionState(
+        actionId=action.actionId, actionType=action.actionType,
+        actionStatus=types.VDA5050ActionStatus.FINISHED)]})
+    await restarted._on_client_message(done)
     await recorder.run_pending_ops()
 
     assert mission.status.state == State.CANCELED
@@ -174,7 +187,7 @@ async def test_timeout_run_is_timeout(tmp_path):
     robot, _ = _make_robot(recorder)
     mission = _mission(far=50.0)
     await _start(robot, mission)
-    await robot._wait_mission_timeout(0, "m1")
+    await robot._fail_mission_on_timeout("m1")
     await recorder.run_pending_ops()
     [run] = fdb.runs.values()
     assert (run["state"], run["abort_cause"]) == ("TIMEOUT", "DISPATCH.TIMEOUT")
@@ -238,7 +251,11 @@ async def test_recording_failures_do_not_change_mission_execution(tmp_path, brea
             recorder.queue.put_latest = boom
     mission, robot, db = await _run_mission(recorder)
     if breakage != "exploding":
-        await recorder.run_pending_ops()           # retries exhaust against the fake
+        # Lifecycle writes retry forever against a database that stays down: bound the drain.
+        try:
+            await asyncio.wait_for(recorder.run_pending_ops(), 0.5)
+        except asyncio.TimeoutError:
+            pass
 
     assert mission.status.state == reference.status.state == State.COMPLETED
     assert _mission_states_written(db) == _mission_states_written(ref_db)

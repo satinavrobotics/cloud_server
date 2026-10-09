@@ -2,6 +2,7 @@
 (packages/api/run_admin.py record_cancel_requested): tagged with the mission's open run,
 gated by the robot's recording level, and never failing the cancel itself."""
 import datetime
+import json
 import os
 import uuid
 
@@ -106,7 +107,7 @@ async def test_database_failure_never_raises():
 async def test_cancel_route_emits_after_the_cancel():
     mission = SimpleNamespace(spec=SimpleNamespace(robot="r1"), cancel=AsyncMock())
     database = SimpleNamespace(get_object=AsyncMock(return_value=mission),
-                               update_spec=AsyncMock())
+                               update_spec=AsyncMock(), update_spec_fields=AsyncMock())
     recorder = AsyncMock(return_value=True)
     with patch.object(main, "service", SimpleNamespace(database=database)), \
             patch.object(run_admin, "record_cancel_requested", recorder):
@@ -114,13 +115,13 @@ async def test_cancel_route_emits_after_the_cancel():
                                      base_url="http://t") as client:
             resp = await client.post("/api/v1/missions/m1/cancel")
     assert resp.status_code == 200
-    database.update_spec.assert_awaited_once()
+    database.update_spec_fields.assert_awaited_once()
     recorder.assert_awaited_once_with(database, "m1", "r1")
 
 
 async def test_cancel_route_failure_emits_nothing():
     database = SimpleNamespace(get_object=AsyncMock(side_effect=RuntimeError("nope")),
-                               update_spec=AsyncMock())
+                               update_spec=AsyncMock(), update_spec_fields=AsyncMock())
     recorder = AsyncMock()
     with patch.object(main, "service", SimpleNamespace(database=database)), \
             patch.object(run_admin, "record_cancel_requested", recorder):
@@ -129,3 +130,63 @@ async def test_cancel_route_failure_emits_nothing():
             resp = await client.post("/api/v1/missions/m1/cancel")
     assert resp.status_code == 400
     recorder.assert_not_awaited()
+
+
+class _Store:
+    """A mission row with the real jsonb `||` semantics of update_spec_fields."""
+
+    def __init__(self, spec):
+        self.spec = dict(spec)
+        self.reads_done = False
+
+    async def get_object(self, cls, name):
+        from cloud_common.objects.mission import (
+            MissionObjectV1, MissionStatusV1)
+        from cloud_common.objects.object import ObjectLifecycleV1
+        stale = self.spec  # the API's read
+        self.reads_done = True
+        # The dispatcher's replan patch lands between the API's read and its write.
+        self.spec = {**self.spec, "route_rev": 5, "planned_path": ["n9"]}
+        return MissionObjectV1(name=name, lifecycle=ObjectLifecycleV1.ALIVE,
+                               status=MissionStatusV1(), **stale)
+
+    async def update_spec(self, cls, name, spec, publisher_id):
+        self.spec = json.loads(spec.json())  # whole-spec overwrite
+
+    async def update_spec_fields(self, cls, name, fields, publisher_id):
+        self.spec = {**self.spec, **fields}
+
+
+async def test_cancel_does_not_revert_a_concurrent_replan_patch():
+    from cloud_common.objects.mission import MissionNodeV1
+    store = _Store(json.loads(
+        __import__("cloud_common.objects.mission", fromlist=["x"]).MissionSpecV1(
+            robot="r1", mission_tree=[MissionNodeV1(sequence={})]).json()))
+    database = SimpleNamespace(get_object=store.get_object, update_spec=store.update_spec,
+                               update_spec_fields=store.update_spec_fields)
+    with patch.object(main, "service", SimpleNamespace(database=database)), \
+            patch.object(run_admin, "record_cancel_requested", AsyncMock(return_value=True)):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                     base_url="http://t") as client:
+            resp = await client.post("/api/v1/missions/m1/cancel")
+    assert resp.status_code == 200
+    assert store.spec["needs_canceled"] is True
+    assert store.spec["route_rev"] == 5
+    assert store.spec["planned_path"] == ["n9"]
+
+
+async def test_mission_put_edit_writes_only_the_edited_fields():
+    from cloud_common.objects.mission import MissionNodeV1
+    store = _Store(json.loads(
+        __import__("cloud_common.objects.mission", fromlist=["x"]).MissionSpecV1(
+            robot="r1", mission_tree=[MissionNodeV1(sequence={})]).json()))
+    database = SimpleNamespace(get_object=store.get_object, update_spec=store.update_spec,
+                               update_spec_fields=store.update_spec_fields,
+                               update_status=AsyncMock())
+    with patch.object(main, "service", SimpleNamespace(database=database)):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                     base_url="http://t") as client:
+            resp = await client.put("/api/v1/missions/m1", json={"timeout": 77})
+    assert resp.status_code == 200
+    assert store.spec["timeout"] == 77
+    assert store.spec["route_rev"] == 5 and store.spec["planned_path"] == ["n9"]

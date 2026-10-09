@@ -61,8 +61,31 @@ class TestDetector:
         d = RunChangeDetector()
         assert d.on_state(812) is None
         assert d.on_state(813) is None and d.on_state(813) is None
-        ev = d.on_state(0)
+        assert d.on_state(0) is None                      # awaiting confirmation
+        ev = d.on_state(1)                                # the new process keeps counting low
         assert ev["state_header_id"] == 0 and ev["last_state_header_id"] == 813
+
+    def test_retained_redelivery_of_the_same_online_is_no_restart(self):
+        d = RunChangeDetector()
+        d.on_connection("ONLINE", 5)
+        # the dispatcher's own MQTT reconnect: the broker redelivers the retained ONLINE
+        assert d.on_connection("ONLINE", 5, retained=True) is None
+        assert d.on_connection("ONLINE", 5, retained=True) is None
+        # a live equal ONLINE is still a restarted client
+        assert d.on_connection("ONLINE", 5) is not None
+        # a retained ONLINE LOWER than the last one is a restart missed while disconnected
+        d.on_connection("ONLINE", 9)
+        assert d.on_connection("ONLINE", 1, retained=True) is not None
+
+    def test_single_reordered_state_is_no_restart(self):
+        d = RunChangeDetector()
+        for h in (10, 11, 12):
+            assert d.on_state(h) is None
+        assert d.on_state(10) is None                     # redelivered/reordered older message
+        assert d.on_state(13) is None                     # the old sequence goes on
+        assert d.on_state(14) is None
+        assert d.on_state(3) is None                      # and a later stray one is debounced too
+        assert d.on_state(15) is None
 
     def test_one_restart_counted_once(self):
         d = RunChangeDetector()
@@ -73,7 +96,7 @@ class TestDetector:
         assert d.on_state(1) is None
         # and the other order: the state shows it first, the ONLINE comes late
         d.on_state(40)
-        assert d.on_state(3) is not None
+        assert d.on_state(3) is None and d.on_state(4) is not None
         assert d.on_connection("ONLINE", 1) is None
 
     def test_garbage_is_ignored(self):
@@ -241,7 +264,7 @@ class TestDispatcherRunChange:
         db = FakeDb([("UPDATE map_sessions SET aligned = false", ([], 0))])
         r = _robot(db)
         r._on_client_message = AsyncMock()
-        for hid in (10, 11, 0):
+        for hid in (10, 11, 0, 1):
             await r._on_state_message(types.VDA5050State(
                 headerId=hid, timestamp="", nodeStates=[], edgeStates=[], errors=[]))
         unplaces = [s for s, _ in db.sql if s.startswith("UPDATE map_sessions SET aligned")]

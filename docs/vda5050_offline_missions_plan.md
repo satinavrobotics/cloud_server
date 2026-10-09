@@ -19,7 +19,7 @@ File:line references are against the tree on 2026-10-08. "Unverified" marks clai
    - Fix: `exclude_none=True`, plus a regression test that pins a digest computed under the old model.
 5. **The client sends `allowedDeviationXY: 0` explicitly** (`sati-client/services/missionApi.ts:240-254`, with a stale comment). The server must treat 0 as unset.
 6. **The API status PUT replaces the whole status** (`packages/api/main.py` ~2346) and keeps only `run_id`/`order_rev`. Every new dispatcher-owned status field must be preserved there.
-7. **The mission timeout keeps running while the robot is offline** (`_arm_mission_timeout` `:2282`, `_wait_mission_timeout` `:2302`).
+7. **The mission timeout keeps running while the robot is offline** (`_arm_mission_timeout` `:2282`, `_fail_mission_on_timeout`).
    - A long offline route is FAILED, and a cancelOrder is sent to an offline robot.
    - This conflicts with offline operation, so it is added as item C5.
 8. **The "canceled" path runs before the edgeBlocked check** (`server.py:2725-2748`).
@@ -287,7 +287,7 @@ Review fixes, dispatcher (2026-10-08, `tests/unit/test_offline_missions_dispatch
 - A paused timeout resumes on any robot state, not only when the online flag flips. An operator cancel keeps the timeout running while the robot is offline, as the backstop that ends the mission.
 - Node reports and the edgeBlocked exclusion are only taken for an order built from the node's current route. A reroute drops the reports on the node's old route.
 - A "canceled" while nodes are listed is ignored only while the robot drives or within 10 s of the order's first send; otherwise it is a drop and the node is resent.
-- The reroute cancel dwell counts from the order's first send, not the last resend. The held cancel is reset at a new pass and at mission end. The two cancel sends share `_cancel_current_order`.
+- The reroute cancel dwell counts from the order's first send, not the last resend. The held cancel is reset at a new pass and at mission end. The two cancel sends share `_cancel_order`.
 - `skipped_nodes` capped at 100. Repeated reports are skipped before they are resolved, so a note the cap dropped is not taken again. Non-finite offsets are rejected.
 - An allowedDeviationXY of 0.1 (the old Pose2D default, which stored routes carry) reads as unset (`ROUTE_DEVIATION_XY_LEGACY_DEFAULT_M`, `none` turns it off). An unknown `VDA5050_NODE_POLICY_MODE` warns and falls back to `factsheet`. The policy is logged at startup, and compose passes the theta, zero and legacy keys.
 

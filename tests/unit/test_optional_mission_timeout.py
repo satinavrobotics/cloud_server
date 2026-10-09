@@ -58,7 +58,7 @@ async def test_explicit_timeout_fails_running_mission():
     r._arm_mission_timeout()
     assert r._mission_timeout_task is not None
     r._cancel_mission_timeout()
-    await r._wait_mission_timeout(0, "m1")
+    await r._fail_mission_on_timeout("m1")
     assert m.status.state == mission_object.MissionStateV1.FAILED
     assert m.status.failure_reason == fleet_recorder.MISSION_TIMEOUT_REASON
 

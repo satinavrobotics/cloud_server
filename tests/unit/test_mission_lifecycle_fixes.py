@@ -239,6 +239,10 @@ class _FakeMissionDb:
         self.row = cls(name=name, lifecycle=self.row.lifecycle, status=self.row.status.dict(),
                        **json.loads(spec.json()))
 
+    async def update_spec_fields(self, cls, name, fields, publisher_id):
+        self.row = cls(name=name, lifecycle=self.row.lifecycle, status=self.row.status.dict(),
+                       **{**json.loads(self.row.spec.json()), **fields})
+
     async def update_status(self, cls, name, status, publisher_id):
         self.row.status = status
 

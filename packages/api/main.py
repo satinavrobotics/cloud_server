@@ -5,6 +5,7 @@ API Delegation Service - Main Entry Point
 FastAPI application that provides REST and WebSocket endpoints for clients.
 """
 
+import json
 import asyncio
 import logging
 import uuid
@@ -2389,6 +2390,7 @@ async def update_mission(mission_name: str, mission_data: dict):
             # This is a spec update
             edits = {}
             reroute = None
+            touched = set()  # spec keys this request changes: the only ones written back
             for key, value in mission_data.items():
                 if key in ("status", "name", "lifecycle", "force"):
                     continue
@@ -2403,6 +2405,7 @@ async def update_mission(mission_name: str, mission_data: dict):
                     continue
                 else:
                     setattr(mission, key, value)
+                    touched.add(key)
             if edits:
                 # Only a mission that has not started can be edited: once its orders are
                 # with the robot the operator has to start a new mission instead.
@@ -2418,6 +2421,7 @@ async def update_mission(mission_name: str, mission_data: dict):
                                         detail=f"Invalid mission spec: {str(e)}")
                 for key in edits:
                     setattr(mission, key, getattr(edited, key))
+                touched.update(edits)
                 # Every node of the tree has a status entry (the dispatcher reads them
                 # by name), so a new tree needs its entries made and old ones dropped.
                 if "mission_tree" in edits:
@@ -2448,7 +2452,13 @@ async def update_mission(mission_name: str, mission_data: dict):
                 # dispatcher resumes from, and a stored request would be re-applied on
                 # every delivery of the row. The dispatcher acts once per route_rev.
                 await mission.update(reroute)
-            await service.database.update_spec(MissionObjectV1, mission.name, mission.spec, publisher_id)
+                touched.update(("mission_tree", "planned_path", "route_rev"))
+            # Only the keys this request changed: writing the whole spec read above back would
+            # revert what the dispatcher patched since (a replan's mission_tree / planned_path).
+            spec_json = json.loads(mission.spec.json())
+            await service.database.update_spec_fields(
+                MissionObjectV1, mission.name, {k: spec_json[k] for k in touched if k in spec_json},
+                publisher_id)
             if "mission_tree" in edits:
                 await service.database.update_status(
                     MissionObjectV1, mission.name, mission.status, publisher_id)
@@ -2536,7 +2546,10 @@ async def cancel_mission(mission_name: str):
     try:
         mission = await service.database.get_object(MissionObjectV1, mission_name)
         await mission.cancel()
-        await service.database.update_spec(MissionObjectV1, mission_name, mission.spec, uuid.uuid4())
+        # Only the flag: the whole spec read above would revert what the dispatcher patched
+        # since (a replan's mission_tree / planned_path / route_rev).
+        await service.database.update_spec_fields(
+            MissionObjectV1, mission_name, {"needs_canceled": True}, uuid.uuid4())
         await run_admin.record_cancel_requested(service.database, mission_name,
                                                 getattr(mission.spec, "robot", None))
         return {"success": True, "message": f"Mission {mission_name} cancelled"}

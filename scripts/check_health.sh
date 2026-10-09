@@ -79,6 +79,14 @@ else
   echo "❌ UNHEALTHY"
 fi
 
+printf "%-20s " "Mission Dispatch:"
+md_status=$(docker ps --filter name=mission-dispatch --format '{{.Status}}' 2>/dev/null | head -n1)
+case "$md_status" in
+  *"(healthy)"*) echo "✅ HEALTHY" ;;
+  "") echo "❌ DOWN" ;;
+  *) echo "❌ UNHEALTHY ($md_status)" ;;
+esac
+
 echo ""
 echo "Docker Containers:"
 echo "=================="

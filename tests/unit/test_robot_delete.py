@@ -234,9 +234,11 @@ def test_fleet_recorder_forgets_deleted_robot():
     rec = fr.FleetRecorder.__new__(fr.FleetRecorder)
     rec._tracks, rec._latest_rows, rec._runs = {"r1": 1, "r2": 2}, {"r1": 1}, {"r1": 1}
     rec.policy = MagicMock()
+    rec._abandon_run = MagicMock()
     gone = MagicMock()
     gone.name = "r1"
     rec.on_robot_deleted(gone)
+    rec._abandon_run.assert_called_once_with(1, "robot_deleted")
     assert rec._tracks == {"r2": 2} and rec._latest_rows == {} and rec._runs == {}
     assert not rec.knows("r1")
     rec.policy.apply_robot_object.assert_called_once_with(gone)

@@ -45,6 +45,7 @@ class _Db:
         self.sql = []
         self.get_object = AsyncMock()
         self.update_spec = AsyncMock()
+        self.update_spec_fields = AsyncMock()
         self.update_status = AsyncMock()
 
     @asynccontextmanager
@@ -240,11 +241,11 @@ async def test_a_reroute_through_a_blocked_node_is_refused_with_409_unless_force
     detail = resp.json()["detail"]
     assert detail["code"] == "ROUTE_THROUGH_BLOCKED_NODES"
     assert [r["graph_node_id"] for r in detail["blocked_nodes"]] == ["2"]
-    db.update_spec.assert_not_awaited()
+    db.update_spec_fields.assert_not_awaited()
 
     resp = await _call(db, "PUT", "/api/v1/missions/m1", json={**body, "force": True})
     assert resp.status_code == 200
-    db.update_spec.assert_awaited_once()
+    db.update_spec_fields.assert_awaited_once()
     assert mission.route_rev == 1
     assert [w.node_id for w in mission.mission_tree[0].route.waypoints] == ["1", "2", "3"]
     assert not any(sql == blocked_nodes.ACTIVE_FOR_MAP_SQL for sql, _ in db.sql[1:])

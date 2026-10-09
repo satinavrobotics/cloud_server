@@ -97,8 +97,28 @@ services:
       - MISSION_TIMEOUT_PAUSE_OFFLINE=${MISSION_TIMEOUT_PAUSE_OFFLINE:-true}
       - BLOCKED_NODE_EXCLUSION_MIN=${BLOCKED_NODE_EXCLUSION_MIN:-10}
       - ORDER_CANCEL_MIN_DWELL_S=${ORDER_CANCEL_MIN_DWELL_S:-2}
+      # Fleet events spilled during a database outage survive a container recreate. A
+      # directory of its own: the heartbeat (/tmp/mission_dispatch) must not outlive the container.
+      - FLEET_SPILL_PATH=/var/lib/mission_dispatch/spill/fleet_events_spill.jsonl
+    volumes:
+      - mission_dispatch_spill:/var/lib/mission_dispatch/spill
     network_mode: "host"
     restart: unless-stopped
+    # Python is PID 1 and handles SIGTERM itself (packages/controllers/mission/lifecycle.py,
+    # RobotServer.graceful_shutdown, bounded at 8 s), so the default 10 s would do; 15 s
+    # leaves slack. `init: true` adds tini as PID 1 to reap zombies (the dispatcher spawns
+    # none today, so it is cheap insurance) and forwards signals to Python.
+    stop_grace_period: 20s
+    init: true
+    # Liveness: the dispatcher touches this file every 5 s only while a SELECT 1 and the MQTT
+    # connection are healthy. Plain docker compose does NOT restart an unhealthy container;
+    # the status is visible in `docker ps` / scripts/check_health.sh (docs: packages/controllers/mission/README.md).
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime(os.getenv('MISSION_DISPATCH_HEARTBEAT_FILE','/tmp/mission_dispatch/heartbeat'))<60 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     depends_on:
       mosquitto:
         condition: service_started
@@ -391,6 +411,7 @@ services:
 
 volumes:
   arango_data:
+  mission_dispatch_spill:
   pgdata14:
     # Production PG14 data. This was the container's anonymous volume, pinned by name so that
     # `down`/`up` reattaches it instead of creating a fresh, empty one. external: compose never

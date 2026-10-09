@@ -310,7 +310,7 @@ class VDA5050Edge(pydantic.BaseModel):
     def from_mission_order(cls, mission_id: str, sequence: int,
                            mission_node_id: int) -> "VDA5050Edge":
         return VDA5050Edge(
-            edgeId=f"{mission_id}-e{sequence}",
+            edgeId=f"{order_ids.order_id(mission_id, mission_node_id)}-e{sequence}",
             sequenceId=sequence,
             startNodeId=order_ids.node_id(mission_id, mission_node_id, sequence - 1),
             endNodeId=order_ids.node_id(mission_id, mission_node_id, sequence + 1))
@@ -362,6 +362,15 @@ class VDA5050Info(pydantic.BaseModel):
     infoLevel: str
 
 
+def utc_timestamp(now: Optional[datetime.datetime] = None) -> str:
+    """The header timestamp of an outgoing message: ISO 8601, UTC, millisecond precision,
+    with the trailing Z VDA5050 asks for ("2026-10-09T11:22:33.123Z")."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is not None:
+        now = now.astimezone(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
 class VDA5050Order(pydantic.BaseModel):
     """VDA5050 Order message sent from mission server to robot"""
     headerId: int = 0
@@ -391,45 +400,6 @@ class VDA5050Order(pydantic.BaseModel):
                 f"{node_count} nodes and {edge_count} edges, but there should be "
                 f"{target_edge_count} edges")
         return edges
-
-    @classmethod
-    def from_mission(cls, mission_object: mission.MissionObjectV1,
-                     robot_object: robot.RobotObjectV1,
-                     header_id: int,
-                     timestamp: str) -> "VDA5050Order":
-        # Create an initial node from the robots current position
-        nodes = [VDA5050Node(
-            nodeId=f"{mission_object.name}-s0-n0",
-            sequenceId=0,
-            position={
-                "x": robot_object.status.pose.x,
-                "y": robot_object.status.pose.y,
-                "theta": robot_object.status.pose.theta
-            })]
-        edges = []
-        node_sequence = 1
-        for i, mission_node in enumerate(mission_object.mission_tree):
-            # If this is a route mission node, add each pose in the route as a node
-            if mission_node.route is not None:
-                nodes += [VDA5050Node.from_pose2d(pose2d, str(mission_object.name),
-                                                  j + node_sequence, i + 1) for j, pose2d
-                          in enumerate(mission_node.route.waypoints)]
-                edges += [VDA5050Edge.from_mission_order(str(mission_object.name),
-                                                         e + node_sequence, i + 1)
-                          for e in range(mission_node.route.size)]
-                node_sequence += len(mission_node.route.waypoints)
-            # If this is an action mission node, attach the actions to the last vda5050 node
-            elif mission_node.action is not None:
-                nodes[-1].actions += [VDA5050Action.from_mission_action(mission_node.action,
-                                                                        nodes[-1].nodeId,
-                                                                        i + 1)]
-        return VDA5050Order(
-            headerId=header_id,
-            timestamp=timestamp,
-            orderId=mission_object.name,
-            orderUpdateId=0,
-            nodes=nodes,
-            edges=edges)
 
     @classmethod
     def from_route(cls, route: mission.MissionRouteNodeV1,

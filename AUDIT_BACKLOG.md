@@ -42,7 +42,7 @@ code never produces; replaced with stale-echo, persisted-spec and
 first-creation tests (`tests/unit/test_force_cancel_order.py`).
 
 ### A2. ✅ DONE — timeout path double-sent `cancelOrder` — **medium**
-`_wait_mission_timeout` sent a cancel unconditionally; on the `needs_canceled`
+`_wait_mission_timeout` (now `_fail_mission_on_timeout`) sent a cancel unconditionally; on the `needs_canceled`
 route one is normally already outstanding (and `handle_instant_action()` keeps
 resending it regardless of mission), so the comment's "nothing will resend/track
 this otherwise" was wrong. Gated on `_has_outstanding_cancel()`; covered by
@@ -200,7 +200,12 @@ literals as dead fallbacks in `graph_builder/server.py`, `mission_planner/server
 
 ## C. Principledness / consistency — deferred
 
-### C1. Unit tests run on Pydantic 2.12; production pins 1.9.0 — **high**
+### C1. Unit tests run on Pydantic 2.12; production pins 1.9.0 — **high** (mitigated 2026-10-09, mission dispatch audit)
+**Mitigated:** `scripts/run_unit_tests_pinned.sh` runs the suite in `tests/Dockerfile.unit` (Python 3.10 +
+the mission and API service pins, `httpx<0.28` for the old starlette `TestClient`). The host env stays on
+pydantic 2 (host Python is 3.12, where 1.9.0 does not install), so `tests/requirements-test.txt` is
+unchanged. Whole `tests/unit` on the pins: all green (`-m unit`: 3061 passed, 84 unmarked tests deselected).
+Original finding:
 `tests/requirements-test.txt` pins `pydantic>=2.0.0,<3.0.0`; every service
 `requirements.txt` pins `==1.9.0` and CLAUDE.md forbids v2 idioms. The green unit
 suite therefore validates a different runtime from what ships (v1-style `class
@@ -256,7 +261,12 @@ It records a waypoint only when `allowedDeviationXY == 0`, but
 every `/api/v1/navigate` mission falls back to the client's pose-proximity
 heuristic. Replace the `== 0` sentinel with an explicit checkpoint flag.
 
-### C6. Whole-spec read-modify-write loses updates — **medium**
+### C6. Whole-spec read-modify-write loses updates — **medium** (mostly fixed: mission dispatch audit 2026-10-09)
+*Status:* the dispatcher's force-cancel clear and `_process_datum_message` now write one field
+(`update_spec_fields`), and the API's mission cancel and PUT write only the fields they change (W12), so
+neither can revert a dispatcher replan patch. Still whole-spec: the API's robot `PUT`/registration and
+`POST .../cancel-order` (`update_spec`), so a datum landing between the API's read and write can still be
+clobbered by it; move those to `update_spec_fields` too. Original finding:
 The force-cancel clear, `_process_datum_message`, and every API get→set→
 `update_spec` write the full spec JSON. A datum message landing between the API's
 `needs_order_cancel=True` write and its echo writes the old spec back and silently
@@ -270,7 +280,9 @@ dispatcher then re-sends the node's order — so a force-cancel while a mission 
 tracked is undone within one state message. Decide: fail/cancel the tracked
 mission, or scope the CANCELED reading to cancels whose `actionId` belongs to it.
 
-### C8. `_wait_mission_timeout` can strand a deleted mission as current — **medium**
+### C8. `_wait_mission_timeout` can strand a deleted mission as current — **medium** (fixed in audit round 3)
+*Status:* fixed in audit round 3 (X3: the timeout runs on the robot's message loop and a deleted mission
+releases the queue). Original finding:
 On `PENDING_DELETE` it deletes the row and returns without `get_next_mission()` /
 IDLE / cancel; the queue stays blocked until `MAX_ORDER_MISMATCHES` rescues it.
 
@@ -292,7 +304,10 @@ ids are `…-instantaction-n{headerId}`, so a failed instant action is attribute
 Fix: only parse `nodeId` references (`order_ids.node_index`), and match `actionId`
 references against the tracked actions instead.
 
-### C12. Instant-action ids are inconsistently scoped — **low/medium**
+### C12. Instant-action ids are inconsistently scoped — **low/medium** (restart repeat fixed: mission dispatch audit 2026-10-09)
+Outgoing `headerId`s (and so the `instantaction-n{headerId}` ids) are now seeded from the clock
+(`HEADER_ID_EPOCH`/`HEADER_ID_RATE`, W13) and no longer restart at 0 after a dispatcher restart; the
+ids still carry no mission/run token. Original finding:
 The mission cancel / timeout-cancel ids carry the run prefix (A15), but the bare
 `instantaction-n{headerId}` ids (`_on_robot_change` custom actions and the like) and
 `force-cancel-instantaction-n{headerId}` carry no mission or run, and `_header_id`
@@ -363,7 +378,10 @@ per lap in the database; nothing prunes them.
 
 ## D. Performance / reliability — deferred
 
-### D1. Blocking I/O on event loops — **medium**
+### D1. Blocking I/O on event loops — **medium** (mission controller notify/charging hook fixed: W3)
+*Status:* the mission controller's webhook calls (notify nodes, the charging hook) run in a worker thread with
+a capped timeout and bounded retries (W3). Open: `time.sleep` in `postgres._get_connection`, the API and
+planner items below. Original finding:
 Mission controller: `requests.get/post` to `mission_ctrl_url` with **no timeout**
 (a hung mission-control freezes dispatch for every robot), sync retries in
 `_process_notify_node`, `time.sleep` in async `postgres._get_connection`. API: sync
@@ -373,7 +391,10 @@ in `async /health`. Planner: sync python-arango in `find_closest_node_*`,
 `find_path`, `get_node_poses` (one `get_node` per waypoint — batch with one AQL
 `FILTER node._key IN @keys`).
 
-### D2. Fire-and-forget status writes — **medium**
+### D2. Fire-and-forget status writes — **medium** (mission controller fixed: W7)
+*Status:* the mission controller's robot and mission status writes go through a per-row serialized queue
+(`_queue_status_write`): retried, tracked, throttled and flushed at shutdown (W7, W9). Open only outside the
+mission controller, if any `ensure_future(update_status(...))` is left. Original finding:
 ~10 `asyncio.ensure_future(update_status(...))` with no error handling; failures
 surface only as "Task exception was never retrieved", and ordering across pool
 connections is not guaranteed (the `_finished_missions` comments already work
@@ -402,7 +423,10 @@ take `map_id` from the MQTT payload while nodes use `robot.current_map`, so an
 image can land in a different bucket than its node. *(Map part fixed in maps M2: images and
 nodes both go to the robot's open session; `robot.current_map` itself was removed in U6.)*
 
-### D6. Postgres watcher hygiene — **low/medium**
+### D6. Postgres watcher hygiene — **low/medium** (watcher part fixed: W1)
+*Status:* W1 made the watcher/handlers resilient (no silent broad `except`, the per-object resync warning
+is gone). Open: the leaked `self._connection` per idle timeout (check) and the WebSocket handlers in
+`api/main.py`. Original finding:
 `self._connection` replaced without closing (one leak per 60 s idle timeout);
 a silent broad `except` — the file's own comment says that is what hid the earlier
 busy-loop bug; every object logged at WARNING on each resync. WebSocket handlers
@@ -434,6 +458,34 @@ on any other receive error.
   `POST /navigate/waypoints`, `GET /rosbags`, `GET /base_models/{id}`,
   `/detection_results*`, `/stats`.
 - Third-party images pinned to `:latest` (mosquitto, arangodb, minio).
+
+### E-fixed. Dead code removed — mission dispatch audit 2026-10-09
+`MQTT_RECONNECT_PERIOD`, `DATABASE_RECONNECT_PERIOD`, `RobotServer._mqtt_on_connect`,
+`VDA5050Order.from_mission`, the unused `sys`/`cast`/`os` imports and the double
+`_detection_results_object` init in the mission controller are gone (the "Dead:" bullet above, mission-controller
+part, is done). Kept: `push_telemetry`/`TelemetrySender` and the charging hook (legacy, still wired to CLI
+flags), and `packages/controllers/mission/tests/{test_context,client}.py` (the e2e conftest imports them).
+
+### H. Mission dispatch audit 2026-10-09 — fixed, and open follow-ups
+Fixed: C12 (restart repeat, W13), `failure_category` now set by the dispatcher (TIMEOUT, ROBOT_APP, CANCELED),
+factsheet `custom_actions` cleared by an empty list, edge ids carry the node index, stale tests
+(run-change confirmation, watcher retry, recorder) brought in line, `_pre_drop_pose` aliasing. Open:
+- (a) Robot status whole-row writes between the API and the dispatcher: a factsheet / `PUT status` change
+  can be reverted by the dispatcher's next write. Proposed `update_status_fields` (jsonb merge) in `postgres.py`.
+- (b) `connection` OFFLINE/CONNECTIONBROKEN does not mark the robot offline at once; the heartbeat timeout is
+  the only source.
+- (c) A mission that was started and then cancelled while its robot is offline blocks that robot's queue
+  until the robot returns (workaround: operator force-cancel).
+- (d) The headerId seed comes from the clock and is not persisted (a clock stepped back could repeat ids).
+- (e) The mission-dispatch healthcheck (heartbeat file) is not acted on by plain `docker compose`; it needs an
+  external watchdog (autoheal or a systemd timer).
+- (f) `deadline` is not enforced: it is in `EDITABLE_SPEC_FIELDS`, in the API docs only as a field (`docs/API_REFERENCE.md`, "ISO 8601 timestamp", never as enforced;
+  the mission type), and `MissionFailureCategoryV1.DEADLINE` exists, but nothing compares it with the clock.
+  Enforcing it needs a timer like `_arm_mission_timeout` (also for PENDING missions: fail with
+  `DEADLINE` once `now > deadline`, cancelling the robot order if started) and a decision on naive/aware time.
+- (g) Time sources: stored mission timestamps are naive local `datetime.now()` in the dispatcher; correct only
+  while the container's TZ is UTC. `docker_compose` sets no `TZ` for `mission-dispatch` (Postgres runs with
+  `timezone=UTC`); the python base image defaults to UTC, but nothing enforces it.
 
 ### C18. No robot publishes `heightMax` — **low**
 mission-dispatch now keeps VDA5050 `physicalParameters.heightMax` as `factsheet.height` (`da91987`,

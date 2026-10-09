@@ -32,8 +32,9 @@ def _current_event_loop_for_sync_tests(request):
     try:
         yield
     finally:
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
-        loop.run_until_complete(asyncio.sleep(0))
-        loop.close()
+        if not loop.is_closed():   # a test (e.g. starlette's TestClient) may have closed it
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.close()
         asyncio.set_event_loop(None)

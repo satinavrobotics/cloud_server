@@ -271,12 +271,16 @@ async def test_a_held_reroute_cancel_does_not_outlive_its_mission_or_pass():
 # REPORTS
 # ---------------------------------------------------------------------------
 async def _writes_of(r, db, state, times=3):
-    """Status writes `times` copies of `state` make (a plain state makes some too)."""
-    before = db.update_status.call_count
+    """Mission status writes `times` copies of `state` make (a plain state makes some too).
+    The robot row is left out: it is written when its discrete fields (errors...) change."""
+    def mission_writes():
+        return sum(1 for c in db.update_status.call_args_list
+                   if c.args[0] is not server_module.api_objects.RobotObjectV1)
+    before = mission_writes()
     for _ in range(times):
         await r._on_client_message(state.copy(deep=True))
     await asyncio.sleep(0)
-    return db.update_status.call_count - before
+    return mission_writes() - before
 
 
 @pytest.mark.unit

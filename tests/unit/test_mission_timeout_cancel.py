@@ -1,6 +1,6 @@
 """Unit test for the mission-timeout cancelOrder fix.
 
-Field incident: a mission timed out (`_wait_mission_timeout`) and was marked FAILED,
+Field incident: a mission timed out (`_fail_mission_on_timeout`) and was marked FAILED,
 but the robot was never told to abandon its order -- it kept reporting the timed-out
 mission's orderId indefinitely. Any subsequent mission dispatched to that robot then
 got rejected ("An order is running") and failed the same way after
@@ -8,7 +8,7 @@ MAX_ORDER_MISMATCHES, with the operator seeing "Robot did not accept the dispatc
 order (still reporting <stale orderId>)" and no way to recover short of manually
 publishing a cancelOrder or restarting the robot's VDA5050 client.
 
-`_wait_mission_timeout` must now send a cancelOrder instant action to the robot before
+`_fail_mission_on_timeout` must now send a cancelOrder instant action to the robot before
 moving on to the next mission, mirroring the explicit-cancel code path in
 `_on_mission_change` ("Update a RUNNING mission").
 """
@@ -56,10 +56,11 @@ async def test_timeout_sends_cancel_order_before_failing_mission():
     r, _ = _make_robot()
     mission = _make_running_mission()
     r._current_mission = mission
+    r._sent_order = object()    # an order went out
     r._send_instant_action = AsyncMock()
     r.get_next_mission = AsyncMock()
 
-    await r._wait_mission_timeout(0, mission.name)
+    await r._fail_mission_on_timeout(mission.name)
 
     r._send_instant_action.assert_awaited_once()
     sent_action = r._send_instant_action.await_args.args[0]
@@ -77,10 +78,11 @@ async def test_timeout_cancel_order_sent_after_needs_canceled_too():
     r, _ = _make_robot()
     mission = _make_running_mission(needs_canceled=True)
     r._current_mission = mission
+    r._sent_order = object()    # an order went out
     r._send_instant_action = AsyncMock()
     r.get_next_mission = AsyncMock()
 
-    await r._wait_mission_timeout(0, mission.name)
+    await r._fail_mission_on_timeout(mission.name)
 
     r._send_instant_action.assert_awaited_once()
     assert mission.status.state == mission_object.MissionStateV1.CANCELED
@@ -98,7 +100,7 @@ async def test_blocked_mission_timeout_does_not_send_cancel_order():
     r._send_instant_action = AsyncMock()
     r.get_next_mission = AsyncMock()
 
-    await r._wait_mission_timeout(0, mission.name)
+    await r._fail_mission_on_timeout(mission.name)
 
     r._send_instant_action.assert_not_awaited()
     r.get_next_mission.assert_not_awaited()
@@ -118,7 +120,42 @@ async def test_timeout_does_not_duplicate_an_outstanding_cancel_order():
     await r._send_cancel_order(f"{mission.name}-instantaction-n0")
     r._send_instant_action.reset_mock()
 
-    await r._wait_mission_timeout(0, mission.name)
+    await r._fail_mission_on_timeout(mission.name)
 
     r._send_instant_action.assert_not_awaited()
     assert mission.status.state == mission_object.MissionStateV1.CANCELED
+
+
+@pytest.mark.unit
+async def test_timeout_leaves_a_foreign_order_alone():
+    """The robot executes an order the dispatcher did not issue (its own offline mission):
+    the timeout ends the mission but never cancels that order."""
+    r, _ = _make_robot()
+    mission = _make_running_mission()
+    r._current_mission = mission
+    r._sent_order = object()
+    r._robot_order_id = "robots-own-order"
+    r._robot_executing = True
+    r._send_instant_action = AsyncMock()
+    r.get_next_mission = AsyncMock()
+
+    await r._fail_mission_on_timeout(mission.name)
+
+    r._send_instant_action.assert_not_awaited()
+    assert mission.status.state == mission_object.MissionStateV1.FAILED
+    r.get_next_mission.assert_awaited_once()
+
+
+@pytest.mark.unit
+async def test_timeout_cancels_the_order_of_its_run_the_robot_reports():
+    r, _ = _make_robot()
+    mission = _make_running_mission()
+    r._current_mission = mission
+    r._robot_order_id = f"{r._order_prefix()}-n0"
+    r._robot_executing = True
+    r._send_instant_action = AsyncMock()
+    r.get_next_mission = AsyncMock()
+
+    await r._fail_mission_on_timeout(mission.name)
+
+    r._send_instant_action.assert_awaited_once()

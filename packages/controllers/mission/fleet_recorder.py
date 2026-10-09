@@ -72,6 +72,11 @@ MISSION_TIMEOUT_REASON = "Mission timed out"
 
 DEFAULT_SPILL_PATH = "/tmp/mission_dispatch/fleet_events_spill.jsonl"
 STATE_ROW_INTERVAL_S = 5.0
+# robot_latest.state_msg (the serialised state message) is refreshed at most this often while
+# nothing discrete changed (driving, moving, order progress, errors, the dispatcher's own
+# fields); last_seen is merged on every state, and a sweep stores the newest state after
+# a quiet period.
+LATEST_STATE_MSG_INTERVAL_S = 5.0
 BATTERY_LOW_PCT = 20.0
 BATTERY_OK_PCT = 25.0
 SWEEP_PERIOD_S = 1.0
@@ -93,6 +98,14 @@ REHYDRATE_ATTEMPTS = 30
 OP_CONNECT_TIMEOUT_S = 5.0
 OP_RETRY_DELAYS_S = (1.0, 2.0, 5.0, 10.0, 30.0)
 MAX_PENDING_OPS = 1000
+# Run-lifecycle ops (start/finish of a run) are never dropped on a transient database error
+# (they retry forever, the delay capped at the last of OP_RETRY_DELAYS_S) and never evicted
+# from a full queue (telemetry-type ops, i.e. legs, go first). A lost finish would leave
+# mission_runs RUNNING and the mission undeletable.
+# Orphaned RUNNING runs are also settled periodically, not only at startup.
+RECONCILE_PERIOD_S = 600.0
+# Runs younger than this are left alone by the periodic reconcile.
+RECONCILE_MIN_AGE_S = 60.0
 # Trajectory rows logged this long after the run ended still belong to it (graph-builder
 # logs waypoints asynchronously from the robot's node updates).
 TRAJECTORY_GRACE_S = 5
@@ -286,6 +299,11 @@ class _Track:
         self.last_raw: Optional[Dict[str, Any]] = None
         self.last_row_ts: Optional[datetime.datetime] = None
         self.last_row_key: Optional[Tuple[Any, ...]] = None
+        # robot_latest.state_msg throttle: when it was last built, from which discrete
+        # signature, and the newest state message not yet stored (None = nothing waits).
+        self.latest_at: Optional[datetime.datetime] = None
+        self.latest_sig: Optional[Tuple[Any, ...]] = None
+        self.latest_waiting: Optional[Any] = None
 
     def set_timeout(self, timeout_s: float) -> None:
         if timeout_s <= 0 or self.heartbeat.timeout.total_seconds() == timeout_s:
@@ -385,6 +403,8 @@ class _Context:
 class _Op:
     attempts = 0
     with_events = True
+    # Losing the op leaves inconsistent state: retried without limit, never evicted.
+    lifecycle = False
 
     async def run(self, recorder: "FleetRecorder") -> None:
         raise NotImplementedError
@@ -403,6 +423,8 @@ class _Finish:
 
 
 class _StartRun(_Op):
+    lifecycle = True
+
     def __init__(self, run: RunInfo, adopt: bool):
         self.info = run
         self.adopt = adopt
@@ -462,6 +484,8 @@ class _WriteLeg(_Op):
 
 
 class _FinishRun(_Op):
+    lifecycle = True
+
     def __init__(self, run: RunInfo, finish: _Finish):
         self.info = run
         self.finish = finish
@@ -476,7 +500,8 @@ class _FinishRun(_Op):
 
 
 class _Reconcile(_Op):
-    """Startup: settle RUNNING runs left by a previous dispatcher process."""
+    """Settle RUNNING runs the dispatcher no longer knows (left by a previous process at
+    startup, or by a lost finish, periodically)."""
 
     def __init__(self, started_before: datetime.datetime):
         self.started_before = started_before
@@ -489,8 +514,10 @@ class _Reconcile(_Op):
             await conn.commit()
             for run_id, mission_name, robot_name, started_at, level in candidates:
                 run_id = uuid.UUID(str(run_id))
-                active = recorder._runs.get(robot_name)
-                if active is not None and active.run_id == run_id:
+                # Runs this process is executing right now (an adopted one is matched by
+                # mission until its stored id is resolved) are never touched.
+                if any(a.run_id == run_id or (not a.resolved and a.mission_name == mission_name)
+                       for a in list(recorder._runs.values())):
                     continue
                 async with conn.cursor() as cursor:
                     await cursor.execute(MISSION_SQL, (mission_name,))
@@ -575,8 +602,29 @@ class FleetRecorder:
             self._writer = TelemetryWriter(self._pool, self.queue, policy=self.policy)
             self._writer.start()
         self._spawn(self._run_worker(), "runs")
+        self._spawn(self._reconcile_loop(), "reconcile")
         self._spawn(self._sweep_loop(), "heartbeat_sweep")
         self._spawn(self._health_loop(), "health_report")
+
+    async def drain(self, timeout_s: float) -> None:
+        """Shutdown, before stop(): run the queued run writes (a _StartRun/_FinishRun is
+        never dropped) for at most `timeout_s`; what does not fit stays unwritten, and the
+        next start's orphan reconciliation settles it. Never raises."""
+        if self._pool is None or not self._ops:
+            return
+        try:
+            await asyncio.wait_for(self.run_pending_ops(), timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning("Run writes not drained within %ss (%d left)", timeout_s,
+                           len(self._ops))
+        except Exception:  # noqa: BLE001
+            logger.exception("Draining the run writes failed")
+
+    async def close(self) -> None:
+        """Close the pool (after stop())."""
+        pool = self._pool
+        if pool is not None:
+            await pool.close()
 
     async def stop(self) -> None:
         for task in self._tasks:
@@ -589,6 +637,17 @@ class FleetRecorder:
         self._tasks = []
         if self._writer is not None:
             await self._writer.stop()
+
+    async def _reconcile_loop(self) -> None:
+        """Periodically queue a _Reconcile (the one at startup is queued by start())."""
+        while True:
+            await self._sleep(RECONCILE_PERIOD_S)
+            self.queue_reconcile()
+
+    def queue_reconcile(self) -> None:
+        if any(isinstance(op, _Reconcile) for op in self._ops):
+            return
+        self._submit(_Reconcile(self._clock() - datetime.timedelta(seconds=RECONCILE_MIN_AGE_S)))
 
     def _spawn(self, coro, name: str) -> None:
         self._tasks.append(asyncio.get_running_loop().create_task(
@@ -659,7 +718,7 @@ class FleetRecorder:
         if name:
             self._tracks.pop(name, None)
             self._latest_rows.pop(name, None)
-            self._runs.pop(name, None)
+            self._abandon_run(self._runs.pop(name, None), "robot_deleted")
         self.policy.apply_robot_object(robot_object)
 
     @_guarded
@@ -728,12 +787,36 @@ class FleetRecorder:
                             {"battery_percent": charge, "threshold": BATTERY_OK_PCT})
 
         self._sw_version(track, sw_version_from_message(message), ts)
-        track.last_raw = json.loads(message.json(by_alias=True, exclude_none=True))
 
         robot_state = (_enum_value(robot_object.status.state) if robot_object is not None
                        else track.robot_state.value)
         self._state_row(track, message, ts, robot_state)
+        self._store_state_msg(track, message, now, robot_state)
+
+    def _store_state_msg(self, track: _Track, message: Any, now: datetime.datetime,
+                         robot_state: Optional[str]) -> None:
+        """Refresh robot_latest.state_msg: at once on a discrete change (the fields the API
+        reads it for: driving, moving, remaining nodes, order, errors, dispatch fields),
+        else at most every LATEST_STATE_MSG_INTERVAL_S; the newest message waits for the
+        sweep. Re-serialising the message is the cost saved. last_seen is always merged."""
+        vel = message.velocity
+        moving = bool(vel is not None and (vel.vx or vel.vy or vel.omega))
+        sig = (message.driving, moving, bool(message.nodeStates or message.edgeStates),
+               message.orderId, robot_state, track.errors.members,
+               tuple(track.dispatch_state().values()))
+        due = (track.latest_at is None or sig != track.latest_sig or now < track.latest_at or
+               (now - track.latest_at).total_seconds() >= LATEST_STATE_MSG_INTERVAL_S)
+        if not due:
+            track.latest_waiting = message
+            self.queue.put_latest(track.robot_name, last_seen=now)
+            return
+        self._build_state_msg(track, message)
+        track.latest_at, track.latest_sig = now, sig
         self._put_latest(track, last_seen=now)
+
+    def _build_state_msg(self, track: _Track, message: Any) -> None:
+        track.last_raw = json.loads(message.json(by_alias=True, exclude_none=True))
+        track.latest_waiting = None
 
     @_guarded
     def on_connection(self, robot_name: str, message: Any,
@@ -870,6 +953,11 @@ class FleetRecorder:
         for track in list(self._tracks.values()):
             if self._started_at is not None and now - self._started_at < track.heartbeat.timeout:
                 continue
+            if track.latest_waiting is not None and track.latest_at is not None and \
+                    (now - track.latest_at).total_seconds() >= LATEST_STATE_MSG_INTERVAL_S:
+                self._build_state_msg(track, track.latest_waiting)
+                track.latest_at = now
+                self._put_latest(track)
             lost = track.heartbeat.check(now)
             if lost is not None:
                 timeout = track.heartbeat.timeout
@@ -975,6 +1063,8 @@ class FleetRecorder:
         current = self._runs.get(robot_name)
         if current is not None and current.mission_name == mission.name:
             return
+        # A different mission's run is still open on this robot: settle it, or it stays RUNNING.
+        self._abandon_run(current, "superseded")
         status = mission.status
         fresh = status.start_timestamp is None and status.passes_completed == 0
         now = self._clock()
@@ -991,6 +1081,13 @@ class FleetRecorder:
             resolved=fresh, planned_path=list(mission.planned_path or []) or None)
         self._runs[robot_name] = run
         self._submit(_StartRun(run, adopt=not fresh))
+
+    def _abandon_run(self, run: Optional[RunInfo], reason: str) -> None:
+        """Close a run that is dropped from `_runs` without run_finished (its robot was
+        deleted, or another mission started on the robot): ABORTED / DISPATCH.ORPHANED."""
+        if run is None:
+            return
+        self._submit(_FinishRun(run, _orphan(reason, None, None, 0, self._clock())))
 
     @_guarded
     def run_finished(self, robot_name: str, mission: Any, robot_object: Any = None) -> None:
@@ -1097,9 +1194,25 @@ class FleetRecorder:
     # --- run worker ----------------------------------------------------------------------
     def _submit(self, op: _Op) -> None:
         if len(self._ops) >= MAX_PENDING_OPS:
-            self.ops_dropped += 1
-            logger.error("Run write queue full; dropping %s", op.describe())
-            return
+            victim = None
+            if op.lifecycle:
+                # Evict the newest telemetry-type op (never the head: it may be running).
+                for i in range(len(self._ops) - 1, 0, -1):
+                    if not self._ops[i].lifecycle:
+                        victim = i
+                        break
+            if victim is None and not op.lifecycle:
+                self.ops_dropped += 1
+                logger.error("Run write queue full; dropping %s", op.describe())
+                return
+            if victim is not None:
+                evicted = self._ops[victim]
+                del self._ops[victim]
+                self.ops_dropped += 1
+                logger.error("Run write queue full; dropping %s to keep %s",
+                             evicted.describe(), op.describe())
+            else:
+                logger.error("Run write queue full of lifecycle ops; keeping %s", op.describe())
         self._ops.append(op)
         if self._ops_wakeup is not None:
             self._ops_wakeup.set()
@@ -1128,8 +1241,8 @@ class FleetRecorder:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                if _is_transient(exc) and op.attempts < len(OP_RETRY_DELAYS_S):
-                    delay = OP_RETRY_DELAYS_S[op.attempts]
+                if _is_transient(exc) and (op.lifecycle or op.attempts < len(OP_RETRY_DELAYS_S)):
+                    delay = OP_RETRY_DELAYS_S[min(op.attempts, len(OP_RETRY_DELAYS_S) - 1)]
                     op.attempts += 1
                     logger.warning("Run write (%s) failed: %s; retry %d in %ss",
                                    op.describe(), exc, op.attempts, delay)

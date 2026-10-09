@@ -20,7 +20,6 @@ import argparse
 import datetime
 import json
 import logging
-import sys
 import time
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Optional, Sequence
 import uuid
@@ -54,6 +53,11 @@ REQUIRED_TABLES_RETRY_PERIOD = 5
 # event instead: on timeout we log a warning and force a fresh connection + full
 # resync, exactly like the exception path already does.
 WATCHER_NOTIFY_TIMEOUT_S = 60
+
+# Backoff of PostgresWatcher after an error (not after a quiet timeout): 1 s, doubling, capped.
+# Reset by the next successful resync. Without it a persistent error was a hot reconnect loop.
+WATCHER_ERROR_BACKOFF_MIN_S = 1.0
+WATCHER_ERROR_BACKOFF_MAX_S = 30.0
 
 # Fixed application-wide key for the advisory lock that serializes schema creation
 # across services (see initialize_database). Any constant works as long as every
@@ -130,6 +134,21 @@ class PostgresWatcher:
         self._object_class = object_class
         self._publisher_id = publisher_id
         self._connection: Optional[psycopg.AsyncConnection] = None
+        self._error_backoff_s = WATCHER_ERROR_BACKOFF_MIN_S
+
+    def _parse_object(self, name: str, lifecycle: str, spec: Any, status: Any
+                      ) -> Optional[objects.ApiObject]:
+        """The object of a row, or None (logged with the row's name) if the model rejects it:
+        one bad row must not stop every other object from being delivered."""
+        try:
+            return self._object_class(name=name,
+                                      lifecycle=objects.ObjectLifecycleV1[lifecycle],
+                                      status=status, **spec)
+        except Exception as err:  # pylint: disable=broad-except
+            self._logger.error("Skipping %s row %r that does not parse (%s: %s)",
+                               self._object_class.table_name(), name,
+                               type(err).__name__, err)
+            return None
 
     async def _get_connection(self) -> psycopg.AsyncConnection:
         connected = False
@@ -180,10 +199,10 @@ class PostgresWatcher:
                     query = self.resync_query(self._object_class)
                     await cursor.execute(query)
                     values = await cursor.fetchall()
-                    objs = [self._object_class(name=name,
-                                               lifecycle=objects.ObjectLifecycleV1[lifecycle],
-                                               status=status, **spec)
-                            for name, lifecycle, spec, status in values]
+                    objs = [obj for obj in (self._parse_object(*row) for row in values)
+                            if obj is not None]
+                    # A resync that got this far (LISTEN + SELECT worked) ends the backoff.
+                    self._error_backoff_s = WATCHER_ERROR_BACKOFF_MIN_S
                     # A resync happens at every (re)connect, including the reconnect after
                     # WATCHER_NOTIFY_TIMEOUT_S without a notification (every minute on a
                     # quiet table), so one line per resync, not one warning per object.
@@ -217,11 +236,20 @@ class PostgresWatcher:
                                 anext(notify_iter), timeout=WATCHER_NOTIFY_TIMEOUT_S)
                         except (asyncio.TimeoutError, StopAsyncIteration):
                             break
-                        publisher, obj_name, lifecycle = notification.payload.split(
-                            " ", 2)
+                        # "<publisher uuid> <name> <LIFECYCLE>" (_notify); the name is what
+                        # is in the middle, so a name with spaces still parses.
+                        try:
+                            publisher, rest = notification.payload.split(" ", 1)
+                            obj_name, lifecycle = rest.rsplit(" ", 1)
+                            own = self._publisher_id == uuid.UUID(publisher)
+                        except ValueError:
+                            self._logger.error("Ignoring malformed %s notification %r",
+                                               self._object_class.table_name(),
+                                               notification.payload)
+                            continue
 
                         # Ignore notifications caused by our changes
-                        if self._publisher_id == uuid.UUID(publisher):
+                        if own:
                             continue
 
                         query = f"SELECT spec, status FROM {self._object_class.table_name()} \
@@ -241,10 +269,9 @@ class PostgresWatcher:
                                                          status={}, **t_default_spec)
                         else:
                             spec, status = values_notify
-                            pop_obj = self._object_class(name=obj_name,
-                                                         lifecycle=\
-                                                         objects.ObjectLifecycleV1[lifecycle],
-                                                         status=status, **spec)
+                            pop_obj = self._parse_object(obj_name, lifecycle, spec, status)
+                            if pop_obj is None:
+                                continue
                         self._logger.debug(
                             "Object from notification: %s", pop_obj.name)
                         yield pop_obj
@@ -269,6 +296,11 @@ class PostgresWatcher:
                                      self._object_class.table_name(),
                                      type(err).__name__, err)
                 await self._close_connection()
+                # Backoff: a persistent error must not become a reconnect + full resync
+                # loop at connect speed.
+                await asyncio.sleep(self._error_backoff_s)
+                self._error_backoff_s = min(self._error_backoff_s * 2,
+                                            WATCHER_ERROR_BACKOFF_MAX_S)
                 self._connection = await self._get_connection()
                 continue
 
@@ -364,7 +396,7 @@ class PostgresDatabase:
                 await self._wait_for_required_tables(pool)
                 self._pool = pool
                 return
-            except (psycopg.OperationalError, psycopg.errors.UniqueViolation):
+            except (psycopg.OperationalError, psycopg.errors.UniqueViolation) as err:
                 # OperationalError: Postgres not accepting connections yet.
                 # UniqueViolation: lost a concurrent CREATE TABLE race on
                 # pg_type_typname_nsp_index (belt-and-suspenders alongside the advisory
@@ -375,7 +407,8 @@ class PostgresDatabase:
                 if self._max_retries is not None and retries >= self._max_retries:
                     raise
                 self._logger.warning(
-                    "Could not connect to Postgres, retry in %ss", POSTGRES_RECONNECT_PERIOD)
+                    "Could not connect to Postgres (%s), retry in %ss", err,
+                    POSTGRES_RECONNECT_PERIOD)
                 await asyncio.sleep(POSTGRES_RECONNECT_PERIOD)
 
     async def _wait_for_required_tables(self, pool: AsyncConnectionPool):
@@ -608,15 +641,19 @@ class PostgresDatabase:
                         "SET lifecycle = %s WHERE name = %s RETURNING *;"
                     await cursor.execute(query, [lifecycle.value, name])
                     if lifecycle == objects.ObjectLifecycleV1.DELETED:
+                        if cursor.rowcount == 0:
+                            # Already gone (a done mission can be queued for deletion twice:
+                            # resync snapshot + notification): deleting it again is a no-op.
+                            return
                         await cursor.fetchone()
                         query = f"DELETE FROM {object_class.table_name()} \
                                   WHERE name = %s RETURNING *;"
                         await cursor.execute(query, [name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
-        except psycopg.OperationalError as err:
-            self._logger.error("Exit: %s", err)
+        except Exception as err:
+            self._logger.error("Database error: %s", err)
             traceback.print_exc()
-            sys.exit(1)
+            raise
 
     async def log_mission_waypoint(
         self,
@@ -658,5 +695,16 @@ class PostgresDatabase:
         """A new autocommit connection outside the pool, for holding a session-level advisory
         lock while a long task runs (packages/api/map_delete.py). The caller closes it."""
         return await psycopg.AsyncConnection.connect(self._auth, autocommit=True, **kwargs)
+
+    async def ping(self) -> None:
+        """A cheap round trip through the pool (SELECT 1); raises when it fails. Used by the
+        dispatcher's liveness heartbeat."""
+        async with self._pool.connection() as conn:
+            await conn.execute("SELECT 1")
+
+    async def close_pool(self) -> None:
+        """Close the pool (clean shutdown). A no-op when it was never opened."""
+        if self._pool is not None:
+            await self._pool.close()
 
 
