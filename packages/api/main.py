@@ -2414,8 +2414,8 @@ async def create_mission(mission_data: dict):
             raise HTTPException(status_code=400, detail="Missing required field: mission_tree")
 
         # Create mission with auto-initialized status
-        # Note: status and lifecycle must be set before **mission_data to avoid being overridden
-        mission_data_with_defaults = {"status": MissionStatusV1(), "lifecycle": ObjectLifecycleV1.ALIVE, **mission_data}
+        # status and lifecycle are server-owned: they come after **mission_data so a caller cannot set them
+        mission_data_with_defaults = {**mission_data, "status": MissionStatusV1(), "lifecycle": ObjectLifecycleV1.ALIVE}
         mission = MissionObjectV1(**mission_data_with_defaults)
         # Dispatcher-owned (see PUT below): a new mission is never dispatched yet, so a
         # caller-supplied run_id could only make its order ids collide with another run's.

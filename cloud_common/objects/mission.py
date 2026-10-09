@@ -622,9 +622,9 @@ class MissionObjectV1(MissionSpecV1, object.ApiObject):
     @staticmethod
     def get_query_map() -> Dict:
         return {
-            "state": "status->>'state' = '{}'",
-            "started_after": "(status->>'start_timestamp') >= '{}'",
-            "started_before": "(status->>'start_timestamp') <= '{}'",
-            "robot": "spec->>'robot' = '{}'",
-            "most_recent": " ORDER BY (status->>'start_timestamp') DESC LIMIT {}"
+            "state": "status->>'state' = %s",
+            "started_after": "(status->>'start_timestamp') >= %s",
+            "started_before": "(status->>'start_timestamp') <= %s",
+            "robot": "spec->>'robot' = %s",
+            "most_recent": " ORDER BY (status->>'start_timestamp') DESC LIMIT %s"
         }

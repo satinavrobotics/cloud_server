@@ -448,40 +448,50 @@ class PostgresDatabase:
         name, lifecycle, _, _ = values
         await self._notify(cursor, table_name, name, lifecycle, publisher_id)
 
+    @staticmethod
+    def _query_value(value):
+        """A query parameter as the text/number psycopg binds for a query-map clause."""
+        if isinstance(value, enum.Enum):
+            return str(value.value)
+        if isinstance(value, bool):
+            return str(value).lower()
+        if isinstance(value, datetime.datetime):
+            return value.isoformat()
+        if isinstance(value, (int, float)):
+            return value
+        return str(value)
+
     async def list_objects(self, object_class: objects.ApiObjectType,
                            query_params: Optional[pydantic.BaseModel] = None,
                            include_deleted: bool = False):
         base_filter = "" if include_deleted else "lifecycle != 'DELETED'"
         query = f"SELECT * FROM {object_class.table_name()}"
         all_clauses = [base_filter] if base_filter else []
+        clause_args: list = []
         extra_clause = ""
+        extra_args: list = []
         if query_params and object_class.get_query_map():
             query_map = object_class.get_query_map()
+            # Query-map clauses hold %s placeholders; every value is bound by psycopg,
+            # never interpolated into the SQL text.
             for param, value in query_params:
-                if param == "most_recent" and value is not None:
-                    extra_clause = query_map[param].format(str(value))
-                elif value is not None:
-                    if isinstance(value, list):
-                        if not value:
-                            continue
-                        # If the value is a list, we format it as a SQL list (v1, v2, ...)
-                        # We also check if the query map uses '=' and convert it to 'IN' for lists
-                        value_str = "(" + ", ".join([f"'{v}'" for v in value]) + ")"
-                        clause = query_map[param]
-                        if " = " in clause and "{}" in clause:
-                            clause = clause.replace(" = ", " IN ")
-                        all_clauses.append(clause.format(value_str))
-                    elif isinstance(value, enum.Enum):
-                        value_str = str(value.value)
-                    elif isinstance(value, bool):
-                        value_str = str(value).lower()
-                    elif isinstance(value, datetime.datetime):
-                        value_str = value.isoformat()
-                    else:
-                        value_str = str(value)
-
-                    if not isinstance(value, list):
-                        all_clauses.append(query_map[param].format(value_str))
+                if value is None:
+                    continue
+                clause = query_map[param]
+                if param == "most_recent":
+                    extra_clause = clause
+                    extra_args = [int(value)]
+                    continue
+                if isinstance(value, list):
+                    if not value:
+                        continue
+                    arg = [self._query_value(v) for v in value]
+                else:
+                    arg = self._query_value(value)
+                if "ANY(%s)" in clause and not isinstance(arg, list):
+                    arg = [arg]
+                all_clauses.append(clause)
+                clause_args.append(arg)
         if all_clauses:
             query += " WHERE " + " AND ".join(all_clauses)
         # Deterministic order (heap order changes on every UPDATE). A query-map
@@ -491,7 +501,7 @@ class PostgresDatabase:
         try:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cursor:
-                    await cursor.execute(query)
+                    await cursor.execute(query, clause_args + extra_args)
                     values = await cursor.fetchall()
                     return [object_class(name=name,
                                          lifecycle=objects.ObjectLifecycleV1[lifecycle],

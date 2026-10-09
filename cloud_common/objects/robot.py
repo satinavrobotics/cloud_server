@@ -315,16 +315,18 @@ class RobotObjectV1(RobotSpecV1, object.ApiObject):
 
     @staticmethod
     def get_query_map() -> Dict:
+        # Every value is bound as a psycopg parameter (%s); "ANY(%s)" clauses take a
+        # list (a single value is wrapped by list_objects).
         return {
             # A robot with no battery reading reports 0.0; keep it out of both ranges.
-            "min_battery": "(status->'battery_level')::float >= {} "
+            "min_battery": "(status->'battery_level')::float >= %s "
                            "AND COALESCE((status->>'battery_unknown')::boolean, false) = false",
-            "max_battery": "(status->'battery_level')::float <= {} "
+            "max_battery": "(status->'battery_level')::float <= %s "
                            "AND COALESCE((status->>'battery_unknown')::boolean, false) = false",
-            "names": "name IN {}",
-            "state": "status->>'state' = '{}'",
-            "online": "status->>'online' = '{}'",
-            "robot_type": "(status->'factsheet'->>'agv_class')::text IN {}"
+            "names": "name = ANY(%s)",
+            "state": "status->>'state' = %s",
+            "online": "status->>'online' = %s",
+            "robot_type": "(status->'factsheet'->>'agv_class')::text = ANY(%s)"
         }
 
     @classmethod
