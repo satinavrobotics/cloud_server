@@ -24,11 +24,12 @@ from packages.services.graph_builder import ingest  # noqa: E402
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService  # noqa: E402
 from packages.topomap_dbs.image_db.server import ImageDatabaseService  # noqa: E402
 from packages.utils import map_geo  # noqa: E402
+from tests.unit.test_costmap_ingest import png_bytes  # noqa: E402
 from tests.unit.test_maps_m2 import IMAGE, NODE, _gb, _row  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
-PNG = b"\x89PNG\r\n\x1a\nfake"
+PNG = png_bytes(448, 336, bit_depth=16)  # the camera block's width x height, u16 grayscale
 CAMERA = {"frame_id": "camera", "width": 448, "height": 336, "fx": 300.0, "fy": 300.0,
           "cx": 224.0, "cy": 168.0, "distortion_model": "plumb_bob", "d": [0, 0, 0, 0, 0],
           "depth_type": "z", "valid_range_m": [0.2, 15.0], "rgb_width": 448,
@@ -64,6 +65,7 @@ def _service(row=None):
     service = _gb(row if row is not None else _row())
     service.image_db.store_depth = Mock(return_value=True)
     service.graph_db.set_node_depth = Mock(return_value=True)
+    service.graph_db.set_node_depths = Mock(return_value=True)
     return service
 
 
@@ -94,6 +96,9 @@ class TestPose3dMap:
         with pytest.raises(ingest.DepthPayloadError):
             ingest.pose3d_map(map_geo.IDENTITY, {"x": 0, "y": 0, "z": 0, "qx": 0, "qy": 0,
                                                  "qz": 0, "qw": 0})
+        with pytest.raises(ingest.CostmapPayloadError):  # the error class is the caller's
+            ingest.pose3d_map(map_geo.IDENTITY, {"x": 0, "y": 0, "z": 0, "qx": 0, "qy": 0,
+                                                 "qz": 0, "qw": 0}, ingest.CostmapPayloadError)
 
 
 class TestPayload:
@@ -101,6 +106,7 @@ class TestPayload:
         {"depth_data": None}, {"camera_name": ""}, {"camera": None},
         {"depth_encoding": "f32_m"}, {"content_type": "image/jpeg"}, {"depth_scale": 0},
         {"robot_pose3d": {"x": 1}}, {"camera_name": "../x"},
+        {"robot_pose3d": {"x": 0, "y": 0, "z": 0, "qx": 0, "qy": 0, "qz": 0, "qw": 0}},
     ])
     def test_invalid(self, patch_):
         with pytest.raises(ingest.DepthPayloadError):
@@ -116,6 +122,29 @@ class TestPayload:
         with pytest.raises(ingest.DepthPayloadError) as exc:
             ingest.check_depth_payload({**DEPTH, "robot_pose3d": pose})
         assert str(exc.value) == message
+
+    @pytest.mark.parametrize("data, message", [
+        ("!!not base64!!", "depth_data is not base64"),
+        (base64.b64encode(b"\xff\xd8\xff" + b"\0" * 40).decode(), "depth_data is not a PNG"),
+        (base64.b64encode(png_bytes(448, 335, 16)).decode(),
+         "depth_data is 448x335, the message says 448x336"),
+        (base64.b64encode(png_bytes(448, 336, 8)).decode(),
+         "depth_data is not a 16-bit grayscale PNG (bit depth 8, colour type 0)"),
+        (base64.b64encode(png_bytes(448, 336, 16, 2)).decode(),
+         "depth_data is not a 16-bit grayscale PNG (bit depth 16, colour type 2)"),
+    ])
+    def test_png_header_is_checked(self, data, message):
+        with pytest.raises(ingest.DepthPayloadError) as exc:
+            ingest.check_depth_payload({**DEPTH, "depth_data": data})
+        assert str(exc.value).startswith(message)
+
+    def test_check_returns_the_parsed_fields_the_record_is_made_from(self):
+        parsed = ingest.check_depth_payload(DEPTH)
+        assert parsed["pose"] == DEPTH["robot_pose3d"] and parsed["camera"] == CAMERA
+        t = {"tx": 1.0, "ty": 0.0, "yaw": 0.0}
+        session = ingest.OpenSession("s1", "yard", False, t, "ALIVE", "mapping")
+        assert ingest.depth_record_from(parsed, t, "s1") == ingest.depth_record(DEPTH, session)
+        assert ingest.depth_record({}, session, parsed) == ingest.depth_record(DEPTH, session)
 
     def test_record(self):
         session = ingest.OpenSession("s1", "yard", False,
@@ -256,7 +285,6 @@ class TestStores:
         svc = GraphDatabaseService.__new__(GraphDatabaseService)
         svc.logger = Mock()
         svc.db = Mock()
-        svc.db.has_collection.return_value = True
         svc.db.aql.execute.return_value = iter(["n1"])
         assert svc.set_node_depth("yard", "n1", "left", {"depth_scale": 0.001})
         aql, = svc.db.aql.execute.call_args.args
@@ -266,8 +294,22 @@ class TestStores:
                         "record": {"depth_scale": 0.001}}
         svc.db.aql.execute.return_value = iter([])
         assert not svc.set_node_depth("yard", "missing", "left", {})
-        svc.db.has_collection.return_value = False
+        svc.db.has_collection.assert_not_called()  # ArangoDB errors on a missing collection
+        svc.db.aql.execute.side_effect = RuntimeError("collection or view not found")
         assert not svc.set_node_depth("gone", "n1", "left", {})
+
+    def test_set_node_depths_merges_several_cameras_in_one_update(self):
+        svc = GraphDatabaseService.__new__(GraphDatabaseService)
+        svc.logger = Mock()
+        svc.db = Mock()
+        svc.db.aql.execute.return_value = iter(["n1"])
+        records = {"left": {"depth_scale": 0.001}, "right": {"depth_scale": 0.002}}
+        assert svc.set_node_depths("yard", "n1", records)
+        svc.db.aql.execute.assert_called_once()
+        aql, = svc.db.aql.execute.call_args.args
+        assert "MERGE(d.depth || {}, @records)" in aql
+        assert svc.db.aql.execute.call_args.kwargs["bind_vars"] == {
+            "@col": "nodes_yard", "key": "n1", "records": records}
 
     @patch("packages.topomap_dbs.minio_base.Minio")
     def test_store_depth_key_and_content_type(self, minio):
@@ -287,4 +329,5 @@ class TestStores:
         minio.return_value.list_objects.return_value = [Mock(object_name=n) for n in names]
         stats = ImageDatabaseService().get_stats(map_id="yard")
         assert stats["node_count"] == 2 and stats["image_count"] == 2
+        assert stats["costmap_count"] == 0
         assert stats["depth_count"] == 1

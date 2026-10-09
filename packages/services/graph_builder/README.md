@@ -297,14 +297,16 @@ u16-millimetre PNG (`depth_data`, base64), `depth_scale`, the stamps, the robot'
 the depth stamp (`robot_pose3d`, run frame) and the camera block (intrinsics, `T_base_cam`).
 Resolved by session and buffered like an image. Stored as `map-{id}/{node}/depth/{camera}.png`
 and, on the ArangoDB node, `depth.{camera}` = the camera block, scale, stamps, session and
-`pose3d_map` (the pose in the map frame). A dropped one counts as `dropped_depth` in
+`pose3d_map` (the pose in the map frame). The PNG's header must be a 16-bit grayscale PNG of the
+camera block's `width` x `height`. A dropped one counts as `dropped_depth` in
 `MAP.INGEST_REJECTED`. Payload: `docs/reconstruction/design.md` §4.3, §5.
 
 ### Costmap layers (`robot/costmap_upload`)
 
 `robot/costmap_upload` (`MQTT_COSTMAP_TOPIC`, default `robot/costmap_upload`, empty = not
 subscribed; subscribed at QoS 1): one message per node and layer with an occupancy PNG
-(u8: 0..100 = occupancy percent, 255 = unknown; the PNG is not decoded by graph-builder).
+(u8: 0..100 = occupancy percent, 255 = unknown; the PNG's pixels are not decoded by graph-builder,
+only its header: signature, width x height equal to `width` x `height`, 8-bit grayscale).
 
 ```json
 {
@@ -329,18 +331,22 @@ The base64 is decoded strictly when saving. An invalid message is logged and cou
 `errors` (no event).
 
 Resolved by session and buffered exactly like depth (per `(robot, node)` and layer, 30 s,
-overwritten per layer, dropped with a rejected node). Stored as `map-{id}/{node}/costmap/{layer}.png`
+overwritten per layer, dropped with a rejected node). The buffers (image, depth, costmap; each)
+are capped at `UPLOAD_BUFFER_MAX_BYTES` (256 MiB of base64) and `UPLOAD_BUFFER_MAX_ENTRIES`
+(5000): a further upload is dropped and counted as `buffer_full` in `MAP.INGEST_REJECTED`
+(logged once a minute). A buffered upload keeps its parsed fields; the record, with its map-frame
+fields, is made when it is stored, with the map_T_session the node was stored with. Stored as `map-{id}/{node}/costmap/{layer}.png`
 (PNG first) and, on the ArangoDB node, `costmap.{layer}` = only these fields (anything else in
-the message is not stored): `session_node_id`, `robot_name`, `layer`, `content_type`,
-`costmap_encoding`, `width`, `height`, `resolution`, `origin` and `origin_pose3d` (robot frame,
-parsed to numbers; `origin_pose3d` only when sent), `frame`, `source_frame`,
-`costmap_stamp_ms`, `keyframe_stamp_ms`, `stamp_offset_ms` (as sent, `null` when absent),
-`source_topic` (as sent, only when present), plus `origin_map` (`x`, `y`, `yaw` through the
+the message is not stored): `layer`, `width`, `height`, `resolution`, `origin` and
+`origin_pose3d` (robot frame, parsed to numbers; `origin_pose3d` only when sent), `frame`,
+`source_frame`, `costmap_stamp_ms`, `keyframe_stamp_ms`, `stamp_offset_ms` and `source_topic`
+(as sent, each only when present), plus `origin_map` (`x`, `y`, `yaw` through the
 session's map_T_session, as the node pose), `origin_pose3d_map` (when `origin_pose3d` was sent)
 and `session_id`. A record is set only once its node's document exists: one that arrives while
 the node is still being written is buffered and stored with it. A dropped one counts as
 `dropped_costmap` in `MAP.INGEST_REJECTED`; stats: `costmap_saved`, `costmap_rejected`,
-`buffered_costmap`.
+`buffered_costmap`. Several layers (or cameras) buffered for one node are written to its
+document in one update.
 
 ## How It Works
 

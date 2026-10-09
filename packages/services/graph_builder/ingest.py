@@ -24,6 +24,9 @@ not know cloud sessions; a different one is only logged at debug). Otherwise it 
                       without an origin); a local map's session too. Finish the session and
                       start a new one
     lookup_failed     Postgres could not be asked
+    buffer_full       a depth / costmap / image that would wait for its node found its upload
+                      buffer at its size cap (UPLOAD_BUFFER_MAX_BYTES / _ENTRIES); not a
+                      session decision, never set for nodes
 
 Realignment (a robot restart mid-session on a GEO map): the robot takes a new datum at every
 navstack start, and a geo map's frame is absolute (UTM grid metres from the map's `geo` origin),
@@ -57,20 +60,25 @@ Depth (3D reconstruction R2, docs/reconstruction/design.md §5): a `robot/depth_
 is resolved like an image and dropped with kind `depth` (`dropped_depth`). Its camera
 parameters go onto the ArangoDB node as `depth.{camera}` (`depth_record`), with the robot's
 full 6-DoF pose at the depth stamp converted into the map frame (`pose3d_map`: x, y and yaw
-change with map_T_session; z, roll and pitch do not).
+change with map_T_session; z, roll and pitch do not). The conversion happens when the record is
+stored, with the transform the node was stored with (a buffered upload carries the parsed
+fields, not a finished record, so a re-placement while it waited cannot split the frames).
 
 Costmap (`robot/costmap_upload`): one occupancy PNG (u8, 0..100 occupied, 255 unknown) per node
 and layer, resolved like depth and dropped with kind `costmap` (`dropped_costmap`). Its record
 goes onto the node as `costmap.{layer}` (`costmap_record`), with the grid origin converted into
-the map frame (`origin_map`, and `origin_pose3d_map` when the robot sent `origin_pose3d`).
+the map frame (`origin_map`, and `origin_pose3d_map` when the robot sent `origin_pose3d`), the
+same way. The PNG's header (not its pixels) is checked: signature, size, bit depth, grayscale.
 """
 
+import base64
 import dataclasses
 import datetime
 import json
 import logging
 import math
 import re
+import struct
 import time
 import uuid as uuid_t
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -92,8 +100,9 @@ MAP_DELETING = "map_deleting"
 MAP_MISSING = "map_missing"
 DATUM_CHANGED = "datum_changed"
 LOOKUP_FAILED = "lookup_failed"
+BUFFER_FULL = "buffer_full"
 REASONS = (NO_SESSION, MAP_DELETING, MAP_MISSING, OPERATE_SESSION, SESSION_PAUSED,
-           SESSION_UNPLACED, DATUM_CHANGED, LOOKUP_FAILED)
+           SESSION_UNPLACED, DATUM_CHANGED, LOOKUP_FAILED, BUFFER_FULL)
 
 # One row per robot at most (partial unique index map_sessions_one_open_per_robot).
 OPEN_SESSION_SQL = (
@@ -245,17 +254,19 @@ class DepthPayloadError(ValueError):
     """A robot/depth_upload message that cannot be stored (missing or malformed fields)."""
 
 
-def pose3d_map(transform: Mapping[str, float], pose3d: Mapping[str, Any]) -> Dict[str, float]:
+def pose3d_map(transform: Mapping[str, float], pose3d: Mapping[str, Any],
+               error: type = DepthPayloadError) -> Dict[str, float]:
     """A robot-frame 6-DoF pose {x, y, z, qx, qy, qz, qw} in the map frame.
 
     map_T_session is a rotation about z by `yaw` plus an x/y translation, so the position's
     x/y are rotated and shifted, z is kept, and the orientation is Rz(yaw) * q (Hamilton): the
-    heading turns by `yaw`, roll and pitch are unchanged. The quaternion is normalized."""
+    heading turns by `yaw`, roll and pitch are unchanged. The quaternion is normalized.
+    A zero or invalid one raises `error`."""
     x, y = map_geo.apply_transform(transform, float(pose3d["x"]), float(pose3d["y"]))
     qx, qy, qz, qw = (float(pose3d[k]) for k in ("qx", "qy", "qz", "qw"))
     n = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
     if not n or not math.isfinite(n):
-        raise DepthPayloadError("robot_pose3d has a zero or invalid quaternion")
+        raise error("robot_pose3d has a zero or invalid quaternion")
     qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
     h = float(transform.get("yaw", 0.0)) / 2.0
     cz, sz = math.cos(h), math.sin(h)  # Rz(yaw) as a quaternion: (0, 0, sz, cz)
@@ -284,16 +295,44 @@ def _pose3d(value: Any, name: str = "robot_pose3d",
     return pose
 
 
-def check_depth_payload(payload: Mapping[str, Any]) -> None:
-    """Raise DepthPayloadError unless `payload` is a storable robot/depth_upload message
-    (design.md §4.3). Cheap: the PNG itself is not decoded."""
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_B64_HEAD = 36  # base64 chars that cover signature + IHDR up to the colour type (27 bytes)
+
+
+def _check_png_header(data: Any, name: str, width: Optional[int], height: Optional[int],
+                      bit_depth: int, error: type) -> None:
+    """Raise `error` unless the base64 `data` starts like a grayscale PNG of `bit_depth` bits
+    (and `width` x `height` when given): signature, IHDR size, bit depth and colour type 0.
+    Only the first bytes are decoded; the pixels are not."""
+    if not isinstance(data, str):
+        raise error(f"{name} is not a base64 string")
+    try:
+        head = base64.b64decode(data[:_PNG_B64_HEAD], validate=True)
+    except ValueError as exc:
+        raise error(f"{name} is not base64: {exc}") from exc
+    if len(head) < 26 or not head.startswith(PNG_SIGNATURE) or head[12:16] != b"IHDR":
+        raise error(f"{name} is not a PNG")
+    w, h, depth, colour = struct.unpack(">IIBB", head[16:26])
+    if (width is not None and w != width) or (height is not None and h != height):
+        raise error(f"{name} is {w}x{h}, the message says {width}x{height}")
+    if depth != bit_depth or colour != 0:
+        raise error(f"{name} is not a {bit_depth}-bit grayscale PNG "
+                    f"(bit depth {depth}, colour type {colour})")
+
+
+def check_depth_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """The parsed fields of a storable robot/depth_upload message (design.md §4.3: camera,
+    depth_scale, depth_stamp_ms, rgb_stamp_ms and `pose` = robot_pose3d as floats or None);
+    DepthPayloadError when it is not storable. Cheap: only the PNG's header is read (a 16-bit
+    grayscale PNG of the camera's width x height, the contract's `(height, width)` uint16)."""
     for key in ("session_node_id", "robot_name", "camera_name", "depth_data"):
         if payload.get(key) in (None, ""):
             raise DepthPayloadError(f"missing {key}")
     camera = str(payload["camera_name"])
     if "/" in camera or camera in (".", ".."):
         raise DepthPayloadError(f"invalid camera_name {camera!r}")
-    if not isinstance(payload.get("camera"), Mapping):
+    block = payload.get("camera")
+    if not isinstance(block, Mapping):
         raise DepthPayloadError("missing camera block")
     encoding = payload.get("depth_encoding", DEPTH_ENCODING)
     if encoding != DEPTH_ENCODING:
@@ -307,27 +346,48 @@ def check_depth_payload(payload: Mapping[str, Any]) -> None:
         raise DepthPayloadError(f"depth_scale: {exc}") from exc
     if not (scale > 0 and math.isfinite(scale)):
         raise DepthPayloadError("depth_scale must be > 0")
-    _pose3d(payload.get("robot_pose3d"))
-
-
-def depth_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str, Any]:
-    """The node's `depth.{camera}` value (design.md §5) for an accepted depth message:
-    the camera block as sent, the scale and stamps, the session, and (when the robot sent
-    `robot_pose3d`) that pose plus `pose3d_map`, converted with the session's map_T_session."""
-    check_depth_payload(payload)
-    record: Dict[str, Any] = {
-        "camera": dict(payload["camera"]),
-        "depth_scale": float(payload.get("depth_scale", 0.001)),
-        "depth_encoding": DEPTH_ENCODING,
-        "depth_stamp_ms": payload.get("depth_stamp_ms"),
-        "rgb_stamp_ms": payload.get("rgb_stamp_ms"),
-        "session_id": session.session_id,
-    }
     pose = _pose3d(payload.get("robot_pose3d"))
     if pose is not None:
-        record["robot_pose3d"] = pose
-        record["pose3d_map"] = pose3d_map(session.map_t_session, pose)
+        n = math.sqrt(sum(pose[k] * pose[k] for k in ("qx", "qy", "qz", "qw")))
+        if not n or not math.isfinite(n):
+            raise DepthPayloadError("robot_pose3d has a zero or invalid quaternion")
+    dims = [v if isinstance(v, int) and not isinstance(v, bool) else None
+            for v in (block.get("width"), block.get("height"))]
+    _check_png_header(payload["depth_data"], "depth_data", dims[0], dims[1], 16,
+                      DepthPayloadError)
+    return {"camera": dict(block), "depth_scale": scale,
+            "depth_stamp_ms": payload.get("depth_stamp_ms"),
+            "rgb_stamp_ms": payload.get("rgb_stamp_ms"), "pose": pose}
+
+
+def depth_record_from(parsed: Mapping[str, Any], transform: Mapping[str, float],
+                      session_id: str) -> Dict[str, Any]:
+    """The node's `depth.{camera}` value (design.md §5) from `check_depth_payload`'s fields:
+    the camera block as sent, the scale and stamps, the session, and (when the robot sent
+    `robot_pose3d`) that pose plus `pose3d_map`, converted with `transform` (the map_T_session
+    the node was stored with)."""
+    record: Dict[str, Any] = {
+        "camera": dict(parsed["camera"]),
+        "depth_scale": parsed["depth_scale"],
+        "depth_encoding": DEPTH_ENCODING,
+        "depth_stamp_ms": parsed["depth_stamp_ms"],
+        "rgb_stamp_ms": parsed["rgb_stamp_ms"],
+        "session_id": session_id,
+    }
+    if parsed["pose"] is not None:
+        record["robot_pose3d"] = dict(parsed["pose"])
+        record["pose3d_map"] = pose3d_map(transform, parsed["pose"])
     return record
+
+
+def depth_record(payload: Mapping[str, Any], session: "OpenSession",
+                 parsed: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """`depth_record_from` for an accepted depth message and its session; `parsed` is
+    check_depth_payload(payload)'s result (parsed here when not given, so it is safe to call
+    directly)."""
+    if parsed is None:
+        parsed = check_depth_payload(payload)
+    return depth_record_from(parsed, session.map_t_session, session.session_id)
 
 
 # --- costmap (`robot/costmap_upload`) ----------------------------------------------------------
@@ -337,9 +397,9 @@ COSTMAP_CONTENT_TYPE = "image/png"
 COSTMAP_DATA_KEY = "costmap_data"  # the PNG (MinIO), never stored on the node
 # A layer names a MinIO object (`{node}/costmap/{layer}.png`) and an ArangoDB attribute.
 COSTMAP_LAYER_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-# Stored on the node as sent (None when absent); `source_topic` only when present.
+# Stored on the node as sent, each only when present (not None) in the message.
 COSTMAP_PASSTHROUGH = ("frame", "source_frame", "costmap_stamp_ms", "keyframe_stamp_ms",
-                       "stamp_offset_ms")
+                       "stamp_offset_ms", "source_topic")
 
 
 class CostmapPayloadError(ValueError):
@@ -376,15 +436,17 @@ def _costmap_pose3d(value: Any) -> Optional[Dict[str, float]]:
     if value in (None, {}):
         return None
     pose = _pose3d(value, "origin_pose3d", CostmapPayloadError)
-    if not math.sqrt(sum(pose[k] ** 2 for k in ("qx", "qy", "qz", "qw"))):
+    if not math.sqrt(sum(pose[k] * pose[k] for k in ("qx", "qy", "qz", "qw"))):
         raise CostmapPayloadError("origin_pose3d has a zero quaternion")
     return pose
 
 
-def _parse_costmap(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def check_costmap_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """The validated, parsed fields of a robot/costmap_upload message (layer, width, height,
-    resolution, origin, origin_pose3d or None); CostmapPayloadError when it is not storable.
-    Cheap: the PNG is neither decoded nor base64-validated here (that happens on save)."""
+    resolution, origin, origin_pose3d or None, `extra` = the passthrough fields that were
+    sent); CostmapPayloadError when it is not storable. Cheap: only the PNG's header is read
+    (an 8-bit grayscale PNG of width x height); the pixels and the rest of the base64 are
+    neither decoded nor validated here (that happens on save)."""
     for key in ("session_node_id", "robot_name", "layer", COSTMAP_DATA_KEY):
         if payload.get(key) in (None, ""):
             raise CostmapPayloadError(f"missing {key}")
@@ -402,49 +464,52 @@ def _parse_costmap(payload: Mapping[str, Any]) -> Dict[str, Any]:
     resolution = _finite(payload, "resolution")
     if not resolution > 0:
         raise CostmapPayloadError("resolution must be > 0")
-    return {"layer": layer, "width": width, "height": height, "resolution": resolution,
-            "origin": _costmap_origin(payload),
-            "origin_pose3d": _costmap_pose3d(payload.get("origin_pose3d"))}
+    parsed = {"layer": layer, "width": width, "height": height, "resolution": resolution,
+              "origin": _costmap_origin(payload),
+              "origin_pose3d": _costmap_pose3d(payload.get("origin_pose3d")),
+              "extra": {k: payload[k] for k in COSTMAP_PASSTHROUGH
+                        if payload.get(k) is not None}}
+    _check_png_header(payload[COSTMAP_DATA_KEY], COSTMAP_DATA_KEY, width, height, 8,
+                      CostmapPayloadError)
+    return parsed
 
 
-def check_costmap_payload(payload: Mapping[str, Any]) -> None:
-    """Raise CostmapPayloadError unless `payload` is a storable robot/costmap_upload message."""
-    _parse_costmap(payload)
+def costmap_record_from(parsed: Mapping[str, Any], transform: Mapping[str, float],
+                        session_id: str) -> Dict[str, Any]:
+    """The node's `costmap.{layer}` value from `check_costmap_payload`'s fields.
 
-
-def costmap_record(payload: Mapping[str, Any], session: "OpenSession") -> Dict[str, Any]:
-    """The node's `costmap.{layer}` value for an accepted costmap message (validated here too,
-    so it is safe to call directly; it cannot fail on a payload check_costmap_payload passed).
-
-    Only known fields are stored: layer, content_type, costmap_encoding, width, height,
-    resolution, origin and origin_pose3d (parsed), frame, source_frame, the three stamps (as
-    sent, None when absent), source_topic (as sent, only when present), `origin_map` (the grid
-    origin through the session's map_T_session, exactly as a node pose), `origin_pose3d_map`
-    when `origin_pose3d` was sent, and `session_id`."""
-    parsed = _parse_costmap(payload)
+    Only known fields are stored: layer, width, height, resolution, origin and origin_pose3d
+    (parsed), frame, source_frame, the three stamps and source_topic (as sent, each only when
+    present), `origin_map` (the grid origin through `transform`, the session's map_T_session
+    the node was stored with, exactly as a node pose), `origin_pose3d_map` when
+    `origin_pose3d` was sent, and `session_id`."""
     origin = parsed["origin"]
-    x, y, yaw = map_pose(session.map_t_session, origin["x"], origin["y"], origin["yaw"])
+    x, y, yaw = map_pose(transform, origin["x"], origin["y"], origin["yaw"])
     record: Dict[str, Any] = {
-        "session_node_id": payload["session_node_id"],
-        "robot_name": payload["robot_name"],
         "layer": parsed["layer"],
-        "content_type": COSTMAP_CONTENT_TYPE,
-        "costmap_encoding": COSTMAP_ENCODING,
         "width": parsed["width"],
         "height": parsed["height"],
         "resolution": parsed["resolution"],
-        "origin": origin,
-        **{k: payload.get(k) for k in COSTMAP_PASSTHROUGH},
+        "origin": dict(origin),
+        **parsed["extra"],
         "origin_map": {"x": x, "y": y, "yaw": yaw},
-        "session_id": session.session_id,
+        "session_id": session_id,
     }
-    if payload.get("source_topic") is not None:
-        record["source_topic"] = payload["source_topic"]
     pose = parsed["origin_pose3d"]
     if pose is not None:
-        record["origin_pose3d"] = pose
-        record["origin_pose3d_map"] = pose3d_map(session.map_t_session, pose)
+        record["origin_pose3d"] = dict(pose)
+        record["origin_pose3d_map"] = pose3d_map(transform, pose, CostmapPayloadError)
     return record
+
+
+def costmap_record(payload: Mapping[str, Any], session: "OpenSession",
+                   parsed: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """`costmap_record_from` for an accepted costmap message and its session; `parsed` is
+    check_costmap_payload(payload)'s result (parsed here when not given, so it is safe to call
+    directly)."""
+    if parsed is None:
+        parsed = check_costmap_payload(payload)
+    return costmap_record_from(parsed, session.map_t_session, session.session_id)
 
 
 class SessionResolver:

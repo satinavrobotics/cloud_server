@@ -127,6 +127,11 @@ def postgres_database_password() -> str:
 
 # Graph Builder specific
 IMAGE_BUFFER_TIMEOUT = float(os.getenv("IMAGE_BUFFER_TIMEOUT", "30.0"))
+# Uploads that arrive before their node wait in memory (graph-builder): each of the image, depth
+# and costmap buffers holds at most this many bytes of base64 data / entries; a further upload
+# is dropped and reported as MAP.INGEST_REJECTED (reason buffer_full).
+UPLOAD_BUFFER_MAX_BYTES = int(os.getenv("UPLOAD_BUFFER_MAX_BYTES", str(256 * 1024 * 1024)))
+UPLOAD_BUFFER_MAX_ENTRIES = int(os.getenv("UPLOAD_BUFFER_MAX_ENTRIES", "5000"))
 
 # ==================== MQTT Configuration ====================
 MQTT_HOST      = os.getenv("MQTT_HOST", "localhost")

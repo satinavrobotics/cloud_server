@@ -604,49 +604,66 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to update node {node_id} in map {map_id}: {e}")
             return False
 
-    # One document update: the new camera is merged into `depth` without a read-modify-write
-    # race between two cameras of the same node.
+    # One document update: new cameras / layers are merged into `depth` / `costmap` without a
+    # read-modify-write race between two of the same node. `@records` is {sub-key: record}.
     SET_NODE_DEPTH_AQL = (
         "FOR d IN @@col FILTER d._key == @key "
         "UPDATE d WITH {depth: MERGE(d.depth || {}, {[@camera]: @record})} IN @@col "
         "OPTIONS {mergeObjects: false} RETURN NEW._key")
+    SET_NODE_DEPTHS_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {depth: MERGE(d.depth || {}, @records)} IN @@col "
+        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+    SET_NODE_COSTMAP_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {costmap: MERGE(d.costmap || {}, {[@layer]: @record})} IN @@col "
+        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+    SET_NODE_COSTMAPS_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {costmap: MERGE(d.costmap || {}, @records)} IN @@col "
+        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+
+    def _update_node_attribute(self, aql: str, map_id: str, node_id: Union[int, str],
+                               bind_vars: Dict[str, Any], what: str) -> bool:
+        """Run one of the SET_NODE_* updates on a node. False (logged) when the map or node
+        does not exist (ArangoDB errors on a missing collection) or on any other failure."""
+        try:
+            cursor = self.db.aql.execute(aql, bind_vars={
+                "@col": f"nodes_{map_id}", "key": str(node_id), **bind_vars})
+            return bool(list(cursor))
+        except Exception as e:
+            self.logger.error(f"Failed to set {what} on node {node_id} in {map_id}: {e}")
+            return False
 
     def set_node_depth(self, map_id: str, node_id: Union[int, str], camera: str,
                        record: Dict[str, Any]) -> bool:
         """Set `depth.{camera}` on a node (3D reconstruction R2, docs/reconstruction/design.md
         §5), keeping the other cameras. False when the map or node does not exist."""
-        try:
-            name = f"nodes_{map_id}"
-            if not self.db.has_collection(name):
-                self.logger.error(f"Collection {name} doesn't exist")
-                return False
-            cursor = self.db.aql.execute(self.SET_NODE_DEPTH_AQL, bind_vars={
-                "@col": name, "key": str(node_id), "camera": camera, "record": record})
-            return bool(list(cursor))
-        except Exception as e:
-            self.logger.error(f"Failed to set depth {camera} on node {node_id} in {map_id}: {e}")
-            return False
+        return self._update_node_attribute(
+            self.SET_NODE_DEPTH_AQL, map_id, node_id,
+            {"camera": camera, "record": record}, f"depth {camera}")
 
-    SET_NODE_COSTMAP_AQL = (
-        "FOR d IN @@col FILTER d._key == @key "
-        "UPDATE d WITH {costmap: MERGE(d.costmap || {}, {[@layer]: @record})} IN @@col "
-        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+    def set_node_depths(self, map_id: str, node_id: Union[int, str],
+                        records: Dict[str, Dict[str, Any]]) -> bool:
+        """`set_node_depth` for several cameras ({camera: record}) in one update."""
+        return self._update_node_attribute(
+            self.SET_NODE_DEPTHS_AQL, map_id, node_id, {"records": records},
+            f"depth {', '.join(records)}")
 
     def set_node_costmap(self, map_id: str, node_id: Union[int, str], layer: str,
                          record: Dict[str, Any]) -> bool:
         """Set `costmap.{layer}` on a node (`robot/costmap_upload`), keeping the other layers.
         False when the map or node does not exist."""
-        try:
-            name = f"nodes_{map_id}"
-            if not self.db.has_collection(name):
-                self.logger.error(f"Collection {name} doesn't exist")
-                return False
-            cursor = self.db.aql.execute(self.SET_NODE_COSTMAP_AQL, bind_vars={
-                "@col": name, "key": str(node_id), "layer": layer, "record": record})
-            return bool(list(cursor))
-        except Exception as e:
-            self.logger.error(f"Failed to set costmap {layer} on node {node_id} in {map_id}: {e}")
-            return False
+        return self._update_node_attribute(
+            self.SET_NODE_COSTMAP_AQL, map_id, node_id,
+            {"layer": layer, "record": record}, f"costmap {layer}")
+
+    def set_node_costmaps(self, map_id: str, node_id: Union[int, str],
+                          records: Dict[str, Dict[str, Any]]) -> bool:
+        """`set_node_costmap` for several layers ({layer: record}) in one update."""
+        return self._update_node_attribute(
+            self.SET_NODE_COSTMAPS_AQL, map_id, node_id, {"records": records},
+            f"costmap {', '.join(records)}")
 
     DEPTH_NODES_AQL = (
         "FOR d IN @@col FILTER d.depth != null "

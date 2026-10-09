@@ -103,7 +103,29 @@ class ImageDatabaseService(MinIOService):
             self.logger.error(f"Failed to store image {image_id} for node {node_id}: {e}")
             return False
 
-    # ==================== Depth (3D reconstruction R2) ====================
+    # ==================== Depth (3D reconstruction R2) and costmap ====================
+
+    def _store_png(self, png_data: bytes, key: str, node_id: str, map_id: str,
+                   metadata: Optional[Dict[str, str]], what: str) -> bool:
+        """Put one PNG of a node at `key` in the map bucket (content type image/png, the
+        non-None `metadata` values as strings plus `node_id`). Returns True if successful."""
+        try:
+            if not self._ensure_map_bucket(map_id):
+                return False
+            meta = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
+            meta["node_id"] = str(node_id)
+            self.client.put_object(
+                self._bucket_name(map_id),
+                key,
+                io.BytesIO(png_data),
+                length=len(png_data),
+                content_type="image/png",
+                metadata=meta,
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to store {what} for node {node_id}: {e}")
+            return False
 
     @staticmethod
     def depth_key(node_id: str, camera: str) -> str:
@@ -120,25 +142,8 @@ class ImageDatabaseService(MinIOService):
         metadata: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Store a node's u16-mm depth PNG for one camera. Returns True if successful."""
-        try:
-            if not self._ensure_map_bucket(map_id):
-                return False
-            meta = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
-            meta["node_id"] = str(node_id)
-            self.client.put_object(
-                self._bucket_name(map_id),
-                self.depth_key(str(node_id), camera),
-                io.BytesIO(png_data),
-                length=len(png_data),
-                content_type="image/png",
-                metadata=meta,
-            )
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to store depth {camera} for node {node_id}: {e}")
-            return False
-
-    # ==================== Costmap (`robot/costmap_upload`) ====================
+        return self._store_png(png_data, self.depth_key(str(node_id), camera), node_id, map_id,
+                               metadata, f"depth {camera}")
 
     @staticmethod
     def costmap_key(node_id: str, layer: str) -> str:
@@ -154,23 +159,8 @@ class ImageDatabaseService(MinIOService):
         metadata: Optional[Dict[str, str]] = None,
     ) -> bool:
         """Store a node's occupancy costmap PNG for one layer. Returns True if successful."""
-        try:
-            if not self._ensure_map_bucket(map_id):
-                return False
-            meta = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
-            meta["node_id"] = str(node_id)
-            self.client.put_object(
-                self._bucket_name(map_id),
-                self.costmap_key(str(node_id), layer),
-                io.BytesIO(png_data),
-                length=len(png_data),
-                content_type="image/png",
-                metadata=meta,
-            )
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to store costmap {layer} for node {node_id}: {e}")
-            return False
+        return self._store_png(png_data, self.costmap_key(str(node_id), layer), node_id, map_id,
+                               metadata, f"costmap {layer}")
 
     def first_image_id(self, node_id: str, map_id: Optional[str] = None) -> Optional[str]:
         """The node's first image (by id), for requests that name none; None without images."""
@@ -474,11 +464,11 @@ class ImageDatabaseService(MinIOService):
 
     @classmethod
     def _count_node_objects(cls, names) -> tuple:
-        """(images, depth images, node ids) of a map bucket's object names: images are
-        `{node}/images/{id}`, depth `{node}/depth/{camera}.png`; `{node}/costmap/{layer}.png`
-        is neither (and alone does not make a node); other prefixes (the reconstruction) are
-        not nodes."""
-        images, depth, nodes = 0, 0, set()
+        """(images, depth images, costmap layers, node ids) of a map bucket's object names:
+        images are `{node}/images/{id}`, depth `{node}/depth/{camera}.png`, costmaps
+        `{node}/costmap/{layer}.png` (counted, but alone they do not make a node); other
+        prefixes (the reconstruction) are not nodes."""
+        images, depth, costmap, nodes = 0, 0, 0, set()
         for name in names:
             parts = name.split("/")
             if len(parts) < 3 or parts[0] in cls.NON_NODE_PREFIXES:
@@ -487,10 +477,13 @@ class ImageDatabaseService(MinIOService):
                 images += 1
             elif parts[1] == "depth":
                 depth += 1
+            elif parts[1] == "costmap":
+                costmap += 1
+                continue
             else:
                 continue
             nodes.add(parts[0])
-        return images, depth, nodes
+        return images, depth, costmap, nodes
 
     def get_stats(
         self, map_id: Optional[str] = None, node_id: Optional[str] = None
@@ -510,12 +503,14 @@ class ImageDatabaseService(MinIOService):
                 if not self.client.bucket_exists(bucket_name):
                     return {"map_id": map_id, "exists": False, "image_count": 0, "node_count": 0}
                 objects = list(self.client.list_objects(bucket_name, recursive=True))
-                images, depth, nodes = self._count_node_objects(o.object_name for o in objects)
+                images, depth, costmap, nodes = self._count_node_objects(
+                    o.object_name for o in objects)
                 return {
                     "map_id": map_id,
                     "exists": True,
                     "image_count": images,
                     "depth_count": depth,
+                    "costmap_count": costmap,
                     "node_count": len(nodes),
                 }
 
@@ -525,7 +520,7 @@ class ImageDatabaseService(MinIOService):
                 for m in maps:
                     bucket_name = self._bucket_name(m)
                     objects = list(self.client.list_objects(bucket_name, recursive=True))
-                    images, _depth, nodes = self._count_node_objects(
+                    images, _depth, _costmap, nodes = self._count_node_objects(
                         o.object_name for o in objects)
                     total_images += images
                     total_nodes.update(f"{m}/{n}" for n in nodes)

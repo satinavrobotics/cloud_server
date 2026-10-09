@@ -8,7 +8,7 @@ for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_
 
 import pytest  # noqa: E402
 
-from packages.services.graph_builder.upload_buffer import NodeUploadBuffer  # noqa: E402
+from packages.services.graph_builder.upload_buffer import DROPPED, NodeUploadBuffer  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -26,9 +26,10 @@ class _Clock:
         self.now += datetime.timedelta(seconds=seconds)
 
 
-def _buffer(clock=None):
+def _buffer(clock=None, **caps):
     stats = {"buffered_x": 0}
-    return NodeUploadBuffer("costmap", stats, "buffered_x", clock=clock or _Clock()), stats
+    return NodeUploadBuffer("costmap", stats, "buffered_x", clock=clock or _Clock(),
+                            **caps), stats
 
 
 def _e(sid="s1", **kw):
@@ -140,3 +141,54 @@ class TestPutUnless:
         handler.join(10)
         thread.join(10)
         assert [e["v"] for e in taken] == [1] and buf == {}
+
+
+class TestCaps:
+    def test_entry_cap_drops_the_new_upload(self):
+        buf, stats = _buffer(max_entries=2)
+        assert buf.put(("r1", 1), "a", _e()) and buf.put(("r1", 2), "a", _e())
+        assert not buf.put(("r1", 3), "a", _e())
+        assert buf.put(("r1", 1), "a", _e(v=2))  # overwrite: not a new entry
+        assert stats["buffered_x"] == 2 and ("r1", 3) not in buf and buf.overflowed == 1
+
+    def test_byte_cap_is_judged_by_the_size_added(self):
+        buf, stats = _buffer(max_bytes=10)
+        assert buf.put(("r1", 1), "a", {"data": "x" * 6})
+        assert not buf.put(("r1", 2), "a", {"data": "x" * 5})
+        assert buf.put(("r1", 1), "a", {"data": "x" * 10})  # replaces its own 6
+        assert buf.bytes == 10 and stats["buffered_x"] == 1
+        assert not buf.put(("r1", 1), "a", {"data": "x" * 11})
+        assert buf[("r1", 1)]["a"][0]["data"] == "x" * 10  # the old entry is kept
+
+    def test_bytes_follow_take_pop_clear_robot_and_cleanup(self):
+        clock = _Clock()
+        buf, _ = _buffer(clock, max_bytes=1000)
+        buf.put(("r1", 1), "a", {"data": "x" * 10})
+        buf.put(("r1", 2), "a", {"data": "x" * 20})
+        buf.put(("r1", 3), "a", {"data": "x" * 30})
+        buf.put(("r2", 1), "a", {"data": "x" * 40})
+        assert buf.bytes == 100
+        buf.take(("r1", 1), 30)
+        assert buf.bytes == 90
+        assert buf.pop(("r1", 2)) == 1 and buf.bytes == 70
+        assert buf.clear_robot("r1") == 1 and buf.bytes == 40
+        clock.advance(100)
+        assert buf.cleanup(50) == 1 and buf.bytes == 0
+
+    def test_put_unless_returns_dropped_when_it_does_not_fit(self):
+        buf, _ = _buffer(max_entries=0)
+        assert buf.put_unless(("r1", 7), "a", _e(), lambda: None) is DROPPED
+        assert buf.put_unless(("r1", 7), "a", _e(), lambda: ("g", "m")) == ("g", "m")
+
+    def test_overflow_is_logged_once_per_window(self, caplog):
+        clock = _Clock()
+        buf, _ = _buffer(clock, max_entries=0)
+        with caplog.at_level("WARNING"):
+            for i in range(5):
+                buf.put(("r1", i), "a", _e())
+            assert caplog.text.count("is full") == 1
+            clock.advance(61)
+            buf.put(("r1", 9), "a", _e())
+        assert caplog.text.count("is full") == 2
+        assert "dropped 5 upload(s)" in caplog.text
+        assert buf.overflowed == 6
