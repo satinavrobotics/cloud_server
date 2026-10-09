@@ -142,7 +142,7 @@ async def test_b_mismatch_failure_while_robot_runs_our_stale_order_sends_cancel(
     r, _ = _make_robot()
     m = await _start(r, _mission())
     stale = _order_id(r)
-    m.status.order_rev += 1                          # the robot holds an older revision
+    assert await r._bump_order_rev()                 # the robot holds an older revision
     await _mismatch_until_failed(r, m, stale)
     assert m.status.state == State.FAILED
     assert len(_cancels(r)) == 1

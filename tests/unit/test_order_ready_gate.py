@@ -9,8 +9,8 @@ node (2 of 4 orders in the 2026-10-09 runs).
 Covers:
 - a new order is held (owed via _pending_send) while the robot lists nodes of another
   dispatcher order, and goes out with the state that empties them;
-- not gated: a resend of the same orderId, the robot's own offline order, a new
-  revision the dispatcher chose (replacing);
+- not gated: a resend of the same orderId, the robot's own offline order, an order
+  released from the wait (a new revision the dispatcher chose, an unanswered cancel);
 - a robot stuck on the old order, not driving, gets one CLEAR cancelOrder after the dwell;
   a driving one is left alone, and a cancel in flight is not doubled;
 - a completion by flag before the final node is logged and recorded once.
@@ -252,3 +252,36 @@ async def test_order_the_robot_reported_failed_or_cancelled_does_not_hold_the_ne
     await r._send_order()
 
     assert _orders(published) == [f"m1-r{mission.status.run_id}-n0"]
+
+
+@pytest.mark.unit
+async def test_released_orders_are_forgotten_once_the_robot_lists_no_nodes():
+    r, _ = _make_robot()
+    mission = _make_mission()
+    await _start(r, mission)
+    r._released_order_ids.add(_OLD_ORDER)
+
+    await r._on_client_message(_state(_OLD_ORDER, executing=True))
+    assert r._released_order_ids == {_OLD_ORDER}
+    await r._on_client_message(_state(_OLD_ORDER, last_node_id=f"{_OLD_ORDER}-s2",
+                                      last_node_seq=2))
+    assert not r._released_order_ids
+
+
+@pytest.mark.unit
+async def test_completion_with_the_previous_orders_last_node_is_recorded():
+    """lastNodeId lags orderId: the previous order's node at the same sequence number is
+    not the new order's final node."""
+    r, _ = _make_robot()
+    mission = _make_mission()
+    r._missions[mission.name] = mission
+    await r._try_start_mission()
+    r._record = MagicMock()
+    order = r._sent_order.orderId
+    final = max(n.sequenceId for n in r._sent_order.nodes)
+
+    r._note_completion_without_final_node(
+        _state(order, last_node_id=f"m1-r{mission.status.run_id}-n9-s{final}",
+               last_node_seq=final), mission.mission_tree[0])
+
+    assert r._record.call_count == 1
