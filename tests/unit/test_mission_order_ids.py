@@ -491,18 +491,14 @@ async def test_api_create_ignores_caller_supplied_run_id():
 
 
 @pytest.mark.unit
-async def test_api_status_write_cannot_blank_or_change_run_id():
+async def test_api_refuses_a_status_write():
+    """The status is dispatcher-owned (run_id / order_rev included): PUT takes no `status`."""
     api_main = _api()
-    existing = _make_mission(name="m1", run_id="ab12cd34", order_rev=2, started=True)
-    db = SimpleNamespace(
-        get_object=AsyncMock(return_value=existing),
-        update_spec=AsyncMock(), update_status=AsyncMock())
+    db = SimpleNamespace(get_object=AsyncMock(), update_spec=AsyncMock(),
+                         update_status=AsyncMock())
     with patch.object(api_main, "service", SimpleNamespace(database=db)):
-        # a stale copy without the fields, and a forged one
-        for status in ({"state": "RUNNING"},
-                       {"state": "RUNNING", "run_id": "deadbeef", "order_rev": 9}):
-            existing.status.run_id, existing.status.order_rev = "ab12cd34", 2
-            await api_main.update_mission("m1", {"status": status})
-            written = db.update_status.await_args.args[2]
-            assert written.run_id == "ab12cd34"
-            assert written.order_rev == 2
+        with pytest.raises(api_main.HTTPException) as exc:
+            await api_main.update_mission("m1", {"status": {"state": "RUNNING",
+                                                            "run_id": "deadbeef"}})
+    assert exc.value.status_code == 400
+    db.update_status.assert_not_awaited()

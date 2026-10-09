@@ -125,10 +125,10 @@ async def test_cancel_route_failure_emits_nothing():
     recorder = AsyncMock()
     with patch.object(main, "service", SimpleNamespace(database=database)), \
             patch.object(run_admin, "record_cancel_requested", recorder):
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app, raise_app_exceptions=False),
                                      base_url="http://t") as client:
             resp = await client.post("/api/v1/missions/m1/cancel")
-    assert resp.status_code == 400
+    assert resp.status_code == 500
     recorder.assert_not_awaited()
 
 

@@ -98,7 +98,7 @@ class TestErrorHandlers:
         assert "detail" in data
         assert "path" in data
         assert data["error"] == "Internal Server Error"
-        assert data["detail"] == "An unexpected error occurred"
+        assert data["detail"].startswith("An unexpected error occurred")
         assert data["path"] == "/test/generic_exception"
 
     def test_service_communication_error_handler(self, test_app):

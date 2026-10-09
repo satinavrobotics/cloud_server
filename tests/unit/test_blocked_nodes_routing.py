@@ -251,22 +251,6 @@ async def test_a_reroute_through_a_blocked_node_is_refused_with_409_unless_force
     assert not any(sql == blocked_nodes.ACTIVE_FOR_MAP_SQL for sql, _ in db.sql[1:])
 
 
-async def test_a_status_put_keeps_the_robots_node_reports():
-    db = _Db()
-    mission = _mission()
-    mission.status.skipped_nodes = [mission_object.MissionSkippedNodeV1(node_id="m1-s4")]
-    mission.status.node_notes = [mission_object.MissionNodeNoteV1(node_id="m1-s4",
-                                                                  info_type="nodeOffset")]
-    mission.status.offset_summary = mission_object.MissionOffsetSummaryV1(n=3)
-    db.get_object = AsyncMock(return_value=mission)
-    resp = await _call(db, "PUT", "/api/v1/missions/m1", json={"status": {}})
-    assert resp.status_code == 200
-    saved = db.update_status.await_args.args[2]
-    assert [s.node_id for s in saved.skipped_nodes] == ["m1-s4"]
-    assert saved.node_notes[0].info_type == "nodeOffset"
-    assert saved.offset_summary.n == 3
-
-
 async def test_clearing_a_position_row_over_http_and_404_when_expired_or_absent():
     db = _Db(deleted=(True,))
     resp = await _call(db, "DELETE", "/api/v1/maps/M/blocked-nodes/%401.50%2C-2.00")

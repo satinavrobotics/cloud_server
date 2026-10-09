@@ -6,6 +6,7 @@ Utilities for FastAPI applications including standardized error handling.
 """
 
 import logging
+import uuid
 from typing import Union
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError, HTTPException
@@ -113,16 +114,18 @@ def add_error_handlers(app: FastAPI):
 
         Logs the full exception and returns a safe error message.
         """
+        # A short reference ties the client's report to this log line without leaking internals.
+        ref = uuid.uuid4().hex[:8]
         logger.error(
-            f"Unexpected error on {request.method} {request.url.path}: {exc}",
-            exc_info=True
+            f"Unexpected error [{ref}] on {request.method} {request.url.path}: {exc!r}",
+            exc_info=(type(exc), exc, exc.__traceback__)
         )
 
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={
                 "error": "Internal Server Error",
-                "detail": "An unexpected error occurred",
+                "detail": f"An unexpected error occurred (ref {ref})",
                 "path": str(request.url.path)
             }
         )

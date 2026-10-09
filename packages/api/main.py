@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any, List, Literal, Tuple
 import os
 from datetime import datetime
 
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
@@ -51,6 +51,7 @@ from cloud_common.objects.mission import (
     MissionStatusV1)
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects import common as common_objects
+from cloud_common.objects.common import ICSUsageError
 from cloud_common.objects.map import MapObjectV1
 from cloud_common.objects.settings import SettingsObjectV1, SettingsSpecV1, GLOBAL_SETTINGS_NAME
 from cloud_common.objects.site import SiteObjectV1
@@ -359,6 +360,16 @@ app = FastAPI(
 add_error_handlers(app)
 
 
+@app.exception_handler(ICSUsageError)
+async def _usage_error_handler(request: Request, exc: ICSUsageError):
+    """A usage error (a validator in cloud_common/objects refusing the caller's input) carries
+    a message meant for the user: 400 with it. Everything else unexpected is the central 500
+    of add_error_handlers; HTTPExceptions (incl. postgres.py's 404/400) pass through."""
+    return JSONResponse(status_code=400, content={"error": "Bad Request", "detail": str(exc),
+                                                  "status_code": 400,
+                                                  "path": str(request.url.path)})
+
+
 def _idempotency_store() -> Optional[IdempotencyStore]:
     if service is None or not service.database.is_running():
         return None
@@ -380,8 +391,7 @@ app.include_router(orchestrator_proxy_router)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     dependencies = health_checker.check_all() if health_checker else {}
     return create_health_response(
@@ -393,8 +403,7 @@ async def health_check():
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats():
     """Get service statistics."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
     
     stats = service.get_stats()
     return StatsResponse(**stats)
@@ -486,22 +495,15 @@ async def list_maps(type: Optional[str] = None, state: Optional[str] = None,
     Maps redesign M1: every map carries `type` ('local'|'geo', plus `geo` for a geo map) and
     `status.state`. Optional filters `type=` and `state=`; archived maps are left out unless
     `include_archived=true` or `state=archived`. DELETING maps are always hidden."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    try:
-        found = await service.database.list_objects(MapObjectV1)
-        # A DELETING map is on its way out (packages/api/map_delete.py): hidden.
-        views = maps.filter_maps(found, type_=type, state=state,
-                                 include_archived=include_archived)
-        # status.node_count/edge_count in the row are stale: report the graph's, as the detail does.
-        views = await asyncio.to_thread(maps.apply_graph_counts, views,
-                                        service.graph_db.get_map_stats)
-        return {"maps": views, "count": len(views)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Failed to list maps: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to list maps: {str(e)}")
+    _require_service()
+    found = await service.database.list_objects(MapObjectV1)
+    # A DELETING map is on its way out (packages/api/map_delete.py): hidden.
+    views = maps.filter_maps(found, type_=type, state=state,
+                             include_archived=include_archived)
+    # status.node_count/edge_count in the row are stale: report the graph's, as the detail does.
+    views = await asyncio.to_thread(maps.apply_graph_counts, views,
+                                    service.graph_db.get_map_stats)
+    return {"maps": views, "count": len(views)}
 
 
 @app.post("/api/v1/maps", status_code=201)
@@ -520,8 +522,7 @@ async def create_map(body: Dict[str, Any]):
 @app.post("/api/v1/map/load", response_model=LoadMapResponse)
 async def load_map(request: LoadMapRequest):
     """Load a map: creates ArangoDB graph collections and registers in Postgres."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
     # Loading would recreate the graph the background delete is removing.
     await service.ensure_map_not_deleting(request.map_id or service.default_map_id)
 
@@ -543,8 +544,7 @@ async def load_map(request: LoadMapRequest):
 @app.get("/api/v1/maps/{map_id}")
 async def get_map(map_id: str):
     """Get a single map by ID, including datum and live node/edge counts."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
     result = await service.get_map(map_id)
     if not result.get("success"):
         raise HTTPException(status_code=404, detail=result.get("error"))
@@ -895,8 +895,7 @@ class UpdateDatumRequest(BaseModel):
 async def update_map_datum(map_id: str, request: UpdateDatumRequest):
     """Register or update the GPS datum for an existing map. 409 on a geo map that has nodes
     or mapping sessions: its origin is its first session's datum and fixed."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
     await service.ensure_map_not_deleting(map_id)
     result = await service.update_map_datum(
         map_id,
@@ -928,8 +927,7 @@ class ApproxLocationRequest(BaseModel):
 async def update_map_approx_location(map_id: str, request: ApproxLocationRequest):
     """Set the approximate location of a local map (pins, distance sort; never placement).
     404 unknown map, 409 on a geo map (its location is its datum/transform), 422 on (0, 0)."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
     await service.ensure_map_not_deleting(map_id)
     result = await service.update_map_approx_location(
         map_id, request.latitude, request.longitude,
@@ -954,16 +952,9 @@ async def delete_map(map_id: str):
 
     WARNING: This will permanently delete all map data including nodes, edges, and images!
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        return await service.delete_map(map_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Failed to delete map {map_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete map: {str(e)}")
+    return await service.delete_map(map_id)
 
 
 # ==================== 3D reconstruction (R3) ====================
@@ -1054,7 +1045,9 @@ async def reconstruction_callback(job_id: str, kind: str, body: Dict[str, Any],
 async def _get_or_create_settings() -> SettingsObjectV1:
     try:
         return await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
-    except Exception:
+    except HTTPException as missing:
+        if missing.status_code != 404:
+            raise
         settings = SettingsObjectV1(name=GLOBAL_SETTINGS_NAME, lifecycle=ObjectLifecycleV1.ALIVE)
         try:
             await service.database.create_object(settings, uuid.uuid4())
@@ -1078,16 +1071,9 @@ def _hook_kwargs(hook) -> Dict[str, Any]:
 @app.get("/api/v1/settings")
 async def get_settings():
     """Fetch the fleet-wide settings object, creating it with defaults on first read."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-    try:
-        settings = await _get_or_create_settings()
-        return settings.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Failed to get settings: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get settings: {str(e)}")
+    _require_service()
+    settings = await _get_or_create_settings()
+    return settings.dict()
 
 
 # Keys of the settings object accepted in a PUT body but never written from it, so a client can
@@ -1114,34 +1100,27 @@ async def update_settings(settings_data: dict):
 
     Partial: only the keys sent change. Unknown keys are a 422 that lists them; name, status
     and lifecycle are accepted and ignored."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
+    changes = _settings_changes(settings_data)
+    settings = await _get_or_create_settings()
+
+    publisher_id = uuid.uuid4()
     try:
-        changes = _settings_changes(settings_data)
-        settings = await _get_or_create_settings()
+        spec = SettingsSpecV1(**{**settings.spec.dict(), **changes})
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=[
+            {"loc": ["body", *err["loc"]], "msg": err["msg"], "type": err["type"]}
+            for err in e.errors()])
+    hook = None
+    if recording.SPEC_FIELD in changes:
+        # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
+        hook = recording.change_hook(recording.RecordingScope.GLOBAL, None,
+                                     recording.request_actor())
+    await service.database.update_spec(SettingsObjectV1, settings.name, spec,
+                                       publisher_id, **_hook_kwargs(hook))
 
-        publisher_id = uuid.uuid4()
-        try:
-            spec = SettingsSpecV1(**{**settings.spec.dict(), **changes})
-        except ValidationError as e:
-            raise HTTPException(status_code=422, detail=[
-                {"loc": ["body", *err["loc"]], "msg": err["msg"], "type": err["type"]}
-                for err in e.errors()])
-        hook = None
-        if recording.SPEC_FIELD in changes:
-            # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
-            hook = recording.change_hook(recording.RecordingScope.GLOBAL, None,
-                                         recording.request_actor())
-        await service.database.update_spec(SettingsObjectV1, settings.name, spec,
-                                           publisher_id, **_hook_kwargs(hook))
-
-        updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
-        return updated_settings.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Failed to update settings: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to update settings: {str(e)}")
+    updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
+    return updated_settings.dict()
 
 
 @app.websocket("/ws/map/{map_id}")
@@ -1177,21 +1156,14 @@ async def list_node_images(map_id: str, node_id: str):
     Returns:
         JSON array of image IDs
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        image_ids = await service.list_node_images(
-            map_id=map_id,
-            node_id=node_id
-        )
+    image_ids = await service.list_node_images(
+        map_id=map_id,
+        node_id=node_id
+    )
 
-        return {"image_ids": image_ids}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error listing images for node {node_id} in map {map_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error listing images: {str(e)}")
+    return {"image_ids": image_ids}
 
 
 @app.get("/api/v1/images/{map_id}/{node_id}/{image_id}/metadata")
@@ -1207,25 +1179,18 @@ async def get_image_metadata(map_id: str, node_id: str, image_id: str):
     Returns:
         JSON object with image metadata including yaw_offset
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        metadata = await service.get_image_metadata(
-            map_id=map_id,
-            node_id=node_id,
-            image_id=image_id
-        )
+    metadata = await service.get_image_metadata(
+        map_id=map_id,
+        node_id=node_id,
+        image_id=image_id
+    )
 
-        if metadata is None:
-            raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+    if metadata is None:
+        raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
 
-        return metadata
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error getting metadata for image {image_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error getting image metadata: {str(e)}")
+    return metadata
 
 
 @app.get("/api/v1/images/{map_id}/{node_id}")
@@ -1248,39 +1213,32 @@ async def get_image(
     Returns:
         Image data as binary response
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        image_data = await service.get_image(
-            map_id=map_id,
-            node_id=node_id,
-            image_id=image_id,
-            size=size,
-        )
+    image_data = await service.get_image(
+        map_id=map_id,
+        node_id=node_id,
+        image_id=image_id,
+        size=size,
+    )
 
-        if image_data is None:
-            raise HTTPException(status_code=404, detail="Image not found")
+    if image_data is None:
+        raise HTTPException(status_code=404, detail="Image not found")
 
-        # Ensure image_data is bytes
-        if not isinstance(image_data, bytes):
-            logging.error(f"Image data is not bytes! Type: {type(image_data)}")
-            image_data = bytes(image_data)
+    # Ensure image_data is bytes
+    if not isinstance(image_data, bytes):
+        logging.error(f"Image data is not bytes! Type: {type(image_data)}")
+        image_data = bytes(image_data)
 
-        # A resized image is always JPEG; the original (or a fallback to it) is sniffed.
-        media_type = "image/jpeg" if size else _sniff_image_type(image_data)
-        headers = {"Content-Type": media_type, "Content-Length": str(len(image_data))}
-        if size and image_id:
-            # a given id of a node is rewritten only when the robot re-sends it
-            headers["Cache-Control"] = "private, max-age=86400"
-        else:
-            headers["Cache-Control"] = "private, no-cache"
-        return Response(content=image_data, media_type=media_type, headers=headers)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error retrieving image for node {node_id} in map {map_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving image: {str(e)}")
+    # A resized image is always JPEG; the original (or a fallback to it) is sniffed.
+    media_type = "image/jpeg" if size else _sniff_image_type(image_data)
+    headers = {"Content-Type": media_type, "Content-Length": str(len(image_data))}
+    if size and image_id:
+        # a given id of a node is rewritten only when the robot re-sends it
+        headers["Cache-Control"] = "private, max-age=86400"
+    else:
+        headers["Cache-Control"] = "private, no-cache"
+    return Response(content=image_data, media_type=media_type, headers=headers)
 
 
 def _sniff_image_type(data: bytes) -> str:
@@ -1310,8 +1268,7 @@ async def create_bag_upload_url(request: CreateBagEntryRequest):
         curl --upload-file bag.bag "{upload_url}"
         rclone copyto bag.bag "{upload_url}"
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.create_bag_upload_url(
         robot_name=request.robot_name,
@@ -1327,8 +1284,7 @@ async def create_bag_upload_url(request: CreateBagEntryRequest):
 @app.get("/api/v1/rosbags", response_model=BagListResponse)
 async def list_all_bags():
     """List all ROS bags across all robots."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     bags = await service.list_bags()
     return BagListResponse(bags=[BagSummary(**b) for b in bags], count=len(bags))
@@ -1337,8 +1293,7 @@ async def list_all_bags():
 @app.get("/api/v1/rosbags/map/{map_id}/list", response_model=BagListResponse)
 async def list_bags_for_map(map_id: str):
     """List all ROS bags whose sidecar metadata records the given map_id."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     bags = await service.list_bags(map_id=map_id)
     return BagListResponse(bags=[BagSummary(**b) for b in bags], count=len(bags), map_id=map_id)
@@ -1347,8 +1302,7 @@ async def list_bags_for_map(map_id: str):
 @app.get("/api/v1/rosbags/{robot_name}/list", response_model=BagListResponse)
 async def list_bags_for_robot(robot_name: str):
     """List all ROS bags for a specific robot."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     bags = await service.list_bags(robot_name=robot_name)
     return BagListResponse(bags=[BagSummary(**b) for b in bags], count=len(bags), robot_name=robot_name)
@@ -1361,8 +1315,7 @@ async def get_bag_metadata(robot_name: str, bag_id: str):
 
     Use the download_url to retrieve the binary directly with curl or rclone.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     meta = await service.get_bag_metadata(robot_name=robot_name, bag_id=bag_id)
     if meta is None:
@@ -1374,8 +1327,7 @@ async def get_bag_metadata(robot_name: str, bag_id: str):
 @app.delete("/api/v1/rosbags/{robot_name}/{bag_id}")
 async def delete_bag(robot_name: str, bag_id: str):
     """Delete a single ROS bag and its metadata sidecar."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.delete_bag(robot_name=robot_name, bag_id=bag_id)
     if not result.get("success"):
@@ -1387,8 +1339,7 @@ async def delete_bag(robot_name: str, bag_id: str):
 @app.delete("/api/v1/rosbags/{robot_name}")
 async def delete_robot_bags(robot_name: str):
     """Delete all ROS bags for a specific robot."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     return await service.delete_robot_bags(robot_name=robot_name)
 
@@ -1407,8 +1358,7 @@ async def create_model_upload_url(request: CreateModelUploadUrlRequest):
     The model entry (with metadata) is created immediately; the binary is
     considered uploaded once the PUT completes.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.create_model_upload_url(
         name=request.name,
@@ -1429,8 +1379,7 @@ async def list_models():
     Models that have been registered but whose binary has not yet been uploaded
     will appear in the list with uploaded=False and download_url=None.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     models = await service.list_models()
     return ModelListResponse(
@@ -1448,8 +1397,7 @@ async def get_model_metadata(model_id: str):
 
         curl -L "{download_url}" -o model.onnx
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     meta = await service.get_model_metadata(model_id)
     if meta is None:
@@ -1461,8 +1409,7 @@ async def get_model_metadata(model_id: str):
 @app.delete("/api/v1/base_models/{model_id}")
 async def delete_model(model_id: str):
     """Delete a base model (binary and metadata)."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.delete_model(model_id)
     if not result.get("success"):
@@ -1480,8 +1427,7 @@ async def get_base_model_download_url(model_id: str):
     uploaded. Used by the robot orchestrator to fetch a model directly from
     object storage.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     url = service.model_db.get_download_url(model_id)
     if url is None:
@@ -1501,8 +1447,7 @@ async def navigate(request: NavigationRequest):
     coordinates (target_lat, target_lon). GPS requires the map to have a datum
     registered via PUT /api/v1/maps/{map_id}/datum.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     has_xy = request.target_x is not None and request.target_y is not None
     has_gps = request.target_lat is not None and request.target_lon is not None
@@ -1564,8 +1509,7 @@ async def navigate_waypoints(request: DirectWaypointsRequest):
 
     Monitor progress via the mission status WebSocket once the mission name is returned.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.direct_waypoints(
         robot_name=request.robot_name,
@@ -1595,8 +1539,7 @@ async def create_livekit_token(request: CreateTokenRequest):
     Returns:
         Token details including the JWT, server URL, and configuration
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.create_livekit_token(
         participant_name=request.participantName,
@@ -1666,29 +1609,23 @@ async def list_robots(
 
     Supports filtering by battery level, state, online status, and robot type.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        params = {}
-        if min_battery is not None:
-            params["min_battery"] = min_battery
-        if max_battery is not None:
-            params["max_battery"] = max_battery
-        if state is not None:
-            params["state"] = state
-        if online is not None:
-            params["online"] = online
-        if robot_type is not None:
-            params["robot_type"] = robot_type
+    params = {}
+    if min_battery is not None:
+        params["min_battery"] = min_battery
+    if max_battery is not None:
+        params["max_battery"] = max_battery
+    if state is not None:
+        params["state"] = state
+    if online is not None:
+        params["online"] = online
+    if robot_type is not None:
+        params["robot_type"] = robot_type
 
-        robots = await service.database.list_objects(RobotObjectV1, query_params=params.items() if params else None)
-        sessions = await maps.robot_sessions(service.database)
-        return await _robot_views(robots, sessions)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list robots: {str(e)}")
+    robots = await service.database.list_objects(RobotObjectV1, query_params=params.items() if params else None)
+    sessions = await maps.robot_sessions(service.database)
+    return await _robot_views(robots, sessions)
 
 
 @app.get("/api/v1/robots/{robot_name}")
@@ -1698,16 +1635,10 @@ async def get_robot(robot_name: str):
 
     Returns the complete robot object including spec and status.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return (await _robot_views([robot], await maps.robot_sessions(service.database)))[0]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Robot not found: {str(e)}")
+    robot = await service.database.get_object(RobotObjectV1, robot_name)
+    return (await _robot_views([robot], await maps.robot_sessions(service.database)))[0]
 
 
 @app.get("/api/v1/robots/{robot_name}/status")
@@ -1717,16 +1648,10 @@ async def get_robot_status(robot_name: str):
 
     Returns the current status of a robot including position, battery, etc.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return robot.status.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Robot not found: {str(e)}")
+    robot = await service.database.get_object(RobotObjectV1, robot_name)
+    return robot.status.dict()
 
 
 @app.get("/api/v1/robots/{robot_name}/diagnostics")
@@ -1740,8 +1665,7 @@ async def get_robot_diagnostics(robot_name: str):
     a normal, expected state (same as an offline robot having no pose) rather than
     an error, so this returns 200 with a null `diagnostics` field instead of a 404.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     cached = service.diagnostics.get_cached(robot_name)
     if cached is None:
@@ -1766,8 +1690,7 @@ async def get_robot_nav2_bt_tree(robot_name: str):
     rather than an error, so this returns 200 with a null `trees` field instead of
     a 404.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     cached = service.diagnostics.get_cached_bt_tree(robot_name)
     if cached is None:
@@ -1792,8 +1715,7 @@ async def get_robot_nav2_bt_state(robot_name: str):
     rather than an error, so this returns 200 with a null `nodes` field instead of
     a 404.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     cached = service.diagnostics.get_cached_bt_state(robot_name)
     if cached is None:
@@ -1820,8 +1742,7 @@ async def get_robot_nav_supervisor(robot_name: str):
     NavSupervisor node) rather than an error, so this returns 200 with a null
     `supervisor` field instead of a 404.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     cached = service.diagnostics.get_cached_nav_supervisor(robot_name)
     if cached is None:
@@ -1844,101 +1765,105 @@ def _apply_factsheet_limits(factsheet, data: dict) -> None:
             setattr(factsheet, field, float(value))
 
 
+def _custom_actions(factsheet_data: dict) -> list:
+    try:
+        return [CustomActionV1(**a) for a in factsheet_data.get("actions", [])]
+    except (ValidationError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=f"Invalid factsheet actions: {e}")
+
+
 @app.post("/api/v1/robots", response_model=dict)
 async def create_robot(robot_data: dict):
     """
     Register a robot (upsert). Creates the robot if it doesn't exist, otherwise updates
     its IP address. Intended to be called by the robot on every startup.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
+    if "name" not in robot_data:
+        raise HTTPException(status_code=400, detail="Missing required field: name")
+    # Validated on registration too; like the other spec fields it only applies when the
+    # robot is created (an existing robot's level is changed with PUT).
+    recording.check_level(robot_data)
+
+    publisher_id = uuid.uuid4()
+    ip_address = robot_data.pop("ip_address", None)
+    entrypoint_port = robot_data.pop("entrypoint_port", None)
+    position_mode = robot_data.pop("position_mode", None)
+    factsheet_data = robot_data.pop("factsheet", None)
+    current_model = robot_data.pop("current_model", None)
+
+    # Try to fetch existing robot; only a 404 means "not registered yet" (a DB error is a 500)
     try:
-        if "name" not in robot_data:
-            raise HTTPException(status_code=400, detail="Missing required field: name")
-        # Validated on registration too; like the other spec fields it only applies when the
-        # robot is created (an existing robot's level is changed with PUT).
-        recording.check_level(robot_data)
+        robot = await service.database.get_object(RobotObjectV1, robot_data["name"])
+    except HTTPException as missing:
+        if missing.status_code != 404:
+            raise
+        robot = None
 
-        publisher_id = uuid.uuid4()
-        ip_address = robot_data.pop("ip_address", None)
-        entrypoint_port = robot_data.pop("entrypoint_port", None)
-        position_mode = robot_data.pop("position_mode", None)
-        factsheet_data = robot_data.pop("factsheet", None)
-        current_model = robot_data.pop("current_model", None)
-
-        # Try to fetch existing robot; any exception (including 404 HTTPException) means not found
-        try:
-            robot = await service.database.get_object(RobotObjectV1, robot_data["name"])
-        except Exception:
-            robot = None
-
-        if robot is not None:
-            # Robot already exists — update IP, port, and position_mode if provided
-            # Field-level writes: mission-dispatch commits to this row all the time (pose,
-            # battery, datum), and a whole spec/status written back would revert that.
-            spec_changes: Dict[str, Any] = {}
-            if ip_address is not None:
-                spec_changes["ip_address"] = ip_address
-            if entrypoint_port is not None:
-                spec_changes["entrypoint_port"] = entrypoint_port
-            if position_mode is not None and robot.position_mode != position_mode:
-                spec_changes["position_mode"] = position_mode
-            if current_model is not None and robot.current_model != current_model:
-                spec_changes["current_model"] = current_model
-            if spec_changes:
-                # Validated (and coerced) by the spec model, written as just these keys.
+    if robot is not None:
+        # Robot already exists — update IP, port, and position_mode if provided
+        # Field-level writes: mission-dispatch commits to this row all the time (pose,
+        # battery, datum), and a whole spec/status written back would revert that.
+        spec_changes: Dict[str, Any] = {}
+        if ip_address is not None:
+            spec_changes["ip_address"] = ip_address
+        if entrypoint_port is not None:
+            spec_changes["entrypoint_port"] = entrypoint_port
+        if position_mode is not None and robot.position_mode != position_mode:
+            spec_changes["position_mode"] = position_mode
+        if current_model is not None and robot.current_model != current_model:
+            spec_changes["current_model"] = current_model
+        if spec_changes:
+            # Validated (and coerced) by the spec model, written as just these keys.
+            try:
                 edited = RobotSpecV1(**{**robot.spec.dict(), **spec_changes})
-                spec_json = json.loads(edited.json())
-                await service.database.update_spec_fields(
-                    RobotObjectV1, robot.name, {k: spec_json[k] for k in spec_changes},
-                    publisher_id)
-            if factsheet_data:
-                robot.status.factsheet.agv_class = factsheet_data.get("agv_class", robot.status.factsheet.agv_class)
-                _apply_factsheet_limits(robot.status.factsheet, factsheet_data)
-                robot.status.factsheet.custom_actions = [
-                    CustomActionV1(**a) for a in factsheet_data.get("actions", [])
-                ]
-                await service.database.update_status_fields(
-                    RobotObjectV1, robot.name,
-                    {"factsheet": json.loads(robot.status.factsheet.json())}, publisher_id)
-            return (await service.database.get_object(RobotObjectV1, robot_data["name"])).dict()
-        else:
-            # Robot doesn't exist — create it (a `current_map` in the body is ignored: maps U6,
-            # the robot's map is its open session)
-            status = RobotStatusV1()
-            if factsheet_data:
-                status.factsheet.agv_class = factsheet_data.get("agv_class", "")
-                _apply_factsheet_limits(status.factsheet, factsheet_data)
-                status.factsheet.custom_actions = [
-                    CustomActionV1(**a) for a in factsheet_data.get("actions", [])
-                ]
-            # status, lifecycle and the dispatcher-owned spec fields are server-owned: they
-            # come after **robot_data so a caller cannot set them
-            for owned in ROBOT_SERVER_OWNED_SPEC_FIELDS:
-                robot_data.pop(owned, None)
-            robot_data_with_defaults = {**robot_data, "status": status,
-                                        "lifecycle": ObjectLifecycleV1.ALIVE}
-            if ip_address is not None:
-                robot_data_with_defaults["ip_address"] = ip_address
-            if entrypoint_port is not None:
-                robot_data_with_defaults["entrypoint_port"] = entrypoint_port
-            if position_mode is not None:
-                robot_data_with_defaults["position_mode"] = position_mode
-            if current_model is not None:
-                robot_data_with_defaults["current_model"] = current_model
+            except ValidationError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid robot spec: {e}")
+            spec_json = json.loads(edited.json())
+            await service.database.update_spec_fields(
+                RobotObjectV1, robot.name, {k: spec_json[k] for k in spec_changes},
+                publisher_id)
+        if factsheet_data:
+            robot.status.factsheet.agv_class = factsheet_data.get("agv_class", robot.status.factsheet.agv_class)
+            _apply_factsheet_limits(robot.status.factsheet, factsheet_data)
+            robot.status.factsheet.custom_actions = _custom_actions(factsheet_data)
+            await service.database.update_status_fields(
+                RobotObjectV1, robot.name,
+                {"factsheet": json.loads(robot.status.factsheet.json())}, publisher_id)
+        return (await service.database.get_object(RobotObjectV1, robot_data["name"])).dict()
+    else:
+        # Robot doesn't exist — create it (a `current_map` in the body is ignored: maps U6,
+        # the robot's map is its open session)
+        status = RobotStatusV1()
+        if factsheet_data:
+            status.factsheet.agv_class = factsheet_data.get("agv_class", "")
+            _apply_factsheet_limits(status.factsheet, factsheet_data)
+            status.factsheet.custom_actions = _custom_actions(factsheet_data)
+        # status, lifecycle and the dispatcher-owned spec fields are server-owned: they
+        # come after **robot_data so a caller cannot set them
+        for owned in ROBOT_SERVER_OWNED_SPEC_FIELDS:
+            robot_data.pop(owned, None)
+        robot_data_with_defaults = {**robot_data, "status": status,
+                                    "lifecycle": ObjectLifecycleV1.ALIVE}
+        if ip_address is not None:
+            robot_data_with_defaults["ip_address"] = ip_address
+        if entrypoint_port is not None:
+            robot_data_with_defaults["entrypoint_port"] = entrypoint_port
+        if position_mode is not None:
+            robot_data_with_defaults["position_mode"] = position_mode
+        if current_model is not None:
+            robot_data_with_defaults["current_model"] = current_model
+        try:
             robot = RobotObjectV1(**robot_data_with_defaults)
-            hook = None
-            if robot.telemetry_recording is not None:
-                hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
-                                             recording.request_actor())
-            await service.database.create_object(robot, publisher_id, **_hook_kwargs(hook))
-            return robot.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception(f"Failed to register robot: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Failed to register robot: {str(e)}")
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid robot: {e}")
+        hook = None
+        if robot.telemetry_recording is not None:
+            hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
+                                         recording.request_actor())
+        await service.database.create_object(robot, publisher_id, **_hook_kwargs(hook))
+        return robot.dict()
 
 
 # Accepted and ignored (the response carries them anyway, so a client may echo them back).
@@ -1951,62 +1876,59 @@ async def update_robot(robot_name: str, robot_data: dict):
     Update a robot (proxy to Mission Dispatcher database).
 
     Updates the robot's spec (only EDITABLE_ROBOT_SPEC_FIELDS; any other key is a 400)
-    or, with `status`, replaces its status wholesale (to clear a fault use
-    POST .../clear-fault instead: a whole-status write reverts what the dispatcher
-    committed since the caller read it).
+    or, with `status`, replaces its status wholesale. DEPRECATED, kept only for the client's
+    fallback while POST .../clear-fault rolls out (to clear a fault use that route: a
+    whole-status write reverts what the dispatcher committed since the caller read it).
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        recording.check_level(robot_data)
-        # Maps U6: robots have no current_map (their map is the open session); an old
-        # caller's field is ignored rather than failing the whole update.
-        robot_data = {k: v for k, v in robot_data.items() if k != "current_map"}
-        unknown = sorted(k for k in robot_data
-                         if k != "status" and k not in EDITABLE_ROBOT_SPEC_FIELDS
-                         and k not in _ROBOT_PUT_IGNORED)
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Fields not editable on a robot: {', '.join(unknown)}. "
-                       f"Editable: {', '.join(EDITABLE_ROBOT_SPEC_FIELDS)}")
-        # Get existing robot
-        robot = await service.database.get_object(RobotObjectV1, robot_name)
+    recording.check_level(robot_data)
+    # Maps U6: robots have no current_map (their map is the open session); an old
+    # caller's field is ignored rather than failing the whole update.
+    robot_data = {k: v for k, v in robot_data.items() if k != "current_map"}
+    unknown = sorted(k for k in robot_data
+                     if k != "status" and k not in EDITABLE_ROBOT_SPEC_FIELDS
+                     and k not in _ROBOT_PUT_IGNORED)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fields not editable on a robot: {', '.join(unknown)}. "
+                   f"Editable: {', '.join(EDITABLE_ROBOT_SPEC_FIELDS)}")
+    # Get existing robot
+    robot = await service.database.get_object(RobotObjectV1, robot_name)
 
-        publisher_id = uuid.uuid4()
+    publisher_id = uuid.uuid4()
 
-        # Update spec if provided
-        edits = {k: v for k, v in robot_data.items() if k in EDITABLE_ROBOT_SPEC_FIELDS}
-        if edits:
-            try:
-                edited = RobotSpecV1(**{**robot.spec.dict(), **edits})
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Invalid robot spec: {str(e)}")
-            hook = None
-            if recording.SPEC_FIELD in edits:
-                # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
-                hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
-                                             recording.request_actor())
-            # Only the keys this request changes: the dispatcher patches datum and
-            # needs_order_cancel on the same row.
-            spec_json = json.loads(edited.json())
-            await service.database.update_spec_fields(
-                RobotObjectV1, robot.name, {k: spec_json[k] for k in edits},
-                publisher_id, **_hook_kwargs(hook))
+    # Update spec if provided
+    edits = {k: v for k, v in robot_data.items() if k in EDITABLE_ROBOT_SPEC_FIELDS}
+    if edits:
+        try:
+            edited = RobotSpecV1(**{**robot.spec.dict(), **edits})
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid robot spec: {e}")
+        hook = None
+        if recording.SPEC_FIELD in edits:
+            # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
+            hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
+                                         recording.request_actor())
+        # Only the keys this request changes: the dispatcher patches datum and
+        # needs_order_cancel on the same row.
+        spec_json = json.loads(edited.json())
+        await service.database.update_spec_fields(
+            RobotObjectV1, robot.name, {k: spec_json[k] for k in edits},
+            publisher_id, **_hook_kwargs(hook))
 
-        # Update status if provided
-        if "status" in robot_data:
+    # Update status if provided
+    if "status" in robot_data:
+        try:
             robot.status = robot.get_status_class()(**robot_data["status"])
-            await service.database.update_status(RobotObjectV1, robot.name, robot.status, publisher_id)
+        except (ValidationError, TypeError) as e:
+            raise HTTPException(status_code=400, detail=f"Invalid robot status: {e}")
+        await service.database.update_status(RobotObjectV1, robot.name, robot.status, publisher_id)
 
-        # Return updated robot
-        updated_robot = await service.database.get_object(RobotObjectV1, robot_name)
-        return updated_robot.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to update robot: {str(e)}")
+    # Return updated robot
+    updated_robot = await service.database.get_object(RobotObjectV1, robot_name)
+    return updated_robot.dict()
 
 
 @app.post("/api/v1/robots/{robot_name}/clear-fault")
@@ -2016,20 +1938,14 @@ async def clear_robot_fault(robot_name: str):
     back to IDLE, leaving every other status field (pose, battery, online, factsheet...)
     as the dispatcher last wrote it. Replaces the client's read + whole-status PUT.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        # 404 for an unknown robot (raised by the database layer)
-        await service.database.get_object(RobotObjectV1, robot_name)
-        await service.database.update_status_fields(
-            RobotObjectV1, robot_name,
-            {"state": RobotStateV1.IDLE.value, "errors": {}}, uuid.uuid4())
-        return (await service.database.get_object(RobotObjectV1, robot_name)).dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to clear fault: {str(e)}")
+    # 404 for an unknown robot (raised by the database layer)
+    await service.database.get_object(RobotObjectV1, robot_name)
+    await service.database.update_status_fields(
+        RobotObjectV1, robot_name,
+        {"state": RobotStateV1.IDLE.value, "errors": {}}, uuid.uuid4())
+    return (await service.database.get_object(RobotObjectV1, robot_name)).dict()
 
 
 @app.delete("/api/v1/robots/{robot_name}")
@@ -2048,19 +1964,12 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
     409 `ROBOT_HAS_ACTIVE_MISSION` (ON_TASK or a pending/running mission; nothing is changed);
     500 any other failure. The robot can be registered again afterwards like a new one.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        return await RobotDeleter(service.database, service.mapping_switch,
-                                  arango_node_count=_arango_node_count).delete(
-            robot_name, delete_telemetry=delete_telemetry, delete_rosbags=delete_rosbags,
-            actor=recording.request_actor(), rosbag_deleter=_delete_rosbags_of)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("Failed to delete robot %s", robot_name)
-        raise HTTPException(status_code=500, detail=f"Failed to delete robot: {str(e)}")
+    return await RobotDeleter(service.database, service.mapping_switch,
+                              arango_node_count=_arango_node_count).delete(
+        robot_name, delete_telemetry=delete_telemetry, delete_rosbags=delete_rosbags,
+        actor=recording.request_actor(), rosbag_deleter=_delete_rosbags_of)
 
 
 @app.post("/api/v1/robots/{robot_name}/slam-save/retry")
@@ -2122,18 +2031,12 @@ async def force_cancel_robot_order(robot_name: str):
     robot the next time it processes a robot-object change. See
     RobotSpecV1.needs_order_cancel's doc comment for the full mechanism.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        await service.database.get_object(RobotObjectV1, robot_name)  # 404 if unknown
-        await service.database.update_spec_fields(
-            RobotObjectV1, robot_name, {"needs_order_cancel": True}, uuid.uuid4())
-        return {"success": True, "message": f"cancelOrder requested for {robot_name}"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to request cancel-order: {str(e)}")
+    await service.database.get_object(RobotObjectV1, robot_name)  # 404 if unknown
+    await service.database.update_spec_fields(
+        RobotObjectV1, robot_name, {"needs_order_cancel": True}, uuid.uuid4())
+    return {"success": True, "message": f"cancelOrder requested for {robot_name}"}
 
 
 @app.post("/api/v1/robots/{robot_name}/actions", response_model=InvokeActionResponse)
@@ -2144,8 +2047,7 @@ async def invoke_custom_action(robot_name: str, request: InvokeActionRequest):
     This endpoint creates a mission with an instant action that will be sent to the robot
     via the Mission Dispatcher. The action is executed immediately without navigation.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
     result = await service.invoke_custom_action(
         robot_name=robot_name,
@@ -2166,15 +2068,15 @@ def _require_service():
 
 
 async def _site_call(what: str, coro):
-    """Run a packages/api/sites.py call: HTTPExceptions pass through, anything else is a
-    logged 500."""
+    """Run a packages/api/sites.py call. HTTPExceptions pass through; anything else is the
+    central handler's logged 500 (`what` is only for the log context)."""
     try:
         return await coro
     except HTTPException:
         raise
-    except Exception as e:
-        logging.exception(f"Failed to {what}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to {what}: {str(e)}")
+    except Exception:
+        logging.getLogger("ApiDelegationService").error("Failed to %s", what)
+        raise
 
 
 @app.get("/api/v1/sites", response_model=List[dict])
@@ -2402,16 +2304,10 @@ async def list_missions():
 
     Returns all mission objects in the database.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        missions = await service.database.list_objects(MissionObjectV1)
-        return [mission.dict() for mission in missions]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list missions: {str(e)}")
+    missions = await service.database.list_objects(MissionObjectV1)
+    return [mission.dict() for mission in missions]
 
 
 @app.get("/api/v1/missions/{mission_name}")
@@ -2421,31 +2317,19 @@ async def get_mission(mission_name: str):
 
     Returns the complete mission object including spec and status.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        mission = await service.database.get_object(MissionObjectV1, mission_name)
-        return mission.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Mission not found: {str(e)}")
+    mission = await service.database.get_object(MissionObjectV1, mission_name)
+    return mission.dict()
 
 
 @app.get("/api/v1/missions/{mission_name}/status")
 async def get_mission_status(mission_name: str):
     """Get just the status field of a mission."""
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        mission = await service.database.get_object(MissionObjectV1, mission_name)
-        return mission.status.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Mission not found: {str(e)}")
+    mission = await service.database.get_object(MissionObjectV1, mission_name)
+    return mission.status.dict()
 
 
 @app.post("/api/v1/missions", response_model=dict)
@@ -2455,39 +2339,37 @@ async def create_mission(mission_data: dict):
 
     Accepts mission specification data and creates a new mission object.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
+    # Validate required fields
+    if "name" not in mission_data:
+        raise HTTPException(status_code=400, detail="Missing required field: name")
+    if "robot" not in mission_data:
+        raise HTTPException(status_code=400, detail="Missing required field: robot")
+    if "mission_tree" not in mission_data:
+        raise HTTPException(status_code=400, detail="Missing required field: mission_tree")
+
+    # Create mission with auto-initialized status
+    # status and lifecycle are server-owned: they come after **mission_data so a caller cannot set them
+    mission_data_with_defaults = {**mission_data, "status": MissionStatusV1(), "lifecycle": ObjectLifecycleV1.ALIVE}
     try:
-        # Validate required fields
-        if "name" not in mission_data:
-            raise HTTPException(status_code=400, detail="Missing required field: name")
-        if "robot" not in mission_data:
-            raise HTTPException(status_code=400, detail="Missing required field: robot")
-        if "mission_tree" not in mission_data:
-            raise HTTPException(status_code=400, detail="Missing required field: mission_tree")
-
-        # Create mission with auto-initialized status
-        # status and lifecycle are server-owned: they come after **mission_data so a caller cannot set them
-        mission_data_with_defaults = {**mission_data, "status": MissionStatusV1(), "lifecycle": ObjectLifecycleV1.ALIVE}
         mission = MissionObjectV1(**mission_data_with_defaults)
-        # Dispatcher-owned (see PUT below): a new mission is never dispatched yet, so a
-        # caller-supplied run_id could only make its order ids collide with another run's.
-        mission.status.run_id = None
-        mission.status.order_rev = 0
-        publisher_id = uuid.uuid4()
-        await service.database.create_object(mission, publisher_id)
-        return mission.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to create mission: {str(e)}")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid mission: {e}")
+    # Dispatcher-owned (see PUT below): a new mission is never dispatched yet, so a
+    # caller-supplied run_id could only make its order ids collide with another run's.
+    mission.status.run_id = None
+    mission.status.order_rev = 0
+    publisher_id = uuid.uuid4()
+    await service.database.create_object(mission, publisher_id)
+    return mission.dict()
 
 
 # Keys PUT /api/v1/missions/{name} takes besides EDITABLE_SPEC_FIELDS: the reroute and its
-# force flag, the status, and server-owned keys a client may echo back (ignored). Any other
-# key is a 400 (needs_canceled is set by POST .../cancel only).
-_MISSION_PUT_ACCEPTED = ("status", "name", "lifecycle", "force", "update_nodes",
+# force flag, and server-owned keys a client may echo back (ignored). Any other key is a 400
+# (needs_canceled is set by POST .../cancel only; `status` is dispatcher-owned: no caller writes
+# a mission's status, so a whole-status body is refused).
+_MISSION_PUT_ACCEPTED = ("name", "lifecycle", "force", "update_nodes",
                          "route_rev", "kind", "goal", "created_at")
 
 
@@ -2496,117 +2378,105 @@ async def update_mission(mission_name: str, mission_data: dict):
     """
     Update a mission (proxy to Mission Dispatcher database).
 
-    Updates the mission's spec or status based on provided data.
+    Updates the mission's spec (or reroutes it). The status is dispatcher-owned: a body
+    carrying `status` is a 400.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        unknown = sorted(k for k in mission_data
-                         if k not in EDITABLE_SPEC_FIELDS and k not in _MISSION_PUT_ACCEPTED)
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Fields not editable on a mission: {', '.join(unknown)}. "
-                       f"Editable: {', '.join(EDITABLE_SPEC_FIELDS)}, update_nodes "
-                       "(a reroute); to cancel use POST .../cancel")
-        # Get existing mission
-        mission = await service.database.get_object(MissionObjectV1, mission_name)
+    if "status" in mission_data:
+        raise HTTPException(
+            status_code=400,
+            detail="A mission's status is owned by the dispatcher and cannot be written; "
+                   "to cancel use POST .../cancel")
+    unknown = sorted(k for k in mission_data
+                     if k not in EDITABLE_SPEC_FIELDS and k not in _MISSION_PUT_ACCEPTED)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fields not editable on a mission: {', '.join(unknown)}. "
+                   f"Editable: {', '.join(EDITABLE_SPEC_FIELDS)}, update_nodes "
+                   "(a reroute); to cancel use POST .../cancel")
+    # Get existing mission
+    mission = await service.database.get_object(MissionObjectV1, mission_name)
 
-        publisher_id = uuid.uuid4()
+    publisher_id = uuid.uuid4()
 
-        # Update spec if provided
-        if "status" not in mission_data or len(mission_data) > 1:
-            # This is a spec update
-            edits = {}
-            reroute = None
-            touched = set()  # spec keys this request changes: the only ones written back
-            for key, value in mission_data.items():
-                if key in ("status", "name", "lifecycle", "force"):
-                    continue
-                if key == "update_nodes":
-                    # A reroute, meant for a running mission; applied below, after any edit.
-                    reroute = value
-                elif key in EDITABLE_SPEC_FIELDS:
-                    edits[key] = value
-                # else: server-owned and ignored (route_rev is bumped by a reroute, the
-                # others are set when the mission is created); a caller's copy must not
-                # change them (_MISSION_PUT_ACCEPTED)
-            if edits:
-                # Only a mission that has not started can be edited: once its orders are
-                # with the robot the operator has to start a new mission instead.
-                if mission.status.state != MissionStateV1.PENDING:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Mission {mission_name} is {mission.status.state.value}; "
-                               "only a PENDING mission can be edited")
-                try:
-                    edited = MissionSpecV1(**{**mission.spec.dict(), **edits})
-                except Exception as e:
-                    raise HTTPException(status_code=400,
-                                        detail=f"Invalid mission spec: {str(e)}")
-                for key in edits:
-                    setattr(mission, key, getattr(edited, key))
-                touched.update(edits)
-                # Every node of the tree has a status entry (the dispatcher reads them
-                # by name), so a new tree needs its entries made and old ones dropped.
-                if "mission_tree" in edits:
-                    node_names = ["root"] + [str(node.name) for node in mission.mission_tree]
-                    mission.status.node_status = {
-                        name: mission.status.node_status.get(name, MissionNodeStatusV1())
-                        for name in node_names}
-            if reroute and not mission_data.get("force"):
-                # A route through a node a robot just reported blocked would send the robot
-                # straight back to it (2026-10-08); the operator can force it.
-                try:
-                    through = await _reroute_through_blocked(reroute)
-                except Exception as err:  # pylint: disable=broad-except
-                    logging.warning("Blocked graph nodes not readable (%s); reroute not "
-                                    "checked against them", err)
-                    through = []
-                if through:
-                    raise HTTPException(status_code=409, detail={
-                        "code": "ROUTE_THROUGH_BLOCKED_NODES",
-                        "message": "The new route goes through graph node(s) a robot reported "
-                                   "blocked: " + ", ".join(
-                                       str(r["graph_node_id"]) for r in through) +
-                                   ". Send force: true to reroute anyway.",
-                        "blocked_nodes": through})
-            if reroute:
-                # Fold the new routes into mission_tree (validated, planned_path cleared,
-                # route_rev bumped) instead of storing the request: the row is what the
-                # dispatcher resumes from, and a stored request would be re-applied on
-                # every delivery of the row. The dispatcher acts once per route_rev.
-                await mission.update(reroute)
-                touched.update(("mission_tree", "planned_path", "route_rev"))
-            # Only the keys this request changed: writing the whole spec read above back would
-            # revert what the dispatcher patched since (a replan's mission_tree / planned_path).
-            spec_json = json.loads(mission.spec.json())
-            await service.database.update_spec_fields(
-                MissionObjectV1, mission.name, {k: spec_json[k] for k in touched if k in spec_json},
-                publisher_id)
+    # Update spec if provided
+    if mission_data:
+        # This is a spec update
+        edits = {}
+        reroute = None
+        touched = set()  # spec keys this request changes: the only ones written back
+        for key, value in mission_data.items():
+            if key in ("name", "lifecycle", "force"):
+                continue
+            if key == "update_nodes":
+                # A reroute, meant for a running mission; applied below, after any edit.
+                reroute = value
+            elif key in EDITABLE_SPEC_FIELDS:
+                edits[key] = value
+            # else: server-owned and ignored (route_rev is bumped by a reroute, the
+            # others are set when the mission is created); a caller's copy must not
+            # change them (_MISSION_PUT_ACCEPTED)
+        if edits:
+            # Only a mission that has not started can be edited: once its orders are
+            # with the robot the operator has to start a new mission instead.
+            if mission.status.state != MissionStateV1.PENDING:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Mission {mission_name} is {mission.status.state.value}; "
+                           "only a PENDING mission can be edited")
+            try:
+                edited = MissionSpecV1(**{**mission.spec.dict(), **edits})
+            except ValidationError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid mission spec: {e}")
+            for key in edits:
+                setattr(mission, key, getattr(edited, key))
+            touched.update(edits)
+            # Every node of the tree has a status entry (the dispatcher reads them
+            # by name), so a new tree needs its entries made and old ones dropped.
             if "mission_tree" in edits:
-                await service.database.update_status(
-                    MissionObjectV1, mission.name, mission.status, publisher_id)
+                node_names = ["root"] + [str(node.name) for node in mission.mission_tree]
+                mission.status.node_status = {
+                    name: mission.status.node_status.get(name, MissionNodeStatusV1())
+                    for name in node_names}
+        if reroute and not mission_data.get("force"):
+            # A route through a node a robot just reported blocked would send the robot
+            # straight back to it (2026-10-08); the operator can force it.
+            try:
+                through = await _reroute_through_blocked(reroute)
+            except Exception as err:  # pylint: disable=broad-except
+                logging.warning("Blocked graph nodes not readable (%s); reroute not "
+                                "checked against them", err)
+                through = []
+            if through:
+                raise HTTPException(status_code=409, detail={
+                    "code": "ROUTE_THROUGH_BLOCKED_NODES",
+                    "message": "The new route goes through graph node(s) a robot reported "
+                               "blocked: " + ", ".join(
+                                   str(r["graph_node_id"]) for r in through) +
+                               ". Send force: true to reroute anyway.",
+                    "blocked_nodes": through})
+        if reroute:
+            # Fold the new routes into mission_tree (validated, planned_path cleared,
+            # route_rev bumped) instead of storing the request: the row is what the
+            # dispatcher resumes from, and a stored request would be re-applied on
+            # every delivery of the row. The dispatcher acts once per route_rev.
+            await mission.update(reroute)
+            touched.update(("mission_tree", "planned_path", "route_rev"))
+        # Only the keys this request changed: writing the whole spec read above back would
+        # revert what the dispatcher patched since (a replan's mission_tree / planned_path).
+        spec_json = json.loads(mission.spec.json())
+        await service.database.update_spec_fields(
+            MissionObjectV1, mission.name, {k: spec_json[k] for k in touched if k in spec_json},
+            publisher_id)
+        if "mission_tree" in edits:
+            await service.database.update_status(
+                MissionObjectV1, mission.name, mission.status, publisher_id)
 
-        # Update status if provided
-        if "status" in mission_data:
-            new_status = mission.get_status_class()(**mission_data["status"])
-            # Dispatcher-owned fields (run_id / order_rev name the VDA5050 orders it has
-            # already sent; the robot's reports of the run): a caller's copy of the status
-            # (stale, or simply without them) must not blank or change them.
-            for field in DISPATCHER_OWNED_STATUS_FIELDS:
-                setattr(new_status, field, getattr(mission.status, field))
-            mission.status = new_status
-            await service.database.update_status(MissionObjectV1, mission.name, mission.status, publisher_id)
-
-        # Return updated mission
-        updated_mission = await service.database.get_object(MissionObjectV1, mission_name)
-        return updated_mission.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to update mission: {str(e)}")
+    # Return updated mission
+    updated_mission = await service.database.get_object(MissionObjectV1, mission_name)
+    return updated_mission.dict()
 
 
 @app.delete("/api/v1/missions/{mission_name}")
@@ -2625,15 +2495,9 @@ async def delete_mission(mission_name: str,
     plus `"deleted_missions": [names]` with with_reruns. Rules: packages/api/run_admin.py.
     """
     _require_service()
-    try:
-        return await run_admin.delete_mission(service.database, mission_name,
-                                              with_reruns=with_reruns,
-                                              publisher_id=uuid.uuid4())
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception(f"Failed to delete mission {mission_name}: {e}")
-        raise HTTPException(status_code=404, detail=f"Failed to delete mission: {str(e)}")
+    return await run_admin.delete_mission(service.database, mission_name,
+                                          with_reruns=with_reruns,
+                                          publisher_id=uuid.uuid4())
 
 
 @app.get("/api/v1/missions/{mission_name}/plan")
@@ -2647,16 +2511,10 @@ async def get_mission_plan(mission_name: str, map_id: Optional[str] = None):
         mission_name: Name of the mission
         map_id: Map ID to use for node lookup (uses default if not provided)
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        result = await service.get_mission_plan(mission_name, map_id=map_id)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Failed to get mission plan: {str(e)}")
+    result = await service.get_mission_plan(mission_name, map_id=map_id)
+    return result
 
 
 @app.post("/api/v1/missions/{mission_name}/cancel")
@@ -2666,23 +2524,17 @@ async def cancel_mission(mission_name: str):
 
     Cancels an active mission.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        mission = await service.database.get_object(MissionObjectV1, mission_name)
-        await mission.cancel()
-        # Only the flag: the whole spec read above would revert what the dispatcher patched
-        # since (a replan's mission_tree / planned_path / route_rev).
-        await service.database.update_spec_fields(
-            MissionObjectV1, mission_name, {"needs_canceled": True}, uuid.uuid4())
-        await run_admin.record_cancel_requested(service.database, mission_name,
-                                                getattr(mission.spec, "robot", None))
-        return {"success": True, "message": f"Mission {mission_name} cancelled"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to cancel mission: {str(e)}")
+    mission = await service.database.get_object(MissionObjectV1, mission_name)
+    await mission.cancel()
+    # Only the flag: the whole spec read above would revert what the dispatcher patched
+    # since (a replan's mission_tree / planned_path / route_rev).
+    await service.database.update_spec_fields(
+        MissionObjectV1, mission_name, {"needs_canceled": True}, uuid.uuid4())
+    await run_admin.record_cancel_requested(service.database, mission_name,
+                                            getattr(mission.spec, "robot", None))
+    return {"success": True, "message": f"Mission {mission_name} cancelled"}
 
 
 # ==================== Detection Results Operations ====================
@@ -2694,16 +2546,10 @@ async def list_detection_results():
 
     Returns all detection result objects in the database.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        results = await service.database.list_objects(DetectionResultsObjectV1)
-        return [result.dict() for result in results]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list detection results: {str(e)}")
+    results = await service.database.list_objects(DetectionResultsObjectV1)
+    return [result.dict() for result in results]
 
 
 @app.get("/api/v1/detection_results/{name}")
@@ -2713,16 +2559,10 @@ async def get_detection_result(name: str):
 
     Returns the complete detection results object.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        result = await service.database.get_object(DetectionResultsObjectV1, name)
-        return result.dict()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Detection results not found: {str(e)}")
+    result = await service.database.get_object(DetectionResultsObjectV1, name)
+    return result.dict()
 
 
 @app.delete("/api/v1/detection_results/{name}")
@@ -2732,16 +2572,10 @@ async def delete_detection_result(name: str):
 
     Removes the detection results from the database.
     """
-    if service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
+    _require_service()
 
-    try:
-        await service.database.set_lifecycle(DetectionResultsObjectV1, name, ObjectLifecycleV1.DELETED, uuid.uuid4())
-        return {"success": True, "message": f"Detection results {name} deleted"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Failed to delete detection results: {str(e)}")
+    await service.database.set_lifecycle(DetectionResultsObjectV1, name, ObjectLifecycleV1.DELETED, uuid.uuid4())
+    return {"success": True, "message": f"Detection results {name} deleted"}
 
 
 @app.websocket("/ws/mission/{mission_name}")

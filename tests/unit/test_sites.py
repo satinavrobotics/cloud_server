@@ -468,9 +468,9 @@ class TestSiteRoutes:
 
     async def test_unexpected_errors_are_500(self, store, svc, hooks):
         store.fail = lambda q: RuntimeError("db gone") if q.startswith("INSERT") else None
-        with pytest.raises(HTTPException) as exc:
+        # unexpected errors propagate to the central handler (a logged 500)
+        with pytest.raises(RuntimeError):
             await main.create_site({"name": "s1"})
-        assert exc.value.status_code == 500
 
     async def test_service_not_initialized(self):
         with patch.object(main, "service", None):

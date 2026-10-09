@@ -638,7 +638,7 @@ thinned by the query to every k-th row plus the last (`downsampled`). 404 for an
   `status` still replaces the status wholesale (deprecated: use clear-fault).
 - `PUT /api/v1/missions/{mission}` takes `robot`, `mission_tree`, `timeout`, `deadline`, `repeat`,
   `then_run`, `register_map`, `mode`, `planned_path` (PENDING missions only, else 409), `update_nodes` +
-  `force` (reroute) and `status`; `route_rev`, `kind`, `goal`, `created_at`, `name`, `lifecycle` are
+  `force` (reroute); `status` is a 400 (dispatcher-owned, nothing writes it); `route_rev`, `kind`, `goal`, `created_at`, `name`, `lifecycle` are
   ignored, any other key (e.g. `needs_canceled`: use `POST .../cancel`) is a 400.
 - `POST /api/v1/robots` ignores a caller's `status`, `lifecycle` and the dispatcher-owned spec fields
   (`needs_order_cancel`, `datum*`); re-registering an existing robot writes only the changed spec keys
@@ -650,6 +650,20 @@ thinned by the query to every k-th row plus the last (`downsampled`). 404 for an
 Operator override for a stuck fault: sets `status.state` to `IDLE` and `status.errors` to `{}`, leaving
 the rest of the status untouched (field-level write, no body). Returns the robot (as `GET
 /api/v1/robots/{robot_name}`); 404 for an unknown robot.
+
+### Errors
+
+- A deliberate `HTTPException` (including the 404/400 `packages/database/postgres.py` raises itself)
+  reaches the client unchanged; `detail` is a string or the existing structured object/422 list.
+- Bad input is a specific 4xx: 400 (missing or invalid field, `ICSUsageError` from the object
+  validators), 409, 422 (lists). Messages name the field, never an internal.
+- Anything unexpected (a database outage included) is a 500 with the generic detail
+  `An unexpected error occurred (ref <8 hex>)`; the exception is logged with its traceback under
+  the same `ref` (`packages/utils/fastapi_helpers.py::add_error_handlers`). Routes do not wrap
+  `except Exception` into 4xx. A read of a missing object is a 404 only because the database
+  layer said so; a DB error on `GET /robots/{r}` is a 500, not a 404.
+- 503 `Service not initialized` while the service is starting (`_require_service()`).
+- Get-or-create paths (`POST /robots`, `GET /settings`) treat only a 404 as "does not exist yet".
 
 ### Status Operations
 

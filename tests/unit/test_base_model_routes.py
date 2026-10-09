@@ -48,7 +48,7 @@ class TestCreateRobotCurrentModel:
     @pytest.mark.asyncio
     async def test_new_robot_persists_current_model(self):
         svc = MagicMock()
-        svc.database.get_object = AsyncMock(side_effect=Exception("not found"))
+        svc.database.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         svc.database.create_object = AsyncMock()
         with patch.object(main, "service", svc):
             result = await main.create_robot({"name": "bot1", "current_model": "detector.onnx"})
@@ -58,7 +58,7 @@ class TestCreateRobotCurrentModel:
     @pytest.mark.asyncio
     async def test_new_robot_without_current_model_defaults_none(self):
         svc = MagicMock()
-        svc.database.get_object = AsyncMock(side_effect=Exception("not found"))
+        svc.database.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         svc.database.create_object = AsyncMock()
         with patch.object(main, "service", svc):
             result = await main.create_robot({"name": "bot2"})

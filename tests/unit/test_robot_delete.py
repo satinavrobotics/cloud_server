@@ -171,7 +171,7 @@ async def test_unknown_robot_is_404(monkeypatch):
     assert db.deleted_tables() == []
 
 
-async def test_route_passes_flags_and_maps_other_errors_to_500(monkeypatch):
+async def test_route_passes_flags_and_leaves_other_errors_to_the_central_handler(monkeypatch):
     svc = MagicMock()
     monkeypatch.setattr(main, "service", svc)
     with patch.object(main, "RobotDeleter") as deleter:
@@ -181,9 +181,8 @@ async def test_route_passes_flags_and_maps_other_errors_to_500(monkeypatch):
         kw = deleter.return_value.delete.await_args.kwargs
         assert kw["delete_telemetry"] is True and kw["delete_rosbags"] is False
         deleter.return_value.delete = AsyncMock(side_effect=RuntimeError("boom"))
-        with pytest.raises(HTTPException) as exc:
+        with pytest.raises(RuntimeError):  # unexpected: the central handler makes it a 500
             await main.delete_robot("r1")
-        assert exc.value.status_code == 500
         deleter.return_value.delete = AsyncMock(side_effect=HTTPException(404, "x"))
         with pytest.raises(HTTPException) as exc:
             await main.delete_robot("r1")

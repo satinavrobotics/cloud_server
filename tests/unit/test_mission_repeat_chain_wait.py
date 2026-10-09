@@ -16,6 +16,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
@@ -528,9 +529,10 @@ async def test_api_rejects_an_invalid_edit_with_400():
                     {"mission_tree": _tree({"name": "w", "parent": "root_sequence",
                                             "action": {"action_type": "wait",
                                                        "action_parameters": {"seconds": 0}}})}):
-            with pytest.raises(HTTPException) as err:
-                await api_main.update_mission("m1", bad)
-            assert err.value.status_code == 400
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api_main.app),
+                                         base_url="http://t") as client:
+                resp = await client.put("/api/v1/missions/m1", json=bad)
+            assert resp.status_code == 400  # ICSUsageError -> 400 (central handler)
     db.update_spec_fields.assert_not_awaited()
 
 

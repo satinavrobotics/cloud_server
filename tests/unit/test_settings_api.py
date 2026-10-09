@@ -40,7 +40,7 @@ class TestGetSettingsRoute:
     @pytest.mark.asyncio
     async def test_creates_settings_with_defaults_on_first_read(self):
         svc = MagicMock()
-        svc.database.get_object = AsyncMock(side_effect=Exception("not found"))
+        svc.database.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         svc.database.create_object = AsyncMock()
         with patch.object(main, "service", svc):
             result = await main.get_settings()
@@ -65,7 +65,7 @@ class TestGetSettingsRoute:
         # recover by re-fetching rather than surfacing that 400 to the caller.
         svc = MagicMock()
         svc.database.get_object = AsyncMock(
-            side_effect=[Exception("not found"), _existing_settings(["fromOtherRequest"])]
+            side_effect=[HTTPException(404, "not found"), _existing_settings(["fromOtherRequest"])]
         )
         svc.database.create_object = AsyncMock(
             side_effect=HTTPException(400, "Object settings with name global already exists")
@@ -78,12 +78,12 @@ class TestGetSettingsRoute:
     @pytest.mark.asyncio
     async def test_reraises_non_conflict_http_exception_from_create(self):
         svc = MagicMock()
-        svc.database.get_object = AsyncMock(side_effect=Exception("not found"))
+        svc.database.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         svc.database.create_object = AsyncMock(side_effect=HTTPException(503, "db unavailable"))
         with patch.object(main, "service", svc):
             with pytest.raises(HTTPException) as exc:
                 await main.get_settings()
-        # get_settings re-raises an HTTPException as is (only other exceptions become a 500).
+        # an HTTPException from the create passes through as is.
         assert exc.value.status_code == 503
 
 
@@ -107,7 +107,7 @@ class TestUpdateSettingsRoute:
     async def test_creates_settings_first_if_missing_then_updates(self):
         svc = MagicMock()
         svc.database.get_object = AsyncMock(
-            side_effect=[Exception("not found"), _existing_settings(["newError"])]
+            side_effect=[HTTPException(404, "not found"), _existing_settings(["newError"])]
         )
         svc.database.create_object = AsyncMock()
         svc.database.update_spec = AsyncMock()

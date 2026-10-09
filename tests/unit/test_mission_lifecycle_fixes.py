@@ -272,8 +272,8 @@ async def test_api_reroute_folds_into_the_tree_and_bumps_route_rev():
 
 @pytest.mark.unit
 async def test_api_reroute_is_validated():
+    import httpx
     import packages.api.main as api_main
-    from fastapi import HTTPException
     existing = _mission()
     existing.status.state = State.RUNNING
     db = _FakeMissionDb(existing)
@@ -281,9 +281,10 @@ async def test_api_reroute_is_validated():
         for bad in ({"nope": {"waypoints": [{"x": 1.0, "y": 1.0, "theta": 0.0}]}},
                     {"root_sequence": {"waypoints": [{"x": 1.0, "y": 1.0, "theta": 0.0}]}},
                     {"a": {"waypoints": []}}):
-            with pytest.raises(HTTPException) as err:
-                await api_main.update_mission("m1", {"update_nodes": bad})
-            assert err.value.status_code == 400
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api_main.app),
+                                         base_url="http://t") as client:
+                resp = await client.put("/api/v1/missions/m1", json={"update_nodes": bad})
+            assert resp.status_code == 400  # ICSUsageError -> 400 (central handler)
     assert db.row.route_rev == 0
 
 
