@@ -411,7 +411,7 @@ async def test_legacy_mission_keeps_its_ids_across_a_resend():
     await r._on_client_message(_executing("patrol-n0"))      # carried on: legacy ids
 
     assert await r._bump_order_rev()                          # a new revision is needed
-    await r._send_order()
+    await r._send_order(replacing=True)   # the dispatcher chose it over the robot's order
 
     run_id = mission.status.run_id
     assert _published_order_ids(events) == [f"patrol-r{run_id}-n0"]

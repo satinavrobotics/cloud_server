@@ -1202,6 +1202,17 @@ class FleetRecorder:
                          f"{note.info_type}")
 
     @_guarded
+    def completed_without_final_node(self, robot_name: str, mission: Any, order_id: str,
+                                     detail: str,
+                                     ts: Optional[datetime.datetime] = None) -> None:
+        """An order the robot reported completed before its final node (a NODE_NOTE)."""
+        self._event(EventCode.MISSION_NODE_NOTE, robot_name, ts or self._clock(), {
+            "mission_name": mission.name, "node_id": order_id,
+            "info_type": "completedWithoutFinalNode", "detail": detail,
+        }, discriminator=f"{mission.name}|{mission.status.run_id}|{order_id}|"
+                         f"completedWithoutFinalNode")
+
+    @_guarded
     def frame_offset_suspected(self, robot_name: str, mission: Any, summary: Any,
                                map_t_session: Optional[Dict[str, Any]],
                                ts: Optional[datetime.datetime] = None) -> None:
