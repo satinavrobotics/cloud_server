@@ -20,12 +20,18 @@ SLAM lock) is held for the orchestrator calls that change the robot (not while w
 save in progress fails the job at once ("SLAM save pending") instead of holding the robot lock
 until it is done; NO orchestrator call is made inside a DB transaction; nothing here raises into
 the caller after the 202 (a failure is the job's `failed` state with a readable `error`).
-Starting a MAPPING session for the robot is refused (409, maps.start_session) while a job runs,
-and a mapping session that appears anyway (it won the race for the lock) fails the job.
+A job is refused (409) while the robot's open MAPPING session records a SLAM map (its recording IS
+the localization mode the job changes), and starting / resuming such a session is refused while a
+job runs (maps.start_session / session_action); one that appears anyway (it won the race for the
+lock) fails the job. A topomap-only mapping session does not block it (decision D, 2026-10-09):
+on a mapping-API robot the orchestrator refuses a mode change while the topomap runs, so the
+job's PUTs (and the rollback's) turn the topomap off in the same PUT and start it again right
+after (MappingSwitch.start), a failed restart being a job warning. A failed SLAM save (the robot
+is still in slam, packages/api/mapping_switch.py) refuses the job too: retry or discard it.
 
 STARTING (the robot's localization facade, packages/api/orchestrator_client.py): after the
-init_pos, read the stored intent (GET /localization; a `slam` intent fails the job "finish it
-first": leaving slam would discard the unsaved map), then PUT /localization {mode: relocalization,
+init_pos, read the stored intent (GET /localization; a `slam` intent fails the job: leaving slam
+would discard the unsaved map), then PUT /localization {mode: relocalization,
 map: <onboard>} with wait=false and partial=ok (the robot switches in-process; an error means
 nothing changed). The robot's own refusal is the job's error text (409 "order active: cancel it
 first", 502 map refused, 503 not ready yet), and so are a partial answer's `problem` and
@@ -122,6 +128,9 @@ class _Undo:
     prev_intent: Optional[Dict[str, Any]] = None   # the stored intent before the job
     # the intents the job may have left on the robot (rollback restores only from these)
     job_intents: List[Any] = field(default_factory=list)
+    # for restarting a topomap the job's PUTs had to turn off (mapping API)
+    switch: Optional[Any] = None
+    robot: Optional[Any] = None
 
 
 @dataclass
@@ -192,6 +201,28 @@ def describe_error(exc: oc.OrchestratorError, what: str) -> str:
     if status == 404:
         return f"{what}: not found on the robot (404: {exc.detail})"
     return f"{what}: the orchestrator answered {status}: {exc.detail}"
+
+
+async def _topomap_on(client: oc.OrchestratorClient) -> bool:
+    """Whether the robot's topomap runs (the mapping API's `topomap` flag); False when unknown."""
+    try:
+        return (await client.get_localization()).get("topomap") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _restart_topomap(undo: _Undo) -> Optional[str]:
+    """Start the topomap a PUT of the job had to turn off (MappingSwitch.start: PUT
+    /localization on the current mode with `topomap: true`). A problem sentence, else None.
+    Never raises."""
+    if undo.switch is None or undo.robot is None:
+        return "the topomap was stopped for the localization switch and not started again"
+    try:
+        actions = await undo.switch.start(undo.robot, [ms.TOPO])
+    except Exception as exc:  # noqa: BLE001 - the switch does not raise; belt and braces
+        return f"the topomap was not started again: {exc}"
+    failed = [a["label"] for a in actions if not a["ok"]]
+    return "; ".join(failed) if failed else None
 
 
 class RelocJobs:
@@ -271,11 +302,10 @@ class RelocJobs:
                 raise HTTPException(409, f"Robot '{robot_name}' is offline")
             open_sessions = await store.open_sessions_of_robot(robot_name)
             session = await store.session(session_id)
-        mapping = [s for s in open_sessions if ms.purpose_of(s) == ms.MAPPING]
-        if mapping:     # user decision 2026-10-08: no reloc while mapping
-            raise HTTPException(409, f"Robot '{robot_name}' has an open mapping session "
-                                     f"({mapping[0]['map_name']}): relocalization is not used "
-                                     "while mapping")
+        slam = maps.slam_mapping_session(open_sessions)
+        if slam is not None:   # decision D 2026-10-09: only a SLAM recording blocks it
+            raise HTTPException(409, "Relocalization cannot be started: "
+                                     + maps.slam_session_reason(robot_name, slam))
         # No await from here to the registration: two requests cannot both pass.
         if self.active_for(robot_name) is not None:
             raise HTTPException(409, f"Relocalization is already running for robot "
@@ -283,6 +313,9 @@ class RelocJobs:
         if switch is not None and switch.slam_save_pending(robot_name):
             raise HTTPException(409, f"Robot '{robot_name}' is still saving a SLAM map; try "
                                      "again when it is done")
+        if switch is not None and switch.slam_save_failed(robot_name) is not None:
+            raise HTTPException(409, "Relocalization cannot be started: "
+                                     + maps.SLAM_FAILED_REASON.format(robot=robot_name))
         now = maps._utcnow()
         job = RelocJob(
             id=str(uuid.uuid4()), map_name=map_name, session_id=str(session_id),
@@ -352,7 +385,7 @@ class RelocJobs:
                 yield
 
     async def _run(self, job: RelocJob, db: Any, switch: Optional[Any], robot: Any) -> None:
-        undo = _Undo()
+        undo = _Undo(switch=switch, robot=robot)
         client = self._client_factory(robot)
         try:
             baseline: Dict[str, Any] = {}
@@ -427,14 +460,19 @@ class RelocJobs:
     async def _restore_intent(self, client: oc.OrchestratorClient, undo: _Undo) -> Optional[str]:
         """Rollback: PUT the stored intent from before the job back (odometry when there
         was none; a slam intent never gets here), unless the robot's intent is not one the job
-        left (someone changed it meanwhile). A problem sentence, else None."""
+        left (someone changed it meanwhile). A running topomap (mapping API) is turned off in
+        the same PUT and started again after it. A problem sentence, else None."""
         mode, _ = oc.restore_target(undo.prev_intent)
+        topomap = await _topomap_on(client)
         try:
-            await oc.restore_intent(client, undo.prev_intent, expect=undo.job_intents)
+            await oc.restore_intent(client, undo.prev_intent, expect=undo.job_intents,
+                                    topomap=False if topomap else None)
         except oc.OrchestratorError as exc:
             return describe_error(exc, f"localization not restored to {mode}")
         except Exception as exc:  # noqa: BLE001
             return f"localization not restored to {mode}: {exc}"
+        if topomap:
+            return await _restart_topomap(undo)
         return None
 
     async def _prepare(self, job: RelocJob, db: Any, switch: Optional[Any],
@@ -498,8 +536,16 @@ class RelocJobs:
         except oc.OrchestratorError as exc:
             raise _Fail(describe_error(exc, "could not read the robot's localization"))
         if prev.get("mode") == "slam":
-            raise _Fail("a SLAM mapping session is active on the robot (409); finish it first")
+            switch = undo.switch
+            if switch is not None and switch.slam_save_failed(job.robot_name) is not None:
+                raise _Fail("the robot is still in SLAM mode after a failed save: retry or "
+                            "discard it")
+            raise _Fail("the robot is recording a SLAM map (409); finish its mapping session "
+                        "first")
         undo.prev_intent = {"mode": prev.get("mode"), "map": prev.get("map")}
+        # mapping API: a mode change is refused while the topomap runs, unless the same PUT
+        # turns it off; it is started again after the switch
+        topomap = prev.get("topomap") is True
         steps = [("relocalization", onboard)]
         if job.mode == MODE_ASSISTED and (prev.get("mode"), prev.get("map")) == steps[0]:
             steps.insert(0, ("odometry", None))
@@ -509,7 +555,11 @@ class RelocJobs:
             undo.intent_changed = True    # before the call: a timed-out call may have applied
             try:
                 try:
-                    answer = await client.put_localization(mode, map_name, wait=False)
+                    if topomap:
+                        answer = await client.put_localization(mode, map_name, wait=False,
+                                                               topomap=False)
+                    else:
+                        answer = await client.put_localization(mode, map_name, wait=False)
                 finally:
                     self._changed(job.robot_name)
             except oc.OrchestratorError as exc:
@@ -523,6 +573,10 @@ class RelocJobs:
             if answer.get("applied") is False:
                 raise _Fail(f"could not start relocalization on '{onboard}': "
                             f"{answer.get('message') or 'the Odin driver is not running'}")
+        if topomap:
+            problem = await _restart_topomap(undo)
+            if problem:
+                job.warnings.append(problem)
 
     def _start_waiting(self, job: RelocJob, baseline: Dict[str, Any]) -> None:
         baseline["started"] = self._clock()
@@ -532,10 +586,14 @@ class RelocJobs:
 
     async def _recheck(self, job: RelocJob, db: Any, switch: Optional[Any]) -> Any:
         """After the locks: the robot is still there and online, no SLAM save, the session still
-        open and not re-placed by anyone else. (A driving robot or an open mapping session no longer fail the job.)
+        open and not re-placed by anyone else, no mapping session that records a SLAM map. (A
+        driving robot or a topomap-only mapping session do not fail the job.)
         Returns the robot."""
         if switch is not None and switch.slam_save_pending(job.robot_name):
             raise _Fail("the robot started saving a SLAM map")
+        if switch is not None and switch.slam_save_failed(job.robot_name) is not None:
+            raise _Fail("the robot is still in SLAM mode after a failed save: retry or discard "
+                        "it")
         async with maps.open_store(db, uuid.uuid4()) as store:
             robot = await store.robot(job.robot_name)
             session = await store.session(job.session_id)
@@ -544,8 +602,8 @@ class RelocJobs:
         if robot is None or not robot.status.online:
             raise _Fail(f"robot '{job.robot_name}' is offline")
         self._check_session(job, session, map_row)
-        if any(ms.purpose_of(s) == ms.MAPPING for s in mine):
-            raise _Fail("a mapping session was opened on the robot")
+        if maps.slam_mapping_session(mine) is not None:
+            raise _Fail("a mapping session that records a SLAM map was opened on the robot")
         return robot
 
     @staticmethod
@@ -577,8 +635,8 @@ class RelocJobs:
             if robot is None or not robot.status.online:
                 raise _Fail(f"robot '{job.robot_name}' went offline during relocalization")
             self._check_session(job, session, map_row)
-            if any(ms.purpose_of(s) == ms.MAPPING for s in mine):
-                raise _Fail("a mapping session was opened on the robot")
+            if maps.slam_mapping_session(mine) is not None:
+                raise _Fail("a mapping session that records a SLAM map was opened on the robot")
             initialized = robot.status.position_initialized
             job.position_initialized = initialized
             job.localization_score = robot.status.localization_score

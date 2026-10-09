@@ -331,12 +331,111 @@ def test_livekit_admin_token_is_hs256_with_grant():
     assert claims["iss"] == "k" and claims["video"] == {"roomList": True}
 
 
+def _switch_mock():
+    switch = MagicMock()
+    locks = {}
+    switch.lock = lambda name: locks.setdefault(name, asyncio.Lock())
+    switch.forget = AsyncMock()
+    switch.slam_records = AsyncMock(return_value=False)
+    return switch
+
+
+class FakeSlamSwitch:
+    """The switch as the delete uses it: the per-robot lock, stop, the SLAM save; every call is
+    recorded with whether the robot's lock was held."""
+
+    def __init__(self):
+        self.locks = {}
+        self.calls = []
+        self.saved = asyncio.Event()
+
+    def lock(self, name):
+        return self.locks.setdefault(name, asyncio.Lock())
+
+    def _held(self, name):
+        return self.lock(name).locked()
+
+    async def stop(self, robot, services):
+        self.calls.append(("stop", list(services), self._held(robot.name)))
+        return [{"service": "topomap", "action": "stop", "ok": True,
+                 "label": "Topomap service stopped", "detail": None}]
+
+    async def slam_records(self, robot, map_name):
+        return True
+
+    def schedule_slam_save(self, robot, map_name, session_id, on_result=None, track=True):
+        self.calls.append(("save", map_name, session_id, track, on_result is not None,
+                           self._held(robot.name)))
+
+        async def run():
+            self.saved.set()
+        return asyncio.ensure_future(run())
+
+    async def forget(self, name):
+        self.calls.append(("forget", name, self._held(name)))
+
+
+async def test_delete_saves_the_slam_map_in_the_background_under_the_robot_lock(monkeypatch):
+    """Item 7: a closed mapping session that recorded SLAM gets its SLAM map saved (background,
+    as a finish; no SLAM save state for the deleted robot), after its topomap stopped, all under
+    the robot's lock, and a concurrent start waits for the delete."""
+    db = FakeDb(sessions=[{"session_id": "s1", "map_name": "m", "ended_at": None,
+                           "paused_at": None, "robot_name": "r1", "purpose": "mapping",
+                           "services": ["topo", "slam"]}])
+    finish = install(db, monkeypatch)
+    finish.side_effect = lambda *a, **k: db.sessions.clear()
+    monkeypatch.setattr(maps, "slam_save_reporter", lambda *a, **k: AsyncMock())
+    orig = maps.open_store
+
+    def online_store(_db, _pid):     # the robot is online: the save is scheduled
+        cm = orig(_db, _pid)
+
+        class Wrap:
+            async def __aenter__(self):
+                store = await cm.__aenter__()
+                lock_robot = store.lock_robot
+
+                async def online(name):
+                    robot = await lock_robot(name)
+                    if robot is not None:
+                        robot.status.online = True
+                    return robot
+                store.lock_robot = online
+                return store
+
+            async def __aexit__(self, *exc):
+                return await cm.__aexit__(*exc)
+        return Wrap()
+    monkeypatch.setattr(maps, "open_store", online_store)
+    switch = FakeSlamSwitch()
+    order = []
+
+    async def concurrent_start():
+        async with switch.lock("r1"):
+            order.append("start")
+    await switch.lock("r1").acquire()     # a session start holds the lock first
+    task = asyncio.ensure_future(RobotDeleter(db, switch).delete("r1"))
+    await asyncio.sleep(0)
+    assert switch.calls == []             # the delete waits for the lock
+    switch.lock("r1").release()
+    start = asyncio.ensure_future(concurrent_start())
+    out = await task
+    await start
+    assert order == ["start"]
+    assert [c[0] for c in switch.calls] == ["stop", "save", "forget"]
+    assert all(c[-1] is True for c in switch.calls)          # all under the robot's lock
+    assert switch.calls[1][1:5] == ("m", "s1", False, True)  # not tracked, outcome reported
+    assert [a["action"] for a in out["robot_actions"]] == ["stop", "save"]
+    assert out["robot_actions"][1]["label"] == "SLAM map save started"
+    await switch.saved.wait()
+
+
 async def test_delete_stops_the_sessions_services_and_reports_robot_actions(monkeypatch):
     db = FakeDb(sessions=[{"session_id": "s1", "map_name": "m", "ended_at": None,
                            "paused_at": None, "robot_name": "r1"}])
     finish = install(db, monkeypatch)
     finish.side_effect = lambda *a, **k: db.sessions.clear()   # closed: no longer open
-    switch = MagicMock()
+    switch = _switch_mock()
     switch.stop = AsyncMock(return_value=[{"service": "topomap", "action": "stop", "ok": True,
                                            "label": "Topomap service stopped",
                                            "detail": None}])
@@ -353,7 +452,7 @@ async def test_a_failed_service_stop_never_blocks_the_delete(monkeypatch):
                            "paused_at": None, "robot_name": "r1"}])
     finish = install(db, monkeypatch)
     finish.side_effect = lambda *a, **k: db.sessions.clear()
-    switch = MagicMock()
+    switch = _switch_mock()
     switch.stop = AsyncMock(return_value=[{"service": "topomap", "action": "stop", "ok": False,
                                            "label": "Could not stop topomap: down",
                                            "detail": "down"}])

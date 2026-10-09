@@ -163,6 +163,9 @@ class MapStatusV1(pydantic.BaseModel):
     open_session_id: Optional[str] = None
     # Latest grid layer version (M7); None while the map has no grid.
     grid_version: Optional[int] = None
+    # When a SLAM map of this map was last saved on a robot (packages/api/maps.py
+    # mark_slam_saved): the map holds data, so it is `ready` even without topomap nodes.
+    slam_saved_at: Optional[datetime.datetime] = None
 
 
 def effective_type(spec: Any) -> str:

@@ -41,6 +41,7 @@ from packages.config import (
 from packages.api.map_delete import MapDeleter
 from packages.api import localization_view, maps, reconstruction
 from packages.api.mapping_switch import MappingSwitch
+from packages.api.slam_save_state import PgSlamStateStore
 from packages.api.orchestrator_maps import OrchestratorMaps
 from packages.api.reloc_job import RelocJobs
 from packages.utils import map_geo
@@ -661,6 +662,9 @@ class ApiDelegationService:
         # The mapping switch: a session's mapping services are started / stopped on the
         # robot's orchestrator, their state read from it (packages/api/mapping_switch.py).
         self.mapping_switch = MappingSwitch()
+        # its per-robot SLAM save state and pre-SLAM intents survive an API restart
+        # (table robot_slam_saves; loaded in start_watchers)
+        self.mapping_switch.state_store = PgSlamStateStore(self.database)
         # Does the robot's orchestrator hold a stored map for a cloud map? (relocalization, D2)
         self.orchestrator_maps = OrchestratorMaps()
         # Reloc jobs the API runs on a robot (in memory: lost when the API restarts;
@@ -2047,6 +2051,9 @@ class ApiDelegationService:
             # Recording policy only (WP9): site levels and robot site assignments.
             event_loop.create_task(self._watch_site_changes()),
             event_loop.create_task(self._watch_site_assignments()),
+            # Maps: restart a mapping session's services after a robot run change.
+            event_loop.create_task(self._watch_run_changes()),
+            event_loop.create_task(self.mapping_switch.load_state()),
         ]
 
         self.diagnostics.set_event_loop(event_loop)
@@ -2232,6 +2239,32 @@ class ApiDelegationService:
                                       f"reconnecting in {reconnect_delay}s...")
                     await asyncio.sleep(reconnect_delay)
 
+    async def _watch_run_changes(self):
+        """mission-dispatch NOTIFYs map_sessions.RUN_CHANGED_CHANNEL (payload: the robot name)
+        when it sees a new robot run (a driver / orchestrator restart): the services of the
+        robot's non-paused mapping session died with it, so they are started again
+        (maps.restart_session_services, in the background, never blocking this loop).
+        Notifications missed while not listening are not replayed (a None from the watcher). Never
+        raises."""
+        from packages.utils.map_sessions import RUN_CHANGED_CHANNEL
+        reconnect_delay = 5  # seconds
+        while self._running:
+            try:
+                watcher = self.database.get_channel_watcher(RUN_CHANGED_CHANNEL)
+                async for payload in watcher.watch():
+                    if not self._running:
+                        break
+                    if payload:
+                        self.mapping_switch.spawn(maps.restart_after_run_change(
+                            self.database, self.mapping_switch, payload))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self._running:
+                    self.logger.error(f"Run change watcher error: {e}, "
+                                      f"reconnecting in {reconnect_delay}s...")
+                    await asyncio.sleep(reconnect_delay)
+
     def _feed_policy(self, method: str, obj: Any) -> None:
         """Hand a watched object to the Phase 0 recording policy. Never raises."""
         telemetry = self.telemetry
@@ -2306,6 +2339,8 @@ class ApiDelegationService:
                     "localization": localization,
                     "localization_warning": localization_view.warning(
                         session_view, robot.status, localization),
+                    # null, or {map, state: saving | failed, detail, at} (mapping_switch)
+                    "slam_save": self.mapping_switch.slam_save_view(robot.name),
                 }
 
                 # Broadcast to all WebSocket clients subscribed to this robot

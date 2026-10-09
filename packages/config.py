@@ -127,6 +127,12 @@ ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "66
 ORCHESTRATOR_SAVE_POLL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_S", "3.0"))
 ORCHESTRATOR_SAVE_POLL_TOTAL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_TOTAL_S", "660.0"))
 ORCHESTRATOR_SAVE_RETRY_S = float(os.getenv("ORCHESTRATOR_SAVE_RETRY_S", "30.0"))
+# After a robot run change (mission-dispatch NOTIFY) the API starts the services of the robot's
+# non-paused mapping session again (packages/api/maps.py restart_after_run_change); a robot that
+# is still coming up refuses, so a failed restart is tried again RUN_CHANGE_RESTART_RETRY_S later,
+# RUN_CHANGE_RESTART_TRIES times in all (only the last failure is reported).
+RUN_CHANGE_RESTART_TRIES = int(os.getenv("RUN_CHANGE_RESTART_TRIES", "3"))
+RUN_CHANGE_RESTART_RETRY_S = float(os.getenv("RUN_CHANGE_RESTART_RETRY_S", "10.0"))
 # How long a fetched mapping service state is reused for the robot views (seconds).
 MAPPING_STATE_TTL_S = float(os.getenv("MAPPING_STATE_TTL_S", "5.0"))
 # How long "does this robot's orchestrator hold a stored map for cloud map X" is reused

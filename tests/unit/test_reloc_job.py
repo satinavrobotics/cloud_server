@@ -37,6 +37,14 @@ from packages.utils import map_sessions as ms  # noqa: E402
 from tests.unit import test_maps_m1 as m1  # noqa: E402
 from tests.unit.test_placement_suggestion import SugDb, _status, _unplaced  # noqa: E402
 
+
+async def _status_detail(coro):
+    try:
+        await coro
+    except HTTPException as exc:
+        return exc.status_code, str(exc.detail)
+    raise AssertionError("no HTTPException")
+
 pytestmark = pytest.mark.unit
 
 RELOC = {"source": "reloc"}
@@ -520,11 +528,28 @@ class TestRefusals:
         out, job = await env.run(s["session_id"])
         assert out["reloc_job"]["state"] == "preparing" and job.state == rj.PLACED
 
-    async def test_mapping_session_open_still_refuses(self, env):
-        # user decision 2026-10-08: no reloc while the robot's open session is a mapping one
+    async def test_slam_mapping_session_open_still_refuses(self, env):
+        # decision D 2026-10-09: no reloc while the robot's mapping session records SLAM
         _robot(env.db)
-        s = _unplaced(env.db, purpose="mapping")
+        s = _unplaced(env.db, purpose="mapping", services=["topo", "slam"])
         await self._refused(env, s["session_id"])
+
+    async def test_topomap_only_mapping_session_may_relocalize(self, env):
+        # decision D 2026-10-09: a topomap-only mapping session does not block it
+        _robot(env.db)
+        s = _unplaced(env.db, purpose="mapping", services=["topo"])
+        env.on_sleep = _localized_after(1)
+        out, job = await env.run(s["session_id"])
+        assert out["reloc_job"]["state"] == "preparing" and job.state == rj.PLACED
+
+    async def test_a_failed_slam_save_refuses_with_its_reason(self, env):
+        _robot(env.db)
+        s = _unplaced(env.db)
+        await env.switch.mark_failed("r1", "barn", "s0", "driver refused")
+        code, detail = await _status_detail(env.place(s["session_id"]))
+        assert code == 409 and "still in SLAM mode after a failed save" in detail
+        assert "retry or discard" in detail
+        assert env.orch.calls == []
 
     async def test_another_job_running_for_the_robot(self, env):
         _robot(env.db)
@@ -710,7 +735,7 @@ class TestFailures:
         env.orch.intent = {"mode": "slam", "map": None}
         env.orch.init_pos = [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         job = await self._failed(env, ASSISTED)
-        assert "SLAM mapping session is active" in job.error
+        assert "recording a SLAM map" in job.error
         assert env.orch.puts() == [] and env.orch.intent["mode"] == "slam"
         assert env.orch.init_pos == [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0]   # restored
 
@@ -835,7 +860,8 @@ class TestFailures:
         s = _unplaced(env.db)
         await env.switch.lock("r1").acquire()
         out = await env.place(s["session_id"])
-        env.db.add_session("shed", "r2", "live", ended=False, purpose="mapping")
+        env.db.add_session("shed", "r2", "live", ended=False, purpose="mapping",
+                           services=["topo", "slam"])
         env.db.sessions[-1]["robot_name"] = "r1"
         env.switch.lock("r1").release()
         await env.jobs.wait_all()
@@ -880,7 +906,8 @@ class TestLifecycleFixes:
         s = _unplaced(env.db)
 
         def hook(e):
-            e.db.add_session("shed", "r2", "live", ended=False, purpose="mapping")
+            e.db.add_session("shed", "r2", "live", ended=False, purpose="mapping",
+                             services=["slam"])
             e.db.sessions[-1]["robot_name"] = "r1"
         env.on_sleep = hook
         _, job = await env.run(s["session_id"])
@@ -971,6 +998,33 @@ class TestLifecycleFixes:
         assert env.orch.puts() == [("relocalization", ONBOARD)]
         assert env.orch.intent["mode"] == "slam"
 
+    async def test_a_running_topomap_is_turned_off_for_the_switch_and_started_again(self, env):
+        """Decision D: relocalizing during a topomap-only mapping session on a mapping-API
+        robot: the orchestrator refuses a mode change while the topomap runs, so the job's PUT
+        turns it off and the switch starts it again right after."""
+        _robot(env.db)
+        s = _unplaced(env.db, purpose="mapping", services=["topo"])
+        env.orch.intent = {"mode": "odometry", "map": None, "topomap": True}
+        sent = []
+
+        async def put(self, mode, map_name=None, wait=False, topomap=None):
+            self.o.enter("put_localization", (mode, map_name))
+            sent.append((mode, map_name, topomap))
+            if self.o.intent.get("topomap") and topomap is None and (
+                    mode, map_name) != (self.o.intent["mode"], self.o.intent["map"]):
+                raise _http(409, "the topomap runs: send topomap false with a mode change")
+            on = self.o.intent.get("topomap") if topomap is None else topomap
+            self.o.intent = {"mode": mode, "map": map_name, "topomap": on}
+            return {"mode": mode, "map": map_name, "applied": True,
+                    "topomap": "started" if topomap else "stopped"}
+        env.switch = MappingSwitch(client_factory=lambda robot: RelocClient(env.orch))
+        env.on_sleep = _localized_after(1)
+        with patch.object(RelocClient, "put_localization", put):
+            _, job = await env.run(s["session_id"])
+        assert job.state == rj.PLACED and not job.warnings
+        assert sent == [("relocalization", ONBOARD, False), ("relocalization", ONBOARD, True)]
+        assert env.orch.intent["topomap"] is True
+
     async def test_starting_a_mapping_session_is_refused_while_a_job_runs(self, env):
         _robot(env.db)
         s = _unplaced(env.db)
@@ -978,14 +1032,28 @@ class TestLifecycleFixes:
         await env.place(s["session_id"])
         assert env.jobs.active_for("r1") is not None
         with pytest.raises(HTTPException) as err:
-            await maps.start_session(None, "shed", {"robot": "r1", "purpose": "mapping"},
+            await maps.start_session(None, "shed", {"robot": "r1", "purpose": "mapping",
+                                                    "services": ["topo", "slam"]},
                                      m1.PUB, switch=env.switch, reloc_jobs=env.jobs)
         assert err.value.status_code == 409 and "relocaliz" in err.value.detail
+        # a topomap-only mapping session is not refused for the job (here: the robot's open
+        # operate session is what refuses it)
+        with pytest.raises(HTTPException) as err:
+            await maps.start_session(None, "shed", {"robot": "r1", "purpose": "mapping",
+                                                    "services": ["topo"]},
+                                     m1.PUB, switch=env.switch, reloc_jobs=env.jobs)
+        assert err.value.status_code == 409 and "relocaliz" not in err.value.detail
         await env.jobs.cancel(env.jobs.active_for("r1"))
 
 
 class TestCanStartBlockers:
     """can_start / can_start_reason say what the server would refuse."""
+
+    async def test_topomap_only_mapping_session_is_offered(self, env):
+        _robot(env.db)
+        s = _unplaced(env.db, purpose="mapping", services=["topo"])
+        reloc = await self._read(env, s)
+        assert reloc["can_start"] is True and reloc["can_start_reason"] is None
 
     async def _read(self, env, s, jobs=True):
         return (await maps.placement_suggestions(
@@ -1007,11 +1075,11 @@ class TestCanStartBlockers:
         out = await maps.map_reloc(None, env.holder, "shed", "r1", env.switch, env.jobs)
         assert out["can_start"] is True and out["warning"] is None
 
-    async def test_open_mapping_session_is_not_offered(self, env):
+    async def test_open_slam_mapping_session_is_not_offered(self, env):
         _robot(env.db)
-        s = _unplaced(env.db, purpose="mapping")
+        s = _unplaced(env.db, purpose="mapping", services=["topo", "slam"])
         reloc = await self._read(env, s)
-        assert reloc["can_start"] is False and "mapping session" in reloc["can_start_reason"]
+        assert reloc["can_start"] is False and "SLAM map" in reloc["can_start_reason"]
         assert reloc["warning"] == reloc["can_start_reason"]
         assert await _status(env.place(s["session_id"])) == 409
         assert env.orch.calls == []

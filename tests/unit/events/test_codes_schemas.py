@@ -101,6 +101,15 @@ VALID_PAYLOADS = {
     EventCode.MAP_SLAM_SAVE_FAILED: {"map_name": "lab", "session_id": "s1", "status": "failed",
                                      "label": "SLAM map not saved: timeout",
                                      "detail": "the save did not finish in time"},
+    EventCode.MAP_SESSION_SERVICES_RESTARTED: {
+        "map_name": "lab", "session_id": "s1", "reason": "run_changed", "ok": True,
+        "robot_actions": [{"service": "topomap", "action": "start", "ok": True,
+                           "label": "Topomap service started", "detail": None}]},
+    EventCode.MAP_SESSION_SERVICES_RESTART_FAILED: {
+        "map_name": "lab", "session_id": "s1", "reason": "slam_save_failed", "ok": False,
+        "robot_actions": [{"service": "SLAM recording", "action": "start", "ok": False,
+                           "label": "SLAM recording not started: x", "detail": "x"}],
+        "slam_warning": "SLAM recording not started: x"},
     EventCode.MAP_RECONSTRUCTION_STARTED: {"map_name": "lab", "job_id": "j1",
                                            "params": {"voxel_m": 0.05}, "nodes_with_depth": 412,
                                            "attempt": 1},

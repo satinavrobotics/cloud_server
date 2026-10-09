@@ -581,7 +581,8 @@ class TestServiceSwitching:
         assert acts(out) == [("topomap", "start", True)]
         assert out["mapping_state"]["status"] == "on"
         out = await self.act(db, switch, sid, "finish")
-        assert orch.services["topomap"] is False and out["map_state"] == "ready"
+        # no nodes and no SLAM map: the map goes back to draft (item 6)
+        assert orch.services["topomap"] is False and out["map_state"] == "draft"
         assert acts(out) == [("topomap", "stop", True)]
         assert ops(orch, "start", "stop") == [
             ("start", "topomap"), ("stop", "topomap"), ("start", "topomap"),
@@ -593,7 +594,7 @@ class TestServiceSwitching:
         orch.reachable = False
         out = await self.act(db, switch, sid, "finish")
         assert out["changed"] is True and out["session"]["state"] == "finished"
-        assert out["map_state"] == "ready" and db.open_session("r1") == []
+        assert out["map_state"] == "draft" and db.open_session("r1") == []
         [a] = out["robot_actions"]
         assert a["ok"] is False and a["action"] == "stop" and "not reachable" in a["detail"]
         assert out["robot_notified"] is False and out["mapping_warning"] == a["label"]
@@ -650,7 +651,7 @@ class TestServiceSwitching:
     async def test_replace_with_operate_stops_the_replaced_mapping_service(self, db):
         orch, switch = prepare(db)
         await start(db, switch)
-        db.maps["yard"]["status"] = {"state": "ready"}
+        db.sessions[0]["node_count"] = 5      # the replaced session mapped something
         out = await start(db, switch, replace=True, purpose="operate")
         assert acts(out) == [("topomap", "stop", True)] and orch.services["topomap"] is False
 
@@ -823,7 +824,7 @@ class TestSlam:
         sid = out["session"]["session_id"]
         fin = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
         await switch.wait_slam_saves()
-        assert fin["map_state"] == "ready" and "slam_warning" not in fin
+        assert fin["map_state"] == "draft" and "slam_warning" not in fin   # nothing saved
         assert ("slam_restore", None) not in slam_ops(orch)   # nothing saved, nothing restored
 
     @pytest.mark.parametrize("error", [
@@ -892,8 +893,10 @@ class TestSlam:
         sid = (await start(db, switch))["session"]["session_id"]
         orch.slam_save_gate = asyncio.Event()
         out = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
-        # the request is answered while the save is still running
-        assert out["map_state"] == "ready" and "slam_warning" not in out
+        # the request is answered while the save is still running; no nodes, no saved SLAM
+        # map yet: draft (the saved map makes it ready, below)
+        assert out["map_state"] == "draft" and "slam_warning" not in out
+        assert switch.slam_save_view("r1")["state"] == "saving"
         await asyncio.sleep(0)
         assert switch.slam_save_pending("r1")
         orch.slam_save_gate.set()
@@ -906,17 +909,40 @@ class TestSlam:
             {"mode": "odometry", "map": None}]
         assert not switch.slam_save_pending("r1")
         switch.on_slam_done.assert_called_with("r1")
+        assert switch.slam_save_view("r1") is None
+        assert db.maps["yard"]["status"]["state"] == "ready"
+        assert db.maps["yard"]["status"]["slam_saved_at"]
 
-    async def test_a_start_is_refused_while_the_save_is_pending(self, db):
+    async def test_a_start_while_the_save_is_pending_starts_after_it(self, db):
+        """Item 1: finish a SLAM session, start a new one within the save window: nothing is
+        sent to the robot meanwhile (the switch back would kill it), and when the save ended the
+        new session's SLAM recording and topomap start; the new session is never killed."""
         orch, switch = slam_prepare(db)
         sid = (await start(db, switch))["session"]["session_id"]
         orch.slam_save_gate = asyncio.Event()
         await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
         await asyncio.sleep(0)
-        out = await start(db, switch)
-        assert "still saving" in out["slam_warning"] and db.open_session("r1")
+        orch.calls.clear()
+        orch.slam_log.clear()
+        db.add_map("lot", type="local", slam_map=True, status={"state": "draft"})
+        out = await maps.start_session(None, "lot", {"robot": "r1"}, m1.PUB, switch=switch)
+        assert "slam_warning" not in out and db.open_session("r1")
+        assert [(a["service"], a["action"], a["ok"]) for a in out["robot_actions"]] == [
+            ("SLAM recording", "start", True), ("topomap", "start", True)]
+        assert all("previous SLAM map" in a["label"] for a in out["robot_actions"])
+        assert ops(orch, "start", "slam_start") == []          # deferred
+        new_sid = out["session"]["session_id"]
         orch.slam_save_gate.set()
         await switch.wait_slam_saves()
+        # saved, back to odometry (topomap off), then the new session's SLAM + topomap started
+        order = [c for c in slam_ops(orch) if c[0] in ("slam_save", "slam_restore",
+                                                         "slam_start")]
+        assert order == [("slam_restore", None), ("slam_start", "cloud-lot")]
+        assert orch.services["topomap"] is True and orch.slam["active"] is True
+        restarted = [e for e in db.events if e["code"] == "MAP.SESSION_SERVICES_RESTARTED"]
+        assert len(restarted) == 1
+        assert restarted[0]["payload"]["session_id"] == new_sid
+        assert restarted[0]["payload"]["reason"] == "slam_save_done"
 
     async def test_save_failure_leaves_the_robot_in_slam_and_warns(self, db):
         orch, switch = slam_prepare(db)

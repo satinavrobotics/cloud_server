@@ -59,6 +59,8 @@ class EventCode(str, enum.Enum):
     MAP_SLAM_CHANGED = "MAP.SLAM_CHANGED"
     MAP_SLAM_SAVE_DONE = "MAP.SLAM_SAVE_DONE"
     MAP_SLAM_SAVE_FAILED = "MAP.SLAM_SAVE_FAILED"
+    MAP_SESSION_SERVICES_RESTARTED = "MAP.SESSION_SERVICES_RESTARTED"
+    MAP_SESSION_SERVICES_RESTART_FAILED = "MAP.SESSION_SERVICES_RESTART_FAILED"
     MAP_RECONSTRUCTION_STARTED = "MAP.RECONSTRUCTION_STARTED"
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
@@ -172,6 +174,14 @@ CODES: Dict[EventCode, CodeMeta] = {
     # `session:<id>:slam_save:<ts>`. FAILED: the map may still complete on the robot (see detail).
     _C.MAP_SLAM_SAVE_DONE: CodeMeta(_S.INFO, True, schemas.MapSlamSave, _A),
     _C.MAP_SLAM_SAVE_FAILED: CodeMeta(_S.WARNING, True, schemas.MapSlamSave, _A),
+    # The API started the services of a robot's open, unpaused mapping session again (after a
+    # run change, the end of a SLAM save, a discarded save: packages/api/maps.py
+    # restart_session_services). Robot set; discriminator `session:<id>:restart:<reason>:<ts>`.
+    # RESTART_FAILED: at least one robot action failed.
+    _C.MAP_SESSION_SERVICES_RESTARTED: CodeMeta(_S.INFO, True, schemas.MapSessionServicesRestarted,
+                                                _A),
+    _C.MAP_SESSION_SERVICES_RESTART_FAILED: CodeMeta(_S.WARNING, True,
+                                                     schemas.MapSessionServicesRestarted, _A),
     # 3D reconstruction (docs/reconstruction/design.md §9.3). No robot; discriminator
     # `map:<name>:reconstruction:<job_id>:<state>`. STARTED on the job's first progress
     # callback; FAILED also for a cancel (reason cancelled / map_deleting).

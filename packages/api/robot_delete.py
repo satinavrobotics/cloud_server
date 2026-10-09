@@ -1,13 +1,19 @@
 """Robot delete: the multi-table cleanup behind DELETE /api/v1/robots/{name}.
 
-`RobotDeleter.delete()` does, in this order:
+`RobotDeleter.delete()` does, in this order, all under the mapping switch's per-robot lock (so a
+concurrent session start / finish / restart of the robot cannot interleave with it):
 
 1. ONE transaction: lock the robot row (404 when it is gone), refuse with 409
    ROBOT_HAS_ACTIVE_MISSION when it is ON_TASK or has a PENDING/RUNNING mission (nothing is
    written before that check), then close the robot's open map session
-   (maps._finish_in: MAP.SESSION_FINISHED, map back to `ready`), delete its
+   (maps._finish_in: MAP.SESSION_FINISHED, the map back to `ready`, or `draft` without data;
+   the ArangoDB node count is read before the transaction), delete its
    robot_site_assignments, robot_run_epochs and robot_latest rows and, with
    `delete_telemetry`, its history rows.
+1b. Best effort, outside the transaction: stop the closed mapping session's services on the
+   robot and save its SLAM map in the background, as a finish does (MAP.SLAM_SAVE_DONE /
+   _FAILED; no SLAM save state is kept for the deleted robot, and its previous state is
+   forgotten).
 2. `delete_rosbags` (before the robot goes, so a MinIO failure leaves the robot in place and the
    call can be repeated).
 3. The robot row itself (PostgresDatabase.set_lifecycle DELETED = hard delete + NOTIFY). The
@@ -24,6 +30,7 @@ History tables are kept unless `delete_telemetry` is true; closed map sessions a
 always stay (they are map/audit history, not robot state).
 """
 
+import contextlib
 import logging
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
@@ -69,9 +76,11 @@ async def _delete_rows(cursor: Any, tables: Tuple[str, ...], robot_name: str) ->
 
 class RobotDeleter:
     def __init__(self, db: Any, switch: Optional[Any] = None,
-                 livekit_remover: Optional[Callable[[str], Awaitable[Any]]] = None):
+                 livekit_remover: Optional[Callable[[str], Awaitable[Any]]] = None,
+                 arango_node_count: Optional[Callable[[str], int]] = None):
         self.db = db
         self.switch = switch
+        self.arango_node_count = arango_node_count
         self.livekit_remover = livekit_remover or LiveKitAdmin().remove_robot_participants
 
     async def _purge(self, robot_name: str, telemetry: bool) -> None:
@@ -85,6 +94,8 @@ class RobotDeleter:
                                actor: Optional[str]) -> Tuple[RobotObjectV1, list]:
         """Step 1. (the robot, the sessions it closed)."""
         closed = []
+        counts = await maps._node_counts(self.arango_node_count,
+                                         [await maps._open_session_map(self.db, robot_name)])
         async with maps.open_store(self.db, uuid.uuid4()) as store:
             robot = await store.lock_robot(robot_name)
             if robot is None:
@@ -99,7 +110,8 @@ class RobotDeleter:
                 locked_map = await store.lock_map(session["map_name"])
                 current = await store.lock_session(session["session_id"])
                 if current is not None and current["ended_at"] is None:
-                    await maps._finish_in(store, locked_map, current, now, actor)
+                    await maps._finish_in(store, locked_map, current, now, actor,
+                                          counts.get(session["map_name"]))
                     closed.append(current)
             await _delete_rows(store.cursor, STATE_TABLES, robot_name)
             if telemetry:
@@ -110,10 +122,27 @@ class RobotDeleter:
                      delete_rosbags: bool = False, actor: Optional[str] = None,
                      rosbag_deleter: Optional[Callable[[str], Awaitable[Dict[str, Any]]]] = None
                      ) -> Dict[str, Any]:
+        lock = (self.switch.lock(robot_name) if self.switch is not None
+                else contextlib.nullcontext())
+        async with lock:
+            return await self._delete(robot_name, delete_telemetry, delete_rosbags, actor,
+                                      rosbag_deleter)
+
+    async def _delete(self, robot_name: str, delete_telemetry: bool, delete_rosbags: bool,
+                      actor: Optional[str],
+                      rosbag_deleter: Optional[Callable[[str], Awaitable[Dict[str, Any]]]]
+                      ) -> Dict[str, Any]:
         robot, closed = await self._close_and_clear(robot_name, delete_telemetry, actor)
         actions: list = []
-        for session in closed:  # best effort, never blocks the delete: stops the robot's services
+        for session in closed:  # best effort, never blocks the delete
             actions += await maps.stop_services(self.db, self.switch, robot, session)
+            # the topomap stopped (no mode change while it runs): save the SLAM map as a finish
+            _, slam_action = await maps._save_slam(self.db, self.switch, session, robot,
+                                                   wait=False, track=False)
+            if slam_action:
+                actions.append(slam_action)
+        if self.switch is not None:
+            await self.switch.forget(robot_name)
         if delete_rosbags:
             result = await rosbag_deleter(robot_name) if rosbag_deleter else {"success": False}
             if not result.get("success"):

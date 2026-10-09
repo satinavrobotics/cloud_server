@@ -797,6 +797,7 @@ class TestSessions:
         assert (await maps.session_action(None, "yard", sid, "resume", PUB))["changed"] is False
 
         await maps.session_action(None, "yard", sid, "pause", PUB)
+        fdb.sessions[0]["node_count"] = 3     # graph-builder stored nodes: the map has data
         out = await maps.session_action(None, "yard", sid, "finish", PUB)
         assert out["map_state"] == "ready" and out["session"]["state"] == "finished"
         assert out["session"]["paused_at"] is None
@@ -822,7 +823,7 @@ class TestSessions:
 class TestArchive:
     async def test_archive_restore(self, fdb):
         fdb.add_map("yard", type="local")
-        fdb.add_session("yard")
+        fdb.add_session("yard", node_count=4)
         out = await maps.archive_map(None, "yard", PUB)
         assert out == {"map_id": "yard", "state": "archived", "changed": True}
         assert (await maps.archive_map(None, "yard", PUB))["changed"] is False

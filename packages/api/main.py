@@ -652,7 +652,9 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     robot_pose: {x, y, theta}} puts the robot on a LOCAL map (422 on a geo map, which is placed
     by the robot's datum); `replace: true` finishes the robot's open session in the same
     transaction. Errors: packages/api/maps.py (module docstring). 409 also while a
-    relocalization job runs for the robot (mapping sessions only). A mapping session's services
+    relocalization job runs for the robot (mapping sessions that record a SLAM map). While the
+    robot's previous SLAM map is still being saved, the services start when the save ended
+    (the actions say so). A mapping session's services
     are started on the robot's orchestrator OUTSIDE any transaction, AFTER the commit
     (a failed start never fails or undoes the session: it is reported in `robot_actions`, maps
     §14.16). The response: {map_id, map_state, changed, session, replaced_session,
@@ -776,10 +778,11 @@ async def get_reloc_job(map_id: str, session_id: str):
 
 @app.delete("/api/v1/maps/{map_id}/sessions/{session_id}/reloc-job")
 async def cancel_reloc_job(map_id: str, session_id: str):
-    """Cancel the session's running relocalization job: the previous `init_pos` and current map
-    are restored on the robot (the legacy relocalization service is NOT stopped; an endpoint-mode
-    relocalization session the job started IS stopped, unless a SLAM session replaced it). Returns the job.
-    404 no job; 409 it has finished."""
+    """Cancel the session's running relocalization job: what the job changed on the robot is
+    restored, best effort: the stored map's previous `init_pos` and the localization intent the
+    robot had before (PUT /localization; odometry when it had none), unless someone changed the
+    intent meanwhile (packages/api/reloc_job.py). Returns the job. 404 no job; 409 it has
+    finished."""
     _require_service()
     return (await service.reloc_jobs.cancel(_reloc_job_of(map_id, session_id))).view()
 
@@ -819,8 +822,10 @@ async def unplace_map_session(map_id: str, session_id: str):
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
 async def map_session_action(map_id: str, session_id: str, action: str):
     """`pause`, `resume` or `finish` a session. Finishing the map's only open mapping session
-    makes the map `ready`; finishing an operate session is "Stop using" (the map state does
-    not change). pause/resume: mapping sessions only (409 on operate). Repeating an action
+    makes the map `ready` when it holds data (nodes or a saved SLAM map) and `draft` otherwise;
+    finishing an operate session is "Stop using" (the map state does not change). pause/resume:
+    mapping sessions only (409 on operate); resume of a session that records a SLAM map: 409
+    while a relocalization job runs for the robot. Repeating an action
     that is already in effect changes nothing in the session (a repeated pause/finish retries the
     stop, a repeated resume the start). After the commit resume starts the session's mapping
     services on the robot's orchestrator, pause/finish stop them; a failure never fails or undoes
@@ -829,7 +834,8 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
-        recording.request_actor(), switch=service.mapping_switch))
+        recording.request_actor(), switch=service.mapping_switch,
+        arango_node_count=_arango_node_count, reloc_jobs=service.reloc_jobs))
 
 
 @app.post("/api/v1/maps/{map_id}/archive")
@@ -860,10 +866,12 @@ async def convert_map_type(map_id: str, body: Dict[str, Any]):
 
 @app.post("/api/v1/maps/{map_id}/restore")
 async def restore_map(map_id: str):
-    """Restore an archived map (to `ready`, or `draft` if it never had a session)."""
+    """Restore an archived map: to `ready` when it holds data (nodes or a saved SLAM map), else
+    `draft`."""
     _require_service()
     return await _site_call("restore map", maps.restore_map(
-        service.database, map_id, uuid.uuid4(), recording.request_actor()))
+        service.database, map_id, uuid.uuid4(), recording.request_actor(),
+        arango_node_count=_arango_node_count))
 
 
 class UpdateDatumRequest(BaseModel):
@@ -1618,7 +1626,9 @@ async def _robot_views(robots: List[RobotObjectV1],
     unplaced_reason} or null (mapless). It is the robot's map (robot.current_map was removed in
     maps U6; packages/utils/map_sessions.py::robot_session_view);
     plus `localization`: intent / device / usable and whether they agree
-    (packages/api/localization_view.py), and `localization_warning` for a placed reloc session."""
+    (packages/api/localization_view.py), and `localization_warning` for a placed reloc session;
+    plus `slam_save`: null, or {map, state: "saving" | "failed", detail, at} (the robot's SLAM
+    save state, packages/api/mapping_switch.py; failed: POST .../slam-save/retry | discard)."""
     snaps = await service.mapping_switch.snapshots(robots) if service else {}
     out = []
     for robot in robots:
@@ -1632,6 +1642,8 @@ async def _robot_views(robots: List[RobotObjectV1],
             robot.status, snap.localization if snap else None, snap.at if snap else None,
             snap.error if snap and snap.reachable is False else None)
         data["localization_warning"] = lv.warning(session, robot.status, data["localization"])
+        slam_save = getattr(getattr(service, "mapping_switch", None), "slam_save_view", None)
+        data["slam_save"] = slam_save(robot.name) if callable(slam_save) else None
         # The mission the robot is on and the ones waiting for it (derived from mission rows).
         index = getattr(service, "mission_index", None)
         data.update(index.view(robot.name) if index is not None
@@ -1977,7 +1989,8 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
     and rosbags are kept unless `delete_telemetry` / `delete_rosbags` are true.
 
     200 `{success, message, deleted: {telemetry, rosbags, sessions_closed}, robot_actions}`
-    (the mapping services stopped on the robot, best effort); 404 unknown robot;
+    (the mapping services stopped on the robot and the SLAM map of a closed mapping session
+    saved in the background, best effort; under the robot's lock); 404 unknown robot;
     409 `ROBOT_HAS_ACTIVE_MISSION` (ON_TASK or a pending/running mission; nothing is changed);
     500 any other failure. The robot can be registered again afterwards like a new one.
     """
@@ -1985,7 +1998,8 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        return await RobotDeleter(service.database, service.mapping_switch).delete(
+        return await RobotDeleter(service.database, service.mapping_switch,
+                                  arango_node_count=_arango_node_count).delete(
             robot_name, delete_telemetry=delete_telemetry, delete_rosbags=delete_rosbags,
             actor=recording.request_actor(), rosbag_deleter=_delete_rosbags_of)
     except HTTPException:
@@ -1993,6 +2007,32 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
     except Exception as e:
         logging.exception("Failed to delete robot %s", robot_name)
         raise HTTPException(status_code=500, detail=f"Failed to delete robot: {str(e)}")
+
+
+@app.post("/api/v1/robots/{robot_name}/slam-save/retry")
+async def retry_slam_save(robot_name: str):
+    """Save the robot's SLAM map again after a failed save (the robot view's `slam_save.state`
+    "failed"; the robot is still in SLAM mode with the unsaved map). The save runs in the
+    background like a finish's (`slam_save.state` "saving", then MAP.SLAM_SAVE_DONE / _FAILED).
+    200 `{robot_actions: [{service: "SLAM recording", action: "save", ok, label, detail}]}`;
+    404 unknown robot; 409 `{detail}` when there is nothing to retry (no failed save, or a save
+    runs). An offline robot is an action with ok false."""
+    _require_service()
+    return await _site_call("retry SLAM save", maps.slam_save_retry(
+        service.database, service.mapping_switch, robot_name))
+
+
+@app.post("/api/v1/robots/{robot_name}/slam-save/discard")
+async def discard_slam_save(robot_name: str):
+    """Leave SLAM mode WITHOUT saving after a failed save: the robot's localization intent from
+    before the recording (odometry when unknown) is put back with the topomap off, `slam_save`
+    becomes null, and the services of the robot's open, unpaused mapping session are started
+    again. 200 `{robot_actions: [{service: "SLAM recording", action: "stop", ...}, ...the
+    restart's]}`; 404 unknown robot; 409 `{detail}` when there is nothing to discard (no failed
+    save, or a save runs). A failed switch is an action with ok false (the state stays)."""
+    _require_service()
+    return await _site_call("discard SLAM save", maps.slam_save_discard(
+        service.database, service.mapping_switch, robot_name))
 
 
 async def _delete_rosbags_of(robot_name: str) -> Dict[str, Any]:

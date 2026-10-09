@@ -415,7 +415,7 @@ class TestRelocFacade:
         s = _unplaced(renv.db)
         renv.orch.intent = {"mode": "slam", "map": None}
         _, job = await renv.run(s["session_id"])
-        assert job.state == rj.FAILED and "finish it first" in job.error
+        assert job.state == rj.FAILED and "finish its mapping session first" in job.error
         assert not renv.orch.calls("PUT", "/localization")
 
     async def test_stored_but_not_applied_fails_and_is_put_back(self, renv):

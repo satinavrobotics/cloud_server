@@ -47,15 +47,23 @@ Start rules:
   robot's own pose}) or, with `replace` on the same map, carried over from the robot's placed
   session; else it starts NOT placed. A mapping session on a local map that has nodes must be
   placed before capture turns on (decision Q-U4);
-- placing (start with `placement`, or place_session) is refused (409) while the robot drives
-  (an active order, or a velocity in its last state) and when its pose differs from the pose
-  the user saw by more than sensor noise (0.02 m / 0.5 deg, decision Q-U7).
+- placing (start with `placement`, or place_session) is never refused because the robot drives
+  (an active order, or a velocity in its last state) or because its pose differs from the pose
+  the user saw by more than sensor noise (0.02 m / 0.5 deg): those only add `warnings`
+  (decision 2026-10-08, placement_warnings()).
 
 A session that is not placed keeps nothing (graph-builder rejects its nodes with
 `session_unplaced`; its service still runs), gets no route orders on that map and no planned paths.
+graph-builder also keeps nothing from an OPERATE session (`operate_session`) or a PAUSED one
+(`session_paused`): only an open, unpaused, placed mapping session adds data.
 
 Map lifecycle: draft -> mapping <-> paused -> ready (finish) -> archived -> ready|draft
-(restore). Only MAPPING sessions move it; operate sessions leave the map state alone.
+(restore). Only MAPPING sessions move it; operate sessions leave the map state alone. A finish
+(also through `replace` or a robot delete) and a restore make the map `ready` only when it holds
+data: nodes (ArangoDB's count, read BEFORE the transaction; the stored counts when it cannot be
+read) or a saved SLAM map (`status.slam_saved_at`, set when a SLAM save of the map succeeded,
+which also turns a `draft` map `ready`); otherwise it is (back to) `draft`, where operate
+sessions are refused.
 Archive and delete are refused while ANY session is open (the message names the robots,
 decision Q-U2). Repeating pause/resume/finish/archive/restore on a map or session already in
 that state is a no-op (`changed: false`, no event). pause/resume are for mapping sessions only.
@@ -72,6 +80,14 @@ services are started / stopped. The switching NEVER blocks or undoes the user's 
 unreachable, no such service) is only reported. Every robot-side action is listed in the
 response's `robot_actions` ([{service, action, ok, label, detail}], also the SLAM ones below);
 `robot_notified` is false and `mapping_warning` carries the joined failure texts when one failed.
+While the robot's previous SLAM map is still being saved (a finish's background save, minutes)
+a start / resume does not touch the robot: its actions say the services start after the save,
+and when the save ended (saved, failed or nothing to save) restart_session_services() starts
+them (SLAM first, then the topomap; a failed save refuses the new SLAM recording until it is
+retried or discarded). The same restart runs after mission-dispatch reports a run change of
+the robot (NOTIFY ms.RUN_CHANGED_CHANNEL: a driver / orchestrator restart killed the services)
+and after a discarded save; each restart is MAP.SESSION_SERVICES_RESTARTED (or _RESTART_FAILED)
+with its `robot_actions`, for a non-paused MAPPING session only.
 
 SLAM maps (`slam` in a mapping session's `services`; `slam_map` on a local map is set at
 creation, changed with PATCH while no mapping session is open and no save is pending, cleared by
@@ -81,8 +97,11 @@ including [], is taken exactly. A MAPPING session with `slam` also records a SLA
 onboard_map_name(map). Right after the session opened (outside any transaction, under the
 robot's lock) the server calls start_slam; finishing the session saves it in a BACKGROUND task
 (minutes: background save, polled; packages/api/mapping_switch.py; its outcome is the event
-MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED). Replace saves the replaced session's SLAM map first
-(awaited), then starts the new one. A SLAM failure never fails or undoes a session: the
+MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED). Replace saves the replaced session's SLAM map first,
+awaited only when the NEW session is a mapping session that records SLAM (one driver per
+robot), else in the background. A failed save leaves the robot in slam: the robot view's
+`slam_save` shows it and POST /api/v1/robots/{r}/slam-save/retry | discard (slam_save_retry,
+slam_save_discard) end it. A SLAM failure never fails or undoes a session: the
 response carries `slam_warning` and the matching `robot_actions`. Resume starts the recording again
 when `slam` is in the services; pause and operate sessions never touch SLAM; finish saves a session's
 SLAM map when `slam` is in its services or (older sessions) the map is slam_map and the robot is
@@ -118,9 +137,10 @@ from cloud_common.objects.map import (
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
 from packages.api.mapping_switch import (
-    SLAM_FAILED, SLAM_SAVED, Snapshot, SlamResult, robot_action, service_action,
-    slam_save_action, slam_start_action, START, STOP)
+    SLAM_FAILED, SLAM_SAVED, SLAM_SERVICE, Snapshot, SlamResult, action_name, robot_action,
+    service_action, slam_save_action, slam_start_action, START, STOP)
 from packages.api.orchestrator_client import onboard_map_name  # noqa: F401 - re-exported
+from packages.config import RUN_CHANGE_RESTART_RETRY_S, RUN_CHANGE_RESTART_TRIES
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.utils import map_geo
@@ -401,7 +421,8 @@ def session_dict(row: Mapping[str, Any]) -> Dict[str, Any]:
         "robot_name": row["robot_name"],
         "kind": row.get("kind", "live"),
         "purpose": purpose,
-        "services": _session_services(row) if purpose == ms.MAPPING else None,
+        "services": _services_of(row, orchestrator_only=False) if purpose == ms.MAPPING
+        else None,
         "state": ms.session_state(row),
         "started_at": _iso(row.get("started_at")),
         "paused_at": _iso(row.get("paused_at")),
@@ -747,7 +768,7 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
     Postgres row: adopt it with POST /map/load, or delete it first)."""
     req = parse_body(CreateMapRequest, data)
     if arango_node_count is not None:
-        nodes = arango_node_count(req.name)
+        nodes = await asyncio.to_thread(arango_node_count, req.name)
         if nodes:
             raise HTTPException(409, f"ArangoDB already has {nodes} nodes for map "
                                      f"'{req.name}' (no Postgres row); choose another name")
@@ -1059,44 +1080,68 @@ def _placement_refusals(map_name: str, session_id: str, session: Optional[Mappin
 
 async def _start_blockers(db: Any, robot: RobotObjectV1, switch: Optional[Any],
                           reloc_jobs: Optional[Any]) -> Optional[str]:
-    """Why a reloc job cannot start for this robot right now (the real races RelocJobs.start
-    refuses with 409): another job runs, or a SLAM save is pending. A driving robot or an open
-    mapping session no longer block (decision 2026-10-08: relocalization is always offered).
-    None when nothing is in the way. Never raises."""
+    """Why a reloc job cannot start for this robot right now besides mapping_blocker (the real
+    races RelocJobs.start refuses with 409): another job runs, a SLAM save is pending, or a
+    failed SLAM save left the robot in slam. A driving robot does not block (decision
+    2026-10-08). None when nothing is in the way. Never raises."""
     try:
         if reloc_jobs is not None and reloc_jobs.active_for(robot.name) is not None:
             return f"relocalization is already running for robot '{robot.name}'"
         if switch is not None and switch.slam_save_pending(robot.name):
             return f"robot '{robot.name}' is still saving a SLAM map"
+        if switch is not None and switch.slam_save_failed(robot.name) is not None:
+            return SLAM_FAILED_REASON.format(robot=robot.name)
     except Exception:  # noqa: BLE001
         logger.exception("Reloc blockers of robot %s not readable", robot.name)
     return None
 
 
+SLAM_FAILED_REASON = ("the robot '{robot}' is still in SLAM mode after a failed save: retry or "
+                      "discard it")
+
+
+def slam_mapping_session(sessions: Sequence[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+    """The open MAPPING session among `sessions` that records a SLAM map (`slam` in its
+    services), or None: relocalization is refused while one is open (its recording is the
+    robot's localization mode). A topomap-only mapping session does not block it."""
+    for s in sessions:
+        if (s.get("ended_at") is None and ms.purpose_of(s) == ms.MAPPING
+                and ms.SLAM in _services_of(s, orchestrator_only=False)):
+            return s
+    return None
+
+
+def slam_session_reason(robot_name: str, session: Mapping[str, Any]) -> str:
+    return (f"robot '{robot_name}' has an open mapping session that records a SLAM map "
+            f"({session['map_name']}): relocalization would discard that recording; finish "
+            "the session first")
+
+
 async def mapping_blocker(db: Any, robot: RobotObjectV1) -> Optional[str]:
-    """Reloc is not offered while the robot's open session is a MAPPING session (user decision
-    2026-10-08: its SLAM driver is in the way). The reason, else None (also when unreadable)."""
+    """Reloc is not offered while the robot's open session is a MAPPING session that records a
+    SLAM map (its recording IS the robot's localization mode; decision D, 2026-10-09: a
+    topomap-only mapping session no longer blocks it). The reason, else None (also when
+    unreadable)."""
     try:
         async with open_store(db, uuid.uuid4()) as store:
             open_sessions = await store.open_sessions_of_robot(robot.name)
     except Exception:  # noqa: BLE001
         logger.exception("Open sessions of robot %s not readable", robot.name)
         return None
-    mapping = [s for s in open_sessions if ms.purpose_of(s) == ms.MAPPING]
-    if mapping:
-        return (f"robot '{robot.name}' has an open mapping session "
-                f"({mapping[0]['map_name']}): relocalization is not used while mapping")
-    return None
+    found = slam_mapping_session(open_sessions)
+    return slam_session_reason(robot.name, found) if found is not None else None
 
 
 async def _can_start(holder: Optional[Any], robot: Optional[RobotObjectV1], map_name: str,
                      held: Optional[bool], fresh: bool = False, db: Any = None,
                      switch: Optional[Any] = None, reloc_jobs: Optional[Any] = None,
                      blockers: bool = False) -> Tuple[bool, Optional[str]]:
-    """(can_start, warning) for the reloc reads and place_session. can_start is true whenever the
-    robot exists (relocalization is always offered); the second element is a NON-blocking
-    warning (the holder's reloc_capability: offline, no orchestrator, stored maps unreadable; with `blockers` also a running job / pending SLAM save, which
-    place_session still refuses with 409). Never raises."""
+    """(can_start, why) for the reloc reads and place_session. can_start is the holder's
+    reloc_capability (true for a known robot whose orchestrator can be asked); with `blockers`
+    it is also false while mapping_blocker() refuses (an open mapping session that records a
+    SLAM map), and `why` then says so. Otherwise `why` is a NON-blocking warning (offline, no
+    orchestrator, stored maps unreadable; with `blockers` also a running job, a pending or a
+    failed SLAM save, which place_session refuses with 409). Never raises."""
     ask = getattr(holder, "reloc_capability", None)
     if ask is None or robot is None:
         return False, ("the robot is unknown" if robot is None
@@ -1126,11 +1171,12 @@ async def reloc_status(db: Any, holder: Optional[Any], map_name: str, session_id
     open session on a local map, else None. `available`: the robot's orchestrator holds a
     stored map for this cloud map, so no manual initial position is needed (place it with
     `source: "reloc"`); `known` false: the orchestrator could not be asked (then `available` is
-    false: manual placement). `can_start` (additive): true whenever the robot exists (source
-    "reloc" then answers 202 with a job; see reloc_job.py); `warning` (= `can_start_reason`,
-    kept for compatibility): a non-blocking text on what may make the job fail (robot offline,
-    no orchestrator, stored maps unreadable, another job running, a SLAM save pending), else
-    null. A GET: no row locks and the cached held read (place_session asks afresh).
+    false: manual placement). `can_start` (additive): _can_start() (source "reloc" then answers
+    202 with a job; see reloc_job.py): false while the robot's open mapping session records a
+    SLAM map (`can_start_reason` says so); `warning` (= `can_start_reason`, kept for
+    compatibility): otherwise a non-blocking text on what may make the job fail (robot offline,
+    no orchestrator, stored maps unreadable, another job running, a SLAM save pending or
+    failed), else null. A GET: no row locks and the cached held read (place_session asks afresh).
     Never raises."""
     try:
         row, session, robot = await _reloc_inputs(db, map_name, session_id)
@@ -1310,8 +1356,11 @@ async def _placement_suggestions(db: Any, map_name: str, session_id: str) -> Dic
 
 
 async def _archive_or_restore(db: Any, name: str, archive: bool, publisher_id: uuid.UUID,
-                              actor: Optional[str]) -> Dict[str, Any]:
+                              actor: Optional[str],
+                              arango_node_count: Optional[Callable[[str], int]] = None
+                              ) -> Dict[str, Any]:
     now = _utcnow()
+    counts = {} if archive else await _node_counts(arango_node_count, [name])
     async with open_store(db, publisher_id) as store:
         row = await _lock_alive_map(store, name)
         state = row.state
@@ -1330,7 +1379,9 @@ async def _archive_or_restore(db: Any, name: str, archive: bool, publisher_id: u
         else:
             if state != ARCHIVED:
                 return {"map_id": name, "state": state, "changed": False}
-            new_state = READY if await store.sessions(name) else DRAFT
+            # the same rule as a finish: `ready` only with data (nodes or a saved SLAM map)
+            new_state = (READY if _has_data(row, await store.sessions(name), counts.get(name))
+                         else DRAFT)
             code = EventCode.MAP_RESTORED
         await store.update_map(row, status={"state": new_state})
         await store.emit(_map_event(code, name, row.type, new_state, actor, now))
@@ -1343,8 +1394,12 @@ async def archive_map(db: Any, name: str, publisher_id: uuid.UUID,
 
 
 async def restore_map(db: Any, name: str, publisher_id: uuid.UUID,
-                      actor: Optional[str] = None) -> Dict[str, Any]:
-    return await _archive_or_restore(db, name, False, publisher_id, actor)
+                      actor: Optional[str] = None,
+                      arango_node_count: Optional[Callable[[str], int]] = None
+                      ) -> Dict[str, Any]:
+    """Archived -> `ready` when the map holds data (_has_data: nodes or a saved SLAM map), else
+    `draft`."""
+    return await _archive_or_restore(db, name, False, publisher_id, actor, arango_node_count)
 
 
 # --- type conversion (geo <-> local) -----------------------------------------------------------
@@ -1600,17 +1655,39 @@ async def refuse_open_session(cursor: Any, map_id: str) -> None:
 
 # --- sessions ----------------------------------------------------------------------------------
 
-def _map_has_nodes(row: MapRow, previous: List[Dict[str, Any]],
-                   arango_node_count: Optional[Callable[[str], int]]) -> bool:
-    """Whether a local map already holds data (then a new mapping session must be placed,
-    decision Q-U4): ArangoDB's count when available, else the sessions' and the row's counts."""
-    if arango_node_count is not None:
+async def _node_counts(arango_node_count: Optional[Callable[[str], int]],
+                       names: Sequence[Optional[str]]) -> Dict[str, Optional[int]]:
+    """{map: ArangoDB node count} read BEFORE a transaction (the count is a blocking
+    python-arango call: in a thread, never while row locks are held). None for a map whose
+    count failed; {} without a counter. Never raises."""
+    out: Dict[str, Optional[int]] = {}
+    if arango_node_count is None:
+        return out
+    for name in dict.fromkeys(n for n in names if n):
         try:
-            return int(arango_node_count(row.name) or 0) > 0
+            out[name] = int(await asyncio.to_thread(arango_node_count, name) or 0)
         except Exception:  # noqa: BLE001 - fall back to the stored counts
-            logger.warning("ArangoDB node count of %s failed; using the stored counts", row.name)
+            logger.warning("ArangoDB node count of %s failed; using the stored counts", name)
+            out[name] = None
+    return out
+
+
+def _map_has_nodes(row: MapRow, previous: Sequence[Mapping[str, Any]],
+                   count: Optional[int]) -> bool:
+    """Whether the map holds nodes (then a new mapping session on a local map must be placed,
+    decision Q-U4): ArangoDB's `count` (read before the transaction) when known, else the
+    sessions' and the row's stored counts."""
+    if count is not None:
+        return count > 0
     return (any(int(s.get("node_count") or 0) > 0 for s in previous)
             or int(row.status.get("node_count") or 0) > 0)
+
+
+def _has_data(row: MapRow, sessions: Sequence[Mapping[str, Any]], count: Optional[int]) -> bool:
+    """Whether the map holds data, i.e. is `ready` rather than `draft` after its last mapping
+    session finished (or when it is restored): nodes (_map_has_nodes) or a saved SLAM map
+    (status.slam_saved_at)."""
+    return bool(row.status.get("slam_saved_at")) or _map_has_nodes(row, sessions, count)
 
 
 def plan_session(row: MapRow, robot: RobotObjectV1, previous: List[Dict[str, Any]],
@@ -1693,15 +1770,6 @@ async def _driving_text(store: Any, robot: RobotObjectV1) -> Optional[str]:
     return ms.driving_reason(state, await store.robot_state_msg(robot.name), mission_open)
 
 
-async def ensure_not_driving(store: Any, robot: RobotObjectV1) -> None:
-    """409 while the robot drives (an active order, or a velocity in its last state). No longer
-    used by the placement flows (they warn); kept for callers that need the refusal."""
-    reason = await _driving_text(store, robot)
-    if reason is not None:
-        raise HTTPException(409, f"Robot '{robot.name}' is driving ({reason}); stop it and "
-                                 "place it again")
-
-
 def _placement_record(req: PlaceRequest, source: str, actor: Optional[str],
                       now: datetime.datetime) -> Dict[str, Any]:
     return {"pose": req.pose.dict(), "robot_pose": req.robot_pose.dict(), "source": source,
@@ -1712,12 +1780,13 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
                     now: datetime.datetime, actor: Optional[str],
                     req: Optional[StartSessionRequest] = None,
                     carried: Optional[Mapping[str, Any]] = None,
-                    arango_node_count: Optional[Callable[[str], int]] = None,
+                    node_count: Optional[int] = None,
                     warnings: Optional[List[str]] = None
                     ) -> Dict[str, Any]:
     """Start a session on the locked map `row` inside the caller's transaction (the rules of
     the module docstring); the new session row. The robot's previous open session must already
-    be finished (`replace`); `carried` is that session when it was on this map."""
+    be finished (`replace`); `carried` is that session when it was on this map. `node_count`:
+    the map's ArangoDB node count, read before the transaction (None: the stored counts)."""
     req = req or StartSessionRequest(robot=robot_name)
     purpose = req.purpose
     map_name = row.name
@@ -1759,7 +1828,7 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
         carried = ms.reusable_session(previous, robot_name,
                                       await store.robot_run_epoch(robot_name))
     has_nodes = (row.type == "local" and placement is None and carried is None
-                 and _map_has_nodes(row, previous, arango_node_count))
+                 and _map_has_nodes(row, previous, node_count))
     services = req.session_services(row.type == "local" and bool(row.spec.get("slam_map")))
     if services is not None and ms.SLAM in services and row.type != "local":
         # Only a geo map cannot record one (the SLAM map is a local frame; see PATCH slam_map).
@@ -1794,12 +1863,13 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
 
 async def _finish_in(store: Any, row: Optional[MapRow], session: Dict[str, Any],
                      now: datetime.datetime, actor: Optional[str],
-                     restore_state: Optional[str] = None) -> Optional[str]:
+                     node_count: Optional[int] = None) -> Optional[str]:
     """Finish the open `session` inside the caller's transaction; the map's state afterwards.
-    A mapping session makes its map `ready` unless another mapping session is still open; an
-    operate session leaves the map as it is. `row`: the locked map row, None when it is gone.
-    `restore_state`: the state the map returns to instead of `ready` (a session whose start
-    failed, on a draft map)."""
+    A mapping session makes its map `ready` when it holds data (_has_data: nodes or a saved
+    SLAM map) and `draft` otherwise, unless another mapping session is still open; an operate
+    session leaves the map as it is. `row`: the locked map row, None when it is gone.
+    `node_count`: the map's ArangoDB node count read before the transaction (None: the stored
+    counts)."""
     session_id = str(session["session_id"])
     # §14.13: the run epoch the placement belongs to, so a later session on this map in the
     # same run can reuse it (None: never reused).
@@ -1811,10 +1881,12 @@ async def _finish_in(store: Any, row: Optional[MapRow], session: Dict[str, Any],
     if row is None:
         return None
     if ms.purpose_of(session) == ms.MAPPING:
-        others = [s for s in await store.sessions(row.name)
+        sessions = await store.sessions(row.name)
+        others = [s for s in sessions
                   if s["ended_at"] is None and str(s["session_id"]) != session_id
                   and ms.purpose_of(s) == ms.MAPPING]
-        status = ({"state": restore_state or READY, "open_session_id": None} if not others else
+        state = READY if _has_data(row, sessions, node_count) else DRAFT
+        status = ({"state": state, "open_session_id": None} if not others else
                   {"open_session_id": str(others[0]["session_id"])})
         await store.update_map(row, status=status)
         row.status.update(status)
@@ -1824,19 +1896,16 @@ async def _finish_in(store: Any, row: Optional[MapRow], session: Dict[str, Any],
     return map_state
 
 
-def _session_services(session: Mapping[str, Any]) -> List[str]:
-    """The `services` of a session as stored (null = a row from before the column: topo; an
-    empty list is a session that runs nothing)."""
-    services = session.get("services")
-    return list(ms.DEFAULT_SERVICES) if services is None else list(services)
-
-
-def _services_of(session: Mapping[str, Any]) -> List[str]:
-    """The ORCHESTRATOR services a mapping session runs (none for an operate session; `slam` is
-    not one: it is driven by start_slam / save_slam)."""
+def _services_of(session: Mapping[str, Any], orchestrator_only: bool = True) -> List[str]:
+    """The services a MAPPING session runs, as stored (null = a row from before the column:
+    topo; an empty list is a session that runs nothing); [] for an operate session.
+    `orchestrator_only` (default) leaves out `slam`, which is no orchestrator service (it is
+    driven by start_slam / save_slam)."""
     if ms.purpose_of(session) != ms.MAPPING:
         return []
-    return [s for s in _session_services(session) if s != ms.SLAM]
+    stored = session.get("services")
+    services = list(ms.DEFAULT_SERVICES) if stored is None else list(stored)
+    return [s for s in services if s != ms.SLAM] if orchestrator_only else services
 
 
 async def start_services(switch: Optional[Any], session: Mapping[str, Any],
@@ -1861,7 +1930,8 @@ async def start_services(switch: Optional[Any], session: Mapping[str, Any],
 async def stop_services(db: Any, switch: Optional[Any], robot: Optional[RobotObjectV1],
                         session: Mapping[str, Any], keep: bool = True) -> List[Dict[str, Any]]:
     """After a session change committed: stop the mapping services of `session` (paused or
-    finished) unless (`keep`) the robot's open mapping session still runs them. A replaced
+    finished) unless (`keep`) the robot's open, unpaused mapping session runs them (a repeated
+    finish of an OLD session must not stop the robot's current session's services). A replaced
     session's are always stopped (`keep` false): the new session starts its own after the SLAM
     switch, and the robot refuses a mode change while its topomap runs. The robot actions; never
     raises; [] when there was nothing to stop."""
@@ -1888,31 +1958,60 @@ async def stop_services(db: Any, switch: Optional[Any], robot: Optional[RobotObj
         return [service_action(svc, STOP, "failed", str(exc)) for svc in services]
 
 
-def slam_save_reporter(db: Any, session: Mapping[str, Any]
+def slam_save_reporter(db: Any, session: Mapping[str, Any], switch: Optional[Any] = None,
+                       event: bool = True, follow_up: bool = True
                        ) -> Callable[[SlamResult], Awaitable[None]]:
-    """The `on_result` of a background SLAM save: MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED
-    (nothing for 'nothing to save'). Raises only what the event write raises (the switch logs
-    it)."""
+    """The `on_result` of a SLAM save of `session`'s map:
+    - a saved map: the map's status.slam_saved_at is set and a `draft` map becomes `ready`
+      (it holds data now; mark_slam_saved);
+    - `event`: MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED (nothing for 'nothing to save');
+    - `follow_up` (with `switch`): the robot's open, unpaused mapping session gets its services
+      (re)started in the background (restart_session_services): a start deferred while the
+      save ran, or a topomap the switch back to the previous mode stopped.
+    Raises only what the event write raises (the switch logs it)."""
     snapshot = dict(session)
 
     async def report(result: SlamResult) -> None:
-        if result.status not in (SLAM_SAVED, SLAM_FAILED):
+        robot_name = snapshot["robot_name"]
+        if follow_up and switch is not None:
+            reason = {SLAM_SAVED: RESTART_SAVE_DONE, SLAM_FAILED: RESTART_SAVE_FAILED}.get(
+                result.status, RESTART_SAVE_DONE)
+            switch.spawn(restart_session_services(db, switch, robot_name, reason))
+        if result.status == SLAM_SAVED:
+            await mark_slam_saved(db, snapshot["map_name"])
+        if not event or result.status not in (SLAM_SAVED, SLAM_FAILED):
             return
         saved = result.status == SLAM_SAVED
         action = slam_save_action(result)
         now = _utcnow()
         sid = str(snapshot["session_id"])
-        event = Event(
+        ev = Event(
             EventCode.MAP_SLAM_SAVE_DONE if saved else EventCode.MAP_SLAM_SAVE_FAILED, now,
-            robot_name=snapshot["robot_name"], source=Source.API,
+            robot_name=robot_name, source=Source.API,
             discriminator=f"session:{sid}:slam_save:{now.isoformat()}",
             payload={"map_name": snapshot["map_name"], "session_id": sid,
                      "status": "saved" if saved else "failed", "label": action["label"],
-                     "detail": result.warning})
+                     "detail": result.warning or result.notice})
         async with open_store(db, uuid.uuid4()) as store:
-            await store.emit(event)
+            await store.emit(ev)
 
     return report
+
+
+async def mark_slam_saved(db: Any, map_name: str) -> None:
+    """A SLAM map of `map_name` was saved on a robot: status.slam_saved_at, and a `draft` map
+    (its sessions finished without nodes) becomes `ready`. Never raises."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            row = await store.lock_map(map_name)
+            if row is None or row.lifecycle == DELETING:
+                return
+            status: Dict[str, Any] = {"slam_saved_at": _utcnow().isoformat()}
+            if row.state == DRAFT:
+                status["state"] = READY
+            await store.update_map(row, status=status)
+    except Exception:  # noqa: BLE001
+        logger.exception("Saved SLAM map of %s not recorded on the map", map_name)
 
 
 def _warning_of(actions: Sequence[Mapping[str, Any]]) -> Optional[str]:
@@ -2035,10 +2134,12 @@ def _slam_session(session: Mapping[str, Any]) -> bool:
 async def _start_slam(db: Any, switch: Any, session: Mapping[str, Any],
                       robot: Optional[RobotObjectV1]
                       ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Before the topomap of the MAPPING `session` starts (session start, resume): start the
-    map's SLAM recording when the session asked for it (`slam` in its services). (the warning,
-    the robot action), both None when it did not; never raises, never blocks the session."""
-    if switch is None or not _slam_session(session) or ms.SLAM not in _session_services(session):
+    """Before the topomap of the MAPPING `session` starts (session start, resume, restart):
+    start the map's SLAM recording when the session asked for it (`slam` in its services). (the
+    warning, the robot action), both None when it did not; never raises, never blocks the
+    session."""
+    if (switch is None or not _slam_session(session)
+            or ms.SLAM not in _services_of(session, orchestrator_only=False)):
         return None, None
     try:
         if robot is None:
@@ -2046,7 +2147,7 @@ async def _start_slam(db: Any, switch: Any, session: Mapping[str, Any],
             return (f"SLAM recording not started: {reason}",
                     slam_start_action(SlamResult(SLAM_FAILED, f"SLAM recording not started: "
                                                               f"{reason}", reason=reason)))
-        result = await switch.start_slam(robot, session["map_name"])
+        result = await switch.start_slam(robot, session["map_name"], session.get("session_id"))
         return result.warning, slam_start_action(result)
     except Exception as exc:  # noqa: BLE001
         logger.exception("SLAM start for map %s failed", session["map_name"])
@@ -2059,7 +2160,7 @@ async def _slam_recorded(db: Any, switch: Any, session: Mapping[str, Any],
     """Whether `session` recorded a SLAM map that finish / replace should save: `slam` is in its
     services, or (a session opened before the option existed) its map is a slam_map map and the
     robot's SLAM driver is recording it right now."""
-    if ms.SLAM in _session_services(session):
+    if ms.SLAM in _services_of(session, orchestrator_only=False):
         return True
     if robot is None or not await _slam_wanted(db, session["map_name"]):
         return False
@@ -2067,13 +2168,15 @@ async def _slam_recorded(db: Any, switch: Any, session: Mapping[str, Any],
 
 
 async def _save_slam(db: Any, switch: Any, session: Mapping[str, Any],
-                     robot: Optional[RobotObjectV1], wait: bool
+                     robot: Optional[RobotObjectV1], wait: bool, track: bool = True
                      ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """After a MAPPING `session` ended: save the map's SLAM map (the map is read now). `wait`
-    awaits the save (replace: the driver must be free for the new session), otherwise it runs in
-    the background (its end is MAP.SLAM_SAVE_DONE / _FAILED) and only an immediate problem
-    (robot gone / offline) fails. (the warning, the robot action), both None when SLAM is not
-    wanted."""
+    awaits the save (replace by a session that records SLAM: the driver must be free for it),
+    otherwise it runs in the background (its end is MAP.SLAM_SAVE_DONE / _FAILED, then the
+    robot's open mapping session gets its services started: slam_save_reporter) and only an
+    immediate problem (robot gone / offline) fails; that one leaves the robot's SLAM save state
+    `failed` (retry / discard). `track` false (a deleted robot): no SLAM save state, no
+    follow-up. (the warning, the robot action), both None when SLAM is not wanted."""
     if switch is None or not _slam_session(session):
         return None, None
     try:
@@ -2082,10 +2185,15 @@ async def _save_slam(db: Any, switch: Any, session: Mapping[str, Any],
         if robot is None or not robot.status.online:
             warning = (f"SLAM map of '{session['map_name']}' not saved: robot "
                        f"'{session['robot_name']}' is not reachable")
+            if track:
+                await switch.mark_failed(session["robot_name"], session["map_name"],
+                                         session["session_id"], warning)
             return warning, slam_save_action(detail=warning)
         task = switch.schedule_slam_save(
             robot, session["map_name"], session["session_id"],
-            on_result=None if wait else slam_save_reporter(db, session))
+            on_result=slam_save_reporter(db, session, switch, event=not wait,
+                                         follow_up=track and not wait),
+            track=track)
         if wait:
             result = await asyncio.shield(task)
             return result.warning, slam_save_action(result)
@@ -2094,6 +2202,181 @@ async def _save_slam(db: Any, switch: Any, session: Mapping[str, Any],
         logger.exception("SLAM save for map %s failed", session["map_name"])
         warning = f"SLAM map not saved: {exc}"
         return warning, slam_save_action(detail=warning)
+
+
+# `reason` of restart_session_services (MAP.SESSION_SERVICES_RESTARTED)
+RESTART_RUN_CHANGED = "run_changed"            # mission-dispatch saw a new robot run
+RESTART_SAVE_DONE = "slam_save_done"           # the previous SLAM save ended (or had nothing)
+RESTART_SAVE_FAILED = "slam_save_failed"       # the previous SLAM save failed
+RESTART_SLAM_DISCARDED = "slam_discarded"      # the failed save was discarded
+
+
+def _deferred_actions(session: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The robot actions of a mapping session whose start waits for the robot's pending SLAM
+    save (ok: nothing failed; they run when the save ended)."""
+    out = []
+    services = _services_of(session, orchestrator_only=False)
+    for svc in sorted(services, key=lambda x: x != ms.SLAM):   # SLAM first, as when started
+        name = SLAM_SERVICE if svc == ms.SLAM else action_name(svc)
+        label = ms.SERVICE_LABELS.get(svc, svc) if svc != ms.SLAM else "SLAM recording"
+        out.append(robot_action(name, START, True, f"{label} starts when the robot has saved "
+                                                   "its previous SLAM map"))
+    return out
+
+
+async def start_session_services(db: Any, switch: Optional[Any], session: Mapping[str, Any],
+                                 robot: Optional[RobotObjectV1]
+                                 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Start a MAPPING `session` on the robot (opening, resume, restart): its SLAM recording
+    first (on the mapping API the topomap needs the slam mode), then its orchestrator services.
+    While the robot's previous SLAM map is still being saved nothing is sent to the robot (the
+    switch back after the save would stop it again, and a mode change is refused meanwhile):
+    the actions say the services start after the save, and the save's follow-up starts them.
+    (robot actions, slam warning); never raises; ([], None) for an operate session. Call it
+    under the robot's lock, outside any DB transaction."""
+    if switch is None or ms.purpose_of(session) != ms.MAPPING:
+        return [], None
+    if switch.slam_save_pending(session["robot_name"]):
+        return _deferred_actions(session), None
+    slam_warning, slam_action = await _start_slam(db, switch, session, robot)
+    actions = [slam_action] if slam_action else []
+    actions += await start_services(switch, session, robot)
+    return actions, slam_warning
+
+
+async def restart_session_services(db: Any, switch: Any, robot_name: str, reason: str,
+                                   locked: bool = False, report_failure: bool = True
+                                   ) -> Optional[List[Dict[str, Any]]]:
+    """Start the services of the robot's open, UNPAUSED MAPPING session again (SLAM first):
+    after mission-dispatch reported a run change (a driver / orchestrator restart killed them),
+    after the robot's previous SLAM save ended (a start deferred meanwhile, or a topomap the
+    switch back stopped) and after a discarded save. Under the robot's lock (`locked`: the
+    caller holds it). Reported as MAP.SESSION_SERVICES_RESTARTED (_RESTART_FAILED when an
+    action failed; not reported at all with `report_failure` false, for a retry) with the robot
+    actions, and pushed like any session change (notify_robot). The robot actions, or None when
+    there was nothing to restart (no such session, robot unknown or offline). Never raises."""
+    if switch is None:
+        return None
+    lock = contextlib.nullcontext() if locked else switch.lock(robot_name)
+    try:
+        async with lock:
+            async with open_store(db, uuid.uuid4()) as store:
+                mine = await store.open_sessions_of_robot(robot_name)
+                robot = await store.robot(robot_name)
+            session = mine[0] if mine else None
+            if (session is None or ms.purpose_of(session) != ms.MAPPING
+                    or session.get("paused_at") is not None or robot is None
+                    or not robot.status.online):
+                return None
+            actions, warning = await start_session_services(db, switch, session, robot)
+            if not actions:
+                return actions
+            ok = all(a["ok"] for a in actions)
+            if not ok and not report_failure:
+                return actions
+            now = _utcnow()
+            sid = str(session["session_id"])
+            event = Event(
+                EventCode.MAP_SESSION_SERVICES_RESTARTED if ok
+                else EventCode.MAP_SESSION_SERVICES_RESTART_FAILED, now,
+                robot_name=robot_name, source=Source.API,
+                discriminator=f"session:{sid}:restart:{reason}:{now.isoformat()}",
+                payload={"map_name": session["map_name"], "session_id": sid, "reason": reason,
+                         "ok": ok, "robot_actions": actions, "slam_warning": warning})
+            async with open_store(db, uuid.uuid4()) as store:
+                await store.emit(event)
+            log = logger.info if ok else logger.warning
+            log("Services of session %s of %s restarted (%s): %s", sid, robot_name, reason,
+                "; ".join(a["label"] for a in actions))
+            await notify_robot(switch, db, robot_name, actions=actions)
+            return actions
+    except Exception:  # noqa: BLE001
+        logger.exception("Services of robot %s not restarted (%s)", robot_name, reason)
+        return None
+
+
+async def restart_after_run_change(db: Any, switch: Any, robot_name: str,
+                                   tries: int = RUN_CHANGE_RESTART_TRIES,
+                                   delay_s: float = RUN_CHANGE_RESTART_RETRY_S,
+                                   sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+                                   ) -> Optional[List[Dict[str, Any]]]:
+    """restart_session_services() after mission-dispatch reported a new robot run (NOTIFY
+    ms.RUN_CHANGED_CHANNEL): a robot that is still coming up may refuse, so a restart with a
+    failed action is tried again `delay_s` later, `tries` times in all; only the last failure
+    is reported. Never raises."""
+    actions = None
+    for attempt in range(max(1, tries)):
+        last = attempt + 1 >= tries
+        actions = await restart_session_services(db, switch, robot_name, RESTART_RUN_CHANGED,
+                                                 report_failure=last)
+        if actions is None or last or all(a["ok"] for a in actions):
+            return actions
+        await sleep(delay_s)
+    return actions
+
+
+async def slam_save_retry(db: Any, switch: Optional[Any], robot_name: str) -> Dict[str, Any]:
+    """POST /api/v1/robots/{robot}/slam-save/retry: save the robot's SLAM map again after a
+    failed save (the robot view's `slam_save.state` "failed"), in the background like a finish
+    (MAP.SLAM_SAVE_DONE / _FAILED; `slam_save` is "saving" meanwhile). {robot_actions: [the
+    save action]}. 404 unknown robot; 409 nothing to retry (no failed save, or a save runs).
+    An offline robot is a failed action (the state stays failed), never an error."""
+    robot = await _robot_or_404(db, robot_name)
+    if switch is None:
+        raise HTTPException(409, f"Robot '{robot_name}' has no failed SLAM save to retry")
+    async with switch.lock(robot_name):
+        if switch.slam_save_pending(robot_name):
+            raise HTTPException(409, f"Robot '{robot_name}' is already saving a SLAM map")
+        failed = switch.slam_save_failed(robot_name)
+        if failed is None:
+            raise HTTPException(409, f"Robot '{robot_name}' has no failed SLAM save to retry")
+        session = {"session_id": failed.get("session_id"), "map_name": failed.get("map"),
+                   "robot_name": robot_name, "purpose": ms.MAPPING, "services": [ms.SLAM]}
+        if not robot.status.online:
+            detail = f"robot '{robot_name}' is offline"
+            return {"robot_actions": [slam_save_action(detail=detail)]}
+        switch.schedule_slam_save(robot, session["map_name"], session["session_id"],
+                                  on_result=slam_save_reporter(db, session, switch))
+        return {"robot_actions": [slam_save_action()]}
+
+
+async def slam_save_discard(db: Any, switch: Optional[Any], robot_name: str) -> Dict[str, Any]:
+    """POST /api/v1/robots/{robot}/slam-save/discard: leave slam WITHOUT saving after a failed
+    save: the robot's previous localization intent (odometry when unknown) is PUT back with the
+    topomap off, the failed state is cleared, and the robot's open, unpaused mapping session
+    gets its services started again. {robot_actions: [the discard (`stop` of "SLAM recording"),
+    then the restart's]}. 404 unknown robot; 409 nothing to discard (no failed save, or a save
+    runs). A failed switch is a failed action (the state stays failed), never an error."""
+    robot = await _robot_or_404(db, robot_name)
+    if switch is None:
+        raise HTTPException(409, f"Robot '{robot_name}' has no failed SLAM save to discard")
+    async with switch.lock(robot_name):
+        if switch.slam_save_pending(robot_name):
+            raise HTTPException(409, f"Robot '{robot_name}' is saving a SLAM map; wait for it")
+        if switch.slam_save_failed(robot_name) is None:
+            raise HTTPException(409, f"Robot '{robot_name}' has no failed SLAM save to discard")
+        if not robot.status.online:
+            detail = f"robot '{robot_name}' is offline"
+            return {"robot_actions": [robot_action(SLAM_SERVICE, STOP, False,
+                                                   f"SLAM recording not discarded: {detail}",
+                                                   detail)]}
+        action = await switch.discard_slam(robot)
+        actions = [action]
+        if action["ok"]:
+            actions += await restart_session_services(
+                db, switch, robot_name, RESTART_SLAM_DISCARDED, locked=True) or []
+    return {"robot_actions": actions}
+
+
+async def _robot_or_404(db: Any, robot_name: str) -> RobotObjectV1:
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            robot = await store.robot(robot_name)
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    if robot is None:
+        raise HTTPException(404, f"Did not find \"robot\" with name \"{robot_name}\"")
+    return robot
 
 
 def _robot_lock(switch: Optional[Any], robot_name: str) -> Any:
@@ -2109,21 +2392,37 @@ async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UU
     """POST /api/v1/maps/{id}/sessions `{robot, purpose?, services?, placement?, replace?}`
     (rules: module docstring). With `replace` the robot's open session (any map, any purpose)
     is finished in the same transaction; a refused start keeps it. After the commit a mapping
-    session's services are started on the robot's orchestrator (and the replaced session's that
-    the new one does not run are stopped); a failure there never fails or undoes the session, it
-    is reported in `robot_actions` (docs/satinav-maps-redesign.md §14.16). The response:
+    session's services are started on the robot's orchestrator (and the replaced session's are
+    stopped); a failure there never fails or undoes the session, it is reported in
+    `robot_actions` (docs/satinav-maps-redesign.md §14.16). The response:
     {map_id, map_state, changed, session, replaced_session} + notify_robot's keys.
-    A MAPPING session is refused (409) while a relocalization job (`reloc_jobs`) runs for the
-    robot: its SLAM driver would be in the way (the job fails when it sees a new mapping session
-    anyway)."""
+    A MAPPING session that records a SLAM map is refused (409) while a relocalization job
+    (`reloc_jobs`) runs for the robot: the job changes the localization mode that IS the
+    recording (a topomap-only mapping session may start meanwhile). The ArangoDB node counts
+    (`arango_node_count`, blocking) are read before the transaction, in a thread."""
     req = parse_body(StartSessionRequest, data)
     async with _robot_lock(switch, req.robot):
         if (reloc_jobs is not None and req.purpose == ms.MAPPING
-                and reloc_jobs.active_for(req.robot) is not None):
+                and reloc_jobs.active_for(req.robot) is not None
+                and (ms.SLAM in req.services if req.services is not None
+                     else await _slam_wanted(db, map_name))):
             raise HTTPException(409, f"Robot '{req.robot}' is relocalizing: wait for the "
-                                     "relocalization job to finish or cancel it")
-        return await _start_session(db, map_name, req, publisher_id, actor, switch,
-                                    arango_node_count)
+                                     "relocalization job to finish or cancel it before "
+                                     "recording a SLAM map")
+        names = [map_name, await _open_session_map(db, req.robot)]
+        counts = await _node_counts(arango_node_count, names)
+        return await _start_session(db, map_name, req, publisher_id, actor, switch, counts)
+
+
+async def _open_session_map(db: Any, robot_name: str) -> Optional[str]:
+    """The map of the robot's open session (read without a lock, before the transaction, for
+    the node count a `replace` finish needs), or None. Never raises."""
+    try:
+        async with open_store(db, uuid.uuid4()) as store:
+            mine = await store.open_sessions_of_robot(robot_name)
+        return mine[0]["map_name"] if mine else None
+    except Exception:  # noqa: BLE001 - the transaction decides; only a count is missed
+        return None
 
 
 class _DryRun(Exception):
@@ -2142,11 +2441,11 @@ class _Opened:
 
 
 async def _open_tx(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
-                   actor: Optional[str], arango_node_count: Optional[Callable[[str], int]],
+                   actor: Optional[str], node_counts: Mapping[str, Optional[int]],
                    now: datetime.datetime, dry_run: bool = False) -> _Opened:
     """The session's transaction (validation, `replace`'s finish, the insert, the map state,
     the events). `dry_run`: everything is checked and computed, then rolled back. No
-    orchestrator call in here."""
+    orchestrator call (and no ArangoDB call: `node_counts` were read before) in here."""
     out = _Opened()
     try:
         async with open_store(db, publisher_id) as store:
@@ -2175,14 +2474,15 @@ async def _open_tx(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
                                              "end it)")
                 if not robot.status.online:
                     raise HTTPException(409, f"Robot '{req.robot}' is offline")
-                await _finish_in(store, rows.get(current["map_name"]), current, now, actor)
+                await _finish_in(store, rows.get(current["map_name"]), current, now, actor,
+                                 node_counts.get(current["map_name"]))
                 out.replaced = current
                 if current["map_name"] == map_name:
                     carried = current
             out.prior_state = row.state
             out.warnings = []
             out.session = await _start_in(store, row, robot, req.robot, now, actor, req, carried,
-                                          arango_node_count, out.warnings)
+                                          node_counts.get(map_name), out.warnings)
             out.robot = robot
             out.map_state = row.state
             if dry_run:
@@ -2196,29 +2496,28 @@ async def _open_tx(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
 
 async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
                          actor: Optional[str], switch: Optional[Any],
-                         arango_node_count: Optional[Callable[[str], int]]) -> Dict[str, Any]:
+                         node_counts: Mapping[str, Optional[int]]) -> Dict[str, Any]:
     now = _utcnow()
-    args = (db, map_name, req, publisher_id, actor, arango_node_count, now)
-    opened = await _open_tx(*args)
+    opened = await _open_tx(db, map_name, req, publisher_id, actor, node_counts, now)
     session, replaced, robot = opened.session, opened.replaced, opened.robot
     slam_warnings: List[str] = []
     actions: List[Dict[str, Any]] = []
     if replaced is not None:
         # the old topomap stops first (no mode change while it runs), then the old SLAM map is
-        # saved (awaited) before the new one starts: one driver per robot
+        # saved: awaited only when the new session records SLAM (one driver per robot), else
+        # in the background (a new mapping session then starts when the save ended)
         actions += await stop_services(db, switch, robot, replaced, keep=False)
-        old, old_action = await _save_slam(db, switch, replaced, robot, wait=True)
+        wait = (ms.purpose_of(session) == ms.MAPPING
+                and ms.SLAM in _services_of(session, orchestrator_only=False))
+        old, old_action = await _save_slam(db, switch, replaced, robot, wait=wait)
         if old:
             slam_warnings.append(old)
         if old_action:
             actions.append(old_action)
-    # SLAM before the topomap: on the mapping API the topomap needs the slam mode
-    new, new_action = await _start_slam(db, switch, session, robot)
+    new_actions, new = await start_session_services(db, switch, session, robot)
     if new:
         slam_warnings.append(new)
-    if new_action:
-        actions.append(new_action)
-    actions += await start_services(switch, session, robot)
+    actions += new_actions
     out = {"map_id": map_name, "map_state": opened.map_state, "changed": True,
            "session": session_dict(session),
            "replaced_session": session_dict(replaced) if replaced else None}
@@ -2239,9 +2538,10 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
     theta}}`: put the robot on a local map. Sets map_T_session, aligned (placed) and
     placement; MAP.SESSION_PLACED (from then on graph-builder keeps the session's nodes; the
     services are not touched). 404 unknown map/session; 409: finished, geo map (placed
-    by its datum), an already placed MAPPING session (re-placing would split its nodes;
-    alignment after the fact is M6), the robot offline, driving or moved (Q-U7). An operate
-    session can be re-placed at any time (a correction).
+    by its datum, except `source: "datum"`), the robot offline. NOT refused, only `warnings`
+    (decision 2026-10-08): the robot drives or moved since its pose was shown, and re-placing
+    an already placed MAPPING session (it splits its nodes: those before keep the old
+    placement). An operate session can be re-placed at any time (a correction).
 
     `source: "reloc"` (body `{source: "reloc"}`, no poses): the robot relocalises on a stored
     map its orchestrator holds (`holder`: packages/api/orchestrator_maps.py). Placed with
@@ -2259,9 +2559,9 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
     {x, y, yaw}}}` (cloud map frame) relocalizes assisted by that pose; it needs a job (409 when
     `can_start` is false). Without `can_start` a bare `source: "reloc"` is the check-only
     placement described above, unchanged. When the orchestrator could start it but the robot
-    drives, has an open mapping session, a job runs or a SLAM save is pending, the answer is
-    409 (the same reasons the reads give as `can_start_reason`): a bare reloc on an unplaced
-    MAPPING session is therefore refused, never placed by the check-only path."""
+    has an open mapping session that records a SLAM map, a job runs, or a SLAM save is pending
+    or failed, the answer is 409 (the same reasons the reads give as `can_start_reason`; a
+    driving robot and a topomap-only mapping session do not refuse it)."""
     req = parse_body(PlaceRequest, data)
     try:
         uuid.UUID(str(session_id))
@@ -2371,8 +2671,8 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
 async def unplace_session(db: Any, map_name: str, session_id: str, publisher_id: uuid.UUID,
                           actor: Optional[str] = None,
                           reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
-    """POST /api/v1/maps/{id}/sessions/{sid}/unplace: mark a placed OPERATE session on a LOCAL
-    map as not placed (aligned = false, placement.unplaced_reason = "manual"; the old
+    """POST /api/v1/maps/{id}/sessions/{sid}/unplace: mark a placed session on a LOCAL map as
+    not placed (aligned = false, placement.unplaced_reason = "manual"; the old
     map_T_session and the robot's last pose are kept, so the "last position" suggestion works).
     MAP.SESSION_UNPLACED.
 
@@ -2381,10 +2681,10 @@ async def unplace_session(db: Any, map_name: str, session_id: str, publisher_id:
     placement and relocalization flows can be re-run without restarting robot services. It is
     not a normal part of using a map.
 
-    404 unknown map/session; 409: finished, a MAPPING session (graph-builder drops an unplaced
-    session's nodes: that would lose the map being built), a geo map (the datum re-places it at
-    once, so it is pointless), or a relocalization job runs for the session. Unplacing an
-    unplaced session changes nothing (`changed: false`)."""
+    404 unknown map/session; 409: finished, a geo map (the datum re-places it at once, so it is
+    pointless), or a relocalization job runs for the session. A MAPPING session is unplaced
+    with a `warnings` entry (graph-builder drops its new nodes until it is placed again).
+    Unplacing an unplaced session changes nothing (`changed: false`)."""
     try:
         uuid.UUID(str(session_id))
     except ValueError:
@@ -2439,13 +2739,17 @@ async def unplace_session(db: Any, map_name: str, session_id: str, publisher_id:
 
 async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          publisher_id: uuid.UUID, actor: Optional[str] = None,
-                         switch: Optional[Any] = None) -> Dict[str, Any]:
+                         switch: Optional[Any] = None,
+                         arango_node_count: Optional[Callable[[str], int]] = None,
+                         reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
     """pause / resume / finish (see the module docstring). After the commit, resume starts the
-    session's services on the robot's orchestrator and pause / finish stop them (a service
-    another open, unpaused mapping session of the robot runs is kept); a repeat retries. What
-    failed never fails or undoes the action: `robot_actions` reports it. Finish also saves the
-    SLAM map of a mapping session that recorded one in the background; resume restarts the
-    SLAM recording when `slam` is in the session's services."""
+    session's services on the robot's orchestrator (SLAM first when `slam` is in them) and
+    pause / finish stop them; a repeat retries. What failed never fails or undoes the action:
+    `robot_actions` reports it. Resume has the guards of a start: 409 while a relocalization
+    job runs for the robot and the session records a SLAM map; while the robot's previous SLAM
+    map is still being saved the services start when the save ended. Finish also saves the
+    SLAM map of a mapping session that recorded one in the background, and makes the map
+    `ready` or `draft` (_finish_in; the ArangoDB count is read before the transaction)."""
     if action not in SESSION_ACTIONS:
         raise HTTPException(404, f"Unknown session action {action!r}")
     try:
@@ -2453,18 +2757,25 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
     except ValueError:
         raise HTTPException(404, f"Did not find mapping session \"{session_id}\"") from None
     robot_name = None
-    if switch is not None:  # the robot's lock is taken before the transaction, as in start
+    found = None
+    if switch is not None or action == "resume":  # the robot's lock is taken before the tx
         async with open_store(db, uuid.uuid4()) as store:
             found = await store.lock_session(session_id)
         robot_name = found["robot_name"] if found is not None else None
+    counts = (await _node_counts(arango_node_count, [map_name]) if action == "finish" else {})
     async with _robot_lock(switch, robot_name):
+        if (action == "resume" and found is not None and reloc_jobs is not None
+                and reloc_jobs.active_for(found["robot_name"]) is not None
+                and ms.SLAM in _services_of(found, orchestrator_only=False)):
+            raise HTTPException(409, f"Robot '{found['robot_name']}' is relocalizing: wait for "
+                                     "the relocalization job to finish or cancel it before "
+                                     "resuming a session that records a SLAM map")
         out, robot, session = await _session_action(db, map_name, session_id, action,
-                                                    publisher_id, actor, switch)
+                                                    publisher_id, actor, switch,
+                                                    counts.get(map_name))
         slam_warning = None
         if action == "resume":
-            slam_warning, slam_action = await _start_slam(db, switch, session, robot)
-            actions = [slam_action] if slam_action else []
-            actions += await start_services(switch, session, robot)
+            actions, slam_warning = await start_session_services(db, switch, session, robot)
         else:
             actions = await stop_services(db, switch, robot, session)
         if action == "finish" and out["changed"]:
@@ -2479,7 +2790,7 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
 
 async def _session_action(db: Any, map_name: str, session_id: str, action: str,
                           publisher_id: uuid.UUID, actor: Optional[str],
-                          switch: Optional[Any] = None
+                          switch: Optional[Any] = None, node_count: Optional[int] = None
                           ) -> Tuple[Dict[str, Any], Optional[RobotObjectV1], Dict[str, Any]]:
     """(response, the session's robot, the session row)."""
     now = _utcnow()
@@ -2498,7 +2809,7 @@ async def _session_action(db: Any, map_name: str, session_id: str, action: str,
             if action == "finish":
                 if ended:
                     return _unchanged(map_name, row.state, session), robot, session
-                map_state = await _finish_in(store, row, session, now, actor)
+                map_state = await _finish_in(store, row, session, now, actor, node_count)
                 return ({"map_id": map_name, "map_state": map_state, "changed": True,
                          "session": session_dict(session)}, robot, session)
             if ended:

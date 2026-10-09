@@ -13,8 +13,9 @@ orchestrator services that capture for it (maps §14.16):
   (robot offline, orchestrator unreachable, no such service, an error answer) is only REPORTED.
   Every call, and every SLAM call, becomes one entry of the response's `robot_actions`
   (robot_action()): {service, action: start|stop|save, ok, label, detail};
-- nodes are gated on the server only (graph-builder puts them into the open session's map, any
-  purpose): a service that keeps running for a closed session captures nothing that is kept.
+- nodes are gated on the server only (graph-builder puts them into the map of the robot's open,
+  unpaused, placed MAPPING session): a service that keeps running for a closed, paused or
+  operate session captures nothing that is kept.
 
 MAPPING API: a robot whose GET /localization reports `topomap` (the orchestrator has
 mapping.topomap_service) runs the topomap as part of its localization: it is started / stopped
@@ -39,20 +40,32 @@ robot's orchestrator has no such service (`mapping_services` says "not_available
 SLAM maps (a local map with `slam_map`, docs/satinav-maps-redesign.md 14.15): besides the
 topomap, a mapping session records a SLAM map on the robot, under onboard_map_name(map). The
 recording is a MODE of the robot's localization facade, not a process: start_slam() = PUT
-/localization {mode: slam} (the intent before it is kept in memory), before the topomap starts
-(on the mapping API the topomap needs the slam mode first); save_slam() after the session finished
-and its topomap stopped (a mode change is refused while the topomap runs) = POST
+/localization {mode: slam} (the intent before it is kept), before the topomap starts (on the
+mapping API the topomap needs the slam mode first); save_slam() after the session finished and its
+topomap stopped (a mode change is refused while the topomap runs) = POST
 /localization/save?background=true (name = the onboard map name, the cloud ids) polled at GET
 /localization/save, and only after a successful save the previous intent is PUT back (odometry
-when unknown): leaving slam discards the unsaved map, so a failed save leaves the robot in slam.
-Both are best effort, never raising, never blocking or undoing the session; what went wrong is a
-`warning` the caller returns as `slam_warning`. Saving takes minutes, so a finish saves in a
-background task (schedule_slam_save) that the robot's SLAM lock serialises with every other SLAM
-call of that robot; start_slam refuses while a save is pending. Pause / resume never touch SLAM.
-The outcome of a background save is logged, reported as MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED
-(the `on_result` callback of schedule_slam_save) and `on_slam_done(robot)` is called. The robot
-does not say WHICH map its slam mode records, so slam_records() is "the stored mode is slam", and
-a save lost to an API restart is not recovered by the cloud.
+when unknown; with `topomap: false` on a mapping-API robot): leaving slam discards the unsaved
+map, so a FAILED save leaves the robot in slam. Both are best effort, never raising, never
+blocking or undoing the session; what went wrong is a `warning` the caller returns as
+`slam_warning`. Saving takes minutes, so a finish saves in a background task (schedule_slam_save)
+that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
+refuses while a save is pending (packages/api/maps.py defers a session start meanwhile and starts
+it when the save ended). Pause / resume never touch SLAM. The outcome of a background save is
+logged, reported as MAP.SLAM_SAVE_DONE / MAP.SLAM_SAVE_FAILED (the `on_result` callback of
+schedule_slam_save) and `on_slam_done(robot)` is called. The robot does not say WHICH map its slam
+mode records, so slam_records() is "the stored mode is slam".
+
+SLAM SAVE STATE (per robot, slam_save_view(): the robot view's `slam_save`): `saving` while a
+tracked save runs, `failed` after a save failed (the robot is still in slam with the unsaved map;
+also a save whose follow-up could not switch the robot back, and a finish whose robot was not
+reachable). A failed state is ended by retrying the save (schedule_slam_save again) or by
+discard_slam() (PUT the previous intent back without saving), and blocks start_slam meanwhile (a
+new recording would continue the unsaved map). The state and the intent from before start_slam
+are kept in memory and, through `state_store` (packages/api/slam_save_state.py, table
+robot_slam_saves), in Postgres: after an API restart load_state() brings them back, and a save
+that was running when the API stopped comes back as `failed` (its outcome is unknown: retry or
+discard).
 """
 
 import asyncio
@@ -88,6 +101,11 @@ SLAM_STARTED, SLAM_ALREADY_RUNNING, SLAM_EXISTS = "started", "already_running", 
 SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
     "saved", "nothing_to_save", "failed", "busy")
 
+# the `state` of a robot's SLAM save state (slam_save_view shows saving / failed)
+RECORDING, SAVING, SAVE_FAILED = "recording", "saving", "failed"
+RESTART_DETAIL = ("the API restarted while the SLAM map was being saved, so its outcome is "
+                  "unknown: retry the save or discard it")
+
 # the `action` of a robot action
 START, STOP, SAVE = "start", "stop", "save"
 SLAM_SERVICE = "SLAM recording"   # `service` of a SLAM action
@@ -104,7 +122,7 @@ def candidates_of(service: str) -> List[str]:
     return list(MAPPING_SERVICE_CANDIDATES[service])
 
 
-def _action_name(service: str) -> str:
+def action_name(service: str) -> str:
     """The `service` of the robot action of a session service that was not switched."""
     return TOPOMAP_SERVICE if service == TOPO else candidates_of(service)[0]
 
@@ -318,6 +336,14 @@ class MappingSwitch:
         self._slam_tasks: Dict[str, "asyncio.Task[SlamResult]"] = {}  # pending saves
         # the stored localization intent before start_slam switched to slam
         self._prev_intent: Dict[str, Dict[str, Any]] = {}
+        # robot -> {map, session_id, state: recording | saving | failed, detail, at}
+        self._slam_state: Dict[str, Dict[str, Any]] = {}
+        # Persistence of _slam_state / _prev_intent (packages/api/slam_save_state.py); None:
+        # memory only (tests). Set by ApiDelegationService.
+        self.state_store: Optional[Any] = None
+        # tasks started after a save (packages/api/maps.py: restarting the open session's
+        # services); wait_slam_saves() waits for them too
+        self._followups: "set[asyncio.Future[Any]]" = set()
 
     def lock(self, robot_name: str) -> asyncio.Lock:
         lock = self._locks.get(robot_name)
@@ -344,11 +370,29 @@ class MappingSwitch:
         return task is not None and not task.done()
 
     async def wait_slam_saves(self, robot_name: Optional[str] = None) -> None:
-        """Wait for the pending background save(s) (of one robot, or all). Never raises."""
-        tasks = [t for n, t in list(self._slam_tasks.items())
-                 if robot_name is None or n == robot_name]
-        if tasks:
+        """Wait for the pending background save(s) (of one robot, or all) and the follow-ups
+        they started (spawn()). Never raises."""
+        while True:
+            tasks = [t for n, t in list(self._slam_tasks.items())
+                     if robot_name is None or n == robot_name]
+            tasks += [t for t in list(self._followups) if not t.done()]
+            if not tasks:
+                return
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    def spawn(self, coro: Awaitable[Any]) -> "asyncio.Future[Any]":
+        """Run `coro` in the background (a follow-up of a save); wait_slam_saves() waits for it.
+        Its failure is only logged."""
+        async def run() -> Any:
+            try:
+                return await coro
+            except Exception:  # noqa: BLE001
+                logger.exception("SLAM follow-up failed")
+                return None
+        task = asyncio.ensure_future(run())
+        self._followups.add(task)
+        task.add_done_callback(self._followups.discard)
+        return task
 
     def _slam_done(self, robot_name: str) -> None:
         self.invalidate(robot_name)
@@ -358,20 +402,121 @@ class MappingSwitch:
             except Exception:  # noqa: BLE001
                 logger.exception("SLAM follow-up for %s failed", robot_name)
 
-    async def start_slam(self, robot: Any, map_name: str) -> SlamResult:
+    # --- the SLAM save state ------------------------------------------------------------------
+
+    def slam_save_view(self, robot_name: str) -> Optional[Dict[str, Any]]:
+        """The robot view's `slam_save`: null, or {map, state: saving | failed, detail, at}."""
+        st = self._slam_state.get(robot_name)
+        if st is None or st.get("state") not in (SAVING, SAVE_FAILED):
+            return None
+        return {"map": st.get("map"), "state": st["state"], "detail": st.get("detail"),
+                "at": st.get("at")}
+
+    def slam_save_failed(self, robot_name: str) -> Optional[Dict[str, Any]]:
+        """The robot's failed SLAM save {map, session_id, state, detail, at}, or None."""
+        st = self._slam_state.get(robot_name)
+        return dict(st) if st is not None and st.get("state") == SAVE_FAILED else None
+
+    def _set_state_now(self, robot_name: str, state: Optional[str], map_name: Any = None,
+                       session_id: Any = None, detail: Optional[str] = None) -> None:
+        """Set (state None: clear) the robot's SLAM state in memory."""
+        if state is None:
+            self._slam_state.pop(robot_name, None)
+        else:
+            self._slam_state[robot_name] = {
+                "map": map_name, "session_id": str(session_id) if session_id is not None
+                else None, "state": state, "detail": detail, "at": _utcnow().isoformat()}
+
+    async def _set_state(self, robot_name: str, state: Optional[str], map_name: Any = None,
+                         session_id: Any = None, detail: Optional[str] = None) -> None:
+        """_set_state_now(), then persist it. Never raises."""
+        self._set_state_now(robot_name, state, map_name, session_id, detail)
+        await self._persist(robot_name)
+
+    async def mark_failed(self, robot_name: str, map_name: Any, session_id: Any,
+                          detail: str) -> None:
+        """A save that could not even start (robot unreachable at the finish): the robot is
+        presumably still in slam with the unsaved map. Never raises."""
+        await self._set_state(robot_name, SAVE_FAILED, map_name, session_id, detail)
+
+    async def _persist(self, robot_name: str) -> None:
+        store = self.state_store
+        if store is None:
+            return
+        st = self._slam_state.get(robot_name)
+        prev = self._prev_intent.get(robot_name)
+        try:
+            if st is None and prev is None:
+                await store.delete(robot_name)
+            else:
+                await store.put(robot_name, {**(st or {"state": RECORDING}),
+                                             "prev_intent": prev})
+        except Exception:  # noqa: BLE001 - the state stays in memory
+            logger.exception("SLAM save state of %s not persisted", robot_name)
+
+    async def load_state(self) -> None:
+        """At API start: the persisted SLAM states and previous intents. A save that was running
+        when the API stopped is `failed` now (its outcome is unknown). Never raises."""
+        store = self.state_store
+        if store is None:
+            return
+        try:
+            rows = await store.load()
+        except Exception:  # noqa: BLE001
+            logger.exception("SLAM save states not loaded")
+            return
+        for robot_name, rec in rows.items():
+            if rec.get("prev_intent") is not None:
+                self._prev_intent[robot_name] = dict(rec["prev_intent"])
+            state = rec.get("state")
+            if state not in (RECORDING, SAVING, SAVE_FAILED):
+                continue
+            self._slam_state[robot_name] = {k: rec.get(k) for k in
+                                            ("map", "session_id", "state", "detail", "at")}
+            if state == SAVING and not self.slam_save_pending(robot_name):
+                await self._set_state(robot_name, SAVE_FAILED, rec.get("map"),
+                                      rec.get("session_id"), RESTART_DETAIL)
+
+    async def forget(self, robot_name: str) -> None:
+        """The robot was deleted: drop its SLAM state and its persisted row (the previous intent
+        stays in memory while a save of it is pending: that save PUTs it back). Never
+        raises."""
+        self._slam_state.pop(robot_name, None)
+        if not self.slam_save_pending(robot_name):
+            self._prev_intent.pop(robot_name, None)
+        if self.state_store is not None:
+            try:
+                await self.state_store.delete(robot_name)
+            except Exception:  # noqa: BLE001
+                logger.exception("SLAM save state of %s not deleted", robot_name)
+
+    # --- SLAM map (never raises) ---------------------------------------------------------------
+
+    async def start_slam(self, robot: Any, map_name: str,
+                         session_id: Any = None) -> SlamResult:
         """Start the SLAM recording of cloud map `map_name` on the robot, `overwrite` false. A
         run that already records this map is fine; an existing map file is kept (not
-        re-recorded). Refused while the robot's previous SLAM save is pending. Call it after the
-        topomap started, outside any DB transaction, under the robot's lock."""
+        re-recorded). Refused while the robot's previous SLAM save is pending, and while it
+        failed (the robot still records the unsaved map: retry or discard it first). Call it
+        after the topomap started, outside any DB transaction, under the robot's lock."""
         name = getattr(robot, "name", "?")
         onboard = oc.onboard_map_name(map_name)
         if self.slam_save_pending(name):
             reason = f"robot '{name}' is still saving its previous SLAM map"
             return SlamResult(SLAM_BUSY, f"SLAM recording not started: {reason}", reason=reason)
+        failed = self.slam_save_failed(name)
+        if failed is not None:
+            reason = (f"the SLAM map of '{failed.get('map')}' was not saved and robot '{name}' "
+                      "still records it: retry or discard that save first")
+            return SlamResult(SLAM_FAILED, f"SLAM recording not started: {reason}",
+                              reason=reason)
         try:
             async with self.slam_lock(name):
                 client = self._client_factory(robot)
-                return await self._start_slam(client, name, map_name, onboard)
+                result = await self._start_slam(client, name, map_name, onboard)
+                if result.status == SLAM_STARTED:
+                    await self._set_state(name, RECORDING, map_name, session_id)
+                return result
         except Exception as exc:  # noqa: BLE001 - never blocks a session
             logger.exception("SLAM start on %s failed", name)
             return SlamResult(SLAM_FAILED, f"SLAM recording not started: {exc}", reason=str(exc))
@@ -417,9 +562,11 @@ class MappingSwitch:
         return SlamResult(SLAM_STARTED)
 
     async def _restore_intent(self, client: oc.OrchestratorClient, name: str) -> Optional[str]:
-        """After a saved SLAM map: PUT back the localization the robot had before start_slam
-        (odometry when unknown). Returns a sentence when that failed (the robot then stays in
-        slam), else None. Never raises."""
+        """Leave slam: PUT back the localization the robot had before start_slam (odometry when
+        unknown), with `topomap: false` on a mapping-API robot (the orchestrator refuses a mode
+        change while the topomap runs; packages/api/maps.py restarts the topomap of an open
+        mapping session afterwards). Returns a sentence when that failed (the robot then stays
+        in slam), else None. Never raises."""
         prev = self._prev_intent.get(name)
         mode, _ = oc.restore_target(prev)
         try:
@@ -435,6 +582,30 @@ class MappingSwitch:
             return f"the robot was not switched back to {mode}: {exc}"
         self._prev_intent.pop(name, None)
         return None
+
+    async def discard_slam(self, robot: Any) -> Dict[str, Any]:
+        """Leave slam WITHOUT saving (the operator gave up on a failed save): PUT the intent
+        from before start_slam back (odometry when unknown), topomap off on a mapping-API robot.
+        On success the failed state is cleared. One robot action (`stop` of the SLAM recording);
+        never raises."""
+        name = getattr(robot, "name", "?")
+        mode, _ = oc.restore_target(self._prev_intent.get(name))
+        try:
+            async with self.slam_lock(name):
+                problem = await self._restore_intent(self._client_factory(robot), name)
+                if problem is None:
+                    await self._set_state(name, None)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("SLAM discard on %s failed", name)
+            problem = f"the robot was not switched back to {mode}: {exc}"
+        finally:
+            self._slam_done(name)
+        if problem:
+            return robot_action(SLAM_SERVICE, STOP, False,
+                                f"SLAM recording not discarded: {problem}", problem)
+        logger.info("SLAM recording on %s discarded (back to %s)", name, mode)
+        return robot_action(SLAM_SERVICE, STOP, True,
+                            f"Unsaved SLAM map discarded, robot back in {mode}")
 
     @staticmethod
     def _slam_start_failed(name: str, map_name: str, exc: oc.OrchestratorError) -> SlamResult:
@@ -484,7 +655,7 @@ class MappingSwitch:
     @staticmethod
     def _save_warning(map_name: str, robot_name: str, detail: str) -> str:
         return (f"SLAM map of '{map_name}' not saved on robot '{robot_name}': {detail} (the robot "
-                "was left in SLAM mode so the map is kept)")
+                "was left in SLAM mode so the map is kept: retry or discard the save)")
 
     async def _save_attempt(self, client: oc.OrchestratorClient, onboard: str, map_name: str,
                             session_id: Any) -> None:
@@ -553,14 +724,21 @@ class MappingSwitch:
             return False
 
     def schedule_slam_save(self, robot: Any, map_name: str, session_id: Any,
-                           on_result: Optional[Callable[[SlamResult], Awaitable[None]]] = None
-                           ) -> "asyncio.Task[SlamResult]":
+                           on_result: Optional[Callable[[SlamResult], Awaitable[None]]] = None,
+                           track: bool = True) -> "asyncio.Task[SlamResult]":
         """save_slam() as a background task (registered per robot, so a following start_slam
         refuses meanwhile); its outcome is logged and passed to `on_result` (the caller emits
-        MAP.SLAM_SAVE_DONE / _FAILED; its failure is only logged). Needs a running event loop."""
+        MAP.SLAM_SAVE_DONE / _FAILED; its failure is only logged). `track` (default): the robot's
+        SLAM save state is `saving` meanwhile and `failed` after a failed save (or a saved map
+        whose switch back failed), cleared otherwise; a deleted robot is not tracked. Needs a
+        running event loop."""
         name = getattr(robot, "name", "?")
+        if track:
+            self._set_state_now(name, SAVING, map_name, session_id)
 
         async def run() -> SlamResult:
+            if track:
+                await self._persist(name)
             result = await self.save_slam(robot, map_name, session_id)
             if result.warning:
                 logger.warning("Background SLAM save of map %s (session %s): %s", map_name,
@@ -568,6 +746,17 @@ class MappingSwitch:
             else:
                 logger.info("Background SLAM save of map %s (session %s): %s", map_name,
                             session_id, result.status)
+            if track:
+                if result.status == SLAM_FAILED:
+                    await self._set_state(name, SAVE_FAILED, map_name, session_id,
+                                          result.warning)
+                elif result.status == SLAM_SAVED and result.notice:
+                    await self._set_state(name, SAVE_FAILED, map_name, session_id,
+                                          f"the SLAM map was saved, but {result.notice}")
+                else:
+                    if result.status == SLAM_NOTHING_TO_SAVE:
+                        self._prev_intent.pop(name, None)   # not in slam: nothing to restore
+                    await self._set_state(name, None)
             if on_result is not None:
                 try:
                     await on_result(result)
@@ -654,18 +843,18 @@ class MappingSwitch:
                     rest.remove(TOPO)
                 names = await self.resolve(client, rest) if rest else {}
             except oc.OrchestratorError as exc:
-                return actions + [service_action(_action_name(svc), action, "failed",
+                return actions + [service_action(action_name(svc), action, "failed",
                                                  _reason(exc)) for svc in rest]
             for svc in rest:
                 orch = names[svc]
                 if orch is None and on:
                     actions.append(service_action(
-                        _action_name(svc), START, "failed",
+                        action_name(svc), START, "failed",
                         f"the robot's orchestrator has no such service (looked for "
                         f"{', '.join(candidates_of(svc))})"))
                     continue
                 if orch is None:  # stop: nothing by that name exists there, so nothing runs
-                    actions.append(service_action(_action_name(svc), STOP, "already"))
+                    actions.append(service_action(action_name(svc), STOP, "already"))
                     continue
                 try:
                     await (client.start(orch) if on else client.stop(orch))
@@ -680,8 +869,8 @@ class MappingSwitch:
             logger.exception("Mapping services %s on %s not switched (%s)", list(services), name,
                              action)
             done = {a["service"] for a in actions}
-            actions += [service_action(_action_name(s), action, "failed", str(exc))
-                        for s in services if _action_name(s) not in done]
+            actions += [service_action(action_name(s), action, "failed", str(exc))
+                        for s in services if action_name(s) not in done]
         finally:
             self.invalidate(name)
         for a in actions:
