@@ -259,6 +259,8 @@ class TestDispatcherRunChange:
         assert payload["reason"] == "run_changed" and payload["purpose"] == "mapping"
         assert payload["evidence"]["connection_header_id"] == 1
         assert _sets(r) == []  # the robot is not told over MQTT: the server gates the nodes
+        # the API is told (NOTIFY in the same transaction): it restarts the mapping services
+        assert [p for s, p in db.sql if "pg_notify" in s] == [(ms.RUN_CHANGED_CHANNEL, "r1")]
 
     async def test_state_message_triggers_it_too(self):
         db = FakeDb([("UPDATE map_sessions SET aligned = false", ([], 0))])

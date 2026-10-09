@@ -2128,7 +2128,9 @@ class Robot:
     async def _on_run_changed(self, evidence: Dict[str, Any]) -> None:
         """The robot's run frame reset (run_change.py): its open session is no longer placed.
         One transaction: aligned = false, placement.unplaced_reason = run_changed (+ when, and
-        the evidence), MAP.SESSION_UNPLACED (graph-builder then drops the session's nodes). A geo
+        the evidence), MAP.SESSION_UNPLACED (graph-builder then drops the session's nodes), a new
+        run epoch, and a NOTIFY on map_sessions.RUN_CHANGED_CHANNEL (payload: the robot name) on
+        which the API restarts the services of the robot's non-paused mapping session. A geo
         session is re-placed by the next datum (_replace_geo_session). Never raises."""
         now = datetime.datetime.now(datetime.timezone.utc)
         self.info(f"New robot run ({evidence}): unplacing its open map session")
@@ -2168,6 +2170,11 @@ class Robot:
                                  "evidence": evidence, "old_map_T_session": transform}))
                 # Every run change, with or without an open session (§14.13).
                 await self._new_run_epoch(conn, evidence)
+                # The API restarts the services of a non-paused mapping session (the restart
+                # that made the new run killed them): NOTIFY, delivered at the commit.
+                async with conn.cursor() as cursor:
+                    await cursor.execute("SELECT pg_notify(%s, %s)",
+                                         (map_sessions.RUN_CHANGED_CHANNEL, self._name))
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Could not unplace the open session after a run change: {err}")
             # The epoch was not renewed either: decide again on the next state message (its

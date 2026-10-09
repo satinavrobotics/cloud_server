@@ -14,7 +14,11 @@ Where map_T_session comes from:
   robot reports its own pose: map_T_session = P_map (+) P_robot^-1 (placement_transform);
 - the first mapping session of an empty local map: identity (the run defines the map frame).
 
-A session that is not placed keeps no nodes, gets no route orders and no planned paths.
+A session that is not placed keeps no nodes, gets no route orders and no planned paths. Only an
+open, unpaused, placed MAPPING session adds nodes (graph-builder drops an operate session's and a
+paused one's). Placing is never refused because the robot drives or moved since its pose was
+shown: the API only warns (packages/api/maps.py placement_warnings, decision 2026-10-08), with
+pose_moved() / driving_reason() below as the texts.
 
 Pure functions plus the SQL that several services share (the API, mission-dispatch,
 mission-planner, graph-builder); no I/O here. (The robot's mapping services are switched by the
@@ -44,8 +48,8 @@ KNOWN_SERVICES = (TOPO, GRID, SLAM)
 DEFAULT_SERVICES = (TOPO,)  # when the request omits `services` (+ SLAM on a slam_map map)
 SERVICE_LABELS = {TOPO: "Topomap", GRID: "Grid map", SLAM: "SLAM map"}
 
-# The robot must stand still while it is placed (decision Q-U7). These are sensor noise, not a
-# movement allowance: the pose shown to the user and the pose at confirm may differ by this much.
+# A robot that moved more than this since its pose was shown is placed anyway, with a warning
+# (decision 2026-10-08; Q-U7 used to refuse it). Sensor noise, not a movement allowance.
 PLACE_POSITION_TOL_M = 0.02
 PLACE_YAW_TOL_RAD = math.radians(0.5)
 # A velocity below this counts as standing (odometry noise on a robot that does not move).
@@ -64,8 +68,8 @@ UNPLACED_MANUAL = "manual"  # POST .../unplace (a DEV/TEST and "redo my placemen
 # A placed `reloc` session counts as degraded (robot state `localization_warning`) when the robot
 # reports positionInitialized false or a localizationScore below RELOC_DEGRADED_SCORE
 # (packages/config.py, env). NOTE: the VDA5050 client's score is today a GNSS-sigma stopgap
-# (1 - deviationRange/0.5), not a map-matching score. Placement itself is refused only for
-# positionInitialized false; the score is a warning.
+# (1 - deviationRange/0.5), not a map-matching score. A check-only `reloc` placement is refused
+# only for positionInitialized false (a reloc job fixes exactly that); the score is a warning.
 
 SESSION_COLUMNS = ("session_id", "map_name", "robot_name", "kind", "purpose", "services",
                    "placement", "started_at", "paused_at", "ended_at", "datum",
@@ -271,7 +275,7 @@ def pose_moved(shown: Mapping[str, Any], now: Mapping[str, Any],
 
 def driving_reason(robot_state: Optional[str], state_msg: Optional[Mapping[str, Any]],
                    mission_open: Optional[bool] = None) -> Optional[str]:
-    """Why the robot counts as driving (decision Q-U7: it must stand still while placed), or
+    """Why the robot counts as driving (a placement warning, decision 2026-10-08), or
     None. `robot_state`: RobotStatusV1.state (ON_TASK / MAP_DEPLOYMENT = an active order);
     `state_msg`: the robot's last VDA5050 state message (robot_latest.state_msg) or None;
     `mission_open`: whether the robot has a PENDING or RUNNING mission (None = unknown).
@@ -371,6 +375,10 @@ UNPLACE_SQL = (
     "placement = COALESCE(placement, '{}'::jsonb) || %s::jsonb "
     "WHERE robot_name = %s AND ended_at IS NULL AND aligned "
     "RETURNING session_id, map_name, purpose, map_t_session")
+# mission-dispatch NOTIFYs this channel (payload: the robot name) in the run change's transaction;
+# the API (packages/api/server.py) LISTENs and restarts the robot's mapping session services
+# (packages/api/maps.py restart_session_services), which the restart behind the new run killed.
+RUN_CHANGED_CHANNEL = "robot_run_changed"
 # Compare-and-set, like graph-builder's REALIGN_SQL: only the writer that read this state wins.
 REPLACE_SQL = (
     "UPDATE map_sessions SET datum = %s::jsonb, map_t_session = %s::jsonb, aligned = true, "
