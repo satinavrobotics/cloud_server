@@ -630,6 +630,27 @@ the robot's own frame, not drawable on the map, never a partly shifted track.
 `points` is empty when nothing was recorded; more than `FLEET_TRACK_MAX_POINTS` (20000) points are
 thinned by the query to every k-th row plus the last (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
 
+### Robot and mission writes
+
+- `PUT /api/v1/robots/{robot}` takes only `labels`, `battery`, `heartbeat_timeout`, `switch_teleop`,
+  `current_model`, `position_mode`, `ip_address`, `entrypoint_port`, `telemetry_recording` (written as
+  just those spec keys); `name`, `lifecycle`, `current_map` are ignored, any other key is a 400 naming it.
+  `status` still replaces the status wholesale (deprecated: use clear-fault).
+- `PUT /api/v1/missions/{mission}` takes `robot`, `mission_tree`, `timeout`, `deadline`, `repeat`,
+  `then_run`, `register_map`, `mode`, `planned_path` (PENDING missions only, else 409), `update_nodes` +
+  `force` (reroute) and `status`; `route_rev`, `kind`, `goal`, `created_at`, `name`, `lifecycle` are
+  ignored, any other key (e.g. `needs_canceled`: use `POST .../cancel`) is a 400.
+- `POST /api/v1/robots` ignores a caller's `status`, `lifecycle` and the dispatcher-owned spec fields
+  (`needs_order_cancel`, `datum*`); re-registering an existing robot writes only the changed spec keys
+  and `status.factsheet`.
+- `POST /api/createToken` always issues the operator grants (publish, subscribe, publish data);
+  `canPublish` / `canSubscribe` / `canPublishData` in the body are ignored.
+
+#### `POST /api/v1/robots/{robot_name}/clear-fault`
+Operator override for a stuck fault: sets `status.state` to `IDLE` and `status.errors` to `{}`, leaving
+the rest of the status untouched (field-level write, no body). Returns the robot (as `GET
+/api/v1/robots/{robot_name}`); 404 for an unknown robot.
+
 ### Status Operations
 
 #### `GET /api/v1/robots/{robot_name}/status`

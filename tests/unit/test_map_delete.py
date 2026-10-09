@@ -444,7 +444,7 @@ def _svc(maps=None, robot=None):
             return robot
         raise HTTPException(404, "not found")
     svc.database.get_object = AsyncMock(side_effect=get_object)
-    svc.database.update_spec = AsyncMock()
+    svc.database.update_spec_fields = AsyncMock()
     svc.map_lifecycle = functools.partial(ApiDelegationService.map_lifecycle, svc)
     svc.ensure_map_not_deleting = functools.partial(
         ApiDelegationService.ensure_map_not_deleting, svc)
@@ -473,8 +473,8 @@ async def test_put_robot_ignores_current_map():
     svc = _svc({"gone": _map("gone", ObjectLifecycleV1.DELETING)}, robot)
     with patch.object(main, "service", svc):
         await main.update_robot("r1", {"current_map": "gone", "labels": ["a"]})
-    spec = svc.database.update_spec.await_args.args[2]
-    assert "current_map" not in spec.dict() and spec.labels == ["a"]
+    fields = svc.database.update_spec_fields.await_args.args[2]
+    assert fields == {"labels": ["a"]}
 
 
 async def test_create_robot_ignores_current_map():

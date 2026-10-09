@@ -279,6 +279,16 @@ class RobotSpecV1(pydantic.BaseModel):
         common.telemetry_recording_field("robot")
 
 
+# Spec fields a client may set with PUT /api/v1/robots/{name}; any other key is a 400.
+EDITABLE_ROBOT_SPEC_FIELDS = ("labels", "battery", "heartbeat_timeout", "switch_teleop",
+                              "current_model", "position_mode", "ip_address",
+                              "entrypoint_port", "telemetry_recording")
+# Spec fields written by the server only (needs_order_cancel by POST .../cancel-order, the
+# datum fields by mission-dispatch): a registration body cannot set them either.
+ROBOT_SERVER_OWNED_SPEC_FIELDS = ("needs_order_cancel", "datum", "datum_changed_at",
+                                  "datum_stamp")
+
+
 class RobotQueryParamsV1(pydantic.BaseModel):
     """Specifies the supported query parameters allowed for robots"""
     min_battery: Optional[float]

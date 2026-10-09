@@ -595,7 +595,8 @@ class PostgresDatabase:
             raise
 
     async def update_spec_fields(self, object_class: objects.ApiObjectType, name: str,
-                                 fields: Dict[str, Any], publisher_id: uuid.UUID):
+                                 fields: Dict[str, Any], publisher_id: uuid.UUID,
+                                 before_commit: Optional[SpecHook] = None):
         """Set only the given top-level spec keys, leaving every other key as stored.
 
         For writers that hold a cached copy of the object (mission-dispatch): writing their
@@ -603,7 +604,8 @@ class PostgresDatabase:
         committed since the cache was filled (e.g. an operator's PUT of telemetry_recording
         just before a datum message). One statement (`spec || patch`), so it is atomic and
         takes the same row lock as update_spec; NOTIFY and 404 behave like update_spec.
-        `fields` must be JSON-serialisable (use json.loads(model.json()) for sub-models)."""
+        `fields` must be JSON-serialisable (use json.loads(model.json()) for sub-models).
+        `before_commit` is as in update_spec(): it sees the locked old spec and the merged one."""
         if not fields:
             return
         unknown = set(fields) - set(object_class.get_spec_class().__fields__)
@@ -612,10 +614,20 @@ class PostgresDatabase:
         try:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cursor:
+                    old_spec = None
+                    if before_commit is not None:
+                        await cursor.execute(
+                            f"SELECT spec FROM {object_class.table_name()} "
+                            "WHERE name = %s FOR UPDATE;", [name])
+                        row = await cursor.fetchone()
+                        old_spec = row[0] if row is not None else None
                     query = f"UPDATE {object_class.table_name()} " \
                             "SET spec = spec || %s::jsonb WHERE name = %s RETURNING *;"
                     await cursor.execute(query, [json.dumps(fields), name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+                if before_commit is not None:
+                    await self._run_hook(before_commit, conn, old_spec,
+                                         json.dumps({**(old_spec or {}), **fields}))
         except Exception as err:
             self._logger.error("Database error: %s", err)
             traceback.print_exc()
@@ -638,6 +650,32 @@ class PostgresDatabase:
                     query = f"UPDATE {object_class.table_name()} " \
                             "SET status = %s WHERE name = %s RETURNING *;"
                     await cursor.execute(query, [status.json(), name])
+                    await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+        except Exception as err:
+            self._logger.error("Database error: %s", err)
+            traceback.print_exc()
+            raise
+
+    async def update_status_fields(self, object_class: objects.ApiObjectType, name: str,
+                                   fields: Dict[str, Any], publisher_id: uuid.UUID):
+        """Set only the given top-level status keys, leaving every other key as stored.
+
+        The status twin of update_spec_fields: an API route that changes a few status fields
+        must not write back a whole status it read earlier, which would revert what
+        mission-dispatch committed in between (pose, battery, the robot's reports). One
+        statement (`status || patch`); NOTIFY and 404 behave like update_status.
+        `fields` must be JSON-serialisable (use json.loads(model.json()) for sub-models)."""
+        if not fields:
+            return
+        unknown = set(fields) - set(object_class.get_status_class().__fields__)
+        if unknown:
+            raise ValueError(f"unknown {object_class.get_alias()} status fields: {sorted(unknown)}")
+        try:
+            async with self._pool.connection() as conn:
+                async with conn.cursor() as cursor:
+                    query = f"UPDATE {object_class.table_name()} " \
+                            "SET status = status || %s::jsonb WHERE name = %s RETURNING *;"
+                    await cursor.execute(query, [json.dumps(fields), name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
         except Exception as err:
             self._logger.error("Database error: %s", err)

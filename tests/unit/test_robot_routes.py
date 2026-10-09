@@ -55,12 +55,11 @@ class TestForceCancelRobotOrderRoute:
     async def test_sets_the_one_shot_flag_on_the_robot_spec(self):
         svc = MagicMock()
         svc.database.get_object = AsyncMock(return_value=_robot())
-        svc.database.update_spec = AsyncMock()
+        svc.database.update_spec_fields = AsyncMock()
         with patch.object(main, "service", svc):
             result = await main.force_cancel_robot_order("r1")
         assert result["success"] is True
-        spec = svc.database.update_spec.await_args.args[2]
-        assert spec.needs_order_cancel is True
+        assert svc.database.update_spec_fields.await_args.args[2] == {"needs_order_cancel": True}
 
     async def test_unknown_robot_is_a_404_not_a_400(self):
         svc = MagicMock()

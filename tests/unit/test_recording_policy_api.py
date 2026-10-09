@@ -123,6 +123,13 @@ def _svc(robot=None, settings=None):
         stored[(cls.get_alias(), name)] = cls(name=name, lifecycle=obj.lifecycle,
                                               status=obj.status, **json.loads(spec.json()))
     svc.database.update_spec = AsyncMock(side_effect=update_spec)
+
+    async def update_spec_fields(cls, name, fields, publisher_id, **kwargs):
+        obj = stored[(cls.get_alias(), name)]
+        stored[(cls.get_alias(), name)] = cls(
+            name=name, lifecycle=obj.lifecycle, status=obj.status,
+            **{**json.loads(obj.spec.json()), **fields})
+    svc.database.update_spec_fields = AsyncMock(side_effect=update_spec_fields)
     svc.database.create_object = AsyncMock()
     svc.database.update_status = AsyncMock()
     return svc
@@ -136,14 +143,14 @@ class TestRobotRoutes:
             with pytest.raises(HTTPException) as exc:
                 await main.update_robot("r1", {"telemetry_recording": "loud"})
         assert exc.value.status_code == 422
-        svc.database.update_spec.assert_not_awaited()
+        svc.database.update_spec_fields.assert_not_awaited()
 
     async def test_put_level_passes_the_hook_and_returns_the_field(self):
         svc = _svc(RobotObjectV1(name="r1", status={}))
         with patch.object(main, "service", svc):
             result = await main.update_robot("r1", {"telemetry_recording": "full"})
         assert result["telemetry_recording"] == "full"
-        kwargs = svc.database.update_spec.call_args.kwargs
+        kwargs = svc.database.update_spec_fields.call_args.kwargs
         assert callable(kwargs["before_commit"])
 
     async def test_put_back_to_inherit(self):
@@ -151,14 +158,14 @@ class TestRobotRoutes:
         with patch.object(main, "service", svc):
             result = await main.update_robot("r1", {"telemetry_recording": None})
         assert result["telemetry_recording"] is None
-        assert "before_commit" in svc.database.update_spec.call_args.kwargs
+        assert "before_commit" in svc.database.update_spec_fields.call_args.kwargs
 
     async def test_put_without_the_field_is_unchanged(self):
         """Existing clients: same update_spec call as before WP8, level untouched."""
         svc = _svc(RobotObjectV1(name="r1", status={}, telemetry_recording="full"))
         with patch.object(main, "service", svc):
             result = await main.update_robot("r1", {"labels": ["a"]})
-        assert svc.database.update_spec.call_args.kwargs == {}
+        assert svc.database.update_spec_fields.call_args.kwargs == {}
         assert result["labels"] == ["a"] and result["telemetry_recording"] == "full"
         assert set(result) == set(RobotObjectV1(name="x", status={}).dict())
 
@@ -166,7 +173,7 @@ class TestRobotRoutes:
         svc = _svc(RobotObjectV1(name="r1", status={}))
         with patch.object(main, "service", svc):
             await main.update_robot("r1", {"status": {"online": True}})
-        svc.database.update_spec.assert_not_awaited()
+        svc.database.update_spec_fields.assert_not_awaited()
 
     async def test_register_new_robot_with_level_passes_the_hook(self):
         svc = _svc()

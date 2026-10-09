@@ -44,7 +44,8 @@ from packages.config import (
     IDEMPOTENCY_TTL_S, IDEMPOTENCY_LEASE_S, IDEMPOTENCY_PURGE_INTERVAL_S,
 )
 from cloud_common.objects.robot import (
-    FACTSHEET_PHYSICAL_FIELDS, CustomActionV1, RobotObjectV1, RobotStatusV1)
+    EDITABLE_ROBOT_SPEC_FIELDS, FACTSHEET_PHYSICAL_FIELDS, ROBOT_SERVER_OWNED_SPEC_FIELDS, CustomActionV1,
+    RobotObjectV1, RobotSpecV1, RobotStateV1, RobotStatusV1)
 from cloud_common.objects.mission import (
     DISPATCHER_OWNED_STATUS_FIELDS, EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
     MissionStatusV1)
@@ -1585,6 +1586,8 @@ async def create_livekit_token(request: CreateTokenRequest):
 
     This endpoint generates a JWT token that allows a participant to join a LiveKit room.
     The token includes permissions for publishing/subscribing to tracks and data messages.
+    The grants are fixed to the operator grants; canPublish / canSubscribe / canPublishData
+    in the request are accepted for compatibility and ignored.
 
     Args:
         request: Token creation request with participant details
@@ -1600,9 +1603,11 @@ async def create_livekit_token(request: CreateTokenRequest):
         room_name=request.roomName,
         ttl=request.ttl,
         metadata=request.metadata,
-        can_publish=request.canPublish,
-        can_subscribe=request.canSubscribe,
-        can_publish_data=request.canPublishData
+        # Grants are fixed here, never the caller's: the operator grants of
+        # packages/services/livekit_sfu_tokens ROLE_GRANTS["operator"]
+        can_publish=True,
+        can_subscribe=True,
+        can_publish_data=True
     )
 
     return CreateTokenResponse(**result)
@@ -1870,28 +1875,33 @@ async def create_robot(robot_data: dict):
 
         if robot is not None:
             # Robot already exists — update IP, port, and position_mode if provided
-            spec_changed = False
+            # Field-level writes: mission-dispatch commits to this row all the time (pose,
+            # battery, datum), and a whole spec/status written back would revert that.
+            spec_changes: Dict[str, Any] = {}
             if ip_address is not None:
-                robot.ip_address = ip_address
-                spec_changed = True
+                spec_changes["ip_address"] = ip_address
             if entrypoint_port is not None:
-                robot.entrypoint_port = entrypoint_port
-                spec_changed = True
+                spec_changes["entrypoint_port"] = entrypoint_port
             if position_mode is not None and robot.position_mode != position_mode:
-                robot.position_mode = position_mode
-                spec_changed = True
+                spec_changes["position_mode"] = position_mode
             if current_model is not None and robot.current_model != current_model:
-                robot.current_model = current_model
-                spec_changed = True
-            if spec_changed:
-                await service.database.update_spec(RobotObjectV1, robot.name, robot.spec, publisher_id)
+                spec_changes["current_model"] = current_model
+            if spec_changes:
+                # Validated (and coerced) by the spec model, written as just these keys.
+                edited = RobotSpecV1(**{**robot.spec.dict(), **spec_changes})
+                spec_json = json.loads(edited.json())
+                await service.database.update_spec_fields(
+                    RobotObjectV1, robot.name, {k: spec_json[k] for k in spec_changes},
+                    publisher_id)
             if factsheet_data:
                 robot.status.factsheet.agv_class = factsheet_data.get("agv_class", robot.status.factsheet.agv_class)
                 _apply_factsheet_limits(robot.status.factsheet, factsheet_data)
                 robot.status.factsheet.custom_actions = [
                     CustomActionV1(**a) for a in factsheet_data.get("actions", [])
                 ]
-                await service.database.update_status(RobotObjectV1, robot.name, robot.status, publisher_id)
+                await service.database.update_status_fields(
+                    RobotObjectV1, robot.name,
+                    {"factsheet": json.loads(robot.status.factsheet.json())}, publisher_id)
             return (await service.database.get_object(RobotObjectV1, robot_data["name"])).dict()
         else:
             # Robot doesn't exist — create it (a `current_map` in the body is ignored: maps U6,
@@ -1903,7 +1913,12 @@ async def create_robot(robot_data: dict):
                 status.factsheet.custom_actions = [
                     CustomActionV1(**a) for a in factsheet_data.get("actions", [])
                 ]
-            robot_data_with_defaults = {"status": status, "lifecycle": ObjectLifecycleV1.ALIVE, **robot_data}
+            # status, lifecycle and the dispatcher-owned spec fields are server-owned: they
+            # come after **robot_data so a caller cannot set them
+            for owned in ROBOT_SERVER_OWNED_SPEC_FIELDS:
+                robot_data.pop(owned, None)
+            robot_data_with_defaults = {**robot_data, "status": status,
+                                        "lifecycle": ObjectLifecycleV1.ALIVE}
             if ip_address is not None:
                 robot_data_with_defaults["ip_address"] = ip_address
             if entrypoint_port is not None:
@@ -1926,39 +1941,59 @@ async def create_robot(robot_data: dict):
         raise HTTPException(status_code=400, detail=f"Failed to register robot: {str(e)}")
 
 
+# Accepted and ignored (the response carries them anyway, so a client may echo them back).
+_ROBOT_PUT_IGNORED = ("name", "lifecycle", "current_map")
+
+
 @app.put("/api/v1/robots/{robot_name}")
 async def update_robot(robot_name: str, robot_data: dict):
     """
     Update a robot (proxy to Mission Dispatcher database).
 
-    Updates the robot's spec or status based on provided data.
+    Updates the robot's spec (only EDITABLE_ROBOT_SPEC_FIELDS; any other key is a 400)
+    or, with `status`, replaces its status wholesale (to clear a fault use
+    POST .../clear-fault instead: a whole-status write reverts what the dispatcher
+    committed since the caller read it).
     """
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
         recording.check_level(robot_data)
-        # Get existing robot
-        robot = await service.database.get_object(RobotObjectV1, robot_name)
         # Maps U6: robots have no current_map (their map is the open session); an old
         # caller's field is ignored rather than failing the whole update.
         robot_data = {k: v for k, v in robot_data.items() if k != "current_map"}
+        unknown = sorted(k for k in robot_data
+                         if k != "status" and k not in EDITABLE_ROBOT_SPEC_FIELDS
+                         and k not in _ROBOT_PUT_IGNORED)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fields not editable on a robot: {', '.join(unknown)}. "
+                       f"Editable: {', '.join(EDITABLE_ROBOT_SPEC_FIELDS)}")
+        # Get existing robot
+        robot = await service.database.get_object(RobotObjectV1, robot_name)
 
         publisher_id = uuid.uuid4()
 
         # Update spec if provided
-        if "status" not in robot_data or len(robot_data) > 1:
-            # This is a spec update
-            for key, value in robot_data.items():
-                if key != "status" and key != "name" and key != "lifecycle":
-                    setattr(robot, key, value)
+        edits = {k: v for k, v in robot_data.items() if k in EDITABLE_ROBOT_SPEC_FIELDS}
+        if edits:
+            try:
+                edited = RobotSpecV1(**{**robot.spec.dict(), **edits})
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid robot spec: {str(e)}")
             hook = None
-            if recording.SPEC_FIELD in robot_data:
+            if recording.SPEC_FIELD in edits:
                 # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
                 hook = recording.change_hook(recording.RecordingScope.ROBOT, robot.name,
                                              recording.request_actor())
-            await service.database.update_spec(RobotObjectV1, robot.name, robot.spec,
-                                               publisher_id, **_hook_kwargs(hook))
+            # Only the keys this request changes: the dispatcher patches datum and
+            # needs_order_cancel on the same row.
+            spec_json = json.loads(edited.json())
+            await service.database.update_spec_fields(
+                RobotObjectV1, robot.name, {k: spec_json[k] for k in edits},
+                publisher_id, **_hook_kwargs(hook))
 
         # Update status if provided
         if "status" in robot_data:
@@ -1972,6 +2007,29 @@ async def update_robot(robot_name: str, robot_data: dict):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to update robot: {str(e)}")
+
+
+@app.post("/api/v1/robots/{robot_name}/clear-fault")
+async def clear_robot_fault(robot_name: str):
+    """
+    Operator override for a stuck FAULT: empties `status.errors` and sets `status.state`
+    back to IDLE, leaving every other status field (pose, battery, online, factsheet...)
+    as the dispatcher last wrote it. Replaces the client's read + whole-status PUT.
+    """
+    if service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    try:
+        # 404 for an unknown robot (raised by the database layer)
+        await service.database.get_object(RobotObjectV1, robot_name)
+        await service.database.update_status_fields(
+            RobotObjectV1, robot_name,
+            {"state": RobotStateV1.IDLE.value, "errors": {}}, uuid.uuid4())
+        return (await service.database.get_object(RobotObjectV1, robot_name)).dict()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to clear fault: {str(e)}")
 
 
 @app.delete("/api/v1/robots/{robot_name}")
@@ -2068,9 +2126,9 @@ async def force_cancel_robot_order(robot_name: str):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
-        robot = await service.database.get_object(RobotObjectV1, robot_name)
-        robot.needs_order_cancel = True
-        await service.database.update_spec(RobotObjectV1, robot_name, robot.spec, uuid.uuid4())
+        await service.database.get_object(RobotObjectV1, robot_name)  # 404 if unknown
+        await service.database.update_spec_fields(
+            RobotObjectV1, robot_name, {"needs_order_cancel": True}, uuid.uuid4())
         return {"success": True, "message": f"cancelOrder requested for {robot_name}"}
     except HTTPException:
         raise
@@ -2426,6 +2484,13 @@ async def create_mission(mission_data: dict):
         raise HTTPException(status_code=400, detail=f"Failed to create mission: {str(e)}")
 
 
+# Keys PUT /api/v1/missions/{name} takes besides EDITABLE_SPEC_FIELDS: the reroute and its
+# force flag, the status, and server-owned keys a client may echo back (ignored). Any other
+# key is a 400 (needs_canceled is set by POST .../cancel only).
+_MISSION_PUT_ACCEPTED = ("status", "name", "lifecycle", "force", "update_nodes",
+                         "route_rev", "kind", "goal", "created_at")
+
+
 @app.put("/api/v1/missions/{mission_name}")
 async def update_mission(mission_name: str, mission_data: dict):
     """
@@ -2437,6 +2502,14 @@ async def update_mission(mission_name: str, mission_data: dict):
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     try:
+        unknown = sorted(k for k in mission_data
+                         if k not in EDITABLE_SPEC_FIELDS and k not in _MISSION_PUT_ACCEPTED)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Fields not editable on a mission: {', '.join(unknown)}. "
+                       f"Editable: {', '.join(EDITABLE_SPEC_FIELDS)}, update_nodes "
+                       "(a reroute); to cancel use POST .../cancel")
         # Get existing mission
         mission = await service.database.get_object(MissionObjectV1, mission_name)
 
@@ -2456,13 +2529,9 @@ async def update_mission(mission_name: str, mission_data: dict):
                     reroute = value
                 elif key in EDITABLE_SPEC_FIELDS:
                     edits[key] = value
-                elif key in ("route_rev", "kind", "goal", "created_at"):
-                    # Server-owned (route_rev is bumped by a reroute, the others are set when
-                    # the mission is created); a caller's copy must not change them.
-                    continue
-                else:
-                    setattr(mission, key, value)
-                    touched.add(key)
+                # else: server-owned and ignored (route_rev is bumped by a reroute, the
+                # others are set when the mission is created); a caller's copy must not
+                # change them (_MISSION_PUT_ACCEPTED)
             if edits:
                 # Only a mission that has not started can be edited: once its orders are
                 # with the robot the operator has to start a new mission instead.

@@ -73,9 +73,13 @@ class TestCreateRobotCurrentModel:
         )
         svc = MagicMock()
         svc.database.get_object = AsyncMock(return_value=existing)
-        svc.database.update_spec = AsyncMock()
         svc.database.update_status = AsyncMock()
+
+        async def update_spec_fields(cls, name, fields, publisher_id):
+            for key, value in fields.items():  # the route re-reads the row it wrote
+                setattr(existing, key, value)
+        svc.database.update_spec_fields = AsyncMock(side_effect=update_spec_fields)
         with patch.object(main, "service", svc):
             result = await main.create_robot({"name": "bot1", "current_model": "newmodel.onnx"})
         assert result["current_model"] == "newmodel.onnx"
-        svc.database.update_spec.assert_awaited()
+        svc.database.update_spec_fields.assert_awaited()
