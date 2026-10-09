@@ -122,7 +122,7 @@ class TestImageDatabaseServiceDeleteImage:
         )
 
         assert result is True
-        mock_client.remove_object.assert_called_once()
+        assert mock_client.remove_object.call_count == 1 + len(ImageDatabaseService.SIZES)
 
 
 @pytest.mark.unit
@@ -435,7 +435,7 @@ class TestImageDatabaseServiceDeleteImageDetailed:
         )
 
         assert result is True
-        mock_client.remove_object.assert_called_once()
+        assert mock_client.remove_object.call_count == 1 + len(ImageDatabaseService.SIZES)
 
     @patch('packages.topomap_dbs.minio_base.Minio')
     def test_delete_image_default_map(self, mock_minio):
@@ -922,8 +922,18 @@ class TestImageDatabaseServiceResized:
         def put_object(bucket, name, data, length, content_type=None, metadata=None):
             objects[name] = data.read()
 
+        def stat_object(bucket, name):
+            if name not in objects:
+                raise S3Error(Mock(), "NoSuchKey", "missing", name, "req", "host")
+            return Mock()
+
+        def remove_object(bucket, name):
+            objects.pop(name, None)
+
         client.get_object.side_effect = get_object
         client.put_object.side_effect = put_object
+        client.stat_object.side_effect = stat_object
+        client.remove_object.side_effect = remove_object
         mock_minio.return_value = client
         return ImageDatabaseService(), client
 
@@ -941,8 +951,7 @@ class TestImageDatabaseServiceResized:
         assert "n1/thumbs/thumb/a.jpg.jpg" in objects
         assert len(small) < len(objects["n1/images/a.jpg"])
 
-        # The second call is served from the cache: the original is not read again.
-        del objects["n1/images/a.jpg"]
+        # The second call is served from the cache.
         assert service.get_image_resized("a.jpg", "n1", "thumb", map_id="m") == small
 
     @patch('packages.topomap_dbs.minio_base.Minio')
@@ -962,6 +971,41 @@ class TestImageDatabaseServiceResized:
         assert service.get_image_resized("nope", "n1", "thumb", map_id="m") is None
         assert service.get_image_resized("bad", "n1", "thumb", map_id="m") == b"not an image"
         assert "n1/thumbs/thumb/bad.jpg" not in objects
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_delete_image_removes_its_thumbnails(self, mock_minio):
+        objects = {"n1/images/a.jpg": _jpeg(400, 300)}
+        service, _ = self._service(mock_minio, objects)
+        service.get_image_resized("a.jpg", "n1", "thumb", map_id="m")
+        service.get_image_resized("a.jpg", "n1", "preview", map_id="m")
+        assert "n1/thumbs/preview/a.jpg.jpg" in objects
+        assert service.delete_image("a.jpg", "n1", "m") is True
+        assert objects == {}
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_store_image_over_an_id_drops_stale_thumbnails(self, mock_minio):
+        objects = {"n1/images/cam": _jpeg(400, 300)}
+        service, client = self._service(mock_minio, objects)
+        client.bucket_exists.return_value = True
+        service.get_image_resized("cam", "n1", "thumb", map_id="m")
+        assert "n1/thumbs/thumb/cam.jpg" in objects
+        assert service.store_image(_jpeg(200, 200), "cam", "n1", "m") is True
+        assert "n1/thumbs/thumb/cam.jpg" not in objects
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_thumbnail_of_a_missing_original_is_not_served(self, mock_minio):
+        objects = {"n1/thumbs/thumb/a.jpg.jpg": b"stale"}
+        service, _ = self._service(mock_minio, objects)
+        assert service.get_image_resized("a.jpg", "n1", "thumb", map_id="m") is None
+
+    @patch('packages.topomap_dbs.minio_base.Minio')
+    def test_jpeg_resize_limits_pixels(self, mock_minio):
+        import io
+        from PIL import Image
+        service, _ = self._service(mock_minio, {})
+        out = service._resize_jpeg(_jpeg(2000, 1000), 160)
+        assert max(Image.open(io.BytesIO(out)).size) <= 160
+        assert Image.MAX_IMAGE_PIXELS == ImageDatabaseService.MAX_IMAGE_PIXELS
 
     def test_sizes_and_key_stay_out_of_the_images_prefix(self):
         assert ImageDatabaseService.SIZES == {"thumb": 160, "preview": 640}

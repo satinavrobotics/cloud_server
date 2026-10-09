@@ -1262,20 +1262,31 @@ async def get_image(
             logging.error(f"Image data is not bytes! Type: {type(image_data)}")
             image_data = bytes(image_data)
 
-        # Use Response with explicit headers to prevent JSON encoding
-        return Response(
-            content=image_data,
-            media_type="image/jpeg",
-            headers={
-                "Content-Type": "image/jpeg",
-                "Content-Length": str(len(image_data))
-            }
-        )
+        # A resized image is always JPEG; the original (or a fallback to it) is sniffed.
+        media_type = "image/jpeg" if size else _sniff_image_type(image_data)
+        headers = {"Content-Type": media_type, "Content-Length": str(len(image_data))}
+        if size and image_id:
+            # a given id of a node is rewritten only when the robot re-sends it
+            headers["Cache-Control"] = "private, max-age=86400"
+        else:
+            headers["Cache-Control"] = "private, no-cache"
+        return Response(content=image_data, media_type=media_type, headers=headers)
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"Error retrieving image for node {node_id} in map {map_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving image: {str(e)}")
+
+
+def _sniff_image_type(data: bytes) -> str:
+    """Content type of image bytes by their magic number (JPEG when unknown)."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data.startswith(b"GIF8"):
+        return "image/gif"
+    return "image/jpeg"
 
 
 # ==================== ROS Bag Operations ====================

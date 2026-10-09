@@ -95,6 +95,8 @@ class ImageDatabaseService(MinIOService):
                 f"Stored image {image_id} for node {node_id} in map {map_id} "
                 f"(bucket={bucket_name}, object={object_name})"
             )
+            # the same id may have been stored before: its cached thumbnails are stale now
+            self._remove_thumbs(bucket_name, node_id, image_id)
             return True
 
         except Exception as e:
@@ -206,6 +208,7 @@ class ImageDatabaseService(MinIOService):
                 raise
 
             self.client.remove_object(bucket_name, object_name)
+            self._remove_thumbs(bucket_name, node_id, image_id)
             self.logger.debug(f"Deleted image {image_id} for node {node_id} from map {map_id}")
             return True
 
@@ -310,20 +313,41 @@ class ImageDatabaseService(MinIOService):
     def thumb_key(node_id: str, image_id: str, size: str) -> str:
         return f"{node_id}/thumbs/{size}/{image_id}.jpg"
 
-    @staticmethod
-    def _resize_jpeg(data: bytes, max_px: int) -> Optional[bytes]:
+    def _remove_thumbs(self, bucket_name: str, node_id: str, image_id: str) -> None:
+        """Remove the cached thumbnails of an image (every size). Best effort."""
+        for size in self.SIZES:
+            try:
+                self.client.remove_object(bucket_name, self.thumb_key(node_id, image_id, size))
+            except Exception as e:  # noqa: BLE001 - a missing key is fine
+                self.logger.debug(f"No thumbnail {size} removed for {node_id}/{image_id}: {e}")
+
+    # Decoding bombs: refuse (-> fall back to the original) anything above this many pixels.
+    MAX_IMAGE_PIXELS = 100_000_000
+    _warned_no_pillow = False
+
+    def _resize_jpeg(self, data: bytes, max_px: int) -> Optional[bytes]:
         """`data` scaled to fit max_px x max_px as a JPEG; None when it cannot be decoded.
         Never enlarges."""
         try:
             from PIL import Image, ImageOps
-
+        except ImportError:
+            if not ImageDatabaseService._warned_no_pillow:
+                ImageDatabaseService._warned_no_pillow = True
+                self.logger.warning("Pillow is not installed: images are served at full size")
+            return None
+        try:
+            Image.MAX_IMAGE_PIXELS = self.MAX_IMAGE_PIXELS
             with Image.open(io.BytesIO(data)) as img:
+                if img.format == "JPEG":
+                    # let the decoder downscale by 1/2, 1/4, 1/8 while reading
+                    img.draft("RGB", (max_px, max_px))
                 img = ImageOps.exif_transpose(img)
                 img.thumbnail((max_px, max_px))
                 out = io.BytesIO()
                 img.convert("RGB").save(out, format="JPEG", quality=80, optimize=True)
                 return out.getvalue()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Image could not be resized: {e}")
             return None
 
     def get_image_resized(
@@ -343,6 +367,10 @@ class ImageDatabaseService(MinIOService):
         bucket_name = self._bucket_name(map_id)
         key = self.thumb_key(node_id, image_id, size)
         try:
+            self.client.stat_object(bucket_name, f"{node_id}/images/{image_id}")
+        except Exception:  # noqa: BLE001 - original gone: a stale thumbnail is not served
+            return None
+        try:
             response = self.client.get_object(bucket_name, key)
             try:
                 return response.read()
@@ -356,6 +384,7 @@ class ImageDatabaseService(MinIOService):
             return None
         small = self._resize_jpeg(original, self.SIZES[size])
         if small is None:
+            self.logger.debug(f"Serving the original of {node_id}/{image_id}: not resizable")
             return original
         try:
             self.client.put_object(

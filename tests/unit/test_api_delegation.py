@@ -1279,6 +1279,42 @@ class TestApiDelegationServiceGetImage:
     @patch('packages.api.server.MissionPlannerClient')
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
     @patch('packages.topomap_dbs.client.GraphDatabaseService')
+    async def test_resized_runs_in_a_thread_and_is_bounded(
+            self, mock_graph, mock_image, mock_planner, mock_db):
+        import threading, time
+        import asyncio
+        import packages.api.server as srv
+        main_thread = threading.get_ident()
+        state = {"threads": set(), "now": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def resized(**kw):
+            with lock:
+                state["threads"].add(threading.get_ident())
+                state["now"] += 1
+                state["peak"] = max(state["peak"], state["now"])
+            time.sleep(0.05)
+            with lock:
+                state["now"] -= 1
+            return b"jpeg"
+
+        inst = Mock()
+        inst.get_image_resized.side_effect = resized
+        mock_image.return_value = inst
+        srv._resize_semaphore = None
+        service = ApiDelegationService()
+        res = await asyncio.gather(*[
+            service.get_image("m", f"n{i}", "a", size="thumb") for i in range(12)])
+        assert res == [b"jpeg"] * 12
+        assert main_thread not in state["threads"]
+        assert state["peak"] <= srv.MAX_CONCURRENT_RESIZES
+        srv._resize_semaphore = None
+
+    @pytest.mark.asyncio
+    @patch('packages.api.server.PostgresDatabase')
+    @patch('packages.api.server.MissionPlannerClient')
+    @patch('packages.topomap_dbs.client.ImageDatabaseService')
+    @patch('packages.topomap_dbs.client.GraphDatabaseService')
     async def test_get_image_not_found(self, mock_graph, mock_image, mock_planner, mock_db):
         """Test getting image when not found."""
         mock_image_instance = Mock()

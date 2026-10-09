@@ -13,4 +13,4 @@ SQLAlchemy==2.0.36
 # 3D reconstruction: the top view (ortho/height) is derived from cloud.ply here (reconstruction_topview.py)
 numpy==1.26.4
 # downscaled node images (topomap_dbs/image_db get_image_resized)
-Pillow>=10.0.0
+Pillow==10.2.0

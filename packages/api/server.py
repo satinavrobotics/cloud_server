@@ -516,6 +516,18 @@ def _with_utc_offset(stamp: Any) -> Any:
     return stamp if parsed.tzinfo else parsed.astimezone().isoformat()
 
 
+# At most this many image resizes (MinIO read + Pillow decode) run at once, in worker threads.
+MAX_CONCURRENT_RESIZES = 4
+_resize_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_resize_semaphore() -> asyncio.Semaphore:
+    global _resize_semaphore
+    if _resize_semaphore is None:
+        _resize_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESIZES)
+    return _resize_semaphore
+
+
 class ApiDelegationService:
     """
     API Delegation Service - Central gateway for client requests.
@@ -1410,9 +1422,12 @@ class ApiDelegationService:
 
         try:
             if size:
-                result = self.image_db.get_image_resized(
-                    map_id=map_id, node_id=node_id, image_id=image_id, size=size
-                )
+                # blocking MinIO + Pillow work: off the event loop, a few at a time
+                async with _get_resize_semaphore():
+                    result = await asyncio.to_thread(
+                        self.image_db.get_image_resized,
+                        map_id=map_id, node_id=node_id, image_id=image_id, size=size,
+                    )
             else:
                 result = self.image_db.get_image(
                     map_id=map_id,
