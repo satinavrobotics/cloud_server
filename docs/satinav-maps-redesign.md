@@ -303,7 +303,8 @@ graph-builder, dispatch, planner; with 2e0b63a).
   one query (`map_sessions` ⋈ `mapobjectv1` ⋈ `robotobjectv1`), cached 1 s per robot, so a
   pause/finish takes effect within ~1 s without a second LISTEN connection. Nodes **and** images
   go to the session's map; the payload `map_id` is ignored (images used to land in `default`).
-  Dropped, with a reason: `no_session`, `map_deleting`, `map_missing`, `session_unplaced`,
+  Dropped, with a reason: `no_session`, `map_deleting`, `map_missing`, `operate_session` and
+  `session_paused` (since §14.17: only an unpaused mapping session takes data), `session_unplaced`,
   `datum_changed` (a session whose robot datum changed since
   it started and cannot be re-anchored: a local map, or a datum in another UTM zone; on a geo
   map a restart is re-anchored, see §13.4),
@@ -545,7 +546,7 @@ Changed:
     - the map is archived, deleting, or `draft` for `operate` (nothing to use);
     - the map already has an open mapping session (for `mapping`);
     - geo map and the robot has no datum;
-    - the robot is driving (an active order or a non-zero velocity), or `robot_pose` differs from the robot's current pose by more than sensor noise (0.02 m / 0.5°): the robot must stand still while placed (Q-U7); stop it and place again.
+    - *(superseded 2026-10-08: placing a driving or moved robot is no longer refused; the answer carries `warnings`, see §14.17)* the robot is driving (an active order or a non-zero velocity), or `robot_pose` differs from the robot's current pose by more than sensor noise (0.02 m / 0.5°).
   - 422:
     - `placement` on a geo map;
     - `services` on `operate`;
@@ -618,7 +619,7 @@ ALTER TABLE map_sessions ADD CONSTRAINT map_sessions_legacy_mapping_check
 | Planner `_resolve_map`, `_robot_xy_in_map` | `robot.current_map`, `robot_frame_in_map` | the session's map and `map_T_session`; unplaced → 409 |
 | Run recorder `mission_runs.map_id` | `current_map` or the pose's map id | the session's map (null when mapless) |
 | Bag metadata `map_id` | `current_map` | the session's map, plus `session_id` |
-| graph-builder `decide()` | open session | plus `not_mapping_session` (operate) and `session_unplaced` |
+| graph-builder `decide()` | open session | plus `operate_session` (operate), `session_paused` and `session_unplaced` (§14.17) |
 | Client marker | the map's transform (off by −1.445° on `map` with the sim, §13.2) | `robot.session.map_T_session` |
 
 **Transition (U2 to U6):** while the old client still sends missions without a session, a waypoint on a map the robot has no session on falls back to today's `robot_frame_in_map`, with a warning. U6 removes the fallback (§14.14): such a waypoint fails the node ("robot is not using map X"), the planner answers 409, and `robot_frame_in_map` is gone.
@@ -725,7 +726,7 @@ U1 → U2 → U3 are sequential. U4 needs U1 (and U3 for the "not placed" state)
 - **Q-U4** Extending a local map: **placement is required before capture.** M6 shrinks.
 - **Q-U5** A robot may use a map another robot is mapping: yes. Several robots mapping the same place (and sharing maps in general) is a **later, separate design step** (not in the coming weeks); nothing in U1–U6 designs for it beyond not blocking it.
 - **Q-U6** M3 is already deployed: keep `mapping/state` as an alias for one release next to `mapping/topo/state`.
-- **Q-U7** **The robot must not move while being placed.** No movement allowance: `place` is refused while the robot drives (an active order, or a non-zero velocity in its state) and if its pose changed between the pose shown and the confirm by more than sensor noise (0.02 m / 0.5°; noise, not an allowance). The UI says to stop the robot first.
+- **Q-U7** **The robot must not move while being placed.** No movement allowance: `place` is refused while the robot drives (an active order, or a non-zero velocity in its state) and if its pose changed between the pose shown and the confirm by more than sensor noise (0.02 m / 0.5°; noise, not an allowance). The UI says to stop the robot first. *Superseded 2026-10-08: the user can always place a robot by hand; driving / moved only add `warnings` to the answer.*
 - **Q-U8** No manual correction of a geo map's placement now (recommendation taken).
 - **Q-U9** An operate session does not end on its own while the robot is offline; it becomes unplaced on the next run change (recommendation taken).
 
@@ -741,7 +742,7 @@ As designed, except:
 - **Who publishes `mapping/set`:** the API after its own session changes (as M3), and **mission-dispatch** after it unplaces or re-places a session (same retained topic, same payload, re-read from the database right before publishing). The two processes do not share the M3 per-robot lock; a race can leave a stale retained message until the next change or API reconnect. graph-builder's `session_unplaced` check is the safety net (a robot capturing while unplaced has its nodes dropped).
 - **Empty local map.** "The first mapping session of an empty local map is identity and placed" uses the map's node count (ArangoDB, falling back to the sessions' and the row's stored counts), not "the first session": a local map whose earlier sessions recorded nothing is still empty.
 - **Placement carried over (addition).** `replace: true` on the **same** local map carries a placed session's `map_T_session` into the new one (`placement.source: "session"`, `from_session_id`), e.g. "Finish mapping → Use" in one step without placing by hand. Only while it is placed, i.e. within the same run.
-- **Stillness check details (Q-U7).** Driving = robot state `ON_TASK`/`MAP_DEPLOYMENT` (an active order), or in the robot's last VDA5050 state (`robot_latest.state_msg`, merged about once a second; ignored when older than 30 s): `driving: true`, a velocity above the noise floor (0.01 m/s, 0.01 rad/s), or remaining `nodeStates`. Moved = `robot_pose` vs `robot.status.pose` beyond 0.02 m / 0.5°. `place` also requires the robot online (its pose must be live). *Since U7:* a stored `ON_TASK`/`MAP_DEPLOYMENT` counts only while the robot has a PENDING or RUNNING mission, or when there is no fresh state message; otherwise it is stale by definition (the dispatcher sets it only while running a mission) and the robot's own state decides.
+- **Stillness check details (Q-U7; since 2026-10-08 these are warnings, not refusals).** Driving = robot state `ON_TASK`/`MAP_DEPLOYMENT` (an active order), or in the robot's last VDA5050 state (`robot_latest.state_msg`, merged about once a second; ignored when older than 30 s): `driving: true`, a velocity above the noise floor (0.01 m/s, 0.01 rad/s), or remaining `nodeStates`. Moved = `robot_pose` vs `robot.status.pose` beyond 0.02 m / 0.5°. `place` also requires the robot online (its pose must be live). *Since U7:* a stored `ON_TASK`/`MAP_DEPLOYMENT` counts only while the robot has a PENDING or RUNNING mission, or when there is no fresh state message; otherwise it is stale by definition (the dispatcher sets it only while running a mission) and the robot's own state decides.
 - **Stale `ON_TASK` (found 2026-09-29, fixed in U7).** `masked-frigatebird` stayed `ON_TASK` for hours after its mission completed (ON_TASK → IDLE logged and recorded at 15:23:21), so placing it was refused as "driving". Cause: mission-dispatch received its **own** robot-status writes back through the Postgres watcher (each write used a fresh publisher id, so the watcher's "skip our own changes" never matched), and the watcher reads the row when it handles the NOTIFY, not when it was sent. The state message at mission end first wrote the status (still ON_TASK), then completed the mission and wrote IDLE with `ensure_future`; the echo of the first write, read before the IDLE write committed, replaced the dispatcher's in-memory robot object with `ON_TASK`, and every later state message (about 1/s) wrote that `ON_TASK` back, with no `ROBOT.STATE_CHANGED` since `_set_robot_state` was never involved. The same echo class as the mission "stale echo" the dispatcher already guards against. Fix: the dispatcher's robot writes carry one publisher id that its robot watcher skips; an echo from anyone else never changes `status.state` (only `_set_robot_state` does); and `ON_TASK`/`MAP_DEPLOYMENT` with no current or queued mission is set back to IDLE (with the event) 30 s after the robot's controller was created, which also heals a stuck robot at the deploy. The repeated "Object from DB: …" lines were the mission watcher's full resync every 60 s on a quiet table (done missions are skipped there, nothing re-ran); it now logs one line per resync.
 - **API details.** Session `state` is `mapping` | `paused` | `operating` | `finished`. The robot's `session` view has `map_T_session: null` while not placed (never a guessed identity) and `unplaced_reason` (`run_changed`). `sessions.open` in `GET /maps/{id}` is the open **mapping** session; `sessions.unaligned` counts mapping sessions only. History paging: `before` = the previous page's `next_before` (a session id). `services` accepts `topo` and the reserved `grid`; `mapping_services` was `{topo: ...}` until U5 (§14.12). WS: `robot_update` carries `session` (from a 1 s cache, so dispatcher changes show within about a second) and the API pushes `session_update` right after its own changes. `POST /robots/{r}/mapping/off` is allowed with an operate session (only an open mapping session blocks it).
 - **Migration** adds a third constraint, `map_sessions_services_check` (only mapping sessions have services). Downgrade deletes operate sessions first (they own no nodes; their robots become mapless). Rehearsed on the production schema: up, idempotent re-run, down, up.
@@ -958,7 +959,57 @@ in `packages/api/README.md`. `robot_notified` is false and `mapping_warning` the
 when one failed; `mapping_switch` is gone; `slam_warning` is kept. The SLAM background save ends
 minutes after the response: the events `MAP.SLAM_SAVE_DONE` / `MAP.SLAM_SAVE_FAILED` report it.
 `mapping_state`, `mapping_service`, `mapping_services` are READ from the orchestrator as before.
-Ingest is unchanged (any open placed session; no mapping-session gating).
+Ingest is unchanged (any open placed session; no mapping-session gating). *Superseded by §14.17:
+only an unpaused mapping session takes data.*
+
+### 14.17 Session lifecycle fixes (2026-10-09, user decisions A-D)
+
+An audit of the mapping / operate session lifecycle; the behaviour changes:
+
+- **Ingest (decision B).** Nothing is written to a map during an operate session: graph-builder
+  drops a node / image / depth of a robot whose open session is an operate session
+  (`operate_session`) or a paused mapping session (`session_paused`), reported like the other
+  rejections (`MAP.INGEST_REJECTED`). Only an open, unpaused, placed mapping session adds data.
+- **A start during a pending SLAM save.** A finish saves the SLAM map in the background (minutes)
+  and, when the save ends, PUTs the previous intent back with `topomap: false` (mapping API). A
+  new session started (or resumed) meanwhile was silently killed by that PUT and its SLAM start
+  was dropped (`BUSY`). Now nothing is sent to the robot while the save runs: the robot actions
+  say the services start after the save, and when it ended (saved, failed, nothing to save) the
+  API starts the robot's open, unpaused mapping session (SLAM first, then the topomap):
+  `maps.restart_session_services`, event `MAP.SESSION_SERVICES_RESTARTED` / `_RESTART_FAILED`.
+- **Failed SLAM save (decision A).** The robot stays in slam (leaving would discard the map). The
+  robot view's `slam_save` (`null` | `{map, state: saving|failed, detail, at}`) shows it,
+  `POST /api/v1/robots/{r}/slam-save/retry` saves again in the background,
+  `POST /api/v1/robots/{r}/slam-save/discard` leaves slam without saving (the pre-SLAM intent,
+  topomap off, then the open mapping session restarted); both answer `{robot_actions}`, 409 when
+  there is nothing to retry / discard. While failed, a new SLAM recording and relocalization are
+  refused ("retry or discard it"). The state and the pre-SLAM intent are kept in
+  `robot_slam_saves` (migration `20261010_01_robot_slam_saves`), so an API restart keeps a failed
+  state; a save running at the restart comes back `failed` (outcome unknown).
+- **Replace** awaits the old SLAM save (under the robot's lock) only when the new session is a
+  mapping session that records SLAM; otherwise the save runs in the background and a new mapping
+  session starts after it.
+- **Run change (decision C).** When mission-dispatch detects a new robot run (a driver /
+  orchestrator restart) it unplaces the session and NOTIFYs `robot_run_changed` (payload: the
+  robot name) in the same transaction; the API LISTENs and restarts the services of the robot's
+  non-paused mapping session (retried `RUN_CHANGE_RESTART_TRIES` times, `RUN_CHANGE_RESTART_RETRY_S`
+  apart, while the robot is coming up; only the last failure is reported). A NOTIFY missed while
+  the API was not listening is not replayed.
+- **Empty maps.** A finish (also through `replace` and robot delete) and a restore leave a map
+  `ready` only when it holds data: ArangoDB nodes (counted before the transaction, in a thread;
+  the stored counts when that fails) or a saved SLAM map (`status.slam_saved_at`, set by a
+  successful save, which also turns a `draft` map `ready`). Otherwise it is `draft`, where operate
+  sessions are refused.
+- **Robot delete** stops the closed session's services and saves its SLAM map in the background
+  (no SLAM save state kept for the deleted robot), all under the robot's lock.
+- **Relocalization during mapping (decision D).** A topomap-only mapping session no longer blocks
+  relocalization; a mapping session that records SLAM still does (its recording is the
+  localization mode), as does a pending or failed SLAM save. On a mapping-API robot the job's
+  `PUT /localization` (and its rollback) turns the topomap off and starts it again right after.
+  Starting or resuming a session that records SLAM is 409 while a job runs; a topomap-only one is
+  not refused.
+- **Resume** has the guards of a start: the reloc-job 409 (SLAM sessions) and the deferral during a
+  pending save.
 
 ---
 
