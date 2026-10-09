@@ -62,9 +62,16 @@ async def test_disabled(monkeypatch):
     svc.navigate.assert_not_awaited()
 
 
-async def test_mapless_reruns_and_gotos_skipped():
+async def test_rerun_gets_its_own_goto():
+    svc = make_service(nav={"success": True, "mission_name": "goto-loop02-rerun-5-1"})
+    assert await pre_goto.queue_pre_goto(svc, make_mission(name="loop02-rerun-5")) \
+        == "goto-loop02-rerun-5-1"
+    assert svc.navigate.await_args.kwargs["mission_name"] == "goto-loop02-rerun-5-1"
+
+
+async def test_mapless_and_gotos_skipped():
     svc = make_service()
-    for m in (make_mission(mode=MissionMode.MAPLESS), make_mission(name="m1-rerun-2"),
+    for m in (make_mission(mode=MissionMode.MAPLESS),
               make_mission(name="goto-x-1"), make_mission(kind="goto")):
         assert await pre_goto.queue_pre_goto(svc, m) is None
     svc.navigate.assert_not_awaited()

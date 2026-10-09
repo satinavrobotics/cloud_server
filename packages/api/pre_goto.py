@@ -19,8 +19,6 @@ from packages.utils import map_geo, map_sessions
 logger = logging.getLogger("ApiDelegationService")
 
 GOTO_PREFIX = "goto-"
-# Reruns are re-created copies of a mission that already ran: not touched.
-RERUN_MARKER = "-rerun-"
 
 
 def goto_name(mission_name: str, n: int = 1) -> str:
@@ -65,8 +63,7 @@ async def _queue_pre_goto(service: Any, mission: Any) -> Optional[str]:
         return None
     if getattr(mission.mode, "value", mission.mode) != "mapped":
         return None
-    if mission.kind is not None or RERUN_MARKER in mission.name \
-            or mission.name.startswith(GOTO_PREFIX):
+    if mission.kind is not None or mission.name.startswith(GOTO_PREFIX):
         return None
     wp = first_waypoint(mission)
     map_id = getattr(wp, "map_id", "") if wp is not None else ""

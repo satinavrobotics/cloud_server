@@ -560,7 +560,7 @@ mission; without the header every request makes its own.
 `POST /api/v1/missions` (`packages/api/pre_goto.py`) first queues a planner go-to named
 `goto-<mission>-1` (`kind: goto`, recognisable by the prefix; no model field) to the topomap node
 closest to the mission's first waypoint, then writes the mission, so the robot does not plan one
-long path through the map. It runs only for a `mapped` mission (not a rerun `-rerun-`, not a
+long path through the map. It runs only for a `mapped` mission (reruns included; not a
 go-to) whose robot has a placed session on the first waypoint's map, when the robot (map frame) is
 farther than `PRE_GOTO_MIN_DISTANCE_M` (2.0) from that waypoint and from the node, and a node lies
 within `PRE_GOTO_NODE_RADIUS_M` (3.0) of the waypoint. `PRE_GOTO_ENABLED=false` turns it off. Any
