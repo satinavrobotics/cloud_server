@@ -443,6 +443,30 @@ class ImageDatabaseService(MinIOService):
             self.logger.error(f"Failed to delete images for node {node_id}: {e}")
             return False
 
+    def delete_nodes_objects(self, node_ids: List[str], map_id: Optional[str] = None) -> List[str]:
+        """Delete every object under `{node}/` (images, thumbnails, depth, costmap layers) of
+        each node. Returns the ids whose objects could not all be removed ([] = all gone; a map
+        without a bucket has nothing to remove)."""
+        map_id = map_id or self.default_map_id
+        bucket_name = self._bucket_name(map_id)
+        try:
+            if not self.client.bucket_exists(bucket_name):
+                return []
+        except Exception as e:
+            self.logger.error(f"Bucket check for {bucket_name} failed: {e}")
+            return [str(n) for n in node_ids]
+        failed: List[str] = []
+        for node_id in node_ids:
+            try:
+                names = [o.object_name for o in self.client.list_objects(
+                    bucket_name, prefix=f"{node_id}/", recursive=True)]
+                for name in names:
+                    self.client.remove_object(bucket_name, name)
+            except Exception as e:
+                self.logger.error(f"Failed to delete objects of node {node_id} in {map_id}: {e}")
+                failed.append(str(node_id))
+        return failed
+
     # ==================== Map Operations ====================
 
     def list_maps(self) -> List[str]:

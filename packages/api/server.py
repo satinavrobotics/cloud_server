@@ -213,6 +213,20 @@ class WebSocketProxyManager:
         if not WEBSOCKETS_AVAILABLE:
             self.logger.warning("websockets library not available - proxy functionality disabled")
 
+    async def broadcast_map_update(self, map_id: str, message: Dict[str, Any]) -> int:
+        """Send `message` to every client of /ws/map/{map_id} on this worker (changes the API
+        makes itself, e.g. deleted nodes; graph-builder's own updates are proxied). Returns the
+        number of clients reached; a failing client is skipped."""
+        entry = self.proxy_connections.get(f"map_updates:{map_id}")
+        sent = 0
+        for client_ws in list(entry["clients"]) if entry else []:
+            try:
+                await client_ws.send_json(message)
+                sent += 1
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning(f"Map update not sent to a client of {map_id}: {e}")
+        return sent
+
     async def proxy_map_updates(self, client_ws: WebSocket, map_id: str):
         """
         Proxy map updates from Graph Builder Service to client.

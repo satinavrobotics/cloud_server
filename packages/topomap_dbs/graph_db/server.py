@@ -717,6 +717,34 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to delete node {node_id} from map {map_id}: {e}")
             return False
 
+    DELETE_EDGES_OF_NODES_AQL = (
+        "FOR e IN @@col FILTER e._from IN @refs OR e._to IN @refs "
+        "REMOVE e IN @@col OPTIONS {ignoreErrors: true} RETURN 1")
+    DELETE_NODES_AQL = (
+        "FOR k IN @keys FILTER DOCUMENT(@@col, k) != null "
+        "REMOVE k IN @@col OPTIONS {ignoreErrors: true} RETURN OLD._key")
+
+    def delete_nodes(self, map_id: str, node_ids: List[Union[int, str]]) -> Tuple[List[str], int]:
+        """Delete nodes of a map together with every edge that touches them (edges first, so
+        nothing dangles if a step fails; a repeat finishes the job). Returns (the ids that
+        existed and are gone, the number of edges removed); ids that were not there are left
+        out. A map without a node collection has no nodes: ([], 0). RAISES on an ArangoDB
+        error (unlike delete_node): the caller must not report a half delete as done."""
+        keys = [str(n) for n in dict.fromkeys(node_ids)]
+        node_collection = f"nodes_{map_id}"
+        if not keys or not self.db.has_collection(node_collection):
+            return [], 0
+        edges = 0
+        edge_collection = f"edges_{map_id}"
+        if self.db.has_collection(edge_collection):
+            refs = [f"{node_collection}/{k}" for k in keys]
+            edges = len(list(self.db.aql.execute(
+                self.DELETE_EDGES_OF_NODES_AQL,
+                bind_vars={"@col": edge_collection, "refs": refs})))
+        removed = list(self.db.aql.execute(
+            self.DELETE_NODES_AQL, bind_vars={"@col": node_collection, "keys": keys}))
+        return [str(k) for k in removed], edges
+
     def remove_node(self, node_id: Union[int, str]) -> bool:
         """
         Remove a node from BOTH ArangoDB and R-tree (synchronized).
