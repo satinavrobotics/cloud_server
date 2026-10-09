@@ -11,7 +11,9 @@ import datetime
 import json
 import math
 import os
+import struct
 import threading
+import zlib
 
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
     os.environ.setdefault(_k, "test")
@@ -30,7 +32,18 @@ from tests.unit.test_maps_m2 import NODE, _gb, _row  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
-PNG = b"\x89PNG\r\n\x1a\nfake"
+
+
+def png_bytes(width=200, height=100, bit_depth=8, colour_type=0):
+    """A PNG with a real signature and IHDR (the header is all graph-builder reads) and no
+    pixel data."""
+    ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, colour_type, 0, 0, 0)
+    chunk = b"IHDR" + ihdr
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(ihdr)) + chunk
+            + struct.pack(">I", zlib.crc32(chunk)) + b"fake pixels")
+
+
+PNG = png_bytes()
 COSTMAP = {"session_node_id": 7, "robot_name": "r1", "layer": "occupancy",
            "costmap_data": base64.b64encode(PNG).decode(), "content_type": "image/png",
            "costmap_encoding": "u8_occ100_unknown255", "width": 200, "height": 100,
@@ -46,6 +59,7 @@ def _service(row=None):
     service = _gb(row if row is not None else _row())
     service.image_db.store_costmap = Mock(return_value=True)
     service.graph_db.set_node_costmap = Mock(return_value=True)
+    service.graph_db.set_node_costmaps = Mock(return_value=True)
     return service
 
 
@@ -109,7 +123,28 @@ class TestPayload:
             ingest.costmap_record({**COSTMAP, "layer": "a/b"}, session)
 
     def test_png_is_not_decoded_by_the_check(self):
-        ingest.check_costmap_payload({**COSTMAP, "costmap_data": "!!not base64!!"})
+        # Only the header is read: whatever follows it (here not even valid base64) is not.
+        head = base64.b64encode(PNG[:33]).decode()
+        ingest.check_costmap_payload({**COSTMAP, "costmap_data": head + "!!not base64!!"})
+
+    @pytest.mark.parametrize("data, message", [
+        ("!!not base64!!", "costmap_data is not base64"),
+        (base64.b64encode(b"GIF89a" + b"\0" * 40).decode(), "costmap_data is not a PNG"),
+        (base64.b64encode(PNG[:20]).decode(), "costmap_data is not a PNG"),
+        (123, "costmap_data is not a base64 string"),
+        (base64.b64encode(png_bytes(width=201)).decode(),
+         "costmap_data is 201x100, the message says 200x100"),
+        (base64.b64encode(png_bytes(height=99)).decode(),
+         "costmap_data is 200x99, the message says 200x100"),
+        (base64.b64encode(png_bytes(bit_depth=16)).decode(),
+         "costmap_data is not a 8-bit grayscale PNG (bit depth 16, colour type 0)"),
+        (base64.b64encode(png_bytes(colour_type=2)).decode(),
+         "costmap_data is not a 8-bit grayscale PNG (bit depth 8, colour type 2)"),
+    ])
+    def test_png_header_is_checked(self, data, message):
+        with pytest.raises(ingest.CostmapPayloadError) as exc:
+            ingest.check_costmap_payload({**COSTMAP, "costmap_data": data})
+        assert str(exc.value).startswith(message)
 
     def test_record(self):
         session = ingest.OpenSession("s1", "yard", False,
@@ -124,8 +159,7 @@ class TestPayload:
         assert rec["session_id"] == "s1" and rec["source_topic"] == "/local_costmap/costmap"
         assert rec["width"] == 200 and rec["resolution"] == 0.05
         assert set(rec) == {
-            "session_node_id", "robot_name", "layer", "content_type", "costmap_encoding",
-            "width", "height", "resolution", "origin", "origin_pose3d", "frame",
+            "layer", "width", "height", "resolution", "origin", "origin_pose3d", "frame",
             "source_frame", "costmap_stamp_ms", "keyframe_stamp_ms", "stamp_offset_ms",
             "source_topic", "origin_map", "origin_pose3d_map", "session_id"}
         assert (rec["frame"], rec["source_frame"]) == ("map", "odom")
@@ -149,9 +183,10 @@ class TestPayload:
         assert all(isinstance(v, float) for v in rec["origin"].values())
         assert rec["resolution"] == 0.1 and isinstance(rec["resolution"], float)
         assert "note" not in rec["origin_pose3d"] and rec["origin_pose3d"]["qw"] == 1.0
-        assert rec["frame"] is None and rec["costmap_stamp_ms"] is None
-        assert rec["content_type"] == "image/png"
-        assert rec["costmap_encoding"] == "u8_occ100_unknown255"
+        # absent optional fields are omitted (not None), source_topic like the others
+        assert not {"frame", "source_frame", "costmap_stamp_ms", "keyframe_stamp_ms",
+                    "stamp_offset_ms", "source_topic"} & set(rec)
+        assert not {"content_type", "costmap_encoding", "session_node_id", "robot_name"} & set(rec)
 
     def test_record_without_pose3d(self):
         session = ingest.OpenSession("s1", "yard", False, dict(map_geo.IDENTITY), "ALIVE",
@@ -208,12 +243,19 @@ class TestCostmapIngest:
     async def test_buffer_overwrites_per_layer(self):
         service = _service()
         await service._handle_costmap_upload(dict(COSTMAP))
-        await service._handle_costmap_upload({**COSTMAP, "width": 300})
+        wide = base64.b64encode(png_bytes(width=300)).decode()
+        await service._handle_costmap_upload({**COSTMAP, "width": 300, "costmap_data": wide})
         await service._handle_costmap_upload({**COSTMAP, "layer": "inflated"})
         assert service.stats["buffered_costmap"] == 2
-        assert service.costmap_buffer[("r1", 7)]["occupancy"][0]["record"]["width"] == 300
+        assert service.costmap_buffer[("r1", 7)]["occupancy"][0]["parsed"]["width"] == 300
         await service._handle_node_update(dict(NODE))
-        assert service.graph_db.set_node_costmap.call_count == 2
+        # both layers of the node in one update (the single-layer setter is not used)
+        service.graph_db.set_node_costmap.assert_not_called()
+        service.graph_db.set_node_costmaps.assert_called_once()
+        m, node_id, records = service.graph_db.set_node_costmaps.call_args.args
+        assert m == "yard" and set(records) == {"occupancy", "inflated"}
+        assert records["occupancy"]["width"] == 300 and records["inflated"]["width"] == 200
+        assert service.stats["costmap_saved"] == 2 and service.stats["errors"] == 0
 
     async def test_png_is_stored_before_the_record(self):
         service = _service()
@@ -352,12 +394,139 @@ class TestCostmapIngest:
         assert service.stats["errors"] == 2
 
 
+class TestFrameAtStoreTime:
+    """The record's map-frame fields use the transform the node is stored with, not the one
+    current when the upload arrived (the session may be re-placed while it waits)."""
+    T1 = {"tx": 10.0, "ty": 0.0, "yaw": 0.0}
+    T2 = {"tx": -20.0, "ty": 5.0, "yaw": math.pi / 2}
+
+    @staticmethod
+    def _replace(service, t):
+        async def fetch(_robot):
+            return _row(t=t)
+        service.sessions = ingest.SessionResolver(fetch, ttl=0)
+
+    def _kinds(self):
+        from tests.unit.test_map_reconstruction_ingest import DEPTH
+        return [("costmap", COSTMAP, "origin_map", lambda t: ingest.map_pose(t, -5.0, -2.5, 0.1)),
+                ("depth", DEPTH, "pose3d_map",
+                 lambda t: ingest.map_geo.apply_transform(t, 1.2, -0.4))]
+
+    @pytest.mark.parametrize("which", [0, 1])
+    async def test_buffered_upload_follows_a_replacement(self, which):
+        kind, payload, field, expected = self._kinds()[which]
+        service = _service(_row(t=self.T1))
+        service.image_db.store_depth = Mock(return_value=True)
+        service.graph_db.set_node_depth = Mock(return_value=True)
+        await getattr(service, f"_handle_{kind}_upload")(dict(payload))
+        self._replace(service, self.T2)  # re-placed while the upload waited
+        await service._handle_node_update(dict(NODE))
+        kw = service.graph_db.add_node.call_args.kwargs
+        record = getattr(service.graph_db, f"set_node_{kind}").call_args.args[3]
+        want = expected(self.T2)
+        assert (kw["x"], kw["y"]) == pytest.approx(
+            ingest.map_geo.apply_transform(self.T2, 3.0, 4.0))
+        assert (record[field]["x"], record[field]["y"]) == pytest.approx(want[:2])
+
+    @pytest.mark.parametrize("which", [0, 1])
+    async def test_direct_upload_uses_the_nodes_transform(self, which):
+        kind, payload, field, expected = self._kinds()[which]
+        service = _service(_row(t=self.T1))
+        service.image_db.store_depth = Mock(return_value=True)
+        service.graph_db.set_node_depth = Mock(return_value=True)
+        await service._handle_node_update(dict(NODE))
+        self._replace(service, self.T2)  # re-placed after the node was stored
+        await getattr(service, f"_handle_{kind}_upload")(dict(payload))
+        record = getattr(service.graph_db, f"set_node_{kind}").call_args.args[3]
+        assert (record[field]["x"], record[field]["y"]) == pytest.approx(
+            expected(self.T1)[:2])
+
+
+class TestBufferCaps:
+    async def test_full_buffer_drops_the_new_upload_and_reports_it(self):
+        service = _service()
+        service.costmap_buffer.max_entries = 1
+        await service._handle_costmap_upload(dict(COSTMAP))
+        await service._handle_costmap_upload({**COSTMAP, "layer": "inflated"})
+        assert service.stats["buffered_costmap"] == 1
+        assert list(service.costmap_buffer[("r1", 7)]) == ["occupancy"]
+        assert service.stats["costmap_rejected"] == 1
+        event = service._write_event.await_args.args[0]
+        assert event.payload["reason"] == "buffer_full"
+        assert event.payload["dropped_costmap"] == 1
+        assert build_row(event, strict=True)["payload"]["reason"] == "buffer_full"
+        # an overwrite of the buffered layer still fits
+        await service._handle_costmap_upload(dict(COSTMAP))
+        assert service.stats["costmap_rejected"] == 1
+
+    async def test_byte_cap(self):
+        service = _service()
+        service.costmap_buffer.max_bytes = len(COSTMAP["costmap_data"]) + 1
+        await service._handle_costmap_upload(dict(COSTMAP))
+        await service._handle_costmap_upload({**COSTMAP, "layer": "inflated"})
+        assert service.stats["buffered_costmap"] == 1
+        assert service.stats["costmap_rejected"] == 1
+        await service._handle_node_update(dict(NODE))
+        assert service.costmap_buffer.bytes == 0
+
+    async def test_stored_directly_when_the_node_is_there_even_if_full(self):
+        service = _service()
+        service.costmap_buffer.max_entries = 0
+        await service._handle_node_update(dict(NODE))
+        await service._handle_costmap_upload(dict(COSTMAP))
+        assert service.stats["costmap_saved"] == 1 and service.stats["costmap_rejected"] == 0
+
+
+class TestFlush:
+    async def test_one_failed_png_does_not_stop_the_other_layer(self):
+        service = _service()
+        await service._handle_costmap_upload(dict(COSTMAP))
+        await service._handle_costmap_upload({**COSTMAP, "layer": "inflated"})
+        service.image_db.store_costmap.side_effect = (
+            lambda png, nid, layer, m, metadata=None: layer != "occupancy")
+        await service._handle_node_update(dict(NODE))
+        service.graph_db.set_node_costmaps.assert_not_called()
+        [call] = service.graph_db.set_node_costmap.call_args_list
+        assert call.args[2] == "inflated"
+        assert service.stats["costmap_saved"] == 1 and service.stats["errors"] == 1
+
+    async def test_failed_record_update_counts_every_stored_png(self):
+        service = _service()
+        await service._handle_costmap_upload(dict(COSTMAP))
+        await service._handle_costmap_upload({**COSTMAP, "layer": "inflated"})
+        service.graph_db.set_node_costmaps.return_value = False
+        await service._handle_node_update(dict(NODE))
+        assert service.image_db.store_costmap.call_count == 2
+        assert service.stats["costmap_saved"] == 0 and service.stats["errors"] == 2
+
+
+class TestImageBufferSession:
+    async def test_image_buffered_in_another_session_is_not_attached(self):
+        service = _service()
+        image = {"session_node_id": 7, "robot_name": "r1", "camera_name": "left",
+                 "image_data": "aGVsbG8=", "timestamp": 1, "yaw_offset": 0.0}
+        await service._handle_image_upload(dict(image))
+        entry, _ = service.image_buffer[("r1", 7)]["left"]
+        assert entry["session_id"] == "s1"
+        entry["session_id"] = "s-old"  # buffered while another session was open
+        await service._handle_node_update(dict(NODE))
+        service.image_db.store_image.assert_not_called()
+        assert service.stats["buffered_images"] == 0
+
+    async def test_image_of_the_same_session_is_attached(self):
+        service = _service()
+        image = {"session_node_id": 7, "robot_name": "r1", "camera_name": "left",
+                 "image_data": "aGVsbG8=", "timestamp": 1, "yaw_offset": 0.0}
+        await service._handle_image_upload(dict(image))
+        await service._handle_node_update(dict(NODE))
+        service.image_db.store_image.assert_called_once()
+
+
 class TestStores:
     def test_set_node_costmap_merges_one_layer(self):
         svc = GraphDatabaseService.__new__(GraphDatabaseService)
         svc.logger = Mock()
         svc.db = Mock()
-        svc.db.has_collection.return_value = True
         svc.db.aql.execute.return_value = iter(["n1"])
         assert svc.set_node_costmap("yard", "n1", "occupancy", {"width": 5})
         aql, = svc.db.aql.execute.call_args.args
@@ -367,8 +536,26 @@ class TestStores:
                         "record": {"width": 5}}
         svc.db.aql.execute.return_value = iter([])
         assert not svc.set_node_costmap("yard", "missing", "occupancy", {})
-        svc.db.has_collection.return_value = False
+        # no has_collection round trip: ArangoDB errors on a missing collection
+        svc.db.has_collection.assert_not_called()
+        svc.db.aql.execute.side_effect = RuntimeError("collection or view not found")
         assert not svc.set_node_costmap("gone", "n1", "occupancy", {})
+        svc.logger.error.assert_called_once()
+
+    def test_set_node_costmaps_merges_several_layers_in_one_update(self):
+        svc = GraphDatabaseService.__new__(GraphDatabaseService)
+        svc.logger = Mock()
+        svc.db = Mock()
+        svc.db.aql.execute.return_value = iter(["n1"])
+        records = {"occupancy": {"width": 5}, "inflated": {"width": 6}}
+        assert svc.set_node_costmaps("yard", "n1", records)
+        svc.db.aql.execute.assert_called_once()
+        aql, = svc.db.aql.execute.call_args.args
+        bind = svc.db.aql.execute.call_args.kwargs["bind_vars"]
+        assert "MERGE(d.costmap || {}, @records)" in aql and "mergeObjects: false" in aql
+        assert bind == {"@col": "nodes_yard", "key": "n1", "records": records}
+        svc.db.aql.execute.return_value = iter([])
+        assert not svc.set_node_costmaps("yard", "missing", records)
 
     @patch("packages.topomap_dbs.minio_base.Minio")
     def test_store_costmap_key_and_content_type(self, minio):
@@ -391,7 +578,7 @@ class TestStores:
         minio.return_value.list_objects.return_value = [Mock(object_name=n) for n in names]
         stats = ImageDatabaseService().get_stats(map_id="yard")
         assert stats["node_count"] == 2 and stats["image_count"] == 2
-        assert stats["depth_count"] == 1
+        assert stats["depth_count"] == 1 and stats["costmap_count"] == 2
 
 
 class _ArangoNodes:

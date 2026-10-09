@@ -24,16 +24,18 @@ processed in a worker thread; one lock (`_upload_lock`) makes the handlers' "nod
 buffer" and the worker's "node there now, take the buffer" atomic, so no upload is lost or
 stranded between them. Images need only the node's global id (they go to MinIO before the node
 is written); depth and costmap records go onto the ArangoDB node and so wait until `add_node`
-succeeded (`_stored_nodes`).
+succeeded (`_stored_nodes`). The buffers are bounded (config.UPLOAD_BUFFER_MAX_*): an upload
+that does not fit is dropped and reported as `buffer_full`.
 """
 
 import logging
 import json
 import base64
 import asyncio
+import dataclasses
 import threading
 import uuid
-from typing import Dict, Any, Optional, List, Union, Set, Tuple
+from typing import Callable, Dict, Any, Optional, List, Union, Set, Tuple
 from datetime import datetime, timezone as _dt_timezone
 from collections import defaultdict
 
@@ -49,10 +51,34 @@ from packages.topomap_dbs.client import TopomapDatabaseClient
 from packages.config import (
     MQTT_KEEPALIVE,
     MINIO_HOST, MINIO_PORT, MINIO_SECURE,
+    UPLOAD_BUFFER_MAX_BYTES, UPLOAD_BUFFER_MAX_ENTRIES,
 )
 from packages.events.emit import Event, emit
 from packages.services.graph_builder import ingest
-from packages.services.graph_builder.upload_buffer import NodeUploadBuffer
+from packages.services.graph_builder.upload_buffer import DROPPED, NodeUploadBuffer
+
+
+@dataclasses.dataclass(frozen=True)
+class _LayerUpload:
+    """What differs between the depth and costmap uploads (one code path for both:
+    `_handle_layer_upload`, `_save_layers`). Names derive from `kind`: `{kind}_buffer`,
+    `image_db.store_{kind}`, `graph_db.set_node_{kind}` / `set_node_{kind}s`, stats
+    `{kind}_saved`, the stamp `{kind}_stamp_ms`."""
+    kind: str        # 'depth' | 'costmap'
+    sub_key: str     # the entry's sub-key field: camera | layer
+    sub_field: str   # the payload field naming it: camera_name | layer
+    data_key: str    # the payload's base64 PNG
+    check: Callable[[Dict[str, Any]], Dict[str, Any]]
+    record: Callable[[Dict[str, Any], Dict[str, float], str], Dict[str, Any]]
+    error: type
+
+
+DEPTH_UPLOAD = _LayerUpload("depth", "camera", "camera_name", "depth_data",
+                            ingest.check_depth_payload, ingest.depth_record_from,
+                            ingest.DepthPayloadError)
+COSTMAP_UPLOAD = _LayerUpload("costmap", "layer", "layer", ingest.COSTMAP_DATA_KEY,
+                              ingest.check_costmap_payload, ingest.costmap_record_from,
+                              ingest.CostmapPayloadError)
 
 
 class UpdatePublisher:
@@ -236,8 +262,10 @@ class GraphBuilderService:
         # Key: (robot_name, session_node_id) -> (global_id, timestamp, map_name, session_id)
         self.session_to_global_map: Dict[Tuple[str, int], Tuple[str, datetime, str, str]] = {}
         # Nodes whose ArangoDB document exists (add_node succeeded): depth and costmap records
-        # can be set on them. (robot_name, session_node_id) -> (global_id, map_name, session_id)
-        self._stored_nodes: Dict[Tuple[str, Any], Tuple[str, str, Optional[str]]] = {}
+        # can be set on them. (robot_name, session_node_id) ->
+        # (global_id, map_name, session_id, the map_T_session the node was stored with)
+        self._stored_nodes: Dict[Tuple[str, Any],
+                                 Tuple[str, str, Optional[str], Dict[str, float]]] = {}
 
         # Robot registration cache
         # Set of robot names that are known to exist in Mission Dispatch
@@ -268,14 +296,15 @@ class GraphBuilderService:
         # buffers, the mapping writes and _stored_nodes.
         self._upload_lock = threading.RLock()
         # camera -> image dict
+        caps = {"max_bytes": UPLOAD_BUFFER_MAX_BYTES, "max_entries": UPLOAD_BUFFER_MAX_ENTRIES}
         self.image_buffer = NodeUploadBuffer("image", self.stats, "buffered_images",
-                                             lock=self._upload_lock, log=self.logger)
-        # camera -> {camera, data, record, session_id} (3D reconstruction R2)
+                                             lock=self._upload_lock, log=self.logger, **caps)
+        # camera -> {camera, data, parsed, session_id} (3D reconstruction R2)
         self.depth_buffer = NodeUploadBuffer("depth", self.stats, "buffered_depth",
-                                             lock=self._upload_lock, log=self.logger)
-        # layer -> {layer, data, record, session_id} (robot/costmap_upload)
+                                             lock=self._upload_lock, log=self.logger, **caps)
+        # layer -> {layer, data, parsed, session_id} (robot/costmap_upload)
         self.costmap_buffer = NodeUploadBuffer("costmap", self.stats, "buffered_costmap",
-                                               lock=self._upload_lock, log=self.logger)
+                                               lock=self._upload_lock, log=self.logger, **caps)
 
         # WebSocket update publisher
         self.update_publisher = UpdatePublisher()
@@ -403,13 +432,15 @@ class GraphBuilderService:
             self.stats["reject_events_failed"] += 1
             self.logger.warning(f"Could not write {event.code.value}: {e}")
 
-    async def _reject(self, resolution: "ingest.Resolution", kind: str, count: int = 1) -> None:
+    async def _reject(self, resolution: "ingest.Resolution", kind: str, count: int = 1,
+                      log: bool = True) -> None:
         """Drop `count` nodes, images, depth images or costmaps ('node' | 'image' | 'depth' |
-        'costmap'): count them and report when due."""
+        'costmap'): count them and report when due. `log` False: the caller logs (the full
+        buffers log once per window)."""
         stat = {"node": "nodes_rejected", "depth": "depth_rejected",
                 "costmap": "costmap_rejected"}.get(kind, "images_rejected")
         self.stats[stat] += count
-        if count:
+        if count and log:
             self.logger.info(
                 f"Dropped {count} {kind}(s) from {resolution.robot_name}: {resolution.reason}"
                 + (f" (map {resolution.map_name})" if resolution.map_name else ""))
@@ -466,12 +497,13 @@ class GraphBuilderService:
         return None
 
     def _stored_node(self, node_key: Tuple[str, Any],
-                     session_id: Optional[str]) -> Optional[Tuple[str, str]]:
-        """(global id, map) of a node of this session whose ArangoDB document exists (depth
-        and costmap records can be set on it), else None. Call under _upload_lock."""
+                     session_id: Optional[str]) -> Optional[Tuple[str, str, Dict[str, float]]]:
+        """(global id, map, map_T_session the node was stored with) of a node of this session
+        whose ArangoDB document exists (depth and costmap records can be set on it), else None.
+        Call under _upload_lock."""
         stored = self._stored_nodes.get(node_key)
         if stored and stored[2] == session_id:
-            return stored[0], stored[1]
+            return stored[0], stored[1], stored[3]
         return None
 
     async def _handle_node_update(self, payload: Dict[str, Any]):
@@ -572,7 +604,8 @@ class GraphBuilderService:
             self.stats["errors"] += 1
             return None
 
-        x, y, yaw = ingest.map_pose(transform or ingest.map_geo.IDENTITY, rx, ry, ryaw)
+        transform = transform or ingest.map_geo.IDENTITY
+        x, y, yaw = ingest.map_pose(transform, rx, ry, ryaw)
 
         self.logger.info(f"📨 Received node update from {robot_name}, session_node_id={session_node_id}")
 
@@ -585,7 +618,8 @@ class GraphBuilderService:
             self._stored_nodes.pop(session_key, None)
             self.session_to_global_map[session_key] = (global_node_id, datetime.now(), map_id,
                                                        session_id)
-            buffered_images = self.image_buffer.take(session_key, self.image_buffer_timeout)
+            buffered_images = self.image_buffer.take(session_key, self.image_buffer_timeout,
+                                                     session_id)
         self.stats["session_mappings"] += 1
 
         self.logger.info(f"🔑 Mapped ({robot_name}, {session_node_id}) -> {global_node_id}")
@@ -624,7 +658,7 @@ class GraphBuilderService:
         # Depth and costmap records go onto the node document: from now on they are stored
         # directly; what was buffered until now is taken under the same lock.
         with self._upload_lock:
-            self._stored_nodes[session_key] = (global_node_id, map_id, session_id)
+            self._stored_nodes[session_key] = (global_node_id, map_id, session_id, transform)
             buffered_depth = self.depth_buffer.take(session_key, self.image_buffer_timeout,
                                                     session_id)
             buffered_costmap = self.costmap_buffer.take(session_key, self.image_buffer_timeout,
@@ -633,10 +667,12 @@ class GraphBuilderService:
         inserted = self.graph_db.add_edges_bulk(edges, map_id=map_id)
         self.stats["edges_created"] += inserted
 
+        # The records are made now, with the transform the node itself got (an upload that
+        # waited may predate a re-placement of the session).
         if buffered_depth:
-            self._save_depth(global_node_id, map_id, buffered_depth)
+            self._save_depth(global_node_id, map_id, buffered_depth, transform, session_id)
         if buffered_costmap:
-            self._save_costmap(global_node_id, map_id, buffered_costmap)
+            self._save_costmap(global_node_id, map_id, buffered_costmap, transform, session_id)
 
         self.stats["nodes_processed"] += 1
         self.logger.info(
@@ -693,20 +729,30 @@ class GraphBuilderService:
         except Exception as e:
             self.logger.error(f"Failed to log mission waypoint: {e}")
 
-    def _on_image_upload_message(self, client, userdata, msg):
-        """Handle an image upload message from MQTT (paho thread): parse it and hand it to
-        _handle_image_upload on the event loop, which needs the session lookup."""
+    def _on_upload_message(self, name: str, handler: Callable, msg) -> None:
+        """An image / depth / costmap upload message from MQTT (paho thread): parse it and hand
+        it to `handler(payload)` on the event loop, which needs the session lookup."""
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
             if self._event_loop is None:
-                self.logger.error("Image upload before the event loop was set; dropped")
+                self.logger.error(f"{name.capitalize()} upload before the event loop was set; "
+                                  "dropped")
                 self.stats["errors"] += 1
                 return
-            asyncio.run_coroutine_threadsafe(self._handle_image_upload(payload),
-                                             self._event_loop)
+            asyncio.run_coroutine_threadsafe(handler(payload), self._event_loop)
         except Exception as e:
-            self.logger.error(f"Error processing image upload message: {e}")
+            self.logger.error(f"Error processing {name} upload message: {e}")
             self.stats["errors"] += 1
+
+    def _on_image_upload_message(self, client, userdata, msg):
+        """robot/image_upload (paho thread)."""
+        self._on_upload_message("image", self._handle_image_upload, msg)
+
+    async def _reject_buffer_full(self, resolution: "ingest.Resolution", kind: str) -> None:
+        """Count an upload dropped because its buffer is at its cap (the buffer logs it once
+        per window) as `buffer_full` in MAP.INGEST_REJECTED."""
+        full = dataclasses.replace(resolution, reason=ingest.BUFFER_FULL)
+        await self._reject(full, kind, log=False)
 
     async def _handle_image_upload(self, payload: Dict[str, Any]):
         """
@@ -746,6 +792,7 @@ class GraphBuilderService:
                 'image_id': camera_name,
                 'data': image_data_b64,
                 'content_type': content_type,
+                'session_id': session.session_id,  # NodeUploadBuffer.take checks it
                 'metadata': {
                     'camera_name': camera_name,
                     'timestamp': timestamp,
@@ -762,7 +809,9 @@ class GraphBuilderService:
             target = self.image_buffer.put_unless(
                 node_key, camera_name, image_dict,
                 lambda: self._mapped_node(node_key, session.session_id))
-            if target is not None:
+            if target is DROPPED:
+                await self._reject_buffer_full(resolution, "image")
+            elif target is not None:
                 global_node_id, map_id = target
                 saved_image_ids = await asyncio.to_thread(
                     self._save_images, global_node_id, map_id, [image_dict])
@@ -775,21 +824,15 @@ class GraphBuilderService:
             self.logger.error(f"Error processing image upload message: {e}")
             self.stats["errors"] += 1
 
-    # ==================== Depth (3D reconstruction R2) ====================
+    # ==================== Depth (3D reconstruction R2) and costmap ====================
 
     def _on_depth_upload_message(self, client, userdata, msg):
-        """robot/depth_upload (paho thread): parse and hand to _handle_depth_upload."""
-        try:
-            payload = json.loads(msg.payload.decode('utf-8'))
-            if self._event_loop is None:
-                self.logger.error("Depth upload before the event loop was set; dropped")
-                self.stats["errors"] += 1
-                return
-            asyncio.run_coroutine_threadsafe(self._handle_depth_upload(payload),
-                                             self._event_loop)
-        except Exception as e:
-            self.logger.error(f"Error processing depth upload message: {e}")
-            self.stats["errors"] += 1
+        """robot/depth_upload (paho thread)."""
+        self._on_upload_message("depth", self._handle_depth_upload, msg)
+
+    def _on_costmap_upload_message(self, client, userdata, msg):
+        """robot/costmap_upload (paho thread)."""
+        self._on_upload_message("costmap", self._handle_costmap_upload, msg)
 
     async def _handle_depth_upload(self, payload: Dict[str, Any]):
         """
@@ -797,151 +840,114 @@ class GraphBuilderService:
         (docs/reconstruction/design.md §5). Resolved like an image: a dropped depth image is
         counted as `depth` in MAP.INGEST_REJECTED. The node's `depth.{camera}` carries the
         camera block, scale, stamps, `robot_pose3d` and its map-frame `pose3d_map`, converted
-        with the session's map_T_session as it is now (the same transform the node gets).
+        with the transform the node was stored with (the same the node pose got).
         """
-        try:
-            try:
-                ingest.check_depth_payload(payload)
-            except ingest.DepthPayloadError as e:
-                self.logger.error(f"Invalid depth upload: {e}")
-                self.stats["errors"] += 1
-                return
-            robot_name = payload['robot_name']
-            session_node_id = payload['session_node_id']
-            camera = str(payload['camera_name'])
-
-            resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
-            if not resolution.accepted:
-                await self._reject(resolution, "depth")
-                return
-            session = resolution.session
-            try:
-                record = ingest.depth_record(payload, session)
-            except ingest.DepthPayloadError as e:
-                self.logger.error(f"Invalid depth upload: {e}")
-                self.stats["errors"] += 1
-                return
-            entry = {"camera": camera, "data": payload['depth_data'], "record": record,
-                     "session_id": session.session_id}
-
-            node_key = (robot_name, session_node_id)
-            target = self.depth_buffer.put_unless(
-                node_key, camera, entry, lambda: self._stored_node(node_key, session.session_id))
-            if target is not None:
-                global_node_id, map_id = target
-                await asyncio.to_thread(self._save_depth, global_node_id, map_id, [entry])
-        except Exception as e:
-            self.logger.error(f"Error processing depth upload message: {e}")
-            self.stats["errors"] += 1
-
-    def _save_depth(self, node_id: str, map_id: str, entries: List[Dict[str, Any]]) -> int:
-        """Store each depth PNG in MinIO, then its parameters on the node. How many were
-        stored (the PNG first: a node never names a depth image that does not exist)."""
-        saved = 0
-        for entry in entries:
-            camera = entry["camera"]
-            try:
-                data = entry["data"]
-                png = data if isinstance(data, bytes) else base64.b64decode(data, validate=True)
-                record = entry["record"]
-                if not self.image_db.store_depth(
-                        png, str(node_id), camera, map_id,
-                        metadata={"camera_name": camera,
-                                  "depth_stamp_ms": record.get("depth_stamp_ms"),
-                                  "session_id": record.get("session_id")}):
-                    self.stats["errors"] += 1
-                    continue
-                if not self.graph_db.set_node_depth(map_id, str(node_id), camera, record):
-                    self.stats["errors"] += 1
-                    continue
-                saved += 1
-                self.stats["depth_saved"] += 1
-            except Exception as e:
-                self.logger.error(f"Error saving depth {camera} of node {node_id}: {e}")
-                self.stats["errors"] += 1
-        return saved
-
-    # ==================== Costmap (robot/costmap_upload) ====================
-
-    def _on_costmap_upload_message(self, client, userdata, msg):
-        """robot/costmap_upload (paho thread): parse and hand to _handle_costmap_upload."""
-        try:
-            payload = json.loads(msg.payload.decode('utf-8'))
-            if self._event_loop is None:
-                self.logger.error("Costmap upload before the event loop was set; dropped")
-                self.stats["errors"] += 1
-                return
-            asyncio.run_coroutine_threadsafe(self._handle_costmap_upload(payload),
-                                             self._event_loop)
-        except Exception as e:
-            self.logger.error(f"Error processing costmap upload message: {e}")
-            self.stats["errors"] += 1
+        await self._handle_layer_upload(DEPTH_UPLOAD, payload)
 
     async def _handle_costmap_upload(self, payload: Dict[str, Any]):
         """
         Store one layer's occupancy costmap of a node, or buffer it until the node arrives
         (same session gating and buffering as depth). A dropped one is counted as `costmap` in
-        MAP.INGEST_REJECTED. The node's `costmap.{layer}` is ingest.costmap_record (the known
-        fields, parsed, plus `origin_map` / `origin_pose3d_map` in the map frame). A malformed
-        message is only logged and counted in stats["errors"]: it is validated once, before the
-        session lookup (the record cannot fail on a validated payload).
+        MAP.INGEST_REJECTED. The node's `costmap.{layer}` is ingest.costmap_record_from (the
+        known fields, parsed, plus `origin_map` / `origin_pose3d_map` in the map frame). A
+        malformed message is only logged and counted in stats["errors"]: it is validated once,
+        before the session lookup.
         """
+        await self._handle_layer_upload(COSTMAP_UPLOAD, payload)
+
+    async def _handle_layer_upload(self, spec: _LayerUpload, payload: Dict[str, Any]):
+        """The depth / costmap upload: validate (once, parsed), resolve the session, then store
+        against the node's document or buffer the parsed fields until the node is stored. The
+        record itself (with its map-frame fields) is made when it is stored."""
         try:
             try:
-                ingest.check_costmap_payload(payload)
-            except ingest.CostmapPayloadError as e:
-                self.logger.error(f"Invalid costmap upload: {e}")
+                parsed = spec.check(payload)
+            except spec.error as e:
+                self.logger.error(f"Invalid {spec.kind} upload: {e}")
                 self.stats["errors"] += 1
                 return
             robot_name = payload['robot_name']
             session_node_id = payload['session_node_id']
-            layer = str(payload['layer'])
+            sub = str(payload[spec.sub_field])
 
             resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
             if not resolution.accepted:
-                await self._reject(resolution, "costmap")
+                await self._reject(resolution, spec.kind)
                 return
             session = resolution.session
-            record = ingest.costmap_record(payload, session)
-            entry = {"layer": layer, "data": payload['costmap_data'], "record": record,
+            entry = {spec.sub_key: sub, "data": payload[spec.data_key], "parsed": parsed,
                      "session_id": session.session_id}
 
             node_key = (robot_name, session_node_id)
-            target = self.costmap_buffer.put_unless(
-                node_key, layer, entry, lambda: self._stored_node(node_key, session.session_id))
-            if target is not None:
-                global_node_id, map_id = target
-                await asyncio.to_thread(self._save_costmap, global_node_id, map_id, [entry])
+            target = getattr(self, f"{spec.kind}_buffer").put_unless(
+                node_key, sub, entry, lambda: self._stored_node(node_key, session.session_id))
+            if target is DROPPED:
+                await self._reject_buffer_full(resolution, spec.kind)
+            elif target is not None:
+                global_node_id, map_id, transform = target
+                await asyncio.to_thread(self._save_layers, spec, global_node_id, map_id,
+                                        [entry], transform, session.session_id)
         except Exception as e:
-            self.logger.error(f"Error processing costmap upload message: {e}")
+            self.logger.error(f"Error processing {spec.kind} upload message: {e}")
             self.stats["errors"] += 1
 
-    def _save_costmap(self, node_id: str, map_id: str, entries: List[Dict[str, Any]]) -> int:
-        """Store each costmap PNG in MinIO, then its record on the node. How many were stored
-        (the PNG first: a node never names a costmap that does not exist)."""
-        saved = 0
+    def _save_depth(self, node_id: str, map_id: str, entries: List[Dict[str, Any]],
+                    transform: Optional[Dict[str, float]] = None,
+                    session_id: Optional[str] = None) -> int:
+        """`_save_layers` for depth entries (`transform` None: identity)."""
+        return self._save_layers(DEPTH_UPLOAD, node_id, map_id, entries,
+                                 transform or ingest.map_geo.IDENTITY, session_id)
+
+    def _save_costmap(self, node_id: str, map_id: str, entries: List[Dict[str, Any]],
+                      transform: Optional[Dict[str, float]] = None,
+                      session_id: Optional[str] = None) -> int:
+        """`_save_layers` for costmap entries (`transform` None: identity)."""
+        return self._save_layers(COSTMAP_UPLOAD, node_id, map_id, entries,
+                                 transform or ingest.map_geo.IDENTITY, session_id)
+
+    def _save_layers(self, spec: _LayerUpload, node_id: str, map_id: str,
+                     entries: List[Dict[str, Any]], transform: Dict[str, float],
+                     session_id: Optional[str]) -> int:
+        """Store each entry's PNG in MinIO, then the records of the ones that stored on the node
+        in one update. How many were stored (the PNG first: a node never names an image that
+        does not exist; each failed entry counts one error). The records are built here, from
+        the entries' parsed fields, with `transform` (the node's map_T_session)."""
+        store = getattr(self.image_db, f"store_{spec.kind}")
+        stamp = f"{spec.kind}_stamp_ms"
+        stored: Dict[str, Dict[str, Any]] = {}
         for entry in entries:
-            layer = entry["layer"]
+            sub = entry[spec.sub_key]
             try:
-                data = entry["data"]
-                png = data if isinstance(data, bytes) else base64.b64decode(data, validate=True)
-                record = entry["record"]
-                if not self.image_db.store_costmap(
-                        png, str(node_id), layer, map_id,
-                        metadata={"layer": layer,
-                                  "costmap_stamp_ms": record.get("costmap_stamp_ms"),
-                                  "session_id": record.get("session_id")}):
+                record = spec.record(entry["parsed"], transform, session_id)
+                png = base64.b64decode(entry["data"], validate=True)
+                if not store(png, str(node_id), sub, map_id,
+                             metadata={spec.sub_field: sub, stamp: record.get(stamp),
+                                       "session_id": record.get("session_id")}):
                     self.stats["errors"] += 1
                     continue
-                if not self.graph_db.set_node_costmap(map_id, str(node_id), layer, record):
-                    self.stats["errors"] += 1
-                    continue
-                saved += 1
-                self.stats["costmap_saved"] += 1
+                stored[sub] = record
             except Exception as e:
-                self.logger.error(f"Error saving costmap {layer} of node {node_id}: {e}")
+                self.logger.error(f"Error saving {spec.kind} {sub} of node {node_id}: {e}")
                 self.stats["errors"] += 1
-        return saved
+        if not stored:
+            return 0
+        try:
+            if len(stored) == 1:
+                [(sub, record)] = stored.items()
+                ok = getattr(self.graph_db, f"set_node_{spec.kind}")(
+                    map_id, str(node_id), sub, record)
+            else:
+                ok = getattr(self.graph_db, f"set_node_{spec.kind}s")(
+                    map_id, str(node_id), stored)
+        except Exception as e:
+            self.logger.error(f"Error saving {spec.kind} {', '.join(stored)} of node "
+                              f"{node_id}: {e}")
+            ok = False
+        if not ok:
+            self.stats["errors"] += len(stored)
+            return 0
+        self.stats[f"{spec.kind}_saved"] += len(stored)
+        return len(stored)
 
     # ==================== Node Processing ====================
 
