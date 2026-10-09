@@ -380,11 +380,18 @@ class MappingSwitch:
                 return
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def spawn(self, coro: Awaitable[Any]) -> "asyncio.Future[Any]":
+    def spawn(self, coro: Awaitable[Any], after_save_of: Optional[str] = None
+              ) -> "asyncio.Future[Any]":
         """Run `coro` in the background (a follow-up of a save); wait_slam_saves() waits for it.
-        Its failure is only logged."""
+        `after_save_of` (a robot): start it only once that robot's save task is done, so a
+        follow-up spawned from inside the save's on_result never sees its own save as pending
+        (slam_save_pending). Its failure is only logged."""
+        save = self._slam_tasks.get(after_save_of) if after_save_of else None
+
         async def run() -> Any:
             try:
+                if save is not None:
+                    await asyncio.wait([save])
                 return await coro
             except Exception:  # noqa: BLE001
                 logger.exception("SLAM follow-up failed")

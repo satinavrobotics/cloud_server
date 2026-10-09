@@ -1976,7 +1976,9 @@ def slam_save_reporter(db: Any, session: Mapping[str, Any], switch: Optional[Any
         if follow_up and switch is not None:
             reason = {SLAM_SAVED: RESTART_SAVE_DONE, SLAM_FAILED: RESTART_SAVE_FAILED}.get(
                 result.status, RESTART_SAVE_DONE)
-            switch.spawn(restart_session_services(db, switch, robot_name, reason))
+            # after this save task is done: the restart must not see it as pending
+            switch.spawn(restart_session_services(db, switch, robot_name, reason),
+                         after_save_of=robot_name)
         if result.status == SLAM_SAVED:
             await mark_slam_saved(db, snapshot["map_name"])
         if not event or result.status not in (SLAM_SAVED, SLAM_FAILED):

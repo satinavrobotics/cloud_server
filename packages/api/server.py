@@ -230,9 +230,9 @@ class WebSocketProxyManager:
 
         try:
             # Add client to proxy connection
-            # Note: If backend service is not configured, this will create a stub connection
-            # that keeps the client connected but doesn't forward messages
-            await self._add_client_to_proxy(connection_key, client_ws, map_id, "map_updates")
+            # Note: without a backend connection the client is closed (1011) so it reconnects
+            if not await self._add_client_to_proxy(connection_key, client_ws, map_id, "map_updates"):
+                return
 
             # Keep connection alive and handle client messages
             while True:
@@ -259,9 +259,11 @@ class WebSocketProxyManager:
         client_ws: WebSocket,
         identifier: str,
         connection_type: str
-    ):
+    ) -> bool:
         """
         Add a client to an existing proxy connection or create a new one.
+        When no backend connection can be made, the client is closed (1011) instead, so it
+        reconnects later, and False is returned (else True).
 
         Args:
             connection_key: Unique key for this proxy connection
@@ -276,21 +278,17 @@ class WebSocketProxyManager:
 
                 backend_ws = await self._connect_to_backend(connection_type, identifier)
 
-                # If backend connection fails, create a stub connection that keeps the client connected
-                # but doesn't forward any messages from a backend
                 if backend_ws is None:
                     self.logger.warning(
-                        f"Backend connection failed for {connection_key}, "
-                        f"creating stub connection (no backend forwarding)"
+                        f"Backend connection failed for {connection_key}, closing the client"
                     )
-                    forward_task = asyncio.create_task(
-                        self._hold_until_cancelled(connection_key)
-                    )
-                else:
-                    # Create task to forward messages from backend to clients
-                    forward_task = asyncio.create_task(
-                        self._forward_from_backend(connection_key, backend_ws)
-                    )
+                    await self._close_client(client_ws, "backend unavailable")
+                    return False
+
+                # Create task to forward messages from backend to clients
+                forward_task = asyncio.create_task(
+                    self._forward_from_backend(connection_key, backend_ws)
+                )
 
                 self.proxy_connections[connection_key] = {
                     "backend": backend_ws,
@@ -304,6 +302,14 @@ class WebSocketProxyManager:
                 f"Client added to {connection_key} "
                 f"(total clients: {len(self.proxy_connections[connection_key]['clients'])})"
             )
+        return True
+
+    async def _close_client(self, client_ws: WebSocket, reason: str):
+        """Close a client socket with 1011 (never raises)."""
+        try:
+            await client_ws.close(code=1011, reason=reason)
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Client socket not closed: {e}")
 
     async def _remove_client_from_proxy(self, connection_key: str, client_ws: WebSocket):
         """
@@ -487,21 +493,12 @@ class WebSocketProxyManager:
                 else:
                     # Max reconnection attempts reached
                     self.logger.error(f"Max reconnection attempts reached for {connection_key}, giving up")
+                    # close the clients (1011) so they reconnect; the next one opens a new proxy
+                    async with self._lock:
+                        entry = self.proxy_connections.pop(connection_key, None)
+                    for client_ws in list(entry["clients"]) if entry else []:
+                        await self._close_client(client_ws, "backend unavailable")
                     return
-
-    async def _hold_until_cancelled(self, connection_key: str):
-        """
-        Keeps a proxy slot alive when no backend connection is available.
-
-        Sleeps indefinitely until cancelled by the last-client-disconnect cleanup path.
-
-        Args:
-            connection_key: Unique key for this proxy connection
-        """
-        try:
-            await asyncio.sleep(float('inf'))
-        except asyncio.CancelledError:
-            self.logger.info(f"Idle hold task cancelled for {connection_key}")
 
 
 def _with_utc_offset(stamp: Any) -> Any:

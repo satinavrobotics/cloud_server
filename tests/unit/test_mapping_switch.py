@@ -1257,3 +1257,26 @@ class TestSlamIsASessionService:
         await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
         await switch.wait_slam_saves()
         assert [op for op, _, _ in orch.slam_log if op == "slam_save"] == ["slam_save"]
+
+
+@pytest.mark.unit
+class TestSaveFollowUp:
+    async def test_a_follow_up_runs_after_its_save_task_is_done(self):
+        switch = make_switch({})
+        seen = []
+
+        async def save(robot, map_name, session_id):
+            from packages.api.mapping_switch import SLAM_NOTHING_TO_SAVE, SlamResult
+            return SlamResult(SLAM_NOTHING_TO_SAVE)
+        switch.save_slam = save
+
+        async def follow_up():
+            seen.append(switch.slam_save_pending("r1"))
+
+        async def on_result(result):
+            switch.spawn(follow_up(), after_save_of="r1")
+            await asyncio.sleep(0)
+            assert seen == []           # not before the save task finished
+        switch.schedule_slam_save(robot(), "yard", "s1", on_result=on_result, track=False)
+        await switch.wait_slam_saves()
+        assert seen == [False]

@@ -511,7 +511,9 @@ def robot_session_view(row: Optional[Mapping[str, Any]]) -> Optional[Dict[str, A
             "placement_source": (placement or {}).get("source") if placed else None,
             # the session's stored node count (what the session views show); it feeds
             # `mapping_state.nodes_sent` of the robot views at no extra query
-            "node_count": int(row.get("node_count") or 0)}
+            "node_count": int(row.get("node_count") or 0),
+            # the mapping services the session switches on (today `topo`, + `slam`); [] if none
+            "services": list(row.get("services") or [])}
 
 
 def by_robot(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Mapping[str, Any]]:

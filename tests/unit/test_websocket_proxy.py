@@ -388,22 +388,28 @@ class TestWebSocketProxyManagerErrorHandling:
         map_id = "test_map_1"
         connection_key = f"map_updates:{map_id}"
 
-        # Should handle the exception gracefully by creating a stub connection
-        # (no exception should be raised)
-        await manager._add_client_to_proxy(connection_key, mock_websocket, map_id, "map_updates")
+        # The client is closed (1011) so it reconnects; no proxy entry is kept
+        added = await manager._add_client_to_proxy(connection_key, mock_websocket, map_id, "map_updates")
 
-        # Verify that a proxy connection was created with a stub task
-        assert connection_key in manager.proxy_connections
-        assert manager.proxy_connections[connection_key]["backend"] is None
-        assert manager.proxy_connections[connection_key]["task"] is not None
+        assert added is False
+        assert connection_key not in manager.proxy_connections
+        assert mock_websocket.close.call_args.kwargs["code"] == 1011
 
-        # Clean up
-        manager.proxy_connections[connection_key]["task"].cancel()
-        try:
-            await manager.proxy_connections[connection_key]["task"]
-        except asyncio.CancelledError:
-            pass
-    
+    async def test_clients_are_closed_when_reconnects_are_exhausted(
+        self, mock_websocket, mock_backend_websocket
+    ):
+        manager = WebSocketProxyManager(graph_builder_ws_url="ws://localhost:8004")
+        key = "map_updates:m1"
+        manager.proxy_connections[key] = {"backend": mock_backend_websocket,
+                                          "clients": {mock_websocket}, "task": None}
+        mock_backend_websocket.__aiter__.side_effect = Exception("gone")
+        manager._connect_to_backend = AsyncMock(return_value=None)
+        with patch("packages.api.server.asyncio.sleep", AsyncMock()):
+            await manager._forward_from_backend(key, mock_backend_websocket)
+
+        assert key not in manager.proxy_connections
+        assert mock_websocket.close.call_args.kwargs["code"] == 1011
+
     @patch('packages.api.server.websockets.connect')
     async def test_client_send_failure_doesnt_affect_others(
         self, mock_connect, mock_backend_websocket
