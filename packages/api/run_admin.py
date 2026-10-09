@@ -29,7 +29,8 @@ mission's recorded runs:
   GET /api/v1/runs, fleet_reads.family_filter);
 - fleet_events WHERE run_id IN those runs (compressed chunks included: TimescaleDB 2.30 does
   DML on compressed chunks, tests/integration/run_admin covers it);
-- robot_track_ts WHERE run_id IN those runs (the Track level's 1 Hz pose/speed rows);
+- robot_track_ts WHERE run_id IN those runs (the Track level's 1 Hz pose/speed rows), bounded
+  by the runs' robot_name(s) and [min started_at, max ended_at + grace] to prune chunks;
 - mission_trajectory WHERE run_id IN those runs, or untagged rows of the mission name(s)
   (run_id IS NULL: rows of a run that was never tagged).
 
@@ -64,7 +65,7 @@ from fastapi import HTTPException
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 
-from packages.api.fleet_reads import effective_level, family_filter
+from packages.api.fleet_reads import TRAJECTORY_GRACE, effective_level, family_filter
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.telemetry_ingest import tables
@@ -216,8 +217,8 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
                     f"WHERE {mission_where} ORDER BY name FOR UPDATE", params)
                 missions = await cur.fetchall()
                 await cur.execute(
-                    f"SELECT run_id, mission_name, robot_name, ended_at IS NULL "
-                    f"FROM mission_runs WHERE {run_where} ORDER BY started_at, run_id "
+                    f"SELECT run_id, mission_name, robot_name, ended_at IS NULL, started_at, "
+                    f"ended_at FROM mission_runs WHERE {run_where} ORDER BY started_at, run_id "
                     "FOR UPDATE", params)
                 runs = await cur.fetchall()
                 if not missions and not with_reruns:
@@ -238,8 +239,14 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
                 await cur.execute("DELETE FROM fleet_events WHERE run_id = ANY(%s::uuid[])",
                                   (run_ids,))
                 deleted_events = cur.rowcount
-                await cur.execute("DELETE FROM robot_track_ts WHERE run_id = ANY(%s::uuid[])",
-                                  (run_ids,))
+                if runs:
+                    # Bounded by robot and time so the delete prunes chunks instead of
+                    # decompressing/scanning every one (all runs are closed here).
+                    await cur.execute(
+                        "DELETE FROM robot_track_ts WHERE run_id = ANY(%s::uuid[]) "
+                        "AND robot_name = ANY(%s::text[]) AND ts BETWEEN %s AND %s",
+                        (run_ids, sorted({r[2] for r in runs}), min(r[4] for r in runs),
+                         max(r[5] or now for r in runs) + TRAJECTORY_GRACE))
                 await cur.execute("DELETE FROM mission_runs WHERE run_id = ANY(%s::uuid[])",
                                   (run_ids,))
                 deleted_runs = cur.rowcount

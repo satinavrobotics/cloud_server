@@ -868,17 +868,22 @@ class FleetRecorder:
                                            default_map=run.map_id):
                 self._submit(_WriteLeg(run, leg))
         if track_on and run.resolved:
-            self._track_row(run, message, ts)
+            self._track_row(run, message, ts, now)
 
-    def _track_row(self, run: RunInfo, message: Any, ts: datetime.datetime) -> None:
+    def _track_row(self, run: RunInfo, message: Any, ts: datetime.datetime,
+                   now: datetime.datetime) -> None:
         """robot_track_ts: the robot's pose and speed, at most once per TRACK_ROW_INTERVAL_S
-        of robot time, while the run is open (Track level and above)."""
+        of RECEIVE time (`now`, the recorder clock), so a robot clock that jumps back or ahead
+        neither floods nor silences the track; the row keeps the robot's own ts. Not recorded
+        while the robot says its pose is not initialised (positionInitialized false; None,
+        older robots, is recorded)."""
         pos = message.agvPosition
-        last = run.last_track_ts
-        if pos is None or (last is not None and 0 <= (ts - last).total_seconds()
-                           < TRACK_ROW_INTERVAL_S):
+        if pos is None or pos.positionInitialized is False:
             return
-        run.last_track_ts = ts
+        last = run.last_track_ts
+        if last is not None and 0 <= (now - last).total_seconds() < TRACK_ROW_INTERVAL_S:
+            return
+        run.last_track_ts = now
         vel = message.velocity
         self.queue.put_track({
             "ts": ts, "robot_name": run.robot_name, "run_id": run.run_id,

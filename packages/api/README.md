@@ -539,18 +539,26 @@ on a robot, site or the global settings; `track` is accepted wherever the other 
 level records what the one below does, plus: `events_only` events, runs, legs and run metrics;
 `track` a 1 Hz pose and speed row per robot while a run is open (`robot_track_ts`, from the VDA5050
 `agvPosition` and `velocity`; one per second of robot time, tagged with the run and the leg in
-progress); `full` the robot state and diagnostics time series as before. Track rows are kept 1 year
-(compressed after 3 days) and are deleted with their run. `not_recorded` in the run timeline lists
+progress); `full` the robot state and diagnostics time series as before. Track rows are throttled on
+the recorder's receive clock (a robot clock that jumps does not flood or silence the track) and are
+not recorded while the robot reports `positionInitialized: false`. Retention: track rows are kept
+1 year (compressed after 3 days), `robot_state_ts` only 30 days, so a `full` run's state series is
+gone long before its track. Track rows are deleted with their run (bounded by robot and run time
+span). The track endpoint reads `robot_track_ts` live: whatever rows exist for the run are served,
+whatever level the run recorded at. `not_recorded` in the run timeline lists
 `track` as missing at `events_only` and `off`.
 
 **`GET /api/v1/runs/{run_id}/track`** -- `{"run_id", "robot_name", "map_id", "frame", "downsampled",
 "points": [{ts, x, y, theta, speed, omega, leg_seq}]}`, oldest first. `speed` is `|(vx, vy)|` in
 m/s, `omega` rad/s, `leg_seq` the `run_legs.seq` of the leg in progress (`null` between legs).
-`frame` is `"map"` when the robot's session on the run's map (`map_id`) is placed: x, y and theta
-are then converted with that session's current `map_T_session`, the frame of the legs and
-`planned_path`. Otherwise `frame` is `"run"` (the robot's own frame, not drawable on the map).
+`frame` is `"map"` when exactly one placed session of the robot on the run's map (`map_id`) spans
+the whole run and its placement (`placement.at` / `unplaced_at`) did not change after the run
+started: x, y and theta are then converted with that session's current `map_T_session`, the frame
+of the legs and `planned_path` (a null theta stays null). Otherwise (no or unplaced session,
+several sessions, placement changed or session opened/closed inside the run) `frame` is `"run"`:
+the robot's own frame, not drawable on the map, never a partly shifted track.
 `points` is empty when nothing was recorded; more than `FLEET_TRACK_MAX_POINTS` (20000) points are
-strided (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
+thinned by the query to every k-th row plus the last (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
 
 ### Status Operations
 

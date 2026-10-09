@@ -48,6 +48,7 @@ class Store:
         self.runs = {}          # run_id -> dict
         self.events = []        # dicts (EVENT_COLUMNS)
         self.trajectory = []    # dicts: mission_id, run_id
+        self.track_delete_calls = []  # (sql, params) of the same
         self.track_deletes = []  # run id sets of the DELETE FROM robot_track_ts calls
         self.notifies = []
         self.executed = []
@@ -91,10 +92,11 @@ class Store:
             assert sql.endswith("ORDER BY name FOR UPDATE")
             cur.rows = [(n, r, s) for n, (r, s) in sorted(self.missions.items())
                         if self.matches(sql, n, params[0])]
-        elif sql.startswith("SELECT run_id, mission_name, robot_name, ended_at IS NULL "
-                            "FROM mission_runs"):
+        elif sql.startswith("SELECT run_id, mission_name, robot_name, ended_at IS NULL, "
+                            "started_at, ended_at FROM mission_runs"):
             assert sql.endswith("FOR UPDATE")
-            cur.rows = [(k, r["mission_name"], r["robot_name"], r["open"])
+            cur.rows = [(k, r["mission_name"], r["robot_name"], r["open"], r["started_at"],
+                         None if r["open"] else r["started_at"] + datetime.timedelta(hours=1))
                         for k, r in sorted(self.runs.items(), key=lambda kv: (
                             kv[1]["started_at"], kv[0]))
                         if self.matches(sql, r["mission_name"], params[0])]
@@ -107,6 +109,7 @@ class Store:
             self.trajectory = keep
         elif sql.startswith("DELETE FROM robot_track_ts"):
             self.track_deletes.append(set(params[0]))
+            self.track_delete_calls.append((sql, params))
         elif sql.startswith("DELETE FROM fleet_events"):
             ids = set(params[0])
             keep = [e for e in self.events if e["run_id"] not in ids]
@@ -367,6 +370,18 @@ class TestMissionDelete:
             "deleted_runs": 2, "deleted_events": 4, "deleted_trajectory": 3,
             "run_ids": [str(rid(1)), str(rid(2))], "run_ids_truncated": False,
             "robots": ["r1"]}
+
+    async def test_track_delete_is_bounded_by_robot_and_time(self):
+        s = family_store()
+        starts = [s.runs[rid(1)]["started_at"], s.runs[rid(2)]["started_at"]]
+        r = await call(s, "DELETE", "/api/v1/missions/m")
+        assert r.status_code == 200, r.text
+        [(sql, params)] = s.track_delete_calls
+        assert "robot_name = ANY" in sql and "ts BETWEEN" in sql
+        run_ids, robots, lower, upper = params
+        assert set(run_ids) == {rid(1), rid(2)} and robots == ["r1"]
+        assert lower == min(starts)
+        assert upper == max(starts) + datetime.timedelta(hours=1) + fleet_reads.TRAJECTORY_GRACE
 
     async def test_single_without_runs(self):
         s = Store()

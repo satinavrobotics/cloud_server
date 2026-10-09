@@ -10,7 +10,7 @@ the robot's VDA5050 state (`agvPosition`, `velocity`), tagged with the run and t
 progress.
 
 - robot_track_ts: hypertable on ts (1-day chunks), compressed after 3 days, dropped after
-  1 year. Pose is the robot's run frame, as in robot_state_ts; the API converts it to the
+  1 year (robot_state_ts keeps 30 days, so a run's track outlives its state series). Pose is the robot's run frame, as in robot_state_ts; the API converts it to the
   map frame when it serves a run's track. `speed` = |(vx, vy)| in m/s, `omega` in rad/s,
   `leg_seq` = run_legs.seq of the leg in progress (NULL between legs). A DELETE of a run's
   rows works on compressed chunks too (run_admin does it).

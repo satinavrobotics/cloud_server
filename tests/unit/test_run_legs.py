@@ -399,7 +399,10 @@ class TestTrack:
 
     async def rows(self, tmp_path, level, messages):
         rec, db, mission, robot = await start(tmp_path, level=level)
-        await feed(rec, mission, robot, *[self.tmsg(mission, *m) for m in messages])
+        for m in messages:  # received when the robot stamped it
+            msg_ = self.tmsg(mission, *m)
+            rec.on_leg_state("r1", msg_, mission, robot, received_at=at(m[0]))
+        await rec.run_pending_ops()
         return [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
 
     async def test_one_row_per_second_with_speed_and_leg(self, tmp_path):
@@ -421,6 +424,28 @@ class TestTrack:
         for level, expected in (("off", 0), ("events_only", 0), ("track", 1), ("full", 1)):
             assert len(await self.rows(tmp_path, level, [(0, 0)])) == expected, level
 
+    async def test_throttle_follows_the_receive_clock(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        # robot ts goes backwards and far into the future; receive times are 0.2 s apart,
+        # then 1 s apart: one row at 0, none at 0.2/0.4, rows at 1.0 and 2.0 whatever the ts
+        for received, robot_t in ((0, 0), (0.2, -50), (0.4, 9999), (1.0, 5), (2.0, 3), (2.5, 4)):
+            rec.on_leg_state("r1", self.tmsg(mission, robot_t, 0), mission, robot,
+                             received_at=at(received))
+        await rec.run_pending_ops()
+        rows = [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
+        assert [dict(zip(fr.tables.TRACK_COLUMNS, r))["ts"] for r in rows] == \
+            [at(0), at(5), at(3)]
+
+    async def test_uninitialised_pose_is_not_recorded(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        for received, init in ((0, False), (1, None), (2, False), (3, True)):
+            m = state(at(received), order_id=order(mission), last_node=node(mission, 0, 0),
+                      driving=True, position_initialized=init)
+            rec.on_leg_state("r1", m, mission, robot, received_at=at(received))
+        await rec.run_pending_ops()
+        rows = [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
+        assert [r[0] for r in rows] == [at(1), at(3)]  # None (older robots) is recorded
+
     async def test_legs_are_still_written_at_track(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path, level="track")
         await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3))
@@ -438,18 +463,25 @@ class TestTrackEndpoint:
                 return [(run_id, "m1", "r1", None, run_map, None, "track", "COMPLETED", None,
                          None, 1, None, at(0), at(30), None, None, [], None)]
             if "FROM robot_track_ts" in sql:
-                assert "run_id = %s" in sql and params[0] == "r1" and params[-1] == run_id
-                return rows
+                assert "run_id = %s" in sql and params[0] == "r1" and params[3] == run_id
+                assert params[-1] == fleet_reads.config.FLEET_TRACK_MAX_POINTS
+                return [tuple(r) + (len(rows),) for r in rows]  # the query appends n
             if "FROM map_sessions" in sql:
                 assert params[:2] == ("r1", "map1")
-                return [] if session is None else [session]
+                if session is None:
+                    return []
+                return session if isinstance(session, list) else [session]
             return []
         return respond
+
+    def session(self, aligned=True, placement=None, started=-100, ended=None):
+        return (aligned, {"tx": 10.0, "ty": 0.0, "yaw": math.pi / 2}, placement,
+                at(started), None if ended is None else at(ended))
 
     ROWS = [(at(0), 1.0, 2.0, 0.0, 0.5, 0.1, 1), (at(1), 2.0, 2.0, 0.0, None, None, None)]
 
     async def test_placed_session_converts_to_the_map_frame(self):
-        session = (True, {"tx": 10.0, "ty": 0.0, "yaw": math.pi / 2})
+        session = self.session()
         body = (await get(FakeDb(self.respond(self.ROWS, session)),
                           f"/api/v1/runs/{self.run_id}/track")).json()
         assert (body["frame"], body["map_id"], body["downsampled"]) == ("map", "map1", False)
@@ -460,7 +492,7 @@ class TestTrackEndpoint:
         assert (second["speed"], second["leg_seq"]) == (None, None)
 
     async def test_unplaced_or_no_session_stays_in_the_run_frame(self):
-        for session in ((False, {"tx": 10.0, "ty": 0.0, "yaw": 0.0}), None):
+        for session in (self.session(aligned=False), None):
             body = (await get(FakeDb(self.respond(self.ROWS, session)),
                               f"/api/v1/runs/{self.run_id}/track")).json()
             assert body["frame"] == "run" and body["points"][0]["x"] == 1.0
@@ -471,13 +503,43 @@ class TestTrackEndpoint:
         assert body["points"] == [] and body["frame"] == "run"
         assert (await get(FakeDb(), f"/api/v1/runs/{uuid.uuid4()}/track")).status_code == 404
 
-    async def test_strided_above_the_cap(self):
-        rows = [(at(i), float(i), 0.0, 0.0, 0.0, 0.0, 1) for i in range(10)]
-        with patch.object(fleet_reads.config, "FLEET_TRACK_MAX_POINTS", 4):
-            body = (await get(FakeDb(self.respond(rows, None)),
+    async def test_missing_theta_stays_null_in_the_map_frame(self):
+        rows = [(at(0), 1.0, 2.0, None, 0.5, None, 1)]
+        body = (await get(FakeDb(self.respond(rows, self.session())),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        point = body["points"][0]
+        assert body["frame"] == "map" and point["theta"] is None and point["x"] == 8.0
+
+    async def test_frame_is_run_unless_one_placement_held_for_the_whole_run(self):
+        placed_before = {"at": at(-50).isoformat(), "source": "datum"}
+        cases = [
+            (self.session(placement=placed_before), "map"),
+            (self.session(placement={}), "map"),
+            (self.session(placement={"at": at(10).isoformat()}), "run"),       # placed mid-run
+            (self.session(placement={"at": at(-5).isoformat(),
+                                     "unplaced_at": at(12).isoformat()}), "run"),
+            (self.session(started=10), "run"),                                  # opened mid-run
+            (self.session(ended=20), "run"),                                    # closed mid-run
+            ([self.session(started=10), self.session(ended=9, started=-100)], "run"),  # two
+        ]
+        for session, frame in cases:
+            body = (await get(FakeDb(self.respond(self.ROWS, session)),
                               f"/api/v1/runs/{self.run_id}/track")).json()
-        assert body["downsampled"] and len(body["points"]) <= 4
-        assert body["points"][-1]["x"] == 9.0
+            assert body["frame"] == frame, session
+            assert (body["points"][0]["x"] == 1.0) == (frame == "run")
+
+    async def test_thinned_by_the_query_and_flagged(self):
+        # the query returns 4 of 10 rows (n = 10 on each)
+        kept = [(at(i), float(i), 0.0, 0.0, 0.0, 0.0, 1, 10) for i in (0, 3, 6, 9)]
+
+        def respond(sql, params):
+            if "FROM robot_track_ts" in sql:
+                assert "row_number()" in sql and params[-1] == 4
+                return kept
+            return self.respond([], None)(sql, params)
+        with patch.object(fleet_reads.config, "FLEET_TRACK_MAX_POINTS", 4):
+            body = (await get(FakeDb(respond), f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["downsampled"] and [p["x"] for p in body["points"]] == [0.0, 3.0, 6.0, 9.0]
 
 
 class TestEndpoints:

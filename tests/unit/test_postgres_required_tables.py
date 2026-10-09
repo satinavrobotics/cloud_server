@@ -47,4 +47,4 @@ def test_dispatch_requires_phase0_tables():
     pytest.importorskip("py_trees")  # not in tests/Dockerfile's image (pre-existing gap)
     from packages.controllers.mission.server import DISPATCH_REQUIRED_TABLES
     assert set(DISPATCH_REQUIRED_TABLES) == {
-        "mission_runs", "fleet_events", "robot_state_ts", "robot_latest"}
+        "mission_runs", "fleet_events", "robot_state_ts", "robot_latest", "robot_track_ts"}

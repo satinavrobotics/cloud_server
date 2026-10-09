@@ -468,22 +468,68 @@ async def mission_legs(db: Any, mission: str, *, include_archived: bool = False
 # --- track -------------------------------------------------------------------------------------
 
 TRACK_COLUMNS = ("ts", "x", "y", "theta", "speed", "omega", "leg_seq")
-# map_T_session of the robot's session on the run's map that overlaps the run (the latest).
+# The robot's sessions on the run's map that overlap the run (two are enough to tell "one").
 _TRACK_SESSION_SQL = (
-    "SELECT aligned, map_t_session FROM map_sessions WHERE robot_name = %s AND map_name = %s "
-    "AND started_at <= %s AND (ended_at IS NULL OR ended_at >= %s) "
-    "ORDER BY started_at DESC LIMIT 1")
+    "SELECT aligned, map_t_session, placement, started_at, ended_at FROM map_sessions "
+    "WHERE robot_name = %s AND map_name = %s AND started_at <= %s "
+    "AND (ended_at IS NULL OR ended_at >= %s) ORDER BY started_at DESC LIMIT 2")
+# Thinned in SQL: every k-th row of the run (k = ceil(n / cap)) plus the last one; the last
+# column is n, the number of rows the run has.
+_TRACK_SQL = (
+    "SELECT {cols}, n FROM (SELECT {cols}, row_number() OVER (ORDER BY ts) AS rn, "
+    "count(*) OVER () AS n FROM robot_track_ts WHERE robot_name = %s "
+    "AND ts >= %s AND ts <= %s AND run_id = %s) t "
+    "WHERE (rn - 1) %% GREATEST(ceil(n::float8 / %s)::int, 1) = 0 OR rn = n ORDER BY ts")
+
+
+def _parse_time(value: Any) -> Optional[datetime.datetime]:
+    if isinstance(value, datetime.datetime):
+        return value
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def track_transform(sessions: Sequence[Sequence[Any]], start: datetime.datetime,
+                    end: datetime.datetime) -> Optional[Dict[str, float]]:
+    """map_T_session to draw a run's track on the map, or None (frame "run").
+
+    One map_T_session is applied to every point, so it is used only when it provably held for
+    the whole run: exactly one session of the robot on the run's map overlaps the run, it spans
+    the whole run (started before `start`, still open or ended after `end`), it is placed
+    (aligned), and its placement did not change inside the run (placement.at, or an
+    unplaced_at, later than `start`). Otherwise part of the track would be silently shifted
+    and the points are returned in the robot's run frame. `sessions` rows: (aligned,
+    map_t_session, placement, started_at, ended_at)."""
+    if len(sessions) != 1:
+        return None
+    aligned, transform, placement, session_start, session_end = sessions[0]
+    if aligned is not True or session_start > start or (
+            session_end is not None and session_end < end):
+        return None
+    placement = placement if isinstance(placement, Mapping) else {}
+    for key in ("at", "unplaced_at"):
+        if placement.get(key) is None:
+            continue
+        changed = _parse_time(placement[key])
+        if changed is None or changed > start:
+            return None
+    return map_sessions.transform_of(transform)
 
 
 def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str, float]]
                  ) -> List[Dict[str, Any]]:
     """robot_track_ts rows (TRACK_COLUMNS order, run frame) as points; with `transform`
-    (map_T_session) x, y, theta are in the map frame. Pose rounded to mm / 0.001 rad."""
+    (map_T_session) x, y, theta are in the map frame (a missing theta stays null). Pose
+    rounded to mm / 0.001 rad."""
     points = []
     for ts, x, y, theta, speed, omega, leg_seq in rows:
         if x is not None and y is not None:
             if transform is not None:
-                x, y, theta = map_geo.apply_pose(transform, x, y, theta or 0.0)
+                x, y, mapped = map_geo.apply_pose(transform, x, y, theta or 0.0)
+                theta = None if theta is None else mapped
             x, y = round(x, 3), round(y, 3)
         points.append({"ts": iso(ts), "x": x, "y": y,
                        "theta": None if theta is None else round(theta, 3),
@@ -496,12 +542,13 @@ def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str,
 async def run_track(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
     """The run's 1 Hz track (pose + speed, recorded at the track and full levels), oldest first.
 
-    `frame` is "map" when the robot's session on the run's map is placed (x, y, theta are then
-    converted with that session's map_T_session as it is now, like the legs and planned path
-    that are drawn on the map) and "run" otherwise (the robot's own frame, `map_id` null or
-    session unplaced). `points` is empty when nothing was recorded (level events_only or off,
-    or older than the 1-year retention); `downsampled` says whether it was strided to
-    FLEET_TRACK_MAX_POINTS. 404 if the run is unknown."""
+    `frame` is "map" when one placed session of the robot on the run's map held for the whole
+    run (see track_transform: x, y, theta are then converted with its map_T_session as it is
+    now, like the legs and planned path drawn on the map) and "run" otherwise (the robot's own
+    frame: `map_id` null, no/unplaced session, several sessions, or a placement changed inside
+    the run). `points` is empty when nothing was recorded (level events_only or off, or older
+    than the 1-year retention); more than FLEET_TRACK_MAX_POINTS rows are thinned by the query
+    (`downsampled`). 404 if the run is unknown."""
     max_points = config.FLEET_TRACK_MAX_POINTS
     async with read_cursor(db) as cur:
         row = await _fetch_run(cur, run_id)
@@ -510,22 +557,22 @@ async def run_track(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
         if ended is None:
             await cur.execute("SELECT now()")
             ended = (await cur.fetchone())[0]
-        await cur.execute(
-            f"SELECT {', '.join(TRACK_COLUMNS)} FROM robot_track_ts WHERE robot_name = %s "
-            "AND ts >= %s AND ts <= %s AND run_id = %s ORDER BY ts",
-            (values["robot_name"], start, ended + TRAJECTORY_GRACE, run_id))
-        rows = await cur.fetchall()
+        await cur.execute(_TRACK_SQL.format(cols=", ".join(TRACK_COLUMNS)),
+                          (values["robot_name"], start, ended + TRAJECTORY_GRACE, run_id,
+                           max_points))
+        fetched = await cur.fetchall()
         transform = None
         map_id = values["map_id"]
-        if rows and map_id:
+        if fetched and map_id:
             await cur.execute(_TRACK_SESSION_SQL, (values["robot_name"], map_id, ended, start))
-            session = await cur.fetchone()
-            if session is not None and session[0] is True:
-                transform = map_sessions.transform_of(session[1])
-    kept = stride(list(rows), max_points)
+            transform = track_transform(await cur.fetchall(), start, ended)
+    total = fetched[0][-1] if fetched else 0
+    rows = [r[:-1] for r in fetched]
+    if len(rows) > max_points:  # the last row on top of a full stride: it replaces the previous
+        del rows[-2]
     return {"run_id": str(run_id), "robot_name": values["robot_name"], "map_id": map_id,
             "frame": "map" if transform is not None else "run",
-            "downsampled": len(kept) < len(rows), "points": track_points(kept, transform)}
+            "downsampled": total > len(rows), "points": track_points(rows, transform)}
 
 
 # --- recording level history (pure) ------------------------------------------------------------

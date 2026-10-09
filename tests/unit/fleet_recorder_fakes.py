@@ -287,7 +287,7 @@ def codes(event_rows):
 
 def state(ts=None, *, errors=(), battery=None, order_id="", last_node="", charging=False,
           version="2.0.0", info=(), x=1.0, y=2.0, driving=False, header=0,
-          velocity=None):
+          velocity=None, position_initialized=None):
     return types.VDA5050State(
         headerId=header, timestamp=(ts or T0).isoformat(), version=version,
         orderId=order_id, lastNodeId=last_node, nodeStates=[], edgeStates=[],
@@ -297,7 +297,8 @@ def state(ts=None, *, errors=(), battery=None, order_id="", last_node="", chargi
         batteryState=None if battery is None else types.VDA5050BatteryState(
             batteryCharge=battery, charging=charging, batteryVoltage=None,
             batteryHealth=None, reach=None),
-        agvPosition=types.VDA5050AgvPosition(x=x, y=y, theta=0.5, mapId="map1"),
+        agvPosition=types.VDA5050AgvPosition(x=x, y=y, theta=0.5, mapId="map1",
+                                          positionInitialized=position_initialized),
         velocity=None if velocity is None else types.VDA5050Velocity(
             vx=velocity[0], vy=velocity[1], omega=velocity[2]), driving=driving,
         informations=[types.VDA5050Info(infoType=k, infoDescription=v, infoLevel="INFO")

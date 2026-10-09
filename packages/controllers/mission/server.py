@@ -105,8 +105,9 @@ LOOP_ERROR_MAX_KINDS = 32
 CHARGING_HOOK_RETRY_S = 60.0
 
 # Phase 0 tables dispatch will write (v2 §5.3). They come from the API's Alembic migration
-# (20260924_01_phase0_core), so on startup dispatch waits until they exist.
-DISPATCH_REQUIRED_TABLES = ("mission_runs", "fleet_events", "robot_state_ts", "robot_latest")
+# (20260924_01_phase0_core; robot_track_ts: 20261009_01_robot_track), so on startup dispatch waits until they exist.
+DISPATCH_REQUIRED_TABLES = ("mission_runs", "fleet_events", "robot_state_ts", "robot_latest",
+                            "robot_track_ts")
 
 # How long the recording-only settings watcher waits before re-watching after a failure
 SETTINGS_WATCH_RETRY_S = 5.0
