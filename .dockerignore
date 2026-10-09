@@ -16,4 +16,4 @@ node_modules
 **/.env
 **/*.env
 docs
-tests
+# tests/ stays in the context: tests/Dockerfile (docker-compose.test.yaml) copies the repo
