@@ -18,7 +18,7 @@
 services:
   # Create an MQTT broker
   mosquitto: 
-    image: eclipse-mosquitto:latest
+    image: eclipse-mosquitto:2.0.22@sha256:fd9982f5ed92a6c2a90805601d2275f8fbd7f2d47c4cb3836f7db0bdc7a91bec   # pinned to the running version; bump deliberately
     command: 
       - /bin/sh
       - -c 
@@ -127,17 +127,24 @@ services:
 
   # Create ArangoDB for topological map
   arangodb:
-    image: arangodb/arangodb:latest
+    # 3.12.4-3 as running; pinned by digest (no verified version tag)
+    image: arangodb/arangodb@sha256:258323b83ed5cd5bacc6e2d7574777db5a8a61ec75f663e4d690824c3301c7c2
     environment:
       - ARANGO_ROOT_PASSWORD=${ARANGO_ROOT_PASSWORD:-openSesame}
     network_mode: "host"
     restart: unless-stopped
     volumes:
       - arango_data:/var/lib/arangodb3
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8529/_admin/server/availability"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   # Create MinIO for image storage
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     # Loopback only; minio-tailnet (below) adds the Tailscale address. Never the LAN/internet.
     command: server /data --address "127.0.0.1:9000" --console-address "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}"
     environment:
@@ -147,12 +154,18 @@ services:
     restart: unless-stopped
     volumes:
       - /media/satiadmin/data0/minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   # Forwards ${MINIO_TAILNET_IP}:9000 (and the console port) to MinIO on 127.0.0.1, so robots
   # and clients on the tailnet keep using presigned URLs on the Tailscale IP. Without
   # MINIO_TAILNET_IP only this container fails; it retries until tailscale0 has the address.
   minio-tailnet:
-    image: nginx:alpine
+    image: nginx:1.29.3-alpine@sha256:b3c656d55d7ad751196f21b7fd2e8d4da9cb430e32f646adcf92441b72f82b14   # nginx 1.29.3 as running
     environment:
       - MINIO_TAILNET_IP=${MINIO_TAILNET_IP:-}
       - MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-9001}
@@ -194,15 +207,21 @@ services:
       - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
     network_mode: "host"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${GRAPH_BUILDER_PORT:-8004}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
     depends_on:
       mosquitto:
         condition: service_started
       postgres:
         condition: service_healthy
       arangodb:
-        condition: service_started
+        condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
 
   # Create Mission Planner Service
   mission-planner-service:
@@ -238,13 +257,19 @@ services:
       - MQTT_KEEPALIVE=${MQTT_KEEPALIVE:-60}
     network_mode: "host"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${MISSION_PLANNER_PORT:-8005}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
     depends_on:
       mosquitto:
         condition: service_started
       postgres:
         condition: service_healthy
       arangodb:
-        condition: service_started
+        condition: service_healthy
 
   # Create LiveKit Service
   livekit-service:
@@ -266,6 +291,12 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     network_mode: "host"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${LIVEKIT_PORT:-8006}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
 
 
   # Self-hosted LiveKit SFU (Tailscale-only): live robot video for the dashboard.
@@ -319,6 +350,12 @@ services:
         required: false
     network_mode: "host"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${LIVEKIT_SFU_TOKENS_PORT:-8008}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
 
   # Create Agent Orchestrator Service (LLM triage of VDA5050 state)
   agent-orchestrator-service:
@@ -346,6 +383,12 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     network_mode: "host"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${AGENT_ORCHESTRATOR_PORT:-8007}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
     depends_on:
       - mosquitto
 
@@ -394,15 +437,21 @@ services:
         required: false
     network_mode: "host"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${API_DELEGATION_PORT:-8000}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
     depends_on:
       mosquitto:
         condition: service_started
       postgres:
         condition: service_healthy
       arangodb:
-        condition: service_started
+        condition: service_healthy
       minio:
-        condition: service_started
+        condition: service_healthy
       mission-planner-service:
         condition: service_started
       livekit-service:

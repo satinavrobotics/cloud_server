@@ -29,9 +29,14 @@ echo ""
 echo "Infrastructure Services:"
 echo "========================"
 
-# Check ArangoDB
+# Run from the repo root so compose resolves the project (container names are not fixed)
+COMPOSE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker_compose/mission_dispatch_services.yaml"
+compose() { docker compose -f "$COMPOSE_FILE" "$@"; }
+
+# Check ArangoDB (any HTTP answer, incl. 401 with auth on, means it is up; no credentials needed)
 printf "%-20s " "ArangoDB:"
-if curl -s -f "http://localhost:8529/_api/version" > /dev/null 2>&1; then
+arango_code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:8529/_api/version" 2>/dev/null)
+if [ "$arango_code" = "200" ] || [ "$arango_code" = "401" ]; then
   echo "✅ RUNNING"
 else
   echo "❌ DOWN"
@@ -45,9 +50,9 @@ else
   echo "❌ DOWN"
 fi
 
-# Check PostgreSQL
+# Check PostgreSQL (pg_isready inside the compose service; user taken from the container's own env)
 printf "%-20s " "PostgreSQL:"
-if docker exec postgres pg_isready -U postgres > /dev/null 2>&1; then
+if compose exec -T postgres sh -c 'pg_isready -U "${POSTGRES_USER:-postgres}"' > /dev/null 2>&1; then
   echo "✅ RUNNING"
 else
   echo "❌ DOWN"
@@ -80,9 +85,11 @@ else
 fi
 
 printf "%-20s " "Mission Dispatch:"
-md_status=$(docker ps --filter name=mission-dispatch --format '{{.Status}}' 2>/dev/null | head -n1)
+md_id=$(compose ps -q mission-dispatch 2>/dev/null | head -n1)
+md_status=""
+[ -n "$md_id" ] && md_status=$(docker inspect -f '{{if .State.Running}}{{if .State.Health}}{{.State.Health.Status}}{{else}}running{{end}}{{else}}{{.State.Status}}{{end}}' "$md_id" 2>/dev/null)
 case "$md_status" in
-  *"(healthy)"*) echo "✅ HEALTHY" ;;
+  healthy) echo "✅ HEALTHY" ;;
   "") echo "❌ DOWN" ;;
   *) echo "❌ UNHEALTHY ($md_status)" ;;
 esac

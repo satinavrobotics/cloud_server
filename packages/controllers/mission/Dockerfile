@@ -2,7 +2,7 @@ FROM python:3.10-slim
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y curl procps && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y procps && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
 COPY packages/controllers/mission/requirements.txt .
