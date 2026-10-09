@@ -270,3 +270,20 @@ class TestLoadSources:
         assert await policy.refresh(pool)
         assert policy.level_for("r1") is FULL
         assert policy.level_for("r2") is DEFAULT_LEVEL
+
+
+class TestTrackLevel:
+    """The ladder off < events_only < track < full (tables each level may write)."""
+
+    @pytest.mark.parametrize("level, track, legs, events, state", [
+        (RecordingLevel.OFF, False, False, False, False),
+        (RecordingLevel.EVENTS_ONLY, False, True, True, False),
+        (RecordingLevel.TRACK, True, True, True, False),
+        (RecordingLevel.FULL, True, True, True, True),
+    ])
+    def test_allows(self, level, track, legs, events, state):
+        assert p.allows(level, tables.TRACK_TABLE) is track
+        assert p.allows(level, tables.LEGS_TABLE) is legs
+        assert p.allows(level, tables.EVENTS_TABLE) is events
+        assert p.allows(level, tables.ROBOT_STATE_TABLE) is state
+        assert p.allows(level, tables.DIAGNOSTICS_TABLE) is state

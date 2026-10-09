@@ -2211,6 +2211,16 @@ async def get_run_legs(run_id: uuid.UUID):
     return await _site_call("get run legs", fleet_reads.run_legs_list(service.database, run_id))
 
 
+@app.get("/api/v1/runs/{run_id}/track")
+async def get_run_track(run_id: uuid.UUID):
+    """The run's 1 Hz track (recorded at the track and full levels): `{"run_id", "robot_name",
+    "map_id", "frame": "map"|"run", "downsampled", "points": [{ts, x, y, theta, speed (m/s),
+    omega (rad/s), leg_seq}]}`, oldest first, in the map frame when the robot's session on the
+    run's map is placed. Empty `points` when nothing was recorded. 404 if unknown."""
+    _require_service()
+    return await _site_call("get run track", fleet_reads.run_track(service.database, run_id))
+
+
 @app.get("/api/v1/missions/{name}/legs")
 async def get_mission_legs(name: str):
     """Legs of all (non-archived) runs of the mission and its reruns, aggregated per leg

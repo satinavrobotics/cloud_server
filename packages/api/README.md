@@ -532,6 +532,26 @@ outside any leg), `time_recovery_s` (overlaps stopped time), `recovery_count`, `
 `expected_s`, `actual_vs_expected` (time of the legs that have an expected time over their
 expected sum), `pass_durations_s` (`[{pass, legs, duration_s}]`).
 
+#### Run track (recording level `track`)
+
+The recording ladder is `off` < `events_only` (default) < `track` < `full` (`telemetry_recording`
+on a robot, site or the global settings; `track` is accepted wherever the other levels are). Each
+level records what the one below does, plus: `events_only` events, runs, legs and run metrics;
+`track` a 1 Hz pose and speed row per robot while a run is open (`robot_track_ts`, from the VDA5050
+`agvPosition` and `velocity`; one per second of robot time, tagged with the run and the leg in
+progress); `full` the robot state and diagnostics time series as before. Track rows are kept 1 year
+(compressed after 3 days) and are deleted with their run. `not_recorded` in the run timeline lists
+`track` as missing at `events_only` and `off`.
+
+**`GET /api/v1/runs/{run_id}/track`** -- `{"run_id", "robot_name", "map_id", "frame", "downsampled",
+"points": [{ts, x, y, theta, speed, omega, leg_seq}]}`, oldest first. `speed` is `|(vx, vy)|` in
+m/s, `omega` rad/s, `leg_seq` the `run_legs.seq` of the leg in progress (`null` between legs).
+`frame` is `"map"` when the robot's session on the run's map (`map_id`) is placed: x, y and theta
+are then converted with that session's current `map_T_session`, the frame of the legs and
+`planned_path`. Otherwise `frame` is `"run"` (the robot's own frame, not drawable on the map).
+`points` is empty when nothing was recorded; more than `FLEET_TRACK_MAX_POINTS` (20000) points are
+strided (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
+
 ### Status Operations
 
 #### `GET /api/v1/robots/{robot_name}/status`

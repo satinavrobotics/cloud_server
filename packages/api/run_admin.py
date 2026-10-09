@@ -29,6 +29,7 @@ mission's recorded runs:
   GET /api/v1/runs, fleet_reads.family_filter);
 - fleet_events WHERE run_id IN those runs (compressed chunks included: TimescaleDB 2.30 does
   DML on compressed chunks, tests/integration/run_admin covers it);
+- robot_track_ts WHERE run_id IN those runs (the Track level's 1 Hz pose/speed rows);
 - mission_trajectory WHERE run_id IN those runs, or untagged rows of the mission name(s)
   (run_id IS NULL: rows of a run that was never tagged).
 
@@ -237,6 +238,8 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
                 await cur.execute("DELETE FROM fleet_events WHERE run_id = ANY(%s::uuid[])",
                                   (run_ids,))
                 deleted_events = cur.rowcount
+                await cur.execute("DELETE FROM robot_track_ts WHERE run_id = ANY(%s::uuid[])",
+                                  (run_ids,))
                 await cur.execute("DELETE FROM mission_runs WHERE run_id = ANY(%s::uuid[])",
                                   (run_ids,))
                 deleted_runs = cur.rowcount

@@ -471,7 +471,7 @@ class TestLevelHistory:
         segs = segments(t(0), t(10), "events_only", [])
         assert brief(segs) == [(t(0), t(10), "events_only", "default")]
         assert fr.not_recorded(segs) == [{"from": t(0), "to": t(10), "level": "events_only",
-                                          "missing": ["time_series"]}]
+                                          "missing": ["time_series", "track"]}]
 
     def test_full_run_has_no_intervals(self):
         segs = segments(t(0), t(10), "full", [], robot="full")
@@ -488,8 +488,8 @@ class TestLevelHistory:
                                (t(4), t(6), "events_only", "robot"),
                                (t(6), t(10), "full", "global")]
         assert fr.not_recorded(segs) == [
-            {"from": t(2), "to": t(4), "level": "off", "missing": ["events", "time_series"]},
-            {"from": t(4), "to": t(6), "level": "events_only", "missing": ["time_series"]}]
+            {"from": t(2), "to": t(4), "level": "off", "missing": ["events", "time_series", "track"]},
+            {"from": t(4), "to": t(6), "level": "events_only", "missing": ["time_series", "track"]}]
 
     def test_site_level_applies_only_while_assigned_and_not_overridden(self):
         assignments = [("site-a", t(-60), t(5)), ("site-b", t(5), None)]

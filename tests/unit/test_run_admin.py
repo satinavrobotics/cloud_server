@@ -48,6 +48,7 @@ class Store:
         self.runs = {}          # run_id -> dict
         self.events = []        # dicts (EVENT_COLUMNS)
         self.trajectory = []    # dicts: mission_id, run_id
+        self.track_deletes = []  # run id sets of the DELETE FROM robot_track_ts calls
         self.notifies = []
         self.executed = []
         self.fail_events = False
@@ -104,6 +105,8 @@ class Store:
                                        and self.matches(sql, t["mission_id"], base)))]
             cur.rowcount = len(self.trajectory) - len(keep)
             self.trajectory = keep
+        elif sql.startswith("DELETE FROM robot_track_ts"):
+            self.track_deletes.append(set(params[0]))
         elif sql.startswith("DELETE FROM fleet_events"):
             ids = set(params[0])
             keep = [e for e in self.events if e["run_id"] not in ids]

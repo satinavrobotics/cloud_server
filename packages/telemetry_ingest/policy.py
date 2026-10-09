@@ -42,6 +42,9 @@ ASSIGNMENTS_CHANNEL = "robot_site_assignments"
 
 
 DEFAULT_LEVEL = RecordingLevel.EVENTS_ONLY
+# The ladder: each level records everything the one below does, plus its own data.
+LEVEL_RANK = {RecordingLevel.OFF: 0, RecordingLevel.EVENTS_ONLY: 1, RecordingLevel.TRACK: 2,
+              RecordingLevel.FULL: 3}
 
 # Always written, at every level (§4.1, §3.3).
 ALWAYS_RECORDED_CODES = frozenset({EventCode.TELEMETRY_RECORDING_CHANGED.value})
@@ -73,14 +76,16 @@ def allows(level: RecordingLevel, table: str, code: Optional[str] = None) -> boo
     if table == tables.LATEST_TABLE:
         return True
     if table == tables.LEGS_TABLE:
-        # Legs behave like events: written at events_only and full, never at off.
-        return level in (RecordingLevel.FULL, RecordingLevel.EVENTS_ONLY)
+        # Legs behave like events: written at every level but off.
+        return LEVEL_RANK[level] >= LEVEL_RANK[RecordingLevel.EVENTS_ONLY]
     if table == tables.EVENTS_TABLE:
         if code is not None and str(getattr(code, "value", code)) in ALWAYS_RECORDED_CODES:
             return True
-        return level in (RecordingLevel.FULL, RecordingLevel.EVENTS_ONLY)
+        return LEVEL_RANK[level] >= LEVEL_RANK[RecordingLevel.EVENTS_ONLY]
+    if table == tables.TRACK_TABLE:
+        return LEVEL_RANK[level] >= LEVEL_RANK[RecordingLevel.TRACK]
     if table in tables.TIMESERIES_COLUMNS:
-        return level is RecordingLevel.FULL
+        return LEVEL_RANK[level] >= LEVEL_RANK[RecordingLevel.FULL]
     raise ValueError(f"unknown table {table!r}")
 
 

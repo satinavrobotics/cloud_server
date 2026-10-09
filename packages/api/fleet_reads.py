@@ -40,8 +40,9 @@ resolved at the start); if the reconstruction disagrees, the segment carries
 
 What each level does NOT store (§4.1), i.e. `not_recorded[].missing`:
   full         -> nothing (no interval)
-  events_only  -> ["time_series"]            (robot_state_ts, diagnostics_ts and their rollups)
-  off          -> ["events", "time_series"]  (every fleet_events code except
+  track        -> ["time_series"]            (robot_state_ts, diagnostics_ts and their rollups)
+  events_only  -> ["time_series", "track"]   (and robot_track_ts, the 1 Hz run track)
+  off          -> ["events", "time_series", "track"]  (every fleet_events code except
                                               TELEMETRY.RECORDING_CHANGED, incl. the run's own
                                               MISSION.RUN_STARTED/RUN_FINISHED)
 Always stored, at every level: mission_runs, robot_latest, TELEMETRY.RECORDING_CHANGED, and
@@ -72,7 +73,7 @@ from packages.api import recording
 from packages.events import ids
 from packages.events.codes import EventCode, Severity
 from packages.events.schemas import RecordingLevel, RecordingScope, RunOutcome
-from packages.utils import run_legs
+from packages.utils import map_geo, map_sessions, run_legs
 from packages.telemetry_ingest.policy import (
     ASSIGNMENTS_TABLE, DEFAULT_LEVEL, ROBOT_TABLE, SITE_TABLE, PolicySources, load_sources,
     parse_level,
@@ -91,8 +92,9 @@ DEFAULT_LIMIT, MAX_LIMIT = 50, 500
 # §4.1: data kinds a level does not store.
 MISSING_BY_LEVEL: Dict[str, List[str]] = {
     RecordingLevel.FULL.value: [],
-    RecordingLevel.EVENTS_ONLY.value: ["time_series"],
-    RecordingLevel.OFF.value: ["events", "time_series"],
+    RecordingLevel.TRACK.value: ["time_series"],
+    RecordingLevel.EVENTS_ONLY.value: ["time_series", "track"],
+    RecordingLevel.OFF.value: ["events", "time_series", "track"],
 }
 
 
@@ -461,6 +463,69 @@ async def mission_legs(db: Any, mission: str, *, include_archived: bool = False
     return {"mission": mission, "runs": len(run_ids), "legs": len(legs),
             "truncated": len(rows) > MISSION_LEGS_MAX,
             "items": run_legs.aggregate(legs)}
+
+
+# --- track -------------------------------------------------------------------------------------
+
+TRACK_COLUMNS = ("ts", "x", "y", "theta", "speed", "omega", "leg_seq")
+# map_T_session of the robot's session on the run's map that overlaps the run (the latest).
+_TRACK_SESSION_SQL = (
+    "SELECT aligned, map_t_session FROM map_sessions WHERE robot_name = %s AND map_name = %s "
+    "AND started_at <= %s AND (ended_at IS NULL OR ended_at >= %s) "
+    "ORDER BY started_at DESC LIMIT 1")
+
+
+def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str, float]]
+                 ) -> List[Dict[str, Any]]:
+    """robot_track_ts rows (TRACK_COLUMNS order, run frame) as points; with `transform`
+    (map_T_session) x, y, theta are in the map frame. Pose rounded to mm / 0.001 rad."""
+    points = []
+    for ts, x, y, theta, speed, omega, leg_seq in rows:
+        if x is not None and y is not None:
+            if transform is not None:
+                x, y, theta = map_geo.apply_pose(transform, x, y, theta or 0.0)
+            x, y = round(x, 3), round(y, 3)
+        points.append({"ts": iso(ts), "x": x, "y": y,
+                       "theta": None if theta is None else round(theta, 3),
+                       "speed": None if speed is None else round(speed, 3),
+                       "omega": None if omega is None else round(omega, 3),
+                       "leg_seq": leg_seq})
+    return points
+
+
+async def run_track(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
+    """The run's 1 Hz track (pose + speed, recorded at the track and full levels), oldest first.
+
+    `frame` is "map" when the robot's session on the run's map is placed (x, y, theta are then
+    converted with that session's map_T_session as it is now, like the legs and planned path
+    that are drawn on the map) and "run" otherwise (the robot's own frame, `map_id` null or
+    session unplaced). `points` is empty when nothing was recorded (level events_only or off,
+    or older than the 1-year retention); `downsampled` says whether it was strided to
+    FLEET_TRACK_MAX_POINTS. 404 if the run is unknown."""
+    max_points = config.FLEET_TRACK_MAX_POINTS
+    async with read_cursor(db) as cur:
+        row = await _fetch_run(cur, run_id)
+        values = dict(zip(RUN_COLUMNS, row[:len(RUN_COLUMNS)]))
+        start, ended = values["started_at"], values["ended_at"]
+        if ended is None:
+            await cur.execute("SELECT now()")
+            ended = (await cur.fetchone())[0]
+        await cur.execute(
+            f"SELECT {', '.join(TRACK_COLUMNS)} FROM robot_track_ts WHERE robot_name = %s "
+            "AND ts >= %s AND ts <= %s AND run_id = %s ORDER BY ts",
+            (values["robot_name"], start, ended + TRAJECTORY_GRACE, run_id))
+        rows = await cur.fetchall()
+        transform = None
+        map_id = values["map_id"]
+        if rows and map_id:
+            await cur.execute(_TRACK_SESSION_SQL, (values["robot_name"], map_id, ended, start))
+            session = await cur.fetchone()
+            if session is not None and session[0] is True:
+                transform = map_sessions.transform_of(session[1])
+    kept = stride(list(rows), max_points)
+    return {"run_id": str(run_id), "robot_name": values["robot_name"], "map_id": map_id,
+            "frame": "map" if transform is not None else "run",
+            "downsampled": len(kept) < len(rows), "points": track_points(kept, transform)}
 
 
 # --- recording level history (pure) ------------------------------------------------------------

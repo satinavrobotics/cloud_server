@@ -35,6 +35,7 @@ class RunOutcome(str, enum.Enum):
 
 class RecordingLevel(str, enum.Enum):
     FULL = "full"
+    TRACK = "track"
     EVENTS_ONLY = "events_only"
     OFF = "off"
 

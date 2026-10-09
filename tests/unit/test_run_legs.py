@@ -390,6 +390,96 @@ def leg_row(run_id, seq, src, dst, duration, expected=4.0, recoveries=0, recover
     return tuple(base[c] for c in fleet_reads.LEG_COLUMNS)
 
 
+class TestTrack:
+    """robot_track_ts: 1 Hz pose and speed rows at the track and full levels."""
+
+    def tmsg(self, mission, t, seq=0, vel=(0.3, 0.4, 0.1), x=1.0):
+        return state(at(t), order_id=order(mission), last_node=node(mission, 0, seq),
+                     driving=True, velocity=vel, x=x)
+
+    async def rows(self, tmp_path, level, messages):
+        rec, db, mission, robot = await start(tmp_path, level=level)
+        await feed(rec, mission, robot, *[self.tmsg(mission, *m) for m in messages])
+        return [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
+
+    async def test_one_row_per_second_with_speed_and_leg(self, tmp_path):
+        rows = await self.rows(tmp_path, "track", [(0, 0), (0.4, 0), (1.0, 0), (1.5, 2), (2.2, 2)])
+        columns = fr.tables.TRACK_COLUMNS
+        got = [dict(zip(columns, r)) for r in rows]
+        assert [g["ts"] for g in got] == [at(0), at(1.0), at(2.2)]
+        assert got[0]["speed"] == pytest.approx(0.5) and got[0]["omega"] == pytest.approx(0.1)
+        assert (got[0]["x"], got[0]["y"], got[0]["theta"], got[0]["map_id"]) == (1.0, 2.0, 0.5, "map1")
+        assert got[0]["robot_name"] == "r1" and got[0]["run_id"] is not None
+        assert [g["leg_seq"] for g in got] == [1, 1, 2]
+
+    async def test_no_velocity_is_a_null_speed(self, tmp_path):
+        [row] = await self.rows(tmp_path, "full", [(0, 0, None)])
+        got = dict(zip(fr.tables.TRACK_COLUMNS, row))
+        assert got["speed"] is None and got["omega"] is None
+
+    async def test_levels(self, tmp_path):
+        for level, expected in (("off", 0), ("events_only", 0), ("track", 1), ("full", 1)):
+            assert len(await self.rows(tmp_path, level, [(0, 0)])) == expected, level
+
+    async def test_legs_are_still_written_at_track(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3))
+        assert len(db.legs_of()) == 1
+
+
+class TestTrackEndpoint:
+    run_id = uuid.uuid4()
+
+    def respond(self, rows, session, run_map="map1"):
+        run_id = self.run_id
+
+        def respond(sql, params):
+            if "FROM mission_runs" in sql:
+                return [(run_id, "m1", "r1", None, run_map, None, "track", "COMPLETED", None,
+                         None, 1, None, at(0), at(30), None, None, [], None)]
+            if "FROM robot_track_ts" in sql:
+                assert "run_id = %s" in sql and params[0] == "r1" and params[-1] == run_id
+                return rows
+            if "FROM map_sessions" in sql:
+                assert params[:2] == ("r1", "map1")
+                return [] if session is None else [session]
+            return []
+        return respond
+
+    ROWS = [(at(0), 1.0, 2.0, 0.0, 0.5, 0.1, 1), (at(1), 2.0, 2.0, 0.0, None, None, None)]
+
+    async def test_placed_session_converts_to_the_map_frame(self):
+        session = (True, {"tx": 10.0, "ty": 0.0, "yaw": math.pi / 2})
+        body = (await get(FakeDb(self.respond(self.ROWS, session)),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert (body["frame"], body["map_id"], body["downsampled"]) == ("map", "map1", False)
+        first, second = body["points"]
+        assert (first["x"], first["y"], first["theta"]) == (8.0, 1.0, 1.571)
+        assert (first["speed"], first["omega"], first["leg_seq"]) == (0.5, 0.1, 1)
+        assert first["ts"] == "2026-09-24T12:00:00+00:00"
+        assert (second["speed"], second["leg_seq"]) == (None, None)
+
+    async def test_unplaced_or_no_session_stays_in_the_run_frame(self):
+        for session in ((False, {"tx": 10.0, "ty": 0.0, "yaw": 0.0}), None):
+            body = (await get(FakeDb(self.respond(self.ROWS, session)),
+                              f"/api/v1/runs/{self.run_id}/track")).json()
+            assert body["frame"] == "run" and body["points"][0]["x"] == 1.0
+
+    async def test_empty_and_unknown(self):
+        body = (await get(FakeDb(self.respond([], None)),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["points"] == [] and body["frame"] == "run"
+        assert (await get(FakeDb(), f"/api/v1/runs/{uuid.uuid4()}/track")).status_code == 404
+
+    async def test_strided_above_the_cap(self):
+        rows = [(at(i), float(i), 0.0, 0.0, 0.0, 0.0, 1) for i in range(10)]
+        with patch.object(fleet_reads.config, "FLEET_TRACK_MAX_POINTS", 4):
+            body = (await get(FakeDb(self.respond(rows, None)),
+                              f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["downsampled"] and len(body["points"]) <= 4
+        assert body["points"][-1]["x"] == 9.0
+
+
 class TestEndpoints:
     async def test_run_legs(self):
         run_id = uuid.uuid4()

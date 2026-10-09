@@ -88,7 +88,7 @@ class FakeDB:
                             "abort_detail", "passes_completed", "created_by", "mission_tree",
                             "started_at", "ended_at"), params))
             assert isinstance(row["run_id"], uuid.UUID)
-            assert row["recording_level"] in ("full", "events_only", "off")
+            assert row["recording_level"] in ("full", "track", "events_only", "off")
             assert (row["state"] == "RUNNING") == (row["ended_at"] is None)
             row["mission_tree"] = json.loads(row["mission_tree"])
             if row["abort_detail"] is not None:
@@ -286,7 +286,8 @@ def codes(event_rows):
 
 
 def state(ts=None, *, errors=(), battery=None, order_id="", last_node="", charging=False,
-          version="2.0.0", info=(), x=1.0, y=2.0, driving=False, header=0):
+          version="2.0.0", info=(), x=1.0, y=2.0, driving=False, header=0,
+          velocity=None):
     return types.VDA5050State(
         headerId=header, timestamp=(ts or T0).isoformat(), version=version,
         orderId=order_id, lastNodeId=last_node, nodeStates=[], edgeStates=[],
@@ -297,7 +298,8 @@ def state(ts=None, *, errors=(), battery=None, order_id="", last_node="", chargi
             batteryCharge=battery, charging=charging, batteryVoltage=None,
             batteryHealth=None, reach=None),
         agvPosition=types.VDA5050AgvPosition(x=x, y=y, theta=0.5, mapId="map1"),
-        velocity=None, driving=driving,
+        velocity=None if velocity is None else types.VDA5050Velocity(
+            vx=velocity[0], vy=velocity[1], omega=velocity[2]), driving=driving,
         informations=[types.VDA5050Info(infoType=k, infoDescription=v, infoLevel="INFO")
                       for k, v in info])
 

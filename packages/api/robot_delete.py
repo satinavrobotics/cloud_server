@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 STATE_TABLES: Tuple[str, ...] = (ASSIGNMENTS_TABLE, ms.RUN_EPOCH_TABLE, "robot_latest")
 # robot_name-keyed history, removed with delete_telemetry (hypertables: a plain DELETE works,
 # also on compressed chunks).
-TELEMETRY_TABLES: Tuple[str, ...] = ("robot_state_ts", "diagnostics_ts", "fleet_events",
-                                     "mission_runs", "mission_trajectory")
+TELEMETRY_TABLES: Tuple[str, ...] = ("robot_state_ts", "diagnostics_ts", "robot_track_ts",
+                                     "fleet_events", "mission_runs", "mission_trajectory")
 
 ACTIVE_MISSION_SQL = (
     f"SELECT name FROM {maps.MISSION_TABLE} WHERE spec->>'robot' = %s "

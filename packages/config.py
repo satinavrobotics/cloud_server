@@ -193,6 +193,8 @@ FLEET_READ_STATEMENT_TIMEOUT_MS = int(os.getenv("FLEET_READ_STATEMENT_TIMEOUT_MS
 # downsampled) and events per run (the rest is cut, with a `*_truncated` flag).
 FLEET_TIMELINE_MAX_POINTS = int(os.getenv("FLEET_TIMELINE_MAX_POINTS", "2000"))
 FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
+# GET /api/v1/runs/{id}/track: at most this many points (1 Hz = a 5.5 h run); more are strided.
+FLEET_TRACK_MAX_POINTS = int(os.getenv("FLEET_TRACK_MAX_POINTS", "20000"))
 
 # ==================== Phase 0 fixes (API, WP11) ====================
 # F1 map delete (packages/api/map_delete.py): cleanup attempts per round before

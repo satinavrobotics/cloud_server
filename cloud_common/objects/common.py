@@ -30,8 +30,8 @@ import pydantic
 # Phase 0 recording level (docs/satinav-fleet-agent-phase0-v2.md §4.1). The same values as
 # packages/events/schemas.py RecordingLevel, spelled out here because cloud_common is also
 # shipped to services without packages/events (graph-builder, mission-planner).
-TELEMETRY_RECORDING_LEVELS = ("full", "events_only", "off")
-TelemetryRecordingV1 = Literal["full", "events_only", "off"]
+TELEMETRY_RECORDING_LEVELS = ("full", "track", "events_only", "off")
+TelemetryRecordingV1 = Literal["full", "track", "events_only", "off"]
 
 
 # Frame of a GPS datum's local x/y (packages/utils/geo.py): "utm" = UTM grid offsets from the
@@ -80,8 +80,8 @@ def telemetry_recording_field(scope: str) -> Any:
     """The optional `telemetry_recording` spec field; None means "not set here"."""
     return pydantic.Field(
         None, description=(
-            f"Phase 0 live-data recording level for this {scope}: 'full', 'events_only' or "
-            "'off'. None (the default) means not set here: the level is inherited, resolved "
+            f"Phase 0 live-data recording level for this {scope}: 'full', 'track', 'events_only' "
+            "or 'off'. None (the default) means not set here: the level is inherited, resolved "
             "robot -> site -> global settings, and 'events_only' when none is set."))
 
 

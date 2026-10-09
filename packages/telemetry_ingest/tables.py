@@ -16,6 +16,8 @@ LATEST_TABLE = "robot_latest"
 # Mission/run analysis: one row per leg (a move between two topomap nodes), written by dispatch.
 # Not a hypertable and not swept: kept like events.
 LEGS_TABLE = "run_legs"
+# Track level: pose and speed at 1 Hz while a mission runs (hypertable), written by dispatch.
+TRACK_TABLE = "robot_track_ts"
 
 # §3.4, dispatch-written.
 ROBOT_STATE_COLUMNS: Tuple[str, ...] = (
@@ -27,9 +29,14 @@ DIAGNOSTICS_COLUMNS: Tuple[str, ...] = (
     "ts", "robot_name", "cpu", "gpu", "ram", "temp_max", "power_w", "nodes_down",
     "gnss_fix", "gnss_sats", "gnss_h_acc_m", "gnss_corr_age_s",
 )
+# Run frame x, y, theta as the robot reports them; speed = |(vx, vy)|, omega in rad/s.
+TRACK_COLUMNS: Tuple[str, ...] = (
+    "ts", "robot_name", "run_id", "leg_seq", "x", "y", "theta", "speed", "omega", "map_id",
+)
 TIMESERIES_COLUMNS: Dict[str, Tuple[str, ...]] = {
     ROBOT_STATE_TABLE: ROBOT_STATE_COLUMNS,
     DIAGNOSTICS_TABLE: DIAGNOSTICS_COLUMNS,
+    TRACK_TABLE: TRACK_COLUMNS,
 }
 
 # §3.5: each host upserts only its own columns. robot_name is the key and updated_at

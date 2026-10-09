@@ -251,6 +251,10 @@ class IngestQueue:
         """Enqueue one diagnostics_ts row (dict with tables.DIAGNOSTICS_COLUMNS keys)."""
         return self._put_timeseries(tables.DIAGNOSTICS_TABLE, row)
 
+    def put_track(self, row: Mapping[str, Any]) -> str:
+        """Enqueue one robot_track_ts row (dict with tables.TRACK_COLUMNS keys)."""
+        return self._put_timeseries(tables.TRACK_TABLE, row)
+
     def put_latest(self, robot_name: str, **fields: Any) -> str:
         """Merge an update of this host's robot_latest columns for `robot_name`.
 

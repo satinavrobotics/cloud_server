@@ -43,6 +43,7 @@ import datetime
 import functools
 import json
 import logging
+import math
 import re
 import uuid
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
@@ -77,6 +78,7 @@ STATE_ROW_INTERVAL_S = 5.0
 # fields); last_seen is merged on every state, and a sweep stores the newest state after
 # a quiet period.
 LATEST_STATE_MSG_INTERVAL_S = 5.0
+TRACK_ROW_INTERVAL_S = 1.0  # robot_track_ts: one row per second while a run is open
 BATTERY_LOW_PCT = 20.0
 BATTERY_OK_PCT = 25.0
 SWEEP_PERIOD_S = 1.0
@@ -378,6 +380,7 @@ class RunInfo:
     # Legs already stored for an adopted run (a dispatcher restart): this process numbers its
     # own legs after them.
     leg_base: int = 0
+    last_track_ts: Optional[datetime.datetime] = None
 
 
 class _Context:
@@ -847,19 +850,43 @@ class FleetRecorder:
                      received_at: Optional[datetime.datetime] = None) -> None:
         """A VDA5050 state message of the robot's current `mission`, BEFORE the dispatcher
         processes it (so the last node of a mission that completes on this very message still
-        ends its leg). Records the legs it completes. Legs are written wherever events are
-        (events_only and full), never at off."""
+        ends its leg). Records the legs it completes (every level but off) and, at track and
+        above, the 1 Hz track row."""
         run = self._runs.get(robot_name)
         if run is None or mission is None or run.mission_name != mission.name:
             return
-        if not self.policy.allows(tables.LEGS_TABLE, robot_name):
+        legs_on = self.policy.allows(tables.LEGS_TABLE, robot_name)
+        track_on = self.policy.allows(tables.TRACK_TABLE, robot_name)
+        if not (legs_on or track_on):
             return
         now = received_at or self._clock()
         ts = parse_robot_ts(message.timestamp, now)
-        limits = robot_object.status.factsheet if robot_object is not None else None
-        for leg in run.tracker.observe(message=message, mission=mission, ts=ts, received=now,
-                                       limits=limits, default_map=run.map_id):
-            self._submit(_WriteLeg(run, leg))
+        if legs_on:
+            limits = robot_object.status.factsheet if robot_object is not None else None
+            for leg in run.tracker.observe(message=message, mission=mission, ts=ts,
+                                           received=now, limits=limits,
+                                           default_map=run.map_id):
+                self._submit(_WriteLeg(run, leg))
+        if track_on and run.resolved:
+            self._track_row(run, message, ts)
+
+    def _track_row(self, run: RunInfo, message: Any, ts: datetime.datetime) -> None:
+        """robot_track_ts: the robot's pose and speed, at most once per TRACK_ROW_INTERVAL_S
+        of robot time, while the run is open (Track level and above)."""
+        pos = message.agvPosition
+        last = run.last_track_ts
+        if pos is None or (last is not None and 0 <= (ts - last).total_seconds()
+                           < TRACK_ROW_INTERVAL_S):
+            return
+        run.last_track_ts = ts
+        vel = message.velocity
+        self.queue.put_track({
+            "ts": ts, "robot_name": run.robot_name, "run_id": run.run_id,
+            "leg_seq": self.leg_seq(run.robot_name),
+            "x": pos.x, "y": pos.y, "theta": pos.theta,
+            "speed": math.hypot(vel.vx or 0.0, vel.vy or 0.0) if vel else None,
+            "omega": vel.omega if vel else None, "map_id": pos.mapId,
+        })
 
     def leg_seq(self, robot_name: str) -> Optional[int]:
         """run_legs.seq of the leg the robot's run is on (what events are tagged with)."""
