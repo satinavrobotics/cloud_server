@@ -2619,6 +2619,10 @@ async def websocket_mission_status(websocket: WebSocket, mission_name: str):
                 "blocked_waypoint_index": st.blocked_waypoint_index if hasattr(
                     st, "blocked_waypoint_index") else None,
                 "block_reason": st.block_reason if hasattr(st, "block_reason") else None,
+                "block_reason_code": getattr(st, "block_reason_code", None),
+                "blocked_held_s": getattr(st, "blocked_held_s", None),
+                "blocked_sequence_id": getattr(st, "blocked_sequence_id", None),
+                "blocked_skip_refused": getattr(st, "blocked_skip_refused", None),
             },
         }
         await websocket.send_json(snapshot)

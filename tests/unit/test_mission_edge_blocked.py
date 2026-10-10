@@ -102,7 +102,8 @@ def test_mission_status_block_field_defaults_round_trip():
     assert s.block_reason is None
     d = s.dict()
     for key in ("blocked", "blocked_node", "blocked_edge",
-                "blocked_waypoint_index", "block_reason"):
+                "blocked_waypoint_index", "block_reason", "block_reason_code",
+                "blocked_held_s", "blocked_sequence_id", "blocked_skip_refused"):
         assert key in d
 
 

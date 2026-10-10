@@ -361,6 +361,63 @@ def _is_node_skipped_action(action_state: types.VDA5050ActionState) -> bool:
             "node skipped")
 
 
+_REF_ALIASES = {
+    "nodeSequenceId": ("nodeSequenceId", "node_sequence_id"),
+    "blockReason": ("blockReason", "block_reason"),
+    "heldS": ("heldS", "held_s"),
+    "skipRefused": ("skipRefused", "skip_refused"),
+}
+
+
+def _to_float(value: Any) -> Optional[float]:
+    """A finite float >= 0, else None."""
+    try:
+        if isinstance(value, bool) or value is None:
+            return None
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _to_int(value: Any) -> Optional[int]:
+    """A finite integer >= 0 ("4", "4.0"), else None."""
+    number = _to_float(value)
+    if number is None or number != int(number):
+        return None
+    return int(number)
+
+
+def _to_bool(value: Any) -> Optional[bool]:
+    text = str(value).strip().lower() if value is not None else ""
+    if text in ("true", "1", "yes"):
+        return True
+    if text in ("false", "0", "no"):
+        return False
+    return None
+
+
+def _error_ref_details(refs: Any) -> Dict[str, Any]:
+    """Robot error references -> {nodeSequenceId, blockReason, heldS, skipRefused}, each
+    parsed (None when absent or malformed). First value wins; camel and snake keys are
+    accepted; unknown keys are ignored. Never raises."""
+    raw: Dict[str, Any] = {}
+    try:
+        for r in refs or []:
+            key, value = r.referenceKey, r.referenceValue
+            for name, aliases in _REF_ALIASES.items():
+                if key in aliases and name not in raw:
+                    raw[name] = value
+    except Exception:  # pylint: disable=broad-except
+        pass
+    reason = raw.get("blockReason")
+    reason = str(reason).strip() if reason is not None else ""
+    return {"nodeSequenceId": _to_int(raw.get("nodeSequenceId")),
+            "blockReason": reason or None,
+            "heldS": _to_float(raw.get("heldS")),
+            "skipRefused": _to_bool(raw.get("skipRefused"))}
+
+
 def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str, str]:
     """Mirror a VDA5050 state message's errors[] onto the RobotStatusV1.errors dict.
 
@@ -381,6 +438,11 @@ def vda5050_errors_to_status_dict(errors: List[types.VDA5050Error]) -> Dict[str,
             node_refs = [r.referenceValue for r in error.errorReferences
                          if r.referenceKey in ("nodeId", "node_id")]
             key = f"{key}:{node_refs[0]}" if node_refs else f"{key}:{idx}"
+            seq = _error_ref_details(error.errorReferences)["nodeSequenceId"]
+            if node_refs and seq is not None:
+                key = f"{key}:{seq}"
+            if key in result:  # never overwrite another skipped node
+                key = f"{key}#{idx}"
         result[key] = error.errorDescription
     return result
 
@@ -3032,6 +3094,10 @@ class Robot:
         status.blocked_edge = None
         status.blocked_waypoint_index = None
         status.block_reason = None
+        status.block_reason_code = None
+        status.blocked_held_s = None
+        status.blocked_sequence_id = None
+        status.blocked_skip_refused = None
         status.held = False
         status.held_reason = None
         status.run_id = uuid.uuid4().hex[:8]
@@ -3551,23 +3617,33 @@ class Robot:
         for error in message.errors:
             if error.errorType != NODE_SKIPPED:
                 continue
+            details = _error_ref_details(error.errorReferences)
             for ref_value in (r.referenceValue for r in error.errorReferences
                               if r.referenceKey in ("nodeId", "node_id")):
-                key = (NODE_SKIPPED, order_ids.node_of_reference(ref_value), "")
+                key = (NODE_SKIPPED, order_ids.node_of_reference(ref_value),
+                       "" if details["nodeSequenceId"] is None
+                       else str(details["nodeSequenceId"]))
                 if key in seen:
                     continue
                 ref = self._resolve_node_ref(ref_value)
                 if ref is None:
                     continue  # not resolvable yet: taken once it is, not remembered now
                 seen[key] = None
-                if any(s.node_id == ref["node_id"] and s.order_id == ref["order_id"]
+                seq = details["nodeSequenceId"]
+                encoded = order_ids.node_sequence(ref_value)
+                if seq is not None and encoded is not None and seq != encoded:
+                    self.warning(f"[{mission.name}] nodeSkipped {ref_value}: nodeSequenceId "
+                                 f"{seq} differs from the id's sequence {encoded}")
+                if any(s.node_id == ref["node_id"] and s.order_id == ref["order_id"] and
+                       (seq is None or s.sequence_id is None or s.sequence_id == seq)
                        for s in status.skipped_nodes):
                     continue
                 if error.errorLevel == types.VDA5050ErrorLevel.FATAL:
                     self.warning(f"[{mission.name}] nodeSkipped reported as FATAL; read as "
                                  "a warning")
                 skipped = mission_object.MissionSkippedNodeV1(
-                    **ref, description=error.errorDescription, first_seen=now)
+                    **ref, description=error.errorDescription, first_seen=now,
+                    sequence_id=seq, skip_refused=details["skipRefused"])
                 status.skipped_nodes.append(skipped)
                 del status.skipped_nodes[:-MISSION_SKIPPED_NODES_MAX]
                 changed = True
@@ -3748,8 +3824,21 @@ class Robot:
         # Idempotency: the idle robot re-emits this WARNING in every state message,
         # so only act (log + persist) when the block is new or its target changed.
 
+        details = _error_ref_details(blocked_error.errorReferences)
         if (status.blocked and status.blocked_node == blocked_node_name and
                 status.blocked_edge == blocked_edge):
+            # Same block again: keep the live details in memory (stored with the next
+            # write); only a changed reason or skip refusal is worth a write.
+            important = (status.block_reason_code != details["blockReason"] or
+                         status.blocked_skip_refused != details["skipRefused"])
+            status.block_reason_code = details["blockReason"]
+            status.blocked_held_s = details["heldS"]
+            status.blocked_sequence_id = details["nodeSequenceId"]
+            status.blocked_skip_refused = details["skipRefused"]
+            if important:
+                self._queue_status_write(api_objects.MissionObjectV1,
+                                         self._current_mission.name, status,
+                                         self._mission_writer_id())
             return True
 
         status.blocked = True
@@ -3757,6 +3846,10 @@ class Robot:
         status.blocked_edge = blocked_edge
         status.blocked_waypoint_index = blocked_waypoint_index
         status.block_reason = blocked_error.errorDescription
+        status.block_reason_code = details["blockReason"]
+        status.blocked_held_s = details["heldS"]
+        status.blocked_sequence_id = details["nodeSequenceId"]
+        status.blocked_skip_refused = details["skipRefused"]
         if blocked_node_name is not None and blocked_node_name in status.node_status:
             status.node_status[blocked_node_name].error_msg = \
                 blocked_error.errorDescription
@@ -3771,7 +3864,9 @@ class Robot:
 
         self.warning(
             f"Edge blocked: node={blocked_node_name} edge={blocked_edge} "
-            f"reason={blocked_error.errorDescription!r}; mission stays RUNNING, "
+            f"reason={blocked_error.errorDescription!r} blockReason={details['blockReason']} "
+            f"heldS={details['heldS']} seq={details['nodeSequenceId']} "
+            f"skipRefused={details['skipRefused']}; mission stays RUNNING, "
             "awaiting reroute")
 
         # The robot has stopped and is IDLE; reflect that and stop the timeout from
@@ -3795,6 +3890,10 @@ class Robot:
         mission.status.blocked_edge = None
         mission.status.blocked_waypoint_index = None
         mission.status.block_reason = None
+        mission.status.block_reason_code = None
+        mission.status.blocked_held_s = None
+        mission.status.blocked_sequence_id = None
+        mission.status.blocked_skip_refused = None
         if blocked_node is not None and blocked_node in mission.status.node_status:
             mission.status.node_status[blocked_node].error_msg = None
         self.mission_info("Edge block cleared; mission resuming")

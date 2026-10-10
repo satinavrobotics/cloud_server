@@ -87,6 +87,10 @@ class EdgeBlocked(Payload):
     edge_id: Optional[str] = None
     detail: Optional[str] = None
     leg_seq: Optional[int] = None   # run_legs.seq of the leg in progress
+    block_reason: Optional[str] = None   # the robot's machine-readable blockReason
+    held_s: Optional[float] = None
+    sequence_id: Optional[int] = None
+    skip_refused: Optional[bool] = None
 
 
 class OrderChurn(Payload):
@@ -103,6 +107,8 @@ class NodeSkipped(Payload):
     waypoint_index: Optional[int] = None
     graph_node_id: Optional[str] = None
     detail: Optional[str] = None
+    sequence_id: Optional[int] = None
+    skip_refused: Optional[bool] = None
 
 
 class NodeNote(Payload):

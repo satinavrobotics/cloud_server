@@ -400,6 +400,10 @@ class MissionSkippedNodeV1(pydantic.BaseModel):
         None, description="The graph node the waypoint was taken from, if known.")
     description: str = pydantic.Field("", description="What the robot said.")
     first_seen: Optional[datetime.datetime] = None
+    sequence_id: Optional[int] = pydantic.Field(
+        None, description="The robot's nodeSequenceId for the skipped node, if reported.")
+    skip_refused: Optional[bool] = pydantic.Field(
+        None, description="The robot's skipRefused flag, if reported (recorded only).")
 
 
 class MissionNodeNoteV1(pydantic.BaseModel):
@@ -467,6 +471,14 @@ class MissionStatusV1(pydantic.BaseModel):
                            resolvable.")
     block_reason: Optional[str] = pydantic.Field(
         None, description="Human readable description of why the edge is blocked.")
+    block_reason_code: Optional[str] = pydantic.Field(
+        None, description="The robot's machine-readable blockReason, if reported.")
+    blocked_held_s: Optional[float] = pydantic.Field(
+        None, description="Seconds the robot reports having been held at the block.")
+    blocked_sequence_id: Optional[int] = pydantic.Field(
+        None, description="The robot's nodeSequenceId of the blocked node, if reported.")
+    blocked_skip_refused: Optional[bool] = pydantic.Field(
+        None, description="True when the robot refused to skip the blocked node.")
     held: bool = pydantic.Field(
         False, description="True when this PENDING mission's dispatch is being withheld \
                            because the robot is offline or not navigation-ready. Distinct \

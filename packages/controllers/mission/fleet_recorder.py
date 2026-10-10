@@ -1169,6 +1169,10 @@ class FleetRecorder:
         self._event(EventCode.MISSION_EDGE_BLOCKED, robot_name, ts or self._clock(), {
             "mission_name": mission.name, "edge_id": status.blocked_edge,
             "detail": status.block_reason, "leg_seq": self.leg_seq(robot_name),
+            "block_reason": getattr(status, "block_reason_code", None),
+            "held_s": getattr(status, "blocked_held_s", None),
+            "sequence_id": getattr(status, "blocked_sequence_id", None),
+            "skip_refused": getattr(status, "blocked_skip_refused", None),
         }, discriminator=f"{mission.name}|{status.run_id}|{status.blocked_node}|"
                          f"{status.blocked_edge}")
 
@@ -1188,6 +1192,8 @@ class FleetRecorder:
             "mission_name": mission.name, "node_id": skipped.node_id,
             "waypoint_index": skipped.waypoint_index, "graph_node_id": skipped.graph_node_id,
             "detail": skipped.description,
+            "sequence_id": getattr(skipped, "sequence_id", None),
+            "skip_refused": getattr(skipped, "skip_refused", None),
         }, discriminator=f"{mission.name}|{mission.status.run_id}|{skipped.node_id}")
 
     @_guarded

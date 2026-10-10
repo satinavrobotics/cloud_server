@@ -68,7 +68,7 @@ def _error_key(err: Dict[str, Any]) -> tuple:
 def _edge_blocked_detail(err: Dict[str, Any]) -> str:
     """Human-readable detail for an edgeBlocked error, including node/edge refs."""
     desc = err.get("errorDescription") or "Edge blocked"
-    node = edge = None
+    node = edge = reason = held = None
     refs = err.get("errorReferences")
     if isinstance(refs, list):
         for r in refs:
@@ -79,11 +79,19 @@ def _edge_blocked_detail(err: Dict[str, Any]) -> str:
                 node = r.get("referenceValue")
             elif key in ("edgeId", "edge_id"):
                 edge = r.get("referenceValue")
+            elif key in ("blockReason", "block_reason"):
+                reason = reason or r.get("referenceValue")
+            elif key in ("heldS", "held_s"):
+                held = held or r.get("referenceValue")
     extra = []
     if node:
         extra.append(f"node {node}")
     if edge:
         extra.append(f"edge {edge}")
+    if reason:
+        extra.append(f"reason {reason}")
+    if held:
+        extra.append(f"held {held}s")
     return f"{desc} ({', '.join(extra)})" if extra else desc
 
 
