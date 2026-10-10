@@ -58,7 +58,9 @@ from packages.telemetry_ingest import (
     IngestQueue, RecordingPolicy, SpillFile, TelemetryWriter, create_pool, load_latest,
 )
 from packages.telemetry_ingest import health, tables
-from packages.telemetry_ingest.policy import ASSIGNMENTS_CHANNEL, parse_assignment_payload
+from packages.telemetry_ingest.policy import (
+    ASSIGNMENTS_CHANNEL, allows as policy_allows, parse_assignment_payload, parse_level,
+)
 from packages.telemetry_ingest.rehydrate import LatestRow
 from packages.utils import run_legs
 
@@ -121,6 +123,7 @@ SW_VERSION_INFO_TYPES = ("swVersion", "buildId", "softwareVersion")
 _PROTOCOL_VERSION = re.compile(r"^\d+(\.\d+){0,2}$")
 
 MISSION_TABLE = "missionobjectv1"
+NEXT_RUN_FIELD = "telemetry_recording_next_run"
 ACTIVE = "RUNNING"
 
 INSERT_RUN_SQL = (
@@ -137,10 +140,19 @@ FINISH_RUN_SQL = (
 )
 RUN_STATE_SQL = "SELECT state FROM mission_runs WHERE run_id = %s"
 ACTIVE_RUN_SQL = (
-    "SELECT run_id, started_at FROM mission_runs "
+    "SELECT run_id, started_at, recording_level FROM mission_runs "
     "WHERE mission_name = %s AND robot_name = %s AND state = 'RUNNING' "
     "ORDER BY started_at DESC LIMIT 1"
 )
+# The one-off raise (missionobjectv1.spec.telemetry_recording_next_run): the row lock makes the
+# read-and-clear one step, so of two simultaneous run starts only one gets the level.
+CONSUME_NEXT_RUN_SQL = (
+    f"WITH old AS (SELECT spec->>'{NEXT_RUN_FIELD}' AS level FROM {MISSION_TABLE} "
+    "WHERE name = %s FOR UPDATE) "
+    f"UPDATE {MISSION_TABLE} m SET spec = m.spec - '{NEXT_RUN_FIELD}' FROM old "
+    "WHERE m.name = %s AND old.level IS NOT NULL RETURNING old.level"
+)
+SET_RUN_LEVEL_SQL = "UPDATE mission_runs SET recording_level = %s WHERE run_id = %s"
 ORPHAN_CANDIDATES_SQL = (
     "SELECT run_id, mission_name, robot_name, started_at, recording_level FROM mission_runs "
     "WHERE state = 'RUNNING' AND started_at < %s ORDER BY started_at"
@@ -375,6 +387,9 @@ class RunInfo:
     sw_version: Optional[str]
     mission_tree: List[Any]
     resolved: bool = True
+    # True when the level comes from the mission or a one-off raise rather than the robot /
+    # site / global sources: the run's events then follow `recording_level`, not the policy.
+    level_override: bool = False
     planned_path: Optional[List[str]] = None
     tracker: leg_tracker.LegTracker = dataclasses.field(default_factory=leg_tracker.LegTracker)
     # Legs already stored for an adopted run (a dispatcher restart): this process numbers its
@@ -446,12 +461,15 @@ class _StartRun(_Op):
                     if row is not None:
                         info.run_id = uuid.UUID(str(row[0]))
                         info.started_at = to_utc(row[1])
+                        recorder._adopt_level(info, row[2])
                         info.leg_base = await recorder._stored_leg_count(conn, info.run_id)
                         info.resolved = True
                         logger.info("Resumed run %s of mission %s", info.run_id, info.mission_name)
                         recorder._latest_changed(info.robot_name)
                         return
                 inserted = await recorder._insert_run(conn, info, None)
+                if inserted:
+                    await recorder._consume_next_run(conn, info)
                 if inserted and self.with_events:
                     await recorder._emit_run_started(conn, info)
                 if inserted and info.planned_path:
@@ -1102,16 +1120,20 @@ class FleetRecorder:
         now = self._clock()
         track = self._track(robot_name, robot_object)
         map_id = session_map or None
+        # The mission's own level is the most specific scope; unset leaves the robot's.
+        mission_level = parse_level(getattr(mission, "telemetry_recording", None))
+        level = self.policy.inherited_level(robot_name, mission_level)
         run = RunInfo(
             run_id=run_uuid(mission.name, status.run_id, status.start_timestamp),
             mission_name=mission.name, robot_name=robot_name,
             started_at=now if fresh else (to_utc(status.start_timestamp) or now),
-            recording_level=self.policy.level_for(robot_name).value,
+            recording_level=level.value, level_override=mission_level is not None,
             map_id=map_id, site_id=self.policy.site_for(robot_name),
             sw_version=track.sw.value,
             mission_tree=[json.loads(node.json()) for node in mission.mission_tree],
             resolved=fresh, planned_path=list(mission.planned_path or []) or None)
         self._runs[robot_name] = run
+        self.policy.set_run_level(robot_name, level if mission_level is not None else None)
         self._submit(_StartRun(run, adopt=not fresh))
 
     def _abandon_run(self, run: Optional[RunInfo], reason: str) -> None:
@@ -1119,6 +1141,7 @@ class FleetRecorder:
         deleted, or another mission started on the robot): ABORTED / DISPATCH.ORPHANED."""
         if run is None:
             return
+        self.policy.set_run_level(run.robot_name, None)
         self._submit(_FinishRun(run, _orphan(reason, None, None, 0, self._clock())))
 
     @_guarded
@@ -1128,6 +1151,7 @@ class FleetRecorder:
         if run is None or run.mission_name != mission.name:
             return
         del self._runs[robot_name]
+        self.policy.set_run_level(robot_name, None)
         status = mission.status
         outcome = outcome_for(status)
         errors = dict(robot_object.status.errors) if robot_object is not None else {}
@@ -1297,8 +1321,50 @@ class FleetRecorder:
             self._ops.popleft()
 
     # --- SQL used by the ops -------------------------------------------------------------
-    def _events_allowed(self, robot_name: str, code: EventCode) -> bool:
+    def _events_allowed(self, robot_name: str, code: EventCode,
+                        info: Optional[RunInfo] = None) -> bool:
+        if info is not None and info.level_override:   # the run's own level, even after it ended
+            return policy_allows(RecordingLevel(info.recording_level), tables.EVENTS_TABLE,
+                                 code.value)
         return self.policy.allows(tables.EVENTS_TABLE, robot_name, code.value)
+
+    async def _consume_next_run(self, conn: Any, info: RunInfo) -> None:
+        """Take the mission's pending one-off level, if any, for this new run: it is cleared
+        in the run's own transaction (so a failed start gives it back) and recorded on the
+        run row. A failure here never costs the run its start."""
+        try:
+            async with conn.transaction():   # a savepoint: an error leaves the insert alone
+                async with conn.cursor() as cursor:
+                    await cursor.execute(CONSUME_NEXT_RUN_SQL,
+                                         (info.mission_name, info.mission_name))
+                    row = await cursor.fetchone()
+                level = parse_level(row[0]) if row else None
+                if level is not None:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(SET_RUN_LEVEL_SQL, (level.value, info.run_id))
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient(exc):
+                raise
+            logger.warning("Run %s: one-off recording level not applied: %s", info.run_id, exc)
+            return
+        if level is None:
+            return
+        info.recording_level = level.value
+        info.level_override = True
+        if self._runs.get(info.robot_name) is info:
+            self.policy.set_run_level(info.robot_name, level)
+        logger.info("Run %s (%s) records at %s (one-off raise)", info.run_id,
+                    info.mission_name, level.value)
+
+    def _adopt_level(self, info: RunInfo, stored: Any) -> None:
+        """A resumed run keeps the level its row says (a one-off raise has no other trace)."""
+        level = parse_level(stored)
+        if level is None or level.value == info.recording_level:
+            return
+        info.recording_level = level.value
+        info.level_override = True
+        if self._runs.get(info.robot_name) is info:
+            self.policy.set_run_level(info.robot_name, level)
 
     async def _insert_run(self, conn: Any, info: RunInfo, finish: Optional[_Finish]) -> bool:
         params = (
@@ -1361,7 +1427,7 @@ class FleetRecorder:
             logger.exception("Could not write the summary of run %s", info.run_id)
 
     async def _emit_run_started(self, conn: Any, info: RunInfo) -> None:
-        if self._events_allowed(info.robot_name, EventCode.MISSION_RUN_STARTED):
+        if self._events_allowed(info.robot_name, EventCode.MISSION_RUN_STARTED, info):
             await emit(conn, Event(
                 EventCode.MISSION_RUN_STARTED, info.started_at, robot_name=info.robot_name,
                 run_id=info.run_id, site_id=info.site_id, sw_version=info.sw_version,
@@ -1401,7 +1467,7 @@ class FleetRecorder:
             await self._insert_run(conn, info, finish)
             if with_events:
                 await self._emit_run_started(conn, info)
-        if with_events and self._events_allowed(info.robot_name, EventCode.MISSION_RUN_FINISHED):
+        if with_events and self._events_allowed(info.robot_name, EventCode.MISSION_RUN_FINISHED, info):
             await emit(conn, Event(
                 EventCode.MISSION_RUN_FINISHED, finish.ended_at, robot_name=info.robot_name,
                 run_id=info.run_id, site_id=info.site_id, sw_version=info.sw_version,

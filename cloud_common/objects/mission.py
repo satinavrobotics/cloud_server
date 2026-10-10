@@ -75,7 +75,7 @@ class MissionFailureCategoryV1(str, enum.Enum):
 # Spec fields of a still-PENDING mission that an operator may edit (PUT /missions/{name});
 # the API validates them and the dispatcher copies them onto the mission it has loaded.
 EDITABLE_SPEC_FIELDS = ("robot", "mission_tree", "timeout", "deadline", "repeat", "then_run",
-                        "register_map", "mode", "planned_path")
+                        "register_map", "mode", "planned_path", "telemetry_recording")
 
 # Action type the dispatcher executes itself as a timer instead of sending it to the robot.
 WAIT_ACTION_TYPE = "wait"
@@ -330,6 +330,17 @@ class MissionSpecV1(pydantic.BaseModel):
         None, description="Name of another mission to start when this one has completed, "
                           "including all of its repeats. The named mission is copied into a "
                           "new mission, so it can be one that has already run.")
+
+    telemetry_recording: Optional[common.TelemetryRecordingV1] = pydantic.Field(
+        None, description="Recording level of this mission's runs: 'full', 'track', 'events_only' "
+                          "or 'off'. The most specific scope: when set it wins over the robot, "
+                          "site and global levels. None (the default) means not set here.")
+    telemetry_recording_next_run: Optional[common.TelemetryRecordingV1] = pydantic.Field(
+        None, description="One-off recording level for the next run of this mission, set and "
+                          "cancelled by POST/DELETE /missions/{name}/recording/next-run. "
+                          "Dispatcher-owned once set: it is cleared, atomically, when a run "
+                          "starts and uses it (it then wins over telemetry_recording for that "
+                          "run only).")
 
     @pydantic.validator("repeat")
     def _validate_repeat(cls, value):
