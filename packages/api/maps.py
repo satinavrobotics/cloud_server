@@ -64,7 +64,8 @@ data: nodes (ArangoDB's count, read BEFORE the transaction; the stored counts wh
 read) or a saved SLAM map (`status.slam_saved_at`, set when a SLAM save of the map succeeded,
 which also turns a `draft` map `ready`); otherwise it is (back to) `draft`, where operate
 sessions are refused.
-Archive and delete are refused while ANY session is open (the message names the robots,
+Archive and delete are refused while ANY session is open (the message names the robots;
+delete with close_sessions=true finishes them first, delete_map_closing_sessions,
 decision Q-U2). Repeating pause/resume/finish/archive/restore on a map or session already in
 that state is a no-op (`changed: false`, no event). pause/resume are for mapping sessions only.
 
@@ -2843,3 +2844,167 @@ async def _session_action(db: Any, map_name: str, session_id: str, action: str,
 def _unchanged(map_name: str, map_state: str, session: Mapping[str, Any]) -> Dict[str, Any]:
     return {"map_id": map_name, "map_state": map_state, "changed": False,
             "session": session_dict(session)}
+
+
+# --- delete nodes, delete with closing the sessions ---------------------------------------------
+
+MAX_DELETE_NODES = 500
+
+
+class DeleteNodesRequest(pydantic.BaseModel):
+    """POST /api/v1/maps/{id}/nodes/delete: 1..500 node ids (strings), duplicates dropped."""
+    node_ids: List[pydantic.StrictStr] = pydantic.Field(..., min_items=1,
+                                                         max_items=MAX_DELETE_NODES)
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+    @pydantic.validator("node_ids", each_item=True)
+    def _node_id(cls, value):  # noqa: N805 - pydantic v1 validator
+        if not value.strip() or "/" in value or len(value) > 200:
+            raise ValueError("a node id is a non-empty string of at most 200 characters "
+                             "without '/'")
+        return value
+
+    @pydantic.validator("node_ids")
+    def _dedupe(cls, value):  # noqa: N805
+        return list(dict.fromkeys(value))
+
+
+def refuse_recording_session(sessions: Sequence[Mapping[str, Any]], map_name: str) -> None:
+    """409 naming the robots while an UNPAUSED MAPPING session is open on the map: graph-builder
+    is writing nodes then. Operate and paused sessions do not block."""
+    recording = [s for s in sessions
+                 if s["ended_at"] is None and ms.purpose_of(s) == ms.MAPPING
+                 and s["paused_at"] is None]
+    if recording:
+        raise HTTPException(409, f"Map '{map_name}' is being mapped by "
+                                 f"{_robots_phrase(recording)}; pause or finish those sessions "
+                                 "before deleting nodes")
+
+
+async def delete_nodes(db: Any, map_name: str, data: Any, publisher_id: uuid.UUID,
+                       actor: Optional[str],
+                       delete_fn: Callable[[str, List[str]], Mapping[str, Any]],
+                       arango_node_count: Optional[Callable[[str], int]] = None,
+                       notify: Optional[Callable[[str, Dict[str, Any]], Awaitable[Any]]] = None
+                       ) -> Dict[str, Any]:
+    """POST /api/v1/maps/{id}/nodes/delete. 404 unknown map, 409 while the map is being deleted
+    or an unpaused mapping session is open on it (checked before the delete; the blocking
+    ArangoDB / MinIO work is never done inside a transaction, so a session resumed during the
+    delete is not caught). `delete_fn(map, ids)` (TopomapDatabaseClient.delete_nodes) is run in
+    a thread. Afterwards a `ready` map left with no nodes and no saved SLAM map goes back to
+    `draft` (the rule of a finish; count read outside the transaction), MAP.NODES_DELETED is
+    emitted and `notify(map, message)` pushes `nodes_deleted` to the live map stream (a failure
+    only logs). Returns {deleted, missing, edges_deleted, map_state[, image_failures]}."""
+    req = parse_body(DeleteNodesRequest, data)
+    try:
+        async with open_store(db, publisher_id) as store:
+            await _lock_alive_map(store, map_name)
+            refuse_recording_session(await store.sessions(map_name), map_name)
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    result = await asyncio.to_thread(delete_fn, map_name, list(req.node_ids))
+    deleted = [str(n) for n in result.get("deleted", [])]
+    missing = [str(n) for n in result.get("missing", [])]
+    edges = int(result.get("edges_deleted") or 0)
+    failures = [str(n) for n in result.get("image_failures", [])]
+    counts = await _node_counts(arango_node_count, [map_name])
+    now = _utcnow()
+    state: Optional[str] = None
+    try:
+        async with open_store(db, publisher_id) as store:
+            row = await store.lock_map(map_name)
+            if row is not None and row.lifecycle != DELETING:
+                state = row.state
+                if (state == READY and counts.get(map_name) == 0
+                        and not row.status.get("slam_saved_at")):
+                    await store.update_map(row, status={"state": DRAFT})
+                    state = DRAFT
+                if deleted or missing or failures:
+                    await store.emit(Event(
+                        EventCode.MAP_NODES_DELETED, now, source=Source.API,
+                        discriminator=f"map:{map_name}:nodes:{now.isoformat()}",
+                        payload={"map_name": map_name, "deleted": len(deleted),
+                                 "missing": len(missing), "edges_deleted": edges,
+                                 "image_failures": len(failures), "state": state,
+                                 "actor": actor}))
+    except _SCHEMA_ERRORS as exc:
+        raise _undefined_table(exc) from exc
+    if notify is not None and deleted:
+        try:
+            await notify(map_name, {"type": "nodes_deleted", "map_id": map_name,
+                                    "node_ids": deleted, "edges_deleted": edges,
+                                    "timestamp": now.isoformat()})
+        except Exception:  # noqa: BLE001
+            logger.exception("Live map stream of %s not told about the deleted nodes", map_name)
+    out: Dict[str, Any] = {"deleted": deleted, "missing": missing, "edges_deleted": edges,
+                           "map_state": state}
+    if failures:
+        out["image_failures"] = failures
+    return out
+
+
+async def delete_map_closing_sessions(
+        db: Any, map_name: str, publisher_id: uuid.UUID, actor: Optional[str],
+        delete: Callable[[str], Awaitable[Dict[str, Any]]], switch: Optional[Any] = None,
+        arango_node_count: Optional[Callable[[str], int]] = None,
+        reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
+    """DELETE /api/v1/maps/{id}?close_sessions=true: finish every open session on the map (any
+    robot, mapping or operate) through session_action('finish') -- the mapping services are
+    stopped on the robots, a SLAM recording is saved in the BACKGROUND (never awaited; a pending
+    or failed save is reported in `slam_saves` and `slam_warning`, the map is deleted anyway) and
+    an unreachable robot only yields failed `robot_actions` -- and then `delete(map)` (the normal
+    delete, whose guard still refuses with 409 if a robot opened a session in the meantime; the
+    sessions closed so far stay closed). Returns delete's body plus `closed_sessions`
+    [{robot, session_id, purpose}], `robot_actions`, and when something went wrong
+    `slam_warning` / `mapping_warning` / `slam_saves`."""
+    async with open_store(db, uuid.uuid4()) as store:
+        row = await store.get_map(map_name)
+        open_ones = ([s for s in await store.sessions(map_name) if s["ended_at"] is None]
+                     if row is not None and row.lifecycle != DELETING else [])
+    closed: List[Dict[str, Any]] = []
+    actions: List[Dict[str, Any]] = []
+    slam_warnings: List[str] = []
+    mapping_warnings: List[str] = []
+    for session in sorted(open_ones, key=lambda s: str(s["robot_name"])):
+        try:
+            out = await session_action(db, map_name, str(session["session_id"]), "finish",
+                                       publisher_id, actor, switch=switch,
+                                       arango_node_count=arango_node_count,
+                                       reloc_jobs=reloc_jobs)
+        except HTTPException as exc:
+            if exc.status_code == 404:    # finished and gone meanwhile
+                continue
+            raise
+        if not out.get("changed"):
+            continue
+        closed.append({"robot": session["robot_name"], "session_id": str(session["session_id"]),
+                       "purpose": ms.purpose_of(session)})
+        actions.extend(out.get("robot_actions") or [])
+        if out.get("slam_warning"):
+            slam_warnings.append(out["slam_warning"])
+        if out.get("mapping_warning"):
+            mapping_warnings.append(out["mapping_warning"])
+    slam_saves: List[Dict[str, Any]] = []
+    view_of = getattr(switch, "slam_save_view", None)
+    if view_of is not None:
+        for robot_name in dict.fromkeys(c["robot"] for c in closed):
+            view = view_of(robot_name)
+            if view and view.get("map") == map_name:
+                slam_saves.append({"robot": robot_name, **view})
+    result = dict(await delete(map_name))
+    result["closed_sessions"] = closed
+    result["robot_actions"] = actions
+    if slam_saves:
+        result["slam_saves"] = slam_saves
+        slam_warnings.extend(
+            f"SLAM map of robot {s['robot']} is {s['state']}"
+            + (f": {s['detail']}" if s.get("detail") else "")
+            + "; the map is deleted, the onboard SLAM data stays on the robot"
+            for s in slam_saves)
+    if slam_warnings:
+        result["slam_warning"] = "; ".join(dict.fromkeys(slam_warnings))
+    if mapping_warnings:
+        result["mapping_warning"] = "; ".join(dict.fromkeys(mapping_warnings))
+    return result

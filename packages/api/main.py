@@ -432,7 +432,8 @@ async def root():
                 "archive": "POST /api/v1/maps/{map_id}/archive",
                 "convert_type": "POST /api/v1/maps/{map_id}/type",
                 "restore": "POST /api/v1/maps/{map_id}/restore",
-                "delete": "DELETE /api/v1/maps/{map_id}",
+                "delete": "DELETE /api/v1/maps/{map_id}[?close_sessions=true]",
+                "delete_nodes": "POST /api/v1/maps/{map_id}/nodes/delete",
             },
             "get_image": "GET /api/v1/images/{map_id}/{node_id}",
             "rosbags": {
@@ -937,24 +938,57 @@ async def update_map_approx_location(map_id: str, request: ApproxLocationRequest
     return result
 
 
+@app.post("/api/v1/maps/{map_id}/nodes/delete")
+async def delete_map_nodes(map_id: str, body: Dict[str, Any]):
+    """Delete nodes from a map: body `{"node_ids": ["..."]}` (1..500 strings, duplicates
+    dropped). Each node goes from ArangoDB with every edge touching it, and its MinIO objects
+    (images, thumbnails, depth, costmap layers) go too. 200 `{deleted, missing, edges_deleted,
+    map_state}` (`missing`: ids the map did not have; `image_failures`: ids whose objects could
+    not all be removed, only when there are any). 404 unknown map; 409 while the map is being
+    deleted or an UNPAUSED MAPPING session is open on it (the message names the robots; paused
+    and operate sessions do not block); 422 on a bad body. A `ready` map left with no nodes and
+    no saved SLAM map goes back to `draft`. Emits MAP.NODES_DELETED and sends
+    `{"type": "nodes_deleted", "map_id", "node_ids", "edges_deleted", "timestamp"}` to the
+    /ws/map/{map_id} clients."""
+    _require_service()
+    return await _site_call("delete map nodes", maps.delete_nodes(
+        service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
+        service.topomap_db.delete_nodes, arango_node_count=_arango_node_count,
+        notify=service.ws_proxy.broadcast_map_update))
+
+
 @app.delete("/api/v1/maps/{map_id}", status_code=202)
-async def delete_map(map_id: str):
+async def delete_map(map_id: str, close_sessions: bool = False):
     """
     Delete a map and all its data from the graph and image databases.
 
     409 while any session is open on the map (mapping or operate; the message names the
-    robots, maps §14 Q-U2).
+    robots, maps §14 Q-U2), unless `close_sessions=true`: then every open session on the map
+    (any robot, mapping or operate) is finished first, exactly like `.../finish` (a mapping
+    session's services are stopped on the robot, an unreachable robot only yields a failed
+    `robot_actions` entry, a SLAM recording is saved in the background and a pending or failed
+    save is reported in `slam_saves` / `slam_warning`, never awaited), and then the map is
+    marked DELETING. The delete's own guard still runs after the closing: a robot that opened
+    a session meanwhile makes it 409 (the sessions closed so far stay closed).
 
     Returns 202 at once: the map is marked DELETING (hidden from GET /api/v1/maps, 409 on
     assign/load/datum) and a background task deletes it from ArangoDB and MinIO, retrying
     with backoff, then removes it from Postgres (packages/api/map_delete.py). Repeating the
     request is harmless; for a map stuck in DELETING it starts a new round of attempts.
+    With `close_sessions=true` the body also has `closed_sessions` [{robot, session_id,
+    purpose}] and `robot_actions` (and `mapping_warning`, `slam_warning`, `slam_saves` when
+    something went wrong).
 
     WARNING: This will permanently delete all map data including nodes, edges, and images!
     """
     _require_service()
 
-    return await service.delete_map(map_id)
+    if not close_sessions:
+        return await service.delete_map(map_id)
+    return await _site_call("delete map closing its sessions", maps.delete_map_closing_sessions(
+        service.database, map_id, uuid.uuid4(), recording.request_actor(), service.delete_map,
+        switch=service.mapping_switch, arango_node_count=_arango_node_count,
+        reloc_jobs=service.reloc_jobs))
 
 
 # ==================== 3D reconstruction (R3) ====================

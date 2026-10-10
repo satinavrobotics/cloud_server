@@ -138,6 +138,25 @@ class TopomapDatabaseClient:
         self._logger.error(f"Failed to delete map {map_id}: {error_msg}")
         return {"success": False, "map_id": map_id, "error": error_msg}
 
+    def delete_nodes(self, map_id: str, node_ids: List[str]) -> Dict[str, Any]:
+        """
+        Delete nodes of a map from the graph (with all their edges) and their MinIO objects
+        (images, thumbnails, depth, costmap layers). Blocking: call it in a thread.
+
+        Returns {"deleted": [ids that existed], "missing": [ids that did not],
+        "edges_deleted": n, "image_failures": [ids whose objects could not all be removed]}.
+        Raises on an ArangoDB error. The graph goes first: a node without objects is a smaller
+        problem than objects of a node that is still in the map; the objects of nodes already
+        gone from the graph are removed too when the request is repeated (objects of every
+        requested id are deleted, so a repeat cleans up what failed).
+        """
+        requested = [str(n) for n in dict.fromkeys(node_ids)]
+        deleted, edges = self.graph.delete_nodes(map_id, requested)
+        gone = set(deleted)
+        failures = self.image.delete_nodes_objects(requested, map_id)
+        return {"deleted": deleted, "missing": [n for n in requested if n not in gone],
+                "edges_deleted": edges, "image_failures": failures}
+
     def list_maps(self) -> List[str]:
         """
         Return the union of map IDs present in any backend.

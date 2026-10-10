@@ -295,6 +295,20 @@ class MapSessionServicesRestarted(Payload):
     slam_warning: Optional[str] = None
 
 
+class MapNodesDeleted(Payload):
+    """MAP.NODES_DELETED (packages/api/maps.py, POST /api/v1/maps/{id}/nodes/delete): nodes were
+    removed from the map's graph and image store. `deleted` / `missing` count the requested ids
+    that existed / did not; `image_failures` the deleted nodes whose MinIO objects could not all
+    be removed; `state` the map state afterwards (`draft` when it was left empty)."""
+    map_name: str
+    deleted: int
+    missing: int
+    edges_deleted: int
+    image_failures: int = 0
+    state: Optional[str] = None
+    actor: Optional[str] = None
+
+
 class MapTypeChanged(Payload):
     """MAP.TYPE_CHANGED (packages/api/maps.py): the map was converted geo <-> local. Map-frame
     coordinates are unchanged; `geo` / `old_geo` are the georeference after / before (null on a
