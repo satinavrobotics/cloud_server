@@ -4,6 +4,7 @@
 Built on the in-memory store and switch fakes of tests/unit/test_mapping_switch.py.
 """
 import os
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,6 +25,8 @@ from tests.unit.test_mapping_switch import (  # noqa: E402,F401 - `db` is a fixt
 
 pytestmark = pytest.mark.unit
 
+N1, N2, N9 = (str(uuid.uuid4()) for _ in range(3))
+
 
 async def _status(coro):
     try:
@@ -33,7 +36,7 @@ async def _status(coro):
     raise AssertionError("no HTTPException")
 
 
-def _delete_fn(deleted=("n1",), missing=(), edges=2, failures=()):
+def _delete_fn(deleted=(N1,), missing=(), edges=2, failures=()):
     calls = []
 
     def fn(map_id, ids):
@@ -44,7 +47,7 @@ def _delete_fn(deleted=("n1",), missing=(), edges=2, failures=()):
     return fn
 
 
-async def run_delete_nodes(db, ids=("n1",), count=5, fn=None, notify=None, name="yard"):
+async def run_delete_nodes(db, ids=(N1,), count=5, fn=None, notify=None, name="yard"):
     fn = fn or _delete_fn()
     def counter(_name):
         if count is None:
@@ -60,8 +63,11 @@ async def run_delete_nodes(db, ids=("n1",), count=5, fn=None, notify=None, name=
 class TestRequest:
     @pytest.mark.parametrize("body", [{}, {"node_ids": []}, {"node_ids": [1]},
                                       {"node_ids": [""]}, {"node_ids": ["a/b"]},
-                                      {"node_ids": ["a"] * 1 + [str(i) for i in range(500)]},
-                                      {"node_ids": ["a"], "x": 1}, {"node_ids": "a"}])
+                                      {"node_ids": [N1] + [str(uuid.uuid4()) for _ in range(500)]},
+                                      {"node_ids": ["reconstruction"]}, {"node_ids": ["n1"]},
+                                      {"node_ids": [N1, "reconstruction"]},
+                                      {"node_ids": [N1.upper()]},
+                                      {"node_ids": [N1], "x": 1}, {"node_ids": N1}])
     async def test_bad_bodies_are_422(self, db, body):
         db.add_map("yard", type="local")
         code, _ = await _status(maps.delete_nodes(None, "yard", body, m1.PUB, None, _delete_fn()))
@@ -69,10 +75,10 @@ class TestRequest:
 
     async def test_500_ids_and_duplicates(self, db):
         db.add_map("yard", type="local")
-        ids = [str(i) for i in range(498)] + ["0", "0"]
-        out, fn = await run_delete_nodes(db, ids)
-        assert fn.calls == [("yard", [str(i) for i in range(498)])]
-        assert out["deleted"] == ["n1"]
+        base = [str(uuid.uuid4()) for _ in range(498)]
+        out, fn = await run_delete_nodes(db, base + [base[0], base[0]])
+        assert fn.calls == [("yard", base)]
+        assert out["deleted"] == [N1]
 
 
 # --- guards ---------------------------------------------------------------------------------
@@ -100,7 +106,7 @@ class TestGuards:
         db.add_session("yard", "r1", ended=False, purpose="mapping", paused_at=m1.T0)
         db.add_session("yard", "r2", ended=False, purpose="operate")
         out, fn = await run_delete_nodes(db)
-        assert out["deleted"] == ["n1"] and fn.calls
+        assert out["deleted"] == [N1] and fn.calls
 
 
 # --- the effect -----------------------------------------------------------------------------
@@ -109,34 +115,71 @@ class TestEffect:
     async def test_response_event_and_stream(self, db):
         db.add_map("yard", type="local")
         notify = AsyncMock()
-        fn = _delete_fn(deleted=("n1", "n2"), missing=("n9",), edges=3)
-        out, _ = await run_delete_nodes(db, ["n1", "n2", "n9"], fn=fn, notify=notify)
-        assert out == {"deleted": ["n1", "n2"], "missing": ["n9"], "edges_deleted": 3,
+        fn = _delete_fn(deleted=(N1, N2), missing=(N9,), edges=3)
+        out, _ = await run_delete_nodes(db, [N1, N2, N9], fn=fn, notify=notify)
+        assert out == {"deleted": [N1, N2], "missing": [N9], "edges_deleted": 3,
                        "map_state": "ready"}
         [event] = [e for e in db.events if e["code"] == "MAP.NODES_DELETED"]
         assert event["payload"]["deleted"] == 2 and event["payload"]["edges_deleted"] == 3
         assert event["payload"]["missing"] == 1 and event["payload"]["map_name"] == "yard"
         [(map_id, message)] = [c.args for c in notify.await_args_list]
         assert map_id == "yard" and message["type"] == "nodes_deleted"
-        assert message["node_ids"] == ["n1", "n2"] and message["edges_deleted"] == 3
+        assert message["node_ids"] == [N1, N2] and message["edges_deleted"] == 3
 
     async def test_nothing_deleted_sends_nothing(self, db):
         db.add_map("yard", type="local")
         notify = AsyncMock()
-        out, _ = await run_delete_nodes(db, fn=_delete_fn(deleted=(), missing=("n1",), edges=0),
+        out, _ = await run_delete_nodes(db, fn=_delete_fn(deleted=(), missing=(N1,), edges=0),
                                         notify=notify)
-        assert out["deleted"] == [] and out["missing"] == ["n1"]
+        assert out["deleted"] == [] and out["missing"] == [N1]
         notify.assert_not_awaited()
 
     async def test_a_failing_stream_never_fails_the_delete(self, db):
         db.add_map("yard", type="local")
         out, _ = await run_delete_nodes(db, notify=AsyncMock(side_effect=RuntimeError("x")))
-        assert out["deleted"] == ["n1"]
+        assert out["deleted"] == [N1]
 
     async def test_image_failures_are_reported(self, db):
         db.add_map("yard", type="local")
-        out, _ = await run_delete_nodes(db, fn=_delete_fn(failures=("n1",)))
-        assert out["image_failures"] == ["n1"]
+        out, _ = await run_delete_nodes(db, fn=_delete_fn(failures=(N1,)))
+        assert out["image_failures"] == [N1]
+
+    async def test_failed_ids_are_in_response_and_event(self, db):
+        db.add_map("yard", type="local")
+        out, _ = await run_delete_nodes(db, [N1, N2], fn=_delete_fn(
+            deleted=(N1, N2), failures=(N2,)))
+        assert out["image_failures"] == [N2]
+        [event] = [e for e in db.events if e["code"] == "MAP.NODES_DELETED"]
+        assert event["payload"]["image_failures"] == 1
+        assert event["payload"]["image_failed_ids"] == [N2]
+
+    async def test_start_and_resume_are_refused_while_nodes_are_deleted(self, db):
+        db.add_map("yard", type="local")
+        seen = {}
+
+        def fn(map_id, ids):
+            # runs in a thread while the guard is held
+            seen["during"] = dict(maps._NODE_DELETES)
+            return {"deleted": ids, "missing": [], "edges_deleted": 0, "image_failures": []}
+        await run_delete_nodes(db, fn=fn)
+        assert seen["during"] == {"yard": 1} and maps._NODE_DELETES == {}
+        with maps._deleting_nodes("yard"):
+            code, detail = await _status(maps.start_session(
+                None, "yard", {"robot": "r1"}, m1.PUB))
+            assert code == 409 and "being deleted" in detail
+            code, detail = await _status(maps.session_action(
+                None, "yard", str(uuid.uuid4()), "resume", m1.PUB))
+            assert code == 409 and "being deleted" in detail
+            code, _ = await _status(maps.session_action(          # pause is not blocked
+                None, "yard", str(uuid.uuid4()), "pause", m1.PUB))
+            assert code == 404
+        maps.refuse_while_deleting_nodes("yard")
+
+    async def test_guard_is_released_on_error(self, db):
+        db.add_map("yard", type="local")
+        db.add_session("yard", "r1", ended=False, purpose="mapping")
+        await _status(run_delete_nodes(db))
+        assert maps._NODE_DELETES == {}
 
     async def test_empty_ready_map_goes_back_to_draft(self, db):
         db.add_map("yard", type="local")
@@ -192,9 +235,9 @@ class TestStores:
         image.client.list_objects.side_effect = lambda bucket, prefix, recursive: [
             SimpleNamespace(object_name=f"{prefix}{sub}/x") for sub in
             ("images", "thumbs", "depth", "costmap")]
-        assert image.delete_nodes_objects(["n1", "n2"], "m") == []
+        assert image.delete_nodes_objects([N1, N2], "m") == []
         removed = [c.args[1] for c in image.client.remove_object.call_args_list]
-        assert len(removed) == 8 and "n2/costmap/x" in removed and "n1/depth/x" in removed
+        assert len(removed) == 8 and f"{N2}/costmap/x" in removed and f"{N1}/depth/x" in removed
         assert all(c.kwargs["prefix"].endswith("/") for c in
                    image.client.list_objects.call_args_list)
 
@@ -205,20 +248,42 @@ class TestStores:
         image.bucket_prefix = "map-"
         image.client = MagicMock()
         image.client.bucket_exists.return_value = False
-        assert image.delete_nodes_objects(["n1"], "m") == []
+        assert image.delete_nodes_objects([N1], "m") == []
         image.client.bucket_exists.return_value = True
         image.client.list_objects.side_effect = RuntimeError("down")
-        assert image.delete_nodes_objects(["n1"], "m") == ["n1"]
+        assert image.delete_nodes_objects([N1], "m") == [N1]
 
     def test_client_combines_both(self):
         client = TopomapDatabaseClient.__new__(TopomapDatabaseClient)
         client.graph = MagicMock()
         client.image = MagicMock()
-        client.graph.delete_nodes.return_value = (["a"], 4)
+        client.graph.delete_nodes.return_value = ([N1], 4)
         client.image.delete_nodes_objects.return_value = []
-        assert client.delete_nodes("m", ["a", "b", "a"]) == {
-            "deleted": ["a"], "missing": ["b"], "edges_deleted": 4, "image_failures": []}
-        client.graph.delete_nodes.assert_called_once_with("m", ["a", "b"])
+        assert client.delete_nodes("m", [N1, N2, N1]) == {
+            "deleted": [N1], "missing": [N2], "edges_deleted": 4, "image_failures": []}
+        client.graph.delete_nodes.assert_called_once_with("m", [N1, N2])
+
+    def test_non_node_ids_are_refused_before_anything_is_touched(self):
+        client = TopomapDatabaseClient.__new__(TopomapDatabaseClient)
+        client.graph = MagicMock()
+        client.image = MagicMock()
+        with pytest.raises(ValueError):
+            client.delete_nodes("m", [N1, "reconstruction"])
+        client.graph.delete_nodes.assert_not_called()
+        client.image.delete_nodes_objects.assert_not_called()
+
+    @pytest.mark.parametrize("bad", ["reconstruction", "n1", "", "a/b", N1.upper()])
+    def test_image_guard_refuses_non_node_prefixes(self, bad):
+        image = ImageDatabaseService.__new__(ImageDatabaseService)
+        image.logger = MagicMock()
+        image.default_map_id = "d"
+        image.bucket_prefix = "map-"
+        image.client = MagicMock()
+        image.client.bucket_exists.return_value = True
+        with pytest.raises(ValueError):
+            image.delete_nodes_objects([N1, bad], "m")
+        image.client.list_objects.assert_not_called()
+        image.client.remove_object.assert_not_called()
 
 
 def test_route_is_registered():
@@ -330,8 +395,25 @@ class TestCloseSessions:
         code, detail = await _status(close_and_delete(db, switch,
                                                       delete=AsyncMock(side_effect=guard_refuses)))
         assert code == 409 and "r3 (using)" in detail
+        assert "sessions already closed:" in detail and "r1:" in detail and "r2:" in detail
         open_robots = [s["robot_name"] for s in db.sessions if s["ended_at"] is None]
         assert open_robots == ["r3"]            # the first two stay closed, the new one is not touched
+
+    async def test_later_close_failure_lists_the_closed_sessions(self, db):
+        _o1, _o2, switch = setup_two(db)
+        real = maps.session_action
+
+        async def action(*a, **kw):
+            if a[2] == str(db.sessions[1]["session_id"]):
+                raise HTTPException(409, "robot busy")
+            return await real(*a, **kw)
+        maps.session_action = action
+        try:
+            code, detail = await _status(close_and_delete(db, switch))
+        finally:
+            maps.session_action = real
+        assert code == 409 and detail.startswith("robot busy")
+        assert f"r1:{db.sessions[0]['session_id']}" in detail
 
     async def test_session_finished_meanwhile_is_skipped(self, db):
         _o1, _o2, switch = setup_two(db)
@@ -390,3 +472,30 @@ class TestDeleteRoute:
             out = await main.delete_map("yard", close_sessions=True)
         assert out["success"] is True and len(out["closed_sessions"]) == 2
         service.delete_map.assert_awaited_once_with("yard")
+
+
+# --- the ArangoDB node count -------------------------------------------------------------------
+
+class TestArangoNodeCount:
+    def _count(self, stats):
+        graph = SimpleNamespace(get_map_stats=lambda name: stats)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(main, "service", SimpleNamespace(graph_db=graph))
+            return main._arango_node_count("yard")
+
+    def test_count_and_unknown_map(self):
+        assert self._count({"node_count": 4}) == 4
+        assert self._count({"error": "Map yard not found"}) == 0
+
+    def test_other_errors_raise_so_callers_use_the_stored_counts(self):
+        with pytest.raises(RuntimeError):
+            self._count({"error": "connection reset"})
+
+    async def test_transient_error_never_flips_ready_to_draft(self, db):
+        db.add_map("yard", type="local")
+        graph = SimpleNamespace(get_map_stats=lambda name: {"error": "timeout"})
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(main, "service", SimpleNamespace(graph_db=graph))
+            out = await maps.delete_nodes(None, "yard", {"node_ids": [N1]}, m1.PUB, "op",
+                                          _delete_fn(), arango_node_count=main._arango_node_count)
+        assert out["map_state"] == "ready"

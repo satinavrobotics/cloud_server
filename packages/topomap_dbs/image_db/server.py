@@ -24,6 +24,7 @@ except ImportError:
     raise ImportError("minio required. Install: pip install minio")
 
 from packages.topomap_dbs.minio_base import MinIOService
+from packages.topomap_dbs.node_ids import NON_NODE_PREFIXES, is_node_id
 
 
 class ImageDatabaseService(MinIOService):
@@ -446,7 +447,12 @@ class ImageDatabaseService(MinIOService):
     def delete_nodes_objects(self, node_ids: List[str], map_id: Optional[str] = None) -> List[str]:
         """Delete every object under `{node}/` (images, thumbnails, depth, costmap layers) of
         each node. Returns the ids whose objects could not all be removed ([] = all gone; a map
-        without a bucket has nothing to remove)."""
+        without a bucket has nothing to remove). Raises ValueError for an id that is not a node
+        id (e.g. `reconstruction`: a prefix of the bucket holding other data), before anything
+        is removed."""
+        bad = [str(n) for n in node_ids if not is_node_id(n)]
+        if bad:
+            raise ValueError(f"not node ids, refusing to delete their objects: {bad[:5]}")
         map_id = map_id or self.default_map_id
         bucket_name = self._bucket_name(map_id)
         try:
@@ -484,7 +490,7 @@ class ImageDatabaseService(MinIOService):
 
     # Top-level prefixes of a map bucket that are not nodes (3D reconstruction results live
     # under `reconstruction/{job_id}/`, docs/reconstruction/design.md §8.4).
-    NON_NODE_PREFIXES = frozenset({"reconstruction"})
+    NON_NODE_PREFIXES = NON_NODE_PREFIXES
 
     @classmethod
     def _count_node_objects(cls, names) -> tuple:

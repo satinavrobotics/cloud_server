@@ -505,3 +505,6 @@ RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
 PRE_GOTO_ENABLED = _env_bool("PRE_GOTO_ENABLED", "true")
 PRE_GOTO_MIN_DISTANCE_M = float(os.getenv("PRE_GOTO_MIN_DISTANCE_M", "2.0"))
 PRE_GOTO_NODE_RADIUS_M = float(os.getenv("PRE_GOTO_NODE_RADIUS_M", "3.0"))
+# The whole go-to preparation (SQL, ArangoDB, planner) may take this long; then the mission is
+# queued without a go-to.
+PRE_GOTO_TIMEOUT_S = float(os.getenv("PRE_GOTO_TIMEOUT_S", "5.0"))

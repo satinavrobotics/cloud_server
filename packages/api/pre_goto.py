@@ -10,8 +10,10 @@ raises: any failure is logged and the mission is queued as before.
 import asyncio
 import logging
 import math
-from typing import Any, Optional, Tuple
+import uuid
+from typing import Any, List, Optional, Tuple
 
+from cloud_common.objects.mission import MissionObjectV1
 from cloud_common.objects.robot import RobotObjectV1
 from packages import config
 from packages.utils import map_geo, map_sessions
@@ -23,6 +25,15 @@ GOTO_PREFIX = "goto-"
 
 def goto_name(mission_name: str, n: int = 1) -> str:
     return f"{GOTO_PREFIX}{mission_name}-{n}"
+
+
+def free_goto_name(mission_name: str, taken) -> str:
+    """`goto-<mission>-N` with the smallest N >= 1 not in `taken` (deleted missions keep their
+    row, so a reused mission name must not collide with the old go-to)."""
+    n = 1
+    while goto_name(mission_name, n) in taken:
+        n += 1
+    return goto_name(mission_name, n)
 
 
 def first_waypoint(mission: Any) -> Optional[Any]:
@@ -50,15 +61,42 @@ async def _robot_xy_in_map(service: Any, mission: Any, map_id: str
 
 async def queue_pre_goto(service: Any, mission: Any) -> Optional[str]:
     """Queue the go-to for `mission` (not yet written); its name, or None when not applicable
-    or it failed."""
+    or it failed. The whole planner / ArangoDB / SQL work is bounded by PRE_GOTO_TIMEOUT_S: on
+    a timeout the mission is queued without a go-to (and a go-to the planner may already have
+    written is removed)."""
+    chosen: List[str] = []
     try:
-        return await _queue_pre_goto(service, mission)
+        return await asyncio.wait_for(_queue_pre_goto(service, mission, chosen),
+                                      config.PRE_GOTO_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.info("Pre-mission go-to for %s skipped: no answer in %.1f s",
+                    getattr(mission, "name", "?"), config.PRE_GOTO_TIMEOUT_S)
+        if chosen:
+            await discard_pre_goto(service, chosen[0])
+        return None
     except Exception as err:  # pylint: disable=broad-except
         logger.warning("Pre-mission go-to for %s skipped: %s", getattr(mission, "name", "?"), err)
         return None
 
 
-async def _queue_pre_goto(service: Any, mission: Any) -> Optional[str]:
+async def discard_pre_goto(service: Any, name: str) -> None:
+    """Best effort: delete the go-to `name` (the mission it precedes could not be written).
+    Never raises."""
+    try:
+        from packages.api import run_admin    # pylint: disable=import-outside-toplevel
+        await run_admin.delete_mission(service.database, name, with_reruns=False,
+                                       publisher_id=uuid.uuid4())
+        logger.info("Pre-goto %s deleted: its mission was not created", name)
+    except Exception as err:  # pylint: disable=broad-except
+        logger.warning("Pre-goto %s could not be deleted (the robot may drive to its node): %s",
+                       name, err)
+
+
+async def _robot_has_open_mission(service: Any, robot: str, rows: List[Any]) -> bool:
+    return any(m.robot == robot and not m.status.state.done for m in rows)
+
+
+async def _queue_pre_goto(service: Any, mission: Any, chosen: List[str]) -> Optional[str]:
     if not config.PRE_GOTO_ENABLED:
         return None
     if getattr(mission.mode, "value", mission.mode) != "mapped":
@@ -71,6 +109,13 @@ async def _queue_pre_goto(service: Any, mission: Any) -> Optional[str]:
         return None
     min_d = config.PRE_GOTO_MIN_DISTANCE_M
 
+    # A queued or active mission of the robot makes its start pose stale: no go-to then.
+    rows = await service.database.list_objects(MissionObjectV1, include_deleted=True)
+    if await _robot_has_open_mission(
+            service, mission.robot, [m for m in rows if m.lifecycle.value != "DELETED"]):
+        logger.info("Pre-goto for %s: robot %s has a queued or active mission",
+                    mission.name, mission.robot)
+        return None
     robot_xy = await _robot_xy_in_map(service, mission, map_id)
     if robot_xy is None:
         logger.info("Pre-goto for %s: robot not placed on %s", mission.name, map_id)
@@ -90,7 +135,8 @@ async def _queue_pre_goto(service: Any, mission: Any) -> Optional[str]:
     if math.hypot(robot_xy[0] - nx, robot_xy[1] - ny) <= min_d:
         return None
 
-    name = goto_name(mission.name)
+    name = free_goto_name(mission.name, {m.name for m in rows})
+    chosen.append(name)
     result = await service.navigate(
         robot_name=mission.robot, target_x=nx, target_y=ny, map_id=map_id, mission_name=name)
     if not (result or {}).get("success"):

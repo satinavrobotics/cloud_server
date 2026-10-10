@@ -16,6 +16,7 @@ from packages.config import (
     MINIO_HOST, MINIO_PORT, MINIO_SECURE,
     DEFAULT_MAP_ID, ROSBAG_PRESIGN_EXPIRY, require_secret,
 )
+from packages.topomap_dbs.node_ids import is_node_id
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.topomap_dbs.image_db.server import ImageDatabaseService
 from packages.topomap_dbs.rosbag_db.server import RosbagDatabaseService
@@ -151,6 +152,9 @@ class TopomapDatabaseClient:
         requested id are deleted, so a repeat cleans up what failed).
         """
         requested = [str(n) for n in dict.fromkeys(node_ids)]
+        bad = [n for n in requested if not is_node_id(n)]
+        if bad:   # before the graph is touched
+            raise ValueError(f"not node ids: {bad[:5]}")
         deleted, edges = self.graph.delete_nodes(map_id, requested)
         gone = set(deleted)
         failures = self.image.delete_nodes_objects(requested, map_id)

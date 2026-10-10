@@ -146,6 +146,7 @@ from packages.config import (
     OPEN_SESSION_CACHE_TTL_S, RUN_CHANGE_RESTART_RETRY_S, RUN_CHANGE_RESTART_TRIES)
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
+from packages.topomap_dbs.node_ids import is_node_id
 from packages.utils import map_geo
 from packages.utils import map_sessions as ms
 
@@ -771,7 +772,11 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
     Postgres row: adopt it with POST /map/load, or delete it first)."""
     req = parse_body(CreateMapRequest, data)
     if arango_node_count is not None:
-        nodes = await asyncio.to_thread(arango_node_count, req.name)
+        try:
+            nodes = await asyncio.to_thread(arango_node_count, req.name)
+        except Exception:  # noqa: BLE001 - as before: an unreadable count does not block a create
+            logger.warning("ArangoDB node count of %s failed; creating the map anyway", req.name)
+            nodes = 0
         if nodes:
             raise HTTPException(409, f"ArangoDB already has {nodes} nodes for map "
                                      f"'{req.name}' (no Postgres row); choose another name")
@@ -2406,6 +2411,7 @@ async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UU
     recording (a topomap-only mapping session may start meanwhile). The ArangoDB node counts
     (`arango_node_count`, blocking) are read before the transaction, in a thread."""
     req = parse_body(StartSessionRequest, data)
+    refuse_while_deleting_nodes(map_name)
     async with _robot_lock(switch, req.robot):
         if (reloc_jobs is not None and req.purpose == ms.MAPPING
                 and reloc_jobs.active_for(req.robot) is not None
@@ -2768,6 +2774,8 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
             found = await store.lock_session(session_id)
         robot_name = found["robot_name"] if found is not None else None
     counts = (await _node_counts(arango_node_count, [map_name]) if action == "finish" else {})
+    if action == "resume":
+        refuse_while_deleting_nodes(map_name)
     async with _robot_lock(switch, robot_name):
         if (action == "resume" and found is not None and reloc_jobs is not None
                 and reloc_jobs.active_for(found["robot_name"]) is not None
@@ -2861,14 +2869,42 @@ class DeleteNodesRequest(pydantic.BaseModel):
 
     @pydantic.validator("node_ids", each_item=True)
     def _node_id(cls, value):  # noqa: N805 - pydantic v1 validator
-        if not value.strip() or "/" in value or len(value) > 200:
-            raise ValueError("a node id is a non-empty string of at most 200 characters "
-                             "without '/'")
+        if not is_node_id(value):
+            raise ValueError("a node id is a UUID string like graph-builder generates "
+                             "(not e.g. a bucket prefix such as 'reconstruction')")
         return value
 
     @pydantic.validator("node_ids")
     def _dedupe(cls, value):  # noqa: N805
         return list(dict.fromkeys(value))
+
+
+# Maps whose nodes are being deleted right now (name -> in-flight deletes). The delete reads the
+# sessions, then works in ArangoDB / MinIO outside any transaction; a session started or resumed
+# in that window would let graph-builder write into a map mid-delete. In-process (the API runs
+# as one process; the pre-delete session check stays the cross-process guard) and held only
+# for the duration of the call.
+_NODE_DELETES: Dict[str, int] = {}
+
+
+@contextlib.contextmanager
+def _deleting_nodes(map_name: str):
+    _NODE_DELETES[map_name] = _NODE_DELETES.get(map_name, 0) + 1
+    try:
+        yield
+    finally:
+        left = _NODE_DELETES.get(map_name, 1) - 1
+        if left > 0:
+            _NODE_DELETES[map_name] = left
+        else:
+            _NODE_DELETES.pop(map_name, None)
+
+
+def refuse_while_deleting_nodes(map_name: str) -> None:
+    """409 while nodes of the map are being deleted (a start / resume would race the delete)."""
+    if _NODE_DELETES.get(map_name):
+        raise HTTPException(409, f"Nodes of map '{map_name}' are being deleted; retry the "
+                                 "session start/resume in a few seconds")
 
 
 def refuse_recording_session(sessions: Sequence[Mapping[str, Any]], map_name: str) -> None:
@@ -2898,6 +2934,13 @@ async def delete_nodes(db: Any, map_name: str, data: Any, publisher_id: uuid.UUI
     emitted and `notify(map, message)` pushes `nodes_deleted` to the live map stream (a failure
     only logs). Returns {deleted, missing, edges_deleted, map_state[, image_failures]}."""
     req = parse_body(DeleteNodesRequest, data)
+    with _deleting_nodes(map_name):
+        return await _delete_nodes(db, map_name, req, publisher_id, actor, delete_fn,
+                                   arango_node_count, notify)
+
+
+async def _delete_nodes(db, map_name, req, publisher_id, actor, delete_fn,
+                        arango_node_count, notify) -> Dict[str, Any]:
     try:
         async with open_store(db, publisher_id) as store:
             await _lock_alive_map(store, map_name)
@@ -2927,7 +2970,9 @@ async def delete_nodes(db: Any, map_name: str, data: Any, publisher_id: uuid.UUI
                         discriminator=f"map:{map_name}:nodes:{now.isoformat()}",
                         payload={"map_name": map_name, "deleted": len(deleted),
                                  "missing": len(missing), "edges_deleted": edges,
-                                 "image_failures": len(failures), "state": state,
+                                 "image_failures": len(failures),
+                                 "image_failed_ids": failures[:MAX_DELETE_NODES],
+                                 "state": state,
                                  "actor": actor}))
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
@@ -2967,6 +3012,12 @@ async def delete_map_closing_sessions(
     actions: List[Dict[str, Any]] = []
     slam_warnings: List[str] = []
     mapping_warnings: List[str] = []
+    def _failed(exc: HTTPException) -> HTTPException:
+        """The error with the sessions closed so far (they stay closed) in its detail."""
+        done = ", ".join(f"{c['robot']}:{c['session_id']}" for c in closed) or "none"
+        return HTTPException(exc.status_code, f"{exc.detail} (sessions already closed: {done})",
+                             headers=getattr(exc, "headers", None))
+
     for session in sorted(open_ones, key=lambda s: str(s["robot_name"])):
         try:
             out = await session_action(db, map_name, str(session["session_id"]), "finish",
@@ -2976,7 +3027,7 @@ async def delete_map_closing_sessions(
         except HTTPException as exc:
             if exc.status_code == 404:    # finished and gone meanwhile
                 continue
-            raise
+            raise _failed(exc) from exc
         if not out.get("changed"):
             continue
         closed.append({"robot": session["robot_name"], "session_id": str(session["session_id"]),
@@ -2993,7 +3044,12 @@ async def delete_map_closing_sessions(
             view = view_of(robot_name)
             if view and view.get("map") == map_name:
                 slam_saves.append({"robot": robot_name, **view})
-    result = dict(await delete(map_name))
+    try:
+        result = dict(await delete(map_name))
+    except HTTPException as exc:
+        if closed:
+            raise _failed(exc) from exc
+        raise
     result["closed_sessions"] = closed
     result["robot_actions"] = actions
     if slam_saves:

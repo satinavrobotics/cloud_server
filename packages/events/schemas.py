@@ -305,6 +305,7 @@ class MapNodesDeleted(Payload):
     missing: int
     edges_deleted: int
     image_failures: int = 0
+    image_failed_ids: List[str] = []   # the ids behind image_failures
     state: Optional[str] = None
     actor: Optional[str] = None
 

@@ -1,4 +1,5 @@
 """Automatic go-to before a mission (packages/api/pre_goto.py)."""
+import asyncio
 import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -7,7 +8,8 @@ import pytest
 
 from cloud_common.objects.common import Pose2D
 from cloud_common.objects.mission import (
-    MissionNodeV1, MissionObjectV1, MissionRouteNodeV1, MissionMode, MissionStatusV1)
+    MissionNodeV1, MissionObjectV1, MissionRouteNodeV1, MissionMode, MissionStateV1,
+    MissionStatusV1)
 from packages import config
 from packages.api import pre_goto
 from packages.api.mission_index import dispatch_key
@@ -25,8 +27,14 @@ def make_mission(name="m1", wp=(10.0, 0.0), mode=MissionMode.MAPPED, map_id="map
             waypoints=[Pose2D(x=wp[0], y=wp[1], map_id=map_id)]))])
 
 
+def row(name, robot="r1", state="PENDING", lifecycle="ALIVE"):
+    return SimpleNamespace(
+        name=name, robot=robot, lifecycle=SimpleNamespace(value=lifecycle),
+        status=SimpleNamespace(state=MissionStateV1(state)))
+
+
 def make_service(robot_xy=(0.0, 0.0), placed=True, session_map="map1", nodes=None,
-                 nav=None, nav_exc=None):
+                 nav=None, nav_exc=None, rows=()):
     row = ("sid", session_map, "operate", placed, IDENT, None, None, None, None, "local", [])
     cursor = MagicMock()
     cursor.fetchone = AsyncMock(return_value=row)
@@ -38,7 +46,9 @@ def make_service(robot_xy=(0.0, 0.0), placed=True, session_map="map1", nodes=Non
     db = SimpleNamespace(
         get_object=AsyncMock(return_value=SimpleNamespace(
             status=SimpleNamespace(pose=SimpleNamespace(x=robot_xy[0], y=robot_xy[1])))),
-        connection=MagicMock(return_value=cm))
+        connection=MagicMock(return_value=cm),
+        list_objects=AsyncMock(return_value=list(rows)),
+        create_object=AsyncMock())
     if nodes is None:
         nodes = [{"node_id": "5", "pose": {"x": 8.0, "y": 0.0}}]
     graph = SimpleNamespace(nodes_in_range=MagicMock(return_value=(nodes, [1.0] * len(nodes))))
@@ -121,3 +131,88 @@ async def test_goto_sorts_before_mission():
 
 def test_session_row_has_as_many_columns_as_keys():
     assert len(map_sessions.ROBOT_SESSION_KEYS) == 11
+
+
+async def test_next_free_goto_name():
+    rows = [row("goto-m1-1", state="COMPLETED"), row("goto-m1-2", state="CANCELED",
+                                                      lifecycle="DELETED")]
+    svc = make_service(rows=rows, nav={"success": True, "mission_name": "goto-m1-3"})
+    assert await pre_goto.queue_pre_goto(svc, make_mission()) == "goto-m1-3"
+    assert svc.navigate.await_args.kwargs["mission_name"] == "goto-m1-3"
+    assert pre_goto.free_goto_name("m1", set()) == "goto-m1-1"
+
+
+async def test_skipped_while_robot_has_queued_or_active_mission():
+    for state in ("PENDING", "RUNNING"):
+        svc = make_service(rows=[row("other", state=state)])
+        assert await pre_goto.queue_pre_goto(svc, make_mission()) is None
+        svc.navigate.assert_not_awaited()
+    # finished missions, deleted rows and other robots' missions do not count
+    svc = make_service(rows=[row("a", state="COMPLETED"), row("b", state="FAILED"),
+                             row("c", state="RUNNING", lifecycle="DELETED"),
+                             row("d", robot="r2", state="RUNNING")])
+    assert await pre_goto.queue_pre_goto(svc, make_mission()) == "goto-m1-1"
+
+
+async def test_timeout_skips_silently(monkeypatch):
+    monkeypatch.setattr(config, "PRE_GOTO_TIMEOUT_S", 0.05)
+
+    async def slow(**kw):
+        await asyncio.sleep(1)
+    svc = make_service()
+    svc.navigate = AsyncMock(side_effect=slow)
+    m = make_mission()
+    removed = []
+    monkeypatch.setattr(pre_goto, "discard_pre_goto",
+                        AsyncMock(side_effect=lambda s_, n: removed.append(n)))
+    assert await pre_goto.queue_pre_goto(svc, m) is None
+    assert removed == ["goto-m1-1"]        # a go-to the planner may have written is cleaned up
+    assert m.created_at is None
+
+
+async def test_discard_deletes_the_goto_and_never_raises(monkeypatch):
+    from packages.api import run_admin
+    calls = []
+
+    async def ok(db, name, **kw):
+        calls.append((name, kw["with_reruns"]))
+    monkeypatch.setattr(run_admin, "delete_mission", ok)
+    await pre_goto.discard_pre_goto(make_service(), "goto-m1-1")
+    assert calls == [("goto-m1-1", False)]
+    monkeypatch.setattr(run_admin, "delete_mission", AsyncMock(side_effect=RuntimeError("x")))
+    await pre_goto.discard_pre_goto(make_service(), "goto-m1-1")
+
+
+def json_body(d):
+    import json
+    return json.loads(json.dumps(d, default=lambda o: getattr(o, "value", str(o))))
+
+
+async def test_create_mission_deletes_the_goto_when_the_insert_fails():
+    from unittest.mock import patch
+    from packages.api import main
+    svc = make_service()
+    svc.database.create_object = AsyncMock(side_effect=RuntimeError("insert failed"))
+    discard = AsyncMock()
+    body = json_body(make_mission().dict())
+    body.pop("status", None)
+    with patch.object(main, "service", svc), \
+            patch.object(main, "queue_pre_goto", AsyncMock(return_value="goto-m1-1")), \
+            patch.object(main, "discard_pre_goto", discard):
+        with pytest.raises(RuntimeError):
+            await main.create_mission(body)
+    discard.assert_awaited_once_with(svc, "goto-m1-1")
+
+
+async def test_create_mission_keeps_the_goto_on_success():
+    from unittest.mock import patch
+    from packages.api import main
+    svc = make_service()
+    discard = AsyncMock()
+    body = json_body(make_mission().dict())
+    body.pop("status", None)
+    with patch.object(main, "service", svc), \
+            patch.object(main, "queue_pre_goto", AsyncMock(return_value="goto-m1-1")), \
+            patch.object(main, "discard_pre_goto", discard):
+        await main.create_mission(body)
+    discard.assert_not_awaited()

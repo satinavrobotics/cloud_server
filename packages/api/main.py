@@ -26,7 +26,7 @@ from packages.api import fleet_reads, maps, recorder_health, recording, run_admi
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.api.mission_index import mission_ahead
-from packages.api.pre_goto import queue_pre_goto
+from packages.api.pre_goto import discard_pre_goto, queue_pre_goto
 from packages.api.robot_delete import RobotDeleter
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -636,8 +636,16 @@ async def _reroute_through_blocked(reroute: Dict[str, Any]) -> List[Dict[str, An
 
 
 def _arango_node_count(name: str) -> int:
+    """The map's node count in ArangoDB: 0 for a map ArangoDB does not have; any other error
+    raises, so the callers (maps._node_counts -> None) fall back to the stored counts and a
+    transient failure never turns a populated `ready` map into `draft`."""
     stats = service.graph_db.get_map_stats(name)
-    return 0 if "error" in stats else int(stats.get("node_count") or 0)
+    if "error" in stats:
+        err = str(stats["error"])
+        if err.startswith("Map ") and err.endswith(" not found"):
+            return 0
+        raise RuntimeError(f"ArangoDB node count of {name} failed: {stats['error']}")
+    return int(stats.get("node_count") or 0)
 
 
 @app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
@@ -2397,8 +2405,13 @@ async def create_mission(mission_data: dict):
     mission.status.order_rev = 0
     publisher_id = uuid.uuid4()
     # The go-to to the topomap node nearest the first waypoint goes in first (never raises).
-    await queue_pre_goto(service, mission)
-    await service.database.create_object(mission, publisher_id)
+    goto = await queue_pre_goto(service, mission)
+    try:
+        await service.database.create_object(mission, publisher_id)
+    except BaseException:
+        if goto:   # the go-to alone would drive the robot to a node for a mission that is not there
+            await discard_pre_goto(service, goto)
+        raise
     return mission.dict()
 
 
