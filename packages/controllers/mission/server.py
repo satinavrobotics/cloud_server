@@ -560,6 +560,10 @@ class Robot:
     # left over from the previous order while it drives, or this soon after the order
     # went out; otherwise as the robot dropping the order (see update_mission_state).
     CANCELED_LEFTOVER_GRACE_S = 10.0
+    # A new order waits for the robot to finish the previous one (empty nodeStates and
+    # edgeStates). A robot that still lists nodes of it, is not driving and has stayed so
+    # this long gets a cancelOrder, so the order is not held until the mission timeout.
+    ORDER_CLEAR_DWELL_S = 10.0
     # More new order revisions than this for one run within the window is churn: the
     # mission is failed instead of re-issued once more. See _bump_order_rev().
     ORDER_CHURN_MAX_REVISIONS = 5
@@ -685,6 +689,18 @@ class Robot:
         self._robot_order_id: Optional[str] = None
         # Whether that state message still listed nodes or edges: the robot is executing.
         self._robot_executing = False
+        # Whether that state message said the robot is driving.
+        self._robot_driving = False
+        # When a new order first had to wait for the robot's previous one (None: not
+        # waiting); restarted while the robot drives and after each clearing cancel.
+        self._order_gate_since: Optional[float] = None
+        # Orders the robot may still list but that hold nothing back any more: one it kept
+        # after a cancelOrder to drop it went unanswered, or one the dispatcher replaced
+        # with a new revision. Emptied once the robot lists no nodes (see
+        # _robot_still_on_previous_order).
+        self._released_order_ids: Set[str] = set()
+        # The order whose completion without its final node was last reported.
+        self._early_completion_noted: Optional[str] = None
         # A reroute's cancel held back until the robot has adopted the order version just
         # sent (see _replace_cancel_must_wait).
         self._deferred_replace_cancel = False
@@ -807,6 +823,7 @@ class Robot:
             self._order_revisions.clear()
             self._resume_pending = False
             self._pending_send = None
+            self._order_gate_since = None
             self._deferred_replace_cancel = False
             self._blocked_order_id = None
             self._node_reports_seen.clear()
@@ -1192,6 +1209,8 @@ class Robot:
             return
         purpose, run = self._cancel_purposes.pop(action.actionId, (CancelPurpose.STOP, None))
         self._resolved_cancels.append((purpose, run, abandoned))
+        if abandoned and self._robot_executing and self._robot_order_id is not None:
+            self._released_order_ids.add(self._robot_order_id)
 
     async def _handle_force_cancel(self, message: api_objects.RobotObjectV1):
         """Operator escape hatch, independent of mission tracking (see
@@ -1442,6 +1461,7 @@ class Robot:
             self._stop_order_churn(len(self._order_revisions) + 1)
             await self._stop_our_order("churn")  # nothing to do unless it still runs one
             return False
+        replaced = self._current_order_id()
         legacy = status.run_id is None
         if legacy:
             status.run_id = uuid.uuid4().hex[:8]
@@ -1459,6 +1479,9 @@ class Robot:
             return False
         self._order_revisions.append(now)
         self._unknown_content_order_id = None
+        # What the robot still lists of the order replaced here holds nothing back.
+        self._released_order_ids.update(
+            order for order in (replaced, self._robot_order_id) if order is not None)
         self.mission_info(f"Run id {status.run_id} (was a legacy mission)" if legacy
                           else f"Order revision {status.order_rev}")
         return True
@@ -1482,7 +1505,8 @@ class Robot:
     async def _send_order(self, waypoint_offset: int = 0):
         """Send the order of the current behavior-tree node. An order already sent under
         the same orderId is republished unchanged; `waypoint_offset` (a resume) leaves the
-        route's first waypoints out of a newly built order."""
+        route's first waypoints out of a newly built order. A new order waits until the
+        robot has finished the previous one (_robot_still_on_previous_order)."""
         if self._robot_object is None or self._robot_object.lifecycle \
             not in [api_objects.object.ObjectLifecycleV1.ALIVE,
                     api_objects.object.ObjectLifecycleV1.PENDING_DELETE]:
@@ -1530,10 +1554,11 @@ class Robot:
             # An earlier dispatcher process may have sent this orderId with content this
             # one does not know (see _resume_from_state): move to a new revision instead.
             if order_ids.order_id(self._order_prefix(), idx) == \
-                    self._unknown_content_order_id and not await self._bump_order_rev():
-                if not self._current_mission.status.state.done:
-                    self._pending_send = self._pending_send or SEND_NODE
-                return
+                    self._unknown_content_order_id:
+                if not await self._bump_order_rev():
+                    if not self._current_mission.status.state.done:
+                        self._pending_send = self._pending_send or SEND_NODE
+                    return
             order_id = order_ids.order_id(self._order_prefix(), idx)
             if self._sent_order is not None and self._sent_order.orderId == order_id \
                     and order_id in self._dead_order_ids:
@@ -1548,6 +1573,14 @@ class Robot:
                 self._order_resends += 1
                 self.mission_info(f"Resending order {order_id} ({self._order_resends})")
             else:
+                if self._robot_still_on_previous_order(order_id):
+                    await self._wait_for_previous_order(order_id)
+                    return
+                if self._order_gate_since is not None:
+                    self.mission_info(
+                        f"Order {order_id} released: the robot finished the previous one "
+                        f"after {time.monotonic() - self._order_gate_since:.1f} s")
+                    self._order_gate_since = None
                 built = await self._build_order(mission_node, idx, waypoint_offset)
                 if built is None:
                     return
@@ -1571,6 +1604,42 @@ class Robot:
                 f"{self._mqtt_prefix}/{self._name}/order", order.json())
             self.set_mission_node_state(f"{mission_node.name}",
                                         mission_object.MissionStateV1.RUNNING)
+
+    def _robot_still_on_previous_order(self, order_id: str) -> bool:
+        """Whether the robot still executes (nodeStates or edgeStates not empty) an order a
+        dispatcher issued that is not `order_id`: VDA5050 has a new order wait for the previous
+        one to finish. Not the robot's own offline order (it cannot hold a mission back), nor
+        an order the robot reported failed or cancelled (still listing nodes while idle), nor
+        one released (_released_order_ids: kept after an unanswered cancelOrder, or replaced
+        by a new revision the dispatcher chose; the order then goes out as it did before,
+        and the robot decides)."""
+        return self._robot_runs_dispatcher_order() and self._robot_order_id != order_id and \
+            self._robot_order_id not in self._dead_order_ids and \
+            self._robot_order_id not in self._released_order_ids
+
+    async def _wait_for_previous_order(self, order_id: str) -> None:
+        """Hold `order_id` back until the robot's state shows the previous order done: the
+        send stays owed and the next state message retries it. A robot that still lists the
+        order's nodes, is not driving and has stayed so for ORDER_CLEAR_DWELL_S is stuck on
+        it: its order is cancelled (the owed send follows the cancel). Mission timeout
+        bounds the rest."""
+        self._pending_send = self._pending_send or SEND_NODE
+        now = time.monotonic()
+        if self._order_gate_since is None:
+            self._order_gate_since = now
+            self.mission_info(f"Holding order {order_id}: the robot still reports "
+                              f"{self._robot_order_id} (nodes remain)")
+            return
+        if self._robot_driving:
+            self._order_gate_since = now
+            return
+        if now - self._order_gate_since < self.ORDER_CLEAR_DWELL_S:
+            return
+        if await self._cancel_order(
+                CancelPurpose.CLEAR, "clear",
+                f"The robot has stayed on {self._robot_order_id} without driving while "
+                f"{order_id} waits: send cancel order action", ours=OURS_DISPATCHER):
+            self._order_gate_since = now
 
     def _sends_node_policy(self) -> bool:
         """Whether route orders to this robot carry nodePolicy actions: per
@@ -2510,6 +2579,9 @@ class Robot:
         # before dispatch) sees the robot as this message reports it, not the previous one.
         self._robot_order_id = message.orderId
         self._robot_executing = bool(message.nodeStates or message.edgeStates)
+        if not self._robot_executing:
+            self._released_order_ids.clear()
+        self._robot_driving = bool(message.driving)
         # If we have a robot, Update it with the details from the message
         if self._robot_object is not None:
             self._arm_online_watchdog()
@@ -3116,6 +3188,7 @@ class Robot:
         self._order_mismatch_count = 0
         self._order_revisions.clear()
         self._pending_send = None
+        self._order_gate_since = None
         self._deferred_replace_cancel = False
         self._blocked_order_id = None
         self._node_reports_seen.clear()
@@ -4182,8 +4255,33 @@ class Robot:
         if node.type is mission_object.MissionNodeType.ROUTE and \
                 not self._order_route_is_current(message.orderId, node):
             return False
+        self._note_completion_without_final_node(message, node)
         self.set_mission_node_state(str(node.name), mission_object.MissionStateV1.COMPLETED)
         return True
+
+    def _note_completion_without_final_node(self, message: types.VDA5050State,
+                                            node: mission_object.MissionNodeV1) -> None:
+        """Log, and record, a node completed by the robot's missionStatus flag while its
+        lastNodeSequenceId has not reached the order's final node: the robot's report of the
+        final node (and its nodeStates) is behind the flag, which a next order must not
+        overtake (see _robot_still_on_previous_order). Once per order."""
+        sent = self._sent_order
+        if sent is None or sent.orderId != message.orderId or not sent.nodes or \
+                self._early_completion_noted == message.orderId:
+            return
+        final = max(n.sequenceId for n in sent.nodes)
+        # lastNodeId lags orderId: a node of the previous order is not progress in this one.
+        reached = message.lastNodeSequenceId if \
+            order_ids.order_of_node(message.lastNodeId) == message.orderId else -1
+        if reached >= final:
+            return
+        self._early_completion_noted = message.orderId
+        detail = (f"Order {message.orderId} reported completed with lastNodeId "
+                  f"{message.lastNodeId!r} (sequence {message.lastNodeSequenceId}); its "
+                  f"final node has sequence {final}")
+        self.warning(f"[{self._current_mission.name}] {detail}")
+        self._record("completed_without_final_node", self._name, self._current_mission,
+                     message.orderId, detail, self._event_ts)
 
     def _apply_spec_edit(self, target: api_objects.MissionObjectV1,
                          message: api_objects.MissionObjectV1, dispatched: bool):
