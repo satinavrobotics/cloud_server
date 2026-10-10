@@ -225,9 +225,11 @@ class VDA5050Node(pydantic.BaseModel):
     @classmethod
     def from_robot(cls, robot_object: robot.RobotObjectV1, mission_id: str,
                    mission_node_id: int = 0, sequence: int = 0, final: bool = False,
-                   policy: Optional[OrderPolicy] = None) -> "VDA5050Node":
+                   policy: Optional[OrderPolicy] = None,
+                   map_id: str = "") -> "VDA5050Node":
         """The start node, at the robot's pose. Wide enough that the robot does not try to
-        re-reach where it stands, unless it carries the order's actions (`final`)."""
+        re-reach where it stands, unless it carries the order's actions (`final`). `map_id`
+        is the order's mapId (the one its route nodes carry), "" for an order on no map."""
         policy = policy or current_order_policy()
         return VDA5050Node(
             nodeId=order_ids.node_id(mission_id, mission_node_id, sequence),
@@ -235,7 +237,7 @@ class VDA5050Node(pydantic.BaseModel):
             nodePosition=VDA5050NodePosition(
                 x=robot_object.status.pose.x,
                 y=robot_object.status.pose.y,
-                theta=robot_object.status.pose.theta,
+                theta=robot_object.status.pose.theta, mapId=map_id,
                 allowedDeviationXY=policy.deviation_xy_final_m if final
                 else policy.deviation_xy_start_m,
                 # Heading stays free (pass value) even though this is the robot's own
@@ -414,8 +416,12 @@ class VDA5050Order(pydantic.BaseModel):
         metadata on which nodes a route does not depend on)."""
         policy = policy or current_order_policy()
         # Create an initial node from the robots current position
+        # The route's waypoints on a map carry the robot's name of it (the dispatcher relabels
+        # them); the start node gets the same mapId so every node of the order agrees.
+        order_map_id = next((w.map_id for w in route.waypoints if w.map_id), "") \
+            if route is not None else ""
         nodes = [VDA5050Node.from_robot(
-            robot_object, mission_id, mission_node_id, policy=policy)]
+            robot_object, mission_id, mission_node_id, policy=policy, map_id=order_map_id)]
         edges = []
         # Add each pose in the route as a node
         if route is not None:

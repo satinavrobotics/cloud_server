@@ -27,6 +27,7 @@ import cloud_common.objects.mission as mission_object  # noqa: E402
 from cloud_common.objects.map import MapObjectV1  # noqa: E402
 from packages.controllers.mission import server as dispatch_server  # noqa: E402
 from packages.controllers.mission.server import Robot, RouteRefused  # noqa: E402
+import packages.controllers.mission.vda5050_types as types_mod  # noqa: E402
 from packages.database.postgres import PostgresDatabase  # noqa: E402
 from packages.services.mission_planner import main as planner_main  # noqa: E402
 from packages.services.mission_planner import server as planner_server  # noqa: E402
@@ -361,3 +362,30 @@ class TestOrderMapId:
         r._read_open_session = AsyncMock(return_value=session(map_name="barn"))
         with pytest.raises(RouteRefused, match="not using map shed"):
             await r._route_in_robot_frame(_route())
+
+
+class TestOrderStartNodeMapId:
+    async def test_start_node_carries_the_order_map_id(self):
+        r, _ = _robot()
+        r._robot_object.status.pose.map_id = "onboard-x"
+        r._robot_object.status.position_initialized = True
+        r._read_open_session = AsyncMock(return_value=session())
+        route = await r._route_in_robot_frame(_route())
+        order = types_mod.VDA5050Order.from_route(route, r._robot_object, "prefix", 0)
+        assert [n.nodePosition.mapId for n in order.nodes] == ["onboard-x", "onboard-x", ""]
+        # the start node's position is still the robot's own pose
+        assert (order.nodes[0].nodePosition.x, order.nodes[0].nodePosition.y) == (0.0, 0.0)
+
+    def test_mapless_order_unchanged(self):
+        r, _ = _robot()
+        route = mission_object.MissionRouteNodeV1(
+            waypoints=[{"x": 1.0, "y": 1.0, "theta": 0.0, "map_id": ""}])
+        order = types_mod.VDA5050Order.from_route(route, r._robot_object, "prefix", 0)
+        assert [n.nodePosition.mapId for n in order.nodes] == ["", ""]
+
+    def test_move_and_action_orders_unchanged(self):
+        r, _ = _robot()
+        r._robot_object.status.pose.map_id = "onboard-x"
+        action = mission_object.MissionActionNodeV1(action_type="pause_resume")
+        order = types_mod.VDA5050Order.from_action(action, r._robot_object, "prefix", 0)
+        assert [n.nodePosition.mapId for n in order.nodes] == [""]

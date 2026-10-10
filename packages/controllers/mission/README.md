@@ -36,6 +36,9 @@ and the leg tracker keep the cloud name). Agreed contract with the robot team:
 2. `cloud-<map>` (`map_sessions.onboard_map_name`, the name the cloud gives the map's SLAM map on
    the robot).
 
-Waypoints without a map (mapless missions) are sent unchanged, with an empty `mapId`. What was
+The start node (the robot's own pose) carries the same `mapId`, so every node of a route order
+agrees. Waypoints without a map (mapless missions) are sent unchanged, with an empty `mapId`, and
+so are the start node of a mapless route and the nodes of move and action orders (no route nodes
+on a map). What was
 sent is stored in `status.sent_order.frame`: `map_name` (cloud name), `map_id_sent` (the
 `mapId` actually sent), `applied` (`inverse` / `identity` / `none`), `session_id`, `map_t_session`.

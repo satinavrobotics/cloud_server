@@ -444,11 +444,11 @@ async def test_each_order_records_the_frame_it_was_sent_in():
 
     (order,) = _orders(r)
     # Session-frame positions, labelled with the robot's name of the map (cloud-M when it
-    # has not reported one); the start node has none.
+    # has not reported one); the start node carries it too.
     x, y = map_geo.apply_transform(map_geo.invert_transform(T), 10.0, 1.0)
     assert order["nodes"][1]["nodePosition"]["x"] == pytest.approx(x)
     assert order["nodes"][1]["nodePosition"]["y"] == pytest.approx(y)
-    assert [n["nodePosition"]["mapId"] for n in order["nodes"]] == ["", "cloud-M", "cloud-M", "cloud-M"]
+    assert [n["nodePosition"]["mapId"] for n in order["nodes"]] == ["cloud-M", "cloud-M", "cloud-M", "cloud-M"]
     # A robot that took mapId at its word and applied map_T_session once more would
     # drive somewhere else by a constant offset: the double transform.
     gx, gy = map_geo.apply_transform(T, *map_geo.apply_transform(T, x, y))
