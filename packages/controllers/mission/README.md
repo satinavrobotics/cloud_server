@@ -22,3 +22,23 @@ Code: `lifecycle.py`, `RobotServer.run` / `graceful_shutdown` in `server.py`.
   settled by the next start's orphan reconciliation); stop the recorder and close its pool;
   close the DB pool; release the leader lock. The whole is bounded at 13 s
   (`SHUTDOWN_TIMEOUT_S`), then exit 0. Compose sets `stop_grace_period: 20s` and `init: true`.
+
+## Order frame and nodePosition.mapId
+
+Route waypoints are stored in the map frame (`map_id` = the cloud map's name). When an order is
+built, `Robot._route_in_robot_frame` converts them into the robot's session frame with
+inverse(`map_T_session`) and relabels them, on a deep copy (the stored mission, the fleet recorder
+and the leg tracker keep the cloud name). Agreed contract with the robot team:
+`nodePosition.mapId` == the `agvPosition.mapId` the robot reports while localized. So `mapId` is
+
+1. the robot's last reported `agvPosition.mapId`, when its `positionInitialized` is true and the
+   value is non-empty and not `"map"` (the robot's own frame, not a map); else
+2. `cloud-<map>` (`map_sessions.onboard_map_name`, the name the cloud gives the map's SLAM map on
+   the robot).
+
+The start node (the robot's own pose) carries the same `mapId`, so every node of a route order
+agrees. Waypoints without a map (mapless missions) are sent unchanged, with an empty `mapId`, and
+so are the start node of a mapless route and the nodes of move and action orders (no route nodes
+on a map). What was
+sent is stored in `status.sent_order.frame`: `map_name` (cloud name), `map_id_sent` (the
+`mapId` actually sent), `applied` (`inverse` / `identity` / `none`), `session_id`, `map_t_session`.

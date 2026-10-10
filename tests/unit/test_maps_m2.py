@@ -496,12 +496,14 @@ class TestFrames:
         assert (w[1].x, w[1].y) == (5.0, 5.0)
         assert route.waypoints[0].x == mx  # the stored mission is not changed
         db.get_object.assert_not_awaited()  # the session alone converts (no map/datum rule)
-        # identity session: the same object back
+        # identity session: positions as they are, labelled with the robot's map name
         r._read_open_session = AsyncMock(return_value={
             "map_name": "l", "aligned": True, "map_t_session": dict(map_geo.IDENTITY)})
         local = mission_object.MissionRouteNodeV1(waypoints=[{"x": 1.0, "y": 2.0,
                                                               "map_id": "l"}])
-        assert await r._route_in_robot_frame(local) is local
+        out = await r._route_in_robot_frame(local)
+        assert (out.waypoints[0].x, out.waypoints[0].y) == (1.0, 2.0)
+        assert out.waypoints[0].map_id == "cloud-l" and local.waypoints[0].map_id == "l"
         # maps U6: 'GEO' is not a map any more, the robot is not using it: refused
         geo_wp = mission_object.MissionRouteNodeV1(waypoints=[{"x": 1.0, "y": 1.0,
                                                                "map_id": "GEO"}])

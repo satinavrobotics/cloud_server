@@ -32,7 +32,7 @@ UNKNOWN = "UNKNOWN"
 MAP_REJECTED_ERROR = "relocalizationMapRejectedError"
 RELOCALIZING_ERROR = "relocalizationNotReadyError"
 # The VDA client's mapId while the robot is not localized on a stored map.
-FRAME_MAP_ID = "map"
+FRAME_MAP_ID = ms.FRAME_MAP_ID
 # Robot-side reasons the pose is not usable, most specific first.
 _NOT_READY_ERRORS = (MAP_REJECTED_ERROR, RELOCALIZING_ERROR, "poseHealthNotReadyError",
                      "tfChainNotReadyError", "navigationNotReadyError", "robotBaseNotReadyError")

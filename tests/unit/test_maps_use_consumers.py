@@ -27,6 +27,7 @@ import cloud_common.objects.mission as mission_object  # noqa: E402
 from cloud_common.objects.map import MapObjectV1  # noqa: E402
 from packages.controllers.mission import server as dispatch_server  # noqa: E402
 from packages.controllers.mission.server import Robot, RouteRefused  # noqa: E402
+import packages.controllers.mission.vda5050_types as types_mod  # noqa: E402
 from packages.database.postgres import PostgresDatabase  # noqa: E402
 from packages.services.mission_planner import main as planner_main  # noqa: E402
 from packages.services.mission_planner import server as planner_server  # noqa: E402
@@ -296,3 +297,95 @@ class TestBagMetadata:
         with patch.object(maps, "robot_sessions", AsyncMock(return_value={})):
             out = await svc.create_bag_upload_url("r1")
         assert out["map_id"] is None and out["session_id"] is None
+
+
+class TestOrderMapId:
+    """nodePosition.mapId = the robot's own name of the map (agreed contract); coordinates are
+    the session frame's as before; the stored mission keeps the cloud name."""
+
+    def _localized(self, r, map_id="cloud-office6", initialized=True):
+        r._robot_object.status.pose.map_id = map_id
+        r._robot_object.status.position_initialized = initialized
+
+    async def test_reported_name_used_when_localized(self):
+        r, _ = _robot()
+        self._localized(r, "onboard-x")
+        r._read_open_session = AsyncMock(return_value=session())
+        route = _route()
+        out = await r._route_in_robot_frame(route)
+        assert out.waypoints[0].map_id == "onboard-x"
+        assert out.waypoints[1].map_id == ""           # mapless: untouched
+        assert r._last_route_frame["map_id_sent"] == "onboard-x"
+        assert r._last_route_frame["map_name"] == "shed"
+
+    @pytest.mark.parametrize("map_id,initialized", [
+        ("cloud-other", False), ("cloud-other", None), ("map", True), ("", True), (None, True)])
+    async def test_fallback_to_cloud_prefix(self, map_id, initialized):
+        r, _ = _robot()
+        self._localized(r, map_id, initialized)
+        r._read_open_session = AsyncMock(return_value=session())
+        out = await r._route_in_robot_frame(_route())
+        assert out.waypoints[0].map_id == "cloud-shed"
+        assert r._last_route_frame["map_id_sent"] == "cloud-shed"
+
+    async def test_coordinates_unchanged_and_mission_not_mutated(self):
+        r, _ = _robot()
+        self._localized(r)
+        r._read_open_session = AsyncMock(return_value=session())
+        route = _route()
+        before = route.json()
+        out = await r._route_in_robot_frame(route)
+        w = out.waypoints
+        assert (w[0].x, w[0].y, w[0].theta) == pytest.approx((2.0, 1.0, 0.2))
+        assert out is not route
+        assert route.json() == before and route.waypoints[0].map_id == "shed"
+
+    async def test_identity_session_is_relabelled_too(self):
+        r, _ = _robot()
+        self._localized(r)
+        r._read_open_session = AsyncMock(
+            return_value=session(transform=dict(map_geo.IDENTITY)))
+        route = _route()
+        out = await r._route_in_robot_frame(route)
+        assert out.waypoints[0].map_id == "cloud-office6"
+        assert (out.waypoints[0].x, out.waypoints[0].y) == (route.waypoints[0].x,
+                                                            route.waypoints[0].y)
+        assert route.waypoints[0].map_id == "shed"
+        assert r._last_route_frame["applied"] == "identity"
+
+    async def test_refusals_unchanged(self):
+        r, _ = _robot()
+        self._localized(r)
+        r._read_open_session = AsyncMock(return_value=session(aligned=False))
+        with pytest.raises(RouteRefused, match="not placed on map shed"):
+            await r._route_in_robot_frame(_route())
+        r._read_open_session = AsyncMock(return_value=session(map_name="barn"))
+        with pytest.raises(RouteRefused, match="not using map shed"):
+            await r._route_in_robot_frame(_route())
+
+
+class TestOrderStartNodeMapId:
+    async def test_start_node_carries_the_order_map_id(self):
+        r, _ = _robot()
+        r._robot_object.status.pose.map_id = "onboard-x"
+        r._robot_object.status.position_initialized = True
+        r._read_open_session = AsyncMock(return_value=session())
+        route = await r._route_in_robot_frame(_route())
+        order = types_mod.VDA5050Order.from_route(route, r._robot_object, "prefix", 0)
+        assert [n.nodePosition.mapId for n in order.nodes] == ["onboard-x", "onboard-x", ""]
+        # the start node's position is still the robot's own pose
+        assert (order.nodes[0].nodePosition.x, order.nodes[0].nodePosition.y) == (0.0, 0.0)
+
+    def test_mapless_order_unchanged(self):
+        r, _ = _robot()
+        route = mission_object.MissionRouteNodeV1(
+            waypoints=[{"x": 1.0, "y": 1.0, "theta": 0.0, "map_id": ""}])
+        order = types_mod.VDA5050Order.from_route(route, r._robot_object, "prefix", 0)
+        assert [n.nodePosition.mapId for n in order.nodes] == ["", ""]
+
+    def test_move_and_action_orders_unchanged(self):
+        r, _ = _robot()
+        r._robot_object.status.pose.map_id = "onboard-x"
+        action = mission_object.MissionActionNodeV1(action_type="pause_resume")
+        order = types_mod.VDA5050Order.from_action(action, r._robot_object, "prefix", 0)
+        assert [n.nodePosition.mapId for n in order.nodes] == [""]

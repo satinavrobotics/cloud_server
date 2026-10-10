@@ -34,6 +34,17 @@ from packages.utils import geo, map_geo
 
 MAPPING, OPERATE = "mapping", "operate"
 PURPOSES = (MAPPING, OPERATE)
+
+# How the robot names a cloud map's SLAM map on board ("cloud-<map>"), and the mapId it reports
+# while it is on no map (odometry or slam: its own frame). Shared by the API and the dispatcher.
+ONBOARD_MAP_PREFIX = "cloud-"
+FRAME_MAP_ID = "map"
+
+
+def onboard_map_name(map_name: str) -> str:
+    """The name a cloud map's SLAM map has on the robot's orchestrator. The prefix keeps it clear
+    of the orchestrator's reserved names and of maps stored by hand."""
+    return ONBOARD_MAP_PREFIX + map_name
 TOPO, GRID, SLAM = "topo", "grid", "slam"
 # Orchestrator services a session can switch on (§14.5). `grid` is reserved for sati_grid_mapping,
 # which does not exist yet: accepted, and robots that do not run it ignore it.
