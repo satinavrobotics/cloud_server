@@ -2534,6 +2534,10 @@ class Robot:
         (mapless missions: already robot frame) are sent as they are. The stored mission is
         not changed.
 
+        Every waypoint on a map is sent with that map's name on the robot as its mapId
+        (`_order_map_id`; the coordinates are the session frame's), in a deep copy: the stored
+        mission, the fleet recorder and the leg tracker keep the cloud map name.
+
         What was applied is left in `_last_route_frame` (MissionSentOrderV1.frame) and
         logged, so node offsets the robot reports can be read in the map frame."""
         names = {wp.map_id for wp in route.waypoints if wp.map_id}
@@ -2553,24 +2557,38 @@ class Robot:
             t = session["map_t_session"]
             if not map_geo.is_identity(t):
                 inverse[name] = map_geo.invert_transform(t)
+        sent_names = {name: self._order_map_id(name) for name in names}
         self._last_route_frame = {
             "applied": "inverse" if inverse else "identity",
             "map_name": session["map_name"], "session_id": session.get("session_id"),
             "map_t_session": session["map_t_session"],
-            # The nodes keep the map's name as mapId although their positions are in the
-            # robot's session frame (the robot team is asked which frame they expect).
-            "map_id_sent": ", ".join(sorted(names))}
+            # nodePosition.mapId of the order's nodes: the robot's own name of the map (see
+            # _order_map_id), not the cloud map's; the positions are in the session frame.
+            "map_id_sent": ", ".join(sorted(set(sent_names.values())))}
         self.mission_info(f"Order frame: {self._last_route_frame}")
-        if not inverse:
-            return route
         converted = route.copy(deep=True)
         for wp in converted.waypoints:
+            if not wp.map_id:
+                continue
             t = inverse.get(wp.map_id)
             if t is not None:
                 wp.x, wp.y, wp.theta = map_geo.apply_pose(t, wp.x, wp.y, wp.theta)
-        self.mission_info(f"Route waypoints converted from the frame of map(s) "
-                          f"{', '.join(sorted(inverse))} into the robot's frame")
+            wp.map_id = sent_names[wp.map_id]
+        if inverse:
+            self.mission_info(f"Route waypoints converted from the frame of map(s) "
+                              f"{', '.join(sorted(inverse))} into the robot's frame")
         return converted
+
+    def _order_map_id(self, map_name: str) -> str:
+        """nodePosition.mapId for a waypoint on cloud map `map_name`: the agvPosition.mapId the
+        robot reports while it is localized (position initialized, not empty, not the frame
+        name "map"), else the name the cloud gave the map on the robot (cloud-<map>)."""
+        status = self._robot_object.status if self._robot_object is not None else None
+        reported = getattr(getattr(status, "pose", None), "map_id", None)
+        if getattr(status, "position_initialized", None) is True and reported \
+                and reported != map_sessions.FRAME_MAP_ID:
+            return reported
+        return map_sessions.onboard_map_name(map_name)
 
     async def _on_client_message(self, message: types.VDA5050State):
         self.debug("[%s] Got feedback", message.orderId)

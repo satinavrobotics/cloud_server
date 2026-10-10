@@ -53,6 +53,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
+from packages.utils import map_sessions
+
 from packages.config import (
     ORCHESTRATOR_QUERY_TIMEOUT_S, ORCHESTRATOR_START_TIMEOUT_S, ORCHESTRATOR_STOP_TIMEOUT_S,
 )
@@ -88,8 +90,9 @@ def orchestrator_address(robot: Any) -> Optional[Tuple[str, int]]:
 
 def onboard_map_name(map_name: str) -> str:
     """The name a cloud map's SLAM map has on the robot's orchestrator. The prefix keeps it clear
-    of the orchestrator's reserved names and of maps stored by hand."""
-    return "cloud-" + map_name
+    of the orchestrator's reserved names and of maps stored by hand. One definition, in
+    packages.utils.map_sessions (the mission dispatcher needs it and does not import the API)."""
+    return map_sessions.onboard_map_name(map_name)
 
 
 def cloud_link(map_name: Any, session_id: Any) -> Dict[str, str]:
