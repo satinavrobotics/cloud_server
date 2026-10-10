@@ -484,7 +484,7 @@ on any other receive error.
 `VDA5050Order.from_mission`, the unused `sys`/`cast`/`os` imports and the double
 `_detection_results_object` init in the mission controller are gone (the "Dead:" bullet above, mission-controller
 part, is done). Kept: `push_telemetry`/`TelemetrySender` and the charging hook (legacy, still wired to CLI
-flags), and `packages/controllers/mission/tests/{test_context,client}.py` (the e2e conftest imports them).
+flags); `packages/controllers/mission/tests/client.py` (the robot simulator) is kept. The Bazel-era `test_context.py` and the `tests/e2e/mission_dispatcher` suite that imported it were removed: they could not be collected (`tests.utils.test_utils` does not exist).
 
 ### H. Mission dispatch audit 2026-10-09 — fixed, and open follow-ups
 Fixed: C12 (restart repeat, W13), `failure_category` now set by the dispatcher (TIMEOUT, ROBOT_APP, CANCELED),

@@ -318,7 +318,7 @@ The client simulator will simulate a set of robots that will do the following:
 - Report the updated mission status and robot position back to the server through VDA5050 feedback messages.
 - Optionally fail every $N^\text{th}$ mission where $N$ is configurable.
 
-**To run from the repo (the simulator the `tests/e2e/mission_dispatcher` suite drives in-process):**
+**To run from the repo (the robot simulator):**
 ```
 # Runs a simulation with two robots
 # First robot:
