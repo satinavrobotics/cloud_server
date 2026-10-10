@@ -44,6 +44,7 @@ class FakeDB:
         self.trajectory = []    # dicts: mission_id, robot_name, ts, run_id
         self.legs = {}          # (run_id, seq) -> row dict (run_legs)
         self.missions = {}      # name -> (lifecycle, robot, status dict)
+        self.next_run = {}      # mission name -> pending one-off recording level
         self.latest = []        # tuples in rehydrate SELECT_SQL column order
         self.health = {}        # recorder_health: process -> row dict
         self.unavailable = False
@@ -52,10 +53,10 @@ class FakeDB:
 
     # --- state helpers -------------------------------------------------------------------
     def snapshot(self):
-        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs))
+        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run))
 
     def restore(self, snap):
-        self.runs, self.events, self.trajectory, self.legs = snap
+        self.runs, self.events, self.trajectory, self.legs, self.next_run = snap
 
     def legs_of(self, run_id=None):
         return [r for _, r in sorted(self.legs.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
@@ -113,7 +114,8 @@ class FakeDB:
                            if r["mission_name"] == mission and r["robot_name"] == robot
                            and r["state"] == "RUNNING"), key=lambda r: r["started_at"],
                           reverse=True)
-            cursor.results = [(r["run_id"], r["started_at"]) for r in rows[:1]]
+            cursor.results = [(r["run_id"], r["started_at"], r["recording_level"])
+                              for r in rows[:1]]
         elif sql == fr.ORPHAN_CANDIDATES_SQL:
             cursor.results = [(r["run_id"], r["mission_name"], r["robot_name"], r["started_at"],
                                r["recording_level"])
@@ -122,6 +124,15 @@ class FakeDB:
         elif sql == fr.MISSION_SQL:
             mission = self.missions.get(params[0])
             cursor.results = [mission] if mission is not None else []
+        elif sql == fr.CONSUME_NEXT_RUN_SQL:
+            level = self.next_run.pop(params[0], None)
+            cursor.results = [(level,)] if level is not None else []
+            cursor.rowcount = len(cursor.results)
+        elif sql == fr.SET_RUN_LEVEL_SQL:
+            level, run_id = params
+            assert level in ("full", "track", "events_only", "off")
+            self.runs[run_id]["recording_level"] = level
+            cursor.rowcount = 1
         elif sql == fr.TRAJECTORY_SQL:
             run_id, mission, robot, start, end, grace = params
             for row in self.trajectory:

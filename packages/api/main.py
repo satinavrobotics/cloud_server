@@ -2567,6 +2567,56 @@ async def get_mission_plan(mission_name: str, map_id: Optional[str] = None):
     return result
 
 
+class MissionNextRunRecording(BaseModel):
+    level: common_objects.TelemetryRecordingV1 = Field(
+        ..., description="Recording level for the next run of the mission only: "
+                         "full, track, events_only or off.")
+
+
+def _next_run_view(mission: MissionObjectV1, **extra) -> dict:
+    return {"mission": mission.name, "telemetry_recording": mission.telemetry_recording,
+            "telemetry_recording_next_run": mission.telemetry_recording_next_run, **extra}
+
+
+@app.post("/api/v1/missions/{mission_name}/recording/next-run")
+async def set_mission_next_run_recording(mission_name: str, body: MissionNextRunRecording):
+    """
+    Record the next run of this mission at `level`, once: the dispatcher clears the raise
+    when a run starts and uses it, so the run after that falls back by itself. Replaces a
+    pending raise. Only a PENDING mission has a next run (409 otherwise); the level wins
+    over the mission's own `telemetry_recording` for that run.
+    """
+    _require_service()
+
+    mission = await service.database.get_object(MissionObjectV1, mission_name)
+    if mission.status.state != MissionStateV1.PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Mission {mission_name} is {mission.status.state.value}; the next run "
+                   "can only be raised on a PENDING mission")
+    await service.database.update_spec_fields(
+        MissionObjectV1, mission_name, {"telemetry_recording_next_run": body.level},
+        uuid.uuid4())
+    return _next_run_view(await service.database.get_object(MissionObjectV1, mission_name))
+
+
+@app.delete("/api/v1/missions/{mission_name}/recording/next-run")
+async def cancel_mission_next_run_recording(mission_name: str):
+    """
+    Cancel a raise no run has used yet. 200 either way; `cancelled` says whether one was
+    pending (false: none was, or a run started and consumed it first).
+    """
+    _require_service()
+
+    mission = await service.database.get_object(MissionObjectV1, mission_name)
+    pending = mission.telemetry_recording_next_run is not None
+    if pending:
+        await service.database.update_spec_fields(
+            MissionObjectV1, mission_name, {"telemetry_recording_next_run": None}, uuid.uuid4())
+    return _next_run_view(await service.database.get_object(MissionObjectV1, mission_name),
+                          cancelled=pending)
+
+
 @app.post("/api/v1/missions/{mission_name}/cancel")
 async def cancel_mission(mission_name: str):
     """

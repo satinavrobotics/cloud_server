@@ -1,6 +1,10 @@
 """Per-robot recording level (docs/satinav-fleet-agent-phase0-v2.md §4).
 
 Resolution order (§4.2), first set value wins:
+  0. a run's one-off raise (missionobjectv1.spec.telemetry_recording_next_run, consumed when
+     the run starts), then the mission's own level (missionobjectv1.spec.telemetry_recording):
+     the most specific scopes, applied for the robot while that mission's run is open
+     (`set_run_level`); no mission/one-off level changes nothing below
   1. robotobjectv1.spec.telemetry_recording
   2. siteobjectv1.spec.telemetry_recording of the robot's current site
      (the robot_site_assignments row whose `valid` range contains now)
@@ -62,9 +66,11 @@ def parse_level(value: Any) -> Optional[RecordingLevel]:
 
 
 def resolve(robot_level: Any = None, site_level: Any = None,
-            global_level: Any = None) -> RecordingLevel:
-    """§4.2 precedence: robot, then site, then global, then DEFAULT_LEVEL."""
-    for value in (robot_level, site_level, global_level):
+            global_level: Any = None, mission_level: Any = None,
+            next_run_level: Any = None) -> RecordingLevel:
+    """§4.2 precedence: the one-off next-run level, the mission's level, then robot, site,
+    global, then DEFAULT_LEVEL."""
+    for value in (next_run_level, mission_level, robot_level, site_level, global_level):
         level = parse_level(value)
         if level is not None:
             return level
@@ -119,6 +125,9 @@ class RecordingPolicy:
         self._now = now
         self._sources = sources or PolicySources()
         self._cache: Dict[Optional[str], RecordingLevel] = {}
+        # Robot -> level of its open run when the run's mission (or a one-off raise) set one.
+        # Not part of the sources: a refresh keeps it.
+        self._run_levels: Dict[str, RecordingLevel] = {}
         self._stale = sources is None
         self._loaded = sources is not None
         self._generation = 0  # bumped by invalidate(); a refresh only clears what it saw
@@ -135,19 +144,35 @@ class RecordingPolicy:
 
     def level_for(self, robot_name: Optional[str]) -> RecordingLevel:
         """Resolved level; robot_name None (fleet-level rows) uses the global layer only."""
+        if robot_name in self._run_levels:
+            return self._run_levels[robot_name]
         try:
             return self._cache[robot_name]
         except KeyError:
             pass
-        src = self._sources
-        if robot_name is None:
-            level = resolve(None, None, src.global_level)
-        else:
-            site = src.robot_sites.get(robot_name)
-            site_level = src.site_levels.get(site) if site is not None else None
-            level = resolve(src.robot_levels.get(robot_name), site_level, src.global_level)
+        level = self.inherited_level(robot_name)
         self._cache[robot_name] = level
         return level
+
+    def inherited_level(self, robot_name: Optional[str], mission_level: Any = None,
+                        next_run_level: Any = None) -> RecordingLevel:
+        """The level from the sources alone (ignoring an open run's level), with the
+        mission's and a one-off level on top when given."""
+        src = self._sources
+        if robot_name is None:
+            return resolve(None, None, src.global_level, mission_level, next_run_level)
+        site = src.robot_sites.get(robot_name)
+        site_level = src.site_levels.get(site) if site is not None else None
+        return resolve(src.robot_levels.get(robot_name), site_level, src.global_level,
+                       mission_level, next_run_level)
+
+    def set_run_level(self, robot_name: str, level: Optional[RecordingLevel]) -> None:
+        """The level the robot records at while its open run's mission (or a one-off raise)
+        sets one; None ends it, and the robot follows the sources again."""
+        if level is None:
+            self._run_levels.pop(robot_name, None)
+        else:
+            self._run_levels[robot_name] = level
 
     def allows(self, table: str, robot_name: Optional[str], code: Optional[str] = None) -> bool:
         return allows(self.level_for(robot_name), table, code)
@@ -166,6 +191,7 @@ class RecordingPolicy:
             "robot_levels": dict(self._sources.robot_levels),
             "site_levels": dict(self._sources.site_levels),
             "robot_sites": dict(self._sources.robot_sites),
+            "run_levels": {k: v.value for k, v in self._run_levels.items()},
             "resolved": {k: v.value for k, v in self._cache.items()},
         }
 
@@ -201,6 +227,7 @@ class RecordingPolicy:
                    or robot_name in self._sources.robot_sites)
         self._sources.robot_levels.pop(robot_name, None)
         self._sources.robot_sites.pop(robot_name, None)
+        self._run_levels.pop(robot_name, None)
         return self._set(changed)
 
     def set_robot_site(self, robot_name: str, site_id: Optional[str]) -> bool:

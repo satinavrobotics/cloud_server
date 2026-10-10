@@ -3233,6 +3233,7 @@ class Robot:
                 timeout=template.timeout,
                 mode=template.mode,
                 register_map=template.register_map,
+                telemetry_recording=template.telemetry_recording,
                 repeat=template.repeat,
                 then_run=template.then_run,
                 status=mission_object.MissionStatusV1(),

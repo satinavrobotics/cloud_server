@@ -643,6 +643,44 @@ the robot's own frame, not drawable on the map, never a partly shifted track.
 `points` is empty when nothing was recorded; more than `FLEET_TRACK_MAX_POINTS` (20000) points are
 thinned by the query to every k-th row plus the last (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
 
+#### Recording level per mission and a one-off raise for the next run
+
+Two more scopes sit above robot, site and global. Resolution, first set value wins: the mission's
+one-off raise, the mission's `telemetry_recording`, the robot's, the site's, the global one,
+`events_only`. Both mission fields are `null` (unset) by default and unset changes nothing. `debug`
+is not a level.
+
+Mission object fields (returned by `GET /api/v1/missions`, `GET /api/v1/missions/{m}`, and every
+mission write; each is `"full" | "track" | "events_only" | "off" | null`):
+
+- `telemetry_recording` -- the level for every run of this mission. Accepted by
+  `POST /api/v1/missions` and by `PUT /api/v1/missions/{m}` (PENDING missions only, like the other
+  edits; send `null` to unset). Another value is a 400 (`Invalid mission` / `Invalid mission spec`).
+- `telemetry_recording_next_run` -- a pending one-off raise: the next run of this mission records at
+  this level, instead of `telemetry_recording`. Set and cancelled only with the two routes below
+  (`PUT` refuses it with a 400; `POST /missions` accepts it as a convenience).
+
+**`POST /api/v1/missions/{mission}/recording/next-run`**, body `{"level": "full"}`. 200:
+`{"mission": "m1", "telemetry_recording": "track" | null, "telemetry_recording_next_run": "full"}`.
+Replaces a pending raise. 404 unknown mission; 409 when the mission is not PENDING (it has no next
+run to raise: create a rerun, then raise that); 422 when `level` is missing or not one of the four
+levels. Any level may be asked for, a lower one than the resolved level too (it is applied as given).
+
+**`DELETE /api/v1/missions/{mission}/recording/next-run`** cancels a raise no run has used yet. 200:
+`{"mission", "telemetry_recording", "telemetry_recording_next_run": null, "cancelled": true | false}`
+(`false`: none was pending, or a run started and took it first; calling it again is harmless). 404
+unknown mission.
+
+Lifecycle: mission-dispatch takes the raise when a run of the mission STARTS, in one locked
+statement (two simultaneous starts cannot both get it), clears it, and writes the level it used to
+the run's `recording_level`. A run that resumes after a dispatcher restart keeps its stored level. So
+after the start `telemetry_recording_next_run` is `null` again and `GET /api/v1/runs/{id}`'s
+`recording_level` shows what was actually recorded. A raise is kept across restarts (it lives in the
+mission's spec) and is simply removed with the mission. The level applies to the robot while the run
+is open: its events, legs and track rows follow it, and the robot returns to its own level when the
+run ends. Limitation: only mission-dispatch's recorder knows the run's level; data the API process
+ingests (robot diagnostics) still follows the robot / site / global level.
+
 ### Robot and mission writes
 
 - `PUT /api/v1/robots/{robot}` takes only `labels`, `battery`, `heartbeat_timeout`, `switch_teleop`,
@@ -650,7 +688,7 @@ thinned by the query to every k-th row plus the last (`downsampled`). 404 for an
   just those spec keys); `name`, `lifecycle`, `current_map` are ignored, any other key is a 400 naming it.
   `status` still replaces the status wholesale (deprecated: use clear-fault).
 - `PUT /api/v1/missions/{mission}` takes `robot`, `mission_tree`, `timeout`, `deadline`, `repeat`,
-  `then_run`, `register_map`, `mode`, `planned_path` (PENDING missions only, else 409), `update_nodes` +
+  `then_run`, `register_map`, `mode`, `planned_path`, `telemetry_recording` (PENDING missions only, else 409), `update_nodes` +
   `force` (reroute); `status` is a 400 (dispatcher-owned, nothing writes it); `route_rev`, `kind`, `goal`, `created_at`, `name`, `lifecycle` are
   ignored, any other key (e.g. `needs_canceled`: use `POST .../cancel`) is a 400.
 - `POST /api/v1/robots` ignores a caller's `status`, `lifecycle` and the dispatcher-owned spec fields
