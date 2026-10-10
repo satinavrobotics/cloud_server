@@ -495,3 +495,13 @@ RECORDER_RECONCILE_PERIOD_S = float(os.getenv("RECORDER_RECONCILE_PERIOD_S", "60
 RECORDER_RECONCILE_MIN_AGE_S = float(os.getenv("RECORDER_RECONCILE_MIN_AGE_S", "60.0"))
 # Trajectory rows logged this long after the run ended still belong to it.
 RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
+
+# ==================== Pre-mission go-to (API) ====================
+# packages/api/pre_goto.py: before a MAPPED mission is queued (POST /api/v1/missions) the server
+# first queues a planner go-to to the topomap node closest to the mission's first waypoint, so
+# the robot does not plan one long path through the whole map. Skipped (the mission is queued
+# as before) when the robot is within PRE_GOTO_MIN_DISTANCE_M of that waypoint or node, or when no
+# node lies within PRE_GOTO_NODE_RADIUS_M of the waypoint.
+PRE_GOTO_ENABLED = _env_bool("PRE_GOTO_ENABLED", "true")
+PRE_GOTO_MIN_DISTANCE_M = float(os.getenv("PRE_GOTO_MIN_DISTANCE_M", "2.0"))
+PRE_GOTO_NODE_RADIUS_M = float(os.getenv("PRE_GOTO_NODE_RADIUS_M", "3.0"))
