@@ -145,7 +145,7 @@ class TestRobotView:
                      "state": "mapping", "aligned": True,
                      "map_T_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.1},
                      "unplaced_reason": None, "placement_source": None, "node_count": 0,
-                     "services": ["topo"]}
+                     "services": ["topo"], "unplaced_reason_text": None, "frame": None}
         assert ms.robot_session_view({**self._s(services=None)})["services"] == []
         assert ms.robot_session_view({**self._s(node_count=7)})["node_count"] == 7
         v = ms.robot_session_view({**self._s(purpose="operate", aligned=False,

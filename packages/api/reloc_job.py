@@ -734,6 +734,10 @@ class RelocJobs:
                              "actor": job.actor, "at": now.isoformat()}
                 if job.init_pose is not None:
                     placement["init_pose"] = dict(job.init_pose)
+                # Frame witness: the frame the robot is localized in right now (the stored map's
+                # onboard name; verified by _wait before this runs).
+                placement = ms.placement_with_frame(
+                    placement, ms.definitive_frame(*ms.frame_reading(robot.status)))
                 fields = {"map_t_session": transform, "aligned": True, "placement": placement}
                 session.update(fields)
                 await store.update_session(job.session_id, **fields)

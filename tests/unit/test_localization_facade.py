@@ -58,6 +58,8 @@ class FakeRobot:
         self.maps = set()             # stored map names
         self.init_pos = None
         self.save_started = False
+        self.save_then = None         # the `then` of the started save
+        self.then_result = "done"     # the then_state a then=stay save ends with
 
     def calls(self, method, path):
         return [c for c in self.log if c[0] == method and c[1] == path]
@@ -102,12 +104,22 @@ class FakeRobot:
                     return R(409, json={"detail": "the driver is not in slam mode"})
                 self.maps.add(body["name"])
                 self.save_started = body["name"]
+                self.save_then = request.url.params.get("then")
                 return R(202, json={"started": True, "map": body["name"]})
             if not self.save_started:
                 return R(404, json={"detail": "no save"})
             state = self.save_polls.pop(0) if len(self.save_polls) > 1 else self.save_polls[0]
+            extra = {}
+            if state == "done" and self.save_then == "stay":
+                # the orchestrator relocalizes the robot on the saved map itself
+                if self.then_result in ("done", "not_localized", "stored"):
+                    self.intent = {"mode": "relocalization", "map": self.save_started}
+                extra = {"then": "stay", "then_state": self.then_result,
+                         "localization": {"mode": self.intent["mode"],
+                                          "map": self.intent["map"]}}
             return R(200, json={"map": self.save_started, "status": state,
-                                "error": self.save_failure if state == "failed" else None})
+                                "error": self.save_failure if state == "failed" else None,
+                                **extra})
         # services (the topomap the mapping session starts)
         if path == "/services" and method == "GET":
             return R(200, json=[{"name": "topomap", "running": False}])
@@ -195,7 +207,7 @@ class TestCapability:
 # --- the SLAM recording ----------------------------------------------------------------------------
 
 class TestSlam:
-    async def test_start_is_a_mode_switch_and_the_save_restores_the_previous_intent(self):
+    async def test_start_is_a_mode_switch_and_the_save_stays_on_the_saved_map(self):
         fake = FakeRobot(intent={"mode": "relocalization", "map": "lab"})
         switch = _slam_switch(fake)
         res = await switch.start_slam(_plain_robot(), "shed")
@@ -205,10 +217,12 @@ class TestSlam:
         res = await switch.save_slam(_plain_robot(), "shed", "sess-1")
         assert res.status == SLAM_SAVED and res.ok and res.notice is None
         post = fake.calls("POST", "/localization/save")[0]
-        assert post[2] == {"background": "true"}
+        assert post[2] == {"background": "true", "then": "stay"}
         assert post[3] == {"name": ONBOARD, "cloud_map_id": "shed", "cloud_session_id": "sess-1"}
         assert len(fake.calls("GET", "/localization/save")) == 2     # polled until done
-        assert fake.intent == {"mode": "relocalization", "map": "lab"}
+        # NOT back on the pre-SLAM relocalization map 'lab' (incident 2026-10-11)
+        assert fake.intent == {"mode": "relocalization", "map": ONBOARD}
+        assert len(fake.calls("PUT", "/localization")) == 1          # only the slam start
         assert not fake.deprecated_calls()
 
     async def test_a_503_start_is_retried(self):
@@ -231,12 +245,12 @@ class TestSlam:
     def test_restore_target(self, prev, target):
         assert oc.restore_target(prev) == target
 
-    async def test_the_default_after_a_save_is_odometry(self):
+    async def test_after_a_save_the_robot_is_on_the_saved_map_whatever_it_was_on(self):
         fake = FakeRobot()
         switch = _slam_switch(fake)
         await switch.start_slam(_plain_robot(), "shed")
         await switch.save_slam(_plain_robot(), "shed", 1)
-        assert fake.intent == {"mode": "odometry", "map": None}
+        assert fake.intent == {"mode": "relocalization", "map": ONBOARD}
 
     async def test_a_running_slam_is_not_started_again_and_an_existing_map_is_kept(self):
         fake = FakeRobot(intent={"mode": "slam", "map": None})
@@ -271,20 +285,16 @@ class TestSlam:
         assert fake.intent["mode"] == "slam"                  # the unsaved map is not discarded
         assert len(fake.calls("PUT", "/localization")) == 1   # no switch back
 
-    async def test_a_refused_restore_is_reported_on_the_saved_map(self):
-        fake = FakeRobot()
+    async def test_a_switch_that_did_not_happen_is_reported_on_the_saved_map(self):
+        fake = FakeRobot(intent={"mode": "relocalization", "map": "lab"})
+        fake.then_result = "failed"
         switch = _slam_switch(fake)
         await switch.start_slam(_plain_robot(), "shed")
-        orig = fake.handler
-
-        def refuse_put(request):
-            if request.method == "PUT":
-                return httpx.Response(409, json={"detail": "order active: cancel it first"})
-            return orig(request)
-        fake.handler = refuse_put
         res = await switch.save_slam(_plain_robot(), "shed", 1)
-        assert res.status == SLAM_SAVED and res.ok
-        assert "order active: cancel it first" in res.notice
+        assert res.status == SLAM_SAVED and res.ok and res.then_state == "failed"
+        assert "not switched onto the saved map" in res.notice
+        assert fake.intent["mode"] == "slam"      # still recording: retry / discard
+        assert len(fake.calls("PUT", "/localization")) == 1   # never back to 'lab' by itself
         from packages.api.mapping_switch import slam_save_action
         action = slam_save_action(res)
         assert action["ok"] is False and action["label"].startswith("SLAM map saved, but")
@@ -324,7 +334,7 @@ class TestSlam:
             await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
             await switch.wait_slam_saves()
         assert d.codes()[-1] == "MAP.SLAM_SAVE_DONE"
-        assert fake.intent["mode"] == "odometry"
+        assert fake.intent == {"mode": "relocalization", "map": "cloud-yard"}
 
 
 # --- relocalization --------------------------------------------------------------------------------
@@ -573,10 +583,11 @@ class TestTopomapOnTheMappingApi:
             sid = out["session"]["session_id"]
             out = await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
             await switch.wait_slam_saves()
-        # the topomap stops before the save; the save switches back to odometry
-        assert _puts(fake)[2:] == [{"mode": "slam", "topomap": False},
-                                   {"mode": "odometry", "topomap": False}]
-        assert fake.topomap is False and fake.intent["mode"] == "odometry"
+        # the topomap stops before the save; the save (then=stay) leaves the robot on the saved
+        # map, with no PUT of the old intent
+        assert _puts(fake)[2:] == [{"mode": "slam", "topomap": False}]
+        assert fake.topomap is False
+        assert fake.intent == {"mode": "relocalization", "map": "cloud-yard"}
         assert d.codes()[-1] == "MAP.SLAM_SAVE_DONE"
         assert not [c for c in fake.log if c[1].startswith("/services/topomap")]
         assert not fake.deprecated_calls()

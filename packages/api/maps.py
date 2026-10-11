@@ -562,6 +562,19 @@ class SqlStore:
             return None
         return (row[0], row[1]) if row is not None else None
 
+    async def robot_slam_save(self, name: str) -> Optional[Dict[str, Any]]:
+        """The robot's robot_slam_saves row {map_name, state} (recording | saving | failed: the
+        robot reports mapId "map" meanwhile; frame witness suppressed), None without a row or
+        when it cannot be read. In a savepoint."""
+        try:
+            async with self.conn.transaction():
+                await self.cursor.execute(ms.SLAM_SAVE_ROW_SQL, (name,))
+                row = await self.cursor.fetchone()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("robot_slam_saves of %s not readable (%s)", name, exc)
+            return None
+        return {"map_name": row[0], "state": row[1]} if row is not None else None
+
     async def robot_state_pose(self, name: str, start: Optional[datetime.datetime] = None,
                                end: Optional[datetime.datetime] = None, first: bool = False
                                ) -> Optional[Dict[str, Any]]:
@@ -905,7 +918,10 @@ async def session_summary(db: Any, name: str, switch: Optional[Any] = None,
             if map_type == "local":
                 here = {r["robot_name"] for r in rows if r["ended_at"] is None}
                 for robot in sorted({r["robot_name"] for r in rows} - here):
-                    last = ms.reusable_session(rows, robot, await store.robot_run_epoch(robot))
+                    robot_obj = await store.robot(robot)
+                    reading = ms.frame_reading(robot_obj.status) if robot_obj else None
+                    last = ms.reusable_session(rows, robot, await store.robot_run_epoch(robot),
+                                               reading, await _slam_save_row(store, robot))
                     if last is not None:
                         reusable[robot] = str(last["session_id"])
     except _SCHEMA_ERRORS as exc:
@@ -1700,12 +1716,14 @@ def _has_data(row: MapRow, sessions: Sequence[Mapping[str, Any]], count: Optiona
 
 def plan_session(row: MapRow, robot: RobotObjectV1, previous: List[Dict[str, Any]],
                  purpose: str = ms.MAPPING, placement: Optional[Dict[str, Any]] = None,
-                 carried: Optional[Mapping[str, Any]] = None, has_nodes: bool = False
-                 ) -> Dict[str, Any]:
+                 carried: Optional[Mapping[str, Any]] = None, has_nodes: bool = False,
+                 frame: Optional[str] = None) -> Dict[str, Any]:
     """What a new session on `row` by `robot` records, and what it changes on the map:
     {'datum', 'map_t_session', 'aligned', 'placement', 'spec'} (pure; 409 if a geo map has no
     datum). `placement`: {pose, robot_pose, source, actor, at} from the request; `carried`: the
-    robot's placed session on this local map that is being replaced (same run)."""
+    robot's placed session on this local map that is being replaced (same run); `frame`: the
+    frame witness of a NEW placement (ms.placement_frame; a carried placement keeps its own).
+    A geo map's placement has no witness: the datum re-places it."""
     map_type = row.type
     spec_patch: Dict[str, Any] = {}
     if row.obj.type is None:
@@ -1728,17 +1746,37 @@ def plan_session(row: MapRow, robot: RobotObjectV1, previous: List[Dict[str, Any
         return {"datum": None,
                 "map_t_session": ms.placement_transform(placement["pose"],
                                                         placement["robot_pose"]),
-                "aligned": True, "placement": placement, "spec": spec_patch}
+                "aligned": True, "placement": ms.placement_with_frame(placement, frame),
+                "spec": spec_patch}
     if carried is not None and ms.is_placed(carried):
+        kept = {"source": ms.SOURCE_SESSION, "from_session_id": str(carried["session_id"]),
+                "at": _iso(_utcnow())}
         return {"datum": None, "map_t_session": ms.transform_of(carried.get("map_t_session")),
                 "aligned": True,
-                "placement": {"source": ms.SOURCE_SESSION,
-                              "from_session_id": str(carried["session_id"]),
-                              "at": _iso(_utcnow())},
+                "placement": ms.placement_with_frame(kept, ms.placement_frame(carried)),
                 "spec": spec_patch}
     first_of_empty = purpose == ms.MAPPING and not has_nodes
     return {"datum": None, "map_t_session": dict(map_geo.IDENTITY), "aligned": first_of_empty,
-            "placement": None, "spec": spec_patch}
+            "placement": (ms.placement_with_frame({}, frame) if first_of_empty and frame
+                          else None), "spec": spec_patch}
+
+
+async def _slam_save_row(store: Any, robot_name: str) -> Optional[Dict[str, Any]]:
+    """The robot's SLAM recording / save row (the frame witness is suppressed meanwhile), None
+    when there is none or the store cannot say."""
+    read = getattr(store, "robot_slam_save", None)
+    if read is None:
+        return None
+    try:
+        return await read(robot_name)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _carry_refused_text(robot_name: str, session: Mapping[str, Any], observed: Any) -> str:
+    return (f"Robot '{robot_name}' is localized on '{observed}', not in the frame its previous "
+            f"placement on this map was made in ('{ms.placement_frame(session)}'): the new "
+            "session starts unplaced; place it again or relocalize the robot")
 
 
 def origin_as_legacy_datum(geo: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1830,11 +1868,31 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
             warnings += await placement_warnings(store, robot, req.placement.robot_pose.dict())
         placement = _placement_record(req.placement, ms.SOURCE_USER, actor, now)
     carried = carried if carried is not None and ms.is_placed(carried) else None
+    # Frame witness: the run epoch does not prove the robot is still in the frame a placement
+    # was made in (it may have relocalized elsewhere). Never blocks: a placement whose witness
+    # DEFINITELY differs from the robot's reading is not carried (the session starts unplaced,
+    # with a warning); unknown (legacy, no reading, SLAM save under way) is carried as before.
+    reading = ms.frame_reading(robot.status)
+    save_row = await _slam_save_row(store, robot_name) if carried is not None else None
+    if carried is not None and ms.frame_verdict(carried, *reading, save_row) == ms.FRAME_MISMATCH:
+        if warnings is not None:
+            warnings.append(_carry_refused_text(robot_name, carried, reading[0]))
+        carried = None
+        placement_reusable_blocked = True
+    else:
+        placement_reusable_blocked = False
     if carried is None and placement is None and row.type == "local":
         # §14.13: the robot's last session on this map, finished placed in the run it is
         # still in, lends its placement (the robot has not restarted since).
-        carried = ms.reusable_session(previous, robot_name,
-                                      await store.robot_run_epoch(robot_name))
+        epoch = await store.robot_run_epoch(robot_name)
+        reusable = ms.reusable_session(previous, robot_name, epoch)
+        if reusable is not None:
+            save_row = await _slam_save_row(store, robot_name)
+            if ms.frame_verdict(reusable, *reading, save_row) == ms.FRAME_MISMATCH:
+                if warnings is not None and not placement_reusable_blocked:
+                    warnings.append(_carry_refused_text(robot_name, reusable, reading[0]))
+                reusable = None
+        carried = reusable
     has_nodes = (row.type == "local" and placement is None and carried is None
                  and _map_has_nodes(row, previous, node_count))
     services = req.session_services(row.type == "local" and bool(row.spec.get("slam_map")))
@@ -1842,7 +1900,15 @@ async def _start_in(store: Any, row: MapRow, robot: Optional[RobotObjectV1], rob
         # Only a geo map cannot record one (the SLAM map is a local frame; see PATCH slam_map).
         raise HTTPException(400, f"Map '{map_name}' is a geo map: a SLAM map can only be "
                                  "recorded for a local map")
-    plan = plan_session(row, robot, previous, purpose, placement, carried, has_nodes)
+    # The witness of a NEW placement: the frame the placement is valid in. A session that
+    # records SLAM is in the saved map's frame once the save ended (`cloud-<map>`); otherwise
+    # the robot's definitive reading now (None when it has none: legacy-like, never verified).
+    frame = None
+    if row.type == "local":
+        frame = (ms.slam_frame_witness(map_name)
+                 if purpose == ms.MAPPING and services is not None and ms.SLAM in services
+                 else ms.definitive_frame(*reading))
+    plan = plan_session(row, robot, previous, purpose, placement, carried, has_nodes, frame)
     if services is not None and ms.SLAM in services and not row.spec.get("slam_map"):
         # The user chose to record a SLAM map for this map: it becomes a slam_map map.
         plan["spec"] = {**(plan["spec"] or {}), "slam_map": True}
@@ -2675,6 +2741,14 @@ async def place_session(db: Any, map_name: str, session_id: str, data: Any,
                     "its nodes (those before keep the old placement)")
             old = session.get("map_t_session") if ms.is_placed(session) else None
             placement = _placement_record(req, req.source or ms.SOURCE_USER, actor, now)
+            if not by_datum and row.type == "local":
+                # Frame witness: the frame this placement is valid in. A SLAM-recording mapping
+                # session is in the saved map's frame once the save ended.
+                frame = (ms.slam_frame_witness(map_name)
+                         if ms.purpose_of(session) == ms.MAPPING
+                         and ms.SLAM in _services_of(session, orchestrator_only=False)
+                         else ms.definitive_frame(*ms.frame_reading(robot.status)))
+                placement = ms.placement_with_frame(placement, frame)
             if not reloc and not by_datum:
                 transform = ms.placement_transform(placement["pose"], placement["robot_pose"])
             fields: Dict[str, Any] = {"map_t_session": transform, "aligned": True,

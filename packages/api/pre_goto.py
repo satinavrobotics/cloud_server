@@ -55,6 +55,20 @@ async def _robot_xy_in_map(service: Any, mission: Any, map_id: str
         session = map_sessions.robot_session_from_row(await cursor.fetchone())
     if session is None or session["map_name"] != map_id or not map_sessions.is_placed(session):
         return None
+    # Frame witness: a definite mismatch is not placed (the mission is queued without a go-to).
+    map_id_seen, initialized = map_sessions.frame_reading(robot.status)
+
+    async def read_save_row() -> Optional[dict]:
+        try:
+            async with service.database.connection() as conn:
+                cursor = await conn.execute(map_sessions.SLAM_SAVE_ROW_SQL, (mission.robot,))
+                row = await cursor.fetchone()
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return {"map_name": row[0], "state": row[1]} if row is not None else None
+    if await map_sessions.confirmed_verdict(
+            session, map_id_seen, initialized, read_save_row) == map_sessions.FRAME_MISMATCH:
+        return None
     pose = robot.status.pose
     return map_geo.apply_transform(session["map_t_session"], pose.x, pose.y)
 

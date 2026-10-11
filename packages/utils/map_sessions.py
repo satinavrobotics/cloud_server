@@ -70,6 +70,8 @@ SOURCE_DATUM = "datum"        # a geo session re-placed from the robot's datum (
 SOURCE_LAST_POSITION = "last_position"  # suggested from where the robot last was on this map
 SOURCE_RELOC = "reloc"        # the robot relocalised on a stored map it holds (no manual pose)
 UNPLACED_RUN_CHANGED = "run_changed"
+# The robot's localization frame is no longer the one the placement was made in (the frame witness).
+UNPLACED_FRAME_CHANGED = "frame_changed"
 UNPLACED_MANUAL = "manual"  # POST .../unplace (a DEV/TEST and "redo my placement" hook)
 
 # A placed `reloc` session counts as degraded (robot state `localization_warning`) when the robot
@@ -472,12 +474,18 @@ def epoch_to_stamp(session: Mapping[str, Any], epoch_row: Optional[Tuple[Any, An
 
 
 def reusable_session(sessions: Iterable[Mapping[str, Any]], robot_name: str,
-                     epoch_row: Optional[Tuple[Any, Any]]) -> Optional[Mapping[str, Any]]:
+                     epoch_row: Optional[Tuple[Any, Any]],
+                     reading: Optional[Tuple[Any, Any]] = None,
+                     slam_save_row: Optional[Mapping[str, Any]] = None
+                     ) -> Optional[Mapping[str, Any]]:
     """The finished session of `robot_name` whose placement a new session on the same LOCAL map
     reuses (§14.13), or None. `sessions`: that map's sessions (any robot); `epoch_row`: the
     robot's (epoch, continuity_known). Only the robot's most recent finished session on the
     map counts, and only if it ended placed (a run change unplaces, so an unplaced end never
-    counts), stamped an epoch, and that epoch is still the robot's, with continuity known."""
+    counts), stamped an epoch, and that epoch is still the robot's, with continuity known.
+    `reading` ((mapId, positionInitialized) of the robot, frame_reading): a session whose frame
+    witness DEFINITELY differs from it is not reused (the epoch does not prove the frame; an
+    unknown verdict, e.g. a legacy session without a witness, still reuses)."""
     if epoch_row is None:
         return None
     epoch, known = epoch_row
@@ -490,7 +498,132 @@ def reusable_session(sessions: Iterable[Mapping[str, Any]], robot_name: str,
     last = max(mine, key=lambda s: (s["ended_at"], str(s.get("session_id"))))
     if not is_placed(last) or last.get("run_epoch") is None:
         return None
+    if reading is not None and frame_verdict(last, reading[0], reading[1],
+                                             slam_save_row) == FRAME_MISMATCH:
+        return None
     return last if str(last["run_epoch"]) == str(epoch) else None
+
+
+# --- the frame witness: verify, not assume ---------------------------------------------------------
+#
+# A placement is valid in ONE frame of the robot: its odometry frame (VDA mapId "map") or the frame
+# of a stored map it is localized on (mapId = that map's onboard name). `placement.frame =
+# {"map_id": <that mapId>}` records which one (the "witness"). The run epoch alone does not prove
+# it: a robot that relocalizes (or is switched back to another map after a SLAM save) changes its
+# frame without a new run (incident 2026-10-11, formidable-peacock: the cloud carried an identity
+# placement while the robot reported 'cloud-office7').
+#
+# frame_verdict() compares the witness with the robot's DEFINITIVE reading: positionInitialized
+# true and a non-empty mapId (localization_view.device_view semantics: "map" = odometry/SLAM, not on
+# a map; a name = localized there). Anything else is `unknown` and never refuses or unplaces. The
+# mission dispatcher unplaces a session after a confirmed mismatch (FrameWatcher,
+# packages/controllers/mission/run_change.py); the planner, the pre-goto and the order conversion
+# refuse a route on a definitive mismatch at once, without writing anything.
+#
+# HOOK: the orchestrator will report `frame_id` / `frame_changed_at` on GET /localization (null =
+# "no frame now", NOT "changed"). Adopt it in frame_reading() / definitive_frame(); nothing
+# depends on it today.
+
+FRAME_OK, FRAME_MISMATCH, FRAME_UNKNOWN = "ok", "mismatch", "unknown"
+# robot_slam_saves (packages/api/slam_save_state.py): a row exists while the robot records,
+# saves or has a failed SLAM map. Read by the dispatcher only after a mismatch.
+SLAM_SAVE_ROW_SQL = "SELECT map_name, state FROM robot_slam_saves WHERE robot_name = %s"
+
+
+def definitive_frame(map_id: Any, initialized: Any) -> Optional[str]:
+    """The frame the robot's reading names for certain, else None: positionInitialized true and
+    a non-empty mapId ("map" = odometry / SLAM, a name = localized on that stored map)."""
+    if initialized is True and isinstance(map_id, str) and map_id:
+        return map_id
+    return None
+
+
+def frame_reading(status: Any) -> Tuple[Optional[str], Optional[bool]]:
+    """(mapId, positionInitialized) of a RobotStatus; (None, None) while it is offline (its last
+    state is old: no verdict). The one place that reads the robot's frame (see HOOK above)."""
+    if not getattr(status, "online", False):
+        return None, None
+    pose = getattr(status, "pose", None)
+    return getattr(pose, "map_id", None), getattr(status, "position_initialized", None)
+
+
+def placement_frame(session: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """The frame witness (mapId) of a session's placement, or None (legacy / geo / not made)."""
+    frame = ((session or {}).get("placement") or {}).get("frame")
+    map_id = frame.get("map_id") if isinstance(frame, Mapping) else None
+    return map_id if isinstance(map_id, str) and map_id else None
+
+
+def placement_with_frame(placement: Optional[Mapping[str, Any]], map_id: Optional[str]
+               ) -> Optional[Dict[str, Any]]:
+    """`placement` with the witness `map_id` set (unchanged when `map_id` is None)."""
+    if not map_id:
+        return dict(placement) if placement is not None else None
+    out = dict(placement or {})
+    out["frame"] = {"map_id": map_id}
+    return out
+
+
+def slam_frame_witness(map_name: str) -> str:
+    """The frame a SLAM-recording mapping session of `map_name` is in once its map is saved."""
+    return onboard_map_name(map_name)
+
+
+def frame_verdict(session: Optional[Mapping[str, Any]], map_id: Any, initialized: Any,
+                  slam_save_row: Optional[Mapping[str, Any]] = None) -> str:
+    """ok | mismatch | unknown: whether the robot is in the frame its placed `session` was
+    placed in. `session`: a robot_session_from_row dict / session row (needs aligned, placement,
+    map_type); `map_id`, `initialized`: the robot's reading (frame_reading);
+    `slam_save_row`: the robot's robot_slam_saves row (None: none). Unknown (never refuses):
+    no placed session, no witness (legacy, geo), no definitive reading, or a SLAM
+    recording / save is under way (the robot reports "map" while it records)."""
+    if session is None or not is_placed(session) or session.get("map_type") == "geo":
+        return FRAME_UNKNOWN
+    expected = placement_frame(session)
+    if expected is None or slam_save_row is not None:
+        return FRAME_UNKNOWN
+    observed = definitive_frame(map_id, initialized)
+    if observed is None:
+        return FRAME_UNKNOWN
+    return FRAME_OK if observed == expected else FRAME_MISMATCH
+
+
+def frame_mismatch_text(session: Mapping[str, Any], map_id: Any) -> str:
+    """The refusal / reason text of a mismatch: "robot is localized on 'cloud-office7', not on
+    office8"."""
+    expected = placement_frame(session) or ""
+    if expected == FRAME_MAP_ID:
+        wanted = "in its odometry frame"
+    elif expected == slam_frame_witness(str(session.get("map_name"))):
+        wanted = f"on {session.get('map_name')}"
+    else:
+        wanted = f"on '{expected}'"
+    seen = (f"localized on '{map_id}'" if map_id and map_id != FRAME_MAP_ID
+            else "not localized (odometry frame)")
+    return f"robot is {seen}, not {wanted}"
+
+
+async def confirmed_verdict(session: Optional[Mapping[str, Any]], map_id: Any,
+                            initialized: Any, read_save_row: Any) -> str:
+    """frame_verdict() that reads the robot's SLAM save row (`read_save_row`: async fn -> row
+    or None, never raising) only when the first answer is a mismatch."""
+    verdict = frame_verdict(session, map_id, initialized, None)
+    if verdict == FRAME_MISMATCH:
+        verdict = frame_verdict(session, map_id, initialized, await read_save_row())
+    return verdict
+
+
+def session_frame_view(session: Optional[Mapping[str, Any]], map_id: Any, initialized: Any,
+                       slam_save_row: Optional[Mapping[str, Any]] = None
+                       ) -> Optional[Dict[str, Any]]:
+    """The robot view's derived `session.frame` {expected, observed, state: ok | mismatch |
+    unknown}, or None for no placed session / no witness. `observed`: the definitive frame or
+    None."""
+    expected = placement_frame(session)
+    if session is None or not is_placed(session) or expected is None:
+        return None
+    return {"expected": expected, "observed": definitive_frame(map_id, initialized),
+            "state": frame_verdict(session, map_id, initialized, slam_save_row)}
 
 
 # --- the robot view --------------------------------------------------------------------------------
@@ -520,7 +653,53 @@ def robot_session_view(row: Optional[Mapping[str, Any]]) -> Optional[Dict[str, A
             # `mapping_state.nodes_sent` of the robot views at no extra query
             "node_count": int(row.get("node_count") or 0),
             # the mapping services the session switches on (today `topo`, + `slam`); [] if none
-            "services": list(row.get("services") or [])}
+            "services": list(row.get("services") or []),
+            # human text of `unplaced_reason` (frame_changed carries the frame evidence)
+            "unplaced_reason_text": unplaced_reason_text(placement) if not placed else None,
+            # the placement's frame witness; `observed` / `state` are derived at read time
+            # (session_view_with_frame), never stored in this view
+            "frame": session_frame_view(row, None, None)}
+
+
+UNPLACED_REASON_TEXT = {
+    UNPLACED_RUN_CHANGED: "the robot restarted: its frame is new",
+    UNPLACED_MANUAL: "the placement was removed by hand",
+    UNPLACED_FRAME_CHANGED: "the robot's localization frame changed: it is no longer in the "
+                            "frame the placement was made in",
+}
+
+
+def unplaced_reason_text(placement: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """Human text of why a session is unplaced (placement.unplaced_reason; frame_changed adds
+    the frame evidence), or None."""
+    placement = placement or {}
+    reason = placement.get("unplaced_reason")
+    if not reason:
+        return None
+    text = UNPLACED_REASON_TEXT.get(reason, str(reason))
+    ev = placement.get("unplaced_evidence") or {}
+    if reason == UNPLACED_FRAME_CHANGED and ev.get("observed_map_id") is not None:
+        text += (f" (placed in '{ev.get('expected_map_id')}', the robot reported "
+                 f"'{ev.get('observed_map_id')}')")
+    return text
+
+
+def session_view_with_frame(view: Optional[Mapping[str, Any]], status: Any,
+                            slam_save_row: Optional[Mapping[str, Any]] = None
+                            ) -> Optional[Dict[str, Any]]:
+    """`view` (robot_session_view; possibly cached) with `frame` {expected, observed, state}
+    derived from the robot's CURRENT reading `status` (RobotStatus). A copy; None stays None;
+    a view without a witness keeps `frame` null."""
+    if view is None:
+        return None
+    out = dict(view)
+    frame = view.get("frame")
+    if frame and frame.get("expected") and view.get("aligned"):
+        map_id, initialized = frame_reading(status)
+        out["frame"] = session_frame_view(
+            {"aligned": True, "placement": {"frame": {"map_id": frame["expected"]}}},
+            map_id, initialized, slam_save_row)
+    return out
 
 
 def by_robot(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Mapping[str, Any]]:

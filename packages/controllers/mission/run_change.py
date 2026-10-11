@@ -89,3 +89,43 @@ class RunChangeDetector:
         self.pending_state_drop = (hid, last)
         self.last_state_header = last   # the baseline stays the old run's until confirmed
         return None
+
+
+@dataclasses.dataclass
+class FrameWatcher:
+    """Per robot; debounces the frame witness check (map_sessions.frame_verdict): a placed
+    session whose frame witness differs from the robot's DEFINITIVE reading is unplaced only
+    after the mismatch was seen in `confirm_states` consecutive definitive states AND for
+    `confirm_s` seconds, with the same (session, expected, observed). A matching state resets it;
+    an `unknown` state (no definitive reading, SLAM save under way, no witness) neither confirms
+    nor resets it. Pure (the caller passes the monotonic clock and the wall time)."""
+    confirm_s: float = 30.0
+    confirm_states: int = 3
+    key: Optional[Tuple[Any, Any, Any]] = None
+    first_seen: Optional[float] = None
+    first_seen_at: Optional[str] = None
+    states: int = 0
+
+    def reset(self) -> None:
+        self.key = self.first_seen = self.first_seen_at = None
+        self.states = 0
+
+    def on_verdict(self, verdict: str, session_id: Any, expected: Any, observed: Any,
+                   now: float, wall: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """The evidence {expected_map_id, observed_map_id, first_seen_at, states} of a confirmed
+        mismatch (the watcher is reset), else None."""
+        if verdict == "unknown":
+            return None
+        if verdict != "mismatch":
+            self.reset()
+            return None
+        key = (str(session_id), expected, observed)
+        if key != self.key:
+            self.key, self.first_seen, self.first_seen_at, self.states = key, now, wall, 0
+        self.states += 1
+        if self.states < self.confirm_states or now - self.first_seen < self.confirm_s:
+            return None
+        evidence = {"expected_map_id": expected, "observed_map_id": observed,
+                    "first_seen_at": self.first_seen_at, "states": self.states}
+        self.reset()
+        return evidence

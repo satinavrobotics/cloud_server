@@ -43,10 +43,15 @@ recording is a MODE of the robot's localization facade, not a process: start_sla
 /localization {mode: slam} (the intent before it is kept), before the topomap starts (on the
 mapping API the topomap needs the slam mode first); save_slam() after the session finished and its
 topomap stopped (a mode change is refused while the topomap runs) = POST
-/localization/save?background=true (name = the onboard map name, the cloud ids) polled at GET
-/localization/save, and only after a successful save the previous intent is PUT back (odometry
-when unknown; with `topomap: false` on a mapping-API robot): leaving slam discards the unsaved
-map, so a FAILED save leaves the robot in slam. Both are best effort, never raising, never
+/localization/save?background=true&then=stay (name = the onboard map name, the cloud ids) polled at
+GET /localization/save: the orchestrator itself relocalizes the robot on the saved map and the
+status stays `saving` until that switch is over; `then_state` (done | not_localized | stored |
+failed | skipped) and `localization` say where the robot is (_saved_result). The robot is NEVER
+put back on its pre-SLAM intent after a save (that stale intent, e.g. relocalization on another
+map, made the cloud assume a frame the robot was not in: incident 2026-10-11; the placement's
+frame witness, map_sessions.frame_verdict, now verifies it). The pre-SLAM intent is only for
+discard_slam(). Leaving slam discards the unsaved
+map, so a FAILED save (or a then=stay that was refused: 409) leaves the robot in slam. Both are best effort, never raising, never
 blocking or undoing the session; what went wrong is a `warning` the caller returns as
 `slam_warning`. Saving takes minutes, so a finish saves in a background task (schedule_slam_save)
 that the robot's SLAM lock serialises with every other SLAM call of that robot; start_slam
@@ -80,7 +85,7 @@ from packages.api.orchestrator_services import pick_service
 from packages.config import (
     MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_QUERY_TIMEOUT_S,
     ORCHESTRATOR_SAVE_POLL_S, SLAM_SAVE_MAX_ATTEMPTS, SLAM_SAVE_POLL_ERRORS, SLAM_SAVE_START_TRIES,
-    ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S,
+    ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S, ORCHESTRATOR_SAVE_THEN_S,
 )
 from packages.utils.map_sessions import KNOWN_SERVICES, ORCHESTRATOR_SERVICES, SLAM, TOPO
 
@@ -100,6 +105,8 @@ SOURCE = "orchestrator"
 SLAM_STARTED, SLAM_ALREADY_RUNNING, SLAM_EXISTS = "started", "already_running", "exists"
 SLAM_SAVED, SLAM_NOTHING_TO_SAVE, SLAM_FAILED, SLAM_BUSY = (
     "saved", "nothing_to_save", "failed", "busy")
+# POST /localization/save?then=stay: after the save the robot stays localized on the saved map
+THEN_STAY = "stay"
 
 # the `state` of a robot's SLAM save state (slam_save_view shows saving / failed)
 RECORDING, SAVING, SAVE_FAILED = "recording", "saving", "failed"
@@ -190,6 +197,10 @@ class SlamResult:
     warning: Optional[str] = None
     reason: Optional[str] = None   # a failed start: the bare reason (the orchestrator's message)
     notice: Optional[str] = None   # a saved map whose follow-up failed (the robot stays in slam)
+    # a saved map the robot was switched onto, with something to tell the operator that is not a
+    # failure (still searching for its position; driver down: applies at the next start)
+    detail: Optional[str] = None
+    then_state: Optional[str] = None   # the orchestrator's `then_state` of a then=stay save
 
     @property
     def ok(self) -> bool:
@@ -279,6 +290,9 @@ def slam_save_action(result: Optional[SlamResult] = None,
     if result.status == SLAM_SAVED and result.notice:
         return robot_action(service, SAVE, False, f"SLAM map saved, but {result.notice}",
                             result.notice)
+    if result.status == SLAM_SAVED and result.detail:
+        return robot_action(service, SAVE, True, f"SLAM map saved; {result.detail}",
+                            result.detail)
     if result.status == SLAM_SAVED:
         return robot_action(service, SAVE, True, "SLAM map saved")
     if result.status == SLAM_NOTHING_TO_SAVE:
@@ -308,11 +322,14 @@ class MappingSwitch:
                  save_poll_s: float = ORCHESTRATOR_SAVE_POLL_S,
                  save_poll_total_s: float = ORCHESTRATOR_SAVE_POLL_TOTAL_S,
                  save_retry_s: float = ORCHESTRATOR_SAVE_RETRY_S,
-                 fetch_budget_s: float = SNAPSHOT_BUDGET_S):
+                 fetch_budget_s: float = SNAPSHOT_BUDGET_S,
+                 save_then_s: float = ORCHESTRATOR_SAVE_THEN_S):
         self._client_factory = client_factory
         self.fetch_budget_s = fetch_budget_s
         self._sleep = sleep
         self._save_poll_s = save_poll_s
+        # a then=stay save stays `saving` until the switch onto the saved map is over
+        self._save_then_s = save_then_s
         self._save_poll_total_s = save_poll_total_s
         self._save_retry_s = save_retry_s
         self.ttl = ttl
@@ -428,6 +445,17 @@ class MappingSwitch:
         st = self._slam_state.get(robot_name)
         return st.get("state") if st is not None and st.get("state") in (
             RECORDING, SAVING, SAVE_FAILED) else None
+
+    def slam_save_row(self, robot_name: str) -> Optional[Dict[str, Any]]:
+        """{map_name, state} while the robot records, saves or has a failed SLAM map (the
+        robot_slam_saves row; the robot reports mapId "map" meanwhile, so the frame witness
+        check is suppressed), else None. Memory only: no I/O."""
+        st = self._slam_state.get(robot_name)
+        if st is not None and st.get("state") in (RECORDING, SAVING, SAVE_FAILED):
+            return {"map_name": st.get("map"), "state": st["state"]}
+        if self.slam_save_pending(robot_name):
+            return {"map_name": None, "state": SAVING}
+        return None
 
     def slam_save_failed(self, robot_name: str) -> Optional[Dict[str, Any]]:
         """The robot's failed SLAM save {map, session_id, state, detail, at}, or None."""
@@ -644,10 +672,9 @@ class MappingSwitch:
                 graced = False
                 for _ in range(SAVE_MAX_ATTEMPTS):
                     try:
-                        await self._save_attempt(client, onboard, map_name, session_id)
+                        final = await self._save_attempt(client, onboard, map_name, session_id)
                         logger.info("SLAM map %s of %s saved (%s)", map_name, name, onboard)
-                        return SlamResult(SLAM_SAVED,
-                                          notice=await self._restore_intent(client, name))
+                        return self._saved_result(name, onboard, final)
                     except _NothingToSave as exc:
                         logger.info("SLAM map %s on %s: nothing to save (%s)", map_name, name,
                                     exc)
@@ -669,18 +696,68 @@ class MappingSwitch:
         finally:
             self._slam_done(name)
 
+    def _saved_result(self, name: str, onboard: str, final: Mapping[str, Any]) -> SlamResult:
+        """The result of a SAVED map saved with `then=stay`: the orchestrator relocalized the
+        robot on it itself (`then_state`). NEVER falls back to the pre-SLAM intent or odometry
+        (that is how the frame went stale: incident 2026-10-11); the stale intent is only for
+        discard_slam, so it is dropped on success and kept when the robot stays in slam.
+        - done: relocalized and LOCALIZED on the saved map;
+        - not_localized: switched but still searching (the session is kept; the dispatcher's
+          frame guard decides after FRAME_CONFIRM_S if it never localizes);
+        - stored: the driver is down, the intent applies at its next start;
+        - failed / skipped / absent: saved, but the robot was not switched, it is still in slam
+          (a notice: the failed save state offers retry / discard)."""
+        then_state = final.get("then_state")
+        loc = final.get("localization") if isinstance(final.get("localization"), Mapping) else {}
+        where = loc.get("map")
+        if then_state == "done":
+            self._prev_intent.pop(name, None)
+            detail = None
+            if where and where != onboard:
+                detail = (f"the robot is localized on '{where}', not on the saved map "
+                          f"'{onboard}'")
+            return SlamResult(SLAM_SAVED, detail=detail, then_state=then_state)
+        if then_state == "not_localized":
+            self._prev_intent.pop(name, None)
+            return SlamResult(
+                SLAM_SAVED, then_state=then_state,
+                detail=f"the robot was switched to the saved map '{onboard}' but has not "
+                       "localized yet (it keeps searching; relocalize it if it does not)")
+        if then_state == "stored":
+            self._prev_intent.pop(name, None)
+            return SlamResult(
+                SLAM_SAVED, then_state=then_state,
+                detail=f"the Odin driver is down: the robot relocalizes on '{onboard}' at its "
+                       "next start")
+        if then_state in ("pending", "switching"):
+            self._prev_intent.pop(name, None)
+            return SlamResult(
+                SLAM_SAVED, then_state=then_state,
+                detail="the robot is still being switched onto the saved map")
+        why = final.get("then_error") or final.get("error")
+        base = ("the robot was not switched onto the saved map (it is still in SLAM mode)"
+                if then_state in ("failed", "skipped") else
+                "the orchestrator did not report switching the robot onto the saved map "
+                "(it may still be in SLAM mode)")
+        return SlamResult(SLAM_SAVED, then_state=then_state,
+                          notice=f"{base}: {why}" if why else base)
+
     @staticmethod
     def _save_warning(map_name: str, robot_name: str, detail: str) -> str:
         return (f"SLAM map of '{map_name}' not saved on robot '{robot_name}': {detail} (the robot "
                 "was left in SLAM mode so the map is kept: retry or discard the save)")
 
     async def _save_attempt(self, client: oc.OrchestratorClient, onboard: str, map_name: str,
-                            session_id: Any) -> None:
-        """Start one background save (POST /localization/save) and poll it until it is done.
-        Raises _NothingToSave (409 and the robot is not in slam mode) or _SaveFailed."""
+                            session_id: Any) -> Dict[str, Any]:
+        """Start one background save with `then=stay` (POST /localization/save: the orchestrator
+        relocalizes the robot on the saved map itself) and poll it until it is done (the status
+        stays `saving` until that switch is over). Returns the final status body. Raises
+        _NothingToSave (409 and the robot is not in slam mode) or _SaveFailed. A 409 of the
+        `then` (topomap recording, an active order, a PUT or save in progress, driver down)
+        changes nothing: the robot stays in slam and the failed save state offers retry."""
         for tries in range(SAVE_START_TRIES):
             try:
-                await client.save_localization(onboard, map_name, session_id)
+                await client.save_localization(onboard, map_name, session_id, then=THEN_STAY)
                 break
             except oc.OrchestratorError as exc:
                 if exc.kind != oc.HTTP:
@@ -702,7 +779,7 @@ class MappingSwitch:
                     continue
                 raise _SaveFailed(exc.detail, slow="already in progress" in exc.detail.lower())
         waited, errors = 0.0, 0
-        while waited <= self._save_poll_total_s:
+        while waited <= self._save_poll_total_s + self._save_then_s:
             try:
                 st = await client.localization_save_status()
                 errors = 0
@@ -714,7 +791,7 @@ class MappingSwitch:
             if st.get("map") not in (None, onboard):
                 st = {}     # the status of another map's save
             if st.get("status") == "done":
-                return
+                return st
             if st.get("status") == "failed":
                 error = str(st.get("error") or "the orchestrator reported a failed save")
                 raise _SaveFailed(error, slow=_looks_slow(error))

@@ -130,6 +130,8 @@ RUN_CHECK_RETRY_S = config.DISPATCH_RUN_CHECK_RETRY_S
 # The run-epoch check runs inline on the robot's state loop: it is given this long (a pool
 # stall can last 30 s), then it counts as failed and is retried after RUN_CHECK_RETRY_S.
 RUN_CHECK_TIMEOUT_S = config.DISPATCH_RUN_CHECK_TIMEOUT_S
+# The frame check reads the robot's open session at most this often (seconds).
+FRAME_SESSION_TTL_S = 5.0
 # A current mission whose start failed (an exception before its tree existed) is started
 # again on a robot state message at most this often, and failed after this many attempts.
 START_RETRY_S = config.DISPATCH_START_RETRY_S
@@ -743,6 +745,10 @@ class Robot:
         # which this robot's last datum arrived (the first datum of an epoch may be the
         # retained one of an older run).
         self._run_detector = run_change.RunChangeDetector()
+        # The frame witness check (_check_frame): debounce state and a short session cache.
+        self._frame_watcher = run_change.FrameWatcher(
+            confirm_s=config.FRAME_CONFIRM_S, confirm_states=config.FRAME_CONFIRM_STATES)
+        self._frame_session_cache: Optional[Tuple[float, Any]] = None
         self._datum_epoch: Optional[int] = None
         # The robot's connection went OFFLINE/CONNECTIONBROKEN and has not been ONLINE since;
         # and the pose before a state-header drop that awaits confirmation (run_change.py).
@@ -2520,6 +2526,98 @@ class Robot:
             self.warning(f"Open session not readable ({err}); route nodes on a map are refused")
             return SESSION_UNKNOWN
 
+    # --- the frame witness (map_sessions.frame_verdict) ---------------------------------------
+
+    async def _read_slam_save_row(self) -> Optional[Dict[str, Any]]:
+        """The robot's robot_slam_saves row {map_name, state} (recording | saving | failed: the
+        robot reports mapId "map" meanwhile), None when there is none, the table is missing or
+        it cannot be read. Never raises."""
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.SLAM_SAVE_ROW_SQL, (self._name,))
+                    row = await cursor.fetchone()
+        except Exception:  # pylint: disable=broad-except
+            return None
+        return {"map_name": row[0], "state": row[1]} if row is not None else None
+
+    async def _check_frame(self, message: types.VDA5050State) -> None:
+        """After a state's pose was stored: verify the robot's open placed session is still
+        valid in the frame the robot reports (map_sessions.frame_verdict). A confirmed mismatch
+        (FrameWatcher: FRAME_CONFIRM_S and FRAME_CONFIRM_STATES definitive states) unplaces it
+        with reason frame_changed: one transaction like _on_run_changed's, MAP.SESSION_UNPLACED,
+        no new run epoch and no services NOTIFY (the run did not change; nothing was killed).
+        States without a definitive reading do nothing (no query). Never raises."""
+        try:
+            position = message.agvPosition
+            if position is None or map_sessions.definitive_frame(
+                    position.mapId, position.positionInitialized) is None:
+                return
+            map_id, initialized = position.mapId, position.positionInitialized
+            now = time.monotonic()
+            session = await self._frame_session(now)
+            if not isinstance(session, dict):
+                self._frame_watcher.reset()
+                return
+            verdict = await map_sessions.confirmed_verdict(
+                session, map_id, initialized, self._read_slam_save_row)
+            evidence = self._frame_watcher.on_verdict(
+                verdict, session.get("session_id"), map_sessions.placement_frame(session),
+                map_id, now, datetime.datetime.now(datetime.timezone.utc).isoformat())
+            if evidence is not None:
+                await self._on_frame_changed(evidence, map_id, initialized)
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Frame check failed: {err!r}")
+
+    async def _frame_session(self, now: float) -> Any:
+        """The open session for the frame check, read at most every FRAME_SESSION_TTL_S."""
+        cached = self._frame_session_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+        session = await self._read_open_session()
+        if session is SESSION_UNKNOWN:
+            return None
+        self._frame_session_cache = (now + FRAME_SESSION_TTL_S, session)
+        return session
+
+    async def _on_frame_changed(self, evidence: Dict[str, Any], map_id: Any,
+                                initialized: Any) -> None:
+        """Unplace the open session after a confirmed frame mismatch (see _check_frame). It is
+        read again first: the session may have changed or been placed again meanwhile."""
+        self._frame_session_cache = None
+        session = await self._read_open_session()
+        if not isinstance(session, dict) or await map_sessions.confirmed_verdict(
+                session, map_id, initialized,
+                self._read_slam_save_row) != map_sessions.FRAME_MISMATCH:
+            return
+        now = datetime.datetime.now(datetime.timezone.utc)
+        evidence = {**evidence, "expected_map_id": map_sessions.placement_frame(session),
+                    "session_id": session["session_id"]}
+        self.info(f"Robot frame changed ({evidence}): unplacing its open map session")
+        patch = {"unplaced_reason": map_sessions.UNPLACED_FRAME_CHANGED,
+                 "unplaced_at": now.isoformat(), "unplaced_evidence": evidence}
+        try:
+            async with self._database.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(map_sessions.UNPLACE_SQL, (json.dumps(patch), self._name))
+                    rows = await cursor.fetchall()
+                for session_id, map_name, purpose, transform in rows:
+                    await self._emit(conn, Event(
+                        EventCode.MAP_SESSION_UNPLACED, now, robot_name=self._name,
+                        source=Source.DISPATCH,
+                        discriminator=f"session:{session_id}:unplaced:{now.isoformat()}",
+                        payload={"map_name": map_name, "session_id": str(session_id),
+                                 "purpose": purpose,
+                                 "reason": map_sessions.UNPLACED_FRAME_CHANGED,
+                                 "evidence": evidence, "old_map_T_session": transform}))
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Could not unplace the open session after a frame change: {err}")
+            return
+        for _sid, map_name, purpose, _t in rows:
+            self.warning(f"Session on map '{map_name}' ({purpose}) is no longer placed: the "
+                         f"robot reports frame '{evidence['observed_map_id']}', the placement "
+                         f"was made in '{evidence['expected_map_id']}'")
+
     async def _route_in_robot_frame(
             self, route: mission_object.MissionRouteNodeV1) -> mission_object.MissionRouteNodeV1:
         """The route's waypoints in the robot's current frame (maps redesign M2, §14).
@@ -2554,6 +2652,15 @@ class Robot:
                 raise RouteRefused(f"robot is not using map {name}")
             if not map_sessions.is_placed(session):
                 raise RouteRefused(f"robot is not placed on map {name}")
+            # Frame witness (map_sessions.frame_verdict): refused at once, without writing, when
+            # the robot DEFINITELY is in another frame than the placement was made in; the
+            # debounced unplace (_check_frame) is separate. `unknown` is allowed.
+            map_id, initialized = map_sessions.frame_reading(
+                self._robot_object.status if self._robot_object is not None else None)
+            if await map_sessions.confirmed_verdict(
+                    session, map_id, initialized,
+                    self._read_slam_save_row) == map_sessions.FRAME_MISMATCH:
+                raise RouteRefused(map_sessions.frame_mismatch_text(session, map_id))
             t = session["map_t_session"]
             if not map_geo.is_identity(t):
                 inverse[name] = map_geo.invert_transform(t)
@@ -4497,6 +4604,7 @@ class Robot:
             await self._persist_run_header(message.headerId)
         try:
             await self._on_client_message(message)
+            await self._check_frame(message)   # never raises
         finally:
             self._event_ts = None
             self._record("on_state", self._name, message, self._robot_object)

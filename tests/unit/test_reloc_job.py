@@ -378,6 +378,8 @@ class TestModeOdin:
         assert row["aligned"] is True and row["map_t_session"] == ms.reloc_map_t_session()
         assert row["placement"]["source"] == "reloc" and "init_pose" not in row["placement"]
         assert row["placement"]["robot_pose"] == {"x": 3.0, "y": 4.0, "theta": 0.2}
+        # the frame witness: the frame the robot reported when it was placed
+        assert row["placement"]["frame"] == {"map_id": ONBOARD}
         assert env.db.codes() == [EventCode.MAP_SESSION_PLACED.value]
         assert env.orch.current_map == ONBOARD
 

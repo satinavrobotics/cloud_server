@@ -369,10 +369,12 @@ class MapSessionPlaced(Payload):
 
 class MapSessionUnplaced(Payload):
     """MAP.SESSION_UNPLACED (mission-dispatch, maps §14 U3): the robot's run frame reset, so its
-    open session is no longer placed. `reason` run_changed, or `manual` (POST .../unplace, API:
-    `actor` says who; the map_T_session is kept); `evidence`: what showed it (the
-    VDA5050 header ids: `connection_header_id` / `last_connection_header_id`, or
-    `state_header_id` / `last_state_header_id`)."""
+    open session is no longer placed. `reason` run_changed, `frame_changed` (the robot's
+    localization frame is no longer the one the placement was made in: the frame witness;
+    `evidence`: `expected_map_id`, `observed_map_id`, `first_seen_at`, `states`; the run did not
+    change), or `manual` (POST .../unplace, API: `actor` says who; the map_T_session is kept);
+    `evidence`: what showed it (the VDA5050 header ids: `connection_header_id` /
+    `last_connection_header_id`, or `state_header_id` / `last_state_header_id`)."""
     map_name: str
     session_id: str
     purpose: Optional[str] = None

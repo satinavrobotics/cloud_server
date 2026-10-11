@@ -122,8 +122,8 @@ class TestSlamSaveState:
         await switch.wait_slam_saves()
         assert switch.slam_save_view("r1") is None
         assert orch.slam["active"] is False and "cloud-yard" in orch.slam_files
-        assert [b for op, _, b in orch.slam_log if op == "slam_restore"] == [
-            {"mode": "odometry", "map": None}]
+        assert [b for op, _, b in orch.slam_log if op == "slam_restore"] == []   # then=stay
+        assert orch.save_thens[-1] == "stay"
         assert codes(db, "MAP.SLAM_SAVE_DONE", "MAP.SLAM_SAVE_FAILED") == [
             "MAP.SLAM_SAVE_FAILED", "MAP.SLAM_SAVE_DONE"]
         assert db.events[-1]["payload"]["session_id"] == sid

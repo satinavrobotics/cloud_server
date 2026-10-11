@@ -178,6 +178,14 @@ ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "66
 ORCHESTRATOR_SAVE_POLL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_S", "3.0"))
 ORCHESTRATOR_SAVE_POLL_TOTAL_S = float(os.getenv("ORCHESTRATOR_SAVE_POLL_TOTAL_S", "660.0"))
 ORCHESTRATOR_SAVE_RETRY_S = float(os.getenv("ORCHESTRATOR_SAVE_RETRY_S", "30.0"))
+# A save with `then=stay` stays `saving` until the orchestrator's switch onto the saved map is over
+# (about 8-10 s): the poll waits this much longer than ORCHESTRATOR_SAVE_POLL_TOTAL_S.
+ORCHESTRATOR_SAVE_THEN_S = float(os.getenv("ORCHESTRATOR_SAVE_THEN_S", "45.0"))
+# Frame witness (packages/utils/map_sessions.py, run_change.FrameWatcher): a placed session is
+# unplaced (reason frame_changed) only after the robot's definitive reading disagreed with the
+# placement's frame for this long AND in this many consecutive definitive states.
+FRAME_CONFIRM_S = float(os.getenv("FRAME_CONFIRM_S", "30.0"))
+FRAME_CONFIRM_STATES = int(os.getenv("FRAME_CONFIRM_STATES", "3"))
 # After a robot run change (mission-dispatch NOTIFY) the API starts the services of the robot's
 # non-paused mapping session again (packages/api/maps.py restart_after_run_change); a robot that
 # is still coming up refuses, so a failed restart is tried again RUN_CHANGE_RESTART_RETRY_S later,

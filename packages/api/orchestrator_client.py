@@ -216,16 +216,25 @@ class OrchestratorClient:
                                json_body=body)
         return out if isinstance(out, dict) else {}
 
-    async def save_localization(self, name: str, cloud_map_id: str,
-                                cloud_session_id: Any) -> Dict[str, Any]:
-        """POST /localization/save?background=true with the cloud ids: 202 at once, or a 4xx
-        (409 not in slam / a save runs / cloud_map_id held, 503, 502)."""
+    async def save_localization(self, name: str, cloud_map_id: str, cloud_session_id: Any,
+                                then: Optional[str] = None) -> Dict[str, Any]:
+        """POST /localization/save?background=true[&then=stay] with the cloud ids: 202 at once,
+        or a 4xx (409 not in slam / a save runs / cloud_map_id held / with `then`: the topomap
+        records, an active order, a PUT or save in progress, driver down; 503, 502). `then`
+        "stay": after the save the orchestrator relocalizes the robot on the saved map itself
+        (see MappingSwitch.save_slam)."""
         body = {"name": name, **cloud_link(cloud_map_id, cloud_session_id)}
+        params = {"background": "true"}
+        if then:
+            params["then"] = then
         return await self._call("POST", "/localization/save", ORCHESTRATOR_START_TIMEOUT_S,
-                                params={"background": "true"}, json_body=body)
+                                params=params, json_body=body)
 
     async def localization_save_status(self) -> Dict[str, Any]:
-        """GET /localization/save -> {map, status: saving|done|failed, error, meta, ...}."""
+        """GET /localization/save -> {map, status: saving|done|failed, error, meta, then,
+        then_state: pending|switching|done|not_localized|stored|failed|skipped,
+        localization: {mode, map}, ...}. With `then` the status stays `saving` until the switch
+        is over."""
         body = await self._call("GET", "/localization/save", ORCHESTRATOR_QUERY_TIMEOUT_S)
         return body if isinstance(body, dict) else {}
 

@@ -45,6 +45,7 @@ from packages.api.slam_save_state import PgSlamStateStore
 from packages.api.orchestrator_maps import OrchestratorMaps
 from packages.api.reloc_job import RelocJobs
 from packages.utils import map_geo
+from packages.utils import map_sessions as _map_sessions
 
 
 def map_datum_transform(spec: MapSpecV1) -> Optional[Dict[str, Any]]:
@@ -2312,7 +2313,10 @@ class ApiDelegationService:
                     continue
 
                 # Build WebSocket message
-                session_view = await self._robot_session(robot.name)
+                # `frame`: the placement's frame witness against this very state (derived)
+                session_view = _map_sessions.session_view_with_frame(
+                    await self._robot_session(robot.name), robot.status,
+                    self.mapping_switch.slam_save_row(robot.name))
                 # The intent as last read by the REST view: a state update never calls the robot
                 snap = self.mapping_switch.cached(robot.name)
                 localization = localization_view.build(

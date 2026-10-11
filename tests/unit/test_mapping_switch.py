@@ -61,6 +61,10 @@ class FakeOrch:
         self.save_results = []        # per started save: {"status": "done"|"failed", error}
         self.save_status = None       # what GET /localization/save reports
         self.busy_starts = 0          # saves answered 502 "Map transfer already in progress"
+        self.save_thens = []          # the `then` of every started save
+        self.then_results = []        # per then=stay save: then_state (default "done")
+        self.then_refusals = []       # per then=stay save: an HTTP status to refuse it with
+        self.localized_map = None     # the map the robot is relocalized on (after then=stay)
 
     def _enter(self, op, name=None):
         self.calls.append((op, name))
@@ -137,7 +141,9 @@ async def _get_localization(self):
     """GET /localization: the stored intent (no `topomap`: no mapping API, /services runs it)."""
     o = self.orch
     await o._slam("slam_state", check_tx=False)
-    return {"mode": "slam", "map": None} if o.slam["active"] else {"mode": o.mode, "map": None}
+    if o.slam["active"]:
+        return {"mode": "slam", "map": None}
+    return {"mode": o.mode, "map": o.localized_map if o.mode == "relocalization" else None}
 
 
 async def _put_localization(self, mode, map_name=None, wait=False, topomap=None):
@@ -151,7 +157,7 @@ async def _put_localization(self, mode, map_name=None, wait=False, topomap=None)
     return {"mode": mode, "map": map_name, "applied": True, "problem": None}
 
 
-async def _save_localization(self, name, cloud_map_id, cloud_session_id):
+async def _save_localization(self, name, cloud_map_id, cloud_session_id, then=None):
     """POST /localization/save?background=true: validates, then runs the save per the
     orchestrator's `save_results` script (default: done at once). The robot stays in slam."""
     body = {"cloud_map_id": cloud_map_id, "cloud_session_id": cloud_session_id}
@@ -164,10 +170,24 @@ async def _save_localization(self, name, cloud_map_id, cloud_session_id):
         raise _http(502, "Map transfer already in progress")
     if not o.slam["active"]:
         raise _http(409, "the driver is not in slam mode")
+    if then == "stay" and o.then_refusals:
+        raise _http(o.then_refusals.pop(0), "cannot stay: the topomap is recording")
+    o.save_thens.append(then)
     outcome = o.save_results.pop(0) if o.save_results else {"status": "done"}
+    status = {"map": name, "status": outcome["status"], "error": outcome.get("error")}
     if outcome["status"] == "done":
         o.slam_files.add(name)
-    o.save_status = {"map": name, "status": outcome["status"], "error": outcome.get("error")}
+        if then == "stay":
+            state = o.then_results.pop(0) if o.then_results else "done"
+            status.update(then="stay", then_state=state,
+                          localization={"mode": "relocalization", "map": name})
+            if state in ("done", "not_localized"):
+                o.slam, o.mode, o.localized_map = (
+                    {"active": False, "map": None}, "relocalization", name)
+            elif state == "stored":
+                o.slam, o.mode, o.localized_map = (
+                    {"active": False, "map": None}, "relocalization", name)
+    o.save_status = status
     return {"started": True, "map": name}
 
 
@@ -903,10 +923,12 @@ class TestSlam:
         await switch.wait_slam_saves()
         saves = [b for op, name, b in orch.slam_log if op == "slam_save"]
         assert saves == [{"cloud_map_id": "yard", "cloud_session_id": sid}]
-        # saved, then the intent from before the slam mode is PUT back
+        # saved with then=stay: the robot stays localized on the saved map; the intent from
+        # before the slam mode is NOT put back (incident 2026-10-11)
         assert orch.slam == {"active": False, "map": None} and "cloud-yard" in orch.slam_files
-        assert [b for op, _, b in orch.slam_log if op == "slam_restore"] == [
-            {"mode": "odometry", "map": None}]
+        assert orch.save_thens == ["stay"]
+        assert [b for op, _, b in orch.slam_log if op == "slam_restore"] == []
+        assert (orch.mode, orch.localized_map) == ("relocalization", "cloud-yard")
         assert not switch.slam_save_pending("r1")
         switch.on_slam_done.assert_called_with("r1")
         assert switch.slam_save_view("r1") is None
@@ -934,10 +956,11 @@ class TestSlam:
         new_sid = out["session"]["session_id"]
         orch.slam_save_gate.set()
         await switch.wait_slam_saves()
-        # saved, back to odometry (topomap off), then the new session's SLAM + topomap started
+        # saved and kept on the saved map (no switch back), then the new session's SLAM +
+        # topomap started
         order = [c for c in slam_ops(orch) if c[0] in ("slam_save", "slam_restore",
                                                          "slam_start")]
-        assert order == [("slam_restore", None), ("slam_start", "cloud-lot")]
+        assert order == [("slam_start", "cloud-lot")]
         assert orch.services["topomap"] is True and orch.slam["active"] is True
         restarted = [e for e in db.events if e["code"] == "MAP.SESSION_SERVICES_RESTARTED"]
         assert len(restarted) == 1
@@ -1053,6 +1076,88 @@ class TestSlam:
         out = await start(db, switch, replace=True)
         assert "'lot' not saved" in out["slam_warning"]
         assert out["session"]["map_name"] == "yard"
+
+    # --- then=stay (frame witness work, 2026-10-11) -----------------------------------------
+
+    async def test_save_asks_for_then_stay_and_never_restores_the_old_intent(self, db):
+        """The incident: the pre-SLAM intent was relocalization on cloud-office7; after the
+        save the robot must stay on the SAVED map, never go back to office7."""
+        orch, switch = slam_prepare(db)
+        orch.mode, orch.localized_map = "relocalization", "cloud-office7"
+        await start(db, switch)
+        assert switch._prev_intent["r1"] == {"mode": "relocalization", "map": "cloud-office7"}
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "saved" and res.ok and res.notice is None and res.detail is None
+        assert res.then_state == "done"
+        assert orch.save_thens == ["stay"]
+        assert [op for op, _ in slam_ops(orch) if op == "slam_restore"] == []
+        assert (orch.mode, orch.localized_map) == ("relocalization", "cloud-yard")
+        assert "r1" not in switch._prev_intent        # no longer needed
+
+    @pytest.mark.parametrize("then_state,word", [
+        ("not_localized", "has not localized yet"),
+        ("stored", "next start"),
+    ])
+    async def test_a_switched_but_unlocalized_or_stored_robot_is_reported_not_failed(
+            self, db, then_state, word):
+        orch, switch = slam_prepare(db)
+        orch.then_results = [then_state]
+        sid = (await start(db, switch))["session"]["session_id"]
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        assert switch.slam_save_view("r1") is None            # not a failed save: keep session
+        assert db.codes()[-1] == "MAP.SLAM_SAVE_DONE"
+        orch.slam = {"active": True, "map": "cloud-yard"}     # record again, save directly
+        orch.slam_files.discard("cloud-yard")
+        orch.then_results = [then_state]
+        res = await switch.save_slam(db.robots["r1"], "yard", sid)
+        assert res.status == "saved" and res.notice is None and word in res.detail
+        assert res.then_state == then_state
+        from packages.api.mapping_switch import slam_save_action
+        action = slam_save_action(res)
+        assert action["ok"] is True and word in action["detail"]
+
+    @pytest.mark.parametrize("then_state", ["failed", "skipped"])
+    async def test_a_save_that_did_not_switch_leaves_a_failed_state_and_discard_restores(
+            self, db, then_state):
+        orch, switch = slam_prepare(db)
+        orch.mode, orch.localized_map = "relocalization", "cloud-office7"
+        orch.then_results = [then_state]
+        orch.slam_files.discard("cloud-yard")
+        sid = (await start(db, switch))["session"]["session_id"]
+        orch.slam = {"active": True, "map": "cloud-yard"}     # the switch did not happen
+        orch.then_results = [then_state]
+        # the fake leaves the robot in slam when the then failed
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await switch.wait_slam_saves()
+        view = switch.slam_save_view("r1")
+        assert view["state"] == "failed" and "not switched onto the saved map" in view["detail"]
+        assert db.codes()[-1] == "MAP.SLAM_SAVE_DONE"       # the map IS saved, as before
+        assert "not switched onto the saved map" in db.events[-1]["payload"]["detail"]
+        # discard still PUTs the pre-SLAM intent back (the robot stays on its old map)
+        action = await switch.discard_slam(db.robots["r1"])
+        assert action["ok"] is True
+        assert [b for op, _, b in orch.slam_log if op == "slam_restore"] == [
+            {"mode": "relocalization", "map": "cloud-office7"}]
+        assert switch.slam_save_view("r1") is None
+
+    async def test_a_refused_then_changes_nothing_and_is_reported(self, db):
+        orch, switch = slam_prepare(db)
+        orch.mode, orch.localized_map = "relocalization", "cloud-office7"
+        await start(db, switch)
+        orch.then_refusals = [409]
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "failed" and "left in SLAM mode" in res.warning
+        assert "topomap is recording" in res.warning
+        assert orch.slam["active"] is True
+        assert [op for op, _ in slam_ops(orch) if op == "slam_restore"] == []   # no fallback
+
+    async def test_the_poll_waits_past_the_plain_save_timeout_for_the_switch(self, db):
+        orch, switch = slam_prepare(db, save_poll_total_s=0.0, save_then_s=9.0,
+                                    save_poll_s=1.0)
+        await start(db, switch)
+        res = await switch.save_slam(db.robots["r1"], "yard", "S")
+        assert res.status == "saved"
 
     async def test_without_a_switch_nothing_happens(self, db):
         db.add_map("yard", type="local", slam_map=True, status={"state": "draft"})

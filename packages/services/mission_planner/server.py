@@ -188,7 +188,29 @@ class MissionPlannerService:
             raise RobotNotPlacedError(
                 f"Robot '{name}' is not placed on map '{map_id}' (its run frame "
                 "changed or it was never placed): place it on the map first")
+        # Frame witness: refused at once (nothing is written) when the robot DEFINITELY is in
+        # another frame than the placement was made in; `unknown` is allowed.
+        map_id_seen, initialized = map_sessions.frame_reading(getattr(robot, "status", None))
+        if await map_sessions.confirmed_verdict(
+                session, map_id_seen, initialized,
+                self._slam_save_row(name)) == map_sessions.FRAME_MISMATCH:
+            raise RobotNotPlacedError(
+                f"Robot '{name}': {map_sessions.frame_mismatch_text(session, map_id_seen)} "
+                "(its placement is not valid in this frame): place it again or relocalize it")
         return map_geo.apply_transform(session["map_t_session"], x, y)
+
+    def _slam_save_row(self, robot_name: str):
+        """An async fn reading the robot's robot_slam_saves row (None: none / unreadable)."""
+        async def read() -> Optional[Dict[str, Any]]:
+            try:
+                async with self.database.connection() as conn:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute(map_sessions.SLAM_SAVE_ROW_SQL, (robot_name,))
+                        row = await cursor.fetchone()
+            except Exception:  # noqa: BLE001
+                return None
+            return {"map_name": row[0], "state": row[1]} if row is not None else None
+        return read
 
     async def _gps_to_map(self, map_id: str, lat: float, lon: float
                           ) -> Optional[Tuple[float, float, str]]:

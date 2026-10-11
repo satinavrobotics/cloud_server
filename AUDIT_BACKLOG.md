@@ -671,3 +671,9 @@ SLAM rules, `/api/createToken` grants, config centralisation, healthchecks / `.d
 
 ### I6. Observations from the 2026-10-09 deploy
 - graph-builder `/health` reports `mqtt_connected: false` although it is subscribed (see D5).
+
+### I7. Frame witness (2026-10-11, formidable-peacock incident): deferred
+1. [low] Adopt the orchestrator's `frame_id` / `frame_changed_at` (GET /localization) in `map_sessions.frame_reading()` once it ships; today the witness is verified from the VDA state only.
+2. [low] A replace by a new SLAM mapping session still does the `then=stay` switch (about 10 s) before the new SLAM start; no known `then` value avoids it.
+3. [low] A SLAM start that failed leaves a session witnessed `cloud-<map>` while the robot reports "map": it is unplaced `frame_changed` after the 30 s debounce (the start failure is also reported).
+4. [low] tests/integration/maps/checks_use.py / checks_reuse.py were not re-run (need the real-Postgres rig).

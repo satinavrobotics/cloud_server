@@ -35,6 +35,7 @@ from packages.utils.service_utils import (
 )
 from packages.utils.fastapi_helpers import add_error_handlers
 from packages.utils import blocked_nodes
+from packages.utils import map_sessions as ms
 from packages.config import (
     ARANGO_HOST, ARANGO_PORT, ARANGO_USERNAME, DATA_BASE_NAME,
     URL_MISSION_PLANNER, URL_LIVEKIT, GRAPH_BUILDER_WS_URL, MISSION_DISPATCHER_WS_URL, MQTT_ENABLED,
@@ -1661,6 +1662,11 @@ async def _robot_views(robots: List[RobotObjectV1],
         data = robot.dict()
         snap = snaps.get(robot.name)
         session = (sessions or {}).get(robot.name)
+        # Frame witness: the placement's frame against the robot's reading NOW (derived at read
+        # time; the cached session view only carries the expected frame).
+        save_row = getattr(getattr(service, "mapping_switch", None), "slam_save_row", None)
+        session = ms.session_view_with_frame(
+            session, robot.status, save_row(robot.name) if callable(save_row) else None)
         data["mapping_state"] = snap.state(session) if snap else None
         data["mapping_services"] = snap.mapping_services() if snap else None
         data["session"] = session
