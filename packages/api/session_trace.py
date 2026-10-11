@@ -88,6 +88,15 @@ def _iso(when: Any) -> Optional[str]:
     return when.isoformat() if when is not None else None
 
 
+def ordered_nodes(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The `session_trace_nodes` rows as trace nodes (x, y, time, capture, session_node_id, id,
+    row) in laying-down order."""
+    return trace.order([{"x": r.get("x"), "y": r.get("y"),
+                         "time": trace.parse_time(r.get("timestamp")), "capture": _capture(r),
+                         "session_node_id": r.get("session_node_id"), "id": str(r["id"]),
+                         "row": r} for r in rows])
+
+
 async def session_trace(db: Any, graph: Any, image_db: Any, map_id: str, session_id: str,
                         limit: Optional[int] = None, offset: Optional[int] = None
                         ) -> Dict[str, Any]:
@@ -100,10 +109,7 @@ async def session_trace(db: Any, graph: Any, image_db: Any, map_id: str, session
     rows: List[Dict[str, Any]] = []
     if ms.purpose_of(session) == ms.MAPPING:
         rows = await asyncio.to_thread(graph.session_trace_nodes, map_id, sid)
-    nodes = [{"x": r.get("x"), "y": r.get("y"), "time": trace.parse_time(r.get("timestamp")),
-              "capture": _capture(r), "session_node_id": r.get("session_node_id"),
-              "id": str(r["id"]), "row": r} for r in rows]
-    nodes = trace.order(nodes)
+    nodes = ordered_nodes(rows)
     rows = [n["row"] for n in nodes]
     source = trace.timestamp_source(nodes)
     all_steps = trace.steps(nodes)

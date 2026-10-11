@@ -2398,7 +2398,9 @@ def _robot_lock(switch: Optional[Any], robot_name: str) -> Any:
 async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UUID,
                         actor: Optional[str] = None, switch: Optional[Any] = None,
                         arango_node_count: Optional[Callable[[str], int]] = None,
-                        reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
+                        reloc_jobs: Optional[Any] = None,
+                        on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None
+                        ) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/sessions `{robot, purpose?, services?, placement?, replace?}`
     (rules: module docstring). With `replace` the robot's open session (any map, any purpose)
     is finished in the same transaction; a refused start keeps it. After the commit a mapping
@@ -2422,7 +2424,8 @@ async def start_session(db: Any, map_name: str, data: Any, publisher_id: uuid.UU
                                      "recording a SLAM map")
         names = [map_name, await _open_session_map(db, req.robot)]
         counts = await _node_counts(arango_node_count, names)
-        return await _start_session(db, map_name, req, publisher_id, actor, switch, counts)
+        return await _start_session(db, map_name, req, publisher_id, actor, switch, counts,
+                                    on_finished)
 
 
 async def _open_session_map(db: Any, robot_name: str) -> Optional[str]:
@@ -2507,10 +2510,14 @@ async def _open_tx(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
 
 async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UUID,
                          actor: Optional[str], switch: Optional[Any],
-                         node_counts: Mapping[str, Optional[int]]) -> Dict[str, Any]:
+                         node_counts: Mapping[str, Optional[int]],
+                         on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None
+                         ) -> Dict[str, Any]:
     now = _utcnow()
     opened = await _open_tx(db, map_name, req, publisher_id, actor, node_counts, now)
     session, replaced, robot = opened.session, opened.replaced, opened.robot
+    if replaced is not None and on_finished is not None:
+        await on_finished(replaced)
     slam_warnings: List[str] = []
     actions: List[Dict[str, Any]] = []
     if replaced is not None:
@@ -2752,8 +2759,11 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          publisher_id: uuid.UUID, actor: Optional[str] = None,
                          switch: Optional[Any] = None,
                          arango_node_count: Optional[Callable[[str], int]] = None,
-                         reloc_jobs: Optional[Any] = None) -> Dict[str, Any]:
-    """pause / resume / finish (see the module docstring). After the commit, resume starts the
+                         reloc_jobs: Optional[Any] = None,
+                         on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None
+                         ) -> Dict[str, Any]:
+    """pause / resume / finish (see the module docstring). `on_finished(session)` is awaited
+    after a finish committed (the edge statistics of the session; it must not raise). After the commit, resume starts the
     session's services on the robot's orchestrator (SLAM first when `slam` is in them) and
     pause / finish stop them; a repeat retries. What failed never fails or undoes the action:
     `robot_actions` reports it. Resume has the guards of a start: 409 while a relocalization
@@ -2787,6 +2797,8 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                                                     publisher_id, actor, switch,
                                                     counts.get(map_name))
         slam_warning = None
+        if action == "finish" and out["changed"] and on_finished is not None:
+            await on_finished(session)
         if action == "resume":
             actions, slam_warning = await start_session_services(db, switch, session, robot)
         else:

@@ -16,6 +16,7 @@ from packages.events.emit import COLUMNS as EVENT_COLUMNS, INSERT_SQL as EVENT_I
 from packages.telemetry_ingest import IngestQueue, RecordingPolicy, SpillFile, health, tables
 from packages.telemetry_ingest.policy import PolicySources
 from packages.telemetry_ingest.rehydrate import SELECT_SQL as LATEST_SELECT_SQL
+from packages.utils import edge_stats_db
 
 UTC = datetime.timezone.utc
 T0 = datetime.datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
@@ -43,6 +44,7 @@ class FakeDB:
         self.events = {}        # (event_id, ts) -> row dict
         self.trajectory = []    # dicts: mission_id, robot_name, ts, run_id
         self.legs = {}          # (run_id, seq) -> row dict (run_legs)
+        self.edge_obs = {}      # primary key tuple -> row dict (edge_observations)
         self.missions = {}      # name -> (lifecycle, robot, status dict)
         self.next_run = {}      # mission name -> pending one-off recording level
         self.latest = []        # tuples in rehydrate SELECT_SQL column order
@@ -53,10 +55,12 @@ class FakeDB:
 
     # --- state helpers -------------------------------------------------------------------
     def snapshot(self):
-        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run))
+        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run,
+                              self.edge_obs))
 
     def restore(self, snap):
-        self.runs, self.events, self.trajectory, self.legs, self.next_run = snap
+        (self.runs, self.events, self.trajectory, self.legs, self.next_run,
+         self.edge_obs) = snap
 
     def legs_of(self, run_id=None):
         return [r for _, r in sorted(self.legs.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
@@ -175,6 +179,34 @@ class FakeDB:
         elif sql == fr.SET_SUMMARY_SQL:
             summary, run_id = params
             self.runs[run_id]["summary_metrics"] = json.loads(summary)
+        elif sql == fr.EDGE_LEGS_SQL:
+            cursor.results = [
+                tuple(leg[f] for f in fr.EDGE_LEG_FIELDS) for leg in self.legs_of(params[0])
+                if leg["from_topomap_node"] and leg["to_topomap_node"]]
+        elif sql == edge_stats_db.INSERT_SQL:
+            row = dict(zip(edge_stats_db.COLUMNS, params))
+            assert row["observed_at"].tzinfo is not None and row["duration_s"] > 0
+            key = tuple(row[c] for c in edge_stats_db.COLUMNS[:6])
+            if key not in self.edge_obs:
+                self.edge_obs[key] = row
+                cursor.rowcount = 1
+        elif sql == edge_stats_db.PRUNE_SQL:
+            map_id, robot, _, _, window = params
+            by_edge = {}
+            for key, row in self.edge_obs.items():
+                if row["map_id"] == map_id and row["robot_name"] == robot:
+                    by_edge.setdefault((row["from_node"], row["to_node"]), []).append(key)
+            for keys in by_edge.values():
+                keys.sort(key=lambda k: (self.edge_obs[k]["observed_at"], k[4], k[5]),
+                          reverse=True)
+                for key in keys[window:]:
+                    del self.edge_obs[key]
+        elif sql == edge_stats_db.SELECT_SQL:
+            map_id, robot, _ = params
+            cursor.results = [tuple(r[c] for c in edge_stats_db.COLUMNS)
+                              for r in self.edge_obs.values()
+                              if r["map_id"] == map_id and (robot is None
+                                                            or r["robot_name"] == robot)]
         elif sql == EVENT_INSERT_SQL:
             row = dict(zip(EVENT_COLUMNS, params))
             assert row["ts"].tzinfo is not None

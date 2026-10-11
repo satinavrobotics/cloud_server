@@ -62,7 +62,7 @@ from packages.telemetry_ingest.policy import (
     ASSIGNMENTS_CHANNEL, allows as policy_allows, parse_assignment_payload, parse_level,
 )
 from packages.telemetry_ingest.rehydrate import LatestRow
-from packages.utils import run_legs
+from packages.utils import edge_stats, edge_stats_db, run_legs
 
 logger = logging.getLogger("Isaac Mission Dispatch.fleet_recorder")
 
@@ -193,6 +193,15 @@ RUN_LEGS_SQL = (
 RUN_LEG_FIELDS = ("seq", "pass_index", "started_at", "ended_at", "duration_s", "stopped_s",
                   "straight_m", "planned_m", "expected_s", "recoveries", "recovery_s", "blocks")
 SET_SUMMARY_SQL = "UPDATE mission_runs SET summary_metrics = %s::jsonb WHERE run_id = %s"
+# The legs that become per-edge observations (utils/edge_stats.py), after the events filled their
+# recoveries / blocks.
+EDGE_LEGS_SQL = (
+    "SELECT run_id, seq, map_id, from_topomap_node, to_topomap_node, ended_at, duration_s, "
+    "straight_m, recoveries, blocks FROM run_legs WHERE run_id = %s "
+    "AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL ORDER BY seq"
+)
+EDGE_LEG_FIELDS = ("run_id", "seq", "map_id", "from_topomap_node", "to_topomap_node", "ended_at",
+                   "duration_s", "straight_m", "recoveries", "blocks")
 
 MISSION_SQL = f"SELECT lifecycle, spec->>'robot', status FROM {MISSION_TABLE} WHERE name = %s"
 TRAJECTORY_SQL = (
@@ -1437,6 +1446,30 @@ class FleetRecorder:
                 raise
             logger.exception("Could not write the summary of run %s", info.run_id)
 
+    async def _record_edge_observations(self, conn: Any, info: RunInfo) -> None:
+        """The run's legs between topomap nodes as per-edge observations (edge_observations;
+        a repeat changes nothing). Whether a leg is a real topomap edge is decided by the API
+        when it reads: dispatch has no ArangoDB access. A savepoint, so a problem here never
+        costs the run."""
+        try:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(EDGE_LEGS_SQL, (info.run_id,))
+                    rows = await cursor.fetchall()
+                    observations = []
+                    for row in rows:
+                        leg = dict(zip(EDGE_LEG_FIELDS, row), robot_name=info.robot_name)
+                        leg["map_id"] = leg["map_id"] or info.map_id
+                        obs = edge_stats.leg_observation(leg)
+                        if obs is not None:
+                            observations.append(obs)
+                    if observations:
+                        await edge_stats_db.store(cursor, observations)
+        except Exception as exc:  # noqa: BLE001
+            if _is_transient(exc) or getattr(conn, "broken", False):
+                raise
+            logger.exception("Could not record the edge observations of run %s", info.run_id)
+
     async def _emit_run_started(self, conn: Any, info: RunInfo) -> None:
         if self._events_allowed(info.robot_name, EventCode.MISSION_RUN_STARTED, info):
             await emit(conn, Event(
@@ -1488,6 +1521,7 @@ class FleetRecorder:
                          "duration_s": max(0.0, (finish.ended_at - info.started_at)
                                            .total_seconds())}))
         await self._summarize_run(conn, info, finish)
+        await self._record_edge_observations(conn, info)
         # mission_trajectory is written by graph-builder, keyed by mission name; tag this
         # run's rows. A savepoint, so a problem here never costs the run row.
         try:

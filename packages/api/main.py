@@ -23,7 +23,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin
-from packages.api import session_trace, sites
+from packages.api import edge_stats, session_trace, sites
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.api.mission_index import mission_ahead
@@ -649,6 +649,12 @@ def _arango_node_count(name: str) -> int:
     return int(stats.get("node_count") or 0)
 
 
+async def _record_session_edges(session: Dict[str, Any]) -> None:
+    """A finished mapping session's per-edge observations (packages/api/edge_stats.py); never
+    raises."""
+    await edge_stats.record_session(service.database, service.graph_db, session)
+
+
 @app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
 async def start_map_session(map_id: str, body: Dict[str, Any]):
     """Start a session `{robot, purpose?, services?, placement?, replace?}` on the map (maps
@@ -673,7 +679,7 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
         switch=service.mapping_switch, arango_node_count=_arango_node_count,
-        reloc_jobs=service.reloc_jobs))
+        reloc_jobs=service.reloc_jobs, on_finished=_record_session_edges))
 
 
 @app.get("/api/v1/maps/{map_id}/sessions")
@@ -701,6 +707,21 @@ async def map_session_trace(map_id: str, session_id: str, limit: Optional[int] =
     return await _site_call("map session trace", session_trace.session_trace(
         service.database, service.graph_db, service.image_db, map_id, session_id, limit,
         offset))
+
+
+@app.get("/api/v1/maps/{map_id}/edge-stats")
+async def map_edge_stats(map_id: str, robot: Optional[str] = None,
+                         min_count: Optional[int] = None, limit: Optional[int] = None,
+                         offset: Optional[int] = None):
+    """Per-edge traversal statistics of the map's topomap (read-only; groundwork for edge
+    weights): for each (edge, robot) the count, median / p90 traversal time and median speed of
+    the newest 20 observations (mission legs and mapping sessions), `last_observed_at` and the
+    recoveries / blocks seen on legs. `robot` filters, `min_count` (default 1) drops thin
+    edges, `limit` (1-200, default 100) / `offset` page ({total, next_offset}). 404 unknown map;
+    422 bad query. Contract: packages/api/README.md."""
+    _require_service()
+    return await _site_call("map edge stats", edge_stats.edge_stats(
+        service.database, service.graph_db, map_id, robot, min_count, limit, offset))
 
 
 @app.get("/api/v1/maps/{map_id}/sessions/{session_id}/placement-suggestions")
@@ -859,7 +880,8 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
         recording.request_actor(), switch=service.mapping_switch,
-        arango_node_count=_arango_node_count, reloc_jobs=service.reloc_jobs))
+        arango_node_count=_arango_node_count, reloc_jobs=service.reloc_jobs,
+        on_finished=_record_session_edges))
 
 
 @app.post("/api/v1/maps/{map_id}/archive")
@@ -2027,7 +2049,8 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
     _require_service()
 
     return await RobotDeleter(service.database, service.mapping_switch,
-                              arango_node_count=_arango_node_count).delete(
+                              arango_node_count=_arango_node_count,
+                              on_session_finished=_record_session_edges).delete(
         robot_name, delete_telemetry=delete_telemetry, delete_rosbags=delete_rosbags,
         actor=recording.request_actor(), rosbag_deleter=_delete_rosbags_of)
 

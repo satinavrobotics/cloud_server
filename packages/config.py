@@ -496,6 +496,14 @@ RECORDER_RECONCILE_MIN_AGE_S = float(os.getenv("RECORDER_RECONCILE_MIN_AGE_S", "
 # Trajectory rows logged this long after the run ended still belong to it.
 RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
 
+# Per-edge traversal statistics of the topomap (packages/utils/edge_stats.py): the newest
+# EDGE_STATS_WINDOW observations of each (map, edge, robot) are kept and summarised. An observation
+# with a duration over EDGE_STATS_MAX_DURATION_S (a paused session, a stuck robot) or a speed over
+# EDGE_STATS_MAX_SPEED_MPS (bursty MQTT delivery, a wrong clock) is dropped, as is a duration <= 0.
+EDGE_STATS_WINDOW = int(os.getenv("EDGE_STATS_WINDOW", "20"))
+EDGE_STATS_MAX_DURATION_S = float(os.getenv("EDGE_STATS_MAX_DURATION_S", "3600.0"))
+EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", "5.0"))
+
 # ==================== Pre-mission go-to (API) ====================
 # packages/api/pre_goto.py: before a MAPPED mission is queued (POST /api/v1/missions) the server
 # first queues a planner go-to to the topomap node closest to the mission's first waypoint, so
