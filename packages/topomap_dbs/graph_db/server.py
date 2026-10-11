@@ -753,14 +753,19 @@ class GraphDatabaseService:
         "session_node_id: n.session_node_id, "
         "x: n.pose.x, y: n.pose.y, yaw: n.pose.yaw, "
         "timestamp: n.timestamp != null ? n.timestamp : n.created_at, "
+        "capture_time: n.capture_time, "
+        "camera_stamps_ms: IS_ARRAY(n.camera_metadata) ? n.camera_metadata[*].timestamp : [], "
         "depth: ATTRIBUTES(IS_OBJECT(n.depth) ? n.depth : {}), "
         "costmap: ATTRIBUTES(IS_OBJECT(n.costmap) ? n.costmap : {})}")
 
     def session_trace_nodes(self, map_id: str, session_id: str) -> List[Dict[str, Any]]:
         """The nodes one mapping session stored in a map, in the order they were laid down
-        (stored time, then the robot's session_node_id), as light projections: id,
+        (stored receipt time, then the robot's session_node_id; the API re-sorts by capture time
+        when every node has one), as light projections: id,
         session_node_id, x, y, yaw (map frame), timestamp (graph-builder's `timestamp`, else
-        `created_at`; None when neither), depth / costmap (names of the cameras / layers
+        `created_at`; None when neither), capture_time (the robot's, ISO UTC, None when the node
+        has none) and camera_stamps_ms (the stored camera_metadata[].timestamp values, from which
+        the API derives a capture time for nodes stored before `capture_time` existed), depth / costmap (names of the cameras / layers
         with a record). Filtered and sorted in ArangoDB; a persistent index on `session_id`
         is ensured once per collection. A map without a node collection has none ([]).
         RAISES on an ArangoDB error (the caller must not show a half trace)."""

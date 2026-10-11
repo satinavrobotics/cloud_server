@@ -55,6 +55,7 @@ from packages.config import (
 )
 from packages.events.emit import Event, emit
 from packages.services.graph_builder import ingest
+from packages.utils import capture_time
 from packages.services.graph_builder.upload_buffer import DROPPED, NodeUploadBuffer
 
 
@@ -640,6 +641,12 @@ class GraphBuilderService:
 
         metadata['map_id'] = map_id
         metadata['timestamp'] = datetime.now().isoformat()
+        # The robot's capture time (a separate field; `timestamp`/`created_at` stay the cloud's
+        # receipt time). Never taken from payload.metadata: only the sanitised value or absent.
+        metadata.pop(capture_time.FIELD, None)
+        captured = capture_time.extract(payload)
+        if captured is not None:
+            metadata[capture_time.FIELD] = captured
 
         result = self.graph_db.add_node(
             map_id=map_id,

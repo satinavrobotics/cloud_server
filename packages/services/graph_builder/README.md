@@ -290,6 +290,27 @@ The service expects node update messages on the configured MQTT topic with the f
 - `images`: List of image data (base64 encoded)
 - `metadata`: Additional node metadata
 
+### Node times: receipt time and robot capture time
+
+A stored node has two separate times:
+
+- `timestamp` and `created_at`: the **cloud's receipt time** (naive `datetime.now().isoformat()` of
+  the graph-builder host). Always set; unchanged by anything the robot sends.
+- `capture_time` (optional): the **robot's capture time**, ISO 8601 UTC with offset
+  (`2026-10-11T11:59:00+00:00`), read from the payload by `packages/utils/capture_time.py`.
+  Absent when the payload carries no sane capture time. Never taken from `metadata.capture_time`.
+
+The robot has no dedicated field. Sources, first sane wins: `capture_time`, `stamp`, then
+top-level `timestamp` (ISO string with offset, or epoch s / ms / us / ns number, unit told by
+magnitude), then `camera_metadata[].timestamp` (what the robot's topomap node sends: epoch
+**milliseconds** of the TF stamp at the camera frame, earliest wins; only nodes with images have
+one). `metadata.timestamp` (robot-local naive time) is not used. A value is dropped when it is not
+a number / ISO string with an offset, is before 2020-01-01 (e.g. ROS sim time) or more than 300 s
+in the future. A robot clock that is wrong but plausible keeps its values: only differences
+between nodes of one session are meaningful (that is what the session trace uses), not the
+absolute time. Nodes stored before this field existed have no `capture_time`; the session trace
+derives one from their stored `camera_metadata[].timestamp` when present.
+
 ### Depth images (3D reconstruction R2)
 
 `robot/depth_upload` (`MQTT_DEPTH_TOPIC`): one message per node and camera with a lossless

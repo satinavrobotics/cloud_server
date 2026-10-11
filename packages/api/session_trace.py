@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException
 
 from packages.api import maps
+from packages.utils import capture_time
 from packages.utils import map_sessions as ms
 from packages.utils import session_trace as trace
 
@@ -72,6 +73,17 @@ async def _images_of(image_db: Any, map_id: str, node_ids: List[str]) -> Dict[st
     return dict(zip(node_ids, found))
 
 
+def _capture(row: Dict[str, Any]) -> Optional[Any]:
+    """The robot's capture time of a stored node: its `capture_time`, else (nodes stored before
+    that field existed) derived from the stored camera_metadata[].timestamp (epoch ms) with the
+    same sanity rules; None when neither is usable."""
+    got = capture_time.parse(row.get("capture_time")) if row.get("capture_time") else None
+    if got is None:
+        stamps = [{"timestamp": v} for v in (row.get("camera_stamps_ms") or [])]
+        got = capture_time.from_camera_metadata(stamps)
+    return got
+
+
 def _iso(when: Any) -> Optional[str]:
     return when.isoformat() if when is not None else None
 
@@ -88,8 +100,12 @@ async def session_trace(db: Any, graph: Any, image_db: Any, map_id: str, session
     rows: List[Dict[str, Any]] = []
     if ms.purpose_of(session) == ms.MAPPING:
         rows = await asyncio.to_thread(graph.session_trace_nodes, map_id, sid)
-    nodes = [{"x": r.get("x"), "y": r.get("y"), "time": trace.parse_time(r.get("timestamp"))}
-             for r in rows]
+    nodes = [{"x": r.get("x"), "y": r.get("y"), "time": trace.parse_time(r.get("timestamp")),
+              "capture": _capture(r), "session_node_id": r.get("session_node_id"),
+              "id": str(r["id"]), "row": r} for r in rows]
+    nodes = trace.order(nodes)
+    rows = [n["row"] for n in nodes]
+    source = trace.timestamp_source(nodes)
     all_steps = trace.steps(nodes)
     summary = trace.summarize(nodes, all_steps)
     page = range(offset, min(offset + limit, len(rows)))
@@ -102,7 +118,9 @@ async def session_trace(db: Any, graph: Any, image_db: Any, map_id: str, session
             "index": i,
             "node_id": node_id,
             "session_node_id": r.get("session_node_id"),
-            "timestamp": _iso(nodes[i]["time"]),
+            "timestamp": _iso(nodes[i]["capture"] or nodes[i]["time"]),
+            "timestamp_source": (trace.SOURCE_CAPTURE if nodes[i]["capture"] is not None
+                                 else trace.SOURCE_INGEST),
             "pose": {"x": r.get("x"), "y": r.get("y"), "yaw": r.get("yaw")},
             "images": [_image_entry(map_id, node_id, name) for name in images.get(node_id, [])],
             "depth": sorted(r.get("depth") or []),
@@ -115,7 +133,7 @@ async def session_trace(db: Any, graph: Any, image_db: Any, map_id: str, session
         "session_id": sid,
         "purpose": ms.purpose_of(session),
         "state": ms.session_state(session),
-        "timestamp_source": "cloud_ingest",
+        "timestamp_source": source,
         "total": len(rows),
         "limit": limit,
         "offset": offset,
