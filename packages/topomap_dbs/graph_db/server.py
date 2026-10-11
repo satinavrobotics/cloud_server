@@ -49,6 +49,7 @@ class GraphDatabaseService:
         self.db: Optional[StandardDatabase] = None
         self.graph: Optional[Graph] = None
         self.spatial_index_manager: Optional[SpatialIndexManager] = None
+        self._session_indexed: set = set()   # node collections with the session_id index
 
         self._connect_to_arango(arango_username, arango_password)
         self._initialize_graph()
@@ -744,6 +745,36 @@ class GraphDatabaseService:
         removed = list(self.db.aql.execute(
             self.DELETE_NODES_AQL, bind_vars={"@col": node_collection, "keys": keys}))
         return [str(k) for k in removed], edges
+
+    SESSION_TRACE_AQL = (
+        "FOR n IN @@col FILTER n.session_id == @sid "
+        "SORT n.timestamp, n.session_node_id, n._key "
+        "RETURN {id: TO_STRING(n.node_id != null ? n.node_id : n._key), "
+        "session_node_id: n.session_node_id, "
+        "x: n.pose.x, y: n.pose.y, yaw: n.pose.yaw, "
+        "timestamp: n.timestamp != null ? n.timestamp : n.created_at, "
+        "depth: ATTRIBUTES(IS_OBJECT(n.depth) ? n.depth : {}), "
+        "costmap: ATTRIBUTES(IS_OBJECT(n.costmap) ? n.costmap : {})}")
+
+    def session_trace_nodes(self, map_id: str, session_id: str) -> List[Dict[str, Any]]:
+        """The nodes one mapping session stored in a map, in the order they were laid down
+        (stored time, then the robot's session_node_id), as light projections: id,
+        session_node_id, x, y, yaw (map frame), timestamp (graph-builder's `timestamp`, else
+        `created_at`; None when neither), depth / costmap (names of the cameras / layers
+        with a record). Filtered and sorted in ArangoDB; a persistent index on `session_id`
+        is ensured once per collection. A map without a node collection has none ([]).
+        RAISES on an ArangoDB error (the caller must not show a half trace)."""
+        name = f"nodes_{map_id}"
+        if not self.db.has_collection(name):
+            return []
+        if name not in self._session_indexed:
+            try:
+                self.db.collection(name).add_persistent_index(fields=["session_id"])
+                self._session_indexed.add(name)
+            except Exception as e:  # the query works without it, only slower
+                self.logger.warning(f"Could not ensure the session_id index of {name}: {e}")
+        return list(self.db.aql.execute(
+            self.SESSION_TRACE_AQL, bind_vars={"@col": name, "sid": str(session_id)}))
 
     def remove_node(self, node_id: Union[int, str]) -> bool:
         """
