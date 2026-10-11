@@ -22,7 +22,8 @@ from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, sites
+from packages.api import fleet_reads, maps, recorder_health, recording, run_admin
+from packages.api import session_trace, sites
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.api.mission_index import mission_ahead
@@ -684,6 +685,22 @@ async def list_map_sessions(map_id: str, limit: Optional[int] = None,
     _require_service()
     return await _site_call("list map sessions", maps.session_history(
         service.database, map_id, limit, before))
+
+
+@app.get("/api/v1/maps/{map_id}/sessions/{session_id}/trace")
+async def map_session_trace(map_id: str, session_id: str, limit: Optional[int] = None,
+                            offset: Optional[int] = None):
+    """What the session laid down (read-only): its nodes in laying order, each with index,
+    `timestamp` (graph-builder's ingest time; null when unknown), map-frame pose, `images`
+    (url / thumb_url of the node-image route), `depth` / `costmap` (record names) and
+    `from_previous` {distance_m, dt_s, speed_mps} (null on the first node; each value null
+    when not computable), plus `summary` and `limit` (1-200, default 100) / `offset` paging
+    ({total, next_offset}). An operate session: empty trace. 404 unknown map / session / session
+    of another map; 422 bad limit / offset. Contract: packages/api/README.md."""
+    _require_service()
+    return await _site_call("map session trace", session_trace.session_trace(
+        service.database, service.graph_db, service.image_db, map_id, session_id, limit,
+        offset))
 
 
 @app.get("/api/v1/maps/{map_id}/sessions/{session_id}/placement-suggestions")
