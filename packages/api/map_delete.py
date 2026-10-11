@@ -70,6 +70,8 @@ SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
 # Its 3D reconstruction jobs (R3, docs/reconstruction/design.md §8.5) too; their files go with
 # the bucket.
 RECONSTRUCTIONS_SQL = "DELETE FROM map_reconstructions WHERE map_name = %s"
+# Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
+EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
 
 
@@ -310,6 +312,7 @@ class MapDeleter:
                 if removed:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
                     await cursor.execute(RECONSTRUCTIONS_SQL, (map_id,))
+                    await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
             if removed:

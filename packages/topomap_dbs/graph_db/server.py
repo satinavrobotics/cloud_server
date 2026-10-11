@@ -193,12 +193,13 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to fetch nodes from ArangoDB for map {map_id}: {e}")
             return []
 
-    def _get_all_edges_from_arango(self, map_id: str) -> List[Dict[str, Any]]:
+    def _get_all_edges_from_arango(self, map_id: str, strict: bool = False) -> List[Dict[str, Any]]:
         """
         Fetch all edges from ArangoDB for a specific map.
 
         Args:
             map_id: Map identifier (or "__default__" for default collection)
+            strict: raise on an ArangoDB error instead of returning [] (get_edges_strict)
 
         Returns:
             List of edge documents
@@ -236,6 +237,8 @@ class GraphDatabaseService:
             return result
         except Exception as e:
             self.logger.error(f"Failed to fetch edges from ArangoDB for map {map_id}: {e}")
+            if strict:
+                raise
             return []
     
     # ==================== WRITE OPERATIONS ====================
@@ -748,7 +751,7 @@ class GraphDatabaseService:
 
     SESSION_TRACE_AQL = (
         "FOR n IN @@col FILTER n.session_id == @sid "
-        "SORT n.timestamp, n.session_node_id, n._key "
+        "SORT (n.timestamp != null ? n.timestamp : n.created_at), n.session_node_id, n._key "
         "RETURN {id: TO_STRING(n.node_id != null ? n.node_id : n._key), "
         "session_node_id: n.session_node_id, "
         "x: n.pose.x, y: n.pose.y, yaw: n.pose.yaw, "
@@ -1186,4 +1189,10 @@ class GraphDatabaseService:
     def get_edges(self, map_id: str) -> List[Dict[str, Any]]:
         """Get all edges from a specific map."""
         return self._get_all_edges_from_arango(map_id)
+
+    def get_edges_strict(self, map_id: str) -> List[Dict[str, Any]]:
+        """get_edges, but RAISES on an ArangoDB error instead of answering [] (a map without an
+        edge collection still has none: []). For the edge statistics, which must not mistake
+        a database outage for a map without edges."""
+        return self._get_all_edges_from_arango(map_id, strict=True)
 

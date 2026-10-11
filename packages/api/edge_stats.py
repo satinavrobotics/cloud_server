@@ -5,7 +5,11 @@ Observations live in `edge_observations` (migration 20261011_01_edge_observation
 map / edge / robot, packages/utils/edge_stats_db.py). Mission legs are written by mission-dispatch
 when a run ends (packages/controllers/mission/fleet_recorder.py); mapping sessions are written
 here, when the session is finished (`record_session`, called after the finishing transaction
-committed: a failure is logged and never fails or undoes the finish). The statistics are computed
+committed and the robot-side actions are done, as a background task: it never delays them, holds
+no robot lock, and a failure is logged and never fails or undoes the finish). A session whose
+ArangoDB read failed stores nothing; a repeat finish changes nothing and so does not call the
+writer again, so `scripts/backfill_edge_observations.py --apply` (idempotent) records it later.
+The statistics are computed
 on read by packages/utils/edge_stats.py and only for pairs that are an edge of the map NOW (an
 observation on a pair without an edge, or on an edge since deleted, is ignored, not an error).
 Contract: packages/api/README.md. Groundwork for edge weights: nothing here feeds the planner.
@@ -26,12 +30,21 @@ from packages.utils import map_sessions as ms
 
 logger = logging.getLogger("ApiDelegationService.edge_stats")
 
+# The running record_session tasks: a reference keeps each from being garbage collected.
+_tasks: Set["asyncio.Task[Any]"] = set()
+
 
 def _min_count(value: Optional[int]) -> int:
     count = 1 if value is None else int(value)
     if count < 1:
         raise session_trace._query_error("min_count", "must be >= 1")
     return count
+
+
+def _edges_of(graph: Any, map_id: str) -> List[Dict[str, Any]]:
+    """The map's edges; RAISES on an ArangoDB error (get_edges would answer [] and make a
+    database outage look like a map without edges)."""
+    return graph.get_edges_strict(map_id)
 
 
 async def edge_stats(db: Any, graph: Any, map_id: str, robot: Optional[str] = None,
@@ -48,7 +61,12 @@ async def edge_stats(db: Any, graph: Any, map_id: str, robot: Optional[str] = No
             observations = await edge_stats_db.fetch(store.cursor, map_id, robot or None)
     except maps._SCHEMA_ERRORS as exc:
         raise maps._undefined_table(exc) from exc
-    edges = es.edge_set(await asyncio.to_thread(graph.get_edges, map_id))
+    try:
+        edges = es.edge_set(await asyncio.to_thread(_edges_of, graph, map_id))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Edge statistics of map %s: could not read its edges: %s", map_id, exc)
+        raise HTTPException(503, f"The edges of map \"{map_id}\" could not be read from "
+                                 "ArangoDB; try again shortly") from exc
     items = [i for i in es.group_stats(es.on_edges(observations, edges)) if i["count"] >= min_count]
     page = items[offset:offset + limit]
     end = offset + len(page)
@@ -79,21 +97,50 @@ async def session_observations(graph: Any, session: Mapping[str, Any],
     if not observations:
         return []
     if edges is None:
-        edges = es.edge_set(await asyncio.to_thread(graph.get_edges, map_id))
+        edges = es.edge_set(await asyncio.to_thread(_edges_of, graph, map_id))
     return es.on_edges(observations, edges)
 
 
 async def record_session(db: Any, graph: Any, session: Mapping[str, Any]) -> int:
     """Store the observations of a finished mapping session (a repeat changes nothing). Never
-    raises: a failure is logged. Returns the number of rows inserted."""
+    raises: a failure is logged. Returns the number of rows inserted. When ArangoDB cannot be
+    read nothing is stored (a warning); no marker says the session is done, so the backfill
+    script records it later."""
+    sid = session.get("session_id")
     try:
         observations = await session_observations(graph, session)
-        if not observations:
-            return 0
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read the nodes / edges of session %s from ArangoDB, its edge "
+                       "observations are not recorded (run scripts/backfill_edge_observations.py "
+                       "--apply later): %s", sid, exc)
+        return 0
+    if not observations:
+        return 0
+    try:
         async with db.connection() as conn:
             async with conn.cursor() as cursor:
                 return await edge_stats_db.store(cursor, observations)
     except Exception:  # noqa: BLE001
-        logger.exception("Could not record the edge observations of session %s",
-                         session.get("session_id"))
+        logger.exception("Could not record the edge observations of session %s", sid)
         return 0
+
+
+def _task_done(task: "asyncio.Task[Any]") -> None:
+    _tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Recording the edge observations of a session failed", exc_info=task.exception())
+
+
+def schedule_record_session(db: Any, graph: Any, session: Mapping[str, Any]
+                            ) -> Optional["asyncio.Task[Any]"]:
+    """Run record_session as a tracked background task and return at once (None when it could
+    not be started); never raises. `session` is copied, the caller may change its own."""
+    try:
+        task = asyncio.get_running_loop().create_task(record_session(db, graph, dict(session)))
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not start recording the edge observations of session %s",
+                         session.get("session_id"))
+        return None
+    _tasks.add(task)
+    task.add_done_callback(_task_done)
+    return task

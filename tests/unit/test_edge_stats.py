@@ -52,7 +52,9 @@ class TestRules:
     @pytest.mark.parametrize("duration, distance, reason", [
         (2.0, 1.0, None), (2.0, None, None), (0.0, 1.0, "duration"), (-1.0, 1.0, "duration"),
         (None, 1.0, "duration"), (3601.0, 1.0, "too_long"), (1.0, 6.0, "too_fast"),
-        (1.0, 5.0, None)])
+        (1.0, 5.0, None), (0.0004, 1.0, "duration"), (0.0006, 0.0, None),
+        (float("nan"), 1.0, "duration"), (float("inf"), 1.0, "duration"),
+        (2.0, float("nan"), "distance"), (2.0, float("inf"), "distance")])
     def test_reject_reason(self, duration, distance, reason):
         assert es.reject_reason(duration, distance) == reason
 
@@ -79,6 +81,10 @@ class TestRules:
     def test_unusable_legs_are_dropped(self, extra):
         assert es.leg_observation(self.leg(**extra)) is None
 
+    def test_a_duration_that_rounds_to_zero_is_rejected_not_stored_as_zero(self):
+        assert es.leg_observation(self.leg(duration_s=0.0004, straight_m=0.0)) is None
+        assert es.leg_observation(self.leg(duration_s=0.0006, straight_m=0.0))["duration_s"] == 0.001
+
     def test_a_leg_without_a_distance_keeps_its_time(self):
         o = es.leg_observation(self.leg(straight_m=None))
         assert o["duration_s"] == 4.0 and o["speed_mps"] is None
@@ -93,9 +99,25 @@ class TestRules:
                  self.node(5, 41.0, None), self.node(6, 42.0, 9)]                     # no time
         out = es.session_observations("yard", "sess", "r1", nodes)
         assert [(o["from_node"], o["to_node"]) for o in out] == [("n0", "n1"), ("n2", "n3")]
-        assert all(o["source"] == "mapping" and o["source_key"] == "sess"
-                   and o["recoveries"] == 0 and o["blocks"] == 0 for o in out)
+        assert [o["source_key"] for o in out] == ["sess:1", "sess:3"]   # the later node's index
+        assert all(o["source"] == "mapping" and o["recoveries"] == 0 and o["blocks"] == 0
+                   for o in out)
         assert out[0]["speed_mps"] == 0.5 and out[0]["observed_at"] == secs(2)
+
+    def test_a_second_traversal_of_the_same_pair_is_its_own_observation(self):
+        nodes = [self.node(0, 0.0, 0), self.node(1, 1.0, 2), self.node(0, 0.0, 4),
+                 self.node(1, 1.0, 6)]                       # n0 -> n1 twice, n1 -> n0 once
+        out = es.session_observations("yard", "s", "r1", nodes)
+        assert [(o["from_node"], o["to_node"], o["source_key"]) for o in out] == [
+            ("n0", "n1", "s:1"), ("n1", "n0", "s:2"), ("n0", "n1", "s:3")]
+        assert es.session_observations("yard", "s", "r1", nodes) == out        # stable
+
+    def test_a_slow_mapping_step_is_not_a_traversal_but_a_slow_leg_is(self):
+        # 1 m in 600 s = 0.0017 m/s (a paused session): dropped; 1 m in 40 s = 0.025 m/s: kept
+        nodes = [self.node(0, 0.0, 0), self.node(1, 1.0, 600), self.node(2, 2.0, 640)]
+        out = es.session_observations("yard", "s", "r1", nodes)
+        assert [(o["from_node"], o["to_node"]) for o in out] == [("n1", "n2")]
+        assert es.leg_observation(self.leg(duration_s=600.0, straight_m=1.0)) is not None
 
     def test_session_observations_use_capture_time_when_both_nodes_have_it(self):
         nodes = [self.node(0, 0.0, 0, capture=100), self.node(1, 1.0, 1, capture=102)]
@@ -158,8 +180,26 @@ class TestStore:
         assert mine == [f"k{i:03d}" for i in range(5, 25)]              # the oldest 5 are gone
         assert len([k for k in db.edge_obs if k[3] == "r2"]) == 2
         # an older observation written later (a backfill) is pruned at once, not double counted
+        # (store() returns the rows INSERTED, so it counts the one pruned at once)
         assert await store.store(cur, [obs(0)]) == 1
         assert sorted(k[5] for k in db.edge_obs if k[3] == "r1") == mine
+
+    async def test_prune_is_limited_to_the_touched_edges(self):
+        db = FakeDB()
+        cur = await cursor_of(db)
+        for r in [obs(i, src="A", dst="B") for i in range(25)]:     # as stored: over the window
+            db.edge_obs[tuple(r[c] for c in store.COLUMNS[:6])] = r
+        await store.store(cur, [obs(0, src="A", dst="C")])          # touches A->C only
+        assert len([k for k in db.edge_obs if k[2] == "B"]) == 25   # A->B left alone
+        await store.store(cur, [obs(30, src="A", dst="B")])
+        assert len([k for k in db.edge_obs if k[2] == "B"]) == 20
+
+    def test_prune_params_are_the_touched_pairs_per_map_and_robot(self):
+        rows = [obs(0, src="A", dst="B"), obs(1, src="A", dst="B"), obs(2, src="C", dst="D"),
+                obs(3, robot="r2")]
+        assert store.prune_params(rows) == [
+            ("yard", "r1", ["A", "C"], ["B", "D"], "yard", "r1", 20),
+            ("yard", "r2", ["A"], ["B"], "yard", "r2", 20)]
 
 
 # --- writer 1: mission-dispatch at run end -----------------------------------------------------
@@ -213,6 +253,34 @@ class TestRunEndWriter:
         assert run["state"] == "COMPLETED" and run["summary_metrics"]["leg_count"] == 2
         assert db.edge_obs == {}
 
+    @pytest.mark.parametrize("name", ["DeadlockDetected", "LockNotAvailable", "QueryCanceled",
+                                      "SerializationFailure"])
+    async def test_lock_and_cancel_errors_of_the_optional_writer_are_swallowed(
+            self, tmp_path, name, caplog):
+        from psycopg import errors
+        rec, db, run_id = await self.run(tmp_path)
+        info = SimpleNamespace(run_id=run_id, robot_name="r1", map_id="map1")
+        db.edge_obs.clear()
+        db.fail = lambda sql, params: getattr(errors, name)() if sql == store.INSERT_SQL else None
+        with caplog.at_level("WARNING"):
+            await rec._record_edge_observations(FakeConnection(db), info)    # does not raise
+        assert db.edge_obs == {} and "edge observations" in caplog.text
+
+    async def test_a_broken_connection_or_other_operational_error_still_raises(self, tmp_path):
+        import psycopg
+        rec, db, run_id = await self.run(tmp_path)
+        info = SimpleNamespace(run_id=run_id, robot_name="r1", map_id="map1")
+        db.fail = lambda sql, params: (psycopg.OperationalError("server closed the connection")
+                                       if sql == store.INSERT_SQL else None)
+        with pytest.raises(psycopg.OperationalError):
+            await rec._record_edge_observations(FakeConnection(db), info)
+        db.fail = lambda sql, params: (psycopg.errors.DeadlockDetected()
+                                       if sql == store.INSERT_SQL else None)
+        conn = FakeConnection(db)
+        conn.broken = True
+        with pytest.raises(psycopg.errors.DeadlockDetected):
+            await rec._record_edge_observations(conn, info)
+
     async def test_a_run_without_topomap_legs_writes_nothing(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path, mission=make_mission(planned=None))
         await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3),
@@ -231,6 +299,7 @@ def node_row(i, x, t):
 class FakeGraph:
     def __init__(self, rows, edges):
         self.rows, self.edges, self.fail = rows, edges, False
+        self.edges_fail = False
 
     def session_trace_nodes(self, map_id, session_id):
         if self.fail:
@@ -239,6 +308,11 @@ class FakeGraph:
 
     def get_edges(self, map_id):
         return [{"from_node_id": a, "to_node_id": b} for a, b in self.edges]
+
+    def get_edges_strict(self, map_id):
+        if self.edges_fail:
+            raise RuntimeError("arango down")
+        return self.get_edges(map_id)
 
 
 def session(purpose="mapping", robot="r1"):
@@ -257,7 +331,8 @@ class TestSessionWriter:
         assert await api.record_session(FakePool(db), graph, s) == 2
         assert sorted((r["from_node"], r["to_node"]) for r in db.edge_obs.values()) == \
             [("n0", "n1"), ("n1", "n2")]                      # n2 -> n3 has no edge: ignored
-        assert {r["source_key"] for r in db.edge_obs.values()} == {str(s["session_id"])}
+        assert {r["source_key"] for r in db.edge_obs.values()} == {
+            f"{s['session_id']}:1", f"{s['session_id']}:2"}
 
     async def test_finishing_twice_does_not_double_count(self):
         db, graph, s = FakeDB(), FakeGraph(ROWS, EDGES), session()
@@ -271,6 +346,36 @@ class TestSessionWriter:
         graph.fail = True
         assert await api.record_session(FakePool(db), graph, session()) == 0
         assert db.edge_obs == {}
+
+    async def test_an_arango_edge_error_stores_nothing_and_warns_and_a_retry_recovers(self, caplog):
+        db, graph, s = FakeDB(), FakeGraph(ROWS, EDGES), session()
+        graph.edges_fail = True                              # nodes readable, edges not
+        with caplog.at_level("WARNING"):
+            assert await api.record_session(FakePool(db), graph, s) == 0
+        assert db.edge_obs == {} and "backfill" in caplog.text
+        graph.edges_fail = False                             # nothing marked it as done
+        assert await api.record_session(FakePool(db), graph, s) == 2
+
+    async def test_the_hook_runs_in_the_background_and_a_failure_is_only_logged(self, caplog):
+        db, graph, s = FakeDB(), FakeGraph(ROWS, EDGES), session()
+        task = api.schedule_record_session(FakePool(db), graph, s)
+        assert task in api._tasks and db.edge_obs == {}      # returned before it ran
+        await task
+        assert task not in api._tasks and len(db.edge_obs) == 2
+        graph.fail = True
+        with caplog.at_level("WARNING"):
+            await api.schedule_record_session(FakePool(db), graph, session())
+        assert len(db.edge_obs) == 2 and not api._tasks
+
+    async def test_the_finish_action_hook_failure_does_not_fail_the_finish(self, fdb):  # noqa: F811
+        fdb.add_map("yard")
+        row = fdb.add_session("yard", "r1", "live", ended=False, purpose="mapping")
+
+        async def hook(_s):
+            raise RuntimeError("boom")
+        out = await maps.session_action(None, "yard", str(row["session_id"]), "finish", m1.PUB,
+                                        on_finished=hook)
+        assert out["changed"] is True
 
     async def test_the_finish_action_calls_the_hook_once_after_a_change(self, fdb):  # noqa: F811
         fdb.add_map("yard")
@@ -354,6 +459,12 @@ class TestRoute:
             await api.edge_stats(None, seeded[1], "yard", **kw)
         assert exc.value.status_code == 422
 
+    async def test_an_arango_error_is_503_not_an_empty_answer(self, seeded):
+        seeded[1].edges_fail = True
+        with pytest.raises(HTTPException) as exc:
+            await api.edge_stats(None, seeded[1], "yard")
+        assert exc.value.status_code == 503 and "ArangoDB" in exc.value.detail
+
     async def test_unknown_map_is_404(self, seeded):
         with pytest.raises(HTTPException) as exc:
             await api.edge_stats(None, seeded[1], "nope")
@@ -392,7 +503,7 @@ class FakeSources:
         return self.graph.session_trace_nodes(map_id, session_id)
 
     def edges(self, map_id):
-        return self.graph.get_edges(map_id)
+        return self.graph.get_edges_strict(map_id)
 
 
 class FakeWrite:

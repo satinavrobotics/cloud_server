@@ -47,7 +47,10 @@ from packages.utils import map_sessions as ms
 logger = logging.getLogger(__name__)
 
 # Per-robot state that is always removed (it describes the robot, not its history).
-STATE_TABLES: Tuple[str, ...] = (ASSIGNMENTS_TABLE, ms.RUN_EPOCH_TABLE, "robot_latest")
+# edge_observations: the robot's per-edge traversal statistics go with it (so a session it closes
+# here is not recorded either).
+STATE_TABLES: Tuple[str, ...] = (ASSIGNMENTS_TABLE, ms.RUN_EPOCH_TABLE, "robot_latest",
+                                 "edge_observations")
 # robot_name-keyed history, removed with delete_telemetry (hypertables: a plain DELETE works,
 # also on compressed chunks).
 TELEMETRY_TABLES: Tuple[str, ...] = ("robot_state_ts", "diagnostics_ts", "robot_track_ts",
@@ -77,10 +80,8 @@ async def _delete_rows(cursor: Any, tables: Tuple[str, ...], robot_name: str) ->
 class RobotDeleter:
     def __init__(self, db: Any, switch: Optional[Any] = None,
                  livekit_remover: Optional[Callable[[str], Awaitable[Any]]] = None,
-                 arango_node_count: Optional[Callable[[str], int]] = None,
-                 on_session_finished: Optional[Callable[[Any], Awaitable[Any]]] = None):
+                 arango_node_count: Optional[Callable[[str], int]] = None):
         self.db = db
-        self.on_session_finished = on_session_finished
         self.switch = switch
         self.arango_node_count = arango_node_count
         self.livekit_remover = livekit_remover or LiveKitAdmin().remove_robot_participants
@@ -137,8 +138,6 @@ class RobotDeleter:
         robot, closed = await self._close_and_clear(robot_name, delete_telemetry, actor)
         actions: list = []
         for session in closed:  # best effort, never blocks the delete
-            if self.on_session_finished is not None:
-                await self.on_session_finished(session)
             actions += await maps.stop_services(self.db, self.switch, robot, session)
             # the topomap stopped (no mode change while it runs): save the SLAM map as a finish
             _, slam_action = await maps._save_slam(self.db, self.switch, session, robot,

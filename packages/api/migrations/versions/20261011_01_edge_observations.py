@@ -7,7 +7,7 @@ Create Date: 2026-10-11
 One row per observed traversal of a directed topomap edge (from_node -> to_node, ArangoDB node
 ids of `map_id`) by a robot, written when a mission run ends (mission-dispatch, from the run's
 legs, `source = 'leg'`, `source_key = '<run_id>:<seq>'`) and when a mapping session finishes (the
-API, from the session's nodes, `source = 'mapping'`, `source_key = '<session_id>'`). The primary
+API, from the session's nodes, `source = 'mapping'`, `source_key = '<session_id>:<step index>'`). The primary
 key is the source's own id, so writing the same run or session twice changes nothing.
 
 Only the newest 20 (config.EDGE_STATS_WINDOW) rows of each (map, from, to, robot) are kept
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS edge_observations (
   blocks       int NOT NULL DEFAULT 0,
   PRIMARY KEY (map_id, from_node, to_node, robot_name, source, source_key)
 );
-CREATE INDEX IF NOT EXISTS edge_observations_robot_idx ON edge_observations (robot_name, map_id);
+CREATE INDEX IF NOT EXISTS edge_observations_robot_idx ON edge_observations (robot_name, map_id);  -- robot delete
 """)
 
 

@@ -191,11 +191,13 @@ class FakeDB:
                 self.edge_obs[key] = row
                 cursor.rowcount = 1
         elif sql == edge_stats_db.PRUNE_SQL:
-            map_id, robot, _, _, window = params
+            map_id, robot, froms, tos, _, _, window = params
+            touched = set(zip(froms, tos))
             by_edge = {}
             for key, row in self.edge_obs.items():
-                if row["map_id"] == map_id and row["robot_name"] == robot:
-                    by_edge.setdefault((row["from_node"], row["to_node"]), []).append(key)
+                pair = (row["from_node"], row["to_node"])
+                if row["map_id"] == map_id and row["robot_name"] == robot and pair in touched:
+                    by_edge.setdefault(pair, []).append(key)
             for keys in by_edge.values():
                 keys.sort(key=lambda k: (self.edge_obs[k]["observed_at"], k[4], k[5]),
                           reverse=True)

@@ -13,7 +13,7 @@ kept, as the live writers do.
 
 The default is a DRY RUN: it counts and prints, writes nothing (the Postgres session is READ ONLY).
 `--apply` writes `edge_observations`; it is idempotent (the primary key is the source's own id:
-run_id:seq, session_id), so running it again, or after the live writers ran, adds nothing.
+run_id:seq, session_id:step), so running it again, or after the live writers ran, adds nothing.
 Environment as scripts/export_map.py (the services' names; `--compose-env FILE` reads
 docker_compose/.env for a run on the cloud host against localhost).
 """
@@ -93,14 +93,13 @@ def collect(sources: Any) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
 def write(cursor: Any, observations: Iterable[Mapping[str, Any]],
           window: Optional[int] = None) -> int:
     """The synchronous twin of edge_stats_db.store (same SQL). Returns the rows inserted."""
-    window = config.EDGE_STATS_WINDOW if window is None else window
-    inserted, touched = 0, set()
+    observations = list(observations)
+    inserted = 0
     for obs in observations:
         cursor.execute(db.INSERT_SQL, tuple(obs[c] for c in db.COLUMNS))
         inserted += max(0, cursor.rowcount)
-        touched.add((obs["map_id"], obs["robot_name"]))
-    for map_id, robot in sorted(touched):
-        cursor.execute(db.PRUNE_SQL, (map_id, robot, map_id, robot, window))
+    for params in db.prune_params(observations, window):
+        cursor.execute(db.PRUNE_SQL, params)
     return inserted
 
 

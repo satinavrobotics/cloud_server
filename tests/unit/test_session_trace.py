@@ -268,7 +268,7 @@ class TestArangoQuery:
         svc = self._service([{"id": "a"}])
         assert svc.session_trace_nodes("yard", "sid-1") == [{"id": "a"}]
         args, kwargs = svc.db.aql.execute.call_args
-        assert "FILTER n.session_id == @sid" in args[0] and "SORT n.timestamp" in args[0]
+        assert "FILTER n.session_id == @sid" in args[0] and "SORT (n.timestamp != null ? n.timestamp : n.created_at), n.session_node_id, n._key" in args[0]
         assert kwargs["bind_vars"] == {"@col": "nodes_yard", "sid": "sid-1"}
         svc.db.collection.return_value.add_persistent_index.assert_called_once_with(
             fields=["session_id"])

@@ -287,6 +287,20 @@ def _is_transient(exc: BaseException) -> bool:
     return isinstance(exc, (psycopg.OperationalError, psycopg_pool.PoolTimeout))
 
 
+def _is_lock_or_cancel(exc: BaseException) -> bool:
+    """A deadlock / serialization failure, lock timeout or cancelled statement: the database
+    refused THIS statement (psycopg raises them as OperationalError subclasses, which
+    _is_transient counts as connection-level)."""
+    try:
+        from psycopg import errors
+    except ImportError:  # pragma: no cover - the dispatcher always has it
+        return False
+    # DeadlockDetected / SerializationFailure are not subclasses of TransactionRollback here
+    return isinstance(exc, (errors.TransactionRollback, errors.DeadlockDetected,
+                            errors.SerializationFailure, errors.LockNotAvailable,
+                            errors.QueryCanceled))
+
+
 def _guarded(fn):
     """Recording hooks must never raise into mission handling."""
     @functools.wraps(fn)
@@ -1466,7 +1480,15 @@ class FleetRecorder:
                     if observations:
                         await edge_stats_db.store(cursor, observations)
         except Exception as exc:  # noqa: BLE001
-            if _is_transient(exc) or getattr(conn, "broken", False):
+            if getattr(conn, "broken", False):
+                raise
+            if _is_lock_or_cancel(exc):
+                # a deadlock / lock timeout / cancelled statement of this OPTIONAL writer: the
+                # savepoint is rolled back and the run end goes on (the legs stay in run_legs)
+                logger.warning("Could not record the edge observations of run %s: %s",
+                               info.run_id, exc)
+                return
+            if _is_transient(exc):
                 raise
             logger.exception("Could not record the edge observations of run %s", info.run_id)
 

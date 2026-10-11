@@ -500,9 +500,13 @@ RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
 # EDGE_STATS_WINDOW observations of each (map, edge, robot) are kept and summarised. An observation
 # with a duration over EDGE_STATS_MAX_DURATION_S (a paused session, a stuck robot) or a speed over
 # EDGE_STATS_MAX_SPEED_MPS (bursty MQTT delivery, a wrong clock) is dropped, as is a duration <= 0.
+# A MAPPING step (two consecutive session nodes) slower than EDGE_STATS_MIN_SPEED_MPS is dropped
+# too: the session was paused or the robot stood still, so its time is no traversal time (legs are
+# not filtered by a minimum speed).
 EDGE_STATS_WINDOW = int(os.getenv("EDGE_STATS_WINDOW", "20"))
 EDGE_STATS_MAX_DURATION_S = float(os.getenv("EDGE_STATS_MAX_DURATION_S", "3600.0"))
 EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", "5.0"))
+EDGE_STATS_MIN_SPEED_MPS = float(os.getenv("EDGE_STATS_MIN_SPEED_MPS", "0.02"))
 
 # ==================== Pre-mission go-to (API) ====================
 # packages/api/pre_goto.py: before a MAPPED mission is queued (POST /api/v1/missions) the server

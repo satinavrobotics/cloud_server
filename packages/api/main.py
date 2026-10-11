@@ -650,9 +650,9 @@ def _arango_node_count(name: str) -> int:
 
 
 async def _record_session_edges(session: Dict[str, Any]) -> None:
-    """A finished mapping session's per-edge observations (packages/api/edge_stats.py); never
-    raises."""
-    await edge_stats.record_session(service.database, service.graph_db, session)
+    """A finished mapping session's per-edge observations (packages/api/edge_stats.py), as a
+    background task: returns at once, never raises."""
+    edge_stats.schedule_record_session(service.database, service.graph_db, session)
 
 
 @app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
@@ -2049,8 +2049,7 @@ async def delete_robot(robot_name: str, delete_telemetry: bool = False,
     _require_service()
 
     return await RobotDeleter(service.database, service.mapping_switch,
-                              arango_node_count=_arango_node_count,
-                              on_session_finished=_record_session_edges).delete(
+                              arango_node_count=_arango_node_count).delete(
         robot_name, delete_telemetry=delete_telemetry, delete_rosbags=delete_rosbags,
         actor=recording.request_actor(), rosbag_deleter=_delete_rosbags_of)
 

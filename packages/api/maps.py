@@ -2516,8 +2516,6 @@ async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UU
     now = _utcnow()
     opened = await _open_tx(db, map_name, req, publisher_id, actor, node_counts, now)
     session, replaced, robot = opened.session, opened.replaced, opened.robot
-    if replaced is not None and on_finished is not None:
-        await on_finished(replaced)
     slam_warnings: List[str] = []
     actions: List[Dict[str, Any]] = []
     if replaced is not None:
@@ -2544,7 +2542,20 @@ async def _start_session(db: Any, map_name: str, req: Any, publisher_id: uuid.UU
         out["slam_warning"] = "; ".join(slam_warnings)
     if opened.warnings:
         out["warnings"] = list(opened.warnings)
+    if replaced is not None:  # after the robot actions (the hook only schedules a background task)
+        await _session_finished(on_finished, replaced)
     return out
+
+
+async def _session_finished(on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]],
+                            session: Dict[str, Any]) -> None:
+    """Call the finish hook of a session that was just finished; a failure is logged only."""
+    if on_finished is None:
+        return
+    try:
+        await on_finished(session)
+    except Exception:  # noqa: BLE001
+        logger.exception("Finish hook of session %s failed (ignored)", session.get("session_id"))
 
 
 async def place_session(db: Any, map_name: str, session_id: str, data: Any,
@@ -2763,7 +2774,8 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None
                          ) -> Dict[str, Any]:
     """pause / resume / finish (see the module docstring). `on_finished(session)` is awaited
-    after a finish committed (the edge statistics of the session; it must not raise). After the commit, resume starts the
+    once after a finish committed, after the robot actions and the robot's lock are done (the
+    edge statistics of the session: it must only schedule work; its failure is logged). After the commit, resume starts the
     session's services on the robot's orchestrator (SLAM first when `slam` is in them) and
     pause / finish stop them; a repeat retries. What failed never fails or undoes the action:
     `robot_actions` reports it. Resume has the guards of a start: 409 while a relocalization
@@ -2797,8 +2809,6 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                                                     publisher_id, actor, switch,
                                                     counts.get(map_name))
         slam_warning = None
-        if action == "finish" and out["changed"] and on_finished is not None:
-            await on_finished(session)
         if action == "resume":
             actions, slam_warning = await start_session_services(db, switch, session, robot)
         else:
@@ -2810,6 +2820,8 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
         out.update(await notify_robot(switch, db, out["session"]["robot_name"], actions=actions))
         if slam_warning:
             out["slam_warning"] = slam_warning
+    if action == "finish" and out["changed"]:
+        await _session_finished(on_finished, session)
     return out
 
 

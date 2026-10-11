@@ -6,17 +6,23 @@ An observation is one robot traversing one directed topomap edge (from -> to) on
 - `leg`: a mission leg (run_legs: one robot move from one topomap node to the next). source_key
   `<run_id>:<seq>`. Carries the recoveries / blocks seen on the leg.
 - `mapping`: two consecutive nodes of a mapping session (packages/utils/session_trace.py steps).
-  source_key `<session_id>`. No recoveries / blocks.
+  source_key `<session_id>:<step index>` (the index of the later node in the session's order, so
+  a second traversal of the same directed pair in one session is its own observation). No
+  recoveries / blocks.
 
 Only an observation on a pair that IS a topomap edge counts (`on_edges`): the graph builder joins
 a new node to every node within its distance threshold, so consecutive mapping nodes are usually
 but not always connected, and a leg between two route nodes of a mission need not be an edge.
-Observations with a duration <= 0 or over EDGE_STATS_MAX_DURATION_S, or a speed over
-EDGE_STATS_MAX_SPEED_MPS, are dropped (`reject_reason`). The statistics (`group_stats`) are
+Observations with a duration <= 0 (after rounding to milliseconds, as stored) or over
+EDGE_STATS_MAX_DURATION_S, a non-finite distance / duration, or a speed over
+EDGE_STATS_MAX_SPEED_MPS, are dropped (`reject_reason`). A mapping step slower than
+EDGE_STATS_MIN_SPEED_MPS (a session paused or the robot standing still between two nodes) is
+dropped too: its time is not a traversal time (legs are not filtered this way). The statistics (`group_stats`) are
 computed from the newest EDGE_STATS_WINDOW observations of each (map, edge, robot).
 Nothing here touches a database; see packages/utils/run_legs.py for the same structure.
 """
 import datetime
+import math
 import statistics
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -29,15 +35,22 @@ EdgeKey = Tuple[str, str]                 # (from node id, to node id)
 
 
 def reject_reason(duration_s: Optional[float], distance_m: Optional[float]) -> Optional[str]:
-    """Why an observation is unusable (None when it is fine): no / non-positive duration, a
-    duration over EDGE_STATS_MAX_DURATION_S, or a speed (distance / duration, when the distance is
-    known) over EDGE_STATS_MAX_SPEED_MPS."""
-    if duration_s is None or not duration_s > 0:
+    """Why an observation is unusable (None when it is fine): no / non-finite / non-positive
+    duration (judged after the rounding to milliseconds that is stored), a duration over
+    EDGE_STATS_MAX_DURATION_S, a non-finite distance, or a speed (distance / duration, when the
+    distance is known) over EDGE_STATS_MAX_SPEED_MPS."""
+    if duration_s is None or not math.isfinite(duration_s):
+        return "duration"
+    duration_s = round(duration_s, 3)
+    if not duration_s > 0:
         return "duration"
     if duration_s > config.EDGE_STATS_MAX_DURATION_S:
         return "too_long"
-    if distance_m is not None and distance_m / duration_s > config.EDGE_STATS_MAX_SPEED_MPS:
-        return "too_fast"
+    if distance_m is not None:
+        if not math.isfinite(distance_m):
+            return "distance"
+        if distance_m / duration_s > config.EDGE_STATS_MAX_SPEED_MPS:
+            return "too_fast"
     return None
 
 
@@ -45,9 +58,10 @@ def _observation(map_id: str, src: str, dst: str, robot: str, source: str, sourc
                  observed_at: datetime.datetime, duration_s: float,
                  distance_m: Optional[float], recoveries: int = 0, blocks: int = 0
                  ) -> Dict[str, Any]:
+    duration_s = round(duration_s, 3)
     return {"map_id": map_id, "from_node": src, "to_node": dst, "robot_name": robot,
             "source": source, "source_key": source_key, "observed_at": observed_at,
-            "duration_s": round(duration_s, 3),
+            "duration_s": duration_s,
             "distance_m": None if distance_m is None else round(distance_m, 4),
             "speed_mps": (round(distance_m / duration_s, 4) if distance_m is not None else None),
             "recoveries": int(recoveries), "blocks": int(blocks)}
@@ -74,17 +88,20 @@ def session_observations(map_id: str, session_id: str, robot_name: str,
                          nodes: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """The observations of a mapping session: `nodes` as session_trace.order() returns them
     (dicts with id, x, y, time, capture). One per consecutive pair whose step has a distance and
-    a usable duration; observed_at = the later node's time on the clock the step used."""
+    a usable duration and a speed of at least EDGE_STATS_MIN_SPEED_MPS; observed_at = the later
+    node's time on the clock the step used; source_key `<session_id>:<index of the later node>`."""
     out = []
-    for prev, cur, st in zip(nodes, nodes[1:], trace.steps(nodes)[1:]):
+    for index, (prev, cur, st) in enumerate(zip(nodes, nodes[1:], trace.steps(nodes)[1:]), 1):
         if not st or st["distance_m"] is None or reject_reason(st["dt_s"], st["distance_m"]):
+            continue
+        if st["distance_m"] / round(st["dt_s"], 3) < config.EDGE_STATS_MIN_SPEED_MPS:
             continue
         if str(prev["id"]) == str(cur["id"]):
             continue
         both = prev.get("capture") is not None and cur.get("capture") is not None
         when = cur["capture"] if both else cur.get("time")
         out.append(_observation(map_id, str(prev["id"]), str(cur["id"]), robot_name,
-                                SOURCE_MAPPING, str(session_id), when, st["dt_s"],
+                                SOURCE_MAPPING, f"{session_id}:{index}", when, st["dt_s"],
                                 st["distance_m"]))
     return out
 

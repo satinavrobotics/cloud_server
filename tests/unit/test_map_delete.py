@@ -87,6 +87,8 @@ class FakeCursor:
             db.sessions_deleted.append(params[0])
         elif sql == map_delete.RECONSTRUCTIONS_SQL:
             db.reconstructions_deleted.append(params[0])
+        elif sql == map_delete.EDGE_OBSERVATIONS_SQL:
+            db.edge_observations_deleted.append(params[0])
         elif sql == emit_mod.INSERT_SQL:
             if db.fail_events:
                 raise RuntimeError("fleet_events unavailable")
@@ -149,6 +151,7 @@ class FakeDb:
         self.statements = []
         self.sessions_deleted = []
         self.reconstructions_deleted = []
+        self.edge_observations_deleted = []
         self.robots = {}
         self.locks = {} if locks is None else locks
         self.fail_events = False
@@ -224,6 +227,7 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     assert "site_a" not in db.rows
     assert db.sessions_deleted == ["site_a"]  # its mapping sessions go with the row
     assert db.reconstructions_deleted == ["site_a"]  # and its reconstruction jobs (R3)
+    assert db.edge_observations_deleted == ["site_a"]  # and its edge statistics
     assert graph.calls == ["site_a"] and images.calls == ["site_a"]
     assert [p[1].split(" ", 1)[1] for p in db.notifies] == ["site_a DELETING", "site_a DELETED"]
     assert sleeps == []
