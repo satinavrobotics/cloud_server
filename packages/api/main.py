@@ -683,10 +683,30 @@ async def clear_blocked_node(map_id: str, graph_node_id: str):
     return {"map_id": map_id, "graph_node_id": graph_node_id, "cleared": True}
 
 
-async def _reroute_through_blocked(reroute: Dict[str, Any]) -> List[Dict[str, Any]]:
+async def _mission_half_width(robot_name: Optional[str]) -> Optional[float]:
+    """The overlay half width of the mission's robot (blocked_geometry.half_width_for of its
+    factsheet, as the planner's overlay uses); None when the robot cannot be read, which keeps
+    the BLOCKED_SEGMENT_HALF_WIDTH_M constant."""
+    if not robot_name:
+        return None
+    try:
+        robot = await service.database.get_object(RobotObjectV1, str(robot_name))
+        factsheet = robot.status.factsheet
+        from packages.utils import blocked_geometry
+        return blocked_geometry.half_width_for(getattr(factsheet, "length", None),
+                                               getattr(factsheet, "width", None))
+    except Exception as err:  # pylint: disable=broad-except
+        logging.info("Robot %s footprint not readable (%s); reroute check uses the constant "
+                     "half width", robot_name, err)
+        return None
+
+
+async def _reroute_through_blocked(reroute: Dict[str, Any],
+                                   half_width_m: Optional[float] = None) -> List[Dict[str, Any]]:
     """The active blocked-node rows a reroute's waypoints go through, by the planner's rule
     (blocked_nodes.row_blocks): each route's first waypoint, where the robot starts, is
-    never blocked."""
+    never blocked. `half_width_m`: the rerouted robot's half width (`_mission_half_width`);
+    None keeps the constant."""
     rows_by_map: Dict[str, List[Dict[str, Any]]] = {}
     hits: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for route in reroute.values():
@@ -707,7 +727,8 @@ async def _reroute_through_blocked(reroute: Dict[str, Any]) -> List[Dict[str, An
             polyline = [xy for _, xy in blocked_nodes.route_points(
                 [w for w in waypoints if w.get("map_id") == map_id], skip_first=False)
                 if xy is not None]
-            for row in blocked_nodes.rows_hit(rows_by_map[map_id], points, polyline=polyline):
+            for row in blocked_nodes.rows_hit(rows_by_map[map_id], points, polyline=polyline,
+                                              half_width_m=half_width_m):
                 hits[(map_id, str(row["graph_node_id"]))] = row
     return list(hits.values())
 
@@ -2375,12 +2396,26 @@ async def get_run_timeline(run_id: uuid.UUID):
 
 
 @app.get("/api/v1/runs/{run_id}/legs")
-async def get_run_legs(run_id: uuid.UUID):
+async def get_run_legs(run_id: uuid.UUID, with_chart_keys: bool = False):
     """The legs of one run in order: each robot move from one topomap node to the next, with
     robot-clock start/end, duration, distances, expected time, recoveries and blocks.
-    `{"run_id", "items": [leg...]}`; empty when the run recorded none. 404 if unknown."""
+    `{"run_id", "items": [leg...]}`; empty when the run recorded none. 404 if unknown.
+    With `with_chart_keys=true` each leg also has `chart_keys`, the scene-graph charts its
+    node-to-node line crosses (read time, best effort: absent when the map has no scene graph or
+    it could not be read in time; null for a leg whose node positions are unknown)."""
     _require_service()
-    return await _site_call("get run legs", fleet_reads.run_legs_list(service.database, run_id))
+    out = await _site_call("get run legs", fleet_reads.run_legs_list(service.database, run_id))
+    if with_chart_keys and out.get("items"):
+        from packages.utils import blocked_chart_tags
+
+        def node_xy(map_id: str, node_id: str):
+            node = service.graph_db.get_node(map_id, node_id)
+            try:
+                return float(node["x"]), float(node["y"])
+            except (TypeError, KeyError, ValueError):
+                return None
+        await blocked_chart_tags.add_leg_chart_keys(out["items"], node_xy, _scene_graph_reads)
+    return out
 
 
 @app.get("/api/v1/runs/{run_id}/track")
@@ -2616,7 +2651,8 @@ async def update_mission(mission_name: str, mission_data: dict):
             # A route through a node a robot just reported blocked would send the robot
             # straight back to it (2026-10-08); the operator can force it.
             try:
-                through = await _reroute_through_blocked(reroute)
+                through = await _reroute_through_blocked(
+                    reroute, await _mission_half_width(getattr(mission, "robot", None)))
             except Exception as err:  # pylint: disable=broad-except
                 logging.warning("Blocked graph nodes not readable (%s); reroute not "
                                 "checked against them", err)

@@ -85,3 +85,50 @@ async def add_chart_keys(rows: List[Dict[str, Any]], map_id: str, get_reads: Cal
         logging.getLogger(__name__).info("No chart keys for blocked nodes of map %s: %s",
                                          map_id, err or type(err).__name__)
         return False
+
+
+MAX_LEG_NODES = 400           # distinct topomap nodes looked up per request (one query each)
+
+
+async def add_leg_chart_keys(legs: List[Dict[str, Any]],
+                             node_xy: Callable[[str, str], Optional[Tuple[float, float]]],
+                             get_reads: Callable[[], Any], timeout_s: float = TIMEOUT_S) -> bool:
+    """Set `chart_keys` on each run leg (in place) from the scene-graph charts its straight
+    topomap-node-to-node line crosses (`blocked_geometry.leg_chart_keys`); True when any map
+    was tagged. A leg whose nodes have no position gets `chart_keys: None`; a map without a
+    readable graph is left untouched. `node_xy(map_id, node_id)` is blocking (run in a thread).
+    Never raises."""
+    try:
+        by_map: Dict[str, List[Dict[str, Any]]] = {}
+        for leg in legs:
+            if leg.get("map_id") and leg.get("from_topomap_node") and leg.get("to_topomap_node"):
+                by_map.setdefault(str(leg["map_id"]), []).append(leg)
+        wanted = {(m, str(leg[k])) for m, group in by_map.items() for leg in group
+                  for k in ("from_topomap_node", "to_topomap_node")}
+        if not wanted or len(wanted) > MAX_LEG_NODES:
+            return False
+        loop = asyncio.get_running_loop()
+
+        async def tag_map(map_id: str, group: List[Dict[str, Any]]) -> bool:
+            xy: Dict[str, Optional[Tuple[float, float]]] = {}
+            for node in {str(leg[k]) for leg in group for k in ("from_topomap_node", "to_topomap_node")}:
+                xy[node] = await loop.run_in_executor(None, node_xy, map_id, node)
+            pts = [p for p in xy.values() if p is not None]
+            if not pts:
+                return False
+            locate = await _locator(get_reads(), map_id, pts)
+            if locate is None:
+                return False
+            for leg in group:
+                a, b = xy.get(str(leg["from_topomap_node"])), xy.get(str(leg["to_topomap_node"]))
+                leg["chart_keys"] = None if a is None or b is None else \
+                    blocked_geometry.leg_chart_keys([a, b], locate)[0]
+            return True
+
+        async def run() -> bool:
+            done = [await tag_map(m, g) for m, g in by_map.items()]
+            return any(done)
+        return await asyncio.wait_for(run(), timeout_s)
+    except Exception as err:  # pylint: disable=broad-except
+        logging.getLogger(__name__).info("No chart keys for run legs: %s", err or type(err).__name__)
+        return False

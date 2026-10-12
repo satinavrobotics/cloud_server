@@ -388,3 +388,43 @@ async def test_purge_expired_runs_at_most_once_per_interval():
     assert db.log[0][1] == (blocked_nodes.PURGE_AFTER_S,)
     await blocked_nodes.purge_expired(db, now=1000.0 + blocked_nodes.PURGE_EVERY_S)
     assert len(db.log) == 2
+
+
+async def test_the_reroute_check_uses_the_robots_half_width(monkeypatch):
+    # A row with the robot's pose at (-1,0), blocked waypoint (2,0): a leg 0.4 m beside the
+    # segment passes for a narrow robot and is refused for a wide one.
+    row = _row("2", 2.0, 0.0)
+    row["robot_x"], row["robot_y"] = -1.0, 0.0
+    leg = [{"x": 0.0, "y": 0.4, "map_id": "M", "node_id": "a"},
+           {"x": 3.0, "y": 0.4, "map_id": "M", "node_id": "b"}]
+    monkeypatch.setattr(api_main, "service", SimpleNamespace(database=_Db([row])))
+    assert await api_main._reroute_through_blocked({"go": {"waypoints": leg}}, 0.2) == []
+    assert len(await api_main._reroute_through_blocked({"go": {"waypoints": leg}}, 0.5)) == 1
+    assert len(await api_main._reroute_through_blocked({"go": {"waypoints": leg}})) == 1  # constant 0.5
+
+
+async def test_mission_half_width_reads_the_factsheet_and_degrades(monkeypatch):
+    from unittest.mock import AsyncMock
+    fs = SimpleNamespace(length=1.2, width=0.6)
+    robot = SimpleNamespace(status=SimpleNamespace(factsheet=fs))
+    db = SimpleNamespace(get_object=AsyncMock(return_value=robot))
+    monkeypatch.setattr(api_main, "service", SimpleNamespace(database=db))
+    assert await api_main._mission_half_width("r1") == pytest.approx(0.3)
+    fs.length = fs.width = -1.0                          # factsheet not received yet
+    from packages.utils import blocked_geometry
+    assert await api_main._mission_half_width("r1") == blocked_geometry.HALF_WIDTH_M
+    db.get_object.side_effect = RuntimeError("down")
+    assert await api_main._mission_half_width("r1") is None
+    assert await api_main._mission_half_width(None) is None
+
+
+def test_an_edge_row_without_the_robots_pose_stays_a_point_disc():
+    """Documented limit (integration.md, Blocked overlay 8): the row has edge_from / edge_to ids
+    but no position of edge_from, so only the blocked waypoint is known: a disc, not a segment."""
+    from packages.utils import blocked_geometry
+    row = _row("2", 2.0, 0.0)
+    row["edge_from"], row["edge_to"] = "1", "2"
+    assert blocked_geometry.row_segment(row) is None
+    assert blocked_geometry.overlay([row], 0.5) == ([(2.0, 0.0, 0.5)], [])
+    assert blocked_nodes.rows_hit([row], [(None, (2.1, 0.0))], polyline=[(0.0, 0.3), (3.0, 0.3)])
+    assert not blocked_nodes.rows_hit([row], [(None, (5.0, 0.0))], polyline=[(0.0, 0.3), (1.0, 0.3)])

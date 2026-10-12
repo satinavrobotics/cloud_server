@@ -31,11 +31,12 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_MAX_VERSION_LAG_S` | 120.0 | planner | graph older than the ingest by more than this -> `stale_graph`; 0 disables |
 | `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.0 | planner | route narrower than factsheet width + margin -> `too_narrow` (only when the check is enabled) |
 | `SCENE_GRAPH_WIDTH_CHECK_ENABLED` | false | planner | gates `too_narrow`: engine `Route.min_width` is not the passage width yet (open defect), so it is off |
-| `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag) |
+| `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag); maps with `status.scene_graph_enabled` = false are skipped (a failed registry query loads every map) |
 
 Not env-configurable (`WorkerConfig`/`RunnerConfig` defaults): nodes read per step 200, replay margin 60 s, PNG retry
 2 s / expiry 60 s, rebuild-request check 30 s, backoff 10 s, `commit_retries` 5, `empty_rebuild_confirmations` 2, map
-discovery 60 s, `max_maps` 64, terminal retry 60 s, needs_rebuild retry 300 s.
+discovery 60 s, `max_maps` 64, terminal retry 60 s, needs_rebuild retry 300 s. Planner `GraphCache` load back-off: 5 s doubling to 300 s per map
+(`BACKOFF_BASE_S` / `BACKOFF_MAX_S`), reset by the next successful load.
 
 **Compose (31dae3f).** `mission_dispatch_services.yaml` forwards `SCENE_GRAPH_WORKER_ENABLED` and the worker tuning
 variables to `graph-builder-service`, `SCENE_GRAPH_WORKER_ENABLED` to `api-delegation-service`, and the planner
@@ -176,7 +177,7 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | `store_timeout` / `store_error` | store open or `meta` timed out (> `LOAD_TIMEOUT_S`) / raised | Arango/MinIO slow or down; check their health |
 | `no_graph` | map has no saved version | map not enabled, never ingested, or emptied (version 0 rebuild) |
 | `load_timeout` | cold graph load took > `LOAD_TIMEOUT_S`; it continues in the background and fills the cache | only when no older version of the map is cached (first request after restart; pre-warm avoids it). A newer version is loaded in the background (single flight) while the newest cached one is served, bounded by `stale_graph`. Persistent on a quiet map = graph too large for the timeout |
-| `load_error` | `store.load` raised | store/snapshot problem; see worker `save` failures and planner log |
+| `load_error` | `store.load` raised, or the map is in load back-off after a failed load (5 s doubling to 300 s; no new load per request; an older cached version is served meanwhile) | store/snapshot problem; see worker `save` failures and planner log (`scene graph load ... failed`) |
 | `stale_graph` | oldest costmap stored after the version's cursor is older than `MAX_VERSION_LAG_S` | worker behind, stalled, or map switched off while uploads continue. Unknown lag (no cursor, query error) never rejects |
 | `start_no_navigable_space` / `goal_no_navigable_space` | no free cell near the point | robot pose or goal outside mapped free space |
 | `start_too_far` / `goal_too_far` | nearest free cell beyond the snap limit (0.5 m / 1.5 m) | pose inaccurate or goal tapped in a wall; raise snap only with care |
@@ -252,7 +253,7 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | Planner always `load_timeout` | no cached version yet: map size, MinIO latency, pre-warm failed (planner log) | wait for the background load, set `SCENE_GRAPH_PREWARM_MAPS`, or raise `LOAD_TIMEOUT_S` within the 5 s dispatcher budget |
 | Planner always `stale_graph` | lag: worker stalled, behind, or map disabled while uploads continue | fix ingest, re-enable the map, or (last resort) `MAX_VERSION_LAG_S` higher / 0 |
 | Planner `store_unavailable` | planner env has ARANGO_*/MINIO_*; retry is every 30 s | fix env/network, restart planner |
-| Route clips a known obstacle / robot refuses leg | active `blocked-nodes` rows (`GET /api/v1/maps/{id}/blocked-nodes?with_chart_keys=true`); migration applied | clear/expire row; check migration |
+| Route clips a known obstacle / robot refuses leg | active `blocked-nodes` rows (`GET /api/v1/maps/{id}/blocked-nodes?with_chart_keys=true`; run legs: `GET /api/v1/runs/{id}/legs?with_chart_keys=true`); migration applied | clear/expire row; check migration |
 | Blocked rows missing pose (disc rule only) | columns NULL: rows written before the migration or without localization | none; expire naturally |
 | Map delete stuck at `scene_graph` | `scene_graph: lock ...` in saga error; the worker holds the lock during a long fold | retried with backoff; if persistent, disable the map and wait for release (~2 min) |
 | Open-field map extremely slow / `slow fold` warnings | fold times in the log | disable the map; keep the planner off for it |

@@ -328,7 +328,8 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
   -1 until the factsheet arrives -> params default, counted. Known cost: optimistic for a long robot (a passage it
   cannot turn in can look navigable); `Route.min_width` is checked against the same rule so it does not cover length.
   Revisit before the planner switches on for a robot with length >> width.
-* Leg recording on lattice routes: chart keys for new run views, leaf-edge views for legacy only.
+* Leg recording on lattice routes: chart keys for new run views (derived at read time,
+  `GET /runs/{id}/legs?with_chart_keys=true`), leaf-edge views for legacy only.
 
 ### CIMBI's answers to the store requests (2026-10-12; store.py semantics are theirs)
 
@@ -383,8 +384,9 @@ the blocked waypoint; `route_hits_row` tests the route's legs against it; `overl
    (`half_width_for(length, width)`, floor 0.05 m); the constant `BLOCKED_SEGMENT_HALF_WIDTH_M` (0.5) only while the
    footprint is unknown (-1). **The lead scales with it** (`lead_for`: at least `LEAD_M` 1.0 and half width + 0.5),
    keeping lead > half width (or a leg leaving the robot sideways is "blocked" by its own start). The planner
-   (`_overlay_half_width`) passes the robot's value; `_reroute_through_blocked` in `packages/api/main.py` has no
-   robot and still uses the constant.
+   (`_overlay_half_width`) passes the robot's value; the reroute check (`_reroute_through_blocked` in
+   `packages/api/main.py`, from `PUT /missions/{name}` with `update_nodes`) takes the mission's robot's factsheet the
+   same way (`_mission_half_width`, one `RobotObjectV1` read); an unreadable robot keeps the constant.
 2. **Migration `20261012_01_blocked_geometry`** (additive, nullable, no backfill; downgrade drops them). Four
    columns, `robot_x, robot_y, prev_x, prev_y`; only `robot_x/robot_y` are written (robot position in the map frame
    at the report, from the reporting state, taken to the map frame by the order's transform). `prev_x`/`prev_y` are
@@ -401,9 +403,19 @@ the blocked waypoint; `route_hits_row` tests the route's legs against it; `overl
    half width from the obstacle is refused until the block expires or is cleared.
 6. **Chart keys are derived at read time, nothing is stored**: `leg_chart_keys(polyline, locate)` and
    `row_chart_keys(row, locate)` (`blocked_geometry`, `blocked_chart_tags`). `GET .../blocked-nodes?with_chart_keys=true`
-   adds `chart_keys` per row, best effort (no graph, no pose or a store error leaves it out). Run legs cannot carry
-   chart keys without a migration, so run views of chart routes stay keyed by the legacy leaf ids (the "Leg recording
-   on lattice routes" decision stays pending).
+   adds `chart_keys` per row, best effort (no graph, no pose or a store error leaves it out). **Run legs the same way,
+   no migration**: `GET /api/v1/runs/{run_id}/legs?with_chart_keys=true` adds `chart_keys` to each leg: the charts the
+   straight line from the position of `from_topomap_node` to that of `to_topomap_node` crosses
+   (`blocked_chart_tags.add_leg_chart_keys`; node positions by `graph_db.get_node`, at most 400 distinct nodes, one
+   owner-plane read per map, 2 s). Absent on every leg when the map has no readable graph, `null` for a leg whose node
+   positions are unknown. The stored legs are untouched, so a legacy run gets keys too. The mission aggregate
+   (`/missions/{name}/legs`) is not tagged.
+8. **Edge rows are not segments (documented limit)**: a row with `edge_from`/`edge_to` but no robot pose (reported
+   after an offline gap, or written before the pose columns) has only the position of the blocked waypoint, so it is
+   a disc (point rule) like any pose-less row. The position of `edge_from` is not in the row (`prev_x`/`prev_y` are not
+   written, item 2) and a segment from the previous waypoint would also condemn the stretch the robot just drove.
+   Making it a segment needs a graph lookup of `edge_from` in the reader (planner, API) or writing `prev_x/prev_y`
+   again; not done.
 7. **`run_id` of a blocked row** is derived from `vda_node_id` (`run_id_of`: the dispatcher's run prefix) and
    resolved against `mission_runs` (`resolve_run_ids`: the run of the same mission and robot that started last
    before the report). Exact for the first pass of a mission; a heuristic for repeat passes (the recorder keeps the

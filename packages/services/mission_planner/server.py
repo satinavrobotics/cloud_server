@@ -135,6 +135,17 @@ class MissionPlannerService:
             if not maps:
                 maps = await asyncio.get_running_loop().run_in_executor(
                     None, self.graph_db.list_maps)
+            try:
+                # a map switched off (status.scene_graph_enabled = false) is not worth a load
+                off = await scene_route.disabled_maps(self.database, maps)
+                if off:
+                    self.logger.info(f"Scene graph pre-warm skips disabled maps {sorted(off)}")
+                maps = [m for m in maps if str(m) not in off]
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # pylint: disable=broad-except
+                self.logger.warning(f"Scene graph pre-warm cannot read the per-map switch "
+                                    f"({err!r}); loading every map")
             sem = asyncio.Semaphore(max(1, int(config.SCENE_GRAPH_PREWARM_CONCURRENCY)))
 
             async def one(map_id: str) -> None:

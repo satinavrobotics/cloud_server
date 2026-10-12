@@ -197,3 +197,81 @@ async def test_list_default_is_unchanged_and_chart_keys_are_opt_in(monkeypatch):
     monkeypatch.setattr(api_main, "_scene_graph_reads", lambda: _Reads(fail=True))
     resp = await _get(db, "/api/v1/maps/M/blocked-nodes?with_chart_keys=true")
     assert resp.status_code == 200 and "chart_keys" not in resp.json()["blocked_nodes"][0]
+
+
+# --- (C) chart keys of run legs ------------------------------------------------------------
+def test_add_leg_chart_keys_tags_legs_by_the_charts_their_line_crosses():
+    pos = {("M", "n1"): (1.0, 1.0), ("M", "n2"): (9.0, 1.0), ("M", "n3"): (2.0, 1.0)}
+    legs = [{"map_id": "M", "from_topomap_node": "n1", "to_topomap_node": "n2"},
+            {"map_id": "M", "from_topomap_node": "n1", "to_topomap_node": "n3"},
+            {"map_id": "M", "from_topomap_node": "n1", "to_topomap_node": "gone"},
+            {"map_id": "M", "from_topomap_node": None, "to_topomap_node": "n2"}]
+    assert asyncio.run(tags.add_leg_chart_keys(legs, lambda m, n: pos.get((m, n)), lambda: _Reads()))
+    assert legs[0]["chart_keys"] == ["A:0", "B:1"]
+    assert legs[1]["chart_keys"] == ["A:0"]
+    assert legs[2]["chart_keys"] is None            # a node without a position
+    assert "chart_keys" not in legs[3]              # not a node-to-node leg
+
+
+def test_add_leg_chart_keys_is_best_effort():
+    legs = [{"map_id": "M", "from_topomap_node": "a", "to_topomap_node": "b"}]
+    xy = lambda m, n: (1.0, 1.0)  # noqa: E731
+    for reads in (_Reads(available=False), _Reads(fail=True)):
+        assert not asyncio.run(tags.add_leg_chart_keys(legs, xy, lambda r=reads: r))
+        assert "chart_keys" not in legs[0]
+
+    def broken(m, n):
+        raise RuntimeError("db")
+    assert not asyncio.run(tags.add_leg_chart_keys(legs, broken, lambda: _Reads()))
+    assert not asyncio.run(tags.add_leg_chart_keys([], xy, lambda: _Reads()))
+    many = [{"map_id": "M", "from_topomap_node": f"a{i}", "to_topomap_node": f"b{i}"}
+            for i in range(tags.MAX_LEG_NODES)]
+    assert not asyncio.run(tags.add_leg_chart_keys(many, xy, lambda: _Reads()))
+
+
+class _LegsDb(_Db):
+    def cursor(self):
+        db = self
+
+        class _C:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def execute(self, sql, params=None):
+                self.sql = sql
+
+            async def fetchone(self):
+                return db.runs[0]
+
+            async def fetchall(self):
+                from packages.api import fleet_reads
+                row = {c: None for c in fleet_reads.LEG_COLUMNS}
+                row.update(run_id=str(uuid.uuid4()), seq=1, map_id="M", from_topomap_node="n1",
+                           to_topomap_node="n2")
+                return [tuple(row[c] for c in fleet_reads.LEG_COLUMNS)]
+        return _C()
+
+
+@pytest.mark.asyncio
+async def test_run_legs_endpoint_chart_keys_are_opt_in(monkeypatch):
+    from packages.api import fleet_reads
+    monkeypatch.setattr(fleet_reads, "_fetch_run", lambda cur, run_id: asyncio.sleep(0))
+    monkeypatch.setattr(api_main, "_scene_graph_reads", lambda: _Reads())
+    nodes = {"n1": (1.0, 1.0), "n2": (9.0, 1.0)}
+    graph_db = SimpleNamespace(get_node=lambda m, n: {"x": nodes[n][0], "y": nodes[n][1]})
+    db = _LegsDb([(1,)])
+    url = f"/api/v1/runs/{uuid.uuid4()}/legs"
+
+    async def get(suffix):
+        api_main.service, previous = SimpleNamespace(database=db, graph_db=graph_db), api_main.service
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api_main.app),
+                                         base_url="http://t") as client:
+                return (await client.get(url + suffix)).json()
+        finally:
+            api_main.service = previous
+    assert "chart_keys" not in (await get(""))["items"][0]
+    assert (await get("?with_chart_keys=true"))["items"][0]["chart_keys"] == ["A:0", "B:1"]

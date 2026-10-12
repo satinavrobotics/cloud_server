@@ -133,13 +133,19 @@ class GraphCache:
     """Loaded scene graphs by (map, version), a small LRU. `store_factory()` returns the store (called
     lazily, in a worker thread, because it connects). `get` never waits longer than `load_timeout_s`:
     a cold load keeps running in its thread, shared by later requests, and fills the cache when it
-    ends; this request falls back."""
+    ends; this request falls back. A load that FAILS backs the map off (exponential from
+    `backoff_base_s`, capped at `backoff_max_s`, reset by the next successful load): until it
+    ends no new load is started for the map's versions, a request with an older version cached
+    is served from it and one without falls back `load_error`, as the failed load itself did."""
 
     RETRY_STORE_S = 30.0
+    BACKOFF_BASE_S = 5.0
+    BACKOFF_MAX_S = 300.0
 
     def __init__(self, store_factory: Callable[[], Any], max_entries: int = 4,
                  load_timeout_s: float = 2.0, clock: Callable[[], float] = None,
-                 versions_per_map: int = 2):
+                 versions_per_map: int = 2, backoff_base_s: Optional[float] = None,
+                 backoff_max_s: Optional[float] = None):
         import time
         self._factory = store_factory
         self._max = max(1, int(max_entries))
@@ -153,6 +159,9 @@ class GraphCache:
         self.loads = 0                 # store.load calls started (tests, metrics)
         self._cursors: Dict[Tuple[str, int], Any] = {}   # (map, version) -> its ingest cursor
         self._served: Dict[str, int] = {}                # map -> version `get` last returned
+        self._backoff_base = self.BACKOFF_BASE_S if backoff_base_s is None else float(backoff_base_s)
+        self._backoff_max = self.BACKOFF_MAX_S if backoff_max_s is None else float(backoff_max_s)
+        self._failures: Dict[str, Tuple[int, float]] = {}   # map -> (consecutive failures, retry at)
 
     def _open_store(self):
         if self._store is not None:
@@ -168,7 +177,17 @@ class GraphCache:
             raise ChartFallback("store_unavailable") from err
         return self._store
 
+    def _backed_off(self, map_id: str) -> bool:
+        failure = self._failures.get(map_id)
+        return failure is not None and self._clock() < failure[1]
+
+    def _note_failure(self, map_id: str) -> None:
+        count = self._failures.get(map_id, (0, 0.0))[0] + 1
+        delay = min(self._backoff_max, self._backoff_base * (2 ** min(count - 1, 30)))
+        self._failures[map_id] = (count, self._clock() + delay)
+
     def _insert(self, key, graph) -> None:
+        self._failures.pop(key[0], None)
         self._graphs[key] = graph
         self._graphs.move_to_end(key)
         # at most `versions_per_map` graphs of one map (a 90 m graph is large), then the global LRU
@@ -192,6 +211,7 @@ class GraphCache:
             self._loading.pop(key, None)
             if f.cancelled() or f.exception() is not None:
                 if not f.cancelled():
+                    self._note_failure(key[0])
                     _log.warning("scene graph load %s failed: %s", key, f.exception())
                 return
             self._insert(key, f.result())
@@ -249,6 +269,15 @@ class GraphCache:
             self._graphs.move_to_end(key)
             self._served[map_id] = key[1]
             return self._graphs[key], key[1]
+        if key not in self._loading and self._backed_off(map_id):
+            # the last load of this map failed a moment ago: do not start another per request
+            older = [k for k in self._graphs if k[0] == map_id and k[1] < key[1]]
+            if not older:
+                raise ChartFallback("load_error")
+            prev = max(older, key=lambda k: k[1])
+            self._graphs.move_to_end(prev)
+            self._served[map_id] = prev[1]
+            return self._graphs[prev], prev[1]
         fut = self._start_load(store, key, loop)
         # A newer version than the cached one: refresh in the background (the load above is single
         # flight per key) and keep serving the newest older version meanwhile; the caller bounds its
@@ -269,6 +298,26 @@ class GraphCache:
             raise ChartFallback("load_error") from err
         self._served[map_id] = key[1]
         return graph, key[1]
+
+
+# Maps explicitly switched off (`status.scene_graph_enabled` a JSON false): the same query as
+# graph_builder.scene_guard.DISABLED_SQL (pinned equal by a test; the planner image does not
+# import the graph-builder service).
+DISABLED_MAPS_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
+                     "AND lifecycle <> 'DELETED' AND status->%s = 'false'::jsonb")
+ENABLED_KEY = "scene_graph_enabled"
+
+
+async def disabled_maps(database: Any, map_ids: Sequence[str]) -> set:
+    """The `map_ids` whose `status.scene_graph_enabled` is false. RAISES when the registry cannot
+    be asked (the caller decides; the pre-warm then loads every map)."""
+    names = sorted({str(m) for m in map_ids if m})
+    if not names:
+        return set()
+    async with database.connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(DISABLED_MAPS_SQL, (names, ENABLED_KEY))
+            return {str(r[0]) for r in await cursor.fetchall()}
 
 
 def version_lag_s(graph_db: Any, map_id: str, cursor: Any,

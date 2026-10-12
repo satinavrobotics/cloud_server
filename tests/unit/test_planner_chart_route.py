@@ -518,3 +518,142 @@ async def test_prewarm_store_failure_is_logged_not_fatal(monkeypatch):
         raise RuntimeError("no store")
     svc._scene_cache = scene_route.GraphCache(factory)
     await asyncio.wait_for(svc.start_scene_prewarm(), 2.0)
+
+
+# ---- pre-warm skips maps switched off; load back-off ---------------------------------------------
+
+class _SwitchDb:
+    """`connection()` -> cursor answering the disabled-maps query for the names in `off`."""
+
+    def __init__(self, off=(), fail=False):
+        self.off, self.fail, self.sql = set(off), fail, []
+
+    def connection(self):
+        db = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                if db.fail:
+                    raise RuntimeError("down")
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            def cursor(self):
+                return self
+
+            async def execute(self, sql, params):
+                db.sql.append((sql, params))
+                self.names = params[0]
+
+            async def fetchall(self):
+                return [(n,) for n in self.names if n in db.off]
+        return _Ctx()
+
+
+@pytest.mark.unit
+def test_disabled_maps_sql_is_the_graph_builders():
+    from packages.services.graph_builder import scene_guard
+    assert scene_route.DISABLED_MAPS_SQL == scene_guard.DISABLED_SQL
+    assert scene_route.ENABLED_KEY == scene_guard.ENABLED_KEY
+
+
+@pytest.mark.unit
+async def test_prewarm_skips_maps_switched_off_and_does_not_load_them(monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
+    monkeypatch.setattr(config, "SCENE_GRAPH_PREWARM_MAPS", ())
+    store = FakeStore(FakeGraph(), version=2)
+    svc = _service()
+    svc._scene_cache = scene_route.GraphCache(lambda: store, max_entries=8)
+    svc.graph_db.list_maps.return_value = ["m1", "m2", "m3"]
+    svc.database = _SwitchDb(off={"m2"})
+    await asyncio.wait_for(svc.start_scene_prewarm(), 2.0)
+    assert sorted(store.loads) == [("m1", 2), ("m3", 2)]
+    assert svc.database.sql[0][1][1] == "scene_graph_enabled"
+
+
+@pytest.mark.unit
+async def test_prewarm_configured_maps_are_filtered_too_and_a_failed_query_loads_all(monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
+    monkeypatch.setattr(config, "SCENE_GRAPH_PREWARM_MAPS", ("a", "b"))
+    store = FakeStore(FakeGraph(), version=1)
+    svc = _service()
+    svc._scene_cache = scene_route.GraphCache(lambda: store, max_entries=8)
+    svc.database = _SwitchDb(off={"a"})
+    await asyncio.wait_for(svc.start_scene_prewarm(), 2.0)
+    assert store.loads == [("b", 1)]
+    store.loads.clear()
+    svc2 = _service()
+    svc2._scene_cache = scene_route.GraphCache(lambda: store, max_entries=8)
+    svc2.database = _SwitchDb(fail=True)
+    await asyncio.wait_for(svc2.start_scene_prewarm(), 2.0)
+    assert sorted(store.loads) == [("a", 1), ("b", 1)]
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.mark.unit
+async def test_failing_load_backs_off_exponentially_capped_and_resets_on_success(on):
+    clock = _Clock()
+    store = FakeStore(FakeGraph(), version=1)
+    store.load_error = RuntimeError("boom")
+    cache = scene_route.GraphCache(lambda: store, max_entries=8, load_timeout_s=1.0, clock=clock,
+                                   backoff_base_s=10.0, backoff_max_s=35.0)
+    with pytest.raises(scene_route.ChartFallback) as err:
+        await cache.get("m")
+    assert err.value.reason == "load_error" and len(store.loads) == 1
+    for _ in range(3):                                  # within the 10 s: no new load, same reason
+        with pytest.raises(scene_route.ChartFallback) as err:
+            await cache.get("m")
+        assert err.value.reason == "load_error"
+    assert len(store.loads) == 1
+    clock.t += 10.0                                     # window over: one retry, which fails
+    with pytest.raises(scene_route.ChartFallback):
+        await cache.get("m")
+    assert len(store.loads) == 2
+    clock.t += 19.0                                     # second window is 20 s
+    with pytest.raises(scene_route.ChartFallback):
+        await cache.get("m")
+    assert len(store.loads) == 2
+    clock.t += 1.0
+    with pytest.raises(scene_route.ChartFallback):
+        await cache.get("m")
+    assert len(store.loads) == 3
+    clock.t += 35.0                                     # third would be 40 s: capped at 35 s
+    with pytest.raises(scene_route.ChartFallback):
+        await cache.get("m")
+    assert len(store.loads) == 4
+    assert cache._failures["m"][1] - clock.t == 35.0
+    store.load_error = None                             # recovered: loads, resets the back-off
+    clock.t += 35.0
+    graph, version = await cache.get("m")
+    assert version == 1 and "m" not in cache._failures
+
+
+@pytest.mark.unit
+async def test_back_off_is_per_map_and_a_failed_refresh_is_not_retried_per_request(on):
+    clock = _Clock()
+    store = FakeStore(FakeGraph(), version=1)
+    cache = scene_route.GraphCache(lambda: store, max_entries=8, load_timeout_s=1.0, clock=clock,
+                                   backoff_base_s=10.0)
+    await cache.get("m")
+    store.version, store.load_error = 2, RuntimeError("boom")
+    assert (await cache.get("m"))[1] == 1               # refresh starts, fails in the background
+    await asyncio.sleep(0.1)
+    n = len(store.loads)
+    for _ in range(3):
+        assert (await cache.get("m"))[1] == 1           # older version served, no new load
+    assert len(store.loads) == n
+    store.load_error = None
+    assert (await cache.get("other"))[1] == 2           # another map is not held back
+    clock.t += 10.0
+    assert (await cache.get("m"))[1] == 1               # retry starts ...
+    await asyncio.sleep(0.1)
+    assert (await cache.get("m"))[1] == 2 and "m" not in cache._failures
