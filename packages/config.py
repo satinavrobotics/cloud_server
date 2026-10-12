@@ -533,6 +533,9 @@ PRE_GOTO_TIMEOUT_S = float(os.getenv("PRE_GOTO_TIMEOUT_S", "5.0"))
 # Both default off: the planner and the ingest worker only use the scene graph when enabled.
 SCENE_GRAPH_PLANNER_ENABLED = _env_bool("SCENE_GRAPH_PLANNER_ENABLED", "false")
 SCENE_GRAPH_WORKER_ENABLED = _env_bool("SCENE_GRAPH_WORKER_ENABLED", "false")
+# How far the planner may move a point onto navigable space: the robot's start, a tapped goal.
+SCENE_GRAPH_START_SNAP_M = float(os.getenv("SCENE_GRAPH_START_SNAP_M", "0.5"))
+SCENE_GRAPH_GOAL_SNAP_M = float(os.getenv("SCENE_GRAPH_GOAL_SNAP_M", "1.5"))
 # A waypoint takes a leaf id only when a leaf lies within this distance of it.
 SCENE_GRAPH_LEAF_SNAP_M = float(os.getenv("SCENE_GRAPH_LEAF_SNAP_M", "1.0"))
 # Largest gap between two waypoints of a scene-graph route.

@@ -78,3 +78,16 @@ def test_simplify_drops_duplicates_and_scales_with_window():
 def test_planned_path_none_when_two_waypoints_share_a_leaf():
     poses, planned = sr.build_waypoints([(0.0, 0.0), (1.0, 0.0)], "m", lambda x, y: "same")
     assert len(poses) == 2 and planned is None
+
+
+def snap(key="a:1", d=0.2, crosses=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(key=key, distance=d, crosses_blocked=crosses)
+
+
+def test_snap_problem_rules():
+    assert sr.snap_problem(snap(), 0.5) is None
+    assert sr.snap_problem(snap(d=0.9), 0.5) == sr.SNAP_TOO_FAR
+    assert sr.snap_problem(snap(key=None, d=0.9), 1.5) == sr.SNAP_TOO_FAR      # key None beyond max_dist
+    assert sr.snap_problem(snap(key=None, d=float("inf")), 1.5) == sr.SNAP_NO_SPACE
+    assert sr.snap_problem(snap(d=0.3, crosses=True), 0.5) == sr.SNAP_CROSSES_BLOCKED

@@ -11,7 +11,7 @@ already rely on (docs/scene_graph/integration.md, "Planner contract"):
   `waypoints[i]` with `planned_path[i]` and drops topomap ids on any length mismatch.
 """
 import math
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from cloud_common.objects import common
 
@@ -73,3 +73,22 @@ def build_waypoints(points: Sequence[Pt], map_id: str,
     planned = ([str(n) for n in ids]
                if poses and all(n is not None for n in ids) and len(set(ids)) == len(ids) else None)
     return poses, planned
+
+
+# Why a start or goal cannot be used (failed_at "find_robot_node" / "find_target_node" text).
+SNAP_NO_SPACE = "no_navigable_space"
+SNAP_TOO_FAR = "too_far"
+SNAP_CROSSES_BLOCKED = "crosses_blocked"
+
+
+def snap_problem(snap: Any, max_dist: float) -> Optional[str]:
+    """None when `snap` (the library's Snap: key, distance, crosses_blocked) may be used, else the
+    reason. The planner never moves a point across a known blocked cell or further than `max_dist`
+    (a start is the robot's own position: small; a goal may be tapped in a wall: a little larger)."""
+    if getattr(snap, "key", None) is None or not math.isfinite(getattr(snap, "distance", math.inf)):
+        return SNAP_NO_SPACE if not math.isfinite(getattr(snap, "distance", math.inf)) else SNAP_TOO_FAR
+    if snap.distance > max_dist:
+        return SNAP_TOO_FAR
+    if getattr(snap, "crosses_blocked", False):
+        return SNAP_CROSSES_BLOCKED
+    return None
