@@ -216,12 +216,13 @@ def test_level_bounds_are_accepted():
         assert run(r.view("m", BBox(0, 0, 1, 1), level=level))["available"] is True
 
 
-def test_raster_too_large_is_422_but_json_view_is_not_cell_limited():
-    r, _ = reads(max_cells=100)
-    with pytest.raises(HTTPException) as e:
-        run(r.view("m", BBox(0, 0, 100, 100), raster=True))
-    assert e.value.status_code == 422
-    assert run(r.view("m", BBox(0, 0, 100, 100)))["available"] is True
+def test_area_cap_applies_to_json_and_raster_before_any_load():
+    r, calls = reads(max_cells=100)
+    for raster in (True, False):
+        with pytest.raises(HTTPException) as e:
+            run(r.view("m", BBox(0, 0, 100, 100), raster=raster))
+        assert e.value.status_code == 422
+    assert calls == []
 
 
 def test_module_limits_are_the_documented_ones():
@@ -386,3 +387,215 @@ def test_build_event_validates_for_every_kind():
         codes[kind] = row["code"]
     assert codes["updated"] == "MAP.SCENE_GRAPH_UPDATED" and codes["skipped"] == "MAP.SCENE_GRAPH_DISABLED_SKIPPED"
     assert len(set(codes.values())) == 5
+
+
+# ---------------------------------------------------------------- review fixes
+import threading
+
+
+def _gate_reads(**kw):
+    """reads whose load blocks until `go` is set; counts loads."""
+    go, loads = threading.Event(), []
+
+    def load(mid, v, b):
+        loads.append((mid, v))
+        assert go.wait(5)
+        return FakeGraph([])
+    return sgr.SceneGraphReads(lambda m: {"version": 3, "params": {"lattice": 0.1}}, load, **kw), go, loads
+
+
+def test_build_enabled_goes_through_from_client(monkeypatch):
+    from packages.scene_graph import store as store_mod
+    seen = []
+    real = store_mod.SceneGraphStore.from_client.__func__
+
+    def spy(cls, client, **kw):
+        seen.append(client)
+        return real(cls, client, **kw)
+    monkeypatch.setattr(store_mod.SceneGraphStore, "from_client", classmethod(spy))
+
+    class Col:
+        def get(self, key):
+            return {"_key": "meta", "version": 3, "generation": 1, "params": {"lattice": 0.1},
+                    "params_hash": "h", "cursor": None, "manifest": "g1/manifest-3.json", "created_ms": 111}
+
+    class Db:
+        def has_collection(self, name):
+            return name == "sg_meta_known"
+
+        def collection(self, name):
+            return Col()
+    client = NS(graph=NS(db=Db()), image=NS(client=None, _bucket_name=lambda m: "b", _ensure_map_bucket=lambda m: True))
+    r = sgr.build(True, client)
+    assert seen == [client]
+    assert run(r.view("nope", BBox(0, 0, 1, 1)))["available"] is False       # real store + backend, no meta
+    assert run(r._version("known", None))[0] == 3                           # meta + created_ms epoch via the store
+    assert run(r._version("known", None))[2] == (111, 1)
+    with pytest.raises(ValueError):
+        sgr.build(True)
+
+
+def test_recreated_map_with_the_same_version_is_not_served_from_cache():
+    state = {"epoch": 1000, "charts": ["a:1"]}
+
+    def load(mid, v, b):
+        g = FakeGraph([])
+        orig = g.query
+
+        def q(bbox, level, raster):
+            res = orig(bbox, level, raster)
+            res.charts = [chart(k) for k in state["charts"]]
+            return res
+        g.query = q
+        return g
+    r = sgr.SceneGraphReads(lambda m: {"version": 1, "params": {"lattice": 0.1}}, load,
+                            epoch=lambda m, v: state["epoch"])
+    b = BBox(0, 0, 1, 1)
+    first = run(r.view("m", b, version=1))
+    body1, h1 = run(r.raster("m", b, version=1))
+    state.update(epoch=2000, charts=["z:1", "y:1"])             # deleted, recreated, back at version 1
+    second = run(r.view("m", b, version=1))
+    body2, h2 = run(r.raster("m", b, version=1))
+    assert [c["key"] for c in first["charts"]] == ["a:1"]
+    assert [c["key"] for c in second["charts"]] == ["z:1", "y:1"]
+    assert h1["ETag"] != h2["ETag"] and first["epoch"] != second["epoch"]
+    for h in (h1, h2):
+        assert "immutable" not in h["Cache-Control"]
+    # the old client ETag no longer matches: full body, not 304
+    body, _ = run(r.raster("m", b, version=1, if_none_match=h1["ETag"]))
+    assert body is not None
+
+
+def test_epoch_falls_back_to_meta_fields_without_an_epoch_function():
+    m = {"version": 1, "generation": 1, "params_hash": "a", "cursor": {"c": 1}, "params": {"lattice": 0.1}}
+    r = sgr.SceneGraphReads(lambda mid: m, lambda *a: FakeGraph([]))
+    _, h1 = run(r.raster("m", BBox(0, 0, 1, 1)))
+    m["cursor"] = {"c": 2}
+    _, h2 = run(r.raster("m", BBox(0, 0, 1, 1)))
+    assert h1["ETag"] != h2["ETag"]
+
+
+def test_from_store_epoch_uses_created_ms_of_the_manifest():
+    created = {"cur": 5000, 2: 4000}
+    docs = NS(meta=lambda mid: {"version": 3, "generation": 1, "created_ms": created["cur"]})
+    store = NS(meta=lambda mid: {"version": 3, "params": {"lattice": 0.1}}, docs=docs,
+               manifest=lambda mid, v: {"created_ms": created[v], "generation": 1},
+               load=lambda mid, v, tiles=None: FakeGraph([]))
+    r = sgr.from_store(store)
+    assert run(r._version("m", None))[2] == (5000, 1)
+    assert run(r._version("m", 2))[2] == (4000, 1)
+
+
+def test_single_flight_json_and_raster_share_one_computation():
+    r, go, loads = _gate_reads()
+    b = BBox(0, 0, 3, 3)
+
+    async def both():
+        t1 = asyncio.ensure_future(r.view("m", b))
+        t2 = asyncio.ensure_future(r.raster("m", b))
+        t3 = asyncio.ensure_future(r.view("m", b, raster=True))
+        await asyncio.sleep(0.2)
+        go.set()
+        return await asyncio.gather(t1, t2, t3)
+    out = run(both())
+    assert len(loads) == 1 and out[0]["available"] and out[1][0] is not None
+
+
+def test_cache_is_thread_safe_under_eviction_pressure():
+    r = sgr.SceneGraphReads(lambda m: {"version": 3, "params": {"lattice": 0.1}}, lambda *a: FakeGraph([]))
+    r._results.max_items = 2
+    errors = []
+
+    def work(i):
+        try:
+            for j in range(40):
+                x = ((i * 7 + j) % 9) * 6.4
+                run(r.view("m", BBox(x, 0, x + 1, 1)))
+        except Exception as exc:        # noqa: BLE001
+            errors.append(exc)
+    ts = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert errors == [] and len(r._results) <= 2
+
+
+def test_result_cache_is_bounded_by_bytes(monkeypatch):
+    monkeypatch.setattr(sgr, "CACHE_RESULT_BYTES", 1000)
+    r, _ = reads()
+    for i in range(10):
+        run(r.view("m", BBox(i * 6.4, 0, i * 6.4 + 1, 1), raster=True))
+    assert r._results._bytes <= 1000 and 0 < len(r._results) < 10
+
+
+def test_bbox_snaps_outward_to_tiles_so_pans_hit_the_cache():
+    r, calls = reads()
+    a = run(r.view("m", BBox(1.0, 1.0, 5.0, 5.0)))
+    b = run(r.view("m", BBox(1.5, 0.2, 5.9, 6.0)))
+    assert a["bbox"] == b["bbox"] == [0.0, 0.0, 6.4, 6.4]
+    assert len(calls) == 1
+    assert calls[0][0].x1 < 6.4          # the store is not asked to touch the next tile
+
+
+def test_raster_applies_the_chart_cap_and_the_u16_guard():
+    r, _ = reads(max_charts=1)
+    with pytest.raises(HTTPException) as e:
+        run(r.raster("m", BBox(0, 0, 1, 1)))
+    assert e.value.status_code == 422
+
+    class Many(FakeGraph):
+        def query(self, bbox, level, raster):
+            res = super().query(bbox, level, raster)
+            res.raster.keys = ["k%d" % i for i in range(sgr.MAX_OWNER_KEYS + 1)]
+            return res
+    big = sgr.SceneGraphReads(lambda m: {"version": 3}, lambda *a: Many([]))
+    with pytest.raises(HTTPException) as e:
+        run(big.raster("m", BBox(0, 0, 1, 1)))
+    assert e.value.status_code == 422
+    with pytest.raises(HTTPException):
+        run(big.view("m", BBox(0, 0, 1, 1), raster=True))
+    assert run(big.view("m", BBox(0, 0, 1, 1)))["available"]          # no plane asked: JSON is fine
+    body, _ = run(big.raster("m", BBox(0, 0, 1, 1), plane="dependent"))   # u8 plane has no key limit
+    assert body is not None
+
+
+def test_etag_is_ascii_for_non_ascii_digit_bboxes_and_304_skips_the_query():
+    box = sgr.parse_bbox("\u0660,\u0660,\u0661,\u0661")       # arabic-indic digits parse as floats
+    assert box == BBox(0, 0, 1, 1)
+    r, calls = reads()
+    body, h = run(r.raster("m", box, version=3))
+    assert body is not None
+    h["ETag"].encode("ascii")
+    assert len(calls) == 1
+    body2, h2 = run(r.raster("m", box, version=3, if_none_match=f'"zzz", W/{h["ETag"]}'))
+    assert body2 is None and h2["ETag"] == h["ETag"] and len(calls) == 1
+    cold, _ = reads()
+    none, _ = run(cold.raster("m", box, version=3, if_none_match=h["ETag"]))
+    assert none is None          # same epoch/version/bbox: 304 with nothing computed
+
+
+def test_cache_control_never_immutable():
+    r, _ = reads()
+    _, pinned = run(r.raster("m", BBox(0, 0, 1, 1), version=3))
+    _, cur = run(r.raster("m", BBox(0, 0, 1, 1)))
+    assert "immutable" not in pinned["Cache-Control"] and "max-age" in pinned["Cache-Control"]
+    assert cur["Cache-Control"] == "no-cache"
+
+
+def test_lineage_validates_caps_and_caches():
+    calls = []
+
+    def lin(mid, v):
+        calls.append(v)
+        return {"a:1": ["a:2"]}
+    r = sgr.SceneGraphReads(lambda mid: {"version": 5}, lambda *a: None, lin)
+    for bad, code in ((-1, 422), (9, 404)):
+        with pytest.raises(HTTPException) as e:
+            run(r.lineage("m", bad))
+        assert e.value.status_code == code
+    assert run(r.lineage("m", 2))["retired"] == {"a:1": ["a:2"]}
+    run(r.lineage("m", 2))
+    assert calls == [2]
+    far = sgr.SceneGraphReads(lambda mid: {"version": 10_000}, lambda *a: None, lin)
+    with pytest.raises(HTTPException) as e:
+        run(far.lineage("m", 1))
+    assert e.value.status_code == 409 and calls == [2]

@@ -1079,6 +1079,14 @@ class TestApiDelegationServiceDeleteMap:
     """ApiDelegationService.delete_map() hands off to the background MapDeleter (WP11 F1); these
     check the store results one cleanup attempt sees (the saga: tests/unit/test_map_delete.py)."""
 
+    @pytest.fixture(autouse=True)
+    def _no_scene_graph(self):
+        """These tests use Mock clients, on which the scene graph probe cannot rule a graph out
+        (and a probe that fails deliberately fails the step, tests/unit/test_map_delete.py)."""
+        with patch.object(ApiDelegationService, "_scene_graph_delete_hooks",
+                          return_value=(None, None)):
+            yield
+
     @pytest.mark.asyncio
     @patch('packages.api.server.PostgresDatabase')
     @patch('packages.api.server.MissionPlannerClient')

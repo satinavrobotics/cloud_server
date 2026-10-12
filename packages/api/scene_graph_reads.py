@@ -9,7 +9,10 @@ dependency on the engine and is testable with fakes. Reads are pinned to one ver
 says which, and the same `version` can be passed back for a consistent follow-up (raster after JSON).
 """
 import asyncio
+import hashlib
 import math
+import threading
+from concurrent.futures import Future
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -19,12 +22,19 @@ from fastapi import HTTPException
 from packages.scene_graph.api import BBox, MissingTiles
 
 MAX_LEVEL = 8
-MAX_CELLS = 4_000_000         # raster cells per request (8 MB as u16)
+MAX_CELLS = 4_000_000         # lattice cells per request, JSON or raster (the raster is 12 MB as u16 + u8)
 MAX_CHARTS = 20_000
-CACHE_RESULTS = 8
+MAX_OWNER_KEYS = 65_534       # the owner plane is u16: 0 = no chart, i = keys[i - 1]
+CACHE_RESULTS = 64            # count bound; the byte bound below is the one that matters for rasters
+CACHE_RESULT_BYTES = 96 * 1024 * 1024
 CACHE_GRAPHS = 2
-CACHE_VIEWS = 8               # (map, version, tile-set) views kept; tiles load lazily inside a view
+CACHE_VIEWS = 8               # (map, epoch, version, tile-set) views kept; tiles load lazily inside a view
+CACHE_LINEAGE = 32
 MAX_TILE_RETRIES = 3          # MissingTiles rounds (a bbox edge can touch one tile more than the manifest scan)
+MAX_LINEAGE_SPAN = 256        # versions between from_version and current
+TILE_M = 6.4                  # store tile side: 128 costmap cells * 0.05 m; bboxes snap outward to this grid
+EDGE_EPS = 1e-6              # m; the store reads a bbox edge on a tile boundary as touching the next tile
+REVALIDATE_S = 60             # max-age of a response that names `version`; the ETag carries the epoch
 
 
 def parse_bbox(text: Optional[str]) -> BBox:
@@ -50,14 +60,91 @@ def link_json(l: Any) -> Dict[str, Any]:
             "portal": [list(l.portal[0]), list(l.portal[1])], "channels": dict(l.channels or {})}
 
 
+class _Cache:
+    """A bounded LRU under one lock with single-flight computation: concurrent misses on a key share
+    one computation (the followers wait on the leader's future). Safe to call from worker threads."""
+
+    def __init__(self, max_items: int, max_bytes: Optional[int] = None,
+                 size: Callable[[Any], int] = lambda v: 0) -> None:
+        self.max_items, self.max_bytes, self._size = max_items, max_bytes, size
+        self._lock = threading.Lock()
+        self._data: "OrderedDict[Any, Tuple[Any, int]]" = OrderedDict()
+        self._inflight: Dict[Any, Future] = {}
+        self._bytes = 0
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._data)
+
+    def peek(self, key: Any) -> Any:
+        with self._lock:
+            hit = self._data.get(key)
+            if hit is None:
+                return None
+            self._data.move_to_end(key)
+            return hit[0]
+
+    def get_or_compute(self, key: Any, compute: Callable[[], Any]) -> Any:
+        with self._lock:
+            hit = self._data.get(key)
+            if hit is not None:
+                self._data.move_to_end(key)
+                return hit[0]
+            fut = self._inflight.get(key)
+            leader = fut is None
+            if leader:
+                fut = self._inflight[key] = Future()
+        if not leader:
+            return fut.result()
+        try:
+            value = compute()
+        except BaseException as exc:      # not cached; the followers see the same failure
+            with self._lock:
+                self._inflight.pop(key, None)
+            fut.set_exception(exc)
+            raise
+        nbytes = int(self._size(value))
+        with self._lock:
+            self._inflight.pop(key, None)
+            if self.max_bytes is None or nbytes <= self.max_bytes:
+                self._data[key] = (value, nbytes)
+                self._bytes += nbytes
+                while self._data and (len(self._data) > self.max_items or
+                                      (self.max_bytes is not None and self._bytes > self.max_bytes)):
+                    _, (_, n) = self._data.popitem(last=False)
+                    self._bytes -= n
+        fut.set_result(value)
+        return value
+
+
+def _result_bytes(res: Any) -> int:
+    n = 256 * (len(getattr(res, "charts", ())) + len(getattr(res, "links", ())))
+    r = getattr(res, "raster", None)
+    if r is not None:
+        n += int(getattr(r.index, "nbytes", 0)) + int(getattr(getattr(r, "dependent", None), "nbytes", 0))
+    return n
+
+
+def _tag(value: Any) -> str:
+    return hashlib.sha1(repr(value).encode("utf-8", "replace")).hexdigest()[:12]
+
+
 class SceneGraphReads:
     """`meta(map_id) -> {}|{version, params, ...}`, `load(map_id, version, bbox) -> SceneGraph` (raises LookupError for a version not retained),
     `lineage(map_id, from_version) -> {key: [keys]}`; all blocking, run in a thread.
 
+    `epoch(map_id, version) -> hashable|None` names the incarnation of a (map, version): a map deleted and
+    recreated restarts at version 1, so version alone is not a cache key. It is part of every cache key and
+    of the ETag. Without it (or when it returns None) `meta["epoch"]`, then (generation, params_hash,
+    cursor) of the meta stand in; those are best effort.
+
     Tiled reads: with `tiles_in(map_id, bbox, version) -> [(tx, ty)]` and `open_view(map_id, version, tiles)
     -> object with query(bbox, level, raster)` (a `StoredView`), a request reads only the tiles of its bbox;
-    views are cached per (map, version, tile-set) in a bounded LRU. Without them, `load` is used (whole graph
-    if `whole_graph`)."""
+    views are cached per (map, epoch, version, tile-set) in a bounded LRU. Without them, `load` is used (whole
+    graph if `whole_graph`).
+
+    Every request's bbox is snapped outward to the tile grid and capped at `max_cells` lattice cells; the
+    response's `bbox` is the snapped one. One query (always with its raster) serves JSON and raster alike."""
 
     def __init__(self, meta: Callable[[str], Dict[str, Any]],
                  load: Callable[[str, Optional[int], BBox], Any],
@@ -65,99 +152,120 @@ class SceneGraphReads:
                  max_cells: int = MAX_CELLS, max_charts: int = MAX_CHARTS,
                  whole_graph: bool = False,
                  tiles_in: Optional[Callable[[str, BBox, Optional[int]], List[Tuple[int, int]]]] = None,
-                 open_view: Optional[Callable[[str, Optional[int], Any], Any]] = None) -> None:
+                 open_view: Optional[Callable[[str, Optional[int], Any], Any]] = None,
+                 epoch: Optional[Callable[[str, Optional[int]], Any]] = None,
+                 tile_m: float = TILE_M) -> None:
         """`whole_graph`: `load` ignores the bbox, so one loaded graph serves every bbox of a
         (map, version); without it each bbox is loaded by itself."""
-        self._meta, self._load, self._lineage = meta, load, lineage
+        self._meta, self._load, self._lineage, self._epoch = meta, load, lineage, epoch
         self._whole = whole_graph
         self._tiles_in, self._open_view = tiles_in, open_view
-        self._views: "OrderedDict[tuple, Any]" = OrderedDict()
-        self._graphs: "OrderedDict[tuple, Any]" = OrderedDict()
-        self.max_cells, self.max_charts = max_cells, max_charts
-        self._results: "OrderedDict[tuple, Any]" = OrderedDict()
+        self.max_cells, self.max_charts, self.tile_m = max_cells, max_charts, tile_m
+        self._views = _Cache(CACHE_VIEWS)
+        self._graphs = _Cache(CACHE_GRAPHS)
+        self._results = _Cache(CACHE_RESULTS, CACHE_RESULT_BYTES, _result_bytes)
+        self._lineages = _Cache(CACHE_LINEAGE)
 
-    async def _version(self, map_id: str, version: Optional[int]) -> Tuple[Optional[int], Dict[str, Any]]:
+    # -- version, epoch, bbox
+    async def _version(self, map_id: str, version: Optional[int]) -> Tuple[Optional[int], Dict[str, Any], Any]:
+        """(resolved version, meta, epoch). The epoch is the incarnation of the resolved version."""
         meta = await asyncio.to_thread(self._meta, map_id) or {}
         current = meta.get("version")
         if current is None:
-            return None, meta
+            return None, meta, None
         if version is None or version == current:
-            return int(current), meta
-        if version > current or version < 0:
+            version = int(current)
+        elif version > current or version < 0:
             raise HTTPException(status_code=404, detail=f"scene graph version {version} does not exist")
-        return int(version), meta         # an older version; the store says if it is still retained
+        else:
+            version = int(version)         # an older version; the store says if it is still retained
+        return version, meta, await asyncio.to_thread(self._epoch_of, map_id, version, meta)
 
-    def _check(self, bbox: BBox, level: int, meta: Dict[str, Any], raster: bool) -> None:
+    def _epoch_of(self, map_id: str, version: int, meta: Dict[str, Any]) -> Any:
+        e = None
+        if self._epoch is not None:
+            try:
+                e = self._epoch(map_id, version)
+            except (LookupError, FileNotFoundError):
+                raise HTTPException(status_code=404,
+                                    detail=f"scene graph version {version} is not retained") from None
+        if e is None:
+            e = meta.get("epoch")
+        if e is None:
+            e = (meta.get("generation"), meta.get("params_hash"), repr(meta.get("cursor")))
+        return e
+
+    def _snap(self, bbox: BBox) -> BBox:
+        """Outward to the tile grid, so nearby pans share one cache entry."""
+        t = self.tile_m
+        return BBox(round(math.floor(bbox.x0 / t) * t, 6), round(math.floor(bbox.y0 / t) * t, 6),
+                    round(math.ceil(bbox.x1 / t) * t, 6), round(math.ceil(bbox.y1 / t) * t, 6))
+
+    def _check(self, bbox: BBox, level: int, meta: Dict[str, Any]) -> BBox:
+        """Validates and returns the snapped bbox; the area cap applies to JSON and raster alike."""
         if not 0 <= level <= MAX_LEVEL:
             raise HTTPException(status_code=422, detail=f"level must be 0..{MAX_LEVEL}")
+        box = self._snap(bbox)
         step = float((meta.get("params") or {}).get("lattice") or 0.1)
-        cells = ((bbox.x1 - bbox.x0) / step) * ((bbox.y1 - bbox.y0) / step)
-        if raster and cells > self.max_cells:
+        cells = ((box.x1 - box.x0) / step) * ((box.y1 - box.y0) / step)
+        if cells > self.max_cells:
             raise HTTPException(status_code=422, detail=(
-                f"bbox is {int(cells)} cells (limit {self.max_cells}); request a smaller area"))
+                f"bbox is {int(min(cells, 1e18))} cells (limit {self.max_cells}); request a smaller area"))
+        return box
 
-    async def _result(self, map_id: str, version: int, bbox: BBox, level: int, raster: bool) -> Any:
-        """The query result, cached per (map, version, bbox, level, raster): the JSON view and its
-        raster are one query, so the keys in one index the plane of the other."""
-        key = (map_id, version, (bbox.x0, bbox.y0, bbox.x1, bbox.y1), level, raster)
-        if key in self._results:
-            self._results.move_to_end(key)
-            return self._results[key]
+    async def _result(self, map_id: str, epoch: Any, version: int, bbox: BBox, level: int) -> Any:
+        """The query result (always with the raster plane), cached per (map, epoch, version, bbox, level):
+        the JSON view and its raster are one query, so the keys in one index the plane of the other."""
+        key = (map_id, epoch, version, (bbox.x0, bbox.y0, bbox.x1, bbox.y1), level)
+        # the snapped far edges lie on a tile boundary, which the store counts as inside the next tile
+        qbox = BBox(bbox.x0, bbox.y0, bbox.x1 - EDGE_EPS, bbox.y1 - EDGE_EPS)
 
         def run_whole() -> Any:
-            gkey = (map_id, version)
-            graph = self._graphs.get(gkey) if self._whole else None
-            if graph is None:
-                graph = self._load(map_id, version, bbox)
-                if self._whole:
-                    self._graphs[gkey] = graph
-                    while len(self._graphs) > CACHE_GRAPHS:
-                        self._graphs.popitem(last=False)
-            return graph.query(bbox, level, raster)
+            graph = self._graphs.get_or_compute((map_id, epoch, version), lambda: self._load(map_id, version, qbox)) \
+                if self._whole else self._load(map_id, version, qbox)
+            return graph.query(qbox, level, True)
 
         def run_tiled() -> Any:
-            tiles = frozenset(tuple(t) for t in self._tiles_in(map_id, bbox, version))
+            tiles = frozenset(tuple(t) for t in self._tiles_in(map_id, qbox, version))
             for _ in range(MAX_TILE_RETRIES + 1):
-                vkey = (map_id, version, tiles)
-                view = self._views.get(vkey)
-                if view is None:
-                    view = self._open_view(map_id, version, tiles)
-                    self._views[vkey] = view
-                    while len(self._views) > CACHE_VIEWS:
-                        self._views.popitem(last=False)
-                else:
-                    self._views.move_to_end(vkey)
+                view = self._views.get_or_compute(
+                    (map_id, epoch, version, tiles), lambda: self._open_view(map_id, version, tiles))
                 try:
-                    return view.query(bbox, level, raster)
+                    return view.query(qbox, level, True)
                 except MissingTiles as exc:      # the bbox edge reaches a tile the manifest scan did not name
                     tiles = tiles | frozenset(tuple(t) for t in exc.tiles)
             raise MissingTiles(sorted(tiles))
         run = run_tiled if self._tiles_in is not None and self._open_view is not None else run_whole
         try:
-            res = await asyncio.to_thread(run)
+            return await asyncio.to_thread(self._results.get_or_compute, key, run)
         except MissingTiles:
             raise HTTPException(status_code=409, detail="scene graph tiles changed during the read; retry") from None
         except (LookupError, FileNotFoundError):
             raise HTTPException(status_code=404, detail=f"scene graph version {version} is not retained") from None
-        self._results[key] = res
-        while len(self._results) > CACHE_RESULTS:
-            self._results.popitem(last=False)
-        return res
+
+    def _guard(self, res: Any, owner_plane: bool) -> None:
+        n = len(res.charts)
+        if n > self.max_charts:
+            raise HTTPException(status_code=422, detail=(
+                f"{n} charts in this bbox (limit {self.max_charts}); use a higher level or a smaller bbox"))
+        r = getattr(res, "raster", None)
+        if owner_plane and r is not None and len(r.keys) > MAX_OWNER_KEYS:
+            raise HTTPException(status_code=422, detail=(
+                f"{len(r.keys)} charts in the raster (limit {MAX_OWNER_KEYS}); use a higher level or a smaller bbox"))
 
     async def view(self, map_id: str, bbox: BBox, level: int = 0, version: Optional[int] = None,
                    raster: bool = False) -> Dict[str, Any]:
         """Charts and links; with `raster` also the plane's keys and geometry (bytes come from
-        `raster()`), so one request describes what the client then draws."""
-        version, meta = await self._version(map_id, version)
+        `raster()`), so one request describes what the client then draws. `bbox` in the answer is the
+        tile-snapped box that was read."""
+        version, meta, epoch = await self._version(map_id, version)
         if version is None:
             return {"available": False, "map_id": map_id, "version": None, "charts": [], "links": []}
-        self._check(bbox, level, meta, raster=raster)
-        res = await self._result(map_id, version, bbox, level, raster)
-        if len(res.charts) > self.max_charts:
-            raise HTTPException(status_code=422, detail=(
-                f"{len(res.charts)} charts in this bbox (limit {self.max_charts}); use a higher level or a smaller bbox"))
-        out = {"available": True, "map_id": map_id, "version": version, "level": level,
-               "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1],
+        box = self._check(bbox, level, meta)
+        res = await self._result(map_id, epoch, version, box, level)
+        self._guard(res, owner_plane=raster)
+        out = {"available": True, "map_id": map_id, "version": version, "epoch": _tag(epoch), "level": level,
+               "bbox": [box.x0, box.y0, box.x1, box.y1],
                "charts": [chart_json(c) for c in res.charts],
                "links": [link_json(l) for l in res.links], "raster": None}
         r = res.raster if raster else None
@@ -168,17 +276,32 @@ class SceneGraphReads:
         return out
 
     async def raster(self, map_id: str, bbox: BBox, level: int = 0, version: Optional[int] = None,
-                     plane: str = "owner") -> Tuple[bytes, Dict[str, str]]:
+                     plane: str = "owner", if_none_match: Optional[str] = None
+                     ) -> Tuple[Optional[bytes], Dict[str, str]]:
         """(body, headers). `owner`: u16 little-endian, 0 = no chart, i = keys[i - 1] of the same
         version, bbox and level in `view(raster=True)`. `dependent`: u8 0/1. Row-major, row 0 at the
-        bbox's lower-left origin."""
+        bbox's lower-left origin. The ETag depends only on (epoch, version, plane, level, snapped bbox), so
+        a matching `if_none_match` answers `(None, headers)` (304) before anything is computed.
+
+        A response is never `immutable`: the URL does not carry the epoch, so a map recreated under the same
+        id would be served stale. A request that names `version` gets a short max-age, others `no-cache`; both revalidate by ETag."""
         if plane not in ("owner", "dependent"):
             raise HTTPException(status_code=422, detail="plane must be owner or dependent")
-        version, meta = await self._version(map_id, version)
+        version_req = version
+        version, meta, epoch = await self._version(map_id, version)
         if version is None:
             raise HTTPException(status_code=404, detail="no scene graph for this map")
-        self._check(bbox, level, meta, raster=True)
-        res = await self._result(map_id, version, bbox, level, True)
+        box = self._check(bbox, level, meta)
+        coords = "_".join(repr(float(v)) for v in (box.x0, box.y0, box.x1, box.y1))
+        etag = f'"{_tag(epoch)}.{version}.{plane}.{level}.{coords}"'
+        headers = {"ETag": etag, "X-Scene-Graph-Version": str(version),
+                   "Cache-Control": ("no-cache" if version_req is None else f"public, max-age={REVALIDATE_S}")}
+        if if_none_match:
+            tags = [t.strip() for t in if_none_match.split(",")]
+            if "*" in tags or etag in tags or f"W/{etag}" in tags:
+                return None, headers
+        res = await self._result(map_id, epoch, version, box, level)
+        self._guard(res, owner_plane=(plane == "owner"))
         r = res.raster
         if r is None:
             raise HTTPException(status_code=404, detail="no raster for this bbox")
@@ -187,17 +310,26 @@ class SceneGraphReads:
         else:
             body, dtype = np.ascontiguousarray(r.dependent, dtype=np.uint8).tobytes(), "u8"
         rows, cols = r.index.shape
-        headers = {"X-Raster-Shape": f"{rows},{cols}", "X-Raster-Origin": f"{r.origin[0]},{r.origin[1]}",
-                   "X-Raster-Step": str(r.step), "X-Raster-Dtype": dtype,
-                   "X-Scene-Graph-Version": str(version)}
+        headers.update({"X-Raster-Shape": f"{rows},{cols}", "X-Raster-Origin": f"{r.origin[0]},{r.origin[1]}",
+                        "X-Raster-Step": str(r.step), "X-Raster-Dtype": dtype})
         return body, headers
 
     async def lineage(self, map_id: str, from_version: int) -> Dict[str, Any]:
-        version, _ = await self._version(map_id, None)
+        version, _, epoch = await self._version(map_id, None)
         if version is None or self._lineage is None:
             return {"available": False, "from_version": from_version, "version": version, "retired": {}}
+        if from_version < 0:
+            raise HTTPException(status_code=422, detail="from_version must be >= 0")
+        if from_version > version:
+            raise HTTPException(status_code=404, detail=f"scene graph version {from_version} does not exist")
+        if version - from_version > MAX_LINEAGE_SPAN:
+            raise HTTPException(status_code=409, detail=(
+                f"{version - from_version} versions since {from_version} (limit {MAX_LINEAGE_SPAN}); "
+                "reselect from the current charts"))
         try:
-            retired = await asyncio.to_thread(self._lineage, map_id, from_version)
+            retired = await asyncio.to_thread(
+                self._lineages.get_or_compute, (map_id, epoch, from_version, version),
+                lambda: self._lineage(map_id, from_version))
         except Exception as exc:
             if type(exc).__name__ == "TooOld":    # the store no longer retains the span: reselect from current charts
                 raise HTTPException(status_code=409, detail=str(exc)) from None
@@ -213,27 +345,50 @@ def _unavailable_load(map_id: str, version: Optional[int], bbox: BBox) -> Any:
     raise LookupError("scene graph disabled")
 
 
+def _store_epoch(store: Any) -> Optional[Callable[[str, Optional[int]], Any]]:
+    """(created_ms, generation) of the version's manifest: a recreated map restarts at version 1 but not
+    at the same creation time. The current version is answered from the meta document alone."""
+    docs = getattr(store, "docs", None)
+    if not callable(getattr(docs, "meta", None)):
+        return None
+
+    def epoch(map_id: str, version: Optional[int]) -> Any:
+        m = docs.meta(map_id) or {}
+        if version is None or version == m.get("version"):
+            return (m.get("created_ms"), m.get("generation")) if m.get("created_ms") is not None else None
+        if callable(getattr(store, "manifest", None)):
+            man = store.manifest(map_id, version) or {}
+            return (man.get("created_ms"), man.get("generation")) if man.get("created_ms") is not None else None
+        return None
+    return epoch
+
+
 def from_store(store: Any) -> SceneGraphReads:
     """Reads over a `SceneGraphStore`: bbox -> `tiles_in` -> `view(tiles=)`, so a request touches only the
     tiles of its bbox (`load(tiles=)` is the writer's all-tiles call and raises MissingTiles for a subset).
     A store without `view` / `tiles_in` falls back to the whole graph per (map, version)."""
     lineage = getattr(store, "lineage", None)
+    epoch = _store_epoch(store)
     if callable(getattr(store, "view", None)) and callable(getattr(store, "tiles_in", None)):
         return SceneGraphReads(
             meta=store.meta,
             load=lambda map_id, version, bbox: store.load(map_id, version),
             lineage=lineage,
             tiles_in=lambda map_id, bbox, version: store.tiles_in(map_id, bbox, version),
-            open_view=lambda map_id, version, tiles: store.view(map_id, version, tiles))
+            open_view=lambda map_id, version, tiles: store.view(map_id, version, tiles),
+            epoch=epoch)
     return SceneGraphReads(
         meta=store.meta,
         load=lambda map_id, version, bbox: store.load(map_id, version),
-        lineage=lineage, whole_graph=True)
+        lineage=lineage, whole_graph=True, epoch=epoch)
 
 
-def build(enabled: bool) -> SceneGraphReads:
-    """Reads for the API service: `enabled` False answers `available: false` for every map."""
+def build(enabled: bool, client: Any = None) -> SceneGraphReads:
+    """Reads for the API service: `enabled` False answers `available: false` for every map. `client` is
+    the TopomapDatabaseClient the store is built on (`SceneGraphStore.from_client`)."""
     if not enabled:
         return SceneGraphReads(_unavailable_meta, _unavailable_load)
+    if client is None:
+        raise ValueError("scene graph reads need the topomap database client")
     from packages.scene_graph.store import SceneGraphStore   # lazy: the engine is optional
-    return from_store(SceneGraphStore())
+    return from_store(SceneGraphStore.from_client(client))

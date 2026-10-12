@@ -590,7 +590,10 @@ def _scene_graph_reads():
     if _scene_reads is None:
         from packages.api import scene_graph_reads
         from packages.config import SCENE_GRAPH_WORKER_ENABLED
-        _scene_reads = scene_graph_reads.build(SCENE_GRAPH_WORKER_ENABLED)
+        client = getattr(service, "topomap_db", None)
+        if SCENE_GRAPH_WORKER_ENABLED and client is None:
+            return scene_graph_reads.build(False)      # service not up yet: answer unavailable, retry next call
+        _scene_reads = scene_graph_reads.build(SCENE_GRAPH_WORKER_ENABLED, client)
     return _scene_reads
 
 
@@ -613,18 +616,16 @@ async def get_map_scene_graph_raster(map_id: str, bbox: str, level: int = 0,
                                      version: Optional[int] = None, plane: str = "owner",
                                      if_none_match: Optional[str] = Header(None)):
     """The owner plane (u16 little-endian, 0 = no chart, i = keys[i-1]) or the `dependent` plane (u8)
-    over a bbox, row-major. Shape, origin and step are in the X-Raster-* headers. A request that
-    names `version` is immutable and cached forever."""
+    over a bbox, row-major. Shape, origin and step are in the X-Raster-* headers. The bbox is snapped
+    outward to the tile grid (see the JSON view's `bbox`). Responses carry an ETag (epoch, version, plane,
+    level, bbox) and are revalidated, never `immutable`: a map recreated under the same id restarts at
+    version 1."""
     _require_service()
     from packages.api import scene_graph_reads
     box = scene_graph_reads.parse_bbox(bbox)
     body, headers = await _site_call("read scene graph raster", _scene_graph_reads().raster(
-        map_id, box, level, version, plane))
-    etag = f'"{headers["X-Scene-Graph-Version"]}-{plane}-{level}-{bbox}"'
-    headers["ETag"] = etag
-    headers["Cache-Control"] = ("public, max-age=31536000, immutable" if version is not None
-                                else "no-cache")
-    if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
+        map_id, box, level, version, plane, if_none_match))
+    if body is None:
         return Response(status_code=304, headers=headers)
     return Response(content=body, media_type="application/octet-stream", headers=headers)
 
