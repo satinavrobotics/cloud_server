@@ -30,11 +30,12 @@ def _row(node, x=1.0, y=1.0, expires=EXPIRES):
     return {"map_name": "M", "graph_node_id": node, "edge_from": None, "edge_to": None,
             "source": "edgeBlocked", "robot_name": "r1", "mission_name": "m1",
             "vda_node_id": "m1-n1-s4", "reason": "blocked", "x": x, "y": y,
-            "created_at": None, "expires_at": expires}
+            "created_at": None, "expires_at": expires,
+            "robot_x": None, "robot_y": None, "prev_x": None, "prev_y": None}
 
 
 def _tuple(row):
-    return tuple(row[c] for c in blocked_nodes.COLUMNS)
+    return tuple(row.get(c) for c in blocked_nodes.COLUMNS)
 
 
 class _Db:
@@ -267,3 +268,79 @@ async def test_listing_blocked_nodes_without_a_readable_table_is_an_empty_list()
     assert resp.json()["blocked_nodes"] == [] and "error" in resp.json()
     resp = await _call(_Db([_row("2")]), "GET", "/api/v1/maps/M/blocked-nodes")
     assert [r["graph_node_id"] for r in resp.json()["blocked_nodes"]] == ["2"]
+
+
+# --- the obstacle as a segment (rows with the robot's pose) --------------------------------
+# A -> B is one long leg; the robot stood at (3, 0) when B-ward waypoint (6, 0) was blocked,
+# so the obstacle lies on (4, 0)-(6, 0): no graph node is near it, the leg A-B crosses it, and
+# the detour through D does not.
+SEG_NODES = {"A": (0.0, 0.0), "B": (10.0, 0.0), "D": (5.0, 4.0)}
+SEG_EDGES = [{"from": a, "to": b} for a, b in (("A", "B"), ("A", "D"), ("D", "B"))]
+
+
+def _seg_row(with_pose=True):
+    row = _row("9", 6.0, 0.0)
+    if with_pose:
+        row.update(robot_x=3.0, robot_y=0.0, prev_x=0.0, prev_y=0.0)
+    return row
+
+
+def _seg_planner(rows):
+    svc = _planner(rows, plain=("A", "B"), edges=SEG_EDGES)
+    svc.graph_db.get_all_nodes.return_value = [
+        {"node_id": n, "pose": {"x": x, "y": y}} for n, (x, y) in SEG_NODES.items()]
+    return svc
+
+
+def test_rows_hit_judges_the_legs_only_for_rows_with_a_pose():
+    leg = [SEG_NODES["A"], SEG_NODES["B"]]
+    points = [("B", SEG_NODES["B"])]
+    assert blocked_nodes.rows_hit([_seg_row()], points) == []          # points only: as before
+    assert blocked_nodes.rows_hit([_seg_row(False)], points, polyline=leg) == []
+    assert len(blocked_nodes.rows_hit([_seg_row()], points, polyline=leg)) == 1
+    assert blocked_nodes.rows_hit([_seg_row()], points,
+                                  polyline=[SEG_NODES["A"], SEG_NODES["D"], SEG_NODES["B"]]) == []
+
+
+def test_the_planner_detours_a_leg_through_an_obstacle_segment_no_node_is_near():
+    row = _seg_row()
+    assert _seg_planner([row])._path_avoiding("A", "B", "M", [row]) == (["A", "D", "B"], None, [])
+    old = _seg_row(False)       # written before the pose columns: the disc at (6, 0) misses
+    assert _seg_planner([old])._path_avoiding("A", "B", "M", [old]) == (["A", "B"], None, [])
+
+
+def test_the_planner_refuses_when_the_only_detour_still_crosses_the_segment():
+    row = _seg_row()
+    edges = [{"from": "A", "to": "B"}]
+    svc = _seg_planner([row])
+    svc.graph_db.get_edges.return_value = edges
+    path, error, rows = svc._path_avoiding("A", "B", "M", [row])
+    assert path is None and "No route avoids" in error and rows[0]["graph_node_id"] == "9"
+
+
+async def test_the_reroute_check_refuses_a_leg_through_the_segment(monkeypatch):
+    def wps(path):
+        return [{"x": SEG_NODES[n][0], "y": SEG_NODES[n][1], "map_id": "M", "node_id": n}
+                for n in path]
+    hits = await _reroute_hits([_seg_row()], wps(["A", "B"]), monkeypatch)
+    assert [r["graph_node_id"] for r in hits] == ["9"]
+    assert await _reroute_hits([_seg_row()], wps(["A", "D", "B"]), monkeypatch) == []
+    assert await _reroute_hits([_seg_row(False)], wps(["A", "B"]), monkeypatch) == []
+
+
+def test_a_stop_closer_than_the_lead_makes_a_segment_from_the_robot_to_the_waypoint():
+    from packages.utils import blocked_geometry
+    row = _row("9", 0.6, 0.0)
+    row.update(robot_x=0.0, robot_y=0.0)
+    (a, b) = blocked_geometry.row_segment(row)
+    assert a == (0.0, 0.0) and b == (0.6, 0.0)      # not empty, not reversed
+    assert blocked_geometry.route_hits_row(row, [(0.3, -1.0), (0.3, 1.0)])
+
+
+def test_the_upsert_writes_the_geometry_columns_in_column_order():
+    params = blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60, x=6.0, y=0.0,
+                                         robot_x=3.0, robot_y=0.0, prev_x=0.0, prev_y=1.0)
+    assert len(params) == blocked_nodes.UPSERT_SQL.count("%s")
+    assert params[9:15] == (6.0, 0.0, 3.0, 0.0, 0.0, 1.0) and params[-1] == 60.0
+    legacy = blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60, x=6.0, y=0.0)
+    assert legacy[11:15] == (None, None, None, None)

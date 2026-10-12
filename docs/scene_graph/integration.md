@@ -263,26 +263,34 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
   leaf threshold for `waypoints[i].node_id`; `run_id` (derive later from session and time, or look up at ingest).
 
 
-## Blocked overlay: draft for review (nothing below is applied)
+## Blocked overlay (applied 2026-10-12; was a draft for review)
 
-Done and unwired: `packages/utils/blocked_geometry.py` (+ tests): the obstacle is the segment from `LEAD_M`
-(1.0 m, must exceed `HALF_WIDTH_M` 0.5 m or a leg leaving the robot sideways is "blocked" by its own start) ahead
-of the robot's pose to the blocked waypoint; `route_hits_row` tests the route's legs against it; `overlay` yields
-`(discs, segments)` for `Blocked`. Rows without a robot pose keep the old disc rule.
+`packages/utils/blocked_geometry.py` (+ tests): the obstacle is the segment from `LEAD_M` (1.0 m, must exceed
+`HALF_WIDTH_M` 0.5 m or a leg leaving the robot sideways is "blocked" by its own start) ahead of the robot's pose
+to the blocked waypoint; `route_hits_row` tests the route's legs against it; `overlay` yields `(discs, segments)`
+for `Blocked`. Rows without a robot pose keep the old disc rule.
 
-Needs your go-ahead (changes shared tables and the dispatcher):
+Applied:
 
 1. Migration `20261012_01_blocked_graph_nodes_geometry` (additive, nullable, no backfill; downgrade drops them):
-   `ALTER TABLE blocked_graph_nodes ADD COLUMN IF NOT EXISTS robot_x double precision,
-   ADD COLUMN IF NOT EXISTS robot_y double precision, ADD COLUMN IF NOT EXISTS prev_x double precision,
-   ADD COLUMN IF NOT EXISTS prev_y double precision;`
-   `prev_x/prev_y` (previous waypoint) is kept for a later fit; the overlay does not use it yet.
-2. `blocked_nodes.COLUMNS`/`UPSERT_SQL`/`upsert_params` gain the four columns. Must ship **after** the migration
-   (ACTIVE_FOR_MAP_SQL selects them), same release, migration first.
-3. mission-dispatch's edgeBlocked handler passes the robot's pose (latest robot row in map frame) and the previous
-   waypoint; rows from before keep NULLs.
-4. `_reroute_through_blocked` (API) and `blocked_nodes.rows_hit` additionally call `route_hits_row` on the route's
-   polyline; the planner passes `overlay(...)` to `route()` when the scene-graph planner is on.
-5. Open: the 1.0 m lead assumes obstacles are seen at more than 1 m; a robot that stops at 0.6 m reports a segment
-   of near zero length (clipped to the waypoint) which is a disc in effect. Acceptable, or use the costmap's
-   lethal cells at the block instead (needs the dispatcher to send them; not proposed).
+   `robot_x, robot_y` (robot position in the map frame at the report), `prev_x, prev_y` (previous waypoint; kept
+   for a later fit, the overlay does not use it).
+2. `blocked_nodes.COLUMNS`/`UPSERT_SQL`/`upsert_params` carry the four columns. **Deploy order: migration first**
+   (`ACTIVE_FOR_MAP_SQL` selects the columns and the upsert writes them; there is no fallback for an unmigrated
+   database: the dispatcher's write only logs, the planner reads none and plans without blocks, the API list fails).
+3. mission-dispatch's edgeBlocked handler (`_exclude_blocked_node`) writes the robot's last reported position,
+   taken to the map frame by the transform the order was sent with (`_pose_in_map`, as `_offset_in_map`), and the
+   previous waypoint. Unknown position, uninitialized localization or unrecorded order frame: NULLs (disc rule).
+4. `blocked_nodes.rows_hit(..., polyline=)` adds `route_hits_row` to the point rule. The API's
+   `_reroute_through_blocked` passes the route's waypoints as polyline (start included). The planner's
+   `_path_avoiding` does the same for the graph's shortest path, keeps graph nodes within `HALF_WIDTH_M` of a
+   segment out of the detour search, and rejects a detour whose legs still cross a segment (reported as "no route
+   avoids"). Rows without a pose: behavior identical to before.
+5. **Not wired**: handing `overlay(...)` to the scene-graph `route()`: the planner still reports
+   `planner = legacy`, so there is no call site yet; wire it with the switch.
+6. Stops under 1 m (decided, conservative): when the blocked waypoint is closer than `LEAD_M` to the robot,
+   `row_segment` clips the start to the waypoint's own distance, so the segment runs from the robot's pose to the
+   waypoint (never empty beyond the zero-length case of a robot standing on the waypoint, never reversed). The
+   check then flags legs within `HALF_WIDTH_M` of that short segment, which includes the robot's own start region;
+   a detour leaving sideways from a robot that stopped under 0.5 m from the obstacle is also refused until the
+   block expires or is cleared. Using the costmap's lethal cells instead is not proposed.

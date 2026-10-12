@@ -3760,6 +3760,25 @@ class Robot:
         ref["graph_node_id"] = graph_node
         return ref
 
+    def _pose_in_map(self, order_id: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
+        """The robot's last reported position in the map frame, by the transform order
+        `order_id` was sent with (MissionSentOrderV1.frame), as for `_offset_in_map`; (None,
+        None) when the position or the order's frame is not known (the block is then kept as a
+        plain waypoint, the rule of rows written before the pose columns)."""
+        record = self._sent_order_record(order_id)
+        frame = record.frame if record is not None else None
+        pose = self._robot_object.status.pose if self._robot_object is not None else None
+        if frame is None or pose is None or \
+                not self._robot_object.status.position_initialized:
+            return None, None
+        try:
+            x, y = float(pose.x), float(pose.y)
+            if frame.get("applied") == "inverse":
+                x, y = map_geo.apply_transform(frame["map_t_session"], x, y)
+        except (KeyError, TypeError, ValueError):
+            return None, None
+        return (x, y) if math.isfinite(x) and math.isfinite(y) else (None, None)
+
     def _exclude_blocked_node(self, node_ref: str, source: str, reason: Optional[str]) -> None:
         """Keep the graph node of a waypoint the robot reported blocked out of new routes
         for BLOCKED_NODE_EXCLUSION_MIN (blocked_graph_nodes, read by the planner), for every
@@ -3776,12 +3795,15 @@ class Robot:
             return
         previous = node.route.waypoints[index - 1].node_id if index > 0 else None
         graph_node = ref["graph_node_id"] or blocked_nodes.synthetic_id(waypoint.x, waypoint.y)
+        robot_x, robot_y = self._pose_in_map(ref["order_id"])
+        prev = node.route.waypoints[index - 1] if index > 0 else None
         params = blocked_nodes.upsert_params(
             waypoint.map_id, graph_node, source,
             order_policy.current().blocked_node_exclusion_min * 60.0,
             edge_from=previous, edge_to=ref["graph_node_id"], robot_name=self._name,
             mission_name=str(self._current_mission.name), vda_node_id=ref["node_id"],
-            reason=reason, x=waypoint.x, y=waypoint.y)
+            reason=reason, x=waypoint.x, y=waypoint.y, robot_x=robot_x, robot_y=robot_y,
+            prev_x=None if prev is None else prev.x, prev_y=None if prev is None else prev.y)
         self.mission_info(f"Keeping graph node {graph_node} on map {waypoint.map_id} out of "
                           f"new routes for {order_policy.current().blocked_node_exclusion_min:g}"
                           f" min ({source})")

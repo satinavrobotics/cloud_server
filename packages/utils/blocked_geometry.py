@@ -10,8 +10,8 @@ The segment starts `lead_m` ahead of the robot, never at it, so a detour that le
 robot stands is not blocked by its own start. Rows without `robot_x, robot_y` (written before the
 columns existed) keep the old rule: a disc of `MATCH_RADIUS_M` around `x, y`.
 
-Pure functions: nothing here imports the engine or the database. Draft, not wired: see
-docs/scene_graph/integration.md, "Blocked overlay: draft".
+Pure functions: nothing here imports the engine or the database. Applied in the reroute
+check and the planner's path search; see docs/scene_graph/integration.md, "Blocked overlay".
 """
 import math
 import os
@@ -63,7 +63,8 @@ def _waypoint(row: Mapping[str, Any]) -> Optional[Pt]:
 
 def row_segment(row: Mapping[str, Any], lead_m: float = LEAD_M) -> Optional[Tuple[Pt, Pt]]:
     """(a, b): from `lead_m` ahead of the robot's pose to the blocked waypoint; None when the row
-    has no robot pose or no waypoint position. Clipped so a is never beyond b."""
+    has no robot pose or no waypoint position. When the waypoint is within `lead_m` of the
+    robot, a is the robot's pose itself (conservative), so a is never beyond b."""
     wp = _waypoint(row)
     try:
         rx, ry = float(row["robot_x"]), float(row["robot_y"])
@@ -75,7 +76,11 @@ def row_segment(row: Mapping[str, Any], lead_m: float = LEAD_M) -> Optional[Tupl
     length = math.hypot(bx - rx, by - ry)
     if length == 0.0:
         return (bx, by), (bx, by)
-    t = min(max(lead_m, 0.0), length) / length
+    if length <= lead_m:
+        # A stop closer than the lead: the whole way from the pose to the waypoint, never a
+        # point at the waypoint or a segment pointing back at the robot.
+        return (rx, ry), (bx, by)
+    t = max(lead_m, 0.0) / length
     return (rx + t * (bx - rx), ry + t * (by - ry)), (bx, by)
 
 
@@ -91,6 +96,17 @@ def route_hits_row(row: Mapping[str, Any], polyline: Sequence[Pt], half_width_m:
     if len(pts) == 1:
         return point_segment_distance(pts[0], a, b) <= half_width_m
     return any(segment_segment_distance(p, q, a, b) <= half_width_m for p, q in zip(pts, pts[1:]))
+
+
+def near_obstacle(rows: Iterable[Mapping[str, Any]], xy: Pt, half_width_m: float = HALF_WIDTH_M,
+                  lead_m: float = LEAD_M) -> bool:
+    """Whether the point `xy` is within `half_width_m` of the obstacle segment of any of `rows`
+    (rows without a robot pose have no segment and never match)."""
+    for row in rows:
+        seg = row_segment(row, lead_m)
+        if seg is not None and point_segment_distance(xy, seg[0], seg[1]) <= half_width_m:
+            return True
+    return False
 
 
 def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_m: float = HALF_WIDTH_M,

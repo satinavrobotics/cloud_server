@@ -24,7 +24,7 @@ def test_segment_distance_crossing_parallel_and_apart():
 
 def test_row_segment_starts_ahead_of_robot_and_clips():
     assert bg.row_segment(row(), lead_m=0.5) == ((0.5, 0.0), (10.0, 0.0))
-    assert bg.row_segment(row(x=0.2), lead_m=0.5) == ((0.2, 0.0), (0.2, 0.0))   # shorter than the lead
+    assert bg.row_segment(row(x=0.2), lead_m=0.5) == ((0.0, 0.0), (0.2, 0.0))   # shorter than the lead: from the pose
     assert bg.LEAD_M > bg.HALF_WIDTH_M
     assert bg.row_segment({"x": 1.0, "y": 1.0}) is None                          # legacy row
 

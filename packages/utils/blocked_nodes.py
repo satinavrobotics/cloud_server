@@ -1,6 +1,7 @@
 """
 Graph nodes a robot reported blocked, kept out of new routes for a while (table
-blocked_graph_nodes, migration 20261008_01). mission-dispatch writes them, the mission planner
+blocked_graph_nodes, migrations 20261008_01 and 20261012_01: ship the latter first, the
+SQL below names its columns). mission-dispatch writes them, the mission planner
 reads them, the API lists and clears them; the SQL and the path search live here so all three
 read the table the same way.
 
@@ -15,7 +16,7 @@ Today only mission-dispatch's edgeBlocked handling writes rows; the "nodeBlocked
 import math
 import os
 from collections import deque
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 SOURCES = ("edgeBlocked", "nodeBlocked", "operator")
 
@@ -23,19 +24,23 @@ SOURCES = ("edgeBlocked", "nodeBlocked", "operator")
 MATCH_RADIUS_M = float(os.getenv("BLOCKED_NODE_MATCH_RADIUS_M", "0.5"))
 
 COLUMNS = ("map_name", "graph_node_id", "edge_from", "edge_to", "source", "robot_name",
-           "mission_name", "vda_node_id", "reason", "x", "y", "created_at", "expires_at")
+           "mission_name", "vda_node_id", "reason", "x", "y", "created_at", "expires_at",
+           "robot_x", "robot_y", "prev_x", "prev_y")
 
 # A new report on a node already blocked extends its expiry (never shortens it) and keeps
 # the newest report's details; on a row that had expired it starts a new block (created_at).
 UPSERT_SQL = (
     "INSERT INTO blocked_graph_nodes (map_name, graph_node_id, edge_from, edge_to, source, "
-    "robot_name, mission_name, vda_node_id, reason, x, y, expires_at) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now() + make_interval(secs => %s)) "
+    "robot_name, mission_name, vda_node_id, reason, x, y, robot_x, robot_y, prev_x, prev_y, "
+    "expires_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+    "now() + make_interval(secs => %s)) "
     "ON CONFLICT (map_name, graph_node_id) DO UPDATE SET "
     "edge_from = EXCLUDED.edge_from, edge_to = EXCLUDED.edge_to, source = EXCLUDED.source, "
     "robot_name = EXCLUDED.robot_name, mission_name = EXCLUDED.mission_name, "
     "vda_node_id = EXCLUDED.vda_node_id, reason = EXCLUDED.reason, x = EXCLUDED.x, "
-    "y = EXCLUDED.y, "
+    "y = EXCLUDED.y, robot_x = EXCLUDED.robot_x, robot_y = EXCLUDED.robot_y, "
+    "prev_x = EXCLUDED.prev_x, prev_y = EXCLUDED.prev_y, "
     "created_at = CASE WHEN blocked_graph_nodes.expires_at <= now() THEN now() "
     "ELSE blocked_graph_nodes.created_at END, "
     "expires_at = GREATEST(blocked_graph_nodes.expires_at, EXCLUDED.expires_at)")
@@ -78,11 +83,14 @@ def upsert_params(map_name: str, graph_node_id: str, source: str, expires_in_s: 
                   edge_from: Optional[str] = None, edge_to: Optional[str] = None,
                   robot_name: Optional[str] = None, mission_name: Optional[str] = None,
                   vda_node_id: Optional[str] = None, reason: Optional[str] = None,
-                  x: Optional[float] = None, y: Optional[float] = None) -> Tuple[Any, ...]:
+                  x: Optional[float] = None, y: Optional[float] = None,
+                  robot_x: Optional[float] = None, robot_y: Optional[float] = None,
+                  prev_x: Optional[float] = None, prev_y: Optional[float] = None
+                  ) -> Tuple[Any, ...]:
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}")
     return (map_name, graph_node_id, edge_from, edge_to, source, robot_name, mission_name,
-            vda_node_id, reason, x, y, float(expires_in_s))
+            vda_node_id, reason, x, y, robot_x, robot_y, prev_x, prev_y, float(expires_in_s))
 
 
 async def fetch_active(database: Any, map_id: str) -> List[Dict[str, Any]]:
@@ -115,11 +123,20 @@ def row_blocks(row: Mapping[str, Any], node_id: Optional[Any] = None,
 
 def rows_hit(rows: Iterable[Mapping[str, Any]],
              points: Iterable[Tuple[Optional[Any], Optional[Tuple[float, float]]]],
-             radius_m: Optional[float] = None) -> List[Dict[str, Any]]:
-    """The `rows` that block any of `points` ((node_id, xy) pairs), in row order."""
+             radius_m: Optional[float] = None,
+             polyline: Optional[Sequence[Tuple[float, float]]] = None) -> List[Dict[str, Any]]:
+    """The `rows` that block any of `points` ((node_id, xy) pairs), in row order.
+
+    With a `polyline` (the route's positions in order, the robot's start included), a row that
+    has the robot's pose at the block (`robot_x`, `robot_y`) also blocks a route whose legs pass
+    the obstacle segment (blocked_geometry.route_hits_row); this is in addition to the point
+    rule. Rows without a robot pose, and calls without a polyline, are judged as before."""
+    from packages.utils import blocked_geometry  # imports this module: not at the top
     points = list(points)
+    poly = [(float(x), float(y)) for x, y in polyline] if polyline else []
     return [dict(row) for row in rows
-            if any(row_blocks(row, node_id, xy, radius_m) for node_id, xy in points)]
+            if any(row_blocks(row, node_id, xy, radius_m) for node_id, xy in points)
+            or (poly and blocked_geometry.route_hits_row(row, poly))]
 
 
 def route_points(waypoints: Sequence[Any], skip_first: bool = True
@@ -162,10 +179,13 @@ def node_xy(node: Mapping[str, Any]) -> Optional[Tuple[float, float]]:
 
 
 def shortest_path_avoiding(edges: Iterable[Mapping[str, Any]], start: str, end: str,
-                           excluded: Set[str]) -> Optional[List[str]]:
+                           excluded: Set[str],
+                           edge_blocked: Optional[Callable[[str, str], bool]] = None
+                           ) -> Optional[List[str]]:
     """The fewest-hops path from `start` to `end` along the directed `edges` (graph_db's
     {from, to}) that passes no `excluded` node; None if there is none. The start node is
-    never excluded (the robot is there). Same metric as graph_db.shortest_path (hop count,
+    never excluded (the robot is there). `edge_blocked(a, b)`, when given, also rules
+    out single edges (a leg across an obstacle segment). Same metric as graph_db.shortest_path (hop count,
     OUTBOUND)."""
     start, end = str(start), str(end)
     if end in excluded and end != start:
@@ -173,6 +193,8 @@ def shortest_path_avoiding(edges: Iterable[Mapping[str, Any]], start: str, end: 
     adjacency: Dict[str, List[str]] = {}
     for edge in edges:
         a, b = str(edge.get("from")), str(edge.get("to"))
+        if edge_blocked is not None and edge_blocked(a, b):
+            continue
         adjacency.setdefault(a, []).append(b)
     previous: Dict[str, Optional[str]] = {start: None}
     queue = deque([start])

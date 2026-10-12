@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
-from packages.utils import blocked_nodes
+from packages.utils import blocked_geometry, blocked_nodes
 from packages.services.mission_planner import scene_route
 from packages.utils import map_geo
 from packages.utils import map_sessions
@@ -682,10 +682,19 @@ class MissionPlannerService:
             return None, f"No path found from node {start} to node {end}", []
         plain = [str(p) for p in plain]
         synthetic = any(blocked_nodes.position_of(str(b["graph_node_id"])) for b in blocked)
-        nodes = self.graph_db.get_all_nodes(map_id) if synthetic else None
+        # Rows with the robot's pose at the block are judged on the route's legs too, which
+        # needs the node positions.
+        segmented = [b for b in blocked
+                     if b.get("robot_x") is not None and b.get("robot_y") is not None]
+        nodes = self.graph_db.get_all_nodes(map_id) if synthetic or segmented else None
         xy_of = {str(n.get("node_id", n.get("_key"))): blocked_nodes.node_xy(n)
                  for n in nodes or []}
-        on_path = blocked_nodes.rows_hit(blocked, [(n, xy_of.get(n)) for n in plain[1:]])
+
+        def polyline_of(path: List[str]) -> Optional[List[Tuple[float, float]]]:
+            return [xy_of[n] for n in path if xy_of.get(n) is not None] if segmented else None
+
+        on_path = blocked_nodes.rows_hit(blocked, [(n, xy_of.get(n)) for n in plain[1:]],
+                                         polyline=polyline_of(plain))
         if not on_path:
             return plain, None, []
 
@@ -702,11 +711,24 @@ class MissionPlannerService:
                           f"{until(on_goal)}); choose another goal or plan with "
                           "ignore_exclusions"), on_goal
         excluded = blocked_nodes.excluded_node_ids(blocked, nodes)
+        for node_id, xy in xy_of.items():
+            # A graph node on a row's obstacle segment is as blocked as one at its waypoint.
+            if xy is not None and blocked_geometry.near_obstacle(segmented, xy):
+                excluded.add(node_id)
         excluded.discard(start)
         self.logger.info(f"Planning around blocked graph node(s) {names(on_path)}")
         edges = self.graph_db.get_edges(map_id)
-        path = blocked_nodes.shortest_path_avoiding(edges, start, end, excluded) \
+        def crosses(a: str, b: str) -> bool:
+            """An edge whose straight leg passes an obstacle segment."""
+            return bool(segmented) and a in xy_of and b in xy_of and \
+                xy_of[a] is not None and xy_of[b] is not None and bool(
+                    blocked_nodes.rows_hit(segmented, [], polyline=[xy_of[a], xy_of[b]]))
+
+        path = blocked_nodes.shortest_path_avoiding(edges, start, end, excluded, crosses) \
             if edges else None
+        if path is not None and segmented and blocked_nodes.rows_hit(
+                segmented, [], polyline=polyline_of(path)):
+            path = None  # a leg of the detour still crosses an obstacle segment
         if path is None:
             return None, (f"No route avoids the blocked graph node(s) {names(on_path)} "
                           f"(blocked until {until(on_path)}); wait, clear the block, or "

@@ -689,7 +689,12 @@ async def _reroute_through_blocked(reroute: Dict[str, Any]) -> List[Dict[str, An
                 rows_by_map[map_id] = await blocked_nodes.fetch_active(service.database,
                                                                        map_id)
             points = blocked_nodes.route_points(wps, skip_first=False)
-            for row in blocked_nodes.rows_hit(rows_by_map[map_id], points):
+            # The route's legs too (the first waypoint, where the robot starts, included): a
+            # row with the robot's pose at the block is a segment, not only a waypoint disc.
+            polyline = [xy for _, xy in blocked_nodes.route_points(
+                [w for w in waypoints if w.get("map_id") == map_id], skip_first=False)
+                if xy is not None]
+            for row in blocked_nodes.rows_hit(rows_by_map[map_id], points, polyline=polyline):
                 hits[(map_id, str(row["graph_node_id"]))] = row
     return list(hits.values())
 
@@ -1057,10 +1062,12 @@ async def delete_map_nodes(map_id: str, body: Dict[str, Any]):
     `{"type": "nodes_deleted", "map_id", "node_ids", "edges_deleted", "timestamp"}` to the
     /ws/map/{map_id} clients."""
     _require_service()
+    from packages.config import SCENE_GRAPH_WORKER_ENABLED
     return await _site_call("delete map nodes", maps.delete_nodes(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
         service.topomap_db.delete_nodes, arango_node_count=_arango_node_count,
-        notify=service.ws_proxy.broadcast_map_update))
+        notify=service.ws_proxy.broadcast_map_update,
+        scene_graph=SCENE_GRAPH_WORKER_ENABLED))
 
 
 @app.delete("/api/v1/maps/{map_id}", status_code=202)
