@@ -111,11 +111,21 @@ class MissionPlannerService:
         self.knn_k = knn_k
         self.range_search_radius = range_search_radius
 
-        # Chart-graph planner (SCENE_GRAPH_PLANNER_ENABLED): graphs cached by (map, version); the
-        # store is opened on first use, off the event loop.
+        # Chart-graph planner (SCENE_GRAPH_PLANNER_ENABLED): graphs cached by (map, version) with
+        # their own bounded thread pools (loads, store/meta I/O) and a third for the plan itself,
+        # so nothing of it runs on, or starves, the default executor. The store is opened on
+        # first use, off the event loop.
         self._scene_cache = scene_route.GraphCache(
             self._open_scene_store, max_entries=config.SCENE_GRAPH_CACHE_VERSIONS,
-            load_timeout_s=config.SCENE_GRAPH_LOAD_TIMEOUT_S)
+            load_timeout_s=config.SCENE_GRAPH_LOAD_TIMEOUT_S,
+            versions_per_map=config.SCENE_GRAPH_CACHE_VERSIONS_PER_MAP,
+            max_stale_s=config.SCENE_GRAPH_MAX_VERSION_LAG_S,
+            meta_ttl_s=config.SCENE_GRAPH_META_TTL_S,
+            max_bytes=config.SCENE_GRAPH_CACHE_MAX_BYTES)
+        self._plan_pool = scene_route.BoundedPool(
+            "sg-plan", 2, config.SCENE_GRAPH_PLAN_MAX_INFLIGHT, busy_reason="planner_busy")
+        # chart-route outcomes by reason ("served" or the fallback reason), for get_stats()
+        self._chart_outcomes: Dict[str, int] = {}
 
         self._prewarm_task: Optional["asyncio.Task"] = None
 
@@ -133,8 +143,7 @@ class MissionPlannerService:
         try:
             maps = list(config.SCENE_GRAPH_PREWARM_MAPS)
             if not maps:
-                maps = await asyncio.get_running_loop().run_in_executor(
-                    None, self.graph_db.list_maps)
+                maps = await self._scene_cache.io(self.graph_db.list_maps)
             try:
                 # a map switched off (status.scene_graph_enabled = false) is not worth a load
                 off = await scene_route.disabled_maps(self.database, maps)
@@ -146,6 +155,14 @@ class MissionPlannerService:
             except Exception as err:  # pylint: disable=broad-except
                 self.logger.warning(f"Scene graph pre-warm cannot read the per-map switch "
                                     f"({err!r}); loading every map")
+            capacity = max(1, int(config.SCENE_GRAPH_CACHE_VERSIONS))
+            if len(maps) > capacity:
+                # one graph per map would not fit: warming more would evict what was just loaded
+                self.logger.warning(
+                    f"Scene graph pre-warm: {len(maps)} maps but SCENE_GRAPH_CACHE_VERSIONS="
+                    f"{capacity}; warming {maps[:capacity]}, not {maps[capacity:]} (raise the "
+                    "cache size or list SCENE_GRAPH_PREWARM_MAPS)")
+                maps = maps[:capacity]
             sem = asyncio.Semaphore(max(1, int(config.SCENE_GRAPH_PREWARM_CONCURRENCY)))
 
             async def one(map_id: str) -> None:
@@ -175,88 +192,129 @@ class MissionPlannerService:
     async def _try_chart_route(
         self, robot_name: str, map_id: str, target_x: float, target_y: float,
         robot_pose: Optional[Tuple[float, float]], ignore_exclusions: bool,
+        ctx: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """(result fields, None) for a chart-graph route, or (None, reason) when the legacy planner
-        must run. Never raises: every exception is a fallback reason."""
+        must run. Never raises: every exception is a fallback reason. The whole attempt has ONE
+        monotonic deadline (SCENE_GRAPH_TOTAL_BUDGET_S): the dispatcher's replan timeout is 5 s
+        and the legacy planner needs its share after a fallback. `ctx`, when given, receives the
+        robot row read here (`ctx["robot"]`) so the legacy steps need not read it again."""
+        loop = asyncio.get_running_loop()
+        budget = float(config.SCENE_GRAPH_TOTAL_BUDGET_S)
+        deadline = loop.time() + budget
         try:
-            robot = await self.get_robot_status(robot_name)
-            if robot is None:
-                return None, "robot_unavailable"
-            try:
-                start_xy = await self._robot_xy_in_map(robot, map_id, robot_pose)
-            except RobotNotPlacedError:
-                return None, "robot_not_placed"       # the legacy path reports it to the caller
-            graph, version = await self._scene_cache.get(map_id)
-            loop = asyncio.get_running_loop()
-            if config.SCENE_GRAPH_MAX_VERSION_LAG_S > 0:
-                # the graph must not lag the ingest by more than the threshold; unknown never rejects
-                try:
-                    lag = await asyncio.wait_for(
-                        loop.run_in_executor(None, scene_route.version_lag_s, self.graph_db,
-                                             map_id, self._scene_cache.cursor(map_id)),
-                        config.SCENE_GRAPH_LOAD_TIMEOUT_S)
-                except asyncio.TimeoutError:
-                    lag = None
-                if lag is not None and lag > config.SCENE_GRAPH_MAX_VERSION_LAG_S:
-                    return None, "stale_graph"
-
-            rows = [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
-            overlay = blocked_geometry.overlay(
-                rows, blocked_nodes.MATCH_RADIUS_M,
-                self._overlay_half_width(robot)) if rows else ([], [])
-
-            def node_of(x: float, y: float) -> Optional[str]:
-                try:
-                    nodes, dists = self.graph_db.k_nearest_neighbors(
-                        x=x, y=y, k=1, map_id=map_id)
-                except Exception:  # pylint: disable=broad-except
-                    return None
-                if not nodes or not dists or dists[0] > config.SCENE_GRAPH_LEAF_SNAP_M:
-                    return None
-                return str(nodes[0].get("node_id"))
-
-            try:
-                plan = await asyncio.wait_for(
-                    loop.run_in_executor(
-                        None, lambda: scene_route.plan_on_graph(
-                            graph, map_id, tuple(start_xy), (target_x, target_y), overlay,
-                            node_of, config.SCENE_GRAPH_START_SNAP_M,
-                            config.SCENE_GRAPH_GOAL_SNAP_M,
-                            config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
-                            # Engine `Route.min_width` is not the passage width (defect, to be
-                            # fixed in packages/scene_graph): no width check unless enabled.
-                            self._robot_width(robot) if config.SCENE_GRAPH_WIDTH_CHECK_ENABLED
-                            else None,
-                            config.SCENE_GRAPH_WIDTH_MARGIN_M)),
-                    config.SCENE_GRAPH_PLAN_BUDGET_S)
-            except asyncio.TimeoutError:
-                return None, "plan_timeout"
-            # The legacy point rule (graph node id, "@x,y" position) on the final waypoints, for the
-            # rows the overlay cannot place: no robot pose (a pose row is an obstacle segment that
-            # route() and the line of sight already avoid). A hit goes to the legacy planner, which
-            # reports or detours the blocked rows.
-            unplaced = [r for r in rows if r.get("robot_x") is None or r.get("robot_y") is None]
-            if unplaced:
-                hit = blocked_nodes.rows_hit(unplaced, blocked_nodes.route_points(plan.waypoints))
-                if hit:
-                    return None, "blocked_row_on_route"
-            plan.version = version
-            ids = plan.planned_path
-            return {
-                "robot_position": {"x": float(start_xy[0]), "y": float(start_xy[1])},
-                "start_node_id": ids[0], "end_node_id": ids[-1],
-                "target_node_position": {"x": plan.goal_xy[0], "y": plan.goal_xy[1]},
-                "path": ids, "path_length": len(ids),
-                "waypoints": plan.waypoints, "waypoints_count": len(plan.waypoints),
-                "planner": scene_route.PLANNER_SCENE_GRAPH,
-                "min_width": plan.min_width, "chart_keys": plan.charts,
-                "graph_version": version,
-            }, None
+            return await asyncio.wait_for(
+                self._chart_route(robot_name, map_id, target_x, target_y, robot_pose,
+                                  ignore_exclusions, deadline, ctx), budget)
+        except asyncio.TimeoutError:
+            return None, "budget_exhausted"
         except scene_route.ChartFallback as fb:
             return None, fb.reason
         except Exception as err:  # pylint: disable=broad-except
             self.logger.warning(f"Chart route failed ({err!r}); using the legacy planner")
             return None, "error"
+
+    async def _chart_route(
+        self, robot_name: str, map_id: str, target_x: float, target_y: float,
+        robot_pose: Optional[Tuple[float, float]], ignore_exclusions: bool,
+        deadline: float, ctx: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        loop = asyncio.get_running_loop()
+
+        def stage(limit: float) -> Tuple[float, bool]:
+            """(wait, bound_by_budget): min(the stage's own limit, what the request has left);
+            ChartFallback when under MIN_REMAINING_S is left."""
+            left = deadline - loop.time()
+            if left < scene_route.MIN_REMAINING_S:
+                raise scene_route.ChartFallback("budget_exhausted")
+            return min(limit, left), left <= limit
+
+        robot = await self.get_robot_status(robot_name)
+        if ctx is not None:
+            ctx["robot"] = robot
+        if robot is None:
+            return None, "robot_unavailable"
+        try:
+            start_xy = await self._robot_xy_in_map(robot, map_id, robot_pose)
+        except RobotNotPlacedError:
+            return None, "robot_not_placed"       # the legacy path reports it to the caller
+        graph, version = await self._scene_cache.get(map_id, deadline)
+
+        # the version's ingest lag (a DB query on the I/O pool) and the blocked rows (Postgres)
+        # are independent: ask both at once; an unknown lag never rejects
+        lag_fut = None
+        cursor = self._scene_cache.cursor(map_id)
+        if config.SCENE_GRAPH_MAX_VERSION_LAG_S > 0 and cursor is not None:
+            try:
+                lag_fut = self._scene_cache.io(scene_route.version_lag_s, self.graph_db, map_id,
+                                               cursor)
+            except scene_route.ChartFallback:
+                lag_fut = None
+        lag_wait, _ = stage(config.SCENE_GRAPH_LOAD_TIMEOUT_S)
+
+        async def lag_of() -> Optional[float]:
+            if lag_fut is None:
+                return None
+            try:
+                return await asyncio.wait_for(lag_fut, lag_wait)
+            except (asyncio.TimeoutError, scene_route.ChartFallback):
+                return None
+
+        async def rows_of() -> List[Dict[str, Any]]:
+            return [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
+
+        lag, rows = await asyncio.gather(lag_of(), rows_of())
+        if lag is not None and lag > config.SCENE_GRAPH_MAX_VERSION_LAG_S:
+            return None, "stale_graph"
+        overlay = blocked_geometry.overlay(
+            rows, blocked_nodes.MATCH_RADIUS_M,
+            self._overlay_half_width(robot)) if rows else ([], [])
+
+        def node_of(x: float, y: float) -> Optional[str]:
+            """The leaf within SCENE_GRAPH_LEAF_SNAP_M of the point, None when there is none; a
+            database error RAISES (plan_on_graph reports it as leaf_lookup_error)."""
+            nodes, dists = self.graph_db.k_nearest_neighbors(x=x, y=y, k=1, map_id=map_id)
+            if not nodes or not dists or dists[0] > config.SCENE_GRAPH_LEAF_SNAP_M:
+                return None
+            return str(nodes[0].get("node_id"))
+
+        check_width = config.SCENE_GRAPH_WIDTH_CHECK_ENABLED
+        plan_wait, budget_bound = stage(config.SCENE_GRAPH_PLAN_BUDGET_S)
+        plan_fut = self._plan_pool.submit(
+            lambda: scene_route.plan_on_graph(
+                graph, map_id, tuple(start_xy), (target_x, target_y), overlay, node_of,
+                config.SCENE_GRAPH_START_SNAP_M, config.SCENE_GRAPH_GOAL_SNAP_M,
+                config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
+                self._robot_width(robot) if check_width else None,
+                config.SCENE_GRAPH_WIDTH_MARGIN_M,
+                self._robot_length(robot) if check_width else None))
+        try:
+            plan = await asyncio.wait_for(plan_fut, plan_wait)
+        except asyncio.TimeoutError:
+            return None, "budget_exhausted" if budget_bound else "plan_timeout"
+        # The legacy point rule (graph node id, "@x,y" position) on the final waypoints, for the
+        # rows the overlay cannot place: no robot pose (a pose row is an obstacle segment that
+        # route() and the line of sight already avoid). A hit goes to the legacy planner, which
+        # reports or detours the blocked rows.
+        unplaced = [r for r in rows if r.get("robot_x") is None or r.get("robot_y") is None]
+        if unplaced:
+            hit = blocked_nodes.rows_hit(unplaced, blocked_nodes.route_points(plan.waypoints))
+            if hit:
+                return None, "blocked_row_on_route"
+        ids = plan.planned_path
+        # Note: end_node_id is the LEAF nearest the goal waypoint (within LEAF_SNAP_M, up to 1 m
+        # off), target_node_position the snapped goal cell centre (within GOAL_SNAP_M of the tap):
+        # the two need not coincide; the legacy planner's pair is node and node position.
+        return {
+            "robot_position": {"x": float(start_xy[0]), "y": float(start_xy[1])},
+            "start_node_id": ids[0], "end_node_id": ids[-1],
+            "target_node_position": {"x": plan.goal_xy[0], "y": plan.goal_xy[1]},
+            "path": ids, "path_length": len(ids),
+            "waypoints": plan.waypoints, "waypoints_count": len(plan.waypoints),
+            "planner": scene_route.PLANNER_SCENE_GRAPH,
+            "min_width": plan.min_width, "chart_keys": plan.charts,
+            "graph_version": version,
+        }, None
 
     @staticmethod
     def _robot_width(robot: Optional[robot_object.RobotObjectV1]) -> Optional[float]:
@@ -267,6 +325,16 @@ class MissionPlannerService:
         except (TypeError, ValueError):
             return None
         return width if math.isfinite(width) and width > 0.0 else None
+
+    @staticmethod
+    def _robot_length(robot: Optional[robot_object.RobotObjectV1]) -> Optional[float]:
+        """The planning robot's footprint length in metres (factsheet), None while unknown."""
+        length = getattr(getattr(getattr(robot, "status", None), "factsheet", None), "length", None)
+        try:
+            length = float(length)
+        except (TypeError, ValueError):
+            return None
+        return length if math.isfinite(length) and length > 0.0 else None
 
     @staticmethod
     def _overlay_half_width(robot: Optional[robot_object.RobotObjectV1]) -> float:
@@ -430,9 +498,11 @@ class MissionPlannerService:
         robot_name: str,
         map_id: Optional[str] = None,
         pose_xy: Optional[Tuple[float, float]] = None,
+        robot: Optional[robot_object.RobotObjectV1] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         """
         Find the closest graph node to the robot's current position.
+        `robot`: the robot row when the caller has just read it (saves the second read).
 
         Uses KNN query on graph database.
 
@@ -451,7 +521,8 @@ class MissionPlannerService:
         # Query KNN
         try:
             # Get robot status
-            robot = await self.get_robot_status(robot_name)
+            if robot is None:
+                robot = await self.get_robot_status(robot_name)
             if not robot:
                 return None, f"Robot '{robot_name}' not found in database"
 
@@ -879,10 +950,15 @@ class MissionPlannerService:
                           f"{until(on_goal)}); choose another goal or plan with "
                           "ignore_exclusions"), on_goal
         excluded = blocked_nodes.excluded_node_ids(blocked, nodes)
+        # A graph node on a row's obstacle segment is as blocked as one at its waypoint. The
+        # segments are computed once, not per node and row.
+        near_half, near_lead = blocked_geometry.widths(half_width_m)
+        row_segments = [seg for seg in (blocked_geometry.row_segment(r, near_lead)
+                                        for r in segmented) if seg is not None]
         for node_id, xy in xy_of.items():
-            # A graph node on a row's obstacle segment is as blocked as one at its waypoint.
-            if xy is not None and blocked_geometry.near_obstacle(
-                    segmented, xy, *blocked_geometry.widths(half_width_m)):
+            if xy is not None and any(
+                    blocked_geometry.point_segment_distance(xy, a, b) <= near_half
+                    for a, b in row_segments):
                 excluded.add(node_id)
         excluded.discard(start)
         self.logger.info(f"Planning around blocked graph node(s) {names(on_path)}")
@@ -977,9 +1053,14 @@ class MissionPlannerService:
 
         # Chart-graph planner (flag, off by default): any reason it cannot serve this request
         # falls through to the legacy steps below, unchanged, and is reported.
+        known_robot: Optional[robot_object.RobotObjectV1] = None
         if config.SCENE_GRAPH_PLANNER_ENABLED:
+            ctx: Dict[str, Any] = {}
             chart, reason = await self._try_chart_route(
-                robot_name, map_id, target_x, target_y, robot_pose, ignore_exclusions)
+                robot_name, map_id, target_x, target_y, robot_pose, ignore_exclusions, ctx)
+            known_robot = ctx.get("robot")
+            self._chart_outcomes[reason or "served"] = \
+                self._chart_outcomes.get(reason or "served", 0) + 1
             if chart is not None:
                 result.update(chart)
                 result["map_id"] = map_id
@@ -994,7 +1075,7 @@ class MissionPlannerService:
         # Step 1: Find closest node to robot
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")
         start_node, error = await self.find_closest_node_to_robot(
-            robot_name, map_id, pose_xy=robot_pose)
+            robot_name, map_id, pose_xy=robot_pose, robot=known_robot)
         if error:
             not_placed = error.startswith(NOT_PLACED_PREFIX)
             result["error"] = error[len(NOT_PLACED_PREFIX):] if not_placed else error
@@ -1030,7 +1111,8 @@ class MissionPlannerService:
         if blocked:
             path, error, blocking = self._path_avoiding(
                 start_node['node_id'], end_node['node_id'], map_id, blocked,
-                self._overlay_half_width(await self.get_robot_status(robot_name)))
+                self._overlay_half_width(
+                    known_robot or await self.get_robot_status(robot_name)))
             if error and blocking:
                 result["error"] = error
                 result["failed_at"] = "blocked_nodes"
@@ -1064,7 +1146,7 @@ class MissionPlannerService:
         robot_xy = None
         if len(waypoints) >= 2:
             try:
-                robot = await self.get_robot_status(robot_name)
+                robot = known_robot or await self.get_robot_status(robot_name)
                 robot_xy = await self._robot_xy_in_map(robot, map_id, robot_pose) \
                     if robot else None
             except Exception as err:  # pylint: disable=broad-except
@@ -1085,7 +1167,9 @@ class MissionPlannerService:
         result["map_id"] = map_id
         result["goal"] = {"x": target_x, "y": target_y, "map_id": map_id,
                           "node_id": result.get("end_node_id")}
-        result["planner"] = scene_route.PLANNER_LEGACY
+        if config.SCENE_GRAPH_PLANNER_ENABLED:
+            # flag off: the response carries no `planner` key, as before the chart planner existed
+            result["planner"] = scene_route.PLANNER_LEGACY
         result["success"] = True
         return result
 
@@ -1353,7 +1437,7 @@ class MissionPlannerService:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get service statistics."""
-        return {
+        stats = {
             "service": "mission_planner",
             "graph_db_url": f"arangodb://{self._arango_host}:{self._arango_port}",
             "database_url": f"postgresql://{self._postgres_host}:{self._postgres_port}",
@@ -1361,9 +1445,18 @@ class MissionPlannerService:
             "knn_k": self.knn_k,
             "range_search_radius": self.range_search_radius,
         }
+        if config.SCENE_GRAPH_PLANNER_ENABLED:
+            stats["scene_graph"] = {
+                "outcomes": dict(self._chart_outcomes),    # "served" and each fallback reason
+                "cache": self._scene_cache.stats(),
+                "plan_inflight": self._plan_pool.inflight,
+            }
+        return stats
 
     def cleanup(self):
         """Clean up resources before shutdown."""
         if self._prewarm_task is not None:
             self._prewarm_task.cancel()
+        self._scene_cache.close()
+        self._plan_pool.close()
 

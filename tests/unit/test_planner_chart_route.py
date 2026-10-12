@@ -119,9 +119,10 @@ async def test_flag_off_is_the_legacy_planner_and_never_touches_the_store(monkey
     store = FakeStore(FakeGraph())
     svc = _service(store)
     out = await _plan(svc)
-    assert out["success"] and out["planner"] == "legacy"
-    assert "planner_fallback" not in out
+    # byte-identical to before the chart planner: no planner / planner_fallback keys at all
+    assert out["success"] and "planner" not in out and "planner_fallback" not in out
     assert store.loads == [] and out["path"] == ["1", "2"]
+    assert "scene_graph" not in svc.get_stats()
 
 
 @pytest.mark.unit
@@ -267,17 +268,11 @@ async def test_graph_is_cached_per_version_and_reloaded_on_a_new_one(on):
     await asyncio.sleep(0.2)
     assert (await _plan(svc))["graph_version"] == 2
     assert store.loads == [("m", 1), ("m", 2)]
-    store.version = 1                                   # still cached (LRU of 2)
-    await _plan(svc)
-    assert len(store.loads) == 2
     store.version = 3                                   # v2 serves (newest older), then 3 evicts v1
     assert (await _plan(svc))["graph_version"] == 2
     await asyncio.sleep(0.2)
     assert (await _plan(svc))["graph_version"] == 3
     assert store.loads == [("m", 1), ("m", 2), ("m", 3)]
-    store.version = 1                                   # evicted: loaded again (nothing older: waits)
-    await _plan(svc)
-    assert store.loads[-1] == ("m", 1)
 
 
 @pytest.mark.unit

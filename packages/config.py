@@ -547,21 +547,36 @@ SCENE_GRAPH_LEAF_SNAP_M = float(os.getenv("SCENE_GRAPH_LEAF_SNAP_M", "1.0"))
 # Largest gap between two waypoints of a scene-graph route.
 SCENE_GRAPH_MAX_WAYPOINT_GAP_M = float(os.getenv("SCENE_GRAPH_MAX_WAYPOINT_GAP_M", "5.0"))
 
-# Planner budget (the dispatcher replans with a 5 s timeout): a cold graph load is never waited for
-# longer than LOAD_TIMEOUT_S (it goes on in the background, the request uses the legacy planner),
-# snap + route + simplify + leaf lookup must fit PLAN_BUDGET_S. CACHE_VERSIONS: loaded graphs kept
-# in memory by (map, version).
+# Planner budget (the dispatcher replans with a 5 s timeout, the legacy planner needs the rest):
+# TOTAL_BUDGET_S is ONE monotonic deadline per request for every chart-route stage (robot, store,
+# graph load, lag, blocked rows, plan); each wait is min(its own timeout, what is left), and with
+# under ~0.3 s left the request falls back at once (`budget_exhausted`). LOAD_TIMEOUT_S: a cold
+# graph load is not waited for longer (it goes on in the background). PLAN_BUDGET_S: snap + route +
+# simplify + leaf lookup. PLAN_MAX_INFLIGHT: plans running or hung in the plan thread pool (2
+# threads) before a request falls back `planner_busy`.
 SCENE_GRAPH_LOAD_TIMEOUT_S = float(os.getenv("SCENE_GRAPH_LOAD_TIMEOUT_S", "2.0"))
 SCENE_GRAPH_PLAN_BUDGET_S = float(os.getenv("SCENE_GRAPH_PLAN_BUDGET_S", "3.0"))
+SCENE_GRAPH_TOTAL_BUDGET_S = float(os.getenv("SCENE_GRAPH_TOTAL_BUDGET_S", "3.5"))
+SCENE_GRAPH_PLAN_MAX_INFLIGHT = int(os.getenv("SCENE_GRAPH_PLAN_MAX_INFLIGHT", "4"))
+# Loaded graphs kept in memory: CACHE_VERSIONS in total (an LRU over maps), at most
+# CACHE_VERSIONS_PER_MAP of one map (the served and the one being refreshed), CACHE_MAX_BYTES their
+# summed `nbytes` when the graph reports it (0 = no byte budget; the newest graph is always kept).
 SCENE_GRAPH_CACHE_VERSIONS = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS", "4"))
+SCENE_GRAPH_CACHE_VERSIONS_PER_MAP = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS_PER_MAP", "2"))
+SCENE_GRAPH_CACHE_MAX_BYTES = int(os.getenv("SCENE_GRAPH_CACHE_MAX_BYTES", "0"))
+# A store.meta answer is reused this long per map and shared by concurrent requests (one query).
+SCENE_GRAPH_META_TTL_S = float(os.getenv("SCENE_GRAPH_META_TTL_S", "0.75"))
 # A chart route needs a graph at least as new as the ingest: when the oldest costmap stored after the
-# version's cursor has waited longer than this, the planner falls back (`stale_graph`). 0 disables.
+# version's cursor has waited longer than this, the planner falls back (`stale_graph`); the same
+# bound applies to how long a newer version may have been known (in the store's meta) while an
+# older loaded one is served, whatever the cursor says. 0 disables both.
 SCENE_GRAPH_MAX_VERSION_LAG_S = float(os.getenv("SCENE_GRAPH_MAX_VERSION_LAG_S", "120.0"))
-# A route narrower than the planning robot's factsheet width plus this margin is `too_narrow`.
-SCENE_GRAPH_WIDTH_MARGIN_M = float(os.getenv("SCENE_GRAPH_WIDTH_MARGIN_M", "0.0"))
-# Gate of the `too_narrow` comparison above. OFF by default: the engine's `Route.min_width` is not
-# the passage width (it is 2 * the minimum clearance along a corner-hugging path: 0.6 m in a 1.5 m
-# corridor), so the check refuses robots that fit. Turn on only after the engine defect is fixed.
+# A route whose narrowest passage (engine Route.min_width, lattice error +-0.05 m) is under the
+# robot's footprint plus this margin is `too_narrow`: need = width + margin when the route needs no
+# turn in place, hypot(length, width) + margin when it does. The margin is the lattice error:
+# lattice / 2 = 0.05 m for the default 0.1 m lattice.
+SCENE_GRAPH_WIDTH_MARGIN_M = float(os.getenv("SCENE_GRAPH_WIDTH_MARGIN_M", "0.05"))
+# Gate of the `too_narrow` comparison above. OFF by default until it is validated on real maps.
 SCENE_GRAPH_WIDTH_CHECK_ENABLED = _env_bool("SCENE_GRAPH_WIDTH_CHECK_ENABLED", "false")
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
@@ -569,6 +584,41 @@ SCENE_GRAPH_WIDTH_CHECK_ENABLED = _env_bool("SCENE_GRAPH_WIDTH_CHECK_ENABLED", "
 SCENE_GRAPH_PREWARM_MAPS = tuple(m.strip() for m in os.getenv("SCENE_GRAPH_PREWARM_MAPS", "").split(",")
                                  if m.strip())
 SCENE_GRAPH_PREWARM_CONCURRENCY = int(os.getenv("SCENE_GRAPH_PREWARM_CONCURRENCY", "2"))
+
+
+def _validate_scene_graph_planner() -> None:
+    """Clamp planner settings that would break it (a zero timeout, a negative size) to their
+    defaults and say so once; the planner is a best-effort path, so a bad value is repaired, not fatal."""
+    fixed = []
+    for name, lo, default in (
+            ("SCENE_GRAPH_LOAD_TIMEOUT_S", 0.0, 2.0), ("SCENE_GRAPH_PLAN_BUDGET_S", 0.0, 3.0),
+            ("SCENE_GRAPH_TOTAL_BUDGET_S", 0.0, 3.5), ("SCENE_GRAPH_START_SNAP_M", 0.0, 0.5),
+            ("SCENE_GRAPH_GOAL_SNAP_M", 0.0, 1.5), ("SCENE_GRAPH_LEAF_SNAP_M", 0.0, 1.0)):
+        value = globals()[name]
+        if not (value > lo and value < float("inf")):            # also NaN
+            fixed.append(f"{name}={value} -> {default}")
+            globals()[name] = default
+    for name, default, lo in (
+            ("SCENE_GRAPH_CACHE_VERSIONS", 4, 1), ("SCENE_GRAPH_CACHE_VERSIONS_PER_MAP", 2, 1),
+            ("SCENE_GRAPH_PLAN_MAX_INFLIGHT", 4, 1), ("SCENE_GRAPH_PREWARM_CONCURRENCY", 2, 1),
+            ("SCENE_GRAPH_CACHE_MAX_BYTES", 0, 0)):
+        value = globals()[name]
+        if value < lo:
+            fixed.append(f"{name}={value} -> {default}")
+            globals()[name] = default
+    for name, default in (("SCENE_GRAPH_MAX_VERSION_LAG_S", 120.0), ("SCENE_GRAPH_META_TTL_S", 0.75),
+                          ("SCENE_GRAPH_WIDTH_MARGIN_M", 0.05), ("SCENE_GRAPH_MAX_WAYPOINT_GAP_M", 5.0)):
+        value = globals()[name]
+        if not (value >= 0.0 and value < float("inf")):
+            fixed.append(f"{name}={value} -> {default}")
+            globals()[name] = default
+    if fixed:
+        import logging
+        logging.getLogger("config").warning("invalid scene graph planner settings reset: %s",
+                                            "; ".join(fixed))
+
+
+_validate_scene_graph_planner()
 
 # Scene-graph ingest worker batching (measured: a whole-batch fold costs seconds, and a larger
 # batch amortises a fixed solve, so the worker folds in batches, never leaf by leaf).
