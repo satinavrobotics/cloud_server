@@ -14,3 +14,5 @@ SQLAlchemy==2.0.36
 numpy==1.26.4
 # downscaled node images (topomap_dbs/image_db get_image_resized)
 Pillow==10.2.0
+# scene graph library (packages/scene_graph, read API)
+scipy==1.11.4

@@ -29,6 +29,9 @@ COPY packages/database/ /app/packages/database/
 # Copy events package (MAP.INGEST_REJECTED, maps redesign M2)
 COPY packages/events/ /app/packages/events/
 
+# Copy scene_graph library (scene-graph worker, SCENE_GRAPH_WORKER_ENABLED; needs numpy + scipy)
+COPY packages/scene_graph/ /app/packages/scene_graph/
+
 # Copy cloud_common package
 COPY cloud_common/ /app/cloud_common/
 

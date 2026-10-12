@@ -30,6 +30,7 @@ from packages.config import (
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
     RADIUS_THRESHOLD, DISTANCE_THRESHOLD, IMAGE_BUFFER_TIMEOUT,
     PORT_GRAPH_BUILDER, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
+    SCENE_GRAPH_WORKER_ENABLED,
 )
 
 
@@ -126,10 +127,22 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_periodic_cleanup())
     asyncio.create_task(_periodic_reject_flush())
+    scene_host = None
+    if SCENE_GRAPH_WORKER_ENABLED:
+        try:
+            from .scene_host import start_scene_worker
+            scene_host = start_scene_worker(service, asyncio.get_running_loop())
+        except Exception as e:  # noqa: BLE001
+            logging.error(f"Scene graph worker not started: {type(e).__name__}: {e}")
     logging.info("🚀 Graph Builder Service started")
 
     yield
 
+    if scene_host is not None:
+        try:
+            await asyncio.to_thread(scene_host.stop)
+        except Exception as e:  # noqa: BLE001
+            logging.error(f"Scene graph worker shutdown failed: {e}")
     if service:
         service.disconnect_mqtt()
     logging.info("👋 Graph Builder Service shutting down")

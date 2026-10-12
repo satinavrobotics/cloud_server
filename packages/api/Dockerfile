@@ -41,6 +41,9 @@ COPY packages/utils/ /app/packages/utils/
 COPY packages/events/ /app/packages/events/
 COPY packages/telemetry_ingest/ /app/packages/telemetry_ingest/
 
+# Scene graph library (read API: packages/api/scene_graph_reads.py; needs numpy + scipy)
+COPY packages/scene_graph/ /app/packages/scene_graph/
+
 # Copy config
 COPY packages/config.py /app/packages/config.py
 

@@ -43,6 +43,7 @@ pillow>=10.0.0
 
 # 3D reconstruction top view (packages/api/reconstruction_topview.py; the API pins it too)
 numpy==1.26.4
+scipy==1.11.4  # packages/scene_graph
 
 # Spatial indexing (for tests)
 rtree>=1.0.0
