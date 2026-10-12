@@ -1,7 +1,11 @@
 # Scene graph: integration plan
 
-Status: proposal, revised after review. Companion to `design.md` (the algorithm); this file scopes how it joins the
-running system.
+Status: proposal, revised after review and for scale. Companion to `design.md` (the algorithm); this file scopes how
+it joins the running system.
+
+**Ownership.** CIMBI: the algorithm (`packages/scene_graph`) and its persistence (snapshot, `sg_*` storage), see
+`handoff_cimbi.md`. LACI: everything else here (ingest worker, read API, client, planner, lifecycle hooks, events,
+ops). Pieces 1, 3, 4 (snapshot part) and the refold in 5 are CIMBI's; the rest is LACI's.
 
 ## Decisions
 
@@ -21,14 +25,34 @@ running system.
   `_Region.node()` returns -1 off the lattice (which would index the last node). It is not a planning API.
 * The coarse lattice is small (about 1.7k nodes for office8), so a plain Dijkstra on it gives the exact path, takes a
   blocked overlay trivially, and has no portal-sampling stretch (1.00-1.24). **Planning therefore searches the coarse
-  lattice directly.** Regions, anchors and links are for display, "go to place" goal picking and hierarchy; `Router`
-  is demoted to an optional accelerator for very large maps.
+  lattice, not anchor-to-anchor.** Regions, anchors and links serve display, "go to place" goal picking and hierarchy,
+  and at scale `Router`'s portal graph selects the corridor (see "Scale design").
 * There is no serialization. State to persist: the `CellMap` chunks (value, owner, visited), `anchors`, `_next`,
   `_last` (per session; without it the first leaf after a restart skips `clear_path`) and the params hash.
 * Fold is destructive and the result history-dependent. A leaf delete or a session realign is therefore a **full
   refold** (O(N) costmap fetches from MinIO) and changes partition and anchor ids. This supersedes design.md's
   "a leaf is folded once and not queried again" for those two events only.
 * One leaf costs `_rebuild()` plus a `_Region` construction again in `links()` and in `build_levels()`.
+
+## Scale design (small and very large maps)
+
+One principle: every operation is local and bounded; a small map is the degenerate case.
+
+* **Incremental builder**: repair only the leaf window plus margin (clearance capped so it is local); per-leaf cost is
+  independent of map size. Today `_rebuild` is O(map) per leaf.
+* **Planning = corridor, then refine**: portal graph (`Router`'s role) picks the region sequence; the lattice search
+  runs only inside those regions plus a one-region margin. On a small map the corridor is the whole map. Waypoints
+  come from the refined lattice path (simplified).
+* **Tiled persistence**: snapshot per tile plus a manifest; the planner loads only the tiles a corridor touches,
+  cached by `(map, version, tile)`. Tiles are storage only; regions cross tile borders.
+* **Local refold**: leaf delete refolds only the leaves overlapping the affected tiles (spatial query on the existing
+  node index; no membership table); regions elsewhere keep their ids. Realign is a background rebuild with an atomic
+  version switch.
+* **Serve by view**: `GET .../scene-graph?bbox=&level=`; hierarchy levels are zoom level of detail; the websocket
+  sends the dirty bbox and changed ids, not the graph.
+* **Gate**: synthetic worlds to about 1M lattice nodes; per-leaf update flat in map size; plan latency bounded by the
+  corridor; path cost within 1.05x of the full-lattice search; invariants equal to a full rebuild's.
+  Everything about large scale is a projection until this gate passes.
 
 ## Pieces
 
