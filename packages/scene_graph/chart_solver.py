@@ -9,6 +9,7 @@
               smallest-chart order, each tries to be removed, else moved to the projected centroid of its chart; a step is taken iff the set stays
               feasible and strictly lowers (|A|, #dependents, sum of D over owned cells) lexicographically.  Stationary under the proposal map.
   locality  = a step re-simulates only the cells that can read a changed cell: the closure of (cells seen by the changed anchors) under 'reads'."""
+import hashlib
 import math
 import numpy as np
 from scipy import ndimage
@@ -26,11 +27,11 @@ def octile(dy, dx, h):
 
 class Row:
     """everything one anchor cell contributes: the cells it sees, and the tables of its digital drives"""
-    __slots__ = ('a', 'T', 'SEG', 'P', 'Q', 'rect', 'D', 'dep', 'chg')
+    __slots__ = ('a', 'T', 'SEG', 'P', 'Q', 'rect', 'D', 'dep', 'chg', 'im', 'inv', 'nq')
 
 
 class Local:
-    def __init__(s, nav, clr, h=0.1, r=0.25, mult=1.5, eps=None, img_rows=None, delta=None, sight_range=None):
+    def __init__(s, nav, clr, h=0.1, r=0.25, mult=1.5, eps=None, img_rows=None, delta=None, sight_range=None, kmemo=None):
         s.h, s.r = h, r
         # sight_range (m): an anchor sees a cell only within this Euclidean distance (centre to centre); None = unbounded.
         # It must reach a ball of the place scale, else an anchor could not even see the ball it was put in for.
@@ -65,6 +66,7 @@ class Local:
         s._pick = {}
         s._chart_memo = {}
         s._mask_cache = {}
+        s.kmemo = [{}, {}] if kmemo is None else kmemo          # (this frame, previous frame): kernel tests and proposals by chart content
         s.stats = dict(rows=0, resim=0, resim_cells=0, closure_iter=0, trials=0)
 
     def _near(s, a, T):
@@ -110,7 +112,7 @@ class Local:
                 r_ = Row(); r_.a = a; r_.chg = np.zeros(0, np.int64)
                 r_.T = s.flat2idx[im['T']]
                 r_.SEG = s._toidx(im['SEG']); r_.P = s._toidx(im['P']); r_.Q = s._toidx(im['Q'])
-                r_.rect = im['rect']; r_.dep = im['dep']
+                r_.rect = im['rect']; r_.dep = im['dep']; r_.im = im; r_.inv = None; r_.nq = 0     # unchanged: exported as it came
                 r_.D = octile(s.ys[r_.T] - s.ys[a], s.xs[r_.T] - s.xs[a], s.h)
                 s.rows[a] = r_; s.stats['rows_reused'] = s.stats.get('rows_reused', 0) + 1
                 return r_
@@ -132,7 +134,7 @@ class Local:
             xmin = min(xmin, int(cc[first].min())); xmax = max(xmax, int(cc[first].max()))
         back = s.drives_ok(s.ys[T], s.xs[T], ya, xa)
         Tv = T[ok & back]
-        r_ = Row(); r_.a = a; r_.T = Tv; r_.rect = (ymin, ymax, xmin, xmax); r_.chg = T
+        r_ = Row(); r_.a = a; r_.T = Tv; r_.rect = (ymin, ymax, xmin, xmax); r_.chg = T; r_.im = None; r_.inv = None; r_.nq = 0
         dd = np.unique(np.concatenate(depf)) if depf else np.zeros(0, np.int64)       # forward-visible region and its first blockers
         m_ = np.zeros((s.H + 2, s.W + 2), bool); m_[dd // s.W + 1, dd % s.W + 1] = True
         m_ = ndimage.binary_dilation(m_, structure=np.ones((3, 3)))                     # the reverse drive is the same segment digitised from the other end
@@ -190,9 +192,10 @@ class Local:
         u = np.unique(np.stack([cy, cx], 1), axis=0)
         wy = (s.ys[Tc] - ay).astype(np.int32); wx = (s.xs[Tc] - ax).astype(np.int32)
         C = np.zeros(len(Tc), bool)
-        for (uy_, ux_) in u.tolist():
-            C |= s._on_drive(wy, wx, uy_ - ay, ux_ - ax)                       # a -> x
-            C |= s._on_drive(-wy, -wx, uy_ - ay - wy, ux_ - ax - wx)           # x -> a: origin x, cell relative to x = (cell - a) - (x - a)
+        for i in range(0, len(u), 64):                                        # changed cells in blocks: one broadcast per block, not a call per cell
+            cy = (u[i:i + 64, 0] - ay).astype(np.int32)[:, None]; cx = (u[i:i + 64, 1] - ax).astype(np.int32)[:, None]
+            C |= s._on_drive(wy[None, :], wx[None, :], cy, cx).any(0)                           # a -> x
+            C |= s._on_drive(-wy[None, :], -wx[None, :], cy - wy[None, :], cx - wx[None, :]).any(0)   # x -> a: origin x, cell relative to x = (cell - a) - (x - a)
         inC = np.zeros(s.N + 1, bool); inC[Tc[C]] = True
         newf = s.flat2idx[s.delta_flat]; newf = newf[newf < s.N]
         inC[newf] = True
@@ -229,7 +232,7 @@ class Local:
         else:
             SEG, P, Q, T = SEGk, Pk, Qk, Tk
         o = np.argsort(T, kind='stable')
-        r_ = Row(); r_.a = a; r_.T = T[o]; r_.SEG = SEG[o]; r_.P = P[o]; r_.Q = Q[o]
+        r_ = Row(); r_.a = a; r_.T = T[o]; r_.SEG = SEG[o]; r_.P = P[o]; r_.Q = Q[o]; r_.im = None; r_.inv = None; r_.nq = 0
         r_.D = octile(s.ys[r_.T] - ay, s.xs[r_.T] - ax, s.h)
         dep = im['dep']
         if depf:
@@ -266,7 +269,8 @@ class Local:
         out = {}
         f = np.append(s.flat, -1)
         for a, r_ in s.rows.items():
-            out[(int(s.ys[a]), int(s.xs[a]))] = dict(T=s.flat[r_.T], SEG=f[r_.SEG], P=f[r_.P], Q=f[r_.Q], rect=r_.rect, dep=r_.dep)
+            key = (int(s.ys[a]), int(s.xs[a]))
+            out[key] = r_.im if r_.im is not None else dict(T=s.flat[r_.T], SEG=f[r_.SEG], P=f[r_.P], Q=f[r_.Q], rect=r_.rect, dep=r_.dep)
         return out
 
     # ---- ownership by rounds on a set S of cells, the rest frozen
@@ -303,20 +307,34 @@ class Local:
         P = np.concatenate([pad(p[3], Pw, A[p[0]]) for p in parts]) if Pw else np.zeros((len(cells), 0), np.int32)
         Q = np.concatenate([pad(p[4], Pw, A[p[0]]) for p in parts]) if Pw else np.zeros((len(cells), 0), np.int32)
         n = len(cells)
+        # the cells the drives read: a drive of length nl occupies the first nl columns of its table, the rest repeats its anchor (column 0),
+        # so rows are scattered in groups of equal length, each with only its own columns
+        act = np.argsort(nl, kind='stable'); nls = nl[act]
         rd_ = np.zeros(N + 1, bool)
-        rd_[SEG.ravel()] = True; rd_[P.ravel()] = True; rd_[Q.ravel()] = True; rd_[cells] = True
+        gv, g0 = np.unique(nls, return_index=True); g1 = np.append(g0[1:], n)
+        for v_g, i0, i1 in zip(gv.tolist(), g0.tolist(), g1.tolist()):
+            g = act[i0:i1]
+            rd_[SEG[g, :v_g].ravel()] = True
+            if Pw:
+                pw = min(v_g, Pw); rd_[P[g, :pw].ravel()] = True; rd_[Q[g, :pw].ravel()] = True
+        rd_[cells] = True
         s._reads = reads = np.nonzero(rd_[:N])[0]
-        # frozen cells become readable at their own round: do not stop before the last one that is read
+        # frozen cells become readable at their own round (the events below): do not stop before the last one that is read
         v_ = rnd_e[reads]; v_ = v_[v_ < BIG]
-        tmax = int(v_.max()) if len(v_) else 0
         # a drive is ready only if its last cell before the target is already owned by its anchor: one gather per row and round decides which
         # rows get the full test (every cell of the drive and its diagonal cells), so a round costs O(rows) and not O(rows x drive length)
         last = SEG[np.arange(n), nl - 1]
+        # rows by drive length: at round t only the prefix with nl <= t can be ready, and a row whose cell is owned never is again (ownership
+        # is only ever added here), so the active list shrinks as cells are owned; the rest of a round is unchanged
+        ev = np.unique(v_ + 1)
         t = 0
         while True:
             t += 1
             touched = None
-            idx = np.nonzero((nl <= t) & (own_e[last] == jv) & (rnd_e[last] < t) & (own_e[cells] < 0))[0]
+            k_ = int(np.searchsorted(nls, t, 'right'))
+            cand = act[:k_]
+            lc = last[cand]
+            idx = cand[(own_e[lc] == jv[cand]) & (rnd_e[lc] < t) & (own_e[cells[cand]] < 0)]
             if len(idx):
                 jh = jv[idx, None]; SEGh = SEG[idx]
                 ready = ((own_e[SEGh] == jh) & (rnd_e[SEGh] < t)).all(1)
@@ -331,25 +349,62 @@ class Local:
                     pick_ = od[first]
                     touched = rc[pick_]; won = rj[pick_]
             if touched is None:
-                if t > tmax: break
+                # nothing changed: the next round differs only where a frozen cell becomes readable (round r + 1; a drive's last cell is at
+                # distance nl - 1, so it is owned no earlier than round nl - 1 and an eligible drive is always waiting on such an event)
+                e_ = np.searchsorted(ev, t, 'right')
+                if e_ >= len(ev): break
+                t = int(ev[e_]) - 1
                 continue
             own_e[touched] = won; rnd_e[touched] = t
+            m_ = own_e[cells[cand]] < 0                                  # only the examined prefix can have lost rows
+            act = np.concatenate([cand[m_], act[k_:]]); nls = np.concatenate([nls[:k_][m_], nls[k_:]])
         own[:] = own_e[:N]; rnd[:] = rnd_e[:N]
         return invo
+
+    def _inverse(s, r_):
+        """cell -> targets of this row that have the cell on their drive or on an orthogonal cell of one (CSR, built once per row and frame:
+        the drive tables are read-only, so a changed set X is answered from its own entries instead of a pass over the whole table)"""
+        if r_.inv is None:
+            T = len(r_.T)
+            cols = [r_.SEG.ravel()]; rows = [np.repeat(np.arange(T, dtype=np.int32), r_.SEG.shape[1])]
+            if r_.P.shape[1]:
+                for tab in (r_.P, r_.Q):
+                    cols.append(tab.ravel()); rows.append(np.repeat(np.arange(T, dtype=np.int32), tab.shape[1]))
+            c = np.concatenate(cols); t = np.concatenate(rows)
+            m = c < s.N                                             # the sentinel (outside F) is never in a changed set
+            r_.inv = coo_matrix((np.ones(int(m.sum()), np.int8), (c[m], t[m])), shape=(s.N + 1, T)).tocsr()
+        return r_.inv
 
     def readers(s, A, X):
         """cells that have a cell of X on a drive (or orthogonal cell of a drive) of some anchor that sees them.
         Only anchors whose dependency set meets X can have such a cell (every drive cell of a visible target is in it)."""
         if not len(X): return np.zeros(0, np.int64)
         out = []
-        Xm = np.zeros(s.H * s.W, bool); Xm[s.flat[X]] = True
-        Xc = np.zeros(s.N + 1, bool); Xc[X] = True                 # by cell, the sentinel N (outside F) is never in X
+        Xf = s.flat[X]
+        Xm = np.zeros(s.H * s.W, bool); Xm[Xf] = True
+        Xc = None
+        xy0, xy1 = int(Xf.min() // s.W), int(Xf.max() // s.W); xx = Xf % s.W; xx0, xx1 = int(xx.min()), int(xx.max())
         for a in A:
             r_ = s.row(a)
+            ry0, ry1, rx0, rx1 = r_.rect                           # the dependency set lies within the rect grown by one cell
+            if xy1 < ry0 - 1 or xy0 > ry1 + 1 or xx1 < rx0 - 1 or xx0 > rx1 + 1: continue
             if not len(r_.T) or not Xm[r_.dep].any(): continue
-            h = Xc[r_.SEG].any(1)
-            if r_.P.shape[1]: h |= Xc[r_.P].any(1) | Xc[r_.Q].any(1)
-            if h.any(): out.append(r_.T[h])
+            r_.nq += 1
+            if r_.nq == 1:                                         # a row asked once is read through (no index to build for one question)
+                if Xc is None: Xc = np.zeros(s.N + 1, bool); Xc[X] = True
+                h = Xc[r_.SEG].any(1)
+                if r_.P.shape[1]: h |= Xc[r_.P].any(1) | Xc[r_.Q].any(1)
+                h = np.nonzero(h)[0]
+            else:
+                inv = s._inverse(r_)
+                ln = inv.indptr[X + 1] - inv.indptr[X]; tot = int(ln.sum())
+                if tot:
+                    k = np.repeat(inv.indptr[X] - np.cumsum(ln) + ln, ln) + np.arange(tot)       # the entries of the rows X, concatenated
+                    mk = np.zeros(len(r_.T), bool); mk[inv.indices[k]] = True
+                    h = np.nonzero(mk)[0]
+                else:
+                    h = np.zeros(0, np.int64)
+            if len(h): out.append(r_.T[h])
         return np.unique(np.concatenate(out)) if out else np.zeros(0, np.int64)
 
     def settle(s, A, own_base, rnd_base, S0, X0=None, local=True):
@@ -373,26 +428,39 @@ class Local:
 
     # ---- pockets: unowned cells (8-connected) holding a ball of radius s
     def pocket_from(s, own, seeds):
-        """components of unowned cells containing a seed; returns the list of (min cell, argmax clr cell) of those holding a ball >= scale"""
-        seen = set(); out = []
-        s._pk_seen = seen
-        for c0 in seeds.tolist():
-            if own[c0] >= 0 or c0 in seen: continue
-            comp = [c0]; seen.add(c0); st = [c0]
-            while st:
-                c = st.pop(); y, x = int(s.ys[c]), int(s.xs[c])
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        yy, xx = y + dy, x + dx
-                        if 0 <= yy < s.H and 0 <= xx < s.W:
-                            n_ = int(s.idx[yy, xx])
-                            if n_ >= 0 and n_ not in seen and own[n_] < 0:
-                                seen.add(n_); st.append(n_); comp.append(n_)
-            comp = np.array(comp)
-            if s.clr[comp].max() >= s.scale:
-                mx = comp[s.clr[comp] == s.clr[comp].max()].min()
-                out.append((int(comp.min()), int(mx)))
-        return sorted(out)
+        """components of unowned cells (8-connected) containing a seed; returns the list of (min cell, argmax clr cell) of those holding a ball >= scale.
+        `s._pk_seen` = every cell of the components that contain a seed (what the answer depends on)."""
+        seeds = np.asarray(seeds, np.int64)
+        seeds = seeds[own[seeds] < 0] if len(seeds) else seeds
+        s._pk_seen = np.zeros(0, np.int64)
+        if not len(seeds): return []
+        U = np.nonzero(own < 0)[0]                                   # ascending cell index
+        pos = -np.ones(s.N, np.int64); pos[U] = np.arange(len(U))
+        R, C = [], []
+        for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+            y2, x2 = s.ys[U] + dy, s.xs[U] + dx
+            ok = (y2 >= 0) & (y2 < s.H) & (x2 >= 0) & (x2 < s.W)
+            i = np.nonzero(ok)[0]
+            n_ = s.idx[y2[i], x2[i]]
+            m = n_ >= 0
+            i, n_ = i[m], n_[m]
+            j = pos[n_]; m = j >= 0
+            R.append(i[m]); C.append(j[m])
+        R = np.concatenate(R); C = np.concatenate(C)
+        _, lab = connected_components(coo_matrix((np.ones(len(R), np.int8), (R, C)), shape=(len(U), len(U))), directed=False)
+        sel = np.unique(lab[pos[seeds]])
+        m = np.isin(lab, sel)
+        cells = U[m]; lb = lab[m]
+        s._pk_seen = cells
+        clr = s.clr[cells]
+        top = np.full(lab.max() + 1, -np.inf); np.maximum.at(top, lb, clr)
+        _, first = np.unique(lb, return_index=True)                  # cells ascending: the first of a label is its minimum
+        lmin = cells[first]; ls = lb[first]
+        ok = top[ls] >= s.scale
+        eq = clr == top[lb]
+        _, fe = np.unique(lb[eq], return_index=True)
+        mx = dict(zip(lb[eq][fe].tolist(), cells[eq][fe].tolist()))
+        return sorted((int(c), int(mx[int(l)])) for c, l, o in zip(lmin, ls, ok) if o)
 
     # ---- anchor of one chart: kernel (cells that drive straight to every owned cell inside the chart) and clearance band
     def _kernel_member(s, mk, ym, xm, y):
@@ -432,9 +500,26 @@ class Local:
         key = mine.tobytes()
         c = s._chart_memo.get(key)
         if c is None:
-            peak = s.clr[mine].max()
-            cand = mine[s.clr[mine] >= s.band * peak - 1e-9]         # band cells of this chart only: O(chart), not O(map)
-            c = dict(key=key, mine=mine, ym=s.ys[mine], xm=s.xs[mine], cand=cand, band=set(cand.tolist()), member={}, prop=False)
+            clr = s.clr[mine]
+            peak = clr.max()
+            cand = mine[clr >= s.band * peak - 1e-9]                 # band cells of this chart only: O(chart), not O(map)
+            ym, xm = s.ys[mine], s.xs[mine]
+            y0, x0 = int(ym.min()), int(xm.min())
+            # What a kernel test or the proposal reads is the chart's cells, F inside their bounding box (every drive between two cells of
+            # the box, and the orthogonal cells of its diagonal steps, stay in the box) and their clearance (the band): that content, in
+            # coordinates relative to the box, is the memo key, so the answer carries over to any frame in which the chart is unchanged.
+            y1, x1 = int(ym.max()), int(xm.max())
+            m_ = np.zeros((y1 - y0 + 1, x1 - x0 + 1), bool); m_[ym - y0, xm - x0] = True
+            hk = hashlib.blake2b(digest_size=16)
+            hk.update(np.array(m_.shape, np.int32).tobytes()); hk.update(np.packbits(m_).tobytes())
+            hk.update(np.packbits(s.nav[y0:y1 + 1, x0:x1 + 1]).tobytes()); hk.update(clr.tobytes())
+            ck = hk.digest()
+            pm = s.kmemo[0].get(ck)
+            if pm is None:
+                pm = s.kmemo[1].get(ck)
+                if pm is None: pm = dict(member={}, prop=False)
+                s.kmemo[0][ck] = pm
+            c = dict(key=key, mine=mine, ym=ym, xm=xm, cand=cand, band=set(cand.tolist()), pm=pm, y0=y0, x0=x0, wb=x1 - x0 + 1)
             s._chart_memo[key] = c
         return c
 
@@ -454,9 +539,10 @@ class Local:
 
     def _in_kernel_band(s, c, y):
         if y not in c['band']: return False
-        v = c['member'].get(y)
+        rk = (int(s.ys[y]) - c['y0']) * c['wb'] + (int(s.xs[y]) - c['x0'])
+        v = c['pm']['member'].get(rk)
         if v is None:
-            v = c['member'][y] = s._kernel_member(s._mask(c), c['ym'], c['xm'], y)
+            v = c['pm']['member'][rk] = s._kernel_member(s._mask(c), c['ym'], c['xm'], y)
         return v
 
     def anchor_ok(s, mine, a):
@@ -469,7 +555,10 @@ class Local:
         refined by steepest descent of the octile drive length sum over adjacent kernel-and-band cells; None if no cell qualifies.
         Tests kernel membership of a few candidates, not of the whole band."""
         c = s._chart(mine)
-        if c['prop'] is not False: return c['prop']
+        pm = c['pm']
+        if pm['prop'] is not False:
+            rel = pm['prop']
+            return None if rel is None else int(s.idx[c['y0'] + rel[0], c['x0'] + rel[1]])
         n = len(mine); sy = int(c['ym'].sum()); sx = int(c['xm'].sum())
         cand = c['cand']                                             # band cells of the chart, ascending cell index
         d2 = (n * s.ys[cand] - sy) ** 2 + (n * s.xs[cand] - sx) ** 2    # (n * distance to the centroid)^2, exact
@@ -492,7 +581,7 @@ class Local:
                                 if j < Jc - 1e-9 and (best is None or (j, y) < best): best = (j, y)
                 if best is None: break
                 Jc, cur = best
-        c['prop'] = cur
+        pm['prop'] = None if cur is None else (int(s.ys[cur]) - c['y0'], int(s.xs[cur]) - c['x0'])
         return cur
 
     # ---- state of a solution
@@ -535,14 +624,16 @@ class Local:
             A.append(c); own_b[c] = len(A) - 1; rnd_b[c] = 0; X0 = [c]
         elif op[0] == 'remove':
             j = op[1]; a = A[j]
-            S0 = np.union1d(s.row(a).T, [a])
+            # removing an anchor changes only what it owned (a cell owned by another anchor keeps its owner: that anchor is still a valid
+            # candidate and was the nearest); whatever else reads a changed cell is found by the closure of settle
+            S0 = np.union1d(np.nonzero(own == j)[0], [a])
             own_b[own_b == j] = -1
             own_b[own_b > j] -= 1
             rnd_b[a] = BIG; own_b[a] = -1; X0 = [a]
             del A[j]
         else:
             j, b = op[1], op[2]; a = A[j]
-            S0 = np.union1d(np.union1d(s.row(a).T, s.row(b).T), [a, b])
+            S0 = np.union1d(np.union1d(np.nonzero(own == j)[0], s.row(b).T), [a, b])      # what a owned, what b can now claim
             own_b[own_b == j] = -1
             rnd_b[a] = BIG; own_b[a] = -1
             A[j] = b; own_b[b] = j; rnd_b[b] = 0; X0 = [a, b]
@@ -578,7 +669,7 @@ class Local:
             if len(A) > 1:
                 A2, o2, r2, S, invo = s.apply(A, own, rnd, ('remove', j), local=local); used |= invo; reads.append(s._apply_reads); reads.append(S)
                 ok = s.feasible_after(A2, o2, S)
-                reads.append(np.fromiter(s._pk_seen, np.int64, len(s._pk_seen)))
+                reads.append(s._pk_seen)
                 if ok: done = (A2, o2, r2, S)
             if done is None:
                 mine = np.nonzero(own == j)[0]
@@ -588,7 +679,7 @@ class Local:
                     used.add(b)
                     A2, o2, r2, S, invo = s.apply(A, own, rnd, ('move', j, b), local=local); used |= invo; reads.append(s._apply_reads); reads.append(S)
                     ok = s.feasible_after(A2, o2, S)
-                    reads.append(np.fromiter(s._pk_seen, np.int64, len(s._pk_seen)))
+                    reads.append(s._pk_seen)
                     if ok:
                         aff = np.union1d(S, np.nonzero((own == j) | (o2 == j))[0])
                         old = s.objective(A, own, aff); new = s.objective(A2, o2, aff)

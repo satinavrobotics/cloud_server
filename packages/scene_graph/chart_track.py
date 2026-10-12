@@ -13,6 +13,7 @@ class Track:
         s.img_rows = {}         # (y,x) -> row of an anchor (or of a hypothetical move target) in image positions, valid for the last frame
         s.tried = {}            # (y,x) -> (set of (y,x) of the anchors the last trial used, flat positions it read)
         s.last = {}
+        s.kmemo = [{}, {}]      # chart content -> kernel-test and proposal answers, this frame and the previous one (chart_solver._chart)
 
     def grow(s, shift, shape):
         """The canvas grew: the old image sits at `shift` (rows, cols in lattice cells) inside an image of `shape`.
@@ -50,7 +51,7 @@ class Track:
         delta = (nav != s.nav)                              # F membership: what the drives and ownership depend on
         dclr = (np.abs(clr - s.clr) > 1e-9) & nav & s.nav    # clearance: what the band depends on
         t_delta = time.perf_counter() - t0
-        sp = L.Local(nav, clr, h=s.h, r=s.r, mult=s.mult, img_rows=s.img_rows, delta=delta, sight_range=s.sight_range)
+        sp = L.Local(nav, clr, h=s.h, r=s.r, mult=s.mult, img_rows=s.img_rows, delta=delta, sight_range=s.sight_range, kmemo=s.kmemo)
         t_build = time.perf_counter() - t0 - t_delta
         N = sp.N
         keep = [k for k, (y, x) in enumerate(s.anchors) if sp.idx[y, x] >= 0]
@@ -117,6 +118,7 @@ class Track:
         queue = {a for a in A if a not in tried}
         A, own, rnd, tried = sp.descend(A, own, rnd, queue=queue, local=local, tried=tried)
         dt = time.perf_counter() - t0
+        s.kmemo = [{}, s.kmemo[0]]   # entries not used for two frames are dropped
         # persist
         s.nav = nav.copy(); s.clr = clr.copy()
         s.anchors = [(int(sp.ys[a]), int(sp.xs[a])) for a in A]

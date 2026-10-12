@@ -6,10 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-RES = 0.05                 # costmap cell (m)
-LAT = 2                    # lattice step in costmap cells
-NONE_ROUND = (1 << 30)     # chart_solver.BIG: a cell that no round has reached
-
 
 @dataclass
 class LeafRecord:

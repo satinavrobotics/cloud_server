@@ -115,7 +115,12 @@ class ChartGraph(SceneGraph):
         self._cache: dict = {}
         self._shift = (0, 0)                    # canvas growth of the batch being solved (lattice cells)
         self._ecache = None                     # (free, square-fits) of the last F build
+        self._dcache = None                     # (free, distance transform of free in cells) of the last F build
+        self._pl = None                         # driven evidence of the last F build: last point per session and the G / W / S images
+        self._pl_new: List[str] = []            # leaves added since then (appended to a session in capture order => incremental)
+        self._pl_full = False                   # a leaf was removed or changed: rebuild the evidence
         self._wcache: dict = {}                 # widest-path widths by pair content
+        self._rcache: dict = {}                 # routes from the anchor inside a chart, by chart content
 
     # ------------------------------------------------------------------ canvas and fold
     def _ensure(self, gx0: int, gy0: int, gx1: int, gy1: int) -> Tuple[int, int]:
@@ -190,7 +195,7 @@ class ChartGraph(SceneGraph):
             keep = {lf.key for lf in leaves}
             for k in [k for k, r in self._leaves.items()
                       if bbox.x0 <= r.x <= bbox.x1 and bbox.y0 <= r.y <= bbox.y1 and k not in keep]:
-                del self._leaves[k]
+                del self._leaves[k]; self._pl_full = True
             gx0, gy0 = int(math.floor(bbox.x0 / RES)), int(math.floor(bbox.y0 / RES))
             gx1, gy1 = int(math.ceil(bbox.x1 / RES)), int(math.ceil(bbox.y1 / RES))
             region = (gx0, gy0, gx1, gy1)
@@ -213,8 +218,12 @@ class ChartGraph(SceneGraph):
                     self._chan[name] = (np.full(self._V.shape, 255, np.uint8), -np.ones(self._V.shape, np.int64))
                 v, t = self._chan[name]
                 self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, lf.stamp_ms)
-            self._leaves[lf.key] = _Rec(lf.session, lf.stamp_ms, lf.x, lf.y, lf.r_d,
-                                        None if lf.view is None else CamView(lf.key, lf.view.x, lf.view.y, lf.view.yaw, lf.view.fov, lf.view.rng))
+            rec = _Rec(lf.session, lf.stamp_ms, lf.x, lf.y, lf.r_d,
+                       None if lf.view is None else CamView(lf.key, lf.view.x, lf.view.y, lf.view.yaw, lf.view.fov, lf.view.rng))
+            old_rec = self._leaves.get(lf.key)
+            if old_rec is None: self._pl_new.append(lf.key)
+            elif (old_rec.session, old_rec.t, old_rec.x, old_rec.y, old_rec.r_d) != (rec.session, rec.t, rec.x, rec.y, rec.r_d): self._pl_full = True
+            self._leaves[lf.key] = rec
             self._watermark = max(self._watermark, (lf.stamp_ms, lf.key))
         birth = max(((lf.stamp_ms, lf.key) for lf in leaves), default=self._watermark)[1]
         self._pending = []
@@ -289,18 +298,141 @@ class ChartGraph(SceneGraph):
         self._ecache = (free, sq)
         return sq
 
+    def _clearance_cells(self, free: np.ndarray, shift: Tuple[int, int]) -> np.ndarray:
+        """`distance_transform_edt(free)`, recomputed only where it can have changed.  A cell outside the changed box grown by R (the largest
+        distance of the previous map) keeps its value: its nearest blocked cell was within R and is untouched, and a newly blocked cell is
+        farther than R.  Inside, the transform of a window is exact for every cell whose value does not exceed its distance to the window's
+        edge (anything blocked outside the window is farther than that); the window widens until that holds for the whole box.  New canvas
+        area counts as changed (it was not part of the previous transform)."""
+        c, self._dcache = self._dcache, None
+        if c is None:
+            dt = ndimage.distance_transform_edt(free)
+            self._dcache = (free, dt)
+            return dt
+        fp, dp = c
+        H, W = free.shape
+        newarea = None
+        if fp.shape != free.shape:
+            oy, ox = 2 * shift[0], 2 * shift[1]
+            if oy + fp.shape[0] > H or ox + fp.shape[1] > W:
+                dt = ndimage.distance_transform_edt(free); self._dcache = (free, dt); return dt
+            f2 = np.zeros_like(free); f2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = fp
+            d2 = np.zeros(free.shape); d2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = dp
+            newarea = np.ones(free.shape, bool); newarea[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = False
+            fp, dp = f2, d2
+        ch = fp != free
+        if newarea is not None: ch |= newarea
+        if not ch.any():
+            self._dcache = (free, dp)
+            return dp
+        rows = np.nonzero(ch.any(1))[0]; cols = np.nonzero(ch.any(0))[0]
+        R = int(math.ceil(float(dp.max()))) + 1
+        ey0, ey1 = max(0, rows[0] - R), min(H, rows[-1] + 1 + R)
+        ex0, ex1 = max(0, cols[0] - R), min(W, cols[-1] + 1 + R)
+        rw = R + 1
+        while True:
+            wy0, wy1, wx0, wx1 = max(0, ey0 - rw), min(H, ey1 + rw), max(0, ex0 - rw), min(W, ex1 + rw)
+            dtw = ndimage.distance_transform_edt(free[wy0:wy1, wx0:wx1])
+            sub = dtw[ey0 - wy0:ey1 - wy0, ex0 - wx0:ex1 - wx0]
+            yy = np.arange(ey0, ey1)[:, None]; xx = np.arange(ex0, ex1)[None, :]
+            inf = np.inf
+            bound = np.minimum(np.minimum(np.where(wy0 > 0, yy - wy0 + 1.0, inf), np.where(wy1 < H, wy1 - yy, inf)),
+                               np.minimum(np.where(wx0 > 0, xx - wx0 + 1.0, inf), np.where(wx1 < W, wx1 - xx, inf)))
+            full_window = wy0 == 0 and wy1 == H and wx0 == 0 and wx1 == W
+            if full_window or bool((sub <= bound).all()): break
+            rw *= 2
+        dt = dp.copy()
+        dt[ey0:ey1, ex0:ex1] = sub
+        self._dcache = (free, dt)
+        return dt
+
+    def _disc(self, thr: float) -> np.ndarray:
+        """offsets whose distance, computed exactly as the distance transform does (sqrt of the integer square, times the lattice step), is within thr"""
+        if not hasattr(self, "_cache_disc"): self._cache_disc = {}
+        if self._cache_disc.get(thr) is None:
+            R = int(math.ceil(thr / self._h)) + 1
+            dy, dx = np.mgrid[-R:R + 1, -R:R + 1]
+            self._cache_disc[thr] = np.sqrt((dy * dy + dx * dx).astype(np.float64)) * self._h <= thr
+        return self._cache_disc[thr]
+
+    def _evidence(self, shape: Tuple[int, int], shift: Tuple[int, int]):
+        """G (reachability), W (proven for this robot), S (body covered) images from the driven polylines.  Full: the distance transform of each
+        robot's polyline raster.  Incremental: leaves only appended to their sessions in capture order add cells to the rasters, and each added
+        cell adds exactly its disc to G, W and S (a union of discs is what thresholding the transform of a raster is)."""
+        r, h = self.params.robot_half_side, self._h
+        H, Wd = shape
+        st = self._pl
+        new_keys, full = self._pl_new, self._pl_full
+        self._pl_new, self._pl_full = [], False
+        if st is not None and not full:
+            if st["shape"] != shape:
+                sy, sx = shift
+                oH, oW = st["shape"]
+                # the lattice position of a pose is round-half-even of a half-integer: shifting the canvas by an odd number of cells can
+                # move it by one, so only even shifts carry the old rasters over exactly
+                if sy + oH > H or sx + oW > Wd or sy % 2 or sx % 2: st = None
+                else:
+                    def pad(a):
+                        b = np.zeros(shape, bool); b[sy:sy + oH, sx:sx + oW] = a; return b
+                    st = dict(shape=shape, G=pad(st["G"]), W=pad(st["W"]), S=pad(st["S"]),
+                              last={k: (t, key, x + sx, y + sy, d) for k, (t, key, x, y, d) in st["last"].items()})
+        if st is not None and not full:
+            by_s: Dict[str, list] = {}
+            for k in new_keys:
+                r_ = self._leaves.get(k)
+                if r_ is not None: by_s.setdefault(r_.session, []).append((r_.t, k, r_))
+            ok = True
+            for sess, items in by_s.items():
+                items.sort(key=lambda it: (it[0], it[1]))
+                lt = st["last"].get(sess)
+                if lt is not None and (items[0][0], items[0][1]) <= (lt[0], lt[1]): ok = False; break
+            if ok:
+                G, Wm, S = st["G"], st["W"], st["S"]
+                last = dict(st["last"])
+                for sess, items in by_s.items():
+                    for t, k, r_ in items:
+                        gx, gy = int(math.floor(r_.x / RES)), int(math.floor(r_.y / RES))
+                        x, y, d = round((gx - self._cx0) / 2.0), round((gy - self._cy0) / 2.0), round(r_.r_d, 4)
+                        cells = []
+                        if 0 <= y < H and 0 <= x < Wd: cells.append((np.array([y]), np.array([x])))
+                        lt = last.get(sess)
+                        if lt is not None and lt[4] == d:
+                            rr, cc = _line(lt[3], lt[2], y, x)
+                            m = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < Wd)
+                            cells.append((rr[m], cc[m]))
+                        last[sess] = (t, k, x, y, d)
+                        if not cells: continue
+                        ry = np.concatenate([c[0] for c in cells]); rx = np.concatenate([c[1] for c in cells])
+                        for thr, tgt in ((h + 1e-9, G), (d + 1e-9, S)) + (((d - r + h) + 1e-9, Wm),) * (d >= r - 1e-9):
+                            se = self._disc(thr); R = se.shape[0] // 2
+                            y0, y1, x0, x1 = max(0, ry.min() - R), min(H, ry.max() + R + 1), max(0, rx.min() - R), min(Wd, rx.max() + R + 1)
+                            crop = np.zeros((y1 - y0, x1 - x0), bool); crop[ry - y0, rx - x0] = True
+                            tgt[y0:y1, x0:x1] |= ndimage.binary_dilation(crop, structure=se)
+                self._pl = dict(shape=shape, G=G, W=Wm, S=S, last=last)
+                return G, Wm, S
+        # full rebuild
+        G = np.zeros(shape, bool); Wm = np.zeros_like(G); S = np.zeros_like(G)
+        for d, raster in self._polylines().items():
+            dist = ndimage.distance_transform_edt(~raster) * h
+            G |= dist <= h + 1e-9; S |= dist <= d + 1e-9
+            if d >= r - 1e-9: Wm |= dist <= (d - r + h) + 1e-9
+        last = {}
+        for k, rec in self._leaves.items():
+            gx, gy = int(math.floor(rec.x / RES)), int(math.floor(rec.y / RES))
+            cur = last.get(rec.session)
+            if cur is None or (rec.t, k) > (cur[0], cur[1]):
+                last[rec.session] = (rec.t, k, round((gx - self._cx0) / 2.0), round((gy - self._cy0) / 2.0), round(rec.r_d, 4))
+        self._pl = dict(shape=shape, G=G, W=Wm, S=S, last=last)
+        return G, Wm, S
+
     def _build_F(self, shift: Tuple[int, int] = (0, 0)):
         r, h = self.params.robot_half_side, self._h
         V = self._V
         free = (V != 255) & (V < 100)
         sq = self._erode(free, shift)
-        clr = ndimage.distance_transform_edt(free) * RES
+        clr = self._clearance_cells(free, shift) * RES
         sq_h, fr_h, clr_h = sq[::2, ::2], free[::2, ::2], clr[::2, ::2]
-        G = np.zeros(sq_h.shape, bool); W = np.zeros_like(G); S = np.zeros_like(G)
-        for d, raster in self._polylines().items():
-            dist = ndimage.distance_transform_edt(~raster) * h
-            G |= dist <= h + 1e-9; S |= dist <= d + 1e-9
-            if d >= r - 1e-9: W |= dist <= (d - r + h) + 1e-9
+        G, W, S = self._evidence(sq_h.shape, shift)
         cand = sq_h | (W & fr_h)
         lab, _ = ndimage.label(cand, structure=np.ones((3, 3)))
         g = G & cand
@@ -464,16 +596,28 @@ class ChartGraph(SceneGraph):
         order = np.argsort(ec, kind="stable"); ecs = ec[order]
         cut = np.searchsorted(ecs, np.arange(-1, k + 1))
         cells_of = [np.nonzero(full == j)[0] for j in range(k)]
-        D, PRED, LOC = [], [], []
+        D, PRED, CJ = [], [], []
+        rnew: dict = {}
         for j, a in enumerate(A):
             cj = cells_of[j]
-            loc = -np.ones(N, np.int64); loc[cj] = np.arange(len(cj))
-            e = order[cut[j + 1]:cut[j + 2]]
-            n = len(cj)
-            g = coo_matrix((np.concatenate([Ln[e], Ln[e]]), (np.concatenate([loc[R[e]], loc[C[e]]]), np.concatenate([loc[C[e]], loc[R[e]]]))),
-                           shape=(n, n)).tocsr()
-            d, pr = dijkstra(g, directed=False, indices=int(loc[a]), return_predecessors=True)
-            D.append(d); PRED.append(pr); LOC.append((loc, cj))
+            # the routes inside a chart are a function of its cells (relative to their corner) and its anchor: unchanged charts are served
+            # from the last batch; cells are ascending, so a cell's place in the chart is its searchsorted position
+            ys, xs = sp.ys[cj], sp.xs[cj]
+            y0, x0 = int(ys.min()), int(xs.min())
+            hk = hashlib.blake2b(digest_size=16)
+            hk.update((ys - y0).astype(np.int32).tobytes()); hk.update((xs - x0).astype(np.int32).tobytes())
+            hk.update(np.array([sp.ys[a] - y0, sp.xs[a] - x0], np.int32).tobytes())
+            key = hk.digest()
+            hit = self._rcache.get(key)
+            if hit is None:
+                e = order[cut[j + 1]:cut[j + 2]]
+                n = len(cj)
+                lr = np.searchsorted(cj, R[e]); lc = np.searchsorted(cj, C[e])
+                g = coo_matrix((np.concatenate([Ln[e], Ln[e]]), (np.concatenate([lr, lc]), np.concatenate([lc, lr]))), shape=(n, n)).tocsr()
+                hit = dijkstra(g, directed=False, indices=int(np.searchsorted(cj, a)), return_predecessors=True)
+            rnew[key] = hit
+            D.append(hit[0]); PRED.append(hit[1]); CJ.append(cj)
+        self._rcache = rnew
         pairs: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
         for dy, dx in ((0, 1), (1, 0)):
             y2, x2 = sp.ys + dy, sp.xs + dx
@@ -486,10 +630,10 @@ class ChartGraph(SceneGraph):
                 pairs.setdefault((ju, jv), []).append((u, v))
 
         def route(j, cell):
-            loc, cj = LOC[j]
+            cj = CJ[j]
             p = [cell]
             while p[-1] != int(A[j]):
-                q = PRED[j][loc[p[-1]]]
+                q = PRED[j][int(np.searchsorted(cj, p[-1]))]
                 if q < 0: return None
                 p.append(int(cj[q]))
             return p[::-1]
@@ -504,7 +648,7 @@ class ChartGraph(SceneGraph):
                 best = None
                 for u, v in es:
                     if lab[sp.ys[u], sp.xs[u]] != comp: continue
-                    du = D[a][LOC[a][0][u]]; dv = D[b][LOC[b][0][v]]
+                    du = D[a][int(np.searchsorted(CJ[a], u))]; dv = D[b][int(np.searchsorted(CJ[b], v))]
                     tot = du + dv + math.hypot(sp.ys[u] - sp.ys[v], sp.xs[u] - sp.xs[v]) * 0.1
                     if np.isfinite(tot) and (best is None or tot < best[0]): best = (float(tot), u, v)
                 if best is None: continue
@@ -528,11 +672,13 @@ class ChartGraph(SceneGraph):
         sig, link_sig = {}, set()
         if s is not None:
             gy0, gx0 = self._cy0 // 2, self._cx0 // 2
+            ys, xs = np.nonzero(s.plane >= 0)
+            lab = s.plane[ys, xs]
+            k = len(s.keys)
+            cnt = np.bincount(lab, minlength=k)
+            chk = np.bincount(lab, weights=((ys.astype(np.int64) + gy0) * 7919 + (xs.astype(np.int64) + gx0)).astype(np.float64), minlength=k)
             for j, key in enumerate(s.keys):
-                m = s.plane == j
-                ys, xs = np.nonzero(m)
-                gy, gx = ys.astype(np.int64) + gy0, xs.astype(np.int64) + gx0
-                sig[key] = (int(s.sp.ys[s.A[j]]) + gy0, int(s.sp.xs[s.A[j]]) + gx0, int(m.sum()), int((gy * 7919 + gx).sum() % 1000003))
+                sig[key] = (int(s.sp.ys[s.A[j]]) + gy0, int(s.sp.xs[s.A[j]]) + gx0, int(cnt[j]), int(round(chk[j])) % 1000003)
             for l in s.links:
                 link_sig.add((s.keys[l["a"]], s.keys[l["b"]], round(l["length"], 3), round(l["width"], 3)))
         return sig, link_sig
@@ -785,9 +931,11 @@ class ChartGraph(SceneGraph):
             group = [int(g) for g in levels[level]["parent"]]
             node_ids = [int(n) for n in levels[level]["nodes"]]
         charts = []
+        by_group: Dict[int, List[int]] = {}
+        for j, g_ in enumerate(group): by_group.setdefault(g_, []).append(j)
         for n in node_ids:
-            members = [j for j in range(len(s.A)) if group[j] == n]
-            if not (present & set(members)): continue
+            members = by_group.get(n, [])
+            if not any(m_ in present for m_ in members): continue
             c = s.charts[n]
             parents = {}
             for L_ in range(1, len(levels)):
@@ -821,14 +969,12 @@ class ChartGraph(SceneGraph):
         rast = None
         if raster and sub.size:
             keys = [c.key for c in charts]
-            pos = {s.keys.index(k_): i + 1 for i, k_ in enumerate(keys)}
-            if level > 0:
-                lut = {j: pos.get(group[j], 0) for j in range(len(s.A))}
-            else:
-                lut = {j: pos.get(j, 0) for j in range(len(s.A))}
-            idx = np.zeros(sub.shape, np.uint16)
-            for j, i in lut.items():
-                if i: idx[sub == j] = i
+            kidx = {k_: j for j, k_ in enumerate(s.keys)}
+            pos = {kidx[k_]: i + 1 for i, k_ in enumerate(keys)}
+            lut = np.zeros(len(s.A) + 1, np.uint16)                  # the last slot answers -1 (not a chart cell)
+            for j in range(len(s.A)):
+                lut[j] = pos.get(group[j] if level > 0 else j, 0)
+            idx = lut[sub]
             rast = OwnerRaster(origin=((self._cx0 + 2 * x0) * RES, (self._cy0 + 2 * y0) * RES), step=self._h, index=idx, keys=keys,
                                dependent=s.dep[y0:y1, x0:x1].copy())
         return ViewResult(self.version, charts, links, rast)
