@@ -111,7 +111,7 @@ def test_leaf_stamp_integration():
                 "costmap": {"occupancy": {"costmap_stamp_ms": int(r.timestamp() * 1000) + ahead_s * 1000}}}
 
     first = [sl.leaf_stamp(node(i, 120), clock=clock) for i in range(4)]
-    assert [s for _, s in first[:2]] == [sl.STAMP_RECEIPT] * 2
+    assert [s for _, s in first[:2]] == [sl.STAMP_PROVISIONAL] * 2
     assert first[3] == (rms + 30 * 1000, sl.STAMP_COSTMAP_CORRECTED)
     # without a session id the old behaviour applies
     n = node(0, 120)

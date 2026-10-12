@@ -178,7 +178,6 @@ def test_replay_and_restart_are_idempotent():
         guard=Guard(), config=sw.WorkerConfig(batch_size=10, replay_margin_ms=10 ** 12, save_every_leaves=1,
                                               min_save_interval_s=0, save_when_idle=True),
         now_ms=lambda: T0)
-    eng.version = store.v
     for _ in range(100):
         if worker2.step().state == sw.IDLE:
             break
@@ -189,10 +188,14 @@ def test_stored_stamps_are_written_and_reused():
     leaves = leaves_of(cw.corridor)
     _, _, _, src = run_worker(leaves)
     stamped = {k: n.get("scene_stamp_ms") for k, n in src.nodes.items()}
-    assert all(v is not None for v in stamped.values())
+    # the first MIN_OBS leaves of a session are folded under the receipt time while the estimator is
+    # not trusted yet; that provisional stamp is not kept on the node (a replay may do better)
+    first = [l.key for l in leaves[:2]]
+    assert [k for k, v in stamped.items() if v is None] == first
+    assert all(v is not None for k, v in stamped.items() if k not in first)
     # the per-session estimator folds the constant 500 ms simulated transit delay into the stamp:
     # the shift is one constant, so spacing and order are those of the capture times
-    shifts = {stamped[l.key] - l.stamp_ms for l in leaves}
+    shifts = {stamped[l.key] - l.stamp_ms for l in leaves if stamped[l.key] is not None}
     assert shifts == {500}
 
 

@@ -24,9 +24,11 @@ offset (plus the minimal latency):
 Until `min_obs` observations are in, the offset is not trusted: `correct` reports it and the
 caller falls back to the receipt time (never newer than receipt: conservative).
 
-The minimum only decreases with more observations, so a leaf's corrected stamp may change
-between two folds of the same leaf. The fold is idempotent per (cell, capture time, value), so
-refolding with the better stamp is just a newer fold; the worker needs to do nothing special.
+The minimum only decreases with more observations, so the estimate for a session improves while
+it runs. A leaf's corrected stamp does not follow it: the worker stores the stamp it first folded
+a leaf under on the node (first write wins, `scene_leaf.STAMP_STORED`) and re-reads it from there,
+so a restart, a replay or a rebuild folds the leaf under the same time. Only the receipt-time
+placeholder given below `min_obs` observations is not stored.
 
 Pure: no I/O, no wall clock (time is the receipt times fed in), no config. State is bounded:
 three numbers per session and a session map capped at `max_sessions` (LRU) and `ttl_ms`.

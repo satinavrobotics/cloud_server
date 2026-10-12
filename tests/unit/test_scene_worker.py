@@ -210,19 +210,27 @@ def test_png_not_landed_is_retried_then_folded():
     assert r.engine.batches == [["a"]]
     assert r.worker.stats.pending == 1
     r.no_png = frozenset()
+    r.clock.advance(3)                      # png_retry_s (2 s) of wall clock
     r.drain()
     assert r.engine.batches == [["a"], ["b"]]
     assert r.worker.stats.pending == 0
 
 
-def test_png_never_lands_expires_after_margin():
+def test_png_never_lands_expires_by_wall_clock_not_by_cursor_distance():
     r = Rig([make_node("a", 1000), make_node("b", 2000)])
     r.no_png = frozenset({"a"})
     r.drain()
+    # the cursor moves 200 s of stored time in no wall time: "a" must still be waited for
     r.source.add(make_node("c", 200_000))
+    r.drain()
+    assert r.worker.stats.skipped[sw.SKIP_PNG_EXPIRED] == 0
+    assert r.worker.stats.pending == 1
+    assert r.worker.cursor[0] < 1001            # the persisted cursor stays below the missing node
+    r.clock.advance(61)                         # the replay margin of wall clock
     r.drain()
     assert r.worker.stats.skipped[sw.SKIP_PNG_EXPIRED] == 1
     assert r.worker.stats.pending == 0
+    assert r.worker.cursor == (200_000, "c")
 
 
 def test_duplicate_delivery_does_not_double_count():

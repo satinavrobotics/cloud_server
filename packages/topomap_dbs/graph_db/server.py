@@ -679,29 +679,43 @@ class GraphDatabaseService:
     # clock at the moment a node's costmap record was written (`costmap_stored_ms`, set by the
     # two SET_NODE_COSTMAP* updates above), never the robot's capture time, which a late or
     # offset upload puts behind any watermark. `(stored_ms, _key)` is a total order.
+    # Only the fields the scene worker reads (scene_adapter / scene_leaf / the robot lookup), not
+    # the whole document: this runs every idle step per map.
+    COSTMAP_SINCE_FIELDS = ("_key", "node_id", "costmap_stored_ms", "costmap", "pose", "session_id",
+                            "robot_name", "timestamp", "created_at", "capture_time", "scene_stamp_ms")
     COSTMAP_SINCE_AQL = (
         "FOR n IN @@col FILTER n.costmap_stored_ms != null AND "
         "(n.costmap_stored_ms > @since OR (n.costmap_stored_ms == @since AND n._key > @after)) "
-        "SORT n.costmap_stored_ms, n._key LIMIT @limit RETURN n")
+        "SORT n.costmap_stored_ms, n._key LIMIT @limit "
+        "RETURN KEEP(n, " + ", ".join(f'"{f}"' for f in COSTMAP_SINCE_FIELDS) + ")")
 
     def costmap_nodes_since(self, map_id: str, since_ms: int = 0, after_key: str = "",
                             limit: int = 200) -> List[Dict[str, Any]]:
-        """Up to `limit` node documents whose costmap was stored after the cursor
-        `(since_ms, after_key)`, oldest first; the caller keeps the last one's
+        """Up to `limit` node documents (only the COSTMAP_SINCE_FIELDS) whose costmap was stored
+        after the cursor `(since_ms, after_key)`, oldest first; the caller keeps the last one's
         `(costmap_stored_ms, _key)` as the next cursor and re-reads a margin on restart (the fold
         is idempotent). A persistent index on `costmap_stored_ms` is ensured once per
-        collection. [] for a map without a node collection. RAISES on an ArangoDB error."""
+        collection, and that is also when the collection's existence is checked: afterwards a
+        poll is one AQL query, and a collection dropped meanwhile (map deleted) answers []
+        from its "collection not found" error. [] for a map without a node collection. RAISES on
+        any other ArangoDB error."""
         name = f"nodes_{map_id}"
-        if not self.db.has_collection(name):
-            return []
         if name not in self._costmap_indexed:
+            if not self.db.has_collection(name):
+                return []
             try:
                 self.db.collection(name).add_persistent_index(fields=["costmap_stored_ms"])
                 self._costmap_indexed.add(name)
             except Exception as e:  # the query works without it, only slower
                 self.logger.warning(f"Could not ensure the costmap_stored_ms index of {name}: {e}")
-        return list(self.db.aql.execute(self.COSTMAP_SINCE_AQL, bind_vars={
-            "@col": name, "since": int(since_ms), "after": str(after_key), "limit": int(limit)}))
+        try:
+            return list(self.db.aql.execute(self.COSTMAP_SINCE_AQL, bind_vars={
+                "@col": name, "since": int(since_ms), "after": str(after_key), "limit": int(limit)}))
+        except Exception as e:
+            if getattr(e, "error_code", None) == 1203:      # ERROR_ARANGO_DATA_SOURCE_NOT_FOUND
+                self._costmap_indexed.discard(name)
+                return []
+            raise
 
     # First write wins: a leaf's scene stamp is never changed once set (integration.md, "Open").
     SET_SCENE_STAMPS_AQL = (

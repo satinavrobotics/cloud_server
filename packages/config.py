@@ -559,3 +559,10 @@ SCENE_GRAPH_BATCH_MAX_LEAVES = int(os.getenv("SCENE_GRAPH_BATCH_MAX_LEAVES", "48
 SCENE_GRAPH_PUBLISH_INTERVAL_S = float(os.getenv("SCENE_GRAPH_PUBLISH_INTERVAL_S", "5.0"))
 # A fold of one batch that takes longer than this is logged as a warning (it is not aborted).
 SCENE_GRAPH_BATCH_BUDGET_S = float(os.getenv("SCENE_GRAPH_BATCH_BUDGET_S", "10.0"))
+# Idle polling of a map with nothing new: first visit after IDLE_S, doubling up to IDLE_MAX_S while
+# nothing changes (a new upload resets it, so a quiet map is seen up to IDLE_MAX_S late). The
+# lifecycle / lock of a map is looked up (Postgres) at most every LIFECYCLE_CHECK_S, and always
+# right before a save.
+SCENE_GRAPH_IDLE_S = float(os.getenv("SCENE_GRAPH_IDLE_S", "2.0"))
+SCENE_GRAPH_IDLE_MAX_S = float(os.getenv("SCENE_GRAPH_IDLE_MAX_S", "30.0"))
+SCENE_GRAPH_LIFECYCLE_CHECK_S = float(os.getenv("SCENE_GRAPH_LIFECYCLE_CHECK_S", "5.0"))

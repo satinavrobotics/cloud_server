@@ -23,9 +23,12 @@ observations, and the receipt-age bound cannot catch it (an offline upload looks
 a clock, the sane robot stamp (up to `clock.max_skew_s` ahead of receipt; no age bound, the
 offset replaces it) is fed with its receipt to the session's minimum-delay offset estimate and
 returned as `stamp + offset` clamped to the receipt, with source `*_corrected`. Until the session
-has enough observations the leaf gets the receipt time (STAMP_RECEIPT). The receipt is the
-node's `costmap_stored_ms` (DB clock) when present, else its `timestamp`. A corrected stamp may
-improve between folds of the same leaf; the fold is idempotent, so that is just a newer fold.
+has enough observations the leaf gets the receipt time, as STAMP_PROVISIONAL. The receipt is the
+node's `costmap_stored_ms` (DB clock) when present, else its `timestamp`. A corrected stamp is
+final: the worker writes it to the node (`scene_stamp_ms`, first write wins) before folding and
+every later read gets it back as STAMP_STORED, so the estimate improving later changes nothing
+for that leaf. The one stamp that is NOT kept is STAMP_PROVISIONAL (the placeholder of a session below
+`min_obs`; STAMP_RECEIPT, a node with no usable robot stamp at all, is deterministic and kept): it is never newer than the receipt, and a replay may then use the better estimate.
 Without a clock the behaviour above is unchanged.
 """
 import datetime
@@ -38,6 +41,7 @@ MAX_AGE_S = 7 * 24 * 3600.0
 STAMP_COSTMAP = "costmap_stamp"
 STAMP_CAPTURE = "capture_time"
 STAMP_RECEIPT = "receipt"
+STAMP_PROVISIONAL = "receipt_provisional"   # clock given but the session's offset is not trusted yet
 STAMP_STORED = "scene_stamp"      # the stamp the leaf was first folded under, kept on the node
 STAMP_FIELD = "scene_stamp_ms"
 STAMP_COSTMAP_CORRECTED = "costmap_stamp_corrected"
@@ -113,7 +117,7 @@ def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
             if moment is None:
                 continue
             ms, trusted = clock.correct(str(session), _ms(moment), receipt_ms)
-            return (ms, _CORRECTED[source]) if trusted else (receipt_ms, STAMP_RECEIPT)
+            return (ms, _CORRECTED[source]) if trusted else (receipt_ms, STAMP_PROVISIONAL)
         moment = capture_time.parse(raw, now)
         if moment is None:
             continue

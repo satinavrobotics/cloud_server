@@ -6,9 +6,9 @@
   connection: a dropped connection means the lock is gone and the worker must stop (fenced).
 * Lifecycle: `is_deleting()` is True when the map's `mapobjectv1` row is DELETING or DELETED, or
   missing (the same view as `GraphBuilderService.manual_target_state`). The worker checks it
-  before every fold and save, so it never recreates `sg_*` or the bucket after the delete saga
-  dropped them. A residual window between that check and the write remains: the saga should also
-  take this lock before it drops (integration.md, "Review findings" 6).
+  every step (rate limited) and before every save, so it never recreates `sg_*` or the bucket
+  after the delete saga dropped them. A failing query raises: the worker backs off. A residual
+  window between that check and the write remains: the saga should also take this lock before it drops (integration.md, "Review findings" 6).
 
 Synchronous (psycopg 3, as the worker is). The connection factory is injected so the logic is
 testable without a database; `connect_from_conninfo` is the production factory.
@@ -109,17 +109,15 @@ class PgGuard:
         self._close(conn)
 
     def is_deleting(self, map_id: str) -> bool:
-        """DELETING or missing (an unknown map is never written to). An unanswerable lifecycle
-        query counts as deleting: no save on a guess."""
+        """DELETING or missing (an unknown map is never written to). RAISES when the lifecycle
+        query fails: the worker treats that as a transient error (BACKOFF, no save), not as a
+        verdict that the map is being deleted."""
         conn = self._conns.get(map_id)
         transient = conn is None
         try:
             if transient:
                 conn = self._connect()
             row = conn.execute(LIFECYCLE_SQL, (map_id,)).fetchone()
-        except Exception:  # noqa: BLE001
-            log.exception("scene guard %s: lifecycle query failed", map_id)
-            return True
         finally:
             if transient and conn is not None:
                 self._close(conn)

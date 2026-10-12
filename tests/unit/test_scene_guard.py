@@ -1,3 +1,4 @@
+import pytest
 import hashlib
 
 from packages.services.graph_builder import scene_guard as sg
@@ -96,7 +97,8 @@ def test_is_deleting():
     h.lifecycles["m"] = ("ALIVE",)
     assert not g.is_deleting("m")
     h.broken = True
-    assert g.is_deleting("m")                   # unanswerable: no save on a guess
+    with pytest.raises(Exception):              # unanswerable: raises, the worker backs off (not DELETING)
+        g.is_deleting("m")
 
 
 def test_registered_maps_is_a_positive_check():

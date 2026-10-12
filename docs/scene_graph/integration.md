@@ -136,13 +136,39 @@ the mission-planner compose service needs `MINIO_*` secrets for the store.
 
 ## Order and status (2026-10-12)
 
-* **Done, engine-independent (LACI)**: ingest adapter, stamp rule and per-session clock, stable stamp, worker, lock and
-  lifecycle guard, runner, `costmap_stored_ms` cursor, delete-saga drop, planner response fields and waypoint builder
-  (flags off), read API and websocket message, blocked-overlay geometry (unwired).
-* **Waiting on CIMBI**: engine behind `api.py`, `store.py`, `lineage()`, open-field scale gate, bbox -> tiles.
-* **Then (LACI)**: wire runner into graph-builder `main.py` behind `SCENE_GRAPH_WORKER_ENABLED`, `route()` into
-  `plan_route` behind `SCENE_GRAPH_PLANNER_ENABLED` (per map, last, after a corridor/door map validates the
-  structure), client layers, blocked-overlay migration (needs go-ahead), Dockerfile/requirements (numpy).
+* **Done (LACI)**: ingest adapter, stamp rule and per-session clock, stable stamp, worker, lock and lifecycle
+  guard, runner and host (`scene_host`, started by graph-builder `main.py` behind `SCENE_GRAPH_WORKER_ENABLED`),
+  `costmap_stored_ms` cursor, generation rebuild and rebuild request, per-map switch, delete-saga drop, planner
+  response fields and waypoint builder, `route()` in `plan_route` behind `SCENE_GRAPH_PLANNER_ENABLED`, read API and
+  websocket message, blocked-overlay geometry (not wired to `route()`).
+* **Done (CIMBI)**: engine behind `api.py`, `store.py` (versioned snapshots, CAS, generations).
+* **Open**: client layers, Dockerfile/requirements (numpy), the open-field scale gate (CIMBI; not re-checked
+  here), and a run of the worker against a real ArangoDB / MinIO / Postgres: everything above is tested against
+  fakes and the in-memory store only.
+
+### Scene ingest: behavior fixed after review (2026-10-12)
+
+* **Restart**: the engine is built after the writer lock is held (`engine_factory(stored_version)`, pinned to the
+  version read under the lock), so a replica that does not own a map holds no engine. `engine.version` (the engine's
+  fold counter, `manifest.engine_version`) is not compared with the store's snapshot `version`; they are different
+  counters, and comparing them sent every restart to `needs_rebuild`.
+* **Rebuild**: while a pending generation is being rebuilt every save expects the LIVE version (a pending save
+  returns the pending generation's own counter); `commit_generation` returns the new live one.
+* **PNG fetch**: "object not there" (NoSuchKey / NoSuchBucket) is kept pending and asked again every
+  `png_retry_s`, given up after `png_expire_s` of wall clock (default: the replay margin, 60 s); the persisted
+  cursor stays below the oldest pending node. A fetch that raises (MinIO down) is a BACKOFF: reading stops at that
+  node, nothing past it is handled, no leaf is skipped.
+* **Stamp**: a stamp is kept on the node (first write wins) when it is final. The receipt-time stamp that a
+  session gets until its clock has `min_obs` observations is NOT kept: it is never newer than the receipt and a
+  replay may use the better estimate. Not kept means a leaf folded under the placeholder can be folded again
+  under an earlier corrected stamp; the earlier fold stays in the cells it won (newest capture wins), so the
+  cost is a leaf that is slightly "too new" in those cells until newer data arrives.
+* **Terminal states** (`fenced`, `needs_rebuild`, `deleting`) are logged at warning and reported once per
+  transition as `MAP.SCENE_GRAPH_FOLD_FAILED` with `stage` = the state; a map starved by `max_maps` is reported
+  once with `stage = "max_maps"`. A lifecycle query that fails is a BACKOFF, never "deleting".
+* **Polling**: an idle map backs off from `SCENE_GRAPH_IDLE_S` (2 s) up to `SCENE_GRAPH_IDLE_MAX_S` (30 s); the
+  lifecycle / lock lookup runs at most every `SCENE_GRAPH_LIFECYCLE_CHECK_S` (5 s) and always before a save; the
+  cursor query returns only the fields the worker reads and does not check the collection every time.
 
 ## Interface draft 0.9 (CIMBI, 2026-10-12): resolved and consequences
 

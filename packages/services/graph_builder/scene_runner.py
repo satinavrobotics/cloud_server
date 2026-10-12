@@ -15,11 +15,14 @@ worker is dropped (`image_db.list_maps` swallows MinIO errors and then returns [
 
 Terminal worker states are not final for the map: the worker is closed (its lock released) and
 the map is retried after a pause, so a map that was deleted and re-created, a lost lock or a
-rebuilt generation recovers without a restart. `needs_rebuild` is reported once through
-`on_status` and retried slowly (the rebuild itself is not implemented here).
+rebuilt generation recovers without a restart. A change into a terminal state is logged at
+warning and reported once as a `fold_failed` event (`stage` = the state) and through `on_status`;
+`needs_rebuild` (a params / generation change the worker could not rebuild by itself) is retried
+slowly. The rebuild into a new generation itself is the worker's.
 
-Nothing in this file is wired into `main.py` yet: it is enabled behind
-`SCENE_GRAPH_WORKER_ENABLED` (default off) once the engine and store exist.
+`main.py` starts this (through scene_host) only when `SCENE_GRAPH_WORKER_ENABLED` is on (default
+off). A worker's own `sleep_s` is honoured for the next visit (it grows while a map is idle);
+`idle_s` is used only when the worker gives none.
 """
 import logging
 import time
@@ -34,7 +37,7 @@ log = logging.getLogger("GraphBuilderService.scene_runner")
 @dataclass
 class RunnerConfig:
     discover_s: float = 60.0            # how often the map list is refreshed
-    idle_s: float = 2.0                 # a caught-up map is visited again after this
+    idle_s: float = 2.0                 # a caught-up map is visited again after this (when the worker names no sleep)
     backoff_s: float = 10.0             # transient failure, lock held elsewhere, build errors
     terminal_retry_s: float = 60.0      # after deleting / fenced
     rebuild_retry_s: float = 300.0      # after needs_rebuild
@@ -57,6 +60,7 @@ class SceneRunner:
         self.skip_reason, self.on_event = skip_reason, on_event     # reason or None; (map, kind, payload)
         self._absent: Dict[str, int] = {}
         self._skip_reported: Dict[str, float] = {}
+        self._capped: set = set()           # maps already reported as starved by max_maps
         self._rr = 0
         self._workers: Dict[str, Any] = {}
         self._due: Dict[str, float] = {}
@@ -123,6 +127,7 @@ class SceneRunner:
             self._drop(gone)
             self._due.pop(gone, None)
             self.last_state.pop(gone, None)
+            self._capped.discard(gone)
         for present in maps:
             self._absent.pop(present, None)
         self._known = sorted(keep)
@@ -156,9 +161,18 @@ class SceneRunner:
         if worker is None:
             if len(self._workers) >= cfg.max_maps:
                 self._due[map_id] = t + cfg.backoff_s
+                if map_id not in self._capped:       # once per map, not once per retry
+                    self._capped.add(map_id)
+                    log.warning("scene runner %s: not started, %d workers already running "
+                                "(max_maps)", map_id, len(self._workers))
+                    self._report(map_id, "fold_failed", {
+                        "stage": "max_maps", "consecutive": 1,
+                        "detail": f"{len(self._workers)} workers running (max_maps {cfg.max_maps}): "
+                                  f"this map is not ingested"})
                 return
             try:
                 worker = self._workers[map_id] = self.make_worker(map_id)
+                self._capped.discard(map_id)
             except Exception:  # noqa: BLE001
                 log.exception("scene runner %s: building the worker failed", map_id)
                 self._due[map_id] = t + cfg.backoff_s
@@ -178,21 +192,34 @@ class SceneRunner:
         state = result.state
         if self.last_state.get(map_id) != state:
             self.last_state[map_id] = state
-            if self.on_status is not None and state in sw.TERMINAL:
-                try:
-                    self.on_status(map_id, state)
-                except Exception:  # noqa: BLE001
-                    log.exception("scene runner %s: status callback failed", map_id)
+            if state in sw.TERMINAL:
+                log.warning("scene runner %s: worker stopped: %s (%s)", map_id, state,
+                            getattr(result, "detail", ""))
+                self._report(map_id, "fold_failed", {
+                    "stage": state, "consecutive": 1, "detail": str(getattr(result, "detail", ""))[:300]})
+                if self.on_status is not None:
+                    try:
+                        self.on_status(map_id, state)
+                    except Exception:  # noqa: BLE001
+                        log.exception("scene runner %s: status callback failed", map_id)
         if state == sw.WORKED:
             self._due[map_id] = t
         elif state == sw.IDLE:
-            self._due[map_id] = t + cfg.idle_s
+            self._due[map_id] = t + (getattr(result, "sleep_s", 0.0) or cfg.idle_s)
         elif state in (sw.BACKOFF, sw.NOT_OWNER):
             self._due[map_id] = t + max(cfg.backoff_s, getattr(result, "sleep_s", 0.0) or 0.0)
         else:                                   # terminal: release the lock, retry later
             self._drop(map_id)
             self._due[map_id] = t + (cfg.rebuild_retry_s if state == sw.NEEDS_REBUILD
                                      else cfg.terminal_retry_s)
+
+    def _report(self, map_id: str, kind: str, payload: Dict[str, Any]) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(map_id, kind, payload)
+        except Exception:  # noqa: BLE001
+            log.exception("scene runner %s: event failed", map_id)
 
     def _drop(self, map_id: str) -> None:
         worker = self._workers.pop(map_id, None)

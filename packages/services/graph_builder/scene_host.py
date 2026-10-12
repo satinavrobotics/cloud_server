@@ -5,8 +5,10 @@ that can fail (importing `packages.scene_graph`, building the store, opening the
 happens here, behind one `try`: a failure is logged with its reason and the service keeps running
 without the worker. The runner runs in its own thread (the worker is synchronous); a crash inside
 it is logged and the loop restarts it after a pause, so it never takes the process down.
-`stop()` stops the thread, joins it, and closes the runner (every worker's advisory lock) and the
-guard's connections.
+`stop()` sets the stop flag and joins the thread; the thread itself closes the runner (every
+worker's advisory lock) and the guard's connections when its loop ends, so they are never closed
+from the caller's thread while a step may still be using them. Only when the thread is not alive
+(never started, or already ended) does `stop()` close them itself.
 """
 import logging
 import threading
@@ -33,6 +35,7 @@ class SceneWorkerHost:
         self.runner, self.guard = runner, guard
         self.restart_pause_s = restart_pause_s
         self._stop = threading.Event()
+        self._closed = threading.Lock()         # taken once: the final close runs once
         self._thread: Optional[threading.Thread] = None
 
     @property
@@ -46,31 +49,46 @@ class SceneWorkerHost:
         self._thread.start()
 
     def _loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self.runner.run(self._stop.wait, self._stop.is_set)
-            except Exception:  # noqa: BLE001
-                log.exception("scene graph runner crashed; restarting in %.0fs", self.restart_pause_s)
+        try:
+            while not self._stop.is_set():
                 try:
-                    self.runner.close()
+                    self.runner.run(self._stop.wait, self._stop.is_set)
                 except Exception:  # noqa: BLE001
-                    log.exception("scene graph runner: close after crash failed")
-                self._stop.wait(self.restart_pause_s)
+                    log.exception("scene graph runner crashed; restarting in %.0fs", self.restart_pause_s)
+                    self._close_runner()
+                    self._stop.wait(self.restart_pause_s)
+        finally:
+            self._close_all()
+
+    def _close_runner(self) -> None:
+        try:
+            self.runner.close()
+        except Exception:  # noqa: BLE001
+            log.exception("scene graph runner: close failed")
+
+    def _close_all(self) -> None:
+        if not self._closed.acquire(blocking=False):
+            return
+        self._close_runner()
+        try:
+            if self.guard is not None:
+                self.guard.close()
+        except Exception:  # noqa: BLE001
+            log.exception("scene graph host: guard close failed")
 
     def stop(self, timeout: float = JOIN_TIMEOUT_S) -> None:
-        """Stop and join the runner thread, release the locks. Blocking: call it off the event loop."""
+        """Stop the runner thread; it releases the locks as it ends. Blocking: call it off the
+        event loop. A thread that outlives `timeout` (a step in a long fold) keeps running to its
+        next stop check and closes everything itself; nothing is closed under its feet here."""
         self._stop.set()
         thread = self._thread
         if thread is not None:
             thread.join(timeout)
             if thread.is_alive():
-                log.error("scene graph runner did not stop within %.0fs", timeout)
-        for closer in (self.runner, self.guard):
-            try:
-                if closer is not None:
-                    closer.close()
-            except Exception:  # noqa: BLE001
-                log.exception("scene graph host: close failed")
+                log.error("scene graph runner did not stop within %.0fs; it closes the locks when "
+                          "its current step ends", timeout)
+                return
+        self._close_all()       # no thread (never started / ended): idempotent
         self._thread = None
 
 
@@ -91,11 +109,18 @@ def worker_config(params: Any) -> Any:
     """WorkerConfig from the SCENE_GRAPH_* settings of packages.config."""
     from packages import config
     from . import scene_worker
+    lo = max(1, config.SCENE_GRAPH_BATCH_MIN_LEAVES)
+    hi = max(1, config.SCENE_GRAPH_BATCH_MAX_LEAVES)
+    if lo > hi:
+        log.warning("SCENE_GRAPH_BATCH_MIN_LEAVES (%d) > SCENE_GRAPH_BATCH_MAX_LEAVES (%d): "
+                    "using %d for both", lo, hi, hi)
+        lo = hi
     return scene_worker.WorkerConfig(
-        batch_min_leaves=max(1, config.SCENE_GRAPH_BATCH_MIN_LEAVES),
-        batch_max_leaves=max(1, config.SCENE_GRAPH_BATCH_MAX_LEAVES),
+        batch_min_leaves=lo, batch_max_leaves=hi,
         min_save_interval_s=config.SCENE_GRAPH_PUBLISH_INTERVAL_S,
         batch_budget_s=config.SCENE_GRAPH_BATCH_BUDGET_S,
+        idle_sleep_s=config.SCENE_GRAPH_IDLE_S, idle_max_s=config.SCENE_GRAPH_IDLE_MAX_S,
+        lifecycle_check_s=config.SCENE_GRAPH_LIFECYCLE_CHECK_S,
         expected_params_hash=expected_params_hash(params))
 
 
@@ -117,15 +142,16 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     sink = scene_events.make_event_sink(database, loop) if database is not None and loop is not None else None
 
     def make_worker(map_id: str) -> Any:
-        meta = store.meta(map_id) or {}
-        stored = int(meta.get("version") or 0)
-        if stored and meta.get("params_hash") not in (None, cfg.expected_params_hash):
-            engine = ChartGraph(params)         # params changed: the worker rebuilds a new generation
-        else:
-            engine = store.load(map_id) if stored else ChartGraph(params)
+        # No engine here: the worker builds it through `engine_factory` once it HOLDS the map's
+        # writer lock (a replica that does not own the map loads nothing), pinned to the stored
+        # version it read under that lock. A params change never reaches the factory: the worker
+        # starts a new generation with `new_engine` instead.
+        def load(version: int) -> Any:
+            return store.load(map_id, version) if version else ChartGraph(params)
+
         return scene_worker.SceneWorker(
-            map_id, source=service.graph_db, fetch_png=fetch_png, footprint=footprint, engine=engine,
-            store=store, cursor_store=cursors, guard=guard, config=cfg,
+            map_id, source=service.graph_db, fetch_png=fetch_png, footprint=footprint,
+            engine_factory=load, store=store, cursor_store=cursors, guard=guard, config=cfg,
             now_ms=lambda: int(time.time() * 1000),
             publish=scene_events.make_publish(service.update_publisher, loop, map_id),
             new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,),
