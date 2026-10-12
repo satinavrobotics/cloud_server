@@ -5,9 +5,9 @@
   ownership by ROUNDS (no visiting order):  own_0 = anchors.  In round t every unowned cell x joins the nearest (D, then index) anchor j
               whose whole drive j->x (minus x) is owned by j after round t-1, with the diagonal rule (an orthogonal cell of every diagonal step is owned by j).
               A function of (F, A) only; a cell reads only cells on drives that end in it.
-  solve     = construct (add at the largest-clearance cell of the lowest-numbered pocket / off-band anchor) then descend: anchors in cell-index order,
-              each tries to be removed, else moved to the band medoid; a step is taken iff the set stays feasible and strictly lowers
-              (|A|, #dependents, sum of D over owned cells) lexicographically.  Locally minimal for single removals / moves, in that order.
+  solve     = (chart_track.Track.step) add at the largest-clearance cell of the lowest-numbered pocket / off-band anchor, then descend: anchors in
+              smallest-chart order, each tries to be removed, else moved to the projected centroid of its chart; a step is taken iff the set stays
+              feasible and strictly lowers (|A|, #dependents, sum of D over owned cells) lexicographically.  Stationary under the proposal map.
   locality  = a step re-simulates only the cells that can read a changed cell: the closure of (cells seen by the changed anchors) under 'reads'."""
 import math
 import numpy as np
@@ -30,7 +30,7 @@ class Row:
 
 
 class Local:
-    def __init__(s, nav, clr, h=0.1, r=0.25, mult=1.5, eps=None, rows_cache=None, img_rows=None, delta=None, sight_range=None):
+    def __init__(s, nav, clr, h=0.1, r=0.25, mult=1.5, eps=None, img_rows=None, delta=None, sight_range=None):
         s.h, s.r = h, r
         # sight_range (m): an anchor sees a cell only within this Euclidean distance (centre to centre); None = unbounded.
         # It must reach a ball of the place scale, else an anchor could not even see the ball it was put in for.
@@ -45,8 +45,6 @@ class Local:
         s.idxp = np.where(s.idx >= 0, s.idx, N)
         s.clrI = clr; s.clr = clr[s.ys, s.xs]
         s.flat = s.ys * s.W + s.xs                       # image position of every cell (stable across frames)
-        lab = np.zeros(nav.shape, np.int32)
-        l4, n4 = ndimage.label(nav, structure=np.ones((3, 3)))   # F-components for the lattice graph: 8-neighbour with the corner rule is a subset; use 4-conn labels of drives below
         # components under the drive rule (8-neighbour, no corner cutting): build the edge list once, vectorised
         rows, cols = [], []
         for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
@@ -59,8 +57,7 @@ class Local:
             rows.append(a); cols.append(b)
         a = np.concatenate(rows); b = np.concatenate(cols)
         s.ncomp, s.comp = connected_components(coo_matrix((np.ones(len(a)), (a, b)), shape=(N, N)), directed=False)
-        s.compmax = np.zeros(s.ncomp); np.maximum.at(s.compmax, s.comp, s.clr)
-        s.rows = {} if rows_cache is None else rows_cache       # anchor cell -> Row (this frame)
+        s.rows = {}                                              # anchor cell -> Row (this frame)
         s.img_rows = {} if img_rows is None else img_rows       # (y,x) -> rows of the previous frame in image positions
         s.delta = delta                                          # bool image: cells whose F membership changed since the previous frame
         s.delta_flat = None if delta is None else np.nonzero(delta.ravel())[0]
@@ -267,9 +264,8 @@ class Local:
     def export_rows(s):
         """rows used in this frame, in image positions (for the next frame)"""
         out = {}
-        N = s.N
+        f = np.append(s.flat, -1)
         for a, r_ in s.rows.items():
-            f = np.append(s.flat, -1)
             out[(int(s.ys[a]), int(s.xs[a]))] = dict(T=s.flat[r_.T], SEG=f[r_.SEG], P=f[r_.P], Q=f[r_.Q], rect=r_.rect, dep=r_.dep)
         return out
 
@@ -295,49 +291,49 @@ class Local:
             parts.append([j, S[hit][o_], r_.SEG[pj], r_.P[pj], r_.Q[pj], r_.D[pj], nl[o_]])
         if not parts: s._reads = np.zeros(0, np.int64); return []
         invo = [A[p[0]] for p in parts]
+        # every part in one set of arrays: a round is a handful of vector operations whatever the number of anchors.  A drive table is
+        # padded with its own anchor (always owned by it at round 0), which is what the per-anchor tables repeat past their end anyway.
+        Lw = max(p[2].shape[1] for p in parts); Pw = max(p[3].shape[1] for p in parts)
+
+        def pad(x, w, a):
+            return x if x.shape[1] == w else np.concatenate([x, np.full((x.shape[0], w - x.shape[1]), a, x.dtype)], 1)
+        jv = np.concatenate([np.full(len(p[1]), p[0], np.int32) for p in parts])
+        cells = np.concatenate([p[1] for p in parts]); Dj = np.concatenate([p[5] for p in parts]); nl = np.concatenate([p[6] for p in parts])
+        SEG = np.concatenate([pad(p[2], Lw, A[p[0]]) for p in parts])
+        P = np.concatenate([pad(p[3], Pw, A[p[0]]) for p in parts]) if Pw else np.zeros((len(cells), 0), np.int32)
+        Q = np.concatenate([pad(p[4], Pw, A[p[0]]) for p in parts]) if Pw else np.zeros((len(cells), 0), np.int32)
+        n = len(cells)
         rd_ = np.zeros(N + 1, bool)
-        for part in parts:
-            rd_[part[2].ravel()] = True; rd_[part[3].ravel()] = True; rd_[part[4].ravel()] = True; rd_[part[1]] = True
-        s._reads = np.nonzero(rd_[:N])[0]
-        tmax = 0                                      # frozen cells become readable at their own round: do not stop before the last one that is read
-        for part in parts:
-            for arr in (part[2], part[3], part[4]):
-                v_ = rnd_e[arr]; v_ = v_[v_ < BIG]
-                if len(v_): tmax = max(tmax, int(v_.max()))
-        bestD = np.full(N + 1, np.inf); bestJ = np.full(N + 1, -1, np.int64)
+        rd_[SEG.ravel()] = True; rd_[P.ravel()] = True; rd_[Q.ravel()] = True; rd_[cells] = True
+        s._reads = reads = np.nonzero(rd_[:N])[0]
+        # frozen cells become readable at their own round: do not stop before the last one that is read
+        v_ = rnd_e[reads]; v_ = v_[v_ < BIG]
+        tmax = int(v_.max()) if len(v_) else 0
+        # a drive is ready only if its last cell before the target is already owned by its anchor: one gather per row and round decides which
+        # rows get the full test (every cell of the drive and its diagonal cells), so a round costs O(rows) and not O(rows x drive length)
+        last = SEG[np.arange(n), nl - 1]
         t = 0
         while True:
             t += 1
-            touched = []
-            for part in parts:
-                j, cells, SEG, P, Q, Dj, nl = part
-                if not len(cells): continue
-                hi = int(np.searchsorted(nl, t, side='right'))
-                if hi == 0: continue
-                cs_, SEGh, Ph, Qh, Dh = cells[:hi], SEG[:hi], P[:hi], Q[:hi], Dj[:hi]
-                oseg = own_e[SEGh]
-                mine = oseg == j
-                ready = (mine & (rnd_e[SEGh] < t)).all(1)
-                dead = ((oseg >= 0) & ~mine).any(1)               # a cell of the drive belongs to another anchor: this drive can never be ready
-                if Ph.shape[1]:
-                    op = own_e[Ph]; oq = own_e[Qh]
-                    ready &= (((op == j) & (rnd_e[Ph] < t)) | ((oq == j) & (rnd_e[Qh] < t))).all(1)
-                ready &= own_e[cs_] < 0
+            touched = None
+            idx = np.nonzero((nl <= t) & (own_e[last] == jv) & (rnd_e[last] < t) & (own_e[cells] < 0))[0]
+            if len(idx):
+                jh = jv[idx, None]; SEGh = SEG[idx]
+                ready = ((own_e[SEGh] == jh) & (rnd_e[SEGh] < t)).all(1)
+                if Pw:
+                    Ph, Qh = P[idx], Q[idx]
+                    ready &= (((own_e[Ph] == jh) & (rnd_e[Ph] < t)) | ((own_e[Qh] == jh) & (rnd_e[Qh] < t))).all(1)
                 if ready.any():
-                    rc = cs_[ready]; rd = Dh[ready]
-                    m_ = rd < bestD[rc]
-                    rc = rc[m_]; rd = rd[m_]
-                    bestD[rc] = rd; bestJ[rc] = j; touched.append(rc)
-                keep_h = (~dead) & (own_e[cs_] < 0)
-                if not keep_h.all():
-                    kf = np.ones(len(cells), bool); kf[:hi] = keep_h
-                    part[1], part[2], part[3], part[4], part[5], part[6] = cells[kf], SEG[kf], P[kf], Q[kf], Dj[kf], nl[kf]
-            if not touched:
+                    sel = idx[ready]
+                    rc = cells[sel]; rd = Dj[sel]; rj = jv[sel]
+                    od = np.lexsort((rj, rd, rc))                    # per cell: nearest anchor, then the lowest index
+                    rcs = rc[od]; first = np.ones(len(rcs), bool); first[1:] = rcs[1:] != rcs[:-1]
+                    pick_ = od[first]
+                    touched = rc[pick_]; won = rj[pick_]
+            if touched is None:
                 if t > tmax: break
                 continue
-            cs = np.unique(np.concatenate(touched))
-            own_e[cs] = bestJ[cs]; rnd_e[cs] = t
-            bestD[cs] = np.inf; bestJ[cs] = -1
+            own_e[touched] = won; rnd_e[touched] = t
         own[:] = own_e[:N]; rnd[:] = rnd_e[:N]
         return invo
 
@@ -347,11 +343,12 @@ class Local:
         if not len(X): return np.zeros(0, np.int64)
         out = []
         Xm = np.zeros(s.H * s.W, bool); Xm[s.flat[X]] = True
+        Xc = np.zeros(s.N + 1, bool); Xc[X] = True                 # by cell, the sentinel N (outside F) is never in X
         for a in A:
             r_ = s.row(a)
             if not len(r_.T) or not Xm[r_.dep].any(): continue
-            h = np.isin(r_.SEG, X).any(1)
-            if r_.P.shape[1]: h |= np.isin(r_.P, X).any(1) | np.isin(r_.Q, X).any(1)
+            h = Xc[r_.SEG].any(1)
+            if r_.P.shape[1]: h |= Xc[r_.P].any(1) | Xc[r_.Q].any(1)
             if h.any(): out.append(r_.T[h])
         return np.unique(np.concatenate(out)) if out else np.zeros(0, np.int64)
 
@@ -381,7 +378,7 @@ class Local:
         s._pk_seen = seen
         for c0 in seeds.tolist():
             if own[c0] >= 0 or c0 in seen: continue
-            comp = [c0]; seen.add(c0); st = [c0]; best = c0
+            comp = [c0]; seen.add(c0); st = [c0]
             while st:
                 c = st.pop(); y, x = int(s.ys[c]), int(s.xs[c])
                 for dy in (-1, 0, 1):
@@ -564,17 +561,6 @@ class Local:
         return True
 
     # ---- construct and descend, canonical order
-    def construct(s, A0=(), local=True):
-        A = []
-        for a in A0:
-            if a not in A: A.append(int(a))
-        own, rnd = s.full_state(A) if len(A) else (-np.ones(s.N, np.int32), np.full(s.N, BIG, np.int32))
-        for _ in range(s.N + 1):
-            v = s.violation(A, own)
-            if v is None: return A, own, rnd
-            A, own, rnd, _, _ = s.apply(A, own, rnd, ('add', v[1]), local=local)
-        raise RuntimeError('construct did not terminate')
-
     def descend(s, A, own, rnd, queue=None, local=True, tried=None):
         """worklist, smallest chart first (ties by cell index).  tried[a] = (anchors the trial used, cells it read): a commit re-queues exactly
         the anchors whose trial used a changed anchor or read a cell whose owner or round changed."""
@@ -614,7 +600,6 @@ class Local:
                 continue
             A2, o2, r2, S = done
             tried.pop(a, None)
-            if getattr(s, 'log', None) is not None: s.log.append(('commit', a, len(A2)))
             old_owner = np.where(own[S] >= 0, np.array(A, np.int64)[np.maximum(own[S], 0)], -1)
             new_owner = np.where(o2[S] >= 0, np.array(A2, np.int64)[np.maximum(o2[S], 0)], -1)
             chg = np.zeros(s.N + 1, bool)
@@ -628,8 +613,3 @@ class Local:
             for ak in A:                                   # anchors without a trial since their own sight changed
                 if ak not in tried and ak not in pending: pending.add(ak)
         return A, own, rnd, tried
-
-    def solve(s, prev_cells=(), local=True):
-        A, own, rnd = s.construct(prev_cells, local=local)
-        A, own, rnd, _ = s.descend(A, own, rnd, local=local)
-        return A, own, rnd

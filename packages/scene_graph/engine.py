@@ -15,6 +15,7 @@ Not implemented here: sparse / tiled in-memory planes (one dense canvas that gro
 the whole canvas per batch; only the chart solve is local), persistence (store.py), the leaf-delete winner plane (refold
 rebuilds the bbox from the leaves the caller supplies).
 """
+import hashlib
 import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -22,7 +23,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy import ndimage
 from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.csgraph import breadth_first_order, dijkstra, minimum_spanning_tree
 
 from .api import BBox, Blocked, Chart, Dirty, Key, Leaf, Link, OwnerRaster, Route, SceneGraph, SceneParams, Snap, ViewResult
 from .chart_keys import assign_A, overlaps
@@ -112,6 +113,9 @@ class ChartGraph(SceneGraph):
         self._sig: Dict[Key, tuple] = {}
         self._link_sig: set = set()
         self._cache: dict = {}
+        self._shift = (0, 0)                    # canvas growth of the batch being solved (lattice cells)
+        self._ecache = None                     # (free, square-fits) of the last F build
+        self._wcache: dict = {}                 # widest-path widths by pair content
 
     # ------------------------------------------------------------------ canvas and fold
     def _ensure(self, gx0: int, gy0: int, gx1: int, gy1: int) -> Tuple[int, int]:
@@ -215,6 +219,7 @@ class ChartGraph(SceneGraph):
         birth = max(((lf.stamp_ms, lf.key) for lf in leaves), default=self._watermark)[1]
         self._pending = []
         self._cache = {}
+        self._shift = shift
         self._solve(shift, birth)
         self.version += 1
         return self._dirty(old, old_sig, old_link_sig, old_keys, bounds, region)
@@ -241,13 +246,54 @@ class ChartGraph(SceneGraph):
                     rr, cc = _line(y, x, yy, xx); ok = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W); m[rr[ok], cc[ok]] = True
         return out
 
-    def _build_F(self):
+    def _erode(self, free: np.ndarray, shift: Tuple[int, int]) -> np.ndarray:
+        """cells where the robot square fits at one of the headings.  An erosion reads `free` only inside the square's support, so a cell of
+        the previous result stays exact unless `free` changed within that support: recompute the changed box widened by the support (plus
+        the support again, so the inner part is exact) and splice it into the previous result.  New canvas area is unknown (not free), which
+        is what the border value assumed before the canvas grew."""
+        sqs = _squares(self.params.robot_half_side)
+        c, self._ecache = self._ecache, None
+        prev = None
+        if c is not None:
+            fp, sp_ = c
+            if fp.shape == free.shape:
+                prev = c
+            else:
+                oy, ox = 2 * shift[0], 2 * shift[1]
+                if oy + fp.shape[0] <= free.shape[0] and ox + fp.shape[1] <= free.shape[1]:
+                    f2 = np.zeros_like(free); f2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = fp
+                    s2 = np.zeros_like(free); s2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = sp_
+                    prev = (f2, s2)
+        if prev is None:
+            sq = np.zeros_like(free)
+            for st in sqs:
+                sq |= ndimage.binary_erosion(free, structure=st, border_value=0)
+        else:
+            fp, sp_ = prev
+            d = fp != free
+            if not d.any():
+                sq = sp_
+            else:
+                H, W = free.shape
+                pad = max(max(st.shape) for st in sqs)
+                rows = np.nonzero(d.any(1))[0]; cols = np.nonzero(d.any(0))[0]
+                y0, y1 = max(0, rows[0] - pad), min(H, rows[-1] + 1 + pad)
+                x0, x1 = max(0, cols[0] - pad), min(W, cols[-1] + 1 + pad)
+                wy0, wy1, wx0, wx1 = max(0, y0 - pad), min(H, y1 + pad), max(0, x0 - pad), min(W, x1 + pad)
+                win = free[wy0:wy1, wx0:wx1]
+                e = np.zeros_like(win)
+                for st in sqs:
+                    e |= ndimage.binary_erosion(win, structure=st, border_value=0)
+                sq = sp_.copy()
+                sq[y0:y1, x0:x1] = e[y0 - wy0:y1 - wy0, x0 - wx0:x1 - wx0]
+        self._ecache = (free, sq)
+        return sq
+
+    def _build_F(self, shift: Tuple[int, int] = (0, 0)):
         r, h = self.params.robot_half_side, self._h
         V = self._V
         free = (V != 255) & (V < 100)
-        sq = np.zeros_like(free)
-        for st in _squares(r):
-            sq |= ndimage.binary_erosion(free, structure=st, border_value=0)
+        sq = self._erode(free, shift)
         clr = ndimage.distance_transform_edt(free) * RES
         sq_h, fr_h, clr_h = sq[::2, ::2], free[::2, ::2], clr[::2, ::2]
         G = np.zeros(sq_h.shape, bool); W = np.zeros_like(G); S = np.zeros_like(G)
@@ -264,7 +310,7 @@ class ChartGraph(SceneGraph):
     # ------------------------------------------------------------------ solve
     def _solve(self, shift: Tuple[int, int], birth: str):
         p = self.params
-        nav, clr, S = self._build_F()
+        nav, clr, S = self._build_F(shift)
         if self._track is None:
             self._track = Track(r=p.robot_half_side, mult=p.place_mult, h=self._h, sight_range=p.sight_range)
         elif shift != (0, 0) or (self._track.nav is not None and self._track.nav.shape != nav.shape):
@@ -361,43 +407,57 @@ class ChartGraph(SceneGraph):
     # ------------------------------------------------------------------ links
     @staticmethod
     def _widest_strict(sp, full, A, a, b) -> float:
-        """twice the largest t such that anchors a and b stay connected through cells of chart a U chart b with clr >= t,
-        a diagonal step needing both orthogonal cells in the threshold set too (a squeeze is not a passage of width t)"""
+        """twice the largest t such that anchors a and b stay connected through cells of chart a U chart b with clr >= t, a diagonal step
+        needing both orthogonal cells in the threshold set too (a squeeze is not a passage of width t).  Both orthogonal cells of a diagonal
+        step are 4-neighbours of both of its ends, so that rule adds no connection to 4-connectivity: the answer is the bottleneck of the
+        widest 4-connected path, read off the maximum spanning tree of the two charts (an edge is as wide as its narrower cell)."""
         cells = np.nonzero((full == a) | (full == b))[0]
-        order = cells[np.argsort(-sp.clr[cells], kind="stable")]
-        par: Dict[int, int] = {}
-        ys, xs, idx, H, W = sp.ys, sp.xs, sp.idx, sp.H, sp.W
+        n = len(cells)
+        pos = -np.ones(sp.N, np.int64); pos[cells] = np.arange(n)
+        ys, xs, clr = sp.ys[cells], sp.xs[cells], sp.clr[cells]
+        U, V = [], []
+        for dy, dx in ((0, 1), (1, 0)):
+            y2, x2 = ys + dy, xs + dx
+            ok = (y2 < sp.H) & (x2 < sp.W)
+            j = np.full(n, -1, np.int64)
+            nb = sp.idx[y2[ok], x2[ok]]                              # neighbour cell (-1: not in F) -> its place among the two charts
+            j[ok] = np.where(nb >= 0, pos[np.maximum(nb, 0)], -1)
+            m = j >= 0
+            U.append(np.nonzero(m)[0]); V.append(j[m])
+        U, V = np.concatenate(U), np.concatenate(V)
+        ia, ib = int(pos[int(A[a])]), int(pos[int(A[b])])
+        if ia < 0 or ib < 0 or not len(U): return 0.0
+        top = float(clr.max()) + 1.0
+        wgt = top - np.minimum(clr[U], clr[V])                       # positive, smaller = wider
+        g = coo_matrix((wgt, (U, V)), shape=(n, n)).tocsr()
+        tree = minimum_spanning_tree(g)
+        order, pred = breadth_first_order(tree, ia, directed=False, return_predecessors=True)
+        if ib != ia and pred[ib] < 0: return 0.0
+        v, low = ib, float(clr[ib])
+        while v != ia:
+            v = int(pred[v]); low = min(low, float(clr[v]))
+        return 2.0 * low
 
-        def find(x):
-            while par[x] != x:
-                par[x] = par[par[x]]; x = par[x]
-            return x
-
-        def union(u, v):
-            ru, rv = find(u), find(v)
-            if ru != rv: par[ru] = rv
-
-        def at(y, x):
-            if 0 <= y < H and 0 <= x < W:
-                i = int(idx[y, x]); return i if i in par else None
-            return None
+    def _width(self, sp, full, A, a, b, wnew) -> float:
+        """`_widest_strict`, memoised by everything it reads: the cells of the two charts (relative to their corner), their clearance and the
+        two anchors.  Most pairs are untouched by a batch; a changed cell, clearance or anchor changes the key."""
+        cells = np.nonzero((full == a) | (full == b))[0]
+        ys, xs = sp.ys[cells], sp.xs[cells]
+        y0, x0 = int(ys.min()), int(xs.min())
         ia, ib = int(A[a]), int(A[b])
-        for u in order.tolist():
-            par[u] = u; y, x = int(ys[u]), int(xs[u])
-            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-                v = at(y + dy, x + dx)
-                if v is not None: union(u, v)
-            for dy in (-1, 1):
-                for dx in (-1, 1):
-                    o = at(y + dy, x + dx); p = at(y + dy, x); q = at(y, x + dx)
-                    if o is not None and p is not None and q is not None:
-                        union(u, o); union(p, q)
-            if ia in par and ib in par and find(ia) == find(ib):
-                return 2.0 * float(sp.clr[u])
-        return 0.0
+        h = hashlib.blake2b(digest_size=16)
+        h.update((ys - y0).astype(np.int32).tobytes()); h.update((xs - x0).astype(np.int32).tobytes()); h.update(sp.clr[cells].tobytes())
+        h.update(np.array([sp.ys[ia] - y0, sp.xs[ia] - x0, sp.ys[ib] - y0, sp.xs[ib] - x0], np.int32).tobytes())
+        k = h.digest()
+        w = self._wcache.get(k)
+        if w is None:
+            w = self._widest_strict(sp, full, A, a, b)
+        wnew[k] = w
+        return w
 
     def _links(self, sp, A, full, edges, chv) -> List[dict]:
         R, C, Ln = edges
+        wnew: dict = {}
         N, k = sp.N, len(A)
         # per chart: shortest routes from the anchor inside the chart (one compact graph per chart)
         ec = np.where(full[R] == full[C], full[R], -1)
@@ -439,7 +499,7 @@ class ChartGraph(SceneGraph):
             for u, v in es:
                 m[sp.ys[u], sp.xs[u]] = True; m[sp.ys[v], sp.xs[v]] = True
             lab, n = ndimage.label(m, structure=np.ones((3, 3)))
-            width = self._widest_strict(sp, full, A, a, b)
+            width = self._width(sp, full, A, a, b, wnew)
             for comp in range(1, n + 1):
                 best = None
                 for u, v in es:
@@ -458,18 +518,21 @@ class ChartGraph(SceneGraph):
                         acc += math.hypot(sp.ys[x] - sp.ys[y], sp.xs[x] - sp.xs[y]) * 0.1 * 0.5 * (f[x] + f[y])
                     integ[name] = acc
                 out.append(dict(a=a, b=b, length=tot, width=width, u=u, v=v, route=cells, integ=integ))
+        self._wcache = wnew
         return out
 
     # ------------------------------------------------------------------ dirty
-    @staticmethod
-    def _signatures(s: Optional[_Solved]):
-        """per chart key (anchor cell, cell count, cell checksum) and the set of (a, b, length, width) of the links"""
+    def _signatures(self, s: Optional[_Solved]):
+        """per chart key (anchor cell, cell count, cell checksum) and the set of (a, b, length, width) of the links; cells are global
+        lattice coordinates, so a canvas that grew to the left or top changes nothing"""
         sig, link_sig = {}, set()
         if s is not None:
+            gy0, gx0 = self._cy0 // 2, self._cx0 // 2
             for j, key in enumerate(s.keys):
                 m = s.plane == j
                 ys, xs = np.nonzero(m)
-                sig[key] = (int(s.sp.ys[s.A[j]]), int(s.sp.xs[s.A[j]]), int(m.sum()), int((ys.astype(np.int64) * 7919 + xs).sum() % 1000003))
+                gy, gx = ys.astype(np.int64) + gy0, xs.astype(np.int64) + gx0
+                sig[key] = (int(s.sp.ys[s.A[j]]) + gy0, int(s.sp.xs[s.A[j]]) + gx0, int(m.sum()), int((gy * 7919 + gx).sum() % 1000003))
             for l in s.links:
                 link_sig.add((s.keys[l["a"]], s.keys[l["b"]], round(l["length"], 3), round(l["width"], 3)))
         return sig, link_sig
@@ -479,8 +542,13 @@ class ChartGraph(SceneGraph):
         sig, link_sig = self._signatures(s)
         changed_cells = None
         if s is not None:
-            if old is not None and old.plane.shape == s.plane.shape:
-                a = np.where(old.plane >= 0, np.array([self._hash(k) for k in old.keys] + [0])[old.plane], 0) if len(old.keys) else np.zeros(s.plane.shape)
+            op = None if old is None else old.plane
+            if op is not None and op.shape != s.plane.shape:
+                sy, sx = self._shift
+                if sy + op.shape[0] <= s.plane.shape[0] and sx + op.shape[1] <= s.plane.shape[1]:
+                    big = -np.ones(s.plane.shape, op.dtype); big[sy:sy + op.shape[0], sx:sx + op.shape[1]] = op; op = big
+            if op is not None and op.shape == s.plane.shape:
+                a = np.where(op >= 0, np.array([self._hash(k) for k in old.keys] + [0])[op], 0) if len(old.keys) else np.zeros(s.plane.shape)
                 b = np.where(s.plane >= 0, np.array([self._hash(k) for k in s.keys] + [0])[s.plane], 0) if len(s.keys) else np.zeros(s.plane.shape)
                 changed_cells = a != b
         self._sig, self._link_sig = sig, link_sig
