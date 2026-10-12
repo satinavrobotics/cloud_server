@@ -543,3 +543,107 @@ async def test_after_delete_hook_not_called_when_the_delete_fails():
     await _request_and_wait(deleter, "site_a")
     hook.assert_not_awaited()
 
+
+
+# --- scene graph: lock + drop under the worker's advisory lock ------------------------------------
+
+class SceneDrop:
+    def __init__(self, db=None, key=None, exc=None):
+        self.calls, self.db, self.key, self.exc = [], db, key, exc
+        self.lock_held_during_drop = []
+
+    def __call__(self, map_id):
+        self.calls.append(map_id)
+        if self.db is not None:
+            self.lock_held_during_drop.append(self.key in self.db.locks)
+        if self.exc is not None:
+            raise self.exc
+        return True
+
+
+def test_scene_lock_key_is_the_workers_key():
+    from packages.services.graph_builder import scene_guard
+    assert map_delete.scene_lock_key("site_a") == scene_guard.lock_key("site_a")
+
+
+async def test_scene_graph_dropped_under_the_worker_lock_before_the_other_stores():
+    db = FakeDb()
+    db.seed("site_a")
+    order = []
+    drop = SceneDrop(db, map_delete.scene_lock_key("site_a"))
+
+    class Ordered(Store):
+        def __call__(self, map_id):
+            order.append("graph" if self is graph else "images")
+            return Store.__call__(self, map_id)
+    graph = Ordered()
+    images = Ordered()
+    deleter, _ = _deleter(db, graph, images, scene_drop=lambda m: order.append("scene") or drop(m),
+                          scene_active=lambda m: True)
+    await _request_and_wait(deleter, "site_a")
+    assert order == ["scene", "graph", "images"]
+    assert drop.lock_held_during_drop == [True]
+    assert "site_a" not in db.rows
+    assert db.locks == {}                      # released after the pass
+
+
+async def test_scene_lock_timeout_fails_the_attempt_and_drops_nothing_then_retries():
+    db = FakeDb()
+    db.seed("site_a")
+    holder = FakeConn(db)                      # a fold holds the worker's lock
+    await holder.execute("SELECT pg_try_advisory_lock(%s)", (map_delete.scene_lock_key("site_a"),))
+    graph, images, drop = Store(), Store(), SceneDrop()
+    deleter, sleeps = _deleter(db, graph, images, max_attempts=2, scene_drop=drop,
+                               scene_active=lambda m: True, scene_lock_timeout_s=2.0,
+                               scene_lock_poll_s=1.0)
+    await _request_and_wait(deleter, "site_a")
+    assert not graph.calls and not images.calls and not drop.calls
+    row = db.rows["site_a"]
+    assert row["lifecycle"] == "DELETING"      # stays hidden, retried by the next round
+    assert row["status"]["delete_attempts"] == 2
+    assert "scene_graph: lock" in row["status"]["delete_error"]
+    assert [e["code"] for e in db.events] == ["MAP.DELETE_FAILED"]
+
+
+async def test_scene_lock_freed_midway_lets_the_attempt_proceed():
+    db = FakeDb()
+    db.seed("site_a")
+    holder = FakeConn(db)
+    await holder.execute("SELECT pg_try_advisory_lock(%s)", (map_delete.scene_lock_key("site_a"),))
+    drop, polls = SceneDrop(), []
+
+    async def sleep(s):
+        polls.append(s)
+        if len(polls) == 2:
+            await holder.close()
+    deleter = MapDeleter(db, Store(), Store(), max_attempts=1, sleep=sleep, now=lambda: T0,
+                         scene_drop=drop, scene_active=lambda m: True,
+                         scene_lock_timeout_s=10.0, scene_lock_poll_s=1.0)
+    await _request_and_wait(deleter, "site_a")
+    assert drop.calls == ["site_a"] and "site_a" not in db.rows
+
+
+async def test_scene_drop_failure_fails_the_attempt_and_releases_the_lock():
+    db = FakeDb()
+    db.seed("site_a")
+    graph = Store()
+    drop = SceneDrop(exc=RuntimeError("arango down"))
+    deleter, _ = _deleter(db, graph, max_attempts=1, scene_drop=drop, scene_active=lambda m: True)
+    await _request_and_wait(deleter, "site_a")
+    assert "scene_graph: arango down" in db.rows["site_a"]["status"]["delete_error"]
+    assert db.locks == {}
+
+
+async def test_inactive_scene_graph_leaves_the_saga_unchanged():
+    db = FakeDb()
+    db.seed("site_a")
+    drop = SceneDrop()
+    deleter, _ = _deleter(db, scene_drop=drop, scene_active=lambda m: False)
+    await _request_and_wait(deleter, "site_a")
+    assert not drop.calls and "site_a" not in db.rows
+    # and with no scene hooks at all (the default) only the delete lock was ever taken
+    db2 = FakeDb()
+    db2.seed("b")
+    d2, _ = _deleter(db2)
+    await _request_and_wait(d2, "b")
+    assert len([s for s in db2.statements if s.startswith("SELECT pg_try_advisory_lock")]) == 1

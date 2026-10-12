@@ -25,6 +25,18 @@ MAP.DELETED (maps redesign M2): ts = when the row was removed, discriminator
 `map:<map_id>:deleted:<delete_requested_at>`; written only by the runner whose DELETE removed
 the row, so once per delete.
 
+Scene graph (docs/scene_graph/integration.md, "Review findings" 6): when `scene_active(map)`
+says the map has a scene graph (SCENE_GRAPH_WORKER_ENABLED or a graph exists), each attempt
+first takes the worker's session advisory lock `scene_graph:<map_id>` (same key as
+packages/services/graph_builder/scene_guard.py), polling `pg_try_advisory_lock` for up to
+`scene_lock_timeout_s`, holds it across the drops and releases it after. A timeout fails the
+attempt (`scene_graph: lock ...`), which the normal backoff retries; nothing is dropped
+without the lock. Under the lock `scene_drop(map_id)` (SceneGraphStore.drop: `sg_*` and the
+`scene_graph/` objects) runs before the graph and image deletes, so a fold cannot recreate
+them afterwards: the map is already DELETING (marked by request(), which is what the worker's
+guard `is_deleting` reads) and the worker releases the lock when it sees that. With the
+feature off and no graph, none of this runs.
+
 Not deleted: ROS bags (a robot's recordings; they only name the map in a sidecar) and base
 models (not per map). No robot refers to the map: a robot's map is its open session (maps
 §14.2), and the delete is refused while any session on the map is open (maps.py); the session
@@ -79,6 +91,11 @@ def lock_key(map_id: str) -> int:
     return advisory_lock_key(f"map_delete:{map_id}")
 
 
+def scene_lock_key(map_id: str) -> int:
+    """The scene worker's per-map lock (scene_guard.lock_key: sha256 of `scene_graph:<id>`)."""
+    return advisory_lock_key(f"scene_graph:{map_id}")
+
+
 def failed_discriminator(map_id: str, attempts: int) -> str:
     """Part of MAP.DELETE_FAILED's event_id (stored data: never change the format)."""
     return f"map:{map_id}:attempts:{attempts}"
@@ -116,8 +133,17 @@ class MapDeleter:
                  now: Callable[[], datetime.datetime] = _utcnow,
                  on_mark: Optional[Callable[[Any, str], Awaitable[Any]]] = None,
                  after_mark: Optional[Callable[[str, Any], Awaitable[Any]]] = None,
-                 after_delete: Optional[Callable[[str], Awaitable[Any]]] = None):
+                 after_delete: Optional[Callable[[str], Awaitable[Any]]] = None,
+                 scene_drop: Optional[Callable[[str], Any]] = None,
+                 scene_active: Optional[Callable[[str], bool]] = None,
+                 scene_lock_timeout_s: float = 30.0, scene_lock_poll_s: float = 0.5):
         self._db = db
+        # Scene graph: `scene_active(map_id)` (blocking; None = never) decides whether the
+        # lock + drop run; `scene_drop(map_id)` (blocking; SceneGraphStore.drop) removes it.
+        self._scene_drop = scene_drop
+        self._scene_active = scene_active
+        self._scene_lock_timeout_s = scene_lock_timeout_s
+        self._scene_lock_poll_s = scene_lock_poll_s
         # 3D reconstruction (R3): `on_mark(cursor, map_id)` runs in request()'s transaction
         # after the mark (cancels the map's active job); `after_mark(map_id, its result)` after
         # the commit (service cancel, events). An after_mark failure never fails the delete.
@@ -281,9 +307,73 @@ class MapDeleter:
             await self._sleep(self.backoff(attempt))
 
     async def _attempt(self, map_id: str) -> Optional[str]:
-        """One pass over both stores; None if everything is gone, else the error text."""
+        """One pass over the stores; None if everything is gone, else the error text. When the
+        map has a scene graph the pass runs under the scene worker's lock (see module doc)."""
+        scene_conn = None
+        if await self._scene_is_active(map_id):
+            scene_conn, error = await self._take_scene_lock(map_id)
+            if scene_conn is None:
+                return error
+        try:
+            steps = self._steps
+            if self._scene_active is not None and scene_conn is not None:
+                if self._scene_drop is not None:
+                    steps = (("scene_graph", self._scene_drop),) + steps
+                else:
+                    logger.warning("Map %s has a scene graph but no scene_drop is wired; "
+                                   "its sg_* collections are not dropped", map_id)
+            return await self._run_steps(map_id, steps)
+        finally:
+            if scene_conn is not None:
+                try:
+                    await scene_conn.close()  # releases the advisory lock
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def _scene_is_active(self, map_id: str) -> bool:
+        if self._scene_active is None:
+            return False
+        try:
+            return bool(await asyncio.to_thread(self._scene_active, map_id))
+        except Exception:  # noqa: BLE001 - unknown: take the lock, the safe side
+            logger.exception("Map %s: scene graph probe failed; treating it as present", map_id)
+            return True
+
+    async def _take_scene_lock(self, map_id: str):
+        """(connection holding the lock, None) or (None, error text)."""
+        key = scene_lock_key(map_id)
+        polls = max(1, int(self._scene_lock_timeout_s / max(self._scene_lock_poll_s, 0.01)))
+        try:
+            conn = await self._db.dedicated_connection()
+        except Exception as exc:  # noqa: BLE001
+            return None, f"scene_graph: lock connection: {exc or type(exc).__name__}"
+        try:
+            for poll in range(polls + 1):
+                cursor = await conn.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+                if (await cursor.fetchone())[0]:
+                    return conn, None
+                if poll < polls:
+                    await self._sleep(self._scene_lock_poll_s)
+        except asyncio.CancelledError:
+            await self._close_quietly(conn)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await self._close_quietly(conn)
+            return None, f"scene_graph: lock failed: {exc or type(exc).__name__}"
+        await self._close_quietly(conn)
+        return None, (f"scene_graph: lock {map_id} not free within "
+                      f"{self._scene_lock_timeout_s:g}s (a fold is running); will retry")
+
+    @staticmethod
+    async def _close_quietly(conn: Any) -> None:
+        try:
+            await conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _run_steps(self, map_id: str, steps) -> Optional[str]:
         errors = []
-        for name, delete in self._steps:
+        for name, delete in steps:
             try:
                 result = await asyncio.to_thread(delete, map_id)
                 # The stores return a bool; a {"success": ..., "error": ...} dict is accepted too.

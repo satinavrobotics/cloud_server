@@ -47,14 +47,16 @@ def _delete_fn(deleted=(N1,), missing=(), edges=2, failures=()):
     return fn
 
 
-async def run_delete_nodes(db, ids=(N1,), count=5, fn=None, notify=None, name="yard"):
+async def run_delete_nodes(db, ids=(N1,), count=5, fn=None, notify=None, name="yard",
+                           scene_graph=False):
     fn = fn or _delete_fn()
     def counter(_name):
         if count is None:
             raise RuntimeError("ArangoDB down")
         return count
     out = await maps.delete_nodes(None, name, {"node_ids": list(ids)}, m1.PUB, "op", fn,
-                                  arango_node_count=counter, notify=notify)
+                                  arango_node_count=counter, notify=notify,
+                                  scene_graph=scene_graph)
     return out, fn
 
 
@@ -499,3 +501,26 @@ class TestArangoNodeCount:
             out = await maps.delete_nodes(None, "yard", {"node_ids": [N1]}, m1.PUB, "op",
                                           _delete_fn(), arango_node_count=main._arango_node_count)
         assert out["map_state"] == "ready"
+
+
+# --- scene graph: leaves retracted -> the map is marked needs-rebuild (flag) -------------------
+
+class TestSceneGraphRetraction:
+    KEY = maps.SCENE_GRAPH_NEEDS_REBUILD_KEY
+
+    async def test_marks_the_map_when_the_flag_is_on(self, db):
+        db.add_map("yard", type="local")
+        await run_delete_nodes(db, [N1, N2], fn=_delete_fn(deleted=(N1, N2)), scene_graph=True)
+        mark = db.maps["yard"]["status"][self.KEY]
+        assert mark["reason"] == "nodes_deleted" and mark["nodes"] == 2 and mark["at"]
+
+    async def test_flag_off_leaves_status_untouched(self, db):
+        db.add_map("yard", type="local")
+        await run_delete_nodes(db, scene_graph=False)
+        assert self.KEY not in db.maps["yard"]["status"]
+
+    async def test_nothing_deleted_nothing_marked(self, db):
+        db.add_map("yard", type="local")
+        await run_delete_nodes(db, [N9], fn=_delete_fn(deleted=(), missing=(N9,)),
+                               scene_graph=True)
+        assert self.KEY not in db.maps["yard"]["status"]

@@ -37,6 +37,7 @@ from packages.config import (
     MINIO_HOST, MINIO_PORT, MINIO_SECURE,
     MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE, DEFAULT_MAP_ID,
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
+    SCENE_GRAPH_WORKER_ENABLED,
 )
 from packages.api.map_delete import MapDeleter
 from packages.api import localization_view, maps, reconstruction
@@ -551,6 +552,34 @@ class ApiDelegationService:
     - Proxy functionality to underlying microservices
     """
     
+    def _scene_graph_delete_hooks(self):
+        """(drop, active) for MapDeleter, or (None, None) when the scene graph cannot be reached.
+        `active(map)` is SCENE_GRAPH_WORKER_ENABLED or a graph exists for the map; with the
+        feature off and no graph the delete saga is unchanged."""
+        try:
+            from packages.scene_graph.store import SceneGraphStore  # lazy: the engine is optional
+            store = SceneGraphStore.from_client(self.topomap_db)
+        except Exception:  # noqa: BLE001
+            if SCENE_GRAPH_WORKER_ENABLED:
+                self.logger.exception("Scene graph store unavailable: map delete will not drop it")
+            return None, None
+
+        def drop(map_id: str) -> bool:
+            store.drop(map_id)
+            return True
+
+        def active(map_id: str) -> bool:
+            if SCENE_GRAPH_WORKER_ENABLED:
+                return True
+            try:
+                meta = store.docs.meta(map_id)
+            except Exception:  # noqa: BLE001 - feature off: a failed probe never changes the saga
+                self.logger.warning("Scene graph probe of %s failed; delete proceeds without "
+                                    "the scene graph step", map_id, exc_info=True)
+                return False
+            return isinstance(meta, dict) and bool(meta)
+        return drop, active
+
     def __init__(
         self,
         arango_host: str = ARANGO_HOST,
@@ -649,6 +678,7 @@ class ApiDelegationService:
 
         # WP11 F1: DELETE /maps/{id} marks the map DELETING; this cleans up in the background.
         # The mark also cancels the map's active reconstruction job (same transaction).
+        scene_drop, scene_active = self._scene_graph_delete_hooks()
         self.map_deleter = MapDeleter(
             self.database,
             lambda map_id: self.graph_db.delete_map(map_id),
@@ -656,7 +686,8 @@ class ApiDelegationService:
             max_attempts=MAP_DELETE_MAX_ATTEMPTS, backoff_s=MAP_DELETE_BACKOFF_S,
             backoff_max_s=MAP_DELETE_BACKOFF_MAX_S,
             on_mark=reconstruction.mark_map_deleting,
-            after_mark=self.reconstruction.after_map_delete_marked)
+            after_mark=self.reconstruction.after_map_delete_marked,
+            scene_drop=scene_drop, scene_active=scene_active)
 
         # Configuration
         self.default_map_id = default_map_id
