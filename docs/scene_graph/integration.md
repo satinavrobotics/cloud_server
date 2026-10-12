@@ -221,6 +221,17 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
   Revisit before the planner switches on for a robot with length >> width.
 * Leg recording on lattice routes: chart keys for new run views, leaf-edge views for legacy only.
 
+### Scale gate with `sight_range = 5.0` (CIMBI prototype, Python, per-leaf local update, 2026-10-12)
+
+* Walled halls are flat: 4.2k / 12.6k / 31k cells = 0.44 / 0.73 / 0.71 s per leaf (slope 0.24); without the cap
+  0.60 s / 27 s / did not finish. **Met for walled floors.**
+* **Open fields not met**: a 4.7k-cell field took 3.1 s per leaf (worst 44 s); larger ones did not finish. Row
+  recomputation is to be bounded by the leaf's own 5 m window in the port. Budget: do not assume per-leaf latency in
+  open space; the worker batches and the planner switch stays off for open-field maps until the gate passes.
+* `office8`: the cap never binds; keys 14 kept / 0 born / 0 retired. On 12 of 36 synthetic cases the partition
+  changes (far dead-end cells become dependents). `sight_range` is in the params hash.
+* Links are one per connected stretch of lattice-adjacent boundary cells (diagonal-only contact does not link).
+
 ## Open
 
 * CIMBI: sight-range cap for open fields; `occupancy_depth` backfill timing; store `lineage()` and engine.
