@@ -27,7 +27,8 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import breadth_first_order, dijkstra, minimum_spanning_tree
 
-from .api import BBox, Blocked, Chart, Dirty, Key, Leaf, Link, OwnerRaster, Route, SceneGraph, SceneParams, Snap, ViewResult
+from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, SceneGraph,
+                  SceneParams, Snap, ViewResult)
 from .chart_keys import assign_A, overlaps
 from .chart_levels import hierarchy
 from .chart_track import Track
@@ -97,8 +98,13 @@ def _line(y0: int, x0: int, y1: int, x1: int):
 
 
 class ChartGraph(SceneGraph):
+    # A safety bound, not geometry: the dense canvas allocates ~17 B per full-resolution cell, so one leaf with an absurd pose
+    # must be refused (LeafError) instead of allocating gigabytes. 2**28 cells = 0.67 km^2 at 0.05 m = ~4.5 GB of planes.
+    max_canvas_cells = 1 << 28
+
     def __init__(self, params: SceneParams = SceneParams()):
         super().__init__(params)
+        self.faulted: Optional[BaseException] = None   # set when an exception escaped after the state began to change
         if params.sight_range < params.place - 1e-12:
             raise ValueError("sight_range below the place scale")
         self.version = 0
@@ -127,30 +133,51 @@ class ChartGraph(SceneGraph):
         self._rcache: dict = {}                 # routes from the anchor inside a chart, by chart content
 
     # ------------------------------------------------------------------ canvas and fold
-    def _ensure(self, gx0: int, gy0: int, gx1: int, gy1: int) -> Tuple[int, int]:
-        """grow the canvas to hold [gx0, gx1) x [gy0, gy1); returns the shift (rows, cols) in LATTICE cells of old content"""
+    def _plan_canvas(self, gx0: int, gy0: int, gx1: int, gy1: int):
+        """None when [gx0, gx1) x [gy0, gy1) fits; else the new canvas geometry. Raises LeafError above max_canvas_cells."""
         if self._V is None:
-            self._cx0 = (gx0 - MARGIN) // 2 * 2; self._cy0 = (gy0 - MARGIN) // 2 * 2
-            W = (gx1 + MARGIN - self._cx0 + 1) // 2 * 2; H = (gy1 + MARGIN - self._cy0 + 1) // 2 * 2
-            self._V = np.full((H, W), 255, np.uint8); self._T = -np.ones((H, W), np.int64); self._B = -np.ones((H, W), np.int64)
-            return 0, 0
-        H, W = self._V.shape
-        if gx0 >= self._cx0 and gy0 >= self._cy0 and gx1 <= self._cx0 + W and gy1 <= self._cy0 + H:
-            return 0, 0
-        nx0 = min(self._cx0, (gx0 - MARGIN) // 2 * 2); ny0 = min(self._cy0, (gy0 - MARGIN) // 2 * 2)
-        nx1 = max(self._cx0 + W, gx1 + MARGIN); ny1 = max(self._cy0 + H, gy1 + MARGIN)
-        nW = (nx1 - nx0 + 1) // 2 * 2; nH = (ny1 - ny0 + 1) // 2 * 2
-        oy, ox = self._cy0 - ny0, self._cx0 - nx0
+            cx0 = (gx0 - MARGIN) // 2 * 2; cy0 = (gy0 - MARGIN) // 2 * 2
+            W = (gx1 + MARGIN - cx0 + 1) // 2 * 2; H = (gy1 + MARGIN - cy0 + 1) // 2 * 2
+            plan = dict(fresh=True, cx0=cx0, cy0=cy0, H=H, W=W, oy=0, ox=0, h=0, w=0)
+        else:
+            h, w = self._V.shape
+            if gx0 >= self._cx0 and gy0 >= self._cy0 and gx1 <= self._cx0 + w and gy1 <= self._cy0 + h:
+                return None
+            nx0 = min(self._cx0, (gx0 - MARGIN) // 2 * 2); ny0 = min(self._cy0, (gy0 - MARGIN) // 2 * 2)
+            nx1 = max(self._cx0 + w, gx1 + MARGIN); ny1 = max(self._cy0 + h, gy1 + MARGIN)
+            plan = dict(fresh=False, cx0=nx0, cy0=ny0, H=(ny1 - ny0 + 1) // 2 * 2, W=(nx1 - nx0 + 1) // 2 * 2,
+                        oy=self._cy0 - ny0, ox=self._cx0 - nx0, h=h, w=w)
+        if plan["H"] * plan["W"] > self.max_canvas_cells:
+            raise LeafError(None, f"the batch needs a canvas of {plan['H']} x {plan['W']} cells, above the bound "
+                                  f"{self.max_canvas_cells} (an absurd pose?)")
+        return plan
+
+    def _grow_canvas(self, plan):
+        """Allocate the grown planes WITHOUT touching the state (a MemoryError leaves the engine as it was)."""
+        H, W, oy, ox, h, w = plan["H"], plan["W"], plan["oy"], plan["ox"], plan["h"], plan["w"]
+        if plan["fresh"]:
+            return dict(V=np.full((H, W), 255, np.uint8), T=-np.ones((H, W), np.int64), B=-np.ones((H, W), np.int64),
+                        chan={}, kp=None)
 
         def grow(a, fill):
-            b = np.full((nH, nW), fill, a.dtype); b[oy:oy + H, ox:ox + W] = a; return b
-        self._V = grow(self._V, 255); self._T = grow(self._T, -1); self._B = grow(self._B, -1)
-        self._chan = {k: (grow(v, 255), grow(t, -1)) for k, (v, t) in self._chan.items()}
+            b = np.full((H, W), fill, a.dtype); b[oy:oy + h, ox:ox + w] = a; return b
+        out = dict(V=grow(self._V, 255), T=grow(self._T, -1), B=grow(self._B, -1),
+                   chan={k: (grow(v, 255), grow(t, -1)) for k, (v, t) in self._chan.items()}, kp=None)
         if self._key_plane is not None:
-            kp = np.full((nH // 2, nW // 2), -1, self._key_plane.dtype)
-            kp[oy // 2:oy // 2 + H // 2, ox // 2:ox // 2 + W // 2] = self._key_plane; self._key_plane = kp
-        self._cx0, self._cy0 = nx0, ny0
-        return oy // 2, ox // 2
+            kp = np.full((H // 2, W // 2), -1, self._key_plane.dtype)
+            kp[oy // 2:oy // 2 + h // 2, ox // 2:ox // 2 + w // 2] = self._key_plane; out["kp"] = kp
+        return out
+
+    def _commit_canvas(self, plan, arrays) -> Tuple[int, int]:
+        self._V, self._T, self._B, self._chan = arrays["V"], arrays["T"], arrays["B"], arrays["chan"]
+        if arrays["kp"] is not None: self._key_plane = arrays["kp"]
+        self._cx0, self._cy0 = plan["cx0"], plan["cy0"]
+        return (0, 0) if plan["fresh"] else (plan["oy"] // 2, plan["ox"] // 2)
+
+    def _ensure(self, gx0: int, gy0: int, gx1: int, gy1: int) -> Tuple[int, int]:
+        """grow the canvas to hold [gx0, gx1) x [gy0, gy1); returns the shift (rows, cols) in LATTICE cells of old content"""
+        plan = self._plan_canvas(gx0, gy0, gx1, gy1)
+        return (0, 0) if plan is None else self._commit_canvas(plan, self._grow_canvas(plan))
 
     @staticmethod
     def _fold_into(V, T, w, gx, gy, cx0, cy0, t, B=None):
@@ -173,8 +200,54 @@ class ChartGraph(SceneGraph):
         gx, gy = int(round(x0 / RES)), int(round(y0 / RES))
         chans = {k: to_lattice(v, lf.resolution, lf.origin, lf.origin_yaw, RES)[0] for k, v in lf.channels.items()
                  if k not in RESERVED and v is not None}
-        self._pending.append((lf, w, gx, gy, chans))
-        return gx, gy, gx + w.shape[1], gy + w.shape[0]
+        return gx, gy, w, chans
+
+    def _prepare(self, leaves: Sequence[Leaf]) -> list:
+        """VALIDATION PHASE. Check and rasterise every leaf of the batch before anything is mutated: a LeafError here leaves
+        the engine bit-identical, so the caller may retry or bisect the batch. A window side is capped at 4 x sight_range
+        (a leaf window is 2 x sight_range by convention: 10 x 10 m; 4 x leaves room for other sensors)."""
+        cap_m = 4.0 * self.params.sight_range
+        out: list = []; seen: Dict[str, Leaf] = {}
+        fin = lambda v: isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool) and math.isfinite(v)
+        for lf in leaves:
+            k = getattr(lf, "key", None)
+
+            def bad(why, k=k):
+                raise LeafError(k, why)
+            if not isinstance(k, str) or not k: bad("key must be a non-empty string")
+            if k in seen:
+                o = seen[k]
+                if (o.stamp_ms, o.x, o.y, o.session, o.r_d, tuple(o.origin), o.resolution, o.origin_yaw) != \
+                        (lf.stamp_ms, lf.x, lf.y, lf.session, lf.r_d, tuple(lf.origin), lf.resolution, lf.origin_yaw) \
+                        or o.window_u8.shape != lf.window_u8.shape or not np.array_equal(o.window_u8, lf.window_u8):
+                    bad("duplicate key with different content in one batch")
+                continue
+            seen[k] = lf
+            w = lf.window_u8
+            if not isinstance(w, np.ndarray) or w.ndim != 2 or w.dtype != np.uint8: bad("window_u8 must be a 2-D uint8 array")
+            if w.size == 0: bad("empty window")
+            if not isinstance(lf.stamp_ms, (int, np.integer)) or isinstance(lf.stamp_ms, bool): bad("stamp_ms must be an integer")
+            if lf.session is not None and not isinstance(lf.session, str): bad("session must be a string")
+            for name in ("x", "y", "yaw", "resolution", "r_d", "origin_yaw"):
+                if not fin(getattr(lf, name)): bad(f"{name} must be a finite number")
+            if not (isinstance(lf.origin, (tuple, list)) and len(lf.origin) == 2 and fin(lf.origin[0]) and fin(lf.origin[1])):
+                bad("origin must be two finite numbers")
+            if lf.resolution <= 0: bad("resolution must be > 0")
+            if lf.r_d <= 0: bad("r_d must be > 0")
+            if max(w.shape) * lf.resolution > cap_m:
+                bad(f"window side {max(w.shape) * lf.resolution:.1f} m exceeds {cap_m:.1f} m (4 x sight_range)")
+            for name, cv in (lf.channels or {}).items():
+                if name in RESERVED or cv is None: continue
+                if not isinstance(cv, np.ndarray) or cv.ndim != 2 or cv.dtype != np.uint8 or cv.shape != w.shape:
+                    bad(f"channel {name!r} must be a 2-D uint8 array of the window's shape")
+            if lf.view is not None and not all(fin(getattr(lf.view, a)) for a in ("x", "y", "yaw", "fov", "rng")):
+                bad("view must have finite fields")
+            try:
+                gx, gy, wl, chans = self._fold_leaf(lf)
+            except Exception as e:                                   # noqa: BLE001 - any resampling failure is the leaf's
+                bad(f"cannot resample the window: {e!r}")
+            out.append((lf, wl, gx, gy, chans))
+        return out
 
     # ------------------------------------------------------------------ public: fold / refold
     def fold_many(self, leaves: Sequence[Leaf]) -> Dirty:
@@ -185,29 +258,51 @@ class ChartGraph(SceneGraph):
         the box are reset, a stored leaf whose pose lies in the box and is not supplied is a deleted one."""
         return self._apply(leaves, bbox)
 
+    def _check(self) -> None:
+        if self.faulted is not None: raise EngineFaulted(self.faulted)
+
     def _apply(self, leaves: Sequence[Leaf], bbox: Optional[BBox]) -> Dirty:
-        old = self._solved
-        old_sig, old_link_sig, old_keys = dict(self._sig), set(self._link_sig), list(self._keys)
-        self._pending = []
+        self._check()
+        # ---- validation: nothing is mutated until every leaf is checked, resampled and the canvas is allocated
+        if bbox is not None and not all(isinstance(v, (int, float, np.integer, np.floating)) and math.isfinite(v)
+                                        for v in (bbox.x0, bbox.y0, bbox.x1, bbox.y1)):
+            raise LeafError(None, "bbox must be finite")
+        prepared = self._prepare(leaves)
         bounds = None
-        for lf in leaves:
-            b = self._fold_leaf(lf)
+        for _, wl, gx, gy, _ in prepared:
+            b = (gx, gy, gx + wl.shape[1], gy + wl.shape[0])
             bounds = b if bounds is None else (min(bounds[0], b[0]), min(bounds[1], b[1]), max(bounds[2], b[2]), max(bounds[3], b[3]))
         region = None
+        if bbox is not None and self._V is not None:
+            gx0, gy0 = int(math.floor(bbox.x0 / RES)), int(math.floor(bbox.y0 / RES))
+            gx1, gy1 = int(math.ceil(bbox.x1 / RES)), int(math.ceil(bbox.y1 / RES))
+            region = (gx0, gy0, gx1, gy1)
+        if not prepared and region is None:
+            return Dirty(None, [], {}, [], self._watermark)
+        plan = grown = None
+        if bounds is not None:
+            plan = self._plan_canvas(*bounds)                        # LeafError above the canvas bound
+            if plan is not None: grown = self._grow_canvas(plan)     # a MemoryError here changes nothing
+        # ---- mutation: from here an escaping exception leaves the state undefined => the engine is FAULTED
+        old = self._solved
+        old_sig, old_link_sig, old_keys = dict(self._sig), set(self._link_sig), list(self._keys)
+        try:
+            return self._mutate(leaves, bbox, prepared, bounds, region, plan, grown, old, old_sig, old_link_sig, old_keys)
+        except BaseException as e:                                   # noqa: BLE001
+            self.faulted = e
+            raise
+
+    def _mutate(self, leaves, bbox, prepared, bounds, region, plan, grown, old, old_sig, old_link_sig, old_keys) -> Dirty:
+        self._pending = []
         if bbox is not None and self._V is not None:
             # a stored leaf of the area that was not supplied is a deleted leaf
             keep = {lf.key for lf in leaves}
             for k in [k for k, r in self._leaves.items()
                       if bbox.x0 <= r.x <= bbox.x1 and bbox.y0 <= r.y <= bbox.y1 and k not in keep]:
                 self._leaf_del(k); self._pl_full = True
-            gx0, gy0 = int(math.floor(bbox.x0 / RES)), int(math.floor(bbox.y0 / RES))
-            gx1, gy1 = int(math.ceil(bbox.x1 / RES)), int(math.ceil(bbox.y1 / RES))
-            region = (gx0, gy0, gx1, gy1)
-        if not self._pending and region is None:
-            return Dirty(None, [], {}, [], self._watermark)
         shift = (0, 0)
-        if bounds is not None:
-            shift = self._ensure(*bounds)
+        if plan is not None:
+            shift = self._commit_canvas(plan, grown)
         if region is not None and self._V is not None:
             x0, y0 = max(region[0] - self._cx0, 0), max(region[1] - self._cy0, 0)
             x1, y1 = min(region[2] - self._cx0, self._V.shape[1]), min(region[3] - self._cy0, self._V.shape[0])
@@ -215,7 +310,7 @@ class ChartGraph(SceneGraph):
                 self._V[y0:y1, x0:x1] = 255; self._T[y0:y1, x0:x1] = -1; self._B[y0:y1, x0:x1] = -1
                 for v, t in self._chan.values():
                     v[y0:y1, x0:x1] = 255; t[y0:y1, x0:x1] = -1
-        for lf, w, gx, gy, chans in self._pending:
+        for lf, w, gx, gy, chans in prepared:
             self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B)
             for name, cw in chans.items():
                 if name not in self._chan:
@@ -230,7 +325,6 @@ class ChartGraph(SceneGraph):
             self._leaf_put(lf.key, rec)
             self._watermark = max(self._watermark, (lf.stamp_ms, lf.key))
         birth = max(((lf.stamp_ms, lf.key) for lf in leaves), default=self._watermark)[1]
-        self._pending = []
         self._cache = {}
         self._shift = shift
         self._solve(shift, birth)
@@ -743,6 +837,7 @@ class ChartGraph(SceneGraph):
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         """The navigable cell nearest (x, y) with the real distance; refused (key None) beyond `max_dist`, never beyond
         sight_range. `crosses_blocked`: the straight segment to it passes a known blocked cell."""
+        self._check()
         far = Snap(None, None, None, math.inf)
         s = self._solved
         if s is None or self._V is None: return far
@@ -789,6 +884,7 @@ class ChartGraph(SceneGraph):
         return keep
 
     def corridor(self, a: Key, b: Key, blocked: Optional[Blocked] = None) -> Optional[List[Tuple[int, int]]]:
+        self._check()
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
         keep = self._corridor_charts(s.keys.index(a), s.keys.index(b))
@@ -815,6 +911,7 @@ class ChartGraph(SceneGraph):
     def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None) -> Optional[Route]:
         """Shortest lattice route between the anchors of charts a and b in navigable space (blocked cells removed).
         Searches the chart corridor first and the whole graph if that finds nothing or a longer way."""
+        self._check()
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
         sp = s.sp; ja, jb = s.keys.index(a), s.keys.index(b)
@@ -928,6 +1025,7 @@ class ChartGraph(SceneGraph):
 
     def export_state(self) -> EngineState:
         """The resumable state, by reference (the arrays are not copied: the store slices them into tiles)."""
+        self._check()
         p = self.params
         st = EngineState(params=dict(robot_half_side=p.robot_half_side, lattice=p.lattice, place_mult=p.place_mult,
                                      sight_range=p.sight_range),
@@ -989,6 +1087,7 @@ class ChartGraph(SceneGraph):
         return self._cache["levels"]
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
+        self._check()
         s = self._solved
         if s is None:
             return ViewResult(self.version, [], [], None)
@@ -1060,6 +1159,7 @@ class ChartGraph(SceneGraph):
 
     def cover(self, keys: Sequence[Key], k: int = 2) -> Tuple[List[str], float, bool]:
         """Minimal set of leaf keys whose camera views k-cover the given charts and the blocked cells bounding them."""
+        self._check()
         s = self._solved
         if s is None: return [], 0.0, True
         idx = [s.keys.index(x) for x in keys if x in s.keys]

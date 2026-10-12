@@ -138,6 +138,20 @@ class MissingTiles(Exception):
     def __init__(self, tiles): super().__init__(f"tiles not loaded: {tiles}"); self.tiles = tiles
 
 
+class LeafError(ValueError):
+    """A leaf (or its batch) is unusable: raised by fold_many / refold in the validation phase, BEFORE anything is
+    mutated, so the engine state is bit-identical afterwards and the batch can be retried or bisected. `key` names the leaf."""
+    def __init__(self, key, reason):
+        super().__init__(f"leaf {key!r}: {reason}"); self.key = key; self.reason = reason
+
+
+class EngineFaulted(RuntimeError):
+    """An exception escaped after the engine began to mutate (solver or internal): its state is undefined. Every later call
+    raises this until a new engine is built (store.load); `cause` is the original exception."""
+    def __init__(self, cause):
+        super().__init__(f"engine faulted: {cause!r}; rebuild it from the store"); self.cause = cause
+
+
 class SceneGraph:
     """The contract. The engine is `packages.scene_graph.engine.ChartGraph` (a subclass); this base raises
     NotImplementedError so a caller can be tested against the signatures alone."""

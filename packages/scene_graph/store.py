@@ -183,7 +183,7 @@ class SceneGraphStore:
         out = {k: m[k] for k in ("version", "generation", "params", "params_hash", "cursor", "epoch", "created_ms") if k in m}
         if m.get("pending"):       # what a worker needs to RESUME a rebuild after a restart or a fence
             out["pending"] = {k: m["pending"].get(k) for k in ("generation", "version", "params_hash", "cursor", "watermark",
-                                                               "rebuild_batch")}
+                                                               "rebuild_batch", "begun_ms")}
         return out
 
     def watermark(self, map_id: str) -> Tuple[int, str]:
@@ -322,7 +322,13 @@ class SceneGraphStore:
         content_hash = params_hash({k: v for k, v in body.items() if k not in ("retired", "engine_version", "canvas", "cursor")},
                                    "content")
         if prev is not None and prev.get("content_hash") == content_hash:
-            if not pend and meta is not None and meta.get("cursor") != cursor:
+            # nothing but (maybe) the cursor moved: same version; the cursor moves in place by CAS, in the pending record
+            # for a pending generation. An identical call writes nothing at all.
+            if pend:
+                if pending.get("cursor") != cursor:
+                    if not self.docs.cas_meta(map_id, cur, dict(meta, pending=dict(pending, cursor=cursor))):
+                        raise StaleVersion("lost the compare-and-set")
+            elif meta is not None and meta.get("cursor") != cursor:
                 if not self.docs.cas_meta(map_id, cur, dict(meta, cursor=cursor)):
                     raise StaleVersion("lost the compare-and-set")
             return pending.get("version", 0) if pend else cur
@@ -610,7 +616,7 @@ class SceneGraphStore:
         g = max(used) + 1
         new = dict(meta)
         new["pending"] = {"generation": g, "version": 0, "manifest": None, "params_hash": params_hash, "cursor": None,
-                          "watermark": None, "rebuild_batch": rebuild_batch}
+                          "watermark": None, "rebuild_batch": rebuild_batch, "begun_ms": int(self.clock() * 1000)}
         if not self.docs.cas_meta(map_id, meta["version"], new): raise StaleVersion("lost the compare-and-set")
         return g
 
