@@ -11,10 +11,11 @@ never run automatically, dry run by default.
 
 Run where the API's environment is set (ARANGO_*, MINIO_*), e.g. inside the API container.
 
-Which nodes: those with a non-empty `costmap` object and no `costmap_stored_ms`. Nothing else is
-written, and only when the field is still null at write time (a live writer's DB-clock stamp is
-never overwritten), so a second run changes nothing and an interrupted run is resumed by running
-it again.
+Which nodes: those with a non-empty `costmap` object and no usable `costmap_stored_ms` (absent,
+null, 0, negative or not a number: a stamp is valid only when it is a positive number). Nothing else is
+written, and only when the field is still unstamped in that sense at write time (a live writer's
+DB-clock stamp, a positive number, is never overwritten), so a second run changes nothing and an
+interrupted run is resumed by running it again.
 
 Which time, per node, best first (the `source` of the report):
   minio_last_modified  newest last-modified of the node's costmap PNGs in MinIO (the store time
@@ -39,6 +40,7 @@ import datetime
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from packages.services.graph_builder import scene_leaf
@@ -55,14 +57,22 @@ PROJECTION = ("{_key: n._key, timestamp: n.timestamp, created_at: n.created_at, 
               "costmap: n.costmap}")
 SELECT_AQL = ("FOR n IN @@col FILTER n._key > @after AND IS_OBJECT(n.costmap) "
               "AND LENGTH(ATTRIBUTES(n.costmap)) > 0 SORT n._key LIMIT @limit RETURN " + PROJECTION)
-# Only while the field is still null: never overwrites a stamp a live write set meanwhile.
-STAMP_AQL = ("FOR u IN @items FOR d IN @@col FILTER d._key == u.key AND d.costmap_stored_ms == null "
+# Only while the field is still unstamped (absent, null, 0, negative, not a number; the same rule
+# as the Python selection): never overwrites a valid stamp a live write set meanwhile.
+STAMP_AQL = ("FOR u IN @items FOR d IN @@col FILTER d._key == u.key "
+             "AND (!IS_NUMBER(d.costmap_stored_ms) OR d.costmap_stored_ms <= 0) "
              "UPDATE d WITH {costmap_stored_ms: u.ms} IN @@col OPTIONS {mergeObjects: false} "
              "RETURN NEW._key")
 
 
 def _is_num(v: Any) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def is_stamped(node: Dict[str, Any]) -> bool:
+    """A usable `costmap_stored_ms`: a positive number (0 / non-numeric count as unstamped)."""
+    v = node.get("costmap_stored_ms")
+    return _is_num(v) and v > 0
 
 
 def candidates(node: Dict[str, Any], minio_ms: Optional[int], now_ms: int) -> Dict[str, int]:
@@ -158,35 +168,46 @@ class MinioTimes:
 
 
 def backfill_map(store: Any, map_id: str, minio: Optional[Callable] = None, apply: bool = False,
-                 batch: int = 500, now_ms: Optional[int] = None) -> Dict[str, Any]:
+                 batch: int = 500, now_ms: Optional[int] = None, workers: int = 8) -> Dict[str, Any]:
     """Backfill one map; the report: nodes (with a costmap), already (stamped), to_stamp, stamped,
     skipped (no usable time; their keys in `skipped_keys`), sources {source: count}. Reads and
-    writes in batches of `batch` (no collection lock; each write is a single guarded update)."""
+    writes in batches of `batch` (no collection lock; each write is a single guarded update).
+    The MinIO stats of a batch run on `workers` threads."""
+    if batch < 1 or workers < 1:
+        raise ValueError("batch and workers must be >= 1")
     run_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     cands: Dict[str, Dict[str, int]] = {}
     todo: List[str] = []
-    todo_set: set = set()
     nodes = already = 0
     after = ""
-    while True:
-        rows = store.nodes(map_id, after, batch)
-        if not rows:
-            break
-        for n in rows:
-            key = str(n["_key"])
-            nodes += 1
-            if _is_num(n.get("costmap_stored_ms")) and n["costmap_stored_ms"] > 0:
-                already += 1
-            else:
-                todo.append(key)
-                todo_set.add(key)
-            minio_ms = None
-            if minio is not None and key in todo_set:
-                minio_ms = minio(map_id, key, list((n.get("costmap") or {}).keys()))
-            cands[key] = candidates(n, minio_ms, run_ms)
-        after = str(rows[-1]["_key"])
-        if len(rows) < batch:
-            break
+    pool = ThreadPoolExecutor(max_workers=workers) if minio is not None and workers > 1 else None
+    try:
+        while True:
+            rows = store.nodes(map_id, after, batch)
+            if not rows:
+                break
+            pending = []
+            for n in rows:
+                key = str(n["_key"])
+                nodes += 1
+                if is_stamped(n):
+                    already += 1
+                else:
+                    todo.append(key)
+                    pending.append(n)
+                cands[key] = candidates(n, None, run_ms)
+            if minio is not None and pending:
+                def stat(n: Dict[str, Any]) -> Optional[int]:
+                    return minio(map_id, str(n["_key"]), list((n.get("costmap") or {}).keys()))
+                times = pool.map(stat, pending) if pool is not None else map(stat, pending)
+                for n, minio_ms in zip(pending, times):
+                    cands[str(n["_key"])] = candidates(n, minio_ms, run_ms)
+            after = str(rows[-1]["_key"])
+            if len(rows) < batch:
+                break
+    finally:
+        if pool is not None:
+            pool.shutdown()
     chosen, skipped = plan(cands, todo, run_ms)
     sources: Dict[str, int] = {}
     for _ms, src in chosen.values():
@@ -206,14 +227,22 @@ def main(argv: Optional[List[str]] = None, store: Any = None, minio: Any = None)
     ap.add_argument("--map", action="append", dest="maps", help="map id (repeatable); default all")
     ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
     ap.add_argument("--no-minio", action="store_true", help="do not stat MinIO objects")
-    ap.add_argument("--batch", type=int, default=500)
+    ap.add_argument("--batch", type=int, default=500, help="nodes per read/write batch (>= 1)")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="threads for the MinIO stats (>= 1, default 8)")
     args = ap.parse_args(argv)
+    if args.batch < 1 or args.workers < 1:
+        ap.error("--batch and --workers must be >= 1")
     if store is None:
         from arango import ArangoClient
         from packages import config
+        if not config.ARANGO_PASSWORD:
+            print("ARANGO_PASSWORD is not set: export it (the API's environment) and run again",
+                  file=sys.stderr)
+            return 2
         client = ArangoClient(hosts=f"http://{config.ARANGO_HOST}:{config.ARANGO_PORT}")
         store = ArangoStore(client.db(config.DATA_BASE_NAME, username=config.ARANGO_USERNAME,
-                                      password=config.ARANGO_PASSWORD or "openSesame"))
+                                      password=config.ARANGO_PASSWORD))
         if not args.no_minio:
             from packages.topomap_dbs.image_db.server import ImageDatabaseService
             minio = MinioTimes(ImageDatabaseService(
@@ -224,7 +253,7 @@ def main(argv: Optional[List[str]] = None, store: Any = None, minio: Any = None)
         minio = None
     print("APPLY" if args.apply else "DRY RUN (nothing written; --apply to write)")
     for map_id in (args.maps or store.maps()):
-        r = backfill_map(store, map_id, minio, args.apply, args.batch)
+        r = backfill_map(store, map_id, minio, args.apply, args.batch, workers=args.workers)
         print(f"{map_id}: nodes={r['nodes']} already={r['already']} to_stamp={r['to_stamp']} "
               f"stamped={r['stamped']} skipped={r['skipped']} sources={r['sources']}")
         if r["skipped_keys"]:

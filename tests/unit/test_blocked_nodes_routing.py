@@ -31,7 +31,7 @@ def _row(node, x=1.0, y=1.0, expires=EXPIRES):
             "source": "edgeBlocked", "robot_name": "r1", "mission_name": "m1",
             "vda_node_id": "m1-n1-s4", "reason": "blocked", "x": x, "y": y,
             "created_at": None, "expires_at": expires,
-            "robot_x": None, "robot_y": None, "prev_x": None, "prev_y": None}
+            "robot_x": None, "robot_y": None}
 
 
 def _tuple(row):
@@ -281,7 +281,7 @@ SEG_EDGES = [{"from": a, "to": b} for a, b in (("A", "B"), ("A", "D"), ("D", "B"
 def _seg_row(with_pose=True):
     row = _row("9", 6.0, 0.0)
     if with_pose:
-        row.update(robot_x=3.0, robot_y=0.0, prev_x=0.0, prev_y=0.0)
+        row.update(robot_x=3.0, robot_y=0.0)
     return row
 
 
@@ -339,8 +339,52 @@ def test_a_stop_closer_than_the_lead_makes_a_segment_from_the_robot_to_the_waypo
 
 def test_the_upsert_writes_the_geometry_columns_in_column_order():
     params = blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60, x=6.0, y=0.0,
-                                         robot_x=3.0, robot_y=0.0, prev_x=0.0, prev_y=1.0)
+                                         robot_x=3.0, robot_y=0.0)
     assert len(params) == blocked_nodes.UPSERT_SQL.count("%s")
-    assert params[9:15] == (6.0, 0.0, 3.0, 0.0, 0.0, 1.0) and params[-1] == 60.0
+    assert params[9:13] == (6.0, 0.0, 3.0, 0.0) and params[-1] == 60.0
     legacy = blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60, x=6.0, y=0.0)
-    assert legacy[11:15] == (None, None, None, None)
+    assert legacy[11:13] == (None, None)
+    assert "prev_x" not in blocked_nodes.UPSERT_SQL
+
+
+def test_a_null_pose_report_does_not_erase_an_earlier_pose():
+    sql = blocked_nodes.UPSERT_SQL
+    assert "robot_x = COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x)" in sql
+    assert "robot_y = COALESCE(EXCLUDED.robot_y, blocked_graph_nodes.robot_y)" in sql
+
+
+def test_rows_hit_accepts_a_generator_and_matches_route_hits_row():
+    from packages.utils import blocked_geometry
+    row = _row("9", 6.0, 0.0)
+    row.update(robot_x=0.0, robot_y=0.0)
+    poly = [(3.0, -1.0), (3.0, 1.0)]
+    assert blocked_nodes.rows_hit((r for r in [row]), [], polyline=poly) == [row]
+    assert blocked_nodes.rows_hit([row], [], polyline=[(3.0, 3.0), (3.0, 4.0)]) == []
+    crosses = blocked_nodes.leg_crosser([row, _row("8", 1.0, 1.0)])   # the 2nd has no pose
+    assert crosses((3.0, -1.0), (3.0, 1.0)) is True
+    assert crosses((3.0, 3.0), (3.0, 4.0)) is False
+    assert blocked_geometry.route_hits_row(row, poly)
+
+
+async def test_purge_expired_runs_at_most_once_per_interval():
+    class Cur:
+        def __init__(self, log): self.log = log
+        async def __aenter__(self): return self
+        async def __aexit__(self, *e): return False
+        async def execute(self, sql, params=None): self.log.append((sql, params))
+
+    class Conn(Cur):
+        def cursor(self): return Cur(self.log)
+
+    class Db:
+        def __init__(self): self.log = []
+        def connection(self): return Conn(self.log)
+
+    db = Db()
+    blocked_nodes._last_purge = float("-inf")
+    await blocked_nodes.purge_expired(db, now=1000.0)
+    await blocked_nodes.purge_expired(db, now=1001.0)
+    assert [sql for sql, _ in db.log] == [blocked_nodes.PURGE_SQL]
+    assert db.log[0][1] == (blocked_nodes.PURGE_AFTER_S,)
+    await blocked_nodes.purge_expired(db, now=1000.0 + blocked_nodes.PURGE_EVERY_S)
+    assert len(db.log) == 2

@@ -84,11 +84,11 @@ def row_segment(row: Mapping[str, Any], lead_m: float = LEAD_M) -> Optional[Tupl
     return (rx + t * (bx - rx), ry + t * (by - ry)), (bx, by)
 
 
-def route_hits_row(row: Mapping[str, Any], polyline: Sequence[Pt], half_width_m: float = HALF_WIDTH_M,
-                   lead_m: float = LEAD_M) -> bool:
-    """Whether the straight legs of `polyline` pass within `half_width_m` of the row's obstacle
-    segment. A row without a robot pose is not judged here (the disc rule decides)."""
-    seg = row_segment(row, lead_m)
+def segment_hits(seg: Optional[Tuple[Pt, Pt]], polyline: Sequence[Pt],
+                 half_width_m: float = HALF_WIDTH_M) -> bool:
+    """Whether the straight legs of `polyline` pass within `half_width_m` of `seg` (a row_segment
+    result, None never hit). Split out of route_hits_row so a caller testing many legs against the
+    same rows computes each row's segment once."""
     pts = list(polyline)
     if seg is None or not pts:
         return False
@@ -96,6 +96,13 @@ def route_hits_row(row: Mapping[str, Any], polyline: Sequence[Pt], half_width_m:
     if len(pts) == 1:
         return point_segment_distance(pts[0], a, b) <= half_width_m
     return any(segment_segment_distance(p, q, a, b) <= half_width_m for p, q in zip(pts, pts[1:]))
+
+
+def route_hits_row(row: Mapping[str, Any], polyline: Sequence[Pt], half_width_m: float = HALF_WIDTH_M,
+                   lead_m: float = LEAD_M) -> bool:
+    """Whether the straight legs of `polyline` pass within `half_width_m` of the row's obstacle
+    segment. A row without a robot pose is not judged here (the disc rule decides)."""
+    return segment_hits(row_segment(row, lead_m), polyline, half_width_m)
 
 
 def near_obstacle(rows: Iterable[Mapping[str, Any]], xy: Pt, half_width_m: float = HALF_WIDTH_M,

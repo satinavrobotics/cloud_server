@@ -740,6 +740,9 @@ class Robot:
         # Timestamp of the robot state message being handled, for the events it causes
         # (see _record); None outside that.
         self._event_ts: Optional[datetime.datetime] = None
+        # True while handling the first state after the robot was offline: its reports may be
+        # older than its position (blocked-node pose is then not recorded).
+        self._state_is_after_offline = False
         # Maps §14 U3: a new robot run (VDA5050 header ids restart) unplaces its session; a
         # datum re-places a geo one. `_datum_epoch`: the dispatcher's MQTT connection epoch in
         # which this robot's last datum arrived (the first datum of an epoch may be the
@@ -2702,6 +2705,7 @@ class Robot:
         self._manufacturer = message.manufacturer or self._manufacturer
         # First, so that every decision on this message (a held mission's start, a cancel
         # before dispatch) sees the robot as this message reports it, not the previous one.
+        self._state_is_after_offline = False
         self._robot_order_id = message.orderId
         self._robot_executing = bool(message.nodeStates or message.edgeStates)
         if not self._robot_executing:
@@ -2755,6 +2759,8 @@ class Robot:
             if not self._robot_object.status.online:
                 self.info("Robot Online")
                 self._reset_resend_budgets()
+                # This state carries what happened while offline (see _pose_in_map).
+                self._state_is_after_offline = True
             # Any state means the robot is back, whatever the online flag says (a watcher
             # row read before the offline write landed can have set it again).
             if self._timeout_paused is not None:
@@ -3760,30 +3766,35 @@ class Robot:
         ref["graph_node_id"] = graph_node
         return ref
 
-    def _pose_in_map(self, order_id: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
-        """The robot's last reported position in the map frame, by the transform order
-        `order_id` was sent with (MissionSentOrderV1.frame), as for `_offset_in_map`; (None,
-        None) when the position or the order's frame is not known (the block is then kept as a
-        plain waypoint, the rule of rows written before the pose columns)."""
+    def _pose_in_map(self, order_id: Optional[str], position: Optional[Any] = None
+                     ) -> Tuple[Optional[float], Optional[float]]:
+        """The robot's position in the map frame when it reported the block, by the transform
+        order `order_id` was sent with (MissionSentOrderV1.frame), as for `_offset_in_map`.
+        `position` is the agvPosition of the state message that carried the report; (None,
+        None) when it has none, is not initialized, the order's frame is not known, or the
+        message was the first one after a reconnect (it carries what happened offline, so its
+        position is where the robot is now, not where it stopped). The block is then kept as a
+        plain waypoint, the rule of rows written before the pose columns."""
         record = self._sent_order_record(order_id)
         frame = record.frame if record is not None else None
-        pose = self._robot_object.status.pose if self._robot_object is not None else None
-        if frame is None or pose is None or \
-                not self._robot_object.status.position_initialized:
+        if frame is None or position is None or self._state_is_after_offline or \
+                not getattr(position, "positionInitialized", None):
             return None, None
         try:
-            x, y = float(pose.x), float(pose.y)
+            x, y = float(position.x), float(position.y)
             if frame.get("applied") == "inverse":
                 x, y = map_geo.apply_transform(frame["map_t_session"], x, y)
         except (KeyError, TypeError, ValueError):
             return None, None
         return (x, y) if math.isfinite(x) and math.isfinite(y) else (None, None)
 
-    def _exclude_blocked_node(self, node_ref: str, source: str, reason: Optional[str]) -> None:
+    def _exclude_blocked_node(self, node_ref: str, source: str, reason: Optional[str],
+                              position: Optional[Any] = None) -> None:
         """Keep the graph node of a waypoint the robot reported blocked out of new routes
         for BLOCKED_NODE_EXCLUSION_MIN (blocked_graph_nodes, read by the planner), for every
         robot on the map. Best effort: a waypoint on no map is skipped, and a failed write
-        only logs. When the waypoint's graph node is not known, its position is kept out."""
+        only logs. When the waypoint's graph node is not known, its position is kept out.
+        `position`: the agvPosition of the state message that carried the report."""
         ref = self._resolve_node_ref(node_ref)
         if ref is None or ref["waypoint_index"] is None:
             return
@@ -3795,15 +3806,13 @@ class Robot:
             return
         previous = node.route.waypoints[index - 1].node_id if index > 0 else None
         graph_node = ref["graph_node_id"] or blocked_nodes.synthetic_id(waypoint.x, waypoint.y)
-        robot_x, robot_y = self._pose_in_map(ref["order_id"])
-        prev = node.route.waypoints[index - 1] if index > 0 else None
+        robot_x, robot_y = self._pose_in_map(ref["order_id"], position)
         params = blocked_nodes.upsert_params(
             waypoint.map_id, graph_node, source,
             order_policy.current().blocked_node_exclusion_min * 60.0,
             edge_from=previous, edge_to=ref["graph_node_id"], robot_name=self._name,
             mission_name=str(self._current_mission.name), vda_node_id=ref["node_id"],
-            reason=reason, x=waypoint.x, y=waypoint.y, robot_x=robot_x, robot_y=robot_y,
-            prev_x=None if prev is None else prev.x, prev_y=None if prev is None else prev.y)
+            reason=reason, x=waypoint.x, y=waypoint.y, robot_x=robot_x, robot_y=robot_y)
         self.mission_info(f"Keeping graph node {graph_node} on map {waypoint.map_id} out of "
                           f"new routes for {order_policy.current().blocked_node_exclusion_min:g}"
                           f" min ({source})")
@@ -3818,6 +3827,7 @@ class Robot:
             async with self._database.connection() as conn:
                 async with conn.cursor() as cursor:
                     await cursor.execute(blocked_nodes.UPSERT_SQL, params)
+            await blocked_nodes.purge_expired(self._database)
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Could not store blocked graph node {params[1]} ({err}); new "
                          "routes may still go through it")
@@ -4081,7 +4091,8 @@ class Robot:
                             if r.referenceKey in ("nodeId", "node_id")), None)
         if blocked_ref is not None:
             self._exclude_blocked_node(blocked_ref, "edgeBlocked",
-                                       blocked_error.errorDescription)
+                                       blocked_error.errorDescription,
+                                       position=message.agvPosition)
 
         self.warning(
             f"Edge blocked: node={blocked_node_name} edge={blocked_edge} "

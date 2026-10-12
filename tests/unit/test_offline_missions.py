@@ -798,7 +798,7 @@ async def test_an_edge_blocked_report_keeps_its_graph_node_out_of_new_routes():
     upserts = [p for sql, p in writes if sql == blocked_nodes.UPSERT_SQL]
     assert len(upserts) == 1
     (map_name, graph_node, edge_from, edge_to, source, robot, mission, vda, _reason,
-     x, y, robot_x, robot_y, prev_x, prev_y, expires_in) = upserts[0]
+     x, y, robot_x, robot_y, expires_in) = upserts[0]
     assert (map_name, graph_node, edge_from, edge_to, source) == ("M", "g1", "g0", "g1",
                                                                   "edgeBlocked")
     assert (robot, mission, vda, x, y) == ("r1", "m1", f"{order}-s4", 10.0, 2.0)
@@ -824,17 +824,50 @@ async def _blocked_params(initialized, pose=(1.0, 0.5)):
 
 
 @pytest.mark.unit
-async def test_a_blocked_report_carries_the_robots_pose_in_the_map_frame_and_the_previous_waypoint():
+async def test_a_blocked_report_carries_the_robots_pose_in_the_map_frame():
     params = await _blocked_params(True)
     rx, ry = map_geo.apply_transform(T, 1.0, 0.5)
-    assert params[11:15] == pytest.approx((rx, ry, 10.0, 1.0))    # robot x, y, prev x, y
+    assert params[11:13] == pytest.approx((rx, ry))    # robot x, y
+    assert len(params) == 14                            # ... then expires_in: no prev_x/prev_y
+
+
+@pytest.mark.unit
+async def test_a_blocked_report_in_the_first_state_after_a_reconnect_has_null_pose_columns():
+    r, db, m = await _start_on_map()
+    writes = []
+    db.connection = MagicMock(side_effect=lambda: _Conn(writes))
+    r._robot_object.status.online = False        # the robot dropped off, then reconnects
+    order = _order_id(r)
+    s = _state(order)
+    s.errors = [_edge_blocked(f"{order}-s4")]
+    s.agvPosition = types.VDA5050AgvPosition(
+        positionInitialized=True, x=1.0, y=0.5, theta=0.0, mapId="cloud-M")
+    await r._on_client_message(s)
+    await asyncio.sleep(0)
+    (params,) = [p for sql, p in writes if sql == blocked_nodes.UPSERT_SQL]
+    assert params[11] is None and params[12] is None
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_the_pose_of_a_block_is_the_one_of_the_message_that_carried_it():
+    r, db, m = await _start_on_map()
+    order = _order_id(r)
+    s = _state(order)
+    s.agvPosition = types.VDA5050AgvPosition(
+        positionInitialized=True, x=1.0, y=0.5, theta=0.0, mapId="cloud-M")
+    await r._on_client_message(s)                         # the robot's status pose: (1.0, 0.5)
+    other = types.VDA5050AgvPosition(
+        positionInitialized=True, x=7.0, y=7.0, theta=0.0, mapId="cloud-M")
+    assert r._pose_in_map(order, other) == pytest.approx(map_geo.apply_transform(T, 7.0, 7.0))
+    assert r._pose_in_map(order, None) == (None, None)
+    r._cancel_mission_timeout()
 
 
 @pytest.mark.unit
 async def test_a_blocked_report_without_an_initialized_position_keeps_null_pose_columns():
     params = await _blocked_params(False)
     assert params[9:11] == (10.0, 2.0) and params[11] is None and params[12] is None
-    assert params[13:15] == (10.0, 1.0)
 
 
 @pytest.mark.unit

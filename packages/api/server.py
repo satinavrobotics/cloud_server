@@ -553,16 +553,20 @@ class ApiDelegationService:
     """
     
     def _scene_graph_delete_hooks(self):
-        """(drop, active) for MapDeleter, or (None, None) when the scene graph cannot be reached.
-        `active(map)` is SCENE_GRAPH_WORKER_ENABLED or a graph exists for the map; with the
-        feature off and no graph the delete saga is unchanged."""
+        """(drop, active) for MapDeleter. `active(map)` is SCENE_GRAPH_WORKER_ENABLED or a graph
+        exists for the map; with the feature off and positively no scene metadata the delete saga
+        is unchanged (`active` False, nothing dropped).
+
+        When the store cannot be built, the hooks do not pretend nothing is there: a probe that
+        does not need the engine (the map's `sg_meta_<map>` collection) may still rule a graph
+        out (feature off only); otherwise `active` is True and `drop` raises, which fails the
+        scene_graph step of the saga (retried with backoff) instead of deleting the map and
+        leaving its sg_* collections and objects behind."""
         try:
             from packages.scene_graph.store import SceneGraphStore  # lazy: the engine is optional
             store = SceneGraphStore.from_client(self.topomap_db)
-        except Exception:  # noqa: BLE001
-            if SCENE_GRAPH_WORKER_ENABLED:
-                self.logger.exception("Scene graph store unavailable: map delete will not drop it")
-            return None, None
+        except Exception as err:  # noqa: BLE001
+            return self._unbuildable_scene_hooks(err)
 
         def drop(map_id: str) -> bool:
             store.drop(map_id)
@@ -571,13 +575,38 @@ class ApiDelegationService:
         def active(map_id: str) -> bool:
             if SCENE_GRAPH_WORKER_ENABLED:
                 return True
-            try:
-                meta = store.docs.meta(map_id)
-            except Exception:  # noqa: BLE001 - feature off: a failed probe never changes the saga
-                self.logger.warning("Scene graph probe of %s failed; delete proceeds without "
-                                    "the scene graph step", map_id, exc_info=True)
-                return False
+            # A failed probe raises: the saga then treats the scene graph as present (takes
+            # the lock and drops), never as absent.
+            meta = store.docs.meta(map_id)
             return isinstance(meta, dict) and bool(meta)
+        return drop, active
+
+    def _unbuildable_scene_hooks(self, err: Exception):
+        """The hooks when the SceneGraphStore cannot be built (see _scene_graph_delete_hooks)."""
+        self.logger.error(
+            "Scene graph store unavailable (%s): map deletes cannot drop scene graphs; a delete "
+            "is only allowed through when the feature is off and the map has no scene metadata",
+            err, exc_info=True)
+
+        def drop(map_id: str) -> bool:
+            raise RuntimeError(f"scene graph store unavailable ({err}); cannot drop the scene "
+                               f"graph of map {map_id}, will retry")
+
+        def active(map_id: str) -> bool:
+            if SCENE_GRAPH_WORKER_ENABLED:
+                return True
+            try:
+                present = self.topomap_db.graph.db.has_collection(f"sg_meta_{map_id}")
+            except Exception:  # noqa: BLE001 - cannot rule it out
+                self.logger.warning("Scene graph store unavailable and the probe of %s failed; "
+                                    "its delete will fail the scene_graph step and retry",
+                                    map_id, exc_info=True)
+                return True
+            if present:
+                self.logger.warning("Map %s has scene graph metadata but the store is "
+                                    "unavailable; its delete will fail the scene_graph step "
+                                    "and retry", map_id)
+            return bool(present)
         return drop, active
 
     def __init__(

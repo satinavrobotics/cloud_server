@@ -89,6 +89,8 @@ class FakeCursor:
             db.reconstructions_deleted.append(params[0])
         elif sql == map_delete.EDGE_OBSERVATIONS_SQL:
             db.edge_observations_deleted.append(params[0])
+        elif sql == map_delete.BLOCKED_NODES_SQL:
+            db.blocked_deleted.append(params[0])
         elif sql == emit_mod.INSERT_SQL:
             if db.fail_events:
                 raise RuntimeError("fleet_events unavailable")
@@ -152,6 +154,7 @@ class FakeDb:
         self.sessions_deleted = []
         self.reconstructions_deleted = []
         self.edge_observations_deleted = []
+        self.blocked_deleted = []
         self.robots = {}
         self.locks = {} if locks is None else locks
         self.fail_events = False
@@ -228,6 +231,7 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     assert db.sessions_deleted == ["site_a"]  # its mapping sessions go with the row
     assert db.reconstructions_deleted == ["site_a"]  # and its reconstruction jobs (R3)
     assert db.edge_observations_deleted == ["site_a"]  # and its edge statistics
+    assert db.blocked_deleted == ["site_a"]  # and its blocked-node exclusions
     assert graph.calls == ["site_a"] and images.calls == ["site_a"]
     assert [p[1].split(" ", 1)[1] for p in db.notifies] == ["site_a DELETING", "site_a DELETED"]
     assert sleeps == []
@@ -647,3 +651,53 @@ async def test_inactive_scene_graph_leaves_the_saga_unchanged():
     d2, _ = _deleter(db2)
     await _request_and_wait(d2, "b")
     assert len([s for s in db2.statements if s.startswith("SELECT pg_try_advisory_lock")]) == 1
+
+
+# --- scene graph delete hooks when the store cannot be built --------------------------------
+
+def _hook_service(has_collection):
+    svc = ApiDelegationService.__new__(ApiDelegationService)
+    svc.logger = MagicMock()
+    svc.topomap_db = MagicMock()
+    svc.topomap_db.graph.db.has_collection.side_effect = has_collection
+    return svc
+
+
+def _hooks_without_store(svc, enabled):
+    import packages.api.server as server_mod
+    with patch("packages.scene_graph.store.SceneGraphStore.from_client",
+               side_effect=RuntimeError("no engine")), \
+            patch.object(server_mod, "SCENE_GRAPH_WORKER_ENABLED", enabled):
+        drop, active = svc._scene_graph_delete_hooks()
+        return drop, active, active("m") if True else None
+
+
+def test_unbuildable_store_with_flag_on_fails_the_scene_step():
+    svc = _hook_service(lambda name: False)
+    drop, active, is_active = _hooks_without_store(svc, True)
+    assert is_active is True
+    with pytest.raises(RuntimeError, match="retry"):
+        drop("m")
+
+
+def test_unbuildable_store_flag_off_is_skipped_only_when_no_metadata_is_there():
+    svc = _hook_service(lambda name: name == "sg_meta_has")
+    import packages.api.server as server_mod
+    with patch("packages.scene_graph.store.SceneGraphStore.from_client",
+               side_effect=RuntimeError("no engine")), \
+            patch.object(server_mod, "SCENE_GRAPH_WORKER_ENABLED", False):
+        drop, active = svc._scene_graph_delete_hooks()
+        assert active("none") is False
+        assert active("has") is True
+    with pytest.raises(RuntimeError):
+        drop("has")
+
+
+def test_unbuildable_store_and_failing_probe_cannot_rule_out_so_the_step_fails():
+    def boom(name):
+        raise ConnectionError("arango down")
+    svc = _hook_service(boom)
+    drop, active, is_active = _hooks_without_store(svc, False)
+    assert is_active is True
+    with pytest.raises(RuntimeError):
+        drop("m")

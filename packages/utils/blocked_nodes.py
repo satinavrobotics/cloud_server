@@ -13,8 +13,10 @@ The first node of a route is never blocked: the robot is there.
 Today only mission-dispatch's edgeBlocked handling writes rows; the "nodeBlocked" and
 "operator" sources are reserved. `map_name` holds the waypoint's map_id.
 """
+import logging
 import math
 import os
+import time
 from collections import deque
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -25,22 +27,25 @@ MATCH_RADIUS_M = float(os.getenv("BLOCKED_NODE_MATCH_RADIUS_M", "0.5"))
 
 COLUMNS = ("map_name", "graph_node_id", "edge_from", "edge_to", "source", "robot_name",
            "mission_name", "vda_node_id", "reason", "x", "y", "created_at", "expires_at",
-           "robot_x", "robot_y", "prev_x", "prev_y")
+           "robot_x", "robot_y")
 
 # A new report on a node already blocked extends its expiry (never shortens it) and keeps
 # the newest report's details; on a row that had expired it starts a new block (created_at).
+# A report without the robot's pose (NULL) never erases an earlier valid one. The table's
+# prev_x/prev_y columns (migration 20261012_01) are no longer written: nothing reads them.
 UPSERT_SQL = (
     "INSERT INTO blocked_graph_nodes (map_name, graph_node_id, edge_from, edge_to, source, "
-    "robot_name, mission_name, vda_node_id, reason, x, y, robot_x, robot_y, prev_x, prev_y, "
+    "robot_name, mission_name, vda_node_id, reason, x, y, robot_x, robot_y, "
     "expires_at) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
     "now() + make_interval(secs => %s)) "
     "ON CONFLICT (map_name, graph_node_id) DO UPDATE SET "
     "edge_from = EXCLUDED.edge_from, edge_to = EXCLUDED.edge_to, source = EXCLUDED.source, "
     "robot_name = EXCLUDED.robot_name, mission_name = EXCLUDED.mission_name, "
     "vda_node_id = EXCLUDED.vda_node_id, reason = EXCLUDED.reason, x = EXCLUDED.x, "
-    "y = EXCLUDED.y, robot_x = EXCLUDED.robot_x, robot_y = EXCLUDED.robot_y, "
-    "prev_x = EXCLUDED.prev_x, prev_y = EXCLUDED.prev_y, "
+    "y = EXCLUDED.y, "
+    "robot_x = COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x), "
+    "robot_y = COALESCE(EXCLUDED.robot_y, blocked_graph_nodes.robot_y), "
     "created_at = CASE WHEN blocked_graph_nodes.expires_at <= now() THEN now() "
     "ELSE blocked_graph_nodes.created_at END, "
     "expires_at = GREATEST(blocked_graph_nodes.expires_at, EXCLUDED.expires_at)")
@@ -53,6 +58,31 @@ ACTIVE_FOR_MAP_SQL = (
 # not blocked: cleared quietly, reported as not found).
 DELETE_SQL = ("DELETE FROM blocked_graph_nodes WHERE map_name = %s AND graph_node_id = %s "
               "RETURNING expires_at > now()")
+
+# Rows expired for longer than this are dropped (nothing reads an expired row; the API's
+# clear tolerates its absence). A map delete removes the rest (map_delete finish).
+PURGE_SQL = ("DELETE FROM blocked_graph_nodes "
+             "WHERE expires_at < now() - make_interval(secs => %s)")
+PURGE_AFTER_S = 86400.0
+PURGE_EVERY_S = 3600.0
+_last_purge = float("-inf")
+
+
+async def purge_expired(database: Any, now: Optional[float] = None) -> None:
+    """Drop rows expired for more than PURGE_AFTER_S, at most once per PURGE_EVERY_S per
+    process (cheap; called from the upsert and list paths). Best effort: own connection
+    (so a failure cannot abort the caller's transaction), errors are only logged."""
+    global _last_purge  # pylint: disable=global-statement
+    now = time.monotonic() if now is None else now
+    if now - _last_purge < PURGE_EVERY_S:
+        return
+    _last_purge = now
+    try:
+        async with database.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(PURGE_SQL, (PURGE_AFTER_S,))
+    except Exception as err:  # pylint: disable=broad-except
+        logging.getLogger(__name__).warning("Could not purge expired blocked nodes: %s", err)
 
 
 def synthetic_id(x: float, y: float) -> str:
@@ -84,13 +114,12 @@ def upsert_params(map_name: str, graph_node_id: str, source: str, expires_in_s: 
                   robot_name: Optional[str] = None, mission_name: Optional[str] = None,
                   vda_node_id: Optional[str] = None, reason: Optional[str] = None,
                   x: Optional[float] = None, y: Optional[float] = None,
-                  robot_x: Optional[float] = None, robot_y: Optional[float] = None,
-                  prev_x: Optional[float] = None, prev_y: Optional[float] = None
+                  robot_x: Optional[float] = None, robot_y: Optional[float] = None
                   ) -> Tuple[Any, ...]:
     if source not in SOURCES:
         raise ValueError(f"unknown source {source!r}")
     return (map_name, graph_node_id, edge_from, edge_to, source, robot_name, mission_name,
-            vda_node_id, reason, x, y, robot_x, robot_y, prev_x, prev_y, float(expires_in_s))
+            vda_node_id, reason, x, y, robot_x, robot_y, float(expires_in_s))
 
 
 async def fetch_active(database: Any, map_id: str) -> List[Dict[str, Any]]:
@@ -99,7 +128,9 @@ async def fetch_active(database: Any, map_id: str) -> List[Dict[str, Any]]:
     async with database.connection() as conn:
         async with conn.cursor() as cursor:
             await cursor.execute(ACTIVE_FOR_MAP_SQL, (map_id,))
-            return [row_dict(r) for r in await cursor.fetchall()]
+            rows = [row_dict(r) for r in await cursor.fetchall()]
+    await purge_expired(database)
+    return rows
 
 
 def row_blocks(row: Mapping[str, Any], node_id: Optional[Any] = None,
@@ -131,12 +162,30 @@ def rows_hit(rows: Iterable[Mapping[str, Any]],
     has the robot's pose at the block (`robot_x`, `robot_y`) also blocks a route whose legs pass
     the obstacle segment (blocked_geometry.route_hits_row); this is in addition to the point
     rule. Rows without a robot pose, and calls without a polyline, are judged as before."""
-    from packages.utils import blocked_geometry  # imports this module: not at the top
     points = list(points)
     poly = [(float(x), float(y)) for x, y in polyline] if polyline else []
-    return [dict(row) for row in rows
-            if any(row_blocks(row, node_id, xy, radius_m) for node_id, xy in points)
-            or (poly and blocked_geometry.route_hits_row(row, poly))]
+    geometry = _geometry() if poly else None
+    out = []
+    for row in rows:
+        if any(row_blocks(row, node_id, xy, radius_m) for node_id, xy in points) or \
+                (poly and geometry.route_hits_row(row, poly)):
+            out.append(dict(row))
+    return out
+
+
+def _geometry() -> Any:
+    from packages.utils import blocked_geometry  # imports this module: not at the top
+    return blocked_geometry
+
+
+def leg_crosser(rows: Iterable[Mapping[str, Any]]) -> Callable[[Tuple[float, float],
+                                                                Tuple[float, float]], bool]:
+    """`crosses(a, b)`: whether the straight leg a -> b passes the obstacle segment of any of
+    `rows` (rows without a robot pose never match). The segments are computed once, for
+    path searches that test many legs against the same rows."""
+    geometry = _geometry()
+    segs = [s for s in (geometry.row_segment(r) for r in rows) if s is not None]
+    return lambda a, b: any(geometry.segment_hits(s, [a, b]) for s in segs)
 
 
 def route_points(waypoints: Sequence[Any], skip_first: bool = True

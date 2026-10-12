@@ -1,3 +1,4 @@
+import pytest
 import datetime
 
 from tools import scene_costmap_stored_backfill as bf
@@ -39,7 +40,7 @@ class FakeStore:
         done = 0
         for it in items:
             d = self.docs[it["key"]]
-            if d.get("costmap_stored_ms") is None:      # the AQL guard
+            if not bf.is_stamped(d):                    # the AQL guard
                 d["costmap_stored_ms"] = it["ms"]
                 done += 1
         self.writes.append(len(items))
@@ -115,5 +116,41 @@ def test_main_dry_run_by_default(capsys):
 
 
 def test_arango_stamp_aql_is_guarded_and_touches_only_the_field():
-    assert "d.costmap_stored_ms == null" in bf.STAMP_AQL
+    assert "!IS_NUMBER(d.costmap_stored_ms) OR d.costmap_stored_ms <= 0" in bf.STAMP_AQL
     assert "UPDATE d WITH {costmap_stored_ms: u.ms}" in bf.STAMP_AQL
+
+
+def test_zero_and_non_numeric_stamps_converge_and_valid_ones_are_kept():
+    a, b, c, ok = (node(k, ts=T) for k in "abcd")
+    a["costmap_stored_ms"], b["costmap_stored_ms"], c["costmap_stored_ms"] = 0, "x", -5
+    ok["costmap_stored_ms"] = 777
+    s = FakeStore([a, b, c, ok])
+    r = bf.backfill_map(s, "m", apply=True, now_ms=NOW)
+    assert (r["already"], r["to_stamp"], r["stamped"]) == (1, 3, 3)
+    assert [s.docs[k]["costmap_stored_ms"] for k in "abcd"] == [T, T, T, 777]
+    assert bf.backfill_map(s, "m", apply=True, now_ms=NOW)["stamped"] == 0
+
+
+def test_minio_stats_run_on_a_pool_and_keep_their_results_per_node():
+    import threading
+    seen = set()
+
+    def minio(map_id, key, layers):
+        seen.add(threading.get_ident())
+        return T + ord(key)
+
+    s = FakeStore([node(k, ts=T - 1000) for k in "abcdef"])
+    r = bf.backfill_map(s, "m", minio, apply=True, batch=4, now_ms=NOW, workers=3)
+    assert r["stamped"] == 6 and r["sources"] == {"minio_last_modified": 6}
+    assert [s.docs[k]["costmap_stored_ms"] for k in "abcdef"] == [T + ord(k) for k in "abcdef"]
+
+
+def test_main_rejects_a_batch_below_one_and_requires_the_password(monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        bf.main(["--batch", "0", "--no-minio"], store=FakeStore([]))
+    with pytest.raises(SystemExit):
+        bf.main(["--workers", "0", "--no-minio"], store=FakeStore([]))
+    from packages import config
+    monkeypatch.setattr(config, "ARANGO_PASSWORD", None)
+    assert bf.main(["--no-minio"]) == 2
+    assert "ARANGO_PASSWORD" in capsys.readouterr().err

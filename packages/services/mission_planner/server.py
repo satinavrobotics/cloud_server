@@ -793,11 +793,12 @@ class MissionPlannerService:
         excluded.discard(start)
         self.logger.info(f"Planning around blocked graph node(s) {names(on_path)}")
         edges = self.graph_db.get_edges(map_id)
+        leg_crosses = blocked_nodes.leg_crosser(segmented) if segmented else None
+
         def crosses(a: str, b: str) -> bool:
             """An edge whose straight leg passes an obstacle segment."""
-            return bool(segmented) and a in xy_of and b in xy_of and \
-                xy_of[a] is not None and xy_of[b] is not None and bool(
-                    blocked_nodes.rows_hit(segmented, [], polyline=[xy_of[a], xy_of[b]]))
+            return leg_crosses is not None and xy_of.get(a) is not None and \
+                xy_of.get(b) is not None and leg_crosses(xy_of[a], xy_of[b])
 
         path = blocked_nodes.shortest_path_avoiding(edges, start, end, excluded, crosses) \
             if edges else None

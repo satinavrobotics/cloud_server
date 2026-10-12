@@ -84,6 +84,8 @@ SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
 RECONSTRUCTIONS_SQL = "DELETE FROM map_reconstructions WHERE map_name = %s"
 # Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
 EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
+# Its blocked-node exclusions (migration 20261008_01_blocked_graph_nodes) too.
+BLOCKED_NODES_SQL = "DELETE FROM blocked_graph_nodes WHERE map_name = %s"
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
 
 
@@ -403,6 +405,7 @@ class MapDeleter:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
                     await cursor.execute(RECONSTRUCTIONS_SQL, (map_id,))
                     await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
+                    await cursor.execute(BLOCKED_NODES_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
             if removed:
