@@ -13,6 +13,7 @@ already rely on (docs/scene_graph/integration.md, "Planner contract"):
 import asyncio
 import logging
 import math
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -148,6 +149,7 @@ class GraphCache:
         self._graphs: "OrderedDict[Tuple[str, int], Any]" = OrderedDict()
         self._loading: Dict[Tuple[str, int], "asyncio.Future"] = {}
         self.loads = 0                 # store.load calls started (tests, metrics)
+        self._cursors: Dict[str, Any] = {}   # map -> ingest cursor of the version `get` last returned
 
     def _open_store(self):
         if self._store is not None:
@@ -168,6 +170,11 @@ class GraphCache:
         self._graphs.move_to_end(key)
         while len(self._graphs) > self._max:
             self._graphs.popitem(last=False)
+
+    def cursor(self, map_id: str) -> Any:
+        """The ingest cursor `[costmap_stored_ms, node key]` stored with the version `get` last
+        returned for the map (None when unknown)."""
+        return self._cursors.get(map_id)
 
     async def get(self, map_id: str) -> Tuple[Any, int]:
         """(graph, version) of the map's current version; ChartFallback otherwise."""
@@ -190,6 +197,7 @@ class GraphCache:
         version = (meta or {}).get("version")
         if version is None:
             raise ChartFallback("no_graph")
+        self._cursors[map_id] = (meta or {}).get("cursor")
         key = (map_id, int(version))
         if key in self._graphs:
             self._graphs.move_to_end(key)
@@ -215,6 +223,35 @@ class GraphCache:
         except Exception as err:  # pylint: disable=broad-except
             raise ChartFallback("load_error") from err
         return graph, key[1]
+
+
+def version_lag_s(graph_db: Any, map_id: str, cursor: Any,
+                  now_ms: Optional[float] = None) -> Optional[float]:
+    """How stale the loaded graph version is, in seconds: the age of the oldest costmap stored in
+    the topomap after the version's ingest cursor (`store.meta(map)["cursor"]`, the worker's
+    `(costmap_stored_ms, node key)`), 0.0 when nothing is waiting. None = unknown (no cursor, no
+    such query, database error): the caller must not reject on it. One indexed AQL query with
+    limit 1; blocking (run it in a thread). `costmap_stored_ms` is the database clock: the
+    planner and ArangoDB are expected to share a host or an NTP-synced clock."""
+    try:
+        ms, key = int(cursor[0]), str(cursor[1])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    try:
+        rows = graph_db.costmap_nodes_since(map_id, ms, key, 1)
+    except Exception as err:  # pylint: disable=broad-except
+        _log.warning("scene graph lag of map %s unknown: %s", map_id, err)
+        return None
+    if not isinstance(rows, list):
+        return None
+    if not rows:
+        return 0.0
+    try:
+        stored = float(rows[0]["costmap_stored_ms"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    now = time.time() * 1000.0 if now_ms is None else float(now_ms)
+    return max(0.0, (now - stored) / 1000.0)
 
 
 def blocked_free_los(graph: Any, overlay: Tuple[list, list]) -> Callable[[Pt, Pt], bool]:
@@ -255,9 +292,12 @@ def blocked_free_los(graph: Any, overlay: Tuple[list, list]) -> Callable[[Pt, Pt
 
 def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
-                  start_snap_m: float, goal_snap_m: float, max_gap_m: float) -> ChartPlan:
+                  start_snap_m: float, goal_snap_m: float, max_gap_m: float,
+                  robot_width_m: Optional[float] = None, width_margin_m: float = 0.0) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
-    Raises ChartFallback for every case the legacy planner must take over."""
+    Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
+    planning robot's footprint width (None / <= 0: unknown, never rejects): a route whose narrowest
+    passage is under it plus `width_margin_m` is `too_narrow`."""
     from packages.scene_graph.api import Blocked, MissingTiles
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
     problem = snap_problem(snap_a, start_snap_m)
@@ -274,7 +314,19 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     except MissingTiles as err:
         raise ChartFallback("missing_tiles") from err
     if route is None or not route.nodes:
+        if blocked is not None:
+            # unreachable only because of the overlay? say so (the legacy planner then reports the
+            # blocking rows as failed_at "blocked_nodes").
+            try:
+                free = graph.route(snap_a.key, snap_b.key, None)
+            except MissingTiles:
+                free = None
+            if free is not None and free.nodes:
+                raise ChartFallback("blocked_by_overlay")
         raise ChartFallback("unreachable")
+    if robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0 \
+            and float(route.min_width) < float(robot_width_m) + max(0.0, width_margin_m):
+        raise ChartFallback("too_narrow")
     # The lattice route runs anchor to anchor; the real ends are the snapped start and goal cells.
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
     visible = blocked_free_los(graph, overlay)

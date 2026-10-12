@@ -22,11 +22,15 @@ load("//bzl:python.bzl", "mission_dispatch_py_binary", "mission_dispatch_py_libr
 # Mission Planner Service (business logic)
 mission_dispatch_py_library(
     name = "server",
-    srcs = ["server.py"],
+    srcs = ["server.py", "scene_route.py"],
     deps = [
         "//packages/topomap_dbs/graph_db:client",
         "//packages/database:client",
         "//:cloud_common_objects",
+        # TODO: "//packages/scene_graph:scene_graph" once packages/scene_graph has a BUILD target
+        # (the chart planner imports packages.scene_graph lazily; the Dockerfile copies it).
+        requirement("numpy"),
+        requirement("scipy"),
         requirement("requests"),
         requirement("paho-mqtt"),
     ],

@@ -32,6 +32,7 @@ class FakeGraph:
         self.route_error = None
         self.blocked_seen = "unset"
         self.routes = 0
+        self.only_free = False         # reachable only without an overlay
 
     def snap(self, x, y, max_dist=None):
         cx = min(max(x, 0.0), 10.0 - 1e-9)
@@ -48,7 +49,7 @@ class FakeGraph:
         self.blocked_seen = blocked
         if self.route_error:
             raise self.route_error
-        if self.unreachable:
+        if self.unreachable or (self.only_free and blocked is not None):
             return None
         nodes = [((i + 0.5) * H, 0.05) for i in range(100)]
         return Route(charts=["c0", "c1"], length=10.0, min_width=0.8, nodes=nodes)
@@ -61,11 +62,14 @@ class FakeStore:
         self.meta_error = None
         self.load_error = None
         self.gate = None
+        self.cursor = None
 
     def meta(self, map_id):
         if self.meta_error:
             raise self.meta_error
-        return {"version": self.version} if self.version is not None else {}
+        if self.version is None:
+            return {}
+        return {"version": self.version, "cursor": self.cursor} if self.cursor else {"version": self.version}
 
     def load(self, map_id, version=None):
         self.loads.append((map_id, version))
@@ -287,3 +291,98 @@ async def test_a_cold_load_over_the_timeout_does_not_block_planning_and_fills_th
     await asyncio.sleep(0.2)
     out = await _plan(svc)
     assert out["planner"] == scene_route.PLANNER_SCENE_GRAPH and len(store.loads) == 1
+
+
+# ---- robot width, version lag, rows the overlay cannot place ---------------------------------------
+
+def _width(svc, value):
+    svc.get_robot_status.return_value.status.factsheet.width = value
+
+
+@pytest.mark.unit
+async def test_route_narrower_than_the_robot_falls_back_too_narrow(on):
+    graph = FakeGraph()                                    # the fake route's min_width is 0.8
+    svc = _service(FakeStore(graph))
+    _width(svc, 1.0)
+    out = await _plan(svc)
+    assert out["planner"] == "legacy" and out["planner_fallback"] == "too_narrow" and out["success"]
+    _width(svc, 0.6)
+    out = await _plan(svc)
+    assert out["planner"] == scene_route.PLANNER_SCENE_GRAPH and out["min_width"] == 0.8
+
+
+@pytest.mark.unit
+async def test_unknown_robot_width_never_rejects_and_margin_applies(on, monkeypatch):
+    svc = _service(FakeStore(FakeGraph()))
+    for unknown in (-1, 0, None):
+        _width(svc, unknown)
+        assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+    _width(svc, 0.7)
+    monkeypatch.setattr(config, "SCENE_GRAPH_WIDTH_MARGIN_M", 0.2)
+    assert (await _plan(svc))["planner_fallback"] == "too_narrow"
+
+
+def _lagging(svc, store, age_s, rows="one"):
+    store.cursor = [1_000, "k1"]
+    import time as _t
+    waiting = [{"costmap_stored_ms": _t.time() * 1000 - age_s * 1000, "_key": "k2"}]
+    svc.graph_db.costmap_nodes_since.side_effect = None
+    svc.graph_db.costmap_nodes_since.return_value = waiting if rows == "one" else []
+
+
+@pytest.mark.unit
+async def test_graph_lagging_the_ingest_falls_back_stale_graph(on, monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 60.0)
+    store = FakeStore(FakeGraph())
+    svc = _service(store)
+    _lagging(svc, store, 300)
+    out = await _plan(svc)
+    assert out["planner"] == "legacy" and out["planner_fallback"] == "stale_graph"
+    svc.graph_db.costmap_nodes_since.assert_called_with("m", 1000, "k1", 1)   # the version's own cursor
+    _lagging(svc, store, 5)                               # a fresh upload is not lag
+    assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+    _lagging(svc, store, 0, rows="none")                  # nothing waiting
+    assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+
+
+@pytest.mark.unit
+async def test_unknown_lag_or_disabled_check_never_rejects(on, monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 60.0)
+    store = FakeStore(FakeGraph())
+    svc = _service(store)
+    store.cursor = None                                    # no cursor saved: unknown
+    svc.graph_db.costmap_nodes_since.return_value = [{"costmap_stored_ms": 1}]
+    assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+    store.cursor = [1, "k"]
+    svc.graph_db.costmap_nodes_since.side_effect = RuntimeError("arango down")
+    assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+    svc.graph_db.costmap_nodes_since.side_effect = None
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 0.0)
+    assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+    assert svc.graph_db.costmap_nodes_since.call_count == 1  # no cursor: no query; error: one; disabled: none
+
+
+@pytest.mark.unit
+async def test_reachable_only_without_the_overlay_is_reported_blocked_by_overlay(on):
+    graph = FakeGraph()
+    graph.only_free = True
+    svc = _service(FakeStore(graph))
+    svc._active_blocked_nodes = AsyncMock(return_value=[
+        {"graph_node_id": "@5.00,0.00", "x": 5.0, "y": 0.0}])
+    out = await _plan(svc)
+    assert out["planner"] == "legacy" and out["planner_fallback"] == "blocked_by_overlay"
+    graph.unreachable = True                              # unreachable even without it
+    assert (await _plan(svc))["planner_fallback"] == "unreachable"
+
+
+@pytest.mark.unit
+async def test_blocked_graph_node_id_on_the_route_goes_to_the_legacy_planner(on):
+    """A row naming a topomap node id (no position, no robot pose) places nothing in the overlay;
+    the legacy point rule on the waypoints' leaf ids still applies."""
+    graph = FakeGraph()
+    svc = _service(FakeStore(graph))
+    svc._active_blocked_nodes = AsyncMock(return_value=[{"graph_node_id": "n5"}])
+    out = await _plan(svc)                                # leaf ids are n<round(x)>: the route passes n5
+    assert out["planner"] == "legacy" and out["planner_fallback"] == "blocked_row_on_route"
+    svc._active_blocked_nodes = AsyncMock(return_value=[{"graph_node_id": "n77"}])
+    assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH

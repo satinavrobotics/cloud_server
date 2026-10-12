@@ -141,6 +141,18 @@ class MissionPlannerService:
             except RobotNotPlacedError:
                 return None, "robot_not_placed"       # the legacy path reports it to the caller
             graph, version = await self._scene_cache.get(map_id)
+            loop = asyncio.get_running_loop()
+            if config.SCENE_GRAPH_MAX_VERSION_LAG_S > 0:
+                # the graph must not lag the ingest by more than the threshold; unknown never rejects
+                try:
+                    lag = await asyncio.wait_for(
+                        loop.run_in_executor(None, scene_route.version_lag_s, self.graph_db,
+                                             map_id, self._scene_cache.cursor(map_id)),
+                        config.SCENE_GRAPH_LOAD_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    lag = None
+                if lag is not None and lag > config.SCENE_GRAPH_MAX_VERSION_LAG_S:
+                    return None, "stale_graph"
 
             rows = [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
             overlay = blocked_geometry.overlay(
@@ -157,7 +169,6 @@ class MissionPlannerService:
                     return None
                 return str(nodes[0].get("node_id"))
 
-            loop = asyncio.get_running_loop()
             try:
                 plan = await asyncio.wait_for(
                     loop.run_in_executor(
@@ -165,10 +176,20 @@ class MissionPlannerService:
                             graph, map_id, tuple(start_xy), (target_x, target_y), overlay,
                             node_of, config.SCENE_GRAPH_START_SNAP_M,
                             config.SCENE_GRAPH_GOAL_SNAP_M,
-                            config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M)),
+                            config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
+                            self._robot_width(robot), config.SCENE_GRAPH_WIDTH_MARGIN_M)),
                     config.SCENE_GRAPH_PLAN_BUDGET_S)
             except asyncio.TimeoutError:
                 return None, "plan_timeout"
+            # The legacy point rule (graph node id, "@x,y" position) on the final waypoints, for the
+            # rows the overlay cannot place: no robot pose (a pose row is an obstacle segment that
+            # route() and the line of sight already avoid). A hit goes to the legacy planner, which
+            # reports or detours the blocked rows.
+            unplaced = [r for r in rows if r.get("robot_x") is None or r.get("robot_y") is None]
+            if unplaced:
+                hit = blocked_nodes.rows_hit(unplaced, blocked_nodes.route_points(plan.waypoints))
+                if hit:
+                    return None, "blocked_row_on_route"
             plan.version = version
             ids = plan.planned_path
             return {
@@ -195,6 +216,16 @@ class MissionPlannerService:
         factsheet = getattr(getattr(robot, "status", None), "factsheet", None)
         return blocked_geometry.half_width_for(getattr(factsheet, "length", None),
                                                getattr(factsheet, "width", None))
+
+    @staticmethod
+    def _robot_width(robot: Optional[robot_object.RobotObjectV1]) -> Optional[float]:
+        """The planning robot's footprint width in metres (factsheet), None while unknown (-1)."""
+        width = getattr(getattr(getattr(robot, "status", None), "factsheet", None), "width", None)
+        try:
+            width = float(width)
+        except (TypeError, ValueError):
+            return None
+        return width if math.isfinite(width) and width > 0.0 else None
 
     def _require_map(self, map_id: Optional[str]) -> str:
         """`map_id` if it names a map; else the configured fallback (None in production);
