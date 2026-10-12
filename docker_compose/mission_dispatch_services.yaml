@@ -124,6 +124,11 @@ services:
         condition: service_started
       postgres:
         condition: service_healthy
+      # The API container's entrypoint runs `alembic upgrade head` before it serves, so "healthy"
+      # means "migrated": the dispatcher's blocked_nodes upsert names columns added by migration
+      # 20261012_01_blocked_geometry. (The planner cannot wait for the API: the API waits for it.)
+      api-delegation-service:
+        condition: service_healthy
 
   # Create ArangoDB for topological map
   arangodb:
@@ -216,11 +221,28 @@ services:
       - SCENE_GRAPH_IDLE_S=${SCENE_GRAPH_IDLE_S:-2.0}
       - SCENE_GRAPH_IDLE_MAX_S=${SCENE_GRAPH_IDLE_MAX_S:-30.0}
       - SCENE_GRAPH_LIFECYCLE_CHECK_S=${SCENE_GRAPH_LIFECYCLE_CHECK_S:-5.0}
+      - SCENE_GRAPH_MAX_MAPS=${SCENE_GRAPH_MAX_MAPS:-64}
+      - SCENE_GRAPH_SAVE_EVERY_LEAVES=${SCENE_GRAPH_SAVE_EVERY_LEAVES:-50}
+      - SCENE_GRAPH_SAVE_EVERY_S=${SCENE_GRAPH_SAVE_EVERY_S:-30.0}
+      - SCENE_GRAPH_REPLAY_MARGIN_S=${SCENE_GRAPH_REPLAY_MARGIN_S:-60.0}
+      - SCENE_GRAPH_REPLAY_RECHECK_S=${SCENE_GRAPH_REPLAY_RECHECK_S:-60.0}
+      - SCENE_GRAPH_REBUILD_MAX_AGE_S=${SCENE_GRAPH_REBUILD_MAX_AGE_S:-900.0}
+      - SCENE_GRAPH_REBUILD_BATCH=${SCENE_GRAPH_REBUILD_BATCH:-48}
+      - SCENE_GRAPH_REBUILD_DEBOUNCE_S=${SCENE_GRAPH_REBUILD_DEBOUNCE_S:-30.0}
+      - SCENE_GRAPH_LOAD_FAIL_LIMIT=${SCENE_GRAPH_LOAD_FAIL_LIMIT:-3}
+      - SCENE_GRAPH_STEP_BUDGET_S=${SCENE_GRAPH_STEP_BUDGET_S:-0.0}
+      - SCENE_GRAPH_SLOW_STEP_S=${SCENE_GRAPH_SLOW_STEP_S:-30.0}
+      - SCENE_GRAPH_STATS_LOG_S=${SCENE_GRAPH_STATS_LOG_S:-60.0}
+      # Postgres connections held: one per owned map + 2 (lifecycle + lock), against max_connections.
+      # Cap the maps one process owns with SCENE_GRAPH_MAX_MAPS (runbook section 1).
       - DISTANCE_THRESHOLD=${SIMILARITY_DISTANCE_THRESHOLD:-5.0}
       - RADIUS_THRESHOLD=${GRAPH_BUILDER_RADIUS_THRESHOLD:-2.0}
       - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
     network_mode: "host"
     restart: unless-stopped
+    # A worker drains its in-flight batch and saves its chart on SIGTERM (up to the batch
+    # budget + a save); the default 10 s would SIGKILL a save in progress.
+    stop_grace_period: 35s
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${GRAPH_BUILDER_PORT:-8004}/health', timeout=4); sys.exit(0)"]
       interval: 30s
@@ -280,6 +302,9 @@ services:
       - SCENE_GRAPH_CACHE_VERSIONS=${SCENE_GRAPH_CACHE_VERSIONS:-4}
       - SCENE_GRAPH_MAX_VERSION_LAG_S=${SCENE_GRAPH_MAX_VERSION_LAG_S:-120.0}
       - SCENE_GRAPH_WIDTH_MARGIN_M=${SCENE_GRAPH_WIDTH_MARGIN_M:-0.0}
+      - SCENE_GRAPH_WIDTH_CHECK_ENABLED=${SCENE_GRAPH_WIDTH_CHECK_ENABLED:-false}
+      - SCENE_GRAPH_PREWARM_MAPS=${SCENE_GRAPH_PREWARM_MAPS:-}
+      - SCENE_GRAPH_PREWARM_CONCURRENCY=${SCENE_GRAPH_PREWARM_CONCURRENCY:-2}
     network_mode: "host"
     restart: unless-stopped
     healthcheck:
@@ -436,6 +461,10 @@ services:
       - MINIO_SECURE=false
       # Scene-graph reads + delete-saga hooks (same flag as graph-builder; off by default).
       - SCENE_GRAPH_WORKER_ENABLED=${SCENE_GRAPH_WORKER_ENABLED:-false}
+      # The delete saga waits for a running fold (per-poll timeout; a busy lock burns no attempts
+      # until the total deadline).
+      - SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S=${SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S:-30.0}
+      - SCENE_GRAPH_DELETE_LOCK_DEADLINE_S=${SCENE_GRAPH_DELETE_LOCK_DEADLINE_S:-3600.0}
       - MISSION_PLANNER_URL=http://localhost:${MISSION_PLANNER_PORT:-8005}
       - LIVEKIT_URL=http://localhost:${LIVEKIT_PORT:-8006}
       - POSTGRES_DATABASE_PORT=${POSTGRES_DATABASE_PORT}

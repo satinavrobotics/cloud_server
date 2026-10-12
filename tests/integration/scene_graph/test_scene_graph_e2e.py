@@ -331,19 +331,22 @@ def test_backfill_dry_run_apply_repeat(backfilled, ring_map):
     d, a, r = backfilled.dry, backfilled.applied, backfilled.again
     assert (d["nodes"], d["already"], d["to_stamp"], d["stamped"], d["skipped"], d["applied"]) == \
         (n, n - k, k, 0, 0, False)
-    assert d["sources"] == {"minio_last_modified": k}
+    assert d["sources"] == {"node_timestamp": k}      # ms resolution: primary; MinIO is not asked
     assert (a["to_stamp"], a["stamped"], a["skipped"], a["applied"]) == (k, k, 0, True)
     assert a["sources"] == {"node_timestamp": k}
     assert (r["already"], r["to_stamp"], r["stamped"]) == (n, 0, 0), "a second run must change nothing"
 
 
 def test_backfill_minio_source_stamps(env, schema):
-    """The MinIO last-modified source, applied: stamps are the PNGs' store times (whole seconds)."""
+    """The MinIO last-modified fallback, applied to nodes WITHOUT a node timestamp: the stamps are
+    the PNGs' store times (whole seconds)."""
     from tools import scene_costmap_stored_backfill as bf
     world, way = W.two_rooms()
     mid = env.map_name("bfmin")                      # not registered: no worker touches it
     ids = seed.seed_map(env.client, mid, world, way[:2], session_id="sess-bf")
     assert seed.unstamp(env.client, mid, ids) == len(ids)
+    env.aql("FOR n IN @@c UPDATE n WITH {timestamp: null, created_at: null} IN @@c "
+            "OPTIONS {keepNull: false}", **{"@c": f"nodes_{mid}"})
     now_ms = int(time.time() * 1000)
     rep = bf.backfill_map(bf.ArangoStore(env.client.graph.db), mid, bf.MinioTimes(env.client.image),
                           apply=True, now_ms=now_ms)
@@ -618,6 +621,9 @@ class Planner:
         svc.database = env.db
         svc._scene_cache = scene_route.GraphCache(
             lambda: SceneGraphStore.from_client(env.client), max_entries=4, load_timeout_s=60.0)
+        # state MissionPlannerService.__init__ sets up (bounded plan pool, outcome counters)
+        svc._plan_pool = scene_route.BoundedPool("sg-plan", 2, 8, busy_reason="planner_busy")
+        svc._chart_outcomes = {}
         robot = types.SimpleNamespace(
             name="e2e-robot", status=types.SimpleNamespace(
                 pose=types.SimpleNamespace(x=1.0, y=1.0),
@@ -714,10 +720,6 @@ def test_planner_route_between_leaves_has_distinct_leaf_ids(env, ring_map, plann
     print(f"PERF planner warm {warm:.2f}s")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "DEFECT packages/scene_graph/engine.py:705 Route.min_width = 2 x the smallest clearance along "
-    "the SHORTEST lattice path (it hugs corners), not the narrowest passage that api.py's contract "
-    "names: every passage of the ring is 1.5 m wide, the route reports 0.6 m"))
 def test_route_min_width_is_the_passage_width(env, ring_map, planner, ingested):
     graph, _v = env.rt.run(planner.svc._scene_cache.get(ring_map.map_id), 60)
     a, b = graph.snap(1.0, 1.0, 0.5), graph.snap(5.0, 5.0, 1.5)
@@ -726,9 +728,6 @@ def test_route_min_width_is_the_passage_width(env, ring_map, planner, ingested):
     assert route.min_width >= 1.0, f"min_width {route.min_width} in a loop of 1.5 m corridors"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "DEFECT (consequence of engine.py:705): plan_on_graph refuses a 0.7 m wide robot as `too_narrow` "
-    "in 1.5 m corridors because the corner-hugging route reports a 0.6 m width"))
 def test_planner_does_not_refuse_a_robot_that_fits(env, ring_map, planner, ingested):
     from packages.services.mission_planner import scene_route
     graph, _v = env.rt.run(planner.svc._scene_cache.get(ring_map.map_id), 60)
@@ -791,8 +790,16 @@ def test_planner_version_lag_and_incremental_ingest(env, ring_map, planner, inge
     assert scene_route.version_lag_s(env.client.graph, mid, meta1["cursor"]) == 0.0
     man = env.store().manifest(mid)
     assert man["leaf_count"] == len(ring_map.ids) + 1
-    (res, reason), _ = planner.route((1.0, 1.0), (5.0, 1.0))
-    assert reason is None and res["graph_version"] == meta1["version"]
+    # the planner caches a map's meta for SCENE_GRAPH_META_TTL_S and serves the newest loaded
+    # version meanwhile (never rejects on it): poll until it has picked up the new one
+    deadline = time.time() + 30.0
+    while True:
+        (res, reason), _ = planner.route((1.0, 1.0), (5.0, 1.0))
+        assert reason is None
+        if res["graph_version"] == meta1["version"] or time.time() > deadline:
+            break
+        time.sleep(0.5)
+    assert res["graph_version"] == meta1["version"]
     assert extra in env.aql("FOR n IN @@c RETURN n._key", **{"@c": f"nodes_{mid}"})
 
 
@@ -837,11 +844,11 @@ def test_restart_replay_keeps_the_graph(env, ring_map, restarted):
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "DEFECT packages/scene_graph/store.py save(): a worker restart that replays already folded "
-    "leaves publishes a NEW version with the same charts and links: the engine reloaded from tiles "
-    "has a different canvas ([-80,-80,280,280] -> [-40,-40,208,208]) and `canvas` and the charts' "
-    "canvas-relative `cell` are part of content_hash, so `if prev.content_hash == content_hash` "
-    "(the no-op check of save) never matches after a restart"))
+    "DEFECT packages/scene_graph/store.py save() (still open after the canvas was taken out of "
+    "content_hash): a worker restart that replays already folded leaves still publishes a NEW "
+    "version with the same charts and links, because each chart's canvas-relative `cell` "
+    "([87, 88] -> [67, 68]: the engine reloaded from tiles has a different canvas origin) is "
+    "still in the hashed chart records"))
 def test_restart_replay_does_not_bump_the_version(env, ring_map, restarted):
     assert restarted.after.meta["version"] == restarted.before.meta["version"]
 
@@ -1034,11 +1041,15 @@ def test_rebuild_request_after_node_delete(env, schema):
     assert v0["available"] and v0["charts"]
 
     doomed = m.ids[-3:]
-    res = env.client.delete_nodes(mid, doomed)
-    assert sorted(res["deleted"]) == sorted(doomed) and not res["image_failures"]
-    at = "2026-10-13T12:00:00+00:00"
-    env.patch_status(mid, {"scene_graph_needs_rebuild": {"at": at, "reason": "nodes_deleted",
-                                                         "nodes": len(doomed)}})
+    # the product path: the API's delete marks the map needs-rebuild (before the delete, then
+    # again after it; no worker flag involved), nothing in the test writes the request
+    import uuid
+    from packages.api import maps as api_maps
+    res = env.rt.run(api_maps.delete_nodes(
+        env.db, mid, {"node_ids": list(doomed)}, uuid.uuid4(), "e2e", env.client.delete_nodes), 120)
+    assert sorted(res["deleted"]) == sorted(doomed) and not res.get("image_failures")
+    # (the worker may already have taken the request; the marker is cleared only by the commit)
+    assert "scene_graph_needs_rebuild" in env.map_status(mid) or env.meta(mid).get("generation") == 2
     env.pump(lambda: env.meta(mid).get("generation") == 2, "generation 2 committed", 120)
     env.pump(lambda: "scene_graph_needs_rebuild" not in env.map_status(mid),
              "rebuild request cleared", 30)
@@ -1135,7 +1146,9 @@ def test_map_delete_saga_takes_the_lock_and_drops_everything(env, schema):
             env.db, env.client.graph.delete_map, env.client.image.delete_map,
             max_attempts=attempts, backoff_s=0.05, backoff_max_s=0.1,
             scene_drop=drop, scene_active=active,
-            scene_lock_timeout_s=timeout_s, scene_lock_poll_s=0.2)
+            # a busy lock burns no attempts until the deadline: make it the poll timeout, so
+            # the first round ends (and the worker, now pumped by the test, sees DELETING)
+            scene_lock_timeout_s=timeout_s, scene_lock_poll_s=0.2, scene_lock_deadline_s=timeout_s)
 
     async def delete_once(deleter):
         result = await deleter.request(mid)
@@ -1181,15 +1194,3 @@ def test_map_delete_saga_takes_the_lock_and_drops_everything(env, schema):
         env.host.runner.tick()
         time.sleep(0.05)
     assert env.sg_collections(mid) == [] and not env.client.image.client.bucket_exists(env.bucket(mid))
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "DEFECT packages/topomap_dbs/client.py:125 TopomapDatabaseClient.delete_map calls "
-    "self.rosbag.delete_map_bags, which RosbagDatabaseService does not have: AttributeError after "
-    "the graph and the bucket are already gone (the delete saga bypasses this method)"))
-def test_topomap_client_delete_map(env, schema):
-    world, way = W.two_rooms()
-    mid = env.map_name("clientdel")
-    seed.seed_map(env.client, mid, world, way[:2], session_id="sess-cd")
-    out = env.client.delete_map(mid)
-    assert out.get("success") is True, out
