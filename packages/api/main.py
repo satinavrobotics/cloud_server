@@ -599,7 +599,7 @@ def _scene_graph_reads():
 
 @app.get("/api/v1/maps/{map_id}/scene-graph")
 async def get_map_scene_graph(map_id: str, bbox: str, level: int = 0, version: Optional[int] = None,
-                              raster: bool = False):
+                              raster: bool = False, response: Response = None):
     """The high-level chart graph of an area: {available, version, charts, links, raster}. `bbox` is
     `x0,y0,x1,y1` in map-frame metres. `available: false` when the map has no scene graph (yet).
     With `raster=true` the response also holds the plane's keys and geometry; fetch the plane from
@@ -607,8 +607,11 @@ async def get_map_scene_graph(map_id: str, bbox: str, level: int = 0, version: O
     _require_service()
     from packages.api import scene_graph_reads
     box = scene_graph_reads.parse_bbox(bbox)
-    return await _site_call("read scene graph", _scene_graph_reads().view(
+    out = await _site_call("read scene graph", _scene_graph_reads().view(
         map_id, box, level, version, raster))
+    if not out.get("available"):
+        response.headers["Cache-Control"] = scene_graph_reads.NO_GRAPH_CACHE
+    return out
 
 
 @app.get("/api/v1/maps/{map_id}/scene-graph/raster")
@@ -631,21 +634,26 @@ async def get_map_scene_graph_raster(map_id: str, bbox: str, level: int = 0,
 
 
 @app.get("/api/v1/maps/{map_id}/scene-graph/lineage")
-async def get_map_scene_graph_lineage(map_id: str, from_version: int):
+async def get_map_scene_graph_lineage(map_id: str, from_version: int, response: Response = None):
     """{retired: {old chart key: [successor keys, largest overlap first]}} since `from_version`; the
     client walks its selected keys forward through it."""
     _require_service()
-    return await _site_call("read scene graph lineage",
-                            _scene_graph_reads().lineage(map_id, from_version))
+    out = await _site_call("read scene graph lineage", _scene_graph_reads().lineage(map_id, from_version))
+    if not out.get("available"):
+        response.headers["Cache-Control"] = "no-store"
+    return out
 
 
 @app.get("/api/v1/maps/{map_id}/blocked-nodes")
-async def list_blocked_nodes(map_id: str):
+async def list_blocked_nodes(map_id: str, with_chart_keys: bool = False):
     """The map's graph nodes a robot reported blocked whose exclusion has not expired: the
     planner leaves them out of new routes, and a reroute through one is refused (409) unless
     forced. `graph_node_id` "@x,y" is a position whose graph node was not known. If the
     table is not readable (as for the planner and the reroute check, which then go on
-    without it): an empty list with `error`."""
+    without it): an empty list with `error`. `run_id` is the mission_runs row of the report
+    (null when it cannot be told). With `with_chart_keys=true` each row also has `chart_keys`,
+    the scene-graph charts its obstacle crosses (read time, best effort: the field is absent on
+    every row when the map has no scene graph or it could not be read in time)."""
     _require_service()
     try:
         rows = await blocked_nodes.fetch_active(service.database, map_id)
@@ -653,6 +661,10 @@ async def list_blocked_nodes(map_id: str):
         logging.warning("Blocked graph nodes of map %s not readable: %s", map_id, err)
         return {"map_id": map_id, "blocked_nodes": [],
                 "error": "Blocked graph nodes not readable"}
+    await blocked_nodes.resolve_run_ids(service.database, rows)
+    if with_chart_keys and rows:
+        from packages.utils import blocked_chart_tags
+        await blocked_chart_tags.add_chart_keys(rows, map_id, _scene_graph_reads)
     return {"map_id": map_id, "blocked_nodes": rows}
 
 
