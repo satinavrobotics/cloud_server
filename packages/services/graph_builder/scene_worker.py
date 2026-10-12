@@ -31,6 +31,20 @@ fake; the worker passes `cursor=` and `expected_version=` to `store.save` and, a
 LOWER of the cursor_store value and `store.meta(map_id)["cursor"]` (more replay is always safe,
 the fold is idempotent).
 
+Batching (measured: a fold costs seconds and a larger batch amortises a fixed solve): adapted
+leaves wait in a buffer and are folded in ONE `fold_many` once `batch_min_leaves` are waiting, or
+once the oldest has waited `min_save_interval_s` (the publish interval; a trickle is never held
+longer). A backlog (a fold slower than arrivals) is folded `batch_max_leaves` at a time, so the
+worker never lags in small batches. The cursor only covers folded leaves; a buffered leaf is
+re-read after a restart. A fold slower than `batch_budget_s` is logged (map, leaves, seconds).
+
+Params / generation: when the stored `params_hash` differs from `expected_params_hash` and the
+store can `begin_generation` (and `new_engine` is given) the worker rebuilds in a new generation
+from the first leaf (saves go to the pending generation with `generation=`, readers keep the old
+one), then `commit_generation`s once caught up. Without those it ends in NEEDS_REBUILD as before.
+Saves are always made with the generation the worker started in (a fence against another writer
+that committed a new one).
+
 Assumed (not in CIMBI's draft yet): `store.save(map_id, sg, dirty, *, expected_version, cursor)`
 raising `SaveFenced` on mismatch; `store.meta()` carrying `version`, `generation`, `params_hash`
 and optionally `cursor`; `engine` already loaded at `meta["version"]` by the caller.
@@ -110,6 +124,11 @@ class WorkerConfig:
     robot_fields: Sequence[str] = ("robot_name", "robot_id", "robot")   # node field holding the robot (unverified)
     expected_params_hash: Optional[str] = None
     expected_generation: Optional[int] = None
+    # batching (config.py SCENE_GRAPH_BATCH_*; the neutral defaults here fold every page whole)
+    batch_min_leaves: int = 1               # fold once this many leaves wait ...
+    batch_max_leaves: int = 1_000_000       # ... at most this many per fold_many ...
+    # ... or once the oldest has waited min_save_interval_s (the publish interval)
+    batch_budget_s: float = 0.0             # warn when one fold takes longer (0: off)
 
 
 @dataclass
@@ -127,6 +146,12 @@ class SceneWorkerStats:
     version: int = 0
     unsaved_leaves: int = 0                 # folded, not yet saved
     version_lag_s: float = 0.0              # age of the oldest unsaved fold
+    buffered_leaves: int = 0                # adapted, waiting for a batch (gauge)
+    last_fold_s: float = 0.0
+    max_fold_s: float = 0.0
+    slow_folds: int = 0                     # folds over batch_budget_s
+    fold_failures: int = 0                  # consecutive (fold / tiles)
+    rebuilds: int = 0
 
 
 @dataclass
@@ -137,6 +162,19 @@ class StepResult:
     version: Optional[int] = None           # set when this step saved
     sleep_s: float = 0.0
     detail: str = ""
+
+
+@dataclass
+class RebuiltDirty(Dirty):
+    """The publish after a generation switch: everything may have changed (`scene_events` reports
+    it as truncated, i.e. "refetch the whole view"); `retired` is the old -> new key map."""
+    full: bool = True
+
+
+@dataclass
+class _Entry:
+    node: Mapping[str, Any]
+    leaf: Any                               # None: a terminal skip, kept only to order the cursor
 
 
 def merge_dirty(a: Optional[Dirty], b: Dirty) -> Dirty:
@@ -162,7 +200,10 @@ class SceneWorker:
                  publish: Optional[Callable[[int, Dirty], None]] = None,
                  load_tiles: Optional[Callable[[Any, Iterable], None]] = None,
                  on_needs_rebuild: Optional[Callable[[str], None]] = None,
-                 clock: Optional[scene_clock.SessionClock] = None) -> None:
+                 clock: Optional[scene_clock.SessionClock] = None,
+                 new_engine: Optional[Callable[[], Any]] = None,
+                 on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+                 fence_errors: Tuple[type, ...] = ()) -> None:
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
         self.engine, self.store, self.cursor_store, self.guard = engine, store, cursor_store, guard
         self.stats = stats if stats is not None else SceneWorkerStats()
@@ -184,6 +225,18 @@ class SceneWorker:
         self._oldest_unsaved_ms: Optional[int] = None
         self._new_stamps: Dict[str, int] = {}        # key -> stamp to keep on the node before the fold
         self._footprints: Dict[str, Tuple[float, bool, int]] = {}   # robot -> (r_d, known, asked_ms)
+        self.new_engine, self.on_event, self.fence_errors = new_engine, on_event, tuple(fence_errors)
+        self._buf: List[_Entry] = []                 # adapted, in cursor order, waiting for a batch
+        self._buffered: Dict[str, int] = {}          # key -> stored_ms of the leaves in _buf
+        self._buf_since_ms: Optional[int] = None     # when the oldest waiting leaf arrived
+        self._generation: Optional[int] = None       # generation this worker writes to
+        self._rebuild_gen: Optional[int] = None      # pending generation being rebuilt
+        self._rebuild_started_ms = 0
+        self._rebuild_saved = False
+        self._watermark: Tuple[int, str] = (0, "")
+        self._leaves_since_publish = 0
+        self._fail_stage = ""
+        self._fail_count = 0
 
     # ------------------------------------------------------------------ public
 
@@ -227,54 +280,59 @@ class SceneWorker:
             res = self._save()
             if res is not None:
                 return res
-        # 2. pull
-        since = self._scan if self._scan is not None else (
-            max(0, self._cursor[0] - cfg.replay_margin_ms), "")
-        try:
-            nodes = list(self.source.costmap_nodes_since(self.map_id, since[0], since[1], cfg.batch_size))
-        except Exception as exc:
-            self.stats.source_errors += 1
-            log.warning("scene worker %s: source failed: %s", self.map_id, exc)
-            return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"source: {exc}")
-        more = len(nodes) >= cfg.batch_size
-        self._scan = self._order(nodes[-1]) if (more and nodes) else None
-        # 3. adapt
-        leaves, handled, skipped = [], [], 0
-        self._new_stamps = {}
-        for node in nodes:
-            outcome = self._adapt(node)
-            if outcome == "duplicate":
-                continue
-            if outcome == "pending":
-                continue
-            handled.append(node)
-            if isinstance(outcome, str):
-                skipped += 1
-                self.stats.skipped[outcome] += 1
-            else:
-                leaves.append(outcome)
-        self._expire_pending()
+        # 2. pull (not while a full batch is already waiting: fold that first)
+        more, skipped = False, 0
+        if self._leaf_count() < cfg.batch_max_leaves:
+            since = self._scan if self._scan is not None else (
+                max(0, self._cursor[0] - cfg.replay_margin_ms), "")
+            try:
+                nodes = list(self.source.costmap_nodes_since(self.map_id, since[0], since[1], cfg.batch_size))
+            except Exception as exc:
+                self.stats.source_errors += 1
+                log.warning("scene worker %s: source failed: %s", self.map_id, exc)
+                return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"source: {exc}")
+            more = len(nodes) >= cfg.batch_size
+            self._scan = self._order(nodes[-1]) if (more and nodes) else None
+            # 3. adapt into the buffer
+            for node in nodes:
+                outcome = self._adapt(node)
+                if outcome in ("duplicate", "pending"):
+                    continue
+                if isinstance(outcome, str):
+                    skipped += 1
+                    self.stats.skipped[outcome] += 1
+                    self._buf.append(_Entry(node, None))
+                else:
+                    self._buf.append(_Entry(node, outcome))
+                    self._buffered[str(node.get("_key", ""))] = int(node.get("costmap_stored_ms") or 0)
+            self._expire_pending()
+        else:
+            more = True                       # a backlog waits behind the full batch
+        if self._leaf_count() and self._buf_since_ms is None:
+            self._buf_since_ms = self.now_ms()
+        self._release_leading_skips()
         # 4. fold once per batch
         folded = 0
-        if leaves:
+        batch = self._take_batch()
+        if batch:
             err = self._keep_stamps()
             if err is None:
-                err = self._fold(leaves)
+                err = self._fold([e.leaf for e in batch])
             if err is not None:
                 self._scan = None      # re-read from the margin once the cause is gone
                 return err
-            folded = len(leaves)
+            folded = len(batch)
+            self._pop(batch)
             self.stats.batches += 1
             self.stats.folded += folded
             self.stats.unsaved_leaves += folded
+            self._leaves_since_publish += folded
             if self._oldest_unsaved_ms is None:
                 self._oldest_unsaved_ms = self.now_ms()
-        for node in handled:
-            key, ms = str(node.get("_key", "")), int(node.get("costmap_stored_ms") or 0)
-            self._seen[key] = ms
-            self._candidate = max(self._candidate, (ms, key))
+            self._release_leading_skips()
         # 5-7. save (rate limited), then advance the cursor
         idle = not more and not folded and not skipped      # a re-read of the margin alone is idle
+        waiting = self._leaf_count() > 0
         saved: Optional[int] = None
         if self._dirty is not None and self._due(idle=idle):
             res = self._save()
@@ -284,11 +342,18 @@ class SceneWorker:
             saved = self.stats.version
         elif self._dirty is None:
             self._commit()      # nothing unsaved: terminal skips alone move the cursor
+        if self._rebuild_gen is not None and not more and not folded and not waiting and self._dirty is None:
+            res = self._commit_rebuild()
+            if res is not None:
+                return res
         self._refresh_gauges()
         if more or folded or skipped:       # progress: call again at once (the next step may idle-save)
             state, sleep = WORKED, 0.0
         else:
             state, sleep = IDLE, cfg.idle_sleep_s
+            if waiting and self._buf_since_ms is not None:     # a trickle: wake when its wait is up
+                left = self._batch_wait_s() - (self.now_ms() - self._buf_since_ms) / 1000.0
+                sleep = min(sleep, max(left, 0.05))
         return StepResult(state, folded=folded, skipped=skipped, version=saved, sleep_s=sleep)
 
     # ------------------------------------------------------------------ internals
@@ -319,20 +384,37 @@ class SceneWorker:
             self.guard.release(self.map_id)
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"meta: {exc}")
         cfg = self.config
+        version = int(meta.get("version") or 0)
+        self._generation = int(meta["generation"]) if meta.get("generation") is not None else None
+        rebuilding = False
         if cfg.expected_params_hash is not None and meta.get("params_hash") not in (None, cfg.expected_params_hash):
             self.rebuild_reason = "params_hash"
-            return self._terminal(NEEDS_REBUILD, "params_hash")
+            if self.new_engine is None or not hasattr(self.store, "begin_generation"):
+                return self._terminal(NEEDS_REBUILD, "params_hash")
+            try:
+                gen = int(self.store.begin_generation(self.map_id))
+            except Exception as exc:
+                self.guard.release(self.map_id)
+                log.warning("scene worker %s: begin_generation failed: %s", self.map_id, exc)
+                return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"begin_generation: {exc}")
+            # fold every leaf again, under the configured params, into the pending generation
+            self.engine = self.new_engine()
+            self._rebuild_gen, self._rebuild_saved = gen, False
+            self._rebuild_started_ms = self.now_ms()
+            rebuilding = True
+            self._event("rebuild_started", reason="needs_rebuild")
+            log.info("scene worker %s: params changed (%s -> %s): rebuilding in generation %d",
+                     self.map_id, meta.get("params_hash"), cfg.expected_params_hash, gen)
         if cfg.expected_generation is not None and meta.get("generation") not in (None, cfg.expected_generation):
             self.rebuild_reason = "generation"
             return self._terminal(NEEDS_REBUILD, "generation")
-        version = int(meta.get("version") or 0)
         have = getattr(self.engine, "version", None)
-        if have is not None and int(have) != version:
+        if not rebuilding and have is not None and int(have) != version:
             self.rebuild_reason = "engine_version"
             return self._terminal(NEEDS_REBUILD, f"engine_version {have} != stored {version}")
         stored = [c for c in (self._cursor_of(self.cursor_store.get(self.map_id)),
                               self._cursor_of(meta.get("cursor"))) if c is not None]
-        self._cursor = min(stored) if stored else ZERO_CURSOR
+        self._cursor = ZERO_CURSOR if rebuilding else (min(stored) if stored else ZERO_CURSOR)
         self._candidate = self._cursor
         self._expected_version = version
         self.stats.version = version
@@ -369,6 +451,8 @@ class SceneWorker:
     def _adapt(self, node: Mapping[str, Any]):
         """Leaf, a terminal skip reason (str), "duplicate" or "pending"."""
         key, ms = str(node.get("_key", "")), int(node.get("costmap_stored_ms") or 0)
+        if self._buffered.get(key) == ms:       # a margin re-read of a leaf that waits for its batch
+            return "duplicate"
         if self._seen.get(key) == ms:
             self.stats.duplicates += 1
             return "duplicate"
@@ -420,15 +504,100 @@ class SceneWorker:
         except Exception as exc:
             self.stats.source_errors += 1
             log.warning("scene worker %s: keeping stamps failed: %s", self.map_id, exc)
+            self._new_stamps = {**stamps, **self._new_stamps}   # the leaves stay buffered: keep theirs
             self._scan = None
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"stamps: {exc}")
         return None
 
+    # ---- batching
+
+    def _leaf_count(self) -> int:
+        return sum(1 for e in self._buf if e.leaf is not None)
+
+    def _batch_wait_s(self) -> float:
+        return float(self.config.min_save_interval_s)
+
+    def _take_batch(self) -> List[_Entry]:
+        """The entries (leaves and the skips between them) of the next fold, or []: fewer than
+        batch_min_leaves wait and the oldest has not waited the publish interval yet."""
+        cfg, n = self.config, self._leaf_count()
+        if not n:
+            return []
+        waited_s = 0.0 if self._buf_since_ms is None else (self.now_ms() - self._buf_since_ms) / 1000.0
+        if n < max(1, cfg.batch_min_leaves) and waited_s < self._batch_wait_s():
+            return []
+        take, out = max(1, cfg.batch_max_leaves), []
+        for entry in self._buf:
+            out.append(entry)
+            if entry.leaf is not None:
+                take -= 1
+                if take == 0:
+                    break
+        return out
+
+    def _handled(self, node: Mapping[str, Any]) -> None:
+        key, ms = str(node.get("_key", "")), int(node.get("costmap_stored_ms") or 0)
+        self._seen[key] = ms
+        self._candidate = max(self._candidate, (ms, key))
+
+    def _pop(self, batch: List[_Entry]) -> None:
+        del self._buf[:len(batch)]
+        for entry in batch:
+            self._handled(entry.node)
+            if entry.leaf is not None:
+                self._buffered.pop(str(entry.node.get("_key", "")), None)
+        self._buf_since_ms = self.now_ms() if self._leaf_count() else None
+
+    def _release_leading_skips(self) -> None:
+        """Terminal skips in front of the first waiting leaf (or all of them) are done: they move the cursor."""
+        n = 0
+        while n < len(self._buf) and self._buf[n].leaf is None:
+            n += 1
+        if n:
+            for entry in self._buf[:n]:
+                self._handled(entry.node)
+            del self._buf[:n]
+
+    # ---- events
+
+    def _event(self, kind: str, **payload: Any) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(kind, payload)
+        except Exception:
+            log.exception("scene worker %s: event %s failed", self.map_id, kind)
+
+    def _failed(self, stage: str, detail: str) -> None:
+        """Count a failure of `stage` (fold | tiles | save); report the 1st, 2nd, 4th, 8th ... in a row."""
+        if stage == self._fail_stage:
+            self._fail_count += 1
+        else:
+            self._fail_stage, self._fail_count = stage, 1
+        if stage in ("fold", "tiles"):
+            self.stats.fold_failures = self._fail_count
+        n = self._fail_count
+        if n & (n - 1) == 0:
+            self._event("fold_failed", stage=stage, detail=detail[:300], consecutive=n)
+
+    def _recovered(self, *stages: str) -> None:
+        if self._fail_stage in stages:
+            self._fail_stage, self._fail_count = "", 0
+            if "fold" in stages:
+                self.stats.fold_failures = 0
+
+    # ---- fold
+
     def _fold(self, leaves: List[Any]) -> Optional[StepResult]:
+        cfg = self.config
+        t0 = self.now_ms()
         for attempt in (0, 1):
             try:
                 dirty = self.engine.fold_many(leaves)
                 self._dirty = merge_dirty(self._dirty, dirty)
+                self._watermark = tuple(getattr(dirty, "watermark", self._watermark))
+                self._fold_timed(len(leaves), (self.now_ms() - t0) / 1000.0)
+                self._recovered("fold", "tiles")
                 return None
             except MissingTiles as exc:
                 self.stats.missing_tiles += 1
@@ -442,8 +611,20 @@ class SceneWorker:
                     break
             except Exception as exc:
                 log.exception("scene worker %s: fold failed", self.map_id)
-                return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"fold: {exc}")
-        return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail="missing tiles")
+                self._failed("fold", f"{type(exc).__name__}: {exc}")
+                return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc}")
+        self._failed("tiles", "missing tiles")
+        return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail="missing tiles")
+
+    def _fold_timed(self, leaves: int, seconds: float) -> None:
+        st = self.stats
+        st.last_fold_s = seconds
+        st.max_fold_s = max(st.max_fold_s, seconds)
+        budget = self.config.batch_budget_s
+        if budget and seconds > budget:
+            st.slow_folds += 1
+            log.warning("scene worker %s: fold of %d leaves took %.1fs (budget %.1fs)",
+                        self.map_id, leaves, seconds, budget)
 
     def _due(self, idle: bool, force: bool = False) -> bool:
         cfg, now = self.config, self.now_ms()
@@ -465,16 +646,21 @@ class SceneWorker:
         if not self.guard.held(self.map_id):
             return self._terminal(FENCED, "writer lock lost")
         target = self._candidate
+        kwargs: Dict[str, Any] = {}
+        gen = self._rebuild_gen if self._rebuild_gen is not None else self._generation
+        if gen is not None:
+            kwargs["generation"] = gen
         try:
             version = self.store.save(self.map_id, self.engine, self._dirty,
-                                      expected_version=self._expected_version, cursor=target)
-        except SaveFenced as exc:
+                                      expected_version=self._expected_version, cursor=target, **kwargs)
+        except (SaveFenced,) + self.fence_errors as exc:
             return self._terminal(FENCED, str(exc) or "save fenced")
+        except ValueError as exc:
+            if "generation" in str(exc):        # the generation we write to is no longer begun / current
+                return self._terminal(FENCED, str(exc))
+            return self._save_failed(exc)
         except Exception as exc:
-            self.stats.save_failures += 1
-            self._last_save_ms = self.now_ms()
-            log.warning("scene worker %s: save failed: %s", self.map_id, exc)
-            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"save: {exc}")
+            return self._save_failed(exc)
         dirty, self._dirty = self._dirty, None
         self._expected_version = int(version)
         self._last_save_ms = self.now_ms()
@@ -483,13 +669,61 @@ class SceneWorker:
         self.stats.version = int(version)
         self.stats.unsaved_leaves = 0
         self.stats.save_failures = 0
+        self._recovered("save")
+        self._rebuild_saved = self._rebuild_saved or self._rebuild_gen is not None
         self._commit(target)
-        if self.publish is not None and dirty is not None:
+        if self._rebuild_gen is None:       # a pending generation is not readable yet: nothing to announce
+            charts = len(getattr(dirty, "changed", None) or []) if dirty is not None else None
+            self._event("updated", version=int(version), leaves_folded=self._leaves_since_publish,
+                        charts_changed=charts)
+            self._leaves_since_publish = 0
+        if self._rebuild_gen is None and self.publish is not None and dirty is not None:
             try:
                 self.publish(int(version), dirty)
             except Exception:
                 log.exception("scene worker %s: publish callback failed", self.map_id)
         self._refresh_gauges()
+        return None
+
+    def _save_failed(self, exc: Exception) -> StepResult:
+        self.stats.save_failures += 1
+        self._last_save_ms = self.now_ms()
+        log.warning("scene worker %s: save failed: %s", self.map_id, exc)
+        self._failed("save", f"{type(exc).__name__}: {exc}")
+        return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"save: {exc}")
+
+    def _commit_rebuild(self) -> Optional[StepResult]:
+        """Caught up in the pending generation: switch readers to it. None on success / nothing to switch yet."""
+        if not self._rebuild_saved:
+            return None             # no leaf yet: nothing was saved into the pending generation
+        if self._deleting():
+            return self._terminal(DELETING, "map deleting before generation commit")
+        if not self.guard.held(self.map_id):
+            return self._terminal(FENCED, "writer lock lost")
+        gen = self._rebuild_gen
+        try:
+            version, retired = self.store.commit_generation(self.map_id, gen)
+        except self.fence_errors as exc:
+            return self._terminal(FENCED, str(exc) or "commit fenced")
+        except Exception as exc:
+            log.warning("scene worker %s: generation commit failed: %s", self.map_id, exc)
+            self._failed("save", f"commit: {type(exc).__name__}: {exc}")
+            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"commit: {exc}")
+        self._recovered("save")
+        self._generation, self._rebuild_gen, self._rebuild_saved = gen, None, False
+        self._expected_version = int(version)
+        self.stats.version = int(version)
+        self.stats.rebuilds += 1
+        self._event("rebuild_completed", reason="needs_rebuild", version=int(version),
+                    duration_s=round(max(0, self.now_ms() - self._rebuild_started_ms) / 1000.0, 3))
+        self._leaves_since_publish = 0
+        self._event("updated", version=int(version), leaves_folded=0, charts_changed=None)
+        if self.publish is not None:
+            try:
+                self.publish(int(version), RebuiltDirty(bbox=None, changed=[], retired=dict(retired or {}),
+                                                        links=[], watermark=self._watermark))
+            except Exception:
+                log.exception("scene worker %s: publish callback failed", self.map_id)
         return None
 
     def _commit(self, cursor: Optional[Cursor] = None) -> None:
@@ -504,5 +738,6 @@ class SceneWorker:
 
     def _refresh_gauges(self) -> None:
         self.stats.pending = len(self._pending)
+        self.stats.buffered_leaves = self._leaf_count()
         oldest = self._oldest_unsaved_ms
         self.stats.version_lag_s = 0.0 if oldest is None else max(0.0, (self.now_ms() - oldest) / 1000.0)

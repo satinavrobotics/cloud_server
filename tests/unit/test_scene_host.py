@@ -143,3 +143,46 @@ def test_build_host_wires_real_pieces_lazily():
                           graph_db=object(), update_publisher=object())
     host = sh.build_host(svc, None, conninfo="dbname=x")     # no connection is opened until used
     assert isinstance(host, sh.SceneWorkerHost) and host.runner is not None and host.guard is not None
+
+
+def test_expected_params_hash_matches_what_the_store_writes():
+    pytest.importorskip("packages.scene_graph.store")
+    from packages.scene_graph.api import SceneParams
+    from packages.scene_graph.engine import ChartGraph
+    from packages.scene_graph.store import PIPELINE
+    from packages.scene_graph.store_codec import params_hash
+    p = SceneParams()
+    assert sh.params_dict(p) == ChartGraph(p).export_state().params
+    assert sh.expected_params_hash(p) == params_hash(ChartGraph(p).export_state().params, PIPELINE)
+    assert sh.expected_params_hash(SceneParams(lattice=0.2)) != sh.expected_params_hash(p)
+
+
+def test_worker_config_reads_the_settings(monkeypatch):
+    pytest.importorskip("packages.scene_graph.store")
+    from packages import config
+    from packages.scene_graph.api import SceneParams
+    monkeypatch.setattr(config, "SCENE_GRAPH_BATCH_MIN_LEAVES", 4)
+    monkeypatch.setattr(config, "SCENE_GRAPH_BATCH_MAX_LEAVES", 30)
+    monkeypatch.setattr(config, "SCENE_GRAPH_PUBLISH_INTERVAL_S", 7.5)
+    monkeypatch.setattr(config, "SCENE_GRAPH_BATCH_BUDGET_S", 12.0)
+    cfg = sh.worker_config(SceneParams())
+    assert (cfg.batch_min_leaves, cfg.batch_max_leaves, cfg.min_save_interval_s, cfg.batch_budget_s) == \
+        (4, 30, 7.5, 12.0)
+    assert cfg.expected_params_hash == sh.expected_params_hash(SceneParams())
+
+
+def test_config_defaults():
+    from packages import config
+    assert (config.SCENE_GRAPH_BATCH_MIN_LEAVES, config.SCENE_GRAPH_BATCH_MAX_LEAVES) == (6, 48)
+    assert config.SCENE_GRAPH_PUBLISH_INTERVAL_S == 5.0 and config.SCENE_GRAPH_BATCH_BUDGET_S == 10.0
+
+
+def test_non_map_bucket_is_never_listed_for_a_worker():
+    """list_maps of the host is the registry-filtered one: a bucket alone does not make a map."""
+    pytest.importorskip("packages.scene_graph.store")
+    from types import SimpleNamespace
+    svc = SimpleNamespace(topomap_db=object(), image_db=SimpleNamespace(list_maps=lambda: ["real", "map_junk"]),
+                          graph_db=object(), update_publisher=object())
+    host = sh.build_host(svc, None, conninfo="dbname=x")
+    host.guard.registered_maps = lambda c: [m for m in c if m == "real"]    # the registry has `real` only
+    assert host.runner.list_maps() == ["real"]

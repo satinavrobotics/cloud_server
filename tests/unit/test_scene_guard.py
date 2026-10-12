@@ -11,6 +11,14 @@ class Cur:
         return self.row
 
 
+class RowsCur:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+
 class Conn:
     def __init__(self, hub):
         self.hub, self.closed, self.locks = hub, False, set()
@@ -27,6 +35,9 @@ class Conn:
         if "pg_advisory_unlock" in sql:
             self.locks.discard(params[0])
             return Cur((True,))
+        if "ANY(" in sql:
+            return RowsCur([(n,) for n in params[0]
+                            if n in self.hub.lifecycles and self.hub.lifecycles[n][0] not in ("DELETED", "DELETING")])
         if "mapobjectv1" in sql:
             return Cur(self.hub.lifecycles.get(params[0]))
         return Cur((1,))
@@ -86,3 +97,25 @@ def test_is_deleting():
     assert not g.is_deleting("m")
     h.broken = True
     assert g.is_deleting("m")                   # unanswerable: no save on a guess
+
+
+def test_registered_maps_is_a_positive_check():
+    hub = Hub()
+    hub.lifecycles = {"real": ("READY",), "going": ("DELETING",), "gone": ("DELETED",)}
+    g = sg.PgGuard(hub.connect)
+    got = g.registered_maps(["real", "going", "gone", "map_junk", "", None])
+    assert got == ["real"]                    # a bucket with no registry row is not a map
+    assert hub.conns[-1].closed
+    assert g.registered_maps([]) == []
+
+
+def test_registered_maps_raises_when_registry_unreachable():
+    hub = Hub()
+    hub.broken = True
+    g = sg.PgGuard(hub.connect)
+    try:
+        g.registered_maps(["a"])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an unanswered registry must not read as 'no maps'")

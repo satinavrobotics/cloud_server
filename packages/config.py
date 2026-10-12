@@ -540,3 +540,14 @@ SCENE_GRAPH_GOAL_SNAP_M = float(os.getenv("SCENE_GRAPH_GOAL_SNAP_M", "1.5"))
 SCENE_GRAPH_LEAF_SNAP_M = float(os.getenv("SCENE_GRAPH_LEAF_SNAP_M", "1.0"))
 # Largest gap between two waypoints of a scene-graph route.
 SCENE_GRAPH_MAX_WAYPOINT_GAP_M = float(os.getenv("SCENE_GRAPH_MAX_WAYPOINT_GAP_M", "5.0"))
+
+# Scene-graph ingest worker batching (measured: a whole-batch fold costs seconds, and a larger
+# batch amortises a fixed solve, so the worker folds in batches, never leaf by leaf).
+# A batch is folded once at least BATCH_MIN_LEAVES are waiting, or when the oldest waiting leaf has
+# waited PUBLISH_INTERVAL_S (a trickle). A backlog is folded BATCH_MAX_LEAVES at a time.
+SCENE_GRAPH_BATCH_MIN_LEAVES = int(os.getenv("SCENE_GRAPH_BATCH_MIN_LEAVES", "6"))
+SCENE_GRAPH_BATCH_MAX_LEAVES = int(os.getenv("SCENE_GRAPH_BATCH_MAX_LEAVES", "48"))
+# Floor between two snapshot saves (publishes) of one map, and the longest a leaf waits for a batch.
+SCENE_GRAPH_PUBLISH_INTERVAL_S = float(os.getenv("SCENE_GRAPH_PUBLISH_INTERVAL_S", "5.0"))
+# A fold of one batch that takes longer than this is logged as a warning (it is not aborted).
+SCENE_GRAPH_BATCH_BUDGET_S = float(os.getenv("SCENE_GRAPH_BATCH_BUDGET_S", "10.0"))

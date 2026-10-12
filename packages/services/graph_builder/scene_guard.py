@@ -15,12 +15,16 @@ testable without a database; `connect_from_conninfo` is the production factory.
 """
 import hashlib
 import logging
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Iterable, List
 
 log = logging.getLogger("GraphBuilderService.scene_guard")
 
 LOCK_PREFIX = "scene_graph"
 LIFECYCLE_SQL = "SELECT lifecycle FROM mapobjectv1 WHERE name = %s AND lifecycle <> 'DELETED'"
+# The maps registry (the same table GraphBuilderService.manual_target_state reads). A MinIO bucket
+# with the map prefix is a map only when it has a live row here.
+REGISTERED_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
+                  "AND lifecycle <> 'DELETED' AND lifecycle <> 'DELETING'")
 
 
 def lock_key(map_id: str, prefix: str = LOCK_PREFIX) -> int:
@@ -104,6 +108,22 @@ class PgGuard:
             if transient and conn is not None:
                 self._close(conn)
         return row is None or row[0] == "DELETING"
+
+    def registered_maps(self, candidates: Iterable[str]) -> List[str]:
+        """The candidates (bucket-derived ids) that are registered, live maps: a positive check.
+        A bucket that is not a map (a leftover, another tenant, `map-` + junk) is never returned,
+        so no worker is built for it. RAISES when the registry cannot be asked (the caller keeps
+        its previous list; an unanswered question is not "no maps")."""
+        names = sorted({c for c in candidates if isinstance(c, str) and c})
+        if not names:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(REGISTERED_SQL, (names,)).fetchall()
+        finally:
+            self._close(conn)
+        live = {str(r[0]) for r in rows}
+        return [n for n in names if n in live]
 
     def close(self) -> None:
         for map_id in list(self._conns):

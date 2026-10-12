@@ -91,6 +91,9 @@ def test_map_removed_from_list_closes_worker():
     r.maps = ["b"]
     r.t = 61
     r.runner.tick()
+    assert not [w for w in r.made if w.map_id == "a"][0].closed   # one empty listing drops nothing
+    r.t = 122
+    r.runner.tick()
     assert [w.closed for w in r.made if w.map_id == "a"] == [True]
 
 
@@ -102,6 +105,65 @@ def test_max_maps_bounds_memory():
 
 def test_run_closes_everything_on_stop():
     r = Rig(["a"])
-    stops = iter([False, True])
+    import itertools
+    stops = itertools.chain([False, False, True], itertools.repeat(True))
     r.runner.run(sleep=lambda s: None, should_stop=lambda: next(stops))
     assert r.made[0].closed
+
+
+def test_round_robin_one_step_per_map_per_pass_and_rotating_start():
+    r = Rig(["a", "b", "c"], {k: [sw.WORKED] * 6 for k in "abc"})
+    order = []
+    orig = r.make
+
+    def make(map_id):
+        w = orig(map_id)
+        step = w.step
+
+        def logged():
+            order.append(map_id)
+            return step()
+        w.step = logged
+        return w
+    r.runner.make_worker = make
+    for _ in range(3):
+        r.runner.tick()
+    assert [sorted(order[i:i + 3]) for i in (0, 3, 6)] == [["a", "b", "c"]] * 3   # each map once per pass
+    assert [order[0], order[3], order[6]] == ["a", "b", "c"]                     # the start rotates
+
+
+def test_slow_map_does_not_starve_the_others():
+    r = Rig(["slow", "b"], {"slow": [sw.WORKED] * 5, "b": [sw.WORKED] * 5})
+    for _ in range(4):
+        r.runner.tick()
+    steps = {w.map_id: w.steps for w in r.made}
+    assert steps["b"] == steps["slow"] == 4
+
+
+def test_should_stop_is_checked_between_maps():
+    r = Rig(["a", "b", "c"])
+    calls = iter([False, True])
+    assert r.runner.tick(lambda: next(calls, True)) == 1
+
+
+def test_skipped_map_is_reported_once_per_interval_and_not_stepped():
+    events = []
+    r = Rig(["a", "off"])
+    r.runner.skip_reason = lambda m: "map_not_enabled" if m == "off" else None
+    r.runner.on_event = lambda m, k, p: events.append((m, k, p))
+    r.runner.tick()
+    assert [w.map_id for w in r.made] == ["a"]
+    assert events == [("off", "skipped", {"reason": "map_not_enabled"})]
+    r.t = 61
+    r.runner.tick()
+    assert len(events) == 1                     # rate limited
+    r.t = 3700
+    r.runner.tick()
+    assert len(events) == 2
+
+
+def test_non_string_and_empty_map_ids_are_ignored():
+    r = Rig([])
+    r.runner.list_maps = lambda: ["a", "", None, 7]
+    r.runner.tick()
+    assert [w.map_id for w in r.made] == ["a"]

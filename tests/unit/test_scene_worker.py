@@ -84,7 +84,24 @@ class FakeStore:
     def meta(self, map_id):
         return {"version": self.v, **self.meta_doc}
 
-    def save(self, map_id, sg, dirty, *, expected_version, cursor):
+    pending = None
+    commits = []
+
+    def begin_generation(self, map_id):
+        self.pending = self.meta_doc.get("generation", 1) + 1
+        return self.pending
+
+    def commit_generation(self, map_id, generation):
+        assert generation == self.pending and self.saves, "commit needs a begun generation with a saved state"
+        self.v += 1
+        self.meta_doc.update(generation=generation, params_hash=self.new_hash)
+        self.commits = self.commits + [(generation, self.v)]
+        return self.v, {"old:1": ["new:1"]}
+
+    new_hash = "new"
+
+    def save(self, map_id, sg, dirty, *, expected_version, cursor, generation=None):
+        self.save_generations = getattr(self, "save_generations", []) + [generation]
         if self.fence or expected_version != self.v:
             raise sw.SaveFenced("expected %s, store has %s" % (expected_version, self.v))
         if self.fail:
@@ -475,3 +492,174 @@ def test_stamp_write_failure_means_no_fold():
     res = r.worker.step()
     assert res.state == sw.BACKOFF and r.engine.batches == []
     assert r.worker.cursor == (0, "")
+
+
+# ---------------------------------------------------------------- batching, budget, rebuild, events
+
+def _nodes(n, start=1000):
+    return [make_node("n%03d" % i, start + i) for i in range(n)]
+
+
+def test_trickle_below_min_waits_for_the_publish_interval_then_folds():
+    cfg = sw.WorkerConfig(batch_min_leaves=6, batch_max_leaves=48, min_save_interval_s=5,
+                          save_when_idle=True)
+    r = Rig(_nodes(2), cfg=cfg)
+    res = r.worker.step()
+    assert r.engine.batches == [] and res.state == sw.IDLE
+    assert 0 < res.sleep_s <= 2.0
+    r.clock.advance(3)
+    r.worker.step()
+    assert r.engine.batches == []              # still inside the wait
+    assert r.worker.cursor == sw.ZERO_CURSOR   # nothing folded: the cursor must not pass buffered leaves
+    r.clock.advance(3)
+    r.drain()
+    assert r.engine.batches == [["n000", "n001"]]
+    assert r.worker.cursor == (1001, "n001")
+
+
+def test_min_reached_folds_at_once():
+    cfg = sw.WorkerConfig(batch_min_leaves=6, batch_max_leaves=48, min_save_interval_s=5)
+    r = Rig(_nodes(6), cfg=cfg)
+    r.worker.step()
+    assert len(r.engine.batches) == 1 and len(r.engine.batches[0]) == 6
+
+
+def test_backlog_is_coalesced_up_to_max_in_one_fold():
+    # a slow fold: 100 leaves arrive while one fold runs; the next folds take batch_max at a time
+    cfg = sw.WorkerConfig(batch_size=200, batch_min_leaves=6, batch_max_leaves=48, min_save_interval_s=5,
+                          save_every_leaves=1000)
+    r = Rig(_nodes(7), cfg=cfg)
+    r.worker.step()
+    assert [len(b) for b in r.engine.batches] == [7]
+    for n in _nodes(100, start=5000):
+        r.source.add(n)
+    r.drain(n=10)
+    assert [len(b) for b in r.engine.batches] == [7, 48, 48]      # no small batches while backlogged
+    assert r.worker.stats.buffered_leaves == 4                     # the tail is a trickle: it waits
+    r.clock.advance(6)
+    r.drain()
+    assert [len(b) for b in r.engine.batches] == [7, 48, 48, 4]
+    assert r.worker.cursor == (5099, "n099")
+
+
+def test_fold_failure_keeps_buffered_leaves_and_retries():
+    cfg = sw.WorkerConfig(batch_min_leaves=2, batch_max_leaves=10, min_save_interval_s=0)
+    r = Rig(_nodes(3), cfg=cfg)
+    r.engine.raise_once = RuntimeError("solver")
+    assert r.worker.step().state == sw.BACKOFF
+    assert r.worker.cursor == sw.ZERO_CURSOR
+    r.drain()
+    assert r.engine.batches == [["n000", "n001", "n002"]]
+
+
+def test_slow_fold_logs_a_warning_with_map_leaves_seconds(caplog):
+    cfg = sw.WorkerConfig(batch_budget_s=10.0)
+    r = Rig(_nodes(3), cfg=cfg)
+    real = r.engine.fold_many
+
+    def slow(leaves):
+        r.clock.advance(12.5)
+        return real(leaves)
+    r.engine.fold_many = slow
+    with caplog.at_level("WARNING"):
+        r.worker.step()
+    msg = [m for m in caplog.messages if "budget" in m]
+    assert msg and MAP in msg[0] and "3 leaves" in msg[0] and "12.5s" in msg[0]
+    assert r.worker.stats.slow_folds == 1 and r.worker.stats.max_fold_s == 12.5
+    r.engine.fold_many = real
+    caplog.clear()
+    r.source.add(make_node("x", 9000))
+    r.worker.step()
+    assert not [m for m in caplog.messages if "budget" in m]
+
+
+def test_save_passes_the_stored_generation():
+    r = Rig([make_node("a", 1000)], store=FakeStore(meta={"params_hash": "h", "generation": 3}))
+    r.drain()
+    assert r.store.save_generations == [3]
+
+
+def test_store_stale_version_is_fenced_not_retried():
+    class Stale(Exception):
+        pass
+
+    class S(FakeStore):
+        def save(self, *a, **k):
+            raise Stale("expected 3, stored 5")
+    r = Rig([make_node("a", 1000)], store=S(), fence_errors=(Stale,))
+    assert r.drain().state == sw.FENCED
+
+
+def test_params_hash_change_rebuilds_in_a_new_generation_then_commits():
+    events = []
+    store = FakeStore(version=5, meta={"params_hash": "old", "generation": 1, "cursor": (9_000_000, "z")})
+    cfg = sw.WorkerConfig(expected_params_hash="new", min_save_interval_s=0)
+    fresh = FakeEngine()
+    fresh.version = 0
+    r = Rig(_nodes(3), store=store, cfg=cfg, new_engine=lambda: fresh,
+            on_event=lambda k, p: events.append((k, p)))
+    r.engine.version = 99                      # the old engine is ignored (hash mismatch)
+    r.worker = r.make()
+    r.drain()
+    assert r.engine.batches == [] and fresh.batches == [["n000", "n001", "n002"]]   # all leaves, from the start
+    assert store.save_generations == [2]       # saved into the pending generation
+    assert store.commits == [(2, store.v)]
+    assert r.worker.state == "" and r.worker._rebuild_gen is None
+    kinds = [k for k, _ in events]
+    assert kinds[0] == "rebuild_started" and "rebuild_completed" in kinds
+    done = dict(events)["rebuild_completed"]
+    assert done["version"] == store.v and done["reason"] == "needs_rebuild" and done["duration_s"] >= 0
+    assert "updated" in kinds
+    # the publish after the switch is a full refetch hint carrying the lineage
+    assert r.published and r.published[-1][0] == store.v
+    # later saves go to the new current generation
+    r.source.add(make_node("late", 5_000))
+    r.drain()
+    assert store.save_generations[-1] == 2 and len(store.commits) == 1
+    assert fresh.batches[-1] == ["late"]
+
+
+def test_params_hash_change_without_rebuild_support_still_ends_in_needs_rebuild():
+    store = FakeStore(meta={"params_hash": "old", "generation": 1})
+    r = Rig([make_node("a", 1000)], store=store, cfg=sw.WorkerConfig(expected_params_hash="new"))
+    assert r.worker.step().state == sw.NEEDS_REBUILD
+
+
+def test_matching_params_hash_does_not_rebuild():
+    store = FakeStore(meta={"params_hash": "same", "generation": 1})
+    r = Rig([make_node("a", 1000)], store=store, cfg=sw.WorkerConfig(expected_params_hash="same"),
+            new_engine=lambda: FakeEngine())
+    r.drain()
+    assert r.engine.batches == [["a"]] and store.pending is None
+
+
+def test_events_updated_and_fold_failed_with_consecutive_count():
+    events = []
+    cfg = sw.WorkerConfig(min_save_interval_s=0)
+    r = Rig(_nodes(2), cfg=cfg, on_event=lambda k, p: events.append((k, p)))
+    real = r.engine.fold_many
+    state = {"n": 0}
+
+    def flaky(leaves):
+        state["n"] += 1
+        if state["n"] <= 3:
+            raise RuntimeError("solver blew up")
+        return real(leaves)
+    r.engine.fold_many = flaky
+    for _ in range(3):
+        assert r.worker.step().state == sw.BACKOFF
+    failed = [p for k, p in events if k == "fold_failed"]
+    assert [p["consecutive"] for p in failed] == [1, 2]          # 1, 2, (3 held back), 4, 8 ...
+    assert failed[0]["stage"] == "fold" and "solver blew up" in failed[0]["detail"]
+    r.drain()
+    upd = [p for k, p in events if k == "updated"]
+    assert len(upd) == 1 and upd[0]["leaves_folded"] == 2 and upd[0]["charts_changed"] == 2
+    assert r.worker.stats.fold_failures == 0
+
+
+def test_save_failure_is_reported_as_fold_failed_stage_save():
+    events = []
+    r = Rig([make_node("a", 1000)], on_event=lambda k, p: events.append((k, p)))
+    r.store.fail = 1
+    r.drain()
+    assert ("fold_failed", {"stage": "save", "detail": "OSError: minio down", "consecutive": 1}) in events
