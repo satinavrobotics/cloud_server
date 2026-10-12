@@ -152,6 +152,11 @@ class WorkerConfig:
     # How often the map's `scene_graph_needs_rebuild` request is looked up (one cheap query per
     # map per interval; also once at start). 0 disables the check.
     rebuild_check_s: float = 30.0
+    # Consecutive failures of `commit_generation` that are not a verdict (store unreachable, ...)
+    # before the worker stops with FENCED (reported as an event; the runner retries later).
+    commit_retries: int = 5
+    # Caught-up steps with nothing folded and nothing saved before a rebuild is declared empty.
+    empty_rebuild_confirmations: int = 2
     # batching (config.py SCENE_GRAPH_BATCH_*; the neutral defaults here fold every page whole)
     batch_min_leaves: int = 1               # fold once this many leaves wait ...
     batch_max_leaves: int = 1_000_000       # ... at most this many per fold_many ...
@@ -282,6 +287,8 @@ class SceneWorker:
         self._rebuild_saved = False
         self._rebuild_event_reason = "needs_rebuild"
         self._rebuild_request: Optional[Mapping[str, Any]] = None   # the status key this rebuild answers
+        self._commit_failures = 0                    # consecutive non-verdict commit_generation failures
+        self._empty_confirms = 0                     # caught-up steps of a rebuild that saved nothing
         self._request_checked_ms: Optional[int] = None
         self._clear_failed_at: Optional[str] = None  # a committed request whose key could not be cleared
         self._watermark: Tuple[int, str] = (0, "")
@@ -600,6 +607,7 @@ class SceneWorker:
         self.engine = self.new_engine()
         self._rebuild_gen, self._rebuild_saved = gen, False
         self._rebuild_started_ms = self.now_ms()
+        self._empty_confirms = self._commit_failures = 0
         self._rebuild_event_reason = reason
         self._rebuild_request = request
         self._event("rebuild_started", reason=reason)
@@ -974,7 +982,8 @@ class SceneWorker:
     def _commit_rebuild(self) -> Optional[StepResult]:
         """Caught up in the pending generation: switch readers to it. None on success / nothing to switch yet."""
         if not self._rebuild_saved:
-            return None             # no leaf yet: nothing was saved into the pending generation
+            return self._finish_empty_rebuild()
+        self._empty_confirms = 0
         res = self._lifecycle(force=True, where="map deleting before generation commit")
         if res is not None:
             return res
@@ -983,10 +992,17 @@ class SceneWorker:
             version, retired = self.store.commit_generation(self.map_id, gen)
         except self.fence_errors as exc:
             return self._terminal(FENCED, str(exc) or "commit fenced")
+        except ValueError as exc:
+            # "no such pending generation with a saved state": decide from the store's state
+            verdict = self._pending_state(gen)
+            if verdict == "superseded":
+                return self._terminal(FENCED, f"generation {gen} was committed or superseded: {exc}")
+            if verdict == "gone":
+                return self._restart_rebuild(f"pending generation {gen} vanished: {exc}")
+            return self._commit_failed(exc)
         except Exception as exc:
-            log.warning("scene worker %s: generation commit failed: %s", self.map_id, exc)
-            self._failed("save", f"commit: {type(exc).__name__}: {exc}")
-            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"commit: {exc}")
+            return self._commit_failed(exc)
+        self._commit_failures = 0
         self._recovered("save")
         self._generation, self._rebuild_gen, self._rebuild_saved = gen, None, False
         self._expected_version = int(version)
@@ -1003,6 +1019,102 @@ class SceneWorker:
             try:
                 self.publish(int(version), RebuiltDirty(bbox=None, changed=[], retired=dict(retired or {}),
                                                         links=[], watermark=self._watermark))
+            except Exception:
+                log.exception("scene worker %s: publish callback failed", self.map_id)
+        return None
+
+    def _pending_state(self, gen: Optional[int]) -> str:
+        """After a ValueError from commit_generation: "superseded" (the live generation is already
+        `gen` or newer: another writer got there), "gone" (the pending generation is no longer
+        `gen`, or holds no saved state: begin again) or "unknown" (the store cannot say)."""
+        try:
+            meta = self.store.meta(self.map_id)
+            docs = getattr(self.store, "docs", None)
+            raw = docs.meta(self.map_id) if docs is not None else None
+        except Exception:
+            return "unknown"
+        if not meta:
+            return "gone"                   # the store was dropped under us
+        if gen is not None and int(meta.get("generation") or 0) >= int(gen):
+            return "superseded"
+        if docs is None:
+            return "unknown"
+        pend = (raw or {}).get("pending")
+        if not pend or int(pend.get("generation", -1)) != int(gen) or not pend.get("manifest"):
+            return "gone"
+        return "unknown"
+
+    def _commit_failed(self, exc: Exception) -> StepResult:
+        """A commit failure that is not a verdict: backoff, bounded, then a terminal FENCED."""
+        self._commit_failures += 1
+        log.warning("scene worker %s: generation commit failed (%d/%d): %s", self.map_id,
+                    self._commit_failures, self.config.commit_retries, exc)
+        self._failed("save", f"commit: {type(exc).__name__}: {exc}")
+        if self._commit_failures >= max(1, self.config.commit_retries):
+            return self._terminal(FENCED, f"generation commit failed {self._commit_failures} times: "
+                                          f"{type(exc).__name__}: {exc}")
+        return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"commit: {exc}")
+
+    def _restart_rebuild(self, why: str) -> StepResult:
+        """The pending generation is gone: fold everything again into a new one (or, when the store
+        was dropped, into a fresh first generation)."""
+        log.warning("scene worker %s: %s: restarting the rebuild", self.map_id, why)
+        self._commit_failures = 0
+        reason = self._rebuild_event_reason
+        request = self._rebuild_request
+        try:
+            has_state = bool(self.store.meta(self.map_id))
+        except Exception as exc:
+            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"meta: {exc}")
+        if not has_state:
+            self._rebuild_gen, self._rebuild_saved = None, False
+            self._generation, self._expected_version = None, 0
+            self.engine = self.new_engine()
+            self._reset_fold_state()
+            self.stats.version = 0
+            return StepResult(WORKED, detail=why)
+        err = self._begin_rebuild(reason, request)
+        if err is not None:
+            return err
+        self._reset_fold_state()
+        return StepResult(WORKED, detail=why)
+
+    def _finish_empty_rebuild(self) -> Optional[StepResult]:
+        """A rebuild that is caught up with no leaf to save: the map has nothing to fold (all its
+        nodes were deleted, or none has a usable costmap). The store cannot commit a generation
+        without state, so the stale graph is dropped (`store.drop`: a rebuildable index) and the
+        request answered; without `drop` the request is only cleared."""
+        self._empty_confirms += 1
+        if self._empty_confirms < max(1, self.config.empty_rebuild_confirmations):
+            return None
+        res = self._lifecycle(force=True, where="map deleting before empty rebuild")
+        if res is not None:
+            return res
+        drop = getattr(self.store, "drop", None)
+        if drop is not None:
+            try:
+                drop(self.map_id)
+            except Exception as exc:
+                self._empty_confirms = 0
+                return self._commit_failed(exc)
+            self._generation, self._expected_version = None, 0
+            self.stats.version = 0
+        else:
+            log.warning("scene worker %s: empty rebuild and the store cannot drop: request cleared, "
+                        "the previous graph stays", self.map_id)
+        self._commit_failures = self._empty_confirms = 0
+        self._rebuild_gen = None
+        self.stats.rebuilds += 1
+        self._event("rebuild_completed", reason=self._rebuild_event_reason, version=0, leaves=0,
+                    duration_s=round(max(0, self.now_ms() - self._rebuild_started_ms) / 1000.0, 3))
+        self._leaves_since_publish = 0
+        request, self._rebuild_request = self._rebuild_request, None
+        if request is not None:
+            self._clear_request(request)
+        if drop is not None and self.publish is not None:
+            try:
+                self.publish(0, RebuiltDirty(bbox=None, changed=[], retired={}, links=[],
+                                             watermark=self._watermark))
             except Exception:
                 log.exception("scene worker %s: publish callback failed", self.map_id)
         return None

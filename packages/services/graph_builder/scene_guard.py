@@ -24,7 +24,10 @@ LOCK_PREFIX = "scene_graph"
 LIFECYCLE_SQL = "SELECT lifecycle FROM mapobjectv1 WHERE name = %s AND lifecycle <> 'DELETED'"
 # The maps registry (the same table GraphBuilderService.manual_target_state reads). A MinIO bucket
 # with the map prefix is a map only when it has a live row here.
-REGISTERED_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
+# Matched on the MinIO bucket slug (`minio_base._bucket_name`: lower-cased, `_` -> `-`), because
+# `image_db.list_maps()` returns the slug with `-` turned back into `_`: a map `my-map` (or `My_Map`)
+# is listed as `my_map`, which is not its registry name. The SQL returns the real names.
+REGISTERED_SQL = ("SELECT name FROM mapobjectv1 WHERE lower(replace(name, '_', '-')) = ANY(%s) "
                   "AND lifecycle <> 'DELETED' AND lifecycle <> 'DELETING'")
 # Status keys of the map object (jsonb `status`), the contract with packages/api/maps.py:
 # `scene_graph_needs_rebuild` is set by the node-delete API (== maps.SCENE_GRAPH_NEEDS_REBUILD_KEY,
@@ -41,6 +44,11 @@ CLEAR_REBUILD_SQL = ("UPDATE mapobjectv1 SET status = status - %s WHERE name = %
 # the global setting (the worker only runs when SCENE_GRAPH_WORKER_ENABLED is on).
 DISABLED_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
                 "AND lifecycle <> 'DELETED' AND status->%s = 'false'::jsonb")
+
+
+def bucket_slug(map_id: str) -> str:
+    """The MinIO bucket suffix of a map id, as `topomap_dbs.minio_base._bucket_name` builds it."""
+    return map_id.lower().replace("_", "-")
 
 
 def lock_key(map_id: str, prefix: str = LOCK_PREFIX) -> int:
@@ -133,11 +141,25 @@ class PgGuard:
             return []
         conn = self._connect()
         try:
-            rows = conn.execute(REGISTERED_SQL, (names,)).fetchall()
+            rows = conn.execute(REGISTERED_SQL, (sorted({bucket_slug(n) for n in names}),)).fetchall()
         finally:
             self._close(conn)
-        live = {str(r[0]) for r in rows}
-        return [n for n in names if n in live]
+        by_slug: Dict[str, List[str]] = {}
+        for row in rows:
+            by_slug.setdefault(bucket_slug(str(row[0])), []).append(str(row[0]))
+        out = set()
+        for cand in names:
+            real = by_slug.get(bucket_slug(cand), [])
+            if cand in real:
+                out.add(cand)
+            elif len(real) == 1:
+                out.add(real[0])
+            elif real:
+                # two registry names share one bucket: its content cannot be told apart, and two
+                # writers into one `scene_graph/` prefix would corrupt it. Skip until resolved.
+                log.error("scene guard: candidate %r matches several registered maps %s (they share "
+                          "a MinIO bucket); skipped", cand, sorted(real))
+        return sorted(out)
 
     def disabled_maps(self, candidates: Iterable[str]) -> set:
         """The candidates whose `status.scene_graph_enabled` is false. RAISES when the registry
