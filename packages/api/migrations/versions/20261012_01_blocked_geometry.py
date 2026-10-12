@@ -11,10 +11,13 @@ treat the obstacle as a segment from the robot's pose to the waypoint
 (packages/utils/blocked_geometry.py):
 
 - robot_x, robot_y: the robot's position (map frame, metres) when it reported the block.
-- prev_x, prev_y: the previous waypoint of the route (map frame); kept for a later fit.
+- prev_x, prev_y: RESERVED, UNUSED. Added with the others for a possible later fit; nothing
+  writes or reads them (kept so the migration stays one reviewed, idempotent unit).
 
 Additive: four nullable columns, no backfill (rows written before keep NULLs and the old disc
-rule). Must be applied BEFORE the dispatcher / planner / API that read and write them.
+rule). Apply BEFORE the dispatcher / planner / API that use them (compose makes the dispatcher wait
+for the migrating API container); packages/utils/blocked_nodes.py falls back to column-less SQL
+on an unmigrated database.
 downgrade() drops them.
 """
 from alembic import op

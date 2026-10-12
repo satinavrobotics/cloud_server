@@ -3,7 +3,7 @@
 Topomap Database Client
 
 Unified client wrapping GraphDatabaseService and ImageDatabaseService.
-Provides coordinated compound operations (create_map, delete_map, list_maps,
+Provides coordinated compound operations (create_map, list_maps,
 is_healthy) while exposing both sub-clients via .graph and .image for
 specialised operations.
 """
@@ -112,32 +112,6 @@ class TopomapDatabaseClient:
         graph-db needs an explicit create call.
         """
         return self.graph.create_map(map_id)
-
-    def delete_map(self, map_id: str) -> Dict[str, Any]:
-        """
-        Delete a map from graph, image, and rosbag databases.
-
-        All three deletions are always attempted; partial failures are
-        reported in the returned dict.
-        """
-        graph_ok  = self.graph.delete_map(map_id)
-        image_ok  = self.image.delete_map(map_id)
-        rosbag_ok = self.rosbag.delete_map_bags(map_id)
-
-        if graph_ok and image_ok and rosbag_ok:
-            return {"success": True, "map_id": map_id}
-
-        errors: List[str] = []
-        if not graph_ok:
-            errors.append("graph_db: failed to delete map")
-        if not image_ok:
-            errors.append("image_db: failed to delete MinIO bucket")
-        if not rosbag_ok:
-            errors.append("rosbag_db: failed to delete ROS bag bucket")
-
-        error_msg = "; ".join(errors)
-        self._logger.error(f"Failed to delete map {map_id}: {error_msg}")
-        return {"success": False, "map_id": map_id, "error": error_msg}
 
     def delete_nodes(self, map_id: str, node_ids: List[str]) -> Dict[str, Any]:
         """

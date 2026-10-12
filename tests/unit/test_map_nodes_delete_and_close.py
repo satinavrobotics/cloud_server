@@ -47,16 +47,14 @@ def _delete_fn(deleted=(N1,), missing=(), edges=2, failures=()):
     return fn
 
 
-async def run_delete_nodes(db, ids=(N1,), count=5, fn=None, notify=None, name="yard",
-                           scene_graph=False):
+async def run_delete_nodes(db, ids=(N1,), count=5, fn=None, notify=None, name="yard"):
     fn = fn or _delete_fn()
     def counter(_name):
         if count is None:
             raise RuntimeError("ArangoDB down")
         return count
     out = await maps.delete_nodes(None, name, {"node_ids": list(ids)}, m1.PUB, "op", fn,
-                                  arango_node_count=counter, notify=notify,
-                                  scene_graph=scene_graph)
+                                  arango_node_count=counter, notify=notify)
     return out, fn
 
 
@@ -503,24 +501,48 @@ class TestArangoNodeCount:
         assert out["map_state"] == "ready"
 
 
-# --- scene graph: leaves retracted -> the map is marked needs-rebuild (flag) -------------------
+# --- scene graph: leaves retracted -> the map is marked needs-rebuild, before the delete ------
 
 class TestSceneGraphRetraction:
     KEY = maps.SCENE_GRAPH_NEEDS_REBUILD_KEY
 
-    async def test_marks_the_map_when_the_flag_is_on(self, db):
+    async def test_marks_the_map_unconditionally(self, db):
         db.add_map("yard", type="local")
-        await run_delete_nodes(db, [N1, N2], fn=_delete_fn(deleted=(N1, N2)), scene_graph=True)
+        await run_delete_nodes(db, [N1, N2], fn=_delete_fn(deleted=(N1, N2)))
         mark = db.maps["yard"]["status"][self.KEY]
         assert mark["reason"] == "nodes_deleted" and mark["nodes"] == 2 and mark["at"]
 
-    async def test_flag_off_leaves_status_untouched(self, db):
+    async def test_marker_is_written_before_the_destructive_delete(self, db):
         db.add_map("yard", type="local")
-        await run_delete_nodes(db, scene_graph=False)
-        assert self.KEY not in db.maps["yard"]["status"]
+        seen = {}
+        inner = _delete_fn()
 
-    async def test_nothing_deleted_nothing_marked(self, db):
+        def fn(map_id, ids):
+            seen["mark"] = dict(db.maps["yard"]["status"].get(self.KEY) or {})
+            return inner(map_id, ids)
+        await run_delete_nodes(db, fn=fn)
+        assert seen["mark"].get("reason") == "nodes_deleting" and seen["mark"]["at"]
+
+    async def test_a_failing_delete_still_leaves_the_marker(self, db):
         db.add_map("yard", type="local")
-        await run_delete_nodes(db, [N9], fn=_delete_fn(deleted=(), missing=(N9,)),
-                               scene_graph=True)
-        assert self.KEY not in db.maps["yard"]["status"]
+
+        def boom(map_id, ids):
+            raise RuntimeError("ArangoDB went away mid-delete")
+        with pytest.raises(RuntimeError):
+            await run_delete_nodes(db, fn=boom)
+        assert self.KEY in db.maps["yard"]["status"]
+
+    async def test_second_stamp_has_a_fresh_token(self, db, monkeypatch):
+        import datetime
+        db.add_map("yard", type="local")
+        ticks = iter(datetime.datetime(2026, 10, 13, 12, 0, i, tzinfo=datetime.timezone.utc)
+                     for i in range(1, 50))
+        monkeypatch.setattr(maps, "_utcnow", lambda: next(ticks))
+        seen = {}
+        inner = _delete_fn()
+
+        def fn(map_id, ids):
+            seen["before"] = db.maps["yard"]["status"][self.KEY]["at"]
+            return inner(map_id, ids)
+        await run_delete_nodes(db, fn=fn)
+        assert db.maps["yard"]["status"][self.KEY]["at"] != seen["before"]

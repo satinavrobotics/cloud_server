@@ -426,8 +426,11 @@ class SceneGraphUpdated(Payload):
 
 
 class SceneGraphFoldFailed(Payload):
-    """MAP.SCENE_GRAPH_FOLD_FAILED: a batch could not be folded or saved (`stage`: fold, tiles,
-    save). The worker backs off and retries; `consecutive` counts the failures in a row."""
+    """MAP.SCENE_GRAPH_FOLD_FAILED: the worker could not make progress on a map (`stage`, an open
+    set: fold, tiles, save, load; terminal: deleting, fenced, needs_rebuild; max_maps = the map
+    is not ingested because the process owns its maximum of maps). Retryable stages back off and
+    retry, terminal ones close the worker and retry later; `consecutive` counts failures in a
+    row (reported at 1, 2, 4, 8, ...)."""
     map_name: str
     stage: str
     detail: Optional[str] = None
@@ -445,8 +448,9 @@ class SceneGraphRebuild(Payload):
 
 
 class SceneGraphSkipped(Payload):
-    """MAP.SCENE_GRAPH_DISABLED_SKIPPED: the scene graph is disabled (`reason`: worker_disabled,
-    map_not_enabled), so the map's leaves were not folded."""
+    """MAP.SCENE_GRAPH_DISABLED_SKIPPED: the map's leaves are not folded because its status says
+    `scene_graph_enabled: false` (`reason`: `map_not_enabled`). `worker_disabled` is reserved:
+    with the worker flag off no worker runs, so nothing emits it."""
     map_name: str
     reason: str
 

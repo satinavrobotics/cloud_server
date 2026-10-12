@@ -267,6 +267,12 @@ FLEET_TRACK_MAX_POINTS = int(os.getenv("FLEET_TRACK_MAX_POINTS", "20000"))
 MAP_DELETE_MAX_ATTEMPTS = int(os.getenv("MAP_DELETE_MAX_ATTEMPTS", "5"))
 MAP_DELETE_BACKOFF_S = float(os.getenv("MAP_DELETE_BACKOFF_S", "2.0"))
 MAP_DELETE_BACKOFF_MAX_S = float(os.getenv("MAP_DELETE_BACKOFF_MAX_S", "60.0"))
+# Scene graph: a delete first takes the worker's advisory lock `scene_graph:<map>`, polling up to
+# SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S per attempt. A fold holding it does NOT consume
+# MAP_DELETE_MAX_ATTEMPTS: the delete keeps retrying (backoff) until the lock has been busy for
+# SCENE_GRAPH_DELETE_LOCK_DEADLINE_S in total; only then does a busy lock count as a failed attempt.
+SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S = float(os.getenv("SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S", "30.0"))
+SCENE_GRAPH_DELETE_LOCK_DEADLINE_S = float(os.getenv("SCENE_GRAPH_DELETE_LOCK_DEADLINE_S", "3600.0"))
 # F3 Idempotency-Key (packages/api/idempotency.py): how long a key is remembered, how long an
 # unfinished request holds its key before a retry may take it over (longer than any guarded
 # route can take), and how often a worker purges expired keys (seconds).

@@ -1096,12 +1096,10 @@ async def delete_map_nodes(map_id: str, body: Dict[str, Any]):
     `{"type": "nodes_deleted", "map_id", "node_ids", "edges_deleted", "timestamp"}` to the
     /ws/map/{map_id} clients."""
     _require_service()
-    from packages.config import SCENE_GRAPH_WORKER_ENABLED
     return await _site_call("delete map nodes", maps.delete_nodes(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
         service.topomap_db.delete_nodes, arango_node_count=_arango_node_count,
-        notify=service.ws_proxy.broadcast_map_update,
-        scene_graph=SCENE_GRAPH_WORKER_ENABLED))
+        notify=service.ws_proxy.broadcast_map_update))
 
 
 @app.delete("/api/v1/maps/{map_id}", status_code=202)

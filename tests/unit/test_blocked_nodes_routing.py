@@ -428,3 +428,94 @@ def test_an_edge_row_without_the_robots_pose_stays_a_point_disc():
     assert blocked_geometry.overlay([row], 0.5) == ([(2.0, 0.0, 0.5)], [])
     assert blocked_nodes.rows_hit([row], [(None, (2.1, 0.0))], polyline=[(0.0, 0.3), (3.0, 0.3)])
     assert not blocked_nodes.rows_hit([row], [(None, (5.0, 0.0))], polyline=[(0.0, 0.3), (1.0, 0.3)])
+
+
+# ---- unmigrated database (migration 20261012_01 not applied yet) ---------------------------
+
+class UndefinedColumn(Exception):
+    """Named like psycopg.errors.UndefinedColumn."""
+
+
+class _MigCursor:
+    def __init__(self, db):
+        self.db = db
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, sql, params=()):
+        self.db.executed.append((sql, params))
+        if self.db.migrated is False and ("robot_x" in sql and "NULL::double" not in sql):
+            raise UndefinedColumn('column "robot_x" does not exist')
+
+    async def fetchall(self):
+        return []
+
+
+class _MigConn:
+    def __init__(self, db):
+        self.db = db
+
+    async def __aenter__(self):
+        self.db.connections += 1
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def cursor(self):
+        return _MigCursor(self.db)
+
+    async def rollback(self):
+        self.db.rollbacks += 1
+
+
+class _MigDb:
+    def __init__(self, migrated):
+        self.migrated, self.executed, self.connections, self.rollbacks = migrated, [], 0, 0
+
+    def connection(self):
+        return _MigConn(self)
+
+
+def test_legacy_upsert_sql_matches_its_params():
+    assert "robot_x" not in blocked_nodes.LEGACY_UPSERT_SQL
+    params = blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60, x=6.0, y=0.0,
+                                         robot_x=3.0, robot_y=0.0)
+    legacy = blocked_nodes.legacy_params(params)
+    assert len(legacy) == blocked_nodes.LEGACY_UPSERT_SQL.count("%s")
+    assert legacy[9:11] == (6.0, 0.0) and legacy[-1] == 60.0
+
+
+async def test_upsert_falls_back_on_an_unmigrated_database():
+    db = _MigDb(migrated=False)
+    params = blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60, x=6.0, y=0.0,
+                                         robot_x=3.0, robot_y=0.0)
+    await blocked_nodes.upsert(db, params)
+    assert [s for s, _ in db.executed] == [blocked_nodes.UPSERT_SQL, blocked_nodes.LEGACY_UPSERT_SQL]
+    assert db.connections == 2                       # a fresh connection: the failed one aborted
+
+
+async def test_upsert_uses_the_full_statement_when_migrated_and_reraises_other_errors():
+    db = _MigDb(migrated=True)
+    await blocked_nodes.upsert(db, blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60))
+    assert [s for s, _ in db.executed] == [blocked_nodes.UPSERT_SQL]
+
+    class Boom(_MigCursor):
+        async def execute(self, sql, params=()):
+            raise RuntimeError("connection reset")
+    db2 = _MigDb(migrated=True)
+    db2.connection = lambda: type("C", (_MigConn,), {"cursor": lambda self: Boom(db2)})(db2)
+    with pytest.raises(RuntimeError):
+        await blocked_nodes.upsert(db2, blocked_nodes.upsert_params("M", "9", "edgeBlocked", 60))
+
+
+async def test_fetch_active_falls_back_on_an_unmigrated_database():
+    db = _MigDb(migrated=False)
+    assert await blocked_nodes.fetch_active(db, "M") == []
+    assert [s for s, _ in db.executed[:2]] == [blocked_nodes.ACTIVE_FOR_MAP_SQL,
+                                               blocked_nodes.LEGACY_ACTIVE_FOR_MAP_SQL]
+    assert db.rollbacks == 1

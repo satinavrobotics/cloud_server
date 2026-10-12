@@ -591,7 +591,7 @@ async def test_scene_graph_dropped_under_the_worker_lock_before_the_other_stores
     assert db.locks == {}                      # released after the pass
 
 
-async def test_scene_lock_timeout_fails_the_attempt_and_drops_nothing_then_retries():
+async def test_scene_lock_timeout_past_the_deadline_counts_as_failed_attempts():
     db = FakeDb()
     db.seed("site_a")
     holder = FakeConn(db)                      # a fold holds the worker's lock
@@ -599,7 +599,7 @@ async def test_scene_lock_timeout_fails_the_attempt_and_drops_nothing_then_retri
     graph, images, drop = Store(), Store(), SceneDrop()
     deleter, sleeps = _deleter(db, graph, images, max_attempts=2, scene_drop=drop,
                                scene_active=lambda m: True, scene_lock_timeout_s=2.0,
-                               scene_lock_poll_s=1.0)
+                               scene_lock_poll_s=1.0, scene_lock_deadline_s=5.0)
     await _request_and_wait(deleter, "site_a")
     assert not graph.calls and not images.calls and not drop.calls
     row = db.rows["site_a"]
@@ -607,6 +607,46 @@ async def test_scene_lock_timeout_fails_the_attempt_and_drops_nothing_then_retri
     assert row["status"]["delete_attempts"] == 2
     assert "scene_graph: lock" in row["status"]["delete_error"]
     assert [e["code"] for e in db.events] == ["MAP.DELETE_FAILED"]
+
+
+async def test_a_busy_scene_lock_does_not_consume_attempts_before_the_deadline():
+    db = FakeDb()
+    db.seed("site_a")
+    holder = FakeConn(db)                      # a long fold
+    await holder.execute("SELECT pg_try_advisory_lock(%s)", (map_delete.scene_lock_key("site_a"),))
+    drop, sleeps = SceneDrop(), []
+
+    async def sleep(s):
+        sleeps.append(s)
+        if len(sleeps) > 12:                   # many poll cycles and busy retries later
+            await holder.close()
+    deleter = MapDeleter(db, Store(), Store(), max_attempts=1, sleep=sleep, now=lambda: T0,
+                         scene_drop=drop, scene_active=lambda m: True, backoff_s=1.0,
+                         backoff_max_s=2.0, scene_lock_timeout_s=2.0, scene_lock_poll_s=1.0,
+                         scene_lock_deadline_s=3600.0)
+    await _request_and_wait(deleter, "site_a")
+    assert drop.calls == ["site_a"] and "site_a" not in db.rows
+    assert not [e for e in db.events if e["code"] == "MAP.DELETE_FAILED"]
+
+
+async def test_busy_lock_shows_its_reason_without_counting():
+    db = FakeDb()
+    db.seed("site_a")
+    holder = FakeConn(db)
+    await holder.execute("SELECT pg_try_advisory_lock(%s)", (map_delete.scene_lock_key("site_a"),))
+    seen = []
+
+    async def sleep(s):
+        r = db.rows.get("site_a")
+        if r and r["status"].get("delete_error"):
+            seen.append((r["status"].get("delete_attempts"), r["status"]["delete_error"]))
+        if len(seen) >= 2:
+            await holder.close()
+    deleter = MapDeleter(db, Store(), Store(), max_attempts=1, sleep=sleep, now=lambda: T0,
+                         scene_drop=SceneDrop(), scene_active=lambda m: True,
+                         scene_lock_timeout_s=1.0, scene_lock_poll_s=1.0)
+    await _request_and_wait(deleter, "site_a")
+    assert seen and all("scene_graph: lock" in e and not a for a, e in seen)
 
 
 async def test_scene_lock_freed_midway_lets_the_attempt_proceed():

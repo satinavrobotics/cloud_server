@@ -21,6 +21,8 @@ import time
 from collections import deque
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+logger = logging.getLogger(__name__)
+
 SOURCES = ("edgeBlocked", "nodeBlocked", "operator")
 
 # A position row ("@x,y") keeps out the graph nodes within this distance of it (metres).
@@ -33,7 +35,7 @@ COLUMNS = ("map_name", "graph_node_id", "edge_from", "edge_to", "source", "robot
 # A new report on a node already blocked extends its expiry (never shortens it) and keeps
 # the newest report's details; on a row that had expired it starts a new block (created_at).
 # A report without the robot's pose (NULL) never erases an earlier valid one. The table's
-# prev_x/prev_y columns (migration 20261012_01) are no longer written: nothing reads them.
+# prev_x/prev_y columns (migration 20261012_01) are reserved and unused: nothing writes or reads them.
 UPSERT_SQL = (
     "INSERT INTO blocked_graph_nodes (map_name, graph_node_id, edge_from, edge_to, source, "
     "robot_name, mission_name, vda_node_id, reason, x, y, robot_x, robot_y, "
@@ -54,6 +56,51 @@ UPSERT_SQL = (
 ACTIVE_FOR_MAP_SQL = (
     f"SELECT {', '.join(COLUMNS)} FROM blocked_graph_nodes "
     "WHERE map_name = %s AND expires_at > now() ORDER BY created_at")
+
+# The same statements without robot_x / robot_y, for a database whose migration 20261012_01 has
+# not run yet (the migration is meant to come first; this keeps blocks working, with the old disc
+# rule, if a service starts ahead of it).
+_POSE_COLUMNS = ("robot_x", "robot_y")
+LEGACY_UPSERT_SQL = (
+    UPSERT_SQL.replace("x, y, robot_x, robot_y, ", "x, y, ")
+    .replace("%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ",
+             "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ")
+    .replace("robot_x = COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x), ", "")
+    .replace("robot_y = COALESCE(EXCLUDED.robot_y, blocked_graph_nodes.robot_y), ", "")
+)
+LEGACY_ACTIVE_FOR_MAP_SQL = (
+    "SELECT " + ", ".join(
+        f"NULL::double precision AS {c}" if c in _POSE_COLUMNS else c for c in COLUMNS)
+    + " FROM blocked_graph_nodes WHERE map_name = %s AND expires_at > now() ORDER BY created_at")
+
+
+def undefined_column(err: BaseException) -> bool:
+    """True for PostgreSQL's undefined_column (SQLSTATE 42703), as psycopg raises it."""
+    return (type(err).__name__ == "UndefinedColumn"
+            or getattr(err, "sqlstate", None) == "42703")
+
+
+def legacy_params(params: Tuple[Any, ...]) -> Tuple[Any, ...]:
+    """`upsert_params(...)` without robot_x / robot_y (positions 11, 12), for LEGACY_UPSERT_SQL."""
+    return tuple(params[:11]) + tuple(params[13:])
+
+
+async def upsert(database: Any, params: Tuple[Any, ...]) -> None:
+    """Run UPSERT_SQL on a pooled connection; on an unmigrated database (undefined column) run
+    the column-less statement on a fresh connection (the failed transaction is gone)."""
+    try:
+        async with database.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(UPSERT_SQL, params)
+        return
+    except Exception as err:  # noqa: BLE001
+        if not undefined_column(err):
+            raise
+        logger.warning("blocked_graph_nodes has no robot_x/robot_y (migration 20261012_01 not "
+                       "applied): block stored without the robot's pose")
+    async with database.connection() as conn:
+        async with conn.cursor() as cursor:
+            await cursor.execute(LEGACY_UPSERT_SQL, legacy_params(params))
 
 # Removes the row, expired or not; returns whether it was still active (an expired row is
 # not blocked: cleared quietly, reported as not found).
@@ -214,7 +261,13 @@ async def fetch_active(database: Any, map_id: str) -> List[Dict[str, Any]]:
     connection())."""
     async with database.connection() as conn:
         async with conn.cursor() as cursor:
-            await cursor.execute(ACTIVE_FOR_MAP_SQL, (map_id,))
+            try:
+                await cursor.execute(ACTIVE_FOR_MAP_SQL, (map_id,))
+            except Exception as err:  # noqa: BLE001
+                if not undefined_column(err):
+                    raise
+                await conn.rollback()           # the failed statement aborted the transaction
+                await cursor.execute(LEGACY_ACTIVE_FOR_MAP_SQL, (map_id,))
             rows = [row_dict(r) for r in await cursor.fetchall()]
     await purge_expired(database)
     return rows

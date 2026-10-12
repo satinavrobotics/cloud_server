@@ -2983,8 +2983,10 @@ class DeleteNodesRequest(pydantic.BaseModel):
 # as one process; the pre-delete session check stays the cross-process guard) and held only
 # for the duration of the call.
 _NODE_DELETES: Dict[str, int] = {}
-# Map status key set when nodes are deleted and the scene graph is on (read by the scene runner
-# / ops; cleared by whoever rebuilds).
+# Map status key set when nodes are deleted (read by the scene runner / ops; cleared by whoever
+# rebuilds, compare-and-clear on `at`). Set unconditionally and BEFORE the destructive delete
+# (re-stamped after it): the API process does not know whether a worker runs elsewhere, a
+# crash between delete and mark would lose the signal, and a spurious rebuild is harmless.
 SCENE_GRAPH_NEEDS_REBUILD_KEY = "scene_graph_needs_rebuild"
 
 
@@ -3024,8 +3026,8 @@ async def delete_nodes(db: Any, map_name: str, data: Any, publisher_id: uuid.UUI
                        actor: Optional[str],
                        delete_fn: Callable[[str, List[str]], Mapping[str, Any]],
                        arango_node_count: Optional[Callable[[str], int]] = None,
-                       notify: Optional[Callable[[str, Dict[str, Any]], Awaitable[Any]]] = None,
-                       scene_graph: bool = False) -> Dict[str, Any]:
+                       notify: Optional[Callable[[str, Dict[str, Any]], Awaitable[Any]]] = None
+                       ) -> Dict[str, Any]:
     """POST /api/v1/maps/{id}/nodes/delete. 404 unknown map, 409 while the map is being deleted
     or an unpaused mapping session is open on it (checked before the delete; the blocking
     ArangoDB / MinIO work is never done inside a transaction, so a session resumed during the
@@ -3033,22 +3035,26 @@ async def delete_nodes(db: Any, map_name: str, data: Any, publisher_id: uuid.UUI
     a thread. Afterwards a `ready` map left with no nodes and no saved SLAM map goes back to
     `draft` (the rule of a finish; count read outside the transaction), MAP.NODES_DELETED is
     emitted and `notify(map, message)` pushes `nodes_deleted` to the live map stream (a failure
-    only logs). With `scene_graph` (SCENE_GRAPH_WORKER_ENABLED) the map's status gets
-    `scene_graph_needs_rebuild` when leaves were deleted (SCENE_GRAPH_NEEDS_REBUILD_KEY: the
-    scene graph still holds the retracted leaves; integration.md "Review findings" 6, minimal
-    version). Returns {deleted, missing, edges_deleted, map_state[, image_failures]}."""
+    only logs). The map's status gets `scene_graph_needs_rebuild` (SCENE_GRAPH_NEEDS_REBUILD_KEY;
+    the scene graph still holds the retracted leaves) BEFORE the delete runs, always (no flag:
+    a delete that fails or finds nothing costs one spurious rebuild, a lost marker costs a
+    graph with retracted leaves), and again after it with a fresh `at` so a rebuild that began
+    before the delete finished cannot clear it. Returns {deleted, missing, edges_deleted, map_state[, image_failures]}."""
     req = parse_body(DeleteNodesRequest, data)
     with _deleting_nodes(map_name):
         return await _delete_nodes(db, map_name, req, publisher_id, actor, delete_fn,
-                                   arango_node_count, notify, scene_graph)
+                                   arango_node_count, notify)
 
 
 async def _delete_nodes(db, map_name, req, publisher_id, actor, delete_fn,
-                        arango_node_count, notify, scene_graph=False) -> Dict[str, Any]:
+                        arango_node_count, notify) -> Dict[str, Any]:
     try:
         async with open_store(db, publisher_id) as store:
-            await _lock_alive_map(store, map_name)
+            row = await _lock_alive_map(store, map_name)
             refuse_recording_session(await store.sessions(map_name), map_name)
+            await store.update_map(row, status={SCENE_GRAPH_NEEDS_REBUILD_KEY: {
+                "at": _utcnow().isoformat(), "reason": "nodes_deleting",
+                "nodes": len(req.node_ids)}})
     except _SCHEMA_ERRORS as exc:
         raise _undefined_table(exc) from exc
     result = await asyncio.to_thread(delete_fn, map_name, list(req.node_ids))
@@ -3068,8 +3074,9 @@ async def _delete_nodes(db, map_name, req, publisher_id, actor, delete_fn,
                         and not row.status.get("slam_saved_at")):
                     await store.update_map(row, status={"state": DRAFT})
                     state = DRAFT
-                if scene_graph and deleted:
+                if deleted:
                     # Leaves were retracted: the folded scene graph is stale until rebuilt.
+                    # A fresh token: a rebuild started before this point must not clear it.
                     await store.update_map(row, status={SCENE_GRAPH_NEEDS_REBUILD_KEY: {
                         "at": now.isoformat(), "reason": "nodes_deleted",
                         "nodes": len(deleted)}})

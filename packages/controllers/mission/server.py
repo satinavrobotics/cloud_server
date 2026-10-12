@@ -3824,9 +3824,7 @@ class Robot:
 
     async def _write_blocked_node(self, params: Tuple[Any, ...]) -> None:
         try:
-            async with self._database.connection() as conn:
-                async with conn.cursor() as cursor:
-                    await cursor.execute(blocked_nodes.UPSERT_SQL, params)
+            await blocked_nodes.upsert(self._database, params)
             await blocked_nodes.purge_expired(self._database)
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Could not store blocked graph node {params[1]} ({err}); new "

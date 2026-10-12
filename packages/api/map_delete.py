@@ -29,9 +29,12 @@ Scene graph (docs/scene_graph/integration.md, "Review findings" 6): when `scene_
 says the map has a scene graph (SCENE_GRAPH_WORKER_ENABLED or a graph exists), each attempt
 first takes the worker's session advisory lock `scene_graph:<map_id>` (same key as
 packages/services/graph_builder/scene_guard.py), polling `pg_try_advisory_lock` for up to
-`scene_lock_timeout_s`, holds it across the drops and releases it after. A timeout fails the
-attempt (`scene_graph: lock ...`), which the normal backoff retries; nothing is dropped
-without the lock. Under the lock `scene_drop(map_id)` (SceneGraphStore.drop: `sg_*` and the
+`scene_lock_timeout_s` (SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S), holds it across the drops and
+releases it after. A timeout (a fold is running) does NOT count as a failed attempt: the status
+shows `delete_error` = `scene_graph: lock ...`, `delete_attempts` is unchanged, and the round
+retries with backoff until the lock has been busy for `scene_lock_deadline_s` in total
+(SCENE_GRAPH_DELETE_LOCK_DEADLINE_S); after that each busy lock counts as an ordinary failed
+attempt. Nothing is dropped without the lock. Under the lock `scene_drop(map_id)` (SceneGraphStore.drop: `sg_*` and the
 `scene_graph/` objects) runs before the graph and image deletes, so a fold cannot recreate
 them afterwards: the map is already DELETING (marked by request(), which is what the worker's
 guard `is_deleting` reads) and the worker releases the lock when it sees that. With the
@@ -123,6 +126,11 @@ def _parse_ts(value: Any) -> Optional[datetime.datetime]:
     return None
 
 
+class SceneLockBusy(str):
+    """The error text of an attempt that could not take the scene lock in time: a busy lock is
+    waiting, not failing (see the module doc)."""
+
+
 class MapDeleter:
     """Runs map deletes in the background. `delete_graph` / `delete_images` are the blocking
     ArangoDB / MinIO deletes (return True when the data is gone, including "was not there");
@@ -138,7 +146,8 @@ class MapDeleter:
                  after_delete: Optional[Callable[[str], Awaitable[Any]]] = None,
                  scene_drop: Optional[Callable[[str], Any]] = None,
                  scene_active: Optional[Callable[[str], bool]] = None,
-                 scene_lock_timeout_s: float = 30.0, scene_lock_poll_s: float = 0.5):
+                 scene_lock_timeout_s: float = 30.0, scene_lock_poll_s: float = 0.5,
+                 scene_lock_deadline_s: float = 3600.0):
         self._db = db
         # Scene graph: `scene_active(map_id)` (blocking; None = never) decides whether the
         # lock + drop run; `scene_drop(map_id)` (blocking; SceneGraphStore.drop) removes it.
@@ -146,6 +155,7 @@ class MapDeleter:
         self._scene_active = scene_active
         self._scene_lock_timeout_s = scene_lock_timeout_s
         self._scene_lock_poll_s = scene_lock_poll_s
+        self._scene_lock_deadline_s = scene_lock_deadline_s
         # 3D reconstruction (R3): `on_mark(cursor, map_id)` runs in request()'s transaction
         # after the mark (cancels the map's active job); `after_mark(map_id, its result)` after
         # the commit (service cancel, events). An after_mark failure never fails the delete.
@@ -288,7 +298,10 @@ class MapDeleter:
                 pass
 
     async def _round(self, map_id: str) -> None:
-        for attempt in range(1, self.max_attempts + 1):
+        attempt = 0          # failed attempts of this round (a busy scene lock is not one)
+        busy = 0             # consecutive busy-lock retries
+        busy_waited_s = 0.0  # time spent waiting for the scene lock this round
+        while attempt < self.max_attempts:
             row = await self._load(map_id)
             if row is None or row[0] != DELETING:
                 return  # finished by another runner, or never marked
@@ -298,6 +311,17 @@ class MapDeleter:
                 await self._finish(map_id, status)
                 await self._notify_deleted(map_id)
                 return
+            if isinstance(error, SceneLockBusy):
+                busy += 1
+                wait = self.backoff(busy)
+                busy_waited_s += self._scene_lock_timeout_s + wait
+                if busy_waited_s < self._scene_lock_deadline_s:
+                    logger.info("Map %s: scene lock busy (%d); retrying in %.0fs", map_id, busy,
+                                wait)
+                    await self._record_busy(map_id, error)
+                    await self._sleep(wait)
+                    continue
+            attempt += 1
             total = int(status.get("delete_attempts") or 0) + 1
             requested_at = _parse_ts(status.get("delete_requested_at")) or self._now()
             exhausted = attempt >= self.max_attempts
@@ -307,6 +331,16 @@ class MapDeleter:
             if exhausted:
                 return
             await self._sleep(self.backoff(attempt))
+
+    async def _record_busy(self, map_id: str, error: str) -> None:
+        """Show why the delete is waiting (`delete_error`) without counting an attempt."""
+        try:
+            async with self._db.connection() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(RECORD_SQL, (json.dumps({"delete_error": str(error)}),
+                                                      map_id))
+        except Exception:  # noqa: BLE001 - a status write must not end the retries
+            logger.exception("Map %s: could not record the busy scene lock", map_id)
 
     async def _attempt(self, map_id: str) -> Optional[str]:
         """One pass over the stores; None if everything is gone, else the error text. When the
@@ -363,8 +397,8 @@ class MapDeleter:
             await self._close_quietly(conn)
             return None, f"scene_graph: lock failed: {exc or type(exc).__name__}"
         await self._close_quietly(conn)
-        return None, (f"scene_graph: lock {map_id} not free within "
-                      f"{self._scene_lock_timeout_s:g}s (a fold is running); will retry")
+        return None, SceneLockBusy(f"scene_graph: lock {map_id} not free within "
+                                   f"{self._scene_lock_timeout_s:g}s (a fold is running); will retry")
 
     @staticmethod
     async def _close_quietly(conn: Any) -> None:

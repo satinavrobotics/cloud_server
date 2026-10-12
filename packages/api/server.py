@@ -37,6 +37,7 @@ from packages.config import (
     MINIO_HOST, MINIO_PORT, MINIO_SECURE,
     MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE, DEFAULT_MAP_ID,
     MAP_DELETE_MAX_ATTEMPTS, MAP_DELETE_BACKOFF_S, MAP_DELETE_BACKOFF_MAX_S,
+    SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S, SCENE_GRAPH_DELETE_LOCK_DEADLINE_S,
     SCENE_GRAPH_WORKER_ENABLED,
 )
 from packages.api.map_delete import MapDeleter
@@ -716,7 +717,9 @@ class ApiDelegationService:
             backoff_max_s=MAP_DELETE_BACKOFF_MAX_S,
             on_mark=reconstruction.mark_map_deleting,
             after_mark=self.reconstruction.after_map_delete_marked,
-            scene_drop=scene_drop, scene_active=scene_active)
+            scene_drop=scene_drop, scene_active=scene_active,
+            scene_lock_timeout_s=SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S,
+            scene_lock_deadline_s=SCENE_GRAPH_DELETE_LOCK_DEADLINE_S)
 
         # Configuration
         self.default_map_id = default_map_id

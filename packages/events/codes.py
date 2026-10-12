@@ -199,9 +199,10 @@ CODES: Dict[EventCode, CodeMeta] = {
     # Scene graph (docs/scene_graph/integration.md, ops/events). Source graph_builder, no robot;
     # discriminator `map:<name>:scene_graph:<kind>:<version or ts>`. UPDATED: a snapshot was
     # published (emit at most once per publish interval, never per leaf). FOLD_FAILED: the
-    # worker could not fold or save a batch (it backs off and retries). REBUILD_*: the index
-    # `sg_*` or the snapshot is rebuilt from the leaves. DISABLED_SKIPPED: a map was skipped
-    # because the scene graph is switched off (rate-limit per map).
+    # worker could not make progress (stages fold/tiles/save/load retry, deleting/fenced/
+    # needs_rebuild are terminal, max_maps = not ingested). REBUILD_*: the snapshot and the
+    # index `sg_*` are rebuilt from the leaves. DISABLED_SKIPPED: a map was skipped because its
+    # status has scene_graph_enabled=false (reason map_not_enabled; rate-limited per map).
     _C.MAP_SCENE_GRAPH_UPDATED: CodeMeta(_S.INFO, True, schemas.SceneGraphUpdated, _G),
     _C.MAP_SCENE_GRAPH_FOLD_FAILED: CodeMeta(_S.WARNING, True, schemas.SceneGraphFoldFailed, _G),
     _C.MAP_SCENE_GRAPH_REBUILD_STARTED: CodeMeta(_S.INFO, True, schemas.SceneGraphRebuild, _G),
