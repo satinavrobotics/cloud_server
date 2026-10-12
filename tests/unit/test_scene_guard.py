@@ -119,3 +119,80 @@ def test_registered_maps_raises_when_registry_unreachable():
         pass
     else:
         raise AssertionError("an unanswered registry must not read as 'no maps'")
+
+
+# ---- status keys: per-map switch and the rebuild request
+
+class StatusCur:
+    def __init__(self, row=None, rows=(), rowcount=0):
+        self.row, self.rows, self.rowcount = row, rows, rowcount
+
+    def fetchone(self):
+        return self.row
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class StatusConn:
+    """mapobjectv1.status as a dict per map; understands the three guard queries."""
+
+    def __init__(self, status, broken=False):
+        self.status, self.broken, self.closed, self.sql = status, broken, False, []
+
+    def execute(self, sql, params=None):
+        if self.broken:
+            raise RuntimeError("down")
+        self.sql.append(sql)
+        if sql.startswith("UPDATE"):
+            key, name, _, at = params
+            doc = self.status.get(name, {})
+            if isinstance(doc.get(key), dict) and doc[key].get("at") == at:
+                del doc[key]
+                return StatusCur(rowcount=1)
+            return StatusCur(rowcount=0)
+        if "ANY(" in sql:
+            names, key = params
+            return StatusCur(rows=[(n,) for n in names if self.status.get(n, {}).get(key) is False])
+        key, name = params
+        if name not in self.status:
+            return StatusCur(None)
+        return StatusCur((self.status[name].get(key),))
+
+    def close(self):
+        self.closed = True
+
+
+def test_status_keys_match_the_api_constant():
+    from packages.api import maps
+    assert sg.NEEDS_REBUILD_KEY == maps.SCENE_GRAPH_NEEDS_REBUILD_KEY
+
+
+def test_disabled_maps_only_an_explicit_false_counts():
+    status = {"off": {sg.ENABLED_KEY: False}, "on": {sg.ENABLED_KEY: True}, "unset": {},
+              "junk": {sg.ENABLED_KEY: "no"}}
+    conn = StatusConn(status)
+    g = sg.PgGuard(lambda: conn)
+    assert g.disabled_maps(["off", "on", "unset", "junk", ""]) == {"off"}
+    assert g.disabled_maps([]) == set()
+    conn.broken = True
+    try:
+        g.disabled_maps(["off"])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("an unanswered lookup must raise so the caller keeps its answer")
+
+
+def test_rebuild_request_read_and_compare_and_clear():
+    req = {"at": "2026-10-12T10:00:00+00:00", "reason": "nodes_deleted", "nodes": 3}
+    status = {"m": {sg.NEEDS_REBUILD_KEY: dict(req)}, "none": {}}
+    g = sg.PgGuard(lambda: StatusConn(status))
+    assert g.rebuild_request("m") == req
+    assert g.rebuild_request("none") is None and g.rebuild_request("missing") is None
+    # a newer delete arrived during the rebuild: clearing the old `at` must keep the key
+    status["m"][sg.NEEDS_REBUILD_KEY]["at"] = "2026-10-12T10:05:00+00:00"
+    assert g.clear_rebuild_request("m", req["at"]) is False
+    assert sg.NEEDS_REBUILD_KEY in status["m"]
+    assert g.clear_rebuild_request("m", "2026-10-12T10:05:00+00:00") is True
+    assert sg.NEEDS_REBUILD_KEY not in status["m"]

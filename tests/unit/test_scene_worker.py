@@ -663,3 +663,174 @@ def test_save_failure_is_reported_as_fold_failed_stage_save():
     r.store.fail = 1
     r.drain()
     assert ("fold_failed", {"stage": "save", "detail": "OSError: minio down", "consecutive": 1}) in events
+
+
+# ---------------------------------------------------------------- needs-rebuild request (node delete)
+
+class RequestGuard(FakeGuard):
+    """FakeGuard + the status key `scene_graph_needs_rebuild` with compare-and-clear."""
+
+    def __init__(self):
+        super().__init__()
+        self.request = None
+        self.lookups = 0
+        self.clears = []
+        self.fail_clear = False
+
+    def rebuild_request(self, map_id):
+        self.lookups += 1
+        return dict(self.request) if self.request else None
+
+    def clear_rebuild_request(self, map_id, at):
+        if self.fail_clear:
+            raise RuntimeError("pg down")
+        self.clears.append(at)
+        if self.request and self.request["at"] == at:
+            self.request = None
+            return True
+        return False
+
+
+def _request_rig(nodes=(), request=None, version=5, check_s=30.0, **kw):
+    events = []
+    store = FakeStore(version=version, meta={"params_hash": "same", "generation": 1})
+    cfg = sw.WorkerConfig(expected_params_hash="same", min_save_interval_s=0, rebuild_check_s=check_s)
+    fresh = FakeEngine()
+    fresh.version = 0
+    engines = [fresh]
+    r = Rig(nodes, store=store, cfg=cfg, new_engine=lambda: engines.pop(0) if engines else FakeEngine(),
+            on_event=lambda k, p: events.append((k, p)), **kw)
+    r.guard = RequestGuard()
+    r.guard.request = request
+    r.engine.version = version
+    r.worker = r.make()
+    r.events, r.fresh = events, fresh
+    return r
+
+
+REQ = {"at": "2026-10-12T10:00:00+00:00", "reason": "nodes_deleted", "nodes": 2}
+
+
+def test_request_at_start_rebuilds_into_a_new_generation_and_clears_the_key_at_commit():
+    r = _request_rig(_nodes(3), request=REQ)
+    r.drain()
+    assert r.engine.batches == [] and r.fresh.batches == [["n000", "n001", "n002"]]   # every leaf, new engine
+    assert r.store.save_generations == [2] and r.store.commits == [(2, r.store.v)]
+    assert r.guard.clears == [REQ["at"]] and r.guard.request is None
+    kinds = dict(r.events)
+    assert kinds["rebuild_started"] == {"reason": "nodes_deleted"}
+    assert kinds["rebuild_completed"]["reason"] == "nodes_deleted"
+    assert kinds["rebuild_completed"]["version"] == r.store.v
+
+
+def test_key_is_not_cleared_before_the_generation_commits():
+    r = _request_rig(_nodes(3), request=REQ)
+    r.worker.step()                      # starts the rebuild, folds, saves into the pending generation
+    assert r.worker._rebuild_gen is not None or r.store.commits
+    if not r.store.commits:
+        assert r.guard.request is not None and r.guard.clears == []
+    r.drain()
+    assert r.guard.request is None
+
+
+def test_newer_delete_during_the_rebuild_keeps_the_key_and_triggers_another_rebuild():
+    r = _request_rig(_nodes(3), request=REQ, check_s=1.0)
+    r.worker.step()                      # rebuild begun
+    newer = {"at": "2026-10-12T10:00:30+00:00", "reason": "nodes_deleted", "nodes": 1}
+    r.guard.request = newer              # a delete lands while rebuilding
+    r.drain()
+    assert r.store.commits and r.guard.clears == [REQ["at"]]
+    assert r.guard.request == newer      # the compare did not match: the newer request survived
+    r.clock.advance(2)                   # past the check interval: the next poll sees it
+    r.drain()
+    assert len(r.store.commits) == 2 and r.guard.request is None
+    started = [p for k, p in r.events if k == "rebuild_started"]
+    assert len(started) == 2
+
+
+def test_request_mid_run_after_check_interval_starts_a_rebuild_and_forgets_old_state():
+    r = _request_rig(_nodes(2), check_s=30.0)
+    r.drain()
+    assert r.engine.batches == [["n000", "n001"]] and not r.store.commits
+    lookups = r.guard.lookups
+    r.worker.step()
+    assert r.guard.lookups == lookups            # within the interval: no query per step
+    r.guard.request = REQ
+    r.clock.advance(31)
+    r.drain()
+    assert r.fresh.batches == [["n000", "n001"]]  # read again from the start
+    assert r.store.commits and r.guard.request is None
+    assert r.worker.cursor > sw.ZERO_CURSOR
+
+
+def test_check_is_rate_limited_per_map():
+    r = _request_rig(_nodes(1), check_s=30.0)
+    r.drain()
+    base = r.guard.lookups                        # 1 at start
+    for _ in range(20):
+        r.worker.step()
+    assert r.guard.lookups == base
+    r.clock.advance(31)
+    r.worker.step()
+    assert r.guard.lookups == base + 1
+
+
+def test_never_saved_graph_just_restarts_the_fold_and_clears():
+    r = _request_rig([], request=None, version=0)
+    r.engine.version = 0
+    r.store.v = 0
+    r.worker = r.make()
+    r.worker.step()                      # started, idle
+    r.guard.request = REQ
+    r.clock.advance(31)
+    r.worker.step()
+    assert r.guard.request is None and r.store.pending is None   # no generation for an empty graph
+    assert r.worker.engine is r.fresh
+
+
+def test_params_rebuild_also_answers_the_request():
+    events = []
+    store = FakeStore(version=5, meta={"params_hash": "old", "generation": 1})
+    fresh = FakeEngine()
+    fresh.version = 0
+    r = Rig(_nodes(2), store=store, cfg=sw.WorkerConfig(expected_params_hash="new", min_save_interval_s=0),
+            new_engine=lambda: fresh, on_event=lambda k, p: events.append((k, p)))
+    r.guard = RequestGuard()
+    r.guard.request = REQ
+    r.worker = r.make()
+    r.drain()
+    assert len(store.commits) == 1                 # one rebuild, not two
+    assert dict(events)["rebuild_completed"]["reason"] == "needs_rebuild"
+    assert r.guard.request is None
+
+
+def test_no_new_engine_support_leaves_the_key_alone():
+    store = FakeStore(version=3, meta={"params_hash": "same", "generation": 1})
+    r = Rig(_nodes(1), store=store, cfg=sw.WorkerConfig(expected_params_hash="same"))
+    r.guard = RequestGuard()
+    r.guard.request = REQ
+    r.worker = r.make()
+    r.drain()
+    assert r.engine.batches == [["n000"]] and r.guard.request == REQ
+
+
+def test_failed_clear_is_retried_and_lookup_errors_do_not_stop_the_worker():
+    r = _request_rig(_nodes(2), request=REQ, check_s=1.0)
+    r.guard.fail_clear = True
+    r.drain()
+    assert r.store.commits and r.guard.request == REQ and r.worker._clear_failed_at == REQ["at"]
+    r.guard.fail_clear = False
+    r.clock.advance(2)
+    r.worker.step()
+    assert r.guard.request is None and r.worker._clear_failed_at is None
+    def boom(map_id):
+        raise RuntimeError("pg down")
+    r.guard.rebuild_request = boom
+    r.clock.advance(2)
+    assert r.worker.step().state == sw.IDLE
+
+
+def test_guard_without_the_lookup_is_ignored():
+    r = Rig(_nodes(1), store=FakeStore(version=3, meta={}), new_engine=lambda: FakeEngine())
+    r.drain()
+    assert r.engine.batches == [["n000"]]

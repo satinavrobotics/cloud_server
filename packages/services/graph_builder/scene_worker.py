@@ -124,6 +124,9 @@ class WorkerConfig:
     robot_fields: Sequence[str] = ("robot_name", "robot_id", "robot")   # node field holding the robot (unverified)
     expected_params_hash: Optional[str] = None
     expected_generation: Optional[int] = None
+    # How often the map's `scene_graph_needs_rebuild` request is looked up (one cheap query per
+    # map per interval; also once at start). 0 disables the check.
+    rebuild_check_s: float = 30.0
     # batching (config.py SCENE_GRAPH_BATCH_*; the neutral defaults here fold every page whole)
     batch_min_leaves: int = 1               # fold once this many leaves wait ...
     batch_max_leaves: int = 1_000_000       # ... at most this many per fold_many ...
@@ -233,6 +236,10 @@ class SceneWorker:
         self._rebuild_gen: Optional[int] = None      # pending generation being rebuilt
         self._rebuild_started_ms = 0
         self._rebuild_saved = False
+        self._rebuild_event_reason = "needs_rebuild"
+        self._rebuild_request: Optional[Mapping[str, Any]] = None   # the status key this rebuild answers
+        self._request_checked_ms: Optional[int] = None
+        self._clear_failed_at: Optional[str] = None  # a committed request whose key could not be cleared
         self._watermark: Tuple[int, str] = (0, "")
         self._leaves_since_publish = 0
         self._fail_stage = ""
@@ -275,6 +282,8 @@ class SceneWorker:
         elif not self.guard.held(self.map_id):
             return self._terminal(FENCED, "writer lock lost")
         cfg = self.config
+        if self._started and self._poll_rebuild_request():
+            return StepResult(WORKED)
         # a failed save left folded state in memory: retry it before pulling more
         if self._dirty is not None and self.stats.save_failures and self._due(idle=False, force=True):
             res = self._save()
@@ -389,25 +398,30 @@ class SceneWorker:
         rebuilding = False
         if cfg.expected_params_hash is not None and meta.get("params_hash") not in (None, cfg.expected_params_hash):
             self.rebuild_reason = "params_hash"
-            if self.new_engine is None or not hasattr(self.store, "begin_generation"):
+            if not self._can_rebuild():
                 return self._terminal(NEEDS_REBUILD, "params_hash")
-            try:
-                gen = int(self.store.begin_generation(self.map_id))
-            except Exception as exc:
+            err = self._begin_rebuild("needs_rebuild")
+            if err is not None:
                 self.guard.release(self.map_id)
-                log.warning("scene worker %s: begin_generation failed: %s", self.map_id, exc)
-                return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"begin_generation: {exc}")
-            # fold every leaf again, under the configured params, into the pending generation
-            self.engine = self.new_engine()
-            self._rebuild_gen, self._rebuild_saved = gen, False
-            self._rebuild_started_ms = self.now_ms()
+                return err
             rebuilding = True
-            self._event("rebuild_started", reason="needs_rebuild")
             log.info("scene worker %s: params changed (%s -> %s): rebuilding in generation %d",
-                     self.map_id, meta.get("params_hash"), cfg.expected_params_hash, gen)
+                     self.map_id, meta.get("params_hash"), cfg.expected_params_hash, self._rebuild_gen)
         if cfg.expected_generation is not None and meta.get("generation") not in (None, cfg.expected_generation):
             self.rebuild_reason = "generation"
             return self._terminal(NEEDS_REBUILD, "generation")
+        request = self._read_rebuild_request(force=True)
+        if request is not None:
+            if rebuilding:
+                self._rebuild_request = request     # this rebuild covers it; cleared at commit
+            elif self._can_rebuild() and version > 0:
+                err = self._begin_rebuild(str(request.get("reason") or "nodes_deleted"), request)
+                if err is not None:
+                    self.guard.release(self.map_id)
+                    return err
+                rebuilding = True
+            elif version == 0:
+                self._clear_request(request)        # nothing was ever saved: the first build is fresh
         have = getattr(self.engine, "version", None)
         if not rebuilding and have is not None and int(have) != version:
             self.rebuild_reason = "engine_version"
@@ -420,6 +434,103 @@ class SceneWorker:
         self.stats.version = version
         self._started = True
         return None
+
+    # ---- rebuild requests (status.scene_graph_needs_rebuild, set by the API on node delete)
+
+    def _can_rebuild(self) -> bool:
+        return self.new_engine is not None and hasattr(self.store, "begin_generation")
+
+    def _read_rebuild_request(self, force: bool = False) -> Optional[Mapping[str, Any]]:
+        """The map's pending rebuild request ({at, reason, nodes}) or None. Asks the guard at most
+        once per `rebuild_check_s` (always when `force`); a guard without the lookup, a failed
+        query and a value without `at` all mean "none"."""
+        look = getattr(self.guard, "rebuild_request", None)
+        interval = self.config.rebuild_check_s
+        if look is None or interval <= 0:
+            return None
+        now = self.now_ms()
+        if (not force and self._request_checked_ms is not None
+                and now - self._request_checked_ms < interval * 1000):
+            return None
+        self._request_checked_ms = now
+        try:
+            request = look(self.map_id)
+        except Exception:
+            log.exception("scene worker %s: rebuild request lookup failed", self.map_id)
+            return None
+        if isinstance(request, Mapping) and request.get("at"):
+            return request
+        return None
+
+    def _clear_request(self, request: Mapping[str, Any]) -> None:
+        """Remove the key if it still carries `request["at"]` (a newer delete keeps it)."""
+        clear = getattr(self.guard, "clear_rebuild_request", None)
+        at = str(request.get("at"))
+        try:
+            if clear is not None:
+                clear(self.map_id, at)
+            self._clear_failed_at = None
+        except Exception:
+            self._clear_failed_at = at
+            log.exception("scene worker %s: clearing the rebuild request failed", self.map_id)
+
+    def _poll_rebuild_request(self) -> bool:
+        """Mid-run: act on a request. True when a rebuild generation was begun (state was reset)."""
+        if self._rebuild_gen is not None:
+            return False                # a rebuild is running; its commit clears what it answers
+        if self._clear_failed_at is not None:
+            self._clear_request({"at": self._clear_failed_at})
+        request = self._read_rebuild_request()
+        if request is None or not self._can_rebuild():
+            return False
+        if self._expected_version == 0:
+            # nothing saved yet: drop the in-memory fold and start over, no generation needed
+            self.engine = self.new_engine()
+            self._reset_fold_state()
+            self._clear_request(request)
+            log.info("scene worker %s: rebuild request on a never-saved graph: restarted the fold", self.map_id)
+            return True
+        if self._begin_rebuild(str(request.get("reason") or "nodes_deleted"), request) is not None:
+            return False                # begin_generation failed: asked again after the interval
+        self._reset_fold_state()
+        return True
+
+    def _begin_rebuild(self, reason: str, request: Optional[Mapping[str, Any]] = None) -> Optional[StepResult]:
+        """Begin a pending generation, switch to a fresh engine and announce it. None on success,
+        a BACKOFF result when begin_generation failed (the caller decides about the lock)."""
+        try:
+            gen = int(self.store.begin_generation(self.map_id))
+        except Exception as exc:
+            log.warning("scene worker %s: begin_generation failed: %s", self.map_id, exc)
+            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"begin_generation: {exc}")
+        # fold every leaf again, under the configured params, into the pending generation
+        self.engine = self.new_engine()
+        self._rebuild_gen, self._rebuild_saved = gen, False
+        self._rebuild_started_ms = self.now_ms()
+        self._rebuild_event_reason = reason
+        self._rebuild_request = request
+        self._event("rebuild_started", reason=reason)
+        if request is not None:
+            log.info("scene worker %s: rebuild requested (%s, %s nodes): generation %d",
+                     self.map_id, reason, request.get("nodes"), gen)
+        return None
+
+    def _reset_fold_state(self) -> None:
+        """Forget everything folded or buffered: the engine is new and every leaf is read again."""
+        self._buf.clear()
+        self._buffered.clear()
+        self._seen.clear()
+        self._pending.clear()
+        self._scan = None
+        self._dirty = None
+        self._oldest_unsaved_ms = None
+        self._leaves_since_publish = 0
+        self._cursor = self._candidate = ZERO_CURSOR
+        self._buf_since_ms = None
+        st = self.stats
+        st.unsaved_leaves = st.save_failures = st.fold_failures = 0
+        self._fail_stage, self._fail_count = "", 0
+        self._refresh_gauges()
 
     @staticmethod
     def _cursor_of(raw: Any) -> Optional[Cursor]:
@@ -714,9 +825,12 @@ class SceneWorker:
         self._expected_version = int(version)
         self.stats.version = int(version)
         self.stats.rebuilds += 1
-        self._event("rebuild_completed", reason="needs_rebuild", version=int(version),
+        self._event("rebuild_completed", reason=self._rebuild_event_reason, version=int(version),
                     duration_s=round(max(0, self.now_ms() - self._rebuild_started_ms) / 1000.0, 3))
         self._leaves_since_publish = 0
+        request, self._rebuild_request = self._rebuild_request, None
+        if request is not None:
+            self._clear_request(request)
         self._event("updated", version=int(version), leaves_folded=0, charts_changed=None)
         if self.publish is not None:
             try:

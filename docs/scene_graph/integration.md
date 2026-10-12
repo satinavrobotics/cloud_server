@@ -100,6 +100,40 @@ Dropped: "link cost from observation" (edge observations accrue per leaf edge; r
   the contract (supersedes this section where they differ).
 * New response fields (additive, optional): `min_width`, `chart_keys` of the route.
 
+### Planner wiring (`plan_route`, `SCENE_GRAPH_PLANNER_ENABLED`, default off)
+
+`MissionPlannerService.plan_route` tries the chart graph first when the flag is on and otherwise runs the legacy
+steps unchanged. The chart route needs all of: a placed robot, a stored graph, snaps within limits, a route, and one
+distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`, `planner_fallback: <reason>`).
+
+1. **Graph**: `SceneGraphStore.meta(map)["version"]` pins the version; `store.load(map, version)` runs in a thread and
+   is cached by `(map, version)` (LRU, `SCENE_GRAPH_CACHE_VERSIONS`). A cold load is waited for at most
+   `SCENE_GRAPH_LOAD_TIMEOUT_S`; it continues in the background (shared by later requests, fills the cache), the
+   request falls back (`load_timeout`).
+2. **Start/goal**: robot position through `_robot_xy_in_map`, then `snap` with `SCENE_GRAPH_START_SNAP_M` /
+   `SCENE_GRAPH_GOAL_SNAP_M`; refused by `snap_problem` (`start_`/`goal_` + `no_navigable_space` | `too_far` |
+   `crosses_blocked`).
+3. **Overlay**: active `blocked_graph_nodes` rows (none with `ignore_exclusions`) go through
+   `blocked_geometry.overlay(rows, MATCH_RADIUS_M)` into `Blocked(discs, segments)` and are passed to `route()`. The
+   same overlay is applied in the line-of-sight test of the simplification, so no shortened leg crosses it.
+4. **Route**: `route(start_key, goal_key, blocked)`. Lattice route runs anchor to anchor, so the point list is
+   `[snapped start] + route.nodes + [snapped goal]`. `None` -> `unreachable`, `MissingTiles` -> `missing_tiles`.
+5. **Waypoints**: `simplify` (line of sight = every half-step sample is a free lattice cell by `snap`, memoised per
+   cell; gap cap `SCENE_GRAPH_MAX_WAYPOINT_GAP_M`; a stub under 0.5 m at the end is merged) -> `build_waypoints` with
+   the nearest leaf within `SCENE_GRAPH_LEAF_SNAP_M` (`graph_db.k_nearest_neighbors`). `planned_path` = those ids
+   and `start_node_id`/`end_node_id` its ends. If any waypoint has no leaf or two share one: fallback
+   (`waypoints_without_distinct_leaf_ids`).
+6. **Budget**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (`plan_timeout`).
+
+Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `chart_keys`, `graph_version`,
+`planner_fallback` (only when the flag is on and the legacy planner ran). Reasons: `robot_unavailable`,
+`robot_not_placed`, `store_unavailable`, `store_timeout`, `store_error`, `no_graph`, `load_timeout`, `load_error`,
+`start_*`, `goal_*`, `unreachable`, `missing_tiles`, `waypoints_without_distinct_leaf_ids`, `plan_timeout`, `error`.
+
+Not done: `min_width` is reported but not yet compared with the planning robot's width; no version-lag threshold; the
+first-node-behind test (H5) is not applied; `planner_fallback` is not yet exposed by `PlanResponse` in `main.py`;
+the mission-planner compose service needs `MINIO_*` secrets for the store.
+
 ## Order and status (2026-10-12)
 
 * **Done, engine-independent (LACI)**: ingest adapter, stamp rule and per-session clock, stable stamp, worker, lock and
@@ -294,3 +328,32 @@ Applied:
    check then flags legs within `HALF_WIDTH_M` of that short segment, which includes the robot's own start region;
    a detour leaving sideways from a robot that stopped under 0.5 m from the obstacle is also refused until the
    block expires or is cleared. Using the costmap's lethal cells instead is not proposed.
+
+## Rebuild request and per-map switch (2026-10-12)
+
+Both live in the map object's `status` (jsonb), read by graph-builder through `PgGuard` (`scene_guard.py`).
+
+**`status.scene_graph_needs_rebuild`** `{at, reason: "nodes_deleted", nodes}`: set by `maps.delete_nodes` when
+`SCENE_GRAPH_WORKER_ENABLED` is on. The worker looks it up once at start and then at most every
+`WorkerConfig.rebuild_check_s` (30 s) per map. On a request it does what a params-hash mismatch does:
+`begin_generation` + `new_engine`, cursor back to zero, every leaf refolded into the pending generation, readers keep
+the old version until `commit_generation`. `REBUILD_STARTED/COMPLETED` carry `reason: "nodes_deleted"` (`needs_rebuild`
+stays the params-hash reason). After the commit the key is removed only if its `at` still equals the one rebuilt for
+(`UPDATE ... WHERE status->key->>'at' = at`), so a delete that landed during the rebuild survives and causes one more
+rebuild. A failed clear is retried at the next check. Notes: a graph that was never saved is simply restarted in place
+(no generation); a rebuild already running for a params change also answers the request; a crash mid-rebuild leaves
+the key set, so the restart rebuilds again. The rebuild is a full refold (the delete-local refold of "Scale design" is
+still CIMBI's `refold`), and unsaved folds of the old engine are discarded. The clear does not `NOTIFY` the object
+watchers (nothing watches this key).
+
+**`status.scene_graph_enabled`**: default (key absent) follows `SCENE_GRAPH_WORKER_ENABLED`. A JSON `false` excludes
+the map: the runner skips it (a running worker is dropped within two discoveries, about 2 minutes) and reports
+`MAP.SCENE_GRAPH_DISABLED_SKIPPED {reason: "map_not_enabled"}` at most once an hour per map. Only `false` counts, and
+`true` does not switch a map on while the global flag is off (the worker is not started then). Set it with SQL, e.g.
+`UPDATE mapobjectv1 SET status = status || '{"scene_graph_enabled": false}' WHERE name = '<map>'`; there is no API
+for it yet. The flags are read in the runner's discovery query (every 60 s, one query for all maps); a failed query
+keeps the previous answer.
+
+**Worker-disabled event at startup: not done.** `MAP.SCENE_GRAPH_DISABLED_SKIPPED` requires `map_name`, so a
+service-level "worker off" would be one event per map on every restart, and it would need a registry query and
+event-DB write from a feature that is off. The existing startup log and the per-map event above cover it.

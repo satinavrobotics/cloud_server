@@ -14,8 +14,9 @@ Synchronous (psycopg 3, as the worker is). The connection factory is injected so
 testable without a database; `connect_from_conninfo` is the production factory.
 """
 import hashlib
+import json
 import logging
-from typing import Any, Callable, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 log = logging.getLogger("GraphBuilderService.scene_guard")
 
@@ -25,6 +26,21 @@ LIFECYCLE_SQL = "SELECT lifecycle FROM mapobjectv1 WHERE name = %s AND lifecycle
 # with the map prefix is a map only when it has a live row here.
 REGISTERED_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
                   "AND lifecycle <> 'DELETED' AND lifecycle <> 'DELETING'")
+# Status keys of the map object (jsonb `status`), the contract with packages/api/maps.py:
+# `scene_graph_needs_rebuild` is set by the node-delete API (== maps.SCENE_GRAPH_NEEDS_REBUILD_KEY,
+# pinned by a test; graph-builder's image does not carry packages.api) and cleared here;
+# `scene_graph_enabled` is the per-map switch (docs/scene_graph/integration.md "Per-map switch").
+NEEDS_REBUILD_KEY = "scene_graph_needs_rebuild"
+ENABLED_KEY = "scene_graph_enabled"
+REBUILD_REQUEST_SQL = ("SELECT status->%s FROM mapobjectv1 WHERE name = %s "
+                       "AND lifecycle <> 'DELETED' AND lifecycle <> 'DELETING'")
+# Compare-and-clear: only the request this worker rebuilt for (`at`) is removed.
+CLEAR_REBUILD_SQL = ("UPDATE mapobjectv1 SET status = status - %s WHERE name = %s "
+                     "AND status->%s->>'at' = %s")
+# Maps explicitly switched off. Only a JSON `false` counts; a missing key, true or junk follows
+# the global setting (the worker only runs when SCENE_GRAPH_WORKER_ENABLED is on).
+DISABLED_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
+                "AND lifecycle <> 'DELETED' AND status->%s = 'false'::jsonb")
 
 
 def lock_key(map_id: str, prefix: str = LOCK_PREFIX) -> int:
@@ -124,6 +140,53 @@ class PgGuard:
             self._close(conn)
         live = {str(r[0]) for r in rows}
         return [n for n in names if n in live]
+
+    def disabled_maps(self, candidates: Iterable[str]) -> set:
+        """The candidates whose `status.scene_graph_enabled` is false. RAISES when the registry
+        cannot be asked (the caller keeps its previous answer)."""
+        names = sorted({c for c in candidates if isinstance(c, str) and c})
+        if not names:
+            return set()
+        conn = self._connect()
+        try:
+            rows = conn.execute(DISABLED_SQL, (names, ENABLED_KEY)).fetchall()
+        finally:
+            self._close(conn)
+        return {str(r[0]) for r in rows}
+
+    def rebuild_request(self, map_id: str) -> Optional[Dict[str, Any]]:
+        """`status.scene_graph_needs_rebuild` ({at, reason, nodes}) of a live map, else None.
+        RAISES when the query fails (the worker logs it and asks again later)."""
+        conn = self._conns.get(map_id)
+        transient = conn is None
+        try:
+            if transient:
+                conn = self._connect()
+            row = conn.execute(REBUILD_REQUEST_SQL, (NEEDS_REBUILD_KEY, map_id)).fetchone()
+        finally:
+            if transient and conn is not None:
+                self._close(conn)
+        value = row[0] if row else None
+        if isinstance(value, str):          # a driver without jsonb decoding
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+        return value if isinstance(value, dict) and value.get("at") else None
+
+    def clear_rebuild_request(self, map_id: str, at: str) -> bool:
+        """Remove the request when it still carries `at` (a delete that arrived during the rebuild
+        wrote a newer one, which stays). True when a row was changed."""
+        conn = self._conns.get(map_id)
+        transient = conn is None
+        try:
+            if transient:
+                conn = self._connect()
+            cur = conn.execute(CLEAR_REBUILD_SQL, (NEEDS_REBUILD_KEY, map_id, NEEDS_REBUILD_KEY, str(at)))
+            return bool(getattr(cur, "rowcount", 0))
+        finally:
+            if transient and conn is not None:
+                self._close(conn)
 
     def close(self) -> None:
         for map_id in list(self._conns):

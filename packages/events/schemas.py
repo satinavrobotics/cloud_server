@@ -436,7 +436,8 @@ class SceneGraphFoldFailed(Payload):
 
 class SceneGraphRebuild(Payload):
     """MAP.SCENE_GRAPH_REBUILD_STARTED / _COMPLETED: the scene graph is rebuilt from the leaves
-    (`reason`: needs_rebuild, backfill, manual). COMPLETED carries `version` and `duration_s`."""
+    (`reason`: `needs_rebuild` = params hash changed, `nodes_deleted` = request set by the node
+    delete, backfill, manual; an open set). COMPLETED carries `version` and `duration_s`."""
     map_name: str
     reason: str
     version: Optional[int] = None

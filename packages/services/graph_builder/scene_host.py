@@ -131,11 +131,24 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
             new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,),
             on_event=(lambda kind, payload: sink(map_id, kind, payload)) if sink else None)
 
-    def list_maps() -> list:
-        """MinIO buckets that are live rows of the maps registry: a bucket alone is not a map."""
-        return guard.registered_maps(service.image_db.list_maps())
+    switched_off: set = set()
 
-    runner = scene_runner.SceneRunner(list_maps, make_worker, on_event=sink)
+    def list_maps() -> list:
+        """MinIO buckets that are live rows of the maps registry: a bucket alone is not a map.
+        The per-map switch is read in the same discovery (one query), for `skip_reason`."""
+        maps = guard.registered_maps(service.image_db.list_maps())
+        try:
+            off = guard.disabled_maps(maps)
+            switched_off.clear()
+            switched_off.update(off)
+        except Exception:  # noqa: BLE001  an unanswered question keeps the previous answer
+            log.exception("scene graph: per-map switch lookup failed; keeping the previous answer")
+        return maps
+
+    def skip_reason(map_id: str) -> Optional[str]:
+        return "map_not_enabled" if map_id in switched_off else None
+
+    runner = scene_runner.SceneRunner(list_maps, make_worker, on_event=sink, skip_reason=skip_reason)
     return SceneWorkerHost(runner, guard)
 
 

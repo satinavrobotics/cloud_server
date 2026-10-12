@@ -186,3 +186,27 @@ def test_non_map_bucket_is_never_listed_for_a_worker():
     host = sh.build_host(svc, None, conninfo="dbname=x")
     host.guard.registered_maps = lambda c: [m for m in c if m == "real"]    # the registry has `real` only
     assert host.runner.list_maps() == ["real"]
+
+
+def test_per_map_switch_feeds_the_runner_skip_reason_and_event():
+    pytest.importorskip("packages.scene_graph.store")
+    from types import SimpleNamespace
+    svc = SimpleNamespace(topomap_db=object(), image_db=SimpleNamespace(list_maps=lambda: ["a", "b"]),
+                          graph_db=object(), update_publisher=object())
+    host = sh.build_host(svc, None, conninfo="dbname=x")
+    host.guard.registered_maps = lambda c: list(c)
+    answer = {"off": {"b"}}
+    def disabled(c):
+        if answer["off"] is None:
+            raise RuntimeError("pg down")
+        return set(answer["off"]) & set(c)
+    host.guard.disabled_maps = disabled
+    r = host.runner
+    assert r.list_maps() == ["a", "b"]
+    assert r.skip_reason("a") is None and r.skip_reason("b") == "map_not_enabled"
+    answer["off"] = None                               # lookup fails: previous answer is kept
+    r.list_maps()
+    assert r.skip_reason("b") == "map_not_enabled"
+    answer["off"] = set()                              # switched back on
+    r.list_maps()
+    assert r.skip_reason("b") is None
