@@ -195,6 +195,7 @@ def test_late_landing_costmap_found_through_margin():
     r.drain()
     # a node whose costmap became visible late, stored_ms below the committed cursor but within margin
     r.source.add(make_node("late", 80_000))
+    r.clock.advance(61)                     # the full margin is re-read every replay_recheck_s
     r.drain()
     assert r.engine.batches == [["a"], ["late"]]
     # outside the margin (60 s) it is not found
@@ -644,7 +645,7 @@ def test_matching_params_hash_does_not_rebuild():
 def test_events_updated_and_fold_failed_with_consecutive_count():
     events = []
     cfg = sw.WorkerConfig(min_save_interval_s=0)
-    r = Rig(_nodes(2), cfg=cfg, on_event=lambda k, p: events.append((k, p)))
+    r = Rig(_nodes(1), cfg=cfg, on_event=lambda k, p: events.append((k, p)))   # one leaf: no bisect
     real = r.engine.fold_many
     state = {"n": 0}
 
@@ -661,7 +662,7 @@ def test_events_updated_and_fold_failed_with_consecutive_count():
     assert failed[0]["stage"] == "fold" and "solver blew up" in failed[0]["detail"]
     r.drain()
     upd = [p for k, p in events if k == "updated"]
-    assert len(upd) == 1 and upd[0]["leaves_folded"] == 2 and upd[0]["charts_changed"] == 2
+    assert len(upd) == 1 and upd[0]["leaves_folded"] == 1 and upd[0]["charts_changed"] == 1
     assert r.worker.stats.fold_failures == 0
 
 
@@ -702,7 +703,8 @@ class RequestGuard(FakeGuard):
 def _request_rig(nodes=(), request=None, version=5, check_s=30.0, **kw):
     events = []
     store = FakeStore(version=version, meta={"params_hash": "same", "generation": 1})
-    cfg = sw.WorkerConfig(expected_params_hash="same", min_save_interval_s=0, rebuild_check_s=check_s)
+    cfg = sw.WorkerConfig(expected_params_hash="same", min_save_interval_s=0, rebuild_check_s=check_s,
+                          rebuild_debounce_s=0)
     fresh = FakeEngine()
     fresh.version = 0
     engines = [fresh]

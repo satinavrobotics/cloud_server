@@ -44,6 +44,7 @@ class RunnerConfig:
     max_maps: int = 64                  # workers kept in memory at once (peak memory bound)
     skip_event_interval_s: float = 3600.0   # per map: how often MAP.SCENE_GRAPH_DISABLED_SKIPPED repeats
     slow_step_s: float = 0.0            # warn when one step of a map takes longer (0: off)
+    not_owner_retry_s: float = 30.0     # a map whose lock another replica holds is asked for this rarely
 
 
 class SceneRunner:
@@ -67,6 +68,8 @@ class SceneRunner:
         self._known: List[str] = []
         self._discovered_at: Optional[float] = None
         self.last_state: Dict[str, str] = {}
+        self._last_step_at: Dict[str, float] = {}
+        self.loops = 0
 
     @property
     def workers(self) -> Dict[str, Any]:
@@ -101,6 +104,24 @@ class SceneRunner:
         finally:
             self.close()
 
+    def snapshot(self) -> Dict[str, Any]:
+        """Runner state for /health: {maps: {map: {state, last_step_age_s, ...}}}."""
+        now = self.now()
+        maps: Dict[str, Any] = {}
+        for map_id in list(self._known):
+            at = self._last_step_at.get(map_id)
+            entry: Dict[str, Any] = {"state": self.last_state.get(map_id),
+                                     "last_step_age_s": None if at is None else round(max(0.0, now - at), 1)}
+            worker = self._workers.get(map_id)
+            stats = getattr(worker, "stats", None)
+            if stats is not None:
+                entry.update(version=getattr(stats, "version", None), pending=getattr(stats, "pending", None),
+                             buffered=getattr(stats, "buffered_leaves", None),
+                             version_lag_s=round(getattr(stats, "version_lag_s", 0.0), 1),
+                             skipped=dict(getattr(stats, "skipped", {}) or {}))
+            maps[map_id] = entry
+        return {"maps": maps, "workers": len(self._workers)}
+
     def close(self) -> None:
         for map_id in list(self._workers):
             self._drop(map_id)
@@ -127,6 +148,7 @@ class SceneRunner:
             self._drop(gone)
             self._due.pop(gone, None)
             self.last_state.pop(gone, None)
+            self._last_step_at.pop(gone, None)
             self._capped.discard(gone)
         for present in maps:
             self._absent.pop(present, None)
@@ -159,15 +181,17 @@ class SceneRunner:
         cfg = self.config
         worker = self._workers.get(map_id)
         if worker is None:
-            if len(self._workers) >= cfg.max_maps:
+            # a worker that does not hold its map's lock (NOT_OWNER) holds no engine: not counted
+            active = sum(1 for m in self._workers if self.last_state.get(m) != sw.NOT_OWNER)
+            if active >= cfg.max_maps:
                 self._due[map_id] = t + cfg.backoff_s
                 if map_id not in self._capped:       # once per map, not once per retry
                     self._capped.add(map_id)
                     log.warning("scene runner %s: not started, %d workers already running "
-                                "(max_maps)", map_id, len(self._workers))
+                                "(max_maps)", map_id, active)
                     self._report(map_id, "fold_failed", {
                         "stage": "max_maps", "consecutive": 1,
-                        "detail": f"{len(self._workers)} workers running (max_maps {cfg.max_maps}): "
+                        "detail": f"{active} workers running (max_maps {cfg.max_maps}): "
                                   f"this map is not ingested"})
                 return
             try:
@@ -186,6 +210,7 @@ class SceneRunner:
             self._due[map_id] = t + cfg.backoff_s
             return
         took = self.now() - started
+        self._last_step_at[map_id] = self.now()
         if cfg.slow_step_s and took > cfg.slow_step_s:
             log.warning("scene runner %s: step took %.1fs (%d leaves folded)", map_id, took,
                         getattr(result, "folded", 0))
@@ -206,7 +231,9 @@ class SceneRunner:
             self._due[map_id] = t
         elif state == sw.IDLE:
             self._due[map_id] = t + (getattr(result, "sleep_s", 0.0) or cfg.idle_s)
-        elif state in (sw.BACKOFF, sw.NOT_OWNER):
+        elif state == sw.NOT_OWNER:
+            self._due[map_id] = t + max(cfg.not_owner_retry_s, getattr(result, "sleep_s", 0.0) or 0.0)
+        elif state == sw.BACKOFF:
             self._due[map_id] = t + max(cfg.backoff_s, getattr(result, "sleep_s", 0.0) or 0.0)
         else:                                   # terminal: release the lock, retry later
             self._drop(map_id)

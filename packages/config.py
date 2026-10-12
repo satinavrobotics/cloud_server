@@ -581,3 +581,25 @@ SCENE_GRAPH_BATCH_BUDGET_S = float(os.getenv("SCENE_GRAPH_BATCH_BUDGET_S", "10.0
 SCENE_GRAPH_IDLE_S = float(os.getenv("SCENE_GRAPH_IDLE_S", "2.0"))
 SCENE_GRAPH_IDLE_MAX_S = float(os.getenv("SCENE_GRAPH_IDLE_MAX_S", "30.0"))
 SCENE_GRAPH_LIFECYCLE_CHECK_S = float(os.getenv("SCENE_GRAPH_LIFECYCLE_CHECK_S", "5.0"))
+# Worker robustness knobs (docs/scene_graph/runbook.md). MAX_MAPS: workers kept in memory at once.
+# SAVE_EVERY_*: a snapshot is saved after this many folded leaves / this many seconds (still never
+# faster than PUBLISH_INTERVAL_S). REPLAY_MARGIN_S: how far below the furthest node a restart
+# re-reads (late visible costmaps); the whole margin is re-read again every REPLAY_RECHECK_S.
+SCENE_GRAPH_MAX_MAPS = int(os.getenv("SCENE_GRAPH_MAX_MAPS", "64"))
+SCENE_GRAPH_SAVE_EVERY_LEAVES = int(os.getenv("SCENE_GRAPH_SAVE_EVERY_LEAVES", "50"))
+SCENE_GRAPH_SAVE_EVERY_S = float(os.getenv("SCENE_GRAPH_SAVE_EVERY_S", "30.0"))
+SCENE_GRAPH_REPLAY_MARGIN_S = float(os.getenv("SCENE_GRAPH_REPLAY_MARGIN_S", "60.0"))
+SCENE_GRAPH_REPLAY_RECHECK_S = float(os.getenv("SCENE_GRAPH_REPLAY_RECHECK_S", "60.0"))
+# Rebuilds: a rebuild is committed at its next save once older than REBUILD_MAX_AGE_S even if uploads
+# keep arriving; folds inside a rebuild are fixed batches of REBUILD_BATCH leaves; a node delete
+# starts a rebuild only after REBUILD_DEBOUNCE_S without a newer delete.
+SCENE_GRAPH_REBUILD_MAX_AGE_S = float(os.getenv("SCENE_GRAPH_REBUILD_MAX_AGE_S", "900.0"))
+SCENE_GRAPH_REBUILD_BATCH = int(os.getenv("SCENE_GRAPH_REBUILD_BATCH", "48"))
+SCENE_GRAPH_REBUILD_DEBOUNCE_S = float(os.getenv("SCENE_GRAPH_REBUILD_DEBOUNCE_S", "30.0"))
+# Engine load that fails deterministically this many times in a row falls into a rebuild.
+SCENE_GRAPH_LOAD_FAIL_LIMIT = int(os.getenv("SCENE_GRAPH_LOAD_FAIL_LIMIT", "3"))
+# One worker step stops reading nodes after this long (0: unbounded); a step slower than
+# SLOW_STEP_S is logged (0: off); STATS_LOG_S: one stats line per map this often (0: off).
+SCENE_GRAPH_STEP_BUDGET_S = float(os.getenv("SCENE_GRAPH_STEP_BUDGET_S", "0.0"))
+SCENE_GRAPH_SLOW_STEP_S = float(os.getenv("SCENE_GRAPH_SLOW_STEP_S", "30.0"))
+SCENE_GRAPH_STATS_LOG_S = float(os.getenv("SCENE_GRAPH_STATS_LOG_S", "60.0"))

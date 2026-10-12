@@ -127,11 +127,12 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_periodic_cleanup())
     asyncio.create_task(_periodic_reject_flush())
+    global _scene_host
     scene_host = None
     if SCENE_GRAPH_WORKER_ENABLED:
         try:
             from .scene_host import start_scene_worker
-            scene_host = start_scene_worker(service, asyncio.get_running_loop())
+            scene_host = _scene_host = start_scene_worker(service, asyncio.get_running_loop())
         except Exception as e:  # noqa: BLE001
             logging.error(f"Scene graph worker not started: {type(e).__name__}: {e}")
     logging.info("🚀 Graph Builder Service started")
@@ -139,6 +140,7 @@ async def lifespan(app: FastAPI):
     yield
 
     if scene_host is not None:
+        _scene_host = None
         try:
             await asyncio.to_thread(scene_host.stop)
         except Exception as e:  # noqa: BLE001
@@ -147,6 +149,8 @@ async def lifespan(app: FastAPI):
         service.disconnect_mqtt()
     logging.info("👋 Graph Builder Service shutting down")
 
+
+_scene_host = None
 
 app = FastAPI(
     title="Graph Builder Service",
@@ -176,6 +180,17 @@ async def root():
     )
 
 
+def _scene_graph_health() -> dict:
+    """Runner state of the scene-graph worker (running, per-map state / last step age), or {}."""
+    host = _scene_host
+    if host is None:
+        return {"scene_graph_worker": {"enabled": bool(SCENE_GRAPH_WORKER_ENABLED), "running": False}}
+    try:
+        return {"scene_graph_worker": {"enabled": True, **host.state()}}
+    except Exception as exc:  # noqa: BLE001
+        return {"scene_graph_worker": {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}}
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -188,7 +203,8 @@ async def health_check():
             "graph_db": health_details["graph_db"],
         },
         details={
-            "mqtt_connected": health_details["mqtt_connected"]
+            "mqtt_connected": health_details["mqtt_connected"],
+            **_scene_graph_health(),
         }
     )
 

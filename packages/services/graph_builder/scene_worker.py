@@ -68,6 +68,7 @@ Interface assumed of the store: `store.save(map_id, sg, dirty, *, expected_versi
 generation])` raising `SaveFenced` / the configured `fence_errors` on mismatch; `store.meta()`
 carrying `version`, `generation`, `params_hash` and optionally `cursor`.
 """
+import inspect
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
@@ -94,6 +95,7 @@ NEEDS_REBUILD = "needs_rebuild"     # terminal for the worker: params hash / gen
 TERMINAL = (DELETING, FENCED, NEEDS_REBUILD)
 
 SKIP_PNG_EXPIRED = "png_missing_expired"
+SKIP_FOLD_ERROR = "fold_error"        # a leaf the engine cannot fold (bisected and quarantined)
 
 
 class SaveFenced(Exception):
@@ -162,6 +164,31 @@ class WorkerConfig:
     batch_max_leaves: int = 1_000_000       # ... at most this many per fold_many ...
     # ... or once the oldest has waited min_save_interval_s (the publish interval)
     batch_budget_s: float = 0.0             # warn when one fold takes longer (0: off)
+    # Replay: the full margin (`replay_margin_ms` below the furthest node) is re-read at start, after
+    # a failure, and at most every `replay_recheck_s` (a costmap that became visible late). Every
+    # other poll re-reads only `poll_margin_ms` (rows committed out of order within seconds).
+    replay_recheck_s: float = 60.0
+    poll_margin_ms: int = 5_000
+    # Rebuild (finding 1/2): a rebuild is committed once its scan reached the head of the nodes; a
+    # rebuild older than `rebuild_max_age_s` is committed at its next save even when the scan has
+    # not (steady uploads, a slow fold). Folds inside a rebuild are fixed batches of `rebuild_batch`
+    # leaves (no time-based flush) until the head is reached. A delete-triggered rebuild waits for
+    # `rebuild_debounce_s` without a newer request (deletes in bursts coalesce).
+    rebuild_max_age_s: float = 900.0
+    rebuild_batch: int = 48
+    rebuild_debounce_s: float = 30.0
+    # engine load that fails deterministically this many times in a row falls into a rebuild (or
+    # NEEDS_REBUILD when the worker cannot rebuild)
+    load_fail_limit: int = 3
+    # a fold that fails twice in a row with a batch of several leaves is bisected to the poison leaf
+    poison_single_limit: int = 5            # a lone leaf failing this many times in a row is quarantined
+    # per step: stop reading nodes after this much time / this many PNG re-asks (0: unbounded)
+    step_budget_s: float = 0.0
+    png_retries_per_step: int = 20
+    stats_log_s: float = 60.0               # one stats line per map this often (0: off)
+    updated_event_interval_s: float = 60.0  # 'updated' events per map at most this often
+    # a cursor-only persist (skip-only progress) when the cursor is this far ahead of the stored one
+    cursor_persist_margin_ms: Optional[int] = None    # None: replay_margin_ms
 
 
 @dataclass
@@ -250,7 +277,8 @@ class SceneWorker:
                  on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
                  fence_errors: Tuple[type, ...] = (),
                  engine_factory: Optional[Callable[[int], Any]] = None,
-                 loaded_version: Optional[int] = None) -> None:
+                 loaded_version: Optional[int] = None,
+                 mono_ms: Optional[Callable[[], int]] = None) -> None:
         if engine is None and engine_factory is None:
             raise ValueError("SceneWorker needs an engine or an engine_factory")
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
@@ -259,6 +287,9 @@ class SceneWorker:
         self.stats = stats if stats is not None else SceneWorkerStats()
         self.config = config or WorkerConfig()
         self.now_ms, self.publish = now_ms, publish
+        # every interval below (png expiry, save floor, lifecycle, debounce) is measured on this
+        # clock: monotonic in production (`mono_ms`), the injected `now_ms` when none is given
+        self._mono: Callable[[], int] = mono_ms if mono_ms is not None else now_ms
         self.load_tiles, self.on_needs_rebuild = load_tiles, on_needs_rebuild
         self.clock = clock if clock is not None else scene_clock.SessionClock()
         self.state = ""                     # last terminal state, "" while running
@@ -295,6 +326,23 @@ class SceneWorker:
         self._leaves_since_publish = 0
         self._fail_stage = ""
         self._fail_count = 0
+        self._full_replay = True                     # re-read the whole margin on the next poll
+        self._last_full_replay_ms = 0
+        self._outage_since: Optional[int] = None     # PNG fetches raising since (excluded from expiry)
+        self._load_failures = 0                      # consecutive deterministic engine-load failures
+        self._load_gave_up = False
+        self._quarantined: List[str] = []            # keys the last fold isolated as poison
+        self._stored_cursor: Cursor = ZERO_CURSOR    # the cursor the store holds (sg_meta)
+        self._resume_cursor: Optional[Cursor] = None # set by a rebuild that resumed a pending generation
+        self._request_seen: Optional[str] = None     # `at` of the delete request being debounced
+        self._request_seen_ms = 0
+        self._warned_cannot_rebuild = False
+        self._last_updated_event_ms: Optional[int] = None
+        self._leaves_since_event = 0
+        self._last_stats_ms: Optional[int] = None
+        self._last_step_ms: Optional[int] = None     # when the worker last completed a step
+        self.last_result_state = ""
+        self._head = False                           # this step's scan reached the newest node
 
     # ------------------------------------------------------------------ public
 
@@ -321,6 +369,34 @@ class SceneWorker:
         return res
 
     def step(self) -> StepResult:
+        res = self._step()
+        self.last_result_state = res.state
+        self._last_step_ms = self._mono()
+        self._log_stats()
+        return res
+
+    def last_step_age_s(self) -> Optional[float]:
+        return None if self._last_step_ms is None else max(0.0, (self._mono() - self._last_step_ms) / 1000.0)
+
+    def _log_stats(self) -> None:
+        every = self.config.stats_log_s
+        if not every:
+            return
+        now = self._mono()
+        if self._last_stats_ms is None:
+            self._last_stats_ms = now
+            return
+        if now - self._last_stats_ms < every * 1000:
+            return
+        self._last_stats_ms = now
+        st = self.stats
+        log.info("scene worker %s: stats state=%s folded=%d skipped=%s pending=%d buffered=%d "
+                 "version=%d lag=%.0fs saves=%d save_failures=%d source_errors=%d rebuilds=%d "
+                 "rebuilding=%s", self.map_id, self.last_result_state, st.folded, dict(st.skipped),
+                 len(self._pending), st.buffered_leaves, st.version, st.version_lag_s, st.saves,
+                 st.save_failures, st.source_errors, st.rebuilds, self._rebuild_gen is not None)
+
+    def _step(self) -> StepResult:
         if self.state in TERMINAL:
             return StepResult(self.state)
         cfg = self.config
@@ -341,20 +417,26 @@ class SceneWorker:
                 return res
         # 2. pull (not while a full batch is already waiting: fold that first)
         more = False
+        t_step = self._mono()
         skipped, fetch_error = self._retry_pending()
-        if fetch_error is None and self._leaf_count() < cfg.batch_max_leaves:
+        if fetch_error is None and self._leaf_count() < self._batch_max():
             since = self._scan if self._scan is not None else (
-                max(0, self._candidate[0] - cfg.replay_margin_ms), "")
+                max(0, self._candidate[0] - self._margin_ms()), "")
             try:
                 nodes = list(self.source.costmap_nodes_since(self.map_id, since[0], since[1], cfg.batch_size))
             except Exception as exc:
                 self.stats.source_errors += 1
+                self._full_replay = True
                 log.warning("scene worker %s: source failed: %s", self.map_id, exc)
                 return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"source: {exc}")
             more = len(nodes) >= cfg.batch_size
             self._scan = self._order(nodes[-1]) if (more and nodes) else None
             # 3. adapt into the buffer
-            for node in nodes:
+            for i, node in enumerate(nodes):
+                if (cfg.step_budget_s and i and self._mono() - t_step > cfg.step_budget_s * 1000):
+                    # out of time for this step: continue behind the last node handled
+                    self._scan, more = self._order(nodes[i - 1]), True
+                    break
                 try:
                     outcome = self._adapt(node)
                 except _FetchError as exc:
@@ -368,33 +450,48 @@ class SceneWorker:
         if fetch_error is not None:
             self.stats.source_errors += 1
             self._scan = None
+            self._full_replay = True
         if self._leaf_count() and self._buf_since_ms is None:
-            self._buf_since_ms = self.now_ms()
+            self._buf_since_ms = self._mono()
         self._release_leading_skips()
+        # a rebuild folds fixed batches; at the head of the nodes the remainder is flushed
+        self._head = (not more) and fetch_error is None
         # 4. fold once per batch
         folded = 0
+        self._quarantined = []
         batch = self._take_batch()
         if batch:
             err = self._keep_stamps()
             if err is None:
-                err = self._fold([e.leaf for e in batch])
+                err = self._fold([e.leaf for e in batch if e.leaf is not None])
             if err is not None:
                 self._scan = None      # re-read from the margin once the cause is gone
+                self._full_replay = True
                 return err
             folded = len(batch)
+            n_leaves = sum(1 for e in batch if e.leaf is not None) - len(self._quarantined)
             self._pop(batch)
+            if self._quarantined:
+                dead = set(self._quarantined)
+                self.stats.skipped[SKIP_FOLD_ERROR] += len(dead)
             self.stats.batches += 1
-            self.stats.folded += folded
-            self.stats.unsaved_leaves += folded
-            self._leaves_since_publish += folded
-            if self._oldest_unsaved_ms is None:
-                self._oldest_unsaved_ms = self.now_ms()
+            self.stats.folded += n_leaves
+            self.stats.unsaved_leaves += n_leaves
+            self._leaves_since_publish += n_leaves
+            self._leaves_since_event += n_leaves
+            if self._oldest_unsaved_ms is None and n_leaves:
+                self._oldest_unsaved_ms = self._mono()
             self._release_leading_skips()
         # 5-7. save (rate limited), then advance the cursor
         idle = not more and not folded and not skipped      # a re-read of the margin alone is idle
         waiting = self._leaf_count() > 0
         saved: Optional[int] = None
-        if self._dirty is not None and self._due(idle=idle):
+        rebuilding = self._rebuild_gen is not None
+        # a rebuild that reached the head (or is past its max age) saves what it folded, then commits
+        force_commit = rebuilding and self._rebuild_overdue()
+        at_head = rebuilding and self._head and not self._pending and fetch_error is None
+        if self._dirty is not None and (self._due(idle=idle)
+                                        or ((at_head or force_commit) and self._due(idle=False, force=True))):
             res = self._save()
             if res is not None:
                 res.folded, res.skipped = folded, skipped
@@ -402,8 +499,12 @@ class SceneWorker:
             saved = self.stats.version
         elif self._dirty is None:
             self._commit()      # nothing unsaved: terminal skips alone move the cursor
-        if (self._rebuild_gen is not None and not more and not folded and not waiting
-                and self._dirty is None and fetch_error is None and not self._pending):
+            res = self._persist_cursor()
+            if res is not None:
+                return res
+        if rebuilding and self._dirty is None and fetch_error is None and (
+                (at_head and (self._rebuild_saved or (not folded and not waiting)))
+                or (force_commit and self._rebuild_saved)):
             res = self._commit_rebuild()
             if res is not None:
                 return res
@@ -422,17 +523,76 @@ class SceneWorker:
             if self._pending:                # a PNG is due again soon: do not oversleep it
                 sleep = min(sleep, max(cfg.png_retry_s, 0.05))
             if waiting and self._buf_since_ms is not None:     # a trickle: wake when its wait is up
-                left = self._batch_wait_s() - (self.now_ms() - self._buf_since_ms) / 1000.0
+                left = self._batch_wait_s() - (self._mono() - self._buf_since_ms) / 1000.0
                 sleep = min(sleep, max(left, 0.05))
         return StepResult(state, folded=folded, skipped=skipped, version=saved, sleep_s=sleep)
 
     # ------------------------------------------------------------------ internals
 
+    def _margin_ms(self) -> int:
+        """How far below the furthest node this poll starts. The whole replay margin is re-read at
+        start, after a failure and every `replay_recheck_s`; other polls re-read a few seconds only,
+        so an idle map does not re-read the last minute on every poll (finding 12)."""
+        cfg, now = self.config, self._mono()
+        if self._full_replay or now - self._last_full_replay_ms >= cfg.replay_recheck_s * 1000:
+            self._full_replay, self._last_full_replay_ms = False, now
+            return cfg.replay_margin_ms
+        return min(cfg.poll_margin_ms, cfg.replay_margin_ms)
+
+    def _batch_max(self) -> int:
+        cfg = self.config
+        if self._rebuild_gen is not None and cfg.rebuild_batch > 0:
+            return min(cfg.batch_max_leaves, cfg.rebuild_batch)
+        return cfg.batch_max_leaves
+
+    def _rebuild_overdue(self) -> bool:
+        cfg = self.config
+        return (self._rebuild_gen is not None and cfg.rebuild_max_age_s > 0
+                and self._mono() - self._rebuild_started_ms > cfg.rebuild_max_age_s * 1000)
+
+    def _persist_cursor(self) -> Optional[StepResult]:
+        """Skip-only progress (nothing to save) moves the cursor in memory only; make it durable
+        once it is more than the persist margin ahead of the stored one. The store moves
+        `meta.cursor` in place when only the cursor changed (same version), so this is cheap."""
+        cfg = self.config
+        if self._rebuild_gen is not None or not self._started or self._expected_version <= 0:
+            return None
+        margin = cfg.cursor_persist_margin_ms if cfg.cursor_persist_margin_ms is not None \
+            else cfg.replay_margin_ms
+        target = self._durable(self._candidate)
+        if target[0] - self._stored_cursor[0] <= margin:
+            return None
+        if self._last_save_ms is not None and self._mono() - self._last_save_ms < cfg.min_save_interval_s * 1000:
+            return None
+        if self.engine is None:
+            return None
+        res = self._lifecycle(force=True, where="map deleting before cursor persist")
+        if res is not None:
+            return res
+        kwargs: Dict[str, Any] = {}
+        if self._generation is not None:
+            kwargs["generation"] = self._generation
+        try:
+            empty = Dirty(bbox=None, changed=[], retired={}, links=[], watermark=self._watermark)
+            version = self.store.save(self.map_id, self.engine, empty,
+                                      expected_version=self._expected_version, cursor=target, **kwargs)
+        except (SaveFenced,) + self.fence_errors as exc:
+            return self._terminal(FENCED, str(exc) or "cursor persist fenced")
+        except Exception as exc:  # noqa: BLE001  cheap, optional: the next attempt retries
+            log.warning("scene worker %s: cursor persist failed: %s", self.map_id, exc)
+            self._last_save_ms = self._mono()
+            return None
+        self._stored_cursor = target
+        self._last_save_ms = self._mono()
+        if version is not None and int(version) != self._expected_version:
+            self._expected_version = self.stats.version = int(version)
+        return None
+
     def _lifecycle(self, force: bool, where: str) -> Optional[StepResult]:
         """The map's lifecycle and (once started) the writer lock. None = fine; DELETING / FENCED
         are terminal; a lifecycle query that FAILS is a BACKOFF, never a verdict. Rate limited to
         `lifecycle_check_s` unless `force` (saves, commits, start)."""
-        now = self.now_ms()
+        now = self._mono()
         if (not force and self._lifecycle_ok_ms is not None
                 and now - self._lifecycle_ok_ms < self.config.lifecycle_check_s * 1000):
             return None
@@ -472,22 +632,27 @@ class SceneWorker:
         cfg = self.config
         version = int(meta.get("version") or 0)
         self._generation = int(meta["generation"]) if meta.get("generation") is not None else None
+        self._resume_cursor = None
         rebuilding = False
+        request = self._read_rebuild_request(force=True)
         if cfg.expected_params_hash is not None and meta.get("params_hash") not in (None, cfg.expected_params_hash):
             self.rebuild_reason = "params_hash"
             if not self._can_rebuild():
+                self._warn_cannot_rebuild("params_hash")
                 return self._terminal(NEEDS_REBUILD, "params_hash")
-            err = self._begin_rebuild("needs_rebuild")
+            # a pending generation of the expected params is resumed from its cursor, unless a
+            # delete request exists (the pending state may hold leaves deleted since)
+            err = self._begin_rebuild("needs_rebuild", resume_ok=request is None)
             if err is not None:
                 self.guard.release(self.map_id)
                 return err
             rebuilding = True
-            log.info("scene worker %s: params changed (%s -> %s): rebuilding in generation %d",
-                     self.map_id, meta.get("params_hash"), cfg.expected_params_hash, self._rebuild_gen)
+            log.info("scene worker %s: params changed (%s -> %s): rebuilding in generation %d%s",
+                     self.map_id, meta.get("params_hash"), cfg.expected_params_hash, self._rebuild_gen,
+                     " (resumed)" if self._resume_cursor is not None else "")
         if cfg.expected_generation is not None and meta.get("generation") not in (None, cfg.expected_generation):
             self.rebuild_reason = "generation"
             return self._terminal(NEEDS_REBUILD, "generation")
-        request = self._read_rebuild_request(force=True)
         if request is not None:
             if rebuilding:
                 self._rebuild_request = request     # this rebuild covers it; cleared at commit
@@ -499,25 +664,62 @@ class SceneWorker:
                 rebuilding = True
             elif version == 0:
                 self._clear_request(request)        # nothing was ever saved: the first build is fresh
+            else:
+                self._warn_cannot_rebuild("rebuild request")
         if not rebuilding:
             err = self._ensure_engine(version)
             if err is not None:
-                self.guard.release(self.map_id)
-                return err
+                if not self._load_gave_up:
+                    self.guard.release(self.map_id)
+                    return err
+                # the stored graph cannot be loaded and retrying will not change that
+                if self._can_rebuild() and version > 0:
+                    err = self._begin_rebuild("load_failed")
+                    if err is not None:
+                        self.guard.release(self.map_id)
+                        return err
+                    rebuilding = True
+                    self._load_gave_up, self._load_failures = False, 0
+                else:
+                    self.rebuild_reason = "load_failed"
+                    return self._terminal(NEEDS_REBUILD, f"load_failed: {err.detail}")
         stored = [c for c in (self._cursor_of(self.cursor_store.get(self.map_id)),
                               self._cursor_of(meta.get("cursor"))) if c is not None]
-        self._cursor = ZERO_CURSOR if rebuilding else (min(stored) if stored else ZERO_CURSOR)
+        if rebuilding:
+            self._cursor = self._resume_cursor or ZERO_CURSOR
+        else:
+            self._cursor = min(stored) if stored else ZERO_CURSOR
+        self._stored_cursor = self._cursor_of(meta.get("cursor")) or ZERO_CURSOR
         self._candidate = self._cursor
         self._expected_version = version
         self.stats.version = version
         self._started = True
-        self._lifecycle_ok_ms = self.now_ms()
+        self._full_replay = True
+        self._lifecycle_ok_ms = self._mono()
         return None
+
+    def _warn_cannot_rebuild(self, what: str) -> None:
+        if not self._warned_cannot_rebuild:
+            self._warned_cannot_rebuild = True
+            log.warning("scene worker %s: %s needs a rebuild but this worker cannot rebuild (no "
+                        "new_engine / begin_generation)", self.map_id, what)
+
+    # exceptions of the store that retrying cannot change (a corrupt / mismatched stored graph)
+    _DETERMINISTIC = ("StateMismatch", "FileNotFoundError", "KeyError", "ValueError", "TooOld",
+                      "JSONDecodeError", "UnpackError", "IndexError", "AssertionError")
+
+    @classmethod
+    def _deterministic(cls, exc: BaseException) -> bool:
+        if any(c.__name__ in cls._DETERMINISTIC for c in type(exc).__mro__):
+            return True
+        return "other parameters" in str(exc)
 
     def _ensure_engine(self, version: int) -> Optional[StepResult]:
         """The engine for the stored `version`, built now that the writer lock is held. A engine
         handed in is kept when it was loaded at this version (or says nothing about it); one that
-        raced the lock (loaded at another version) is reloaded through the factory."""
+        raced the lock (loaded at another version) is reloaded through the factory. A load that
+        fails deterministically `load_fail_limit` times in a row sets `_load_gave_up`: the caller
+        rebuilds (or stops with NEEDS_REBUILD) instead of loading the whole map every backoff."""
         if self.engine is not None and self._loaded_version in (None, version):
             return None
         if self.engine_factory is None:
@@ -530,8 +732,15 @@ class SceneWorker:
         except Exception as exc:
             log.exception("scene worker %s: loading the engine (version %s) failed", self.map_id, version)
             self._failed("load", f"{type(exc).__name__}: {exc}")
+            if self._deterministic(exc):
+                self._load_failures += 1
+                if self._load_failures >= max(1, self.config.load_fail_limit):
+                    self._load_gave_up = True
+            else:
+                self._load_failures = 0
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"load: {exc}")
         self._loaded_version = version
+        self._load_failures = 0
         self._recovered("load")
         return None
 
@@ -548,7 +757,7 @@ class SceneWorker:
         interval = self.config.rebuild_check_s
         if look is None or interval <= 0:
             return None
-        now = self.now_ms()
+        now = self._mono()
         if (not force and self._request_checked_ms is not None
                 and now - self._request_checked_ms < interval * 1000):
             return None
@@ -575,13 +784,26 @@ class SceneWorker:
             log.exception("scene worker %s: clearing the rebuild request failed", self.map_id)
 
     def _poll_rebuild_request(self) -> bool:
-        """Mid-run: act on a request. True when a rebuild generation was begun (state was reset)."""
+        """Mid-run: act on a request. True when a rebuild generation was begun (state was reset).
+        A request is acted on once it has been the newest for `rebuild_debounce_s` (a burst of
+        deletes is one rebuild)."""
         if self._rebuild_gen is not None:
             return False                # a rebuild is running; its commit clears what it answers
         if self._clear_failed_at is not None:
             self._clear_request({"at": self._clear_failed_at})
         request = self._read_rebuild_request()
-        if request is None or not self._can_rebuild():
+        if request is not None:
+            at = str(request.get("at"))
+            if at != self._request_seen:
+                self._request_seen, self._request_seen_ms = at, self._mono()
+        if request is None:
+            return False
+        if not self._can_rebuild():
+            self._warn_cannot_rebuild("rebuild request")
+            return False
+        debounce = self.config.rebuild_debounce_s
+        if debounce > 0 and self._mono() - self._request_seen_ms < debounce * 1000:
+            # the request is looked up again after `rebuild_check_s` and acted on then
             return False
         if self._expected_version == 0:
             # nothing saved yet: drop the in-memory fold and start over, no generation needed
@@ -595,22 +817,108 @@ class SceneWorker:
         self._reset_fold_state()
         return True
 
-    def _begin_rebuild(self, reason: str, request: Optional[Mapping[str, Any]] = None) -> Optional[StepResult]:
-        """Begin a pending generation, switch to a fresh engine and announce it. None on success,
-        a BACKOFF result when begin_generation failed (the caller decides about the lock)."""
+    # -- store API probing (the store grows `fresh=`, `params_hash=`, meta()["pending"], load(pending=))
+
+    @staticmethod
+    def _params_of(fn: Any) -> frozenset:
         try:
-            gen = int(self.store.begin_generation(self.map_id))
+            return frozenset(inspect.signature(fn).parameters)
+        except (TypeError, ValueError):
+            return frozenset()
+
+    def _store_pending(self) -> Optional[Dict[str, Any]]:
+        """The store's pending generation as {generation, version, params_hash, cursor}, or None.
+        Reads `meta()["pending"]` (new API) and falls back to the raw doc / manifest (old API)."""
+        try:
+            meta = self.store.meta(self.map_id) or {}
+            info = meta.get("pending")
+            if not isinstance(info, Mapping):
+                docs = getattr(self.store, "docs", None)
+                raw = (docs.meta(self.map_id) or {}).get("pending") if docs is not None else None
+                info = raw if isinstance(raw, Mapping) else None
+            if info is None:
+                return None
+            info = dict(info)
+            if info.get("params_hash") is None and info.get("manifest") and hasattr(self.store, "_raw_manifest"):
+                man = self.store._raw_manifest(self.map_id, info["manifest"]) or {}
+                info["params_hash"], info["cursor"] = man.get("params_hash"), man.get("cursor")
+            return info
+        except Exception as exc:  # noqa: BLE001
+            log.warning("scene worker %s: pending generation lookup failed: %s", self.map_id, exc)
+            return None
+
+    def _load_pending(self) -> Any:
+        """The engine restored from the pending generation, or None when the store cannot."""
+        store = self.store
+        try:
+            if "pending" in self._params_of(getattr(store, "load", None)):
+                return store.load(self.map_id, pending=True)
+            loader = getattr(store, "load_pending", None)
+            return loader(self.map_id) if loader is not None else None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("scene worker %s: loading the pending generation failed: %s", self.map_id, exc)
+            return None
+
+    def _begin_generation(self, resume: bool) -> int:
+        """Begin (resume=False: always fresh and EMPTY, discarding a pending one) or resume the
+        pending generation. Feature-detects `fresh=` / `params_hash=`; on the old API a stale
+        pending generation is cleared through the doc store before it is begun again."""
+        begin = self.store.begin_generation
+        sig = self._params_of(begin)
+        kwargs: Dict[str, Any] = {}
+        expected = self.config.expected_params_hash
+        if "params_hash" in sig and expected is not None:
+            kwargs["params_hash"] = expected
+        if "rebuild_batch" in sig and self.config.rebuild_batch > 0:
+            kwargs["rebuild_batch"] = int(self.config.rebuild_batch)
+        if not resume:
+            if "fresh" in sig:
+                kwargs["fresh"] = True
+            else:
+                self._clear_pending_doc()
+        return int(begin(self.map_id, **kwargs))
+
+    def _clear_pending_doc(self) -> None:
+        docs = getattr(self.store, "docs", None)
+        if docs is None:
+            return
+        meta = docs.meta(self.map_id)
+        if meta and meta.get("pending"):
+            new = {k: v for k, v in meta.items() if k != "pending"}
+            if not docs.cas_meta(self.map_id, meta["version"], new):
+                raise SaveFenced("lost the compare-and-set clearing the pending generation")
+
+    def _begin_rebuild(self, reason: str, request: Optional[Mapping[str, Any]] = None,
+                       resume_ok: bool = False) -> Optional[StepResult]:
+        """Begin a pending generation, switch to a fresh engine and announce it. None on success,
+        a BACKOFF result when begin_generation failed (the caller decides about the lock).
+        With `resume_ok` a pending generation of the expected params that holds a cursor is
+        resumed (its engine restored, the scan continues from its cursor); otherwise the pending
+        generation starts EMPTY (a stale one is never extended)."""
+        engine, resumed = None, None
+        if resume_ok and request is None:
+            pend = self._store_pending()
+            expected = self.config.expected_params_hash
+            if (pend and expected is not None and pend.get("params_hash") == expected
+                    and pend.get("cursor") is not None and self._cursor_of(pend.get("cursor")) is not None):
+                engine = self._load_pending()
+                if engine is not None:
+                    resumed = self._cursor_of(pend.get("cursor"))
+        try:
+            gen = self._begin_generation(resume=resumed is not None)
         except Exception as exc:
             log.warning("scene worker %s: begin_generation failed: %s", self.map_id, exc)
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"begin_generation: {exc}")
         # fold every leaf again, under the configured params, into the pending generation
-        self.engine = self.new_engine()
-        self._rebuild_gen, self._rebuild_saved = gen, False
-        self._rebuild_started_ms = self.now_ms()
+        self.engine = engine if engine is not None else self.new_engine()
+        self._resume_cursor = resumed
+        self._rebuild_gen, self._rebuild_saved = gen, resumed is not None
+        self._rebuild_started_ms = self._mono()
         self._empty_confirms = self._commit_failures = 0
         self._rebuild_event_reason = reason
         self._rebuild_request = request
-        self._event("rebuild_started", reason=reason)
+        extra = {"resumed": True} if resumed is not None else {}
+        self._event("rebuild_started", reason=reason, **extra)
         if request is not None:
             log.info("scene worker %s: rebuild requested (%s, %s nodes): generation %d",
                      self.map_id, reason, request.get("nodes"), gen)
@@ -629,6 +937,8 @@ class SceneWorker:
         self._leaves_since_publish = 0
         self._cursor = self._candidate = ZERO_CURSOR
         self._buf_since_ms = None
+        self._full_replay = True
+        self._outage_since = None
         st = self.stats
         st.unsaved_leaves = st.save_failures = st.fold_failures = 0
         self._fail_stage, self._fail_count = "", 0
@@ -649,7 +959,7 @@ class SceneWorker:
 
     def _robot_half_side(self, node: Mapping[str, Any]) -> Tuple[float, bool]:
         robot = next((str(node[f]) for f in self.config.robot_fields if node.get(f)), "")
-        now = self.now_ms()
+        now = self._mono()
         hit = self._footprints.get(robot)
         if hit and (hit[1] or now - hit[2] < self.config.footprint_retry_s * 1000):
             return hit[0], hit[1]
@@ -679,9 +989,12 @@ class SceneWorker:
             png = self.fetch_png(self.map_id, key, layer)
         except Exception as exc:
             log.warning("scene worker %s: png fetch of %s failed: %s", self.map_id, key, exc)
+            if self._outage_since is None:
+                self._outage_since = self._mono()
             raise _FetchError(f"{key}: {exc}") from exc
+        self._fetch_recovered()
         if png is None:                          # confirmed missing: not there (yet)
-            now = self.now_ms()
+            now = self._mono()
             held = self._pending.get(key)
             if held is None:
                 self._pending[key] = _Pending(node, ms, now, now)
@@ -706,6 +1019,16 @@ class SceneWorker:
             self.stats.default_r_d += 1
         return leaf
 
+    def _fetch_recovered(self) -> None:
+        """A fetch answered again: the time it was failing does not count towards a pending
+        PNG's expiry (its wait is shifted by the outage)."""
+        if self._outage_since is None:
+            return
+        gap = max(0, self._mono() - self._outage_since)
+        self._outage_since = None
+        for held in self._pending.values():
+            held.first_ms += gap
+
     def _accept(self, node: Mapping[str, Any], outcome: Any) -> int:
         """Buffer an adapt outcome. Returns 1 when it was a NEW terminal skip (progress), else 0."""
         if outcome in ("duplicate", "pending"):
@@ -721,23 +1044,39 @@ class SceneWorker:
 
     def _retry_pending(self) -> Tuple[int, Optional[_FetchError]]:
         """Ask again for PNGs that were missing; give up on those older than `png_expire_s` of
-        WALL clock (stored time is no clock: a backlog moves through it in seconds). Returns
-        (new terminal skips, the fetch error that stopped the retries or None)."""
-        cfg, skipped, error = self.config, 0, None
+        MONOTONIC wall clock, not counting a MinIO outage (stored time is no clock: a backlog moves
+        through it in seconds). One last fetch is made before expiring. At most
+        `png_retries_per_step` are asked per step. An expired node is routed through the buffer
+        as a terminal skip, so the cursor never passes leaves still waiting there. Returns (new
+        terminal skips, the fetch error that stopped the retries or None)."""
+        cfg, skipped, error, asked = self.config, 0, None, 0
         if self._pending:
-            now = self.now_ms()
+            now = self._mono()
             expire_ms = (cfg.png_expire_s if cfg.png_expire_s is not None
                          else cfg.replay_margin_ms / 1000.0) * 1000.0
+            cap = cfg.png_retries_per_step
             for key, held in list(self._pending.items()):
-                if now - held.first_ms > expire_ms:
-                    del self._pending[key]
-                    self.stats.skipped[SKIP_PNG_EXPIRED] += 1
-                    log.warning("scene worker %s: node %s: PNG still missing after %.0fs, giving up",
-                                self.map_id, key, (now - held.first_ms) / 1000.0)
-                    self._handled(held.node)
+                if self._outage_since is None and now - held.first_ms > expire_ms:
+                    held_node = held.node
+                    waited = (now - held.first_ms) / 1000.0
+                    try:
+                        outcome = self._adapt(held_node, retry=True)      # one last look
+                    except _FetchError as exc:
+                        error = exc
+                        break
+                    if outcome == "pending":
+                        del self._pending[key]
+                        log.warning("scene worker %s: node %s: PNG still missing after %.0fs, giving up",
+                                    self.map_id, key, waited)
+                        skipped += self._accept(held_node, SKIP_PNG_EXPIRED)
+                    else:
+                        skipped += self._accept(held_node, outcome)
                     continue
                 if now - held.tried_ms < cfg.png_retry_s * 1000:
                     continue
+                if cap and asked >= cap:
+                    break
+                asked += 1
                 try:
                     outcome = self._adapt(held.node, retry=True)
                 except _FetchError as exc:
@@ -783,10 +1122,17 @@ class SceneWorker:
         cfg, n = self.config, self._leaf_count()
         if not n:
             return []
-        waited_s = 0.0 if self._buf_since_ms is None else (self.now_ms() - self._buf_since_ms) / 1000.0
-        if n < max(1, cfg.batch_min_leaves) and waited_s < self._batch_wait_s():
-            return []
-        take, out = max(1, cfg.batch_max_leaves), []
+        waited_s = 0.0 if self._buf_since_ms is None else (self._mono() - self._buf_since_ms) / 1000.0
+        if self._rebuild_gen is not None and cfg.rebuild_batch > 0:
+            # canonical rebuild: fixed batches, no time-based flush; the remainder at the head
+            if n < cfg.rebuild_batch and not self._head and not self._rebuild_overdue():
+                return []
+            take = max(1, cfg.rebuild_batch)
+        else:
+            if n < max(1, cfg.batch_min_leaves) and waited_s < self._batch_wait_s():
+                return []
+            take = max(1, cfg.batch_max_leaves)
+        out = []
         for entry in self._buf:
             out.append(entry)
             if entry.leaf is not None:
@@ -805,7 +1151,7 @@ class SceneWorker:
         for entry in batch:
             self._handled(entry.node)
             self._buffered.pop(str(entry.node.get("_key", "")), None)
-        self._buf_since_ms = self.now_ms() if self._leaf_count() else None
+        self._buf_since_ms = self._mono() if self._leaf_count() else None
 
     def _release_leading_skips(self) -> None:
         """Terminal skips in front of the first waiting leaf (or all of them) are done: they move the cursor."""
@@ -850,14 +1196,32 @@ class SceneWorker:
 
     def _fold(self, leaves: List[Any]) -> Optional[StepResult]:
         cfg = self.config
-        t0 = self.now_ms()
+        t0 = self._mono()
+        failure = self._try_fold(leaves)
+        if failure is None:
+            self._fold_timed(len(leaves), (self._mono() - t0) / 1000.0)
+            self._recovered("fold", "tiles")
+            return None
+        kind, exc = failure
+        if kind == "tiles":
+            self._failed("tiles", "missing tiles")
+            return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail="missing tiles")
+        log.error("scene worker %s: fold failed", self.map_id, exc_info=exc)
+        self._failed("fold", f"{type(exc).__name__}: {exc}")
+        # a poison leaf would block the map for good: after two failures in a row, find it
+        limit = 2 if len(leaves) > 1 else max(2, cfg.poison_single_limit)
+        if self._fail_stage == "fold" and self._fail_count >= limit:
+            return self._isolate(leaves, exc)
+        return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc}")
+
+    def _try_fold(self, leaves: List[Any]) -> Optional[Tuple[str, Optional[BaseException]]]:
+        """One fold_many (tiles loaded and retried once). None on success, else ("tiles", None)
+        or ("error", exc)."""
         for attempt in (0, 1):
             try:
                 dirty = self.engine.fold_many(leaves)
                 self._dirty = merge_dirty(self._dirty, dirty)
                 self._watermark = tuple(getattr(dirty, "watermark", self._watermark))
-                self._fold_timed(len(leaves), (self.now_ms() - t0) / 1000.0)
-                self._recovered("fold", "tiles")
                 return None
             except MissingTiles as exc:
                 self.stats.missing_tiles += 1
@@ -870,11 +1234,44 @@ class SceneWorker:
                     log.exception("scene worker %s: tile load failed", self.map_id)
                     break
             except Exception as exc:
-                log.exception("scene worker %s: fold failed", self.map_id)
-                self._failed("fold", f"{type(exc).__name__}: {exc}")
-                return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc}")
-        self._failed("tiles", "missing tiles")
-        return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail="missing tiles")
+                return "error", exc
+        return "tiles", None
+
+    def _isolate(self, leaves: List[Any], first: BaseException) -> Optional[StepResult]:
+        """Bisect a batch that keeps failing: fold the halves, recursing into a failing one, until
+        the leaf that cannot be folded is alone. It is quarantined (skip reason `fold_error`, an
+        event, the cursor moves past it); everything else of the batch is folded."""
+        bad: List[Any] = []
+
+        def walk(chunk: List[Any]) -> Optional[str]:
+            failure = self._try_fold(chunk)
+            if failure is None:
+                return None
+            if failure[0] == "tiles":
+                return "tiles"
+            if len(chunk) == 1:
+                bad.append((chunk[0], failure[1]))
+                return None
+            mid = len(chunk) // 2
+            return walk(chunk[:mid]) or walk(chunk[mid:])
+
+        stop = walk(list(leaves))
+        for leaf, exc in bad:
+            key = str(getattr(leaf, "key", "?"))
+            self._quarantined.append(key)
+            log.error("scene worker %s: leaf %s cannot be folded, quarantined: %s: %s",
+                      self.map_id, key, type(exc).__name__, exc)
+            self._event("fold_failed", stage="poison_leaf", detail=f"{key}: {type(exc).__name__}: {exc}"[:300],
+                        consecutive=1)
+        if stop is not None:
+            self._failed("tiles", "missing tiles")
+            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail="missing tiles")
+        if not bad:
+            # the batch folded in pieces (the failure was not tied to one leaf): carry on
+            log.warning("scene worker %s: batch of %d folded in pieces after %s", self.map_id,
+                        len(leaves), type(first).__name__)
+        self._recovered("fold", "tiles")
+        return None
 
     def _fold_timed(self, leaves: int, seconds: float) -> None:
         st = self.stats
@@ -887,7 +1284,7 @@ class SceneWorker:
                         self.map_id, leaves, seconds, budget)
 
     def _due(self, idle: bool, force: bool = False) -> bool:
-        cfg, now = self.config, self.now_ms()
+        cfg, now = self.config, self._mono()
         if self._last_save_ms is not None and now - self._last_save_ms < cfg.min_save_interval_s * 1000:
             return False
         if force:
@@ -929,7 +1326,8 @@ class SceneWorker:
         # else: `version` is the pending generation's own counter. The compare-and-set of every
         # save is on the LIVE version, which a pending save does not change: keep expecting it
         # until commit_generation returns the new live one.
-        self._last_save_ms = self.now_ms()
+        self._last_save_ms = self._mono()
+        self._stored_cursor = max(self._stored_cursor, target)
         self._oldest_unsaved_ms = None
         self.stats.saves += 1
         self.stats.unsaved_leaves = 0
@@ -939,8 +1337,7 @@ class SceneWorker:
         self._commit(target)
         if self._rebuild_gen is None:       # a pending generation is not readable yet: nothing to announce
             charts = len(getattr(dirty, "changed", None) or []) if dirty is not None else None
-            self._event("updated", version=int(version), leaves_folded=self._leaves_since_publish,
-                        charts_changed=charts)
+            self._event_updated(int(version), charts)
             self._leaves_since_publish = 0
         if self._rebuild_gen is None and self.publish is not None and dirty is not None:
             try:
@@ -949,6 +1346,18 @@ class SceneWorker:
                 log.exception("scene worker %s: publish callback failed", self.map_id)
         self._refresh_gauges()
         return None
+
+    def _event_updated(self, version: int, charts: Optional[int]) -> None:
+        """'updated' events are at most one per `updated_event_interval_s` per map (the websocket
+        publish is not throttled); the leaves folded in between are summed into the next one."""
+        now, every = self._mono(), self.config.updated_event_interval_s
+        last = self._last_updated_event_ms
+        if every > 0 and last is not None and now - last < every * 1000:
+            return
+        self._last_updated_event_ms = now
+        self._event("updated", version=version, leaves_folded=self._leaves_since_event,
+                    charts_changed=charts)
+        self._leaves_since_event = 0
 
     def _generation_gone(self, gen: Optional[int]) -> bool:
         """After a ValueError from save: the generation written to is neither the store's current
@@ -974,7 +1383,7 @@ class SceneWorker:
 
     def _save_failed(self, exc: Exception) -> StepResult:
         self.stats.save_failures += 1
-        self._last_save_ms = self.now_ms()
+        self._last_save_ms = self._mono()
         log.warning("scene worker %s: save failed: %s", self.map_id, exc)
         self._failed("save", f"{type(exc).__name__}: {exc}")
         return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"save: {exc}")
@@ -990,7 +1399,7 @@ class SceneWorker:
         gen = self._rebuild_gen
         try:
             version, retired = self.store.commit_generation(self.map_id, gen)
-        except self.fence_errors as exc:
+        except (SaveFenced,) + self.fence_errors as exc:
             return self._terminal(FENCED, str(exc) or "commit fenced")
         except ValueError as exc:
             # "no such pending generation with a saved state": decide from the store's state
@@ -1009,11 +1418,13 @@ class SceneWorker:
         self.stats.version = int(version)
         self.stats.rebuilds += 1
         self._event("rebuild_completed", reason=self._rebuild_event_reason, version=int(version),
-                    duration_s=round(max(0, self.now_ms() - self._rebuild_started_ms) / 1000.0, 3))
+                    duration_s=round(max(0, self._mono() - self._rebuild_started_ms) / 1000.0, 3))
         self._leaves_since_publish = 0
         request, self._rebuild_request = self._rebuild_request, None
         if request is not None:
             self._clear_request(request)
+        self._last_updated_event_ms = self._mono()
+        self._leaves_since_event = 0
         self._event("updated", version=int(version), leaves_folded=0, charts_changed=None)
         if self.publish is not None:
             try:
@@ -1106,7 +1517,7 @@ class SceneWorker:
         self._rebuild_gen = None
         self.stats.rebuilds += 1
         self._event("rebuild_completed", reason=self._rebuild_event_reason, version=0,
-                    duration_s=round(max(0, self.now_ms() - self._rebuild_started_ms) / 1000.0, 3))
+                    duration_s=round(max(0, self._mono() - self._rebuild_started_ms) / 1000.0, 3))
         self._leaves_since_publish = 0
         request, self._rebuild_request = self._rebuild_request, None
         if request is not None:
@@ -1122,8 +1533,10 @@ class SceneWorker:
     def _durable(self, cursor: Cursor) -> Cursor:
         """The cursor that may be persisted: not past the oldest node whose PNG is still missing
         (a restart must read it again)."""
-        if self._pending:
-            return min(cursor, (min(p.ms for p in self._pending.values()), ""))
+        floors = [p.ms for p in self._pending.values()]
+        floors += list(self._buffered.values())      # adapted leaves (and skips) not folded yet
+        if floors:
+            return min(cursor, (min(floors), ""))
         return cursor
 
     def _commit(self, cursor: Optional[Cursor] = None) -> None:
@@ -1140,4 +1553,4 @@ class SceneWorker:
         self.stats.pending = len(self._pending)
         self.stats.buffered_leaves = self._leaf_count()
         oldest = self._oldest_unsaved_ms
-        self.stats.version_lag_s = 0.0 if oldest is None else max(0.0, (self.now_ms() - oldest) / 1000.0)
+        self.stats.version_lag_s = 0.0 if oldest is None else max(0.0, (self._mono() - oldest) / 1000.0)

@@ -38,6 +38,17 @@ class SceneWorkerHost:
         self._closed = threading.Lock()         # taken once: the final close runs once
         self._thread: Optional[threading.Thread] = None
 
+    def state(self) -> dict:
+        """For /health: whether the thread runs plus the runner's per-map view."""
+        out = {"running": self.running}
+        snap = getattr(self.runner, "snapshot", None)
+        if snap is not None:
+            try:
+                out.update(snap())
+            except Exception as exc:  # noqa: BLE001
+                out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -117,6 +128,15 @@ def worker_config(params: Any) -> Any:
         lo = hi
     return scene_worker.WorkerConfig(
         batch_min_leaves=lo, batch_max_leaves=hi,
+        save_every_leaves=config.SCENE_GRAPH_SAVE_EVERY_LEAVES, save_every_s=config.SCENE_GRAPH_SAVE_EVERY_S,
+        replay_margin_ms=int(config.SCENE_GRAPH_REPLAY_MARGIN_S * 1000),
+        replay_recheck_s=config.SCENE_GRAPH_REPLAY_RECHECK_S,
+        rebuild_max_age_s=config.SCENE_GRAPH_REBUILD_MAX_AGE_S,
+        rebuild_debounce_s=config.SCENE_GRAPH_REBUILD_DEBOUNCE_S,
+        rebuild_batch=config.SCENE_GRAPH_REBUILD_BATCH,
+        load_fail_limit=config.SCENE_GRAPH_LOAD_FAIL_LIMIT,
+        step_budget_s=config.SCENE_GRAPH_STEP_BUDGET_S,
+        stats_log_s=config.SCENE_GRAPH_STATS_LOG_S,
         min_save_interval_s=config.SCENE_GRAPH_PUBLISH_INTERVAL_S,
         batch_budget_s=config.SCENE_GRAPH_BATCH_BUDGET_S,
         idle_sleep_s=config.SCENE_GRAPH_IDLE_S, idle_max_s=config.SCENE_GRAPH_IDLE_MAX_S,
@@ -153,6 +173,7 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
             map_id, source=service.graph_db, fetch_png=fetch_png, footprint=footprint,
             engine_factory=load, store=store, cursor_store=cursors, guard=guard, config=cfg,
             now_ms=lambda: int(time.time() * 1000),
+            mono_ms=lambda: int(time.monotonic() * 1000),
             publish=scene_events.make_publish(service.update_publisher, loop, map_id),
             new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,),
             on_event=(lambda kind, payload: sink(map_id, kind, payload)) if sink else None)
@@ -174,7 +195,11 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     def skip_reason(map_id: str) -> Optional[str]:
         return "map_not_enabled" if map_id in switched_off else None
 
-    runner = scene_runner.SceneRunner(list_maps, make_worker, on_event=sink, skip_reason=skip_reason)
+    from packages import config as _config
+    runner = scene_runner.SceneRunner(
+        list_maps, make_worker, on_event=sink, skip_reason=skip_reason,
+        config=scene_runner.RunnerConfig(max_maps=_config.SCENE_GRAPH_MAX_MAPS,
+                                         slow_step_s=_config.SCENE_GRAPH_SLOW_STEP_S))
     return SceneWorkerHost(runner, guard)
 
 

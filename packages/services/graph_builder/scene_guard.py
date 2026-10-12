@@ -63,7 +63,7 @@ def connect_from_conninfo(conninfo: str) -> Callable[[], Any]:
     """A factory of autocommit psycopg connections for `conninfo`."""
     def connect():
         import psycopg
-        return psycopg.connect(conninfo, autocommit=True)
+        return psycopg.connect(conninfo, autocommit=True, connect_timeout=5)
     return connect
 
 

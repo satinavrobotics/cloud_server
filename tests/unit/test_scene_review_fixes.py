@@ -124,7 +124,7 @@ def test_generation_rebuild_with_several_saves_commits_against_the_real_store():
     live = store.meta("m")["version"]
     p2 = SceneParams(robot_half_side=0.3)
     w = worker(store, src, ChartGraph(SceneParams()), new_engine=lambda: ChartGraph(p2),
-               cfg=sw.WorkerConfig(batch_size=4, min_save_interval_s=0, save_every_leaves=1,
+               cfg=sw.WorkerConfig(batch_size=4, min_save_interval_s=0, save_every_leaves=1, rebuild_batch=4,
                                    expected_params_hash=scene_host.expected_params_hash(p2)))
     res = drive(w)
     assert res.state == sw.IDLE, res
@@ -416,3 +416,49 @@ def test_batch_min_above_max_is_clamped_with_a_warning(monkeypatch, caplog):
         cfg = scene_host.worker_config(SceneParams())
     assert (cfg.batch_min_leaves, cfg.batch_max_leaves) == (10, 10)
     assert any("BATCH_MIN_LEAVES" in r.message for r in caplog.records)
+
+
+# ---- batch A: resume / discard of a pending generation against the REAL store
+
+def _params_rebuild_worker(store, src, p2, clock, max_steps_cfg=None):
+    return worker(store, src, ChartGraph(SceneParams()), new_engine=lambda: ChartGraph(p2), clock=clock,
+                  cfg=max_steps_cfg or sw.WorkerConfig(
+                      batch_size=4, min_save_interval_s=0, save_every_leaves=1, rebuild_batch=4,
+                      rebuild_debounce_s=0, expected_params_hash=scene_host.expected_params_hash(p2)))
+
+
+def test_a_rebuild_interrupted_mid_way_resumes_from_the_pending_cursor_real_store():
+    store = real_store()
+    src = ts.Source(NODES)
+    clock = [ts.T0 + 10_000_000]
+    drive(worker(store, src, ChartGraph(SceneParams()), clock=clock))
+    p2 = SceneParams(robot_half_side=0.3)
+    w1 = _params_rebuild_worker(store, src, p2, clock)
+    for _ in range(3):                         # a few pending saves, then the process dies
+        w1.step()
+    pend = store.meta("m")["pending"]
+    assert pend["cursor"] is not None and w1.stats.saves >= 1 and w1.stats.rebuilds == 0
+    w1.guard.release("m")
+    w2 = _params_rebuild_worker(store, src, p2, clock)
+    w2.step()
+    assert w2._resume_cursor is not None and tuple(w2._resume_cursor) == tuple(pend["cursor"])
+    assert drive(w2).state == sw.IDLE
+    assert w2.stats.rebuilds == 1 and store.meta("m")["generation"] == 2
+
+
+def test_a_stale_pending_of_other_params_is_discarded_not_extended_real_store():
+    store = real_store()
+    src = ts.Source(NODES)
+    clock = [ts.T0 + 10_000_000]
+    drive(worker(store, src, ChartGraph(SceneParams()), clock=clock))
+    p_old = SceneParams(robot_half_side=0.35)
+    w1 = _params_rebuild_worker(store, src, p_old, clock)
+    w1.step()
+    stale_gen = store.meta("m")["pending"]["generation"]
+    w1.guard.release("m")
+    p2 = SceneParams(robot_half_side=0.3)
+    w2 = _params_rebuild_worker(store, src, p2, clock)
+    assert drive(w2).state == sw.IDLE
+    meta = store.meta("m")
+    assert w2.stats.rebuilds == 1 and meta["generation"] > stale_gen
+    assert w2.stats.folded >= len(NODES) - 1       # folded from zero into an empty generation
