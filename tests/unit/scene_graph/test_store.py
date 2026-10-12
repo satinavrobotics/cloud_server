@@ -128,22 +128,21 @@ def test_idempotent_save_writes_nothing():
     store, b = _store()
     w, leaves = _world("two_rooms")
     g, v = _grow(store, "m", leaves, 8)
-    n = len(b.list("m")); puts = b.puts
+    n = len(b.list("m"))
     d = g.fold_many([])                                     # nothing new
-    assert store.save("m", g, d, v, {"n": 99}) != v          # a changed cursor is a new version (manifest only)
-    v3 = store.save("m", g, d, v + 1, {"n": 99})
-    assert v3 == v + 1                                      # same state, same cursor: nothing written
-    assert len(b.list("m")) == n + 1
+    assert store.save("m", g, d, v, {"n": 99}) == v          # same state: same version; only the cursor moves, in place
+    assert store.meta("m")["cursor"] == {"n": 99} and len(b.list("m")) == n
+    assert store.save("m", g, d, v, {"n": 99}) == v          # and again: nothing at all
 
 
 def test_compare_and_set_fences_a_stale_writer_and_leaves_no_readable_state():
     store, b = _store()
     w, leaves = _world("two_rooms")
-    g, v = _grow(store, "m", leaves[:20], 10)
-    other = ChartGraph(SceneParams()); other.fold_many(leaves[:20])
-    d = g.fold_many(leaves[20:])
+    g, v = _grow(store, "m", leaves[:10], 5)
+    other = ChartGraph(SceneParams()); other.fold_many(leaves[:10])
+    d = g.fold_many(leaves[10:])
     store.save("m", g, d, v, {})                             # the first writer wins
-    d2 = other.fold_many(leaves[20:])
+    d2 = other.fold_many(leaves[10:])
     with pytest.raises(StaleVersion):
         store.save("m", other, d2, v, {})                    # the zombie still thinks the version is v
     assert store.meta("m")["version"] == v + 1
@@ -152,9 +151,9 @@ def test_compare_and_set_fences_a_stale_writer_and_leaves_no_readable_state():
 def test_crash_before_the_commit_leaves_the_previous_version_readable_and_gc_collects_orphans():
     store, b = _store()
     w, leaves = _world("two_rooms")
-    g, v = _grow(store, "m", leaves[:20], 10)
+    g, v = _grow(store, "m", leaves[:10], 5)
     before_sig = _sig(store.load("m"))
-    d = g.fold_many(leaves[20:])
+    d = g.fold_many(leaves[10:])
 
     def boom(kind, name):
         if kind == "meta": raise RuntimeError("crash before the commit")
@@ -410,3 +409,40 @@ def test_rounds_are_stored_exactly_without_a_range_limit():
     t = store.manifest("m")["tiles"]
     assert len(t) >= 1 and h._track.rnd_img is not None
     assert st.rnd.dtype == np.int32
+
+
+def test_replay_with_a_new_cursor_and_canvas_does_not_bump_the_version():
+    from tests.unit.scene_graph import chart_worlds as cw
+    from packages.scene_graph.api import SceneParams
+    from packages.scene_graph.engine import ChartGraph
+    from packages.scene_graph.store import SceneGraphStore, MemoryBackend
+    w, way = cw.two_rooms()
+    leaves = cw.drive(w, way)
+    be = MemoryBackend()
+    st = SceneGraphStore(be, be)
+    g = ChartGraph(SceneParams()); d = g.fold_many(leaves)
+    v = st.save("m", g, d, None, {"c": 1})
+    d2 = g.fold_many(leaves[-6:])                                      # a restart replays the margin: nothing changes
+    assert st.save("m", g, d2, v, {"c": 2}) == v                      # same content: same version ...
+    m = st.meta("m")
+    assert m["version"] == v and m["cursor"] == {"c": 2}              # ... and the cursor moved in place
+    assert m["epoch"] and m["created_ms"]
+
+
+def test_epoch_changes_after_a_drop_and_the_expansion_cache_cannot_serve_the_old_history():
+    from tests.unit.scene_graph import chart_worlds as cw
+    from packages.scene_graph.api import SceneParams
+    from packages.scene_graph.engine import ChartGraph
+    from packages.scene_graph.store import SceneGraphStore, MemoryBackend
+    be = MemoryBackend()
+    a, b = SceneGraphStore(be, be), SceneGraphStore(be, be)            # two processes on one backend
+    w, way = cw.two_rooms(); g = ChartGraph(SceneParams()); d = g.fold_many(cw.drive(w, way))
+    a.save("m", g, d, None, None)
+    first = b.view("m").query(BBox(-5, -5, 20, 20), raster=False)      # b caches the expansion of manifest-1
+    e1 = a.meta("m")["epoch"]
+    a.drop("m")
+    w2, way2 = cw.corridor(); g2 = ChartGraph(SceneParams()); d2 = g2.fold_many(cw.drive(w2, way2))
+    a.save("m", g2, d2, None, None)                                    # version 1 again, another history
+    assert a.meta("m")["epoch"] != e1
+    second = b.view("m").query(BBox(-5, -5, 20, 20), raster=False)
+    assert {c.key for c in second.charts} == {c.key for c in g2.query(BBox(-5, -5, 20, 20), raster=False).charts}

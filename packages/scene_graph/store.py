@@ -22,6 +22,7 @@ the engine come from the manifest.
 import logging
 import math
 import time
+import uuid
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -162,7 +163,7 @@ class SceneGraphStore:
     def meta(self, map_id: str) -> dict:
         m = self.docs.meta(map_id)
         if not m: return {}
-        return {k: m[k] for k in ("version", "generation", "params", "params_hash", "cursor") if k in m}
+        return {k: m[k] for k in ("version", "generation", "params", "params_hash", "cursor", "epoch", "created_ms") if k in m}
 
     def watermark(self, map_id: str) -> Tuple[int, str]:
         m = self.docs.meta(map_id)
@@ -278,8 +279,14 @@ class SceneGraphStore:
                 "segments": seg_hashes, "leaf_count": len(st.leaves),
                 "retired": {k: v for k, v in (dirty.retired if dirty is not None else {}).items()}}
         # idempotence: the state (not its history: retired keys, engine counter) and the cursor are what a version is
-        content_hash = params_hash({k: v for k, v in body.items() if k not in ("retired", "engine_version")}, "content")
+        # a version is the semantic state: not its history (retired keys, engine counter), not the canvas layout (tiles are
+        # in global coordinates) and not the ingest cursor, which moves on a replay that changes nothing
+        content_hash = params_hash({k: v for k, v in body.items() if k not in ("retired", "engine_version", "canvas", "cursor")},
+                                   "content")
         if prev is not None and prev.get("content_hash") == content_hash:
+            if not pend and meta is not None and meta.get("cursor") != cursor:
+                if not self.docs.cas_meta(map_id, cur, dict(meta, cursor=cursor)):
+                    raise StaleVersion("lost the compare-and-set")
             return pending.get("version", 0) if pend else cur
         body["content_hash"] = content_hash
 
@@ -302,9 +309,10 @@ class SceneGraphStore:
         mname = "g%d/manifest-%d.json" % (gen, newv)
         self.blobs.put(map_id, mname, canonical_json(body))
         gens = dict((meta or {}).get("generations", {})); gens.setdefault(str(gen), newv)
+        epoch = (meta or {}).get("epoch") or uuid.uuid4().hex[:12]
         new_meta = {"version": newv, "generation": gen, "params": st.params, "params_hash": body["params_hash"],
                     "cursor": cursor, "watermark": list(st.watermark), "manifest": mname, "generations": gens,
-                    "created_ms": body["created_ms"]}
+                    "created_ms": body["created_ms"], "epoch": epoch}
         if meta and meta.get("pending"): new_meta["pending"] = meta["pending"]
         if meta and "index_version" in meta: new_meta["index_version"] = meta["index_version"]
         if not self.docs.cas_meta(map_id, cur, new_meta):
@@ -339,10 +347,12 @@ class SceneGraphStore:
             tiles[name] = h
             blobs["g%d/t/%s" % (gen, h)] = blob
 
-    def _manifest_by_name(self, map_id, name):
-        """the manifest with its pages expanded: tiles {"tx,ty": hash}, charts (by id), links, key_ids"""
+    def _manifest_by_name(self, map_id, name, epoch=None):
+        """the manifest with its pages expanded: tiles {"tx,ty": hash}, charts (by id), links, key_ids. Cached by
+        (map, epoch, name): version numbers restart after a drop, so a name alone can name another history's manifest."""
         if not name: return None
-        hit = self._expanded.get((map_id, name))
+        if epoch is None: epoch = (self.docs.meta(map_id) or {}).get("epoch")
+        hit = self._expanded.get((map_id, epoch, name))
         if hit is not None: return hit
         m = self._raw_manifest(map_id, name)
         tiles, charts, links = {}, [], []
@@ -354,7 +364,7 @@ class SceneGraphStore:
         charts.sort(key=lambda c: c["id"]); links.sort(key=lambda l: (l["a"], l["b"], l["portal"][0], l["portal"][1]))
         m = dict(m, tiles=tiles, charts=charts, links=links, key_ids={c["key"]: c["id"] for c in charts})
         if len(self._expanded) > 8: self._expanded.pop(next(iter(self._expanded)))
-        self._expanded[(map_id, name)] = m
+        self._expanded[(map_id, epoch, name)] = m
         return m
 
     def manifest(self, map_id: str, version: Optional[int] = None) -> dict:
@@ -484,7 +494,7 @@ class SceneGraphStore:
             self._refs(map_id, self.blobs.get(map_id, pend["manifest"]), refs)
         dead = [n for n in self.blobs.list(map_id) if n not in refs and n not in keep_names]
         self.blobs.delete(map_id, dead)
-        for key in [k for k in self._expanded if k[0] == map_id and k[1] in set(dead)]:
+        for key in [k for k in self._expanded if k[0] == map_id and k[2] in set(dead)]:
             del self._expanded[key]
         return {"deleted": len(dead), "kept_versions": sorted(keep_v)}
 

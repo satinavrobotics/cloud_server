@@ -848,8 +848,28 @@ class ChartGraph(SceneGraph):
         for c in path:
             kk = s.keys[int(s.full[c])]
             if not charts or charts[-1] != kk: charts.append(kk)
-        return Route(charts=charts, length=float(dd), min_width=float(2.0 * sp.clr[path].min()),
+        return Route(charts=charts, length=float(dd), min_width=self._route_width(path, src),
                      nodes=[self._cell_xy(int(sp.ys[c]), int(sp.xs[c])) for c in path])
+
+    def _route_width(self, path: List[int], src: int) -> float:
+        """Passage width of a route: the narrowest strict widest-path width (Link.width) of the links it crosses, each
+        taken at the contact nearest the crossing. A lattice path hugs corners, so its own clearance is not a width.
+        A route inside one chart has no passage: the clearance at its anchor."""
+        s = self._solved; sp = s.sp
+        by_pair: Dict[Tuple[int, int], list] = {}
+        for l in s.links:
+            by_pair.setdefault((min(l["a"], l["b"]), max(l["a"], l["b"])), []).append(l)
+        w = math.inf
+        for c0, c1 in zip(path[:-1], path[1:]):
+            j0, j1 = int(s.full[c0]), int(s.full[c1])
+            if j0 == j1: continue
+            cand = by_pair.get((min(j0, j1), max(j0, j1)))
+            if not cand:                                     # diagonal-only contact: no link; the two cells decide
+                w = min(w, 2.0 * float(min(sp.clr[c0], sp.clr[c1]))); continue
+            y, x = (int(sp.ys[c0]) + int(sp.ys[c1])) / 2.0, (int(sp.xs[c0]) + int(sp.xs[c1])) / 2.0
+            best = min(cand, key=lambda l: math.hypot((int(sp.ys[l["u"]]) + int(sp.ys[l["v"]])) / 2.0 - y, (int(sp.xs[l["u"]]) + int(sp.xs[l["v"]])) / 2.0 - x))
+            w = min(w, float(best["width"]))
+        return float(w) if math.isfinite(w) else float(2.0 * sp.clr[src])
 
     # ------------------------------------------------------------------ persistence hooks (store.py)
     def export_state(self) -> EngineState:

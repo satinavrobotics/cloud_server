@@ -286,3 +286,19 @@ def test_snap_reports_the_real_distance_and_never_hides_a_wall():
         pytest.fail("no refused snap with a finite distance found")
     # locate with no limit equals the old behaviour (within sight_range)
     assert g.locate(ax, ay) == s.key
+
+
+def test_route_min_width_is_the_passage_not_a_cell_on_a_hugged_corner():
+    g, w, _ = built("two_rooms", 0.9)
+    v = g.query(ALL, raster=False)
+    keys = [c.key for c in v.charts]
+    best = None
+    for a in keys:
+        for b in keys:
+            r = g.route(a, b) if a != b else None
+            if r is not None and (best is None or len(r.charts) > len(best.charts)): best = r
+    assert best is not None and len(best.charts) >= 2
+    link_w = {frozenset((l.a, l.b)): l.width for l in v.links}
+    crossed = [link_w[frozenset(p)] for p in zip(best.charts[:-1], best.charts[1:]) if frozenset(p) in link_w]
+    assert crossed and best.min_width == pytest.approx(min(crossed))
+    assert 0.8 <= best.min_width <= 1.0 + 1e-9 or best.min_width > 1.0          # the 0.9 m door is not reported as 0.1-0.4
