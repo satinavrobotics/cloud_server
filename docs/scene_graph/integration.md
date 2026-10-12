@@ -1,8 +1,11 @@
 # Scene graph: integration plan
 
-Status: proposal, revised for the v2 algorithm (free-space charts) and CIMBI's reply of 2026-10-12. Companion to
-`design.md` (v1 algorithm, being replaced) and `handoff_cimbi.md` (the contract with CIMBI). The library interface is
-**not frozen**; items marked *(pending interface)* depend on it.
+Status (2026-10-13): built on `feat/scene-graph-v2` and exercised end to end against real ArangoDB / MinIO / Postgres
+by the e2e harness (below); not yet run on a production stack. The sections below are the design and the decisions
+behind it; "Order and status" and "Open defects" are the current state. Operations (settings, deploy order, rollback,
+events, troubleshooting): `runbook.md`, not repeated here. Companion to `design.md` (v1 algorithm, replaced) and
+`handoff_cimbi.md` (the contract with CIMBI). Items marked *(pending interface)* were written before the library
+interface was fixed; read them against `packages/scene_graph/api.py`.
 
 **Ownership.** CIMBI: the algorithm (`packages/scene_graph`) and its persistence (snapshot, tile layout, `sg_*`
 formats). LACI: everything else here (ingest worker, read API, client, planner, lifecycle hooks, events, ops).
@@ -114,8 +117,9 @@ distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`,
    `SCENE_GRAPH_GOAL_SNAP_M`; refused by `snap_problem` (`start_`/`goal_` + `no_navigable_space` | `too_far` |
    `crosses_blocked`).
 3. **Overlay**: active `blocked_graph_nodes` rows (none with `ignore_exclusions`) go through
-   `blocked_geometry.overlay(rows, MATCH_RADIUS_M)` into `Blocked(discs, segments)` and are passed to `route()`. The
-   same overlay is applied in the line-of-sight test of the simplification, so no shortened leg crosses it.
+   `blocked_geometry.overlay(rows, MATCH_RADIUS_M, half_width)` into `Blocked(discs, segments)` and are passed to
+   `route()` (`plan_on_graph`). The same overlay is applied in the line-of-sight test of the simplification, so no
+   shortened leg crosses it. A route that exists without the overlay but not with it: `blocked_by_overlay`.
 4. **Route**: `route(start_key, goal_key, blocked)`. Lattice route runs anchor to anchor, so the point list is
    `[snapped start] + route.nodes + [snapped goal]`. `None` -> `unreachable`, `MissingTiles` -> `missing_tiles`.
 5. **Waypoints**: `simplify` (line of sight = every half-step sample is a free lattice cell by `snap`, memoised per
@@ -126,25 +130,64 @@ distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`,
 6. **Budget**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (`plan_timeout`).
 
 Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `chart_keys`, `graph_version`,
-`planner_fallback` (only when the flag is on and the legacy planner ran). Reasons: `robot_unavailable`,
-`robot_not_placed`, `store_unavailable`, `store_timeout`, `store_error`, `no_graph`, `load_timeout`, `load_error`,
-`start_*`, `goal_*`, `unreachable`, `missing_tiles`, `waypoints_without_distinct_leaf_ids`, `plan_timeout`, `error`.
+`planner_fallback` (only when the flag is on and the legacy planner ran; on plan and navigation responses). Reasons
+(meaning and operational reading: `runbook.md` section 7): `robot_unavailable`, `robot_not_placed`,
+`store_unavailable`, `store_timeout`, `store_error`, `no_graph`, `load_timeout`, `load_error`, `stale_graph`,
+`start_*`, `goal_*`, `blocked_by_overlay`, `unreachable`, `missing_tiles`, `too_narrow`,
+`waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`, `plan_timeout`, `error`.
 
-Not done: `min_width` is reported but not yet compared with the planning robot's width; no version-lag threshold; the
-first-node-behind test (H5) is not applied; `planner_fallback` is not yet exposed by `PlanResponse` in `main.py`;
-the mission-planner compose service needs `MINIO_*` secrets for the store.
+* **`stale_graph`**: the oldest costmap stored after the loaded version's ingest cursor is older than
+  `SCENE_GRAPH_MAX_VERSION_LAG_S` (default 120, 0 disables). Unknown lag never rejects.
+* **Stale-version serving**: when a new version is still loading at the timeout, the newest version already loaded
+  for the map is used, bounded by the lag test against that version's own cursor; `load_timeout` is raised only
+  with nothing loaded.
+* **`too_narrow`**: `Route.min_width` < factsheet width + `SCENE_GRAPH_WIDTH_MARGIN_M` (default 0). Gated by
+  `SCENE_GRAPH_WIDTH_CHECK_ENABLED`, **default off**, because the engine's `Route.min_width` is not the width of the
+  passage (see "Open defects"); with it off `min_width` is still reported.
+* **`blocked_row_on_route`**: the legacy point rule on the final waypoints' leaf ids, applied only to rows without a
+  robot pose (those the overlay cannot place); the legacy planner then reports or detours them.
+* The H5 first-node-behind test and the `failed_at` legacy-rule overlay do not apply to chart routes: the route
+  starts at the snapped robot position, so there is no node behind it.
 
-## Order and status (2026-10-12)
+## Order and status (2026-10-13)
 
 * **Done (LACI)**: ingest adapter, stamp rule and per-session clock, stable stamp, worker, lock and lifecycle
   guard, runner and host (`scene_host`, started by graph-builder `main.py` behind `SCENE_GRAPH_WORKER_ENABLED`),
-  `costmap_stored_ms` cursor, generation rebuild and rebuild request, per-map switch, delete-saga drop, planner
-  response fields and waypoint builder, `route()` in `plan_route` behind `SCENE_GRAPH_PLANNER_ENABLED`, read API and
-  websocket message, blocked-overlay geometry (not wired to `route()`).
-* **Done (CIMBI)**: engine behind `api.py`, `store.py` (versioned snapshots, CAS, generations).
-* **Open**: client layers, Dockerfile/requirements (numpy), the open-field scale gate (CIMBI; not re-checked
-  here), and a run of the worker against a real ArangoDB / MinIO / Postgres: everything above is tested against
-  fakes and the in-memory store only.
+  `costmap_stored_ms` cursor and backfill tool, generation rebuild and rebuild request, per-map switch, delete-saga
+  drop, planner (`plan_route`, `plan_on_graph`) behind `SCENE_GRAPH_PLANNER_ENABLED` with the width, lag and
+  overlay checks and `planner_fallback` on plan and navigation responses, blocked overlay wired into `route()`,
+  read API and websocket message, planner BUILD/compose environment (numpy/scipy in the requirements, MinIO/Arango
+  secrets and the planner variables in compose), authorization audit (result: none, below), ingest hardening,
+  operator runbook, end-to-end harness, client wiring (sati-client `eac8613` / `cc728fc`).
+* **Done (CIMBI)**: engine behind `api.py`, `store.py` (versioned snapshots, CAS, generations); per-batch cost
+  round 1 (`27d7145`).
+* **Verified**: `tools/scene_graph_e2e/run.sh` brings up a throw-away ArangoDB + MinIO + Postgres
+  (`docker_compose/scene_graph_e2e.yaml`) and runs `tests/integration/scene_graph`: 25 passed, plus strict xfails
+  that pin the open defects below (a fixed defect fails the run, so its marker gets removed).
+* **Open**: "Open defects". Not verified on a production-sized map or stack.
+
+### Measurements (e2e / bench, 2026-10-13)
+
+* 90 x 90 m, 225 leaves: `store.load` 28.5 s, `route` 62 ms, `plan_on_graph` about 100 ms, warm `snap` about 10 us.
+  A cold load on a map this size exceeds `SCENE_GRAPH_LOAD_TIMEOUT_S`; the stale-version serving above keeps the
+  planner on the chart route while a new version loads.
+* Open rooms of 12-15 m: a fold takes minutes (engine); open-field maps stay off (runbook section 8).
+
+### Open defects
+
+| Owner | Defect | Effect / decision |
+|---|---|---|
+| CIMBI | Fold result depends on capture-stamp order: `min_width` ranges 0.1..0.64 over permutations of the same leaves | breaks the order-independence claim; strict xfail |
+| CIMBI | `Route.min_width` is not the passage width (`engine.py:705`) | `too_narrow` gated off (`SCENE_GRAPH_WIDTH_CHECK_ENABLED`) until fixed |
+| CIMBI | Restart replay bumps the version: `store.save` puts the canvas in `content_hash` | a restart publishes a version with no new data |
+| CIMBI | `store.meta()` has no epoch / `created_ms`; `SceneGraphStore._expanded` cache is not keyed by epoch | reads take the epoch from the manifest; a stale expanded entry is possible after drop + recreate |
+| CIMBI | Growth-batch fix; open-field decision | pending |
+| LACI | Real MinIO adapter test missing | add |
+| not ours | `TopomapDatabaseClient.delete_map` calls `rosbag.delete_map_bags`, which does not exist | map delete fails at that step; fix in the topomap client |
+
+Known limits: `r_d` = half the smaller footprint side (decision pending, "Decisions for LACI's user"); no per-extent
+re-solve (every delete or params change is a whole-map rebuild); bucket-slug collisions skip both maps; no Bazel
+BUILD for `packages/scene_graph` (CIMBI's directory).
 
 ### Scene ingest: behavior fixed after review (2026-10-12)
 
@@ -224,7 +267,7 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
 4. **Clock skew.** The 7-day age bound (`scene_leaf`) lets an ahead clock beat newer correct observations
    permanently. Replace with a per-session offset (receipt of session start / telemetry minus robot stamp) applied
    to the whole session, clamped to receipt, whole-session fallback to receipt beyond a bound of minutes; metric per
-   robot. Not yet implemented: `scene_leaf` still has the per-leaf rule.
+   robot. Implemented since (`ec8ee94`, `388cd1a`): per-session clock offset in the adapter.
 5. **A version exists only as the return of `save()`;** publish = save; websocket and ETag after the manifest and
    `sg_meta` write; version numbers monotonic across restarts and generations, assigned by the store.
 6. **Lifecycle.** The worker checks map lifecycle (`DELETING`) before every save so it cannot recreate `sg_*` or the
@@ -239,17 +282,23 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
    header (octet-stream), with ETag/version.
 8. **Client.** `MapWebSocket.handleMessage` ignores unknown types and the publisher has no replay: add a
    `scene_graph_updated` branch, refetch on `onConnect`, `since_version` catch-up. Goals are stored as `{x, y,
-   map_id}`, so only selections need lineage re-mapping. The sati-client repo has no `feat/scene-graph-v2` branch.
-9. **Ops.** graph-builder needs numpy, scipy and Pillow; mission-planner numpy and scipy; the API scipy (numpy
-   1.26.4 pinned: pick a compatible scipy); each Dockerfile (and BUILD) must COPY `packages/scene_graph/`.
+   map_id}`, so only selections need lineage re-mapping. Client wiring landed in sati-client `eac8613` / `cc728fc`.
+9. **Ops.** graph-builder and mission-planner need numpy and scipy (pinned 1.26.4 / 1.11.4); the API scipy; each
+   Dockerfile (and BUILD) must COPY `packages/scene_graph/`. Pillow turned out not needed: PNG decode is `zlib` +
+   numpy in `scene_adapter`.
    `packages/scene_graph/__init__.py` still exports v1 names that clash with `api.py`.
 10. **Event codes** need no migration (`Source.GRAPH_BUILDER` is allowed): `EventCode` + `CODES` + payload class +
     client mapping.
 11. **Planner budget.** The dispatcher replans with a 5 s timeout: corridor, tile load, route and simplify must
     fit (tiles cached by `(map, version, tile)`), else it falls back silently. Define a budget; log the fallback.
+   (Done: `SCENE_GRAPH_PLAN_BUDGET_S`, the `Chart planner not used (<reason>)` log, `planner_fallback`.)
 12. **Backfill** of existing maps: hours at the builder's measured cost; big `fold_many` batches, one snapshot,
     resumable, per-map planner flag gated on "backfill complete and validated".
-13. **Authorization** on the new routes follows `/maps/{id}/graph`; cap bbox area and raster size; rate limit.
+13. **Authorization.** Audit result: there is **no** authorization anywhere in the API (not on `/maps/{id}/graph`,
+    not on the three scene-graph routes), so "follows `/maps/{id}/graph`" means none. Recommended design: one
+    `authorize_map` dependency on every map-scoped route, run **before** the read cache, 404 for a map the caller may
+    not see (no existence leak), responses `Cache-Control: private`. Not built (an API-wide change). Bbox area and
+    raster size are capped (done); no rate limit.
 14. **Tests**: property tests for idempotency (duplicate delivery, shuffled order, different batch splits: same cells
     and planes) and a plan -> order -> VDA5050 schema validation test.
 
@@ -319,41 +368,46 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
 * LACI: **stable per-leaf stamp** (done): the worker writes the stamp it first computed onto the node
   (`scene_stamp_ms`, first write wins, written BEFORE the fold so a replay after a crash cannot recompute another
   one) and `leaf_stamp` always prefers it. Nodes folded before this change get their stamp at their next fold.
-* LACI: time-source fallback bound (7 days, implemented in `scene_leaf`); where the robot footprint (`r_d`) lives; the
-  leaf threshold for `waypoints[i].node_id`; `run_id` (derive later from session and time, or look up at ingest).
+* Resolved: time-source fallback bound (7 days, in `scene_leaf`); robot footprint (`r_d`) from the factsheet; leaf
+  threshold for `waypoints[i].node_id` (`SCENE_GRAPH_LEAF_SNAP_M`); `run_id` (derived at read time, below).
+* Remaining: "Open defects" under "Order and status".
 
 
-## Blocked overlay (applied 2026-10-12; was a draft for review)
+## Blocked overlay (built; 2026-10-12/13)
 
-`packages/utils/blocked_geometry.py` (+ tests): the obstacle is the segment from `LEAD_M` (1.0 m, must exceed
-`HALF_WIDTH_M` 0.5 m or a leg leaving the robot sideways is "blocked" by its own start) ahead of the robot's pose
-to the blocked waypoint; `route_hits_row` tests the route's legs against it; `overlay` yields `(discs, segments)`
-for `Blocked`. Rows without a robot pose keep the old disc rule.
+`packages/utils/blocked_geometry.py` (+ tests): the obstacle is the segment from `lead` ahead of the robot's pose to
+the blocked waypoint; `route_hits_row` tests the route's legs against it; `overlay` yields `(discs, segments)` for
+`Blocked`. Rows without a robot pose keep the old disc rule.
 
-Applied:
-
-1. Migration `20261012_01_blocked_geometry` (additive, nullable, no backfill; downgrade drops them):
-   `robot_x, robot_y` (robot position in the map frame at the report), `prev_x, prev_y` (previous waypoint; kept
-   for a later fit, the overlay does not use it).
-2. `blocked_nodes.COLUMNS`/`UPSERT_SQL`/`upsert_params` carry the four columns. **Deploy order: migration first**
-   (`ACTIVE_FOR_MAP_SQL` selects the columns and the upsert writes them; there is no fallback for an unmigrated
-   database: the dispatcher's write only logs, the planner reads none and plans without blocks, the API list fails).
-3. mission-dispatch's edgeBlocked handler (`_exclude_blocked_node`) writes the robot's last reported position,
-   taken to the map frame by the transform the order was sent with (`_pose_in_map`, as `_offset_in_map`), and the
-   previous waypoint. Unknown position, uninitialized localization or unrecorded order frame: NULLs (disc rule).
-4. `blocked_nodes.rows_hit(..., polyline=)` adds `route_hits_row` to the point rule. The API's
-   `_reroute_through_blocked` passes the route's waypoints as polyline (start included). The planner's
-   `_path_avoiding` does the same for the graph's shortest path, keeps graph nodes within `HALF_WIDTH_M` of a
-   segment out of the detour search, and rejects a detour whose legs still cross a segment (reported as "no route
-   avoids"). Rows without a pose: behavior identical to before.
-5. **Not wired**: handing `overlay(...)` to the scene-graph `route()`: the planner still reports
-   `planner = legacy`, so there is no call site yet; wire it with the switch.
-6. Stops under 1 m (decided, conservative): when the blocked waypoint is closer than `LEAD_M` to the robot,
-   `row_segment` clips the start to the waypoint's own distance, so the segment runs from the robot's pose to the
-   waypoint (never empty beyond the zero-length case of a robot standing on the waypoint, never reversed). The
-   check then flags legs within `HALF_WIDTH_M` of that short segment, which includes the robot's own start region;
-   a detour leaving sideways from a robot that stopped under 0.5 m from the obstacle is also refused until the
-   block expires or is cleared. Using the costmap's lethal cells instead is not proposed.
+1. **Half width** is half the *smaller* footprint side from the planning robot's factsheet
+   (`half_width_for(length, width)`, floor 0.05 m); the constant `BLOCKED_SEGMENT_HALF_WIDTH_M` (0.5) only while the
+   footprint is unknown (-1). **The lead scales with it** (`lead_for`: at least `LEAD_M` 1.0 and half width + 0.5),
+   keeping lead > half width (or a leg leaving the robot sideways is "blocked" by its own start). The planner
+   (`_overlay_half_width`) passes the robot's value; `_reroute_through_blocked` in `packages/api/main.py` has no
+   robot and still uses the constant.
+2. **Migration `20261012_01_blocked_geometry`** (additive, nullable, no backfill; downgrade drops them). Four
+   columns, `robot_x, robot_y, prev_x, prev_y`; only `robot_x/robot_y` are written (robot position in the map frame
+   at the report, from the reporting state, taken to the map frame by the order's transform). `prev_x`/`prev_y` are
+   no longer written and nothing reads them. The upsert is `COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x)`
+   (same for y): a re-report without a position keeps the earlier one. **Deploy order: migration first** (no
+   fallback for an unmigrated database; runbook section 2).
+3. `blocked_nodes.rows_hit(..., polyline=)` adds `route_hits_row` to the point rule; the API's
+   `_reroute_through_blocked` passes the route's waypoints, the legacy planner's `_path_avoiding` does the same for
+   its detour. Rows without a pose: behaviour as before.
+4. **Wired**: the planner hands `overlay(...)` to `route()` and to the line-of-sight test (`plan_on_graph`);
+   `blocked_by_overlay` and `blocked_row_on_route` are the fallbacks.
+5. Stops under `lead` (conservative, kept): `row_segment` clips the start to the waypoint's own distance, so the
+   segment runs from the robot's pose to the waypoint; a detour leaving sideways from a robot that stopped under a
+   half width from the obstacle is refused until the block expires or is cleared.
+6. **Chart keys are derived at read time, nothing is stored**: `leg_chart_keys(polyline, locate)` and
+   `row_chart_keys(row, locate)` (`blocked_geometry`, `blocked_chart_tags`). `GET .../blocked-nodes?with_chart_keys=true`
+   adds `chart_keys` per row, best effort (no graph, no pose or a store error leaves it out). Run legs cannot carry
+   chart keys without a migration, so run views of chart routes stay keyed by the legacy leaf ids (the "Leg recording
+   on lattice routes" decision stays pending).
+7. **`run_id` of a blocked row** is derived from `vda_node_id` (`run_id_of`: the dispatcher's run prefix) and
+   resolved against `mission_runs` (`resolve_run_ids`: the run of the same mission and robot that started last
+   before the report). Exact for the first pass of a mission; a heuristic for repeat passes (the recorder keeps the
+   first pass's row) and for runs adopted after a dispatcher restart. A failed lookup leaves the derived id.
 
 ## Rebuild request and per-map switch (2026-10-12)
 
@@ -363,7 +417,7 @@ Both live in the map object's `status` (jsonb), read by graph-builder through `P
 `SCENE_GRAPH_WORKER_ENABLED` is on. The worker looks it up once at start and then at most every
 `WorkerConfig.rebuild_check_s` (30 s) per map. On a request it does what a params-hash mismatch does:
 `begin_generation` + `new_engine`, cursor back to zero, every leaf refolded into the pending generation, readers keep
-the old version until `commit_generation`. `REBUILD_STARTED/COMPLETED` carry `reason: "nodes_deleted"` (`needs_rebuild`
+the old version until `commit_generation`. `REBUILD_STARTED/COMPLETED` carry the request's `reason` (`nodes_deleted` from node delete; `needs_rebuild`
 stays the params-hash reason). After the commit the key is removed only if its `at` still equals the one rebuilt for
 (`UPDATE ... WHERE status->key->>'at' = at`), so a delete that landed during the rebuild survives and causes one more
 rebuild. A failed clear is retried at the next check. Notes: a graph that was never saved is simply restarted in place
@@ -383,3 +437,27 @@ keeps the previous answer.
 **Worker-disabled event at startup: not done.** `MAP.SCENE_GRAPH_DISABLED_SKIPPED` requires `map_name`, so a
 service-level "worker off" would be one event per map on every restart, and it would need a registry query and
 event-DB write from a feature that is off. The existing startup log and the per-map event above cover it.
+
+## Read contract for a map without a graph (2026-10-13)
+
+* `GET /maps/{id}/scene-graph` and `/scene-graph/lineage`: 200 with `available: false` (no graph yet, worker flag
+  off on the API, or a dropped graph); `/scene-graph/raster`: 404. All three answer `Cache-Control: no-store`, since
+  the answer changes the moment a graph is built.
+* `scene_graph_updated` with `version: 0` is the hint "no graph" (an empty rebuild dropped it): clients drop the
+  view; it is not a version to pin.
+* The identity of a version is its **epoch** `(created_ms, generation)` from the manifest, part of the ETag and of
+  every read-cache key: a map recreated under the same id restarts at version 1 but never matches an old ETag.
+  Responses are never `immutable`. A drop (delete saga, empty rebuild) purges the map's read caches.
+
+## Ingest classification (2026-10-13)
+
+* **`commit_generation` failures** are classified: FENCED when the live version is already at or past ours; a
+  rebuild restart when our pending generation vanished; otherwise a bounded BACKOFF (`commit_retries`, 5) that then
+  ends FENCED. Reported as `fold_failed` stage `save`, detail `commit: ...`.
+* **Empty rebuild**: after `empty_rebuild_confirmations` (2) caught-up steps with no foldable leaf the worker calls
+  `store.drop`, publishes version 0 and emits `rebuild_completed` (`version: 0`); the request is cleared.
+* **`fold_failed` stages**: `fold`, `tiles`, `save`, `load`, and the terminal `deleting`, `fenced`, `needs_rebuild`,
+  `max_maps` (table and alerts: runbook section 5).
+* **Registered maps** are matched by bucket slug (lower-case, `_` equal to `-`, `scene_guard.bucket_slug`); two
+  registered maps with one slug are both skipped with an error log (no event).
+* **PNG decode** is `zlib` + numpy (no Pillow).
