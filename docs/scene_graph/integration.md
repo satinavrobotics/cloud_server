@@ -261,3 +261,28 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
   one) and `leaf_stamp` always prefers it. Nodes folded before this change get their stamp at their next fold.
 * LACI: time-source fallback bound (7 days, implemented in `scene_leaf`); where the robot footprint (`r_d`) lives; the
   leaf threshold for `waypoints[i].node_id`; `run_id` (derive later from session and time, or look up at ingest).
+
+
+## Blocked overlay: draft for review (nothing below is applied)
+
+Done and unwired: `packages/utils/blocked_geometry.py` (+ tests): the obstacle is the segment from `LEAD_M`
+(1.0 m, must exceed `HALF_WIDTH_M` 0.5 m or a leg leaving the robot sideways is "blocked" by its own start) ahead
+of the robot's pose to the blocked waypoint; `route_hits_row` tests the route's legs against it; `overlay` yields
+`(discs, segments)` for `Blocked`. Rows without a robot pose keep the old disc rule.
+
+Needs your go-ahead (changes shared tables and the dispatcher):
+
+1. Migration `20261012_01_blocked_graph_nodes_geometry` (additive, nullable, no backfill; downgrade drops them):
+   `ALTER TABLE blocked_graph_nodes ADD COLUMN IF NOT EXISTS robot_x double precision,
+   ADD COLUMN IF NOT EXISTS robot_y double precision, ADD COLUMN IF NOT EXISTS prev_x double precision,
+   ADD COLUMN IF NOT EXISTS prev_y double precision;`
+   `prev_x/prev_y` (previous waypoint) is kept for a later fit; the overlay does not use it yet.
+2. `blocked_nodes.COLUMNS`/`UPSERT_SQL`/`upsert_params` gain the four columns. Must ship **after** the migration
+   (ACTIVE_FOR_MAP_SQL selects them), same release, migration first.
+3. mission-dispatch's edgeBlocked handler passes the robot's pose (latest robot row in map frame) and the previous
+   waypoint; rows from before keep NULLs.
+4. `_reroute_through_blocked` (API) and `blocked_nodes.rows_hit` additionally call `route_hits_row` on the route's
+   polyline; the planner passes `overlay(...)` to `route()` when the scene-graph planner is on.
+5. Open: the 1.0 m lead assumes obstacles are seen at more than 1 m; a robot that stops at 0.6 m reports a segment
+   of near zero length (clipped to the waypoint) which is a disc in effect. Acceptable, or use the costmap's
+   lethal cells at the block instead (needs the dispatcher to send them; not proposed).
