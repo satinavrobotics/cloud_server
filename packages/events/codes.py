@@ -65,6 +65,11 @@ class EventCode(str, enum.Enum):
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
     MAP_NODES_DELETED = "MAP.NODES_DELETED"
+    MAP_SCENE_GRAPH_UPDATED = "MAP.SCENE_GRAPH_UPDATED"
+    MAP_SCENE_GRAPH_FOLD_FAILED = "MAP.SCENE_GRAPH_FOLD_FAILED"
+    MAP_SCENE_GRAPH_REBUILD_STARTED = "MAP.SCENE_GRAPH_REBUILD_STARTED"
+    MAP_SCENE_GRAPH_REBUILD_COMPLETED = "MAP.SCENE_GRAPH_REBUILD_COMPLETED"
+    MAP_SCENE_GRAPH_DISABLED_SKIPPED = "MAP.SCENE_GRAPH_DISABLED_SKIPPED"
     MISSION_ORDER_CHURN = "MISSION.ORDER_CHURN"
     MISSION_NODE_SKIPPED = "MISSION.NODE_SKIPPED"
     MISSION_NODE_NOTE = "MISSION.NODE_NOTE"
@@ -191,6 +196,17 @@ CODES: Dict[EventCode, CodeMeta] = {
                                              _R),
     _C.MAP_NODES_DELETED: CodeMeta(_S.INFO, True, schemas.MapNodesDeleted, _A),
     _C.MAP_RECONSTRUCTION_FAILED: CodeMeta(_S.WARNING, True, schemas.ReconstructionFailed, _R),
+    # Scene graph (docs/scene_graph/integration.md, ops/events). Source graph_builder, no robot;
+    # discriminator `map:<name>:scene_graph:<kind>:<version or ts>`. UPDATED: a snapshot was
+    # published (emit at most once per publish interval, never per leaf). FOLD_FAILED: the
+    # worker could not fold or save a batch (it backs off and retries). REBUILD_*: the index
+    # `sg_*` or the snapshot is rebuilt from the leaves. DISABLED_SKIPPED: a map was skipped
+    # because the scene graph is switched off (rate-limit per map).
+    _C.MAP_SCENE_GRAPH_UPDATED: CodeMeta(_S.INFO, True, schemas.SceneGraphUpdated, _G),
+    _C.MAP_SCENE_GRAPH_FOLD_FAILED: CodeMeta(_S.WARNING, True, schemas.SceneGraphFoldFailed, _G),
+    _C.MAP_SCENE_GRAPH_REBUILD_STARTED: CodeMeta(_S.INFO, True, schemas.SceneGraphRebuild, _G),
+    _C.MAP_SCENE_GRAPH_REBUILD_COMPLETED: CodeMeta(_S.INFO, True, schemas.SceneGraphRebuild, _G),
+    _C.MAP_SCENE_GRAPH_DISABLED_SKIPPED: CodeMeta(_S.INFO, True, schemas.SceneGraphSkipped, _G),
     # The dispatcher stopped a mission whose order kept being re-issued (Robot._bump_order_rev).
     _C.MISSION_ORDER_CHURN: CodeMeta(_S.ERROR, True, schemas.OrderChurn, _D),
     # The robot skipped a blocked node its nodePolicy allowed it to skip, or reported an

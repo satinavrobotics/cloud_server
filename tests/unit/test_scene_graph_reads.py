@@ -190,3 +190,48 @@ def test_future_version_is_404_and_whole_graph_loads_once_for_many_bboxes():
     for i in range(3):
         run(w.view("m", BBox(i, 0, i + 1, 1)))
     assert len(loads) == 1
+
+
+@pytest.mark.parametrize("text", [None, "", "1,2,3", "a,b,c,d", "0,0,1,1,2", "nan,0,1,1", "0,0,inf,1",
+                                  "1,0,0,1", "0,1,1,1"])
+def test_parse_bbox_errors_are_422(text):
+    with pytest.raises(HTTPException) as e:
+        sgr.parse_bbox(text)
+    assert e.value.status_code == 422
+
+
+@pytest.mark.parametrize("level", [-1, sgr.MAX_LEVEL + 1])
+def test_level_out_of_range_is_422_for_view_and_raster(level):
+    r, _ = reads()
+    for call in (lambda: r.view("m", BBox(0, 0, 1, 1), level=level),
+                 lambda: r.raster("m", BBox(0, 0, 1, 1), level=level)):
+        with pytest.raises(HTTPException) as e:
+            run(call())
+        assert e.value.status_code == 422
+
+
+def test_level_bounds_are_accepted():
+    r, _ = reads()
+    for level in (0, sgr.MAX_LEVEL):
+        assert run(r.view("m", BBox(0, 0, 1, 1), level=level))["available"] is True
+
+
+def test_raster_too_large_is_422_but_json_view_is_not_cell_limited():
+    r, _ = reads(max_cells=100)
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 100, 100), raster=True))
+    assert e.value.status_code == 422
+    assert run(r.view("m", BBox(0, 0, 100, 100)))["available"] is True
+
+
+def test_module_limits_are_the_documented_ones():
+    assert (sgr.MAX_CELLS, sgr.MAX_CHARTS, sgr.MAX_LEVEL) == (4_000_000, 20_000, 8)
+    r = sgr.SceneGraphReads(lambda m: {"version": 1}, lambda *a: None)
+    assert (r.max_cells, r.max_charts) == (sgr.MAX_CELLS, sgr.MAX_CHARTS)
+
+
+def test_negative_version_is_404():
+    r, _ = reads()
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 1, 1), version=-1))
+    assert e.value.status_code == 404

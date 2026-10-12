@@ -416,6 +416,40 @@ class MapIngestRejected(Payload):
     payload_session_id: Optional[str] = None
 
 
+class SceneGraphUpdated(Payload):
+    """MAP.SCENE_GRAPH_UPDATED (graph-builder scene-graph worker): a snapshot `version` was
+    published. `leaves_folded` since the previous publish; `charts_changed` from its Dirty."""
+    map_name: str
+    version: int
+    leaves_folded: Optional[int] = None
+    charts_changed: Optional[int] = None
+
+
+class SceneGraphFoldFailed(Payload):
+    """MAP.SCENE_GRAPH_FOLD_FAILED: a batch could not be folded or saved (`stage`: fold, tiles,
+    save). The worker backs off and retries; `consecutive` counts the failures in a row."""
+    map_name: str
+    stage: str
+    detail: Optional[str] = None
+    consecutive: Optional[int] = None
+
+
+class SceneGraphRebuild(Payload):
+    """MAP.SCENE_GRAPH_REBUILD_STARTED / _COMPLETED: the scene graph is rebuilt from the leaves
+    (`reason`: needs_rebuild, backfill, manual). COMPLETED carries `version` and `duration_s`."""
+    map_name: str
+    reason: str
+    version: Optional[int] = None
+    duration_s: Optional[float] = None
+
+
+class SceneGraphSkipped(Payload):
+    """MAP.SCENE_GRAPH_DISABLED_SKIPPED: the scene graph is disabled (`reason`: worker_disabled,
+    map_not_enabled), so the map's leaves were not folded."""
+    map_name: str
+    reason: str
+
+
 class ReconstructionStarted(Payload):
     """MAP.RECONSTRUCTION_STARTED (packages/api/reconstruction.py): the service's first
     progress callback for the job."""
