@@ -24,24 +24,27 @@ PLANNER_LEGACY = "legacy"
 def simplify(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool],
              max_gap: float) -> List[Pt]:
     """Greedy string pulling: from each kept point go to the farthest later point that is visible
-    from it and at most `max_gap` away. The first and last points are always kept; with
-    `max_gap` <= 0 no cap applies."""
-    pts = list(points)
+    from it and at most `max_gap` away (straight line). The first and last points are always kept;
+    with `max_gap` <= 0 no cap applies. Consecutive duplicates are dropped. The candidates of a
+    step are the points up to the first one beyond `max_gap`, so the cost is O(points x window),
+    not O(points^2): a 1 km route on a 0.1 m lattice has 10 000 points."""
+    pts: List[Pt] = []
+    for p in points:
+        if not pts or p != pts[-1]:
+            pts.append(p)
     if len(pts) <= 2:
         return pts
     kept = [pts[0]]
-    i = 0
-    last = len(pts) - 1
+    i, last = 0, len(pts) - 1
     while i < last:
-        j = i + 1
-        for k in range(last, i, -1):
-            if max_gap > 0 and math.dist(pts[i], pts[k]) > max_gap and k > i + 1:
-                continue
-            if k == i + 1 or visible(pts[i], pts[k]):
-                j = k
+        best = i + 1                       # the next lattice point is always reachable
+        for k in range(i + 2, last + 1):
+            if max_gap > 0 and math.dist(pts[i], pts[k]) > max_gap:
                 break
-        kept.append(pts[j])
-        i = j
+            if visible(pts[i], pts[k]):
+                best = k
+        kept.append(pts[best])
+        i = best
     return kept
 
 
@@ -49,7 +52,8 @@ def build_waypoints(points: Sequence[Pt], map_id: str,
                     node_of: Callable[[float, float], Optional[str]],
                     goal_theta: Optional[float] = None
                     ) -> Tuple[List[common.Pose2D], Optional[List[str]]]:
-    """(waypoints, planned_path or None) for an already simplified point list."""
+    """(waypoints, planned_path or None) for an already simplified point list.
+    `planned_path` is None unless every waypoint has a distinct leaf id."""
     pts = list(points)
     poses: List[common.Pose2D] = []
     for i, (x, y) in enumerate(pts):
@@ -64,5 +68,8 @@ def build_waypoints(points: Sequence[Pt], map_id: str,
             theta = 0.0
         poses.append(common.Pose2D(x=x, y=y, theta=theta, map_id=map_id, node_id=node_of(x, y)))
     ids = [p.node_id for p in poses]
-    planned = [str(n) for n in ids] if poses and all(n is not None for n in ids) else None
+    # one id per waypoint, no repeats: two waypoints snapped to the same leaf would be a zero-length
+    # leg for the leg tracker, so such a route carries no planned_path (its legs are VDA-id only).
+    planned = ([str(n) for n in ids]
+               if poses and all(n is not None for n in ids) and len(set(ids)) == len(ids) else None)
     return poses, planned

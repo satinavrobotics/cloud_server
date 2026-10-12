@@ -22,6 +22,7 @@ MAX_LEVEL = 8
 MAX_CELLS = 4_000_000         # raster cells per request (8 MB as u16)
 MAX_CHARTS = 20_000
 CACHE_RESULTS = 8
+CACHE_GRAPHS = 2
 
 
 def parse_bbox(text: Optional[str]) -> BBox:
@@ -54,8 +55,13 @@ class SceneGraphReads:
     def __init__(self, meta: Callable[[str], Dict[str, Any]],
                  load: Callable[[str, Optional[int], BBox], Any],
                  lineage: Optional[Callable[[str, int], Dict[str, List[str]]]] = None,
-                 max_cells: int = MAX_CELLS, max_charts: int = MAX_CHARTS) -> None:
+                 max_cells: int = MAX_CELLS, max_charts: int = MAX_CHARTS,
+                 whole_graph: bool = False) -> None:
+        """`whole_graph`: `load` ignores the bbox, so one loaded graph serves every bbox of a
+        (map, version); without it each bbox is loaded by itself."""
         self._meta, self._load, self._lineage = meta, load, lineage
+        self._whole = whole_graph
+        self._graphs: "OrderedDict[tuple, Any]" = OrderedDict()
         self.max_cells, self.max_charts = max_cells, max_charts
         self._results: "OrderedDict[tuple, Any]" = OrderedDict()
 
@@ -64,9 +70,11 @@ class SceneGraphReads:
         current = meta.get("version")
         if current is None:
             return None, meta
-        if version is not None and version != current:
-            return int(version), meta     # a pinned older version; the store decides if it is retained
-        return int(current), meta
+        if version is None or version == current:
+            return int(current), meta
+        if version > current or version < 0:
+            raise HTTPException(status_code=404, detail=f"scene graph version {version} does not exist")
+        return int(version), meta         # an older version; the store says if it is still retained
 
     def _check(self, bbox: BBox, level: int, meta: Dict[str, Any], raster: bool) -> None:
         if not 0 <= level <= MAX_LEVEL:
@@ -86,7 +94,15 @@ class SceneGraphReads:
             return self._results[key]
 
         def run() -> Any:
-            return self._load(map_id, version, bbox).query(bbox, level, raster)
+            gkey = (map_id, version)
+            graph = self._graphs.get(gkey) if self._whole else None
+            if graph is None:
+                graph = self._load(map_id, version, bbox)
+                if self._whole:
+                    self._graphs[gkey] = graph
+                    while len(self._graphs) > CACHE_GRAPHS:
+                        self._graphs.popitem(last=False)
+            return graph.query(bbox, level, raster)
         try:
             res = await asyncio.to_thread(run)
         except LookupError:
@@ -166,7 +182,7 @@ def from_store(store: Any) -> SceneGraphReads:
     return SceneGraphReads(
         meta=store.meta,
         load=lambda map_id, version, bbox: store.load(map_id, version),
-        lineage=getattr(store, "lineage", None))
+        lineage=getattr(store, "lineage", None), whole_graph=True)
 
 
 def build(enabled: bool) -> SceneGraphReads:

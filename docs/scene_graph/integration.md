@@ -100,15 +100,15 @@ Dropped: "link cost from observation" (edge observations accrue per leaf edge; r
   the contract (supersedes this section where they differ).
 * New response fields (additive, optional): `min_width`, `chart_keys` of the route.
 
-## Order
+## Order and status (2026-10-12)
 
-* **Now, independent of the interface**: time-source rule and capture stamp at ingest; `r_d` source (robot footprint
-  lookup); layer-to-role configuration in graph-builder; `run_id` stamping; delete-saga drop hook; `bbox`/`level`
-  route skeleton and websocket message shape; planner flag, fallback and waypoint-simplification stub; test harness
-  against a fake `SceneGraphStore`.
-* **After the interface freeze**: ingest worker against the real library, read API, client layers, planner on
-  `route`. The planner switches on last, per map, after a corridor/door map has validated the structure (the one real
-  map so far is a single room).
+* **Done, engine-independent (LACI)**: ingest adapter, stamp rule and per-session clock, stable stamp, worker, lock and
+  lifecycle guard, runner, `costmap_stored_ms` cursor, delete-saga drop, planner response fields and waypoint builder
+  (flags off), read API and websocket message, blocked-overlay geometry (unwired).
+* **Waiting on CIMBI**: engine behind `api.py`, `store.py`, `lineage()`, open-field scale gate, bbox -> tiles.
+* **Then (LACI)**: wire runner into graph-builder `main.py` behind `SCENE_GRAPH_WORKER_ENABLED`, `route()` into
+  `plan_route` behind `SCENE_GRAPH_PLANNER_ENABLED` (per map, last, after a corridor/door map validates the
+  structure), client layers, blocked-overlay migration (needs go-ahead), Dockerfile/requirements (numpy).
 
 ## Interface draft 0.9 (CIMBI, 2026-10-12): resolved and consequences
 

@@ -176,3 +176,17 @@ def test_from_store_uses_meta_load_and_optional_lineage():
 def test_scene_graph_prefix_is_not_a_node():
     from packages.topomap_dbs.node_ids import NON_NODE_PREFIXES, is_node_id
     assert "scene_graph" in NON_NODE_PREFIXES and not is_node_id("scene_graph")
+
+
+def test_future_version_is_404_and_whole_graph_loads_once_for_many_bboxes():
+    r, _ = reads()
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 1, 1), version=9))
+    assert e.value.status_code == 404
+    loads = []
+    store = NS(meta=lambda mid: {"version": 2},
+               load=lambda mid, v, tiles=None: loads.append(1) or FakeGraph([]))
+    w = sgr.from_store(store)
+    for i in range(3):
+        run(w.view("m", BBox(i, 0, i + 1, 1)))
+    assert len(loads) == 1

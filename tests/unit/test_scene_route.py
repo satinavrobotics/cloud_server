@@ -60,3 +60,21 @@ def test_single_point_and_empty():
     poses, planned = sr.build_waypoints([(3.0, 4.0)], "m", lambda x, y: "n")
     assert len(poses) == 1 and poses[0].theta == 0.0 and planned == ["n"]
     assert sr.build_waypoints([], "m", lambda x, y: "n") == ([], None)
+
+
+def test_simplify_drops_duplicates_and_scales_with_window():
+    pts = [(0.0, 0.0), (0.0, 0.0), (1.0, 0.0)]
+    assert sr.simplify(pts, always, 0) == [(0.0, 0.0), (1.0, 0.0)]
+    calls = []
+
+    def counting(a, b):
+        calls.append(1)
+        return True
+    long_route = [(i * 0.1, 0.0) for i in range(5000)]
+    out = sr.simplify(long_route, counting, 5.0)
+    assert len(out) > 90 and len(calls) < 5000 * 60      # windowed, not 5000 x 5000 / 2
+
+
+def test_planned_path_none_when_two_waypoints_share_a_leaf():
+    poses, planned = sr.build_waypoints([(0.0, 0.0), (1.0, 0.0)], "m", lambda x, y: "same")
+    assert len(poses) == 2 and planned is None

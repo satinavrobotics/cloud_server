@@ -240,7 +240,7 @@ class SceneWorker:
         self._scan = self._order(nodes[-1]) if (more and nodes) else None
         # 3. adapt
         leaves, handled, skipped = [], [], 0
-        self._new_stamps: Dict[str, int] = {}
+        self._new_stamps = {}
         for node in nodes:
             outcome = self._adapt(node)
             if outcome == "duplicate":

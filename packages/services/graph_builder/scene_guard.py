@@ -15,7 +15,7 @@ testable without a database; `connect_from_conninfo` is the production factory.
 """
 import hashlib
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict
 
 log = logging.getLogger("GraphBuilderService.scene_guard")
 

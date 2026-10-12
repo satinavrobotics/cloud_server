@@ -54,3 +54,11 @@ def test_overlay_splits_segments_and_discs():
     discs, segs = bg.overlay([row(), legacy, nodeonly], disc_radius_m=0.5)
     assert discs == [(3.0, 4.0, 0.5)]
     assert segs == [((bg.LEAD_M, 0.0), (10.0, 0.0), bg.HALF_WIDTH_M)]
+
+
+def test_synthetic_position_rows_become_discs_or_segments():
+    synth = {"graph_node_id": "@3.00,4.00", "x": None, "y": None}
+    discs, segs = bg.overlay([synth], disc_radius_m=0.5)
+    assert discs == [(3.0, 4.0, 0.5)] and segs == []
+    with_pose = dict(synth, robot_x=0.0, robot_y=4.0)
+    assert bg.row_segment(with_pose, lead_m=1.0) == ((1.0, 4.0), (3.0, 4.0))

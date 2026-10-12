@@ -17,6 +17,8 @@ import math
 import os
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from packages.utils.blocked_nodes import position_of
+
 Pt = Tuple[float, float]
 
 # Must exceed HALF_WIDTH_M: otherwise a leg leaving the robot sideways is within the segment's width.
@@ -51,14 +53,25 @@ def segment_segment_distance(a: Pt, b: Pt, c: Pt, d: Pt) -> float:
                point_segment_distance(c, a, b), point_segment_distance(d, a, b))
 
 
+def _waypoint(row: Mapping[str, Any]) -> Optional[Pt]:
+    """The blocked waypoint: the row's x, y, else the position a synthetic "@x,y" id names."""
+    try:
+        return float(row["x"]), float(row["y"])
+    except (KeyError, TypeError, ValueError):
+        return position_of(str(row.get("graph_node_id", "")))
+
+
 def row_segment(row: Mapping[str, Any], lead_m: float = LEAD_M) -> Optional[Tuple[Pt, Pt]]:
     """(a, b): from `lead_m` ahead of the robot's pose to the blocked waypoint; None when the row
     has no robot pose or no waypoint position. Clipped so a is never beyond b."""
+    wp = _waypoint(row)
     try:
         rx, ry = float(row["robot_x"]), float(row["robot_y"])
-        bx, by = float(row["x"]), float(row["y"])
     except (KeyError, TypeError, ValueError):
         return None
+    if wp is None:
+        return None
+    bx, by = wp
     length = math.hypot(bx - rx, by - ry)
     if length == 0.0:
         return (bx, by), (bx, by)
@@ -83,8 +96,8 @@ def route_hits_row(row: Mapping[str, Any], polyline: Sequence[Pt], half_width_m:
 def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_m: float = HALF_WIDTH_M,
             lead_m: float = LEAD_M) -> Tuple[List[Tuple[float, float, float]], List[Tuple[Pt, Pt, float]]]:
     """(discs, segments) for the planner's transient `Blocked`: a row with a robot pose is a
-    segment, any other row with a position a disc. Rows naming a graph node without a position
-    contribute nothing here (the graph-node exclusion handles them)."""
+    segment, any other row with a position a disc. A row without any position (a plain graph node id)
+    contributes nothing here: the graph-node exclusion handles it."""
     discs: List[Tuple[float, float, float]] = []
     segments: List[Tuple[Pt, Pt, float]] = []
     for row in rows:
@@ -92,8 +105,7 @@ def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_
         if seg is not None:
             segments.append((seg[0], seg[1], half_width_m))
             continue
-        try:
-            discs.append((float(row["x"]), float(row["y"]), disc_radius_m))
-        except (KeyError, TypeError, ValueError):
-            continue
+        wp = _waypoint(row)
+        if wp is not None:
+            discs.append((wp[0], wp[1], disc_radius_m))
     return discs, segments
