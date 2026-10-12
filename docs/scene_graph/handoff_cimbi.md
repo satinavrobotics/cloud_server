@@ -5,6 +5,25 @@ owns everything that connects it to the running system (`integration.md`: ingest
 lifecycle hooks, events, ops). This file is the contract between the two. Anything marked **DECIDE** needs an answer
 from both of us before either side builds on it.
 
+## Amendments after CIMBI's reply (v2, 2026-10-12) - these override anything below that conflicts
+
+Accepted by LACI: Leaf also carries `r_d` and optional extra channel windows; fold order-independent by (capture
+time, value), watermark for replay efficiency only; persistent chart keys with lineage by overlap (the client
+re-maps through a lineage map, "ids stable forever" is not required); `Route` returns chart keys, length, minimum
+width; `query(bbox, level)` returns charts with driven / ever-blocked fractions and links with length, widest-path
+width and per-channel integrals; `cover(chart_keys, k)`; no price in the graph; planning on the lattice; no
+clearance cap, locality from the read-dependency closure (bounded by chart scale, not map size, to be shown);
+snapshot in MinIO is canonical (with a per-cell capture-time plane and the planes the planner prices from), Arango
+`sg_*` an index, LACI adds the saga drop; layers are roles, not a single layer; robot size is per leaf (`r_d`),
+not per map. Do not build on v1 internals (`_Region`, `Router`, `build_levels`, tau/gamma).
+
+Questions back to CIMBI: (1) the source of "ever blocked" (costmap lethal or robot events delivered to the worker?);
+(2) the chart geometry encoding for display (outline polygons vs a raster tile of owner keys); (3) evidence that the
+re-solve closure is bounded by scale; (4) which planes the planner needs from the snapshot to price a corridor, and
+whether they load per tile; (5) confirm star-shaped charts give few-waypoint straight segments inside a chart.
+LACI side: the capture-time source is the robot capture stamp, sanity-checked against receive time (LACI defines the
+fallback); `r_d` comes from the robot footprint at ingest.
+
 ## Why the scope below
 
 Requirement: one design for small and very large maps. Principle: every operation is local and bounded; a small map

@@ -1,92 +1,118 @@
 # Scene graph: integration plan
 
-Status: proposal, revised after review and for scale. Companion to `design.md` (the algorithm); this file scopes how
-it joins the running system.
+Status: proposal, revised for the v2 algorithm (free-space charts) and CIMBI's reply of 2026-10-12. Companion to
+`design.md` (v1 algorithm, being replaced) and `handoff_cimbi.md` (the contract with CIMBI). The library interface is
+**not frozen**; items marked *(pending interface)* depend on it.
 
-**Ownership.** CIMBI: the algorithm (`packages/scene_graph`) and its persistence (snapshot, `sg_*` storage), see
-`handoff_cimbi.md`. LACI: everything else here (ingest worker, read API, client, planner, lifecycle hooks, events,
-ops). Pieces 1, 3, 4 (snapshot part) and the refold in 5 are CIMBI's; the rest is LACI's.
+**Ownership.** CIMBI: the algorithm (`packages/scene_graph`) and its persistence (snapshot, tile layout, `sg_*`
+formats). LACI: everything else here (ingest worker, read API, client, planner, lifecycle hooks, events, ops).
 
 ## Decisions
 
-1. **The leaf graph stays.** Topo nodes and edges (`nodes_{id}`, `edges_{id}`, `GET /maps/{id}/graph`) are unchanged
-   and remain the record of what each mission and session laid down (logs: `session_trace`, `edge-stats`, run views).
-   The high-level graph is *additional*, derived from the leaves; it is what the map window displays and what
-   planning uses.
-2. **Planner output keeps its shape**: `/api/v1/plan` returns `waypoints` as poses, as today; dispatcher, order
-   building, mapId and frame handling are not touched. Two fields need a defined meaning, see "Planner contract".
+1. **The leaf graph stays.** Topo nodes and edges (`nodes_{id}`, `edges_{id}`, `GET /maps/{id}/graph`) remain the
+   record of what each mission and session laid down (logs: `session_trace`, `edge-stats`, run views). The high-level
+   graph is *additional*, derived from the leaves; it is what the map window displays and what planning uses.
+2. **Planner output keeps its shape**: `/api/v1/plan` returns `waypoints` as poses; dispatcher, order building, mapId
+   and frame handling are untouched. See "Planner contract".
 3. **The builder is a separate worker inside the graph-builder service**, outside the MQTT/upload path and
    `_upload_lock`, fed from the database, one writer per map (advisory lock).
-4. **Costmap row order is verified** (nav2, row 0 = origin y); the library's convention is correct. No open item.
+4. **Planning searches the cost lattice inside a corridor of charts**, not anchor to anchor (v2 measured anchor-hub
+   stretch 1.15 mean / 1.58 max). Charts, links and levels serve display, "go to place" and the corridor.
+5. **The snapshot in MinIO (`map-{id}/scene_graph/`) is the single source of truth; Arango `sg_*` is a rebuildable
+   index.** Both are needed for lifecycle: the snapshot dies with the bucket, the index needs an explicit drop in
+   the delete saga (`graph_db.delete_map` drops only `nodes_`/`edges_`/graph).
+6. **Costmap layers are roles, not a choice.** The library takes occupancy (the only channel that shapes the
+   partition) plus optional channels; graph-builder maps stored layer names to roles by configuration. Old
+   recordings get an `occupancy_depth` layer from depth: a separate backfill step, pending CIMBI's user.
+7. **Costmap row order is verified** (nav2, row 0 = origin y). No open item.
 
-## Corrections from review (facts about the library)
+## What v2 changes (vs the v1-based plan)
 
-* `Router.cost(a, b)` returns a float only, over coarse node indices; it has no path and no point lookup, and
-  `_Region.node()` returns -1 off the lattice (which would index the last node). It is not a planning API.
-* The coarse lattice is small (about 1.7k nodes for office8), so a plain Dijkstra on it gives the exact path, takes a
-  blocked overlay trivially, and has no portal-sampling stretch (1.00-1.24). **Planning therefore searches the coarse
-  lattice, not anchor-to-anchor.** Regions, anchors and links serve display, "go to place" goal picking and hierarchy,
-  and at scale `Router`'s portal graph selects the corridor (see "Scale design").
-* There is no serialization. State to persist: the `CellMap` chunks (value, owner, visited), `anchors`, `_next`,
-  `_last` (per session; without it the first leaf after a restart skips `clear_path`) and the params hash.
-* Fold is destructive and the result history-dependent. A leaf delete or a session realign is therefore a **full
-  refold** (O(N) costmap fetches from MinIO) and changes partition and anchor ids. This supersedes design.md's
-  "a leaf is folded once and not queried again" for those two events only.
-* One leaf costs `_rebuild()` plus a `_Region` construction again in `links()` and in `build_levels()`.
+* **Order-independent fold** by (capture time, value); unknown never overwrites. Folding a leaf twice is a no-op, so
+  delivery can be at-least-once and the strict `(stamp, id)` ordering and per-leaf `sg_folded` flag are dropped. The
+  watermark remains only to make restart replay cheap.
+* **Capture time is now data.** The snapshot carries a per-cell capture-time plane (without it the fold is
+  order-dependent again). Capture stamps are compared across robots and sessions, so ingest must define the time
+  source: the robot capture stamp (`costmap_stamp_ms` / the node's capture time), sanity-checked against server
+  receive time, with a documented fallback when the clocks disagree beyond a bound. *(LACI)*
+* **Per-leaf robot size.** `Leaf` carries `r_d`, the half-side of the robot that drove. This replaces "robot radius
+  per map". The planner serves a different robot than the one that mapped, so a route is checked against its own
+  robot: `Route` returns the minimum width along it and the planner compares that with the planning robot's width.
+  Source of `r_d`: the robot's footprint (robot object / orchestrator config), stamped at ingest. *(LACI)*
+* **Keys are persistent chart keys with lineage** (about 94-95% overlap per frame). A key can retire, split or merge,
+  so the API and websocket carry a lineage map (retired key -> successor keys) with each version, and the client
+  re-maps selections and saved goals through it. Stable-id-forever is not promised.
+* **Planes the planner needs.** The planning price is computed at plan time from planes (driven/witnessed, worst
+  costmap value ever seen, ever-blocked), not stored in the graph. The planner must load those planes for the
+  corridor's tiles, version-pinned, not just charts and links.
+* **Blocked events feed the graph.** `query` reports an ever-blocked fraction per chart; the source of "blocked" is
+  not defined yet (costmap lethal? robot `edgeBlocked` / `blocked_graph_nodes` events?). If events, the dispatcher
+  side delivers them to the worker. **Open question to CIMBI.**
+* **Locality from the re-solve's read-dependency closure**, not a clearance cap (CIMBI). Condition we hold them to:
+  the closure is bounded by the chart scale, not by map size; it is the first thing the scale gate measures.
+* **`cover(chart_keys, k) -> leaf keys`** (pose-only, minimal set) is a new integration point: "reconstruct this
+  room" via the reconstruction gateway (`packages/api/reconstruction.py`) instead of whole-map manifests.
+* **Star-shaped charts** (every cell seen from the anchor along a near-optimal straight segment) allow very few
+  waypoints inside one chart. Candidate optimization for waypoint simplification; to confirm with CIMBI.
+* Dropped from v1: `Router`, `_Region`, `build_levels`, tau/gamma, the `_last`/`_next` snapshot list, the "full
+  refold on delete" claim (order-independence lets a delete recompute only the cells that leaf won).
 
 ## Scale design (small and very large maps)
 
-One principle: every operation is local and bounded; a small map is the degenerate case.
+Principle: every operation is local and bounded; a small map is the degenerate case.
 
-* **Incremental builder**: repair only the leaf window plus margin (clearance capped so it is local); per-leaf cost is
-  independent of map size. Today `_rebuild` is O(map) per leaf.
-* **Planning = corridor, then refine**: portal graph (`Router`'s role) picks the region sequence; the lattice search
-  runs only inside those regions plus a one-region margin. On a small map the corridor is the whole map. Waypoints
-  come from the refined lattice path (simplified).
+* **Incremental builder**: local re-solve over the read-dependency closure (CIMBI). Per-leaf cost independent of map
+  size. Gate below.
+* **Planning = corridor, then refine**: the chart graph selects the chart sequence; the lattice search runs only
+  inside those charts plus a one-chart margin. On a small map the corridor is the whole map.
 * **Tiled persistence**: snapshot per tile plus a manifest; the planner loads only the tiles a corridor touches,
-  cached by `(map, version, tile)`. Tiles are storage only; regions cross tile borders.
-* **Local refold**: leaf delete refolds only the leaves overlapping the affected tiles (spatial query on the existing
-  node index; no membership table); regions elsewhere keep their ids. Realign is a background rebuild with an atomic
-  version switch.
+  cached by `(map, version, tile)`. Tiles are storage only; charts cross tile borders.
+* **Local re-solve on delete or realign**: leaf delete recomputes the cells that leaf won from the remaining leaves
+  overlapping them (spatial query on the existing node index; no membership table). Realign shifts a session
+  wholesale: a background rebuild with an atomic version switch.
 * **Serve by view**: `GET .../scene-graph?bbox=&level=`; hierarchy levels are zoom level of detail; the websocket
-  sends the dirty bbox and changed ids, not the graph.
-* **Gate**: synthetic worlds to about 1M lattice nodes; per-leaf update flat in map size; plan latency bounded by the
-  corridor; path cost within 1.05x of the full-lattice search; invariants equal to a full rebuild's.
-  Everything about large scale is a projection until this gate passes.
+  carries the dirty bbox, changed keys and lineage.
+* **Gate** (CIMBI, section F of the handoff): synthetic worlds to about 1M lattice nodes; per-leaf update flat in
+  map size; plan latency bounded by the corridor; path cost within 1.05x of the full-lattice search; invariants as
+  after a full rebuild. Everything about large scale is a projection until it passes.
 
 ## Pieces
 
-| # | Piece | Scope |
-|---|---|---|
-| 1 | **Library** (first) | `to_snapshot`/`from_snapshot` (chunks, anchors, `_next`, `_last`, params hash; `.npz`); `fold_many(leaves)` (fold all, rebuild once) for catch-up and backfill; one shared `_Region` for `links()`, `build_levels()` and planning; `locate(x, y)` snapping to the nearest navigable node; `route(a, b)` returning the node path on the coarse lattice with an optional blocked overlay; `log` made optional; leaf resampling from a rotated map frame (nearest neighbour, unknown mask preserved) and cell alignment against the payload `resolution`; level ids keyed `(level, id)` with a stable parent id; scipy in requirements |
-| 2 | **Ingest** | One mechanism: a per-map monotonic `sg_seq` assigned when a node's costmap record is stored, plus a watermark in `sg_meta`. The worker folds leaves in `(costmap stamp, id)` order past the watermark. `run_id` is stamped at the same write (merged from the former run-to-leaf piece; `session_id` is already stored) |
-| 3 | **Storage** | Per-map `sg_anchors_{id}`, `sg_links_{id}`, `sg_meta_{id}` in Arango (dropped by the delete saga with the rest). One immutable `snapshot-{version}.npz` in MinIO `map-{id}/scene_graph/` plus a `latest` pointer; a derived PNG of the owner plane for the client if wanted. No per-anchor rasters (the snapshot's owner plane replaces them). Params live in `sg_meta` with their hash; a params change forces a full rebuild |
-| 4 | **Worker** | Snapshot every N leaves or T seconds and at idle; replay is bounded to the delta since the last snapshot. Publish links/levels once per batch or at most every T seconds. Rebuilds from deletes and realigns are debounced. Version rule: anchors and links are written in one transaction and `sg_meta.version` is set last |
-| 5 | **Lifecycle** | Map delete: saga drops collections and objects. Node delete: debounced full refold. Realign: verify whether node poses and `origin_map` are rewritten by `_realign_session`; then refold. Backfill script for existing maps (as the edge-stats one). Anchor ids change on a refold: remap by maximum overlap with the previous ids, or accept churn |
-| 6 | **Read API** | `GET /maps/{id}/scene-graph?level=&version=` (anchors, links, hierarchy, `version`, ETag); `scene_graph_updated {version}` on `/ws/map/{id}`, so a client never mixes versions; `MAP.SCENE_GRAPH_*` events |
-| 7 | **Client** | `SceneGraph` types, `useSceneGraph`, anchor/link/region layers; map window and goal picking use it; `/graph` feeds only per-run log views (`RunStatsTab`, trace). Thumbnails: representative visited leaf per anchor |
-| 8 | **Planner** | Behind a flag, and a per-request fallback to the old search when the scene graph is missing, stale (version lag over a threshold) or start/goal not navigable after snapping. Point -> `locate` -> `route` on the coarse lattice -> waypoints from the node path (simplified). Blocked nodes and `edgeBlocked` become a transient overlay (disk of radius about robot radius + margin around the position, the segment for an edge) on the lattice, so blocks inside a region work |
-| 9 | **Ops** | Dockerfile/requirements, compose and CLAUDE.md entries, build-latency and version-lag metrics, integration test on real Arango/Postgres, robot radius as per-map setting stored in `sg_meta` |
+| # | Piece | Owner | Scope |
+|---|---|---|---|
+| 1 | Library: algorithm | CIMBI | v2 charts, local re-solve, `fold_many`, `refold`, `locate`, `route`, `query`, `cover`, resampling of rotated windows, key lineage. Interface in `handoff_cimbi.md` *(pending interface)* |
+| 2 | Library: persistence | CIMBI | Tiled snapshot including the capture-time and witness/worst/blocked planes, manifest, `sg_*` index, `sg_meta` (version set last, params and hash, generation, watermark), `store.load/save/watermark/drop` *(pending interface)* |
+| 3 | Ingest worker | LACI | Per-map single writer (advisory lock) in graph-builder. Pulls not-yet-folded leaves from Arango (at-least-once, idempotent fold), builds `Leaf` (decode PNG, pose and yaw in map frame, resolution, session, capture stamp with the time-source rule, `r_d`, channels by role), batches into `fold_many`, snapshots every N leaves / T seconds / idle, publishes at most every T seconds, emits `Dirty` to the websocket. `run_id` stamped on the node at the same write as the costmap record |
+| 4 | Lifecycle | LACI | Saga: drop `sg_*_{id}` (index) in `map_delete`; snapshot dies with the bucket. Node delete -> debounced local re-solve. Realign (`MAP.SESSION_REALIGNED`, check whether `origin_map` and node poses are rewritten) -> background rebuild. Backfill script for existing maps (precedent: edge-stats) incl. `occupancy_depth` when released |
+| 5 | Read API | LACI | `GET /maps/{id}/scene-graph?bbox=&level=&version=` (charts with driven / ever-blocked fractions, links with length, width and channel integrals, hierarchy, version, ETag, lineage); `scene_graph_updated {version, dirty, lineage}` on `/ws/map/{id}`; `MAP.SCENE_GRAPH_*` events. Chart geometry encoding (outline polygons vs raster tile) is open with CIMBI |
+| 6 | Client | LACI | `SceneGraph` types, `useSceneGraph`, chart / link layers (driven vs not-driven free space is new information worth showing); map window and goal picking use it; selections and saved goals re-mapped through lineage; `/graph` feeds only per-run log views (`RunStatsTab`, trace). Thumbnails: a representative visited leaf per chart |
+| 7 | Planner | LACI | Behind a flag, with per-request fallback to the old search when the scene graph is missing, stale (version lag over a threshold) or start/goal not navigable after snapping. `locate` -> `route` (corridor then refine, price computed from planes at plan time) -> simplified waypoints. Check `Route.min_width` against the planning robot. Blocked nodes and `edgeBlocked` become a transient overlay on the lattice (disk around the position, segment for an edge) |
+| 8 | Reconstruction link | LACI | `cover(chart_keys, k)` into the reconstruction manifest for room-level jobs; needs CIMBI's `cover` |
+| 9 | Ops | LACI | Dependencies (scipy and whatever v2 needs), Dockerfile/compose, CLAUDE.md, metrics (build latency, version lag, closure size), integration test on real Arango/Postgres |
 
-Dropped: "link cost from observation". Edge observations accrue per leaf edge and routes no longer follow leaf edges,
-so the feed would dry up; revisit when the lattice route has its own traversal statistics.
+Dropped: "link cost from observation" (edge observations accrue per leaf edge; routes no longer follow leaf edges).
 
 ## Planner contract
 
 * `waypoints[i].node_id`: the nearest leaf within a threshold, else `None`. The dispatcher resolves a robot-reported
-  blocked node by `waypoints[i].node_id` with a synthetic `@x,y` fallback (`controllers/mission/server.py` blocked
-  handling), so blocks that match by position still work when it is `None`.
+  blocked node by `waypoints[i].node_id` with a synthetic `@x,y` fallback, so position matching still works.
 * `start_node_id` / `end_node_id` / `path` / `path_length`: filled from the snapped leaf pair and the lattice path
-  length; the first-node drop logic is kept on the same inputs.
+  length; the first-node drop logic keeps the same inputs.
+* New response fields (additive, optional): `min_width`, `chart_keys` of the route.
 
 ## Order
 
-1 -> 2 + 3 -> 4 -> 6 -> 7. Piece 5 (delete/realign) follows 1 and 4 (it needs snapshot and refold). Piece 8 can be
-prototyped offline against the snapshot before UI, and switches on last, per map, after a corridor/door map has
-validated the structure (the one real map so far is a single room).
+* **Now, independent of the interface**: time-source rule and capture stamp at ingest; `r_d` source (robot footprint
+  lookup); layer-to-role configuration in graph-builder; `run_id` stamping; delete-saga drop hook; `bbox`/`level`
+  route skeleton and websocket message shape; planner flag, fallback and waypoint-simplification stub; test harness
+  against a fake `SceneGraphStore`.
+* **After the interface freeze**: ingest worker against the real library, read API, client layers, planner on
+  `route`. The planner switches on last, per map, after a corridor/door map has validated the structure (the one real
+  map so far is a single room).
 
 ## Open
 
-* Robot radius source: per map (stored in `sg_meta`) for the first production run; per robot later.
-* Anchor-id continuity across refolds: remap by overlap versus accept churn.
-* Which costmap layer feeds the graph.
+* CIMBI: source of "ever blocked"; chart geometry encoding for the client; whether the closure is bounded by scale;
+  `occupancy_depth` backfill timing.
+* LACI: time-source fallback bound; where the robot footprint (`r_d`) lives; the leaf threshold for
+  `waypoints[i].node_id`.
