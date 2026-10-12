@@ -16,6 +16,17 @@ A robot stamp is used only when it is sane (`capture_time.parse`: after 2020, at
 MAX_FUTURE_S ahead of receipt) and not older than `max_age_s` before receipt. The age bound is
 generous on purpose: an upload may legitimately wait. A stamp outside it is a wrong clock, and
 the receipt time is used instead. The source is returned so the worker can count fallbacks.
+
+Clock correction (optional, `clock=` a scene_clock.SessionClock the worker keeps per process):
+trusting a robot stamp lets a robot whose clock runs ahead win cells against newer correct
+observations, and the receipt-age bound cannot catch it (an offline upload looks old too). With
+a clock, the sane robot stamp (up to `clock.max_skew_s` ahead of receipt; no age bound, the
+offset replaces it) is fed with its receipt to the session's minimum-delay offset estimate and
+returned as `stamp + offset` clamped to the receipt, with source `*_corrected`. Until the session
+has enough observations the leaf gets the receipt time (STAMP_RECEIPT). The receipt is the
+node's `costmap_stored_ms` (DB clock) when present, else its `timestamp`. A corrected stamp may
+improve between folds of the same leaf; the fold is idempotent, so that is just a newer fold.
+Without a clock the behaviour above is unchanged.
 """
 import datetime
 from typing import Any, Mapping, Optional, Tuple
@@ -27,6 +38,9 @@ MAX_AGE_S = 7 * 24 * 3600.0
 STAMP_COSTMAP = "costmap_stamp"
 STAMP_CAPTURE = "capture_time"
 STAMP_RECEIPT = "receipt"
+STAMP_COSTMAP_CORRECTED = "costmap_stamp_corrected"
+STAMP_CAPTURE_CORRECTED = "capture_time_corrected"
+_CORRECTED = {STAMP_COSTMAP: STAMP_COSTMAP_CORRECTED, STAMP_CAPTURE: STAMP_CAPTURE_CORRECTED}
 
 ROLE_OCCUPANCY = "occupancy"
 # Stored layer name -> role. Only occupancy shapes the partition; the others are optional
@@ -58,10 +72,23 @@ def _ms(moment: datetime.datetime) -> int:
 
 
 def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
-               max_age_s: float = MAX_AGE_S) -> Optional[Tuple[int, str]]:
+               max_age_s: float = MAX_AGE_S, clock: Any = None,
+               session: Optional[str] = None) -> Optional[Tuple[int, str]]:
     """`(epoch ms, source)` the leaf is folded under, or None when the node has no usable time at
-    all (no sane robot stamp and no receipt time): the worker skips such a leaf and counts it."""
+    all (no sane robot stamp and no receipt time): the worker skips such a leaf and counts it.
+    `clock` / `session` (default `node['session_id']`): see the module docstring."""
     receipt = _receipt(node)
+    stored = node.get("costmap_stored_ms")
+    receipt_ms = None
+    if clock is not None:
+        if isinstance(stored, (int, float)) and not isinstance(stored, bool) and stored > 0:
+            receipt_ms = int(stored)
+        elif receipt is not None:
+            receipt_ms = _ms(receipt)
+        if session is None:
+            session = node.get("session_id")
+        if receipt_ms is None or not session:
+            clock = None
     if layer is None:
         layer = role_layers(node.get("costmap")).get(ROLE_OCCUPANCY, ROLE_OCCUPANCY)
     now = receipt or datetime.datetime.now(_UTC)
@@ -71,6 +98,13 @@ def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
         candidates.append((STAMP_COSTMAP, record.get("costmap_stamp_ms")))
     candidates.append((STAMP_CAPTURE, node.get(capture_time.FIELD)))
     for source, raw in candidates:
+        if clock is not None:
+            lenient = datetime.datetime.fromtimestamp(receipt_ms / 1000.0 + clock.max_skew_s, _UTC)
+            moment = capture_time.parse(raw, lenient)
+            if moment is None:
+                continue
+            ms, trusted = clock.correct(str(session), _ms(moment), receipt_ms)
+            return (ms, _CORRECTED[source]) if trusted else (receipt_ms, STAMP_RECEIPT)
         moment = capture_time.parse(raw, now)
         if moment is None:
             continue
