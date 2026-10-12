@@ -15,7 +15,7 @@ check and the planner's path search; see docs/scene_graph/integration.md, "Block
 """
 import math
 import os
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from packages.utils.blocked_nodes import position_of
 
@@ -24,6 +24,35 @@ Pt = Tuple[float, float]
 # Must exceed HALF_WIDTH_M: otherwise a leg leaving the robot sideways is within the segment's width.
 LEAD_M = float(os.getenv("BLOCKED_SEGMENT_LEAD_M", "1.0"))
 HALF_WIDTH_M = float(os.getenv("BLOCKED_SEGMENT_HALF_WIDTH_M", "0.5"))
+
+
+MIN_HALF_WIDTH_M = 0.05
+
+
+def half_width_for(length: Any, width: Any, default: float = HALF_WIDTH_M) -> float:
+    """The overlay half width for a robot: half of the SMALLER footprint side (the r_d rule of
+    scene_adapter.half_side, integration.md "Decisions": to be rethought for a long robot).
+    Either side unknown (-1 until the factsheet arrives, missing, non-finite) gives `default`."""
+    try:
+        sides = [float(length), float(width)]
+    except (TypeError, ValueError):
+        return default
+    if any((not math.isfinite(s)) or s <= 0.0 for s in sides):
+        return default
+    return max(MIN_HALF_WIDTH_M, min(sides) / 2.0)
+
+
+def lead_for(half_width_m: float) -> float:
+    """The lead that keeps a robot's own start clear of the segment: LEAD_M, and never less than
+    the margin LEAD_M - HALF_WIDTH_M beyond the half width (the invariant LEAD_M > HALF_WIDTH_M)."""
+    return max(LEAD_M, half_width_m + (LEAD_M - HALF_WIDTH_M))
+
+
+def widths(half_width_m: Optional[float]) -> Tuple[float, float]:
+    """(half width, lead) to use: the constants for None, else the given half width and its lead."""
+    if half_width_m is None:
+        return HALF_WIDTH_M, LEAD_M
+    return half_width_m, lead_for(half_width_m)
 
 
 def point_segment_distance(p: Pt, a: Pt, b: Pt) -> float:
@@ -117,10 +146,12 @@ def near_obstacle(rows: Iterable[Mapping[str, Any]], xy: Pt, half_width_m: float
 
 
 def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_m: float = HALF_WIDTH_M,
-            lead_m: float = LEAD_M) -> Tuple[List[Tuple[float, float, float]], List[Tuple[Pt, Pt, float]]]:
+            lead_m: Optional[float] = None) -> Tuple[List[Tuple[float, float, float]], List[Tuple[Pt, Pt, float]]]:
     """(discs, segments) for the planner's transient `Blocked`: a row with a robot pose is a
     segment, any other row with a position a disc. A row without any position (a plain graph node id)
-    contributes nothing here: the graph-node exclusion handles it."""
+    contributes nothing here: the graph-node exclusion handles it. `lead_m` None follows the
+    half width (lead_for), so a wide robot's own start stays clear."""
+    lead_m = lead_for(half_width_m) if lead_m is None else lead_m
     discs: List[Tuple[float, float, float]] = []
     segments: List[Tuple[Pt, Pt, float]] = []
     for row in rows:
@@ -132,3 +163,39 @@ def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_
         if wp is not None:
             discs.append((wp[0], wp[1], disc_radius_m))
     return discs, segments
+
+
+def _ordered_unique(keys: Iterable[Optional[str]]) -> List[str]:
+    seen: List[str] = []
+    for key in keys:
+        if key is not None and key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _sample(a: Pt, b: Pt, step_m: float) -> List[Pt]:
+    n = max(1, int(math.ceil(math.hypot(b[0] - a[0], b[1] - a[1]) / max(step_m, 1e-6))))
+    return [(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n) for k in range(n + 1)]
+
+
+def leg_chart_keys(polyline: Sequence[Pt], locate: Callable[[float, float], Optional[str]],
+                   step_m: float = 0.5) -> List[List[str]]:
+    """Chart keys per leg of `polyline` (one list per consecutive pair, in travel order, no
+    repeats), for tagging a driven or blocked leg by the charts it crosses. `locate(x, y)` is
+    the scene graph's `locate` (None outside every chart). The tag is derived at read time from
+    the positions, not stored, so a legacy leg gets one too and a key that died is not kept."""
+    pts = list(polyline)
+    return [_ordered_unique(locate(x, y) for x, y in _sample(p, q, step_m))
+            for p, q in zip(pts, pts[1:])]
+
+
+def row_chart_keys(row: Mapping[str, Any], locate: Callable[[float, float], Optional[str]],
+                   step_m: float = 0.5) -> List[str]:
+    """Chart keys a blocked row maps to: the charts its obstacle segment crosses (a row with the
+    robot's pose), else the chart of the blocked waypoint (a legacy row); [] when the row has no
+    position or lies outside every chart."""
+    seg = row_segment(row)
+    if seg is not None:
+        return _ordered_unique(locate(x, y) for x, y in _sample(seg[0], seg[1], step_m))
+    wp = _waypoint(row)
+    return _ordered_unique([locate(wp[0], wp[1])]) if wp is not None else []

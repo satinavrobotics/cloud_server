@@ -16,6 +16,7 @@ Today only mission-dispatch's edgeBlocked handling writes rows; the "nodeBlocked
 import logging
 import math
 import os
+import re
 import time
 from collections import deque
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -101,11 +102,36 @@ def position_of(graph_node_id: str) -> Optional[Tuple[float, float]]:
         return None
 
 
+# "{name}-r{run_id}" or "{name}-r{run_id}v{order_rev}": the prefix of the order ids the dispatcher
+# generates (controllers/mission/order_ids.run_prefix); run_id is uuid4().hex[:8].
+_RUN_PREFIX = re.compile(r"-r([0-9a-f]{8})(?:v\d+)?$")
+
+
+def run_id_of(row: Mapping[str, Any]) -> Optional[str]:
+    """The `mission_runs.run_id` (uuid string) of the dispatcher run a blocked report was made
+    in, derived from the row, never stored: `vda_node_id` is "{prefix}-n{idx}-s{seq}" and its
+    prefix carries the dispatcher's run id (order_ids), which with `mission_name` is the key of
+    fleet_recorder.run_uuid. None for a row without them (written before the dispatcher
+    numbered runs, a manual row). Stable across restarts and reroutes (order_rev is not part of
+    the key). A repeat pass starts a new dispatcher run id, so its blocks name that pass's id."""
+    node, mission = row.get("vda_node_id"), row.get("mission_name")
+    if not node or not mission:
+        return None
+    from packages.controllers.mission import fleet_recorder, order_ids  # not at the top: heavy
+    order = order_ids.order_of_node(str(node))
+    prefix = order_ids.order_prefix(order) if order else None
+    match = _RUN_PREFIX.search(prefix) if prefix else None
+    if match is None or prefix[:match.start()] != str(mission):
+        return None
+    return str(fleet_recorder.run_uuid(str(mission), match.group(1)))
+
+
 def row_dict(row: Sequence[Any]) -> Dict[str, Any]:
     out = dict(zip(COLUMNS, row))
     for key in ("created_at", "expires_at"):
         if out.get(key) is not None and hasattr(out[key], "isoformat"):
             out[key] = out[key].isoformat()
+    out["run_id"] = run_id_of(out)
     return out
 
 
@@ -155,20 +181,24 @@ def row_blocks(row: Mapping[str, Any], node_id: Optional[Any] = None,
 def rows_hit(rows: Iterable[Mapping[str, Any]],
              points: Iterable[Tuple[Optional[Any], Optional[Tuple[float, float]]]],
              radius_m: Optional[float] = None,
-             polyline: Optional[Sequence[Tuple[float, float]]] = None) -> List[Dict[str, Any]]:
+             polyline: Optional[Sequence[Tuple[float, float]]] = None,
+             half_width_m: Optional[float] = None) -> List[Dict[str, Any]]:
     """The `rows` that block any of `points` ((node_id, xy) pairs), in row order.
 
     With a `polyline` (the route's positions in order, the robot's start included), a row that
     has the robot's pose at the block (`robot_x`, `robot_y`) also blocks a route whose legs pass
     the obstacle segment (blocked_geometry.route_hits_row); this is in addition to the point
-    rule. Rows without a robot pose, and calls without a polyline, are judged as before."""
+    rule. Rows without a robot pose, and calls without a polyline, are judged as before.
+    `half_width_m`: the passing robot's half width (blocked_geometry.half_width_for); None keeps
+    the constant."""
     points = list(points)
     poly = [(float(x), float(y)) for x, y in polyline] if polyline else []
     geometry = _geometry() if poly else None
     out = []
     for row in rows:
         if any(row_blocks(row, node_id, xy, radius_m) for node_id, xy in points) or \
-                (poly and geometry.route_hits_row(row, poly)):
+                (poly and geometry.route_hits_row(
+                    row, poly, *geometry.widths(half_width_m))):
             out.append(dict(row))
     return out
 
@@ -178,14 +208,15 @@ def _geometry() -> Any:
     return blocked_geometry
 
 
-def leg_crosser(rows: Iterable[Mapping[str, Any]]) -> Callable[[Tuple[float, float],
-                                                                Tuple[float, float]], bool]:
+def leg_crosser(rows: Iterable[Mapping[str, Any]], half_width_m: Optional[float] = None
+                ) -> Callable[[Tuple[float, float], Tuple[float, float]], bool]:
     """`crosses(a, b)`: whether the straight leg a -> b passes the obstacle segment of any of
     `rows` (rows without a robot pose never match). The segments are computed once, for
     path searches that test many legs against the same rows."""
     geometry = _geometry()
-    segs = [s for s in (geometry.row_segment(r) for r in rows) if s is not None]
-    return lambda a, b: any(geometry.segment_hits(s, [a, b]) for s in segs)
+    half, lead = geometry.widths(half_width_m)
+    segs = [s for s in (geometry.row_segment(r, lead) for r in rows) if s is not None]
+    return lambda a, b: any(geometry.segment_hits(s, [a, b], half) for s in segs)
 
 
 def route_points(waypoints: Sequence[Any], skip_first: bool = True

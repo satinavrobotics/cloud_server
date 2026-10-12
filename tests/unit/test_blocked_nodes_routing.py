@@ -31,7 +31,7 @@ def _row(node, x=1.0, y=1.0, expires=EXPIRES):
             "source": "edgeBlocked", "robot_name": "r1", "mission_name": "m1",
             "vda_node_id": "m1-n1-s4", "reason": "blocked", "x": x, "y": y,
             "created_at": None, "expires_at": expires,
-            "robot_x": None, "robot_y": None}
+            "robot_x": None, "robot_y": None, "run_id": None}   # run_id: derived by row_dict
 
 
 def _tuple(row):

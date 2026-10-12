@@ -143,8 +143,9 @@ class MissionPlannerService:
             graph, version = await self._scene_cache.get(map_id)
 
             rows = [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
-            overlay = blocked_geometry.overlay(rows, blocked_nodes.MATCH_RADIUS_M) if rows \
-                else ([], [])
+            overlay = blocked_geometry.overlay(
+                rows, blocked_nodes.MATCH_RADIUS_M,
+                self._overlay_half_width(robot)) if rows else ([], [])
 
             def node_of(x: float, y: float) -> Optional[str]:
                 try:
@@ -185,6 +186,15 @@ class MissionPlannerService:
         except Exception as err:  # pylint: disable=broad-except
             self.logger.warning(f"Chart route failed ({err!r}); using the legacy planner")
             return None, "error"
+
+    @staticmethod
+    def _overlay_half_width(robot: Optional[robot_object.RobotObjectV1]) -> float:
+        """Half width of a blocked obstacle segment for the robot being planned: half of the
+        smaller footprint side from its factsheet (blocked_geometry.half_width_for), the
+        BLOCKED_SEGMENT_HALF_WIDTH_M constant while the footprint is unknown."""
+        factsheet = getattr(getattr(robot, "status", None), "factsheet", None)
+        return blocked_geometry.half_width_for(getattr(factsheet, "length", None),
+                                               getattr(factsheet, "width", None))
 
     def _require_map(self, map_id: Optional[str]) -> str:
         """`map_id` if it names a map; else the configured fallback (None in production);
@@ -739,7 +749,8 @@ class MissionPlannerService:
             return []
 
     def _path_avoiding(self, start_node_id: Union[int, str], end_node_id: Union[int, str],
-                       map_id: str, blocked: List[Dict[str, Any]]
+                       map_id: str, blocked: List[Dict[str, Any]],
+                       half_width_m: Optional[float] = None
                        ) -> Tuple[Optional[List[str]], Optional[str], List[Dict[str, Any]]]:
         """The shortest path that passes none of the `blocked` rows' graph nodes (the robot's
         own start node excepted): (path, None, []). On failure (None, error, rows): `rows`
@@ -747,7 +758,8 @@ class MissionPlannerService:
         when no detour exists), empty when there is no path at all.
 
         The graph's own shortest path is used unless it passes a blocked node, so a block
-        elsewhere on the map does not change a route; only then are the edges searched."""
+        elsewhere on the map does not change a route; only then are the edges searched.
+        `half_width_m`: the robot's overlay half width (None keeps the constant)."""
         start, end = str(start_node_id), str(end_node_id)
         try:
             plain = self.graph_db.shortest_path(start, end, map_id)
@@ -769,7 +781,7 @@ class MissionPlannerService:
             return [xy_of[n] for n in path if xy_of.get(n) is not None] if segmented else None
 
         on_path = blocked_nodes.rows_hit(blocked, [(n, xy_of.get(n)) for n in plain[1:]],
-                                         polyline=polyline_of(plain))
+                                         polyline=polyline_of(plain), half_width_m=half_width_m)
         if not on_path:
             return plain, None, []
 
@@ -788,12 +800,13 @@ class MissionPlannerService:
         excluded = blocked_nodes.excluded_node_ids(blocked, nodes)
         for node_id, xy in xy_of.items():
             # A graph node on a row's obstacle segment is as blocked as one at its waypoint.
-            if xy is not None and blocked_geometry.near_obstacle(segmented, xy):
+            if xy is not None and blocked_geometry.near_obstacle(
+                    segmented, xy, *blocked_geometry.widths(half_width_m)):
                 excluded.add(node_id)
         excluded.discard(start)
         self.logger.info(f"Planning around blocked graph node(s) {names(on_path)}")
         edges = self.graph_db.get_edges(map_id)
-        leg_crosses = blocked_nodes.leg_crosser(segmented) if segmented else None
+        leg_crosses = blocked_nodes.leg_crosser(segmented, half_width_m) if segmented else None
 
         def crosses(a: str, b: str) -> bool:
             """An edge whose straight leg passes an obstacle segment."""
@@ -803,7 +816,7 @@ class MissionPlannerService:
         path = blocked_nodes.shortest_path_avoiding(edges, start, end, excluded, crosses) \
             if edges else None
         if path is not None and segmented and blocked_nodes.rows_hit(
-                segmented, [], polyline=polyline_of(path)):
+                segmented, [], polyline=polyline_of(path), half_width_m=half_width_m):
             path = None  # a leg of the detour still crosses an obstacle segment
         if path is None:
             return None, (f"No route avoids the blocked graph node(s) {names(on_path)} "
@@ -935,7 +948,8 @@ class MissionPlannerService:
         blocked = [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
         if blocked:
             path, error, blocking = self._path_avoiding(
-                start_node['node_id'], end_node['node_id'], map_id, blocked)
+                start_node['node_id'], end_node['node_id'], map_id, blocked,
+                self._overlay_half_width(await self.get_robot_status(robot_name)))
             if error and blocking:
                 result["error"] = error
                 result["failed_at"] = "blocked_nodes"
