@@ -41,6 +41,10 @@ COPY packages/config.py /app/packages/config.py
 # Copy all topomap_dbs packages
 COPY packages/topomap_dbs/ /app/packages/topomap_dbs/
 
+# Operator tool (needs scene_leaf, image_db, ARANGO_*, MINIO_* of this image):
+#   docker compose exec graph-builder-service python -m tools.scene_costmap_stored_backfill [--map ID] [--apply]
+COPY tools/__init__.py tools/scene_costmap_stored_backfill.py /app/tools/
+
 # Set Python path and disable bytecode caching
 ENV PYTHONPATH=/app
 ENV PYTHONDONTWRITEBYTECODE=1

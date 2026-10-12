@@ -27,8 +27,8 @@ mission_dispatch_py_library(
         "//packages/topomap_dbs/graph_db:client",
         "//packages/database:client",
         "//:cloud_common_objects",
-        # TODO: "//packages/scene_graph:scene_graph" once packages/scene_graph has a BUILD target
-        # (the chart planner imports packages.scene_graph lazily; the Dockerfile copies it).
+        # The chart planner imports packages.scene_graph lazily (the Dockerfile copies it).
+        "//packages/scene_graph:scene_graph",
         requirement("numpy"),
         requirement("scipy"),
         requirement("requests"),

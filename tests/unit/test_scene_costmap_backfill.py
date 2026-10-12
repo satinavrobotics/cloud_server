@@ -80,17 +80,64 @@ def test_live_stamp_is_never_overwritten():
     assert r["stamped"] == 0 and s.docs["a"]["costmap_stored_ms"] == 777
 
 
-def test_minio_preferred_and_fallback_is_calibrated_to_it():
-    # a, b have a MinIO time (node timestamp runs 3 h behind it, the naive-local-time case);
-    # c has none and gets its node timestamp shifted by the median offset
+def test_node_timestamp_is_primary_and_minio_is_only_a_calibrated_fallback():
+    # a, b have a node timestamp (ms resolution, the real order); MinIO runs 3 h ahead of it
+    # (the naive-local-time case) and has 1 s resolution that would scramble a/b. c has no node
+    # timestamp: it gets its MinIO time shifted by the median (node - minio) offset.
     off = 3 * 3600 * 1000
-    s = FakeStore([node("a", ts=T), node("b", ts=T + 1000), node("c", ts=T + 2000)])
-    mt = {"a": T + off, "b": T + 1000 + off}
-    minio = lambda m, k, layers: mt.get(k)
+    s = FakeStore([node("a", ts=T), node("b", ts=T + 300), node("c", cap=T + 2000)])
+    mt = {"a": T + off + 900, "b": T + off, "c": T + 2000 + off}
+    asked = []
+
+    def minio(m, k, layers):
+        asked.append(k)
+        return mt.get(k)
     r = bf.backfill_map(s, "m", minio, apply=True, now_ms=NOW)
-    assert r["sources"] == {"minio_last_modified": 2, "node_timestamp+offset": 1}
+    assert r["sources"] == {"node_timestamp": 2, "minio_last_modified+offset": 1}
     got = {k: d["costmap_stored_ms"] for k, d in s.docs.items()}
-    assert got == {"a": T + off, "b": T + 1000 + off, "c": T + 2000 + off}
+    assert got["a"] < got["b"]                       # not the scrambled MinIO order
+    assert got == {"a": T, "b": T + 300, "c": T + 1700}      # offset = median(-off-900, -off+300)
+    assert sorted(asked) == ["a", "b", "c"]          # the calibration sample + the fallback node
+
+
+def test_minio_not_asked_when_every_node_has_a_timestamp():
+    s = FakeStore([node(k, ts=T) for k in "abc"])
+    bf.backfill_map(s, "m", lambda *a: pytest.fail("MinIO must not be touched"), apply=True,
+                    now_ms=NOW)
+    assert all(d["costmap_stored_ms"] == T for d in s.docs.values())
+
+
+def test_minio_is_the_reference_when_no_node_has_a_timestamp():
+    s = FakeStore([node("a", cap=T), node("b", cap=T + 1000)])
+    r = bf.backfill_map(s, "m", lambda m, k, l: T + 5 if k == "a" else None, apply=True, now_ms=NOW)
+    assert r["sources"] == {"minio_last_modified": 1, "capture_time+offset": 1}
+    assert s.docs["b"]["costmap_stored_ms"] == T + 1000 + 5
+
+
+def test_timestamped_nodes_are_stamped_before_the_slow_phase_and_progress_is_reported():
+    s = FakeStore([node("a", ts=T), node("b", ts=T + 1), node("z", cap=T)])
+    lines = []
+
+    def minio(m, k, layers):
+        # at this point the reference-source nodes are already written (interruptible run)
+        assert s.docs["a"].get("costmap_stored_ms") == T
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        bf.backfill_map(s, "m", minio, apply=True, now_ms=NOW, workers=1, progress=lines.append,
+                        progress_every=1)
+    assert "costmap_stored_ms" not in s.docs["z"] and s.docs["b"]["costmap_stored_ms"] == T + 1
+    assert lines and "read" in lines[0]
+
+
+def test_module_imports_with_graph_builder_dependencies_only():
+    # the tool ships in the graph-builder image: its only package imports must be satisfied there
+    import importlib
+    import re
+    src = open(bf.__file__).read()
+    mods = set(re.findall(r"^(?:from|import) (packages[\w.]*)", src, re.M))
+    assert mods <= {"packages.services.graph_builder", "packages.utils"}
+    importlib.reload(bf)
 
 
 def test_falls_back_to_capture_time_and_skips_nodes_without_time():
@@ -139,7 +186,7 @@ def test_minio_stats_run_on_a_pool_and_keep_their_results_per_node():
         seen.add(threading.get_ident())
         return T + ord(key)
 
-    s = FakeStore([node(k, ts=T - 1000) for k in "abcdef"])
+    s = FakeStore([node(k, cap=T - 1000) for k in "abcdef"])
     r = bf.backfill_map(s, "m", minio, apply=True, batch=4, now_ms=NOW, workers=3)
     assert r["stamped"] == 6 and r["sources"] == {"minio_last_modified": 6}
     assert [s.docs[k]["costmap_stored_ms"] for k in "abcdef"] == [T + ord(k) for k in "abcdef"]

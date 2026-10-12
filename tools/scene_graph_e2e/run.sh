@@ -18,8 +18,8 @@
 #   SG_E2E_MIGRATE=local|docker|sql  force one migration method
 #
 # It never touches the production stack: no shared names, ports, networks or volumes. The images
-# are the ones already present (arangodb/arangodb:latest, minio/minio:latest,
-# timescale/timescaledb-ha:pg17.11-ts2.30.1); override with SG_E2E_{ARANGO,MINIO,POSTGRES}_IMAGE.
+# are pinned to the same digests / tags as docker_compose/mission_dispatch_services.yaml
+# (ArangoDB, MinIO, timescaledb-ha pg17.11-ts2.30.1); override with SG_E2E_{ARANGO,MINIO,POSTGRES}_IMAGE.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

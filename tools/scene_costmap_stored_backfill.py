@@ -9,7 +9,10 @@ never run automatically, dry run by default.
     python -m tools.scene_costmap_stored_backfill [--map ID ...] [--no-minio]            # dry run
     python -m tools.scene_costmap_stored_backfill [--map ID ...] --apply [--batch 500]
 
-Run where the API's environment is set (ARANGO_*, MINIO_*), e.g. inside the API container.
+Run where ARANGO_* and MINIO_* are set and packages.services.graph_builder.scene_leaf exists:
+the graph-builder container (the API image does not carry scene_leaf), e.g.
+    docker compose -f docker_compose/mission_dispatch_services.yaml exec graph-builder-service \\
+        python -m tools.scene_costmap_stored_backfill --map <ID>
 
 Which nodes: those with a non-empty `costmap` object and no usable `costmap_stored_ms` (absent,
 null, 0, negative or not a number: a stamp is valid only when it is a positive number). Nothing else is
@@ -18,15 +21,20 @@ DB-clock stamp, a positive number, is never overwritten), so a second run change
 interrupted run is resumed by running it again.
 
 Which time, per node, best first (the `source` of the report):
-  minio_last_modified  newest last-modified of the node's costmap PNGs in MinIO (the store time
-                       on the MinIO host's clock; skipped with --no-minio)
   node_timestamp       the node's `timestamp` (graph-builder receipt), else `created_at`; naive
-                       values are read as UTC, like scene_leaf does
+                       values are read as UTC, like scene_leaf does. Millisecond resolution and
+                       the order the nodes were received in: the primary source.
+  minio_last_modified  newest last-modified of the node's costmap PNGs in MinIO (1 s resolution,
+                       the MinIO host's clock; a fallback for nodes without a timestamp, and the
+                       calibration of that fallback; skipped with --no-minio)
   capture_time         the robot's `capture_time`
   costmap_stamp_ms     the robot's stamp inside the costmap record
 All sources of one map are put on ONE axis so the relative order is the real one: the reference
-source is the best one any node to stamp has; a node that lacks it gets its best other source shifted by the median (reference - other) over the nodes that
+source is the best one any node to stamp has (normally node_timestamp, which needs no MinIO call);
+a node that lacks it gets its best other source shifted by the median (reference - other) over the nodes that
 have both (source `<name>+offset`; `<name>` unshifted when no node has both: `uncalibrated`).
+MinIO is stat-ed only for those nodes plus a sample of 64 used to measure the offset.
+Nodes with the reference source are stamped first, so an interrupted run keeps them.
 Values are clamped to [1, run start]. A node with no usable time is skipped and counted: it is
 not stamped, so the cursor does not see it (it is not given "now", which would put an old leaf
 after everything newer).
@@ -50,7 +58,7 @@ SRC_MINIO = "minio_last_modified"
 SRC_NODE = "node_timestamp"
 SRC_CAPTURE = "capture_time"
 SRC_RECORD = "costmap_stamp_ms"
-PRIORITY = (SRC_MINIO, SRC_NODE, SRC_CAPTURE, SRC_RECORD)
+PRIORITY = (SRC_NODE, SRC_MINIO, SRC_CAPTURE, SRC_RECORD)
 
 PROJECTION = ("{_key: n._key, timestamp: n.timestamp, created_at: n.created_at, "
               "capture_time: n.capture_time, costmap_stored_ms: n.costmap_stored_ms, "
@@ -95,13 +103,14 @@ def candidates(node: Dict[str, Any], minio_ms: Optional[int], now_ms: int) -> Di
     return out
 
 
-def plan(cands: Dict[str, Dict[str, int]], todo: Iterable[str],
-         run_ms: int) -> Tuple[Dict[str, Tuple[int, str]], List[str]]:
+def plan(cands: Dict[str, Dict[str, int]], todo: Iterable[str], run_ms: int,
+         ref: Optional[str] = None) -> Tuple[Dict[str, Tuple[int, str]], List[str]]:
     """`({key: (ms, source)}, [keys without any time])` for the keys in `todo`, from the
-    candidates of ALL the map's costmap nodes (the others only calibrate). Pure."""
+    candidates of ALL the map's costmap nodes (the others only calibrate). `ref` forces the
+    reference source (the axis nodes stamped earlier are on). Pure."""
     todo = list(todo)
-    ref_src = next((src for src in PRIORITY
-                    if any(src in cands.get(k, {}) for k in todo)), None)
+    ref_src = ref or next((src for src in PRIORITY
+                           if any(src in cands.get(k, {}) for k in todo)), None)
     offsets: Dict[str, Optional[float]] = {}
     for src in PRIORITY:
         if src == ref_src or ref_src is None:
@@ -168,55 +177,105 @@ class MinioTimes:
 
 
 def backfill_map(store: Any, map_id: str, minio: Optional[Callable] = None, apply: bool = False,
-                 batch: int = 500, now_ms: Optional[int] = None, workers: int = 8) -> Dict[str, Any]:
+                 batch: int = 500, now_ms: Optional[int] = None, workers: int = 8,
+                 progress: Optional[Callable[[str], None]] = None, progress_every: int = 20,
+                 calib_sample: int = 64) -> Dict[str, Any]:
     """Backfill one map; the report: nodes (with a costmap), already (stamped), to_stamp, stamped,
     skipped (no usable time; their keys in `skipped_keys`), sources {source: count}. Reads and
     writes in batches of `batch` (no collection lock; each write is a single guarded update).
-    The MinIO stats of a batch run on `workers` threads."""
+
+    Phases (MinIO is the slow one, so it is touched as little as possible):
+      1. read every node with a costmap (database only; no MinIO);
+      2. when some node to stamp has a node timestamp, that is the reference: those nodes are
+         stamped NOW (incrementally; an interrupted run keeps them and is resumed by running
+         again), then MinIO is asked only for the nodes without a timestamp plus an evenly spread
+         sample of `calib_sample` nodes that have both, to learn the median offset;
+      3. otherwise (no node has a timestamp) MinIO is asked for every node to stamp.
+    `progress(line)` is called every `progress_every` batches of each phase."""
     if batch < 1 or workers < 1:
         raise ValueError("batch and workers must be >= 1")
+    say = progress or (lambda _line: None)
     run_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     cands: Dict[str, Dict[str, int]] = {}
+    rows_by_key: Dict[str, Dict[str, Any]] = {}
     todo: List[str] = []
-    nodes = already = 0
+    nodes = already = batches = 0
     after = ""
-    pool = ThreadPoolExecutor(max_workers=workers) if minio is not None and workers > 1 else None
-    try:
-        while True:
-            rows = store.nodes(map_id, after, batch)
-            if not rows:
-                break
-            pending = []
-            for n in rows:
-                key = str(n["_key"])
-                nodes += 1
-                if is_stamped(n):
-                    already += 1
-                else:
-                    todo.append(key)
-                    pending.append(n)
-                cands[key] = candidates(n, None, run_ms)
-            if minio is not None and pending:
-                def stat(n: Dict[str, Any]) -> Optional[int]:
-                    return minio(map_id, str(n["_key"]), list((n.get("costmap") or {}).keys()))
-                times = pool.map(stat, pending) if pool is not None else map(stat, pending)
-                for n, minio_ms in zip(pending, times):
-                    cands[str(n["_key"])] = candidates(n, minio_ms, run_ms)
-            after = str(rows[-1]["_key"])
-            if len(rows) < batch:
-                break
-    finally:
-        if pool is not None:
-            pool.shutdown()
-    chosen, skipped = plan(cands, todo, run_ms)
+    while True:
+        rows = store.nodes(map_id, after, batch)
+        if not rows:
+            break
+        for n in rows:
+            key = str(n["_key"])
+            nodes += 1
+            if is_stamped(n):
+                already += 1
+            else:
+                todo.append(key)
+            cands[key] = candidates(n, None, run_ms)
+            rows_by_key[key] = n
+        after = str(rows[-1]["_key"])
+        batches += 1
+        if batches % progress_every == 0:
+            say(f"{map_id}: read {nodes} nodes ({len(todo)} to stamp)")
+        if len(rows) < batch:
+            break
+    say(f"{map_id}: read {nodes} nodes ({len(todo)} to stamp)")
+
+    stamped = 0
+    chosen: Dict[str, Tuple[int, str]] = {}
+    skipped: List[str] = []
+
+    def write(items_map: Dict[str, Tuple[int, str]], label: str) -> int:
+        done = 0
+        items = [{"key": k, "ms": ms} for k, (ms, _s) in sorted(items_map.items())]
+        for i in range(0, len(items), batch):
+            done += store.stamp(map_id, items[i:i + batch])
+            if (i // batch + 1) % progress_every == 0:
+                say(f"{map_id}: {label} {min(i + batch, len(items))}/{len(items)}")
+        return done
+
+    def stats(keys: List[str]) -> None:
+        """Add the MinIO time to `cands` for `keys` (threaded)."""
+        if minio is None or not keys:
+            return
+
+        def stat(k: str) -> Optional[int]:
+            return minio(map_id, k, list((rows_by_key[k].get("costmap") or {}).keys()))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                times = list(pool.map(stat, keys))
+        else:
+            times = [stat(k) for k in keys]
+        for k, ms in zip(keys, times):
+            if ms is not None and ms > 0:
+                cands[k][SRC_MINIO] = int(ms)
+        say(f"{map_id}: MinIO times for {len(keys)} nodes")
+
+    if any(SRC_NODE in cands[k] for k in todo):
+        # the reference is the node timestamp: those nodes need nothing from MinIO
+        direct, rest = [k for k in todo if SRC_NODE in cands[k]], [k for k in todo if SRC_NODE not in cands[k]]
+        first, _ = plan({k: cands[k] for k in direct}, direct, run_ms)
+        chosen.update(first)
+        if apply:
+            stamped += write(first, "stamped")
+        if rest:
+            have = sorted(k for k, c in cands.items() if SRC_NODE in c)
+            step = max(1, len(have) // max(1, calib_sample))
+            sample = have[::step][:max(1, calib_sample)] if calib_sample > 0 else []
+            stats(sorted(set(rest) | set(sample)))
+            second, skipped = plan(cands, rest, run_ms, ref=SRC_NODE)
+            chosen.update(second)
+            if apply:
+                stamped += write(second, "stamped (calibrated)")
+    else:
+        stats(todo)
+        chosen, skipped = plan(cands, todo, run_ms)
+        if apply:
+            stamped += write(chosen, "stamped")
     sources: Dict[str, int] = {}
     for _ms, src in chosen.values():
         sources[src] = sources.get(src, 0) + 1
-    stamped = 0
-    if apply:
-        items = [{"key": k, "ms": ms} for k, (ms, _s) in sorted(chosen.items())]
-        for i in range(0, len(items), batch):
-            stamped += store.stamp(map_id, items[i:i + batch])
     return {"map": map_id, "nodes": nodes, "already": already, "to_stamp": len(chosen),
             "stamped": stamped, "skipped": len(skipped), "skipped_keys": skipped[:20],
             "sources": sources, "applied": apply}
@@ -253,7 +312,8 @@ def main(argv: Optional[List[str]] = None, store: Any = None, minio: Any = None)
         minio = None
     print("APPLY" if args.apply else "DRY RUN (nothing written; --apply to write)")
     for map_id in (args.maps or store.maps()):
-        r = backfill_map(store, map_id, minio, args.apply, args.batch, workers=args.workers)
+        r = backfill_map(store, map_id, minio, args.apply, args.batch, workers=args.workers,
+                         progress=lambda line: print("  " + line, file=sys.stderr, flush=True))
         print(f"{map_id}: nodes={r['nodes']} already={r['already']} to_stamp={r['to_stamp']} "
               f"stamped={r['stamped']} skipped={r['skipped']} sources={r['sources']}")
         if r["skipped_keys"]:

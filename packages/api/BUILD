@@ -29,8 +29,11 @@ def mission_dispatch_py_binary(**kwargs):
 # API Delegation Service (business logic)
 mission_dispatch_py_library(
     name = "server",
-    srcs = ["server.py"],
+    # The scene-graph read routes and the map-delete saga (which drops the scene graph under the
+    # worker's advisory lock) are imported by main.py / server.py.
+    srcs = ["server.py", "scene_graph_reads.py", "map_delete.py"],
     deps = [
+        "//packages/scene_graph:scene_graph",
         "//packages/topomap_dbs/graph_db:client",
         "//packages/topomap_dbs/image_db:client",
         "//packages/services/mission_planner:client",

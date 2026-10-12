@@ -31,6 +31,33 @@ mission_dispatch_py_library(
     visibility = ["//visibility:public"]
 )
 
+# Scene-graph ingest worker (SCENE_GRAPH_WORKER_ENABLED): leaf building, guard (Postgres lifecycle
+# and advisory lock), runner, host, events, store adapter. Started by main.py; imports
+# packages.scene_graph for the engine and store.
+mission_dispatch_py_library(
+    name = "scene",
+    srcs = [
+        "scene_adapter.py",
+        "scene_clock.py",
+        "scene_events.py",
+        "scene_guard.py",
+        "scene_host.py",
+        "scene_leaf.py",
+        "scene_runner.py",
+        "scene_sources.py",
+        "scene_worker.py",
+    ],
+    deps = [
+        "//packages/scene_graph:scene_graph",
+        "//packages/topomap_dbs/graph_db:client",
+        "//packages/topomap_dbs/image_db:client",
+        requirement("numpy"),
+        requirement("scipy"),
+        requirement("psycopg"),
+    ],
+    visibility = ["//visibility:public"],
+)
+
 # Graph Builder Service (FastAPI binary)
 mission_dispatch_py_binary(
     name = "graph_builder",
@@ -38,6 +65,7 @@ mission_dispatch_py_binary(
     srcs = ["main.py"],
     deps = [
         ":server",
+        ":scene",
         requirement("fastapi"),
         requirement("uvicorn"),
         requirement("pydantic"),
