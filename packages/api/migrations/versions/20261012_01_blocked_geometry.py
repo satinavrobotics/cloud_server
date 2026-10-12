@@ -1,6 +1,6 @@
-"""blocked_graph_nodes_geometry (where the robot stood and came from when it reported a block)
+"""blocked_geometry (where the robot stood and came from when it reported a block)
 
-Revision ID: 20261012_01_blocked_graph_nodes_geometry
+Revision ID: 20261012_01_blocked_geometry
 Revises: 20261011_01_edge_observations
 Create Date: 2026-10-12
 
@@ -19,7 +19,7 @@ downgrade() drops them.
 """
 from alembic import op
 
-revision = "20261012_01_blocked_graph_nodes_geometry"
+revision = "20261012_01_blocked_geometry"
 down_revision = "20261011_01_edge_observations"
 branch_labels = None
 depends_on = None

@@ -332,7 +332,7 @@ for `Blocked`. Rows without a robot pose keep the old disc rule.
 
 Applied:
 
-1. Migration `20261012_01_blocked_graph_nodes_geometry` (additive, nullable, no backfill; downgrade drops them):
+1. Migration `20261012_01_blocked_geometry` (additive, nullable, no backfill; downgrade drops them):
    `robot_x, robot_y` (robot position in the map frame at the report), `prev_x, prev_y` (previous waypoint; kept
    for a later fit, the overlay does not use it).
 2. `blocked_nodes.COLUMNS`/`UPSERT_SQL`/`upsert_params` carry the four columns. **Deploy order: migration first**

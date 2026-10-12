@@ -310,9 +310,6 @@ def ingested(env, ring_map, backfilled):
 
 # ------------------------------------------------------------------------------ stage: schema
 
-@pytest.mark.xfail(strict=True, reason=(
-    "DEFECT packages/api/migrations/versions/20261012_01_blocked_graph_nodes_geometry.py: revision id "
-    "is 40 chars, alembic_version.version_num is varchar(32): `upgrade head` cannot complete"))
 def test_migration_revision_ids_fit_the_version_table():
     """`alembic_version.version_num` is varchar(32) (alembic's default; alembic.ini states the
     32-character rule): a longer revision id makes `alembic upgrade head` fail with
@@ -1102,11 +1099,6 @@ def test_empty_map_rebuild_drops_the_graph(env, empty_rebuilt):
     assert out["available"] is False
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "DEFECT packages/services/graph_builder/scene_worker.py:1108 (_finish_empty_rebuild) emits "
-    "rebuild_completed with `leaves=0`, packages/events/schemas.py SceneGraphRebuild "
-    "(extra=forbid) has no such field: the event is stored flagged invalid (ERROR in the log; "
-    "strict validation would drop it)"))
 def test_empty_rebuild_event_payload_is_valid(env, empty_rebuilt):
     from packages.events import schemas
     rows = stack.wait_until(

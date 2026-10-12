@@ -1105,7 +1105,7 @@ class SceneWorker:
         self._commit_failures = self._empty_confirms = 0
         self._rebuild_gen = None
         self.stats.rebuilds += 1
-        self._event("rebuild_completed", reason=self._rebuild_event_reason, version=0, leaves=0,
+        self._event("rebuild_completed", reason=self._rebuild_event_reason, version=0,
                     duration_s=round(max(0, self.now_ms() - self._rebuild_started_ms) / 1000.0, 3))
         self._leaves_since_publish = 0
         request, self._rebuild_request = self._rebuild_request, None

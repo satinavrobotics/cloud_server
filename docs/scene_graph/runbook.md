@@ -48,7 +48,7 @@ defaults come from `config.py` (it sets only the password in compose).
 Each step gates the next. Flags stay false until the step that names them.
 
 1. **Images.** numpy 1.26.4 + scipy 1.11.4 in graph-builder, planner and API; each image copies `packages/scene_graph/`.
-2. **Migration first.** `20261012_01_blocked_graph_nodes_geometry` (four nullable `blocked_graph_nodes` columns). It
+2. **Migration first.** `20261012_01_blocked_geometry` (four nullable `blocked_graph_nodes` columns). It
    runs when the API container starts (`packages.api.entrypoint`: `alembic upgrade head` under the `migrations`
    advisory lock). Start/update `api-delegation-service` first and wait for healthy. Check:
    `SELECT column_name FROM information_schema.columns WHERE table_name='blocked_graph_nodes' AND column_name IN ('robot_x','robot_y','prev_x','prev_y');` (4 rows).
