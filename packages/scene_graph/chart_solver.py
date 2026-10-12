@@ -66,6 +66,8 @@ class Local:
         s.delta_flat = None if delta is None else np.nonzero(delta.ravel())[0]
         s.flat2idx = np.full(nav.size + 1, N, np.int64); s.flat2idx[s.flat] = np.arange(N)   # image position -> cell (N = not in F)
         s._pick = {}
+        s._chart_memo = {}
+        s._mask_cache = {}
         s.stats = dict(rows=0, resim=0, resim_cells=0, closure_iter=0, trials=0)
 
     def _near(s, a, T):
@@ -395,8 +397,24 @@ class Local:
                 out.append((int(comp.min()), int(mx)))
         return sorted(out)
 
-    # ---- anchor band of one chart (memoised on the chart's cells)
+    # ---- anchor of one chart: kernel (cells that drive straight to every owned cell inside the chart) and clearance band
+    def _kernel_member(s, mk, ym, xm, y):
+        """does cell y reach every owned cell by a digital drive that stays in the chart (farthest cells first, early exit)"""
+        d2 = (ym - s.ys[y]) ** 2 + (xm - s.xs[y]) ** 2
+        order = np.argsort(-d2, kind='stable'); pos = 0; step = 16
+        while pos < len(order):
+            sel = order[pos:pos + step]; pos += step; step *= 2
+            yy = np.full(len(sel), s.ys[y]); xx = np.full(len(sel), s.xs[y])
+            rr, cc, n = s.rast(yy, xx, ym[sel], xm[sel])
+            g = mk[rr, cc].all(1) & s.corners(rr, cc, s.nav)
+            dg = (rr[:, 1:] != rr[:, :-1]) & (cc[:, 1:] != cc[:, :-1])
+            a_ = mk[rr[:, :-1], cc[:, 1:]] | ~dg; b_ = mk[rr[:, 1:], cc[:, :-1]] | ~dg
+            g &= (a_ | b_).all(1)
+            if not g.all() or not s.drives_ok(ym[sel], xm[sel], yy, xx).all(): return False
+        return True
+
     def pick(s, mine):
+        """(octile-L1 medoid of kernel and band, the kernel-and-band cells): the full scan, the reference the proposal is tested against"""
         key = mine.tobytes()
         v = s._pick.get(key)
         if v is None:
@@ -404,28 +422,81 @@ class Local:
             cand = mine[s.clr[mine] >= s.band * peak - 1e-9]
             mk = np.zeros((s.H, s.W), bool); mk[s.ys[mine], s.xs[mine]] = True
             ym, xm = s.ys[mine], s.xs[mine]
-            keep = []
-            for y in cand:
-                d2 = (ym - s.ys[y]) ** 2 + (xm - s.xs[y]) ** 2
-                order = np.argsort(-d2, kind='stable'); ok = True; pos = 0; step = 16
-                while ok and pos < len(order):
-                    sel = order[pos:pos + step]; pos += step; step *= 2
-                    yy = np.full(len(sel), s.ys[y]); xx = np.full(len(sel), s.xs[y])
-                    rr, cc, n = s.rast(yy, xx, ym[sel], xm[sel])
-                    g = mk[rr, cc].all(1) & s.corners(rr, cc, s.nav)
-                    dg = (rr[:, 1:] != rr[:, :-1]) & (cc[:, 1:] != cc[:, :-1])
-                    a_ = mk[rr[:, :-1], cc[:, 1:]] | ~dg; b_ = mk[rr[:, 1:], cc[:, :-1]] | ~dg
-                    g &= (a_ | b_).all(1)
-                    if not g.all(): ok = False; break
-                    if not s.drives_ok(ym[sel], xm[sel], yy, xx).all(): ok = False
-                if ok: keep.append(int(y))
-            band = np.array(keep, int)
+            band = np.array([int(y) for y in cand if s._kernel_member(mk, ym, xm, y)], int)
             if not len(band): v = (None, band)
             else:
                 dmat = octile(s.ys[band][:, None] - ym[None, :], s.xs[band][:, None] - xm[None, :], s.h)
                 v = (int(band[np.argmin(dmat.mean(1))]), band)
             s._pick[key] = v
         return v
+
+    def _chart(s, mine):
+        """per-chart data memoised on its cells (small: no map-sized arrays are kept per chart)"""
+        key = mine.tobytes()
+        c = s._chart_memo.get(key)
+        if c is None:
+            peak = s.clr[mine].max()
+            cand = mine[s.clr[mine] >= s.band * peak - 1e-9]         # band cells of this chart only: O(chart), not O(map)
+            c = dict(key=key, mine=mine, ym=s.ys[mine], xm=s.xs[mine], cand=cand, band=set(cand.tolist()), member={}, prop=False)
+            s._chart_memo[key] = c
+        return c
+
+    def _mask(s, c):
+        """membership image of the chart being worked on (a few kept: an image is map-sized)"""
+        mk = s._mask_cache.get(c['key'])
+        if mk is None:
+            if len(s._mask_cache) >= 4: s._mask_cache.pop(next(iter(s._mask_cache)))
+            mk = np.zeros((s.H, s.W), bool); mk[c['ym'], c['xm']] = True
+            s._mask_cache[c['key']] = mk
+        return mk
+
+    @staticmethod
+    def _in_chart(c, y):
+        i = np.searchsorted(c['mine'], y)
+        return bool(i < len(c['mine']) and c['mine'][i] == y)
+
+    def _in_kernel_band(s, c, y):
+        if y not in c['band']: return False
+        v = c['member'].get(y)
+        if v is None:
+            v = c['member'][y] = s._kernel_member(s._mask(c), c['ym'], c['xm'], y)
+        return v
+
+    def anchor_ok(s, mine, a):
+        """F2 for one chart with ONE kernel test: the anchor is in the kernel and on the clearance band"""
+        c = s._chart(mine)
+        return s._in_chart(c, a) and s._in_kernel_band(c, a)
+
+    def propose(s, mine):
+        """projected centroid: the kernel-and-band cell nearest the chart's centroid (exact integer sums, ties by cell index),
+        refined by steepest descent of the octile drive length sum over adjacent kernel-and-band cells; None if no cell qualifies.
+        Tests kernel membership of a few candidates, not of the whole band."""
+        c = s._chart(mine)
+        if c['prop'] is not False: return c['prop']
+        n = len(mine); sy = int(c['ym'].sum()); sx = int(c['xm'].sum())
+        cand = c['cand']                                             # band cells of the chart, ascending cell index
+        d2 = (n * s.ys[cand] - sy) ** 2 + (n * s.xs[cand] - sx) ** 2    # (n * distance to the centroid)^2, exact
+        order = np.lexsort((cand, d2))
+        cur = None
+        for k in order:
+            if s._in_kernel_band(c, int(cand[k])): cur = int(cand[k]); break
+        if cur is not None:
+            J = lambda y: float(octile(s.ys[y] - c['ym'], s.xs[y] - c['xm'], s.h).sum())
+            Jc = J(cur)
+            while True:
+                best = None                                          # (J, cell): strictly better than Jc, ties by cell index
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        y2, x2 = s.ys[cur] + dy, s.xs[cur] + dx
+                        if (dy or dx) and 0 <= y2 < s.H and 0 <= x2 < s.W:
+                            y = int(s.idx[y2, x2])
+                            if y >= 0 and s._in_chart(c, y) and s._in_kernel_band(c, y):
+                                j = J(y)
+                                if j < Jc - 1e-9 and (best is None or (j, y) < best): best = (j, y)
+                if best is None: break
+                Jc, cur = best
+        c['prop'] = cur
+        return cur
 
     # ---- state of a solution
     def full_state(s, A):
@@ -454,8 +525,7 @@ class Local:
         order = range(len(A)) if anchors is None else sorted(anchors, key=lambda j: A[j])
         for j in sorted(order, key=lambda j: A[j]):
             mine = np.nonzero(own == j)[0]
-            b, band = s.pick(mine)
-            if b is None or A[j] not in set(band.tolist()):
+            if not s.anchor_ok(mine, A[j]):
                 for c in mine[np.argsort(-s.clr[mine], kind='stable')]:
                     if int(c) not in inA: return ('band', int(c))
         return None
@@ -490,8 +560,7 @@ class Local:
         touched = np.unique(own2[S]); touched = touched[touched >= 0]
         for j in touched.tolist():
             mine = np.nonzero(own2 == j)[0]
-            b, band = s.pick(mine)
-            if b is None or A2[j] not in set(band.tolist()): return False
+            if not s.anchor_ok(mine, A2[j]): return False
         return True
 
     # ---- construct and descend, canonical order
@@ -527,7 +596,7 @@ class Local:
                 if ok: done = (A2, o2, r2, S)
             if done is None:
                 mine = np.nonzero(own == j)[0]
-                b, band = s.pick(mine)
+                b = s.propose(mine)
                 reads.append(mine)
                 if b is not None and b != a and b not in A:
                     used.add(b)
