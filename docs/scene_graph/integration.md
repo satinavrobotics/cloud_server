@@ -221,6 +221,27 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
   Revisit before the planner switches on for a robot with length >> width.
 * Leg recording on lattice routes: chart keys for new run views, leaf-edge views for legacy only.
 
+### CIMBI's answers to the store requests (2026-10-12; store.py semantics are theirs)
+
+* `save(map_id, sg, dirty, expected_version, cursor, generation=None)`: compare-and-set on `sg_meta.version`
+  (raises `StaleVersion`), `cursor` = opaque JSON persisted in the same step; one watermark only (`sg_meta`).
+  `meta()` -> `{}` for a never-saved map, else `{version, generation, params, params_hash, cursor}`.
+* Per-version manifest holds charts + links (version-pinned reads); `sg_*` Arango docs index the CURRENT version only.
+* Time plane int64 ms; `ever_blocked` becomes a time plane (latest capture time reported blocked, max-merge):
+  consumers decay by age, no provenance needed.
+* `lineage(map_id, from_version)` compacted cumulative, "too old, reselect" signal; retention = last K (default 5)
+  + leased versions; tiles shared by content hash. `begin_generation`/commit with a pointer switch and a persisted
+  old->new key map. `tiles_for(leaves)`; `fold_many` raises `MissingTiles` before touching state.
+* Delete: no winner plane; the time plane identifies the cells a leaf won (time == its capture stamp): refold the
+  bbox from the overlapping leaves. **Consequence for our clock correction**: the stamp a leaf is folded under must
+  be stable (see "Open"), or that lookup and idempotency break.
+* `Leaf.r_d` is evidence only (W(r) needs r_d >= r); `SceneParams.robot_half_side` per map partitions free space.
+  Only 100/255 block; 1..99 is the soft channel (`occupancy_depth` has only 0/100/255).
+* `cover()` view: from the node's depth record via `leafcover.view_from_node(key, pose, camera.T_base_cam, camera.fx,
+  camera.width, camera.valid_range_m[1], h=0.1, p=0.2)`; no extra node field. Piece 8 is unblocked.
+* Backfill: `occupancy_depth` written on 7 maps / 438 nodes via `set_node_costmaps` (verified, restore path in
+  CIMBI's scratchpad); `office8` has `occupancy`.
+
 ### Scale gate with `sight_range = 5.0` (CIMBI prototype, Python, per-leaf local update, 2026-10-12)
 
 * Walled halls are flat: 4.2k / 12.6k / 31k cells = 0.44 / 0.73 / 0.71 s per leaf (slope 0.24); without the cap
@@ -235,5 +256,7 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
 ## Open
 
 * CIMBI: sight-range cap for open fields; `occupancy_depth` backfill timing; store `lineage()` and engine.
+* LACI: **stable per-leaf stamp**: `SessionClock`'s offset can improve after a leaf was folded, which would fold the
+  same leaf under a different stamp. Persist the first-fold stamp on the node (`scene_stamp_ms`) and prefer it;
 * LACI: time-source fallback bound (7 days, implemented in `scene_leaf`); where the robot footprint (`r_d`) lives; the
   leaf threshold for `waypoints[i].node_id`; `run_id` (derive later from session and time, or look up at ingest).
