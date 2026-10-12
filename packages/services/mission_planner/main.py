@@ -75,6 +75,10 @@ class PlanResponse(BaseModel):
     error: Optional[str] = None
     failed_at: Optional[str] = None
     blocked_nodes: Optional[list] = Field(None, description="With failed_at 'blocked_nodes': the blocked graph nodes that made planning fail (on the goal, or on the shortest path with no detour around them)")
+    planner: Optional[str] = Field(None, description="'scene_graph' or 'legacy': which planner produced the route")
+    min_width: Optional[float] = Field(None, description="Narrowest passage along a scene-graph route, metres; null for legacy routes")
+    chart_keys: Optional[list] = Field(None, description="Scene-graph chart keys the route crosses, in order; null for legacy routes")
+    graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
 
 
 class NavigationResponse(BaseModel):
@@ -93,6 +97,10 @@ class NavigationResponse(BaseModel):
     error: Optional[str] = Field(None, description="Error message if failed")
     failed_at: Optional[str] = Field(None, description="Stage where planning failed")
     message: Optional[str] = Field(None, description="Success message")
+    planner: Optional[str] = Field(None, description="'scene_graph' or 'legacy': which planner produced the route")
+    min_width: Optional[float] = Field(None, description="Narrowest passage along a scene-graph route, metres; null for legacy routes")
+    chart_keys: Optional[list] = Field(None, description="Scene-graph chart keys the route crosses, in order; null for legacy routes")
+    graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
 
 
 # HealthResponse is now imported from packages.utils.service_utils
@@ -297,6 +305,10 @@ async def plan_only(request: PlanRequest):
             error=result.get("error"),
             failed_at=result.get("failed_at"),
             blocked_nodes=result.get("blocked_nodes"),
+            planner=result.get("planner"),
+            min_width=result.get("min_width"),
+            chart_keys=result.get("chart_keys"),
+            graph_version=result.get("graph_version"),
         )
     except HTTPException:
         raise

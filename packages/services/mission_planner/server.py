@@ -17,6 +17,7 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import blocked_nodes
+from packages.services.mission_planner import scene_route
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -875,6 +876,7 @@ class MissionPlannerService:
         result["map_id"] = map_id
         result["goal"] = {"x": target_x, "y": target_y, "map_id": map_id,
                           "node_id": result.get("end_node_id")}
+        result["planner"] = scene_route.PLANNER_LEGACY
         result["success"] = True
         return result
 

@@ -528,3 +528,12 @@ PRE_GOTO_NODE_RADIUS_M = float(os.getenv("PRE_GOTO_NODE_RADIUS_M", "3.0"))
 # The whole go-to preparation (SQL, ArangoDB, planner) may take this long; then the mission is
 # queued without a go-to.
 PRE_GOTO_TIMEOUT_S = float(os.getenv("PRE_GOTO_TIMEOUT_S", "5.0"))
+
+# ==================== Scene graph (feat/scene-graph-v2) ====================
+# Both default off: the planner and the ingest worker only use the scene graph when enabled.
+SCENE_GRAPH_PLANNER_ENABLED = _env_bool("SCENE_GRAPH_PLANNER_ENABLED", "false")
+SCENE_GRAPH_WORKER_ENABLED = _env_bool("SCENE_GRAPH_WORKER_ENABLED", "false")
+# A waypoint takes a leaf id only when a leaf lies within this distance of it.
+SCENE_GRAPH_LEAF_SNAP_M = float(os.getenv("SCENE_GRAPH_LEAF_SNAP_M", "1.0"))
+# Largest gap between two waypoints of a scene-graph route.
+SCENE_GRAPH_MAX_WAYPOINT_GAP_M = float(os.getenv("SCENE_GRAPH_MAX_WAYPOINT_GAP_M", "5.0"))
