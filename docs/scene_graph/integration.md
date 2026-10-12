@@ -110,9 +110,29 @@ Dropped: "link cost from observation" (edge observations accrue per leaf edge; r
   `route`. The planner switches on last, per map, after a corridor/door map has validated the structure (the one real
   map so far is a single room).
 
+## Interface draft 0.9 (CIMBI, 2026-10-12): resolved and consequences
+
+Types are in `packages/scene_graph/api.py` and `store.py` (CIMBI's, pinned by `test_api_contract.py`).
+
+* **Rotation**: `Leaf.origin_yaw`; the library resamples. The adapter passes `costmap.{layer}.origin_map` through.
+* **Geometry**: `query(bbox, level, raster=True)` -> `ViewResult.raster` (`OwnerRaster`: u16 owner index plane,
+  keys, `dependent` plane). No polygons from the library: the API serves the raster (PNG/u16, per bbox) and the
+  client derives outlines. `Chart.leaf` gives a thumbnail leaf.
+* **Lineage**: `Dirty.retired: key -> successors` (largest overlap first, `[]` = vanished), persisted per version
+  (`lineage-{version}.json`; `store.lineage(map_id, from_version)` follows). The API exposes it; the client walks
+  forward from the version of its selection.
+* **Corridor**: chart graph always loaded (small); cells tiled. `corridor(a, b, blocked) -> tiles`, then planner
+  loads tiles, then `route`; `route` raises `MissingTiles` and never does I/O.
+* **Ever blocked** = costmap lethal (100) in any folded window, OR-merged. Robot blocked events are not an input to
+  the library; they stay the planner's transient `Blocked` overlay. No event delivery from the dispatcher.
+* **Closure bound**: bounded by the sight extent of the affected anchors, not by chart scale. Flat where walls bound
+  sight (7k -> 17k cells: 1.7 -> 2.2 s per leaf), grows with sight extent in long halls and open fields (slope 0.6).
+  No sight-range cap yet; CIMBI raises it for the outdoor case. **Consequence for us**: the "per-leaf cost flat in
+  map size" claim holds for indoor maps only until a cap exists; the worker must batch (one re-solve per batch,
+  debounced) and the publish interval is a setting, not a constant; the scale gate adds an open-field world.
+
 ## Open
 
-* CIMBI: source of "ever blocked"; chart geometry encoding for the client; whether the closure is bounded by scale;
-  `occupancy_depth` backfill timing.
-* LACI: time-source fallback bound; where the robot footprint (`r_d`) lives; the leaf threshold for
-  `waypoints[i].node_id`.
+* CIMBI: sight-range cap for open fields; `occupancy_depth` backfill timing; store `lineage()` and engine.
+* LACI: time-source fallback bound (7 days, implemented in `scene_leaf`); where the robot footprint (`r_d`) lives; the
+  leaf threshold for `waypoints[i].node_id`; `run_id` (derive later from session and time, or look up at ingest).
