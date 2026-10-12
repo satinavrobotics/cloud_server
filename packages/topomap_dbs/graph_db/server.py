@@ -22,6 +22,9 @@ try:
 except ImportError:
     from spatial_index_manager import SpatialIndexManager
 
+# Per-map scene-graph index collections (`{prefix}{map_id}`), dropped with the map.
+SCENE_GRAPH_COLLECTION_PREFIXES = ("sg_anchors_", "sg_links_", "sg_meta_")
+
 
 class GraphDatabaseService:
     """Graph Database Service backed by ArangoDB with ArangoDB geo indexes for spatial queries."""
@@ -1106,6 +1109,12 @@ class GraphDatabaseService:
 
             if self.db.has_collection(edge_collection):
                 self.db.delete_collection(edge_collection)
+
+            # The scene-graph index (rebuildable; its snapshot lives in the map's bucket and goes
+            # with it). Names are owned by packages/scene_graph's store: keep in sync.
+            for prefix in SCENE_GRAPH_COLLECTION_PREFIXES:
+                if self.db.has_collection(f"{prefix}{map_id}"):
+                    self.db.delete_collection(f"{prefix}{map_id}")
 
             self.logger.info(f"✅ Deleted map: {map_id}")
             return True
