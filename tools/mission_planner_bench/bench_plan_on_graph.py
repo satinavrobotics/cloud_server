@@ -6,7 +6,9 @@ Builds a grid of rooms joined by 1.2 m doors inside a side_m x side_m square (fu
 leaf windows, no sensing simulation), folds and saves it, loads it as the planner does (`store.load`) and
 times: load, first snap (builds the nearest-cell cache), warm snaps, `route`, `blocked_free_los` cell checks
 (one `snap` per lattice cell) and the whole `plan_on_graph` for a corner-to-corner goal.
-Read-only use of tests/unit/scene_graph (synth constants).
+Measured (CPU, this host): 90x90 m, 225 rooms of 6 m, 225 leaves: load 28 s, first snap 19 ms, warm snap 10 us,
+route 62 ms (132 m), simplify 38 ms (2068 snaps), plan_on_graph 102 ms. Open 12-15 m rooms make the fold,
+not the planner, slow (minutes).
 """
 import math
 import os

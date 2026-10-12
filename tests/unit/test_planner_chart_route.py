@@ -386,3 +386,29 @@ async def test_blocked_graph_node_id_on_the_route_goes_to_the_legacy_planner(on)
     assert out["planner"] == "legacy" and out["planner_fallback"] == "blocked_row_on_route"
     svc._active_blocked_nodes = AsyncMock(return_value=[{"graph_node_id": "n77"}])
     assert (await _plan(svc))["planner"] == scene_route.PLANNER_SCENE_GRAPH
+
+
+@pytest.mark.unit
+async def test_a_slow_new_version_routes_on_the_loaded_older_one_bounded_by_its_lag(on, monkeypatch):
+    import time as _t
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 60.0)
+    store = FakeStore(FakeGraph(), version=1)
+    store.cursor = [1_000, "k1"]
+    svc = _service()
+    svc._scene_cache = scene_route.GraphCache(lambda: store, max_entries=3, load_timeout_s=0.1)
+    # v1's cursor has an old unfolded upload behind it, v2's has none
+    svc.graph_db.costmap_nodes_since.side_effect = lambda m, ms, key, n: (
+        [{"costmap_stored_ms": _t.time() * 1000 - 300_000, "_key": "k2"}] if ms == 1_000 else [])
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 0.0)     # v1 is fresh while unchecked
+    assert (await _plan(svc))["graph_version"] == 1
+    store.version, store.cursor = 2, [2_000, "k9"]
+    store.gate = threading.Event()
+    out = await _plan(svc)                              # v2 loading: v1 serves
+    assert out["planner"] == scene_route.PLANNER_SCENE_GRAPH and out["graph_version"] == 1
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 60.0)
+    out = await _plan(svc)                              # v1's own cursor says it is too old
+    assert out["planner_fallback"] == "stale_graph"
+    store.gate.set()
+    await asyncio.sleep(0.2)
+    out = await _plan(svc)
+    assert out["planner"] == scene_route.PLANNER_SCENE_GRAPH and out["graph_version"] == 2

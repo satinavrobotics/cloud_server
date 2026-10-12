@@ -149,7 +149,8 @@ class GraphCache:
         self._graphs: "OrderedDict[Tuple[str, int], Any]" = OrderedDict()
         self._loading: Dict[Tuple[str, int], "asyncio.Future"] = {}
         self.loads = 0                 # store.load calls started (tests, metrics)
-        self._cursors: Dict[str, Any] = {}   # map -> ingest cursor of the version `get` last returned
+        self._cursors: Dict[Tuple[str, int], Any] = {}   # (map, version) -> its ingest cursor
+        self._served: Dict[str, int] = {}                # map -> version `get` last returned
 
     def _open_store(self):
         if self._store is not None:
@@ -174,7 +175,7 @@ class GraphCache:
     def cursor(self, map_id: str) -> Any:
         """The ingest cursor `[costmap_stored_ms, node key]` stored with the version `get` last
         returned for the map (None when unknown)."""
-        return self._cursors.get(map_id)
+        return self._cursors.get((map_id, self._served.get(map_id, -1)))
 
     async def get(self, map_id: str) -> Tuple[Any, int]:
         """(graph, version) of the map's current version; ChartFallback otherwise."""
@@ -197,10 +198,14 @@ class GraphCache:
         version = (meta or {}).get("version")
         if version is None:
             raise ChartFallback("no_graph")
-        self._cursors[map_id] = (meta or {}).get("cursor")
         key = (map_id, int(version))
+        self._cursors[key] = (meta or {}).get("cursor")
+        if len(self._cursors) > 8 * self._max:
+            for old in [k for k in self._cursors if k not in self._graphs and k != key]:
+                del self._cursors[old]
         if key in self._graphs:
             self._graphs.move_to_end(key)
+            self._served[map_id] = key[1]
             return self._graphs[key], key[1]
         fut = self._loading.get(key)
         if fut is None:
@@ -219,9 +224,19 @@ class GraphCache:
         try:
             graph = await asyncio.wait_for(asyncio.shield(fut), left())
         except asyncio.TimeoutError as err:
+            # A new version is still loading (a big map takes seconds, the worker publishes every few):
+            # route on the newest version already loaded for this map. The caller bounds its age by
+            # the ingest lag of THAT version's cursor (`cursor(map)`).
+            older = [k for k in self._graphs if k[0] == map_id]
+            if older:
+                prev = older[-1]               # OrderedDict: least to most recently used
+                self._graphs.move_to_end(prev)
+                self._served[map_id] = prev[1]
+                return self._graphs[prev], prev[1]
             raise ChartFallback("load_timeout") from err
         except Exception as err:  # pylint: disable=broad-except
             raise ChartFallback("load_error") from err
+        self._served[map_id] = key[1]
         return graph, key[1]
 
 

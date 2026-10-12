@@ -34,6 +34,7 @@ MAX_TILE_RETRIES = 3          # MissingTiles rounds (a bbox edge can touch one t
 MAX_LINEAGE_SPAN = 256        # versions between from_version and current
 TILE_M = 6.4                  # store tile side: 128 costmap cells * 0.05 m; bboxes snap outward to this grid
 EDGE_EPS = 1e-6              # m; the store reads a bbox edge on a tile boundary as touching the next tile
+NO_GRAPH_CACHE = "no-store"   # the answer for a map without a graph: it changes the moment one is built
 REVALIDATE_S = 60             # max-age of a response that names `version`; the ETag carries the epoch
 
 
@@ -83,6 +84,13 @@ class _Cache:
                 return None
             self._data.move_to_end(key)
             return hit[0]
+
+    def discard_map(self, map_id: str) -> None:
+        """Forget every entry of one map (keys lead with the map id); in-flight computations finish unshared."""
+        with self._lock:
+            for key in [k for k in self._data if isinstance(k, tuple) and k and k[0] == map_id]:
+                _, n = self._data.pop(key)
+                self._bytes -= n
 
     def get_or_compute(self, key: Any, compute: Callable[[], Any]) -> Any:
         with self._lock:
@@ -172,6 +180,9 @@ class SceneGraphReads:
         meta = await asyncio.to_thread(self._meta, map_id) or {}
         current = meta.get("version")
         if current is None:
+            # no meta (never built, or dropped after an empty rebuild): nothing cached for the map may be served
+            for cache in (self._views, self._graphs, self._results, self._lineages):
+                cache.discard_map(map_id)
             return None, meta, None
         if version is None or version == current:
             version = int(current)
@@ -290,7 +301,8 @@ class SceneGraphReads:
         version_req = version
         version, meta, epoch = await self._version(map_id, version)
         if version is None:
-            raise HTTPException(status_code=404, detail="no scene graph for this map")
+            raise HTTPException(status_code=404, detail="no scene graph for this map",
+                                headers={"Cache-Control": NO_GRAPH_CACHE})
         box = self._check(bbox, level, meta)
         coords = "_".join(repr(float(v)) for v in (box.x0, box.y0, box.x1, box.y1))
         etag = f'"{_tag(epoch)}.{version}.{plane}.{level}.{coords}"'

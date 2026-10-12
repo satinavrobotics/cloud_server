@@ -599,3 +599,74 @@ def test_lineage_validates_caps_and_caches():
     with pytest.raises(HTTPException) as e:
         run(far.lineage("m", 1))
     assert e.value.status_code == 409 and calls == [2]
+
+
+# ---- map without a graph (never built, or dropped after an empty rebuild) ----------------------
+
+def _real_reads():
+    from packages.scene_graph.api import SceneParams
+    from packages.scene_graph.engine import ChartGraph
+    from packages.scene_graph.store import MemoryBackend, SceneGraphStore
+    from tests.unit.scene_graph import chart_worlds as cw
+    b = MemoryBackend()
+    store = SceneGraphStore(b, b, clock=lambda: 1_700_000_000.0)
+    w, way = cw.two_rooms()
+    leaves = cw.drive(w, way)
+    g = ChartGraph(SceneParams())
+    store.save("m", g, g.fold_many(leaves), None, {"n": 1})
+    return sgr.from_store(store), store
+
+
+def test_never_built_map_is_available_false_and_raster_404_no_store():
+    r, _ = _real_reads()
+    b = BBox(0, 0, 10, 10)
+    v = run(r.view("none", b))
+    assert v == {"available": False, "map_id": "none", "version": None, "charts": [], "links": []}
+    assert run(r.view("none", b, version=3))["available"] is False        # a pinned read is no error either
+    with pytest.raises(HTTPException) as e:
+        run(r.raster("none", b))
+    assert e.value.status_code == 404 and e.value.headers["Cache-Control"] == "no-store"
+    assert "ETag" not in (e.value.headers or {})
+    lin = run(r.lineage("none", 0))
+    assert lin["available"] is False and lin["retired"] == {}
+
+
+def test_drop_after_cached_version_serves_nothing_stale_and_a_rebuild_is_fresh():
+    r, store = _real_reads()
+    b = BBox(0, 0, 40, 40)
+    first = run(r.view("m", b))
+    body, headers = run(r.raster("m", b))
+    assert first["available"] and first["charts"] and body
+    run(r.lineage("m", 1))
+    assert len(r._results) and len(r._views)
+    store.drop("m")
+    assert run(r.view("m", b))["available"] is False
+    assert run(r.view("m", b, version=first["version"]))["available"] is False
+    with pytest.raises(HTTPException) as e:
+        run(r.raster("m", b, version=first["version"], if_none_match=headers["ETag"]))   # old ETag, no 304
+    assert e.value.status_code == 404
+    assert run(r.lineage("m", 0))["available"] is False
+    assert len(r._results) == 0 and len(r._views) == 0 and len(r._lineages) == 0
+    # a new incarnation restarts at version 1: new epoch, never the old cached answer or a 304
+    from packages.scene_graph.api import SceneParams
+    from packages.scene_graph.engine import ChartGraph
+    from tests.unit.scene_graph import chart_worlds as cw
+    w, way = cw.two_rooms()
+    g = ChartGraph(SceneParams())
+    store.clock = lambda: 1_700_000_100.0
+    store.save("m", g, g.fold_many(cw.drive(w, way)[:6]), None, {"n": 1})
+    again = run(r.view("m", b))
+    assert again["available"] and again["version"] == first["version"]
+    body2, h2 = run(r.raster("m", b, if_none_match=headers["ETag"]))
+    assert body2 is not None and h2["ETag"] != headers["ETag"]
+
+
+def test_fake_cache_is_purged_when_meta_disappears():
+    state = {"m": {"version": 3, "params": {"lattice": 0.1}}}
+    calls = []
+    r = sgr.SceneGraphReads(lambda mid: state["m"], lambda mid, v, b: FakeGraph(calls), whole_graph=True)
+    run(r.view("m", BBox(0, 0, 1, 1)))
+    assert len(r._results) == 1 and len(r._graphs) == 1
+    state["m"] = {}
+    assert run(r.view("m", BBox(0, 0, 1, 1)))["available"] is False
+    assert len(r._results) == 0 and len(r._graphs) == 0
