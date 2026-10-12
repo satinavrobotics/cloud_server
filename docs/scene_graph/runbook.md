@@ -29,19 +29,21 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_PLAN_BUDGET_S` | 3.0 | planner | snap + route + simplify + leaf lookup (dispatcher replans with a 5 s timeout) |
 | `SCENE_GRAPH_CACHE_VERSIONS` | 4 | planner | loaded graphs kept per process, keyed (map, version) |
 | `SCENE_GRAPH_MAX_VERSION_LAG_S` | 120.0 | planner | graph older than the ingest by more than this -> `stale_graph`; 0 disables |
-| `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.0 | planner | route narrower than factsheet width + margin -> `too_narrow` |
+| `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.0 | planner | route narrower than factsheet width + margin -> `too_narrow` (only when the check is enabled) |
+| `SCENE_GRAPH_WIDTH_CHECK_ENABLED` | false | planner | gates `too_narrow`: engine `Route.min_width` is not the passage width yet (open defect), so it is off |
+| `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag) |
 
 Not env-configurable (`WorkerConfig`/`RunnerConfig` defaults): nodes read per step 200, replay margin 60 s, PNG retry
 2 s / expiry 60 s, rebuild-request check 30 s, backoff 10 s, `commit_retries` 5, `empty_rebuild_confirmations` 2, map
 discovery 60 s, `max_maps` 64, terminal retry 60 s, needs_rebuild retry 300 s.
 
-**Compose gap.** `docker_compose/mission_dispatch_services.yaml` forwards only the planner variables (to
-`mission-planner-service`). It does **not** pass `SCENE_GRAPH_WORKER_ENABLED` to `graph-builder-service` or
-`api-delegation-service`, nor any worker tuning variable. Neither service has an `env_file`, so setting them in `.env`
-alone has no effect: add them to those two `environment:` lists before switching on.
-`mission-planner-service` needs the ARANGO_* and MINIO_* secrets (already present); graph-builder needs
-`POSTGRES_PASSWORD` (present) and builds its lock connection from `POSTGRES_DATABASE_{NAME,USERNAME,HOST,PORT}`, whose
-defaults come from `config.py` (it sets only the password in compose).
+**Compose (31dae3f).** `mission_dispatch_services.yaml` forwards `SCENE_GRAPH_WORKER_ENABLED` and the worker tuning
+variables to `graph-builder-service`, `SCENE_GRAPH_WORKER_ENABLED` to `api-delegation-service`, and the planner
+variables to `mission-planner-service`, all as `${VAR:-default}` with the worker off. graph-builder also gets
+`POSTGRES_DATABASE_{PORT,NAME,USERNAME,PASSWORD}` (`POSTGRES_DATABASE_HOST` falls back to `POSTGRES_HOST`).
+`mission-planner-service` needs the ARANGO_* and MINIO_* secrets (already present). Planner-only additions:
+`SCENE_GRAPH_WIDTH_CHECK_ENABLED` (default false), `SCENE_GRAPH_PREWARM_MAPS` (comma list; default: every listed map
+with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2).
 
 ## 2. Deploy order
 
@@ -173,7 +175,7 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | `store_unavailable` | scene graph store could not be built (retried after 30 s) | planner lacks ARANGO_*/MINIO_* env or store down |
 | `store_timeout` / `store_error` | store open or `meta` timed out (> `LOAD_TIMEOUT_S`) / raised | Arango/MinIO slow or down; check their health |
 | `no_graph` | map has no saved version | map not enabled, never ingested, or emptied (version 0 rebuild) |
-| `load_timeout` | cold graph load took > `LOAD_TIMEOUT_S`; it continues in the background and fills the cache | **expected on the first request of every new version**: a new version is a new cache key. Frequent during active ingest; persistent on a quiet map = graph too large for the timeout |
+| `load_timeout` | cold graph load took > `LOAD_TIMEOUT_S`; it continues in the background and fills the cache | only when no older version of the map is cached (first request after restart; pre-warm avoids it). A newer version is loaded in the background (single flight) while the newest cached one is served, bounded by `stale_graph`. Persistent on a quiet map = graph too large for the timeout |
 | `load_error` | `store.load` raised | store/snapshot problem; see worker `save` failures and planner log |
 | `stale_graph` | oldest costmap stored after the version's cursor is older than `MAX_VERSION_LAG_S` | worker behind, stalled, or map switched off while uploads continue. Unknown lag (no cursor, query error) never rejects |
 | `start_no_navigable_space` / `goal_no_navigable_space` | no free cell near the point | robot pose or goal outside mapped free space |
@@ -182,7 +184,7 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | `blocked_by_overlay` | route exists without the active blocked-node rows, not with them | an active block (expiry pending) stands in the way; legacy then reports `blocked_nodes` |
 | `unreachable` | no route in the chart graph | real disconnection, or map not yet fully ingested |
 | `missing_tiles` | the corridor needs tiles not loaded | snapshot incomplete/inconsistent; investigate the version |
-| `too_narrow` | `min_width` < robot factsheet width + margin | route has a passage narrower than this robot (width only, not length) |
+| `too_narrow` | `min_width` < robot factsheet width + margin; **inactive unless `SCENE_GRAPH_WIDTH_CHECK_ENABLED`** (engine `min_width` is not the passage width) | route has a passage narrower than this robot (width only, not length) |
 | `waypoints_without_distinct_leaf_ids` | a waypoint has no leaf within 1.0 m, or two waypoints share one | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
 | `blocked_row_on_route` | a blocked row without a robot pose (old disc rule) hits the final waypoints | legacy planner reports/detours it |
 | `plan_timeout` | snap + route + simplify + leaf lookup > `PLAN_BUDGET_S` (the thread keeps running) | map/route too large for the budget; see capacity |
@@ -203,8 +205,8 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
   finish. Keep such maps disabled and the planner away from them until CIMBI's sight-range cap lands.
 * **Backfill of an existing map** is hours at the builder's cost (big batches, resumable). Rebuild cost is the same
   full refold; there is no per-extent re-solve.
-* **Planner.** Warm path must fit 3 s (5 s dispatcher timeout). A cold load is waited for 2 s; each new version is
-  cold (cache of 4 versions per process, per map and version). Read API: result cache 96 MiB, 2 loaded graphs,
+* **Planner.** Warm path must fit 3 s (5 s dispatcher timeout). A cold load is waited for 2 s; a new version loads in the
+  background while the older cached one is served (2 versions per map, cache of 4 versions per process). Read API: result cache 96 MiB, 2 loaded graphs,
   8 tile views.
 * **Restart replay.** The cursor is the lower of the in-memory copy and the store's; replay margin 60 s; rebuild
   restarts from zero.
@@ -234,7 +236,7 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 
 | Symptom | Check | Action |
 |---|---|---|
-| Flag true but no UPDATED events, no log line | graph-builder env actually has `SCENE_GRAPH_WORKER_ENABLED` (compose gap, section 1) | add to compose `environment:`, recreate container |
+| Flag true but no UPDATED events, no log line | graph-builder env actually has `SCENE_GRAPH_WORKER_ENABLED` (compose forwards it since 31dae3f; check `.env`) | set it in `.env`, recreate container |
 | `scene graph worker not started: ...` | exception text in the log (numpy/scipy import, store, Postgres) | fix the cause, restart graph-builder; the service stays up without the worker |
 | Map never ingested, no events | map registered and live in `mapobjectv1`; bucket exists; not `scene_graph_enabled: false`; bucket-slug collision log | fix registry/switch; rename colliding map |
 | Nodes uploaded before the feature never appear | backfill report: `to_stamp` / `skipped` | run backfill `--apply`, then force a rebuild (section 3) |
@@ -247,7 +249,7 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | Read API `available: false` | API worker flag; map has a saved version; worker state | enable flag on the API; ingest the map |
 | Read API 422 "bbox is N cells" / "N charts" | request size | smaller bbox or higher level |
 | Read API 409 "tiles changed" / lineage 409 | version moved during the read / span > 256 / too old | retry; for lineage reselect from current charts |
-| Planner always `load_timeout` | map size, MinIO latency, ingest publishing every 5 s (new version = cold) | pause mapping on that map, or raise `LOAD_TIMEOUT_S` within the 5 s dispatcher budget |
+| Planner always `load_timeout` | no cached version yet: map size, MinIO latency, pre-warm failed (planner log) | wait for the background load, set `SCENE_GRAPH_PREWARM_MAPS`, or raise `LOAD_TIMEOUT_S` within the 5 s dispatcher budget |
 | Planner always `stale_graph` | lag: worker stalled, behind, or map disabled while uploads continue | fix ingest, re-enable the map, or (last resort) `MAX_VERSION_LAG_S` higher / 0 |
 | Planner `store_unavailable` | planner env has ARANGO_*/MINIO_*; retry is every 30 s | fix env/network, restart planner |
 | Route clips a known obstacle / robot refuses leg | active `blocked-nodes` rows (`GET /api/v1/maps/{id}/blocked-nodes?with_chart_keys=true`); migration applied | clear/expire row; check migration |
