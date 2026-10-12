@@ -113,7 +113,12 @@ def run_id_of(row: Mapping[str, Any]) -> Optional[str]:
     prefix carries the dispatcher's run id (order_ids), which with `mission_name` is the key of
     fleet_recorder.run_uuid. None for a row without them (written before the dispatcher
     numbered runs, a manual row). Stable across restarts and reroutes (order_rev is not part of
-    the key). A repeat pass starts a new dispatcher run id, so its blocks name that pass's id."""
+    the key).
+
+    This is the uuid of the DISPATCHER run id of the pass the report was made in. It equals
+    mission_runs.run_id for the first pass only: a repeat pass starts a new dispatcher run id
+    while the recorder keeps the first pass's mission_runs row, so for later passes (and for a
+    run adopted after a restart) use `resolve_run_ids`, which looks the run up."""
     node, mission = row.get("vda_node_id"), row.get("mission_name")
     if not node or not mission:
         return None
@@ -124,6 +129,62 @@ def run_id_of(row: Mapping[str, Any]) -> Optional[str]:
     if match is None or prefix[:match.start()] != str(mission):
         return None
     return str(fleet_recorder.run_uuid(str(mission), match.group(1)))
+
+
+# The mission_runs rows a report's mission and robot may belong to. A repeat pass gets a new
+# dispatcher run id but the recorder keeps ONE mission_runs row for the mission on the robot
+# (fleet_recorder.run_started returns early when the mission's run is open), keyed by the FIRST
+# pass's id (or, after a dispatcher restart, adopted by mission and robot): so for a later pass
+# `run_id_of` names a uuid no mission_runs row has.
+RUNS_OF_MISSIONS_SQL = (
+    "SELECT run_id, mission_name, robot_name, started_at FROM mission_runs "
+    "WHERE mission_name = ANY(%s) ORDER BY started_at")
+
+
+async def resolve_run_ids(database: Any, rows: List[Dict[str, Any]]) -> None:
+    """Replace `run_id` of `rows` (in place) by the mission_runs row they belong to, where
+    `run_id_of`'s uuid is not one: the run of the same mission and robot that had started when
+    the report was made (latest `started_at` not after `created_at`, which a re-block resets, so
+    the run may be a later one only if the report is newer than it). One query for all rows;
+    rows without a derived id are not looked at; any failure leaves the derived ids."""
+    todo = [r for r in rows if r.get("run_id") and r.get("mission_name")]
+    if not todo:
+        return
+    try:
+        async with database.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(RUNS_OF_MISSIONS_SQL,
+                                     (sorted({str(r["mission_name"]) for r in todo}),))
+                runs = [(str(a), b, c, d) for a, b, c, d in await cursor.fetchall()]
+    except Exception as err:  # pylint: disable=broad-except
+        logging.getLogger(__name__).warning("Could not resolve run ids of blocked nodes: %s", err)
+        return
+    known = {run[0] for run in runs}
+    for row in todo:
+        if row["run_id"] in known:
+            continue
+        created = _as_datetime(row.get("created_at"))
+        best = None
+        for run_id, mission, robot, started in runs:
+            if mission != row["mission_name"] or (row.get("robot_name") and robot != row["robot_name"]):
+                continue
+            if created is not None and started is not None and started > created:
+                continue
+            best = run_id          # runs are ordered by started_at: the last one wins
+        if best is not None:
+            row["run_id"] = best
+
+
+def _as_datetime(value: Any) -> Any:
+    import datetime
+    if isinstance(value, str):
+        try:
+            value = datetime.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime.datetime) and value.tzinfo is None:
+        value = value.replace(tzinfo=datetime.timezone.utc)
+    return value if isinstance(value, datetime.datetime) else None
 
 
 def row_dict(row: Sequence[Any]) -> Dict[str, Any]:
