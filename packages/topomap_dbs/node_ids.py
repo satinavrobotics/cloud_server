@@ -1,11 +1,11 @@
 """What a topomap node id looks like (graph-builder's `_generate_global_node_id` is a UUID4).
 
-Anything else in a map bucket's top level (`reconstruction/`, ...) is not a node, and deleting
+Anything else in a map bucket's top level (`reconstruction/`, `scene_graph/`, ...) is not a node, and deleting
 "its objects" would delete that data.
 """
 import uuid
 
-NON_NODE_PREFIXES = frozenset({"reconstruction"})
+NON_NODE_PREFIXES = frozenset({"reconstruction", "scene_graph"})
 
 
 def is_node_id(value: object) -> bool:

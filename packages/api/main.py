@@ -581,6 +581,63 @@ async def get_map_graph(map_id: str):
     return await _site_call("read map graph", service.get_map_graph(map_id))
 
 
+_scene_reads: Optional[Any] = None
+
+
+def _scene_graph_reads():
+    """The scene-graph read side, built on first use (the engine is imported only when enabled)."""
+    global _scene_reads
+    if _scene_reads is None:
+        from packages.api import scene_graph_reads
+        from packages.config import SCENE_GRAPH_WORKER_ENABLED
+        _scene_reads = scene_graph_reads.build(SCENE_GRAPH_WORKER_ENABLED)
+    return _scene_reads
+
+
+@app.get("/api/v1/maps/{map_id}/scene-graph")
+async def get_map_scene_graph(map_id: str, bbox: str, level: int = 0, version: Optional[int] = None,
+                              raster: bool = False):
+    """The high-level chart graph of an area: {available, version, charts, links, raster}. `bbox` is
+    `x0,y0,x1,y1` in map-frame metres. `available: false` when the map has no scene graph (yet).
+    With `raster=true` the response also holds the plane's keys and geometry; fetch the plane from
+    /scene-graph/raster with the same bbox, level and the returned `version`."""
+    _require_service()
+    from packages.api import scene_graph_reads
+    box = scene_graph_reads.parse_bbox(bbox)
+    return await _site_call("read scene graph", _scene_graph_reads().view(
+        map_id, box, level, version, raster))
+
+
+@app.get("/api/v1/maps/{map_id}/scene-graph/raster")
+async def get_map_scene_graph_raster(map_id: str, bbox: str, level: int = 0,
+                                     version: Optional[int] = None, plane: str = "owner",
+                                     if_none_match: Optional[str] = Header(None)):
+    """The owner plane (u16 little-endian, 0 = no chart, i = keys[i-1]) or the `dependent` plane (u8)
+    over a bbox, row-major. Shape, origin and step are in the X-Raster-* headers. A request that
+    names `version` is immutable and cached forever."""
+    _require_service()
+    from packages.api import scene_graph_reads
+    box = scene_graph_reads.parse_bbox(bbox)
+    body, headers = await _site_call("read scene graph raster", _scene_graph_reads().raster(
+        map_id, box, level, version, plane))
+    etag = f'"{headers["X-Scene-Graph-Version"]}-{plane}-{level}-{bbox}"'
+    headers["ETag"] = etag
+    headers["Cache-Control"] = ("public, max-age=31536000, immutable" if version is not None
+                                else "no-cache")
+    if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/octet-stream", headers=headers)
+
+
+@app.get("/api/v1/maps/{map_id}/scene-graph/lineage")
+async def get_map_scene_graph_lineage(map_id: str, from_version: int):
+    """{retired: {old chart key: [successor keys, largest overlap first]}} since `from_version`; the
+    client walks its selected keys forward through it."""
+    _require_service()
+    return await _site_call("read scene graph lineage",
+                            _scene_graph_reads().lineage(map_id, from_version))
+
+
 @app.get("/api/v1/maps/{map_id}/blocked-nodes")
 async def list_blocked_nodes(map_id: str):
     """The map's graph nodes a robot reported blocked whose exclusion has not expired: the
