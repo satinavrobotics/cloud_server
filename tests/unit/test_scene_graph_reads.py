@@ -235,3 +235,154 @@ def test_negative_version_is_404():
     with pytest.raises(HTTPException) as e:
         run(r.view("m", BBox(0, 0, 1, 1), version=-1))
     assert e.value.status_code == 404
+
+
+class FakeTiledStore:
+    """meta / tiles_in / view like SceneGraphStore; counts tile loads (a view loads a tile once, lazily)."""
+
+    def __init__(self, side=40, version=3, retained=(3,)):
+        self.side, self.version, self.retained = side, version, set(retained)
+        self.tile_loads, self.view_opens, self.whole_loads = [], [], 0
+
+    def meta(self, mid):
+        return {"version": self.version, "params": {"lattice": 0.1}}
+
+    def tiles_in(self, mid, bbox, version=None):
+        if version is not None and version not in self.retained:
+            raise FileNotFoundError(version)
+        tx0, ty0 = int(bbox.x0 // 6.4), int(bbox.y0 // 6.4)      # 128 cells * 0.05 m
+        tx1, ty1 = int(bbox.x1 // 6.4), int(bbox.y1 // 6.4)
+        return [(x, y) for x in range(max(tx0, 0), min(tx1, self.side - 1) + 1)
+                for y in range(max(ty0, 0), min(ty1, self.side - 1) + 1)]
+
+    def view(self, mid, version=None, tiles=None):
+        self.view_opens.append(tuple(sorted(tiles)))
+        store, allowed, seen = self, set(tiles), set()
+
+        class V:
+            def query(self, bbox, level=0, raster=True):
+                for t in store.tiles_in(mid, bbox):
+                    if t not in allowed:
+                        from packages.scene_graph.api import MissingTiles
+                        raise MissingTiles([t])
+                    if t not in seen:
+                        seen.add(t)
+                        store.tile_loads.append(t)
+                return FakeGraph([]).query(bbox, level, raster)
+        return V()
+
+    def load(self, mid, version=None, tiles=None):
+        self.whole_loads += 1
+        return FakeGraph([])
+
+
+def test_tiled_store_small_bbox_on_large_map_loads_few_tiles_and_caches():
+    store = FakeTiledStore(side=40)                  # 1600 tiles
+    r = sgr.from_store(store)
+    b = BBox(1.0, 1.0, 5.0, 5.0)                     # inside tile (0, 0)
+    out = run(r.view("m", b, raster=True))
+    assert out["available"] and store.whole_loads == 0
+    assert store.tile_loads == [(0, 0)]
+    run(r.view("m", b, raster=True))                 # result cache
+    run(r.view("m", b, level=1, raster=True))        # view cache: same tile-set, same tiles, no reload
+    assert store.view_opens == [((0, 0),)] and store.tile_loads == [(0, 0)]
+    run(r.view("m", BBox(1.0, 1.0, 13.0, 5.0)))      # wider bbox: 3 tiles only
+    assert set(store.tile_loads) == {(0, 0), (1, 0), (2, 0)} and len(store.tile_loads) == 4   # new tile-set, new view
+
+
+def test_tiled_store_view_cache_is_bounded_lru():
+    store = FakeTiledStore()
+    r = sgr.from_store(store)
+    for i in range(sgr.CACHE_VIEWS + 3):
+        run(r.view("m", BBox(i * 6.4 + 0.1, 0.1, i * 6.4 + 0.2, 0.2)))
+    assert len(r._views) == sgr.CACHE_VIEWS
+
+
+def test_tiled_store_missing_tiles_are_retried_with_the_named_tiles():
+    store = FakeTiledStore()
+    first = store.tiles_in
+    calls = {"n": 0}
+
+    def short(mid, bbox, version=None):              # first scan misses a tile the query then asks for
+        calls["n"] += 1
+        got = first(mid, bbox, version)
+        return got[:-1] if calls["n"] == 1 and len(got) > 1 else got
+    store.tiles_in = short
+    r = sgr.from_store(store)
+    out = run(r.view("m", BBox(1.0, 1.0, 13.0, 5.0)))
+    assert out["available"] is True
+    assert len(store.view_opens) == 2 and len(store.view_opens[1]) == len(store.view_opens[0]) + 1
+
+
+def test_tiled_store_unretained_version_is_404_and_future_is_404():
+    store = FakeTiledStore(version=5, retained=(5,))
+    r = sgr.from_store(store)
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 1, 1), version=2))
+    assert e.value.status_code == 404
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 1, 1), version=9))
+    assert e.value.status_code == 404
+
+
+def test_tiled_store_pinned_version_is_part_of_the_cache_key():
+    store = FakeTiledStore(version=5, retained=(5, 4))
+    r = sgr.from_store(store)
+    b = BBox(0.1, 0.1, 0.5, 0.5)
+    assert run(r.view("m", b))["version"] == 5
+    assert run(r.view("m", b, version=4))["version"] == 4
+    assert len(store.view_opens) == 2
+
+
+def test_persistent_missing_tiles_is_409():
+    class Bad(FakeTiledStore):
+        def view(self, mid, version=None, tiles=None):
+            from packages.scene_graph.api import MissingTiles
+
+            class V:
+                def query(s, *a):
+                    raise MissingTiles([(9, 9)])
+            return V()
+    r = sgr.from_store(Bad())
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 1, 1)))
+    assert e.value.status_code == 409
+
+
+def test_lineage_too_old_is_409():
+    class TooOld(Exception):
+        pass
+
+    def lin(mid, v):
+        raise TooOld("version 3 is no longer retained")
+    r = sgr.SceneGraphReads(lambda mid: {"version": 5}, lambda *a: None, lin)
+    with pytest.raises(HTTPException) as e:
+        run(r.lineage("m", 2))
+    assert e.value.status_code == 409
+
+
+def test_rebuilt_dirty_is_reported_as_truncated():
+    d = NS(bbox=None, changed=[], retired={"a:1": ["b:1"]}, full=True)
+    m = scene_events.updated_message("m", 9, d)
+    assert m["truncated"] and m["changed"] == [] and m["retired"] == {}
+
+
+def test_build_event_validates_for_every_kind():
+    from packages.events.emit import build_row
+    cases = {
+        "updated": {"version": 4, "leaves_folded": 12, "charts_changed": None},
+        "fold_failed": {"stage": "fold", "detail": "boom", "consecutive": 2},
+        "rebuild_started": {"reason": "needs_rebuild"},
+        "rebuild_completed": {"reason": "needs_rebuild", "version": 7, "duration_s": 3.2},
+        "skipped": {"reason": "map_not_enabled"},
+    }
+    codes = {}
+    for kind, payload in cases.items():
+        ev = scene_events.build_event("m1", kind, payload)
+        row = build_row(ev, strict=True)
+        assert row["payload"]["map_name"] == "m1" and row["robot_name"] is None
+        assert row["source"] == "graph_builder"
+        assert ev.discriminator.startswith(f"map:m1:scene_graph:{kind}:")
+        codes[kind] = row["code"]
+    assert codes["updated"] == "MAP.SCENE_GRAPH_UPDATED" and codes["skipped"] == "MAP.SCENE_GRAPH_DISABLED_SKIPPED"
+    assert len(set(codes.values())) == 5

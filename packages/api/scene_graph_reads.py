@@ -4,7 +4,7 @@
 `GET /api/v1/maps/{map_id}/scene-graph/raster`   the owner plane over a bbox, raw little-endian u16
 `GET /api/v1/maps/{map_id}/scene-graph/lineage`  retired chart key -> successors since a version
 
-The library and its store are injected (`SceneGraphReads(meta, load, lineage)`), so the module has no
+The library and its store are injected (`SceneGraphReads(meta, load, lineage[, tiles_in, open_view])`), so the module has no
 dependency on the engine and is testable with fakes. Reads are pinned to one version: the response
 says which, and the same `version` can be passed back for a consistent follow-up (raster after JSON).
 """
@@ -16,13 +16,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import HTTPException
 
-from packages.scene_graph.api import BBox
+from packages.scene_graph.api import BBox, MissingTiles
 
 MAX_LEVEL = 8
 MAX_CELLS = 4_000_000         # raster cells per request (8 MB as u16)
 MAX_CHARTS = 20_000
 CACHE_RESULTS = 8
 CACHE_GRAPHS = 2
+CACHE_VIEWS = 8               # (map, version, tile-set) views kept; tiles load lazily inside a view
+MAX_TILE_RETRIES = 3          # MissingTiles rounds (a bbox edge can touch one tile more than the manifest scan)
 
 
 def parse_bbox(text: Optional[str]) -> BBox:
@@ -50,17 +52,26 @@ def link_json(l: Any) -> Dict[str, Any]:
 
 class SceneGraphReads:
     """`meta(map_id) -> {}|{version, params, ...}`, `load(map_id, version, bbox) -> SceneGraph` (raises LookupError for a version not retained),
-    `lineage(map_id, from_version) -> {key: [keys]}`; all blocking, run in a thread."""
+    `lineage(map_id, from_version) -> {key: [keys]}`; all blocking, run in a thread.
+
+    Tiled reads: with `tiles_in(map_id, bbox, version) -> [(tx, ty)]` and `open_view(map_id, version, tiles)
+    -> object with query(bbox, level, raster)` (a `StoredView`), a request reads only the tiles of its bbox;
+    views are cached per (map, version, tile-set) in a bounded LRU. Without them, `load` is used (whole graph
+    if `whole_graph`)."""
 
     def __init__(self, meta: Callable[[str], Dict[str, Any]],
                  load: Callable[[str, Optional[int], BBox], Any],
                  lineage: Optional[Callable[[str, int], Dict[str, List[str]]]] = None,
                  max_cells: int = MAX_CELLS, max_charts: int = MAX_CHARTS,
-                 whole_graph: bool = False) -> None:
+                 whole_graph: bool = False,
+                 tiles_in: Optional[Callable[[str, BBox, Optional[int]], List[Tuple[int, int]]]] = None,
+                 open_view: Optional[Callable[[str, Optional[int], Any], Any]] = None) -> None:
         """`whole_graph`: `load` ignores the bbox, so one loaded graph serves every bbox of a
         (map, version); without it each bbox is loaded by itself."""
         self._meta, self._load, self._lineage = meta, load, lineage
         self._whole = whole_graph
+        self._tiles_in, self._open_view = tiles_in, open_view
+        self._views: "OrderedDict[tuple, Any]" = OrderedDict()
         self._graphs: "OrderedDict[tuple, Any]" = OrderedDict()
         self.max_cells, self.max_charts = max_cells, max_charts
         self._results: "OrderedDict[tuple, Any]" = OrderedDict()
@@ -93,7 +104,7 @@ class SceneGraphReads:
             self._results.move_to_end(key)
             return self._results[key]
 
-        def run() -> Any:
+        def run_whole() -> Any:
             gkey = (map_id, version)
             graph = self._graphs.get(gkey) if self._whole else None
             if graph is None:
@@ -103,9 +114,30 @@ class SceneGraphReads:
                     while len(self._graphs) > CACHE_GRAPHS:
                         self._graphs.popitem(last=False)
             return graph.query(bbox, level, raster)
+
+        def run_tiled() -> Any:
+            tiles = frozenset(tuple(t) for t in self._tiles_in(map_id, bbox, version))
+            for _ in range(MAX_TILE_RETRIES + 1):
+                vkey = (map_id, version, tiles)
+                view = self._views.get(vkey)
+                if view is None:
+                    view = self._open_view(map_id, version, tiles)
+                    self._views[vkey] = view
+                    while len(self._views) > CACHE_VIEWS:
+                        self._views.popitem(last=False)
+                else:
+                    self._views.move_to_end(vkey)
+                try:
+                    return view.query(bbox, level, raster)
+                except MissingTiles as exc:      # the bbox edge reaches a tile the manifest scan did not name
+                    tiles = tiles | frozenset(tuple(t) for t in exc.tiles)
+            raise MissingTiles(sorted(tiles))
+        run = run_tiled if self._tiles_in is not None and self._open_view is not None else run_whole
         try:
             res = await asyncio.to_thread(run)
-        except LookupError:
+        except MissingTiles:
+            raise HTTPException(status_code=409, detail="scene graph tiles changed during the read; retry") from None
+        except (LookupError, FileNotFoundError):
             raise HTTPException(status_code=404, detail=f"scene graph version {version} is not retained") from None
         self._results[key] = res
         while len(self._results) > CACHE_RESULTS:
@@ -164,7 +196,12 @@ class SceneGraphReads:
         version, _ = await self._version(map_id, None)
         if version is None or self._lineage is None:
             return {"available": False, "from_version": from_version, "version": version, "retired": {}}
-        retired = await asyncio.to_thread(self._lineage, map_id, from_version)
+        try:
+            retired = await asyncio.to_thread(self._lineage, map_id, from_version)
+        except Exception as exc:
+            if type(exc).__name__ == "TooOld":    # the store no longer retains the span: reselect from current charts
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            raise
         return {"available": True, "from_version": from_version, "version": version, "retired": retired}
 
 
@@ -177,12 +214,21 @@ def _unavailable_load(map_id: str, version: Optional[int], bbox: BBox) -> Any:
 
 
 def from_store(store: Any) -> SceneGraphReads:
-    """Reads over a `SceneGraphStore`. The whole graph is loaded per request until the store can
-    name the tiles of a bbox (`tiles=` of `load`); the result cache keeps repeats cheap."""
+    """Reads over a `SceneGraphStore`: bbox -> `tiles_in` -> `view(tiles=)`, so a request touches only the
+    tiles of its bbox (`load(tiles=)` is the writer's all-tiles call and raises MissingTiles for a subset).
+    A store without `view` / `tiles_in` falls back to the whole graph per (map, version)."""
+    lineage = getattr(store, "lineage", None)
+    if callable(getattr(store, "view", None)) and callable(getattr(store, "tiles_in", None)):
+        return SceneGraphReads(
+            meta=store.meta,
+            load=lambda map_id, version, bbox: store.load(map_id, version),
+            lineage=lineage,
+            tiles_in=lambda map_id, bbox, version: store.tiles_in(map_id, bbox, version),
+            open_view=lambda map_id, version, tiles: store.view(map_id, version, tiles))
     return SceneGraphReads(
         meta=store.meta,
         load=lambda map_id, version, bbox: store.load(map_id, version),
-        lineage=getattr(store, "lineage", None), whole_graph=True)
+        lineage=lineage, whole_graph=True)
 
 
 def build(enabled: bool) -> SceneGraphReads:
