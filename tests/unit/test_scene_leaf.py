@@ -56,3 +56,15 @@ def test_role_layers():
     assert sl.role_layers({"occupancy": {}, "depth_occ": {}}) == {"occupancy": "occupancy"}
     assert sl.role_layers({"x": {}}) == {}
     assert sl.role_layers({"d": {}}, {"d": "occupancy"}) == {"occupancy": "d"}
+
+
+def test_robot_occupancy_wins_over_depth_layer():
+    both = {"occupancy_depth": {}, "occupancy": {}}
+    assert sl.role_layers(both) == {"occupancy": "occupancy"}
+    assert sl.role_layers({"occupancy_depth": {}}) == {"occupancy": "occupancy_depth"}
+
+
+def test_leaf_stamp_reads_the_depth_layer_when_it_is_the_only_one():
+    stamp = _ms(RECEIPT) - 1000
+    node = _node(costmap={"occupancy_depth": {"costmap_stamp_ms": stamp}})
+    assert sl.leaf_stamp(node) == (stamp, sl.STAMP_COSTMAP)

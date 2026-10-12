@@ -31,7 +31,11 @@ STAMP_RECEIPT = "receipt"
 ROLE_OCCUPANCY = "occupancy"
 # Stored layer name -> role. Only occupancy shapes the partition; the others are optional
 # channels the library integrates over links (integration.md, decision 6).
-DEFAULT_ROLES: Mapping[str, str] = {"occupancy": ROLE_OCCUPANCY}
+DEFAULT_ROLES: Mapping[str, str] = {"occupancy": ROLE_OCCUPANCY,
+                                    "occupancy_depth": ROLE_OCCUPANCY}
+# Several layers may play one role: the first stored one in this order is used. The robot's own
+# costmap wins over the one generated from depth for maps recorded before costmaps existed.
+LAYER_PRIORITY = ("occupancy", "occupancy_depth")
 
 _UTC = datetime.timezone.utc
 
@@ -53,11 +57,13 @@ def _ms(moment: datetime.datetime) -> int:
     return int(round(moment.timestamp() * 1000.0))
 
 
-def leaf_stamp(node: Mapping[str, Any], layer: str = ROLE_OCCUPANCY,
+def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
                max_age_s: float = MAX_AGE_S) -> Optional[Tuple[int, str]]:
     """`(epoch ms, source)` the leaf is folded under, or None when the node has no usable time at
     all (no sane robot stamp and no receipt time): the worker skips such a leaf and counts it."""
     receipt = _receipt(node)
+    if layer is None:
+        layer = role_layers(node.get("costmap")).get(ROLE_OCCUPANCY, ROLE_OCCUPANCY)
     now = receipt or datetime.datetime.now(_UTC)
     record = (node.get("costmap") or {}).get(layer)
     candidates = []
@@ -76,8 +82,16 @@ def leaf_stamp(node: Mapping[str, Any], layer: str = ROLE_OCCUPANCY,
     return None
 
 
-def role_layers(stored: Mapping[str, Any],
+def role_layers(stored: Optional[Mapping[str, Any]],
                 roles: Mapping[str, str] = DEFAULT_ROLES) -> dict:
     """`role -> layer` for the layers a node has stored (`node['costmap']`); a role with no
-    stored layer is absent. The leaf is built only when the occupancy role is present."""
-    return {role: layer for layer, role in roles.items() if layer in (stored or {})}
+    stored layer is absent. Where several stored layers share a role the one earliest in
+    LAYER_PRIORITY wins (then name order). The leaf is built only when the occupancy role is
+    present."""
+    stored = stored or {}
+    found: dict = {}
+    order = {name: i for i, name in enumerate(LAYER_PRIORITY)}
+    for layer in sorted((l for l in roles if l in stored),
+                        key=lambda l: (order.get(l, len(order)), l)):
+        found.setdefault(roles[layer], layer)
+    return found
