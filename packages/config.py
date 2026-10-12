@@ -553,6 +553,16 @@ SCENE_GRAPH_CACHE_VERSIONS = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS", "4"))
 SCENE_GRAPH_MAX_VERSION_LAG_S = float(os.getenv("SCENE_GRAPH_MAX_VERSION_LAG_S", "120.0"))
 # A route narrower than the planning robot's factsheet width plus this margin is `too_narrow`.
 SCENE_GRAPH_WIDTH_MARGIN_M = float(os.getenv("SCENE_GRAPH_WIDTH_MARGIN_M", "0.0"))
+# Gate of the `too_narrow` comparison above. OFF by default: the engine's `Route.min_width` is not
+# the passage width (it is 2 * the minimum clearance along a corner-hugging path: 0.6 m in a 1.5 m
+# corridor), so the check refuses robots that fit. Turn on only after the engine defect is fixed.
+SCENE_GRAPH_WIDTH_CHECK_ENABLED = _env_bool("SCENE_GRAPH_WIDTH_CHECK_ENABLED", "false")
+# Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
+# (comma-separated) into the cache in the background; empty = every map the graph database lists
+# that has a stored scene graph. CONCURRENCY loads at a time.
+SCENE_GRAPH_PREWARM_MAPS = tuple(m.strip() for m in os.getenv("SCENE_GRAPH_PREWARM_MAPS", "").split(",")
+                                 if m.strip())
+SCENE_GRAPH_PREWARM_CONCURRENCY = int(os.getenv("SCENE_GRAPH_PREWARM_CONCURRENCY", "2"))
 
 # Scene-graph ingest worker batching (measured: a whole-batch fold costs seconds, and a larger
 # batch amortises a fixed solve, so the worker folds in batches, never leaf by leaf).

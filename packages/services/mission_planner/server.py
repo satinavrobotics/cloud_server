@@ -117,7 +117,42 @@ class MissionPlannerService:
             self._open_scene_store, max_entries=config.SCENE_GRAPH_CACHE_VERSIONS,
             load_timeout_s=config.SCENE_GRAPH_LOAD_TIMEOUT_S)
 
+        self._prewarm_task: Optional["asyncio.Task"] = None
+
         self.logger.info("Mission Planner Service initialized")
+
+    def start_scene_prewarm(self) -> Optional["asyncio.Task"]:
+        """Start the background pre-warm of the chart-graph cache (needs a running loop). A no-op
+        while SCENE_GRAPH_PLANNER_ENABLED is off. Never blocks, never raises."""
+        if not config.SCENE_GRAPH_PLANNER_ENABLED or self._prewarm_task is not None:
+            return self._prewarm_task
+        self._prewarm_task = asyncio.get_running_loop().create_task(self._prewarm_scene_graphs())
+        return self._prewarm_task
+
+    async def _prewarm_scene_graphs(self) -> None:
+        try:
+            maps = list(config.SCENE_GRAPH_PREWARM_MAPS)
+            if not maps:
+                maps = await asyncio.get_running_loop().run_in_executor(
+                    None, self.graph_db.list_maps)
+            sem = asyncio.Semaphore(max(1, int(config.SCENE_GRAPH_PREWARM_CONCURRENCY)))
+
+            async def one(map_id: str) -> None:
+                async with sem:
+                    try:
+                        version = await self._scene_cache.warm(map_id)
+                        if version is not None:
+                            self.logger.info(f"Scene graph of map {map_id} v{version} pre-warmed")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as err:  # pylint: disable=broad-except
+                        self.logger.warning(f"Scene graph pre-warm of map {map_id} failed: {err!r}")
+
+            await asyncio.gather(*(one(str(m)) for m in maps or []))
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Scene graph pre-warm failed: {err!r}")
 
     @staticmethod
     def _open_scene_store():
@@ -177,7 +212,11 @@ class MissionPlannerService:
                             node_of, config.SCENE_GRAPH_START_SNAP_M,
                             config.SCENE_GRAPH_GOAL_SNAP_M,
                             config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
-                            self._robot_width(robot), config.SCENE_GRAPH_WIDTH_MARGIN_M)),
+                            # Engine `Route.min_width` is not the passage width (defect, to be
+                            # fixed in packages/scene_graph): no width check unless enabled.
+                            self._robot_width(robot) if config.SCENE_GRAPH_WIDTH_CHECK_ENABLED
+                            else None,
+                            config.SCENE_GRAPH_WIDTH_MARGIN_M)),
                     config.SCENE_GRAPH_PLAN_BUDGET_S)
             except asyncio.TimeoutError:
                 return None, "plan_timeout"
@@ -209,15 +248,6 @@ class MissionPlannerService:
             return None, "error"
 
     @staticmethod
-    def _overlay_half_width(robot: Optional[robot_object.RobotObjectV1]) -> float:
-        """Half width of a blocked obstacle segment for the robot being planned: half of the
-        smaller footprint side from its factsheet (blocked_geometry.half_width_for), the
-        BLOCKED_SEGMENT_HALF_WIDTH_M constant while the footprint is unknown."""
-        factsheet = getattr(getattr(robot, "status", None), "factsheet", None)
-        return blocked_geometry.half_width_for(getattr(factsheet, "length", None),
-                                               getattr(factsheet, "width", None))
-
-    @staticmethod
     def _robot_width(robot: Optional[robot_object.RobotObjectV1]) -> Optional[float]:
         """The planning robot's footprint width in metres (factsheet), None while unknown (-1)."""
         width = getattr(getattr(getattr(robot, "status", None), "factsheet", None), "width", None)
@@ -226,6 +256,15 @@ class MissionPlannerService:
         except (TypeError, ValueError):
             return None
         return width if math.isfinite(width) and width > 0.0 else None
+
+    @staticmethod
+    def _overlay_half_width(robot: Optional[robot_object.RobotObjectV1]) -> float:
+        """Half width of a blocked obstacle segment for the robot being planned: half of the
+        smaller footprint side from its factsheet (blocked_geometry.half_width_for), the
+        BLOCKED_SEGMENT_HALF_WIDTH_M constant while the footprint is unknown."""
+        factsheet = getattr(getattr(robot, "status", None), "factsheet", None)
+        return blocked_geometry.half_width_for(getattr(factsheet, "length", None),
+                                               getattr(factsheet, "width", None))
 
     def _require_map(self, map_id: Optional[str]) -> str:
         """`map_id` if it names a map; else the configured fallback (None in production);
@@ -1314,5 +1353,6 @@ class MissionPlannerService:
 
     def cleanup(self):
         """Clean up resources before shutdown."""
-        pass
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
 

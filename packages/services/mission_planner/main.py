@@ -174,6 +174,8 @@ async def lifespan(app: FastAPI):
         critical=True
     )
 
+    service.start_scene_prewarm()      # background, no-op unless SCENE_GRAPH_PLANNER_ENABLED
+
     logging.info("Mission Planner Service started")
     yield
     if service:

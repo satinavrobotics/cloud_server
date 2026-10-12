@@ -262,19 +262,22 @@ async def test_graph_is_cached_per_version_and_reloaded_on_a_new_one(on):
     await _plan(svc)
     assert store.loads == [("m", 1)]
     store.version = 2
-    await _plan(svc)
+    out = await _plan(svc)                              # v1 serves while v2 loads in the background
+    assert out["graph_version"] == 1
+    await asyncio.sleep(0.2)
+    assert (await _plan(svc))["graph_version"] == 2
     assert store.loads == [("m", 1), ("m", 2)]
     store.version = 1                                   # still cached (LRU of 2)
     await _plan(svc)
     assert len(store.loads) == 2
-    store.version = 3                                   # evicts the least recently used: 2
-    await _plan(svc)
-    store.version = 1
-    await _plan(svc)
+    store.version = 3                                   # v2 serves (newest older), then 3 evicts v1
+    assert (await _plan(svc))["graph_version"] == 2
+    await asyncio.sleep(0.2)
+    assert (await _plan(svc))["graph_version"] == 3
     assert store.loads == [("m", 1), ("m", 2), ("m", 3)]
-    store.version = 2
+    store.version = 1                                   # evicted: loaded again (nothing older: waits)
     await _plan(svc)
-    assert store.loads[-1] == ("m", 2)
+    assert store.loads[-1] == ("m", 1)
 
 
 @pytest.mark.unit
@@ -300,7 +303,8 @@ def _width(svc, value):
 
 
 @pytest.mark.unit
-async def test_route_narrower_than_the_robot_falls_back_too_narrow(on):
+async def test_route_narrower_than_the_robot_falls_back_too_narrow(on, monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_WIDTH_CHECK_ENABLED", True)
     graph = FakeGraph()                                    # the fake route's min_width is 0.8
     svc = _service(FakeStore(graph))
     _width(svc, 1.0)
@@ -313,6 +317,7 @@ async def test_route_narrower_than_the_robot_falls_back_too_narrow(on):
 
 @pytest.mark.unit
 async def test_unknown_robot_width_never_rejects_and_margin_applies(on, monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_WIDTH_CHECK_ENABLED", True)
     svc = _service(FakeStore(FakeGraph()))
     for unknown in (-1, 0, None):
         _width(svc, unknown)
@@ -412,3 +417,104 @@ async def test_a_slow_new_version_routes_on_the_loaded_older_one_bounded_by_its_
     await asyncio.sleep(0.2)
     out = await _plan(svc)
     assert out["planner"] == scene_route.PLANNER_SCENE_GRAPH and out["graph_version"] == 2
+
+
+@pytest.mark.unit
+async def test_width_check_is_off_by_default_and_never_refuses_on_width(on):
+    assert config.SCENE_GRAPH_WIDTH_CHECK_ENABLED is False
+    svc = _service(FakeStore(FakeGraph()))              # fake min_width 0.8
+    _width(svc, 5.0)
+    out = await _plan(svc)
+    assert out["planner"] == scene_route.PLANNER_SCENE_GRAPH and out["min_width"] == 0.8
+
+
+# ---- cache churn: background refresh, bounded versions ------------------------------------------
+
+@pytest.mark.unit
+async def test_newer_version_refreshes_in_background_single_flight_and_serves_old_meanwhile(on):
+    store = FakeStore(FakeGraph(), version=1)
+    cache = scene_route.GraphCache(lambda: store, max_entries=8, load_timeout_s=1.0)
+    assert (await cache.get("m"))[1] == 1
+    store.version = 2
+    store.gate = threading.Event()
+    for _ in range(3):
+        _, v = await asyncio.wait_for(cache.get("m"), 0.5)      # immediate, not waiting for the load
+        assert v == 1
+    await asyncio.sleep(0.05)
+    assert store.loads == [("m", 1), ("m", 2)]                  # one load for three requests
+    store.gate.set()
+    await asyncio.sleep(0.2)
+    assert (await cache.get("m"))[1] == 2 and len(store.loads) == 2
+
+
+@pytest.mark.unit
+async def test_cache_keeps_at_most_two_versions_per_map(on):
+    store = FakeStore(FakeGraph(), version=1)
+    cache = scene_route.GraphCache(lambda: store, max_entries=8, load_timeout_s=1.0)
+    await cache.get("m")
+    for v in (2, 3, 4):
+        store.version = v
+        await cache.get("m")
+        await asyncio.sleep(0.1)
+        await cache.get("m")
+    assert sorted(k for k in cache._graphs if k[0] == "m") == [("m", 3), ("m", 4)]
+
+
+@pytest.mark.unit
+async def test_a_failed_background_refresh_keeps_serving_the_old_version(on):
+    store = FakeStore(FakeGraph(), version=1)
+    cache = scene_route.GraphCache(lambda: store, max_entries=8, load_timeout_s=1.0)
+    await cache.get("m")
+    store.version, store.load_error = 2, RuntimeError("boom")
+    assert (await cache.get("m"))[1] == 1
+    await asyncio.sleep(0.1)
+    assert (await cache.get("m"))[1] == 1
+
+
+# ---- pre-warm ----------------------------------------------------------------------------------------
+
+@pytest.mark.unit
+async def test_prewarm_loads_configured_maps_and_never_raises(monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
+    monkeypatch.setattr(config, "SCENE_GRAPH_PREWARM_MAPS", ("a", "bad", "none"))
+    store = FakeStore(FakeGraph(), version=7)
+    orig_meta, orig_load = store.meta, store.load
+    store.meta = lambda m: {} if m == "none" else orig_meta(m)
+
+    def load(m, v=None):
+        if m == "bad":
+            raise RuntimeError("boom")
+        return orig_load(m, v)
+    store.load = load
+    svc = _service()
+    svc._scene_cache = scene_route.GraphCache(lambda: store, max_entries=8)
+    task = svc.start_scene_prewarm()
+    assert task is not None
+    await asyncio.wait_for(task, 2.0)
+    assert ("a", 7) in svc._scene_cache._graphs and ("none", 7) not in svc._scene_cache._graphs
+
+
+@pytest.mark.unit
+async def test_prewarm_defaults_to_listed_maps_and_is_off_with_the_planner(monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_PREWARM_MAPS", ())
+    store = FakeStore(FakeGraph(), version=2)
+    svc = _service()
+    svc._scene_cache = scene_route.GraphCache(lambda: store, max_entries=8)
+    svc.graph_db.list_maps.return_value = ["m1", "m2"]
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", False)
+    assert svc.start_scene_prewarm() is None and store.loads == []
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
+    await asyncio.wait_for(svc.start_scene_prewarm(), 2.0)
+    assert sorted(store.loads) == [("m1", 2), ("m2", 2)]
+
+
+@pytest.mark.unit
+async def test_prewarm_store_failure_is_logged_not_fatal(monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
+    monkeypatch.setattr(config, "SCENE_GRAPH_PREWARM_MAPS", ("a",))
+    svc = _service()
+
+    def factory():
+        raise RuntimeError("no store")
+    svc._scene_cache = scene_route.GraphCache(factory)
+    await asyncio.wait_for(svc.start_scene_prewarm(), 2.0)

@@ -138,10 +138,12 @@ class GraphCache:
     RETRY_STORE_S = 30.0
 
     def __init__(self, store_factory: Callable[[], Any], max_entries: int = 4,
-                 load_timeout_s: float = 2.0, clock: Callable[[], float] = None):
+                 load_timeout_s: float = 2.0, clock: Callable[[], float] = None,
+                 versions_per_map: int = 2):
         import time
         self._factory = store_factory
         self._max = max(1, int(max_entries))
+        self._per_map = max(1, int(versions_per_map))
         self._timeout = float(load_timeout_s)
         self._clock = clock or time.monotonic
         self._store: Any = None
@@ -169,8 +171,48 @@ class GraphCache:
     def _insert(self, key, graph) -> None:
         self._graphs[key] = graph
         self._graphs.move_to_end(key)
+        # at most `versions_per_map` graphs of one map (a 90 m graph is large), then the global LRU
+        same = [k for k in self._graphs if k[0] == key[0]]
+        while len(same) > self._per_map:
+            del self._graphs[same.pop(0)]
         while len(self._graphs) > self._max:
             self._graphs.popitem(last=False)
+
+    def _start_load(self, store, key, loop) -> "asyncio.Future":
+        """The single-flight load of `key`: started once, shared by every waiter, fills the cache
+        when it ends (also after the request that started it gave up)."""
+        fut = self._loading.get(key)
+        if fut is not None:
+            return fut
+        self.loads += 1
+        fut = loop.run_in_executor(None, store.load, key[0], key[1])
+        self._loading[key] = fut
+
+        def done(f, key=key):
+            self._loading.pop(key, None)
+            if f.cancelled() or f.exception() is not None:
+                if not f.cancelled():
+                    _log.warning("scene graph load %s failed: %s", key, f.exception())
+                return
+            self._insert(key, f.result())
+        fut.add_done_callback(done)
+        return fut
+
+    async def warm(self, map_id: str) -> Optional[int]:
+        """Load the map's current version into the cache, waiting as long as it takes (no request
+        timeout; for pre-warming). Returns the version, None when the map has no graph. Raises on
+        a store / load error."""
+        loop = asyncio.get_running_loop()
+        store = await loop.run_in_executor(None, self._open_store)
+        meta = await loop.run_in_executor(None, store.meta, map_id)
+        version = (meta or {}).get("version")
+        if version is None:
+            return None
+        key = (map_id, int(version))
+        self._cursors[key] = (meta or {}).get("cursor")
+        if key not in self._graphs:
+            await asyncio.shield(self._start_load(store, key, loop))
+        return key[1]
 
     def cursor(self, map_id: str) -> Any:
         """The ingest cursor `[costmap_stored_ms, node key]` stored with the version `get` last
@@ -207,32 +249,21 @@ class GraphCache:
             self._graphs.move_to_end(key)
             self._served[map_id] = key[1]
             return self._graphs[key], key[1]
-        fut = self._loading.get(key)
-        if fut is None:
-            self.loads += 1
-            fut = loop.run_in_executor(None, store.load, map_id, key[1])
-            self._loading[key] = fut
-
-            def done(f, key=key):
-                self._loading.pop(key, None)
-                if f.cancelled() or f.exception() is not None:
-                    if not f.cancelled():
-                        _log.warning("scene graph load %s failed: %s", key, f.exception())
-                    return
-                self._insert(key, f.result())
-            fut.add_done_callback(done)
+        fut = self._start_load(store, key, loop)
+        # A newer version than the cached one: refresh in the background (the load above is single
+        # flight per key) and keep serving the newest older version meanwhile; the caller bounds its
+        # age by the ingest lag of THAT version's cursor (`cursor(map)`). A big map takes seconds
+        # to load, the worker publishes every few.
+        older = [k for k in self._graphs if k[0] == map_id and k[1] < key[1]]
+        if older:
+            prev = max(older, key=lambda k: k[1])
+            self._graphs.move_to_end(prev)
+            self._served[map_id] = prev[1]
+            return self._graphs[prev], prev[1]
         try:
             graph = await asyncio.wait_for(asyncio.shield(fut), left())
         except asyncio.TimeoutError as err:
-            # A new version is still loading (a big map takes seconds, the worker publishes every few):
-            # route on the newest version already loaded for this map. The caller bounds its age by
-            # the ingest lag of THAT version's cursor (`cursor(map)`).
-            older = [k for k in self._graphs if k[0] == map_id]
-            if older:
-                prev = older[-1]               # OrderedDict: least to most recently used
-                self._graphs.move_to_end(prev)
-                self._served[map_id] = prev[1]
-                return self._graphs[prev], prev[1]
+            # cold load (nothing older cached for this map): this request falls back
             raise ChartFallback("load_timeout") from err
         except Exception as err:  # pylint: disable=broad-except
             raise ChartFallback("load_error") from err
@@ -312,7 +343,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects): a route whose narrowest
-    passage is under it plus `width_margin_m` is `too_narrow`."""
+    passage is under it plus `width_margin_m` is `too_narrow` (the caller gates it by
+    SCENE_GRAPH_WIDTH_CHECK_ENABLED)."""
     from packages.scene_graph.api import Blocked, MissingTiles
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
     problem = snap_problem(snap_a, start_snap_m)
