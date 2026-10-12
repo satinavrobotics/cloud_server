@@ -163,6 +163,23 @@ class ImageDatabaseService(MinIOService):
         return self._store_png(png_data, self.costmap_key(str(node_id), layer), node_id, map_id,
                                metadata, f"costmap {layer}")
 
+    def get_costmap(self, node_id: str, layer: str, map_id: Optional[str] = None) -> Optional[bytes]:
+        """A node's costmap PNG of one layer, or None when it is not stored (a layer whose
+        record is on the node before the object is visible, or no such layer)."""
+        try:
+            response = self.client.get_object(self._bucket_name(map_id or self.default_map_id),
+                                              self.costmap_key(str(node_id), layer))
+        except Exception as e:  # noqa: BLE001
+            code = getattr(e, "code", "")
+            if code not in ("NoSuchKey", "NoSuchBucket"):
+                self.logger.error(f"Failed to retrieve costmap {layer} of node {node_id}: {e}")
+            return None
+        try:
+            return response.read()
+        finally:
+            response.close()
+            response.release_conn()
+
     def first_image_id(self, node_id: str, map_id: Optional[str] = None) -> Optional[str]:
         """The node's first image (by id), for requests that name none; None without images."""
         ids = sorted(self.list_node_images(node_id=node_id, map_id=map_id))
