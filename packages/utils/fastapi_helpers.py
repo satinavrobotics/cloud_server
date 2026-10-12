@@ -81,7 +81,8 @@ def add_error_handlers(app: FastAPI):
                 "detail": exc.detail,
                 "status_code": exc.status_code,
                 "path": str(request.url.path)
-            }
+            },
+            headers=exc.headers
         )
 
     @app.exception_handler(requests.RequestException)

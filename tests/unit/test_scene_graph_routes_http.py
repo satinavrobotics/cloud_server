@@ -168,8 +168,6 @@ async def test_raster_no_graph_404_no_store(app_state):
     assert r.json()["detail"] == "no scene graph for this map"
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: add_error_handlers' HTTPException handler "
-                   "(packages/utils/fastapi_helpers.py) drops exc.headers, so the 404's no-store is lost")
 async def test_raster_no_graph_404_carries_no_store(app_state):
     r = await _get(f"/api/v1/maps/nope/scene-graph/raster?{BBOX}")
     assert r.headers.get("cache-control") == "no-store"
