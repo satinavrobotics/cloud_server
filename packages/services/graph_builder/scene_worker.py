@@ -43,7 +43,7 @@ from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Prot
 
 from packages.scene_graph.api import BBox, Dirty, MissingTiles
 
-from . import scene_adapter, scene_leaf
+from . import scene_adapter, scene_clock, scene_leaf
 
 log = logging.getLogger(__name__)
 
@@ -161,13 +161,15 @@ class SceneWorker:
                  config: Optional[WorkerConfig] = None, now_ms: Callable[[], int],
                  publish: Optional[Callable[[int, Dirty], None]] = None,
                  load_tiles: Optional[Callable[[Any, Iterable], None]] = None,
-                 on_needs_rebuild: Optional[Callable[[str], None]] = None) -> None:
+                 on_needs_rebuild: Optional[Callable[[str], None]] = None,
+                 clock: Optional[scene_clock.SessionClock] = None) -> None:
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
         self.engine, self.store, self.cursor_store, self.guard = engine, store, cursor_store, guard
         self.stats = stats if stats is not None else SceneWorkerStats()
         self.config = config or WorkerConfig()
         self.now_ms, self.publish = now_ms, publish
         self.load_tiles, self.on_needs_rebuild = load_tiles, on_needs_rebuild
+        self.clock = clock if clock is not None else scene_clock.SessionClock()
         self.state = ""                     # last terminal state, "" while running
         self.rebuild_reason = ""
         self._started = False
@@ -379,7 +381,7 @@ class SceneWorker:
             return "pending"
         self._pending.pop(key, None)
         r_d, known = self._robot_half_side(node)
-        leaf, reason = scene_adapter.to_leaf(node, png, r_d=r_d, layer=layer)
+        leaf, reason = scene_adapter.to_leaf(node, png, r_d=r_d, layer=layer, clock=self.clock)
         if leaf is None:
             return reason or "unknown"
         if not known:

@@ -52,6 +52,7 @@ class FakeEngine:
 
     def __init__(self):
         self.batches = []
+        self.stamps = {}
         self.raise_once = None
 
     def fold_many(self, leaves):
@@ -59,6 +60,7 @@ class FakeEngine:
             exc, self.raise_once = self.raise_once, None
             raise exc
         self.batches.append([l.key for l in leaves])
+        self.stamps.update({l.key: l.stamp_ms for l in leaves})
         return Dirty(bbox=BBox(0, 0, 1, 1), changed=[l.key for l in leaves], retired={}, links=[],
                      watermark=(max(l.stamp_ms for l in leaves), leaves[-1].key))
 
@@ -428,3 +430,19 @@ def test_merge_dirty():
     m = sw.merge_dirty(a, b)
     assert m.bbox == BBox(-1, 0, 1, 3) and m.changed == ["x", "y"]
     assert m.links == [("a", "b"), ("b", "c")] and m.watermark == (5, "x") and m.retired == {"k": ["m"]}
+
+
+def test_session_clock_corrects_an_ahead_robot_stamp():
+    base = int(RECEIPT.timestamp() * 1000)
+    ahead = 120_000                          # inside the 300 s sanity window: the per-leaf rule accepts it
+    nodes = []
+    for i in range(5):
+        n = make_node(f"n{i}", base + i * 1000)
+        n["costmap"]["occupancy"]["costmap_stamp_ms"] = base + i * 1000 + ahead
+        nodes.append(n)
+    r = Rig(nodes)
+    r.drain()
+    assert set(r.engine.stamps) == {f"n{i}" for i in range(5)}
+    for i in range(5):
+        assert r.engine.stamps[f"n{i}"] == base + i * 1000     # never later than its receipt
+    assert r.worker.clock.offset_ms("s") == -ahead

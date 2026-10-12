@@ -124,13 +124,15 @@ def _num(value: Any) -> Optional[float]:
 
 def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
             channels: Optional[Mapping[str, bytes]] = None,
-            layer: Optional[str] = None) -> Tuple[Optional[Leaf], Optional[str]]:
+            layer: Optional[str] = None,
+            clock: Optional[Any] = None) -> Tuple[Optional[Leaf], Optional[str]]:
     """`(Leaf, None)` or `(None, skip reason)`.
 
     `node` is the stored document (`_key`, `pose`, `session_id`, `timestamp`, `capture_time`,
     `costmap.{layer}`); `png` the bytes of that layer's PNG; `layer` defaults to the occupancy
     role's stored layer; `channels` maps a channel name to the PNG bytes of an optional extra
-    layer (dropped when its size differs from the occupancy window)."""
+    layer (dropped when its size differs from the occupancy window); `clock` is the worker's
+    scene_clock.SessionClock (per-session offset on capture stamps), None = the per-leaf rule."""
     stored = node.get("costmap") or {}
     if layer is None:
         layer = scene_leaf.role_layers(stored).get(scene_leaf.ROLE_OCCUPANCY)
@@ -148,7 +150,7 @@ def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
     res = _num(record.get("resolution"))
     if res is None or res <= 0.0:
         return None, SKIP_RESOLUTION
-    stamp = scene_leaf.leaf_stamp(node, layer)
+    stamp = scene_leaf.leaf_stamp(node, layer, clock=clock)
     if stamp is None:
         return None, SKIP_NO_STAMP
     try:
