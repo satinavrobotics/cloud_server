@@ -215,7 +215,10 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
 ### Decisions for LACI's user
 
 * `run_id`: derive later from session and time (recommended) or look up at ingest.
-* `r_d` rule: rectangle footprint -> half of the larger side; -1 until the factsheet arrives -> params default.
+* `r_d` rule (decided by LACI, **to be rethought**): rectangle footprint -> half of the *smaller* side (width);
+  -1 until the factsheet arrives -> params default, counted. Known cost: optimistic for a long robot (a passage it
+  cannot turn in can look navigable); `Route.min_width` is checked against the same rule so it does not cover length.
+  Revisit before the planner switches on for a robot with length >> width.
 * Leg recording on lattice routes: chart keys for new run views, leaf-edge views for legacy only.
 
 ## Open
