@@ -37,6 +37,14 @@ class FakeSource:
     def add(self, node):
         self.nodes[node["_key"]] = node
 
+    def set_scene_stamps(self, map_id, stamps):
+        if getattr(self, "fail_stamps", False):
+            raise RuntimeError("arango down")
+        self.stamp_writes = getattr(self, "stamp_writes", [])
+        self.stamp_writes.append(dict(stamps))
+        for k, ms in stamps.items():
+            self.nodes[k].setdefault("scene_stamp_ms", ms)     # first write wins
+
     def costmap_nodes_since(self, map_id, since_ms=0, after_key="", limit=200):
         self.calls.append((since_ms, after_key, limit))
         if self.fail:
@@ -446,3 +454,24 @@ def test_session_clock_corrects_an_ahead_robot_stamp():
     for i in range(5):
         assert r.engine.stamps[f"n{i}"] == base + i * 1000     # never later than its receipt
     assert r.worker.clock.offset_ms("s") == -ahead
+
+
+def test_first_fold_stamp_is_kept_on_the_node_and_reused():
+    base = int(RECEIPT.timestamp() * 1000)
+    r = Rig([make_node("a", base)])
+    r.drain()
+    kept = r.source.nodes["a"]["scene_stamp_ms"]
+    assert r.engine.stamps["a"] == kept and r.source.stamp_writes == [{"a": kept}]
+    # the node is re-read (margin / restart) and folded again: same stamp, no second write
+    r.source.nodes["a"]["costmap_stored_ms"] = base + 5     # a re-stored costmap
+    r.drain()
+    assert r.engine.stamps["a"] == kept
+    assert r.source.stamp_writes == [{"a": kept}]
+
+
+def test_stamp_write_failure_means_no_fold():
+    r = Rig([make_node("a", int(RECEIPT.timestamp() * 1000))])
+    r.source.fail_stamps = True
+    res = r.worker.step()
+    assert res.state == sw.BACKOFF and r.engine.batches == []
+    assert r.worker.cursor == (0, "")

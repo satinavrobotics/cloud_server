@@ -55,3 +55,14 @@ def test_cursor_query_without_collection():
     db = _Db(exists=False)
     assert G.costmap_nodes_since(_svc(db), "m") == []
     assert db.calls == []
+
+
+def test_set_scene_stamps_first_write_wins_query_and_binds():
+    db = _Db()
+    svc = SimpleNamespace(db=db, SET_SCENE_STAMPS_AQL=G.SET_SCENE_STAMPS_AQL)
+    n = G.set_scene_stamps(svc, "m", {"a": 5, "b": 7})
+    aql, binds = db.calls[0]
+    assert "d.scene_stamp_ms == null" in aql
+    assert binds == {"@col": "nodes_m", "items": [{"key": "a", "ms": 5}, {"key": "b", "ms": 7}]}
+    assert n == 1                      # the fake cursor yields one row
+    assert G.set_scene_stamps(svc, "m", {}) == 0

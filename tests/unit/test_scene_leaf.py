@@ -68,3 +68,11 @@ def test_leaf_stamp_reads_the_depth_layer_when_it_is_the_only_one():
     stamp = _ms(RECEIPT) - 1000
     node = _node(costmap={"occupancy_depth": {"costmap_stamp_ms": stamp}})
     assert sl.leaf_stamp(node) == (stamp, sl.STAMP_COSTMAP)
+
+
+def test_stored_scene_stamp_is_always_used():
+    node = _node(costmap={"occupancy": {"costmap_stamp_ms": _ms(RECEIPT) - 5000}},
+                 scene_stamp_ms=12345678901234)
+    assert sl.leaf_stamp(node) == (12345678901234, sl.STAMP_STORED)
+    assert sl.leaf_stamp(node, clock=object(), session="s") == (12345678901234, sl.STAMP_STORED)
+    assert sl.leaf_stamp(_node(scene_stamp_ms=0))[1] == sl.STAMP_RECEIPT

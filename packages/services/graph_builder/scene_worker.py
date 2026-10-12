@@ -182,6 +182,7 @@ class SceneWorker:
         self._dirty: Optional[Dirty] = None          # folded, not yet saved
         self._last_save_ms: Optional[int] = None
         self._oldest_unsaved_ms: Optional[int] = None
+        self._new_stamps: Dict[str, int] = {}        # key -> stamp to keep on the node before the fold
         self._footprints: Dict[str, Tuple[float, bool, int]] = {}   # robot -> (r_d, known, asked_ms)
 
     # ------------------------------------------------------------------ public
@@ -239,6 +240,7 @@ class SceneWorker:
         self._scan = self._order(nodes[-1]) if (more and nodes) else None
         # 3. adapt
         leaves, handled, skipped = [], [], 0
+        self._new_stamps: Dict[str, int] = {}
         for node in nodes:
             outcome = self._adapt(node)
             if outcome == "duplicate":
@@ -255,7 +257,9 @@ class SceneWorker:
         # 4. fold once per batch
         folded = 0
         if leaves:
-            err = self._fold(leaves)
+            err = self._keep_stamps()
+            if err is None:
+                err = self._fold(leaves)
             if err is not None:
                 self._scan = None      # re-read from the margin once the cause is gone
                 return err
@@ -381,9 +385,13 @@ class SceneWorker:
             return "pending"
         self._pending.pop(key, None)
         r_d, known = self._robot_half_side(node)
-        leaf, reason = scene_adapter.to_leaf(node, png, r_d=r_d, layer=layer, clock=self.clock)
+        info: Dict[str, Any] = {}
+        leaf, reason = scene_adapter.to_leaf(node, png, r_d=r_d, layer=layer, clock=self.clock,
+                                             stamp_info=info)
         if leaf is None:
             return reason or "unknown"
+        if info.get("source") != scene_leaf.STAMP_STORED:
+            self._new_stamps[key] = int(leaf.stamp_ms)
         if not known:
             self.stats.default_r_d += 1
         return leaf
@@ -397,6 +405,24 @@ class SceneWorker:
         self.stats.pending = len(self._pending)
         for key in [k for k, ms in self._seen.items() if ms < floor]:
             del self._seen[key]
+
+    def _keep_stamps(self) -> Optional[StepResult]:
+        """Persist, before folding, the stamps this batch's leaves are folded under (first write
+        wins on the node). Written BEFORE the fold on purpose: a crash after a save and before a
+        later stamp write would let a replay recompute a different stamp; written first, a failed
+        fold or save just re-uses the stored one. A failed write means no fold."""
+        stamps, self._new_stamps = self._new_stamps, {}
+        write = getattr(self.source, "set_scene_stamps", None)
+        if not stamps or write is None:
+            return None
+        try:
+            write(self.map_id, stamps)
+        except Exception as exc:
+            self.stats.source_errors += 1
+            log.warning("scene worker %s: keeping stamps failed: %s", self.map_id, exc)
+            self._scan = None
+            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"stamps: {exc}")
+        return None
 
     def _fold(self, leaves: List[Any]) -> Optional[StepResult]:
         for attempt in (0, 1):

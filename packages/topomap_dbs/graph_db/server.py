@@ -703,6 +703,23 @@ class GraphDatabaseService:
         return list(self.db.aql.execute(self.COSTMAP_SINCE_AQL, bind_vars={
             "@col": name, "since": int(since_ms), "after": str(after_key), "limit": int(limit)}))
 
+    # First write wins: a leaf's scene stamp is never changed once set (integration.md, "Open").
+    SET_SCENE_STAMPS_AQL = (
+        "FOR u IN @items FOR d IN @@col FILTER d._key == u.key AND d.scene_stamp_ms == null "
+        "UPDATE d WITH {scene_stamp_ms: u.ms} IN @@col OPTIONS {mergeObjects: false} "
+        "RETURN NEW._key")
+
+    def set_scene_stamps(self, map_id: str, stamps: Dict[str, int]) -> int:
+        """Set `scene_stamp_ms` on each node `{key: epoch ms}` that has none; a node that has one
+        keeps it. Returns how many were written. RAISES on an ArangoDB error (the scene worker
+        must not fold under a stamp it could not keep). 0 for a map without a collection."""
+        name = f"nodes_{map_id}"
+        if not stamps or not self.db.has_collection(name):
+            return 0
+        items = [{"key": str(k), "ms": int(v)} for k, v in stamps.items()]
+        return len(list(self.db.aql.execute(self.SET_SCENE_STAMPS_AQL,
+                                            bind_vars={"@col": name, "items": items})))
+
     DEPTH_NODES_AQL = (
         "FOR d IN @@col FILTER d.depth != null "
         "RETURN {_key: d._key, node_id: d.node_id, pose: d.pose, depth: d.depth, "

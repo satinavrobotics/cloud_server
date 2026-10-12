@@ -38,6 +38,8 @@ MAX_AGE_S = 7 * 24 * 3600.0
 STAMP_COSTMAP = "costmap_stamp"
 STAMP_CAPTURE = "capture_time"
 STAMP_RECEIPT = "receipt"
+STAMP_STORED = "scene_stamp"      # the stamp the leaf was first folded under, kept on the node
+STAMP_FIELD = "scene_stamp_ms"
 STAMP_COSTMAP_CORRECTED = "costmap_stamp_corrected"
 STAMP_CAPTURE_CORRECTED = "capture_time_corrected"
 _CORRECTED = {STAMP_COSTMAP: STAMP_COSTMAP_CORRECTED, STAMP_CAPTURE: STAMP_CAPTURE_CORRECTED}
@@ -76,7 +78,14 @@ def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
                session: Optional[str] = None) -> Optional[Tuple[int, str]]:
     """`(epoch ms, source)` the leaf is folded under, or None when the node has no usable time at
     all (no sane robot stamp and no receipt time): the worker skips such a leaf and counts it.
-    `clock` / `session` (default `node['session_id']`): see the module docstring."""
+    `clock` / `session` (default `node['session_id']`): see the module docstring.
+
+    A node that carries `scene_stamp_ms` is folded under it, always (STAMP_STORED): the stamp is a
+    property of the leaf, written once by the worker the first time it is computed, so a better
+    clock estimate later, a restart or a rebuild cannot fold the same leaf under another time."""
+    kept = node.get(STAMP_FIELD)
+    if isinstance(kept, (int, float)) and not isinstance(kept, bool) and kept > 0:
+        return int(kept), STAMP_STORED
     receipt = _receipt(node)
     stored = node.get("costmap_stored_ms")
     receipt_ms = None

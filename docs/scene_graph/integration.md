@@ -256,7 +256,8 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
 ## Open
 
 * CIMBI: sight-range cap for open fields; `occupancy_depth` backfill timing; store `lineage()` and engine.
-* LACI: **stable per-leaf stamp**: `SessionClock`'s offset can improve after a leaf was folded, which would fold the
-  same leaf under a different stamp. Persist the first-fold stamp on the node (`scene_stamp_ms`) and prefer it;
+* LACI: **stable per-leaf stamp** (done): the worker writes the stamp it first computed onto the node
+  (`scene_stamp_ms`, first write wins, written BEFORE the fold so a replay after a crash cannot recompute another
+  one) and `leaf_stamp` always prefers it. Nodes folded before this change get their stamp at their next fold.
 * LACI: time-source fallback bound (7 days, implemented in `scene_leaf`); where the robot footprint (`r_d`) lives; the
   leaf threshold for `waypoints[i].node_id`; `run_id` (derive later from session and time, or look up at ingest).

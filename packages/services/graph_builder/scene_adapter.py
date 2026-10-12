@@ -125,7 +125,8 @@ def _num(value: Any) -> Optional[float]:
 def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
             channels: Optional[Mapping[str, bytes]] = None,
             layer: Optional[str] = None,
-            clock: Optional[Any] = None) -> Tuple[Optional[Leaf], Optional[str]]:
+            clock: Optional[Any] = None,
+            stamp_info: Optional[dict] = None) -> Tuple[Optional[Leaf], Optional[str]]:
     """`(Leaf, None)` or `(None, skip reason)`.
 
     `node` is the stored document (`_key`, `pose`, `session_id`, `timestamp`, `capture_time`,
@@ -153,6 +154,8 @@ def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
     stamp = scene_leaf.leaf_stamp(node, layer, clock=clock)
     if stamp is None:
         return None, SKIP_NO_STAMP
+    if stamp_info is not None:
+        stamp_info["source"] = stamp[1]
     try:
         window = decode_png_gray8(png)
     except PngError:
