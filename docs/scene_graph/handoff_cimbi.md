@@ -5,7 +5,11 @@ owns everything that connects it to the running system (`integration.md`: ingest
 lifecycle hooks, events, ops). This file is the contract between the two. Anything marked **DECIDE** needs an answer
 from both of us before either side builds on it.
 
-## Amendments after CIMBI's reply (v2, 2026-10-12) - these override anything below that conflicts
+> **Superseded below this line.** `packages/scene_graph/api.py` and `store.py` (interface draft 0.9) are the contract;
+> sections after the amendments describe v1 types (`Node`, `Dirty.anchors`, `(stamp,id)` feeding, clearance cap, stable
+> ids, radius per map) and are kept only as history. Open items for CIMBI: `integration.md`, "Review findings".
+
+## Amendments after CIMBI's reply (v2, 2026-10-12)
 
 Accepted by LACI: Leaf also carries `r_d` and optional extra channel windows; fold order-independent by (capture
 time, value), watermark for replay efficiency only; persistent chart keys with lineage by overlap (the client
