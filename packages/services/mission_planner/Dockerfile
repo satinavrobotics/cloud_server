@@ -32,6 +32,9 @@ COPY packages/database/__init__.py /app/packages/database/
 # Copy utils package
 COPY packages/utils/ /app/packages/utils/
 
+# Copy the scene graph library (chart-graph planner, SCENE_GRAPH_PLANNER_ENABLED)
+COPY packages/scene_graph/ /app/packages/scene_graph/
+
 # Copy config file
 COPY packages/config.py /app/packages/config.py
 

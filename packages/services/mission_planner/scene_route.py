@@ -10,8 +10,12 @@ already rely on (docs/scene_graph/integration.md, "Planner contract"):
 * `planned_path` is returned only when every waypoint has a leaf id, because the leg tracker pairs
   `waypoints[i]` with `planned_path[i]` and drops topomap ids on any length mismatch.
 """
+import asyncio
+import logging
 import math
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from cloud_common.objects import common
 
@@ -92,3 +96,197 @@ def snap_problem(snap: Any, max_dist: float) -> Optional[str]:
     if getattr(snap, "crosses_blocked", False):
         return SNAP_CROSSES_BLOCKED
     return None
+
+
+# ---------------------------------------------------------------------------------------------
+# Chart-graph route: version-pinned graph cache and the plan itself (feature-flagged in server.py).
+# Every failure is a `ChartFallback(reason)`; the caller then runs the legacy planner unchanged.
+# ---------------------------------------------------------------------------------------------
+_log = logging.getLogger("MissionPlanner.scene_route")
+
+
+MIN_END_STUB_M = 0.5
+
+
+class ChartFallback(Exception):
+    """The chart route cannot serve this request; `reason` is a short machine-readable text."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass
+class ChartPlan:
+    waypoints: List[common.Pose2D]
+    planned_path: List[str]            # one distinct leaf id per waypoint
+    charts: List[str]
+    min_width: float
+    length: float
+    start_xy: Pt                       # snapped start / goal cells
+    goal_xy: Pt
+    version: Optional[int] = None
+
+
+class GraphCache:
+    """Loaded scene graphs by (map, version), a small LRU. `store_factory()` returns the store (called
+    lazily, in a worker thread, because it connects). `get` never waits longer than `load_timeout_s`:
+    a cold load keeps running in its thread, shared by later requests, and fills the cache when it
+    ends; this request falls back."""
+
+    RETRY_STORE_S = 30.0
+
+    def __init__(self, store_factory: Callable[[], Any], max_entries: int = 4,
+                 load_timeout_s: float = 2.0, clock: Callable[[], float] = None):
+        import time
+        self._factory = store_factory
+        self._max = max(1, int(max_entries))
+        self._timeout = float(load_timeout_s)
+        self._clock = clock or time.monotonic
+        self._store: Any = None
+        self._store_failed_at: Optional[float] = None
+        self._graphs: "OrderedDict[Tuple[str, int], Any]" = OrderedDict()
+        self._loading: Dict[Tuple[str, int], "asyncio.Future"] = {}
+        self.loads = 0                 # store.load calls started (tests, metrics)
+
+    def _open_store(self):
+        if self._store is not None:
+            return self._store
+        if self._store_failed_at is not None and \
+                self._clock() - self._store_failed_at < self.RETRY_STORE_S:
+            raise ChartFallback("store_unavailable")
+        try:
+            self._store = self._factory()
+        except Exception as err:  # pylint: disable=broad-except
+            self._store_failed_at = self._clock()
+            _log.warning("scene graph store unavailable: %s", err)
+            raise ChartFallback("store_unavailable") from err
+        return self._store
+
+    def _insert(self, key, graph) -> None:
+        self._graphs[key] = graph
+        self._graphs.move_to_end(key)
+        while len(self._graphs) > self._max:
+            self._graphs.popitem(last=False)
+
+    async def get(self, map_id: str) -> Tuple[Any, int]:
+        """(graph, version) of the map's current version; ChartFallback otherwise."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._timeout
+
+        def left() -> float:
+            return max(0.01, deadline - loop.time())
+
+        try:
+            store = await asyncio.wait_for(loop.run_in_executor(None, self._open_store), left())
+            meta = await asyncio.wait_for(loop.run_in_executor(None, store.meta, map_id), left())
+        except ChartFallback:
+            raise
+        except asyncio.TimeoutError as err:
+            raise ChartFallback("store_timeout") from err
+        except Exception as err:  # pylint: disable=broad-except
+            _log.warning("scene graph meta of map %s failed: %s", map_id, err)
+            raise ChartFallback("store_error") from err
+        version = (meta or {}).get("version")
+        if version is None:
+            raise ChartFallback("no_graph")
+        key = (map_id, int(version))
+        if key in self._graphs:
+            self._graphs.move_to_end(key)
+            return self._graphs[key], key[1]
+        fut = self._loading.get(key)
+        if fut is None:
+            self.loads += 1
+            fut = loop.run_in_executor(None, store.load, map_id, key[1])
+            self._loading[key] = fut
+
+            def done(f, key=key):
+                self._loading.pop(key, None)
+                if f.cancelled() or f.exception() is not None:
+                    if not f.cancelled():
+                        _log.warning("scene graph load %s failed: %s", key, f.exception())
+                    return
+                self._insert(key, f.result())
+            fut.add_done_callback(done)
+        try:
+            graph = await asyncio.wait_for(asyncio.shield(fut), left())
+        except asyncio.TimeoutError as err:
+            raise ChartFallback("load_timeout") from err
+        except Exception as err:  # pylint: disable=broad-except
+            raise ChartFallback("load_error") from err
+        return graph, key[1]
+
+
+def blocked_free_los(graph: Any, overlay: Tuple[list, list]) -> Callable[[Pt, Pt], bool]:
+    """Line-of-sight test for `simplify` using only the public API: the straight segment is sampled
+    every half lattice step, every sample's lattice cell must be navigable (its centre is the centre
+    of a free cell: `snap` distance <= half a step; memoised per cell), and the segment must clear
+    the transient blocked overlay."""
+    from packages.utils import blocked_geometry as bg
+    h = float(graph.params.lattice)
+    discs, segments = overlay
+    cells: Dict[Tuple[int, int], bool] = {}
+
+    def free(i: int, j: int) -> bool:
+        v = cells.get((i, j))
+        if v is None:
+            s = graph.snap((i + 0.5) * h, (j + 0.5) * h, 0.5 * h)
+            v = s.key is not None and s.distance <= 0.5 * h
+            cells[(i, j)] = v
+        return v
+
+    def visible(a: Pt, b: Pt) -> bool:
+        for (cx, cy, r) in discs:
+            if bg.point_segment_distance((cx, cy), a, b) <= r:
+                return False
+        for (p, q, hw) in segments:
+            if bg.segment_segment_distance(a, b, p, q) <= hw:
+                return False
+        n = max(1, int(math.dist(a, b) / (0.5 * h)))
+        for k in range(n + 1):
+            t = k / n
+            x, y = a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])
+            if not free(int(math.floor(x / h)), int(math.floor(y / h))):
+                return False
+        return True
+
+    return visible
+
+
+def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
+                  overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
+                  start_snap_m: float, goal_snap_m: float, max_gap_m: float) -> ChartPlan:
+    """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
+    Raises ChartFallback for every case the legacy planner must take over."""
+    from packages.scene_graph.api import Blocked, MissingTiles
+    snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
+    problem = snap_problem(snap_a, start_snap_m)
+    if problem:
+        raise ChartFallback("start_" + problem)
+    snap_b = graph.snap(goal_xy[0], goal_xy[1], goal_snap_m)
+    problem = snap_problem(snap_b, goal_snap_m)
+    if problem:
+        raise ChartFallback("goal_" + problem)
+    discs, segments = overlay
+    blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
+    try:
+        route = graph.route(snap_a.key, snap_b.key, blocked)
+    except MissingTiles as err:
+        raise ChartFallback("missing_tiles") from err
+    if route is None or not route.nodes:
+        raise ChartFallback("unreachable")
+    # The lattice route runs anchor to anchor; the real ends are the snapped start and goal cells.
+    pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
+    visible = blocked_free_los(graph, overlay)
+    pts = simplify(pts, visible, max_gap_m)
+    # The gap cap can leave a stub of a few lattice steps at the end (two waypoints on one leaf =
+    # a zero-length leg): merge it into the previous leg when that stays in line of sight.
+    while len(pts) >= 3 and math.dist(pts[-2], pts[-1]) < MIN_END_STUB_M \
+            and visible(pts[-3], pts[-1]):
+        del pts[-2]
+    poses, planned = build_waypoints(pts, map_id, node_of)
+    if planned is None:
+        raise ChartFallback("waypoints_without_distinct_leaf_ids")
+    return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
+                     min_width=float(route.min_width), length=float(route.length),
+                     start_xy=(snap_a.x, snap_a.y), goal_xy=(snap_b.x, snap_b.y))

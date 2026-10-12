@@ -541,6 +541,14 @@ SCENE_GRAPH_LEAF_SNAP_M = float(os.getenv("SCENE_GRAPH_LEAF_SNAP_M", "1.0"))
 # Largest gap between two waypoints of a scene-graph route.
 SCENE_GRAPH_MAX_WAYPOINT_GAP_M = float(os.getenv("SCENE_GRAPH_MAX_WAYPOINT_GAP_M", "5.0"))
 
+# Planner budget (the dispatcher replans with a 5 s timeout): a cold graph load is never waited for
+# longer than LOAD_TIMEOUT_S (it goes on in the background, the request uses the legacy planner),
+# snap + route + simplify + leaf lookup must fit PLAN_BUDGET_S. CACHE_VERSIONS: loaded graphs kept
+# in memory by (map, version).
+SCENE_GRAPH_LOAD_TIMEOUT_S = float(os.getenv("SCENE_GRAPH_LOAD_TIMEOUT_S", "2.0"))
+SCENE_GRAPH_PLAN_BUDGET_S = float(os.getenv("SCENE_GRAPH_PLAN_BUDGET_S", "3.0"))
+SCENE_GRAPH_CACHE_VERSIONS = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS", "4"))
+
 # Scene-graph ingest worker batching (measured: a whole-batch fold costs seconds, and a larger
 # batch amortises a fixed solve, so the worker folds in batches, never leaf by leaf).
 # A batch is folded once at least BATCH_MIN_LEAVES are waiting, or when the oldest waiting leaf has

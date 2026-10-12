@@ -9,6 +9,7 @@ This service handles mission planning by:
 4. Creating and submitting missions to Mission Dispatcher
 """
 
+import asyncio
 import logging
 import datetime
 import math
@@ -17,6 +18,7 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import blocked_geometry, blocked_nodes
+from packages import config
 from packages.services.mission_planner import scene_route
 from packages.utils import map_geo
 from packages.utils import map_sessions
@@ -109,7 +111,80 @@ class MissionPlannerService:
         self.knn_k = knn_k
         self.range_search_radius = range_search_radius
 
+        # Chart-graph planner (SCENE_GRAPH_PLANNER_ENABLED): graphs cached by (map, version); the
+        # store is opened on first use, off the event loop.
+        self._scene_cache = scene_route.GraphCache(
+            self._open_scene_store, max_entries=config.SCENE_GRAPH_CACHE_VERSIONS,
+            load_timeout_s=config.SCENE_GRAPH_LOAD_TIMEOUT_S)
+
         self.logger.info("Mission Planner Service initialized")
+
+    @staticmethod
+    def _open_scene_store():
+        """The scene graph store over ArangoDB + MinIO (needs MINIO_* secrets in this service's env)."""
+        from packages.scene_graph.store import SceneGraphStore
+        from packages.topomap_dbs.client import TopomapDatabaseClient
+        return SceneGraphStore.from_client(TopomapDatabaseClient())
+
+    async def _try_chart_route(
+        self, robot_name: str, map_id: str, target_x: float, target_y: float,
+        robot_pose: Optional[Tuple[float, float]], ignore_exclusions: bool,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """(result fields, None) for a chart-graph route, or (None, reason) when the legacy planner
+        must run. Never raises: every exception is a fallback reason."""
+        try:
+            robot = await self.get_robot_status(robot_name)
+            if robot is None:
+                return None, "robot_unavailable"
+            try:
+                start_xy = await self._robot_xy_in_map(robot, map_id, robot_pose)
+            except RobotNotPlacedError:
+                return None, "robot_not_placed"       # the legacy path reports it to the caller
+            graph, version = await self._scene_cache.get(map_id)
+
+            rows = [] if ignore_exclusions else await self._active_blocked_nodes(map_id)
+            overlay = blocked_geometry.overlay(rows, blocked_nodes.MATCH_RADIUS_M) if rows \
+                else ([], [])
+
+            def node_of(x: float, y: float) -> Optional[str]:
+                try:
+                    nodes, dists = self.graph_db.k_nearest_neighbors(
+                        x=x, y=y, k=1, map_id=map_id)
+                except Exception:  # pylint: disable=broad-except
+                    return None
+                if not nodes or not dists or dists[0] > config.SCENE_GRAPH_LEAF_SNAP_M:
+                    return None
+                return str(nodes[0].get("node_id"))
+
+            loop = asyncio.get_running_loop()
+            try:
+                plan = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, lambda: scene_route.plan_on_graph(
+                            graph, map_id, tuple(start_xy), (target_x, target_y), overlay,
+                            node_of, config.SCENE_GRAPH_START_SNAP_M,
+                            config.SCENE_GRAPH_GOAL_SNAP_M,
+                            config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M)),
+                    config.SCENE_GRAPH_PLAN_BUDGET_S)
+            except asyncio.TimeoutError:
+                return None, "plan_timeout"
+            plan.version = version
+            ids = plan.planned_path
+            return {
+                "robot_position": {"x": float(start_xy[0]), "y": float(start_xy[1])},
+                "start_node_id": ids[0], "end_node_id": ids[-1],
+                "target_node_position": {"x": plan.goal_xy[0], "y": plan.goal_xy[1]},
+                "path": ids, "path_length": len(ids),
+                "waypoints": plan.waypoints, "waypoints_count": len(plan.waypoints),
+                "planner": scene_route.PLANNER_SCENE_GRAPH,
+                "min_width": plan.min_width, "chart_keys": plan.charts,
+                "graph_version": version,
+            }, None
+        except scene_route.ChartFallback as fb:
+            return None, fb.reason
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Chart route failed ({err!r}); using the legacy planner")
+            return None, "error"
 
     def _require_map(self, map_id: Optional[str]) -> str:
         """`map_id` if it names a map; else the configured fallback (None in production);
@@ -804,6 +879,22 @@ class MissionPlannerService:
             return result
 
         result["target"] = {"x": target_x, "y": target_y}
+
+        # Chart-graph planner (flag, off by default): any reason it cannot serve this request
+        # falls through to the legacy steps below, unchanged, and is reported.
+        if config.SCENE_GRAPH_PLANNER_ENABLED:
+            chart, reason = await self._try_chart_route(
+                robot_name, map_id, target_x, target_y, robot_pose, ignore_exclusions)
+            if chart is not None:
+                result.update(chart)
+                result["map_id"] = map_id
+                result["goal"] = {"x": target_x, "y": target_y, "map_id": map_id,
+                                  "node_id": chart["end_node_id"]}
+                result["success"] = True
+                return result
+            self.logger.info(f"Chart planner not used ({reason}); legacy planner")
+            result["planner"] = scene_route.PLANNER_LEGACY
+            result["planner_fallback"] = reason
 
         # Step 1: Find closest node to robot
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")
