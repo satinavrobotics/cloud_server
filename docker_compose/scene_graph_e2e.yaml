@@ -1,0 +1,75 @@
+# Throw-away stack for the scene-graph end-to-end harness (tools/scene_graph_e2e/run.sh,
+# tests/integration/scene_graph/test_scene_graph_e2e.py): real ArangoDB, MinIO and Postgres
+# (TimescaleDB, as production) on their own ports, with their own network and volumes.
+#
+# It never touches the production stack: project name `sg-e2e`, container names `sg-e2e-*`, a
+# private bridge network, loopback-only published ports that do not collide with the defaults
+# (8529 / 9000 / 5432), anonymous volumes that `down -v` removes. Run it through run.sh, which
+# also tears it down; by hand:
+#
+#   docker compose -p sg-e2e -f docker_compose/scene_graph_e2e.yaml up -d --wait
+#   docker compose -p sg-e2e -f docker_compose/scene_graph_e2e.yaml down -v
+#
+# Credentials are throw-away test values (never production secrets).
+name: sg-e2e
+
+services:
+  sg-e2e-arango:
+    image: ${SG_E2E_ARANGO_IMAGE:-arangodb/arangodb:latest}
+    container_name: sg-e2e-arango
+    environment:
+      - ARANGO_ROOT_PASSWORD=${SG_E2E_ARANGO_PASSWORD:-sg-e2e-arango}
+    ports:
+      - "127.0.0.1:${SG_E2E_ARANGO_PORT:-28529}:8529"
+    networks: [sg-e2e]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8529/_admin/server/availability"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 5s
+
+  sg-e2e-minio:
+    image: ${SG_E2E_MINIO_IMAGE:-minio/minio:latest}
+    container_name: sg-e2e-minio
+    command: server /data --address ":9000" --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=${SG_E2E_MINIO_USER:-sge2eminio}
+      - MINIO_ROOT_PASSWORD=${SG_E2E_MINIO_PASSWORD:-sge2eminio-secret}
+    ports:
+      - "127.0.0.1:${SG_E2E_MINIO_PORT:-29000}:9000"
+    networks: [sg-e2e]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-s", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 3s
+
+  sg-e2e-postgres:
+    image: ${SG_E2E_POSTGRES_IMAGE:-timescale/timescaledb-ha:pg17.11-ts2.30.1}
+    container_name: sg-e2e-postgres
+    command: ["postgres", "-c", "timescaledb.telemetry_level=off", "-c", "timezone=UTC",
+              "-c", "max_connections=100"]
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${SG_E2E_POSTGRES_PASSWORD:-sg-e2e-postgres}
+      - POSTGRES_DB=mission
+      - TS_TUNE_MEMORY=1GB
+      - TS_TUNE_NUM_CPUS=1
+      - TS_TUNE_MAX_CONNS=100
+      - TIMESCALEDB_TELEMETRY=off
+    ports:
+      - "127.0.0.1:${SG_E2E_POSTGRES_PORT:-25432}:5432"
+    networks: [sg-e2e]
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mission"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+networks:
+  sg-e2e:
+    name: sg-e2e-net
