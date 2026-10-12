@@ -21,6 +21,7 @@ the engine come from the manifest.
 """
 import logging
 import math
+import threading
 import time
 import uuid
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -31,7 +32,8 @@ from .api import BBox, Chart, Dirty, Leaf, Link, MissingTiles, OwnerRaster, Scen
 from .chart_levels import hierarchy
 from .state import EngineState, LeafRecord
 from .store_backends import ArangoMinioBackend, Blobs, Docs, MemoryBackend  # noqa: F401  (re-exported)
-from .store_codec import canonical_json, pack, pack_json, params_hash, unpack, unpack_json
+from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pack_json, params_hash, unpack,
+                          unpack_json)
 
 PIPELINE = "charts/1"
 RES = 0.05
@@ -151,8 +153,23 @@ class SceneGraphStore:
         self.coverage_mismatches = 0
         self._saves: Dict[str, int] = {}
         self.index_error: Optional[Exception] = None
-        self._expanded: Dict[Tuple[str, str], dict] = {}
-        self._last_segments: Dict[Tuple[str, int], Tuple[list, list]] = {}
+        # expanded manifests by (map, epoch, name): readers may be threads of one process (the planner's executor), so every
+        # mutation is under the lock and a manifest is expanded by one thread while the others wait for it (single flight).
+        # load()/view()/query() keep no other shared mutable state: per call they build their own arrays and engine.
+        self.cache_size = 8
+        self._lock = threading.RLock()
+        self._inflight: Dict[tuple, threading.Event] = {}
+        self._expanded: Dict[Tuple[str, str, str], dict] = {}
+        # what the last committed save of (map, generation) wrote: (manifest name, leaf rows per segment, segment hashes,
+        # {page name: (page content, page hash)}); trusted only while that manifest is the base of the next save
+        self._last_segments: Dict[Tuple[str, int], tuple] = {}
+        self._last_pages: Dict[Tuple[str, int], tuple] = {}
+
+    @staticmethod
+    def params_hash(params: SceneParams) -> str:
+        """The hash save() stamps on a version made with `params` (what begin_generation compares a pending against)."""
+        return params_hash(dict(robot_half_side=params.robot_half_side, lattice=params.lattice, place_mult=params.place_mult,
+                                sight_range=params.sight_range), PIPELINE)
 
     @classmethod
     def from_client(cls, client, **kw):
@@ -163,7 +180,11 @@ class SceneGraphStore:
     def meta(self, map_id: str) -> dict:
         m = self.docs.meta(map_id)
         if not m: return {}
-        return {k: m[k] for k in ("version", "generation", "params", "params_hash", "cursor", "epoch", "created_ms") if k in m}
+        out = {k: m[k] for k in ("version", "generation", "params", "params_hash", "cursor", "epoch", "created_ms") if k in m}
+        if m.get("pending"):       # what a worker needs to RESUME a rebuild after a restart or a fence
+            out["pending"] = {k: m["pending"].get(k) for k in ("generation", "version", "params_hash", "cursor", "watermark",
+                                                               "rebuild_batch")}
+        return out
 
     def watermark(self, map_id: str) -> Tuple[int, str]:
         m = self.docs.meta(map_id)
@@ -188,6 +209,14 @@ class SceneGraphStore:
         st = sg.export_state()
         if st.V is None:
             raise ValueError("nothing to save: the engine has no state")
+        if pend and pending.get("params_hash") and pending["params_hash"] != params_hash(st.params, PIPELINE):
+            raise ValueError("the engine's parameters differ from the pending generation's: begin_generation(params_hash=...)")
+        # a pending manifest is the base of an incremental save only if this engine continues it (its leaves and watermark
+        # are not behind it); a replay from cursor 0 into a pending holding an older attempt rewrites every tile instead of
+        # inheriting the old attempt's tiles outside its dirty region
+        restart = bool(pend and prev is not None and (len(st.leaves) < prev.get("leaf_count", 0)
+                                                      or tuple(st.watermark) < tuple(prev.get("watermark", (-1, "")))))
+        if restart: log.warning("scene-graph %s: pending generation %s is ahead of this engine; rewriting it in full", map_id, gen)
 
         # key ids: stable small integers, never reused; tiles store ids, so a chart reorder changes no tile
         key_ids = dict(prev["key_ids"]) if prev else {}
@@ -207,7 +236,7 @@ class SceneGraphStore:
         tx0, ty0, tx1, ty1 = _tile_range(st)
         prev_tiles = dict(prev["tiles"]) if prev else {}
         allc = {(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)}
-        if prev is None:
+        if prev is None or restart:
             cand, tiles = allc, {}
         else:
             cand, tiles = set(), dict(prev_tiles)
@@ -232,17 +261,19 @@ class SceneGraphStore:
 
         # leaf segments: a segment whose records equal the previous save's is reused by hash, not re-packed
         seg_hashes = []
+        base_name = pending.get("manifest") if pend else (meta or {}).get("manifest")
         last = self._last_segments.get((map_id, gen))
+        if last is not None and last[0] != base_name: last = None
         for n, i in enumerate(range(0, len(st.leaves), SEGMENT)):
             rows = st.leaves[i:i + SEGMENT]
-            if last is not None and n < len(last[0]) and last[0][n] == rows:
-                seg_hashes.append(last[1][n]); continue
+            if last is not None and n < len(last[1]) and last[1][n] == rows:
+                seg_hashes.append(last[2][n]); continue
             arr, m = segment_arrays(rows)
             h, blob = pack(arr, m)
             seg_hashes.append(h); new_blobs["g%d/l/%s" % (gen, h)] = blob
         segs_now = [st.leaves[i:i + SEGMENT] for i in range(0, len(st.leaves), SEGMENT)]
 
-        view = sg.query(BBox(-1e9, -1e9, 1e9, 1e9), level=0, raster=False)
+        view = sg.query(BBox(-1e9, -1e9, 1e9, 1e9), level=0, raster=False, parents=False)
         by_key = {c.key: c for c in view.charts}
         charts = []
         for j, k in enumerate(keys):
@@ -266,11 +297,18 @@ class SceneGraphStore:
         for l in links:
             page(*home[l["a"]])["links"].append(l)
         page_hashes = {}
+        lastp = self._last_pages.get((map_id, gen))
+        if lastp is not None and lastp[0] != base_name: lastp = None
+        lastp = lastp[1] if lastp else {}
         for name, pg in pages.items():
             pg["charts"].sort(key=lambda c: c["id"])
             pg["links"].sort(key=lambda l: (l["a"], l["b"], l["portal"][0], l["portal"][1]))
+            same = lastp.get(name)
+            if same is not None and same[0] == pg:         # equal content: its object exists, nothing to pack or check
+                page_hashes[name] = same[1]; continue
             h, blob = pack_json(pg)
             page_hashes[name] = h; new_blobs["g%d/p/%s" % (gen, h)] = blob
+        pages_now = {name: (pg, page_hashes[name]) for name, pg in pages.items()}
         body = {"format": FORMAT, "pipeline": PIPELINE, "generation": gen, "params": st.params,
                 "params_hash": params_hash(st.params, PIPELINE), "cursor": cursor, "watermark": list(st.watermark),
                 "engine_version": st.version, "canvas": [st.cx0, st.cy0, int(st.V.shape[0]), int(st.V.shape[1])],
@@ -299,10 +337,14 @@ class SceneGraphStore:
             body["version"] = None; body["created_ms"] = int(self.clock() * 1000)
             mname = "g%d/manifest-p%d.json" % (gen, pv)
             self.blobs.put(map_id, mname, canonical_json(body))
-            new_meta = dict(meta); new_meta["pending"] = dict(pending, version=pv, manifest=mname)
+            new_meta = dict(meta)
+            new_meta["pending"] = dict(pending, version=pv, manifest=mname, params_hash=body["params_hash"], cursor=cursor,
+                                       watermark=list(st.watermark))
             if not self.docs.cas_meta(map_id, cur, new_meta):
                 raise StaleVersion("lost the compare-and-set")
-            self._last_segments[(map_id, gen)] = (segs_now, seg_hashes)
+            self._last_segments[(map_id, gen)] = (mname, segs_now, seg_hashes)
+            self._last_pages[(map_id, gen)] = (mname, pages_now)
+            self._remember(map_id, new_meta.get("epoch"), mname, body, tiles, charts, links)
             return pv
         newv = (cur or 0) + 1
         body["version"] = newv; body["created_ms"] = int(self.clock() * 1000)
@@ -317,7 +359,9 @@ class SceneGraphStore:
         if meta and "index_version" in meta: new_meta["index_version"] = meta["index_version"]
         if not self.docs.cas_meta(map_id, cur, new_meta):
             raise StaleVersion("lost the compare-and-set")
-        self._last_segments[(map_id, gen)] = (segs_now, seg_hashes)
+        self._last_segments[(map_id, gen)] = (mname, segs_now, seg_hashes)
+        self._last_pages[(map_id, gen)] = (mname, pages_now)
+        self._remember(map_id, epoch, mname, body, tiles, charts, links)
         try:
             self.docs.put_index(map_id, newv, [{**{k: c[k] for k in ("key", "anchor", "cells", "area", "clearance", "driven",
                                                                       "ever_blocked", "leaf")}} for c in charts],
@@ -343,17 +387,50 @@ class SceneGraphStore:
             name = "%d,%d" % (tx, ty)
             if arrs is None:
                 tiles.pop(name, None); continue
-            h, blob = pack(arrs)
+            h, head, raw = hash_arrays(arrs)
+            if tiles.get(name) != h:                       # an unchanged tile is neither compressed nor written
+                blobs["g%d/t/%s" % (gen, h)] = compress_object(head, raw)
             tiles[name] = h
-            blobs["g%d/t/%s" % (gen, h)] = blob
 
     def _manifest_by_name(self, map_id, name, epoch=None):
         """the manifest with its pages expanded: tiles {"tx,ty": hash}, charts (by id), links, key_ids. Cached by
         (map, epoch, name): version numbers restart after a drop, so a name alone can name another history's manifest."""
         if not name: return None
         if epoch is None: epoch = (self.docs.meta(map_id) or {}).get("epoch")
-        hit = self._expanded.get((map_id, epoch, name))
-        if hit is not None: return hit
+        key = (map_id, epoch, name)
+        while True:
+            with self._lock:
+                hit = self._expanded.get(key)
+                if hit is not None: return hit
+                ev = self._inflight.get(key)
+                mine = ev is None
+                if mine: ev = self._inflight[key] = threading.Event()
+            if mine: break
+            ev.wait()                          # the expanding thread finished (or failed): look again, maybe become it
+        try:
+            m = self._expand(map_id, name)
+            with self._lock:
+                while len(self._expanded) >= max(1, self.cache_size):
+                    self._expanded.pop(next(iter(self._expanded)), None)
+                self._expanded[key] = m
+            return m
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
+            ev.set()
+
+    def _remember(self, map_id, epoch, name, body, tiles, charts, links) -> None:
+        """Write-through: the manifest just committed is the base of the next save, so its expansion is cached from what this
+        save already holds instead of being read back and decompressed page by page."""
+        m = dict(body, tiles=dict(tiles), charts=sorted(charts, key=lambda c: c["id"]),
+                 links=sorted(links, key=lambda l: (l["a"], l["b"], l["portal"][0], l["portal"][1])),
+                 key_ids={c["key"]: c["id"] for c in charts})
+        with self._lock:
+            while len(self._expanded) >= max(1, self.cache_size):
+                self._expanded.pop(next(iter(self._expanded)), None)
+            self._expanded[(map_id, epoch, name)] = m
+
+    def _expand(self, map_id, name):
         m = self._raw_manifest(map_id, name)
         tiles, charts, links = {}, [], []
         for h in m["pages"].values():
@@ -362,14 +439,15 @@ class SceneGraphStore:
             pg = unpack_json(raw)
             tiles.update(pg["tiles"]); charts += pg["charts"]; links += pg["links"]
         charts.sort(key=lambda c: c["id"]); links.sort(key=lambda l: (l["a"], l["b"], l["portal"][0], l["portal"][1]))
-        m = dict(m, tiles=tiles, charts=charts, links=links, key_ids={c["key"]: c["id"] for c in charts})
-        if len(self._expanded) > 8: self._expanded.pop(next(iter(self._expanded)))
-        self._expanded[(map_id, epoch, name)] = m
-        return m
+        return dict(m, tiles=tiles, charts=charts, links=links, key_ids={c["key"]: c["id"] for c in charts})
 
-    def manifest(self, map_id: str, version: Optional[int] = None) -> dict:
+    def manifest(self, map_id: str, version: Optional[int] = None, pending: bool = False) -> dict:
         meta = self.docs.meta(map_id)
         if not meta: raise KeyError(f"no scene graph for {map_id}")
+        if pending:
+            p = meta.get("pending")
+            if not p or not p.get("manifest"): raise KeyError(f"no saved pending generation for {map_id}")
+            return self._manifest_by_name(map_id, p["manifest"])
         if version is None or version == meta["version"]:
             return self._manifest_by_name(map_id, meta["manifest"])
         gens = sorted((int(v), int(g)) for g, v in meta.get("generations", {}).items())
@@ -383,10 +461,12 @@ class SceneGraphStore:
         if raw is None: raise FileNotFoundError(h)
         return unpack(raw)[0]
 
-    def load(self, map_id: str, version: Optional[int] = None, tiles: Optional[Iterable] = None) -> SceneGraph:
-        """The engine as saved: planes and evidence as stored, then one re-solve that rebuilds everything derived."""
+    def load(self, map_id: str, version: Optional[int] = None, tiles: Optional[Iterable] = None,
+             pending: bool = False) -> SceneGraph:
+        """The engine as saved: planes and evidence as stored, then one re-solve that rebuilds everything derived.
+        `pending=True` restores the pending generation's last saved state (a rebuild resumes from meta()["pending"]["cursor"])."""
         from .engine import ChartGraph
-        man = self.manifest(map_id, version)
+        man = self.manifest(map_id, version, pending=pending)
         if tiles is not None:
             have = {tuple(t) for t in tiles}
             missing = sorted(tuple(int(v) for v in n.split(",")) for n in man["tiles"]
@@ -494,8 +574,10 @@ class SceneGraphStore:
             self._refs(map_id, self.blobs.get(map_id, pend["manifest"]), refs)
         dead = [n for n in self.blobs.list(map_id) if n not in refs and n not in keep_names]
         self.blobs.delete(map_id, dead)
-        for key in [k for k in self._expanded if k[0] == map_id and k[2] in set(dead)]:
-            del self._expanded[key]
+        with self._lock:
+            deadset = set(dead)
+            for key in [k for k in self._expanded if k[0] == map_id and k[2] in deadset]:
+                self._expanded.pop(key, None)
         return {"deleted": len(dead), "kept_versions": sorted(keep_v)}
 
     def _refs(self, map_id, raw_manifest: bytes, refs: set) -> None:
@@ -508,13 +590,27 @@ class SceneGraphStore:
                 for t in unpack_json(blob)["tiles"].values(): refs.add("g%d/t/%s" % (g, t))
         for h in m["segments"]: refs.add("g%d/l/%s" % (g, h))
 
-    def begin_generation(self, map_id: str) -> int:
-        """Start a rebuild (a params change or a realign) in a new generation; the current one stays the readable one."""
+    def begin_generation(self, map_id: str, params_hash: Optional[str] = None, fresh: bool = False,
+                         rebuild_batch: Optional[int] = None) -> int:
+        """Start (or resume) a rebuild (a params change or a realign) in a new generation; the current one stays readable.
+        No pending: start g + 1 and record `params_hash`. A pending exists: with `fresh`, or a `params_hash` that is not the
+        pending's, it is DISCARDED (its objects become gc-able) and g + 1 starts empty; otherwise the pending generation is
+        returned and the caller resumes from meta()["pending"]["cursor"]. `rebuild_batch`: the fixed batch size of a
+        canonical rebuild (leaves sorted by (stamp, key)), recorded for whoever resumes it."""
         meta = self.docs.meta(map_id)
         if not meta: raise KeyError("nothing saved yet: save generation 1 first")
-        if meta.get("pending"): return meta["pending"]["generation"]
-        g = max(int(x) for x in meta.get("generations", {str(meta["generation"]): 1})) + 1
-        new = dict(meta); new["pending"] = {"generation": g, "version": 0, "manifest": None}
+        pend = meta.get("pending")
+        if pend and not fresh and (params_hash is None or pend.get("params_hash") in (None, params_hash)):
+            if params_hash is not None and pend.get("params_hash") is None:    # an old pending without a stamp: adopt
+                new = dict(meta); new["pending"] = dict(pend, params_hash=params_hash)
+                if not self.docs.cas_meta(map_id, meta["version"], new): raise StaleVersion("lost the compare-and-set")
+            return pend["generation"]
+        used = [int(x) for x in meta.get("generations", {str(meta["generation"]): 1})] + [int(meta["generation"])]
+        if pend: used.append(int(pend["generation"]))      # never reuse a discarded generation's namespace or manifest names
+        g = max(used) + 1
+        new = dict(meta)
+        new["pending"] = {"generation": g, "version": 0, "manifest": None, "params_hash": params_hash, "cursor": None,
+                          "watermark": None, "rebuild_batch": rebuild_batch}
         if not self.docs.cas_meta(map_id, meta["version"], new): raise StaleVersion("lost the compare-and-set")
         return g
 
@@ -544,9 +640,12 @@ class SceneGraphStore:
         return tiles_for(leaves, params)
 
     def drop(self, map_id: str) -> None:
+        """Delete the map's scene graph: objects first (errors propagate; the saga retries), then the documents."""
+        self.blobs.delete(map_id, self.blobs.list(map_id))
         self.docs.drop(map_id)
-        for key in [k for k in self._expanded if k[0] == map_id]:
-            del self._expanded[key]
+        with self._lock:
+            for key in [k for k in self._expanded if k[0] == map_id]:
+                self._expanded.pop(key, None)
 
 
 def _overlap_keymap(store: SceneGraphStore, map_id, old, new) -> Dict[str, List[str]]:
@@ -555,11 +654,19 @@ def _overlap_keymap(store: SceneGraphStore, map_id, old, new) -> Dict[str, List[
     counts: Dict[Tuple[str, str], int] = {}
     for name in set(old["tiles"]) & set(new["tiles"]):
         tx, ty = (int(v) for v in name.split(","))
-        a = store._tile(map_id, old, tx, ty); b = store._tile(map_id, new, tx, ty)
+        a = store._tile(map_id, old, tx, ty)
+        same = old["tiles"][name] == new["tiles"][name]      # equal hash = equal arrays: one read, pairs are (id, id)
+        b = a if same else store._tile(map_id, new, tx, ty)
         if a is None or b is None or "own" not in a or "own" not in b: continue
-        m = (a["own"] > 0) & (b["own"] > 0)
-        if not m.any(): continue
-        pairs, n = np.unique(np.stack([a["own"][m], b["own"][m]], 1), axis=0, return_counts=True)
+        if same:
+            o = a["own"][a["own"] > 0]
+            if not o.size: continue
+            ids, n = np.unique(o, return_counts=True)
+            pairs = np.stack([ids, ids], 1)
+        else:
+            m = (a["own"] > 0) & (b["own"] > 0)
+            if not m.any(): continue
+            pairs, n = np.unique(np.stack([a["own"][m], b["own"][m]], 1), axis=0, return_counts=True)
         for (i, j), c in zip(pairs, n):
             k = (inv_old.get(int(i)), inv_new.get(int(j)))
             if k[0] and k[1]: counts[k] = counts.get(k, 0) + int(c)
@@ -579,6 +686,14 @@ class StoredView:
         self.keys = [c["key"] for c in man["charts"]]
         self._idx = {c["id"]: j for j, c in enumerate(man["charts"])}
         self._levels = None
+
+    @property
+    def nbytes(self) -> int:
+        """Estimate of what this view holds: the owner tiles it has read plus its share of the manifest (charts, links and the
+        tile table; about 0.6 KB per chart, 0.4 KB per link, 0.1 KB per tile as Python objects). For budgeting caches."""
+        arrays = sum(a.nbytes for t in self._cache.values() if t for a in t.values())
+        m = self.man
+        return int(arrays + 600 * len(m["charts"]) + 400 * len(m["links"]) + 100 * len(m["tiles"]))
 
     def _need(self, tiles):
         """MissingTiles for the stored tiles among `tiles` that this view may not read"""
@@ -623,7 +738,7 @@ class StoredView:
             self._levels = hierarchy(len(k), ls)[0]
         return self._levels
 
-    def query(self, bbox: BBox, level: int = 0, raster: bool = True) -> ViewResult:
+    def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
         man = self.man; charts_m = man["charts"]; n = len(charts_m)
         ext = self._extent()
         if ext is None or n == 0: return ViewResult(self.version, [], [], None)
@@ -631,7 +746,7 @@ class StoredView:
         ly0 = max(ext[1], int(math.floor(bbox.y0 / RES)) // 2); ly1 = min(ext[3], int(math.ceil(bbox.y1 / RES)) // 2 + 1)
         sub, dep = (self._window(lx0, ly0, lx1, ly1) if lx1 > lx0 and ly1 > ly0 else (np.zeros((0, 0), np.int32), np.zeros((0, 0), bool)))
         present = set(np.unique(sub[sub >= 0]).tolist())
-        levels = self._hier()
+        levels = self._hier() if (parents or level > 0) else []
         group, node_ids = list(range(n)), list(range(n))
         if 0 < level < len(levels):
             group = [int(g) for g in levels[level]["parent"]]; node_ids = [int(x) for x in levels[level]["nodes"]]

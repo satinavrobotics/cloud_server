@@ -16,7 +16,9 @@ the whole canvas per batch; only the chart solve is local), persistence (store.p
 rebuilds the bbox from the leaves the caller supplies).
 """
 import hashlib
+import bisect
 import math
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -102,6 +104,8 @@ class ChartGraph(SceneGraph):
         self.version = 0
         self._h = params.lattice
         self._leaves: Dict[str, _Rec] = {}
+        self._leaf_order: List[Tuple[int, str]] = []      # (capture time, key), kept sorted: export_state never sorts
+        self._leaf_recs: Dict[str, LeafRecord] = {}       # exported records, reused until the leaf changes
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
         self._V = self._T = self._B = None
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
@@ -195,7 +199,7 @@ class ChartGraph(SceneGraph):
             keep = {lf.key for lf in leaves}
             for k in [k for k, r in self._leaves.items()
                       if bbox.x0 <= r.x <= bbox.x1 and bbox.y0 <= r.y <= bbox.y1 and k not in keep]:
-                del self._leaves[k]; self._pl_full = True
+                self._leaf_del(k); self._pl_full = True
             gx0, gy0 = int(math.floor(bbox.x0 / RES)), int(math.floor(bbox.y0 / RES))
             gx1, gy1 = int(math.ceil(bbox.x1 / RES)), int(math.ceil(bbox.y1 / RES))
             region = (gx0, gy0, gx1, gy1)
@@ -223,7 +227,7 @@ class ChartGraph(SceneGraph):
             old_rec = self._leaves.get(lf.key)
             if old_rec is None: self._pl_new.append(lf.key)
             elif (old_rec.session, old_rec.t, old_rec.x, old_rec.y, old_rec.r_d) != (rec.session, rec.t, rec.x, rec.y, rec.r_d): self._pl_full = True
-            self._leaves[lf.key] = rec
+            self._leaf_put(lf.key, rec)
             self._watermark = max(self._watermark, (lf.stamp_ms, lf.key))
         birth = max(((lf.stamp_ms, lf.key) for lf in leaves), default=self._watermark)[1]
         self._pending = []
@@ -872,15 +876,63 @@ class ChartGraph(SceneGraph):
         return float(w) if math.isfinite(w) else float(2.0 * sp.clr[src])
 
     # ------------------------------------------------------------------ persistence hooks (store.py)
+    @property
+    def nbytes(self) -> int:
+        """Best estimate of the memory this engine holds: every numpy array reachable from its planes and solver state, each
+        counted once (views by their base); containers by their shallow size. For budgeting caches by bytes, not an audit."""
+        seen: set = set()
+
+        def walk(o, depth=0) -> int:
+            if o is None or depth > 7: return 0
+            if isinstance(o, np.ndarray):
+                b = o.base if isinstance(o.base, np.ndarray) else o
+                if id(b) in seen: return 0
+                seen.add(id(b)); return int(b.nbytes)
+            if id(o) in seen: return 0
+            if isinstance(o, (str, bytes, int, float, bool)): return 0
+            if isinstance(o, dict):
+                seen.add(id(o)); return sys.getsizeof(o) + sum(walk(v, depth + 1) for v in o.values())
+            if isinstance(o, (list, tuple, set)):
+                seen.add(id(o)); n = sys.getsizeof(o)
+                if o and not isinstance(next(iter(o)), (int, float, str, bytes, bool, tuple)):
+                    n += sum(walk(v, depth + 1) for v in o)
+                return n
+            if hasattr(o, "__dict__"):
+                seen.add(id(o)); return sum(walk(v, depth + 1) for v in vars(o).values())
+            return 0
+        return walk(self.__dict__)
+
+    def _leaf_put(self, key: str, rec: "_Rec") -> None:
+        old = self._leaves.get(key)
+        if old is not None:
+            i = bisect.bisect_left(self._leaf_order, (old.t, key))
+            if i < len(self._leaf_order) and self._leaf_order[i] == (old.t, key): del self._leaf_order[i]
+        bisect.insort(self._leaf_order, (rec.t, key))
+        self._leaves[key] = rec
+        self._leaf_recs.pop(key, None)
+
+    def _leaf_del(self, key: str) -> None:
+        old = self._leaves.pop(key, None)
+        if old is not None:
+            i = bisect.bisect_left(self._leaf_order, (old.t, key))
+            if i < len(self._leaf_order) and self._leaf_order[i] == (old.t, key): del self._leaf_order[i]
+        self._leaf_recs.pop(key, None)
+
+    def _leaf_record(self, key: str) -> LeafRecord:
+        r = self._leaf_recs.get(key)
+        if r is None:
+            l = self._leaves[key]
+            r = self._leaf_recs[key] = LeafRecord(key, l.session, l.t, l.x, l.y, l.r_d,
+                                                  None if l.view is None else (l.view.x, l.view.y, l.view.yaw, l.view.fov, l.view.rng))
+        return r
+
     def export_state(self) -> EngineState:
         """The resumable state, by reference (the arrays are not copied: the store slices them into tiles)."""
         p = self.params
         st = EngineState(params=dict(robot_half_side=p.robot_half_side, lattice=p.lattice, place_mult=p.place_mult,
                                      sight_range=p.sight_range),
                          cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, chan=dict(self._chan),
-                         leaves=[LeafRecord(k, r.session, r.t, r.x, r.y, r.r_d,
-                                            None if r.view is None else (r.view.x, r.view.y, r.view.yaw, r.view.fov, r.view.rng))
-                                 for k, r in sorted(self._leaves.items(), key=lambda it: (it[1].t, it[0]))],
+                         leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
         s, tr = self._solved, self._track
         if s is not None and tr is not None:
@@ -907,6 +959,8 @@ class ChartGraph(SceneGraph):
         self._chan = {k: (padf(v, 255), padf(t, -1)) for k, (v, t) in st.chan.items()}
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,
                                     None if l.view is None else CamView(l.key, *l.view)) for l in st.leaves}
+        self._leaf_order = sorted((l.t, l.key) for l in st.leaves)
+        self._leaf_recs = {l.key: l for l in st.leaves}
         self.version = st.version
         self._watermark = tuple(st.watermark)
         self._cache = {}
@@ -934,7 +988,7 @@ class ChartGraph(SceneGraph):
             self._cache["levels"] = hierarchy(len(s.A), s.links)
         return self._cache["levels"]
 
-    def query(self, bbox: BBox, level: int = 0, raster: bool = True) -> ViewResult:
+    def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
         s = self._solved
         if s is None:
             return ViewResult(self.version, [], [], None)
@@ -942,7 +996,7 @@ class ChartGraph(SceneGraph):
         # lattice window of the bbox
         y0 = max(0, int(math.floor(bbox.y0 / RES) - self._cy0) // 2); y1 = min(H, int(math.ceil(bbox.y1 / RES) - self._cy0) // 2 + 1)
         x0 = max(0, int(math.floor(bbox.x0 / RES) - self._cx0) // 2); x1 = min(W, int(math.ceil(bbox.x1 / RES) - self._cx0) // 2 + 1)
-        levels = self._levels()[0]
+        levels = self._levels()[0] if (parents or level > 0) else []
         sub = s.plane[y0:y1, x0:x1] if y1 > y0 and x1 > x0 else np.zeros((0, 0), np.int32)
         present = set(np.unique(sub[sub >= 0]).tolist())
         group = list(range(len(s.A)))

@@ -118,7 +118,18 @@ class ArangoMinioBackend:
             raise
 
     def delete(self, map_id, keys):
-        for k in keys: self.c.image.client.remove_object(self._bucket(map_id), PREFIX + k)
+        """Delete objects in batches (one request per 1000 with MinIO's multi-delete; per object on a client that has only
+        remove_object, e.g. a fake). Failures are raised, never swallowed: a caller that believes it deleted must have."""
+        keys = list(keys)
+        if not keys: return
+        client, bucket = self.c.image.client, self._bucket(map_id)
+        if hasattr(client, "remove_objects"):
+            from minio.deleteobjects import DeleteObject
+            errs = list(client.remove_objects(bucket, (DeleteObject(PREFIX + k) for k in keys)))
+            errs = [e for e in errs if getattr(e, "code", "") != "NoSuchKey"]
+            if errs: raise IOError(f"{len(errs)} of {len(keys)} object(s) not deleted from {bucket}: {errs[0]}")
+        else:
+            for k in keys: client.remove_object(bucket, PREFIX + k)
 
     # -- docs
     def _col(self, map_id, kind, edge=False):
@@ -156,8 +167,9 @@ class ArangoMinioBackend:
         return None if m is None else m.get("index_version")
 
     def drop(self, map_id):
+        """Objects first, then the per-map documents. A failure in the object step raises with the meta document still
+        in place, so the delete saga retries and finds the same work; the other order would leave objects nothing points at."""
+        self.delete(map_id, self.list(map_id))
         db = self.c.graph.db
         for kind in ("anchors", "links", "meta"):
             if db.has_collection(f"sg_{kind}_{map_id}"): db.delete_collection(f"sg_{kind}_{map_id}")
-        try: self.delete(map_id, self.list(map_id))
-        except Exception: pass

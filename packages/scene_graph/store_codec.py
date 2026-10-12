@@ -14,13 +14,23 @@ import numpy as np
 MAGIC = b"SGT1"
 
 
-def pack(arrays: Dict[str, np.ndarray], meta: dict = None) -> Tuple[str, bytes]:
+def hash_arrays(arrays: Dict[str, np.ndarray], meta: dict = None) -> Tuple[str, bytes, bytes]:
+    """(name, header, raw payload) of an object: the name needs no compression, so a caller that already holds this name
+    skips the compressor and the write."""
     names = list(arrays)
     head = json.dumps({"a": [[n, arrays[n].dtype.str, list(arrays[n].shape)] for n in names], "m": meta or {}},
                       sort_keys=True, separators=(",", ":")).encode()
     raw = b"".join(np.ascontiguousarray(arrays[n]).tobytes() for n in names)
-    h = hashlib.sha256(head + raw).hexdigest()[:32]
-    return h, MAGIC + struct.pack("<I", len(head)) + head + zlib.compress(raw, 6)
+    return hashlib.sha256(head + raw).hexdigest()[:32], head, raw
+
+
+def compress_object(head: bytes, raw: bytes) -> bytes:
+    return MAGIC + struct.pack("<I", len(head)) + head + zlib.compress(raw, 6)
+
+
+def pack(arrays: Dict[str, np.ndarray], meta: dict = None) -> Tuple[str, bytes]:
+    h, head, raw = hash_arrays(arrays, meta)
+    return h, compress_object(head, raw)
 
 
 def unpack(blob: bytes) -> Tuple[Dict[str, np.ndarray], dict]:

@@ -39,8 +39,11 @@ def blobs():
             if not mc.bucket_exists(b): mc.make_bucket(b)
             return True
 
+    class DB:                                  # only the MinIO side is real here; the collections are stubs
+        def has_collection(self, n): return False
     client = type("C", (), {})()
     client.image = Image
+    client.graph = type("G", (), {})(); client.graph.db = DB()
     return ArangoMinioBackend(client)
 
 
@@ -68,3 +71,15 @@ def test_save_load_gc_on_real_objects(blobs):
     assert sorted(c.key for c in again.query(big, raster=False).charts) == sorted(c.key for c in g.query(big, raster=False).charts)
     st.gc("sg_test_real")
     assert st.meta("sg_test_real")["version"] == v
+
+
+def test_drop_deletes_many_objects_in_batches_and_raises_nothing(blobs):
+    import time
+    m = "Sg_Test_Drop"
+    n = 2500
+    for i in range(n):
+        blobs.put(m, "scene_graph/g1/t/%05d" % i, b"x")
+    assert len(blobs.list(m)) >= n
+    t = time.time(); blobs.drop(m) if hasattr(blobs, "drop") else None; dt = time.time() - t
+    assert blobs.list(m) == []
+    print("dropped %d objects in %.2f s" % (n, dt))

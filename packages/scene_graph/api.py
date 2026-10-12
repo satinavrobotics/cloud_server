@@ -169,8 +169,9 @@ class SceneGraph:
         """Lattice route in navigable space; None when unreachable."""
         raise NotImplementedError
 
-    def query(self, bbox: BBox, level: int = 0, raster: bool = True) -> ViewResult:
-        """Charts and links of an area; `raster` adds the owner plane for drawing."""
+    def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
+        """Charts and links of an area; `raster` adds the owner plane for drawing; `parents=False` skips the hierarchy view
+        (Chart.parent stays empty) for callers that need only charts and links, e.g. the store's save."""
         raise NotImplementedError
 
     def corridor(self, a: Key, b: Key, blocked: Optional[Blocked] = None) -> Optional[List[Tuple[int, int]]]:

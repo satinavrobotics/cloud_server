@@ -446,3 +446,55 @@ def test_epoch_changes_after_a_drop_and_the_expansion_cache_cannot_serve_the_old
     assert a.meta("m")["epoch"] != e1
     second = b.view("m").query(BBox(-5, -5, 20, 20), raster=False)
     assert {c.key for c in second.charts} == {c.key for c in g2.query(BBox(-5, -5, 20, 20), raster=False).charts}
+
+
+class _Obj:
+    def __init__(self, n): self.object_name = n
+
+
+class _DropMinio:
+    """just enough of the minio client; `fail` makes deletes fail"""
+    def __init__(self, n=5, fail=False, multi=False):
+        self.objs = {"scene_graph/o%d" % i for i in range(n)}; self.fail = fail; self.calls = 0
+        if multi: self.remove_objects = self._remove_objects
+    def list_objects(self, b, prefix="", recursive=True): return [_Obj(o) for o in sorted(self.objs) if o.startswith(prefix)]
+    def remove_object(self, b, o):
+        self.calls += 1
+        if self.fail: raise IOError("S3 500")
+        self.objs.discard(o)
+    def _remove_objects(self, b, objs):
+        self.calls += 1
+        objs = list(objs)
+        if self.fail:
+            return [type("E", (), {"code": "InternalError", "name": o.name})() for o in objs]
+        for o in objs: self.objs.discard(o.name)
+        return []
+
+
+def _adapter(mc):
+    class DB:
+        dropped = []
+        def has_collection(self, n): return True
+        def delete_collection(self, n): DB.dropped.append(n)
+    c = type("C", (), {})(); c.image = type("I", (), {})(); c.image.client = mc; c.image._bucket_name = lambda m: "map-" + m
+    c.graph = type("G", (), {})(); c.graph.db = DB()
+    return ArangoMinioBackend(c), DB
+
+
+def test_drop_raises_when_objects_cannot_be_deleted_and_keeps_the_documents():
+    for multi in (False, True):
+        be, DB = _adapter(_DropMinio(fail=True, multi=multi))
+        with pytest.raises(Exception):
+            be.drop("m")
+        assert DB.dropped == []                                # the meta document is still there: the saga can retry
+
+
+def test_drop_deletes_objects_first_then_the_collections_in_batches():
+    mc = _DropMinio(n=2500, multi=True)
+    be, DB = _adapter(mc)
+    be.drop("m")
+    assert not mc.objs and mc.calls == 1                       # one multi-delete request, not 2500
+    assert sorted(DB.dropped) == ["sg_anchors_m", "sg_links_m", "sg_meta_m"]
+    mc = _DropMinio(n=3)                                       # a client with only remove_object (a fake) still works
+    be, DB = _adapter(mc); be.drop("m")
+    assert not mc.objs and mc.calls == 3
