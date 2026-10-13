@@ -659,3 +659,47 @@ SCENE_GRAPH_LOAD_FAIL_LIMIT = int(os.getenv("SCENE_GRAPH_LOAD_FAIL_LIMIT", "3"))
 SCENE_GRAPH_STEP_BUDGET_S = float(os.getenv("SCENE_GRAPH_STEP_BUDGET_S", "0.0"))
 SCENE_GRAPH_SLOW_STEP_S = float(os.getenv("SCENE_GRAPH_SLOW_STEP_S", "30.0"))
 SCENE_GRAPH_STATS_LOG_S = float(os.getenv("SCENE_GRAPH_STATS_LOG_S", "60.0"))
+
+# Scale of the ingest worker (one process, up to MAX_MAPS maps, small and very large).
+# WORKER_THREADS: size of the dedicated step pool (one step per map at a time, earliest-due map first;
+# a cold engine load never takes the last thread). MAX_RESIDENT_ENGINES / MAX_RESIDENT_BYTES: at most
+# this many engines (this many bytes, `ChartGraph.nbytes`; 0 = off) stay in memory; the least recently
+# active IDLE engine (nothing unsaved / buffered, idle for EVICT_IDLE_S) is saved and dropped, and reloaded
+# on the map's next leaves. LAZY_LOAD: a map's engine is loaded by its first fold, not at worker start.
+# PREFETCH_THREADS / PREFETCH_QUEUE: PNG fetch + decode pool of the leaf pipeline (0 threads = off) and the
+# most prefetched PNGs held at once. MEMORY_RETRY_LIMIT: consecutive MemoryErrors of one batch before it is
+# bisected and the leaf that still fails alone is quarantined.
+SCENE_GRAPH_WORKER_THREADS = int(os.getenv("SCENE_GRAPH_WORKER_THREADS", str(min(8, os.cpu_count() or 2))))
+SCENE_GRAPH_MAX_RESIDENT_ENGINES = int(os.getenv("SCENE_GRAPH_MAX_RESIDENT_ENGINES", "32"))
+SCENE_GRAPH_MAX_RESIDENT_BYTES = int(os.getenv("SCENE_GRAPH_MAX_RESIDENT_BYTES", "0"))
+SCENE_GRAPH_EVICT_IDLE_S = float(os.getenv("SCENE_GRAPH_EVICT_IDLE_S", "60.0"))
+SCENE_GRAPH_LAZY_LOAD = _env_bool("SCENE_GRAPH_LAZY_LOAD", "true")
+SCENE_GRAPH_PREFETCH_THREADS = int(os.getenv("SCENE_GRAPH_PREFETCH_THREADS", "4"))
+SCENE_GRAPH_PREFETCH_QUEUE = int(os.getenv("SCENE_GRAPH_PREFETCH_QUEUE", "64"))
+SCENE_GRAPH_MEMORY_RETRY_LIMIT = int(os.getenv("SCENE_GRAPH_MEMORY_RETRY_LIMIT", "3"))
+
+
+def _validate_scene_graph_worker_scale() -> None:
+    """Reset worker scale settings that would break it (a zero-thread pool, a negative cap) to their
+    defaults and say so once, the same way as the planner settings."""
+    fixed = []
+    for name, default, lo in (
+            ("SCENE_GRAPH_WORKER_THREADS", min(8, os.cpu_count() or 2), 1),
+            ("SCENE_GRAPH_PREFETCH_QUEUE", 64, 1), ("SCENE_GRAPH_MEMORY_RETRY_LIMIT", 3, 1),
+            ("SCENE_GRAPH_MAX_RESIDENT_ENGINES", 32, 0), ("SCENE_GRAPH_MAX_RESIDENT_BYTES", 0, 0),
+            ("SCENE_GRAPH_PREFETCH_THREADS", 4, 0)):
+        value = globals()[name]
+        if value < lo:
+            fixed.append(f"{name}={value} -> {default}")
+            globals()[name] = default
+    value = globals()["SCENE_GRAPH_EVICT_IDLE_S"]
+    if not (value >= 0.0 and value < float("inf")):             # also NaN
+        fixed.append(f"SCENE_GRAPH_EVICT_IDLE_S={value} -> 60.0")
+        globals()["SCENE_GRAPH_EVICT_IDLE_S"] = 60.0
+    if fixed:
+        import logging
+        logging.getLogger("config").warning("invalid scene graph worker settings reset: %s",
+                                            "; ".join(fixed))
+
+
+_validate_scene_graph_worker_scale()

@@ -556,7 +556,7 @@ def test_a_fault_without_an_engine_factory_rebuilds_when_it_can_else_ends():
 
 
 def test_memory_error_keeps_the_engine_and_does_not_count_as_a_fault():
-    r = _fault_rig(_nodes(2), lambda v: pytest.fail("must not reload"))
+    r = _fault_rig(_nodes(2), lambda v: pytest.fail("must not reload"), cfgkw={"memory_retry_limit": 100})
     engine = r.engine
     for _ in range(5):
         engine.raise_once = MemoryError("allocation")

@@ -38,6 +38,33 @@ class PngError(ValueError):
     """Not an 8-bit grayscale, non-interlaced PNG, or damaged."""
 
 
+def _average_row(line: bytes, prev: bytes, width: int) -> bytearray:
+    out, left = bytearray(width), 0
+    for x in range(width):
+        left = (line[x] + ((left + prev[x]) >> 1)) & 0xFF
+        out[x] = left
+    return out
+
+
+def _paeth_row(line: bytes, prev: bytes, width: int) -> bytearray:
+    out, a, c = bytearray(width), 0, 0
+    for x in range(width):
+        b = prev[x]
+        pa, pb = b - c, a - c
+        pc = pa + pb
+        if pa < 0:
+            pa = -pa
+        if pb < 0:
+            pb = -pb
+        if pc < 0:
+            pc = -pc
+        pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+        a = (line[x] + pred) & 0xFF
+        out[x] = a
+        c = b
+    return out
+
+
 def decode_png_gray8(data: bytes) -> np.ndarray:
     """The pixels of an 8-bit grayscale PNG as a u8 array [height, width] (row 0 = first row)."""
     if not data.startswith(PNG_SIGNATURE):
@@ -67,37 +94,23 @@ def decode_png_gray8(data: bytes) -> np.ndarray:
     if len(raw) != stride * height:
         raise PngError("pixel data has the wrong size")
     rows = np.frombuffer(raw, dtype=np.uint8).reshape(height, stride)
-    out = np.zeros((height, width), dtype=np.uint8)
-    prev = np.zeros(width, dtype=np.int32)
-    for y in range(height):
-        ft, line = int(rows[y, 0]), rows[y, 1:].astype(np.int32)
+    out = np.empty((height, width), dtype=np.uint8)
+    prev = bytes(width)                         # the unfiltered row above (bytes: the per-pixel loops below
+    for y in range(height):                     # are 2-3x faster on bytes / ints than on numpy scalars)
+        ft = int(rows[y, 0])
         if ft == 0:
-            cur = line
+            out[y] = rows[y, 1:]
         elif ft == 1:   # Sub
-            cur = np.cumsum(line) & 0xFF
+            out[y] = np.cumsum(rows[y, 1:], dtype=np.int64) & 0xFF
         elif ft == 2:   # Up
-            cur = (line + prev) & 0xFF
+            out[y] = (rows[y, 1:].astype(np.int32) + np.frombuffer(prev, np.uint8)) & 0xFF
         elif ft == 3:   # Average
-            cur = np.empty(width, dtype=np.int32)
-            left = 0
-            for x in range(width):
-                left = (int(line[x]) + ((left + int(prev[x])) >> 1)) & 0xFF
-                cur[x] = left
+            out[y] = np.frombuffer(_average_row(raw[y * stride + 1:(y + 1) * stride], prev, width), np.uint8)
         elif ft == 4:   # Paeth
-            cur = np.empty(width, dtype=np.int32)
-            a = c = 0
-            for x in range(width):
-                b = int(prev[x])
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                a = (int(line[x]) + pred) & 0xFF
-                cur[x] = a
-                c = b
+            out[y] = np.frombuffer(_paeth_row(raw[y * stride + 1:(y + 1) * stride], prev, width), np.uint8)
         else:
             raise PngError(f"unknown filter type {ft}")
-        out[y] = cur
-        prev = cur.astype(np.int32)
+        prev = out[y].tobytes()
     return out
 
 
@@ -126,14 +139,18 @@ def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
             channels: Optional[Mapping[str, bytes]] = None,
             layer: Optional[str] = None,
             clock: Optional[Any] = None,
-            stamp_info: Optional[dict] = None) -> Tuple[Optional[Leaf], Optional[str]]:
+            stamp_info: Optional[dict] = None,
+            window: Optional[np.ndarray] = None,
+            bad_png: bool = False) -> Tuple[Optional[Leaf], Optional[str]]:
     """`(Leaf, None)` or `(None, skip reason)`.
 
     `node` is the stored document (`_key`, `pose`, `session_id`, `timestamp`, `capture_time`,
     `costmap.{layer}`); `png` the bytes of that layer's PNG; `layer` defaults to the occupancy
     role's stored layer; `channels` maps a channel name to the PNG bytes of an optional extra
     layer (dropped when its size differs from the occupancy window); `clock` is the worker's
-    scene_clock.SessionClock (per-session offset on capture stamps), None = the per-leaf rule."""
+    scene_clock.SessionClock (per-session offset on capture stamps), None = the per-leaf rule.
+    `window` is the occupancy PNG already decoded (the worker's prefetch pool decodes off the fold
+    thread); `bad_png` says that decoding it failed (same skip, same place in the order)."""
     stored = node.get("costmap") or {}
     if layer is None:
         layer = scene_leaf.role_layers(stored).get(scene_leaf.ROLE_OCCUPANCY)
@@ -156,10 +173,13 @@ def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
         return None, SKIP_NO_STAMP
     if stamp_info is not None:
         stamp_info["source"] = stamp[1]
-    try:
-        window = decode_png_gray8(png)
-    except PngError:
+    if bad_png:
         return None, SKIP_BAD_PNG
+    if window is None:
+        try:
+            window = decode_png_gray8(png)
+        except PngError:
+            return None, SKIP_BAD_PNG
     if window.shape != (record.get("height"), record.get("width")):
         return None, SKIP_SIZE
     extra = {}

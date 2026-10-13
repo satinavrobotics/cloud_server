@@ -107,6 +107,13 @@ class FakeStore:
         if self.fail:
             self.fail -= 1
             raise IOError("minio down")
+        if generation is not None and generation != self.meta_doc.get("generation", 1):
+            # a save into the PENDING generation (the real store's contract): the live version and
+            # the live cursor do not move, the pending generation counts its own saves
+            self.pending_saves = getattr(self, "pending_saves", 0) + 1
+            self.pending_cursor = cursor
+            self.saves.append((self.v, cursor, list(dirty.changed)))
+            return self.pending_saves
         self.v += 1
         self.saves.append((self.v, cursor, list(dirty.changed)))
         self.meta_doc["cursor"] = cursor
@@ -663,7 +670,7 @@ def test_matching_params_hash_does_not_rebuild():
 
 def test_events_updated_and_fold_failed_with_consecutive_count():
     events = []
-    cfg = sw.WorkerConfig(min_save_interval_s=0)
+    cfg = sw.WorkerConfig(min_save_interval_s=0, memory_retry_limit=100)
     r = Rig(_nodes(1), cfg=cfg, on_event=lambda k, p: events.append((k, p)))   # one leaf: no bisect
     real = r.engine.fold_many
     state = {"n": 0}

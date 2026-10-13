@@ -26,7 +26,8 @@ Per step
        version (or from the saved pending generation of a rebuild) and the leaves since the
        durable cursor are read again; `load_fail_limit` faults in a row without a good fold fall
        into a rebuild, a fault inside that rebuild (or no way to rebuild) ends in NEEDS_REBUILD.
-       `MemoryError` (nothing changed) is a plain backoff.
+       `MemoryError` (nothing changed) is a backoff; `memory_retry_limit` in a row on the same batch
+       bisect it and quarantine the leaf that still fails alone (like a poison leaf).
     5. publish = `store.save(...)`, rate limited (every N leaves / T seconds / on idle, never
        faster than a minimum interval). The version exists only as the return of save.
     6. `publish(version, dirty)` callback with the Dirty merged since the last save.
@@ -75,6 +76,14 @@ younger than `rebuild_max_age_s`; an old-format record (no `begun_ms`) is restar
 request always starts a fresh generation. A cursor-only persist moves the pending cursor of a
 rebuild too (once the pending generation holds a saved state).
 
+Scale: the engine is the only large object a worker holds. With `lazy_load` it is loaded by the
+first fold, not at start (an idle map never loads). `evict()` (called by the runner when its
+resident-engine / byte budget is exceeded) saves what is unsaved and drops the engine of an IDLE
+worker (nothing buffered, pending or unsaved); everything else (seen map, cursors, rebuild state)
+is kept, so the next leaves reload it from the store at the version just saved and nothing is
+re-folded. `PngPrefetch` (shared by all workers, bounded) fetches and decodes the PNGs of a page
+on other threads while the worker adapts / folds.
+
 Terminal states are logged at warning; `SceneRunner` reports them once per transition as a
 `fold_failed` event (`stage` = the state).
 
@@ -85,6 +94,8 @@ carrying `version`, `generation`, `params_hash` and optionally `cursor`.
 import inspect
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass, field
@@ -208,6 +219,12 @@ class WorkerConfig:
     updated_event_interval_s: float = 60.0  # 'updated' events per map at most this often
     # a cursor-only persist (skip-only progress) when the cursor is this far ahead of the stored one
     cursor_persist_margin_ms: Optional[int] = None    # None: replay_margin_ms
+    # Scale. lazy_load: the engine of a stored map (version > 0) is loaded by the first fold, not at start.
+    # nbytes_refresh_s: `engine.nbytes` (a walk of its arrays) is recomputed at most this often.
+    # memory_retry_limit: consecutive MemoryErrors of one batch before it is bisected / quarantined.
+    lazy_load: bool = False
+    nbytes_refresh_s: float = 10.0
+    memory_retry_limit: int = 3
 
 
 @dataclass
@@ -231,6 +248,12 @@ class SceneWorkerStats:
     slow_folds: int = 0                     # folds over batch_budget_s
     fold_failures: int = 0                  # consecutive (fold / tiles)
     rebuilds: int = 0
+    resident: bool = False                  # an engine is held in memory (gauge)
+    resident_bytes: Optional[int] = None    # engine.nbytes (None: the engine cannot say); 0 when not resident
+    loads: int = 0                          # engines loaded through the factory
+    evictions: int = 0                      # engines dropped to free memory
+    prefetch_hits: int = 0                  # leaves whose PNG was fetched + decoded by the prefetch pool
+    memory_isolations: int = 0              # batches bisected after repeated MemoryErrors
 
 
 @dataclass
@@ -283,6 +306,98 @@ def merge_dirty(a: Optional[Dirty], b: Dirty) -> Dirty:
                  watermark=max(a.watermark, b.watermark))
 
 
+class _Ticket:
+    """One prefetched PNG: `result()` is (png | None, window | None, decode error | None) or raises what
+    the fetch raised. `release()` (once; `result` does it) frees its slot in the shared bound."""
+    __slots__ = ("future", "_owner", "_released")
+
+    def __init__(self, future: Any, owner: "PngPrefetch") -> None:
+        self.future, self._owner, self._released = future, owner, False
+
+    def result(self) -> Tuple[Optional[bytes], Any, Optional[BaseException]]:
+        try:
+            return self.future.result()
+        finally:
+            self.release()
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            if self.future.cancel():        # a task that has not started never runs
+                self._owner._unqueued()
+            self._owner._released()
+
+
+class PngPrefetch:
+    """A bounded pool, shared by every worker and separate from the step pool, that fetches (MinIO) and
+    decodes the PNGs of a page of nodes while the worker adapts and folds the earlier ones. At most
+    `max_pending` PNGs (queued, running or finished and not yet consumed) exist at once, so a page of
+    200 windows of many maps cannot pile up in memory; `submit` returns None when the bound is reached
+    and the worker fetches that leaf inline, as it did before. Starts its threads lazily and can be
+    closed and used again (the runner is closed and restarted after a crash)."""
+
+    def __init__(self, threads: int = 4, max_pending: int = 64) -> None:
+        self.threads, self.max_pending = max(1, int(threads)), max(1, int(max_pending))
+        self._lock = threading.Lock()
+        self._pool: Optional[ThreadPoolExecutor] = None
+        self._outstanding = 0
+        self._queued = 0
+        self.submitted = self.rejected = self.hits = 0
+
+    def submit(self, fetch: Callable[[str, str, str], Optional[bytes]], map_id: str, key: str,
+               layer: str) -> Optional[_Ticket]:
+        with self._lock:
+            if self._outstanding >= self.max_pending:
+                self.rejected += 1
+                return None
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(self.threads, thread_name_prefix="scene-prefetch")
+            self._outstanding += 1
+            self._queued += 1
+            self.submitted += 1
+            pool = self._pool
+        try:
+            future = pool.submit(self._task, fetch, map_id, key, layer)
+        except RuntimeError:                # closed under us
+            with self._lock:
+                self._outstanding -= 1
+                self._queued -= 1
+            return None
+        return _Ticket(future, self)
+
+    def _task(self, fetch: Callable[[str, str, str], Optional[bytes]], map_id: str, key: str,
+              layer: str) -> Tuple[Optional[bytes], Any, Optional[BaseException]]:
+        with self._lock:
+            self._queued -= 1
+        png = fetch(map_id, key, layer)     # may raise: the worker sees it as a failed fetch of that leaf
+        if png is None:
+            return None, None, None
+        try:
+            return png, scene_adapter.decode_png_gray8(png), None
+        except scene_adapter.PngError as exc:
+            return png, None, exc
+
+    def _released(self) -> None:
+        with self._lock:
+            self._outstanding -= 1
+
+    def _unqueued(self) -> None:
+        with self._lock:
+            self._queued -= 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {"threads": self.threads, "max_pending": self.max_pending,
+                    "outstanding": self._outstanding, "queue_depth": max(0, self._queued),
+                    "submitted": self.submitted, "rejected": self.rejected, "hits": self.hits}
+
+    def close(self) -> None:
+        with self._lock:
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
 class SceneWorker:
     def __init__(self, map_id: str, *, source: Any, fetch_png: Callable[[str, str, str], Optional[bytes]],
                  footprint: Callable[[str], Tuple[Any, Any]], engine: Any = None, store: Any,
@@ -297,12 +412,20 @@ class SceneWorker:
                  fence_errors: Tuple[type, ...] = (),
                  engine_factory: Optional[Callable[[int], Any]] = None,
                  loaded_version: Optional[int] = None,
-                 mono_ms: Optional[Callable[[], int]] = None) -> None:
+                 mono_ms: Optional[Callable[[], int]] = None,
+                 prefetch: Optional[PngPrefetch] = None) -> None:
         if engine is None and engine_factory is None:
             raise ValueError("SceneWorker needs an engine or an engine_factory")
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
         self.engine, self.store, self.cursor_store, self.guard = engine, store, cursor_store, guard
         self.engine_factory, self._loaded_version = engine_factory, loaded_version
+        self.prefetch = prefetch
+        self._tickets: Dict[Tuple[str, int], _Ticket] = {}   # (key, stored_ms) -> prefetched PNG of this step
+        self._memory_head: Optional[str] = None      # first leaf of the batch that last ran out of memory
+        self._memory_streak = 0
+        self._bytes_at_ms: Optional[int] = None      # when engine.nbytes was last computed
+        self._bytes_stale = True
+        self._bytes_warned = False
         self.stats = stats if stats is not None else SceneWorkerStats()
         self.config = config or WorkerConfig()
         self.now_ms, self.publish = now_ms, publish
@@ -390,14 +513,82 @@ class SceneWorker:
         return res
 
     def step(self) -> StepResult:
-        res = self._step()
+        try:
+            res = self._step()
+        finally:
+            self._drop_tickets()
         self.last_result_state = res.state
+        self._account()
         self._last_step_ms = self._mono()
         self._log_stats()
         return res
 
     def last_step_age_s(self) -> Optional[float]:
         return None if self._last_step_ms is None else max(0.0, (self._mono() - self._last_step_ms) / 1000.0)
+
+    # ---- memory: residency, eviction
+
+    @property
+    def cold(self) -> bool:
+        """No engine in memory: the next fold (or this step, for a worker that was never started) loads
+        one. The runner admits only some of these at a time so loads never take every thread."""
+        return self.engine is None and self.state not in TERMINAL
+
+    def evictable(self) -> bool:
+        """An engine is held and dropping it loses nothing but the load time: nothing is buffered, waiting
+        for a PNG or holding a stamp to write, the worker runs, and a rebuild (if any) has saved state to
+        reload (an unsaved fold is saved by `evict` first)."""
+        return (self.engine is not None and self._started and self.state not in TERMINAL
+                and not self._buf and not self._pending and not self._new_stamps
+                and (self._rebuild_gen is None or self._rebuild_saved)
+                and (self.engine_factory is not None or self._rebuild_gen is not None)
+                and (self._rebuild_gen is not None or self._expected_version > 0)
+                and not (self._load_gave_up or self._fault_streak))
+
+    def evict(self) -> bool:
+        """Free the engine: save what is unsaved (never drop an unsaved fold), then forget the engine and
+        nothing else (`_seen`, cursors, rebuild state stay, so the replay margin is not folded again). The
+        next fold reloads it from the store at the version just saved, or from the pending generation of
+        a rebuild. False when it was not evictable or the save did not go through (nothing was dropped).
+        Runs in the worker's own slot: never concurrently with a step."""
+        if not self.evictable():
+            return False
+        if self._dirty is not None:
+            res = self._save()
+            if res is not None or self._dirty is not None:
+                return False        # failed / fenced / deleting: the step reports it, the engine stays
+        if self.state in TERMINAL or self.engine is None:
+            return False
+        self.engine, self._loaded_version = None, None
+        self.stats.evictions += 1
+        self._bytes_stale = True
+        self._account(force=True)
+        return True
+
+    def _account(self, force: bool = False) -> None:
+        """Residency gauges. `engine.nbytes` (feature-detected: a walk of the engine's arrays) is
+        recomputed after a fold / load, at most every `nbytes_refresh_s`."""
+        st, eng = self.stats, self.engine
+        st.resident = eng is not None
+        if eng is None:
+            st.resident_bytes = 0
+            return
+        now = self._mono()
+        if not force and not self._bytes_stale and st.resident_bytes is not None:
+            return
+        if (not force and self._bytes_at_ms is not None and st.resident_bytes is not None
+                and now - self._bytes_at_ms < self.config.nbytes_refresh_s * 1000):
+            return
+        try:
+            size = getattr(eng, "nbytes", None)
+            st.resident_bytes = int(size) if size is not None else None
+        except Exception:  # noqa: BLE001  a gauge: never the step's problem
+            st.resident_bytes = None
+        if st.resident_bytes is None and not self._bytes_warned:
+            self._bytes_warned = True
+            log.warning("scene worker %s: the engine reports no nbytes: only the engine count is budgeted",
+                        self.map_id)
+        self._bytes_at_ms, self._bytes_stale = now, False
 
     def _log_stats(self) -> None:
         every = self.config.stats_log_s
@@ -413,9 +604,11 @@ class SceneWorker:
         st = self.stats
         log.info("scene worker %s: stats state=%s folded=%d skipped=%s pending=%d buffered=%d "
                  "version=%d lag=%.0fs saves=%d save_failures=%d source_errors=%d rebuilds=%d "
-                 "rebuilding=%s", self.map_id, self.last_result_state, st.folded, dict(st.skipped),
+                 "rebuilding=%s resident=%s bytes=%s loads=%d evictions=%d prefetched=%d",
+                 self.map_id, self.last_result_state, st.folded, dict(st.skipped),
                  len(self._pending), st.buffered_leaves, st.version, st.version_lag_s, st.saves,
-                 st.save_failures, st.source_errors, st.rebuilds, self._rebuild_gen is not None)
+                 st.save_failures, st.source_errors, st.rebuilds, self._rebuild_gen is not None,
+                 st.resident, st.resident_bytes, st.loads, st.evictions, st.prefetch_hits)
 
     def _step(self) -> StepResult:
         if self.state in TERMINAL:
@@ -452,7 +645,8 @@ class SceneWorker:
                 return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"source: {exc}")
             more = len(nodes) >= cfg.batch_size
             self._scan = self._order(nodes[-1]) if (more and nodes) else None
-            # 3. adapt into the buffer
+            # 3. adapt into the buffer (the page's PNGs are fetched + decoded by the prefetch pool meanwhile)
+            self._prefetch(nodes)
             for i, node in enumerate(nodes):
                 if (cfg.step_budget_s and i and self._mono() - t_step > cfg.step_budget_s * 1000):
                     # out of time for this step: continue behind the last node handled
@@ -510,7 +704,8 @@ class SceneWorker:
         rebuilding = self._rebuild_gen is not None
         # a rebuild that reached the head (or is past its max age) saves what it folded, then commits
         force_commit = rebuilding and self._rebuild_overdue()
-        at_head = rebuilding and self._head and not self._pending and fetch_error is None
+        # (not while leaves are still buffered: the generation would be committed without them)
+        at_head = rebuilding and self._head and not self._pending and fetch_error is None and not waiting
         if self._dirty is not None and (self._due(idle=idle)
                                         or ((at_head or force_commit) and self._due(idle=False, force=True))):
             res = self._save()
@@ -692,7 +887,9 @@ class SceneWorker:
                 self._clear_request(request)        # nothing was ever saved: the first build is fresh
             else:
                 self._warn_cannot_rebuild("rebuild request")
-        if not rebuilding:
+        lazy = (cfg.lazy_load and self.engine is None and self.engine_factory is not None
+                and version > 0 and not rebuilding)
+        if not rebuilding and not lazy:
             err = self._ensure_engine(version)
             if err is not None:
                 if not self._load_gave_up:
@@ -766,6 +963,8 @@ class SceneWorker:
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"load: {exc}")
         self._loaded_version = version
         self._load_failures = 0
+        self.stats.loads += 1
+        self._bytes_stale = True
         self._recovered("load")
         return None
 
@@ -1043,8 +1242,17 @@ class SceneWorker:
         layer = scene_leaf.role_layers(node.get("costmap")).get(scene_leaf.ROLE_OCCUPANCY)
         if not layer:
             return scene_adapter.SKIP_NO_LAYER
+        window, bad_png = None, False
+        ticket = None if retry else self._tickets.pop((key, ms), None)
         try:
-            png = self.fetch_png(self.map_id, key, layer)
+            if ticket is not None:
+                png, window, decode_error = ticket.result()
+                bad_png = decode_error is not None
+                if png is not None:
+                    self.stats.prefetch_hits += 1
+                    self.prefetch.hits += 1
+            else:
+                png = self.fetch_png(self.map_id, key, layer)
         except Exception as exc:
             log.warning("scene worker %s: png fetch of %s failed: %s", self.map_id, key, exc)
             if self._outage_since is None:
@@ -1063,7 +1271,7 @@ class SceneWorker:
         r_d, known = self._robot_half_side(node)
         info: Dict[str, Any] = {}
         leaf, reason = scene_adapter.to_leaf(node, png, r_d=r_d, layer=layer, clock=self.clock,
-                                             stamp_info=info)
+                                             stamp_info=info, window=window, bad_png=bad_png)
         if leaf is None:
             return reason or "unknown"
         # Persist the stamp only when it is final. A stored stamp wins forever (first write wins on
@@ -1076,6 +1284,38 @@ class SceneWorker:
         if not known:
             self.stats.default_r_d += 1
         return leaf
+
+    def _would_fetch(self, node: Mapping[str, Any]) -> Optional[Tuple[str, int, str]]:
+        """(key, stored_ms, layer) when `_adapt` would fetch this node's PNG, else None."""
+        key, ms = str(node.get("_key", "")), int(node.get("costmap_stored_ms") or 0)
+        if self._buffered.get(key) == ms or key in self._pending or self._seen.get(key) == ms:
+            return None
+        layer = scene_leaf.role_layers(node.get("costmap")).get(scene_leaf.ROLE_OCCUPANCY)
+        return (key, ms, layer) if layer else None
+
+    def _prefetch(self, nodes: Sequence[Mapping[str, Any]]) -> None:
+        """Hand the PNGs of this page to the prefetch pool, in order, while its bound has room. What it
+        does not take is fetched inline by `_adapt`, exactly as without a pool."""
+        if self.prefetch is None:
+            return
+        for node in nodes:
+            want = self._would_fetch(node)
+            if want is None:
+                continue
+            key, ms, layer = want
+            if (key, ms) in self._tickets:
+                continue
+            ticket = self.prefetch.submit(self.fetch_png, self.map_id, key, layer)
+            if ticket is None:
+                break
+            self._tickets[(key, ms)] = ticket
+
+    def _drop_tickets(self) -> None:
+        """Tickets the step did not consume (it stopped early): their slots go back to the pool."""
+        if self._tickets:
+            tickets, self._tickets = self._tickets, {}
+            for ticket in tickets.values():
+                ticket.release()
 
     def _fetch_recovered(self) -> None:
         """A fetch answered again: the time it was failing does not count towards a pending
@@ -1272,14 +1512,33 @@ class SceneWorker:
             # the cause, quarantine it and fold the rest
             return self._quarantine_leaves(leaves, exc, t0)
         if kind == "memory":
-            log.error("scene worker %s: fold ran out of memory (nothing changed)", self.map_id, exc_info=exc)
-            self._failed("fold", f"MemoryError: {exc}")
-            return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc!r}")
+            return self._out_of_memory(leaves, exc)
         return self._engine_fault(exc)
+
+    def _out_of_memory(self, leaves: List[Any], exc: BaseException) -> StepResult:
+        """MemoryError of a fold: nothing changed, so a backoff retries it. The SAME batch (same first leaf)
+        failing `memory_retry_limit` times in a row is not retried forever: it is bisected (smaller folds
+        need less memory) and a leaf that still runs out of memory alone is quarantined like a poison leaf."""
+        cfg = self.config
+        head = str(getattr(leaves[0], "key", "")) if leaves else ""
+        self._memory_streak = self._memory_streak + 1 if head == self._memory_head else 1
+        self._memory_head = head
+        if self._memory_streak >= max(1, cfg.memory_retry_limit) and len(leaves) > 0:
+            self._memory_head, self._memory_streak = None, 0
+            self.stats.memory_isolations += 1
+            log.error("scene worker %s: fold of %d leaves ran out of memory %d times: bisecting",
+                      self.map_id, len(leaves), cfg.memory_retry_limit, exc_info=exc)
+            self._failed("fold", f"MemoryError: {exc}")
+            return self._isolate(list(leaves), exc, bisect_memory=True)
+        log.error("scene worker %s: fold ran out of memory (nothing changed)", self.map_id, exc_info=exc)
+        self._failed("fold", f"MemoryError: {exc}")
+        return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc!r}")
 
     def _folded(self, n: int, t0: int) -> None:
         self._fold_timed(n, (self._mono() - t0) / 1000.0)
         self._fault_streak = 0
+        self._memory_head, self._memory_streak = None, 0
+        self._bytes_stale = True
         self._recovered("fold", "tiles")
         return None
 
@@ -1339,12 +1598,12 @@ class SceneWorker:
                 self._failed("tiles", "missing tiles")
                 return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail="missing tiles")
             if kind == "memory":
-                self._failed("fold", f"MemoryError: {exc}")
-                return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"fold: {exc!r}")
+                return self._out_of_memory(remaining, exc)
             if kind == "fault":
                 return self._engine_fault(exc)
 
-    def _isolate(self, leaves: List[Any], first: BaseException) -> Optional[StepResult]:
+    def _isolate(self, leaves: List[Any], first: BaseException,
+                 bisect_memory: bool = False) -> Optional[StepResult]:
         """A LeafError that names no leaf of the batch: bisect (the engine is untouched by every
         LeafError, so the halves can be retried) until the leaf that is rejected is alone; it is
         quarantined. A fault met on the way is the engine's (not a leaf's): handled as such."""
@@ -1360,7 +1619,7 @@ class SceneWorker:
             kind, exc = failure
             if kind == "tiles":
                 return "tiles"
-            if kind == "memory":
+            if kind == "memory" and not bisect_memory:
                 return "memory"
             if kind == "fault":
                 fault.append(exc)

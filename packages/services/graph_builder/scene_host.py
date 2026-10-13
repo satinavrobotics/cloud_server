@@ -141,7 +141,20 @@ def worker_config(params: Any) -> Any:
         batch_budget_s=config.SCENE_GRAPH_BATCH_BUDGET_S,
         idle_sleep_s=config.SCENE_GRAPH_IDLE_S, idle_max_s=config.SCENE_GRAPH_IDLE_MAX_S,
         lifecycle_check_s=config.SCENE_GRAPH_LIFECYCLE_CHECK_S,
+        lazy_load=config.SCENE_GRAPH_LAZY_LOAD,
+        memory_retry_limit=max(1, config.SCENE_GRAPH_MEMORY_RETRY_LIMIT),
         expected_params_hash=expected_params_hash(params))
+
+
+def runner_config(config: Any) -> Any:
+    """RunnerConfig from the SCENE_GRAPH_* settings: map cap, the step pool, the memory budget."""
+    from . import scene_runner
+    return scene_runner.RunnerConfig(
+        max_maps=config.SCENE_GRAPH_MAX_MAPS, slow_step_s=config.SCENE_GRAPH_SLOW_STEP_S,
+        threads=max(1, int(config.SCENE_GRAPH_WORKER_THREADS)),
+        max_resident=max(0, int(config.SCENE_GRAPH_MAX_RESIDENT_ENGINES)),
+        max_resident_bytes=max(0, int(config.SCENE_GRAPH_MAX_RESIDENT_BYTES)),
+        evict_idle_s=float(config.SCENE_GRAPH_EVICT_IDLE_S))
 
 
 def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> SceneWorkerHost:
@@ -158,6 +171,11 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     footprint = scene_sources.PgFootprint(scene_guard.connect_from_conninfo(conninfo or default_conninfo()))
     cursors = scene_worker.MemoryCursorStore()
     cfg = worker_config(params)
+    from packages import config as _config
+    # one bounded PNG fetch + decode pool for every map (separate from the step pool)
+    prefetch = (scene_worker.PngPrefetch(_config.SCENE_GRAPH_PREFETCH_THREADS,
+                                         _config.SCENE_GRAPH_PREFETCH_QUEUE)
+                if _config.SCENE_GRAPH_PREFETCH_THREADS > 0 else None)
     database = getattr(service, "database", None)
     sink = scene_events.make_event_sink(database, loop) if database is not None and loop is not None else None
 
@@ -175,7 +193,7 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
             now_ms=lambda: int(time.time() * 1000),
             mono_ms=lambda: int(time.monotonic() * 1000),
             publish=scene_events.make_publish(service.update_publisher, loop, map_id),
-            new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,),
+            new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,), prefetch=prefetch,
             on_event=(lambda kind, payload: sink(map_id, kind, payload)) if sink else None)
 
     switched_off: set = set()
@@ -195,11 +213,9 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     def skip_reason(map_id: str) -> Optional[str]:
         return "map_not_enabled" if map_id in switched_off else None
 
-    from packages import config as _config
     runner = scene_runner.SceneRunner(
-        list_maps, make_worker, on_event=sink, skip_reason=skip_reason,
-        config=scene_runner.RunnerConfig(max_maps=_config.SCENE_GRAPH_MAX_MAPS,
-                                         slow_step_s=_config.SCENE_GRAPH_SLOW_STEP_S))
+        list_maps, make_worker, on_event=sink, skip_reason=skip_reason, prefetch=prefetch,
+        config=runner_config(_config))
     return SceneWorkerHost(runner, guard)
 
 
