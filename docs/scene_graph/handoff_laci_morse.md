@@ -40,17 +40,17 @@ From CIMBI, 2026-10-13. Branch `feat/scene-graph-morse` (from the v2 tip 7843576
 
 ## Expected result of the database generation (reference for checking it)
 
-Regions/links at the base level from the rehearsal (real exports, batches 6/48; the partition does not depend on batching):
+Charts / links / persistence regions per map at the default radius (2 m), commit ee64736 (real exports, batches 6 and 48; the
+partition does not depend on batching). Hospital was not re-run with charts.
 
-| map | regions | links | | map | regions | links |
-|---|---|---|---|---|---|---|
-| office8 | 4 | 5 | | office04 | 7 | 4 |
-| office01 | 6 | 6 | | office5 | 1 | 0 |
-| Officemap | 5 | 6 | | office6 | 3 | 4 |
-| office03 | 5 | 3 | | office7 | 4 | 5 |
-| Hospital | 7 | 6 | | | | |
+| map | charts | links | regions | | map | charts | links | regions |
+|---|---|---|---|---|---|---|---|---|
+| office8 | 12 | 15 | 4 | | office04 | 16 | 15 | 7 |
+| office01 | 15 | 16 | 6 | | office5 | 5 | 5 | 1 |
+| Officemap | 14 | 15 | 5 | | office6 | 14 | 17 | 3 |
+| office03 | 8 | 6 | 5 | | office7 | 14 | 17 | 4 |
 
-(office5 shows 1 region after the driven-unknown rule e3aef5a; it had 2 before.)
+(Links include the links between charts of one region. Anchors are chart centres.)
 
 Generation order: office8 needs the `costmap_stored_ms` backfill first (your tool, dry run by default; the 7 old maps got the field when
 `occupancy_depth` was written); enable the worker per map via `status.scene_graph_enabled` (absent = enabled once the worker flag is on);
