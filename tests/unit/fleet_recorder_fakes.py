@@ -91,7 +91,7 @@ class FakeDB:
             row = dict(zip(("run_id", "mission_name", "robot_name", "site_id", "map_id",
                             "sw_version", "recording_level", "state", "abort_cause",
                             "abort_detail", "passes_completed", "created_by", "mission_tree",
-                            "started_at", "ended_at"), params))
+                            "started_at", "ended_at", "level_override"), params))
             assert isinstance(row["run_id"], uuid.UUID)
             assert row["recording_level"] in ("full", "track", "events_only", "off")
             assert (row["state"] == "RUNNING") == (row["ended_at"] is None)
@@ -136,7 +136,16 @@ class FakeDB:
             level, run_id = params
             assert level in ("full", "track", "events_only", "off")
             self.runs[run_id]["recording_level"] = level
+            self.runs[run_id]["level_override"] = True
             cursor.rowcount = 1
+        elif sql == fr.MARK_LEVEL_SQL:
+            mark, run_id, _same = params
+            row = self.runs.get(run_id)
+            if row is not None and row["state"] == "RUNNING":
+                marks = row.setdefault("level_marks", [])
+                if json.loads(mark)[0] not in marks:
+                    marks.extend(json.loads(mark))
+                    cursor.rowcount = 1
         elif sql == fr.TRAJECTORY_SQL:
             run_id, mission, robot, start, end, grace = params
             for row in self.trajectory:

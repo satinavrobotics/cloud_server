@@ -1,6 +1,6 @@
 # Tracking, recording levels and statistics: redesign (2026-10-13)
 
-Status: **design, nothing implemented.** Decisions below were taken with the user on 2026-10-13. Facts about the current
+Status: **design; stage 1 implemented on a branch (not deployed, see "Stage 1 status").** Decisions below were taken with the user on 2026-10-13. Facts about the current
 state come from a read-only survey of `main` (dedfd54) and the scene-graph docs on `feat/scene-graph-v2`
 (`docs/scene_graph/integration.md`, `planner_upgrade.md` section 13). Re-check a cited line before relying on it.
 
@@ -63,6 +63,23 @@ Three tiers, no mixing:
 3. **Retire leaf statistics** (D4): stop the mapping writer, route `/edge-stats` deprecated, then removed; migration to
    drop `edge_observations` after one release; client Stats tabs move to link statistics.
 4. **Cleanup**: one speed/time module, retention (track 90 days; `run_legs` policy), duplicate constants, orphan rows.
+
+## Stage 1 status (implemented, not deployed)
+
+* Migration `20261013_01_track_map_frame`: `robot_track_ts` gains nullable `x_map`, `y_map`, `theta_map`,
+  `map_session_id`, `run_epoch`; `mission_runs` gains `level_override` (bool, default false) and
+  `level_marks` (jsonb). Verified on TimescaleDB 2.30.1 with a compressed chunk
+  (`tests/integration/test_track_map_frame_postgres.py`, opt-in `TRACK_TEST_DSN`).
+* Recorder: `MapFrame` cached per robot (`FleetRecorder.set_frame` / `invalidate_frame`); dispatch
+  refreshes it from the frame check's 5 s session cache (`Robot._refresh_recorder_frame`) only while a
+  mission runs and the track is recorded, and drops it on run change / frame change / pending header drop.
+  Session and run epoch are on the row, not on `mission_runs`: a run can be re-placed or change session.
+* Reader: `/track` prefers the stored map pose, falls back to `track_transform` only for rows without it,
+  and returns `recorded`, `recording_level`, `level_marks` (and `unplaced_points`).
+* Markers: dispatch appends `{ts, level}` to `mission_runs.level_marks` when a run's effective level
+  changes; `level_segments` applies `level_override` to every segment. No new event code or table.
+* `TRAJECTORY_GRACE` now derives from `config.RECORDER_TRAJECTORY_GRACE_S` in both places.
+* Not done (as scoped): `track_transform` removal (old rows), transits, anything scene-graph.
 
 ## Client consequences
 

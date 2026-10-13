@@ -30,8 +30,11 @@ DIAGNOSTICS_COLUMNS: Tuple[str, ...] = (
     "gnss_fix", "gnss_sats", "gnss_h_acc_m", "gnss_corr_age_s",
 )
 # Run frame x, y, theta as the robot reports them; speed = |(vx, vy)|, omega in rad/s.
+# x_map, y_map, theta_map: the same pose in the open session's map frame, converted at record
+# time (NULL while the robot is not placed), with the session and run epoch that did it.
 TRACK_COLUMNS: Tuple[str, ...] = (
     "ts", "robot_name", "run_id", "leg_seq", "x", "y", "theta", "speed", "omega", "map_id",
+    "x_map", "y_map", "theta_map", "map_session_id", "run_epoch",
 )
 TIMESERIES_COLUMNS: Dict[str, Tuple[str, ...]] = {
     ROBOT_STATE_TABLE: ROBOT_STATE_COLUMNS,

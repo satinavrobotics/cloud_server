@@ -633,17 +633,41 @@ span). The track endpoint reads `robot_track_ts` live: whatever rows exist for t
 whatever level the run recorded at. `not_recorded` in the run timeline lists
 `track` as missing at `events_only` and `off`.
 
-**`GET /api/v1/runs/{run_id}/track`** -- `{"run_id", "robot_name", "map_id", "frame", "downsampled",
-"points": [{ts, x, y, theta, speed, omega, leg_seq}]}`, oldest first. `speed` is `|(vx, vy)|` in
-m/s, `omega` rad/s, `leg_seq` the `run_legs.seq` of the leg in progress (`null` between legs).
-`frame` is `"map"` when exactly one placed session of the robot on the run's map (`map_id`) spans
-the whole run and its placement (`placement.at` / `unplaced_at`) did not change after the run
-started: x, y and theta are then converted with that session's current `map_T_session`, the frame
-of the legs and `planned_path` (a null theta stays null). Otherwise (no or unplaced session,
-several sessions, placement changed or session opened/closed inside the run) `frame` is `"run"`:
-the robot's own frame, not drawable on the map, never a partly shifted track.
-`points` is empty when nothing was recorded; more than `FLEET_TRACK_MAX_POINTS` (20000) points are
-thinned by the query to every k-th row plus the last (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
+**`GET /api/v1/runs/{run_id}/track`** -- `{"run_id", "robot_name", "map_id", "frame", "recorded",
+"recording_level", "level_marks", "downsampled", "points": [{ts, x, y, theta, speed, omega,
+leg_seq}]}` (+ `"unplaced_points"` when some were left out, below), oldest first. `speed` is
+`|(vx, vy)|` in m/s, `omega` rad/s, `leg_seq` the `run_legs.seq` of the leg in progress (`null`
+between legs).
+
+*Frame.* Since tracking-redesign stage 1 (`docs/tracking_redesign_2026-10-13.md`, D2) mission-dispatch
+converts the pose **at record time**: while the robot's open map session is placed (`aligned`) on the
+run's map, the row also stores `x_map`, `y_map`, `theta_map` (through the session's `map_T_session`,
+which is valid for the robot's current run: the dispatcher unplaces the session at every run change),
+plus `map_session_id` and `run_epoch` (provenance). They are NULL while the robot is not placed (and
+for every row recorded before the change). `frame` is `"map"` when the points are in the map frame:
+the stored pose is used for every row that has it. A run with no stored map pose at all falls back to
+the old guess: `"map"` only when exactly one placed session of the robot on the run's map spans the
+whole run and its placement (`placement.at` / `unplaced_at`) did not change after the run started
+(x, y, theta converted with that session's *current* `map_T_session`), else `"run"` (the robot's own
+frame, not drawable on the map, never a partly shifted track). A run with both kinds of row (placed
+part-way) returns the points it can place in the map frame (stored, or converted by the fallback) and
+counts the rest in `unplaced_points`. The recorder reads its transform from a cache refreshed about
+every 5 s and dropped at a run change or confirmed frame change, so a placement changed through the API
+reaches the rows within ~5 s, and at most one row after a run change is detected may carry the old
+transform. A null theta stays null.
+
+*Recorded or not.* `recorded` is `false` when the run's level never stored a track (its
+`recording_level` at start and every `level_marks` entry are `events_only`/`off`): the empty `points`
+then mean "not recorded", not "the robot did not move". It is `true` when rows exist or some level of
+the run stores the track. `recording_level` is the level the run started at; `level_marks` is
+`[{ts, level}]`, written by dispatch (`mission_runs.level_marks`) each time the level the run records at
+changes while it is open (a robot / site / global change; a mission level or one-off raise holds for the
+whole run and writes none), so a stretch of the run without track rows can be told from a robot that
+stood still. The timeline's `recording.segments` apply such a run-level override (`mission_runs.
+level_override`) to every segment (`source: "run"`), not only the first.
+
+More than `FLEET_TRACK_MAX_POINTS` (20000) points are thinned by the query to every k-th row plus the
+last (`downsampled`). 404 for an unknown run. `debug` is not a level yet.
 
 #### Recording level per mission and a one-off raise for the next run
 

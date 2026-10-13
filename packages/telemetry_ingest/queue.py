@@ -346,6 +346,9 @@ class IngestQueue:
         values["ts"] = ids.normalize_ts(values["ts"])
         if values.get("run_id") is not None:
             values["run_id"] = uuid.UUID(str(values["run_id"]))
+        for key in ("map_session_id", "run_epoch"):   # robot_track_ts
+            if values.get(key) is not None:
+                values[key] = uuid.UUID(str(values[key]))
         try:
             self._queue.put_nowait((table, tuple(values.get(c) for c in columns)))
         except asyncio.QueueFull:

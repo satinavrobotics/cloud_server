@@ -456,10 +456,11 @@ class TestDecode:
         assert fr.decode_change(t(1), uuid.uuid4(), None, {"scope": "nope"}) is None
 
 
-def segments(start, end, run_level, rows, assignments=(), robot=None, sites=None, glob=None):
+def segments(start, end, run_level, rows, assignments=(), robot=None, sites=None, glob=None,
+             override=False):
     changes = decode_all(rows, [a[0] for a in assignments])
     return fr.level_segments(start, end, run_level, changes, list(assignments), robot,
-                             sites or {}, glob)
+                             sites or {}, glob, override)
 
 
 def brief(segs):
@@ -467,6 +468,24 @@ def brief(segs):
 
 
 class TestLevelHistory:
+    def test_a_run_override_holds_beyond_the_first_segment(self):
+        rows = [changed_row(t(2), "robot", "r1", None, "off", "r1"),
+                changed_row(t(6), "robot", "r1", "off", "events_only", "r1")]
+        plain = segments(t(0), t(10), "track", rows, glob="full")
+        assert brief(plain) == [(t(0), t(2), "track", "run"), (t(2), t(6), "off", "robot"),
+                                (t(6), t(10), "events_only", "robot")]
+        pinned = segments(t(0), t(10), "track", rows, glob="full", override=True)
+        assert {s["level"] for s in pinned} == {"track"}
+        assert {s["source"] for s in pinned} == {"run"}
+        assert pinned[0]["from"] == t(0) and pinned[-1]["to"] == t(10)
+        assert fr.not_recorded(pinned) == [{"from": t(0), "to": t(10), "level": "track",
+                                            "missing": ["time_series"]}]
+
+    def test_an_override_equal_to_the_configured_level_changes_nothing_until_it_changes(self):
+        rows = [changed_row(t(4), "robot", "r1", None, "off", "r1")]
+        segs = segments(t(0), t(10), "full", rows, glob="full", override=True)
+        assert {s["level"] for s in segs} == {"full"}
+
     def test_no_changes_ever(self):
         segs = segments(t(0), t(10), "events_only", [])
         assert brief(segs) == [(t(0), t(10), "events_only", "default")]

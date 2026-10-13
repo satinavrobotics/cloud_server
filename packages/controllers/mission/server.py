@@ -2301,6 +2301,8 @@ class Robot:
         session is re-placed by the next datum (_replace_geo_session). Never raises."""
         now = datetime.datetime.now(datetime.timezone.utc)
         self.info(f"New robot run ({evidence}): unplacing its open map session")
+        self._frame_session_cache = None
+        self._record("invalidate_frame", self._name)   # no map pose from the old transform
         # A robot that restarted never got what we sent: fresh resend budgets.
         self._reset_resend_budgets()
         patch = {"unplaced_reason": map_sessions.UNPLACED_RUN_CHANGED,
@@ -2569,6 +2571,29 @@ class Robot:
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Frame check failed: {err!r}")
 
+    async def _refresh_recorder_frame(self) -> None:
+        """Tell the fleet recorder which map frame the robot's track rows are converted with
+        (robot_track_ts.x_map...): its open session when that is placed, else none. Only while
+        a mission runs and the recorder records the track; the session is read at most every
+        FRAME_SESSION_TTL_S (the frame check's own cache), so the 1 Hz rows never read the
+        database. While a run change is pending confirmation (a state header id dropped) the
+        frame is withheld: the messages in between are already in the new run's frame. Never
+        raises."""
+        try:
+            recorder = getattr(self._robot_server, "fleet_recorder", None)
+            if recorder is None or self._current_mission is None or \
+                    not recorder.track_wanted(self._name):
+                return
+            if self._run_detector.pending_state_drop is not None:
+                self._frame_session_cache = None
+                self._record("invalidate_frame", self._name)
+                return
+            session = await self._frame_session(time.monotonic())
+            self._record("set_frame", self._name,
+                         fleet_recorder.map_frame_of(session, self._run_epoch))
+        except Exception as err:  # pylint: disable=broad-except
+            self.debug(f"Recorder frame not refreshed: {err!r}")
+
     async def _frame_session(self, now: float) -> Any:
         """The open session for the frame check, read at most every FRAME_SESSION_TTL_S."""
         cached = self._frame_session_cache
@@ -2585,6 +2610,7 @@ class Robot:
         """Unplace the open session after a confirmed frame mismatch (see _check_frame). It is
         read again first: the session may have changed or been placed again meanwhile."""
         self._frame_session_cache = None
+        self._record("invalidate_frame", self._name)
         session = await self._read_open_session()
         if not isinstance(session, dict) or await map_sessions.confirmed_verdict(
                 session, map_id, initialized,
@@ -4586,6 +4612,7 @@ class Robot:
         the recorded robot state and run are the ones this message led to. Events the
         dispatcher raises meanwhile carry the message's timestamp."""
         self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
+        await self._refresh_recorder_frame()   # never raises
         # Legs first: the state that reaches a mission's last node also completes the mission.
         self._record("on_leg_state", self._name, message, self._current_mission,
                      self._robot_object)
