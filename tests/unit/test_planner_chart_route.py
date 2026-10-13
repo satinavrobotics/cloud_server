@@ -44,9 +44,10 @@ class FakeGraph:
             return Snap(None, px, py, d)
         return Snap("c0", px, py, d, self.crosses and x > 10.0)
 
-    def route(self, a, b, blocked=None):
+    def route(self, a, b, blocked=None, start=None, goal=None):
         self.routes += 1
         self.blocked_seen = blocked
+        self.endpoints_seen = (start, goal)
         if self.route_error:
             raise self.route_error
         if self.unreachable or (self.only_free and blocked is not None):
@@ -141,6 +142,9 @@ async def test_success_returns_pose_waypoints_with_distinct_leaf_ids(on):
     assert out["min_width"] == 0.8 and out["chart_keys"] == ["c0", "c1"]
     assert out["goal"] == {"x": 10.0, "y": 0.0, "map_id": "m", "node_id": out["path"][-1]}
     assert graph.blocked_seen is None                      # no blocked rows: no overlay
+    # point to point: the planner hands the snapped start and goal cells to the engine
+    start, goal = graph.endpoints_seen
+    assert start == (pytest.approx(0.05), pytest.approx(0.05)) and goal is not None
     svc.graph_db.shortest_path.assert_not_called()
 
 
