@@ -121,7 +121,7 @@ Stale, to be corrected (not rewritten here):
 ## 8. How to resume (new person)
 
 1. Read section 1 and `formulation.md`. The statements marked EXACT are the ones to rely on; TESTED and HEURISTIC are not.
-2. Run the unit suites: `tests/unit/scene_graph` (host, 197 passed) and `scripts/run_unit_tests_pinned.sh tests/unit -m unit` (the
+2. Run the unit suites: `tests/unit/scene_graph` (host, 202 passed, 3 skipped at `7655b10`; re-count on the branch) and `scripts/run_unit_tests_pinned.sh tests/unit -m unit` (the
    production pins; scipy must be in the image).
 3. E2E on the throw-away stack: `tools/scene_graph_e2e/run.sh` (needs docker and the pinned venv).
 4. Read-only prod check: `docker exec <graph-builder> python -m tools.scene_graph_check_generation --all --expect tools/scene_graph_expected.json`.
