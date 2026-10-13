@@ -97,3 +97,13 @@ async def test_legacy_fallback_reports_why_nothing_is_skippable(on):
     out = await _plan(svc)
     assert out["planner"] == "legacy"
     assert out["node_policy"] == {"total": 0, "skippable": 0, "unavailable": "legacy_planner"}
+
+
+@pytest.mark.unit
+async def test_enrich_keeps_planned_waypoints_when_it_may_not_replan_them(on):
+    from cloud_common.objects import common
+    svc = _service(FakeStore(FakeGraph()))
+    wps = _wps(1.0, 6.0)
+    kept = common.Pose2D(x=3.0, y=0.0, map_id="m", origin="planned", skippable=True)
+    out = await svc.enrich_route("r1", "m", [wps[0], kept, wps[1]], insert_planned=False)
+    assert [w.x for w in out["waypoints"]] == [1.0, 3.0, 6.0]

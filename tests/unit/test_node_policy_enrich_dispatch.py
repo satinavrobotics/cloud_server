@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import cloud_common.objects as api_objects
+from cloud_common.objects import mission as mission_object
 from packages.controllers.mission import order_policy
 from tests.unit.test_mission_goto import _make_robot, _orders
 
@@ -135,3 +136,44 @@ async def test_a_started_mission_is_never_enriched_again():
     await r._enrich_routes()                              # start_timestamp is set now
     planner.enrich_route.assert_not_awaited()
     r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_a_mission_with_a_persisted_run_id_is_not_enriched():
+    # start_timestamp is persisted lazily; the run id goes out before the first order.
+    planner = SimpleNamespace(enrich_route=AsyncMock())
+    r, _ = _make_robot(planner)
+    m = _mission([_wp(0.0), _wp(10.0)])
+    m.status.run_id = "run-1"
+    r._current_mission = m
+    await r._enrich_routes()
+    planner.enrich_route.assert_not_awaited()
+
+
+@pytest.mark.unit
+async def test_a_failing_planner_is_asked_once_not_once_per_route_node():
+    planner = SimpleNamespace(enrich_route=AsyncMock(side_effect=TimeoutError("slow")))
+    r, _ = _make_robot(planner)
+    m = _mission([_wp(0.0), _wp(10.0)])
+    m.mission_tree.append(mission_object.MissionNodeV1(
+        name="b", parent="root", route={"waypoints": [_wp(0.0), _wp(4.0)]}))
+    r._current_mission = m
+    await r._enrich_routes()
+    assert planner.enrich_route.await_count == 1
+
+
+@pytest.mark.unit
+async def test_a_route_edited_during_the_planner_call_is_not_overwritten():
+    r, db = _make_robot(None)
+    m = _mission([_wp(0.0), _wp(10.0)])
+    edited = mission_object.MissionRouteNodeV1(waypoints=[_wp(0.0), _wp(20.0)])
+
+    async def enrich(*_a, **_k):
+        m.mission_tree[0].route = edited          # the operator's PUT landed meanwhile
+        return _enriched(_wp(0.0), _wp(5.0, origin="planned"), _wp(10.0))
+
+    r._robot_server.mission_planner = SimpleNamespace(enrich_route=enrich)
+    r._current_mission = m
+    await r._enrich_routes()
+    assert m.mission_tree[0].route is edited and m.route_rev == 0
+    db.update_spec_fields.assert_not_awaited()
