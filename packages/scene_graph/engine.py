@@ -479,7 +479,8 @@ class ChartGraph(SceneGraph):
         return self._cache_disc[thr]
 
     def _evidence(self, shape: Tuple[int, int], shift: Tuple[int, int]):
-        """G (reachability), W (proven for this robot), S (body covered) images from the driven polylines.  Full: the distance transform of each
+        """G (reachability), W (proven for this robot), S (body covered) images from the driven polylines, and P: W of the leaf POSES alone
+        (a pose is a measured position, the chord between two poses is an interpolation; P is where an unknown cell is proven free).  Full: the distance transform of each
         robot's polyline raster.  Incremental: leaves only appended to their sessions in capture order add cells to the rasters, and each added
         cell adds exactly its disc to G, W and S (a union of discs is what thresholding the transform of a raster is)."""
         r, h = self.params.robot_half_side, self._h
@@ -496,7 +497,7 @@ class ChartGraph(SceneGraph):
                 else:
                     def pad(a):
                         b = np.zeros(shape, bool); b[sy:sy + oH, sx:sx + oW] = a; return b
-                    st = dict(shape=shape, G=pad(st["G"]), W=pad(st["W"]), S=pad(st["S"]),
+                    st = dict(shape=shape, G=pad(st["G"]), W=pad(st["W"]), S=pad(st["S"]), P=pad(st["P"]),
                               last={k: (t, key, x + sx, y + sy, d) for k, (t, key, x, y, d) in st["last"].items()})
         if st is not None and not full:
             by_s: Dict[str, list] = {}
@@ -509,14 +510,20 @@ class ChartGraph(SceneGraph):
                 lt = st["last"].get(sess)
                 if lt is not None and (items[0][0], items[0][1]) <= (lt[0], lt[1]): ok = False; break
             if ok:
-                G, Wm, S = st["G"], st["W"], st["S"]
+                G, Wm, S, Pm = st["G"], st["W"], st["S"], st["P"]
                 last = dict(st["last"])
                 for sess, items in by_s.items():
                     for t, k, r_ in items:
                         gx, gy = int(math.floor(r_.x / RES)), int(math.floor(r_.y / RES))
                         x, y, d = (gx - self._cx0) // 2, (gy - self._cy0) // 2, round(r_.r_d, 4)
                         cells = []
-                        if 0 <= y < H and 0 <= x < Wd: cells.append((np.array([y]), np.array([x])))
+                        if 0 <= y < H and 0 <= x < Wd:
+                            cells.append((np.array([y]), np.array([x])))
+                            if d >= r - 1e-9:                      # the pose alone: W of a point
+                                se = self._disc((d - r + h) + 1e-9); R = se.shape[0] // 2
+                                y0, y1, x0, x1 = max(0, y - R), min(H, y + R + 1), max(0, x - R), min(Wd, x + R + 1)
+                                crop = np.zeros((y1 - y0, x1 - x0), bool); crop[y - y0, x - x0] = True
+                                Pm[y0:y1, x0:x1] |= ndimage.binary_dilation(crop, structure=se)
                         lt = last.get(sess)
                         if lt is not None and lt[4] == d:
                             rr, cc = _line(lt[3], lt[2], y, x)
@@ -530,10 +537,16 @@ class ChartGraph(SceneGraph):
                             y0, y1, x0, x1 = max(0, ry.min() - R), min(H, ry.max() + R + 1), max(0, rx.min() - R), min(Wd, rx.max() + R + 1)
                             crop = np.zeros((y1 - y0, x1 - x0), bool); crop[ry - y0, rx - x0] = True
                             tgt[y0:y1, x0:x1] |= ndimage.binary_dilation(crop, structure=se)
-                self._pl = dict(shape=shape, G=G, W=Wm, S=S, last=last)
-                return G, Wm, S
+                self._pl = dict(shape=shape, G=G, W=Wm, S=S, P=Pm, last=last)
+                return G, Wm, S, Pm
         # full rebuild
-        G = np.zeros(shape, bool); Wm = np.zeros_like(G); S = np.zeros_like(G)
+        G = np.zeros(shape, bool); Wm = np.zeros_like(G); S = np.zeros_like(G); Pm = np.zeros_like(G)
+        poses: Dict[float, np.ndarray] = {}
+        for rec in self._leaves.values():
+            y, x = (int(math.floor(rec.y / RES)) - self._cy0) // 2, (int(math.floor(rec.x / RES)) - self._cx0) // 2
+            if 0 <= y < H and 0 <= x < Wd: poses.setdefault(round(rec.r_d, 4), np.zeros(shape, bool))[y, x] = True
+        for d, pr in poses.items():
+            if d >= r - 1e-9: Pm |= ndimage.distance_transform_edt(~pr) * h <= (d - r + h) + 1e-9
         for d, raster in self._polylines().items():
             dist = ndimage.distance_transform_edt(~raster) * h
             G |= dist <= h + 1e-9; S |= dist <= d + 1e-9
@@ -544,8 +557,8 @@ class ChartGraph(SceneGraph):
             cur = last.get(rec.session)
             if cur is None or (rec.t, k) > (cur[0], cur[1]):
                 last[rec.session] = (rec.t, k, (gx - self._cx0) // 2, (gy - self._cy0) // 2, round(rec.r_d, 4))
-        self._pl = dict(shape=shape, G=G, W=Wm, S=S, last=last)
-        return G, Wm, S
+        self._pl = dict(shape=shape, G=G, W=Wm, S=S, P=Pm, last=last)
+        return G, Wm, S, Pm
 
     def _build_F(self, shift: Tuple[int, int] = (0, 0)):
         """(F, clr, S): the navigable lattice cells, the physical clearance of every lattice cell (distance to the nearest
@@ -555,8 +568,10 @@ class ChartGraph(SceneGraph):
         sq = self._erode(free, shift)
         clr = self._clearance_cells(free, shift) * RES
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
-        G, W, S = self._evidence(sq_h.shape, shift)
-        cand = sq_h | (W & fr_h)
+        G, W, S, P = self._evidence(sq_h.shape, shift)
+        # the body stood at a leaf pose: the cells W proves there are free even where the window is unknown (a camera blind spot
+        # under the robot); a REPORTED blocked cell stays blocked. Along the chord between two poses only known-free cells count.
+        cand = sq_h | (W & fr_h) | (P & (V == 255)[::LAT, ::LAT])
         lab, _ = ndimage.label(cand, structure=np.ones((3, 3)))
         g = G & cand
         keep = np.isin(lab, np.unique(lab[g])) & cand if g.any() else np.zeros_like(cand)
