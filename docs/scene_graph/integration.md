@@ -104,6 +104,16 @@ Dropped: "link cost from observation" (edge observations accrue per leaf edge; r
   the contract (supersedes this section where they differ).
 * New response fields (additive, optional): `min_width`, `chart_keys` of the route.
 
+### Route cost and ties (engine, since 88e5651)
+
+* `Route.cost` is the integer path cost: each lattice edge costs `ceil(length / 1e-4 m)` (at least 1), so costs are exact and
+  comparable across readers. `Route.length` stays the geometric length of the chosen path.
+* Among equal-cost paths the route is the lexicographic minimum of its (y, x) cell sequence (the rule is on cells, not on chart
+  keys, which carry history-dependent lineage). Every reader of the same cells returns the same route; a second reader can be
+  tested for exact equality of cells, not only of length.
+* Planner note: with `start=`/`goal=` the route runs cell to cell; without them it runs anchor to anchor. Pricing (`Route.cost`
+  with multipliers) is not built; the cost today is pure length.
+
 ### Planner wiring (`plan_route`, `SCENE_GRAPH_PLANNER_ENABLED`, default off)
 
 `MissionPlannerService.plan_route` tries the chart graph first when the flag is on and otherwise runs the legacy
