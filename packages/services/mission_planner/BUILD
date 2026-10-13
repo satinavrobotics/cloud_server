@@ -22,7 +22,7 @@ load("//bzl:python.bzl", "mission_dispatch_py_binary", "mission_dispatch_py_libr
 # Mission Planner Service (business logic)
 mission_dispatch_py_library(
     name = "server",
-    srcs = ["server.py", "scene_route.py"],
+    srcs = ["server.py", "scene_route.py", "lazy_plan.py"],
     deps = [
         "//packages/topomap_dbs/graph_db:client",
         "//packages/database:client",
