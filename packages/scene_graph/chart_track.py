@@ -124,12 +124,12 @@ class Track:
         s.anchors = [(int(sp.ys[a]), int(sp.xs[a])) for a in A]
         s.own_img = -np.ones(nav.shape, np.int32); s.own_img[sp.ys, sp.xs] = own
         s.rnd_img = np.full(nav.shape, L.BIG, np.int32); s.rnd_img[sp.ys, sp.xs] = rnd
-        new_rows = sp.export_rows()
         s.tried = {}
         for a, (us, rd) in tried.items():
             if a in A and len(us) and all(u < N for u in us):
                 s.tried[(int(sp.ys[a]), int(sp.xs[a]))] = ({(int(sp.ys[u]), int(sp.xs[u])) for u in us}, np.sort(sp.flat[rd[rd < N]]))
         wanted = set(s.anchors).union(*[v[0] for v in s.tried.values()]) if s.tried else set(s.anchors)
+        new_rows = sp.export_rows(wanted)
         kept_rows = {key: im for key, im in s.img_rows.items() if key in wanted and key not in new_rows}
         kept_rows.update({k_: v_ for k_, v_ in new_rows.items() if k_ in wanted})
         s.img_rows = kept_rows
@@ -162,5 +162,5 @@ class Track:
         s.own_img = -np.ones(nav.shape, np.int32); s.own_img[sp.ys, sp.xs] = own
         s.rnd_img = np.full(nav.shape, L.BIG, np.int32); s.rnd_img[sp.ys, sp.xs] = rnd
         keep = set(s.anchors)
-        s.img_rows = {k: v for k, v in sp.export_rows().items() if k in keep}
+        s.img_rows = sp.export_rows(keep)
         return sp, A, own, rnd, sp.flat[bad]

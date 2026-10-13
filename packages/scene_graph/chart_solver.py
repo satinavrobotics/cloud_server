@@ -264,12 +264,14 @@ class Local:
         s.rows[a] = r_
         return r_
 
-    def export_rows(s):
-        """rows used in this frame, in image positions (for the next frame)"""
+    def export_rows(s, keep=None):
+        """rows used in this frame, in image positions (for the next frame); `keep` = the anchor cells whose image will be kept
+        (a row nobody will read is not converted: the conversion copies three tables per row, int64)"""
         out = {}
         f = np.append(s.flat, -1)
         for a, r_ in s.rows.items():
             key = (int(s.ys[a]), int(s.xs[a]))
+            if keep is not None and key not in keep: continue
             out[key] = r_.im if r_.im is not None else dict(T=s.flat[r_.T], SEG=f[r_.SEG], P=f[r_.P], Q=f[r_.Q], rect=r_.rect, dep=r_.dep)
         return out
 
@@ -701,6 +703,11 @@ class Local:
             for k, (uk, rk) in list(tried.items()):
                 if k not in A or k in pending: continue
                 if (uk & gone_or_new) or chg[rk].any(): pending.add(k); tried.pop(k, None)
+            # a row is a pure function of F and its anchor cell: only the rows of the anchors and of the anchors the surviving memos
+            # used can be asked for again or exported (`wanted` in Track.step), the rest is rebuilt on demand
+            keep_rows = set(A)
+            for uk, _ in tried.values(): keep_rows |= uk
+            for a_ in [a_ for a_ in s.rows if a_ not in keep_rows]: del s.rows[a_]
             for ak in A:                                   # anchors without a trial since their own sight changed
                 if ak not in tried and ak not in pending: pending.add(ak)
         return A, own, rnd, tried
