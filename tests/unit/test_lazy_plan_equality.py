@@ -2,10 +2,9 @@
 on the five test worlds, for seeded anchor-to-anchor pairs, random point pairs and pairs whose points straddle a
 tile boundary (tiles are 64 lattice cells = 6.4 m), without an overlay and with a blocked disc / a blocked segment.
 
-Compared: Route.length (always), the chart-key sequence and the cells (`nodes`), and reachability (lazy None iff the
-engine's is None). Under an overlay the engine searches the whole graph, the lazy reader a subset, and scipy's tie order
-among EQUAL-length routes may differ; the sequence / cell checks there are xfail until the canonical integer tie rule
-(lexicographic minimum of the cell-key sequence) lands in the engine. Length equality is never xfail."""
+Compared: Route.length, Route.cost, the chart-key sequence and the cells (`nodes`), and reachability (lazy None iff the
+engine's is None). Both planners use the canonical rule (minimal integer cost, then lexicographic minimum (y, x) cell
+sequence), so equal-length routes are identical, with or without an overlay."""
 import math
 import random
 
@@ -34,9 +33,6 @@ def _shifted(fn):
 
 
 ALL = {**{n: f for n, f in WORLDS.items()}, **{n + "+shift": _shifted(f) for n, f in WORLDS.items() if n != "grid"}}
-XFAIL_TIE = pytest.mark.xfail(
-    strict=False,
-    reason="awaiting canonical integer tie rule (CIMBI), see docs/scene_graph/planner_findings_2026-10-13.md")
 
 
 def _extent(eng):
@@ -179,7 +175,6 @@ def test_overlay_length_and_reachability_equal(cases, ov):
         _check_length(r)
 
 
-@XFAIL_TIE
 @pytest.mark.parametrize("ov", ["disc", "segment"])
 def test_overlay_chart_sequence_equal(cases, ov):
     for r in _sel(cases[1], (ov,)):
@@ -187,7 +182,6 @@ def test_overlay_chart_sequence_equal(cases, ov):
         _check_seq(r)
 
 
-@XFAIL_TIE
 @pytest.mark.parametrize("ov", ["disc", "segment"])
 def test_overlay_cells_equal(cases, ov):
     for r in _sel(cases[1], (ov,)):

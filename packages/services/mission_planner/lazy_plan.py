@@ -38,6 +38,7 @@ from scipy.sparse.csgraph import dijkstra
 
 from packages.scene_graph.api import Blocked, Route, Snap
 
+ROUTE_UNIT_M = 1e-4              # route cost unit (packages/scene_graph/engine.py)
 RES = 0.05                      # costmap cell; the lattice is 2 x RES (store.py)
 TILE_L = 64                     # lattice cells per tile side (store.py)
 _OFF = 1 << 20                  # linear cell keys: (y + _OFF) * _KW + (x + _OFF), neighbours never wrap
@@ -355,7 +356,9 @@ class PlanGraph:
                 o1 = at(base + dx); o2 = at(base + dy * _KW)       # (y, x+dx) and (y+dy, x): navigable in the plane
                 ok &= (o1 >= 0) & (o2 >= 0)
             a = np.nonzero(ok)[0]
-            R.append(node[mi[a]]); C.append(node[q[a]]); Ln.append(np.full(len(a), math.hypot(dy, dx) * h))
+            R.append(node[mi[a]]); C.append(node[q[a]])
+            # the engine's integer edge cost (engine.ROUTE_UNIT_M): length in units of 1e-4 m, rounded up
+            Ln.append(np.full(len(a), max(math.ceil(math.hypot(dy, dx) * h / ROUTE_UNIT_M - 1e-6), 1.0)))
         R, C, Ln = np.concatenate(R), np.concatenate(C), np.concatenate(Ln)
         nm = len(mi)
 
@@ -366,16 +369,23 @@ class PlanGraph:
         if s is None or d is None:
             return None
         g = coo_matrix((np.concatenate([Ln, Ln]), (np.concatenate([R, C]), np.concatenate([C, R]))), shape=(nm, nm)).tocsr()
-        dist, pr = dijkstra(g, directed=False, indices=s, return_predecessors=True,
-                            **({} if limit is None else {"limit": limit}))
-        if not np.isfinite(dist[d]):
+        # one Dijkstra from the goal, then the canonical walk from the start (engine.ChartGraph.route): the neighbour on a
+        # shortest path with the smallest cell index; nodes are in row-major (y, x) order, so this is the lexicographic
+        # minimum of the (y, x) sequence among the minimal-cost paths.
+        dist = dijkstra(g, directed=False, indices=d,
+                        **({} if limit is None else {"limit": limit / ROUTE_UNIT_M + 1.0}))
+        if not np.isfinite(dist[s]):
             return None
-        path = [d]
-        while path[-1] != s:
-            path.append(int(pr[path[-1]]))
-        path = path[::-1]
-        rows = mi[np.array(path)]
-        return float(dist[d]), np.stack([ch[rows], ys[rows], xs[rows]], 1), len(tiles)
+        path = [s]
+        while path[-1] != d:
+            u = path[-1]
+            lo, hi = g.indptr[u], g.indptr[u + 1]
+            nb = g.indices[lo:hi]
+            path.append(int(nb[(g.data[lo:hi] + dist[nb]) == dist[u]].min()))
+        pa = np.array(path)
+        rows = mi[pa]
+        length = float(np.hypot(np.diff(ys[rows]), np.diff(xs[rows])).sum() * h)
+        return length, np.stack([ch[rows], ys[rows], xs[rows]], 1), len(tiles), int(dist[s])
 
     # ---- route -------------------------------------------------------------------------------
     def route(self, a: str, b: str, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
@@ -399,10 +409,11 @@ class PlanGraph:
                 # The engine searches every chart. Any route of length <= L lies in the charts whose anchors are within
                 # |a - p| + |p - b| <= L + 2 (chart radius + lattice) (a lattice step is at least the Euclidean one):
                 # search those, the answer is the engine's.
-                keep = self._ellipse(src, dst, found[0]) | self._rings(path, rings)
+                slack = 1 + ROUTE_UNIT_M / float(self.params.lattice)   # a min-cost path may be this much longer than found
+                keep = self._ellipse(src, dst, found[0] * slack) | self._rings(path, rings)
                 try:
                     # the corridor's own route (length found[0]) is in `keep`: it bounds the optimum from above
-                    found = self._search(keep, src, dst, blocked, limit=found[0] * (1 + 1e-9) + 1e-9) or found
+                    found = self._search(keep, src, dst, blocked, limit=found[0] * slack * (1 + 1e-9) + 1e-9) or found
                 except CorridorTooLarge:
                     exact = False                              # the corridor's route stands: valid, maybe longer
         if found is None:
@@ -413,14 +424,14 @@ class PlanGraph:
         self.last = dict(rings=rings, whole=whole, exact=exact, tiles=tiles)
         if found is None:
             return None
-        length, rows, _ = found
+        length, rows, _, cost = found
         charts: List[str] = []
         for j in rows[:, 0].tolist():
             kk = self.keys[j]
             if not charts or charts[-1] != kk:
                 charts.append(kk)
         nodes = [((2 * int(x) + 1) * RES, (2 * int(y) + 1) * RES) for y, x in rows[:, 1:].tolist()]
-        return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes)
+        return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes, cost=cost)
 
     def _cell_at(self, p: Optional[Tuple[float, float]], j: int) -> Optional[Tuple[int, int]]:
         """global lattice cell (y, x) containing the point when it is owned by chart j, else None (the anchor is used)"""
