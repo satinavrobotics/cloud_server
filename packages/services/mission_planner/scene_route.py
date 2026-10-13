@@ -292,7 +292,9 @@ class GraphCache:
                  versions_per_map: int = 2, backoff_base_s: Optional[float] = None,
                  backoff_max_s: Optional[float] = None, max_stale_s: float = 0.0,
                  meta_ttl_s: float = 0.0, max_bytes: int = 0, load_workers: int = 2,
-                 io_workers: int = 4):
+                 io_workers: int = 4, lazy: bool = False, lazy_kw: Optional[Dict[str, Any]] = None):
+        self._lazy = bool(lazy)                     # SCENE_GRAPH_PLANNER_MODE=lazy: PlanGraph, not store.load
+        self._lazy_kw = dict(lazy_kw or {})
         self._factory = store_factory
         self._max = max(1, int(max_entries))
         self._per_map = max(1, int(versions_per_map))
@@ -354,6 +356,9 @@ class GraphCache:
 
     def _load_serialised(self, store, map_id: str, version: int):
         with self._load_lock:
+            if self._lazy:                      # the manifest only; tiles are read per request
+                from packages.services.mission_planner.lazy_plan import open_plan
+                return open_plan(store, map_id, version, **self._lazy_kw)
             return store.load(map_id, version)
 
     async def _meta(self, store, map_id: str, timeout: Optional[float]) -> dict:
@@ -628,11 +633,16 @@ def blocked_free_los(graph: Any, overlay: Tuple[list, list]) -> Callable[[Pt, Pt
     discs, segments = overlay
     cells: Dict[Tuple[int, int], bool] = {}
 
+    cell_free = getattr(graph, "free_cell", None)        # the lazy graph answers from its owner tile, no snap
+
     def free(i: int, j: int) -> bool:
         v = cells.get((i, j))
         if v is None:
-            s = graph.snap((i + 0.5) * h, (j + 0.5) * h, 0.5 * h)
-            v = s.key is not None and s.distance <= 0.5 * h
+            if cell_free is not None:
+                v = bool(cell_free(i, j))
+            else:
+                s = graph.snap((i + 0.5) * h, (j + 0.5) * h, 0.5 * h)
+                v = s.key is not None and s.distance <= 0.5 * h
             cells[(i, j)] = v
         return v
 
@@ -700,6 +710,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     `width_margin_m`); the caller gates it by SCENE_GRAPH_WIDTH_CHECK_ENABLED. `node_of` may raise:
     that is `leaf_lookup_error`, a point with no leaf near it returns None."""
     from packages.scene_graph.api import Blocked, MissingTiles
+    from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
     problem = snap_problem(snap_a, start_snap_m)
     if problem:
@@ -715,6 +726,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                             goal=(snap_b.x, snap_b.y))
     except MissingTiles as err:
         raise ChartFallback("missing_tiles") from err
+    except CorridorTooLarge as err:
+        raise ChartFallback("corridor_too_large") from err
     if route is None or not route.nodes:
         if blocked is not None:
             # unreachable only because of the overlay? say so (the legacy planner then reports the
@@ -722,7 +735,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             try:
                 free = graph.route(snap_a.key, snap_b.key, None, start=(snap_a.x, snap_a.y),
                                    goal=(snap_b.x, snap_b.y))
-            except MissingTiles:
+            except (MissingTiles, CorridorTooLarge):
                 free = None
             if free is not None and free.nodes:
                 raise ChartFallback("blocked_by_overlay")
