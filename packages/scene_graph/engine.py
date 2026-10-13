@@ -880,8 +880,9 @@ class ChartGraph(SceneGraph):
         """Shortest lattice route in navigable space (blocked cells removed) between the anchors of charts a and b, or, when
         `start` / `goal` name a navigable cell of chart a / b, between those cells (no anchor is visited; a point outside
         navigable space, or in another chart, falls back to the anchor of its chart). A route inside one chart reads the
-        clearance at that chart's anchor as its width. Searches the chart corridor first and the whole graph if that finds nothing
-        or a longer way."""
+        clearance at that chart's anchor as its width. Searches the chart corridor (the chart path and its neighbours) and returns
+        what that finds; the whole graph only when the corridor finds nothing or an overlay is given. The corridor result is not
+        proved shortest: on 840 real pairs p90 1.00, worst 1.40 x the true shortest."""
         self._check()
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None

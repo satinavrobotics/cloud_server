@@ -78,7 +78,7 @@ identity and a display point, never a waypoint.
 | 24 | Key persistence per frame, one leaf per fold: 0.97-0.98 (office8, office7), 0.95 (office6); a corridor grown from either end 0.98 | TESTED | 95-109 frames per floor |
 | 25 | Cost with charts: 1.1-1.5 microseconds per cell per batch (hall 45k 0.069 s, ring 53k 0.059 s, field 86k 0.108 s); 2.6 microseconds on a 244k-cell field that is one region (0.63 s) | TESTED | a search per anchor inside a window of side 2 rho; unchanged regions are served from the last solve |
 | 26 | rho = 0.4 * sight_range: the sweep rho = 1.5 / 2.0 / 2.5 / 3.5 m gives 128 / 93 / 66 / 51 anchors on the 7 floors and an abstract (anchor chain) stretch p90 of 1.57-1.75 / 1.63-1.83 / 1.79-1.91 / 1.74-2.07; 2.0 matches the previous cover (102 anchors, 1.56-1.67) | HEURISTIC | one physical scale: below it the count grows as 1 / rho^2 without a better stretch |
-| 27 | A route searched point to point inside the corridor (charts on the chart path plus their neighbours) reaches the true shortest path on every partition (p90 1.00, max 1.02 with charts); through the two anchors it does not (p90 1.3 - 2.3x on the regions alone) | TESTED | 120 random pairs >= 3 m per floor |
+| 27 | A route searched point to point inside the corridor (charts on the chart path plus their neighbours) reaches the true shortest path on every partition (p90 1.00; the worst of 840 pairs 1.40, the corridor result is not proved shortest); through the two anchors it does not (p90 1.3 - 2.3x on the regions alone) | TESTED | 120 random pairs >= 3 m per floor |
 
 ## 4. What this partition is not
 
