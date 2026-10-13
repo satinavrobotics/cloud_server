@@ -1,3 +1,7 @@
+> **Superseded (2026-10-13).** The partition described below (tau / gamma watershed with chart tests) was replaced by the
+> persistence (Morse) partition: see `formulation.md` for the definition the code implements and `audit_ledger.md` for the
+> derivation record. Sections 5-8 describe the first prototype and its measurements and are kept for history only.
+
 # Scene graph: free-space places from topo-node costmaps
 
 Status: validated offline on one real map (office8) and six synthetic worlds. Nothing here touches a running
