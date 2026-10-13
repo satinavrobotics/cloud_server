@@ -121,15 +121,20 @@ class MinIOService:
     def _ensure_bucket_exists(self, map_id: str) -> bool:
         return self._ensure_map_bucket(map_id)
 
+    def _list_maps_strict(self) -> List[str]:
+        """Map IDs from the buckets that start with bucket_prefix. RAISES when MinIO cannot be asked
+        (an unanswered question is not "no maps")."""
+        prefix_len = len(self.bucket_prefix)
+        return [
+            b.name[prefix_len:].replace("-", "_")
+            for b in self.client.list_buckets()
+            if b.name.startswith(self.bucket_prefix)
+        ]
+
     def _list_maps(self) -> List[str]:
-        """Return map IDs by scanning buckets that start with bucket_prefix."""
+        """Return map IDs by scanning buckets that start with bucket_prefix ([] on error)."""
         try:
-            prefix_len = len(self.bucket_prefix)
-            return [
-                b.name[prefix_len:].replace("-", "_")
-                for b in self.client.list_buckets()
-                if b.name.startswith(self.bucket_prefix)
-            ]
+            return self._list_maps_strict()
         except Exception as e:
             self.logger.error(f"Failed to list maps: {e}")
             return []

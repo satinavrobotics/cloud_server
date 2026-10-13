@@ -222,7 +222,9 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     def list_maps() -> list:
         """MinIO buckets that are live rows of the maps registry: a bucket alone is not a map.
         The per-map switch is read in the same discovery (one query), for `skip_reason`."""
-        maps = guard.registered_maps(service.image_db.list_maps())
+        # strict listing raises on a MinIO outage: the runner keeps its maps (unknown is not empty)
+        lister = getattr(service.image_db, "list_maps_strict", None) or service.image_db.list_maps
+        maps = guard.registered_maps(lister())
         try:
             off = guard.disabled_maps(maps)
             switched_off.clear()
