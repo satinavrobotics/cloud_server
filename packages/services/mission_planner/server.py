@@ -335,7 +335,12 @@ class MissionPlannerService:
         `node_policy.unavailable` saying why. {"waypoints", "inserted", "changed", "node_policy",
         "graph_version"?}."""
         original = [w.copy() for w in waypoints]
-        base = [w.copy() for w in waypoints if w.origin != common.WAYPOINT_ORIGIN_PLANNED]
+        # Planned waypoints are dropped to be re-planned only when this call re-plans them: with
+        # insert_planned off (a route paired with topomap ids must keep its length) or gap
+        # filling switched off they stay as they are.
+        user = [w.copy() for w in waypoints if w.origin != common.WAYPOINT_ORIGIN_PLANNED]
+        gap_fill = insert_planned and config.NODE_POLICY_GAP_FILL_ENABLED and len(user) >= 2
+        base = user if gap_fill else [w.copy() for w in waypoints]
         wants_corridor = config.NODE_POLICY_SKIP_ENABLED
         report: Dict[str, Any] = {"total": 0, "skippable": 0, "unavailable": None}
 
@@ -346,7 +351,6 @@ class MissionPlannerService:
 
         if not config.SCENE_GRAPH_PLANNER_ENABLED:
             return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
-        gap_fill = insert_planned and config.NODE_POLICY_GAP_FILL_ENABLED and len(base) >= 2
         if not gap_fill and not wants_corridor:
             return unchanged(node_policy_plan.UNAVAILABLE_DISABLED)
         loop = asyncio.get_running_loop()

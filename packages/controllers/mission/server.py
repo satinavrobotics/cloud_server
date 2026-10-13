@@ -1018,8 +1018,11 @@ class Robot:
         go-to (the planner marked its waypoints itself). Never blocks the mission: the planner
         being down or without a scene graph only logs, and the route is used as it is."""
         mission = self._current_mission
+        # `_order_may_be_on_robot`, not only start_timestamp: that one is persisted lazily, the
+        # run id before the first send, and a restart in between must not reshape a route an
+        # order was already built from.
         if mission.kind == "goto" or mission.status.start_timestamp is not None or \
-                self._robot_object is None:
+                self._order_may_be_on_robot() or self._robot_object is None:
             return
         planner = getattr(self._robot_server, "mission_planner", None)
         if planner is None:
@@ -1027,9 +1030,11 @@ class Robot:
         # A route paired with planned_path (topomap ids) must keep its length.
         insert = not mission.planned_path
         changed = False
-        for node in mission.mission_tree:
+        tree = mission.mission_tree
+        for node in list(tree):
             if node.type != mission_object.MissionNodeType.ROUTE or node.route is None:
                 continue
+            before = node.route
             waypoints = node.route.waypoints
             maps = {w.map_id for w in waypoints}
             if len(maps) != 1 or "" in maps:
@@ -1044,13 +1049,21 @@ class Robot:
                 route = mission_object.MissionRouteNodeV1(waypoints=result["waypoints"])
                 report = result.get("node_policy") or {}
                 inserted = int(result.get("inserted") or 0)
-                if result.get("changed") and route != node.route:
-                    node.route = route
-                    changed = True
             except Exception as err:  # pylint: disable=broad-except
+                # The planner being down or slow is the same for the next route node: do not
+                # wait out its timeout once per node, in the robot's message loop.
                 self.warning(f"[{mission.name}] Could not enrich route {node.name} ({err}); "
-                             "using it as it is")
+                             "using the routes as they are")
+                break
+            if mission.mission_tree is not tree or node.route is not before:
+                # An operator's edit (PUT /missions) replaced the route while the planner
+                # worked: the answer is for a route that is gone.
+                self.mission_info(f"Route {node.name} was edited while it was enriched; "
+                                  "not applying the planner's answer")
                 continue
+            if result.get("changed") and route != node.route:
+                node.route = route
+                changed = True
             self.mission_info(
                 f"Route {node.name}: {inserted} planned waypoints inserted; "
                 f"{report.get('skippable', 0)} of {report.get('total', 0)} skippable"
