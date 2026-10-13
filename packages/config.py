@@ -608,6 +608,8 @@ NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "
 # not a bound of the theory. The planner prices on the tile-lazy graph (lazy_plan.PlanGraph) with the clearance read from
 # the stored v planes; pricing is off when the margin exceeds 1 m (the clearance cap) or is within the lattice quantisation of r.
 SCENE_GRAPH_SAFETY_KAPPA = float(os.getenv("SCENE_GRAPH_SAFETY_KAPPA", "1.0"))
+# The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
+BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
 # that has a stored scene graph. CONCURRENCY loads at a time.

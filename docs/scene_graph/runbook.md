@@ -184,17 +184,33 @@ Each step gates the next. Flags stay false until the step that names them.
 
 ### Deploying
 
-`scripts/deploy.sh` (lives on branch `feat/deploy-script` until merged):
+`scripts/deploy.sh`:
 
 ```
-scripts/deploy.sh [--ref REF] [--no-pull] [--no-verify] [--dry-run] SERVICE...
+scripts/deploy.sh [--ref REF] [--no-pull] [--no-verify] [--skip-test-gate] [--dry-run] SERVICE...
 scripts/deploy.sh rollback SERVICE [TAG]
 ```
 
 For each service it tags the running image `pre-<time>-<sha>`, builds, recreates, waits until healthy and rolls back
-automatically on failure. After a deploy it runs the checker for `graph-builder-service` and shows `/stats` for
-`mission-planner-service` (skip with `--no-verify`). `rollback` restores the named tag (default: the latest `pre-*` tag).
-Log: `~/.cache/satina-deploy.log`. It does not edit `.env`.
+automatically on failure. After a deploy it runs the checker for `graph-builder-service`, and for
+`mission-planner-service` it reads `/stats` and requires `build_sha` to equal the deployed commit (skip the checks with
+`--no-verify`). `rollback` restores the named tag (default: the latest `pre-*` tag). Log: `~/.cache/satina-deploy.log`.
+It does not edit `.env`.
+
+Rules the script enforces (2026-10-14):
+
+* **Deploy what the remote has.** The default ref is `origin/main` (the checkout is fast-forwarded to it); `--no-pull`
+  deploys the checkout as it is and is for a rehearsal or an emergency, not for a release. Push first.
+* **Test gate.** `scripts/run_unit_tests_pinned.sh` with no arguments writes `~/.cache/satina-tests/<short sha>` when the
+  full suite passes on a clean tracked tree. A deploy of a sha without that record is refused; `--skip-test-gate`
+  overrides and is logged.
+* **Build identity.** The script exports `GIT_SHA`; compose passes it to the planner as `BUILD_SHA`, `/stats` shows
+  `build_sha`, and the post-deploy check fails if the running image does not report the deployed sha.
+* **Retention.** After a healthy deploy the newest `KEEP_ROLLBACK` (default 3) `pre-*` tags of that service's image are
+  kept; older tags are untagged, never the image a container runs.
+
+Not covered: a functional plan smoke test (a canned plan on a known pair) and image labels for services other than the
+planner; both are recorded as open in `docs/scene_graph/pipeline_state_2026-10-14.md`.
 
 ## 3. Per-map switch and rebuild trigger
 

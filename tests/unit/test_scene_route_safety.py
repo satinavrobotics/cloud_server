@@ -388,9 +388,20 @@ async def test_the_service_reports_priced_plans_in_the_response_the_log_and_the_
     assert len(lines) == 1
     for part in ("map=m", "graph_version=9", "kappa=1.0", "margin_source=map_r", "cost=12345", "exact=False", "tiles=7"):
         assert part in lines[0]
+    assert svc.get_stats()["build_sha"] == config.BUILD_SHA     # the build identity deploy.sh verifies after a deploy
     stats = svc.get_stats()["scene_graph"]
     assert stats["priced_plans"] == 1 and stats["priced_plans_inexact"] == 1
     monkeypatch.setattr(config, "SCENE_GRAPH_SAFETY_KAPPA", 0.0)
     out0 = await svc_plan(svc)
     assert "pricing" not in out0 and svc.get_stats()["scene_graph"]["priced_plans"] == 1
     svc.cleanup()
+
+
+def test_build_identity_defaults_to_unknown_and_the_deploy_scripts_parse():
+    """BUILD_SHA is the commit compose got from scripts/deploy.sh (GIT_SHA); both scripts must stay valid bash."""
+    import os
+    import subprocess
+    assert config.BUILD_SHA == os.environ.get("BUILD_SHA", "unknown").strip() or config.BUILD_SHA == "unknown"
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for script in ("scripts/deploy.sh", "scripts/run_unit_tests_pinned.sh"):
+        assert subprocess.run(["bash", "-n", os.path.join(root, script)], capture_output=True).returncode == 0, script

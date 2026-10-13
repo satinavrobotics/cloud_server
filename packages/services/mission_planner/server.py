@@ -1553,6 +1553,7 @@ class MissionPlannerService:
             "default_map_id": self.default_map_id,
             "knn_k": self.knn_k,
             "range_search_radius": self.range_search_radius,
+            "build_sha": config.BUILD_SHA,
         }
         if config.SCENE_GRAPH_PLANNER_ENABLED:
             stats["scene_graph"] = {

@@ -8,12 +8,18 @@
 # Options:
 #   --ref REF      git ref to deploy (default origin/main); the checkout is fast-forwarded to it
 #   --no-pull      deploy the checkout as it is (no fetch, no checkout change)
-#   --no-verify    skip the post-deploy checks (scene graph checker, planner /stats)
+#   --no-verify    skip the post-deploy checks (scene graph checker, planner /stats, build sha)
+#   --skip-test-gate  deploy a sha without a recorded passing full unit run (logged)
 #   --dry-run      print what would run, change nothing
 #   -h, --help     this text
 #
+# The test gate: scripts/run_unit_tests_pinned.sh records a pass for the checked-out sha when the default (full)
+# suite passes on a clean tree; a deploy of a sha without that record is refused. After a healthy deploy the newest
+# KEEP_ROLLBACK (default 3) `pre-*` rollback tags of the service's image are kept, older ones are untagged.
+#
 # Environment: COMPOSE_FILE (default docker_compose/mission_dispatch_services.yaml), HEALTH_TIMEOUT_S (180),
-# DEPLOY_LOG (default ~/.cache/satina-deploy.log). Settings (.env) are never touched here: edit them first.
+# DEPLOY_LOG (default ~/.cache/satina-deploy.log), TEST_MARKS (default ~/.cache/satina-tests), KEEP_ROLLBACK (3).
+# Settings (.env) are never touched here: edit them first.
 set -euo pipefail
 
 SELF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +28,9 @@ ROOT="$(cd "$(dirname "$COMPOSE_FILE")/.." && pwd)"                 # the checko
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-180}"
 DEPLOY_LOG="${DEPLOY_LOG:-$HOME/.cache/satina-deploy.log}"
 PLANNER_PORT="${PLANNER_PORT:-8005}"
-REF="origin/main"; PULL=1; VERIFY=1; DRY=0
+TEST_MARKS="${TEST_MARKS:-$HOME/.cache/satina-tests}"
+KEEP_ROLLBACK="${KEEP_ROLLBACK:-3}"
+REF="origin/main"; PULL=1; VERIFY=1; DRY=0; GATE=1
 
 usage() { sed -n '2,/^set -e/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 log() {                                                              # a dry run never writes the log `rollback` reads
@@ -46,6 +54,17 @@ wait_healthy() {                                                      # $1 servi
         [ $((SECONDS - t0)) -lt "$HEALTH_TIMEOUT_S" ] || return 1
         sleep 3
     done
+}
+
+prune_rollback_tags() {                                               # $1 repo, $2 running image id: keep the newest N
+    local repo="$1" running="$2" n=0 tag id
+    while read -r tag id; do
+        n=$((n + 1))
+        [ "$n" -gt "$KEEP_ROLLBACK" ] || continue
+        [ "$id" != "$running" ] || continue                           # never untag what runs
+        log "prune rollback tag $repo:$tag"
+        run docker rmi "$repo:$tag" >/dev/null
+    done < <(docker images "$repo" --format '{{.Tag}} {{.ID}} {{.CreatedAt}}' | grep '^pre-' | sort -k3,4r | awk '{print $1, $2}')
 }
 
 do_rollback() {                                                       # $1 service, $2 tag (optional)
@@ -75,6 +94,7 @@ while [ $# -gt 0 ]; do
         --ref) REF="${2:?--ref needs a value}"; shift ;;
         --no-pull) PULL=0 ;;
         --no-verify) VERIFY=0 ;;
+        --skip-test-gate) GATE=0 ;;
         --dry-run) DRY=1 ;;
         -h|--help) usage; exit 0 ;;
         -*) die "unknown option $1" ;;
@@ -97,6 +117,13 @@ if [ "$PULL" = 1 ]; then
     run git merge --ff-only -q "$REF" || die "cannot fast-forward the checkout to $REF"
 fi
 SHA="$(git rev-parse --short HEAD)"
+if [ ! -f "$TEST_MARKS/$SHA" ]; then
+    if [ "$GATE" = 1 ]; then
+        die "no passing full unit run recorded for $SHA ($TEST_MARKS/$SHA): run scripts/run_unit_tests_pinned.sh on this commit, or pass --skip-test-gate"
+    fi
+    log "test gate skipped for $SHA (no recorded full unit run)"
+fi
+export GIT_SHA="$SHA"                                                # compose passes it to the service as BUILD_SHA
 log "deploy $SHA: ${SERVICES[*]}"
 
 for svc in "${SERVICES[@]}"; do
@@ -117,6 +144,10 @@ for svc in "${SERVICES[@]}"; do
     fi
     log "$svc healthy at $SHA"
     prev=""
+    if [ "$DRY" = 0 ]; then
+        c="$(container_of "$svc")"; repo="$(image_of "$c")"; repo="${repo%:*}"
+        prune_rollback_tags "$repo" "$(docker inspect -f '{{.Image}}' "$c" | sed 's/^sha256://' | cut -c1-12)"
+    fi
 done
 
 if [ "$VERIFY" = 1 ] && [ "$DRY" = 0 ]; then
@@ -128,7 +159,10 @@ if [ "$VERIFY" = 1 ] && [ "$DRY" = 0 ]; then
                     --all --expect tools/scene_graph_expected.json)" || { echo "$out" | tail -n 20 >&2; die "scene graph checker failed"; }
                 log "$(printf '%s\n' "$out" | head -n1)" ;;
             mission-planner-service)
-                log "planner /stats: $(curl -fsS "http://localhost:$PLANNER_PORT/stats" | head -c 400)" ;;
+                out="$(curl -fsS "http://localhost:$PLANNER_PORT/stats")" || die "planner /stats not reachable"
+                log "planner /stats: $(printf '%s' "$out" | head -c 400)"
+                printf '%s' "$out" | grep -q "\"build_sha\": *\"$SHA\"" \
+                    || die "planner /stats does not report build_sha $SHA: the running image is not this build" ;;
         esac
     done
 fi
