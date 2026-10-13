@@ -1,6 +1,5 @@
 import dataclasses
 
-import numpy as np
 import pytest
 
 from packages.scene_graph.api import (Blocked, Chart, Dirty, Leaf, Link, MissingTiles, OwnerRaster, Route, SceneGraph, SceneParams,

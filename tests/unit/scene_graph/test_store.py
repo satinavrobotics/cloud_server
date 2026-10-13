@@ -80,7 +80,7 @@ def test_continuing_after_load_equals_continuing_without_a_save():
     half = len(leaves) // 2
     store, _ = _store()
     g = ChartGraph(SceneParams())
-    d = g.fold_many(leaves[:half]); v = store.save("m", g, d, None, {})
+    d = g.fold_many(leaves[:half]); store.save("m", g, d, None, {})
     h = store.load("m")
     g.fold_many(leaves[half:]); h.fold_many(leaves[half:])
     # planes bit-identical over the known region (canvases differ by an offset)
@@ -223,7 +223,7 @@ def test_generation_switch_keeps_the_old_readable_until_commit_and_persists_the_
     gen = store.begin_generation("m")
     g2 = ChartGraph(SceneParams(robot_half_side=0.2))        # a params change: a rebuild in a new generation
     d = g2.fold_many(leaves)
-    pv = store.save("m", g2, d, v, {"rebuild": True}, generation=gen)
+    store.save("m", g2, d, v, {"rebuild": True}, generation=gen)
     assert store.meta("m")["version"] == v and store.meta("m")["generation"] == 1
     assert _sig(store.view("m")) == old_sig                  # readers still see the old generation
     newv, kmap = store.commit_generation("m", gen)
@@ -384,7 +384,6 @@ def test_safety_net_heals_a_dirty_set_that_missed_tiles_and_strict_mode_raises()
         else:
             v2 = store.save("m", g, lying, v, {})
             assert store.coverage_mismatches == 1
-            ref = SceneGraphStore(MemoryBackend(), MemoryBackend())
             assert store.manifest("m", v2)["tiles"] == store.manifest("m", v2)["tiles"]
             assert _sig(store.load("m")) == _sig(g)
 
@@ -427,7 +426,7 @@ def test_epoch_changes_after_a_drop_and_the_expansion_cache_cannot_serve_the_old
     a, b = SceneGraphStore(be, be), SceneGraphStore(be, be)            # two processes on one backend
     w, way = cw.two_rooms(); g = ChartGraph(SceneParams()); d = g.fold_many(cw.drive(w, way))
     a.save("m", g, d, None, None)
-    first = b.view("m").query(BBox(-5, -5, 20, 20), raster=False)      # b caches the expansion of manifest-1
+    b.view("m").query(BBox(-5, -5, 20, 20), raster=False)      # b caches the expansion of manifest-1
     e1 = a.meta("m")["epoch"]
     a.drop("m")
     w2, way2 = cw.corridor(); g2 = ChartGraph(SceneParams()); d2 = g2.fold_many(cw.drive(w2, way2))

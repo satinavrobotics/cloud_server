@@ -1,8 +1,12 @@
 """blocked_geometry (where the robot stood and came from when it reported a block)
 
 Revision ID: 20261012_01_blocked_geometry
-Revises: 20261011_01_edge_observations
+Revises: 20261013_01_track_map_frame
 Create Date: 2026-10-12
+
+Re-parented on top of 20261013_01_track_map_frame (main) so history stays a single line: both were written on
+20261011_01_edge_observations, and two heads make `alembic upgrade head` fail at API start. The id keeps its
+creation date. Nothing had applied it (the live database is at 20261013_01).
 
 A blocked_graph_nodes row holds the position of the blocked waypoint only. With the sparse
 waypoints of a lattice route that waypoint can be far past the obstacle, so the row's
@@ -23,7 +27,7 @@ downgrade() drops them.
 from alembic import op
 
 revision = "20261012_01_blocked_geometry"
-down_revision = "20261011_01_edge_observations"
+down_revision = "20261013_01_track_map_frame"
 branch_labels = None
 depends_on = None
 

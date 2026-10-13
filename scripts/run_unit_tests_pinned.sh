@@ -16,5 +16,6 @@ if [ $# -eq 0 ]; then set -- tests/unit -m unit; fi
 exec docker run --rm --memory=2g --network=none \
   -v "$REPO":/repo -w /repo \
   -e ARANGO_PASSWORD=x -e MINIO_ACCESS_KEY=x -e MINIO_SECRET_KEY=x -e POSTGRES_PASSWORD=x \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   "$IMAGE" \
   python -m pytest -p no:randomly -p no:cacheprovider -o addopts="" --timeout=120 -q "$@"

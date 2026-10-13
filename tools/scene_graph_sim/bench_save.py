@@ -55,7 +55,7 @@ class FakeSG:
                            plane=self.plane, version=self.version, watermark=self.watermark)
 
     def query(self, bbox, level=0, raster=True, **kw):
-        h = SIDE // 2; side = int(np.ceil(np.sqrt(N_CH))); pitch = h // side
+        side = int(np.ceil(np.sqrt(N_CH)))
         ch = []
         for i, k in enumerate(self.keys):
             y, x = self.anchors[i]

@@ -369,7 +369,7 @@ def test_backfill_cli_output(env, ring_map, backfilled, capsys):
 # ------------------------------------------------------------------------------ stage: ingest
 
 def test_ingest_caught_up(env, ring_map, ingested):
-    w, st = ingested.worker, ingested.worker.stats
+    st = ingested.worker.stats
     n = len(ring_map.ids)
     assert st.folded == n and not dict(st.skipped), (st, dict(st.skipped))
     assert st.pending == 0 and st.fold_failures == 0 and st.source_errors == 0

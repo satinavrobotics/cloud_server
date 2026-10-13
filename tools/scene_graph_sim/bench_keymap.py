@@ -12,7 +12,7 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [os.path.dirname(os.path.dirname(HERE)), HERE]
-from packages.scene_graph.api import BBox, Chart, Dirty, SceneParams, ViewResult  # noqa: E402
+from packages.scene_graph.api import Chart, Dirty, SceneParams, ViewResult  # noqa: E402
 from packages.scene_graph.state import EngineState, LeafRecord  # noqa: E402
 from packages.scene_graph.store import MemoryBackend, SceneGraphStore  # noqa: E402
 

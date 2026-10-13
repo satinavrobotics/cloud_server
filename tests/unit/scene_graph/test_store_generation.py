@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from packages.scene_graph.api import BBox, SceneParams
+from packages.scene_graph.api import SceneParams
 from packages.scene_graph.engine import ChartGraph
 from packages.scene_graph.store import MemoryBackend, SceneGraphStore
 

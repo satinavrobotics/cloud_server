@@ -12,7 +12,6 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path[:0] = [ROOT]
-import numpy as np  # noqa: E402
 
 from packages.scene_graph.api import SceneParams  # noqa: E402
 from packages.scene_graph.engine import ChartGraph  # noqa: E402

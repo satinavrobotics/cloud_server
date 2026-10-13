@@ -176,7 +176,6 @@ def verify(g, world=None, r=None, bbox=None):
     out["planar"] = int(chi_F != len(keys0) - holes - arcs + J)
     out["chi_F"] = int(chi_F)
     # links: portal and width; saddle
-    cr = crossings(lab0, B)
     crc = crossings(lab0, clr)
     best = {}
     for l in v0.links:

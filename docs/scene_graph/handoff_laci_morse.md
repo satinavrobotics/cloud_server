@@ -1,6 +1,6 @@
 # Scene graph: handoff of the persistence regions and charts to LACI
 
-From CIMBI, 2026-10-13. Branch `feat/scene-graph-morse` (from the v2 tip 7843576). Read `formulation.md` for the definition and
+From CIMBI, 2026-10-13. Everything here is on `feat/scene-graph-v2` (the one branch). Read `formulation.md` for the definition and
 `audit_ledger.md` for every finding, derivation and verification behind it.
 
 ## What changed for the consumers

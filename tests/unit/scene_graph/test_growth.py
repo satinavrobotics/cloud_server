@@ -1,6 +1,5 @@
 """The canvas grows in every direction while leaves arrive and the result still satisfies every invariant (judged by the
 independent verifier); persistent keys survive the growth."""
-import numpy as np
 import pytest
 
 from packages.scene_graph.api import SceneParams
@@ -62,7 +61,6 @@ def test_growth_in_all_four_directions_keeps_every_invariant(room):
 def test_keys_persist_across_growth(room):
     w, leaves, _ = room
     _, _, tr = _run(w, leaves, check=False)
-    seen_retired_then_back = False
     live_prev = set()
     retired = set()
     for _, keys in tr:

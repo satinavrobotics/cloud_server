@@ -15,7 +15,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path[:0] = [ROOT, HERE]
-from packages.scene_graph.api import BBox, Chart, Dirty, Link, SceneParams, ViewResult  # noqa: E402
+from packages.scene_graph.api import BBox, Chart, Dirty, SceneParams, ViewResult  # noqa: E402
 from packages.scene_graph.state import EngineState, LeafRecord  # noqa: E402
 from packages.scene_graph.store import MemoryBackend, SceneGraphStore  # noqa: E402
 
@@ -44,7 +44,7 @@ def office8():
     print(f"known cells {known}; canvas planes raw {raw} B ({raw / max(known, 1):.0f} B/known cell); "
           f"stored tiles {tile_bytes} B ({tile_bytes / max(known, 1):.1f} B/known cell, {len(man['tiles'])} tiles); "
           f"total objects {len(b.list('o8'))}, {_stored(b, 'o8')} B")
-    t = time.time(); h = store.load("o8"); print(f"load (planes + evidence + one re-solve): {time.time() - t:.2f} s")
+    t = time.time(); store.load("o8"); print(f"load (planes + evidence + one re-solve): {time.time() - t:.2f} s")
     t = time.time(); view = store.view("o8"); view.query(BBox(-100, -100, 100, 100)); print(f"view+query without engine: {time.time() - t:.3f} s")
 
 

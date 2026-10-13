@@ -9,7 +9,6 @@ PNG sha256 is skipped. After each map: read every node and object back and compa
 Stops at the first failure. Never touches the `occupancy` layer.
 """
 import hashlib
-import io
 import json
 import os
 import sys
