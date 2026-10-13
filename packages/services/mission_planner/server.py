@@ -121,7 +121,10 @@ class MissionPlannerService:
             versions_per_map=config.SCENE_GRAPH_CACHE_VERSIONS_PER_MAP,
             max_stale_s=config.SCENE_GRAPH_MAX_VERSION_LAG_S,
             meta_ttl_s=config.SCENE_GRAPH_META_TTL_S,
-            max_bytes=config.SCENE_GRAPH_CACHE_MAX_BYTES)
+            max_bytes=config.SCENE_GRAPH_CACHE_MAX_BYTES,
+            lazy=config.SCENE_GRAPH_PLANNER_MODE == "lazy",
+            lazy_kw=dict(max_tiles=config.SCENE_GRAPH_LAZY_MAX_TILES,
+                         tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE))
         self._plan_pool = scene_route.BoundedPool(
             "sg-plan", 2, config.SCENE_GRAPH_PLAN_MAX_INFLIGHT, busy_reason="planner_busy")
         # chart-route outcomes by reason ("served" or the fallback reason), for get_stats()

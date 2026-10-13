@@ -12,8 +12,10 @@ not the planner, slow (minutes).
 """
 import math
 import os
+import resource
 import sys
 import time
+import tracemalloc
 
 import numpy as np
 
@@ -75,6 +77,33 @@ def timed(label, fn, n=1):
     return r
 
 
+def lazy_section(store, v, side, rooms):
+    """the same measurements on the tile-lazy PlanGraph (SCENE_GRAPH_PLANNER_MODE=lazy)"""
+    from packages.scene_graph.api import Blocked
+    from packages.services.mission_planner.lazy_plan import open_plan
+    print("--- lazy (PlanGraph over StoredView) ---")
+    tracemalloc.start()
+    g = timed("open_plan (manifest only)", lambda: open_plan(store, "big", v))
+    a = timed("snap start (cold)", lambda: g.snap(side / rooms / 2, side / rooms / 2, 1.0))
+    z = g.snap(side - side / rooms / 2, side - side / rooms / 2, 1.0)
+    rt = timed("route corner to corner (cold tiles)", lambda: g.route(a.key, z.key, None, (a.x, a.y), (z.x, z.y)))
+    print(f"   {g.last}")
+    if rt is None:
+        print("no route"); return
+    timed("route corner to corner (warm)", lambda: g.route(a.key, z.key, None, (a.x, a.y), (z.x, z.y)), 3)
+    mid = rt.nodes[len(rt.nodes) // 2]
+    bl = Blocked(discs=[(mid[0], mid[1], 0.6)], segments=[])
+    timed("route with a blocking disc on its middle", lambda: g.route(a.key, z.key, bl, (a.x, a.y), (z.x, z.y)))
+    print(f"   {g.last}")
+    timed("plan_on_graph total", lambda: scene_route.plan_on_graph(
+        g, "big", (a.x, a.y), (z.x, z.y), ([], []), lambda x, y: f"{round(x)}_{round(y)}_{x:.2f}", 0.5, 1.5, 5.0))
+    cur, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    print(f"lazy: traced now {cur / 1e6:.1f} MB, peak {peak / 1e6:.1f} MB (incl. building the world); "
+          f"max RSS of the process {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024:.0f} MB; "
+          f"graph.nbytes {g.nbytes / 1e6:.1f} MB; route {rt.length:.1f} m")
+
+
 def main():
     side = float(sys.argv[1]) if len(sys.argv) > 1 else 100.0
     rooms = int(sys.argv[2]) if len(sys.argv) > 2 else 6
@@ -89,6 +118,9 @@ def main():
     b = MemoryBackend()
     store = SceneGraphStore(b, b)
     v = store.save("big", g, d, None, [0, ""])
+    lazy_section(store, v, side, rooms)
+    if os.environ.get("BENCH_SKIP_FULL"):
+        return
     t = time.perf_counter()
     graph = store.load("big", v)
     print(f"store.load {time.perf_counter() - t:.2f} s")
