@@ -52,7 +52,10 @@ def canonical_json(obj) -> bytes:
 
 
 def params_hash(params: dict, pipeline: str) -> str:
-    return hashlib.sha256(canonical_json({"p": params, "v": pipeline})).hexdigest()[:16]
+    """the hash of the VALUES of the params: numbers are hashed as floats, so 2 and 2.0 (which a document store returns in
+    either spelling after a round trip) give the same hash"""
+    norm = {k: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v for k, v in params.items()}
+    return hashlib.sha256(canonical_json({"p": norm, "v": pipeline})).hexdigest()[:16]
 
 
 def pack_json(obj) -> Tuple[str, bytes]:

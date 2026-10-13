@@ -85,3 +85,11 @@ def test_cursor_only_save_on_a_pending_generation_moves_the_pending_cursor(leave
     assert cas["n"] == 1 and b.puts == puts0
     assert s.save("m", g2, g2.fold_many([]), v, {"i": 9}, generation=gen) == pv
     assert cas["n"] == 1 and b.puts == puts0                             # repeat: nothing
+
+
+def test_params_hash_is_over_values_not_their_json_spelling():
+    """a document store returns 2.0 as 2: the stored hash must still match the params it was computed from"""
+    from packages.scene_graph.store_codec import params_hash
+    a = params_hash({"robot_half_side": 0.25, "lattice": 0.1, "chart_radius": 2.0}, "morse/2")
+    assert a == params_hash({"robot_half_side": 0.25, "lattice": 0.1, "chart_radius": 2}, "morse/2")
+    assert a != params_hash({"robot_half_side": 0.25, "lattice": 0.1, "chart_radius": 2.5}, "morse/2")
