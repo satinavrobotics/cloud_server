@@ -15,6 +15,10 @@ Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.
   (then the corridor's route is returned and `last["exact"]` is False);
 * a diagonal-only contact between two charts has no link; its width is taken from the charts' anchor clearance (the
   engine reads the cells' clearance, which needs a clearance plane: Phase 3), so `min_width` can differ there;
+* the overlay search is bounded by the corridor route's own length (scipy `limit=`, and the cell ellipse that length
+  implies): the optimum is never longer, so the answer is unchanged and the graph built is smaller;
+* tile reads are single flight per tile (no global lock); a tile that cannot be read raises `TileUnavailable` and flags
+  the graph (`unavailable`) for `GraphCache` to drop;
 * `max_tiles` caps a request: a bigger corridor raises `CorridorTooLarge` (the planner falls back to the legacy one).
 
 It reads `StoredView` internals (`_own`, `_cache`, `_idx`); that is the cost of a LACI-only phase. Phase 1 gives these
@@ -48,6 +52,25 @@ class CorridorTooLarge(Exception):
         self.tiles, self.cap = tiles, cap
 
 
+class TileUnavailable(Exception):
+    """A stored tile of the version could not be read (a garbage-collected version, a backend error). The graph is spent:
+    `PlanGraph.unavailable` is set and the cache drops it, so the next request opens the current version."""
+
+    def __init__(self, tile: Tuple[int, int], cause: BaseException):
+        super().__init__("tile %d,%d unavailable: %s: %s" % (tile[0], tile[1], type(cause).__name__, cause))
+        self.tile, self.cause = tile, cause
+
+
+class _Flight:
+    """One tile fetch in progress: the leader fills value / error, the waiters wait on `done`."""
+    __slots__ = ("done", "value", "error")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.value = None
+        self.error: Optional[BaseException] = None
+
+
 class _TileCache(dict):
     """The view's tile cache, bounded: keeps `own` and `v` of the newest `max_tiles` tiles (about 35 KB each)."""
 
@@ -68,6 +91,10 @@ class _TileCache(dict):
                 old, _ = self._order.popitem(last=False)
                 super().pop(old, None)
 
+    def values(self):
+        with self._lock:                 # a snapshot: `nbytes` runs while other threads insert and evict
+            return list(super().values())
+
     def __getitem__(self, k):
         v = super().__getitem__(k)
         with self._lock:
@@ -85,7 +112,10 @@ class PlanGraph:
         self.version = view.version
         self.params = SimpleNamespace(**view.params)
         self.max_tiles = int(max_tiles)
-        self._fetch = threading.Lock()
+        self.unavailable = False                # set when a tile could not be read (see TileUnavailable)
+        self._mu = threading.Lock()             # guards `_inflight` only; no I/O runs under it
+        self._inflight: Dict[Tuple[int, int], _Flight] = {}
+        view._own = self._read                  # the view's own readers (snap, windows) share the single flight
         man = view.man
         by_id = {c["id"]: c for c in man["charts"]}
         order = man.get("order")        # chart ids in ENGINE order: ties in its searches break by it
@@ -124,18 +154,51 @@ class PlanGraph:
         return int(self.view.nbytes + self._adj.data.nbytes + self._g.data.nbytes)
 
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
-        with self._fetch:
-            return self.view.snap(x, y, max_dist)
+        return self.view.snap(x, y, max_dist)
 
     def locate(self, x: float, y: float, max_dist: Optional[float] = None) -> Optional[str]:
         return self.snap(x, y, max_dist).key
 
-    def _tile(self, tx: int, ty: int) -> Optional[Dict[str, np.ndarray]]:
+    def _read(self, tx: int, ty: int) -> Optional[Dict[str, np.ndarray]]:
+        """The owner tile (tx, ty), single flight: concurrent requests read different tiles in parallel and the same tile
+        once. A failed read raises TileUnavailable to the reader and to every waiter, and is not cached."""
+        key = (tx, ty)
         c = self.view._cache
-        if (tx, ty) in c:
-            return c[(tx, ty)]
-        with self._fetch:
-            return self.view._own(tx, ty)
+        try:
+            return c[key]
+        except KeyError:
+            pass
+        with self._mu:
+            try:
+                return c[key]                    # filled between the miss above and the lock
+            except KeyError:
+                pass
+            flight = self._inflight.get(key)
+            leader = flight is None
+            if leader:
+                flight = self._inflight[key] = _Flight()
+        if not leader:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.value
+        try:
+            v = self.view.store._tile(self.view.map_id, self.view.man, tx, ty)
+            c[key] = v
+            flight.value = v if v is None else {n: v[n] for n in ("own", "v") if n in v}
+            return flight.value
+        except BaseException as err:             # pylint: disable=broad-except
+            if isinstance(err, Exception):
+                self.unavailable = True
+                err = err if isinstance(err, TileUnavailable) else TileUnavailable(key, err)
+            flight.error = err
+            raise err
+        finally:
+            with self._mu:
+                self._inflight.pop(key, None)
+            flight.done.set()
+
+    _tile = _read
 
     def free_cell(self, ix: int, iy: int) -> bool:
         """Whether lattice cell (ix, iy) (global, centre ((ix + .5) h, (iy + .5) h)) is navigable; an absent tile is not."""
@@ -194,8 +257,7 @@ class PlanGraph:
 
     def _cells(self, tiles: List[Tuple[int, int]]):
         """linear key, chart index, global (y, x) of every owned cell of the tiles, ascending by key (row-major)"""
-        with self._fetch:
-            self.view._need(tiles)
+        self.view._need(tiles)
         ks, ch, ys, xs = [], [], [], []
         lut = self._lut
         for (tx, ty) in tiles:
@@ -233,12 +295,39 @@ class PlanGraph:
             m |= (cx - (x0 + t * dx)) ** 2 + (cy - (y0 + t * dy)) ** 2 <= hw * hw
         return ~m
 
-    def _search(self, keep: Set[int], src_cell, dst_cell, blocked: Optional[Blocked]):
-        """(length, path as (chart, y, x) rows, tiles) of the lattice route inside `keep`, or None"""
+    @staticmethod
+    def _centre(cell) -> np.ndarray:
+        return np.array([(2 * cell[1] + 1) * RES, (2 * cell[0] + 1) * RES])
+
+    def _within(self, tiles: List[Tuple[int, int]], a: np.ndarray, b: np.ndarray, limit: float) -> List[Tuple[int, int]]:
+        """the tiles that can hold a cell c, or a neighbour of one, with |c - a| + |c - b| <= limit: a lattice step is at
+        least the Euclidean distance of its cell centres, so no route of length <= limit leaves that ellipse"""
+        h = float(self.params.lattice)
+        out = []
+        for (tx, ty) in tiles:
+            lo = np.array([tx * TILE_L * h, ty * TILE_L * h]); hi = lo + TILE_L * h
+            da = np.hypot(*(np.maximum(0.0, np.maximum(lo - a, a - hi))))
+            db = np.hypot(*(np.maximum(0.0, np.maximum(lo - b, b - hi))))
+            if da + db <= limit + 2 * h:
+                out.append((tx, ty))
+        return out
+
+    def _search(self, keep: Set[int], src_cell, dst_cell, blocked: Optional[Blocked], limit: Optional[float] = None):
+        """(length, path as (chart, y, x) rows, tiles) of the lattice route inside `keep`, or None. `limit`, when given,
+        is a proved upper bound of the answer (a route of that length exists in `keep`): cells and tiles that no route
+        of that length can use are left out and Dijkstra stops there; the answer, and its tie-breaks, are unchanged."""
         tiles = self._tiles_for(keep)
+        if limit is not None:
+            a, b = self._centre(src_cell), self._centre(dst_cell)
+            tiles = self._within(tiles, a, b, limit)
         if len(tiles) > self.max_tiles:
             raise CorridorTooLarge(len(tiles), self.max_tiles)
         key, ch, ys, xs = self._cells(tiles)
+        if limit is not None and len(key):
+            # the plane keeps the cells of the ellipse and one lattice step around it (the orthogonals of a diagonal)
+            cx, cy = (2 * xs + 1) * RES, (2 * ys + 1) * RES
+            near = np.hypot(cx - a[0], cy - a[1]) + np.hypot(cx - b[0], cy - b[1]) <= limit + 2 * float(self.params.lattice) + 1e-6
+            key, ch, ys, xs = key[near], ch[near], ys[near], xs[near]
         n = len(key)
         if n == 0:
             return None
@@ -246,6 +335,9 @@ class PlanGraph:
         inkeep[list(keep)] = True
         member = inkeep[ch] & (ch >= 0)
         member &= self._alive(blocked, ys, xs)
+        if limit is not None:
+            cx, cy = (2 * xs + 1) * RES, (2 * ys + 1) * RES
+            member &= np.hypot(cx - a[0], cy - a[1]) + np.hypot(cx - b[0], cy - b[1]) <= limit + 1e-6
         node = np.cumsum(member) - 1                       # compact index among members, row-major as the engine's
         h = float(self.params.lattice)
 
@@ -274,7 +366,8 @@ class PlanGraph:
         if s is None or d is None:
             return None
         g = coo_matrix((np.concatenate([Ln, Ln]), (np.concatenate([R, C]), np.concatenate([C, R]))), shape=(nm, nm)).tocsr()
-        dist, pr = dijkstra(g, directed=False, indices=s, return_predecessors=True)
+        dist, pr = dijkstra(g, directed=False, indices=s, return_predecessors=True,
+                            **({} if limit is None else {"limit": limit}))
         if not np.isfinite(dist[d]):
             return None
         path = [d]
@@ -308,7 +401,8 @@ class PlanGraph:
                 # search those, the answer is the engine's.
                 keep = self._ellipse(src, dst, found[0]) | self._rings(path, rings)
                 try:
-                    found = self._search(keep, src, dst, blocked) or found
+                    # the corridor's own route (length found[0]) is in `keep`: it bounds the optimum from above
+                    found = self._search(keep, src, dst, blocked, limit=found[0] * (1 + 1e-9) + 1e-9) or found
                 except CorridorTooLarge:
                     exact = False                              # the corridor's route stands: valid, maybe longer
         if found is None:

@@ -34,8 +34,26 @@ that code next to the engine.
   The 17 MB at 150 m is the manifest (charts and links as Python objects) plus the tile LRU; it grows with charts,
   not with area covered by a request. The remaining O(map) cost is `store.manifest` (`_expand` of every page).
 
-Open for Phase 1/2: overlay ellipse cost, manifest expand, per-request tile fetch cost against MinIO (the memory
-backend hides it), and single-flight tile fetch.
+### Planner-side hardening (branch `wip/lazy-planner-side`)
+
+* **Single-flight tile fetch**: `PlanGraph._read` replaces the one serialising lock by per-tile in-flight
+  de-duplication (a leader reads, waiters wait on its event); the view's `_own` is pointed at it, so `snap` and the
+  windows share the flight. Different tiles are read in parallel, the same tile once; an exception reaches every
+  waiter as `TileUnavailable` and is not cached. Test: counting backend + thread pool.
+* **Bounded overlay search**: the corridor's route under the overlay (length L) is in the ellipse's chart set, so L
+  bounds the optimum: the second search runs with scipy `limit=L`, drops tiles, cells and plane cells that lie outside
+  the cell ellipse `|c-a|+|c-b| <= L` (a lattice step is at least the Euclidean one; the plane keeps one extra step for
+  the diagonals' orthogonals). Same lengths, same cells (equality tests unchanged). Bench 100 m world, blocking disc
+  on the middle of a corner-to-corner route: 380-420 ms -> 270-300 ms (cold tiles), 210 -> 153 tiles.
+* **Not adopted: skipping the ellipse when no blocked element touches the corridor route.** The engine searches the
+  WHOLE graph under any non-empty overlay, which can be shorter than the corridor route even when the overlay is far
+  away. Counterexample, `_grid_world` (4 x 3 rooms), `s017:0 -> s242:1`: no overlay 15.797 m (corridor), a disc
+  at (-500, -500) r 0.1 15.358 m (whole graph). Pinned by `test_far_overlay_keeps_the_whole_graph_answer`.
+* **`tile_unavailable`**: a tile read that fails (a gc'd version: `FileNotFoundError`, or a backend error) raises
+  `TileUnavailable`, flags `PlanGraph.unavailable`; `plan_on_graph` turns it into `ChartFallback("tile_unavailable")`
+  and `GraphCache.get` evicts flagged graphs, so the next request re-opens the current version.
+
+Open for Phase 1/2: manifest expand, per-request tile fetch cost against MinIO (the memory backend hides it).
 
 ## 1. Problem
 
@@ -202,10 +220,14 @@ Per the integration split: no commit and no message to CIMBI without the user's 
 * **Phase 0 (LACI only, no format change):** `PlanGraph` shim over `store.view(...)`: snap = `StoredView.snap`;
   route = window from `StoredView._window` + sparse chart-graph corridor; corridor tiles from a bbox-expanded
   read. Validates correctness and the estimates against the bench.
-* **Phase 1 (CIMBI):** plan tiles, chart->tile sets, columnar chart graph, `open_plan`, `PlanGraph`, sparse
-  matrices, tile cache, gc leases.
+* **Phase 1 (CIMBI), trimmed after review:** (1) a per-page expansion cache keyed by page hash (a new version
+  re-reads only the changed pages, not every `_expand`); (2) a public read API next to the engine, in ENGINE chart
+  order (replaces `_own` / `_cache` / `_idx` / `manifest["order"]` poking); (3) single-flight tile fetch, a byte-budget
+  tile cache and leases so gc cannot remove a version a request is reading; (4) a cached id -> index table; (5) optional
+  columnar pages. Dropped: stored chart -> tile sets (derivable from the chart cells and the reach, `_tiles_for`),
+  separate plan tiles, `open_plan`/`PlanGraph` as new store types (they stay in the planner).
 * **Phase 2 (LACI):** `GraphCache` open-per-request, `free_cells` LOS, widening policy, fallback reasons
-  (`corridor_too_large`, `tile_unavailable`), config, runbook, prewarm.
+  (`corridor_too_large`, `tile_unavailable`: done on the planner side), config, runbook, prewarm.
 * **Phase 3:** portal-node or hierarchy-level stage 1 for multi-km^2; clearance plane for `min_width`; replace
   `SCENE_GRAPH_CACHE_VERSIONS` by a byte budget.
 * Keep `SCENE_GRAPH_PLANNER_ENABLED`; add a `full_load | lazy` mode flag so rollback is config-only. Keep the
