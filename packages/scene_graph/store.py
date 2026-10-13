@@ -638,6 +638,18 @@ class SceneGraphStore:
             raise StateMismatch("restored keys differ from the stored key table")
         return g
 
+    def tile_v_plane(self, map_id: str, version: int, tx: int, ty: int) -> Optional[np.ndarray]:
+        """The occupancy plane `v` of tile (tx, ty) of `version` as a read-only uint8 [TILE_F, TILE_F] array at the costmap
+        resolution (RES, 0.05 m): costmap cell (row, col) of the tile is global cell (ty * TILE_F + row, tx * TILE_F + col),
+        spanning [col * RES, (col + 1) * RES) on x. `None` when the tile holds nothing in that version. Read-only and safe under
+        concurrent reads (the tile cache and its single flight of `_tile`)."""
+        man = self.manifest(map_id, version)
+        t = self._tile(map_id, man, tx, ty)
+        if t is None: return None
+        v = t["v"].view()
+        v.flags.writeable = False
+        return v
+
     def view(self, map_id: str, version: Optional[int] = None, tiles: Optional[Iterable] = None) -> "StoredView":
         """Read access to one version. With `tiles`, only those tiles may be read: a query that needs another tile of the
         version raises MissingTiles naming it (the caller loads it and asks again)."""
