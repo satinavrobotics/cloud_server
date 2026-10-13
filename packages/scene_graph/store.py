@@ -19,11 +19,13 @@ the engine come from the manifest.
     sg = store.load(map_id)                # engine, planes + evidence + one re-solve
     view = store.view(map_id, version)     # charts / links / owner raster without building an engine
 """
+import contextlib
 import logging
 import math
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -138,9 +140,17 @@ def _tiles_in(x0, y0, x1, y1) -> set:
             for ty in range(int(math.floor(y0 / RES)) // TILE_F, int(math.floor(y1 / RES)) // TILE_F + 1)}
 
 
+class _Flight:
+    """one in-progress fetch that concurrent readers of the same object wait on"""
+    __slots__ = ("ev", "res", "err")
+
+    def __init__(self):
+        self.ev, self.res, self.err = threading.Event(), None, None
+
+
 class SceneGraphStore:
     def __init__(self, blobs: Blobs, docs: Docs, keep_last: int = 5, clock=time.time, verify_every: int = 25,
-                 strict: bool = False):
+                 strict: bool = False, tile_cache_bytes: int = 64 << 20, page_cache_size: int = 4096):
         self.blobs, self.docs, self.keep_last, self.clock = blobs, docs, keep_last, clock
         self.verify_every, self.strict = verify_every, strict     # full-hash check every N saves; strict: raise on a miss
         self.coverage_mismatches = 0
@@ -157,6 +167,16 @@ class SceneGraphStore:
         # {page name: (page content, page hash)}); trusted only while that manifest is the base of the next save
         self._last_segments: Dict[Tuple[str, int], tuple] = {}
         self._last_pages: Dict[Tuple[str, int], tuple] = {}
+        # pages and tiles are immutable and content addressed, so a decoded one is valid for every version that names it:
+        # parsed pages (bounded by count) and decoded tiles (LRU, bounded by the bytes of their arrays; 0 disables), both
+        # keyed (map, object name) and dropped by gc()/drop(). Cached arrays are read-only: they are shared between readers.
+        self.tile_cache_bytes, self.page_cache_size = int(tile_cache_bytes), int(page_cache_size)
+        self._pages: "OrderedDict[Tuple[str, str], dict]" = OrderedDict()
+        self._tiles: "OrderedDict[Tuple[str, str], Optional[Dict[str, np.ndarray]]]" = OrderedDict()
+        self._tile_bytes = 0
+        self._tile_flight: Dict[Tuple[str, str], "_Flight"] = {}
+        self._leases: Dict[Tuple[str, int], int] = {}
+        self._tls = threading.local()
 
     @staticmethod
     def params_hash(params: SceneParams) -> str:
@@ -448,12 +468,27 @@ class SceneGraphStore:
         m = self._raw_manifest(map_id, name)
         tiles, charts, links = {}, [], []
         for h in m["pages"].values():
-            raw = self.blobs.get(map_id, "g%d/p/%s" % (m["generation"], h))
-            if raw is None: raise FileNotFoundError(h)
-            pg = unpack_json(raw)
+            pg = self._page(map_id, "g%d/p/%s" % (m["generation"], h), h)
             tiles.update(pg["tiles"]); charts += pg["charts"]; links += pg["links"]
         charts.sort(key=lambda c: c["id"]); links.sort(key=lambda l: (l["a"], l["b"], l["portal"][0], l["portal"][1]))
         return dict(m, tiles=tiles, charts=charts, links=links, key_ids={c["key"]: c["id"] for c in charts})
+
+    def _page(self, map_id, name, h):
+        """the parsed page `name` (content hashed, so a hit is exact): a new version re-reads only the pages that changed"""
+        key = (map_id, name)
+        with self._lock:
+            pg = self._pages.get(key)
+            if pg is not None:
+                self._pages.move_to_end(key)
+                return pg
+        raw = self.blobs.get(map_id, name)
+        if raw is None: raise FileNotFoundError(h)
+        pg = unpack_json(raw)
+        with self._lock:
+            self._pages[key] = pg
+            while len(self._pages) > max(1, self.page_cache_size):
+                self._pages.popitem(last=False)
+        return pg
 
     def manifest(self, map_id: str, version: Optional[int] = None, pending: bool = False) -> dict:
         meta = self.docs.meta(map_id)
@@ -469,11 +504,82 @@ class SceneGraphStore:
         return self._manifest_by_name(map_id, "g%d/manifest-%d.json" % (gen, version))
 
     def _tile(self, map_id, man, tx, ty):
+        """the decoded tile (shared and read-only), from the byte-budget cache or fetched once for all concurrent readers of
+        the same object (single flight: a failure is not cached and is raised to every waiter). Inside `_no_fill()` (a
+        whole-map load) it reads through the cache without inserting, so one big read does not evict the views' working set."""
         h = man["tiles"].get("%d,%d" % (tx, ty))
         if h is None: return None
-        raw = self.blobs.get(map_id, "g%d/t/%s" % (man["generation"], h))
-        if raw is None: raise FileNotFoundError(h)
-        return unpack(raw)[0]
+        name = "g%d/t/%s" % (man["generation"], h)
+        key = (map_id, name)
+        with self._lock:
+            if key in self._tiles:
+                self._tiles.move_to_end(key)
+                return self._tiles[key]
+            fl = self._tile_flight.get(key)
+            mine = fl is None
+            if mine: fl = self._tile_flight[key] = _Flight()
+        if not mine:
+            fl.ev.wait()
+            if fl.err is not None: raise fl.err
+            return fl.res
+        try:
+            raw = self.blobs.get(map_id, name)
+            if raw is None: raise FileNotFoundError(h)
+            t = unpack(raw)[0]
+            for a in t.values(): a.flags.writeable = False
+            fl.res = t
+            if not getattr(self._tls, "no_fill", False): self._tile_put(key, t)
+            return t
+        except BaseException as e:
+            fl.err = e
+            raise
+        finally:
+            with self._lock:
+                self._tile_flight.pop(key, None)
+            fl.ev.set()
+
+    @contextlib.contextmanager
+    def _no_fill(self):
+        prev = getattr(self._tls, "no_fill", False)
+        self._tls.no_fill = True
+        try:
+            yield
+        finally:
+            self._tls.no_fill = prev
+
+    def _tile_put(self, key, t) -> None:
+        n = sum(a.nbytes for a in t.values())
+        with self._lock:
+            if n > self.tile_cache_bytes or key in self._tiles: return
+            self._tiles[key] = t; self._tile_bytes += n
+            while self._tile_bytes > self.tile_cache_bytes and self._tiles:
+                _, old = self._tiles.popitem(last=False)
+                self._tile_bytes -= sum(a.nbytes for a in old.values())
+
+    def _evict(self, map_id, names=None) -> None:
+        """drop cached pages / tiles of `map_id` (all, or the named objects): gc and drop delete them from the store"""
+        with self._lock:
+            for c in (self._pages, self._tiles):
+                for k in [k for k in c if k[0] == map_id and (names is None or k[1] in names)]:
+                    v = c.pop(k)
+                    if c is self._tiles: self._tile_bytes -= sum(a.nbytes for a in v.values())
+
+    @contextlib.contextmanager
+    def lease(self, map_id: str, version: int):
+        """Hold `version` of `map_id` against gc() for the duration of the block (a reader that must not lose the objects of
+        the version it is working on). Thread-safe and re-entrant: leases are counted. In-process only: another process's gc
+        does not see it (that would need a store-side record, not implemented). A version that is not leased and is
+        collected is gone: reading it raises FileNotFoundError."""
+        key = (map_id, int(version))
+        with self._lock:
+            self._leases[key] = self._leases.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                n = self._leases.get(key, 0) - 1
+                if n > 0: self._leases[key] = n
+                else: self._leases.pop(key, None)
 
     def load(self, map_id: str, version: Optional[int] = None, tiles: Optional[Iterable] = None,
              pending: bool = False, verify: bool = True) -> SceneGraph:
@@ -501,7 +607,8 @@ class SceneGraphStore:
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
         own = np.zeros((H // 2, W // 2), np.int32)
         for (tx, ty) in coords:
-            t = self._tile(map_id, man, tx, ty)
+            with self._no_fill():
+                t = self._tile(map_id, man, tx, ty)
             y, x = (ty - ay0) * TILE_F, (tx - ax0) * TILE_F; ly, lx = y // 2, x // 2
             V[y:y + TILE_F, x:x + TILE_F] = t["v"]; T[y:y + TILE_F, x:x + TILE_F] = t["t"]; B[y:y + TILE_F, x:x + TILE_F] = t["b"]
             for n in man["channels"]:
@@ -569,7 +676,9 @@ class SceneGraphStore:
         if not meta: return {"deleted": 0}
         k = self.keep_last if keep_last is None else keep_last
         cur = meta["version"]
-        keep_v = set(range(max(1, cur - k + 1), cur + 1)) | {v for v in leased if 1 <= v <= cur}
+        with self._lock:
+            held = {v for (m, v) in self._leases if m == map_id}
+        keep_v = set(range(max(1, cur - k + 1), cur + 1)) | {v for v in (*leased, *held) if 1 <= v <= cur}
         refs, keep_names = set(), set()
         gens = sorted((int(v), int(g)) for g, v in meta.get("generations", {}).items())
         for v in sorted(keep_v):
@@ -589,6 +698,7 @@ class SceneGraphStore:
             deadset = set(dead)
             for key in [k for k in self._expanded if k[0] == map_id and k[2] in deadset]:
                 self._expanded.pop(key, None)
+        self._evict(map_id, deadset)
         return {"deleted": len(dead), "kept_versions": sorted(keep_v)}
 
     def _refs(self, map_id, raw_manifest: bytes, refs: set) -> None:
@@ -657,6 +767,7 @@ class SceneGraphStore:
         with self._lock:
             for key in [k for k in self._expanded if k[0] == map_id]:
                 self._expanded.pop(key, None)
+        self._evict(map_id)
 
 
 def _overlap_keymap(store: SceneGraphStore, map_id, old, new) -> Dict[str, List[str]]:
@@ -697,6 +808,7 @@ class StoredView:
         self.keys = [c["key"] for c in man["charts"]]
         self._idx = {c["id"]: j for j, c in enumerate(man["charts"])}
         self._levels = None
+        self._lut: Optional[np.ndarray] = None
 
     @property
     def nbytes(self) -> int:
@@ -722,8 +834,12 @@ class StoredView:
         """chart index [rows, cols] (-1 none) and dependent plane (all False) for the global lattice window [lx0, lx1) x [ly0, ly1)"""
         H, W = ly1 - ly0, lx1 - lx0
         idx = -np.ones((H, W), np.int32); dep = np.zeros((H, W), bool)
-        lut = np.full(max(self._idx, default=0) + 1, -1, np.int32)
-        for i, j in self._idx.items(): lut[i] = j
+        lut = self._lut
+        if lut is None:                      # chart id -> index: one per view, not one per window
+            lut = np.full(max(self._idx, default=0) + 1, -1, np.int32)
+            if self._idx:
+                lut[np.fromiter(self._idx, np.int64, len(self._idx))] = np.fromiter(self._idx.values(), np.int32, len(self._idx))
+            self._lut = lut
         self._need([(tx, ty) for ty in range(ly0 // TILE_L, (ly1 - 1) // TILE_L + 1)
                     for tx in range(lx0 // TILE_L, (lx1 - 1) // TILE_L + 1)])
         for ty in range(ly0 // TILE_L, (ly1 - 1) // TILE_L + 1):
