@@ -496,6 +496,10 @@ class ImageDatabaseService(MinIOService):
         """List all map IDs (one per bucket)."""
         return self._list_maps()
 
+    def list_maps_strict(self) -> List[str]:
+        """Like list_maps, but RAISES when MinIO cannot be listed instead of returning []."""
+        return self._list_maps_strict()
+
     def delete_map(self, map_id: str) -> bool:
         """Delete a map and all its images. Idempotent."""
         ok = self._delete_bucket(self._bucket_name(map_id))

@@ -26,7 +26,8 @@ dropped, never dropped; if every engine is active the budget is exceeded and rep
 
 Fairness (inline mode): a pass gives every due map exactly one `step()` (one batch), starting one
 map further along each pass (round-robin). A map must be missing from the list in two consecutive discoveries before its
-worker is dropped (`image_db.list_maps` swallows MinIO errors and then returns []).
+worker is dropped. A listing that FAILED (raised) is "unknown", not empty: the known set is kept, no miss is
+counted, `discover_errors` counts it and it is logged once per outage.
 
 Terminal worker states are not final for the map: the worker is closed (its lock released) and
 the map is retried after a pause, so a map that was deleted and re-created, a lost lock or a
@@ -83,6 +84,8 @@ class SceneRunner:
         self.now, self.on_status = now, on_status
         self.skip_reason, self.on_event = skip_reason, on_event     # reason or None; (map, kind, payload)
         self._absent: Dict[str, int] = {}
+        self.discover_errors = 0
+        self._discover_failing = False
         self._skip_reported: Dict[str, float] = {}
         self._capped: set = set()           # maps already reported as starved by max_maps
         self._rr = 0
@@ -180,7 +183,7 @@ class SceneRunner:
                     unknown += nb is None
             maps[map_id] = entry
         out: Dict[str, Any] = {
-            "maps": maps, "workers": len(self._workers),
+            "maps": maps, "workers": len(self._workers), "discover_errors": self.discover_errors,
             "pool": {"threads": self.config.threads, "inflight": len(self._inflight),
                      "queue_depth": self._queue_depth,
                      "cold_inflight": sum(1 for _f, _k, cold in self._inflight.values() if cold)},
@@ -220,9 +223,16 @@ class SceneRunner:
             return
         try:
             maps = sorted({m for m in self.list_maps() if isinstance(m, str) and m})
-        except Exception:  # noqa: BLE001
-            log.exception("scene runner: listing maps failed")
-            maps = self._known
+        except Exception as exc:  # noqa: BLE001  unknown is not empty: keep everything, count no miss
+            self.discover_errors += 1
+            if not self._discover_failing:
+                self._discover_failing = True
+                log.warning("scene runner: listing maps failed (%s); keeping the known maps", exc)
+            self._discovered_at = t
+            return
+        if self._discover_failing:
+            self._discover_failing = False
+            log.info("scene runner: map listing recovered")
         self._discovered_at = t
         maps = self._apply_skips(maps, t)
         keep = set(maps)

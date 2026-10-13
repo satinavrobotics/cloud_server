@@ -167,3 +167,77 @@ def test_non_string_and_empty_map_ids_are_ignored():
     r.runner.list_maps = lambda: ["a", "", None, 7]
     r.runner.tick()
     assert [w.map_id for w in r.made] == ["a"]
+
+
+def _listing_rig(maps):
+    r = Rig(maps)
+    r.state = {"maps": list(maps), "fail": False}
+
+    def lister():
+        if r.state["fail"]:
+            raise RuntimeError("minio down")
+        return list(r.state["maps"])
+
+    r.runner.list_maps = lister
+    return r
+
+
+def test_failed_listing_keeps_worker_and_state_across_ticks():
+    r = _listing_rig(["a"])
+    r.runner.tick()
+    worker = r.runner.workers["a"]
+    assert r.runner.last_state.get("a") is not None
+    r.state["fail"] = True
+    for _ in range(6):
+        r.t += 61
+        r.runner.tick()
+        assert r.runner.workers.get("a") is worker and not worker.closed
+        assert "a" in r.runner.last_state
+    assert r.runner.discover_errors == 6
+    assert r.runner.snapshot()["discover_errors"] == 6
+    assert len(r.made) == 1
+
+
+def test_failed_listing_does_not_count_toward_the_two_miss_rule():
+    r = _listing_rig(["a"])
+    r.runner.tick()
+    r.state["maps"] = []                    # one genuine miss
+    r.t += 61
+    r.runner.tick()
+    assert "a" in r.runner.workers
+    r.state["fail"] = True                  # outage between the two misses
+    for _ in range(3):
+        r.t += 61
+        r.runner.tick()
+    assert "a" in r.runner.workers
+    r.state["fail"] = False                 # second genuine miss drops it
+    r.t += 61
+    r.runner.tick()
+    assert "a" not in r.runner.workers and r.made[0].closed
+
+
+def test_empty_listing_still_drops_after_two_misses():
+    r = _listing_rig(["a"])
+    r.runner.tick()
+    r.state["maps"] = []
+    r.t += 61
+    r.runner.tick()
+    assert "a" in r.runner.workers
+    r.t += 61
+    r.runner.tick()
+    assert "a" not in r.runner.workers and "a" not in r.runner.last_state
+
+
+def test_recovery_after_outage_reuses_the_same_worker():
+    r = _listing_rig(["a"])
+    r.runner.tick()
+    worker = r.runner.workers["a"]
+    r.state["fail"] = True
+    for _ in range(4):
+        r.t += 61
+        r.runner.tick()
+    r.state["fail"] = False
+    for _ in range(3):
+        r.t += 61
+        r.runner.tick()
+    assert r.runner.workers["a"] is worker and len(r.made) == 1 and not worker.closed
