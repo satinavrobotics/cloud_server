@@ -154,13 +154,32 @@ class ArangoMinioBackend:
         return bool(list(cur))
 
     def put_index(self, map_id, version, anchors, links):
+        """Replace the index of the current version atomically: one stream transaction empties both collections, inserts the
+        new documents and moves `meta.index_version`; a reader sees the old index or the new one, never an empty or mixed one,
+        and a crash leaves the old one. (A database without transactions, i.e. a test fake, takes the sequential path.)"""
         a, l = self._col(map_id, "anchors"), self._col(map_id, "links", edge=True)
-        a.truncate(); l.truncate()
-        if anchors: a.insert_many([{**d, "_key": d["key"], "version": version} for d in anchors], overwrite=True)
-        if links:
-            l.insert_many([{**d, "_key": f"{i}", "_from": f"sg_anchors_{map_id}/{d['a']}", "_to": f"sg_anchors_{map_id}/{d['b']}",
-                            "version": version} for i, d in enumerate(links)], overwrite=True)
-        self._col(map_id, "meta").update({"_key": "meta", "index_version": version})
+        m = self._col(map_id, "meta")
+        a_docs = [{**d, "_key": d["key"], "version": version} for d in anchors]
+        l_docs = [{**d, "_key": f"{i}", "_from": f"sg_anchors_{map_id}/{d['a']}", "_to": f"sg_anchors_{map_id}/{d['b']}",
+                   "version": version} for i, d in enumerate(links)]
+        db = self.c.graph.db
+        if not hasattr(db, "begin_transaction"):
+            a.truncate(); l.truncate()
+            if a_docs: a.insert_many(a_docs, overwrite=True)
+            if l_docs: l.insert_many(l_docs, overwrite=True)
+            m.update({"_key": "meta", "index_version": version})
+            return
+        txn = db.begin_transaction(write=[a.name, l.name, m.name])
+        try:
+            for col, docs in ((a.name, a_docs), (l.name, l_docs)):
+                txn.aql.execute("FOR d IN @@c REMOVE d IN @@c", bind_vars={"@c": col})
+                if docs: txn.aql.execute("FOR d IN @docs INSERT d INTO @@c", bind_vars={"@c": col, "docs": docs})
+            txn.aql.execute("UPDATE 'meta' WITH {index_version: @v} IN @@c", bind_vars={"@c": m.name, "v": version})
+            txn.commit_transaction()
+        except BaseException:
+            try: txn.abort_transaction()
+            except Exception: pass                      # the transaction is already gone (server-side abort)
+            raise
 
     def index_version(self, map_id):
         m = self.meta(map_id)

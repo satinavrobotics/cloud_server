@@ -331,9 +331,14 @@ class SceneGraphStore:
             return pending.get("version", 0) if pend else cur
         body["content_hash"] = content_hash
 
-        # ---- writes: objects first (unreferenced until the commit), then the commit point
+        # ---- writes: objects first (unreferenced until the commit), then the commit point. Objects are content addressed and
+        # a put of identical bytes is idempotent, so no existence check is made. An object the base manifest references is
+        # known to exist (a committed manifest is never collected) and is not sent again (it is only here when a hash repeats
+        # at another coordinate); everything else is put, also on a retry: a "known" object from an uncommitted attempt could
+        # have been collected by another process in between, so only committed names count.
+        known = self._known_names(prev)
         for name, blob in new_blobs.items():
-            if not self.blobs.exists(map_id, name):
+            if name not in known:
                 self.blobs.put(map_id, name, blob)
         if pend:
             pv = pending.get("version", 0) + 1
@@ -370,8 +375,10 @@ class SceneGraphStore:
                                                                       "ever_blocked", "leaf")}} for c in charts],
                                 [{k: l[k] for k in ("a", "b", "length", "width", "channels")} for l in links])
             self.index_error = None
-        except Exception as e:                       # the index lags; the manifest is the truth, `reindex` repairs it
+        except Exception as e:                       # the index lags (meta.index_version < version); the manifest is the truth
             self.index_error = e
+            log.warning("scene-graph %s: index of version %d not written, it lags (%s: %s); manifest and meta are committed",
+                        map_id, newv, type(e).__name__, e)
         return newv
 
     # ------------------------------------------------------------------ read
@@ -381,6 +388,14 @@ class SceneGraphStore:
         if raw is None: raise FileNotFoundError(name)
         import json
         return json.loads(raw)
+
+    @staticmethod
+    def _known_names(man) -> set:
+        """object names a committed manifest references (they exist)"""
+        if not man: return set()
+        g = man["generation"]
+        return ({"g%d/t/%s" % (g, h) for h in man["tiles"].values()} | {"g%d/l/%s" % (g, h) for h in man["segments"]}
+                | {"g%d/p/%s" % (g, h) for h in man["pages"].values()})
 
     @staticmethod
     def _pack_tiles(st, lut, coords, gen, tiles, blobs) -> None:
