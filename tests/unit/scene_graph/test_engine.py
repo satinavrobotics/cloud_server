@@ -295,3 +295,22 @@ def test_route_width_reads_the_passage_not_a_witness_sliver_beside_it():
         a, b = g.snap(1.0, 1.0, 0.5), g.snap(5.0, 5.0, 1.5)
         r = g.route(a.key, b.key)
         assert r is not None and r.min_width >= 1.2 - 0.1, f"trial {trial}: {r.min_width if r else None}"
+
+
+def test_point_to_point_route_runs_between_the_given_cells_and_visits_no_anchor():
+    g, w, _ = built("ring")
+    v = g.query(ALL, raster=False)
+    keys = [c.key for c in v.charts]
+    rng = random.Random(3)
+    ys, xs = np.nonzero(g._solved.plane >= 0)
+    for _ in range(12):
+        i, j = rng.randrange(len(ys)), rng.randrange(len(ys))
+        p, q = g._cell_xy(int(ys[i]), int(xs[i])), g._cell_xy(int(ys[j]), int(xs[j]))
+        sa, sb = g.snap(*p), g.snap(*q)
+        if sa.key is None or sb.key is None: continue
+        r = g.route(sa.key, sb.key, start=p, goal=q)
+        assert r is not None and r.nodes[0] == pytest.approx(p) and r.nodes[-1] == pytest.approx(q)
+        assert r.length >= np.hypot(p[0] - q[0], p[1] - q[1]) - 1e-6
+    # a start outside navigable space falls back to the anchor
+    r = g.route(keys[0], keys[-1], start=(-100.0, -100.0), goal=(-100.0, -100.0))
+    assert r is not None and r.nodes == g.route(keys[0], keys[-1]).nodes

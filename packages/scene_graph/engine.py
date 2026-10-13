@@ -858,14 +858,29 @@ class ChartGraph(SceneGraph):
             m |= (cx - (x0 + t * dx)) ** 2 + (cy - (y0 + t * dy)) ** 2 <= hw * hw
         return m
 
-    def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None) -> Optional[Route]:
-        """Shortest lattice route between the anchors of charts a and b in navigable space (blocked cells removed).
-        Searches the chart corridor first and the whole graph if that finds nothing or a longer way."""
+    def _cell_at(self, p: Optional[Tuple[float, float]]) -> Optional[int]:
+        """index of the navigable cell containing the map-frame point, None outside navigable space"""
+        if p is None: return None
+        sp = self._solved.sp
+        iy = (int(math.floor(p[1] / RES)) - self._cy0) // 2; ix = (int(math.floor(p[0] / RES)) - self._cx0) // 2
+        if not (0 <= iy < sp.H and 0 <= ix < sp.W): return None
+        c = int(sp.idx[iy, ix])
+        return c if c >= 0 else None
+
+    def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
+              goal: Optional[Tuple[float, float]] = None) -> Optional[Route]:
+        """Shortest lattice route in navigable space (blocked cells removed) between the anchors of charts a and b, or, when
+        `start` / `goal` name a navigable cell, between those cells (no anchor is visited; a point outside navigable space
+        falls back to the anchor of its chart). Searches the chart corridor first and the whole graph if that finds nothing
+        or a longer way."""
         self._check()
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
         sp = s.sp; ja, jb = s.keys.index(a), s.keys.index(b)
         src, dst = int(s.A[ja]), int(s.A[jb])
+        c0, c1 = self._cell_at(start), self._cell_at(goal)
+        if c0 is not None and int(s.full[c0]) == ja: src = c0
+        if c1 is not None and int(s.full[c1]) == jb: dst = c1
         R, C, Ln = s.edges
         N = sp.N
         alive = np.ones(N, bool)

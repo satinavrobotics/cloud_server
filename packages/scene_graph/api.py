@@ -180,8 +180,12 @@ class SceneGraph:
         crosses a known blocked cell. `max_dist` None = sight_range, the outer bound; `key` is None beyond it."""
         raise NotImplementedError
 
-    def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None) -> Optional[Route]:
-        """Lattice route in navigable space; None when unreachable."""
+    def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Pt] = None,
+              goal: Optional[Pt] = None) -> Optional[Route]:
+        """Lattice route in navigable space between charts a and b; None when unreachable. It runs from the anchor of a to
+        the anchor of b, unless `start` / `goal` (map-frame points, e.g. a Snap's x, y) name the cells to route between:
+        then the route is point to point and no anchor is visited (a point outside navigable space falls back to the anchor
+        of its chart). A region is large, its anchor is not on the way."""
         raise NotImplementedError
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
