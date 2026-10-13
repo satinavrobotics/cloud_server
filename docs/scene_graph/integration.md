@@ -3,9 +3,9 @@
 Status (2026-10-13): built on `feat/scene-graph-v2` and exercised end to end against real ArangoDB / MinIO / Postgres
 by the e2e harness (below); not yet run on a production stack. The sections below are the design and the decisions
 behind it; "Order and status" and "Open defects" are the current state. Operations (settings, deploy order, rollback,
-events, troubleshooting): `runbook.md`, not repeated here. Companion to `design.md` (v1 algorithm, replaced) and
-`handoff_cimbi.md` (the contract with CIMBI). Items marked *(pending interface)* were written before the library
-interface was fixed; read them against `packages/scene_graph/api.py`.
+events, troubleshooting): `runbook.md`, not repeated here. The algorithm is defined in `formulation.md` (what the
+engine implements, with its verification in `audit_ledger.md`); the contract with CIMBI is `packages/scene_graph/api.py`.
+Items marked *(pending interface)* were written before the library interface was fixed; read them against it.
 
 **Ownership.** CIMBI: the algorithm (`packages/scene_graph`) and its persistence (snapshot, tile layout, `sg_*`
 formats). LACI: everything else here (ingest worker, read API, client, planner, lifecycle hooks, events, ops).
@@ -84,7 +84,7 @@ Principle: every operation is local and bounded; a small map is the degenerate c
 
 | # | Piece | Owner | Scope |
 |---|---|---|---|
-| 1 | Library: algorithm | CIMBI | v2 charts, local re-solve, `fold_many`, `refold`, `locate`, `route`, `query`, `cover`, resampling of rotated windows, key lineage. Interface in `handoff_cimbi.md` *(pending interface)* |
+| 1 | Library: algorithm | CIMBI | persistence regions cut into bounded charts, `fold_many`, `refold`, `locate`, `route`, `query`, `cover`, resampling of rotated windows, key lineage. Interface: `packages/scene_graph/api.py`; definition: `formulation.md` |
 | 2 | Library: persistence | CIMBI | Tiled snapshot including the capture-time and witness/worst/blocked planes, manifest, `sg_*` index, `sg_meta` (version set last, params and hash, generation, watermark), `store.load/save/watermark/drop` *(pending interface)* |
 | 3 | Ingest worker | LACI | Per-map single writer (advisory lock) in graph-builder. Pulls not-yet-folded leaves from Arango (at-least-once, idempotent fold), builds `Leaf` (decode PNG, pose and yaw in map frame, resolution, session, capture stamp with the time-source rule, `r_d`, channels by role), batches into `fold_many`, snapshots every N leaves / T seconds / idle, publishes at most every T seconds, emits `Dirty` to the websocket. `run_id` stamped on the node at the same write as the costmap record |
 | 4 | Lifecycle | LACI | Saga: drop `sg_*_{id}` (index) in `map_delete`; snapshot dies with the bucket. Node delete -> debounced local re-solve. Realign: see "Review findings" (node poses are not rewritten, so no rebuild trigger unless the legacy tool runs). Backfill script for existing maps (precedent: edge-stats) incl. `occupancy_depth` when released |
@@ -291,7 +291,7 @@ Types are in `packages/scene_graph/api.py` and `store.py` (CIMBI's, pinned by `t
 
 ## Review findings (2026-10-12, two read-only reviews; claims spot-checked)
 
-Verified in code unless marked. Supersedes earlier statements here and in `handoff_cimbi.md` where they differ.
+Verified in code unless marked. Supersedes earlier statements here where they differ.
 
 ### Changes to the plan (LACI)
 
@@ -657,23 +657,16 @@ statement.
 * **Selection removed**: chart selection and its lineage re-mapping were dead code and were dropped; lineage is
   served but not consumed by the client.
 
-## At the Morse format bump (TODO, nothing changed yet)
+## Format bump (FORMAT 4, pipeline `morse/2`)
 
-The star engine on v2 still reads `place_mult` / `sight_range`; the Morse engine ignores `place_mult` (deprecated
-no-op) and no longer reads `sight_range`. They are still written everywhere and pinned. When the store format moves
-to the Morse FORMAT (new generation for every map), do these together, not before:
+Done in code: `SceneParams` is `robot_half_side`, `lattice`, `chart_radius` (the only scene-dependent scale);
+`place_mult` and `sight_range` are gone from the engine, the store, `scene_host.params_dict`, the benchmarks and the unit
+tests. Old stores have a different params hash and are rebuilt as a new generation (no deploy has happened yet).
 
-* [ ] `packages/services/graph_builder/scene_host.py` `params_dict()`: stop writing `place_mult` and `sight_range`
-  (the dict is what `EngineState.params` and the params hash are taken over; a change here is a new params hash, so
-  every map rebuilds once: do it in the same release as the format bump).
-* [ ] `tests/unit/test_scene_host.py` (`params_dict(p) == ChartGraph(p).export_state().params`) and
-  `tests/integration/scene_graph/test_scene_graph_e2e.py` (`meta["params"] == params_dict(params)`): the pins to move
-  with the engine's `export_state().params` and the store's `params_hash` / `ChartGraph` re-creation
-  (`packages/scene_graph/store.py`, CIMBI's) at the same time.
-* [ ] `SceneParams` construction in the worker host / adapter (`scene_host.worker_config`, `new_engine`): drop the two
-  arguments once the dataclass fields are gone.
-* [ ] `meta.params` served to clients (`scene_host.py:109` path via `store.meta`) stops carrying them; check the
-  client (`sati-client`) does not read `sight_range`.
-* [ ] `tools/scene_graph_sim/bench_*.py` and the unit tests that build `SceneParams(place_mult=..., sight_range=...)`.
-* [ ] `reads._check`: once `ViewResult.levels` exists on every served view (it does on the Morse tree), the 422 for
+Left for the integrator:
+
+* [ ] `meta.params` served to clients now carries `chart_radius`; check `sati-client` does not read `sight_range`.
+* [ ] `OwnerRaster.dependent` is always all-zero (there are no dependents any more) and still served as a plane by
+  `reads.py`; drop it from the served raster together with the client's read of it.
+* [x] `reads._check`: `ViewResult.levels` exists on every served view (0 when the hierarchy was not computed).
   a level beyond the map's top level is on by itself; nothing to change.
