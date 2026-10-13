@@ -16,8 +16,9 @@
 # DEPLOY_LOG (default ~/.cache/satina-deploy.log). Settings (.env) are never touched here: edit them first.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/docker_compose/mission_dispatch_services.yaml}"
+SELF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="${COMPOSE_FILE:-$SELF_ROOT/docker_compose/mission_dispatch_services.yaml}"
+ROOT="$(cd "$(dirname "$COMPOSE_FILE")/.." && pwd)"                 # the checkout the compose file belongs to
 HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-180}"
 DEPLOY_LOG="${DEPLOY_LOG:-$HOME/.cache/satina-deploy.log}"
 PLANNER_PORT="${PLANNER_PORT:-8005}"
