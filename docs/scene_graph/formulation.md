@@ -112,6 +112,16 @@ identity and a display point, never a waypoint.
 
 ## 6. Open
 
+* **Rate pricing (not built; later format step).** Price a cell by the age-decayed posterior rate at which it was seen blocked, cost
+  per cell length / (1 - p), p capped at 0.75, integer weights >= 1, an overlay stays hard. Conditions agreed with the planner side:
+  the counts are a separate versioned object (not in tiles or the manifest hash); counts need time buckets or a last-look plane
+  to decay; `route(now=...)` takes an explicit quantised time and `now=None` is today's behaviour; the engine never reads a clock;
+  `Route.length` stays geometric and `Route.cost` is added; under pricing the corridor is a seed, not exact, so the search covers the
+  whole graph and an `exact` flag is exposed; ties are canonical on integer cost. Counting needs per-leaf-key dedup in the engine
+  because delivery is at-least-once (restart, rebuild resume, backfill re-deliver): same (t, session, x, y, r_d, view) adds nothing,
+  absent adds, changed triggers a counts rebuild; the counted stamp is persisted in the leaf record. `api.py` "evidence and length,
+  never a price" is amended when this lands.
+
 * Exact locality: persistence pairing is global in a component; the engine recomputes the persistence regions of the whole map per
   batch (affordable at the measured cost), serves unchanged regions' charts from the last solve, and writes only
   content-hash-changed objects.
