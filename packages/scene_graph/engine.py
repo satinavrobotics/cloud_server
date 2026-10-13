@@ -7,7 +7,7 @@
              robot has been (G). Evidence is the driven polyline of each session, tagged with the half side r_d of its robot.
     charts   star-shaped cover with an anchor each (chart_solver), re-solved locally per batch (chart_track); persistent keys
              by overlap with the previous owner plane (chart_keys).
-    links    one per connected stretch of orthogonal contact; length (the cost) of the shortest route anchor -> contact ->
+    links    one per connected stretch of the interface curve of two charts (orthogonal contact); length (the cost) of the shortest route anchor -> contact ->
              anchor inside the two charts, strict widest-path width, line integral of every channel along that route.
 The graph carries evidence and length, never a price. Pure numpy / scipy, no I/O.
 
@@ -345,10 +345,12 @@ class ChartGraph(SceneGraph):
             self._leaf_put(lf.key, rec)
             self._watermark = max(self._watermark, (lf.stamp_ms, lf.key))
         birth = max(((lf.stamp_ms, lf.key) for lf in leaves), default=self._watermark)[1]
+        # the fold counter moves only when the state did: a cell, a new or changed leaf record, a refold (a replay is a no-op)
+        moved = touched is not None or bool(self._pl_new) or self._pl_full or region is not None
         self._cache = {}
         self._shift = shift
         self._solve(shift, birth)
-        self.version += 1
+        if moved: self.version += 1
         # the dirty box is where cells actually changed (and the area of a refold), not where windows were laid down
         return self._dirty(old, old_sig, old_link_sig, old_keys, touched, region)
 
@@ -487,9 +489,8 @@ class ChartGraph(SceneGraph):
             if st["shape"] != shape:
                 sy, sx = shift
                 oH, oW = st["shape"]
-                # the lattice position of a pose is round-half-even of a half-integer: shifting the canvas by an odd number of cells can
-                # move it by one, so only even shifts carry the old rasters over exactly
-                if sy + oH > H or sx + oW > Wd or sy % 2 or sx % 2: st = None
+                # a pose cell is floor((g - cx0) / 2) with cx0 even: a canvas shift by k lattice cells moves it by exactly k
+                if sy + oH > H or sx + oW > Wd: st = None
                 else:
                     def pad(a):
                         b = np.zeros(shape, bool); b[sy:sy + oH, sx:sx + oW] = a; return b
@@ -706,6 +707,29 @@ class ChartGraph(SceneGraph):
         wnew[k] = w
         return w
 
+    @staticmethod
+    def _stretches(sp, es):
+        """Stretch index of every contact pair of one chart pair: the connected components of the INTERFACE CURVE (each pair
+        is a unit edge between its two cells; two edges are joined when they share an end point). Components of the cell
+        set would merge two stretches that meet only through one cell of a chart poking toward a hole: the intersection of
+        the two closed charts has two components there, and the nerve must count both or it misses the loop around the hole."""
+        parent: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+        def find(v):
+            r = v
+            while parent.setdefault(r, r) != r: r = parent[r]
+            while parent[v] != r: parent[v], v = r, parent[v]
+            return r
+        ends = []
+        for u, v in es:
+            yu, xu, yv, xv = int(sp.ys[u]), int(sp.xs[u]), int(sp.ys[v]), int(sp.xs[v])
+            if yu == yv: e = ((yu, max(xu, xv)), (yu + 1, max(xu, xv)))     # horizontal neighbours: the vertical edge between them
+            else: e = ((max(yu, yv), xu), (max(yu, yv), xu + 1))             # vertical neighbours: the horizontal edge between them
+            ends.append(e); parent[find(e[0])] = find(e[1])
+        roots: Dict[Tuple[int, int], int] = {}
+        comp = [roots.setdefault(find(e[0]), len(roots)) for e in ends]
+        return comp, len(roots)
+
     def _links(self, sp, A, full, edges, chv) -> List[dict]:
         R, C, Ln = edges
         wnew: dict = {}
@@ -758,15 +782,12 @@ class ChartGraph(SceneGraph):
             return p[::-1]
         out = []
         for (a, b), es in sorted(pairs.items()):
-            m = np.zeros((sp.H, sp.W), bool)
-            for u, v in es:
-                m[sp.ys[u], sp.xs[u]] = True; m[sp.ys[v], sp.xs[v]] = True
-            lab, n = ndimage.label(m, structure=np.ones((3, 3)))
+            comp_of, n = self._stretches(sp, es)
             width = self._width(sp, full, A, a, b, wnew)
-            for comp in range(1, n + 1):
+            for comp in range(n):
                 best = None
-                for u, v in es:
-                    if lab[sp.ys[u], sp.xs[u]] != comp: continue
+                for (u, v), cu in zip(es, comp_of):
+                    if cu != comp: continue
                     du = D[a][int(np.searchsorted(CJ[a], u))]; dv = D[b][int(np.searchsorted(CJ[b], v))]
                     tot = du + dv + math.hypot(sp.ys[u] - sp.ys[v], sp.xs[u] - sp.xs[v]) * 0.1
                     if np.isfinite(tot) and (best is None or tot < best[0]): best = (float(tot), u, v)

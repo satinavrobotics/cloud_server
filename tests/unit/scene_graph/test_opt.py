@@ -420,3 +420,40 @@ def test_driven_evidence_survives_out_of_order_arrival_two_sessions_and_a_delete
     g.refold(keep, BBox(-100, -100, 100, 100))
     G, W, S = _evidence_by_definition(g)
     assert (g._pl["G"] == G).all() and (g._pl["W"] == W).all() and (g._pl["S"] == S).all()
+
+
+def test_evidence_is_exact_across_odd_lattice_shifts_in_both_directions():
+    """a pose cell is floor((g - cx0) / 2) with cx0 even, so a canvas shift of k lattice cells moves it by exactly k: the
+    incremental driven evidence needs no even-shift restriction. Translations force odd shifts; both growth directions."""
+    import dataclasses
+    odd = checked = 0
+    for dx in (0.0, 0.15):
+        for rev in (False, True):
+            w, way = cw.two_rooms()
+            leaves = [dataclasses.replace(l, x=l.x + dx, y=l.y + dx * 1.7, origin=(l.origin[0] + dx, l.origin[1] + dx * 1.7))
+                      for l in cw.drive(w, way)]
+            if rev:
+                leaves = [dataclasses.replace(l, x=-l.x, y=-l.y, origin=(-l.origin[0] - 6.0, -l.origin[1] - 6.0)) for l in leaves]
+            g = ChartGraph(SceneParams())
+            for i in range(0, len(leaves), 3):
+                shape0 = None if g._V is None else g._V.shape
+                g.fold_many(leaves[i:i + 3])
+                if shape0 is not None and g._V.shape != shape0 and any(v % 2 for v in g._shift): odd += 1
+                G, W, S = _evidence_by_definition(g)
+                assert (g._pl["G"] == G).all() and (g._pl["W"] == W).all() and (g._pl["S"] == S).all()
+                checked += 1
+    assert odd > 0 and checked > 15
+
+
+def test_engine_version_counts_state_changes_not_calls():
+    w, way = cw.two_rooms()
+    leaves = cw.drive(w, way)
+    g = ChartGraph(SceneParams())
+    g.fold_many(leaves)
+    v = g.version
+    d = g.fold_many(leaves[-5:])                       # a replay: nothing changes
+    assert d.bbox is None and g.version == v
+    g.fold_many([])
+    assert g.version == v
+    g.fold_many(cw.drive(w, [(1.0, 0.8), (5.0, 0.8)], session="b", t0=10 ** 6))   # a new session: leaf records and evidence
+    assert g.version == v + 1

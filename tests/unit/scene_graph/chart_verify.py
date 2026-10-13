@@ -6,7 +6,10 @@ star      every owned cell is reached from its anchor by a classical Bresenham l
           chart, without cutting a corner
 chart4    charts are 4-connected
 band      clearance at the anchor >= (1 - eps) * peak clearance of its chart (eps = h / s)
-topology  chi(free space) = V - E + T - Q of the link graph (one edge per connected stretch of orthogonal contact)
+topology  chi(served region) = V - E + T - Q of the link graph, EXACT (no hole is filled). E counts, per chart pair, the
+          connected components of the INTERFACE CURVE of the two closed charts (unit edges between differing cells, joined
+          when they share an end point). Counting components of the contact CELL SET instead merges two stretches that
+          meet only through one cell of a chart poking toward a hole, and loses the loop around that hole (office01).
 width     link width = widest path (maximin clearance x 2) inside the union of the two charts, 4-connected flood fill
 """
 import math
@@ -19,6 +22,33 @@ from packages.scene_graph.api import BBox
 C4 = ndimage.generate_binary_structure(2, 1)
 C8 = np.ones((3, 3), bool)
 RES = 0.05
+
+
+def _interface_stretches(full):
+    """sum over chart pairs of the connected components of their interface curve (unit edges joined at shared end points)"""
+    H, W = full.shape
+    pairs = {}
+    for y in range(H):
+        for x in range(W):
+            a = full[y, x]
+            if a < 0: continue
+            if x + 1 < W:
+                b = full[y, x + 1]
+                if b >= 0 and b != a: pairs.setdefault((min(a, b), max(a, b)), []).append(((y, x + 1), (y + 1, x + 1)))
+            if y + 1 < H:
+                b = full[y + 1, x]
+                if b >= 0 and b != a: pairs.setdefault((min(a, b), max(a, b)), []).append(((y + 1, x), (y + 1, x + 1)))
+    total = 0
+    for segs in pairs.values():
+        par = {}
+
+        def f(v):
+            while par.setdefault(v, v) != v:
+                par[v] = par[par[v]]; v = par[v]
+            return v
+        for u, w in segs: par[f(u)] = f(w)
+        total += len({f(u) for u, _ in segs})
+    return total
 
 
 def _bres(x0, y0, x1, y1):
@@ -116,12 +146,7 @@ def verify(g, world, r=0.25, bbox=None):
         for y, x in np.argwhere(mk):
             key = (min(int(a_[y, x]), int(b_[y, x])), max(int(a_[y, x]), int(b_[y, x])))
             pairs.setdefault(key, []).extend([(y, x), (y + dy, x + dx)])
-    E = 0
-    for key, pts in pairs.items():
-        m = np.zeros((H, W), bool)
-        for y, x in pts:
-            if 0 <= y < H and 0 <= x < W: m[y, x] = True
-        E += ndimage.label(m, structure=C8)[1]
+    E = _interface_stretches(full)
     T = Q = 0
     for y in range(-1, H):
         for x in range(-1, W):
