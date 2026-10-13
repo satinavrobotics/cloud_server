@@ -78,7 +78,7 @@ def timed(label, fn, n=1):
 
 
 def lazy_section(store, v, side, rooms):
-    """the same measurements on the tile-lazy PlanGraph (SCENE_GRAPH_PLANNER_MODE=lazy)"""
+    """the same measurements on the tile-lazy PlanGraph"""
     from packages.scene_graph.api import Blocked
     from packages.services.mission_planner.lazy_plan import open_plan
     print("--- lazy (PlanGraph over StoredView) ---")

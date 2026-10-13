@@ -1,10 +1,10 @@
 # Scene graph v2: state at end of session and next steps (LACI side)
 
 Branch `feat/scene-graph-v2` (CIMBI's Morse engine with chart_radius, the lazy planner `09a4e99` behind
-`SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load` when written; now `lazy`, `full_load` is the rollback, set explicitly in the prod `.env`), the store read-path patch `16aee6a`; `main` merged as `39fd715`, then `7710d7a`:
+`SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load` when written; production lazy since 2026-10-13 19:00 UTC; `full_load` existed until its removal on 2026-10-13, lazy is the only mode), the store read-path patch `16aee6a`; `main` merged as `39fd715`, then `7710d7a`:
 single alembic head, pinned test image with scipy; HEAD `7710d7a`, origin was @485f39d before those two). Targeted
 tests 339 passed / 3 skipped (MinIO-only) on 2026-10-13 before the main merge (not re-run since); `tools/scene_graph_e2e/run.sh` 32 passed in
-`full_load` and `lazy`; full pinned suite 4158 passed / 0 failed after `7710d7a` (2026-10-13), per CIMBI (not re-run by us).
+`full_load` and `lazy` (while both existed); full pinned suite 4158 passed / 0 failed after `7710d7a` (2026-10-13), per CIMBI (not re-run by us).
 Findings, decisions and open items of the planner-upgrade work: `planner_findings_2026-10-13.md`.
 Client: `sati-client` commit 7178d1a (tiling, abort/pause, epoch/ETag, stale view) is in; the
 client repo also has unrelated uncommitted edits (DeckGLMap, relief, LiveKit): not ours.

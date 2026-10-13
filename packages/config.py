@@ -565,17 +565,15 @@ SCENE_GRAPH_PLAN_MAX_INFLIGHT = int(os.getenv("SCENE_GRAPH_PLAN_MAX_INFLIGHT", "
 SCENE_GRAPH_CACHE_VERSIONS = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS", "4"))
 SCENE_GRAPH_CACHE_VERSIONS_PER_MAP = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS_PER_MAP", "2"))
 SCENE_GRAPH_CACHE_MAX_BYTES = int(os.getenv("SCENE_GRAPH_CACHE_MAX_BYTES", "0"))
-# Planner graph: "full_load" restores the whole engine per (map, version) (store.load; GBs per km^2),
-# "lazy" opens the manifest only and reads the owner tiles of each request's corridor (docs/scene_graph/
-# planner_upgrade.md, Phase 0). A route whose corridor needs more than LAZY_MAX_TILES tiles falls back
-# `corridor_too_large`; LAZY_TILE_CACHE is the number of owner tiles (about 35 KB each) kept per graph.
-# Default "lazy" (equal to full_load under the canonical tie rule, tests/unit/test_lazy_plan_equality.py);
-# rollback = SCENE_GRAPH_PLANNER_MODE=full_load.
-SCENE_GRAPH_PLANNER_MODE = os.getenv("SCENE_GRAPH_PLANNER_MODE", "lazy").strip().lower()
-if SCENE_GRAPH_PLANNER_MODE not in ("full_load", "lazy"):
+# Planner graph: the tile-lazy PlanGraph only (docs/scene_graph/planner_upgrade.md, Phase 0): it opens the
+# manifest and reads the owner tiles of each request's corridor. A route whose corridor needs more than
+# LAZY_MAX_TILES tiles falls back `corridor_too_large`; LAZY_TILE_CACHE is the number of owner tiles
+# (about 35 KB each) kept per graph. The former `full_load` mode (whole engine per version) was removed
+# 2026-10-13; SCENE_GRAPH_PLANNER_MODE is ignored, with a warning when it names anything but `lazy`.
+if os.getenv("SCENE_GRAPH_PLANNER_MODE", "lazy").strip().lower() != "lazy":
     logging.getLogger(__name__).warning(
-        "unknown SCENE_GRAPH_PLANNER_MODE=%r, using 'lazy' (valid: 'full_load', 'lazy')", SCENE_GRAPH_PLANNER_MODE)
-    SCENE_GRAPH_PLANNER_MODE = "lazy"
+        "SCENE_GRAPH_PLANNER_MODE=%r ignored: the planner is always 'lazy' (full_load was removed)",
+        os.getenv("SCENE_GRAPH_PLANNER_MODE"))
 SCENE_GRAPH_LAZY_MAX_TILES = int(os.getenv("SCENE_GRAPH_LAZY_MAX_TILES", "400"))
 SCENE_GRAPH_LAZY_TILE_CACHE = int(os.getenv("SCENE_GRAPH_LAZY_TILE_CACHE", "512"))
 # A store.meta answer is reused this long per map and shared by concurrent requests (one query).

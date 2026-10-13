@@ -1,7 +1,7 @@
 # Planner upgrade: read-only, tile-lazy chart planner
 
 Status (2026-10-13, end of session): **Phase 0 and the planner-side hardening are merged** into `feat/scene-graph-v2`
-as `09a4e99`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (at the merge the default was `full_load`; it is now `lazy`, `full_load` is the rollback; the planner itself stays off:
+as `09a4e99`, behind a `lazy` mode flag (at the merge the default was `full_load`; lazy became the default, then the only mode: `full_load` existed until its removal on 2026-10-13; the planner itself was off at the merge:
 `SCENE_GRAPH_PLANNER_ENABLED`). The store read-path hardening was taken by CIMBI as `16aee6a` (section 9, Phase 1:
 done items marked). Phases 1 (rest), 2 and 3 are plan only. Written 2026-10-13 from a read-only scoping pass over branch
 `feat/scene-graph-v2`; file:line citations are as of that date (before the merge). Current record of the work:
@@ -10,8 +10,8 @@ measurements. Related: `integration.md` (planner wiring, measurements), `runbook
 
 ## 0. Phase 0 result (2026-10-13)
 
-`packages/services/mission_planner/lazy_plan.py` (`PlanGraph`, `open_plan`), selected by
-`SCENE_GRAPH_PLANNER_MODE=lazy` (default `lazy` since the canonical tie rule; `full_load` = rollback; `SCENE_GRAPH_LAZY_MAX_TILES`, `SCENE_GRAPH_LAZY_TILE_CACHE`).
+`packages/services/mission_planner/lazy_plan.py` (`PlanGraph`, `open_plan`), the only planner mode (it was
+selected by `SCENE_GRAPH_PLANNER_MODE=lazy`, default since the canonical tie rule; `full_load` existed until its removal on 2026-10-13; `SCENE_GRAPH_LAZY_MAX_TILES`, `SCENE_GRAPH_LAZY_TILE_CACHE`).
 No format change, no engine change; it reads `StoredView` (`_own`, `_cache`) and the manifest, so Phase 1 only moves
 that code next to the engine.
 
@@ -241,8 +241,8 @@ Per the integration split: no commit and no message to CIMBI without the user's 
   (`corridor_too_large`, `tile_unavailable`: done on the planner side), config, runbook, prewarm.
 * **Phase 3:** portal-node or hierarchy-level stage 1 for multi-km^2; clearance plane for `min_width`; replace
   `SCENE_GRAPH_CACHE_VERSIONS` by a byte budget.
-* Keep `SCENE_GRAPH_PLANNER_ENABLED`; add a `full_load | lazy` mode flag so rollback is config-only. Keep the
-  full-load path until equality is proven.
+* Keep `SCENE_GRAPH_PLANNER_ENABLED`; a `full_load | lazy` mode flag was added so rollback was config-only and the
+  full-load path kept until equality was proven; both are gone (removed 2026-10-13, lazy only; rollback is `SCENE_GRAPH_PLANNER_ENABLED=false` or the previous image).
 
 ## 10. Tests and acceptance
 

@@ -296,7 +296,7 @@ class GraphCache:
                  backoff_max_s: Optional[float] = None, max_stale_s: float = 0.0,
                  meta_ttl_s: float = 0.0, max_bytes: int = 0, load_workers: int = 2,
                  io_workers: int = 4, lazy: bool = False, lazy_kw: Optional[Dict[str, Any]] = None):
-        self._lazy = bool(lazy)                     # SCENE_GRAPH_PLANNER_MODE=lazy: PlanGraph, not store.load
+        self._lazy = bool(lazy)                     # True (the service always): PlanGraph; False: store.load, a test seam
         self._lazy_kw = dict(lazy_kw or {})
         self._factory = store_factory
         self._max = max(1, int(max_entries))
