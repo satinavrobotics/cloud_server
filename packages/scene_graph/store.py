@@ -30,7 +30,7 @@ import numpy as np
 
 from .api import BBox, Chart, Dirty, Leaf, Link, MissingTiles, OwnerRaster, SceneGraph, SceneParams, Snap, ViewResult
 from .chart_levels import hierarchy
-from .state import EngineState, LeafRecord
+from .state import EngineState, LeafRecord, StateMismatch  # noqa: F401  (StateMismatch re-exported)
 from .store_backends import ArangoMinioBackend, Blobs, Docs, MemoryBackend  # noqa: F401  (re-exported)
 from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pack_json, params_hash, unpack,
                           unpack_json)
@@ -42,7 +42,7 @@ TILE_L = 64
 SEGMENT = 1024                # leaf records per segment
 SUPER = 8                     # tiles per super-tile side: the unit of a manifest page
 BIG_ROUND = 1 << 30
-FORMAT = 1
+FORMAT = 2
 log = logging.getLogger("scene_graph.store")
 
 
@@ -56,10 +56,6 @@ class TooOld(Exception):
 
 class DirtyCoverageError(Exception):
     """strict mode: an incremental save missed tiles that a full hash shows changed (the pad is too small)."""
-
-
-class StateMismatch(Exception):
-    """a restored engine does not reproduce the stored key table."""
 
 
 def _fmt(k) -> str:
@@ -278,7 +274,7 @@ class SceneGraphStore:
         charts = []
         for j, k in enumerate(keys):
             c = by_key[k]
-            charts.append({"key": k, "id": live[k], "anchor": [c.anchor[0], c.anchor[1]], "cell": list(st.anchors[j]),
+            charts.append({"key": k, "id": live[k], "anchor": [c.anchor[0], c.anchor[1]], "cell": [st.anchors[j][0] + st.cy0 // 2, st.anchors[j][1] + st.cx0 // 2],   # GLOBAL lattice (y, x): independent of the canvas
                            "cells": c.cells, "area": c.area_m2, "clearance": c.clearance, "driven": c.driven_frac,
                            "ever_blocked": c.ever_blocked_frac, "leaf": c.leaf})
         links = [{"a": l.a, "b": l.b, "length": l.length, "width": l.width,
@@ -313,6 +309,7 @@ class SceneGraphStore:
                 "params_hash": params_hash(st.params, PIPELINE), "cursor": cursor, "watermark": list(st.watermark),
                 "engine_version": st.version, "canvas": [st.cx0, st.cy0, int(st.V.shape[0]), int(st.V.shape[1])],
                 "tile_cells": TILE_F, "channels": chans, "next_id": next_id, "pages": page_hashes,
+                "order": [live[k] for k in keys],          # chart ids in ENGINE order: ties in the solver break by anchor order
                 "chart_count": len(charts), "tile_count": len(tiles),
                 "segments": seg_hashes, "leaf_count": len(st.leaves),
                 "retired": {k: v for k, v in (dirty.retired if dirty is not None else {}).items()}}
@@ -468,7 +465,7 @@ class SceneGraphStore:
         return unpack(raw)[0]
 
     def load(self, map_id: str, version: Optional[int] = None, tiles: Optional[Iterable] = None,
-             pending: bool = False) -> SceneGraph:
+             pending: bool = False, verify: bool = True) -> SceneGraph:
         """The engine as saved: planes and evidence as stored, then one re-solve that rebuilds everything derived.
         `pending=True` restores the pending generation's last saved state (a rebuild resumes from meta()["pending"]["cursor"])."""
         from .engine import ChartGraph
@@ -503,7 +500,10 @@ class SceneGraphStore:
             if "own" in t:
                 own[ly:ly + TILE_L, lx:lx + TILE_L] = t["own"]; dep[ly:ly + TILE_L, lx:lx + TILE_L] = t["dep"].astype(bool)
                 rnd[ly:ly + TILE_L, lx:lx + TILE_L] = t["rnd"]
-        id_to_idx = {c["id"]: j for j, c in enumerate(man["charts"])}
+        by_id = {c["id"]: c for c in man["charts"]}
+        order = man.get("order")
+        charts = [by_id[i] for i in order] if order and len(order) == len(by_id) and set(order) == set(by_id) else list(man["charts"])
+        id_to_idx = {c["id"]: j for j, c in enumerate(charts)}
         lut = np.full(max(id_to_idx, default=0) + 1, -1, np.int32)
         for i, j in id_to_idx.items(): lut[i] = j
         plane = np.where(own > 0, lut[np.minimum(own, len(lut) - 1)], -1).astype(np.int32)
@@ -513,16 +513,20 @@ class SceneGraphStore:
             leaves += segment_records(arr, m)
         p = man["params"]
         st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, chan=chan,
-                         leaves=leaves, anchors=[tuple(c["cell"]) for c in man["charts"]],
-                         keys=[_parse(c["key"]) for c in man["charts"]], plane=plane, dep=dep, rnd=rnd,
+                         leaves=leaves, anchors=[tuple(c["cell"]) for c in charts],
+                         keys=[_parse(c["key"]) for c in charts], plane=plane, dep=dep, rnd=rnd,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
-        # the stored anchor cells are in canvas coordinates of the saved canvas: shift to the loaded one
-        sx, sy = (man["canvas"][0] - st.cx0) // 2, (man["canvas"][1] - st.cy0) // 2
-        st.anchors = [(y + sy, x + sx) for y, x in st.anchors]
+        # stored anchor cells are global lattice coordinates (canvas independent: a loaded engine has another canvas, and a
+        # replay must save identical pages); format 1 stored canvas coordinates and is shifted by the saved canvas origin
+        if man.get("format", FORMAT) >= 2:
+            st.anchors = [(y - st.cy0 // 2, x - st.cx0 // 2) for y, x in st.anchors]
+        else:
+            sx, sy = (man["canvas"][0] - st.cx0) // 2, (man["canvas"][1] - st.cy0) // 2
+            st.anchors = [(y + sy, x + sx) for y, x in st.anchors]
         g = ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"], place_mult=p["place_mult"],
                                    sight_range=p["sight_range"]))
-        g.import_state(st)
-        if [_fmt(k) for k in g._keys] != [c["key"] for c in man["charts"]]:
+        g.import_state(st, verify=verify)
+        if [_fmt(k) for k in g._keys] != [c["key"] for c in charts]:
             raise StateMismatch("restored keys differ from the stored key table")
         return g
 

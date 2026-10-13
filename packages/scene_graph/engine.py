@@ -34,7 +34,7 @@ from .chart_levels import hierarchy
 from .chart_track import Track
 from .leafcover import View as CamView
 from .leafcover import select_views
-from .state import EngineState, LeafRecord
+from .state import EngineState, LeafRecord, StateMismatch
 from .window import to_lattice
 
 RES = 0.05                      # costmap cell (m); the lattice is two cells (SceneParams.lattice = 0.1)
@@ -93,8 +93,10 @@ def _squares(r: float) -> List[np.ndarray]:
 
 
 def _line(y0: int, x0: int, y1: int, x1: int):
-    n = max(abs(y1 - y0), abs(x1 - x0), 1); t = np.arange(n + 1) / n
-    return np.rint(y0 + (y1 - y0) * t).astype(int), np.rint(x0 + (x1 - x0) * t).astype(int)
+    """cells of the digital straight line, ties rounded up in exact integer arithmetic: the line of a translated pair is the
+    translated line (np.rint rounds half to even, so the line depended on the canvas origin)"""
+    n = max(abs(y1 - y0), abs(x1 - x0), 1); k = np.arange(n + 1, dtype=np.int64)
+    return y0 + ((y1 - y0) * k * 2 + n) // (2 * n), x0 + ((x1 - x0) * k * 2 + n) // (2 * n)
 
 
 class ChartGraph(SceneGraph):
@@ -184,7 +186,7 @@ class ChartGraph(SceneGraph):
         H, W = V.shape
         ox, oy = gx - cx0, gy - cy0
         ys0, xs0 = max(0, oy), max(0, ox); ys1, xs1 = min(H, oy + w.shape[0]), min(W, ox + w.shape[1])
-        if ys0 >= ys1 or xs0 >= xs1: return
+        if ys0 >= ys1 or xs0 >= xs1: return None
         sub = w[ys0 - oy:ys1 - oy, xs0 - ox:xs1 - ox]
         Tc, Vc = T[ys0:ys1, xs0:xs1], V[ys0:ys1, xs0:xs1]
         kn = sub != 255
@@ -193,7 +195,12 @@ class ChartGraph(SceneGraph):
         if B is not None:
             Bc = B[ys0:ys1, xs0:xs1]
             bl = kn & (sub >= 100)
+            new_b = bl & (t > Bc)
             Bc[bl] = np.maximum(Bc[bl], t)
+            win = win | new_b
+        if not win.any(): return None                                   # a replay of what is folded changes nothing
+        ys, xs = np.nonzero(win)
+        return (int(xs.min()) + xs0, int(ys.min()) + ys0, int(xs.max()) + 1 + xs0, int(ys.max()) + 1 + ys0)
 
     def _fold_leaf(self, lf: Leaf) -> Tuple[int, int, int, int]:
         w, (x0, y0) = to_lattice(lf.window_u8, lf.resolution, lf.origin, lf.origin_yaw, RES)
@@ -246,6 +253,12 @@ class ChartGraph(SceneGraph):
                 gx, gy, wl, chans = self._fold_leaf(lf)
             except Exception as e:                                   # noqa: BLE001 - any resampling failure is the leaf's
                 bad(f"cannot resample the window: {e!r}")
+            # a pose joins the driven polyline: it must belong to its window. The convention is a window centred on the pose
+            # (+- sight_range); one sight_range of slack around the footprint admits an off-centre window, nothing more
+            sr = self.params.sight_range
+            ex = max(gx * RES - lf.x, lf.x - (gx + wl.shape[1]) * RES, gy * RES - lf.y, lf.y - (gy + wl.shape[0]) * RES)
+            if ex > sr:
+                bad(f"pose is {ex:.1f} m outside its window's footprint (bound: sight_range {sr:.1f} m)")
             out.append((lf, wl, gx, gy, chans))
         return out
 
@@ -310,13 +323,20 @@ class ChartGraph(SceneGraph):
                 self._V[y0:y1, x0:x1] = 255; self._T[y0:y1, x0:x1] = -1; self._B[y0:y1, x0:x1] = -1
                 for v, t in self._chan.values():
                     v[y0:y1, x0:x1] = 255; t[y0:y1, x0:x1] = -1
+        touched = None                                   # global full-resolution cells whose value, time or blocked time changed
+
+        def grow_touched(b):
+            nonlocal touched
+            if b is None: return
+            g = (b[0] + self._cx0, b[1] + self._cy0, b[2] + self._cx0, b[3] + self._cy0)
+            touched = g if touched is None else (min(touched[0], g[0]), min(touched[1], g[1]), max(touched[2], g[2]), max(touched[3], g[3]))
         for lf, w, gx, gy, chans in prepared:
-            self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B)
+            grow_touched(self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B))
             for name, cw in chans.items():
                 if name not in self._chan:
                     self._chan[name] = (np.full(self._V.shape, 255, np.uint8), -np.ones(self._V.shape, np.int64))
                 v, t = self._chan[name]
-                self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, lf.stamp_ms)
+                grow_touched(self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, lf.stamp_ms))
             rec = _Rec(lf.session, lf.stamp_ms, lf.x, lf.y, lf.r_d,
                        None if lf.view is None else CamView(lf.key, lf.view.x, lf.view.y, lf.view.yaw, lf.view.fov, lf.view.rng))
             old_rec = self._leaves.get(lf.key)
@@ -329,7 +349,8 @@ class ChartGraph(SceneGraph):
         self._shift = shift
         self._solve(shift, birth)
         self.version += 1
-        return self._dirty(old, old_sig, old_link_sig, old_keys, bounds, region)
+        # the dirty box is where cells actually changed (and the area of a refold), not where windows were laid down
+        return self._dirty(old, old_sig, old_link_sig, old_keys, touched, region)
 
     # ------------------------------------------------------------------ F(r), evidence
     def _polylines(self) -> Dict[float, np.ndarray]:
@@ -344,7 +365,7 @@ class ChartGraph(SceneGraph):
             pts = []
             for _, _, r in items:
                 gx, gy = int(math.floor(r.x / RES)), int(math.floor(r.y / RES))
-                pts.append((round((gx - self._cx0) / 2.0), round((gy - self._cy0) / 2.0), round(r.r_d, 4)))
+                pts.append(((gx - self._cx0) // 2, (gy - self._cy0) // 2, round(r.r_d, 4)))
             for i, (x, y, d) in enumerate(pts):
                 m = out.setdefault(d, np.zeros((H, W), bool))
                 if 0 <= y < H and 0 <= x < W: m[y, x] = True
@@ -490,7 +511,7 @@ class ChartGraph(SceneGraph):
                 for sess, items in by_s.items():
                     for t, k, r_ in items:
                         gx, gy = int(math.floor(r_.x / RES)), int(math.floor(r_.y / RES))
-                        x, y, d = round((gx - self._cx0) / 2.0), round((gy - self._cy0) / 2.0), round(r_.r_d, 4)
+                        x, y, d = (gx - self._cx0) // 2, (gy - self._cy0) // 2, round(r_.r_d, 4)
                         cells = []
                         if 0 <= y < H and 0 <= x < Wd: cells.append((np.array([y]), np.array([x])))
                         lt = last.get(sess)
@@ -519,7 +540,7 @@ class ChartGraph(SceneGraph):
             gx, gy = int(math.floor(rec.x / RES)), int(math.floor(rec.y / RES))
             cur = last.get(rec.session)
             if cur is None or (rec.t, k) > (cur[0], cur[1]):
-                last[rec.session] = (rec.t, k, round((gx - self._cx0) / 2.0), round((gy - self._cy0) / 2.0), round(rec.r_d, 4))
+                last[rec.session] = (rec.t, k, (gx - self._cx0) // 2, (gy - self._cy0) // 2, round(rec.r_d, 4))
         self._pl = dict(shape=shape, G=G, W=Wm, S=S, last=last)
         return G, Wm, S
 
@@ -1039,7 +1060,7 @@ class ChartGraph(SceneGraph):
             st.plane = s.plane; st.dep = s.dep; st.rnd = tr.rnd_img
         return st
 
-    def import_state(self, st: EngineState) -> None:
+    def import_state(self, st: EngineState, verify: bool = True) -> None:
         """Resume from `st` on a fresh engine: planes and evidence are taken as they are, then one local re-solve (from the
         stored anchors, owner and round planes: nothing changed, so it only rebuilds what is derived) restores charts, links
         and keys. The canvas is padded by MARGIN so that clearance near the stored edge sees unknown, as it did before."""
@@ -1068,16 +1089,48 @@ class ChartGraph(SceneGraph):
             self._sig, self._link_sig = {}, set()
             return
         self._key_plane = padl(st.plane.astype(np.int32), -1)
-        nav, clr, _ = self._build_F()
+        nav, clr, S = self._build_F()
         tr = Track(r=p.robot_half_side, mult=p.place_mult, h=self._h, sight_range=p.sight_range)
         tr.anchors = [(y + pad // 2, x + pad // 2) for y, x in st.anchors]
-        own = np.where(padl(st.dep, False) | (self._key_plane < 0), -1, self._key_plane).astype(np.int32)
-        tr.own_img = own
+        own0 = np.where(padl(st.dep, False) | (self._key_plane < 0), -1, self._key_plane).astype(np.int32)
+        tr.own_img = own0
         tr.rnd_img = padl(st.rnd.astype(np.int32), 1 << 30)
-        tr.nav = nav.copy(); tr.clr = clr.copy()
+        # restore, do not solve: the anchors are the stored ones and ownership is re-simulated from them; no add / remove /
+        # move is tried, so what was saved is what is loaded (a descent here would walk to another stationary point)
+        sp, A, own, rnd, bad = tr.restore(nav, clr)
+        if own is None:
+            raise StateMismatch("a stored anchor lies outside the navigable space rebuilt from the stored planes")
+        if len(bad) and verify:
+            H, W = nav.shape
+            y, x = divmod(int(bad[0]), W)
+            gx = (self._cx0 + 2 * x) // (2 * TILE); gy = (self._cy0 + 2 * y) // (2 * TILE)
+            raise StateMismatch("owner plane differs from the stored one in %d cells, first in tile %d,%d" % (len(bad), gx, gy))
         self._track = tr
-        self._solve((0, 0), "")
+        self._retired_map = {}
+        keys_in = list(self._keys)
+        self._solved = self._evaluate(sp, A, own, nav, clr, S, "")
+        if list(self._keys) != keys_in:
+            raise StateMismatch("restored keys differ from the stored key table")
         self._sig, self._link_sig = self._signatures(self._solved)
+
+    def check_invariants(self) -> List[str]:
+        """The cheap structural subset a worker can run after a load: every anchor is in its chart and in the navigable
+        space, charts are 4-connected, the anchor's clearance is on the band, and the anchor sees its whole chart (kernel).
+        Returns the violated invariants (empty = fine). Pocket cover is what the solver itself maintains."""
+        self._check()
+        s = self._solved
+        if s is None: return []
+        sp = s.sp; out: List[str] = []
+        for j, a in enumerate(s.A):
+            mine = np.nonzero(s.own == j)[0]
+            if len(mine) == 0 or s.own[a] != j:
+                out.append("anchor %s not in its chart" % s.keys[j]); continue
+            if not sp.anchor_ok(mine, a):
+                out.append("anchor %s outside kernel or band" % s.keys[j])
+            m = np.zeros(s.plane.shape, bool); m[sp.ys[mine], sp.xs[mine]] = True
+            lab, n = ndimage.label(m, structure=ndimage.generate_binary_structure(2, 1))
+            if n != 1: out.append("chart %s has %d 4-components" % (s.keys[j], n))
+        return out
 
     # ----- query / cover
     def _levels(self):

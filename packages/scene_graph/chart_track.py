@@ -136,3 +136,31 @@ class Track:
         s.last = dict(t=dt, t_delta=t_delta, t_build=t_build, t_seed=t_seed, N=N, A=len(A), S0=len(S0), S=len(S), queue=len(queue), stats=sp.stats, invalid=len(invalid), gone=len(gone),
                       dirty_cells=int(delta.sum()), clr_cells=int(dclr.sum()), changed_cells=int(Cm.sum()))
         return sp, A, own, rnd
+
+    def restore(s, nav, clr):
+        """Resume from a stored state: `anchors`, `own_img`, `rnd_img` are set by the caller.  No construct and no descend: the
+        ownership and rounds are recomputed from the stored anchors by the deterministic re-simulation and returned next to
+        the cells where they differ from the stored ones (the caller decides what a difference means)."""
+        H, W = nav.shape
+        s.nav = np.zeros_like(nav); s.clr = np.zeros_like(clr)
+        s.img_rows = {}; s.tried = {}; s.kmemo = [{}, {}]
+        sp = L.Local(nav, clr, h=s.h, r=s.r, mult=s.mult, img_rows={}, delta=(nav != s.nav), sight_range=s.sight_range, kmemo=s.kmemo)
+        N = sp.N
+        ys = np.array([a[0] for a in s.anchors], np.int64); xs = np.array([a[1] for a in s.anchors], np.int64)
+        inside = (ys >= 0) & (ys < H) & (xs >= 0) & (xs < W)
+        if not inside.all() or (sp.idx[ys, xs] < 0).any():
+            return sp, [], None, None, np.zeros(0, np.int64)         # a stored anchor lies outside F: not this state
+        A = [int(sp.idx[y, x]) for y, x in s.anchors]
+        ob = s.own_img.ravel()[sp.flat]; rb = s.rnd_img.ravel()[sp.flat]
+        own_s = ob.astype(np.int32); rnd_s = np.where(ob >= 0, rb, L.BIG).astype(np.int32)
+        own = np.full(N, -1, np.int32); rnd = np.full(N, L.BIG, np.int32)
+        for i, a in enumerate(A): own[a] = i; rnd[a] = 0
+        own, rnd, _, _ = sp.settle(A, own, rnd, np.arange(N, dtype=np.int64), local=False)
+        bad = np.nonzero((own != own_s) | (rnd != rnd_s))[0]
+        s.nav = nav.copy(); s.clr = clr.copy()
+        s.anchors = [(int(sp.ys[a]), int(sp.xs[a])) for a in A]
+        s.own_img = -np.ones(nav.shape, np.int32); s.own_img[sp.ys, sp.xs] = own
+        s.rnd_img = np.full(nav.shape, L.BIG, np.int32); s.rnd_img[sp.ys, sp.xs] = rnd
+        keep = set(s.anchors)
+        s.img_rows = {k: v for k, v in sp.export_rows().items() if k in keep}
+        return sp, A, own, rnd, sp.flat[bad]

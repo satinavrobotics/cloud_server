@@ -7,6 +7,10 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
+class StateMismatch(Exception):
+    """a restored engine does not reproduce the stored state (key table or owner plane): the snapshot or the code that read it is wrong."""
+
+
 @dataclass
 class LeafRecord:
     key: str
