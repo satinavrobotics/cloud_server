@@ -1,7 +1,11 @@
 # Planner upgrade: read-only, tile-lazy chart planner
 
-Status: **Phase 0 implemented** on `feat/scene-graph-lazy-planner` (section 0 below); phases 1-3 are plan only. Written 2026-10-13 from a read-only scoping pass over branch
-`feat/scene-graph-v2`. File:line citations are as of that date. Numbers marked *est.* are estimates, not
+Status (2026-10-13, end of session): **Phase 0 and the planner-side hardening are merged** into `feat/scene-graph-v2`
+as `09a4e99`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load`; the planner itself stays off:
+`SCENE_GRAPH_PLANNER_ENABLED`). The store read-path hardening was taken by CIMBI as `16aee6a` (section 9, Phase 1:
+done items marked). Phases 1 (rest), 2 and 3 are plan only. Written 2026-10-13 from a read-only scoping pass over branch
+`feat/scene-graph-v2`; file:line citations are as of that date (before the merge). Current record of the work:
+`planner_findings_2026-10-13.md`. Numbers marked *est.* are estimates, not
 measurements. Related: `integration.md` (planner wiring, measurements), `runbook.md`, `handoff_cimbi.md`.
 
 ## 0. Phase 0 result (2026-10-13)
@@ -34,7 +38,7 @@ that code next to the engine.
   The 17 MB at 150 m is the manifest (charts and links as Python objects) plus the tile LRU; it grows with charts,
   not with area covered by a request. The remaining O(map) cost is `store.manifest` (`_expand` of every page).
 
-### Planner-side hardening (branch `wip/lazy-planner-side`)
+### Planner-side hardening (merged: `b117133` from `wip/lazy-planner-side`, then `09a4e99`)
 
 * **Single-flight tile fetch**: `PlanGraph._read` replaces the one serialising lock by per-tile in-flight
   de-duplication (a leader reads, waiters wait on its event); the view's `_own` is pointed at it, so `snap` and the
@@ -53,7 +57,11 @@ that code next to the engine.
   `TileUnavailable`, flags `PlanGraph.unavailable`; `plan_on_graph` turns it into `ChartFallback("tile_unavailable")`
   and `GraphCache.get` evicts flagged graphs, so the next request re-opens the current version.
 
-Open for Phase 1/2: manifest expand, per-request tile fetch cost against MinIO (the memory backend hides it).
+Open for Phase 1/2: the O(map) `store.manifest` expand (`16aee6a` caches parsed pages by hash, so a new version
+re-reads only the changed ones; the expand of the whole manifest itself remains), per-request tile fetch cost against
+MinIO (the memory backend hides it). Since `16aee6a` `PlanGraph._read` fetches through `store._tile`, so the store's
+single-flight and byte-budget tile cache (keyed by object hash) already serve it; the per-`PlanGraph` `(tx, ty)` LRU
+stays in front. The planner takes no `store.lease(...)` yet (it relies on `tile_unavailable`).
 
 ## 1. Problem
 
@@ -177,8 +185,9 @@ less-shortened path.
    *est.*).
 4. **Bypass `_expand`**: pages are addressable by `(tx//8, ty//8)` via `manifest["pages"]`; fetch only the pages
    for the tiles needed. (`_expanded` caches 8 manifests total across maps, `store.py:159`.)
-5. **`gc` leases**: planner does not lease; `keep_last=5` (`store.py:554-580`). A pinned read can hit
-   `FileNotFoundError`; planner must catch it and re-pin, with a distinct fallback reason.
+5. **`gc` leases**: DONE in the store by `16aee6a` (`SceneGraphStore.lease(map_id, version)`, in-process only: another
+   process's gc does not see it; counted, re-entrant; `gc` keeps leased versions). Not used by the planner yet; as before
+   a pinned read can hit `FileNotFoundError` (`tile_unavailable`, done), and `keep_last=5` applies across processes.
 
 ## 7. Ownership
 
@@ -186,7 +195,7 @@ less-shortened path.
 |---|---|
 | plan-tile object, chart->tile sets, columnar chart graph, `FORMAT` bump | `GraphCache` opens a `PlanGraph` per request |
 | `store.open_plan`, `PlanGraph` (`route/snap/corridor/free_cells`) | `blocked_free_los` takes `free_cells` instead of `graph.snap` |
-| byte-budget tile cache (store-internal), `gc` leases | widening policy, new fallback reasons, config knobs |
+| byte-budget tile cache (store-internal), `gc` leases (both done, `16aee6a`) | widening policy, new fallback reasons, config knobs |
 | remove dense k x k matrices from the reader path | metrics, bench, runbook, prewarm semantics |
 | equality tests vs `ChartGraph.route`; fix `api.py` `corridor`/`MissingTiles` docs | port `GraphCache` tests (`test_planner_chart_route.py:103-650`) |
 
@@ -221,10 +230,12 @@ Per the integration split: no commit and no message to CIMBI without the user's 
   route = window from `StoredView._window` + sparse chart-graph corridor; corridor tiles from a bbox-expanded
   read. Validates correctness and the estimates against the bench.
 * **Phase 1 (CIMBI), trimmed after review:** (1) a per-page expansion cache keyed by page hash (a new version
-  re-reads only the changed pages, not every `_expand`); (2) a public read API next to the engine, in ENGINE chart
-  order (replaces `_own` / `_cache` / `_idx` / `manifest["order"]` poking); (3) single-flight tile fetch, a byte-budget
-  tile cache and leases so gc cannot remove a version a request is reading; (4) a cached id -> index table; (5) optional
-  columnar pages. Dropped: stored chart -> tile sets (derivable from the chart cells and the reach, `_tiles_for`),
+  re-reads only the changed pages, not every `_expand`) **[done, `16aee6a`: page cache]**; (2) a public read API next
+  to the engine, in ENGINE chart order (replaces `_own` / `_cache` / `_idx` / `manifest["order"]` poking) **[open;
+  `lazy_plan.py` still pokes them]**; (3) single-flight tile fetch, a byte-budget tile cache and leases so gc cannot
+  remove a version a request is reading **[done, `16aee6a`: single-flight tiles, byte-budget tile cache keyed by object
+  hash, in-process gc leases]**; (4) a cached id -> index table **[done, `16aee6a`: per-view cached lut; `PlanGraph`
+  keeps its own engine-order lut]**; (5) optional columnar pages **[open]**. Dropped: stored chart -> tile sets (derivable from the chart cells and the reach, `_tiles_for`),
   separate plan tiles, `open_plan`/`PlanGraph` as new store types (they stay in the planner).
 * **Phase 2 (LACI):** `GraphCache` open-per-request, `free_cells` LOS, widening policy, fallback reasons
   (`corridor_too_large`, `tile_unavailable`: done on the planner side), config, runbook, prewarm.
@@ -264,10 +275,11 @@ Acceptance (proposed):
    `|p-q| <= d <= |p-a|+|a-q|`, corridor choice only) vs persisted intra-chart distances (manifest size cost).
 4. Chart graph at multi-km^2: one columnar blob vs per page; whether stage 1 needs a hierarchy level (not stored,
    dense today). Need real chart counts per km^2 (30k/km^2 here is a guess).
-5. Where the tile cache lives and who owns the byte budget; shared with the API's tile views (`runbook.md:247`).
+5. Tile cache: now in the store (`16aee6a`, byte budget, keyed by object hash, shared by all views of one store
+   instance); open: who sets the budget in production and whether the API's tile views (`runbook.md:247`) share it.
 6. Widening policy values: hops, tile cap, when to fall back to legacy.
-7. gc leases vs re-pin on `FileNotFoundError` (`keep_last=5` is enough only if publishes are slow vs request
-   time; publish floor 5 s).
+7. gc leases (store side done, in-process only) vs re-pin on `FileNotFoundError` (`keep_last=5` is enough across
+   processes only if publishes are slow vs request time; publish floor 5 s); should the planner take the lease?
 8. Snap tie-break rule and out-of-canvas behaviour to standardize.
 9. Keep or drop stale-version serving (open is cheap).
 10. Leaf lookup: keep ArangoDB `k_nearest_neighbors` or use `Chart.leaf` from the manifest. See also section 13
@@ -284,20 +296,38 @@ Acceptance (proposed):
 
 Decision (2026-10-13): **keep as is for now**, but both items below are marked for revision soon.
 
+Update (2026-10-13, end of session; verified in `scene_route.py`, `plan_on_graph`): the repeated-leaf-id fallback
+in the text below is **obsolete**. `repair_leaf_ids` and `collapse_repeated_leaf_ids` merge repeats where the line of
+sight allows, `build_waypoints(..., allow_repeats=True)` serves what remains, and `ChartPlan.repeated_leaf_ids` flags it
+(legs on one leaf are ignored by edge statistics, `src == dst`). `ChartFallback("waypoints_without_distinct_leaf_ids")`
+(the name is now misleading) is raised only when a waypoint still has NO leaf id after the repair. Still true: every
+waypoint keeps its exact `x, y, theta`; `planned_path` needs a leaf for each waypoint; edge statistics are per leaf edge.
+What remains for revision: the second bullet (edge statistics on the high-level graph) and, optionally, option (a) for
+a waypoint without any leaf.
+
+Original text (decision 2026-10-13):
+
 * **Leaf-id snapping (step 6 / `build_waypoints`).** Every waypoint keeps its exact `x, y, theta`; the nearest
   leaf id (`graph_db.k_nearest_neighbors`, `SCENE_GRAPH_LEAF_SNAP_M`) is only a label for consumers keyed by
   topomap node id (`planned_path`, `mission_runs.planned_path`, leg tracker, edge statistics, dispatcher
-  blocked-node resolve). The planner falls back to legacy when a waypoint has no leaf or two share one
-  (`waypoints_without_distinct_leaf_ids`); only `planned_path` needs that strictness, the route does not. On large
+  blocked-node resolve). ~~The planner falls back to legacy when a waypoint has no leaf or two share one
+  (`waypoints_without_distinct_leaf_ids`)~~ *(obsolete for "two share one", see the update above; still true for "no
+  leaf")*; only `planned_path` needs that strictness, the route does not. On large
   open maps this throws away good geometric routes. Options when revisited: (a) return the route with
   `planned_path=None` / partial and `node_id=None` (dispatcher already falls back to `@x,y`); (b) key the
   statistics by chart instead of leaf.
 * **Edge statistics should move to the high-level graph.** Today they are per low-level (leaf / topomap) edge,
   paired through `waypoints[i]` <-> `planned_path[i]`. In the revision they should be attributed to the
   high-level graph (charts and links: `chart_keys` is already in the plan response, `Link` carries length and
-  width) rather than leaf nodes. That removes the need for distinct leaf ids per waypoint and the legacy
-  fallback above. Touches the run analysis and leg tracker, not just the planner; design it with the
+  width) rather than leaf nodes. That removes the need for distinct leaf ids per waypoint ~~and the legacy
+  fallback above~~ *(the distinct-id fallback is gone; a leaf-less waypoint still falls back)*. Touches the run
+  analysis and leg tracker, not just the planner; design it with the
   statistics owner, and note that chart keys change across graph versions (use lineage, `Dirty.retired`).
+
+Pointer (2026-10-13, end of session): the design draft for moving statistics onto the chart graph is
+`edge_stats_on_charts_design.md`; the direction already taken is D1 of `docs/tracking_redesign_2026-10-13.md` (store
+entry/exit poses, look up the chart pair on read, no lineage bookkeeping), so the "use lineage, `Dirty.retired`" remark
+above is superseded. Decision of the user: statistics are to be stored in ArangoDB on edges (see the design draft).
 
 ## Critical files
 

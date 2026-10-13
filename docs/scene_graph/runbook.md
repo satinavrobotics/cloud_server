@@ -34,13 +34,26 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_PLAN_MAX_INFLIGHT` | 4 | planner | plans running or hung on the 2-thread plan pool; beyond it a request falls back `planner_busy` |
 | `SCENE_GRAPH_CACHE_VERSIONS` | 4 | planner | loaded graphs kept per process in total (LRU over maps) |
 | `SCENE_GRAPH_CACHE_VERSIONS_PER_MAP` | 2 | planner | of one map: the one served and the one being refreshed |
-| `SCENE_GRAPH_CACHE_MAX_BYTES` | 0 (off) | planner | byte budget of the cache over the graphs' reported `nbytes`; the newest graph is always kept. Size it from the container memory limit (a graph is roughly 3-5 KB per navigable cell, see section 8) |
+| `SCENE_GRAPH_CACHE_MAX_BYTES` | 0 (off) | planner | byte budget of the cache over the graphs' reported `nbytes`; the newest graph is always kept. Size it from the container memory limit and the `cache.bytes` the planner reports (section 7); there is no per-cell figure measured on the current engine, see section 8 |
+| `SCENE_GRAPH_PLANNER_MODE` | `full_load` | planner | `full_load`: restore the whole stored version per (map, version). `lazy`: open the manifest only and read the owner tiles of each request's corridor (see "Planner modes" below). Any other value falls back to `full_load`. Rollback is this setting alone |
+| `SCENE_GRAPH_LAZY_MAX_TILES` | 400 | planner | lazy mode: most owner tiles one request may read; more falls back `corridor_too_large` |
+| `SCENE_GRAPH_LAZY_TILE_CACHE` | 512 | planner | lazy mode: owner tiles kept per loaded graph (about 35 KB each by the config comment; not measured here) |
 | `SCENE_GRAPH_META_TTL_S` | 0.75 | planner | a `store.meta` answer is reused this long per map and shared by concurrent requests (one query in flight) |
 | `SCENE_GRAPH_MAX_VERSION_LAG_S` | 120.0 | planner | graph older than the ingest by more than this -> `stale_graph`; also how long a newer version may have been known (in the store's meta) while an older cached one is served; 0 disables both |
 | `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.05 | planner | added to the robot's needed passage width (the lattice error of `Route.min_width`, lattice / 2). Only used when the check is enabled |
 | `SCENE_GRAPH_WIDTH_CHECK_ENABLED` | false | planner | gates `too_narrow`. Off by default; enable only after the validation in "Width gate" below |
 | `SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S` / `_DEADLINE_S` | 30.0 / 3600.0 | **API** | delete saga: poll the worker's lock this long per attempt; a busy lock (a fold is running) does not consume `MAP_DELETE_MAX_ATTEMPTS` until it has been busy for the deadline in total |
 | `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag); empty = every map the graph database lists with a stored graph, limited to `CACHE_VERSIONS` maps (the rest are named in a warning); maps with `status.scene_graph_enabled` = false are skipped (a failed registry query loads every map) |
+
+**Planner modes.** `SCENE_GRAPH_PLANNER_MODE=full_load` (default): a cache miss restores the whole stored version
+(`store.load`) and route, snap and line of sight run on the full engine. `lazy`: a cache miss opens the manifest only
+and a request reads the owner tiles of its corridor (bounded LRU of `SCENE_GRAPH_LAZY_TILE_CACHE` tiles per graph),
+with the same 8-neighbour rule and cost; route cells may differ among equal-length routes. A corridor that needs more
+than `SCENE_GRAPH_LAZY_MAX_TILES` tiles falls back `corridor_too_large`; a tile that cannot be read falls back
+`tile_unavailable` and the graph is dropped so the next request re-opens the current version. Both reasons occur in
+lazy mode only. Switching mode is a config change and a planner restart; going back to `full_load` is the rollback and
+touches no data. The planner flag itself is off by default and lazy mode has not run on a production stack
+(`planner_upgrade.md`, Phase 0).
 
 Worker robustness settings (graph-builder, read by `scene_host`; forwarded by compose):
 
@@ -87,7 +100,8 @@ healthy (its entrypoint migrates before it serves). graph-builder also gets
 `POSTGRES_DATABASE_{PORT,NAME,USERNAME,PASSWORD}` (`POSTGRES_DATABASE_HOST` falls back to `POSTGRES_HOST`).
 `mission-planner-service` needs the ARANGO_* and MINIO_* secrets (already present). Planner-only additions:
 `SCENE_GRAPH_WIDTH_CHECK_ENABLED` (default false), `SCENE_GRAPH_PREWARM_MAPS` (comma list; default: every listed map
-with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2).
+with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2), `SCENE_GRAPH_PLANNER_MODE` (`full_load`),
+`SCENE_GRAPH_LAZY_MAX_TILES` (400), `SCENE_GRAPH_LAZY_TILE_CACHE` (512).
 
 **Postgres connections.** Each owned map holds one dedicated connection (its advisory lock). On top of that a step
 that does not hold its lock yet, and the discovery, open short-lived connections: with the step pool up to
@@ -126,7 +140,9 @@ off every plan response already reports `min_width`; compare it with a few corri
 Each step gates the next. Flags stay false until the step that names them.
 
 1. **Images.** numpy 1.26.4 + scipy 1.11.4 in graph-builder, planner and API; each image copies `packages/scene_graph/`.
-2. **Migration first.** `20261012_01_blocked_geometry` (four nullable `blocked_graph_nodes` columns; `prev_x`/`prev_y` are reserved and unused, nothing writes or reads them). It
+2. **Migration first.** `20261012_01_blocked_geometry` (four nullable `blocked_graph_nodes` columns; `prev_x`/`prev_y` are reserved and unused, nothing writes or reads them). Its revision is parented on
+   `20261013_01_track_map_frame`, so `alembic upgrade head` applies that one first and then this one (single head).
+   As of 2026-10-13 (CIMBI) `20261012_01` is not applied in the live DB. It
    runs when the API container starts (`packages.api.entrypoint`: `alembic upgrade head` under the `migrations`
    advisory lock). Start/update `api-delegation-service` first and wait for healthy. Check:
    `SELECT column_name FROM information_schema.columns WHERE table_name='blocked_graph_nodes' AND column_name IN ('robot_x','robot_y','prev_x','prev_y');` (4 rows; only `robot_x`/`robot_y` are read or written).
@@ -150,13 +166,18 @@ Each step gates the next. Flags stay false until the step that names them.
    `docker run --rm --entrypoint python graph_builder_service:latest -c "import tools.scene_costmap_stored_backfill"`.
 5. **Ingest.** Set `SCENE_GRAPH_WORKER_ENABLED=true` on graph-builder **and** API, restart both. To canary one map,
    switch every other map off first (section 3): the default is "all maps".
+   After the first generation (and after any rebuild) run the read-only gate in the **graph-builder** image:
+   `docker compose -f docker_compose/mission_dispatch_services.yaml exec graph-builder-service python -m tools.scene_graph_check_generation --all`
+   (`--map ID` for one map, `--expect expected.json` with `{"<map id>": {"charts": N, "links": M}}` to pin the base-level
+   counts). It reports format, pipeline, params hash, invariants, charts / links / levels / widths and one route; exit
+   0 = every map passed (FORMAT 4, pipeline `morse/2`, invariants hold), 1 = a failure.
 6. **Verify** (section 6) on at least one real map: worker started, `MAP.SCENE_GRAPH_UPDATED` events, read API
    `available: true`, no `fold_failed`, reasonable lag.
 7. **Planner last.** `SCENE_GRAPH_PLANNER_ENABLED` stays **false by default** (code, compose and `.env.example`) and is
    switched on deliberately, after step 6 on the maps that matter and with their lag under
    `SCENE_GRAPH_MAX_VERSION_LAG_S`:
    1. Optional: list the maps in `SCENE_GRAPH_PREWARM_MAPS` so the first request after the restart does not meet a
-      cold load (a 90 x 90 m map loads in about 30 s, longer than `LOAD_TIMEOUT_S`).
+      cold load (a cold full load can exceed `LOAD_TIMEOUT_S` on a large map: 12.6 s at 150 x 150 m on the synthetic Morse bench, `planner_upgrade.md` section 0; measure yours with the check tool; `lazy` mode avoids the cold load).
    2. Leave `SCENE_GRAPH_WIDTH_CHECK_ENABLED=false` (section 1, "Width gate").
    3. Set `SCENE_GRAPH_PLANNER_ENABLED=true` on mission-planner-service and recreate it (all settings are read at
       start).
@@ -306,8 +327,8 @@ dispatcher's 5 s replan timeout; the rest is the legacy planner's. A stage that 
 | `blocked_by_overlay` | route exists without the active blocked-node rows, not with them | an active block (expiry pending) stands in the way; legacy then reports `blocked_nodes` |
 | `unreachable` | no route in the chart graph | real disconnection, or map not yet fully ingested |
 | `missing_tiles` | the corridor needs tiles not loaded | snapshot incomplete/inconsistent; investigate the version |
-| `corridor_too_large` | lazy mode (`SCENE_GRAPH_PLANNER_MODE=lazy`): the request's corridor needs more than `LAZY_MAX_TILES` owner tiles | very long route on a big map; raise `SCENE_GRAPH_LAZY_MAX_TILES` if memory allows, or accept the legacy planner |
-| `tile_unavailable` | lazy mode: a stored tile of the cached version could not be read (a garbage-collected version, MinIO error). The graph is dropped from the cache; the next request re-opens the current version | a one-off after a gc is normal; persistent = MinIO problem or `keep_last` too small for the served stale version |
+| `corridor_too_large` | lazy mode (`SCENE_GRAPH_PLANNER_MODE=lazy`): the request's corridor needs more than `LAZY_MAX_TILES` owner tiles | very long route on a big map; never emitted in `full_load`. The default `SCENE_GRAPH_LAZY_MAX_TILES` is 400 owner tiles; a tile is 64 lattice cells = 6.4 m a side, so this caps the tiles read per request, not a distance. Raise it if memory allows, or accept the legacy planner |
+| `tile_unavailable` | lazy mode: a stored tile of the cached version could not be read (a garbage-collected version, MinIO error). The graph is dropped from the cache; the next request re-opens the current version | a one-off after a gc is normal; persistent = MinIO problem or `keep_last` too small for the served stale version (`keep_last` is fixed at 5 in code, not env-configurable: a planner that serves a stale version across more than 5 publishes will see this reason; never emitted in `full_load`) |
 | `too_narrow` | `min_width` < what the robot needs (width + margin straight, `hypot(length, width)` + margin where it turns); **inactive unless `SCENE_GRAPH_WIDTH_CHECK_ENABLED`** (see "Width gate") | route has a passage this robot cannot take |
 | `leaf_lookup_error` | the nearest-leaf query (one kNN per waypoint) raised | Arango problem; see planner log (`scene graph leaf lookup failed`) |
 | `waypoints_without_distinct_leaf_ids` | after dropping interior waypoints where line of sight allows, a waypoint still has no leaf within `LEAF_SNAP_M` (1.0 m). Waypoints that share a leaf no longer cause it: consecutive repeats are merged where line of sight allows, a route on one leaf becomes `[start, goal]`, an unmergeable repeat is served as is (the name is historic) | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
@@ -332,8 +353,9 @@ differ by up to about 1 m (the legacy planner returns a node and its own positio
   with unsaved folds is saved before it is dropped, never lost). When every resident engine is active the budget is
   exceeded and `over_budget` shows in `/health` instead of anything being torn down.
 * **Sizing (estimates, not measurements of this service).**
-  * Memory: about 3-5 KB per navigable lattice cell per resident engine (a 90 x 90 m map at 0.1 m is on the order of
-    2 GB, see integration.md "Measurements"). Set `MAX_RESIDENT_BYTES` to roughly 60-70 % of the graph-builder
+  * Memory: per resident engine not measured on the current (Morse) engine; the earlier per-cell figure came from the
+    previous engine and is not carried over. Read `/health` `resident.bytes` after the first generation and set
+    `MAX_RESIDENT_BYTES` from that, to roughly 60-70 % of the graph-builder
     container's memory limit: the rest is for the fold's temporaries (a fold can need a multiple of the engine),
     decoded PNGs (`PREFETCH_QUEUE` x a costmap) and the process. A cap above the container limit means an OOM kill
     instead of an eviction. `MemoryError` inside a fold is handled (backoff, then bisect), an OOM kill is not.
@@ -341,41 +363,37 @@ differ by up to about 1 m (the legacy planner returns a node and its own positio
     interleave them (and multiply peak memory, since every running fold has temporaries). The default is
     `min(8, cores)`.
   * Connections: Postgres = owned maps + threads + a few; MinIO's default pool is 10 per host (section 1).
-* **Fold cost (CIMBI prototype, per-leaf local update, `sight_range` 5 m; not the production `fold_many`).** Walled
-  floors 4.2k / 12.6k / 31k cells: 0.44 / 0.73 / 0.71 s per leaf. A 48-leaf batch at that rate is about 20-35 s, above
-  the 10 s budget: expect `slow fold` warnings on backlog; raising `BATCH_BUDGET_S` only silences them. Estimates,
-  not measurements of this service.
-* **Open-field maps are not viable yet.** 4.7k-cell open field: 3.1 s per leaf (worst 44 s); larger fields did not
-  finish. Keep such maps disabled and the planner away from them until CIMBI's sight-range cap lands.
-* **Backfill of an existing map** is hours at the builder's cost (big batches, resumable). Rebuild cost is the same
-  full refold; there is no per-extent re-solve.
+* **Fold cost (CIMBI-measured on Morse, per batch, not re-measured on the production stack).** The partition is
+  a function of the folded cells and costs about 1.1-1.5 us per cell per batch: a 45k-cell hall 0.07 s, an 86k-cell
+  field 0.11 s, a 244k-cell open field 0.63 s (`handoff_laci_morse.md`). That is well under `BATCH_BUDGET_S` (10 s);
+  a `slow fold` warning now points at the store or the data, not at the engine.
+* **Open-field / simulation maps.** No engine limit is known on Morse (see the figures above). Keep them
+  `scene_graph_enabled=false` until a measurement on the production stack exists.
+* **Backfill of an existing map** is resumable and runs at the builder's fold cost (large batches); its duration
+  on Morse has not been measured. Rebuild cost is the same full refold; there is no per-extent re-solve.
 * **Planner.** The whole chart-route attempt must fit 3.5 s (5 s dispatcher timeout); the plan itself 3 s of that.
   A cold load is waited for at most 2 s; a new version loads in the background while the older cached one is served
-  (2 versions per map, 4 per process, optional byte cap). Cold load is the planner's real cost today: whole-map
-  writer engine, 28.5 s for 90 x 90 m (integration.md "Measurements"); pre-warm and the stale-version serving cover
-  it. Read API: result cache 96 MiB / 64 results, 2 loaded graphs, 8 tile views.
+  (2 versions per map, 4 per process, optional byte cap). In `full_load` the cold load is `store.load` of the whole
+  version: 1.9 s at 60 x 60 m and 12.6 s at 150 x 150 m on the synthetic Morse rooms bench (`planner_upgrade.md`
+  section 0; real maps not measured); pre-warm and the stale-version serving cover it. In `lazy` mode opening is the
+  manifest only (10 ms at 60 m, 69 ms at 150 m on the same bench) and the cost scales with the corridor. Read API: result cache 96 MiB / 64 results, 2 loaded graphs, 8 tile views.
 * **Restart replay.** The cursor is the lower of the in-memory copy and the store's; replay margin
-  `SCENE_GRAPH_REPLAY_MARGIN_S` (60 s); a replay that folds nothing new should not publish a version, but it
-  currently does (open defect, integration.md); a rebuild restarts from zero unless it can be resumed (section 11).
+  `SCENE_GRAPH_REPLAY_MARGIN_S` (60 s); a replay that folds nothing new publishes no version (same
+  content hash); a rebuild restarts from zero unless it can be resumed (section 11).
 
 ## 9. Known limitations
 
-Open defects (owner, effect, e2e marker) are kept in `integration.md`, "Open defects"; the operational ones:
+Open defects are kept in `integration.md`, "Open defects"; the operational ones:
 
-* **Restart replay bumps the version (CIMBI) when it folds.** A restart of a caught-up worker folds nothing
-  (`already_folded`, `SKIP_FOLDED=true`) and saves nothing, so it publishes no version. When leaves are folded again
-  (skip off, a changed leaf, a rebuild), each chart's canvas-relative `cell` is still part of the content
-  hash, so an engine reloaded from tiles hashes differently and a restart publishes a version with the same charts
-  and links. Harmless (one extra version, planner/clients reload); do not alert on a version bump after a restart.
-  Strict xfail in the e2e.
-* **Fold result depends on capture-stamp order (CIMBI).** The same leaves in another stamp order can give another
-  chart partition and `min_width` (0.1 .. 0.64 m over permutations in the e2e). A rebuild is deterministic for
-  the same data (same scan order, fixed batches), but a live-built graph and a rebuilt one can differ. Strict xfail.
+* **Live vs rebuilt graph.** The partition is a pure function of the folded cells, so a live-built and a rebuilt
+  graph have the same charts and links; only the driven polyline and the per-cell latest-capture evidence follow the
+  capture-stamp order.
 * **Blocked-row pose pairing is only SQL-tested.** The upsert keeps the robot pose and the waypoint it was reported
   with as one pair (a robot pose is never combined with another report's waypoint); the unit tests pin the SQL text,
   and no e2e test runs it against Postgres.
 * **Migration `20261012_01` `prev_x` / `prev_y`** are reserved columns: nothing writes or reads them (an edge row
-  without a robot pose stays a disc).
+  without a robot pose stays a disc). Its revision is parented on `20261013_01_track_map_frame`; as of 2026-10-13 it
+  is not applied in the live DB.
 * **No authorization** on the three scene-graph routes (nor a rate limit); they follow `/maps/{id}/graph`. The
   design is written down (integration.md, finding 13) and deferred by the owner as an API-wide change.
 * **`r_d` rule**: half of the *smaller* footprint side; unknown footprint (-1) uses 0.25 m and is counted
@@ -386,8 +404,8 @@ Open defects (owner, effect, e2e marker) are kept in `integration.md`, "Open def
 * **Not run on production.** Worker, store, guard, saga and planner pass the e2e harness against real ArangoDB / MinIO /
   Postgres (throw-away containers, synthetic worlds). The first run on the production stack is still the verification
   of timing, volumes and the fold cost above.
-* **Cold graph load is the planner's weak point**: whole-map writer engine, seconds to tens of seconds (section 8).
-  A tile-lazy planner is planned (`planner_upgrade.md`), not built.
+* **Cold graph load is the planner's weak point in `full_load` mode** (section 8). A tile-lazy planner (Phase 0)
+  exists behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default off); phases 1-3 are plan only (`planner_upgrade.md`).
 * **Bucket-slug collisions.** MinIO buckets are `lower(name)` with `_` -> `-`. Two registered maps that map to one
   bucket (`a_b` / `a-b`, `My_Map` / `my-map`) cannot be told apart: the worker skips both and logs `candidate ...
   matches several registered maps`. Rename one. No event is emitted for this.
@@ -433,7 +451,9 @@ Open defects (owner, effect, e2e marker) are kept in `integration.md`, "Open def
 | Route clips a known obstacle / robot refuses leg | active `blocked-nodes` rows (`GET /api/v1/maps/{id}/blocked-nodes?with_chart_keys=true`; run legs: `GET /api/v1/runs/{id}/legs?with_chart_keys=true`); migration applied | clear/expire row; check migration |
 | Blocked rows missing pose (disc rule only) | columns NULL: rows written before the migration or without localization | none; expire naturally |
 | Map delete stuck at `scene_graph` | `scene_graph: lock ...` in the map's `delete_error`, `delete_attempts` not rising; the worker holds the lock during a long fold | retried with backoff without consuming attempts until `SCENE_GRAPH_DELETE_LOCK_DEADLINE_S`; if persistent, disable the map and wait for release (~2 min) |
-| Open-field map extremely slow / `slow fold` warnings | fold times in the log | disable the map; keep the planner off for it |
+| `slow fold` warnings | fold times in the log, store latency | find the slow dependency (MinIO/Arango) or the data; as a last resort disable the map |
+| Planner `corridor_too_large` often | `outcomes`, `SCENE_GRAPH_PLANNER_MODE` | raise `SCENE_GRAPH_LAZY_MAX_TILES` if memory allows, or `full_load` |
+| Planner `tile_unavailable` | MinIO health, version gc (`keep_last` 5) | one-off after a gc is normal |
 | graph-builder OOM-killed / restarts under many maps | `/health` `resident.bytes` vs `max_bytes`, container memory limit | set `SCENE_GRAPH_MAX_RESIDENT_BYTES` below the limit (section 8), lower `WORKER_THREADS` |
 | `/health` `resident.over_budget: true` | every resident engine is active; nothing is evicted | expected under sustained load of many maps; raise the cap/limit or reduce `WORKER_THREADS` |
 | `fold_failed` stage `poison_leaf` | `detail` names the node key | the leaf is already quarantined and skipped; inspect that node's costmap, or ignore a single one |
@@ -461,8 +481,8 @@ pending generation holds a saved state).
 1. A new generation is begun (`begin_generation`); readers and the planner keep the old version.
 2. Every leaf is folded again into the pending generation in **fixed batches of `SCENE_GRAPH_REBUILD_BATCH` (48)**,
    with no time-based flush until the head of the nodes is reached, so the same nodes give the same chart partition
-   after every rebuild. (The scan order is `(costmap_stored_ms, key)`; a live-built graph folds in arrival order with
-   time-based flushes and can differ from a rebuilt one.)
+   after every rebuild. (The rebuild scans in `(costmap_stored_ms, key)` order, then folds in `(stamp_ms, key)` order in batches of
+   48; the partition does not depend on batching.)
 3. Committed (`commit_generation`) when the scan reached the head and nothing is buffered or pending; a rebuild
    older than `SCENE_GRAPH_REBUILD_MAX_AGE_S` (900 s) is committed at its next save even if uploads keep arriving.
 4. The request key is cleared only if its `at` is unchanged (a delete that arrived mid-rebuild causes one more).
@@ -515,7 +535,7 @@ big map loading; `resident.bytes` near `max_bytes` with rising `evictions` is th
 ## 12. Read API contract (api-delegation-service)
 
 Routes: `GET /api/v1/maps/{id}/scene-graph?bbox=&level=&version=&raster=&epoch=`, `.../scene-graph/raster?bbox=&level=
-&version=&plane=owner|dependent&epoch=`, `.../scene-graph/lineage?from_version=&epoch=`. No authorization (section 9).
+&version=&plane=owner|dependent&epoch=`, `.../scene-graph/lineage?from_version=&epoch=`. No authorization (section 9). `plane=dependent` is accepted but always all-zero since FORMAT 4; do not build on it.
 
 | Topic | Behaviour |
 |---|---|
