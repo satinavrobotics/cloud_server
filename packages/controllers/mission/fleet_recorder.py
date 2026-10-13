@@ -62,7 +62,7 @@ from packages.telemetry_ingest.policy import (
     ASSIGNMENTS_CHANNEL, allows as policy_allows, parse_assignment_payload, parse_level,
 )
 from packages.telemetry_ingest.rehydrate import LatestRow
-from packages.utils import edge_stats, edge_stats_db, run_legs
+from packages.utils import edge_stats, edge_stats_db, map_geo, map_sessions, run_legs
 
 logger = logging.getLogger("Isaac Mission Dispatch.fleet_recorder")
 
@@ -129,8 +129,8 @@ ACTIVE = "RUNNING"
 INSERT_RUN_SQL = (
     "INSERT INTO mission_runs (run_id, mission_name, robot_name, site_id, map_id, sw_version, "
     "recording_level, state, abort_cause, abort_detail, passes_completed, created_by, "
-    "mission_tree, started_at, ended_at) "
-    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s) "
+    "mission_tree, started_at, ended_at, level_override) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s, %s) "
     "ON CONFLICT (run_id) DO NOTHING"
 )
 FINISH_RUN_SQL = (
@@ -152,7 +152,14 @@ CONSUME_NEXT_RUN_SQL = (
     f"UPDATE {MISSION_TABLE} m SET spec = m.spec - '{NEXT_RUN_FIELD}' FROM old "
     "WHERE m.name = %s AND old.level IS NOT NULL RETURNING old.level"
 )
-SET_RUN_LEVEL_SQL = "UPDATE mission_runs SET recording_level = %s WHERE run_id = %s"
+SET_RUN_LEVEL_SQL = ("UPDATE mission_runs SET recording_level = %s, level_override = true "
+                     "WHERE run_id = %s")
+# The robot's effective level changed while the run was open: append {ts, level} (a retried op
+# appends nothing twice).
+MARK_LEVEL_SQL = (
+    "UPDATE mission_runs SET level_marks = COALESCE(level_marks, '[]'::jsonb) || %s::jsonb "
+    "WHERE run_id = %s AND state = 'RUNNING' "
+    "AND NOT (COALESCE(level_marks, '[]'::jsonb) @> %s::jsonb)")
 ORPHAN_CANDIDATES_SQL = (
     "SELECT run_id, mission_name, robot_name, started_at, recording_level FROM mission_runs "
     "WHERE state = 'RUNNING' AND started_at < %s ORDER BY started_at"
@@ -419,6 +426,46 @@ class RunInfo:
     # own legs after them.
     leg_base: int = 0
     last_track_ts: Optional[datetime.datetime] = None
+    # The level the run last recorded at (policy.level_for), to mark a change; None until the
+    # run is resolved.
+    last_level: Optional[str] = None
+
+
+@dataclasses.dataclass(frozen=True)
+class MapFrame:
+    """What a robot's pose is converted with while its open map session is placed
+    (map_sessions.is_placed): the session's map_T_session {tx, ty, yaw}, valid for the robot's
+    current run (the dispatcher unplaces the session at every run change)."""
+    session_id: str
+    map_name: str
+    transform: Dict[str, float]
+    run_epoch: Optional[str] = None
+
+    def apply(self, x: Any, y: Any, theta: Any) -> Optional[Tuple[float, float, float]]:
+        """(x, y, theta) in the map frame; None when the pose is not a finite number."""
+        try:
+            px, py, pth = map_geo.apply_pose(self.transform, x, y,
+                                             0.0 if theta is None else theta)
+        except (TypeError, ValueError):
+            return None
+        return (px, py, pth) if all(math.isfinite(v) for v in (px, py, pth)) else None
+
+
+def map_frame_of(session: Any, run_epoch: Any = None,
+                 previous: Optional[MapFrame] = None) -> Optional[MapFrame]:
+    """The MapFrame of a map_sessions.robot_session_from_row() dict, None unless the session
+    is placed. `run_epoch`: the robot's current run epoch, if known. `previous`: returned
+    itself when it is the same session, map, epoch and transform (nothing is allocated)."""
+    if not isinstance(session, dict) or not map_sessions.is_placed(session):
+        return None
+    epoch = None if run_epoch is None else str(run_epoch)
+    if previous is not None and previous.session_id == str(session["session_id"]) and \
+            previous.map_name == session["map_name"] and previous.run_epoch == epoch and \
+            previous.transform == session.get("map_t_session"):
+        return previous
+    return MapFrame(session_id=str(session["session_id"]), map_name=session["map_name"],
+                    transform=map_sessions.transform_of(session.get("map_t_session")),
+                    run_epoch=None if run_epoch is None else str(run_epoch))
 
 
 class _Context:
@@ -527,6 +574,24 @@ class _WriteLeg(_Op):
                         leg.stopped_s, leg.straight_m, leg.planned_m, leg.expected_s))
 
 
+class _MarkLevel(_Op):
+    """The effective level of an open run changed (mission_runs.level_marks)."""
+
+    def __init__(self, run: RunInfo, ts: datetime.datetime, level: str):
+        self.info = run
+        self.mark = [{"ts": ts.isoformat(), "level": level}]
+
+    def describe(self) -> str:
+        return f"level mark {self.mark[0]['level']} of run {self.info.run_id}"
+
+    async def run(self, recorder: "FleetRecorder") -> None:
+        mark = json.dumps(self.mark)
+        async with recorder._pool.connection(timeout=OP_CONNECT_TIMEOUT_S) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(MARK_LEVEL_SQL, (mark, self.info.run_id, mark))
+
+
 class _FinishRun(_Op):
     lifecycle = True
 
@@ -607,6 +672,10 @@ class FleetRecorder:
         self._ctx = _Context(self)
         self._tracks: Dict[str, _Track] = {}
         self._runs: Dict[str, RunInfo] = {}
+        # Per robot: the MapFrame its track rows are converted with (dispatch refreshes it
+        # about every FRAME_SESSION_TTL_S and drops it at an unplace / run change); a robot
+        # without an entry is recorded in the run frame only.
+        self._frames: Dict[str, MapFrame] = {}
         self._latest_rows: Dict[str, LatestRow] = {}
         self._ops: Deque[_Op] = collections.deque()
         self._ops_wakeup: Optional[asyncio.Event] = None
@@ -761,6 +830,7 @@ class FleetRecorder:
         name = getattr(robot_object, "name", None)
         if name:
             self._tracks.pop(name, None)
+            self._frames.pop(name, None)
             self._latest_rows.pop(name, None)
             self._abandon_run(self._runs.pop(name, None), "robot_deleted")
         self.policy.apply_robot_object(robot_object)
@@ -896,6 +966,7 @@ class FleetRecorder:
         run = self._runs.get(robot_name)
         if run is None or mission is None or run.mission_name != mission.name:
             return
+        self._mark_level(run)
         legs_on = self.policy.allows(tables.LEGS_TABLE, robot_name)
         track_on = self.policy.allows(tables.TRACK_TABLE, robot_name)
         if not (legs_on or track_on):
@@ -926,13 +997,68 @@ class FleetRecorder:
             return
         run.last_track_ts = now
         vel = message.velocity
-        self.queue.put_track({
+        row = {
             "ts": ts, "robot_name": run.robot_name, "run_id": run.run_id,
             "leg_seq": self.leg_seq(run.robot_name),
             "x": pos.x, "y": pos.y, "theta": pos.theta,
             "speed": math.hypot(vel.vx or 0.0, vel.vy or 0.0) if vel else None,
             "omega": vel.omega if vel else None, "map_id": pos.mapId,
-        })
+        }
+        # The map-frame pose (stage 1 of docs/tracking_redesign_2026-10-13.md): only while the
+        # robot is placed on the run's own map; the cached frame, never a database read here.
+        frame = self._frames.get(run.robot_name)
+        if frame is not None and run.map_id is not None and frame.map_name == run.map_id:
+            mapped = frame.apply(pos.x, pos.y, pos.theta)
+            if mapped is not None:
+                row.update(x_map=mapped[0], y_map=mapped[1],
+                           theta_map=None if pos.theta is None else mapped[2],
+                           map_session_id=frame.session_id, run_epoch=frame.run_epoch)
+        self.queue.put_track(row)
+
+    # --- the map frame of a robot's track (D2) --------------------------------------------
+    def track_row_due(self, robot_name: str) -> bool:
+        """Whether the next state message of the robot writes a track row (the run is
+        resolved, the track is recorded and TRACK_ROW_INTERVAL_S has passed): dispatch reads
+        its session for the frame then, fresh, so a row never carries a stale transform."""
+        run = self._runs.get(robot_name)
+        if run is None or not run.resolved or not self.policy.allows(tables.TRACK_TABLE,
+                                                                      robot_name):
+            return False
+        last = run.last_track_ts
+        return last is None or not 0 <= (self._clock() - last).total_seconds() \
+            < TRACK_ROW_INTERVAL_S
+
+    def frame_for(self, robot_name: str) -> Optional[MapFrame]:
+        return self._frames.get(robot_name)
+
+    @_guarded
+    def set_frame(self, robot_name: str, frame: Optional[MapFrame]) -> None:
+        """The robot's open session as dispatch just read it: placed (a MapFrame) or not
+        (None). Cheap and idempotent; the row writer itself never reads the database."""
+        if frame is None:
+            self._frames.pop(robot_name, None)
+        else:
+            self._frames[robot_name] = frame
+
+    @_guarded
+    def invalidate_frame(self, robot_name: str) -> None:
+        """The robot's session was unplaced / its run changed: no map pose until the next
+        set_frame."""
+        self._frames.pop(robot_name, None)
+
+    def _mark_level(self, run: RunInfo) -> None:
+        """Write {ts, level} on the run when the level it records at changed since the last
+        state message (a level change mid-run leaves an unmarked gap in the track otherwise).
+        Only once the run is resolved, i.e. its start (and a one-off raise) has been applied."""
+        if not run.resolved:
+            return
+        level = self.policy.level_for(run.robot_name).value
+        if run.last_level is None:
+            run.last_level = level
+            return
+        if level != run.last_level:
+            run.last_level = level
+            self._submit(_MarkLevel(run, self._clock(), level))
 
     def leg_seq(self, robot_name: str) -> Optional[int]:
         """run_legs.seq of the leg the robot's run is on (what events are tagged with)."""
@@ -1409,7 +1535,7 @@ class FleetRecorder:
             _json_or_none(finish.detail) if finish else None,
             finish.passes_completed if finish else 0,
             None, json.dumps(info.mission_tree, default=str), info.started_at,
-            finish.ended_at if finish else None,
+            finish.ended_at if finish else None, info.level_override,
         )
         async with conn.cursor() as cursor:
             await cursor.execute(INSERT_RUN_SQL, params)

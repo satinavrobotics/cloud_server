@@ -339,6 +339,235 @@ class TestDispatcherFrameCheck:
 
 # --- the planner and the pre-goto ------------------------------------------------------------------
 
+class TestRecorderFrame:
+    """The dispatcher tells the fleet recorder which map frame the track rows use
+    (robot_track_ts.x_map...): its placed session, read at most every FRAME_SESSION_TTL_S and
+    dropped at once at a run change / frame change; never while the track is not recorded."""
+
+    def robot(self, world, track=True):
+        r = dispatcher_robot(FakeDb(world.results()))
+        recorder = MagicMock()
+        recorder.track_row_due.return_value = track
+        r._robot_server.fleet_recorder = recorder
+        r._current_mission = MagicMock()
+        r._run_epoch = "ep-1"
+        r._run_checked = True
+        return r, recorder
+
+    @staticmethod
+    def frames(recorder):
+        return [c.args for c in recorder.set_frame.call_args_list]
+
+    async def test_a_placed_session_becomes_the_frame_and_is_reused_while_unchanged(self):
+        world = World(sess(map_t_session={"tx": 1.0, "ty": 2.0, "yaw": 0.5}))
+        r, recorder = self.robot(world)
+        for _ in range(3):
+            await r._refresh_recorder_frame()
+        calls = self.frames(recorder)
+        assert len(calls) == 3 and all(c[0] == "r1" for c in calls)
+        frame = calls[0][1]
+        assert (frame.session_id, frame.map_name, frame.run_epoch) == (SID, "office8", "ep-1")
+        assert frame.transform == {"tx": 1.0, "ty": 2.0, "yaw": 0.5}
+        assert calls[1][1] is frame and calls[2][1] is frame   # nothing rebuilt per message
+        # the session is read fresh for every track row (a place / finish must reach the next)
+        assert len([q for q, _ in r._database.sql if "SELECT s.session_id" in q]) == 3
+
+    async def test_an_unplaced_session_gives_no_frame(self):
+        r, recorder = self.robot(World(sess(aligned=False)))
+        await r._refresh_recorder_frame()
+        assert self.frames(recorder) == [("r1", None)]
+
+    async def test_nothing_is_read_without_a_mission_or_when_no_track_is_recorded(self):
+        world = World(sess())
+        r, recorder = self.robot(world, track=False)
+        await r._refresh_recorder_frame()
+        r2, recorder2 = self.robot(world)
+        r2._current_mission = None
+        await r2._refresh_recorder_frame()
+        assert r._database.sql == [] and r2._database.sql == []
+        assert recorder.set_frame.call_count == recorder2.set_frame.call_count == 0
+
+    async def test_a_pending_run_change_withholds_the_frame(self):
+        r, recorder = self.robot(World(sess()))
+        r._run_detector.pending_state_drop = (0, 5)
+        await r._refresh_recorder_frame()
+        recorder.invalidate_frame.assert_called_once_with("r1")
+        assert recorder.set_frame.call_count == 0 and r._database.sql == []
+
+    async def test_a_run_change_drops_the_frame_and_the_cache(self):
+        r, recorder = self.robot(World(sess()))
+        await r._refresh_recorder_frame()
+        assert r._frame_session_cache is not None and r._rec_frame is not None
+        await r._on_run_changed({"signal": "connection_online"})
+        recorder.invalidate_frame.assert_called_with("r1")
+        assert r._frame_session_cache is None and r._rec_frame is None
+
+    async def test_a_confirmed_frame_change_drops_the_frame(self):
+        world = World(sess())
+        r, recorder = self.robot(world)
+        r._frame_watcher = FrameWatcher(confirm_s=0.0, confirm_states=1)
+        await r._refresh_recorder_frame()
+        await r._check_frame(state_msg("cloud-office7"))
+        assert world.unplaced
+        recorder.invalidate_frame.assert_called_with("r1")
+
+
+class FrameRecorder:
+    """Stands in for the fleet recorder: remembers the frame it was given and what each
+    on_leg_state (the track row) would have been converted with."""
+
+    def __init__(self):
+        self.frame = None
+        self.rows = []     # (headerId, frame at the time of the row)
+
+    def track_row_due(self, _name):
+        return True
+
+    def set_frame(self, _name, frame):
+        self.frame = frame
+
+    def invalidate_frame(self, _name):
+        self.frame = None
+
+    def on_leg_state(self, _name, message, *_args, **_kw):
+        self.rows.append((message.headerId, self.frame))
+
+    def __getattr__(self, _name):          # on_state, ... : not under test
+        return lambda *a, **k: None
+
+
+class TestRecorderFrameOrdering:
+    """The track row of a state message is written after the run of that message is decided
+    (audit of c9d1a53: the first message after a reboot or a dispatcher start is in the new
+    run's frame and was converted with the old session's map_T_session)."""
+
+    def robot(self, world):
+        r = dispatcher_robot(FakeDb(world.results()))
+        r._robot_server.fleet_recorder = FrameRecorder()
+        r._current_mission = MagicMock()
+        r._run_epoch = "ep-1"
+        r._run_checked = True
+        r._on_client_message = AsyncMock()
+        r._check_frame = AsyncMock()
+        return r, r._robot_server.fleet_recorder
+
+    async def feed(self, r, *header_ids):
+        for hid in header_ids:
+            await r._on_state_message(state_msg("cloud-office8", hid=hid))
+
+    async def test_a_dropped_header_is_recorded_without_a_map_pose(self):
+        world = World(sess())
+        r, rec = self.robot(world)
+        await self.feed(r, 10, 11, 2, 3, 4)
+        frames = dict(rec.rows)
+        assert frames[10] is not None and frames[11] is not None   # the old run
+        assert frames[2] is None                  # pending: already the new run's frame
+        assert frames[3] is None and world.unplaced   # confirmed: the session is unplaced
+        assert frames[4] is None                  # and stays out
+
+    async def test_a_stray_dropped_header_resumes_the_frame_once_the_old_run_goes_on(self):
+        r, rec = self.robot(World(sess()))
+        await self.feed(r, 10, 11, 2, 12, 13)
+        frames = dict(rec.rows)
+        assert frames[2] is None and frames[12] is not None and frames[13] is not None
+
+    async def test_the_first_message_of_a_new_dispatcher_waits_for_the_run_check(self):
+        r, rec = self.robot(World(sess()))
+        r._run_checked = False
+        r._run_epoch = None
+        r._run_epoch_check = AsyncMock(side_effect=RuntimeError("db down"))
+        await self.feed(r, 7)
+        assert rec.rows == [(7, None)]            # undecided: no map pose
+        r._run_epoch_check = AsyncMock(return_value="ep-2")
+        r._run_check_after = 0.0
+        await self.feed(r, 8)
+        assert r._run_checked and dict(rec.rows)[8].run_epoch == "ep-2"
+
+    async def test_a_failing_run_change_never_leaves_a_stale_frame_for_the_row(self):
+        r, rec = self.robot(World(sess()))
+        await self.feed(r, 10, 11)
+        r._on_run_changed = AsyncMock(side_effect=RuntimeError("boom"))
+        r._run_detector.pending_state_drop = (0, 11)
+        with pytest.raises(RuntimeError):
+            await r._on_state_message(state_msg("cloud-office8", hid=1))
+        assert rec.rows[-1] == (1, None)
+
+
+class TestRecorderFrameFreshness:
+    """The session is read for every track row: a place / re-place / finish / unplace is on
+    the very next row, and a failing read does not flap the frame or hit the database."""
+
+    def robot(self, world):
+        r = dispatcher_robot(FakeDb(world.results()))
+        rec = FrameRecorder()
+        r._robot_server.fleet_recorder = rec
+        r._current_mission = MagicMock()
+        r._run_epoch = "ep-1"
+        r._run_checked = True
+        return r, rec
+
+    async def test_a_placement_change_within_the_cache_ttl_is_seen_at_once(self):
+        world = World(sess(map_t_session={"tx": 1.0, "ty": 0.0, "yaw": 0.0}))
+        r, rec = self.robot(world)
+        await r._refresh_recorder_frame()
+        assert rec.frame.transform["tx"] == 1.0
+        world.session["map_t_session"] = {"tx": 9.0, "ty": 0.0, "yaw": 0.0}   # re-placed
+        await r._refresh_recorder_frame()
+        assert rec.frame.transform["tx"] == 9.0
+        world.session["session_id"] = "6f1c0c2e-0000-4000-8000-0000000000f2"   # replaced
+        await r._refresh_recorder_frame()
+        assert rec.frame.session_id.endswith("f2")
+        world.session["aligned"] = False                                       # API unplace
+        await r._refresh_recorder_frame()
+        assert rec.frame is None
+
+    async def test_a_finished_session_gives_no_frame(self):
+        world = World(sess())
+        r, rec = self.robot(world)
+        await r._refresh_recorder_frame()
+        assert rec.frame is not None
+        r._database.results = [("SELECT s.session_id", lambda _p: ([], 0))]   # none open
+        await r._refresh_recorder_frame()
+        assert rec.frame is None
+
+    async def test_an_unreadable_session_keeps_the_frame_for_a_grace_and_reads_rarely(self):
+        world = World(sess())
+        r, rec = self.robot(world)
+        await r._refresh_recorder_frame()
+        frame = rec.frame
+        assert frame is not None
+
+        def boom(_p):
+            raise RuntimeError("db hiccup")
+        r._database.results = [("SELECT s.session_id", boom)]
+
+        def reads():
+            return len([q for q, _ in r._database.sql if "SELECT s.session_id" in q])
+        before = reads()
+        now = [1000.0]
+        with patch.object(dispatch_server.time, "monotonic", lambda: now[0]):
+            r._rec_frame_at = now[0]
+            for _ in range(5):                       # five messages inside the retry window
+                await r._refresh_recorder_frame()
+                now[0] += 0.3
+            assert reads() == before + 1             # negative cache: one failed read only
+            assert rec.frame is frame                # kept, no flap
+            now[0] += dispatch_server.RECORDER_FRAME_GRACE_S
+            await r._refresh_recorder_frame()
+            assert rec.frame is None                 # grace over
+            r._database.results = World(sess()).results()
+            now[0] += dispatch_server.RECORDER_SESSION_RETRY_S
+            await r._refresh_recorder_frame()
+            assert rec.frame is not None             # recovered
+
+    async def test_the_same_session_does_not_allocate_a_new_frame(self):
+        r, rec = self.robot(World(sess()))
+        await r._refresh_recorder_frame()
+        first = rec.frame
+        await r._refresh_recorder_frame()
+        assert rec.frame is first
+
+
 class TestGates:
     def _robot(self, map_id, init):
         return RobotObjectV1(name="r1", status=RobotStatusV1(

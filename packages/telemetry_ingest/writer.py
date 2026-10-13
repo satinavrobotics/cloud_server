@@ -274,15 +274,30 @@ class TelemetryWriter:
             self._spill.reject(rejected)
         return len(rejected)
 
+    @staticmethod
+    async def _copy(conn: Any, sql: str, rows: List[Any]) -> None:
+        async with conn.transaction():
+            async with conn.cursor() as cursor:
+                async with cursor.copy(sql) as copy:
+                    for row in rows:
+                        await copy.write_row(row)
+
     async def _write_timeseries(self, conn: Any, batch: _Batch) -> None:
         for table in list(batch.timeseries):
             rows = batch.timeseries[table]
             try:
-                async with conn.transaction():
-                    async with conn.cursor() as cursor:
-                        async with cursor.copy(tables.copy_sql(table)) as copy:
-                            for row in rows:
-                                await copy.write_row(row)
+                try:
+                    await self._copy(conn, tables.copy_sql(table), rows)
+                except Exception as err:  # noqa: BLE001
+                    if table != tables.TRACK_TABLE or type(err).__name__ != "UndefinedColumn":
+                        raise
+                    # Started before migration 20261013_01: the map-frame columns do not exist
+                    # yet. Write the run-frame part rather than lose the rows (once per batch).
+                    n = len(tables.TRACK_LEGACY_COLUMNS)
+                    logger.warning("robot_track_ts has no map-frame columns yet (run the "
+                                   "migration); writing %d rows without them", len(rows))
+                    await self._copy(conn, tables.copy_sql(table, tables.TRACK_LEGACY_COLUMNS),
+                                     [tuple(r)[:n] for r in rows])
             except Exception:  # noqa: BLE001
                 batch.failed = True
                 logger.exception("COPY of %d %s rows failed; dropping them", len(rows), table)

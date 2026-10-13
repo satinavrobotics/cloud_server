@@ -446,6 +446,164 @@ class TestTrack:
         rows = [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
         assert [r[0] for r in rows] == [at(1), at(3)]  # None (older robots) is recorded
 
+    SESSION = "22222222-2222-2222-2222-222222222222"
+    FRAME = fr.MapFrame(SESSION, "map1", {"tx": 10.0, "ty": 0.0, "yaw": math.pi / 2},
+                        "11111111-1111-1111-1111-111111111111")
+
+    async def frame_rows(self, tmp_path, frame, steps=((0, 0),), **kw):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        if frame is not None:
+            rec.set_frame("r1", frame)
+        for m in steps:
+            rec.on_leg_state("r1", self.tmsg(mission, *m), mission, robot, received_at=at(m[0]))
+        await rec.run_pending_ops()
+        return rec, [dict(zip(fr.tables.TRACK_COLUMNS, r))
+                     for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
+
+    async def test_map_frame_pose_is_written_with_its_session_and_epoch(self, tmp_path):
+        _, [row] = await self.frame_rows(tmp_path, self.FRAME)
+        # run-frame (1, 2, 0.5) through tx=10, yaw=90deg
+        assert (row["x"], row["y"], row["theta"]) == (1.0, 2.0, 0.5)
+        assert row["x_map"] == pytest.approx(8.0) and row["y_map"] == pytest.approx(1.0)
+        assert row["theta_map"] == pytest.approx(0.5 + math.pi / 2)
+        assert (row["map_session_id"], row["run_epoch"]) == (uuid.UUID(self.SESSION), uuid.UUID(self.FRAME.run_epoch))
+
+    async def test_the_map_pose_is_null_when_the_robot_is_not_placed(self, tmp_path):
+        rec, [row] = await self.frame_rows(tmp_path, None)
+        assert all(row[k] is None for k in ("x_map", "y_map", "theta_map", "map_session_id",
+                                            "run_epoch"))
+        assert row["x"] == 1.0   # the run-frame pose is always there
+
+    async def test_the_cached_frame_is_used_until_invalidated(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        rec.set_frame("r1", self.FRAME)
+        for t in (0, 1):
+            rec.on_leg_state("r1", self.tmsg(mission, t), mission, robot, received_at=at(t))
+        rec.invalidate_frame("r1")                       # run change / unplace
+        rec.on_leg_state("r1", self.tmsg(mission, 2), mission, robot, received_at=at(2))
+        rec.set_frame("r1", self.FRAME)
+        rec.set_frame("r1", None)                        # a refresh that finds it unplaced
+        rec.on_leg_state("r1", self.tmsg(mission, 3), mission, robot, received_at=at(3))
+        rec.set_frame("r1", self.FRAME)                  # placed again
+        rec.on_leg_state("r1", self.tmsg(mission, 4), mission, robot, received_at=at(4))
+        rows = [dict(zip(fr.tables.TRACK_COLUMNS, r))
+                for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
+        assert [r["x_map"] is not None for r in rows] == [True, True, False, False, True]
+        assert db.statements.count(fr.INSERT_RUN_SQL) == 1   # nothing read per row
+
+    async def test_a_frame_of_another_map_is_not_applied(self, tmp_path):
+        other = fr.MapFrame(self.SESSION, "map2", {"tx": 0.0, "ty": 0.0, "yaw": 0.0})
+        _, [row] = await self.frame_rows(tmp_path, other)
+        assert row["x_map"] is None and row["map_session_id"] is None
+
+    async def test_a_forgotten_robot_loses_its_frame(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        rec.set_frame("r1", self.FRAME)
+        gone = api_objects.RobotObjectV1(name="r1", status={})
+        gone.lifecycle = api_objects.object.ObjectLifecycleV1.DELETED
+        rec.on_robot_deleted(gone)
+        assert rec.frame_for("r1") is None
+
+    def test_map_frame_of_reuses_the_previous_frame_while_nothing_changed(self):
+        session = {"session_id": "s", "map_name": "map1", "aligned": True,
+                   "map_t_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.5}}
+        frame = fr.map_frame_of(session, "ep")
+        assert fr.map_frame_of(dict(session), "ep", frame) is frame
+        for changed in ({"map_t_session": {"tx": 1.5, "ty": 2.0, "yaw": 0.5}},
+                        {"session_id": "s2"}, {"map_name": "map2"}):
+            assert fr.map_frame_of({**session, **changed}, "ep", frame) is not frame
+        assert fr.map_frame_of(session, "ep2", frame) is not frame
+
+    def test_map_frame_of_a_session_needs_a_placed_one(self):
+        session = {"session_id": "s", "map_name": "map1", "aligned": True,
+                   "map_t_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.5}}
+        frame = fr.map_frame_of(session, "ep")
+        assert (frame.session_id, frame.map_name, frame.run_epoch) == ("s", "map1", "ep")
+        assert frame.transform == {"tx": 1.0, "ty": 2.0, "yaw": 0.5}
+        assert fr.map_frame_of({**session, "aligned": False}) is None
+        assert fr.map_frame_of({**session, "aligned": None}) is None
+        assert fr.map_frame_of(None) is None and fr.map_frame_of(object()) is None
+        assert fr.map_frame_of(session).run_epoch is None
+        assert fr.MapFrame("s", "m", {"tx": float("nan"), "ty": 0.0, "yaw": 0.0}
+                           ).apply(1.0, 1.0, 0.0) is None
+
+    async def test_a_track_row_is_due_by_level_and_interval(self, tmp_path):
+        for level, wanted in (("off", False), ("events_only", False), ("track", True)):
+            rec, *_ = await start(tmp_path, level=level)
+            assert rec.track_row_due("r1") is wanted
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        rec.on_leg_state("r1", self.tmsg(mission, 0), mission, robot, received_at=at(0))
+        rec._clock = lambda: at(0.5)
+        assert rec.track_row_due("r1") is False       # inside TRACK_ROW_INTERVAL_S
+        rec._clock = lambda: at(1.5)
+        assert rec.track_row_due("r1") is True
+        assert rec.track_row_due("nobody") is False
+
+    async def test_a_level_change_mid_run_is_marked_on_the_run(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        [run_id] = list(db.runs)
+        for t, level in ((0, "track"), (1, "track"), (2, "events_only"), (3, "events_only"),
+                         (4, "full")):
+            rec.policy.set_global_level(level)
+            rec.on_leg_state("r1", self.tmsg(mission, t), mission, robot, received_at=at(t))
+            await rec.run_pending_ops()
+        assert [m["level"] for m in db.runs[run_id]["level_marks"]] == ["events_only", "full"]
+        # at events_only the track stops, and the marks say why
+        rows = [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
+        assert [r[0] for r in rows] == [at(0), at(1), at(4)]
+
+    async def test_level_marks_of_an_adopted_run_go_to_the_stored_run(self, tmp_path):
+        """A dispatcher restart adopts the RUNNING row (a new run_id is read when it resolves);
+        the mark must land on that row, and not before the run is resolved."""
+        rec, db, clock = make_recorder(tmp_path, global_level="track")
+        mission, robot = make_mission(), make_robot()
+        old_id = uuid.uuid4()
+        db.add_run(old_id, "m1", "r1", T0 - datetime.timedelta(minutes=5), level="track")
+        mission.status.start_timestamp = (T0 - datetime.timedelta(minutes=5)).replace(tzinfo=None)
+        mission.status.passes_completed = 1
+        rec.run_started("r1", mission, robot, session_map="map1")
+        rec.policy.set_global_level("events_only")          # changes before it is resolved
+        rec.on_leg_state("r1", self.tmsg(mission, 0), mission, robot, received_at=at(0))
+        await rec.run_pending_ops()
+        assert "level_marks" not in db.runs[old_id]          # unresolved: nothing marked
+        rec.on_leg_state("r1", self.tmsg(mission, 1), mission, robot, received_at=at(1))
+        rec.policy.set_global_level("full")
+        rec.on_leg_state("r1", self.tmsg(mission, 2), mission, robot, received_at=at(2))
+        await rec.run_pending_ops()
+        assert [m["level"] for m in db.runs[old_id]["level_marks"]] == ["full"]
+        assert len(db.runs) == 1
+
+    async def test_no_level_mark_after_the_run_finished(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        [run_id] = list(db.runs)
+        run = rec._runs["r1"]
+        rec.on_leg_state("r1", self.tmsg(mission, 0), mission, robot, received_at=at(0))
+        mission.status.state = State.COMPLETED
+        rec.run_finished("r1", mission, robot)
+        await rec.run_pending_ops()
+        assert db.runs[run_id]["state"] == "COMPLETED"
+        # a mark queued behind the finish (or a state message after it) writes nothing
+        rec._submit(fr._MarkLevel(run, rec._clock(), "full"))
+        rec.policy.set_global_level("full")
+        rec.on_leg_state("r1", self.tmsg(mission, 1), mission, robot, received_at=at(1))
+        await rec.run_pending_ops()
+        assert "level_marks" not in db.runs[run_id]
+
+    async def test_a_run_level_override_is_stored_and_never_marked(self, tmp_path):
+        rec, db, clock = make_recorder(tmp_path, global_level="events_only")
+        mission = make_mission()
+        mission.telemetry_recording = "track"
+        robot = make_robot()
+        rec.run_started("r1", mission, robot, session_map="map1")
+        await rec.run_pending_ops()
+        [run] = db.runs.values()
+        assert (run["recording_level"], run["level_override"]) == ("track", True)
+        for t, level in ((0, "events_only"), (1, "off")):
+            rec.policy.set_global_level(level)
+            rec.on_leg_state("r1", self.tmsg(mission, t), mission, robot, received_at=at(t))
+            await rec.run_pending_ops()
+        assert "level_marks" not in run
+
     async def test_legs_are_still_written_at_track(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path, level="track")
         await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3))
@@ -455,13 +613,13 @@ class TestTrack:
 class TestTrackEndpoint:
     run_id = uuid.uuid4()
 
-    def respond(self, rows, session, run_map="map1"):
+    def respond(self, rows, session, run_map="map1", level="track", marks=None):
         run_id = self.run_id
 
         def respond(sql, params):
             if "FROM mission_runs" in sql:
-                return [(run_id, "m1", "r1", None, run_map, None, "track", "COMPLETED", None,
-                         None, 1, None, at(0), at(30), None, None, [], None)]
+                return [(run_id, "m1", "r1", None, run_map, None, level, "COMPLETED", None,
+                         None, 1, None, at(0), at(30), None, None, [], None, marks)]
             if "FROM robot_track_ts" in sql:
                 assert "run_id = %s" in sql and params[0] == "r1" and params[3] == run_id
                 assert params[-1] == fleet_reads.config.FLEET_TRACK_MAX_POINTS
@@ -478,7 +636,9 @@ class TestTrackEndpoint:
         return (aligned, {"tx": 10.0, "ty": 0.0, "yaw": math.pi / 2}, placement,
                 at(started), None if ended is None else at(ended))
 
-    ROWS = [(at(0), 1.0, 2.0, 0.0, 0.5, 0.1, 1), (at(1), 2.0, 2.0, 0.0, None, None, None)]
+    NO_MAP = (None, None, None)
+    ROWS = [(at(0), 1.0, 2.0, 0.0, 0.5, 0.1, 1) + NO_MAP,
+            (at(1), 2.0, 2.0, 0.0, None, None, None) + NO_MAP]
 
     async def test_placed_session_converts_to_the_map_frame(self):
         session = self.session()
@@ -504,7 +664,7 @@ class TestTrackEndpoint:
         assert (await get(FakeDb(), f"/api/v1/runs/{uuid.uuid4()}/track")).status_code == 404
 
     async def test_missing_theta_stays_null_in_the_map_frame(self):
-        rows = [(at(0), 1.0, 2.0, None, 0.5, None, 1)]
+        rows = [(at(0), 1.0, 2.0, None, 0.5, None, 1) + self.NO_MAP]
         body = (await get(FakeDb(self.respond(rows, self.session())),
                           f"/api/v1/runs/{self.run_id}/track")).json()
         point = body["points"][0]
@@ -530,7 +690,8 @@ class TestTrackEndpoint:
 
     async def test_thinned_by_the_query_and_flagged(self):
         # the query returns 4 of 10 rows (n = 10 on each)
-        kept = [(at(i), float(i), 0.0, 0.0, 0.0, 0.0, 1, 10) for i in (0, 3, 6, 9)]
+        kept = [(at(i), float(i), 0.0, 0.0, 0.0, 0.0, 1) + self.NO_MAP + (10,)
+                for i in (0, 3, 6, 9)]
 
         def respond(sql, params):
             if "FROM robot_track_ts" in sql:
@@ -540,6 +701,64 @@ class TestTrackEndpoint:
         with patch.object(fleet_reads.config, "FLEET_TRACK_MAX_POINTS", 4):
             body = (await get(FakeDb(respond), f"/api/v1/runs/{self.run_id}/track")).json()
         assert body["downsampled"] and [p["x"] for p in body["points"]] == [0.0, 3.0, 6.0, 9.0]
+
+
+    async def test_not_recorded_is_told_apart_from_an_empty_track(self):
+        for level, marks, recorded in (("events_only", None, False), ("off", None, False),
+                                       ("track", None, True), ("full", None, True),
+                                       ("events_only", [{"ts": "t", "level": "track"}], True),
+                                       ("track", [{"ts": "t", "level": "off"}], True)):
+            body = (await get(FakeDb(self.respond([], None, level=level, marks=marks)),
+                              f"/api/v1/runs/{self.run_id}/track")).json()
+            assert (body["points"], body["recorded"], body["recording_level"]) == \
+                ([], recorded, level), (level, marks)
+            assert body["level_marks"] == (marks or [])
+
+    async def test_rows_with_points_are_recorded_whatever_the_level_says(self):
+        body = (await get(FakeDb(self.respond(self.ROWS, None, level="events_only")),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["recorded"] is True
+
+    STORED = [(at(0), 1.0, 2.0, 0.0, 0.5, 0.1, 1, 100.0, 200.0, 0.3),
+              (at(1), 2.0, 2.0, 0.0, None, None, None, 101.0, 200.0, None)]
+
+    async def test_stored_map_pose_is_used_without_a_session_lookup(self):
+        def respond(sql, params):
+            assert "FROM map_sessions" not in sql   # nothing to guess
+            return self.respond(self.STORED, self.session())(sql, params)
+        body = (await get(FakeDb(respond), f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["frame"] == "map" and "unplaced_points" not in body
+        assert [(p["x"], p["y"], p["theta"]) for p in body["points"]] == \
+            [(100.0, 200.0, 0.3), (101.0, 200.0, None)]
+
+    async def test_stored_pose_wins_over_the_session_guess_and_old_rows_use_the_guess(self):
+        mixed = [self.ROWS[0], self.STORED[1]]   # placed late: the first row has no map pose
+        body = (await get(FakeDb(self.respond(mixed, self.session())),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["frame"] == "map" and "unplaced_points" not in body
+        assert [(p["x"], p["y"]) for p in body["points"]] == [(8.0, 1.0), (101.0, 200.0)]
+
+    async def test_rows_that_cannot_be_placed_are_counted_not_mixed_in(self):
+        mixed = [self.ROWS[0], self.STORED[1]]
+        body = (await get(FakeDb(self.respond(mixed, None)),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["frame"] == "map" and body["unplaced_points"] == 1
+        assert [(p["x"], p["y"]) for p in body["points"]] == [(101.0, 200.0)]
+
+    async def test_a_row_without_any_pose_is_counted_with_the_unplaced_ones(self):
+        no_pose = (at(2), None, None, None, 0.0, None, None) + self.NO_MAP
+        rows = [self.STORED[0], no_pose, self.ROWS[1]]
+        body = (await get(FakeDb(self.respond(rows, None)),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert [p["x"] for p in body["points"]] == [100.0]
+        assert body["unplaced_points"] == 2 and body["frame"] == "map"
+
+    async def test_level_marks_come_with_the_run_row(self):
+        marks = [{"ts": "t", "level": "full"}]
+        db = FakeDb(self.respond(self.ROWS, self.session(), marks=marks))
+        body = (await get(db, f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["level_marks"] == marks
+        assert len([q for q, _ in db.executed if "FROM mission_runs" in q]) == 1   # one read
 
 
 class TestEndpoints:

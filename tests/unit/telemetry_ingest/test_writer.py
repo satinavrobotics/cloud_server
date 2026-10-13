@@ -248,6 +248,32 @@ class TestFailures:
         assert writer.metrics.rows_dropped[tables.ROBOT_STATE_TABLE]["write_failed"] == 1
         assert len(db.events) == 1 and not queue.spill.pending
 
+    async def test_track_copy_without_the_new_columns_is_retried_with_the_old_ones(
+            self, pool, db, clock, spill_path):
+        """A dispatch started before migration 20261013_01 loses no track rows."""
+        class UndefinedColumn(Exception):
+            pass
+
+        queue, writer = make(pool, clock, spill_path)
+        row = {"ts": T0, "robot_name": "r1", "run_id": None, "leg_seq": 1, "x": 1.0, "y": 2.0,
+               "theta": 0.5, "speed": 0.3, "omega": 0.0, "map_id": "m",
+               "x_map": 5.0, "y_map": 6.0, "theta_map": 0.1, "map_session_id": None,
+               "run_epoch": None}
+        queue.put_track(row)
+        db.fail = lambda sql, params: (UndefinedColumn("x_map") if sql.startswith(
+            "COPY robot_track_ts") and "x_map" in sql else None)
+        assert await writer.flush_once()
+        assert db.timeseries[tables.TRACK_TABLE] == [
+            tuple(row[c] for c in tables.TRACK_LEGACY_COLUMNS)]
+        assert writer.metrics.rows_written[tables.TRACK_TABLE] == 1
+
+    async def test_track_copy_other_errors_still_drop(self, pool, db, clock, spill_path):
+        queue, writer = make(pool, clock, spill_path)
+        queue.put_track({"ts": T0, "robot_name": "r1", "x": 1.0})
+        db.fail = lambda sql, params: DataError("bad") if sql.startswith("COPY") else None
+        assert not await writer.flush_once()
+        assert writer.metrics.rows_dropped[tables.TRACK_TABLE]["write_failed"] == 1
+
     async def test_latest_refused_is_dropped(self, pool, db, clock, spill_path):
         queue, writer = make(pool, clock, spill_path)
         queue.put_latest("r1", sw_version="v1")

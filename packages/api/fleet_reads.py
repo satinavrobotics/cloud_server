@@ -35,7 +35,10 @@ value of its first later change, else its current configured value.
 
 The first segment of a run's window uses `mission_runs.recording_level` (what dispatch
 resolved at the start); if the reconstruction disagrees, the segment carries
-`reconstructed_level`. Changes take effect in dispatch and the API within ~1 s of the event
+`reconstructed_level`. A run whose level came from the mission or a one-off raise
+(`mission_runs.level_override`) keeps it for the whole run, so every segment carries it
+(source `run`). A change of the level while the run was open is also written by dispatch to
+`mission_runs.level_marks` ([{ts, level}]), which `/track` returns. Changes take effect in dispatch and the API within ~1 s of the event
 (NOTIFY propagation), so interval boundaries are accurate to about a second.
 
 What each level does NOT store (§4.1), i.e. `not_recorded[].missing`:
@@ -392,7 +395,8 @@ async def list_events(db: Any, *, robot: Optional[str] = None, site: Optional[st
 
 
 async def _fetch_run(cur: Any, run_id: uuid.UUID) -> Sequence[Any]:
-    await cur.execute(f"SELECT {_RUN_SELECT}, mission_tree, planned_path FROM mission_runs "
+    await cur.execute(f"SELECT {_RUN_SELECT}, mission_tree, planned_path, level_marks "
+                      "FROM mission_runs "
                       "WHERE run_id = %s", (run_id,))
     row = await cur.fetchone()
     if row is None:
@@ -467,7 +471,8 @@ async def mission_legs(db: Any, mission: str, *, include_archived: bool = False
 
 # --- track -------------------------------------------------------------------------------------
 
-TRACK_COLUMNS = ("ts", "x", "y", "theta", "speed", "omega", "leg_seq")
+TRACK_COLUMNS = ("ts", "x", "y", "theta", "speed", "omega", "leg_seq",
+                 "x_map", "y_map", "theta_map")   # the last three: stored at record time
 # The robot's sessions on the run's map that overlap the run (two are enough to tell "one").
 _TRACK_SESSION_SQL = (
     "SELECT aligned, map_t_session, placement, started_at, ended_at FROM map_sessions "
@@ -519,17 +524,25 @@ def track_transform(sessions: Sequence[Sequence[Any]], start: datetime.datetime,
     return map_sessions.transform_of(transform)
 
 
-def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str, float]]
-                 ) -> List[Dict[str, Any]]:
-    """robot_track_ts rows (TRACK_COLUMNS order, run frame) as points; with `transform`
-    (map_T_session) x, y, theta are in the map frame (a missing theta stays null). Pose
-    rounded to mm / 0.001 rad."""
+def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str, float]],
+                 stored_only: bool = False) -> List[Dict[str, Any]]:
+    """robot_track_ts rows (TRACK_COLUMNS order) as points. A row with a stored map-frame pose
+    (x_map, y_map, theta_map: converted at record time) uses it; otherwise, with `transform`
+    (map_T_session), x, y, theta are converted from the run frame (a missing theta stays
+    null), and without one they stay in the run frame. `stored_only` leaves out a row that
+    would need a transform it does not have. Pose rounded to mm / 0.001 rad."""
     points = []
-    for ts, x, y, theta, speed, omega, leg_seq in rows:
-        if x is not None and y is not None:
+    for ts, x, y, theta, speed, omega, leg_seq, *stored in rows:
+        x_map, y_map, theta_map = stored if len(stored) == 3 else (None, None, None)
+        if x_map is not None and y_map is not None:
+            x, y, theta = x_map, y_map, theta_map
+        elif stored_only and transform is None:
+            continue   # no pose in the map frame (an unplaced stretch, or no pose at all)
+        elif x is not None and y is not None:
             if transform is not None:
                 x, y, mapped = map_geo.apply_pose(transform, x, y, theta or 0.0)
                 theta = None if theta is None else mapped
+        if x is not None and y is not None:
             x, y = round(x, 3), round(y, 3)
         points.append({"ts": iso(ts), "x": x, "y": y,
                        "theta": None if theta is None else round(theta, 3),
@@ -539,16 +552,32 @@ def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str,
     return points
 
 
+def track_recorded(run_level: Optional[str], marks: Any, has_points: bool) -> bool:
+    """Whether the run's track was recorded at all: rows exist, or the level it started at, or
+    one it was marked to change to (mission_runs.level_marks), stores the track."""
+    if has_points:
+        return True
+    levels = [run_level] + [m.get("level") for m in (marks or []) if isinstance(m, Mapping)]
+    return any(parse_level(level) is not None and
+               "track" not in MISSING_BY_LEVEL[parse_level(level).value] for level in levels)
+
+
 async def run_track(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
     """The run's 1 Hz track (pose + speed, recorded at the track and full levels), oldest first.
 
-    `frame` is "map" when one placed session of the robot on the run's map held for the whole
-    run (see track_transform: x, y, theta are then converted with its map_T_session as it is
-    now, like the legs and planned path drawn on the map) and "run" otherwise (the robot's own
+    `frame` is "map" when the points are in the map frame and "run" otherwise (the robot's own
     frame: `map_id` null, no/unplaced session, several sessions, or a placement changed inside
-    the run). `points` is empty when nothing was recorded (level events_only or off, or older
-    than the 1-year retention); more than FLEET_TRACK_MAX_POINTS rows are thinned by the query
-    (`downsampled`). 404 if the run is unknown."""
+    the run). Rows recorded since stage 1 of docs/tracking_redesign_2026-10-13.md carry their
+    map-frame pose, converted at record time (x_map...); it is used for every point when all
+    have it. A run without any such row (older, or never placed) falls back to
+    track_transform (one placed session of the robot on the run's map held for the whole run:
+    converted with its map_T_session as it is now). A run with both keeps the points it can
+    place in the map frame (stored, or converted by that fallback) and counts the others in
+    `unplaced_points`. `recorded` is false when the run's level never stored a track (then
+    `points` is empty because nothing was recorded, not because the robot did not move);
+    `recording_level` is the level the run started at and `level_marks` the changes written
+    while it ran ([{ts, level}]). More than FLEET_TRACK_MAX_POINTS rows are thinned by the
+    query (`downsampled`). 404 if the run is unknown."""
     max_points = config.FLEET_TRACK_MAX_POINTS
     async with read_cursor(db) as cur:
         row = await _fetch_run(cur, run_id)
@@ -557,22 +586,35 @@ async def run_track(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
         if ended is None:
             await cur.execute("SELECT now()")
             ended = (await cur.fetchone())[0]
+        marks = row[len(RUN_COLUMNS) + 2] if len(row) > len(RUN_COLUMNS) + 2 else None
         await cur.execute(_TRACK_SQL.format(cols=", ".join(TRACK_COLUMNS)),
                           (values["robot_name"], start, ended + TRAJECTORY_GRACE, run_id,
                            max_points))
         fetched = await cur.fetchall()
         transform = None
         map_id = values["map_id"]
-        if fetched and map_id:
+        n_cols = len(TRACK_COLUMNS)
+        placed = [r for r in fetched if r[1] is not None and r[2] is not None]
+        stored = [r for r in placed if r[n_cols - 3] is not None and r[n_cols - 2] is not None]
+        if fetched and map_id and len(stored) < len(placed):
             await cur.execute(_TRACK_SESSION_SQL, (values["robot_name"], map_id, ended, start))
             transform = track_transform(await cur.fetchall(), start, ended)
     total = fetched[0][-1] if fetched else 0
     rows = [r[:-1] for r in fetched]
     if len(rows) > max_points:  # the last row on top of a full stride: it replaces the previous
         del rows[-2]
-    return {"run_id": str(run_id), "robot_name": values["robot_name"], "map_id": map_id,
-            "frame": "map" if transform is not None else "run",
-            "downsampled": total > len(rows), "points": track_points(rows, transform)}
+    in_map = bool(stored) or transform is not None
+    points = track_points(rows, transform, stored_only=bool(stored))
+    unplaced = len(rows) - len(points) if stored else 0
+    result = {"run_id": str(run_id), "robot_name": values["robot_name"], "map_id": map_id,
+              "frame": "map" if in_map else "run",
+              "recorded": track_recorded(values["recording_level"], marks, bool(points)),
+              "recording_level": values["recording_level"],
+              "level_marks": marks if isinstance(marks, list) else [],
+              "downsampled": total > len(rows), "points": points}
+    if unplaced:
+        result["unplaced_points"] = unplaced
+    return result
 
 
 # --- recording level history (pure) ------------------------------------------------------------
@@ -672,10 +714,13 @@ def site_at(assignments: Sequence[Assignment], t: datetime.datetime) -> Optional
 def level_segments(start: datetime.datetime, end: datetime.datetime, run_level: Optional[str],
                    changes: Sequence[LevelChange], assignments: Sequence[Assignment],
                    current_robot: Optional[str], current_sites: Mapping[str, Optional[str]],
-                   current_global: Optional[str]) -> List[Dict[str, Any]]:
+                   current_global: Optional[str], run_override: bool = False
+                   ) -> List[Dict[str, Any]]:
     """The robot's effective level over [start, end]: consecutive segments
-    {from, to, level, source, site_id} (source: robot | site | global | default). The first
-    segment's level is `run_level` when given (mission_runs.recording_level)."""
+    {from, to, level, source, site_id} (source: run | robot | site | global | default). The
+    first segment's level is `run_level` when given (mission_runs.recording_level). With
+    `run_override` (mission_runs.level_override: the level came from the mission or a one-off
+    raise, which the recorder keeps for the whole run) it is every segment's level."""
     robot_layer = _Layer([c for c in changes if c.scope == "robot"], current_robot)
     global_layer = _Layer([c for c in changes if c.scope == "global"], current_global)
     site_ids = {c.scope_id for c in changes if c.scope == "site"} | {a[0] for a in assignments}
@@ -696,8 +741,8 @@ def level_segments(start: datetime.datetime, end: datetime.datetime, run_level: 
     segments: List[Dict[str, Any]] = []
     for i, t in enumerate(ordered):
         state = evaluate(t)
-        if i == 0 and run_level is not None and parse_level(run_level) is not None \
-                and run_level != state["level"]:
+        if (i == 0 or run_override) and run_level is not None \
+                and parse_level(run_level) is not None and run_level != state["level"]:
             state = {"level": run_level, "source": "run", "site_id": state["site_id"],
                      "reconstructed_level": state["level"]}
         if segments and all(segments[-1].get(k) == state.get(k)
@@ -828,7 +873,7 @@ async def _track(cur: Any, track: _Track, robot: str, start: datetime.datetime,
 
 
 TRAJECTORY_KEYS = ("ts", "seq", "node_id", "x", "y", "yaw", "map_id")
-TRAJECTORY_GRACE = datetime.timedelta(seconds=5)  # fleet_recorder TRAJECTORY_GRACE_S
+TRAJECTORY_GRACE = datetime.timedelta(seconds=config.RECORDER_TRAJECTORY_GRACE_S)
 
 
 async def _trajectory(cur: Any, run: Mapping[str, Any], start: datetime.datetime,
@@ -854,7 +899,7 @@ async def _trajectory(cur: Any, run: Mapping[str, Any], start: datetime.datetime
 
 
 async def _recording(cur: Any, robot: str, start: datetime.datetime, end: datetime.datetime,
-                     run_level: Optional[str]) -> Dict[str, Any]:
+                     run_level: Optional[str], run_override: bool = False) -> Dict[str, Any]:
     await cur.execute(
         f"SELECT site_id, lower(valid), upper(valid) FROM {ASSIGNMENTS_TABLE} "
         "WHERE robot_name = %s AND NOT isempty(valid) ORDER BY lower(valid)", (robot,))
@@ -874,7 +919,7 @@ async def _recording(cur: Any, robot: str, start: datetime.datetime, end: dateti
     sources = await load_sources(cur.connection, now)
     segments = level_segments(start, end, run_level, changes, assignments,
                               sources.robot_levels.get(robot), sources.site_levels,
-                              sources.global_level)
+                              sources.global_level, run_override)
     in_window = [r for r in rows if start <= r[0] <= end]
     return {
         "level_at_start": segments[0]["level"],
@@ -915,7 +960,9 @@ async def run_timeline(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
                   "diagnostics": await _track(cur, DIAGNOSTICS_TRACK, robot, start, end,
                                               max_points)}
         trajectory = await _trajectory(cur, values, start, end, max_points)
-        rec = await _recording(cur, robot, start, end, values["recording_level"])
+        await cur.execute("SELECT level_override FROM mission_runs WHERE run_id = %s", (run_id,))
+        override = bool((await cur.fetchone() or (False,))[0])
+        rec = await _recording(cur, robot, start, end, values["recording_level"], override)
     return {
         "run": run_dict(row[:len(RUN_COLUMNS)]),
         "window": {"from": iso(start), "to": iso(end), "open": ended is None},
