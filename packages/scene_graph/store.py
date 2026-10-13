@@ -37,6 +37,7 @@ from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pa
 
 PIPELINE = "morse/2"
 RES = 0.05
+RESIDENT_MARGIN_M = 5.0      # a partially resident writer keeps this margin of tiles around a leaf's window
 TILE_F = 128                  # costmap cells per tile side (64 lattice cells)
 TILE_L = 64
 SEGMENT = 1024                # leaf records per segment
@@ -120,8 +121,8 @@ def segment_records(arr, meta) -> List[LeafRecord]:
 
 
 def tiles_for(leaves: Sequence[Leaf], params: SceneParams) -> List[Tuple[int, int]]:
-    """Tiles a writer needs resident to fold `leaves`: their footprints expanded by the sight range."""
-    pad = params.sight_range
+    """Tiles a writer needs resident to fold `leaves`: their footprints expanded by RESIDENT_MARGIN_M."""
+    pad = RESIDENT_MARGIN_M
     out = set()
     for lf in leaves:
         h, w = lf.window_u8.shape
@@ -160,8 +161,8 @@ class SceneGraphStore:
     @staticmethod
     def params_hash(params: SceneParams) -> str:
         """The hash save() stamps on a version made with `params` (what begin_generation compares a pending against)."""
-        return params_hash(dict(robot_half_side=params.robot_half_side, lattice=params.lattice, place_mult=params.place_mult,
-                                sight_range=params.sight_range), PIPELINE)
+        return params_hash(dict(robot_half_side=params.robot_half_side, lattice=params.lattice,
+                                chart_radius=params.chart_radius), PIPELINE)
 
     @classmethod
     def from_client(cls, client, **kw):
@@ -493,8 +494,8 @@ class SceneGraphStore:
             ax1 = max(c[0] for c in coords); ay1 = max(c[1] for c in coords)
         else:
             p = man["params"]
-            return ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"], place_mult=p["place_mult"],
-                                          sight_range=p["sight_range"]))
+            return ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"],
+                                          chart_radius=p["chart_radius"]))
         W, H = (ax1 - ax0 + 1) * TILE_F, (ay1 - ay0 + 1) * TILE_F
         V = np.full((H, W), 255, np.uint8); T = np.full((H, W), -1, np.int64); B = np.full((H, W), -1, np.int64)
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
@@ -523,8 +524,8 @@ class SceneGraphStore:
         st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, chan=chan, leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
-        g = ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"], place_mult=p["place_mult"],
-                                   sight_range=p["sight_range"]))
+        g = ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"],
+                                   chart_radius=p["chart_radius"]))
         g.import_state(st, verify=verify)
         if [_fmt(k) for k in g._keys] != [c["key"] for c in charts]:
             raise StateMismatch("restored keys differ from the stored key table")
@@ -821,7 +822,7 @@ class StoredView:
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         """The engine's `snap` from the stored version: nearest navigable cell with the real distance (refused beyond
         `max_dist` / the sight range but still reported), and whether the straight segment to it crosses a blocked cell."""
-        h = self.man["params"]["lattice"]; R = self.man["params"]["sight_range"]
+        h = self.man["params"]["lattice"]; R = 2.0 * self.man["params"]["chart_radius"]
         far = Snap(None, None, None, math.inf)
         ext = self._extent()
         if ext is None: return far

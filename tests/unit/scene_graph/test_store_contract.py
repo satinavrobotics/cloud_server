@@ -8,7 +8,7 @@ from packages.scene_graph.store import MemoryBackend, SceneGraphStore
 from . import chart_worlds as cw
 
 pytestmark = pytest.mark.unit
-P1, P2 = SceneParams(), SceneParams(sight_range=6.0)
+P1, P2 = SceneParams(), SceneParams(chart_radius=2.4)
 
 
 class Clock:
@@ -50,7 +50,7 @@ def test_begun_ms_is_stamped_kept_across_saves_and_restarted_by_fresh_or_discard
     g3 = s2.begin_generation("m", h2, fresh=True)                        # fresh: discards, restarts the clock
     assert g3 > gen and s2.meta("m")["pending"]["begun_ms"] == int(clock.t * 1000) > t0
     clock.t += 5
-    g4 = s2.begin_generation("m", SceneGraphStore.params_hash(SceneParams(sight_range=7.0)))   # other params: discards
+    g4 = s2.begin_generation("m", SceneGraphStore.params_hash(SceneParams(chart_radius=2.8)))   # other params: discards
     assert g4 > g3 and s2.meta("m")["pending"]["begun_ms"] == int(clock.t * 1000)
 
 

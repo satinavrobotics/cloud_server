@@ -28,8 +28,8 @@ identity and a display point, never a waypoint.
 * **persistence** of a pair of adjacent basins: p = min(peak a, peak b) - s(a, b), s = the largest min(B) over 4-adjacent crossing
   pairs. **merge**: pairs are merged smallest p first while p < tau (survivor: higher peak). Level tau_j = tau0 * 2^j with
   **tau0 = 2 sqrt(2) h**; level 0 is the base partition (`BASE_TAU = 1`), levels continue until every component is one region.
-* **chart radius** rho = `CHART_RADIUS` * `sight_range` = 0.4 * 5 m = 2.0 m (HEURISTIC 26): a chart's diameter is at most 0.8 of
-  what one leaf observes.
+* **chart radius** rho = `SceneParams.chart_radius` = 2.0 m (HEURISTIC 26): the one scale that depends on the site. A chart's
+  diameter is at most 2 rho; `snap` is bounded by it.
 * **chart** (`subdivide`): inside each region, cells are taken in the order of room (B / h rounded, ties in scan order); a cell
   whose geodesic distance (8-neighbour steps inside the region, a diagonal needing both side cells in the region) to every earlier
   **net point** exceeds rho becomes one. A chart is the set of cells whose nearest net point it is (distance, then earlier net
@@ -77,7 +77,7 @@ identity and a display point, never a waypoint.
 | 23 | Locality: owner changes after a batch lie within 0.8 m (hall) and 2.65 m (field) of changed input cells; the same bound as the regions alone for the field | TESTED | `test_store_dirty`; the nearer-anchor tie rule must be canonical (a library multi-source search that picked ties by heap order moved 20 of 30 charts for a 6-cell change) |
 | 24 | Key persistence per frame, one leaf per fold: 0.97-0.98 (office8, office7), 0.95 (office6); a corridor grown from either end 0.98 | TESTED | 95-109 frames per floor |
 | 25 | Cost with charts: 1.1-1.5 microseconds per cell per batch (hall 45k 0.069 s, ring 53k 0.059 s, field 86k 0.108 s); 2.6 microseconds on a 244k-cell field that is one region (0.63 s) | TESTED | a search per anchor inside a window of side 2 rho; unchanged regions are served from the last solve |
-| 26 | rho = 0.4 * sight_range: the sweep rho = 1.5 / 2.0 / 2.5 / 3.5 m gives 128 / 93 / 66 / 51 anchors on the 7 floors and an abstract (anchor chain) stretch p90 of 1.57-1.75 / 1.63-1.83 / 1.79-1.91 / 1.74-2.07; 2.0 matches the previous cover (102 anchors, 1.56-1.67) | HEURISTIC | one physical scale: below it the count grows as 1 / rho^2 without a better stretch |
+| 26 | rho = 2.0 m default: the sweep rho = 1.5 / 2.0 / 2.5 / 3.5 m gives 128 / 93 / 66 / 51 anchors on the 7 floors and an abstract (anchor chain) stretch p90 of 1.57-1.75 / 1.63-1.83 / 1.79-1.91 / 1.74-2.07; 2.0 matches the previous cover (102 anchors, 1.56-1.67) | HEURISTIC | one physical scale: below it the count grows as 1 / rho^2 without a better stretch |
 | 27 | A route searched point to point inside the corridor (charts on the chart path plus their neighbours) reaches the true shortest path on every partition (p90 1.00; the worst of 840 pairs 1.40, the corridor result is not proved shortest); through the two anchors it does not (p90 1.3 - 2.3x on the regions alone) | TESTED | 120 random pairs >= 3 m per floor |
 
 ## 4. What this partition is not
@@ -102,7 +102,7 @@ identity and a display point, never a waypoint.
 ## 5. Generality (indoors and outdoors)
 
 * One environment scale: rho (statement 26), a physical size in metres like h and r. Everything else derives from h, r and the
-  data. `morse.py` takes h and rho as arguments. An outdoor site wanting larger charts raises `sight_range`.
+  data. `morse.py` takes h and rho as arguments. An outdoor site wanting larger charts raises `chart_radius`; up to about one storage tile (6.4 m) no storage setting changes.
 * The levels continue until one region per component, so an outdoor map gets as many levels as its scale needs.
 * The lattice is two costmap cells (`LAT = 2` in `engine.py`: `// 2` and `2*x+1` in `_cell_xy`, snap, query windows, `import_state`
   padding and pose cells; `TILE`, `RES`; `store.py`: `TILE_F`, `TILE_L`, tile slicing). A coarser lattice for a large outdoor

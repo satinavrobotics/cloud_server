@@ -21,7 +21,7 @@
 
 Charts: with a radius each region is cut into geodesic Voronoi cells of a greedy net taken in the order of room (`subdivide`):
 every cell is within `radius` of its anchor, anchors of a region are further than `radius` apart, no chart crosses a pass.
-The engine's radius is CHART_RADIUS * sight_range; `levels` above the charts are `cell_levels`.
+The engine's radius is SceneParams.chart_radius; `levels` above the charts are `cell_levels`.
 
 Counting identity (any tie order): chi(F) = #maxima - sum(saddle multiplicities) (B has no minima). Nothing here reads a chart
 index, a leaf or the canvas: the engine calls `partition` once per batch.
@@ -38,7 +38,6 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 TAU0_FACTOR = 2.0 * math.sqrt(2.0)
-CHART_RADIUS = 0.4                  # chart radius = CHART_RADIUS * sight_range: diameter 0.8 of what one leaf observes
 BASE_TAU = 1                        # the base partition merges persistence below BASE_TAU * tau_0; level j: * 2^j
 TOL = 1e-9                          # persistence comparisons: p < tau - TOL merges (p exactly tau is kept apart)
 BIG = np.iinfo(np.int64).max

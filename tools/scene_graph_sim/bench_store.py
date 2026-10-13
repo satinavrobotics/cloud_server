@@ -62,7 +62,7 @@ def synthetic(side_m=400):
     known = int((V != 255).sum())
     H2 = n // 2
     plane = -np.ones((H2, H2), np.int32); plane[(V[::2, ::2] == 0)] = 0
-    st = EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0, V=V, T=T, B=B,
+    st = EngineState(params=dict(robot_half_side=0.25, lattice=0.1, chart_radius=2.0), cx0=0, cy0=0, V=V, T=T, B=B,
                      leaves=[LeafRecord("n%d" % i, "s", t0 + i * 1000, float(i), 0.0, 0.25) for i in range(5000)],
                      keys=[("n0", 0)], plane=plane, watermark=(t0, "n0"))
 
@@ -94,7 +94,7 @@ def leaves(n=100_000):
     recs = [LeafRecord("n%07d" % i, "s%d" % (i % 3), t0 + i * 1000, float(i % 400) * 0.05, float(i // 400) * 0.05, 0.25) for i in range(n)]
     H2 = V.shape[0] // 2
     plane = np.zeros((H2, H2), np.int32)
-    st = EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0, V=V, T=T, B=B,
+    st = EngineState(params=dict(robot_half_side=0.25, lattice=0.1, chart_radius=2.0), cx0=0, cy0=0, V=V, T=T, B=B,
                      leaves=recs, keys=[("n0", 0)], plane=plane, watermark=(t0, "n0"))
 
     class G:

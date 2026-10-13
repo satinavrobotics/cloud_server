@@ -5,7 +5,7 @@ distance to the non-navigable cells B itself. `verify` returns the number of vio
 cover        the charts are exactly F: every cell of F in exactly one chart, no other cell in any
 chart4       every chart is 4-connected
 anchor       the anchor is in its chart and is the chart cell nearest the chart's centroid (ties: more room)
-radius       every cell is within geodesic distance 0.8 sight_range (the chart's diameter bound) of its anchor, along cells
+radius       every cell is within geodesic distance 2 chart_radius (the chart's diameter bound) of its anchor, along cells
              of its own chart
 planar       chi(F) = sum_i (1 - holes_i) - arcs + junctions, the Euler identity of the planar map of the partition
              (arcs: maximal chains of interface edges through corners of map degree 2; junction: interior corner with >= 3
@@ -154,7 +154,7 @@ def verify(g, world=None, r=None, bbox=None):
                                int(math.floor((c.anchor[0] - ra.origin[0]) / ra.step)))
     holes = 0
     region = {kpos[c.key]: c.region for c in v0.charts}
-    radius = max(0.4 * p.sight_range, h)                 # written from the definition: chart radius 0.4 sight_range
+    radius = max(p.chart_radius, h)
     for j in range(len(keys0)):
         m = lab0 == j
         if not m.any(): out["anchor"] += 1; continue

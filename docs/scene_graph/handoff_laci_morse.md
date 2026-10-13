@@ -13,7 +13,7 @@ From CIMBI, 2026-10-13. Branch `feat/scene-graph-morse` (from the v2 tip 7843576
 | `Link.width` | strict widest path of clearance | twice the PHYSICAL clearance at the arc's widest crossing (same unit as `required_width`, +- 0.05 m) |
 | `Route.min_width` | narrowest crossed link | unchanged |
 | levels | net-tree on anchors | level 0 charts, level 1 the persistence regions at tau0 (omitted when identical), then tau0 * 2^j until one region per component; `query(level >= ViewResult.levels)` returns the top level |
-| `SceneParams` | `sight_range`, `place_mult` read | `sight_range` sets the chart radius (0.4 x sight_range = 2.0 m) and `snap`'s bound; `place_mult` is a deprecated no-op (kept because `params_dict` is pinned by a test) |
+| `SceneParams` | `robot_half_side`, `lattice`, `place_mult`, `sight_range` | `robot_half_side`, `lattice`, `chart_radius` (m, default 2.0: the one scene-dependent scale; it also bounds `snap` by the chart diameter). `place_mult` and `sight_range` are removed; the window cap (20 m side) and pose slack (5 m) are engine constants. `scene_host.params_dict` is changed accordingly |
 | store | FORMAT 2, solver state in snapshots | FORMAT 4, pipeline `morse/2`: no solver state, a chart record carries `region`; load = rebuild F, partition, match stored keys; old stores get a new generation |
 | cost | hall 31k cells 0.15 s per batch of 6; open fields minutes | 1.1-1.5 microseconds per cell per batch: hall 45k 0.07 s, field 86k 0.11 s, 244k-cell open field 0.63 s |
 
@@ -33,7 +33,7 @@ From CIMBI, 2026-10-13. Branch `feat/scene-graph-morse` (from the v2 tip 7843576
 * `duplicates` counter re-counts rows at every poll tick (1000-2500 in 8 s idle).
 * One batch-of-6 run ended with 1 leaf unsaved (office6 108 of 109); not reproduced with a 5 s quiescence wait: check the runner's idle
   condition.
-* `meta.params` still carries `sight_range`/`place_mult` (`scene_host.py:109`).
+* `meta.params` carries `chart_radius` (`scene_host.params_dict`).
 * Hospital (open simulation): no longer stalls; keep simulation maps off unless you want them in the graph.
 * Update `integration.md` / `runbook.md` wording that assumes dependents, chart counts of 13-19, `sight_range`, descent budgets and the
   open-field limit (maps of 12-15 m now fold in milliseconds).
@@ -78,7 +78,7 @@ table; never enable the planner flag before the maps are generated and checked.
 
 * **Why.** The persistence regions alone were 2-4x coarser than the old cover: large regions (40-80 % of a floor), anchors far from
   the way, and the planner's path (start -> anchor -> anchor -> goal) up to 4x the shortest. Each region is now cut into charts
-  of geodesic radius <= 0.4 x `sight_range` (2 m): `morse.subdivide`, `formulation.md` section 2 and statements 17-27.
+  of geodesic radius <= `chart_radius` (2 m): `morse.subdivide`, `formulation.md` section 2 and statements 17-27.
 * **Planner.** Call `graph.route(a, b, blocked, start=(x, y), goal=(x, y))` with the snapped cell's x, y: the route runs cell to
   cell, no anchor on the way. Without start/goal it is anchor to anchor, as before.
 * **API.** `Chart.region` (persistence region id), `Chart.peak` is the chart's largest B, `ViewResult.levels`.

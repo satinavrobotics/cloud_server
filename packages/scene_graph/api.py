@@ -26,13 +26,9 @@ class BBox:
 class SceneParams:
     robot_half_side: float = 0.25      # r (m), per map, set by the cloud server
     lattice: float = 0.1               # h (m)
-    place_mult: float = 1.5            # DEPRECATED, no effect on the partition (morse.py has no placement scale). Still part
-                                       # of the persisted params (graph-builder's `params_dict` pins that set), so it keeps
-                                       # its place in the params hash; remove it with that pin.
-    sight_range: float = 5.0           # m: tied to the leaf window (10 x 10 m => one leaf never observes beyond 5 m from
-                                       # its pose); caps window sizes and pose offsets, bounds `snap`, and sets the chart
-                                       # radius (0.4 x sight_range, morse.CHART_RADIUS). Part of the params hash: changing it
-                                       # is a new generation.
+    chart_radius: float = 2.0          # m: the one scene-dependent scale. Every chart is within this geodesic distance of its
+                                       # net point (diameter <= 2 x chart_radius); `snap` is bounded by the chart diameter.
+                                       # Part of the params hash: changing it is a new generation.
 
 
 @dataclass(frozen=True)
@@ -173,13 +169,13 @@ class SceneGraph:
         raise NotImplementedError
 
     def locate(self, x: float, y: float, max_dist: Optional[float] = None) -> Optional[Key]:
-        """Chart that owns the nearest navigable cell within `max_dist` (default: sight_range), or None. Never raises,
+        """Chart that owns the nearest navigable cell within `max_dist` (default: the chart diameter, 2 x chart_radius), or None. Never raises,
         never -1. The planner applies its own limits (start ~0.5 m, goal ~1-2 m) and uses `snap` to learn the distance."""
         raise NotImplementedError
 
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         """`locate` with the evidence: the snapped cell centre, the real distance, and whether the straight segment to it
-        crosses a known blocked cell. `max_dist` None = sight_range, the outer bound; `key` is None beyond it."""
+        crosses a known blocked cell. `max_dist` None = the chart diameter, the outer bound; `key` is None beyond it."""
         raise NotImplementedError
 
     def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Pt] = None,
