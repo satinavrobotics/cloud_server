@@ -710,19 +710,103 @@ def required_width(robot_width_m: float, robot_length_m: Optional[float], turns:
     return w + max(0.0, float(margin_m))
 
 
+def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
+               kappa: float) -> Any:
+    """The `Safety` (clearance pricing, docs/scene_graph/route_safety.md section 1) of a plan, or None for the
+    legacy shortest route: kappa <= 0, a graph without `deficit_cell`, or a margin not above the map's inscribed
+    radius r. margin = r_c, the circumscribed radius hypot(length, width) / 2 of the planning robot (the length is
+    the width while unknown), r * sqrt(2) while the width is unknown; rate = kappa / (margin - r)."""
+    if not kappa > 0.0 or not callable(getattr(graph, "deficit_cell", None)):
+        return None
+    r = getattr(getattr(graph, "params", None), "robot_half_side", None)
+    if r is None or not (0.0 < float(r) < math.inf):
+        return None
+    r = float(r)
+    if robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0:
+        length = float(robot_length_m) if robot_length_m is not None \
+            and math.isfinite(robot_length_m) and robot_length_m > 0.0 else float(robot_width_m)
+        r_c = math.hypot(length, float(robot_width_m)) / 2.0
+    else:
+        r_c = r * math.sqrt(2.0)
+    margin = r_c
+    if not margin > r:
+        return None
+    from packages.scene_graph.api import Safety
+    return Safety(margin=margin, rate=float(kappa) / (margin - r))
+
+
+PRICE_SAMPLE_M = 0.025          # spacing of the samples that measure the priced cost of a straight segment
+
+
+def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: Sequence[Pt],
+                   safety: Any) -> Callable[[Pt, Pt], bool]:
+    """Cost-aware line of sight (S11): `visible(a, b)` AND the priced cost of the segment (a, b) is at most that of the
+    lattice sub-path between the two points (both found in `lattice_pts`, the route's points). The cost of a straight
+    piece is its length times the mean of 1 + rate * deficit over samples every `PRICE_SAMPLE_M` (at the middle of equal
+    sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell counts as clearance 0); the
+    sub-path is measured the same way between its consecutive points. Then the final polyline costs no more than the
+    lattice path. A point that is not on the route is judged by `visible` alone."""
+    h = float(graph.params.lattice)
+    mu, margin = float(safety.rate), float(safety.margin)
+    memo: Dict[Tuple[int, int], float] = {}
+
+    def factor(x: float, y: float) -> float:
+        c = (int(math.floor(x / h)), int(math.floor(y / h)))
+        f = memo.get(c)
+        if f is None:
+            d = graph.deficit_cell(c[0], c[1], margin)
+            f = memo[c] = 1.0 + mu * (margin if d is None else d)
+        return f
+
+    def cost(a: Pt, b: Pt) -> float:
+        length = math.dist(a, b)
+        if length == 0.0:
+            return 0.0
+        n = max(1, int(math.ceil(length / PRICE_SAMPLE_M - 1e-9)))
+        acc = 0.0
+        for k in range(n):
+            t = (k + 0.5) / n
+            acc += factor(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+        return length * acc / n
+
+    pts: List[Pt] = []
+    for p in lattice_pts:
+        if not pts or p != pts[-1]:
+            pts.append(p)
+    prefix = [0.0]
+    for p, q in zip(pts[:-1], pts[1:]):
+        prefix.append(prefix[-1] + cost(p, q))
+    where: Dict[Pt, int] = {}
+    for i, p in enumerate(pts):
+        where.setdefault(p, i)
+
+    def priced(a: Pt, b: Pt) -> bool:
+        if not visible(a, b):
+            return False
+        ia, ib = where.get(a), where.get(b)
+        if ia is None or ib is None:
+            return True
+        lo, hi = (ia, ib) if ia <= ib else (ib, ia)
+        sub = prefix[hi] - prefix[lo]
+        return cost(a, b) <= sub * (1.0 + 1e-9) + 1e-9
+
+    return priced
+
+
 def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
                   start_snap_m: float, goal_snap_m: float, max_gap_m: float,
                   robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                   robot_length_m: Optional[float] = None,
-                  node_policy_cfg: Optional[Dict[str, Any]] = None) -> ChartPlan:
+                  node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
+                  width_check: bool = True) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
     try:
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
-                              node_policy_cfg)
+                              node_policy_cfg, safety_kappa, width_check)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -733,7 +817,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    start_snap_m: float, goal_snap_m: float, max_gap_m: float,
                    robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                    robot_length_m: Optional[float] = None,
-                   node_policy_cfg: Optional[Dict[str, Any]] = None) -> ChartPlan:
+                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
+                   width_check: bool = True) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -743,7 +828,11 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     that is `leaf_lookup_error`, a point with no leaf near it returns None. `node_policy_cfg`
     ({robot_width, margin, snap_m, budget_s}): every waypoint but the first and the last is made
     skippable where the graph gives the room around it (go-here, product rule 1); the outcome is
-    `ChartPlan.node_policy`."""
+    `ChartPlan.node_policy`.
+    `safety_kappa` > 0 prices the route's clearance (`safety_for`: it needs the graph's `deficit_cell` and a margin
+    above the map's inscribed radius; otherwise the route is the shortest, as with 0) and makes the line of sight
+    cost-aware (`priced_visible`); the footprint (`robot_width_m`, `robot_length_m`) then gives the margin even with
+    `width_check` False, which only gates the `too_narrow` comparison."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -756,9 +845,10 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         raise ChartFallback("goal_" + problem)
     discs, segments = overlay
     blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
+    safety = safety_for(graph, robot_width_m, robot_length_m, safety_kappa)
     try:
         route = graph.route(snap_a.key, snap_b.key, blocked, start=(snap_a.x, snap_a.y),
-                            goal=(snap_b.x, snap_b.y))
+                            goal=(snap_b.x, snap_b.y), **({} if safety is None else {"safety": safety}))
     except MissingTiles as err:
         raise ChartFallback("missing_tiles") from err
     except CorridorTooLarge as err:
@@ -775,7 +865,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             if free is not None and free.nodes:
                 raise ChartFallback("blocked_by_overlay")
         raise ChartFallback("unreachable")
-    check_width = robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0
+    check_width = width_check and robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0
     min_width = float(route.min_width)
     if check_width and min_width < required_width(robot_width_m, robot_length_m, False,
                                                   width_margin_m):
@@ -784,6 +874,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     # prepend/append only matters when an end falls back to its chart anchor.
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
     visible = blocked_free_los(graph, overlay)
+    if safety is not None:
+        visible = priced_visible(visible, graph, pts, safety)
     pts = simplify(pts, visible, max_gap_m)
     # The gap cap can leave a stub of a few lattice steps at the end (two waypoints on one leaf =
     # a zero-length leg): merge it into the previous leg when that stays in line of sight.
@@ -814,7 +906,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         report = node_policy_plan.annotate_corridors(
             graph, poses, range(1, len(poses) - 1), node_policy_cfg.get("robot_width"),
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
-            node_policy_cfg.get("budget_s", 0.0))
+            node_policy_cfg.get("budget_s", 0.0), safety=safety)
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report)

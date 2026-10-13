@@ -601,6 +601,12 @@ NODE_POLICY_SKIP_ENABLED = _env_bool("NODE_POLICY_SKIP_ENABLED", "true")
 NODE_POLICY_GAP_FILL_ENABLED = _env_bool("NODE_POLICY_GAP_FILL_ENABLED", "true")
 NODE_POLICY_WIDTH_BUDGET_S = float(os.getenv("NODE_POLICY_WIDTH_BUDGET_S", "1.0"))
 NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "5.0"))
+# Clearance pricing of the scene-graph route (docs/scene_graph/route_safety.md). KAPPA is the cost multiplier added at the
+# inscribed floor (a cell whose clearance is the map's robot half side costs 1 + KAPPA times its length; cells at or above
+# the planning robot's circumscribed radius cost their length); 0 disables the pricing (the shortest route). Out of range:
+# reset to the default with one warning. The planner prices on the tile-lazy graph (lazy_plan.PlanGraph) with the
+# clearance read from the stored v planes; no other setting is involved.
+SCENE_GRAPH_SAFETY_KAPPA = float(os.getenv("SCENE_GRAPH_SAFETY_KAPPA", "1.0"))
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
 # that has a stored scene graph. CONCURRENCY loads at a time.
@@ -635,9 +641,14 @@ def _validate_scene_graph_planner() -> None:
         if not (value >= 0.0 and value < float("inf")):
             fixed.append(f"{name}={value} -> {default}")
             globals()[name] = default
+    value = SCENE_GRAPH_SAFETY_KAPPA
+    if not (0.0 <= value <= 20.0):                               # also NaN
+        fixed.append(f"SCENE_GRAPH_SAFETY_KAPPA={value} -> 1.0")
+        globals()["SCENE_GRAPH_SAFETY_KAPPA"] = 1.0
     if fixed:
         logging.getLogger("config").warning("invalid scene graph planner settings reset: %s",
                                             "; ".join(fixed))
+
 
 
 _validate_scene_graph_planner()

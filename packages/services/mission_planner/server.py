@@ -288,10 +288,10 @@ class MissionPlannerService:
                 graph, map_id, tuple(start_xy), (target_x, target_y), overlay, node_of,
                 config.SCENE_GRAPH_START_SNAP_M, config.SCENE_GRAPH_GOAL_SNAP_M,
                 config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
-                self._robot_width(robot) if check_width else None,
+                self._robot_width(robot),
                 config.SCENE_GRAPH_WIDTH_MARGIN_M,
-                self._robot_length(robot) if check_width else None,
-                self._node_policy_cfg(robot)))
+                self._robot_length(robot),
+                self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -366,6 +366,8 @@ class MissionPlannerService:
         robot = await self.get_robot_status(robot_name)
         robot_width = self._robot_width(robot)
         snap_m = config.SCENE_GRAPH_START_SNAP_M
+        safety = scene_route.safety_for(graph, robot_width, self._robot_length(robot),
+                                        config.SCENE_GRAPH_SAFETY_KAPPA)    # the planner's clearance pricing
 
         def work() -> Tuple[List[common.Pose2D], int, Dict[str, Any]]:
             poses, inserted = base, 0
@@ -373,13 +375,13 @@ class MissionPlannerService:
                 visible = scene_route.blocked_free_los(graph, ([], []))
                 poses, inserted = node_policy_plan.insert_planned(
                     graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
-                    scene_route.simplify)
+                    scene_route.simplify, safety)
             wanted = [i for i, w in enumerate(poses[:-1])
                       if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
             if wants_corridor:
                 rep = node_policy_plan.annotate_corridors(
                     graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
-                    config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True)
+                    config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety)
             else:
                 rep = {"total": len(wanted), "skippable": 0,
                        "unavailable": node_policy_plan.UNAVAILABLE_DISABLED}
