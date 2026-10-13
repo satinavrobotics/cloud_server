@@ -152,18 +152,19 @@ distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`,
 6. **Budget of the plan**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (3 s), also
    bounded by what is left of the total (`plan_timeout`, or `budget_exhausted` when the total was the binding one).
 
-**Planner modes** (`SCENE_GRAPH_PLANNER_MODE`, default `full_load`; wiring `server.py` -> `GraphCache(lazy=...,
+**Planner modes** (`SCENE_GRAPH_PLANNER_MODE`, default `lazy`; `full_load` is the rollback; wiring `server.py` -> `GraphCache(lazy=...,
 lazy_kw=...)`). `full_load`: a cache miss restores the whole stored version (`store.load`); route, snap and the
 line-of-sight test run on the full engine. `lazy`: a cache miss opens the manifest only (`lazy_plan.open_plan` ->
 `PlanGraph`); a request reads the owner tiles of its corridor (single-flight per tile, bounded LRU
 `SCENE_GRAPH_LAZY_TILE_CACHE`, default 512 tiles of about 35 KB each by the config comment) and answers `snap`,
 `route` and `free_cell` from them with the engine's search made sparse (same 8-neighbour rule and cost, same length;
-route cells may differ among equal-length routes under an overlay; `tests/unit/test_lazy_plan.py`). A corridor that
+the same route cells too: both break ties by the canonical rule, minimal integer cost then lexicographic (y, x);
+`tests/unit/test_lazy_plan.py`, `tests/unit/test_lazy_plan_equality.py`). A corridor that
 needs more than `SCENE_GRAPH_LAZY_MAX_TILES` (default 400) tiles falls back `corridor_too_large`; a tile that cannot
 be read (version garbage-collected, backend error) falls back `tile_unavailable` and the graph is dropped so the next
 request re-opens the current version. Both reasons occur in lazy mode only. In lazy mode the cached object is a
 `PlanGraph` (manifest + a bounded tile LRU). The planner flag itself stays off by default; lazy mode is not
-validated on a production stack.
+validated on a production stack. Set the mode explicitly in the production `.env`.
 
 Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `chart_keys`, `graph_version`,
 `planner_fallback` (only when the flag is on and the legacy planner ran; on plan and navigation responses).

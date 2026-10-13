@@ -1,7 +1,7 @@
 # Planner upgrade: read-only, tile-lazy chart planner
 
 Status (2026-10-13, end of session): **Phase 0 and the planner-side hardening are merged** into `feat/scene-graph-v2`
-as `09a4e99`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load`; the planner itself stays off:
+as `09a4e99`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (at the merge the default was `full_load`; it is now `lazy`, `full_load` is the rollback; the planner itself stays off:
 `SCENE_GRAPH_PLANNER_ENABLED`). The store read-path hardening was taken by CIMBI as `16aee6a` (section 9, Phase 1:
 done items marked). Phases 1 (rest), 2 and 3 are plan only. Written 2026-10-13 from a read-only scoping pass over branch
 `feat/scene-graph-v2`; file:line citations are as of that date (before the merge). Current record of the work:
@@ -11,7 +11,7 @@ measurements. Related: `integration.md` (planner wiring, measurements), `runbook
 ## 0. Phase 0 result (2026-10-13)
 
 `packages/services/mission_planner/lazy_plan.py` (`PlanGraph`, `open_plan`), selected by
-`SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load`; `SCENE_GRAPH_LAZY_MAX_TILES`, `SCENE_GRAPH_LAZY_TILE_CACHE`).
+`SCENE_GRAPH_PLANNER_MODE=lazy` (default `lazy` since the canonical tie rule; `full_load` = rollback; `SCENE_GRAPH_LAZY_MAX_TILES`, `SCENE_GRAPH_LAZY_TILE_CACHE`).
 No format change, no engine change; it reads `StoredView` (`_own`, `_cache`) and the manifest, so Phase 1 only moves
 that code next to the engine.
 
