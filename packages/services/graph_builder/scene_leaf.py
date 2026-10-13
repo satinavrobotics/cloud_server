@@ -24,7 +24,11 @@ a clock, the sane robot stamp (up to `clock.max_skew_s` ahead of receipt; no age
 offset replaces it) is fed with its receipt to the session's minimum-delay offset estimate and
 returned as `stamp + offset` clamped to the receipt, with source `*_corrected`. Until the session
 has enough observations the leaf gets the receipt time, as STAMP_PROVISIONAL. The receipt is the
-node's `costmap_stored_ms` (DB clock) when present, else its `timestamp`. A corrected stamp is
+node's `costmap_stored_ms` (DB clock) when present AND near the node's own time (`receipt_ms`:
+within `receipt_window_s`, default 300 s, of the node `timestamp`, else of its `capture_time`), else
+its `timestamp`. A layer written long after capture (a backfill: `occupancy_depth` generated days
+later by set_node_costmaps) carries a write-time `costmap_stored_ms`; as the receipt it would make
+every leaf of a burst look equally delayed and the estimator degenerate to the write time. A corrected stamp is
 final: the worker writes it to the node (`scene_stamp_ms`, first write wins) before folding and
 every later read gets it back as STAMP_STORED, so the estimate improving later changes nothing
 for that leaf. The one stamp that is NOT kept is STAMP_PROVISIONAL (the placeholder of a session below
@@ -37,6 +41,10 @@ from typing import Any, Mapping, Optional, Tuple
 from packages.utils import capture_time
 
 MAX_AGE_S = 7 * 24 * 3600.0
+# `costmap_stored_ms` is the receipt of a layer only when within this of the node's own time
+# (SCENE_GRAPH_RECEIPT_WINDOW_S in packages.config); <= 0 trusts it always. The robot's upload
+# buffer is ~60 s, so a live write is well inside it.
+DEFAULT_RECEIPT_WINDOW_S = 300.0
 
 STAMP_COSTMAP = "costmap_stamp"
 STAMP_CAPTURE = "capture_time"
@@ -77,9 +85,42 @@ def _ms(moment: datetime.datetime) -> int:
     return int(round(moment.timestamp() * 1000.0))
 
 
+def _positive(value: Any) -> Optional[int]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return int(value)
+    return None
+
+
+def receipt_ms(node: Mapping[str, Any],
+               window_s: float = DEFAULT_RECEIPT_WINDOW_S) -> Optional[Tuple[int, str]]:
+    """`(epoch ms, source)` of the time the cloud received the node's costmap, or None.
+
+    `costmap_stored_ms` (DB clock of the layer write) when it lies within `window_s` of the node's
+    own time: its `timestamp` (graph-builder receipt, always set at creation), else its sane
+    `capture_time`. A stored time farther away is a bulk / late write of a layer (backfill), not a
+    receipt: the node's own time is used (source `node_timestamp` / `capture_time`). No stored time:
+    the node `timestamp`. Sources: `costmap_stored`, `node_timestamp`, `capture_time`."""
+    stored = _positive(node.get("costmap_stored_ms"))
+    own = _receipt(node)
+    own_ms = _ms(own) if own is not None else None
+    if own_ms is None and stored is not None:
+        when = datetime.datetime.fromtimestamp(stored / 1000.0 + MAX_AGE_S, _UTC)
+        moment = capture_time.parse(node.get(capture_time.FIELD), when)
+        if moment is not None:
+            own_ms, own_src = _ms(moment), "capture_time"
+    else:
+        own_src = "node_timestamp"
+    if stored is not None:
+        if own_ms is None or window_s <= 0 or abs(stored - own_ms) <= window_s * 1000.0:
+            return stored, "costmap_stored"
+        return own_ms, own_src
+    return (own_ms, own_src) if own_ms is not None else None
+
+
 def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
                max_age_s: float = MAX_AGE_S, clock: Any = None,
-               session: Optional[str] = None) -> Optional[Tuple[int, str]]:
+               session: Optional[str] = None,
+               receipt_window_s: float = DEFAULT_RECEIPT_WINDOW_S) -> Optional[Tuple[int, str]]:
     """`(epoch ms, source)` the leaf is folded under, or None when the node has no usable time at
     all (no sane robot stamp and no receipt time): the worker skips such a leaf and counts it.
     `clock` / `session` (default `node['session_id']`): see the module docstring.
@@ -91,17 +132,14 @@ def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
     if isinstance(kept, (int, float)) and not isinstance(kept, bool) and kept > 0:
         return int(kept), STAMP_STORED
     receipt = _receipt(node)
-    stored = node.get("costmap_stored_ms")
-    receipt_ms = None
+    got = None
     if clock is not None:
-        if isinstance(stored, (int, float)) and not isinstance(stored, bool) and stored > 0:
-            receipt_ms = int(stored)
-        elif receipt is not None:
-            receipt_ms = _ms(receipt)
+        got = receipt_ms(node, receipt_window_s)
         if session is None:
             session = node.get("session_id")
-        if receipt_ms is None or not session:
+        if got is None or not session:
             clock = None
+    rcpt_ms = got[0] if got is not None else None
     if layer is None:
         layer = role_layers(node.get("costmap")).get(ROLE_OCCUPANCY, ROLE_OCCUPANCY)
     now = receipt or datetime.datetime.now(_UTC)
@@ -112,12 +150,12 @@ def leaf_stamp(node: Mapping[str, Any], layer: Optional[str] = None,
     candidates.append((STAMP_CAPTURE, node.get(capture_time.FIELD)))
     for source, raw in candidates:
         if clock is not None:
-            lenient = datetime.datetime.fromtimestamp(receipt_ms / 1000.0 + clock.max_skew_s, _UTC)
+            lenient = datetime.datetime.fromtimestamp(rcpt_ms / 1000.0 + clock.max_skew_s, _UTC)
             moment = capture_time.parse(raw, lenient)
             if moment is None:
                 continue
-            ms, trusted = clock.correct(str(session), _ms(moment), receipt_ms)
-            return (ms, _CORRECTED[source]) if trusted else (receipt_ms, STAMP_PROVISIONAL)
+            ms, trusted = clock.correct(str(session), _ms(moment), rcpt_ms)
+            return (ms, _CORRECTED[source]) if trusted else (rcpt_ms, STAMP_PROVISIONAL)
         moment = capture_time.parse(raw, now)
         if moment is None:
             continue

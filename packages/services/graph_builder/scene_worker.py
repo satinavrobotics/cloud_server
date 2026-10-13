@@ -124,6 +124,10 @@ TERMINAL = (DELETING, FENCED, NEEDS_REBUILD)
 
 SKIP_PNG_EXPIRED = "png_missing_expired"
 SKIP_FOLD_ERROR = "fold_error"        # a leaf the engine cannot fold (bisected and quarantined)
+# A leaf the stored state already holds (same key, stamp, pose, footprint and view) at a stored time
+# not past the cursor that state was saved with: not folded again after a restart (no re-solve, no
+# new version). Counted in `skipped`; not an error.
+SKIP_ALREADY_FOLDED = "already_folded"
 
 
 class SaveFenced(Exception):
@@ -222,6 +226,11 @@ class WorkerConfig:
     # Scale. lazy_load: the engine of a stored map (version > 0) is loaded by the first fold, not at start.
     # nbytes_refresh_s: `engine.nbytes` (a walk of its arrays) is recomputed at most this often.
     # memory_retry_limit: consecutive MemoryErrors of one batch before it is bisected / quarantined.
+    # Restart replay: leaves the stored state already holds are skipped (SKIP_ALREADY_FOLDED) instead of
+    # being folded again (False: fold the margin again, as before).
+    skip_folded: bool = True
+    # costmap_stored_ms is a leaf's receipt time only within this of the node's own time (scene_leaf.receipt_ms)
+    receipt_window_s: float = scene_leaf.DEFAULT_RECEIPT_WINDOW_S
     lazy_load: bool = False
     nbytes_refresh_s: float = 10.0
     memory_retry_limit: int = 3
@@ -254,6 +263,10 @@ class SceneWorkerStats:
     evictions: int = 0                      # engines dropped to free memory
     prefetch_hits: int = 0                  # leaves whose PNG was fetched + decoded by the prefetch pool
     memory_isolations: int = 0              # batches bisected after repeated MemoryErrors
+    already_folded: int = 0                 # leaves not folded again: the stored state holds them (restart replay)
+    views_built: int = 0                    # leaves folded with a camera view (cover())
+    views_missing: int = 0                  # ... without: the node has no depth record
+    view_failures: int = 0                  # ... without: a depth record whose camera block is unusable
 
 
 @dataclass
@@ -413,13 +426,22 @@ class SceneWorker:
                  engine_factory: Optional[Callable[[int], Any]] = None,
                  loaded_version: Optional[int] = None,
                  mono_ms: Optional[Callable[[], int]] = None,
-                 prefetch: Optional[PngPrefetch] = None) -> None:
+                 prefetch: Optional[PngPrefetch] = None,
+                 stored_leaves: Optional[Callable[[int], Optional[Mapping[str, tuple]]]] = None) -> None:
         if engine is None and engine_factory is None:
             raise ValueError("SceneWorker needs an engine or an engine_factory")
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
         self.engine, self.store, self.cursor_store, self.guard = engine, store, cursor_store, guard
         self.engine_factory, self._loaded_version = engine_factory, loaded_version
         self.prefetch = prefetch
+        # `stored_leaves(version) -> {key: (stamp_ms, session, x, y, r_d, view)}` of a stored version (the
+        # leaf segments of its manifest: no engine load); None = read them from the engine when it is loaded
+        self.stored_leaves = stored_leaves
+        self._known: Optional[Dict[str, tuple]] = None   # the leaves the state loaded at start holds (lazy)
+        self._known_cursor: Cursor = ZERO_CURSOR         # the cursor that state was saved with
+        self._known_version = 0
+        self._known_off = True                           # no skipping: set by start, cleared when usable
+        self._view_warned = False
         self._tickets: Dict[Tuple[str, int], _Ticket] = {}   # (key, stored_ms) -> prefetched PNG of this step
         self._memory_head: Optional[str] = None      # first leaf of the batch that last ran out of memory
         self._memory_streak = 0
@@ -482,6 +504,8 @@ class SceneWorker:
         self._request_seen_ms = 0
         self._warned_cannot_rebuild = False
         self._last_updated_event_ms: Optional[int] = None
+        self._event_held: Optional[Tuple[int, Optional[int]]] = None   # an 'updated' event inside the throttle
+        self._skip_logged: set = set()
         self._leaves_since_event = 0
         self._last_stats_ms: Optional[int] = None
         self._last_step_ms: Optional[int] = None     # when the worker last completed a step
@@ -604,11 +628,13 @@ class SceneWorker:
         st = self.stats
         log.info("scene worker %s: stats state=%s folded=%d skipped=%s pending=%d buffered=%d "
                  "version=%d lag=%.0fs saves=%d save_failures=%d source_errors=%d rebuilds=%d "
-                 "rebuilding=%s resident=%s bytes=%s loads=%d evictions=%d prefetched=%d",
+                 "rebuilding=%s resident=%s bytes=%s loads=%d evictions=%d prefetched=%d "
+                 "already_folded=%d default_r_d=%d views=%d/%d/%d(ok/no_depth/bad)",
                  self.map_id, self.last_result_state, st.folded, dict(st.skipped),
                  len(self._pending), st.buffered_leaves, st.version, st.version_lag_s, st.saves,
                  st.save_failures, st.source_errors, st.rebuilds, self._rebuild_gen is not None,
-                 st.resident, st.resident_bytes, st.loads, st.evictions, st.prefetch_hits)
+                 st.resident, st.resident_bytes, st.loads, st.evictions, st.prefetch_hits,
+                 st.already_folded, st.default_r_d, st.views_built, st.views_missing, st.view_failures)
 
     def _step(self) -> StepResult:
         if self.state in TERMINAL:
@@ -624,6 +650,8 @@ class SceneWorker:
                 return early
         if self._started and self._poll_rebuild_request():
             return StepResult(WORKED)
+        if self._event_held is not None:
+            self._flush_updated_event()
         # a failed save left folded state in memory: retry it before pulling more
         if self._dirty is not None and self.stats.save_failures and self._due(idle=False, force=True):
             res = self._save()
@@ -913,6 +941,11 @@ class SceneWorker:
         else:
             self._cursor = min(stored) if stored else ZERO_CURSOR
         self._stored_cursor = self._cursor_of(meta.get("cursor")) or ZERO_CURSOR
+        # Leaves the stored state holds may be skipped while it is the state this worker folds into: not in a
+        # rebuild (a new engine) and not after the engine was dropped (`_reset_fold_state`).
+        self._known, self._known_version = None, version
+        self._known_cursor = self._stored_cursor
+        self._known_off = rebuilding or version <= 0 or not cfg.skip_folded
         self._candidate = self._cursor
         self._expected_version = version
         self.stats.version = version
@@ -1186,6 +1219,7 @@ class SceneWorker:
         self._buf.clear()
         self._buffered.clear()
         self._seen.clear()
+        self._known, self._known_off = None, True      # the engine is new or rewound: fold everything again
         self._pending.clear()
         self._idle_streak = 0
         self._scan = None
@@ -1226,6 +1260,11 @@ class SceneWorker:
             length, width = -1, -1
         r, known = scene_adapter.half_side(length, width, self.config.default_half_side)
         self._footprints[robot] = (r, known, now)
+        if not known:
+            log.warning("scene worker %s: footprint of robot %r unknown (%s): folding its leaves with the "
+                        "default r_d %.2f m (counted in default_r_d); asked again in %.0fs", self.map_id,
+                        robot or "<node has no robot_name>", "no factsheet row or length/width -1",
+                        r, self.config.footprint_retry_s)
         return r, known
 
     def _adapt(self, node: Mapping[str, Any], retry: bool = False):
@@ -1242,6 +1281,8 @@ class SceneWorker:
         layer = scene_leaf.role_layers(node.get("costmap")).get(scene_leaf.ROLE_OCCUPANCY)
         if not layer:
             return scene_adapter.SKIP_NO_LAYER
+        if not retry and self._state_holds(node, None):
+            return self._already_folded()
         window, bad_png = None, False
         ticket = None if retry else self._tickets.pop((key, ms), None)
         try:
@@ -1270,10 +1311,16 @@ class SceneWorker:
         self._pending.pop(key, None)
         r_d, known = self._robot_half_side(node)
         info: Dict[str, Any] = {}
+        vinfo: Dict[str, Any] = {}
         leaf, reason = scene_adapter.to_leaf(node, png, r_d=r_d, layer=layer, clock=self.clock,
-                                             stamp_info=info, window=window, bad_png=bad_png)
+                                             stamp_info=info, window=window, bad_png=bad_png,
+                                             receipt_window_s=self.config.receipt_window_s,
+                                             view_info=vinfo)
         if leaf is None:
             return reason or "unknown"
+        self._count_view(key, vinfo.get("view"))
+        if not retry and self._state_holds(node, leaf):
+            return self._already_folded()
         # Persist the stamp only when it is final. A stored stamp wins forever (first write wins on
         # the node), and the provisional one is the receipt time given to a session whose clock is
         # not trusted yet (< min_obs observations): keeping it would freeze the leaf at "receipt"
@@ -1284,6 +1331,85 @@ class SceneWorker:
         if not known:
             self.stats.default_r_d += 1
         return leaf
+
+    # ---- restart replay: leaves the stored state already holds
+
+    def _known_leaves(self) -> Optional[Dict[str, tuple]]:
+        """`{key: (stamp_ms, session, x, y, r_d, view)}` of the state this worker started from (read once,
+        lazily), or None when skipping is off or the leaves cannot be read (then everything is folded)."""
+        if self._known_off or self._rebuild_gen is not None:
+            return None
+        if self._known is None:
+            index = None
+            try:
+                if self.stored_leaves is not None and self._known_version > 0:
+                    index = self.stored_leaves(self._known_version)
+                elif self.engine is not None and hasattr(self.engine, "export_state"):
+                    index = {r.key: (int(r.t), str(r.session), float(r.x), float(r.y), float(r.r_d),
+                                     None if r.view is None else tuple(float(v) for v in r.view))
+                             for r in self.engine.export_state().leaves}
+            except Exception as exc:  # noqa: BLE001 - an optimisation only
+                log.warning("scene worker %s: stored leaves unreadable (%s: %s): the replay folds them "
+                            "again", self.map_id, type(exc).__name__, exc)
+            if index is None:
+                self._known_off = True
+                return None
+            self._known = dict(index)
+        return self._known
+
+    def _state_holds(self, node: Mapping[str, Any], leaf: Any) -> bool:
+        """True when the stored state already holds this leaf: its key is there with the same stamp, session,
+        pose, footprint and view, and the node was stored at or before the cursor that state was saved with
+        (so the layer it holds is the one that was folded: a costmap that is stored again gets a newer
+        `costmap_stored_ms`). With `leaf` None the leaf is not built yet: the stamp is the node's kept
+        `scene_stamp_ms`, the rest comes from the node, and a node without a kept stamp is not decided here."""
+        key = str(node.get("_key", ""))
+        if (int(node.get("costmap_stored_ms") or 0), key) > self._known_cursor:
+            return False
+        known = self._known_leaves()
+        rec = known.get(key) if known is not None else None
+        if rec is None:
+            return False
+        if leaf is not None:
+            return rec == (int(leaf.stamp_ms), str(leaf.session), float(leaf.x), float(leaf.y),
+                           float(leaf.r_d), None if leaf.view is None else
+                           (float(leaf.view.x), float(leaf.view.y), float(leaf.view.yaw),
+                            float(leaf.view.fov), float(leaf.view.rng)))
+        kept = node.get(scene_leaf.STAMP_FIELD)
+        if not isinstance(kept, (int, float)) or isinstance(kept, bool) or int(kept) != rec[0]:
+            return False
+        pose = node.get("pose") or {}
+        stored = node.get("costmap") or {}
+        layer = scene_leaf.role_layers(stored).get(scene_leaf.ROLE_OCCUPANCY)
+        record = stored.get(layer) if layer else None
+        session = str(node.get("session_id") or (record or {}).get("session_id") or "")
+        try:
+            same_pose = (float(pose["x"]), float(pose["y"])) == (rec[2], rec[3])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not same_pose or session != rec[1] or float(self._robot_half_side(node)[0]) != rec[4]:
+            return False
+        view, _ = scene_adapter.build_view(node, key, float(pose["x"]), float(pose["y"]), float(pose.get("yaw", 0.0)))
+        return rec[5] == (None if view is None else (float(view.x), float(view.y), float(view.yaw),
+                                                     float(view.fov), float(view.rng)))
+
+    def _already_folded(self) -> str:
+        self.stats.already_folded += 1
+        return SKIP_ALREADY_FOLDED
+
+    def _count_view(self, key: str, state: Optional[str]) -> None:
+        st = self.stats
+        if state == scene_adapter.VIEW_OK:
+            st.views_built += 1
+        elif state == scene_adapter.VIEW_NO_DEPTH:
+            st.views_missing += 1
+        elif state == scene_adapter.VIEW_BAD_CAMERA:
+            st.view_failures += 1
+            if not self._view_warned:
+                self._view_warned = True
+                log.warning("scene worker %s: node %s has a depth record but no usable camera block: its "
+                            "leaf is folded without a view (cover() ignores it); further ones are only "
+                            "counted (view_failures)", self.map_id, key)
 
     def _would_fetch(self, node: Mapping[str, Any]) -> Optional[Tuple[str, int, str]]:
         """(key, stored_ms, layer) when `_adapt` would fetch this node's PNG, else None."""
@@ -1335,6 +1461,10 @@ class SceneWorker:
         self._buffered[key] = ms      # leaves and skips alike: a margin re-read must not queue it again
         if isinstance(outcome, str):
             self.stats.skipped[outcome] += 1
+            if outcome != SKIP_ALREADY_FOLDED and outcome not in self._skip_logged:
+                self._skip_logged.add(outcome)       # the first of each reason; the rest is counted
+                log.warning("scene worker %s: node %s skipped (%s); further skips of this reason are only "
+                            "counted (stats skipped)", self.map_id, key, outcome)
             self._buf.append(_Entry(node, None))
             return 1
         self._buf.append(_Entry(node, outcome))
@@ -1760,7 +1890,9 @@ class SceneWorker:
         except Exception as exc:
             return self._save_failed(exc)
         dirty, self._dirty = self._dirty, None
+        moved = False        # the store keeps the version when only the cursor changed: nothing to announce then
         if self._rebuild_gen is None:
+            moved = int(version) != self._expected_version
             self._expected_version = int(version)
             self.stats.version = int(version)
         # else: `version` is the pending generation's own counter. The compare-and-set of every
@@ -1776,10 +1908,11 @@ class SceneWorker:
         self._rebuild_saved = self._rebuild_saved or self._rebuild_gen is not None
         self._commit(target)
         if self._rebuild_gen is None:       # a pending generation is not readable yet: nothing to announce
-            charts = len(getattr(dirty, "changed", None) or []) if dirty is not None else None
-            self._event_updated(int(version), charts)
+            if moved:
+                charts = len(getattr(dirty, "changed", None) or []) if dirty is not None else None
+                self._event_updated(int(version), charts)
             self._leaves_since_publish = 0
-        if self._rebuild_gen is None and self.publish is not None and dirty is not None:
+        if self._rebuild_gen is None and moved and self.publish is not None and dirty is not None:
             try:
                 self.publish(int(version), dirty)
             except Exception:
@@ -1789,14 +1922,27 @@ class SceneWorker:
 
     def _event_updated(self, version: int, charts: Optional[int]) -> None:
         """'updated' events are at most one per `updated_event_interval_s` per map (the websocket
-        publish is not throttled); the leaves folded in between are summed into the next one."""
+        publish is not throttled). A save inside the interval is not lost: it is held (latest version,
+        charts and leaves summed) and emitted by `_flush_updated_event` once the interval is over."""
+        held = self._event_held
+        if held is not None and charts is not None:
+            charts = (held[1] or 0) + charts
+        self._event_held = (version, charts)
+        self._flush_updated_event()
+
+    def _flush_updated_event(self) -> None:
+        held = self._event_held
+        if held is None:
+            return
         now, every = self._mono(), self.config.updated_event_interval_s
         last = self._last_updated_event_ms
         if every > 0 and last is not None and now - last < every * 1000:
             return
+        self._event_held = None
         self._last_updated_event_ms = now
-        self._event("updated", version=version, leaves_folded=self._leaves_since_event,
-                    charts_changed=charts)
+        skipped = {k: v for k, v in self.stats.skipped.items() if v}
+        self._event("updated", version=held[0], leaves_folded=self._leaves_since_event,
+                    charts_changed=held[1], skipped=skipped or None)
         self._leaves_since_event = 0
 
     def _generation_gone(self, gen: Optional[int]) -> bool:

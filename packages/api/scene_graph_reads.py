@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from fastapi import HTTPException
 
+from packages.scene_graph import TooOld
 from packages.scene_graph.api import BBox, MissingTiles
 
 MAX_LEVEL = 8
@@ -459,7 +460,7 @@ class SceneGraphReads:
         except HTTPException:
             raise
         except Exception as exc:  # pylint: disable=broad-except
-            if type(exc).__name__ == "TooOld":    # the store no longer retains the span: reselect from current charts
+            if isinstance(exc, TooOld):    # the store no longer retains the span: reselect from current charts
                 raise HTTPException(status_code=409, detail=str(exc)) from None
             raise unavailable(exc, "lineage") from exc
         return {"available": True, "from_version": from_version, "version": version, "epoch": _tag(ep),

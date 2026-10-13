@@ -682,7 +682,8 @@ class GraphDatabaseService:
     # Only the fields the scene worker reads (scene_adapter / scene_leaf / the robot lookup), not
     # the whole document: this runs every idle step per map.
     COSTMAP_SINCE_FIELDS = ("_key", "node_id", "costmap_stored_ms", "costmap", "pose", "session_id",
-                            "robot_name", "timestamp", "created_at", "capture_time", "scene_stamp_ms")
+                            "robot_name", "timestamp", "created_at", "capture_time", "scene_stamp_ms",
+                            "depth")        # depth: the camera block of each camera, for Leaf.view (cover())
     COSTMAP_SINCE_AQL = (
         "FOR n IN @@col FILTER n.costmap_stored_ms != null AND "
         "(n.costmap_stored_ms > @since OR (n.costmap_stored_ms == @since AND n._key > @after)) "

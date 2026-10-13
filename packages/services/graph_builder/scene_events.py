@@ -31,9 +31,15 @@ def updated_message(map_id: str, version: int, dirty: Any, max_keys: int = MAX_K
     }
 
 
-def _log_failure(future: Any) -> None:
-    if not future.cancelled() and future.exception() is not None:
-        log.warning("scene_graph_updated not published: %s", future.exception())
+def _log_failure(future: Any, what: str = "scene_graph_updated websocket message not published") -> None:
+    """Done-callback of a publish / event write: say WHAT failed (the two share it), for which map
+    when `what` names it, and the cause (type and text; some exceptions have no text)."""
+    if future.cancelled():
+        log.warning("%s: cancelled", what)
+        return
+    exc = future.exception()
+    if exc is not None:
+        log.warning("%s: %s: %s", what, type(exc).__name__, exc or "(no message)")
 
 
 def make_publish(publisher: Any, loop: asyncio.AbstractEventLoop, map_id: str
@@ -42,7 +48,9 @@ def make_publish(publisher: Any, loop: asyncio.AbstractEventLoop, map_id: str
     def publish(version: int, dirty: Any) -> None:
         message = updated_message(map_id, version, dirty)
         future = asyncio.run_coroutine_threadsafe(publisher.publish(map_id, message), loop)
-        future.add_done_callback(_log_failure)
+        future.add_done_callback(
+            lambda f, m=map_id, v=int(version): _log_failure(
+                f, f"scene_graph_updated websocket message of map {m} version {v} not published"))
     return publish
 
 
@@ -87,7 +95,9 @@ def make_event_sink(database: Any, loop: asyncio.AbstractEventLoop
         try:
             event = build_event(map_id, kind, payload)
             future = asyncio.run_coroutine_threadsafe(_write_event(database, event), loop)
-            future.add_done_callback(_log_failure)
+            future.add_done_callback(
+                lambda f, m=map_id, k=kind: _log_failure(
+                    f, f"scene graph fleet event {k!r} of map {m} not written"))
         except Exception as exc:  # noqa: BLE001
             log.warning("scene graph event %s for %s not written: %s", kind, map_id, exc)
     return sink

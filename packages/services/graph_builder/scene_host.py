@@ -111,9 +111,27 @@ def params_dict(params: Any) -> dict:
 
 def expected_params_hash(params: Any) -> str:
     """The `params_hash` the store writes for a graph built with `params`."""
-    from packages.scene_graph.store import PIPELINE
-    from packages.scene_graph.store_codec import params_hash
-    return params_hash(params_dict(params), PIPELINE)
+    from packages.scene_graph.store import SceneGraphStore
+    return SceneGraphStore.params_hash(params)
+
+
+def stored_leaf_index(store: Any, map_id: str, version: int) -> dict:
+    """`{key: (stamp_ms, session, x, y, r_d, view)}` of the leaves stored with `version`: the leaf
+    segments of its manifest, no tiles and no engine. The worker skips the leaves a restart would
+    fold again. Raises when the store cannot say (the worker then folds the margin again)."""
+    from packages.scene_graph.store import segment_records
+    from packages.scene_graph.store_codec import unpack
+    man = store.manifest(map_id, version)
+    out: dict = {}
+    for h in man.get("segments", []):
+        raw = store.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h))
+        if raw is None:
+            raise FileNotFoundError(f"leaf segment {h}")
+        arr, meta = unpack(raw)
+        for r in segment_records(arr, meta):
+            out[r.key] = (int(r.t), str(r.session), float(r.x), float(r.y), float(r.r_d),
+                          None if r.view is None else tuple(float(v) for v in r.view))
+    return out
 
 
 def worker_config(params: Any) -> Any:
@@ -130,6 +148,8 @@ def worker_config(params: Any) -> Any:
         batch_min_leaves=lo, batch_max_leaves=hi,
         save_every_leaves=config.SCENE_GRAPH_SAVE_EVERY_LEAVES, save_every_s=config.SCENE_GRAPH_SAVE_EVERY_S,
         replay_margin_ms=int(config.SCENE_GRAPH_REPLAY_MARGIN_S * 1000),
+        receipt_window_s=float(config.SCENE_GRAPH_RECEIPT_WINDOW_S),
+        skip_folded=bool(config.SCENE_GRAPH_SKIP_FOLDED),
         replay_recheck_s=config.SCENE_GRAPH_REPLAY_RECHECK_S,
         rebuild_max_age_s=config.SCENE_GRAPH_REBUILD_MAX_AGE_S,
         rebuild_debounce_s=config.SCENE_GRAPH_REBUILD_DEBOUNCE_S,
@@ -192,6 +212,7 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
             engine_factory=load, store=store, cursor_store=cursors, guard=guard, config=cfg,
             now_ms=lambda: int(time.time() * 1000),
             mono_ms=lambda: int(time.monotonic() * 1000),
+            stored_leaves=lambda version: stored_leaf_index(store, map_id, version),
             publish=scene_events.make_publish(service.update_publisher, loop, map_id),
             new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,), prefetch=prefetch,
             on_event=(lambda kind, payload: sink(map_id, kind, payload)) if sink else None)

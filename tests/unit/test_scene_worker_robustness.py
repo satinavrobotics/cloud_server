@@ -824,7 +824,8 @@ def test_updated_events_are_throttled_per_map():
     r.source.add(make_node("z", 900_000))
     r.drain()
     upd = [p for k, p in events if k == "updated"]
-    assert len(upd) == 2 and upd[1]["leaves_folded"] == 5
+    # the saves held inside the interval are emitted (summed) once it is over, before the next fold
+    assert len(upd) == 2 and upd[1]["leaves_folded"] == 4
 
 
 def test_step_budget_stops_reading_but_continues():

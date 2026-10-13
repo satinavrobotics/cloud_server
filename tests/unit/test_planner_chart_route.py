@@ -238,10 +238,23 @@ async def test_unexpected_exception_in_the_route_falls_back(on):
 
 
 @pytest.mark.unit
-async def test_waypoints_sharing_a_leaf_id_fall_back(on):
+async def test_a_route_on_one_leaf_is_served_as_two_waypoints(on):
+    """Every waypoint snaps to one leaf (sparse leaves): the route is served, not given up. (The
+    10 m fake strip is longer than the waypoint gap cap, so the 2-waypoint collapse itself is
+    covered in test_scene_route.)"""
     svc = _service(FakeStore(FakeGraph()))
     svc.graph_db.k_nearest_neighbors.side_effect = lambda x, y, k, map_id: (
         [{"node_id": "n", "x": x, "y": y}], [0.1])
+    out = await _plan(svc)
+    assert out["planner"] == "scene_graph" and not out.get("planner_fallback")
+    assert out["path"] == ["n"] * len(out["waypoints"]) and len(out["waypoints"]) >= 2
+    assert out["start_node_id"] == out["end_node_id"] == "n"
+
+
+@pytest.mark.unit
+async def test_a_waypoint_without_a_leaf_still_falls_back(on):
+    svc = _service(FakeStore(FakeGraph()))
+    svc.graph_db.k_nearest_neighbors.side_effect = lambda x, y, k, map_id: ([], [])
     out = await _plan(svc)
     assert out["planner"] == "legacy"
     assert out["planner_fallback"] == "waypoints_without_distinct_leaf_ids"

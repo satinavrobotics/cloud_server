@@ -177,6 +177,45 @@ def test_repair_respects_the_gap_cap_and_keeps_both_ends():
     assert oi == ["a", "a"]
 
 
+# ---- collapse_repeated_leaf_ids / repeats allowed (F7) ----------------------------------------------
+
+def test_collapse_merges_the_second_of_two_waypoints_on_one_leaf_when_visible():
+    pts = [(0.0, 0.0), (3.0, 0.0), (3.4, 0.0), (6.0, 0.0)]
+    out, oi = sr.collapse_repeated_leaf_ids(pts, ["a", "b", "b", "c"], always, 0.0)
+    assert out == [pts[0], pts[1], pts[3]] and oi == ["a", "b", "c"]
+
+
+def test_collapse_keeps_a_repeat_that_cannot_be_merged_without_cutting_a_corner():
+    pts = [(0.0, 0.0), (3.0, 0.0), (3.0, 0.4), (3.0, 5.0)]
+    never_across = lambda a, b: b == (3.0, 0.4) or a == (3.0, 0.0) and b == (3.0, 0.4) or \
+        (a, b) in {((0.0, 0.0), (3.0, 0.0)), ((3.0, 0.0), (3.0, 0.4)), ((3.0, 0.4), (3.0, 5.0))}
+    out, oi = sr.collapse_repeated_leaf_ids(pts, ["a", "b", "b", "c"], never_across, 0.0)
+    assert out == pts and oi == ["a", "b", "b", "c"]
+
+
+def test_collapse_route_on_one_leaf_becomes_start_goal():
+    pts = [(0.0, 0.0), (0.5, 0.3), (1.0, 0.8), (1.6, 0.8)]
+    out, oi = sr.collapse_repeated_leaf_ids(pts, ["a"] * 4, always, 0.0)
+    assert out == [pts[0], pts[-1]] and oi == ["a", "a"]
+    # start does not see goal: left as is (geometry first)
+    out, oi = sr.collapse_repeated_leaf_ids(pts, ["a"] * 4, lambda a, b: False, 0.0)
+    assert out == pts
+
+
+def test_collapse_leaves_a_route_with_a_missing_leaf_alone():
+    pts = [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)]
+    out, oi = sr.collapse_repeated_leaf_ids(pts, ["a", None, "a"], always, 0.0)
+    assert out == pts and oi == ["a", None, "a"]
+
+
+def test_build_waypoints_can_allow_repeated_ids():
+    pts = [(0.0, 0.0), (1.0, 0.0)]
+    _, planned = sr.build_waypoints(pts, "m", lambda x, y: "same", allow_repeats=True)
+    assert planned == ["same", "same"]
+    _, planned = sr.build_waypoints(pts, "m", lambda x, y: None, allow_repeats=True)
+    assert planned is None
+
+
 # ---- width rule ---------------------------------------------------------------------------------------
 
 def test_required_width_aligned_vs_turn_in_place():

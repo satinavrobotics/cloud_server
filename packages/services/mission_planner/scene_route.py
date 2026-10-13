@@ -70,11 +70,12 @@ def simplify(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool],
 
 
 def build_waypoints(points: Sequence[Pt], map_id: str,
-                    node_of: Callable[[float, float], Optional[str]]
+                    node_of: Callable[[float, float], Optional[str]],
+                    allow_repeats: bool = False
                     ) -> Tuple[List[common.Pose2D], Optional[List[str]]]:
     """(waypoints, planned_path or None) for an already simplified point list.
-    `planned_path` is None unless every waypoint has a distinct leaf id. The last waypoint repeats
-    the previous bearing (a one-point route has theta 0)."""
+    `planned_path` is None unless every waypoint has a leaf id, and (unless `allow_repeats`) a
+    distinct one. The last waypoint repeats the previous bearing (a one-point route has theta 0)."""
     pts = list(points)
     poses: List[common.Pose2D] = []
     for i, (x, y) in enumerate(pts):
@@ -90,7 +91,8 @@ def build_waypoints(points: Sequence[Pt], map_id: str,
     # one id per waypoint, no repeats: two waypoints snapped to the same leaf would be a zero-length
     # leg for the leg tracker, so such a route carries no planned_path (its legs are VDA-id only).
     planned = ([str(n) for n in ids]
-               if poses and all(n is not None for n in ids) and len(set(ids)) == len(ids) else None)
+               if poses and all(n is not None for n in ids)
+               and (allow_repeats or len(set(ids)) == len(ids)) else None)
     return poses, planned
 
 
@@ -127,6 +129,39 @@ def repair_leaf_ids(points: Sequence[Pt], ids: Sequence[Optional[str]],
             del kp[j:]
             del ki[j:]
     kp.append(points[-1]); ki.append(ids[-1])
+    return kp, ki
+
+
+def collapse_repeated_leaf_ids(points: Sequence[Pt], ids: Sequence[Optional[str]],
+                               visible: Callable[[Pt, Pt], bool], max_gap: float = 0.0
+                               ) -> Tuple[List[Pt], List[Optional[str]]]:
+    """Last step of the leaf-id repair (after `repair_leaf_ids`): merge what is still repeated.
+
+    Consecutive waypoints on one leaf are one waypoint where the line of sight allows (the earlier
+    interior one goes, the end points stay). A whole route that sits on ONE leaf (every waypoint
+    within the snap radius of the same leaf: a short hop between sparse leaves, start and goal on
+    one leaf) becomes the minimal two-waypoint path [start, goal] when the start sees the goal
+    (and the gap cap allows it), else it is left as is. A repeat that cannot be merged without
+    cutting a corner stays: the geometry is what is served, the caller accepts repeated ids (a
+    leg between two waypoints of one leaf is not an edge: edge statistics ignore src == dst).
+    A route with a waypoint without a leaf is returned unchanged."""
+    pts, out = list(points), list(ids)
+    if len(pts) < 2 or any(i is None for i in out):
+        return pts, out
+    if len(set(out)) == 1:
+        a, b = pts[0], pts[-1]
+        if a == b or ((max_gap <= 0 or math.dist(a, b) <= max_gap) and visible(a, b)):
+            return ([a, b] if a != b else [b]), ([out[0], out[-1]] if a != b else [out[-1]])
+        return pts, out
+    kp: List[Pt] = [pts[0]]
+    ki: List[Optional[str]] = [out[0]]
+    for i in range(1, len(pts)):
+        if out[i] == ki[-1] and i < len(pts) - 1 and len(kp) >= 1:
+            nxt = pts[i + 1]
+            if (max_gap <= 0 or math.dist(kp[-1], nxt) <= max_gap) and visible(kp[-1], nxt):
+                continue                      # the later repeat goes; the next one is tested from kp[-1]
+        kp.append(pts[i])
+        ki.append(out[i])
     return kp, ki
 
 
@@ -180,6 +215,7 @@ class ChartPlan:
     charts: List[str]
     min_width: float
     goal_xy: Pt                        # snapped goal cell centre
+    repeated_leaf_ids: bool = False    # some consecutive waypoints share a leaf id (not mergeable)
 
 
 class BoundedPool:
@@ -714,9 +750,14 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     # A shared leaf (two waypoints in one leaf's reach) or a waypoint with no leaf near it is not
     # a reason to give the route up: drop such interior waypoints where the line of sight allows.
     pts, ids = repair_leaf_ids(pts, ids, visible, max_gap_m)
+    # What is still repeated is merged where the line of sight allows; a route on one leaf becomes
+    # [start, goal]; an unmergeable repeat is served as is (only a waypoint WITHOUT a leaf falls
+    # back: planned_path needs one id per waypoint).
+    pts, ids = collapse_repeated_leaf_ids(pts, ids, visible, max_gap_m)
     by_pt = dict(zip(pts, ids))
-    poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)])
+    poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)], allow_repeats=True)
     if planned is None:
         raise ChartFallback("waypoints_without_distinct_leaf_ids")
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
-                     min_width=min_width, goal_xy=(snap_b.x, snap_b.y))
+                     min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
+                     repeated_leaf_ids=len(set(planned)) != len(planned))

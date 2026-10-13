@@ -39,6 +39,14 @@ Values are clamped to [1, run start]. A node with no usable time is skipped and 
 not stamped, so the cursor does not see it (it is not given "now", which would put an old leaf
 after everything newer).
 
+Receipt rule (shared with the worker, scene_leaf.receipt_ms): a stamp is the receipt of a leaf's costmap
+only when it is within SCENE_GRAPH_RECEIPT_WINDOW_S (default 300 s) of the node's own time. The nodes this
+tool stamps get the node's own time by construction (node_timestamp is the primary source). Nodes that are
+ALREADY stamped but far from their own time (a layer written long after capture, e.g. a backfilled
+`occupancy_depth` through set_node_costmaps) are not touched (their stamp is the worker's cursor key);
+the report counts them as `far` and the worker uses the node's own time as their receipt, so the
+per-session clock estimate cannot degenerate to the write time.
+
 IMPORTANT (cursor): stamps are in the past. A scene worker whose cursor for the map is already
 past them will not read the backfilled nodes; run this before the worker first ingests the map,
 or trigger a rebuild of that map's scene graph afterwards.
@@ -101,6 +109,13 @@ def candidates(node: Dict[str, Any], minio_ms: Optional[int], now_ms: int) -> Di
         if moment is not None:
             out[SRC_RECORD] = max(out.get(SRC_RECORD, 0), scene_leaf._ms(moment))
     return out
+
+
+def is_far(node: Dict[str, Any], window_s: float = scene_leaf.DEFAULT_RECEIPT_WINDOW_S) -> bool:
+    """True for a stamped node whose `costmap_stored_ms` lies outside `window_s` of its own time: a bulk
+    write of a layer, not a receipt (the worker uses the node's own time as the receipt then)."""
+    got = scene_leaf.receipt_ms(node, window_s)
+    return got is not None and got[1] != "costmap_stored"
 
 
 def plan(cands: Dict[str, Dict[str, int]], todo: Iterable[str], run_ms: int,
@@ -179,7 +194,8 @@ class MinioTimes:
 def backfill_map(store: Any, map_id: str, minio: Optional[Callable] = None, apply: bool = False,
                  batch: int = 500, now_ms: Optional[int] = None, workers: int = 8,
                  progress: Optional[Callable[[str], None]] = None, progress_every: int = 20,
-                 calib_sample: int = 64) -> Dict[str, Any]:
+                 calib_sample: int = 64,
+                 receipt_window_s: float = scene_leaf.DEFAULT_RECEIPT_WINDOW_S) -> Dict[str, Any]:
     """Backfill one map; the report: nodes (with a costmap), already (stamped), to_stamp, stamped,
     skipped (no usable time; their keys in `skipped_keys`), sources {source: count}. Reads and
     writes in batches of `batch` (no collection lock; each write is a single guarded update).
@@ -199,7 +215,7 @@ def backfill_map(store: Any, map_id: str, minio: Optional[Callable] = None, appl
     cands: Dict[str, Dict[str, int]] = {}
     rows_by_key: Dict[str, Dict[str, Any]] = {}
     todo: List[str] = []
-    nodes = already = batches = 0
+    nodes = already = far = batches = 0
     after = ""
     while True:
         rows = store.nodes(map_id, after, batch)
@@ -210,6 +226,8 @@ def backfill_map(store: Any, map_id: str, minio: Optional[Callable] = None, appl
             nodes += 1
             if is_stamped(n):
                 already += 1
+                if is_far(n, receipt_window_s):
+                    far += 1
             else:
                 todo.append(key)
             cands[key] = candidates(n, None, run_ms)
@@ -278,7 +296,7 @@ def backfill_map(store: Any, map_id: str, minio: Optional[Callable] = None, appl
         sources[src] = sources.get(src, 0) + 1
     return {"map": map_id, "nodes": nodes, "already": already, "to_stamp": len(chosen),
             "stamped": stamped, "skipped": len(skipped), "skipped_keys": skipped[:20],
-            "sources": sources, "applied": apply}
+            "sources": sources, "applied": apply, "far": far}
 
 
 def main(argv: Optional[List[str]] = None, store: Any = None, minio: Any = None) -> int:
@@ -310,12 +328,19 @@ def main(argv: Optional[List[str]] = None, store: Any = None, minio: Any = None)
                 minio_secure=config.MINIO_SECURE))
     if args.no_minio:
         minio = None
+    receipt_window_s = scene_leaf.DEFAULT_RECEIPT_WINDOW_S
+    try:
+        from packages import config as _config
+        receipt_window_s = float(_config.SCENE_GRAPH_RECEIPT_WINDOW_S)
+    except Exception:  # noqa: BLE001 - the default is the documented one
+        pass
     print("APPLY" if args.apply else "DRY RUN (nothing written; --apply to write)")
     for map_id in (args.maps or store.maps()):
         r = backfill_map(store, map_id, minio, args.apply, args.batch, workers=args.workers,
+                         receipt_window_s=receipt_window_s,
                          progress=lambda line: print("  " + line, file=sys.stderr, flush=True))
         print(f"{map_id}: nodes={r['nodes']} already={r['already']} to_stamp={r['to_stamp']} "
-              f"stamped={r['stamped']} skipped={r['skipped']} sources={r['sources']}")
+              f"stamped={r['stamped']} skipped={r['skipped']} far={r['far']} sources={r['sources']}")
         if r["skipped_keys"]:
             print(f"  skipped (no usable time), first keys: {r['skipped_keys']}")
     return 0

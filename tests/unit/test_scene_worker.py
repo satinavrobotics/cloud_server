@@ -10,6 +10,8 @@ from packages.scene_graph.api import BBox, Dirty, MissingTiles
 from packages.services.graph_builder import scene_worker as sw
 
 RECEIPT = datetime.datetime(2026, 10, 12, 12, 0, 0)
+# node timestamps are naive and read as UTC (scene_leaf): the stored times of the tests are on that clock
+RECEIPT_MS = int(RECEIPT.replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
 MAP = "m1"
 
 
@@ -474,7 +476,7 @@ def test_merge_dirty():
 
 
 def test_session_clock_corrects_an_ahead_robot_stamp():
-    base = int(RECEIPT.timestamp() * 1000)
+    base = RECEIPT_MS
     ahead = 120_000                          # inside the 300 s sanity window: the per-leaf rule accepts it
     nodes = []
     for i in range(5):
@@ -490,7 +492,7 @@ def test_session_clock_corrects_an_ahead_robot_stamp():
 
 
 def test_first_fold_stamp_is_kept_on_the_node_and_reused():
-    base = int(RECEIPT.timestamp() * 1000)
+    base = RECEIPT_MS
     r = Rig([make_node("a", base)])
     r.drain()
     kept = r.source.nodes["a"]["scene_stamp_ms"]
@@ -503,7 +505,7 @@ def test_first_fold_stamp_is_kept_on_the_node_and_reused():
 
 
 def test_stamp_write_failure_means_no_fold():
-    r = Rig([make_node("a", int(RECEIPT.timestamp() * 1000))])
+    r = Rig([make_node("a", RECEIPT_MS)])
     r.source.fail_stamps = True
     res = r.worker.step()
     assert res.state == sw.BACKOFF and r.engine.batches == []

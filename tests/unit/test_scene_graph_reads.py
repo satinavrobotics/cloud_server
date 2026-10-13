@@ -352,8 +352,7 @@ def test_persistent_missing_tiles_is_409():
 
 
 def test_lineage_too_old_is_409():
-    class TooOld(Exception):
-        pass
+    from packages.scene_graph import TooOld
 
     def lin(mid, v):
         raise TooOld("version 3 is no longer retained")

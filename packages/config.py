@@ -645,6 +645,15 @@ SCENE_GRAPH_MAX_MAPS = int(os.getenv("SCENE_GRAPH_MAX_MAPS", "64"))
 SCENE_GRAPH_SAVE_EVERY_LEAVES = int(os.getenv("SCENE_GRAPH_SAVE_EVERY_LEAVES", "50"))
 SCENE_GRAPH_SAVE_EVERY_S = float(os.getenv("SCENE_GRAPH_SAVE_EVERY_S", "30.0"))
 SCENE_GRAPH_REPLAY_MARGIN_S = float(os.getenv("SCENE_GRAPH_REPLAY_MARGIN_S", "60.0"))
+# `costmap_stored_ms` (DB clock of the layer write) is the receipt of a leaf's costmap only when it
+# lies within this many seconds of the node's own time (its `timestamp`, else its capture_time).
+# A layer written long after capture (backfilled occupancy_depth) is a bulk write, not a receipt:
+# the node's own time is used, so the per-session clock estimate does not degenerate to the write
+# time. <= 0 always trusts costmap_stored_ms.
+SCENE_GRAPH_RECEIPT_WINDOW_S = float(os.getenv("SCENE_GRAPH_RECEIPT_WINDOW_S", "300.0"))
+# Restart replay: skip leaves the stored state already holds (same key, stamp, pose, footprint, view)
+# instead of folding the replay margin again (no re-solve, no new version). false = fold them again.
+SCENE_GRAPH_SKIP_FOLDED = _env_bool("SCENE_GRAPH_SKIP_FOLDED", "true")
 SCENE_GRAPH_REPLAY_RECHECK_S = float(os.getenv("SCENE_GRAPH_REPLAY_RECHECK_S", "60.0"))
 # Rebuilds: a rebuild is committed at its next save once older than REBUILD_MAX_AGE_S even if uploads
 # keep arriving; folds inside a rebuild are fixed batches of REBUILD_BATCH leaves; a node delete
@@ -696,6 +705,10 @@ def _validate_scene_graph_worker_scale() -> None:
     if not (value >= 0.0 and value < float("inf")):             # also NaN
         fixed.append(f"SCENE_GRAPH_EVICT_IDLE_S={value} -> 60.0")
         globals()["SCENE_GRAPH_EVICT_IDLE_S"] = 60.0
+    value = globals()["SCENE_GRAPH_RECEIPT_WINDOW_S"]
+    if not (value == value and abs(value) < float("inf")):      # NaN / inf: the documented default
+        fixed.append(f"SCENE_GRAPH_RECEIPT_WINDOW_S={value} -> 300.0")
+        globals()["SCENE_GRAPH_RECEIPT_WINDOW_S"] = 300.0
     if fixed:
         import logging
         logging.getLogger("config").warning("invalid scene graph worker settings reset: %s",

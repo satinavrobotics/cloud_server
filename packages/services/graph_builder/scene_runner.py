@@ -164,7 +164,12 @@ class SceneRunner:
                              resident=bool(getattr(stats, "resident", False)),
                              resident_bytes=getattr(stats, "resident_bytes", None),
                              loads=getattr(stats, "loads", 0), evictions=getattr(stats, "evictions", 0),
-                             prefetch_hits=getattr(stats, "prefetch_hits", 0))
+                             prefetch_hits=getattr(stats, "prefetch_hits", 0),
+                             already_folded=getattr(stats, "already_folded", 0),
+                             default_r_d=getattr(stats, "default_r_d", 0),
+                             views_built=getattr(stats, "views_built", 0),
+                             views_missing=getattr(stats, "views_missing", 0),
+                             view_failures=getattr(stats, "view_failures", 0))
                 if getattr(stats, "resident", False):
                     resident += 1
                     nb = getattr(stats, "resident_bytes", None)
