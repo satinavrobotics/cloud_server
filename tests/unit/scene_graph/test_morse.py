@@ -191,3 +191,16 @@ def test_levels_run_until_one_region_per_component_and_nest():
     for a, b in zip(lv[:-1], lv[1:]):                                    # nested: a level is a coarsening of the one below
         assert all(b["parent"][p] == b["parent"][a["parent"][p]] for p in range(len(s.A)))
     assert ok(verify(g))
+
+
+def test_a_translated_world_has_the_translated_partition():
+    import dataclasses
+    w, way = cw.island()
+    leaves = cw.drive(w, way)
+    ref = ChartGraph(SceneParams()); ref.fold_many(leaves)
+    dx, dy = 3.0, -1.4                                                    # whole lattice steps (0.1 m)
+    moved = [dataclasses.replace(l, x=l.x + dx, y=l.y + dy, origin=(l.origin[0] + dx, l.origin[1] + dy)) for l in leaves]
+    g = ChartGraph(SceneParams()); g.fold_many(moved)
+    sx, sy = int(round(dx / 0.1)), int(round(dy / 0.1))
+    shifted = sorted((frozenset((y + sy, x + sx) for y, x in c) for c in _cells(ref)), key=min)
+    assert shifted == _cells(g)
