@@ -79,6 +79,19 @@ Three tiers, no mixing:
 * Markers: dispatch appends `{ts, level}` to `mission_runs.level_marks` when a run's effective level
   changes; `level_segments` applies `level_override` to every segment. No new event code or table.
 * `TRAJECTORY_GRACE` now derives from `config.RECORDER_TRAJECTORY_GRACE_S` in both places.
+* Audit fixes (c9d1a53): the run is decided (header drop, run continuity, run change) before the
+  state message's track row is written, and no map pose is written while a drop awaits confirmation
+  or the run epoch is unchecked; dispatch reads the open session fresh for every row that is due (at
+  most 1 Hz, `FleetRecorder.track_row_due`), so place / re-place / finish / replace / unplace reach
+  the next row; an unreadable session keeps the previous frame 5 s and is not re-read for 2 s; the
+  MapFrame is reused while session and transform are unchanged. Residual: after a dispatcher restart
+  that starts a new run epoch the still-placed session's transform is used (the frame witness
+  unplaces it if the frame really differs); rows carry `run_epoch` to tell.
+* **Rolling deploy order** (the new dispatch writes `mission_runs.level_override`/`level_marks`, which
+  have no fallback): 1. deploy the API (runs the migration), 2. wait for the migration, 3. deploy
+  mission-dispatch. A dispatch started earlier loses its run inserts and level marks; its track rows
+  are kept without the map-frame columns (the writer retries a COPY refused with UndefinedColumn once
+  with the old columns). Rollback: dispatch first, then the API.
 * Not done (as scoped): `track_transform` removal (old rows), transits, anything scene-graph.
 
 ## Client consequences

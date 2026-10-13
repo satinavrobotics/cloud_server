@@ -169,3 +169,31 @@ async def test_mission_runs_columns_and_idempotent_up_down_up(conn):
     assert await cur.fetchall() == []
     for sql in migration_sql("20261013_01_track_map_frame", "upgrade"):
         await conn.execute(sql)
+
+
+@skip
+async def test_a_dispatch_started_before_the_migration_still_writes_its_track(conn, tmp_path):
+    """The new dispatch's track COPY (full column list) is refused by the pre-migration table
+    (UndefinedColumn); the writer retries that batch once with the old columns, so the rows
+    are kept and only the map-frame part is lost. (Run inserts and level marks of the new
+    dispatch need the new mission_runs columns: the migration must still come first.)"""
+    from psycopg import errors
+    from packages.telemetry_ingest.queue import IngestQueue, SpillFile
+    from packages.telemetry_ingest.writer import TelemetryWriter
+
+    run = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    full = tuple(range(len(tables.TRACK_COLUMNS)))
+    with pytest.raises(errors.UndefinedColumn):
+        async with conn.cursor() as cur:
+            async with cur.copy(tables.copy_sql("robot_track_ts")) as copy:
+                await copy.write_row((NEW, "r1", run, 1, 1.0, 2.0, 0.5, 0.3, 0.1, "m",
+                                      8.0, 1.0, 2.0, None, None))
+
+    writer = TelemetryWriter(None, IngestQueue("dispatch", SpillFile(tmp_path / "spill.jsonl")))
+    rows = [(NEW, "r1", run, 1, 1.0, 2.0, 0.5, 0.3, 0.1, "m", 8.0, 1.0, 2.0, None, None)]
+    batch = SimpleNamespace(timeseries={tables.TRACK_TABLE: rows}, failed=False)
+    assert len(full) == len(rows[0])
+    await writer._write_timeseries(conn, batch)
+    assert not batch.failed and batch.timeseries == {}
+    cur = await conn.execute("SELECT x, y, map_id FROM robot_track_ts")
+    assert await cur.fetchall() == [(1.0, 2.0, "m")]

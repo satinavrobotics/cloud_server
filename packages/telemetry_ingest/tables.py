@@ -4,7 +4,7 @@ These mirror migration 20260924_01_phase0_core exactly; the migration is the sou
 of truth. `fleet_events` columns come from packages/events/emit.py.
 """
 
-from typing import Dict, FrozenSet, Tuple
+from typing import Dict, FrozenSet, Optional, Tuple
 
 from packages.events.emit import TABLE as _EVENTS_TABLE
 from packages.events.codes import Source
@@ -36,6 +36,9 @@ TRACK_COLUMNS: Tuple[str, ...] = (
     "ts", "robot_name", "run_id", "leg_seq", "x", "y", "theta", "speed", "omega", "map_id",
     "x_map", "y_map", "theta_map", "map_session_id", "run_epoch",
 )
+# robot_track_ts before the map-frame columns (migration 20261013_01): what a writer started
+# before that migration ran falls back to (writer._write_timeseries).
+TRACK_LEGACY_COLUMNS: Tuple[str, ...] = TRACK_COLUMNS[:10]
 TIMESERIES_COLUMNS: Dict[str, Tuple[str, ...]] = {
     ROBOT_STATE_TABLE: ROBOT_STATE_COLUMNS,
     DIAGNOSTICS_TABLE: DIAGNOSTICS_COLUMNS,
@@ -55,9 +58,9 @@ LATEST_OWNED_COLUMNS: Dict[Source, FrozenSet[str]] = {
 }
 
 
-def copy_sql(table: str) -> str:
-    """COPY statement for one time-series table."""
-    return f"COPY {table} ({', '.join(TIMESERIES_COLUMNS[table])}) FROM STDIN"
+def copy_sql(table: str, columns: Optional[Tuple[str, ...]] = None) -> str:
+    """COPY statement for one time-series table (`columns`: a subset, default all)."""
+    return f"COPY {table} ({', '.join(columns or TIMESERIES_COLUMNS[table])}) FROM STDIN"
 
 
 def latest_upsert_sql(columns: Tuple[str, ...]) -> str:

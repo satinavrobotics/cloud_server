@@ -395,7 +395,8 @@ async def list_events(db: Any, *, robot: Optional[str] = None, site: Optional[st
 
 
 async def _fetch_run(cur: Any, run_id: uuid.UUID) -> Sequence[Any]:
-    await cur.execute(f"SELECT {_RUN_SELECT}, mission_tree, planned_path FROM mission_runs "
+    await cur.execute(f"SELECT {_RUN_SELECT}, mission_tree, planned_path, level_marks "
+                      "FROM mission_runs "
                       "WHERE run_id = %s", (run_id,))
     row = await cur.fetchone()
     if row is None:
@@ -535,8 +536,8 @@ def track_points(rows: Sequence[Sequence[Any]], transform: Optional[Mapping[str,
         x_map, y_map, theta_map = stored if len(stored) == 3 else (None, None, None)
         if x_map is not None and y_map is not None:
             x, y, theta = x_map, y_map, theta_map
-        elif stored_only and transform is None and x is not None and y is not None:
-            continue
+        elif stored_only and transform is None:
+            continue   # no pose in the map frame (an unplaced stretch, or no pose at all)
         elif x is not None and y is not None:
             if transform is not None:
                 x, y, mapped = map_geo.apply_pose(transform, x, y, theta or 0.0)
@@ -585,8 +586,7 @@ async def run_track(db: Any, run_id: uuid.UUID) -> Dict[str, Any]:
         if ended is None:
             await cur.execute("SELECT now()")
             ended = (await cur.fetchone())[0]
-        await cur.execute("SELECT level_marks FROM mission_runs WHERE run_id = %s", (run_id,))
-        marks = (await cur.fetchone() or (None,))[0]
+        marks = row[len(RUN_COLUMNS) + 2] if len(row) > len(RUN_COLUMNS) + 2 else None
         await cur.execute(_TRACK_SQL.format(cols=", ".join(TRACK_COLUMNS)),
                           (values["robot_name"], start, ended + TRAJECTORY_GRACE, run_id,
                            max_points))

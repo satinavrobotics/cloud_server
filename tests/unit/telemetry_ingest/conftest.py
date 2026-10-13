@@ -6,6 +6,7 @@ NOTHING, COPY rows, and robot_latest upserts that only touch the listed columns.
 """
 
 import asyncio
+import collections
 import datetime
 import json
 import re
@@ -48,7 +49,8 @@ class FakeDatabase:
     def __init__(self):
         self.events = {}          # (event_id, ts) -> row dict
         self.event_inserts = 0    # insert attempts, including ON CONFLICT no-ops
-        self.timeseries = {tables.ROBOT_STATE_TABLE: [], tables.DIAGNOSTICS_TABLE: []}
+        self.timeseries = collections.defaultdict(list)   # table -> rows (state, diagnostics, ...)
+        self.timeseries.update({tables.ROBOT_STATE_TABLE: [], tables.DIAGNOSTICS_TABLE: []})
         self.latest = {}          # robot -> {column: value}
         self.statements = []      # every SQL statement seen
         self.commits = 0
@@ -143,7 +145,9 @@ class FakeCursor:
 
     def copy(self, sql):
         table = re.match(r"COPY (\w+) \((.*)\) FROM STDIN", sql)
-        assert table.group(2).split(", ") == list(tables.TIMESERIES_COLUMNS[table.group(1)])
+        cols = table.group(2).split(", ")
+        assert cols == list(tables.TIMESERIES_COLUMNS[table.group(1)]) or \
+            (table.group(1) == tables.TRACK_TABLE and cols == list(tables.TRACK_LEGACY_COLUMNS))
         self.db.statements.append(sql)
         if self.db.fail is not None:
             exc = self.db.fail(sql, None)

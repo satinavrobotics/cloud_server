@@ -651,10 +651,15 @@ whole run and its placement (`placement.at` / `unplaced_at`) did not change afte
 (x, y, theta converted with that session's *current* `map_T_session`), else `"run"` (the robot's own
 frame, not drawable on the map, never a partly shifted track). A run with both kinds of row (placed
 part-way) returns the points it can place in the map frame (stored, or converted by the fallback) and
-counts the rest in `unplaced_points`. The recorder reads its transform from a cache refreshed about
-every 5 s and dropped at a run change or confirmed frame change, so a placement changed through the API
-reaches the rows within ~5 s, and at most one row after a run change is detected may carry the old
-transform. A null theta stays null.
+counts the rest in `unplaced_points` (the key is present only when it is above 0: with stored map
+poses in the run, every row that has neither a stored map pose nor a fallback transform, including a
+row without any pose, is left out and counted; `frame` stays `"map"`, there is no mixed value). Dispatch
+reads the robot's open session fresh for every row it writes (at most once per second), so a placement
+changed through the API (place, re-place, unplace, finish, replace) reaches the very next row. A run change
+or confirmed frame change drops the frame at once, and the run is decided before the row of a state message
+is written: no row carries a map pose while a state header drop awaits confirmation or the run epoch of a
+freshly started dispatcher is unchecked. If the session cannot be read the previous frame is kept for 5 s,
+then none. A null theta stays null.
 
 *Recorded or not.* `recorded` is `false` when the run's level never stored a track (its
 `recording_level` at start and every `level_marks` entry are `events_only`/`off`): the empty `points`

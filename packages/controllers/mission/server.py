@@ -132,6 +132,11 @@ RUN_CHECK_RETRY_S = config.DISPATCH_RUN_CHECK_RETRY_S
 RUN_CHECK_TIMEOUT_S = config.DISPATCH_RUN_CHECK_TIMEOUT_S
 # The frame check reads the robot's open session at most this often (seconds).
 FRAME_SESSION_TTL_S = 5.0
+# The recorder's map frame (robot_track_ts.x_map...): the session is read fresh for every track
+# row (<= 1 Hz). When it cannot be read the previous frame is kept this long, and the database
+# is not asked again for RECORDER_SESSION_RETRY_S (a hiccup must not cost a query per message).
+RECORDER_FRAME_GRACE_S = 5.0
+RECORDER_SESSION_RETRY_S = 2.0
 # A current mission whose start failed (an exception before its tree existed) is started
 # again on a robot state message at most this often, and failed after this many attempts.
 START_RETRY_S = config.DISPATCH_START_RETRY_S
@@ -749,6 +754,11 @@ class Robot:
         self._frame_watcher = run_change.FrameWatcher(
             confirm_s=config.FRAME_CONFIRM_S, confirm_states=config.FRAME_CONFIRM_STATES)
         self._frame_session_cache: Optional[Tuple[float, Any]] = None
+        # The fleet recorder's map frame (_refresh_recorder_frame): what was last given to it,
+        # when (monotonic), and the earliest next database read after a failed one.
+        self._rec_frame: Optional[fleet_recorder.MapFrame] = None
+        self._rec_frame_at = 0.0
+        self._rec_read_retry_at = 0.0
         self._datum_epoch: Optional[int] = None
         # The robot's connection went OFFLINE/CONNECTIONBROKEN and has not been ONLINE since;
         # and the pose before a state-header drop that awaits confirmation (run_change.py).
@@ -2301,8 +2311,7 @@ class Robot:
         session is re-placed by the next datum (_replace_geo_session). Never raises."""
         now = datetime.datetime.now(datetime.timezone.utc)
         self.info(f"New robot run ({evidence}): unplacing its open map session")
-        self._frame_session_cache = None
-        self._record("invalidate_frame", self._name)   # no map pose from the old transform
+        self._drop_recorder_frame()   # no map pose from the old transform
         # A robot that restarted never got what we sent: fresh resend budgets.
         self._reset_resend_budgets()
         patch = {"unplaced_reason": map_sessions.UNPLACED_RUN_CHANGED,
@@ -2571,28 +2580,51 @@ class Robot:
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Frame check failed: {err!r}")
 
+    def _drop_recorder_frame(self) -> None:
+        """No map pose for the robot's track rows until the next _refresh_recorder_frame."""
+        self._frame_session_cache = None
+        self._rec_frame = None
+        self._record("invalidate_frame", self._name)
+
     async def _refresh_recorder_frame(self) -> None:
-        """Tell the fleet recorder which map frame the robot's track rows are converted with
-        (robot_track_ts.x_map...): its open session when that is placed, else none. Only while
-        a mission runs and the recorder records the track; the session is read at most every
-        FRAME_SESSION_TTL_S (the frame check's own cache), so the 1 Hz rows never read the
-        database. While a run change is pending confirmation (a state header id dropped) the
-        frame is withheld: the messages in between are already in the new run's frame. Never
-        raises."""
+        """Tell the fleet recorder which map frame the robot's next track row is converted with
+        (robot_track_ts.x_map...): its open session when that is placed, else none. Only when a
+        row is due (a mission runs, the track is recorded, TRACK_ROW_INTERVAL_S passed), and
+        then the session is read fresh, so a place / re-place / finish / replace / unplace
+        reaches the very next row. Withheld while the run is undecided: a state header id
+        dropped and not yet confirmed (the pose is already in the new run's frame), or the
+        run epoch not yet checked (first message after a dispatcher start). When the session
+        cannot be read the previous frame is kept for RECORDER_FRAME_GRACE_S, and the database
+        is not asked again for RECORDER_SESSION_RETRY_S. Never raises."""
         try:
             recorder = getattr(self._robot_server, "fleet_recorder", None)
             if recorder is None or self._current_mission is None or \
-                    not recorder.track_wanted(self._name):
+                    not recorder.track_row_due(self._name):
                 return
-            if self._run_detector.pending_state_drop is not None:
-                self._frame_session_cache = None
-                self._record("invalidate_frame", self._name)
+            now = time.monotonic()
+            if self._run_detector.pending_state_drop is not None or not self._run_checked:
+                self._drop_recorder_frame()
                 return
-            session = await self._frame_session(time.monotonic())
-            self._record("set_frame", self._name,
-                         fleet_recorder.map_frame_of(session, self._run_epoch))
+            if now < self._rec_read_retry_at:
+                session: Any = SESSION_UNKNOWN
+            else:
+                session = await self._read_open_session()
+                if session is SESSION_UNKNOWN:
+                    self._rec_read_retry_at = now + RECORDER_SESSION_RETRY_S
+                else:
+                    self._frame_session_cache = (now + FRAME_SESSION_TTL_S, session)
+            if session is SESSION_UNKNOWN:
+                if self._rec_frame is not None and \
+                        now - self._rec_frame_at > RECORDER_FRAME_GRACE_S:
+                    self._drop_recorder_frame()
+                return
+            frame = fleet_recorder.map_frame_of(session, self._run_epoch, self._rec_frame)
+            self._rec_frame_at = now
+            self._rec_frame = frame
+            self._record("set_frame", self._name, frame)
         except Exception as err:  # pylint: disable=broad-except
             self.debug(f"Recorder frame not refreshed: {err!r}")
+            self._drop_recorder_frame()
 
     async def _frame_session(self, now: float) -> Any:
         """The open session for the frame check, read at most every FRAME_SESSION_TTL_S."""
@@ -2609,8 +2641,7 @@ class Robot:
                                 initialized: Any) -> None:
         """Unplace the open session after a confirmed frame mismatch (see _check_frame). It is
         read again first: the session may have changed or been placed again meanwhile."""
-        self._frame_session_cache = None
-        self._record("invalidate_frame", self._name)
+        self._drop_recorder_frame()
         session = await self._read_open_session()
         if not isinstance(session, dict) or await map_sessions.confirmed_verdict(
                 session, map_id, initialized,
@@ -4612,23 +4643,33 @@ class Robot:
         the recorded robot state and run are the ones this message led to. Events the
         dispatcher raises meanwhile carry the message's timestamp."""
         self._event_ts = fleet_recorder.parse_robot_ts(message.timestamp, None)
-        await self._refresh_recorder_frame()   # never raises
-        # Legs first: the state that reaches a mission's last node also completes the mission.
-        self._record("on_leg_state", self._name, message, self._current_mission,
-                     self._robot_object)
-        if not self._run_checked and time.monotonic() >= self._run_check_after:
-            await self._check_run_continuity(message.headerId)
-        was_pending = self._run_detector.pending_state_drop is not None
-        evidence = self._run_detector.on_state(message.headerId)
-        if self._run_detector.pending_state_drop is not None and not was_pending:
-            # The pose in memory is still the old run's (this message's is stored below).
-            # (a copy: the pose is updated in place by every state message)
-            self._pre_drop_pose = self._robot_object.status.pose.copy() \
-                if self._robot_object is not None else None
-        if evidence is not None:
-            await self._on_run_changed(evidence)
-        else:
-            await self._persist_run_header(message.headerId)
+        # The run is decided first (header drop, run continuity, run change): the pose of the
+        # first message after a robot reboot or a dispatcher start is in a frame the session's
+        # map_T_session does not describe, and the track row below must not convert it.
+        decided = False
+        try:
+            if not self._run_checked and time.monotonic() >= self._run_check_after:
+                await self._check_run_continuity(message.headerId)
+            was_pending = self._run_detector.pending_state_drop is not None
+            evidence = self._run_detector.on_state(message.headerId)
+            if self._run_detector.pending_state_drop is not None and not was_pending:
+                # The pose in memory is still the old run's (this message's is stored below).
+                # (a copy: the pose is updated in place by every state message)
+                self._pre_drop_pose = self._robot_object.status.pose.copy() \
+                    if self._robot_object is not None else None
+            if evidence is not None:
+                await self._on_run_changed(evidence)
+            else:
+                await self._persist_run_header(message.headerId)
+            decided = True
+        finally:
+            if decided:
+                await self._refresh_recorder_frame()   # never raises
+            else:
+                self._drop_recorder_frame()
+            # Legs first: the state that reaches a mission's last node also completes it.
+            self._record("on_leg_state", self._name, message, self._current_mission,
+                         self._robot_object)
         try:
             await self._on_client_message(message)
             await self._check_frame(message)   # never raises

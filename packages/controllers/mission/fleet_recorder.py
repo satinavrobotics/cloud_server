@@ -451,11 +451,18 @@ class MapFrame:
         return (px, py, pth) if all(math.isfinite(v) for v in (px, py, pth)) else None
 
 
-def map_frame_of(session: Any, run_epoch: Any = None) -> Optional[MapFrame]:
+def map_frame_of(session: Any, run_epoch: Any = None,
+                 previous: Optional[MapFrame] = None) -> Optional[MapFrame]:
     """The MapFrame of a map_sessions.robot_session_from_row() dict, None unless the session
-    is placed. `run_epoch`: the robot's current run epoch, if known."""
+    is placed. `run_epoch`: the robot's current run epoch, if known. `previous`: returned
+    itself when it is the same session, map, epoch and transform (nothing is allocated)."""
     if not isinstance(session, dict) or not map_sessions.is_placed(session):
         return None
+    epoch = None if run_epoch is None else str(run_epoch)
+    if previous is not None and previous.session_id == str(session["session_id"]) and \
+            previous.map_name == session["map_name"] and previous.run_epoch == epoch and \
+            previous.transform == session.get("map_t_session"):
+        return previous
     return MapFrame(session_id=str(session["session_id"]), map_name=session["map_name"],
                     transform=map_sessions.transform_of(session.get("map_t_session")),
                     run_epoch=None if run_epoch is None else str(run_epoch))
@@ -1009,10 +1016,17 @@ class FleetRecorder:
         self.queue.put_track(row)
 
     # --- the map frame of a robot's track (D2) --------------------------------------------
-    def track_wanted(self, robot_name: str) -> bool:
-        """Whether the robot's track rows are recorded now (dispatch only reads its session
-        for the frame then)."""
-        return self.policy.allows(tables.TRACK_TABLE, robot_name)
+    def track_row_due(self, robot_name: str) -> bool:
+        """Whether the next state message of the robot writes a track row (the run is
+        resolved, the track is recorded and TRACK_ROW_INTERVAL_S has passed): dispatch reads
+        its session for the frame then, fresh, so a row never carries a stale transform."""
+        run = self._runs.get(robot_name)
+        if run is None or not run.resolved or not self.policy.allows(tables.TRACK_TABLE,
+                                                                      robot_name):
+            return False
+        last = run.last_track_ts
+        return last is None or not 0 <= (self._clock() - last).total_seconds() \
+            < TRACK_ROW_INTERVAL_S
 
     def frame_for(self, robot_name: str) -> Optional[MapFrame]:
         return self._frames.get(robot_name)
@@ -1020,7 +1034,7 @@ class FleetRecorder:
     @_guarded
     def set_frame(self, robot_name: str, frame: Optional[MapFrame]) -> None:
         """The robot's open session as dispatch just read it: placed (a MapFrame) or not
-        (None). Cheap and idempotent; the hot path never reads the database."""
+        (None). Cheap and idempotent; the row writer itself never reads the database."""
         if frame is None:
             self._frames.pop(robot_name, None)
         else:

@@ -20,6 +20,14 @@ Tracking redesign stage 1 (docs/tracking_redesign_2026-10-13.md, decision D2).
 - mission_runs.level_marks (jsonb, NULL until used): list of {ts, level} written by
   mission-dispatch when the robot's effective level changes while the run is open.
 
+Rolling deploy, in this order (the new mission-dispatch writes the new columns and has no
+fallback for mission_runs): 1. deploy the API (it runs this migration at start; the new /track
+reads level_marks and tolerates old rows), 2. wait until the migration has run
+(`alembic current` / the API healthy), 3. only then deploy mission-dispatch. A dispatch started
+before the migration cannot insert run rows (level_override) or write level marks; only its
+track rows survive, without the map-frame columns (the writer retries a COPY refused with
+UndefinedColumn once with the old column list). Rolling back: dispatch first, then the API.
+
 Additive and metadata-only. ADD COLUMN of a nullable column without a default on a compressed
 hypertable is supported by TimescaleDB 2.30 (the compressed chunks get the column too; no chunk
 is decompressed or rewritten), and the compression and retention policies are untouched. The

@@ -504,6 +504,16 @@ class TestTrack:
         rec.on_robot_deleted(gone)
         assert rec.frame_for("r1") is None
 
+    def test_map_frame_of_reuses_the_previous_frame_while_nothing_changed(self):
+        session = {"session_id": "s", "map_name": "map1", "aligned": True,
+                   "map_t_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.5}}
+        frame = fr.map_frame_of(session, "ep")
+        assert fr.map_frame_of(dict(session), "ep", frame) is frame
+        for changed in ({"map_t_session": {"tx": 1.5, "ty": 2.0, "yaw": 0.5}},
+                        {"session_id": "s2"}, {"map_name": "map2"}):
+            assert fr.map_frame_of({**session, **changed}, "ep", frame) is not frame
+        assert fr.map_frame_of(session, "ep2", frame) is not frame
+
     def test_map_frame_of_a_session_needs_a_placed_one(self):
         session = {"session_id": "s", "map_name": "map1", "aligned": True,
                    "map_t_session": {"tx": 1.0, "ty": 2.0, "yaw": 0.5}}
@@ -517,10 +527,17 @@ class TestTrack:
         assert fr.MapFrame("s", "m", {"tx": float("nan"), "ty": 0.0, "yaw": 0.0}
                            ).apply(1.0, 1.0, 0.0) is None
 
-    async def test_track_is_wanted_by_level(self, tmp_path):
+    async def test_a_track_row_is_due_by_level_and_interval(self, tmp_path):
         for level, wanted in (("off", False), ("events_only", False), ("track", True)):
             rec, *_ = await start(tmp_path, level=level)
-            assert rec.track_wanted("r1") is wanted
+            assert rec.track_row_due("r1") is wanted
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        rec.on_leg_state("r1", self.tmsg(mission, 0), mission, robot, received_at=at(0))
+        rec._clock = lambda: at(0.5)
+        assert rec.track_row_due("r1") is False       # inside TRACK_ROW_INTERVAL_S
+        rec._clock = lambda: at(1.5)
+        assert rec.track_row_due("r1") is True
+        assert rec.track_row_due("nobody") is False
 
     async def test_a_level_change_mid_run_is_marked_on_the_run(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path, level="track")
@@ -534,6 +551,43 @@ class TestTrack:
         # at events_only the track stops, and the marks say why
         rows = [r for t, r in rec.queue.drain(100000) if t == "robot_track_ts"]
         assert [r[0] for r in rows] == [at(0), at(1), at(4)]
+
+    async def test_level_marks_of_an_adopted_run_go_to_the_stored_run(self, tmp_path):
+        """A dispatcher restart adopts the RUNNING row (a new run_id is read when it resolves);
+        the mark must land on that row, and not before the run is resolved."""
+        rec, db, clock = make_recorder(tmp_path, global_level="track")
+        mission, robot = make_mission(), make_robot()
+        old_id = uuid.uuid4()
+        db.add_run(old_id, "m1", "r1", T0 - datetime.timedelta(minutes=5), level="track")
+        mission.status.start_timestamp = (T0 - datetime.timedelta(minutes=5)).replace(tzinfo=None)
+        mission.status.passes_completed = 1
+        rec.run_started("r1", mission, robot, session_map="map1")
+        rec.policy.set_global_level("events_only")          # changes before it is resolved
+        rec.on_leg_state("r1", self.tmsg(mission, 0), mission, robot, received_at=at(0))
+        await rec.run_pending_ops()
+        assert "level_marks" not in db.runs[old_id]          # unresolved: nothing marked
+        rec.on_leg_state("r1", self.tmsg(mission, 1), mission, robot, received_at=at(1))
+        rec.policy.set_global_level("full")
+        rec.on_leg_state("r1", self.tmsg(mission, 2), mission, robot, received_at=at(2))
+        await rec.run_pending_ops()
+        assert [m["level"] for m in db.runs[old_id]["level_marks"]] == ["full"]
+        assert len(db.runs) == 1
+
+    async def test_no_level_mark_after_the_run_finished(self, tmp_path):
+        rec, db, mission, robot = await start(tmp_path, level="track")
+        [run_id] = list(db.runs)
+        run = rec._runs["r1"]
+        rec.on_leg_state("r1", self.tmsg(mission, 0), mission, robot, received_at=at(0))
+        mission.status.state = State.COMPLETED
+        rec.run_finished("r1", mission, robot)
+        await rec.run_pending_ops()
+        assert db.runs[run_id]["state"] == "COMPLETED"
+        # a mark queued behind the finish (or a state message after it) writes nothing
+        rec._submit(fr._MarkLevel(run, rec._clock(), "full"))
+        rec.policy.set_global_level("full")
+        rec.on_leg_state("r1", self.tmsg(mission, 1), mission, robot, received_at=at(1))
+        await rec.run_pending_ops()
+        assert "level_marks" not in db.runs[run_id]
 
     async def test_a_run_level_override_is_stored_and_never_marked(self, tmp_path):
         rec, db, clock = make_recorder(tmp_path, global_level="events_only")
@@ -563,11 +617,9 @@ class TestTrackEndpoint:
         run_id = self.run_id
 
         def respond(sql, params):
-            if "level_marks FROM mission_runs" in sql:
-                return [(marks,)]
             if "FROM mission_runs" in sql:
                 return [(run_id, "m1", "r1", None, run_map, None, level, "COMPLETED", None,
-                         None, 1, None, at(0), at(30), None, None, [], None)]
+                         None, 1, None, at(0), at(30), None, None, [], None, marks)]
             if "FROM robot_track_ts" in sql:
                 assert "run_id = %s" in sql and params[0] == "r1" and params[3] == run_id
                 assert params[-1] == fleet_reads.config.FLEET_TRACK_MAX_POINTS
@@ -692,6 +744,21 @@ class TestTrackEndpoint:
                           f"/api/v1/runs/{self.run_id}/track")).json()
         assert body["frame"] == "map" and body["unplaced_points"] == 1
         assert [(p["x"], p["y"]) for p in body["points"]] == [(101.0, 200.0)]
+
+    async def test_a_row_without_any_pose_is_counted_with_the_unplaced_ones(self):
+        no_pose = (at(2), None, None, None, 0.0, None, None) + self.NO_MAP
+        rows = [self.STORED[0], no_pose, self.ROWS[1]]
+        body = (await get(FakeDb(self.respond(rows, None)),
+                          f"/api/v1/runs/{self.run_id}/track")).json()
+        assert [p["x"] for p in body["points"]] == [100.0]
+        assert body["unplaced_points"] == 2 and body["frame"] == "map"
+
+    async def test_level_marks_come_with_the_run_row(self):
+        marks = [{"ts": "t", "level": "full"}]
+        db = FakeDb(self.respond(self.ROWS, self.session(), marks=marks))
+        body = (await get(db, f"/api/v1/runs/{self.run_id}/track")).json()
+        assert body["level_marks"] == marks
+        assert len([q for q, _ in db.executed if "FROM mission_runs" in q]) == 1   # one read
 
 
 class TestEndpoints:
