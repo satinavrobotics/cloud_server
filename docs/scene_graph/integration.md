@@ -156,7 +156,7 @@ Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `char
 Reasons (meaning and operational reading: `runbook.md` section 7): `budget_exhausted`, `planner_busy`, `store_busy`,
 `executor_closed`, `robot_unavailable`, `robot_not_placed`, `store_unavailable`, `store_timeout`, `store_error`,
 `no_graph`, `load_timeout`, `load_error`, `stale_graph`, `start_*`, `goal_*`, `blocked_by_overlay`, `unreachable`,
-`missing_tiles`, `too_narrow`, `leaf_lookup_error`, `waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`,
+`missing_tiles`, `corridor_too_large`, `tile_unavailable`, `too_narrow`, `leaf_lookup_error`, `waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`,
 `plan_timeout`, `error`. `get_stats()["scene_graph"]` (flag on) = `{outcomes: {served | reason: count}, cache:
 {graphs, bytes, loading, load_inflight, io_inflight, backed_off_maps}, plan_inflight}`.
 

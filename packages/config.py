@@ -564,6 +564,15 @@ SCENE_GRAPH_PLAN_MAX_INFLIGHT = int(os.getenv("SCENE_GRAPH_PLAN_MAX_INFLIGHT", "
 SCENE_GRAPH_CACHE_VERSIONS = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS", "4"))
 SCENE_GRAPH_CACHE_VERSIONS_PER_MAP = int(os.getenv("SCENE_GRAPH_CACHE_VERSIONS_PER_MAP", "2"))
 SCENE_GRAPH_CACHE_MAX_BYTES = int(os.getenv("SCENE_GRAPH_CACHE_MAX_BYTES", "0"))
+# Planner graph: "full_load" restores the whole engine per (map, version) (store.load; GBs per km^2),
+# "lazy" opens the manifest only and reads the owner tiles of each request's corridor (docs/scene_graph/
+# planner_upgrade.md, Phase 0). A route whose corridor needs more than LAZY_MAX_TILES tiles falls back
+# `corridor_too_large`; LAZY_TILE_CACHE is the number of owner tiles (about 35 KB each) kept per graph.
+SCENE_GRAPH_PLANNER_MODE = os.getenv("SCENE_GRAPH_PLANNER_MODE", "full_load").strip().lower()
+if SCENE_GRAPH_PLANNER_MODE not in ("full_load", "lazy"):
+    SCENE_GRAPH_PLANNER_MODE = "full_load"
+SCENE_GRAPH_LAZY_MAX_TILES = int(os.getenv("SCENE_GRAPH_LAZY_MAX_TILES", "400"))
+SCENE_GRAPH_LAZY_TILE_CACHE = int(os.getenv("SCENE_GRAPH_LAZY_TILE_CACHE", "512"))
 # A store.meta answer is reused this long per map and shared by concurrent requests (one query).
 SCENE_GRAPH_META_TTL_S = float(os.getenv("SCENE_GRAPH_META_TTL_S", "0.75"))
 # A chart route needs a graph at least as new as the ingest: when the oldest costmap stored after the

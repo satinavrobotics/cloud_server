@@ -693,7 +693,8 @@ class Planner:
         svc.graph_db = env.client.graph
         svc.database = env.db
         svc._scene_cache = scene_route.GraphCache(
-            lambda: SceneGraphStore.from_client(env.client), max_entries=4, load_timeout_s=60.0)
+            lambda: SceneGraphStore.from_client(env.client), max_entries=4, load_timeout_s=60.0,
+            lazy=os.environ.get("SCENE_GRAPH_PLANNER_MODE", "full_load") == "lazy")
         # state MissionPlannerService.__init__ sets up (bounded plan pool, outcome counters)
         svc._plan_pool = scene_route.BoundedPool("sg-plan", 2, 8, busy_reason="planner_busy")
         svc._chart_outcomes = {}

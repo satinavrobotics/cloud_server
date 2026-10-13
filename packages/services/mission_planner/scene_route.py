@@ -292,7 +292,9 @@ class GraphCache:
                  versions_per_map: int = 2, backoff_base_s: Optional[float] = None,
                  backoff_max_s: Optional[float] = None, max_stale_s: float = 0.0,
                  meta_ttl_s: float = 0.0, max_bytes: int = 0, load_workers: int = 2,
-                 io_workers: int = 4):
+                 io_workers: int = 4, lazy: bool = False, lazy_kw: Optional[Dict[str, Any]] = None):
+        self._lazy = bool(lazy)                     # SCENE_GRAPH_PLANNER_MODE=lazy: PlanGraph, not store.load
+        self._lazy_kw = dict(lazy_kw or {})
         self._factory = store_factory
         self._max = max(1, int(max_entries))
         self._per_map = max(1, int(versions_per_map))
@@ -354,6 +356,9 @@ class GraphCache:
 
     def _load_serialised(self, store, map_id: str, version: int):
         with self._load_lock:
+            if self._lazy:                      # the manifest only; tiles are read per request
+                from packages.services.mission_planner.lazy_plan import open_plan
+                return open_plan(store, map_id, version, **self._lazy_kw)
             return store.load(map_id, version)
 
     async def _meta(self, store, map_id: str, timeout: Optional[float]) -> dict:
@@ -419,6 +424,15 @@ class GraphCache:
         count = self._failures.get(map_id, (0, 0.0))[0] + 1
         delay = min(self._backoff_max, self._backoff_base * (2 ** min(count - 1, 30)))
         self._failures[map_id] = (count, self._clock() + delay)
+
+    def _drop_unavailable(self) -> None:
+        """Evict the graphs flagged `unavailable` (a lazy graph that failed to read a tile: its version was garbage
+        collected, or the backend failed): the next request re-opens the map's current version."""
+        for key in [k for k, g in self._graphs.items() if getattr(g, "unavailable", False) is True]:
+            _log.warning("scene graph %s dropped: a tile could not be read", key)
+            self._evict(key)
+            if self._served.get(key[0]) == key[1]:
+                del self._served[key[0]]
 
     def _evict(self, key) -> None:
         self._graphs.pop(key, None)
@@ -538,6 +552,7 @@ class GraphCache:
         if len(self._cursors) > 8 * self._max:
             for old in [k for k in self._cursors if k not in self._graphs and k != key]:
                 del self._cursors[old]
+        self._drop_unavailable()
         if key in self._graphs:
             self._graphs.move_to_end(key)
             self._served[map_id] = key[1]
@@ -628,11 +643,16 @@ def blocked_free_los(graph: Any, overlay: Tuple[list, list]) -> Callable[[Pt, Pt
     discs, segments = overlay
     cells: Dict[Tuple[int, int], bool] = {}
 
+    cell_free = getattr(graph, "free_cell", None)        # the lazy graph answers from its owner tile, no snap
+
     def free(i: int, j: int) -> bool:
         v = cells.get((i, j))
         if v is None:
-            s = graph.snap((i + 0.5) * h, (j + 0.5) * h, 0.5 * h)
-            v = s.key is not None and s.distance <= 0.5 * h
+            if cell_free is not None:
+                v = bool(cell_free(i, j))
+            else:
+                s = graph.snap((i + 0.5) * h, (j + 0.5) * h, 0.5 * h)
+                v = s.key is not None and s.distance <= 0.5 * h
             cells[(i, j)] = v
         return v
 
@@ -692,6 +712,22 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   start_snap_m: float, goal_snap_m: float, max_gap_m: float,
                   robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                   robot_length_m: Optional[float] = None) -> ChartPlan:
+    """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
+    is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
+    from packages.services.mission_planner.lazy_plan import TileUnavailable
+    try:
+        return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
+                              max_gap_m, robot_width_m, width_margin_m, robot_length_m)
+    except TileUnavailable as err:
+        _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
+        raise ChartFallback("tile_unavailable") from err
+
+
+def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
+                   overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
+                   start_snap_m: float, goal_snap_m: float, max_gap_m: float,
+                   robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
+                   robot_length_m: Optional[float] = None) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -700,6 +736,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     `width_margin_m`); the caller gates it by SCENE_GRAPH_WIDTH_CHECK_ENABLED. `node_of` may raise:
     that is `leaf_lookup_error`, a point with no leaf near it returns None."""
     from packages.scene_graph.api import Blocked, MissingTiles
+    from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
     problem = snap_problem(snap_a, start_snap_m)
     if problem:
@@ -715,6 +752,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                             goal=(snap_b.x, snap_b.y))
     except MissingTiles as err:
         raise ChartFallback("missing_tiles") from err
+    except CorridorTooLarge as err:
+        raise ChartFallback("corridor_too_large") from err
     if route is None or not route.nodes:
         if blocked is not None:
             # unreachable only because of the overlay? say so (the legacy planner then reports the
@@ -722,7 +761,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             try:
                 free = graph.route(snap_a.key, snap_b.key, None, start=(snap_a.x, snap_a.y),
                                    goal=(snap_b.x, snap_b.y))
-            except MissingTiles:
+            except (MissingTiles, CorridorTooLarge):
                 free = None
             if free is not None and free.nodes:
                 raise ChartFallback("blocked_by_overlay")
