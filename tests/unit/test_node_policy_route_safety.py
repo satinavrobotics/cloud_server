@@ -7,12 +7,12 @@ import pytest
 
 from cloud_common.objects import common
 from packages import config
-from packages.scene_graph.api import Route, Safety, Snap
+from packages.scene_graph.api import Route, Safety
 from packages.services.mission_planner import node_policy_plan as npp
 from packages.services.mission_planner import scene_route as sr
 
 from .test_node_policy_plan import StripGraph, _poses
-from .test_planner_chart_route import FakeGraph, FakeStore, _service, on  # noqa: F401
+from .test_planner_chart_route import FakeGraph, FakeStore, _service
 
 H = 0.1
 SAFETY = Safety(0.4, 10.0)
@@ -113,7 +113,8 @@ def test_planned_waypoints_use_the_priced_cut():
     assert n_priced >= n_plain and [(p.x, p.y) for p in priced] != [(p.x, p.y) for p in plain]
 
 
-async def test_enrich_and_plan_route_pass_one_safety_from_the_footprint(on, monkeypatch):
+async def test_enrich_and_plan_route_pass_one_safety_from_the_footprint(monkeypatch):
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
     class Priced(FakeGraph):
         params = SimpleNamespace(lattice=H, robot_half_side=0.25)
 

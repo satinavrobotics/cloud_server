@@ -219,6 +219,9 @@ class ChartPlan:
     repeated_leaf_ids: bool = False    # some consecutive waypoints share a leaf id (not mergeable)
     # nodePolicy skip data: {"total", "skippable", "unavailable"}; None when it was not asked for
     node_policy: Optional[Dict[str, Any]] = None
+    # clearance pricing of this plan: {kappa, margin, rate, margin_source ("factsheet" | "map_r"), cost (Route.cost), exact
+    # (the route call's own flag)}; None when the plan is not priced
+    pricing: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -713,9 +716,11 @@ def required_width(robot_width_m: float, robot_length_m: Optional[float], turns:
 def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
                kappa: float) -> Any:
     """The `Safety` (clearance pricing, docs/scene_graph/route_safety.md section 1) of a plan, or None for the
-    legacy shortest route: kappa <= 0, a graph without `deficit_cell`, or a margin not above the map's inscribed
-    radius r. margin = r_c, the circumscribed radius hypot(length, width) / 2 of the planning robot (the length is
-    the width while unknown), r * sqrt(2) while the width is unknown; rate = kappa / (margin - r)."""
+    legacy shortest route: kappa <= 0, a graph without `deficit_cell`, a margin that does not exceed the map's inscribed
+    radius r by more than the lattice clearance quantisation h / sqrt(2) (S12: the price would be noise, and the rate
+    kappa / (margin - r) unbounded), or a margin above the clearance cap of the lazy reader (`lazy_plan._CLR_CAP_M`,
+    1 m: pricing is off beyond it). margin = r_c, the circumscribed radius hypot(length, width) / 2 of the planning
+    robot (the length is the width while unknown), r * sqrt(2) while the width is unknown; rate = kappa / (margin - r)."""
     if not kappa > 0.0 or not callable(getattr(graph, "deficit_cell", None)):
         return None
     r = getattr(getattr(graph, "params", None), "robot_half_side", None)
@@ -729,7 +734,9 @@ def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optio
     else:
         r_c = r * math.sqrt(2.0)
     margin = r_c
-    if not margin > r:
+    h = float(getattr(getattr(graph, "params", None), "lattice", 0.1))
+    from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
+    if not margin - r > h / math.sqrt(2.0) or margin > _CLR_CAP_M:
         return None
     from packages.scene_graph.api import Safety
     return Safety(margin=margin, rate=float(kappa) / (margin - r))
@@ -907,6 +914,12 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             graph, poses, range(1, len(poses) - 1), node_policy_cfg.get("robot_width"),
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
             node_policy_cfg.get("budget_s", 0.0), safety=safety)
+    pricing = None
+    if safety is not None:
+        known = robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0
+        pricing = {"kappa": float(safety_kappa), "margin": safety.margin, "rate": safety.rate,
+                   "margin_source": "factsheet" if known else "map_r", "cost": int(route.cost),
+                   "exact": bool(getattr(route, "exact", True))}
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
-                     repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report)
+                     repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing)

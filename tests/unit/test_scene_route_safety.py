@@ -46,6 +46,14 @@ def test_safety_for_is_none_for_every_legacy_case():
     assert sr.safety_for(SimpleNamespace(params=_G.params), 0.5, None, 1.0) is None   # no deficit_cell
     assert sr.safety_for(_G(), 0.5, None, 1.0) is not None
     assert sr.safety_for(_G(), 0.3, None, 1.0) is None                                # margin 0.212 <= r 0.25
+    # S12: a margin within h / sqrt 2 = 0.0707 m of r is below the lattice clearance quantisation: unpriced
+    assert sr.safety_for(_G(), 0.0001, 0.5, 1.0) is None                              # degenerate 0.5 x 0.0001: margin = r
+    assert sr.safety_for(_G(), 0.2, 0.5, 1.0) is None                                 # 0.5 x 0.2: margin 0.269, 0.019 above r
+    edge = 0.25 + 0.1 / math.sqrt(2)                                                  # the boundary: margin - r = h / sqrt 2
+    length = lambda m: math.sqrt((2 * m) ** 2 - 0.4 ** 2)                             # length of a footprint 0.4 wide with r_c = m
+    assert sr.safety_for(_G(), 0.4, length(edge - 1e-6), 1.0) is None
+    assert sr.safety_for(_G(), 0.4, length(edge + 1e-6), 1.0) is not None
+    assert sr.safety_for(_G(), 2.0, 1.0, 1.0) is None                                 # r_c 1.118 above the 1 m clearance cap
     nop = _G()
     nop.params = SimpleNamespace(lattice=0.1)
     assert sr.safety_for(nop, 0.5, None, 1.0) is None                                 # no inscribed radius known
@@ -280,11 +288,11 @@ def test_p9_priced_visible_is_the_plain_line_of_sight_on_a_free_corridor_and_ref
 # ---- config -------------------------------------------------------------------------------------------------
 def test_p10_config_defaults_and_range_validation(monkeypatch, caplog):
     assert config.SCENE_GRAPH_SAFETY_KAPPA == 1.0 and not hasattr(config, "SCENE_GRAPH_SAFETY_TOLERANCE_M")
-    for v in (0.0, 1.0, 20.0):
+    for v in (0.0, 1.0, 10.0):
         monkeypatch.setattr(config, "SCENE_GRAPH_SAFETY_KAPPA", v)
         config._validate_scene_graph_planner()
         assert config.SCENE_GRAPH_SAFETY_KAPPA == v
-    for v in (-0.1, 20.5, float("nan"), float("inf")):
+    for v in (-0.1, 10.5, float("nan"), float("inf")):
         monkeypatch.setattr(config, "SCENE_GRAPH_SAFETY_KAPPA", v)
         caplog.clear()
         with caplog.at_level("WARNING", logger="config"):
@@ -321,4 +329,68 @@ async def test_the_planner_service_passes_kappa_and_the_footprint_even_with_the_
     await svc_plan(svc)
     width, _margin, length, _policy, kappa, check = seen["args"][-6:]
     assert (width, length, kappa, check) == (0.5, 0.8, 6.0, False)         # the gate stays off, the footprint arrives
+    svc.cleanup()
+
+
+def test_edge_weight_is_the_one_cost_formula():
+    import numpy as np
+    from packages.scene_graph.api import edge_weight
+    assert edge_weight(1000.0, 0.0, 0.0) == 1000.0 and edge_weight(0.0, 0.0, 5.0) == 1.0
+    assert edge_weight(1414.2135, 0.0, 3.0) == 1415.0
+    got = edge_weight(np.array([1000.0, 1000.0]), np.array([0.2, 0.0]), 10.0)
+    assert list(got) == [2000.0, 1000.0]
+
+
+def test_the_plan_reports_its_pricing(graphs):
+    name, eng, lazy = graphs
+    from packages.services.mission_planner import lazy_plan
+    for g in (eng, lazy):
+        p, q = _trial_pairs(eng, 1, 41)[0]
+        plain = _plan(g, p, q, kappa=0.0)
+        assert not isinstance(plain, str) and plain.pricing is None
+        known = _plan(g, p, q, kappa=2.0, width=0.5, length=0.8)
+        unknown = _plan(g, p, q, kappa=2.0)
+        for plan_, source, margin in ((known, "factsheet", math.hypot(0.8, 0.5) / 2), (unknown, "map_r", 0.25 * math.sqrt(2))):
+            assert not isinstance(plan_, str)
+            pr = plan_.pricing
+            assert set(pr) == {"kappa", "margin", "rate", "margin_source", "cost", "exact"}
+            assert pr["kappa"] == 2.0 and pr["margin_source"] == source and pr["exact"] is True
+            assert pr["margin"] == pytest.approx(margin) and pr["rate"] == pytest.approx(2.0 / (margin - 0.25))
+            assert isinstance(pr["cost"], int) and pr["cost"] >= 0
+    assert lazy_plan._CLR_CAP_M == 1.0
+
+
+async def test_the_service_reports_priced_plans_in_the_response_the_log_and_the_stats(monkeypatch, caplog):
+    from .test_planner_chart_route import FakeGraph, FakeStore, _plan as svc_plan, _service
+    from types import SimpleNamespace as NS
+    from packages.scene_graph.api import Route
+
+    class Priced(FakeGraph):
+        params = NS(lattice=0.1, robot_half_side=0.25)
+        last = {"tiles": 7}
+
+        def deficit_cell(self, ix, iy, margin):
+            return 0.0
+
+        def route(self, a, b, blocked=None, start=None, goal=None, safety=None):
+            r = super().route(a, b, blocked, start, goal)
+            return Route(charts=r.charts, length=r.length, min_width=r.min_width, nodes=r.nodes, cost=12345, exact=False)
+
+    monkeypatch.setattr(config, "SCENE_GRAPH_PLANNER_ENABLED", True)
+    monkeypatch.setattr(config, "SCENE_GRAPH_SAFETY_KAPPA", 1.0)
+    svc = _service(FakeStore(Priced(), version=9))
+    with caplog.at_level("INFO"):
+        out = await svc_plan(svc)
+    assert out["success"] and out["planner"] == sr.PLANNER_SCENE_GRAPH
+    pr = out["pricing"]
+    assert pr["kappa"] == 1.0 and pr["margin_source"] == "map_r" and pr["cost"] == 12345 and pr["exact"] is False
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Priced plan")]
+    assert len(lines) == 1
+    for part in ("map=m", "graph_version=9", "kappa=1.0", "margin_source=map_r", "cost=12345", "exact=False", "tiles=7"):
+        assert part in lines[0]
+    stats = svc.get_stats()["scene_graph"]
+    assert stats["priced_plans"] == 1 and stats["priced_plans_inexact"] == 1
+    monkeypatch.setattr(config, "SCENE_GRAPH_SAFETY_KAPPA", 0.0)
+    out0 = await svc_plan(svc)
+    assert "pricing" not in out0 and svc.get_stats()["scene_graph"]["priced_plans"] == 1
     svc.cleanup()

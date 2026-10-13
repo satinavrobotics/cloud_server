@@ -129,6 +129,9 @@ class MissionPlannerService:
             "sg-plan", 2, config.SCENE_GRAPH_PLAN_MAX_INFLIGHT, busy_reason="planner_busy")
         # chart-route outcomes by reason ("served" or the fallback reason), for get_stats()
         self._chart_outcomes: Dict[str, int] = {}
+        # plans served with clearance pricing, and those whose search hit the tile cap (route not proved optimal)
+        self._priced_plans = 0
+        self._priced_inexact = 0
 
         self._prewarm_task: Optional["asyncio.Task"] = None
 
@@ -306,6 +309,14 @@ class MissionPlannerService:
             if hit:
                 return None, "blocked_row_on_route"
         ids = plan.planned_path
+        if plan.pricing is not None:
+            self._priced_plans += 1
+            self._priced_inexact += 0 if plan.pricing["exact"] else 1
+            self.logger.info(
+                "Priced plan map=%s graph_version=%s kappa=%s margin=%.4f rate=%.3f margin_source=%s cost=%d exact=%s tiles=%s",
+                map_id, version, plan.pricing["kappa"], plan.pricing["margin"], plan.pricing["rate"],
+                plan.pricing["margin_source"], plan.pricing["cost"], plan.pricing["exact"],
+                (getattr(graph, "last", None) or {}).get("tiles"))
         # Note: end_node_id is the LEAF nearest the goal waypoint (within LEAF_SNAP_M, up to 1 m
         # off), target_node_position the snapped goal cell centre (within GOAL_SNAP_M of the tap):
         # the two need not coincide; the legacy planner's pair is node and node position.
@@ -318,6 +329,7 @@ class MissionPlannerService:
             "planner": scene_route.PLANNER_SCENE_GRAPH,
             "min_width": plan.min_width, "chart_keys": plan.charts,
             "graph_version": version,
+            **({"pricing": plan.pricing} if plan.pricing is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
         }, None
 
@@ -1547,6 +1559,8 @@ class MissionPlannerService:
                 "outcomes": dict(self._chart_outcomes),    # "served" and each fallback reason
                 "cache": self._scene_cache.stats(),
                 "plan_inflight": self._plan_pool.inflight,
+                "priced_plans": self._priced_plans,
+                "priced_plans_inexact": self._priced_inexact,
             }
         return stats
 

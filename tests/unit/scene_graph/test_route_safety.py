@@ -31,7 +31,8 @@ def world(name):
 
 
 ALL_WORLDS = list(STRUCTURAL) + ["r%d" % s for s in SEEDS]
-SAFETIES = [Safety(0.404, 3.0 / 0.154), Safety(0.45, 15.0), Safety(0.6, 40.0)]
+R_C = 0.25 * math.sqrt(2)          # the circumscribed radius of the map's robot: the planner's default margin
+SAFETIES = [Safety(R_C, 1.0 / (R_C - 0.25)), Safety(0.45, 15.0), Safety(0.6, 40.0)]
 
 
 def _route_pairs(g, n=8, seed=3):

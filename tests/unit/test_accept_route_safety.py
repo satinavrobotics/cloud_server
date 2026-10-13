@@ -46,5 +46,5 @@ def test_the_harness_passes_every_gate_on_a_synthetic_export(tmp_path, monkeypat
     out = capsys.readouterr().out
     assert code == 0, out
     assert "ALL GATES PASS" in out
-    for gid in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "C1", "C2", "C3"):
+    for gid in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "C1", "C2", "C3", "C3c"):
         assert any(line.startswith(gid + " ") and "PASS" in line for line in out.splitlines()), (gid, out)

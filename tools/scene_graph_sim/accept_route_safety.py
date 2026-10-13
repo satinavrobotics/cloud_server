@@ -45,7 +45,7 @@ METRICATION = 1.0824            # sqrt(1 + (sqrt 2 - 1)^2): the 8-neighbour leng
 QUANT_M = 2 * H / math.sqrt(2)  # 0.1414: 2 x the lattice-cell clearance quantisation h / sqrt 2 (S12)
 SAMPLE_COARSE = 0.025
 SAMPLE_FINE = 0.01
-PLAN_P99_ALLOWANCE = 0.1       # of SCENE_GRAPH_PLAN_BUDGET_S: an allowance, not derived
+PLAN_P99_ALLOWANCE = 0.1       # of SCENE_GRAPH_PLAN_BUDGET_S: an allowance, not derived (warm and cold cache alike)
 
 RESULTS: List[Tuple[str, str, bool, str, str]] = []
 
@@ -198,15 +198,19 @@ class Reference:
         return out
 
     def j_cont(self, pts) -> Tuple[float, float, float, float]:
-        """continuum J = L + mu * integral (m - g)+ ds sampled every 1 cm on the full-resolution field: (J, L, min clearance, length
-        below the margin)"""
+        """continuum J = L + mu * integral (m - g)+ ds sampled every 1 cm on the full-resolution field, at the start of each piece
+        so every vertex is a sample, and at the last point (weight 0): (J, L, min clearance, length below the margin); the same
+        sampling as `bench_route_safety.Field.samples`"""
         xs, ys, sg = [], [], []
         for a, b in zip(pts[:-1], pts[1:]):
             n = max(1, int(math.ceil(math.dist(a, b) / SAMPLE_FINE)))
-            t = (np.arange(n) + 0.5) / n
+            t = np.arange(n) / n
             xs.append(a[0] + t * (b[0] - a[0]))
             ys.append(a[1] + t * (b[1] - a[1]))
             sg.append(np.full(n, math.dist(a, b) / n))
+        xs.append(np.array([pts[-1][0]]))
+        ys.append(np.array([pts[-1][1]]))
+        sg.append(np.zeros(1))
         xs, ys, sg = np.concatenate(xs), np.concatenate(ys), np.concatenate(sg)
         c = self.clearance_at(xs, ys)
         return (float(sg.sum() + self.rate * (np.maximum(0.0, self.margin - c) * sg).sum()), float(sg.sum()), float(c.min()),
@@ -307,6 +311,24 @@ def main() -> int:
             plans_default.append(err.reason)
     cold = open_plan(st, "m", max_tiles=config.SCENE_GRAPH_LAZY_MAX_TILES, tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE)
     cold_pri = [route(cold, sa, sb, safety) for sa, sb in pairs]
+
+    def make_cold(graph):
+        """empty the graph's clearance cache, its tile cache and the store's decoded-tile cache: the next plan reads, decodes and
+        computes everything it needs (the backend is in memory: no network)"""
+        from packages.services.mission_planner.lazy_plan import _TileCache
+        with graph._clr_lock:
+            graph._clr.clear()
+        graph.view._cache = _TileCache(config.SCENE_GRAPH_LAZY_TILE_CACHE)
+        with st._lock:
+            st._tiles.clear()
+            st._tile_bytes = 0
+    c0, c1 = [], []
+    for sa, sb in pairs:
+        p, q = (sa.x, sa.y), (sb.x, sb.y)
+        make_cold(lazy)
+        plan(lazy, p, q, 0.0, c0)
+        make_cold(lazy)
+        plan(lazy, p, q, args.kappa, c1)
 
     n_ok = [i for i, r_ in enumerate(base_l) if r_ is not None]
 
@@ -442,6 +464,13 @@ def main() -> int:
              pct(t1, 50) / pct(t0, 50), p99 / pct(t0, 99)),
          "p99 <= %.1f x SCENE_GRAPH_PLAN_BUDGET_S (%.1f s) = %.2f s: an ALLOWANCE, not derived; warm tile cache, in-memory store "
          "(live tile I/O latency is measured separately)" % (PLAN_P99_ALLOWANCE, budget, PLAN_P99_ALLOWANCE * budget))
+
+    gate("C3c", "plan time cold (ALLOWANCE)", pct(c1, 99) <= PLAN_P99_ALLOWANCE * budget,
+         "COLD caches per plan: kappa 0 p50/p95/p99 %.1f/%.1f/%.1f ms, kappa p50/p95/p99 %.1f/%.1f/%.1f ms, p50 ratio %.2f, p99 ratio %.2f" % (
+             pct(c0, 50) * 1e3, pct(c0, 95) * 1e3, pct(c0, 99) * 1e3, pct(c1, 50) * 1e3, pct(c1, 95) * 1e3, pct(c1, 99) * 1e3,
+             pct(c1, 50) / pct(c0, 50), pct(c1, 99) / pct(c0, 99)),
+         "the same allowance, p99 <= %.2f s, with the clearance, tile and decoded-tile caches emptied before every plan "
+         "(an ALLOWANCE, not derived; no network I/O: the live tile read latency comes on top)" % (PLAN_P99_ALLOWANCE * budget))
 
     # ---- report -----------------------------------------------------------------------------------------------------------
     print("### %s: %d leaves, N=%d F cells, %d charts; r=%.3f m=%.3f mu=%.2f/m (kappa %.2f); %d pairs seed %d; routable %d" % (
