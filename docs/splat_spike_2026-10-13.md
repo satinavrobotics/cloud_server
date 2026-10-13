@@ -100,3 +100,85 @@ quality from the current capture. Needed for better quality: higher-res RGB (>= 
 pixels of today), full-density depth or monocular depth prior, fixed exposure, camera height variation
 or a second higher camera, and an RGB-pose time-sync check. Untested: pose refinement (excluded by the
 brief), mapping office8 in daylight, spz/sog encoders.
+
+---
+
+# Round 2: what actually fixes the noise (office7)
+
+Trainer: `docs/splat_spike_scripts/train2.py` (strategies, 2DGS, dense depth, normals, pose deltas).
+All runs: 1500 steps unless noted, every-8th hold-out (12 frames), GPU cap 30 %, peak 0.4-0.7 GB.
+
+## Root cause: per-frame pose error, not the trainer and not the resolution
+- Warping the nearest GROUND-TRUTH neighbour image into a held-out frame through the (densified)
+  depth gives only 17.4 dB (18.3 exposure-aligned) -- the same ceiling every splat run hit.
+- Fitting a free 6-DoF correction per pair lifts that to 22.5 dB, with corrections of mean 2.0 deg and
+  6 cm (some 15 cm). A single shared camera-frame correction (extrinsic) does nothing (17.16 -> 17.07), so
+  it is random per frame (pose jitter / time offset between image stamp and pose), not a calibration
+  bias. A 2 deg error is ~6 px at fx = 174, which is why surfaces blur and the model overfits.
+- Resolution is not the binding constraint: rendering/scoring at 224x168 gains only +0.2-0.35 dB.
+  Exposure is a minor factor (aligned PSNR is +0.5 dB).
+- (This contradicts "poses are good, no refinement needed" at the pixel level: they are good at the cm
+  level for the planner, not for splatting at 6 px/2 deg.)
+
+## Options tried (test PSNR with held-out poses fitted / with raw manifest pose, SSIM, LPIPS)
+Pose delta per frame learned during training (lr 1e-3, from step 300); held-out frames get a 100-step
+pose fit on the frozen scene (an optimistic "fitted" number; the raw-pose number is in brackets).
+| config | gaussians | train s | PSNR fitted (raw) | SSIM | LPIPS | MB .splat |
+|---|---|---|---|---|---|---|
+| round-1 best (raw sparse depth init, no densify, expo, 3k) | 219k | 15 | - (18.57) | 0.631 | 0.482 | 6.7 |
+| MCMC 200k, no pose opt | 200k | 8 | - (18.32) | 0.639 | 0.541 | 6.1 |
+| MCMC 200k + pose opt | 200k | 9 | 20.65 (18.54) | 0.695 | 0.551 | 6.1 |
+| MCMC 3k steps | 200k | 17.5 | 21.52 (19.04) | 0.714 | 0.520 | 6.1 |
+| + dense depth loss (bilateral-filled) | 200k | 9 | 20.79 (18.73) | 0.703 | 0.550 | 6.1 |
+| + depth-derived normal loss | 200k | 10 | 20.61 (18.60) | 0.704 | 0.552 | 6.1 |
+| init from service cloud.ply (299k pts) | 200k | 9 | 20.86 (18.81) | 0.704 | 0.551 | 6.1 |
+| init from dense (filled) depth | 200k | 9 | 20.77 (19.18) | 0.703 | 0.560 | 6.1 |
+| antialiased rasterization | 200k | 9 | 20.79 (18.43) | 0.699 | 0.552 | 6.1 |
+| SSIM weight 0.5 | 200k | 9 | 20.58 (18.33) | 0.700 | 0.548 | 6.1 |
+| scale clamp 0.003-0.15 m | 200k | 9 | 20.50 (18.19) | 0.694 | 0.559 | 6.1 |
+| default densify + pose opt | 357k | 9.5 | 20.43 (18.44) | 0.684 | 0.535 | 10.9 |
+| MCMC budget 100k / 400k | 100k/400k | 8/10 | 20.75 / 20.83 | 0.693 / 0.706 | 0.568 / 0.540 | 3 / 12 |
+| 2DGS + default densify | 380k | 16 | 20.92 (18.72) | 0.700 | 0.472 | 11.6 |
+| 2DGS + MCMC 200k | 200k | 15 | 20.93 (18.94) | 0.700 | 0.513 | 6.1 |
+| **2DGS + default + dense depth 0.2 + normals 0.05 + pose lr 3e-4** | 388k | **17** | **20.77-20.82 (18.7-18.8)** | 0.703 | **0.434** | 11.8 |
+| same, 3000 steps, pose lr 5e-4 | 502k | 37 | 21.01 (18.58) | 0.712 | 0.422 | 15.3 |
+| same with 500 steps | 318k | 6 | 20.09 (18.71) | 0.681 | 0.493 | 9.7 |
+| pose lr 3e-3 | 420k | 34 | 20.3 (train PSNR collapses to 20.6) | 0.66 | 0.54 | 13 |
+| stronger normal (0.3) + depth TV | 396k | 17 | 20.23 | 0.678 | 0.473 | 12.1 |
+
+Block hold-out (12 consecutive nodes), same new best vs round-1 best: PSNR 18.31 (17.20 raw) vs 17.36,
+SSIM 0.562 vs 0.538, LPIPS 0.575 vs 0.660.
+
+Depth densification: a joint-bilateral fill of the 21 % lattice (RGB-guided, 2 s for 95 frames) predicts held-out
+lattice points to 0.5 % median relative error (94 % within 5 %). Monocular prior (Depth Anything V2-Small,
+aligned to the lattice) was unusable on this wide-angle, dark footage: median 49 % error, correlation
+0.15-0.9; MoGe-2 was not run. Dense depth supervision helps LPIPS and sharpness, not PSNR.
+
+Everything lands on the same ~20.8 dB (fitted) / ~18.7 dB (raw) plateau, i.e. the data (pose jitter),
+not the strategy, is binding. Held-out PSNR without pose fitting stops improving after ~500 steps
+(18.5-18.75 from 250 steps on), so early stopping at 500-1000 steps is safe.
+
+## Best configuration (quality per second)
+`--family 2dgs --strategy default --poseopt 1 --pose_lr 3e-4 --dd bil --dd_w 0.2 --nrm_w 0.05 --steps 1500`,
+SH0, init = raw depth voxelised to 5 cm, per-frame exposure. 17 s train (+2 s depth fill, ~1 s init), 0.64 GB VRAM,
+388k surfels, 11.8 MB .splat. Vs round 1: LPIPS 0.49 -> 0.43, SSIM 0.63 -> 0.70, PSNR +2 dB with fitted poses.
+Comparison images (scratchpad `out/`): `compare_heldout.jpg` (GT | round-1 best | new best | new best depth, 6 held-out)
+and `compare_novel.jpg` (round-1 best | new best | new-best depth, 3 novel views).
+Visual judgement: the new best is clearly sharper and less fragmented in the far field (windows, shelves,
+ceiling, chair legs) and its depth maps are clean with sharp edges; round 1 had holes, smeared blobs and floating
+fragments. Remaining defects: the floor and objects closer than ~1 m (camera 0.25 m high, grazing angle) are
+streaky/smeared with some needle artifacts; bright windows are partly blown out; dark areas stay blurry. It is
+better, still not photoreal.
+
+## Feed-forward (AnySplat / DepthSplat / MVSplat): not run
+AnySplat (MIT licence on GitHub and HF) is the only candidate checked. It predicts its own poses (cannot use
+the known ones without a Sim(3) alignment), takes 448x448 square input, and needs pinned heavy deps
+(pytorch3d, xformers 0.0.24, torch_scatter, e3nn). A pip install attempt hung and was abandoned in the time box;
+a derived VGGT backbone may carry non-commercial terms (not verified). Given that the binding problem here is
+pose jitter, a feed-forward model that ignores our poses would not address it. No numbers.
+
+## Updated recommendation
+Go for the optional splat output with the config above (about 20-25 s total per 100 nodes, 12 MB), expected to be
+"clean enough for orientation/visual context". For real photo quality the fixes are on the capture side:
+pose/image timestamp alignment (<10 ms) or per-frame pose refinement against the images, higher RGB resolution
+is secondary (half-res scoring changes only ~0.3 dB), a higher or tilted-down camera for the floor.
