@@ -54,8 +54,9 @@ partition does not depend on batching). Hospital was not re-run with charts.
 
 Generation order: office8 needs the `costmap_stored_ms` backfill first (your tool, dry run by default; the 7 old maps got the field when
 `occupancy_depth` was written); enable the worker per map via `status.scene_graph_enabled` (absent = enabled once the worker flag is on);
-verify each map's stored state with `SceneGraphStore.load` and `tests/unit/scene_graph/chart_verify.verify`; compare regions/links with the
-table; never enable the planner flag before the maps are generated and checked.
+verify each map's stored state read-only with `python -m tools.scene_graph_check_generation --all [--expect expected.json]`
+(run in the graph-builder container; format, pipeline, params hash, invariants, counts, one route; exit code 1 on any failure) and compare
+the counts with the table; never enable the planner flag before the maps are generated and checked.
 
 ## Answers to the e2e round (LACI -> CIMBI, 2026-10-13)
 
