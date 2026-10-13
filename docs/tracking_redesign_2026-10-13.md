@@ -25,7 +25,9 @@ Three tiers, no mixing:
 
 ## Current state worth fixing (survey, unverified lines)
 
-* No consumer of `edge_observations` / `GET /maps/{id}/edge-stats` exists outside the API route: changing the key is cheap.
+* `GET /maps/{id}/edge-stats` **has a consumer**: the sati-client (separate repo) reads it through `MapStatsPane`, `useEdgeStats` and
+  `utils/edgeStats.ts`; the map window Stats shows the count-weighted average speed. Changing or removing the key is a
+  contract change, not a cheap internal one (stage 3).
 * The same movement is stored four ways: `robot_track_ts`, `run_legs`, `edge_observations` (copy of `run_legs`), mapping
   node timestamps. `robot_state_ts` (full) and `mission_trajectory` carry two more overlapping pose series.
 * Speed/time derivations are duplicated (`session_trace.step`, `edge_stats`, `run_legs`, the track's own speed,
@@ -45,6 +47,12 @@ Three tiers, no mixing:
   map, t_in, t_out, in_xy, out_xy, distance, speed, recoveries, blocks, graph_version}`. At `events_only` there is no
   track, so the transit source there is the leg poses (the legs' own start/end in map frame) and the planned route's
   chart keys (`chart_keys` in the plan response): decide in stage 2 which feeds the job without a track; **open**.
+  Note: the plan response's `chart_keys` and `graph_version` are **not persisted** today (dispatch and `mission_runs` keep only
+  `planned_path`), so without a track they are lost; see stage 1.5/2 item below.
+* **Read model**: compute-on-read from the transit table is the first version (planner team's answer, recorded). A later,
+  accepted step is a version-stamped aggregate per chart link in ArangoDB (count, median, p90, speed, recoveries, blocks,
+  window, graph_version), rebuilt from the transit table per graph version. Transits stay the source of truth; the aggregate is
+  a rebuildable cache.
 * **Stats read**: group transits by (chart a, chart b) via `locate` at the current version, last N per
   (map, a, b, robot), same count/median/p90/speed/recoveries/blocks as `edge_stats`; roll-ups to parent charts on read.
 * **One speed/time module**: `packages/utils/` function used by traces, legs, transits. Delete the duplicates.
@@ -58,10 +66,13 @@ Three tiers, no mixing:
 0. **Prerequisite**: scene graph merged to `main` and deployed (`feat/scene-graph-v2`, other session). Nothing in
    stages 2-4 starts before `locate` and the read API are on `main`.
 1. **Frame at record time** (D2) + level markers + `/track` "not recorded" flag. No scene-graph dependency; can go first.
+1.5. **Persist the plan's `chart_keys` and `graph_version`** on `mission_runs` (or per leg) when dispatch accepts the plan, so an
+   `events_only` run without a track can still feed transits. Small migration + dispatch write; can ride with stage 1 or 2.
 2. **Transits** (D1, D3): table + job + read route `GET /maps/{id}/link-stats`; backfill from existing runs where the
    track is convertible.
-3. **Retire leaf statistics** (D4): stop the mapping writer, route `/edge-stats` deprecated, then removed; migration to
-   drop `edge_observations` after one release; client Stats tabs move to link statistics.
+3. **Retire leaf statistics** (D4) is a **contract change**: stop the mapping writer; mark `/edge-stats` deprecated and keep the
+   route for one release **after the sati-client has moved to link statistics** (`MapStatsPane`, `useEdgeStats`,
+   `utils/edgeStats.ts`); only then remove the route and drop `edge_observations` (migration).
 4. **Cleanup**: one speed/time module, retention (track 90 days; `run_legs` policy), duplicate constants, orphan rows.
 
 ## Stage 1 status (implemented, not deployed)
@@ -103,6 +114,7 @@ Three tiers, no mixing:
 
 ## Open
 
-* Source of transits at `events_only` without a track (see Target).
+* Source of transits at `events_only` without a track (see Target): the candidate is the persisted `chart_keys` + `graph_version`
+  (stage 1.5) with the legs' times and poses; not decided.
 * Whether `Chart.leaf` thumbnails replace the leaf-node images for the mission replay.
 * Retention for transits (suggest none, bounded by the last-N window per link + a one-year age cap).
