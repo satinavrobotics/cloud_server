@@ -116,6 +116,7 @@ class StatsResponse(BaseModel):
     default_map_id: Optional[str] = None
     knn_k: int
     range_search_radius: float
+    scene_graph: Optional[Dict[str, Any]] = Field(None, description="Scene graph planner counters (outcomes, cache, plan_inflight); present only when the planner flag is on")
 
 
 class NavigationPlanResponse(BaseModel):

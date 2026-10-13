@@ -145,6 +145,27 @@ class TestRoutes:
         assert exc.value.status_code == 400
 
 
+class TestStatsRoute:
+    async def test_stats_keeps_the_scene_graph_block(self):
+        block = {"outcomes": {"served": 3}, "cache": {"graphs": 1}, "plan_inflight": 0}
+        fake = MagicMock()
+        fake.get_stats.return_value = {
+            "service": "mission_planner", "graph_db_url": "a", "database_url": "b", "default_map_id": None,
+            "knn_k": 5, "range_search_radius": 10.0, "scene_graph": block}
+        with patch.object(planner_main, "service", fake):
+            out = await planner_main.get_stats()
+        assert out.dict()["scene_graph"] == block
+
+    async def test_stats_without_the_planner_flag_has_no_block(self):
+        fake = MagicMock()
+        fake.get_stats.return_value = {
+            "service": "mission_planner", "graph_db_url": "a", "database_url": "b", "default_map_id": None,
+            "knn_k": 5, "range_search_radius": 10.0}
+        with patch.object(planner_main, "service", fake):
+            out = await planner_main.get_stats()
+        assert out.scene_graph is None
+
+
 class TestApiPassThrough:
     async def test_call_mission_planner_passes_map_id(self):
         from packages.api.server import ApiDelegationService
