@@ -32,8 +32,11 @@ identity and a display point, never a waypoint.
   what one leaf observes.
 * **chart** (`subdivide`): inside each region, cells are taken in the order of room (B / h rounded, ties in scan order); a cell
   whose geodesic distance (8-neighbour steps inside the region, a diagonal needing both side cells in the region) to every earlier
-  anchor exceeds rho becomes an **anchor**. A chart is the set of cells whose nearest anchor it is (distance, then earlier
-  anchor). A region smaller than rho is one chart. The first anchor of a region is a cell of maximal B.
+  **net point** exceeds rho becomes one. A chart is the set of cells whose nearest net point it is (distance, then earlier net
+  point). A region smaller than rho is one chart. The first net point of a region is a cell of maximal B.
+* **anchor** (`centres`): the chart cell nearest the chart's centroid (ties: more room, then (row, col)). The net point sits where
+  the cut put it, often at the side of a small chart (measured: its eccentricity was 1.52 x the minimum on charts under 150
+  cells); the centre is what stands for the chart (1.07 x).
 * **link**: one per arc of the interface curve of a chart pair (a maximal chain of unit edges between the two charts, joined at
   shared endpoints; a pair of charts of one region has arcs too). **portal**: the crossing pair attaining s over the arc. **Link.width**: twice the largest, over the
   arc's crossings, of the minimum PHYSICAL clearance (distance to blocked cells) of the crossing pair: a passage width in the same
@@ -65,9 +68,10 @@ identity and a display point, never a waypoint.
 | 15 | The choice of level 0 = tau0 (not 2 tau0) and the exposed level list tau0 * 2^j | HEURISTIC | 2 tau0 persisted worse and collapsed office8 to one region |
 | 16 | Tie order (row, col) is a convention; rot90 / mirror equivariance holds only without plateau ties | HEURISTIC | |
 | 17 | A chart lies in exactly one persistence region: no chart crosses a pass; the charts of a region partition it | EXACT | by construction; verifier `region`, `nesting` |
-| 18 | Covering: every cell of a chart is within geodesic distance rho of its anchor | EXACT | an uncovered cell becomes an anchor; verifier `radius` on 7 real maps x 2 batchings, 13 worlds, 6 random fields |
-| 19 | Packing: two anchors of one region are further than rho apart | EXACT | distance is symmetric and an anchor is only made from an uncovered cell; verifier `packing` |
-| 20 | A chart is 8-connected and every cell reaches its anchor along a shortest path inside the chart | EXACT | the nearer-anchor rule with ties to the earlier anchor is consistent along shortest paths; verifier `voronoi` |
+| 18 | Covering: every cell of a chart is within geodesic distance rho of its net point, so any two cells are within 2 rho and the anchor is within 2 rho of every cell of its chart | EXACT | an uncovered cell becomes a net point; `test_morse`; verifier `radius` (2 rho from the anchor) on 7 real maps x 2 batchings, 13 worlds, 6 random fields |
+| 19 | Packing: two net points of one region are further than rho apart | EXACT | distance is symmetric and a net point is only made from an uncovered cell; `test_morse` |
+| 20 | A chart is 8-connected and every cell reaches its net point along a shortest path inside the chart | EXACT | the nearer-point rule with ties to the earlier point is consistent along shortest paths; `test_morse` (Voronoi check) |
+| 20a | The anchor (nearest cell to the centroid) has eccentricity 1.07 x the chart's minimum (median), 1.15 x (p90), 1.24 x (max); the net point had 1.20 / 1.77 / 1.93 | TESTED | 84 charts of 20 cells or more on the 7 floors, exact eccentricity |
 | 21 | A chart is 4-connected | TESTED | 0 violations in all of the above; the 8-neighbour metric could leave a one-cell diagonal pinch at a bisector |
 | 22 | Charts are a pure function of F, h and rho: independent of arrival order and batching, translation invariant (ties in scan order, which a growing canvas keeps) | EXACT | worker == direct fold, 8 maps x batchings 6 and 48 |
 | 23 | Locality: owner changes after a batch lie within 0.8 m (hall) and 2.65 m (field) of changed input cells; the same bound as the regions alone for the field | TESTED | `test_store_dirty`; the nearer-anchor tie rule must be canonical (a library multi-source search that picked ties by heap order moved 20 of 30 charts for a 6-cell change) |
