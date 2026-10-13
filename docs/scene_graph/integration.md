@@ -67,7 +67,7 @@ Principle: every operation is local and bounded; a small map is the degenerate c
 * **Incremental builder**: the partition is re-computed once per batch over the touched canvas (CIMBI). Gate below.
 * **Planning = corridor, then refine**: the chart graph selects the chart sequence; the lattice search runs only
   inside those charts plus a one-chart margin. On a small map the corridor is the whole map. (Original design; the
-  built planner has two modes, see "Planner modes" below.)
+  built planner is tile-lazy, see "Planner modes" below.)
 * **Tiled persistence**: snapshot per tile plus a manifest; the planner loads only the tiles a corridor touches,
   cached by `(map, version, tile)`. Tiles are storage only; charts cross tile borders.
 * **Delete or realign**: delete is a whole-map rebuild into a pending generation (debounced 30 s); the engine's
@@ -128,7 +128,7 @@ distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`,
    running, then `store_busy`) and plans (2 threads, `SCENE_GRAPH_PLAN_MAX_INFLIGHT` 4, then `planner_busy`) have
    their own bounded pools; a timed-out call keeps its slot until it ends, so a hung call cannot pile work up.
 1. **Graph**: `SceneGraphStore.meta(map)` (cached `SCENE_GRAPH_META_TTL_S`, 0.75 s, one query in flight per map)
-   pins the version; `store.load(map, version)` runs in a thread. The cache holds graphs by `(map, version)` and
+   pins the version; `lazy_plan.open_plan(map, version)` (manifest only; the former `full_load` ran `store.load`) runs in a thread. The cache holds graphs by `(map, version)` and
    names the history the version numbers belong to by the store's **epoch, else its generation**: when a map's token
    changes or its version regresses, every entry of that map is dropped, so a graph of another history is never
    served under a version number. Bounds: `SCENE_GRAPH_CACHE_VERSIONS` (4) graphs in all (LRU over maps),
@@ -162,26 +162,26 @@ distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`,
 6. **Budget of the plan**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (3 s), also
    bounded by what is left of the total (`plan_timeout`, or `budget_exhausted` when the total was the binding one).
 
-**Planner modes** (`SCENE_GRAPH_PLANNER_MODE`, default `lazy`; `full_load` is the rollback; wiring `server.py` -> `GraphCache(lazy=...,
-lazy_kw=...)`). `full_load`: a cache miss restores the whole stored version (`store.load`); route, snap and the
-line-of-sight test run on the full engine. `lazy`: a cache miss opens the manifest only (`lazy_plan.open_plan` ->
-`PlanGraph`); a request reads the owner tiles of its corridor (single-flight per tile, bounded LRU
-`SCENE_GRAPH_LAZY_TILE_CACHE`, default 512 tiles of about 35 KB each by the config comment) and answers `snap`,
-`route` and `free_cell` from them with the engine's search made sparse (same 8-neighbour rule and cost, same length;
-the same route cells too: both break ties by the canonical rule, minimal integer cost then lexicographic (y, x);
-`tests/unit/test_lazy_plan.py`, `tests/unit/test_lazy_plan_equality.py`). A corridor that
+**Planner modes.** One mode: the tile-lazy planner (`full_load`, which restored the whole stored version per cache miss, existed until its
+removal on 2026-10-13; wiring `server.py` -> `GraphCache(lazy=True, lazy_kw=...)`; `lazy=False` remains only as a seam for unit tests with
+fake graphs). A cache miss opens the manifest only (`lazy_plan.open_plan` -> `PlanGraph`); a request reads the owner tiles of its corridor
+(single-flight per tile, bounded LRU `SCENE_GRAPH_LAZY_TILE_CACHE`, default 512 tiles of about 35 KB each by the config comment) and
+answers `snap`, `route` and `free_cell` from them with the engine's search made sparse (same 8-neighbour rule and cost, same length; the
+same route cells too: both break ties by the canonical rule, minimal integer cost then lexicographic (y, x);
+`tests/unit/test_lazy_plan.py`, `tests/unit/test_lazy_plan_equality.py`, the latter using `store.load` as the oracle). A corridor that
 needs more than `SCENE_GRAPH_LAZY_MAX_TILES` (default 400) tiles falls back `corridor_too_large`; a tile that cannot
 be read (version garbage-collected, backend error) falls back `tile_unavailable` and the graph is dropped so the next
-request re-opens the current version. Both reasons occur in lazy mode only. In lazy mode the cached object is a
-`PlanGraph` (manifest + a bounded tile LRU). The planner flag itself stays off by default; lazy mode is not
-validated on a production stack. Set the mode explicitly in the production `.env`.
+request re-opens the current version. The cached object is a `PlanGraph` (manifest + a bounded tile LRU). Any chart-planner failure
+falls back to the legacy planner (`ChartFallback`); the whole chart planner is switched off with `SCENE_GRAPH_PLANNER_ENABLED=false`.
+`store.load` (whole engine) stays for the ingest worker, the read API and the checker. Production runs lazy since 2026-10-13 19:00 UTC
+(445 route pairs identical to the full-load oracle on 8 real maps).
 
 Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `chart_keys`, `graph_version`,
 `planner_fallback` (only when the flag is on and the legacy planner ran; on plan and navigation responses).
 Reasons (meaning and operational reading: `runbook.md` section 7): `budget_exhausted`, `planner_busy`, `store_busy`,
 `executor_closed`, `robot_unavailable`, `robot_not_placed`, `store_unavailable`, `store_timeout`, `store_error`,
 `no_graph`, `load_timeout`, `load_error`, `stale_graph`, `start_*`, `goal_*`, `blocked_by_overlay`, `unreachable`,
-`missing_tiles`, `corridor_too_large`, `tile_unavailable` (these two: lazy mode only), `too_narrow`, `leaf_lookup_error`, `waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`,
+`missing_tiles`, `corridor_too_large`, `tile_unavailable` , `too_narrow`, `leaf_lookup_error`, `waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`,
 `plan_timeout`, `error`. `get_stats()["scene_graph"]` (flag on) = `{outcomes: {served | reason: count}, cache:
 {graphs, bytes, loading, load_inflight, io_inflight, backed_off_maps}, plan_inflight}`.
 
@@ -248,7 +248,7 @@ Reasons (meaning and operational reading: `runbook.md` section 7): `budget_exhau
 | 60 x 60 m | 1.9 s | 21 ms | 63 / 48 ms |
 | 150 x 150 m | 12.6 s | 371 ms | 222 / 450 ms |
 
-A cold full load on a large map can exceed `SCENE_GRAPH_LOAD_TIMEOUT_S`; the stale-version serving above keeps the
+A cold full load (the removed `full_load` mode) on a large map could exceed `SCENE_GRAPH_LOAD_TIMEOUT_S`; the stale-version serving above keeps the
 planner on the chart route while a new version loads. The earlier 90 x 90 m / 225-leaf figures came from the previous
 engine and are not carried over; a production-sized map needs measurement (`tools/mission_planner_bench`,
 `tools/scene_graph_check_generation.py`). Open maps: no engine limit is known on Morse (CIMBI: 244k-cell field 0.63 s

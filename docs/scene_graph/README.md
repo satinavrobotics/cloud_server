@@ -38,7 +38,7 @@ refuted claims: `audit_ledger.md`. The 2026-10-13 artifact with the figures: htt
 | Ingest worker, adapter, host | `packages/services/graph_builder/scene_*.py` | LACI |
 | Read API | `packages/api/scene_graph_reads.py` | LACI |
 | Planner: snap, route, width gate, fallbacks | `packages/services/mission_planner/scene_route.py`, `server.py` | LACI |
-| Lazy planner (tile-loaded `PlanGraph`) | `packages/services/mission_planner/lazy_plan.py` (`SCENE_GRAPH_PLANNER_MODE=lazy`) | LACI |
+| Lazy planner (tile-loaded `PlanGraph`) | `packages/services/mission_planner/lazy_plan.py` (the only planner mode; `full_load` removed 2026-10-13) | LACI |
 | Config and flags | `packages/config.py` (`SCENE_GRAPH_*`), `docker_compose/mission_dispatch_services.yaml`, `.env.example` | both |
 | Migration | `packages/api/migrations/versions/20261012_01_blocked_geometry.py` | LACI |
 
@@ -54,7 +54,7 @@ parameter. The engine's window cap (20 m side) and pose slack (5 m) are validati
 * Stored graphs: checker `--all --expect tools/scene_graph_expected.json` gives 8 of 8 (LACI, reported). Pinned counts
   (charts / links / islands): office8 12/15/0, office01 15/16/3, Officemap 14/15/1, office03 8/6/1, office04 16/15/4,
   office5 5/5/0, office6 14/17/0, office7 14/17/0.
-* Planner: `SCENE_GRAPH_PLANNER_ENABLED=true`, mode `full_load`, `SCENE_GRAPH_CACHE_VERSIONS=8` (it was 4, which pre-warmed only 4
+* Planner: `SCENE_GRAPH_PLANNER_ENABLED=true`, mode `full_load` at the time (lazy since 2026-10-13 19:00 UTC; 445 route pairs identical on 8 real maps; `full_load` removed), `SCENE_GRAPH_CACHE_VERSIONS=8` (it was 4, which pre-warmed only 4
   of 8 maps), all 8 maps pre-warmed at 16:19 UTC (LACI, reported). Hospital and the two test maps are skipped by pre-warm and fall
   back to the legacy planner. The width gate (`SCENE_GRAPH_WIDTH_CHECK_ENABLED`) is off.
 * Rollback tags on the production hosts: `:pre-scenev2-20261013` (before the first deploy), `:pre-7655b10` (before the hash fix),
@@ -70,7 +70,7 @@ parameter. The engine's window cap (20 m side) and pose slack (5 m) are validati
   shortest-path DAG), including under an overlay (`test_engine.py`).
 * **Store:** load equals save, replay does not bump the version, kill and restart give the same leaf set, delete saga leaves
   nothing (rehearsal on the throw-away stack with the real worker on the captured leaves of all 9 maps).
-* **E2E harness:** `tools/scene_graph_e2e/run.sh`, 32 passed in both planner modes (on `4104b8d`; not re-run on `a93a696`).
+* **E2E harness:** `tools/scene_graph_e2e/run.sh`, 32 passed in both planner modes while both existed (on `4104b8d`; not re-run on `a93a696`).
 * **Pinned unit suite:** 4212 passed on the production pins (py3.10, pydantic 1.9.0), on `4104b8d`.
 * **Measurements:** `formulation.md` statements 25-27 (cost, anchor-chain stretch, route quality) and statement 28 (ties).
 
@@ -94,9 +94,9 @@ parameter. The engine's window cap (20 m side) and pose slack (5 m) are validati
 
 1. **Lazy planner tie alignment.** `lazy_plan.py` must choose the same route as the engine (integer cost, then (y, x)). Done on
    branch `cleanup/lazy-tie-rule` at commit `b997c66` (off `a93a696`, not pushed): aligned to integer cost then (y, x), the 5 xfails removed,
-   `SCENE_GRAPH_PLANNER_MODE` defaults to `lazy` (`full_load` kept; an unknown value logs a warning). Verified: lazy equality, lazy plan
+   `SCENE_GRAPH_PLANNER_MODE` defaulted to `lazy` then (`full_load` existed until its removal on 2026-10-13). Verified: lazy equality, lazy plan
    and cache-lazy 130 passed; scene graph and planner subset 292 passed, 3 skipped (MinIO). NOT yet run: the Docker e2e in lazy mode
-   and the pydantic 1.x unit suite. Production stays `full_load`. Review and merge: LACI.
+   and the pydantic 1.x unit suite. Production has been lazy since 2026-10-13 19:00 UTC (445 route pairs identical on 8 real maps); `full_load` removed. Review and merge: LACI.
 2. **Width gate.** Off. Not validated against the live controller (the 30 degree turn rule is an assumption; see `runbook.md`
    section 1, "Width gate"). Needs a real factsheet for the two robots without one, and a live comparison before it is switched on.
 3. **Planner flag on production** runs the scene-graph route with the legacy planner as fallback; coverage of the fallbacks has to

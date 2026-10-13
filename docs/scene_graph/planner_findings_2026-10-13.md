@@ -8,9 +8,9 @@ The current record of the planner-upgrade work: status, what was measured or rev
 
 | What | Where | State |
 |---|---|---|
-| Lazy planner (Phase 0 + hardening) | `lazy_plan.py`, `scene_route.py`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load` at the time; now `lazy` with `full_load` as rollback, see section 10) | merged into v2 as `09a4e99`; v2 pushed by CIMBI as `origin/feat/scene-graph-v2` @485f39d (includes the merge) |
+| Lazy planner (Phase 0 + hardening) | `lazy_plan.py`, `scene_route.py`, first behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load` at the time; `full_load` existed until its removal on 2026-10-13, lazy is now the only mode, see section 10) | merged into v2 as `09a4e99`; v2 pushed by CIMBI as `origin/feat/scene-graph-v2` @485f39d (includes the merge) |
 | Store read-path hardening (page cache, cached lut, single-flight tiles, byte-budget cache, leases) | `packages/scene_graph/store.py` | taken by CIMBI as `16aee6a` (cherry-pick of `61e7ca3`, authorship kept) |
-| e2e `GraphCache(lazy=...)` from `SCENE_GRAPH_PLANNER_MODE` | `tests/integration/scene_graph/test_scene_graph_e2e.py` | committed `88a360d`; e2e 32 passed in `full_load` and `lazy` (before the v2 merge); CIMBI re-ran e2e on `16aee6a`: 32 passed |
+| e2e `GraphCache(lazy=...)` from `SCENE_GRAPH_PLANNER_MODE` (the switch is removed) | `tests/integration/scene_graph/test_scene_graph_e2e.py` | committed `88a360d`; e2e 32 passed in `full_load` and `lazy` (before the v2 merge); CIMBI re-ran e2e on `16aee6a`: 32 passed |
 | Tests after the v2 merge | targeted (lazy planner, scene_graph, planner route, reads) | 339 passed, 3 skipped (MinIO-only), on the v2 merge of 2026-10-13; not re-run since |
 
 Planner flag stays OFF; no database generation was started.

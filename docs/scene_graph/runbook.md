@@ -35,9 +35,9 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_CACHE_VERSIONS` | 4 | planner | loaded graphs kept per process in total (LRU over maps) |
 | `SCENE_GRAPH_CACHE_VERSIONS_PER_MAP` | 2 | planner | of one map: the one served and the one being refreshed |
 | `SCENE_GRAPH_CACHE_MAX_BYTES` | 0 (off) | planner | byte budget of the cache over the graphs' reported `nbytes`; the newest graph is always kept. Size it from the container memory limit and the `cache.bytes` the planner reports (section 7); there is no per-cell figure measured on the current engine, see section 8 |
-| `SCENE_GRAPH_PLANNER_MODE` | `lazy` | planner | `lazy` (default): open the manifest only and read the owner tiles of each request's corridor (see "Planner modes" below). `full_load`: restore the whole stored version per (map, version); the rollback, this setting alone. Any other value logs a warning and falls back to `lazy`. Set it explicitly in the production `.env` |
-| `SCENE_GRAPH_LAZY_MAX_TILES` | 400 | planner | lazy mode: most owner tiles one request may read; more falls back `corridor_too_large` |
-| `SCENE_GRAPH_LAZY_TILE_CACHE` | 512 | planner | lazy mode: owner tiles kept per loaded graph (about 35 KB each by the config comment; not measured here) |
+| `SCENE_GRAPH_PLANNER_MODE` | (removed) | planner | no longer a switch: the planner always uses the lazy tile planner (manifest only, owner tiles of each request's corridor; see "Planner modes" below). `full_load` existed until its removal on 2026-10-13. If set to anything but `lazy` the planner only logs a warning; remove it from the `.env` |
+| `SCENE_GRAPH_LAZY_MAX_TILES` | 400 | planner | most owner tiles one request may read; more falls back `corridor_too_large` |
+| `SCENE_GRAPH_LAZY_TILE_CACHE` | 512 | planner | owner tiles kept per loaded graph (about 35 KB each by the config comment; not measured here) |
 | `SCENE_GRAPH_META_TTL_S` | 0.75 | planner | a `store.meta` answer is reused this long per map and shared by concurrent requests (one query in flight) |
 | `SCENE_GRAPH_MAX_VERSION_LAG_S` | 120.0 | planner | graph older than the ingest by more than this -> `stale_graph`; also how long a newer version may have been known (in the store's meta) while an older cached one is served; 0 disables both |
 | `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.05 | planner | added to the robot's needed passage width (the lattice error of `Route.min_width`, lattice / 2). Only used when the check is enabled |
@@ -45,10 +45,10 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S` / `_DEADLINE_S` | 30.0 / 3600.0 | **API** | delete saga: poll the worker's lock this long per attempt; a busy lock (a fold is running) does not consume `MAP_DELETE_MAX_ATTEMPTS` until it has been busy for the deadline in total |
 | `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag); empty = every map the graph database lists with a stored graph, limited to `CACHE_VERSIONS` maps (the rest are named in a warning); maps with `status.scene_graph_enabled` = false are skipped (a failed registry query loads every map) |
 
-**Planner modes.** `lazy` is the default (same routes as `full_load`, canonical tie rule); `full_load` is the rollback via
-`SCENE_GRAPH_PLANNER_MODE=full_load` (config change and planner restart, touches no data). Set the mode explicitly in
-the production `.env`. Definition, fallbacks (`corridor_too_large`, `tile_unavailable`, lazy mode only) and wiring:
-`integration.md`, "Planner modes". Lazy mode has not run on a production stack (`planner_upgrade.md`, Phase 0).
+**Planner modes.** There is one mode: the lazy tile planner (`full_load` existed until its removal on 2026-10-13; production has run lazy
+since 2026-10-13 19:00 UTC). Rollback for a planner problem: `SCENE_GRAPH_PLANNER_ENABLED=false` (legacy planner) or deploy the previous
+image (`scripts/deploy.sh rollback mission-planner-service`, see "Deploying" in section 2). Definition, fallbacks (`corridor_too_large`,
+`tile_unavailable`) and wiring: `integration.md`, "Planner modes".
 
 Worker robustness settings (graph-builder, read by `scene_host`; forwarded by compose):
 
@@ -95,7 +95,7 @@ healthy (its entrypoint migrates before it serves). graph-builder also gets
 `POSTGRES_DATABASE_{PORT,NAME,USERNAME,PASSWORD}` (`POSTGRES_DATABASE_HOST` falls back to `POSTGRES_HOST`).
 `mission-planner-service` needs the ARANGO_* and MINIO_* secrets (already present). Planner-only additions:
 `SCENE_GRAPH_WIDTH_CHECK_ENABLED` (default false), `SCENE_GRAPH_PREWARM_MAPS` (comma list; default: every listed map
-with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2), `SCENE_GRAPH_PLANNER_MODE` (`lazy`),
+with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2),
 `SCENE_GRAPH_LAZY_MAX_TILES` (400), `SCENE_GRAPH_LAZY_TILE_CACHE` (512).
 
 **Postgres connections.** Each owned map holds one dedicated connection (its advisory lock). On top of that a step
@@ -172,7 +172,7 @@ Each step gates the next. Flags stay false until the step that names them.
    switched on deliberately, after step 6 on the maps that matter and with their lag under
    `SCENE_GRAPH_MAX_VERSION_LAG_S`:
    1. Optional: list the maps in `SCENE_GRAPH_PREWARM_MAPS` so the first request after the restart does not meet a
-      cold load (a cold full load can exceed `LOAD_TIMEOUT_S` on a large map: 12.6 s at 150 x 150 m on the synthetic Morse bench, `planner_upgrade.md` section 0; measure yours with the check tool; `lazy` mode avoids the cold load).
+      cold load (a cold full load can exceed `LOAD_TIMEOUT_S` on a large map: 12.6 s at 150 x 150 m on the synthetic Morse bench, `planner_upgrade.md` section 0; measure yours with the check tool; the lazy planner avoids the cold load).
    2. Leave `SCENE_GRAPH_WIDTH_CHECK_ENABLED=false` (section 1, "Width gate").
    3. Set `SCENE_GRAPH_PLANNER_ENABLED=true` on mission-planner-service and recreate it (all settings are read at
       start).
@@ -180,6 +180,20 @@ Each step gates the next. Flags stay false until the step that names them.
       `Chart planner not used (<reason>)` and `get_stats()["scene_graph"]` (section 7): `outcomes` should be
       dominated by `served`; anything else is a fallback to the legacy planner and costs coverage only.
    5. Rollback is section 4, first row (flag false, restart): immediate.
+
+### Deploying
+
+`scripts/deploy.sh` (lives on branch `feat/deploy-script` until merged):
+
+```
+scripts/deploy.sh [--ref REF] [--no-pull] [--no-verify] [--dry-run] SERVICE...
+scripts/deploy.sh rollback SERVICE [TAG]
+```
+
+For each service it tags the running image `pre-<time>-<sha>`, builds, recreates, waits until healthy and rolls back
+automatically on failure. After a deploy it runs the checker for `graph-builder-service` and shows `/stats` for
+`mission-planner-service` (skip with `--no-verify`). `rollback` restores the named tag (default: the latest `pre-*` tag).
+Log: `~/.cache/satina-deploy.log`. It does not edit `.env`.
 
 ## 3. Per-map switch and rebuild trigger
 
@@ -336,8 +350,8 @@ dispatcher's 5 s replan timeout; the rest is the legacy planner's. A stage that 
 | `blocked_by_overlay` | route exists without the active blocked-node rows, not with them | an active block (expiry pending) stands in the way; legacy then reports `blocked_nodes` |
 | `unreachable` | no route in the chart graph | real disconnection, or map not yet fully ingested |
 | `missing_tiles` | the corridor needs tiles not loaded | snapshot incomplete/inconsistent; investigate the version |
-| `corridor_too_large` | lazy mode (`SCENE_GRAPH_PLANNER_MODE=lazy`): the request's corridor needs more than `LAZY_MAX_TILES` owner tiles | very long route on a big map; never emitted in `full_load`. The default `SCENE_GRAPH_LAZY_MAX_TILES` is 400 owner tiles; a tile is 64 lattice cells = 6.4 m a side, so this caps the tiles read per request, not a distance. Raise it if memory allows, or accept the legacy planner |
-| `tile_unavailable` | lazy mode: a stored tile of the cached version could not be read (a garbage-collected version, MinIO error). The graph is dropped from the cache; the next request re-opens the current version | a one-off after a gc is normal; persistent = MinIO problem or `keep_last` too small for the served stale version (`keep_last` is fixed at 5 in code, not env-configurable: a planner that serves a stale version across more than 5 publishes will see this reason; never emitted in `full_load`) |
+| `corridor_too_large` | the request's corridor needs more than `LAZY_MAX_TILES` owner tiles | very long route on a big map. The default `SCENE_GRAPH_LAZY_MAX_TILES` is 400 owner tiles; a tile is 64 lattice cells = 6.4 m a side, so this caps the tiles read per request, not a distance. Raise it if memory allows, or accept the legacy planner |
+| `tile_unavailable` | a stored tile of the cached version could not be read (a garbage-collected version, MinIO error). The graph is dropped from the cache; the next request re-opens the current version | a one-off after a gc is normal; persistent = MinIO problem or `keep_last` too small for the served stale version (`keep_last` is fixed at 5 in code, not env-configurable: a planner that serves a stale version across more than 5 publishes will see this reason) |
 | `too_narrow` | `min_width` < what the robot needs (width + margin straight, `hypot(length, width)` + margin where it turns); **inactive unless `SCENE_GRAPH_WIDTH_CHECK_ENABLED`** (see "Width gate") | route has a passage this robot cannot take |
 | `leaf_lookup_error` | the nearest-leaf query (one kNN per waypoint) raised | Arango problem; see planner log (`scene graph leaf lookup failed`) |
 | `waypoints_without_distinct_leaf_ids` | after dropping interior waypoints where line of sight allows, a waypoint still has no leaf within `LEAF_SNAP_M` (1.0 m). Waypoints that share a leaf no longer cause it: consecutive repeats are merged where line of sight allows, a route on one leaf becomes `[start, goal]`, an unmergeable repeat is served as is (the name is historic) | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
@@ -382,10 +396,8 @@ differ by up to about 1 m (the legacy planner returns a node and its own positio
   on Morse has not been measured. Rebuild cost is the same full refold; there is no per-extent re-solve.
 * **Planner.** The whole chart-route attempt must fit 3.5 s (5 s dispatcher timeout); the plan itself 3 s of that.
   A cold load is waited for at most 2 s; a new version loads in the background while the older cached one is served
-  (2 versions per map, 4 per process, optional byte cap). In `full_load` the cold load is `store.load` of the whole
-  version: 1.9 s at 60 x 60 m and 12.6 s at 150 x 150 m on the synthetic Morse rooms bench (`planner_upgrade.md`
-  section 0; real maps not measured); pre-warm and the stale-version serving cover it. In `lazy` mode opening is the
-  manifest only (10 ms at 60 m, 69 ms at 150 m on the same bench) and the cost scales with the corridor. Read API: result cache 96 MiB / 64 results, 2 loaded graphs, 8 tile views.
+  (2 versions per map, 4 per process, optional byte cap). The planner is lazy: opening is the
+  manifest only (10 ms at 60 m, 69 ms at 150 m on the same bench; the former `full_load` cold load, `store.load` of the whole version, took 1.9 s and 12.6 s there, `planner_upgrade.md` section 0) and the cost scales with the corridor. Read API: result cache 96 MiB / 64 results, 2 loaded graphs, 8 tile views.
 * **Restart replay.** The cursor is the lower of the in-memory copy and the store's; replay margin
   `SCENE_GRAPH_REPLAY_MARGIN_S` (60 s); a replay that folds nothing new publishes no version (same
   content hash); a rebuild restarts from zero unless it can be resumed (section 11).
@@ -413,8 +425,8 @@ Open defects are kept in `integration.md`, "Open defects"; the operational ones:
 * **Not run on production.** Worker, store, guard, saga and planner pass the e2e harness against real ArangoDB / MinIO /
   Postgres (throw-away containers, synthetic worlds). The first run on the production stack is still the verification
   of timing, volumes and the fold cost above.
-* **Cold graph load is the planner's weak point in `full_load` mode** (section 8). A tile-lazy planner (Phase 0)
-  is the default (`SCENE_GRAPH_PLANNER_MODE=lazy`; `full_load` is the rollback); phases 1-3 are plan only (`planner_upgrade.md`).
+* **Cold graph load was the planner's weak point in the removed `full_load` mode** (section 8). The tile-lazy planner (Phase 0)
+  is now the only mode; phases 1-3 are plan only (`planner_upgrade.md`).
 * **Bucket-slug collisions.** MinIO buckets are `lower(name)` with `_` -> `-`. Two registered maps that map to one
   bucket (`a_b` / `a-b`, `My_Map` / `my-map`) cannot be told apart: the worker skips both and logs `candidate ...
   matches several registered maps`. Rename one. No event is emitted for this.
@@ -461,7 +473,7 @@ Open defects are kept in `integration.md`, "Open defects"; the operational ones:
 | Blocked rows missing pose (disc rule only) | columns NULL: rows written before the migration or without localization | none; expire naturally |
 | Map delete stuck at `scene_graph` | `scene_graph: lock ...` in the map's `delete_error`, `delete_attempts` not rising; the worker holds the lock during a long fold | retried with backoff without consuming attempts until `SCENE_GRAPH_DELETE_LOCK_DEADLINE_S`; if persistent, disable the map and wait for release (~2 min) |
 | `slow fold` warnings | fold times in the log, store latency | find the slow dependency (MinIO/Arango) or the data; as a last resort disable the map |
-| Planner `corridor_too_large` often | `outcomes`, `SCENE_GRAPH_PLANNER_MODE` | raise `SCENE_GRAPH_LAZY_MAX_TILES` if memory allows, or `full_load` |
+| Planner `corridor_too_large` often | `outcomes` | raise `SCENE_GRAPH_LAZY_MAX_TILES` if memory allows, or accept the legacy planner |
 | Planner `tile_unavailable` | MinIO health, version gc (`keep_last` 5) | one-off after a gc is normal |
 | graph-builder OOM-killed / restarts under many maps | `/health` `resident.bytes` vs `max_bytes`, container memory limit | set `SCENE_GRAPH_MAX_RESIDENT_BYTES` below the limit (section 8), lower `WORKER_THREADS` |
 | `/health` `resident.over_budget: true` | every resident engine is active; nothing is evicted | expected under sustained load of many maps; raise the cap/limit or reduce `WORKER_THREADS` |
