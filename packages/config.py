@@ -587,6 +587,17 @@ SCENE_GRAPH_MAX_VERSION_LAG_S = float(os.getenv("SCENE_GRAPH_MAX_VERSION_LAG_S",
 SCENE_GRAPH_WIDTH_MARGIN_M = float(os.getenv("SCENE_GRAPH_WIDTH_MARGIN_M", "0.05"))
 # Gate of the `too_narrow` comparison above. OFF by default until it is validated on real maps.
 SCENE_GRAPH_WIDTH_CHECK_ENABLED = _env_bool("SCENE_GRAPH_WIDTH_CHECK_ENABLED", "false")
+# nodePolicy skip data (docs/node_policies_2026-10-13.md). SKIP_ENABLED: the planner marks go-here
+# waypoints skippable (with a corridor width from the graph) and mission-dispatch sends skippable
+# (it reads the same env name in order_policy.py). GAP_FILL_ENABLED: the planner inserts planned
+# waypoints between an operator's waypoints that are not in the same or a neighbouring chart.
+# WIDTH_BUDGET_S: time the width queries of one request may take (a leg left over is not skippable);
+# ENRICH_TIMEOUT_S: how long mission-dispatch waits for the route-enrich call before starting
+# the mission with the route as it is.
+NODE_POLICY_SKIP_ENABLED = _env_bool("NODE_POLICY_SKIP_ENABLED", "true")
+NODE_POLICY_GAP_FILL_ENABLED = _env_bool("NODE_POLICY_GAP_FILL_ENABLED", "true")
+NODE_POLICY_WIDTH_BUDGET_S = float(os.getenv("NODE_POLICY_WIDTH_BUDGET_S", "1.0"))
+NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "5.0"))
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
 # that has a stored scene graph. CONCURRENCY loads at a time.

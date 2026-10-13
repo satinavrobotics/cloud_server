@@ -19,7 +19,7 @@ from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import blocked_geometry, blocked_nodes
 from packages import config
-from packages.services.mission_planner import scene_route
+from packages.services.mission_planner import node_policy_plan, scene_route
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -290,7 +290,8 @@ class MissionPlannerService:
                 config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
                 self._robot_width(robot) if check_width else None,
                 config.SCENE_GRAPH_WIDTH_MARGIN_M,
-                self._robot_length(robot) if check_width else None))
+                self._robot_length(robot) if check_width else None,
+                self._node_policy_cfg(robot)))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -317,7 +318,18 @@ class MissionPlannerService:
             "planner": scene_route.PLANNER_SCENE_GRAPH,
             "min_width": plan.min_width, "chart_keys": plan.charts,
             "graph_version": version,
+            **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
         }, None
+
+    def _node_policy_cfg(self, robot: Optional[robot_object.RobotObjectV1]
+                         ) -> Optional[Dict[str, Any]]:
+        """Settings of the skip-data pass (scene_route.plan_on_graph), None when switched off."""
+        if not config.NODE_POLICY_SKIP_ENABLED:
+            return None
+        return {"robot_width": self._robot_width(robot),
+                "margin": config.SCENE_GRAPH_WIDTH_MARGIN_M,
+                "snap_m": config.SCENE_GRAPH_START_SNAP_M,
+                "budget_s": config.NODE_POLICY_WIDTH_BUDGET_S}
 
     @staticmethod
     def _robot_width(robot: Optional[robot_object.RobotObjectV1]) -> Optional[float]:
@@ -1074,6 +1086,8 @@ class MissionPlannerService:
             self.logger.info(f"Chart planner not used ({reason}); legacy planner")
             result["planner"] = scene_route.PLANNER_LEGACY
             result["planner_fallback"] = reason
+            result["node_policy"] = {"total": 0, "skippable": 0,
+                                     "unavailable": node_policy_plan.UNAVAILABLE_LEGACY}
 
         # Step 1: Find closest node to robot
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")

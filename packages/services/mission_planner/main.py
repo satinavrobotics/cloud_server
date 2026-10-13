@@ -80,6 +80,7 @@ class PlanResponse(BaseModel):
     chart_keys: Optional[list] = Field(None, description="Scene-graph chart keys the route crosses, in order; null for legacy routes")
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
+    node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total: waypoints that should be skippable, skippable: how many got a corridor width, unavailable: why the others did not (e.g. 'width_unknown', 'legacy_planner'), else null}")
 
 
 class NavigationResponse(BaseModel):
@@ -103,6 +104,7 @@ class NavigationResponse(BaseModel):
     chart_keys: Optional[list] = Field(None, description="Scene-graph chart keys the route crosses, in order; null for legacy routes")
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
+    node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total, skippable, unavailable}; see POST /api/v1/plan")
 
 
 # HealthResponse is now imported from packages.utils.service_utils
@@ -314,6 +316,7 @@ async def plan_only(request: PlanRequest):
             chart_keys=result.get("chart_keys"),
             graph_version=result.get("graph_version"),
             planner_fallback=result.get("planner_fallback"),
+            node_policy=result.get("node_policy"),
         )
     except HTTPException:
         raise

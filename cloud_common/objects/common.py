@@ -118,6 +118,12 @@ class TaskType(enum.Enum):
     MISSION = "MISSION"
     MAP_UPDATE = "MAP_UPDATE"
 
+def _finite_non_negative(name, value):
+    if value is not None and (not math.isfinite(value) or value < 0):
+        raise ICSUsageError(f"{name} must be a finite number >= 0, got {value}")
+    return value
+
+
 class Pose2D(pydantic.BaseModel):
     """Specifies a pose to be traveled to by the robot"""
     x: float = pydantic.Field(
@@ -166,13 +172,13 @@ class Pose2D(pydantic.BaseModel):
                     "waypoints). A client may draw planned waypoints differently.",
         default=None)
 
-    @pydantic.validator("max_wait_s", "corridor_width_m")
-    def _finite_non_negative(cls, value, field):
-        if value is None:
-            return value
-        if not math.isfinite(value) or value < 0:
-            raise ICSUsageError(f"{field.name} must be a finite number >= 0, got {value}")
-        return value
+    @pydantic.validator("max_wait_s")
+    def _max_wait_ok(cls, value):
+        return _finite_non_negative("max_wait_s", value)
+
+    @pydantic.validator("corridor_width_m")
+    def _corridor_ok(cls, value):
+        return _finite_non_negative("corridor_width_m", value)
 
     @pydantic.validator("origin")
     def _known_origin(cls, value):
