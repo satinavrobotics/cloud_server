@@ -296,6 +296,20 @@ unusable camera block (leaf still folded, without a view; first one logged). Gre
    `SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S` per attempt, retries while a fold holds it), drops `sg_*` and `scene_graph/`
    objects, then the rest.
 
+## 6a. Post-generation check and islands (read-only)
+
+`python -m tools.scene_graph_check_generation --all --expect tools/scene_graph_expected.json` (in the graph-builder container;
+the expectations file ships in its image). Per map it reports format, pipeline, params hash, invariants, charts, links, levels,
+link widths, and one route between the two most distant charts of the LARGEST link component.
+
+* **Islands.** Charts outside the largest link component are free cells that no route can reach: the robot body does not squeeze
+  through a corner, so routing is 4-connected while the free space may touch itself only diagonally. They are kept in the graph
+  and marked: the report's `islands` field lists `{count, cells, charts[{key, cells, anchor}]}`. `--expect` pins the count per
+  map. A change of the pinned count is a failure to investigate, not a number to update silently. Pinned values (2026-10-13):
+  office8 0, office01 3, Officemap 1, office03 1, office04 4, office5 0, office6 0, office7 0.
+* **Route check.** Runs only between reachable charts; a failure there means the largest component itself cannot route, which
+  is a defect, not an island.
+
 ## 7. Planner fallback reasons (`planner_fallback`)
 
 Present only when the planner flag is on and the legacy planner served the request. The legacy result is always
