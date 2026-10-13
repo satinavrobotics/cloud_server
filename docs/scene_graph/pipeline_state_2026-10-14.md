@@ -1,5 +1,10 @@
 # Scene graph pipeline: state of 2026-10-14 (after the clearance-pricing integration)
 
+> **Status: CIMBI semi-ready, scene graph + lattice planner.** All 9 real maps are in the graph (8 office maps and
+> Hospital), the lazy chart planner with clearance pricing is deployed and verified, and the checker passes.
+> Further live runs are expected; improvement is not ruled out, but no bottleneck is tracked at present. The open items
+> of section 6 are candidates, not blockers.
+
 Written by the lattice_cimbi session (CIMBI engine + LACI planner side), at the end of the 2026-10-13 / 14 integration.
 Every number below was read from a command or a log in that session; "not verified" says what was not.
 Definitions and derivations of the planner objective are in `route_safety.md`; the deploy rules are in `runbook.md`
@@ -11,7 +16,7 @@ Definitions and derivations of the planner objective are in `route_safety.md`; t
 |---|---|---|---|
 | mission-planner-service | `662bfe8` since 2026-10-13 23:30:44Z (`/stats` reports `build_sha`) | `scripts/deploy.sh` from `origin/main`, log `~/.cache/satina-deploy.log` | lazy planner only; clearance pricing on, `SCENE_GRAPH_SAFETY_KAPPA=1.0`; width check off |
 | api-delegation-service | `b48b7ad` since 21:13:34Z | deploy log | occupancy view read API (another session's branch) |
-| graph-builder-service, mission-dispatch | not in the deploy log (started about 3 h before this write-up) | not verified | graph checker passes (section 3) |
+| graph-builder-service, mission-dispatch | not in the deploy log (started about 3 h before this write-up) | not verified | graph checker passes on 9 of 9 maps (section 3) |
 
 `origin/main` = the planner commit above; local and remote were identical after the push of 2026-10-14 01:23 CEST
 (13 commits: route-safety v2, v3, the occupancy view, the deploy chain).
@@ -33,6 +38,14 @@ p90 1.064 / max 1.233 (vertex-sampled). The pinned full unit suite passed on the
   **8 of 8 maps passed**; FORMAT 4, generation 1 on every map.
 * Charts / links / levels, office7 (map of the 2026-10-13 run): 14 / 17 / 3, no islands; office8: 12 / 15 / 3.
   Maps with islands (1-6 isolated cells, pinned by the expected file): 4 of 8.
+* **Hospital** (an open simulation, 35 nodes with costmaps) was enabled on 2026-10-13 23:56Z by removing its
+  `status.scene_graph_enabled=false` flag (`costmap_stored_ms` was already present on all 35 nodes, so no backfill).
+  The worker folded it from scratch; the checker passes (`--map Hospital`): FORMAT 4, pipeline `morse/2`, version 1,
+  generation 1, **54 charts, 97 links, 4 levels**, no problems; driven fraction mean 0.068 (34 of 54 charts were never
+  driven, expected for a simulation walked once), 23 islands of 7261 cells (regions seen but not connected to the driven
+  component), width min / median 0.64 / 2.82 m, checker route 11 charts, 17.0 m. The worker folds its leaves with the
+  default r_d 0.25 m because the simulated robot (`masked-frigatebird`) has no factsheet row. Not yet pinned in
+  `tools/scene_graph_expected.json` (a graph-builder image change); no Hospital plan has been served yet.
 * Planner (`/stats`, at 23:30Z, build_sha 662bfe8): 8 graphs warmed, no loads in flight, no backed-off map, 0 priced plans since the restart.
 
 ## 4. The live run of 2026-10-13 (formidable-peacock, map office7, planner 6879628, kappa 1)
@@ -72,7 +85,7 @@ p90 1.064 / max 1.233 (vertex-sampled). The pinned full unit suite passed on the
    sensor definition not verified, tolerance removed from the formulation.
 6. **Deploy chain:** no functional plan smoke test; build identity only for the planner; other services' images are not
    labelled.
-7. **Housekeeping:** 9 untracked leftover directories under `.claude/worktrees` (no `.git`, about 110 MB, contents not
+7. **Housekeeping (Hospital is done, section 3):** 9 untracked leftover directories under `.claude/worktrees` (no `.git`, about 110 MB, contents not
    inspected); the 4 unmerged branches `worktree-agent-a0e1c9ae` (a dispatch logging commit), `worktree-agent-a4b44503`
    (superseded designs), `spike/splat-2026-10-13`, and three patch-equivalent branches checked out by other sessions;
    the uncommitted `docker_compose/.env` still has the stale `SCENE_GRAPH_PLANNER_MODE=lazy` lines; the office8 export
