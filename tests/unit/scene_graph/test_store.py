@@ -487,3 +487,20 @@ def test_drop_deletes_objects_first_then_the_collections_in_batches():
     mc = _DropMinio(n=3)                                       # a client with only remove_object (a fake) still works
     be, DB = _adapter(mc); be.drop("m")
     assert not mc.objs and mc.calls == 3
+
+
+def test_a_level_beyond_the_top_is_the_top_in_the_engine_and_in_the_stored_view():
+    store, _ = _store()
+    w, leaves = _world("two_rooms")
+    g, v = _grow(store, "m", leaves, 8)
+    view = store.view("m")
+    top = len(g._levels()[0]) - 1
+    assert top >= 1                                           # the world has a coarser level, else the test says nothing
+    sig = lambda q: (sorted((c.key, c.cells) for c in q.charts), sorted((l.a, l.b, round(l.length, 6)) for l in q.links))
+    for level in range(0, top + 4):
+        a, b = g.query(BIG, level, raster=False), view.query(BIG, level, raster=False)
+        assert sig(a) == sig(b)
+        if level >= top:
+            assert sig(a) == sig(g.query(BIG, top, raster=False))
+    assert sig(g.query(BIG, top + 2, raster=False)) != sig(g.query(BIG, 0, raster=False))   # not the level-0 charts
+    assert sig(g.query(BIG, -3, raster=False)) == sig(g.query(BIG, 0, raster=False))

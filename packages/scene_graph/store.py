@@ -764,8 +764,9 @@ class StoredView:
         sub, dep = (self._window(lx0, ly0, lx1, ly1) if lx1 > lx0 and ly1 > ly0 else (np.zeros((0, 0), np.int32), np.zeros((0, 0), bool)))
         present = set(np.unique(sub[sub >= 0]).tolist())
         levels = self._hier() if (parents or level > 0) else []
+        level = max(0, min(int(level), len(levels) - 1)) if levels else 0   # as the engine: a level beyond the top is the top
         group, node_ids = list(range(n)), list(range(n))
-        if 0 < level < len(levels):
+        if level > 0:
             group = [int(g) for g in levels[level]["parent"]]; node_ids = [int(x) for x in levels[level]["nodes"]]
         h2 = man["params"]["lattice"] ** 2
         charts = []

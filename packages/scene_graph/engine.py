@@ -1064,11 +1064,12 @@ class ChartGraph(SceneGraph):
         y0 = max(0, int(math.floor(bbox.y0 / RES) - self._cy0) // 2); y1 = min(H, int(math.ceil(bbox.y1 / RES) - self._cy0) // 2 + 1)
         x0 = max(0, int(math.floor(bbox.x0 / RES) - self._cx0) // 2); x1 = min(W, int(math.ceil(bbox.x1 / RES) - self._cx0) // 2 + 1)
         levels = self._levels()[0] if (parents or level > 0) else []
+        level = max(0, min(int(level), len(levels) - 1)) if levels else 0   # a level beyond the top is the top
         sub = s.plane[y0:y1, x0:x1] if y1 > y0 and x1 > x0 else np.zeros((0, 0), np.int32)
         present = set(np.unique(sub[sub >= 0]).tolist())
         group = list(range(len(s.A)))
         node_ids = list(range(len(s.A)))
-        if 0 < level < len(levels):
+        if level > 0:
             group = [int(g) for g in levels[level]["parent"]]
             node_ids = [int(n) for n in levels[level]["nodes"]]
         charts = []
