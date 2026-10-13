@@ -360,6 +360,21 @@ def test_the_plan_reports_its_pricing(graphs):
     assert lazy_plan._CLR_CAP_M == 1.0
 
 
+def _stats_response_fields():
+    """The fields `StatsResponse` (packages/services/mission_planner/main.py) declares, read from the source: importing that
+    module builds the service and parses the command line."""
+    import ast
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                        "packages", "services", "mission_planner", "main.py")
+    with open(path, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "StatsResponse":
+            return {item.target.id for item in node.body if isinstance(item, ast.AnnAssign)}
+    raise AssertionError("StatsResponse not found")
+
+
 async def test_the_service_reports_priced_plans_in_the_response_the_log_and_the_stats(monkeypatch, caplog):
     from .test_planner_chart_route import FakeGraph, FakeStore, _plan as svc_plan, _service
     from types import SimpleNamespace as NS
@@ -389,6 +404,9 @@ async def test_the_service_reports_priced_plans_in_the_response_the_log_and_the_
     for part in ("map=m", "graph_version=9", "kappa=1.0", "margin_source=map_r", "cost=12345", "exact=False", "tiles=7"):
         assert part in lines[0]
     assert svc.get_stats()["build_sha"] == config.BUILD_SHA     # the build identity deploy.sh verifies after a deploy
+    # ... and it must survive the HTTP response model: `GET /stats` returns StatsResponse(**get_stats()), which drops any
+    # key the model does not declare (the first deploy of build_sha failed its own check on exactly that)
+    assert set(svc.get_stats()) <= _stats_response_fields()
     stats = svc.get_stats()["scene_graph"]
     assert stats["priced_plans"] == 1 and stats["priced_plans_inexact"] == 1
     monkeypatch.setattr(config, "SCENE_GRAPH_SAFETY_KAPPA", 0.0)
