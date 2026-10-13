@@ -35,13 +35,13 @@ from .store_backends import ArangoMinioBackend, Blobs, Docs, MemoryBackend  # no
 from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pack_json, params_hash, unpack,
                           unpack_json)
 
-PIPELINE = "morse/1"
+PIPELINE = "morse/2"
 RES = 0.05
 TILE_F = 128                  # costmap cells per tile side (64 lattice cells)
 TILE_L = 64
 SEGMENT = 1024                # leaf records per segment
 SUPER = 8                     # tiles per super-tile side: the unit of a manifest page
-FORMAT = 3
+FORMAT = 4
 log = logging.getLogger("scene_graph.store")
 
 
@@ -269,7 +269,7 @@ class SceneGraphStore:
         charts = []
         for j, k in enumerate(keys):
             c = by_key[k]
-            charts.append({"key": k, "id": live[k], "peak": c.peak, "anchor": [c.anchor[0], c.anchor[1]], "cell": [int(math.floor(c.anchor[1] / (2 * RES))), int(math.floor(c.anchor[0] / (2 * RES)))],   # GLOBAL lattice (y, x)
+            charts.append({"key": k, "id": live[k], "peak": c.peak, "region": c.region, "anchor": [c.anchor[0], c.anchor[1]], "cell": [int(math.floor(c.anchor[1] / (2 * RES))), int(math.floor(c.anchor[0] / (2 * RES)))],   # GLOBAL lattice (y, x)
                            "cells": c.cells, "area": c.area_m2, "clearance": c.clearance, "driven": c.driven_frac,
                            "ever_blocked": c.ever_blocked_frac, "leaf": c.leaf})
         links = [{"a": l.a, "b": l.b, "length": l.length, "width": l.width, "saddle": l.saddle,
@@ -747,7 +747,8 @@ class StoredView:
             k = {c["key"]: j for j, c in enumerate(ch)}
             p = self.man["params"]
             tau = morse.tau0(p["lattice"]) * morse.BASE_TAU
-            parents = morse.levels(np.array([c["peak"] for c in ch]), np.array([c["cell"] for c in ch], np.int64).reshape(-1, 2),
+            parents = morse.cell_levels(np.array([c["peak"] for c in ch]), np.array([c["cell"] for c in ch], np.int64).reshape(-1, 2),
+                                   np.array([c["region"] for c in ch], np.int64),
                                    np.array([k[l["a"]] for l in self.man["links"]], np.int64),
                                    np.array([k[l["b"]] for l in self.man["links"]], np.int64),
                                    np.array([l["saddle"] for l in self.man["links"]]), tau)
@@ -776,12 +777,13 @@ class StoredView:
             c = charts_m[nd]
             parents = {L: charts_m[int(levels[L]["parent"][nd])]["key"] for L in range(1, len(levels))}
             if level == 0:
-                charts.append(Chart(c["key"], tuple(c["anchor"]), c["cells"], c["area"], c["clearance"], c["driven"], c["ever_blocked"], c["leaf"], parents, c["peak"]))
+                charts.append(Chart(c["key"], tuple(c["anchor"]), c["cells"], c["area"], c["clearance"], c["driven"], c["ever_blocked"], c["leaf"], parents, c["peak"], c["region"]))
             else:
                 cs = [charts_m[j] for j in members]; cells = sum(x["cells"] for x in cs)
                 charts.append(Chart(c["key"], tuple(c["anchor"]), cells, cells * h2, c["clearance"],
                                     sum(x["driven"] * x["cells"] for x in cs) / max(cells, 1),
-                                    sum(x["ever_blocked"] * x["cells"] for x in cs) / max(cells, 1), c["leaf"], parents, c["peak"]))
+                                    sum(x["ever_blocked"] * x["cells"] for x in cs) / max(cells, 1), c["leaf"], parents,
+                                    max(x["peak"] for x in cs), c["region"]))
         shown = {c.key for c in charts}
         kidx = {c["key"]: j for j, c in enumerate(charts_m)}
         links: List[Link] = []

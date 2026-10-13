@@ -1,4 +1,4 @@
-# Scene graph: handoff of the persistence (Morse) partition to LACI
+# Scene graph: handoff of the persistence regions and charts to LACI
 
 From CIMBI, 2026-10-13. Branch `feat/scene-graph-morse` (from the v2 tip 7843576). Read `formulation.md` for the definition and
 `audit_ledger.md` for every finding, derivation and verification behind it.
@@ -7,15 +7,15 @@ From CIMBI, 2026-10-13. Branch `feat/scene-graph-morse` (from the v2 tip 7843576
 
 | area | before (star charts) | now (persistence partition) |
 |---|---|---|
-| chart count | 5-19 per 70 m2 office | 1-7 (rooms, corridors); regions may have holes |
+| chart count | 5-19 per 70 m2 office | 8-16 per floor on the 7 real floors (93 in all, previous 102): charts of radius <= 2 m cut from 3-7 persistence regions |
 | partition | history dependent (batch boundaries) | pure function of F: identical for any batching/arrival order |
 | `Chart.dependent` | dependents exist | all False |
 | `Link.width` | strict widest path of clearance | twice the PHYSICAL clearance at the arc's widest crossing (same unit as `required_width`, +- 0.05 m) |
 | `Route.min_width` | narrowest crossed link | unchanged |
-| levels | net-tree on anchors | persistence levels tau0 * 2^j until one region per component; `query(level >= count)` returns the top level |
-| `SceneParams` | `sight_range`, `place_mult` read | both deprecated no-ops (kept because `params_dict` is pinned by a test); stop writing them at the next format bump |
-| store | FORMAT 2, solver state in snapshots | FORMAT 3, pipeline `morse/1`: no solver state; load = rebuild F, partition, match stored keys; old stores get a new generation |
-| cost | hall 31k cells 0.15 s per batch of 6; open fields minutes | 0.03 s; field 86k cells 0.05 s; Hospital 0.7 s |
+| levels | net-tree on anchors | level 0 charts, level 1 the persistence regions at tau0 (omitted when identical), then tau0 * 2^j until one region per component; `query(level >= ViewResult.levels)` returns the top level |
+| `SceneParams` | `sight_range`, `place_mult` read | `sight_range` sets the chart radius (0.4 x sight_range = 2.0 m) and `snap`'s bound; `place_mult` is a deprecated no-op (kept because `params_dict` is pinned by a test) |
+| store | FORMAT 2, solver state in snapshots | FORMAT 4, pipeline `morse/2`: no solver state, a chart record carries `region`; load = rebuild F, partition, match stored keys; old stores get a new generation |
+| cost | hall 31k cells 0.15 s per batch of 6; open fields minutes | 1.1-1.5 microseconds per cell per batch: hall 45k 0.07 s, field 86k 0.11 s, 244k-cell open field 0.63 s |
 
 ## What to run before merging into feat/scene-graph-v2
 
@@ -73,3 +73,16 @@ table; never enable the planner flag before the maps are generated and checked.
 * **put_index race.** Fixed: the index swap is one transaction (cd73b80); no reader sees a truncated index.
 * **Hospital.** 0.73 s per batch / 185 MB on the persistence partition; item dropped.
 * **Ledger.** `docs/scene_graph/audit_ledger.md` is the single copy.
+
+## Charts and route (added after the e2e round, 2026-10-13)
+
+* **Why.** The persistence regions alone were 2-4x coarser than the old cover: large regions (40-80 % of a floor), anchors far from
+  the way, and the planner's path (start -> anchor -> anchor -> goal) up to 4x the shortest. Each region is now cut into charts
+  of geodesic radius <= 0.4 x `sight_range` (2 m): `morse.subdivide`, `formulation.md` section 2 and statements 17-27.
+* **Planner.** Call `graph.route(a, b, blocked, start=(x, y), goal=(x, y))` with the snapped cell's x, y: the route runs cell to
+  cell, no anchor on the way. Without start/goal it is anchor to anchor, as before.
+* **API.** `Chart.region` (persistence region id), `Chart.peak` is the chart's largest B, `ViewResult.levels`.
+  Level 1 is now the persistence regions (the old level 1 = 2 tau0 is level 2).
+* **Store.** FORMAT 4 / pipeline `morse/2`: an old store has a different params hash and is rebuilt as a new generation.
+* **Checks.** Verifier (`chart_verify.py`, from definitions): 0 violations on 7 real floors at batches 6 and 48, 13 worlds, 6 random
+  fields; batching independent; unit suites 188 passed.

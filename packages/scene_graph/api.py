@@ -30,8 +30,9 @@ class SceneParams:
                                        # of the persisted params (graph-builder's `params_dict` pins that set), so it keeps
                                        # its place in the params hash; remove it with that pin.
     sight_range: float = 5.0           # m: tied to the leaf window (10 x 10 m => one leaf never observes beyond 5 m from
-                                       # its pose); caps window sizes and pose offsets and bounds `snap`. Part of the params
-                                       # hash: changing it is a new generation.
+                                       # its pose); caps window sizes and pose offsets, bounds `snap`, and sets the chart
+                                       # radius (0.4 x sight_range, morse.CHART_RADIUS). Part of the params hash: changing it
+                                       # is a new generation.
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,8 @@ class Chart:
     ever_blocked_frac: float           # share of cells reported blocked in any leaf
     leaf: Optional[str] = None         # a driven leaf of this chart nearest its anchor (thumbnails), None if never driven
     parent: Dict[int, Key] = field(default_factory=dict)   # level -> parent key (derived view)
-    peak: float = 0.0                  # B at the anchor: the persistence peak (distance to the non-navigable cells, m)
+    peak: float = 0.0                  # largest B in the chart: the persistence peak (distance to the non-navigable cells, m)
+    region: int = 0                    # persistence region (0..) this chart was cut from (charts of one region never cross a pass)
 
 
 @dataclass
@@ -180,8 +182,12 @@ class SceneGraph:
         crosses a known blocked cell. `max_dist` None = sight_range, the outer bound; `key` is None beyond it."""
         raise NotImplementedError
 
-    def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None) -> Optional[Route]:
-        """Lattice route in navigable space; None when unreachable."""
+    def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Pt] = None,
+              goal: Optional[Pt] = None) -> Optional[Route]:
+        """Lattice route in navigable space between charts a and b; None when unreachable. It runs from the anchor of a to
+        the anchor of b, unless `start` / `goal` (map-frame points, e.g. a Snap's x, y) name the cells to route between:
+        then the route is point to point and no anchor is visited. A point outside navigable space, or in a chart other than
+        a / b, falls back to the anchor of its chart. A chart is large, its anchor is not on the way."""
         raise NotImplementedError
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:

@@ -39,11 +39,17 @@ def test_a_save_that_changes_one_region_packs_and_checks_only_that_much(hall, mo
     assert v2 == v + 1
     assert calls["pack_json"] < n_pages                   # untouched pages were reused by content, not re-packed
     assert calls["exists"] <= calls["pack_json"] + 12     # and not probed: only what is new is checked
-    # exactness: the page table equals the one a from-scratch save of the same engine writes
+    # exactness: what the incremental save serves equals a from-scratch save of the same engine. Chart ids are numbered by
+    # first appearance (and listed in that order), so a history that retired a key numbers differently from scratch: compared
+    # by key, not by id
     ref_b = MemoryBackend(); ref = SceneGraphStore(ref_b, ref_b, verify_every=0)
     ref.save("m", g, d, None, {"i": 999})
-    assert st.manifest("m")["pages"] == ref.manifest("m")["pages"]
-    assert st.manifest("m")["tiles"] == ref.manifest("m")["tiles"]
+    assert set(st.manifest("m")["tiles"]) == set(ref.manifest("m")["tiles"])
+    a, b = st.view("m").query(BIG, raster=True), ref.view("m").query(BIG, raster=True)
+    assert sorted((c.key, c.cells, c.anchor, c.region) for c in a.charts) == sorted((c.key, c.cells, c.anchor, c.region) for c in b.charts)
+    assert sorted((l.a, l.b, l.length, l.width) for l in a.links) == sorted((l.a, l.b, l.length, l.width) for l in b.links)
+    assert np.array_equal(np.array([None] + list(a.raster.keys), object)[a.raster.index],
+                          np.array([None] + list(b.raster.keys), object)[b.raster.index])
 
 
 def test_leaf_order_is_incremental_and_equals_a_sort(hall):

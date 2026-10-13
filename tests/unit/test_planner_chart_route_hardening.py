@@ -54,9 +54,9 @@ async def test_plan_timeout_falls_back_and_the_hung_plan_keeps_its_slot(on, monk
     graph = FakeGraph()
     orig = graph.route
 
-    def slow_route(a, b, blocked=None):
+    def slow_route(a, b, blocked=None, start=None, goal=None):
         gate.wait(5)
-        return orig(a, b, blocked)
+        return orig(a, b, blocked, start=start, goal=goal)
     graph.route = slow_route
     svc = _service(FakeStore(graph))
     svc._plan_pool = sr.BoundedPool("sg-plan", 1, 1, busy_reason="planner_busy")
@@ -377,7 +377,7 @@ class LGraph(GridGraph):
         self.min_width = min_width
         self.nodes = nodes if nodes is not None else _l_route()
 
-    def route(self, a, b, blocked=None):
+    def route(self, a, b, blocked=None, start=None, goal=None):
         return Route(charts=["c"], length=18.0, min_width=self.min_width, nodes=self.nodes)
 
 

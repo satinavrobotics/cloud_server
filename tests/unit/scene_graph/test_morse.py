@@ -204,3 +204,53 @@ def test_a_translated_world_has_the_translated_partition():
     sx, sy = int(round(dx / 0.1)), int(round(dy / 0.1))
     shifted = sorted((frozenset((y + sy, x + sx) for y, x in c) for c in _cells(ref)), key=min)
     assert shifted == _cells(g)
+
+
+# ------------------------------------------------------------------------------------------------------- radius-bounded charts
+RADIUS = 1.2
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_charts_cover_pack_and_stay_inside_their_region(seed):
+    from .chart_verify import geodesic
+    F = _random_F(seed, (64, 90))
+    if not F.any():
+        pytest.skip("empty field")
+    p = morse.partition(F, H, morse.tau0(H), radius=RADIUS)
+    sp = p.sp
+    lab = -np.ones(F.shape, int); lab[sp.ys, sp.xs] = p.full
+    reg = -np.ones(F.shape, int); reg[sp.ys, sp.xs] = p.region[p.full]
+    base = morse.partition(F, H, morse.tau0(H))
+    rl = -np.ones(F.shape, int); rl[base.sp.ys, base.sp.xs] = base.full
+    assert p.regions == base.K and np.array_equal(reg, rl)              # the charts refine the persistence regions exactly
+    for j in range(p.K):
+        m = lab == j
+        assert ndimage.label(m)[1] == 1 or ndimage.label(m, structure=np.ones((3, 3)))[1] == 1     # connected (8-neighbour lattice)
+        ay, ax = int(sp.ys[p.anchor[j]]), int(sp.xs[p.anchor[j]])
+        assert lab[ay, ax] == j
+        assert geodesic(m, [(ay, ax)], H)[m].max() <= RADIUS + 1e-9      # covering, inside the chart
+    for k in range(p.regions):
+        anchors = [(int(sp.ys[p.anchor[j]]), int(sp.xs[p.anchor[j]])) for j in np.nonzero(p.region == k)[0]]
+        d = [geodesic(reg == k, [a], H) for a in anchors]
+        for i in range(len(anchors)):
+            for j in range(i):
+                assert d[i][anchors[j]] > RADIUS + 1e-9                  # packing
+        if len(anchors) > 1:                                             # Voronoi: nearest anchor (ties: earlier) owns the cell
+            D = np.stack(d)
+            own = np.argmax(D <= D.min(axis=0) + 1e-9, axis=0)            # nearest within float noise, the earlier one on a tie
+            m = reg == k
+            ids = [j for j in np.nonzero(p.region == k)[0]]
+            assert all(lab[y, x] == ids[own[y, x]] for y, x in zip(*np.nonzero(m)))
+
+
+def test_a_region_smaller_than_the_radius_is_one_chart_and_translation_moves_the_charts_with_the_world():
+    F = _random_F(2, (60, 80))
+    p = morse.partition(F, H, morse.tau0(H), radius=RADIUS)
+    G = np.zeros((F.shape[0] + 9, F.shape[1] + 13), bool)
+    G[4:4 + F.shape[0], 8:8 + F.shape[1]] = F
+    q = morse.partition(G, H, morse.tau0(H), radius=RADIUS)
+    a = {(int(y), int(x)): int(l) for y, x, l in zip(p.sp.ys, p.sp.xs, p.full)}
+    b = {(int(y) - 4, int(x) - 8): int(l) for y, x, l in zip(q.sp.ys, q.sp.xs, q.full)}
+    assert a == b
+    big = morse.partition(F, H, morse.tau0(H), radius=1e3)
+    assert big.K == big.regions                                          # nothing to cut

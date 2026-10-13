@@ -295,3 +295,56 @@ def test_route_width_reads_the_passage_not_a_witness_sliver_beside_it():
         a, b = g.snap(1.0, 1.0, 0.5), g.snap(5.0, 5.0, 1.5)
         r = g.route(a.key, b.key)
         assert r is not None and r.min_width >= 1.2 - 0.1, f"trial {trial}: {r.min_width if r else None}"
+
+
+def test_point_to_point_route_runs_between_the_given_cells_and_visits_no_anchor():
+    g, w, _ = built("ring")
+    v = g.query(ALL, raster=False)
+    keys = [c.key for c in v.charts]
+    rng = random.Random(3)
+    ys, xs = np.nonzero(g._solved.plane >= 0)
+    for _ in range(12):
+        i, j = rng.randrange(len(ys)), rng.randrange(len(ys))
+        p, q = g._cell_xy(int(ys[i]), int(xs[i])), g._cell_xy(int(ys[j]), int(xs[j]))
+        sa, sb = g.snap(*p), g.snap(*q)
+        if sa.key is None or sb.key is None: continue
+        r = g.route(sa.key, sb.key, start=p, goal=q)
+        assert r is not None and r.nodes[0] == pytest.approx(p) and r.nodes[-1] == pytest.approx(q)
+        assert r.length >= np.hypot(p[0] - q[0], p[1] - q[1]) - 1e-6
+    # a start outside navigable space falls back to the anchor
+    r = g.route(keys[0], keys[-1], start=(-100.0, -100.0), goal=(-100.0, -100.0))
+    assert r is not None and r.nodes == g.route(keys[0], keys[-1]).nodes
+
+
+def test_point_to_point_route_width_blocked_ends_and_chart_mismatch():
+    g, w, _ = built("ring")
+    s = g._solved
+    ys, xs = np.nonzero(s.plane >= 0)
+    A = [g._cell_xy(int(s.sp.ys[a]), int(s.sp.xs[a])) for a in s.A]
+    keys = s.keys
+    # a route inside one chart: its width is the clearance at the chart's anchor, wherever it starts
+    j = 0
+    cells = np.nonzero(s.full == j)[0]
+    p = g._cell_xy(int(s.sp.ys[cells[0]]), int(s.sp.xs[cells[0]])); q = g._cell_xy(int(s.sp.ys[cells[-1]]), int(s.sp.xs[cells[-1]]))
+    r = g.route(keys[j], keys[j], start=p, goal=q)
+    assert r is not None and r.min_width == pytest.approx(2.0 * float(s.sp.clr[s.A[j]]))
+    assert r.min_width == pytest.approx(g.route(keys[j], keys[j]).min_width)
+    # a blocked start or goal: no route
+    assert g.route(keys[j], keys[j], Blocked(discs=[(p[0], p[1], 0.3)], segments=[]), start=p, goal=q) is None
+    # a start cell owned by another chart than a: the anchor of a is used
+    if len(keys) > 1:
+        k = next(i for i in range(len(keys)) if i != j)
+        other = np.nonzero(s.full == k)[0][0]
+        po = g._cell_xy(int(s.sp.ys[other]), int(s.sp.xs[other]))
+        r2 = g.route(keys[j], keys[j], start=po, goal=A[j])
+        assert r2 is not None and r2.nodes == g.route(keys[j], keys[j]).nodes
+    # point to point is never longer than start -> anchor -> anchor -> goal along the same cells
+    for i in (0, len(keys) - 1):
+        for t in (1, len(keys) - 2 if len(keys) > 2 else 0):
+            if i == t: continue
+            a_, b_ = keys[i], keys[t]
+            ci = np.nonzero(s.full == i)[0][-1]; ct = np.nonzero(s.full == t)[0][0]
+            ps, pg = g._cell_xy(int(s.sp.ys[ci]), int(s.sp.xs[ci])), g._cell_xy(int(s.sp.ys[ct]), int(s.sp.xs[ct]))
+            direct = g.route(a_, b_, start=ps, goal=pg)
+            via = (g.route(a_, a_, start=ps, goal=A[i]).length + g.route(a_, b_).length + g.route(b_, b_, start=A[t], goal=pg).length)
+            assert direct is not None and direct.length <= via + 1e-6
