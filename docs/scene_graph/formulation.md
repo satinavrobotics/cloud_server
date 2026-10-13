@@ -61,6 +61,14 @@ the graph serves display, goal selection, corridor selection, passage widths and
   grep: route runs on the lattice; cover, snap, raster, widths and ids use cells, anchors and links).
 * Not minimal and not a cover by convex or visibility-closed pieces; regions may have holes (a pillar in a room is one region).
 * Not canonical in the persistence sense below tau0: levels finer than tau0 are not exposed.
+* Not a loop detector. A corridor loop of constant width is a single ridge of B with no peak per corner, every raw basin differs
+  by less than tau0 and the loop is merged whole: ONE region (a region may have holes). Long corridors are likewise one region.
+  A room is its own region only when its peak B exceeds the saddle of the corridor leaving it by more than tau0 (about a 1.8 m
+  room for a 1.2 m corridor). Cycles of rooms joined by corridors are cycles of the link graph and are represented there.
+* A route's `min_width` is a property of its chart sequence: per crossed chart pair the WIDEST arc (Link.width), minimum over
+  the pairs. A pair can have several arcs (the passage and witness slivers along a wall, 0.1 - 0.3 m), a lattice path that hugs
+  a sliver is geometry, not a narrower door. Consequence: a genuinely narrower second door between the same two regions is
+  not reported when a wider one exists. EXACT as a definition, TESTED on the room loop under shuffled stamps.
 
 ## 5. Generality (indoors and outdoors)
 

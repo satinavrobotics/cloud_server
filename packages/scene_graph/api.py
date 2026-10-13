@@ -105,6 +105,8 @@ class ViewResult:
     charts: List[Chart]
     links: List[Link]
     raster: Optional[OwnerRaster] = None
+    levels: int = 0                # number of levels, 0 .. levels-1 valid (a level beyond the top is answered with the top);
+                                   # 0 = not computed: a query with parents=False and level=0 never builds the hierarchy
 
 
 @dataclass
@@ -123,7 +125,7 @@ class Snap:
 class Route:
     charts: List[Key]                  # region sequence
     length: float
-    min_width: float                   # narrowest passage along the route
+    min_width: float                   # narrowest passage along the route: per crossed chart pair its widest arc (slivers beside a passage do not count)
     nodes: List[Pt]                    # lattice path (map-frame centres)
 
 

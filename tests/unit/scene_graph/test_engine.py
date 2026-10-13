@@ -5,7 +5,7 @@ from functools import lru_cache
 import numpy as np
 import pytest
 
-from packages.scene_graph.api import BBox, Blocked, SceneParams, View
+from packages.scene_graph.api import BBox, Blocked, Leaf, SceneParams, View
 from packages.scene_graph.engine import ChartGraph
 from packages.scene_graph.leafcover import coverage
 
@@ -281,3 +281,17 @@ def test_route_min_width_is_the_passage_not_a_cell_on_a_hugged_corner():
     crossed = [link_w[frozenset(p)] for p in zip(best.charts[:-1], best.charts[1:]) if frozenset(p) in link_w]
     assert crossed and best.min_width == pytest.approx(min(crossed))
     assert 0.8 <= best.min_width <= 1.0 + 1e-9 or best.min_width > 1.0          # the 0.9 m door is not reported as 0.1-0.4
+
+
+def test_route_width_reads_the_passage_not_a_witness_sliver_beside_it():
+    """Shuffled capture stamps draw chords through the room loop, whose witness cells leave 0.1 - 0.3 m arcs beside the 1.2 m
+    corridors; a route's min_width is the widest arc of each crossed chart pair, so it reads the corridor."""
+    w, way = cw.room_loop()
+    base = cw.drive(w, way)
+    for trial in (0, 2, 4, 7):
+        order = list(range(len(base))); random.Random(trial).shuffle(order)
+        g = ChartGraph(SceneParams())
+        g.fold_many([Leaf(**{**l.__dict__, "stamp_ms": 1_000 * p}) for l, p in zip(base, order)])
+        a, b = g.snap(1.0, 1.0, 0.5), g.snap(5.0, 5.0, 1.5)
+        r = g.route(a.key, b.key)
+        assert r is not None and r.min_width >= 1.2 - 0.1, f"trial {trial}: {r.min_width if r else None}"

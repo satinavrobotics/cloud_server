@@ -903,23 +903,23 @@ class ChartGraph(SceneGraph):
                      nodes=[self._cell_xy(int(sp.ys[c]), int(sp.xs[c])) for c in path])
 
     def _route_width(self, path: List[int], src: int) -> float:
-        """Passage width of a route: the narrowest strict widest-path width (Link.width) of the links it crosses, each
-        taken at the contact nearest the crossing. A lattice path hugs corners, so its own clearance is not a width.
-        A route inside one chart has no passage: the clearance at its anchor."""
+        """Passage width of a route: the narrowest crossing of the chart sequence, each pair of consecutive charts taken at its
+        WIDEST arc (Link.width, the strict widest-path width). A pair can have several arcs: the passage and slivers of
+        witness cells along a wall; the passage is what the sequence offers, a hugging lattice path through a sliver is
+        geometry, not a narrower door. A lattice path hugs corners, so its own clearance is not a width. A route inside one
+        chart has no passage: the clearance at its anchor."""
         s = self._solved; sp = s.sp
-        by_pair: Dict[Tuple[int, int], list] = {}
+        best: Dict[Tuple[int, int], float] = {}
         for l in s.links:
-            by_pair.setdefault((min(l["a"], l["b"]), max(l["a"], l["b"])), []).append(l)
+            k = (min(l["a"], l["b"]), max(l["a"], l["b"]))
+            best[k] = max(best.get(k, 0.0), float(l["width"]))
         w = math.inf
         for c0, c1 in zip(path[:-1], path[1:]):
             j0, j1 = int(s.full[c0]), int(s.full[c1])
             if j0 == j1: continue
-            cand = by_pair.get((min(j0, j1), max(j0, j1)))
-            if not cand:                                     # diagonal-only contact: no link; the two cells decide
-                w = min(w, 2.0 * float(min(sp.clr[c0], sp.clr[c1]))); continue
-            y, x = (int(sp.ys[c0]) + int(sp.ys[c1])) / 2.0, (int(sp.xs[c0]) + int(sp.xs[c1])) / 2.0
-            best = min(cand, key=lambda l: math.hypot((int(sp.ys[l["u"]]) + int(sp.ys[l["v"]])) / 2.0 - y, (int(sp.xs[l["u"]]) + int(sp.xs[l["v"]])) / 2.0 - x))
-            w = min(w, float(best["width"]))
+            cand = best.get((min(j0, j1), max(j0, j1)))
+            # diagonal-only contact: no link; the two cells decide
+            w = min(w, cand if cand is not None else 2.0 * float(min(sp.clr[c0], sp.clr[c1])))
         return float(w) if math.isfinite(w) else float(2.0 * sp.clr[src])
 
     # ------------------------------------------------------------------ persistence hooks (store.py)
@@ -1139,7 +1139,7 @@ class ChartGraph(SceneGraph):
             idx = lut[sub]
             rast = OwnerRaster(origin=((self._cx0 + 2 * x0) * RES, (self._cy0 + 2 * y0) * RES), step=self._h, index=idx, keys=keys,
                                dependent=s.dep[y0:y1, x0:x1].copy())
-        return ViewResult(self.version, charts, links, rast)
+        return ViewResult(self.version, charts, links, rast, len(levels))
 
     def _link(self, l: dict, ka: Key, kb: Key) -> Link:
         s = self._solved

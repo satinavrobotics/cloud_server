@@ -156,6 +156,9 @@ Branch `feat/scene-graph-v2` (shared worktree), author CIMBIBOY unless noted; br
 | dae7d24 (morse) | v1 modules, tests and tools removed | dead code | importer map re-verified by grep |
 | 2f1185e, 2f77b9b, e3aef5a (morse) | translation determinism test; level clamp; driven unknown cells are free | rehearsal-2 F-2, F-3 | tests; Hospital pose now in F |
 
+| 5182820 (LACI), merged | e2e fixture: four-room loop world (a constant-width ring is one region), room-loop determinism test | e2e on the persistence partition | run.sh 32/32 twice (LACI) |
+| `_route_width` (morse) | widest arc per crossed chart pair; `ViewResult.levels` | LACI issue A: a hugging path read a 0.1 - 0.3 m sliver as the passage; level count for read validation | room loop, 8 shuffled-stamp orders: min_width 0.1 - 0.3 -> 1.2 m; 180 unit tests |
+
 ### Claims refuted or corrected on the way (traceability)
 
 | claim | by | outcome |
@@ -167,6 +170,7 @@ Branch `feat/scene-graph-v2` (shared worktree), author CIMBIBOY unless noted; br
 | "regions by top-component label" / "regions are disks" | Morse research and theory | refuted: steepest parent + merge; regions may have holes |
 | "noise floor = h" | Morse research and theory | overstated: 2 sqrt(2) h, attained |
 | "width = 2 s + 2 r - h" | morse implementation | refuted (3-cell witness strip): physical clearance at the widest crossing |
+| "arcs of one pair with no obstacle between them are one opening" (chord test) | morse implementation | refuted: two doors in one wall whose interface lies beside the wall have a free chord; replaced by the widest arc per pair |
 | "region count within 0.5x-1.5x of the old charts" | morse implementation | not met (2-4x coarser); judged correct, recorded as a semantic change |
 
 ### Not verified / open at the time of writing

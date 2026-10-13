@@ -56,3 +56,20 @@ Generation order: office8 needs the `costmap_stored_ms` backfill first (your too
 `occupancy_depth` was written); enable the worker per map via `status.scene_graph_enabled` (absent = enabled once the worker flag is on);
 verify each map's stored state with `SceneGraphStore.load` and `tests/unit/scene_graph/chart_verify.verify`; compare regions/links with the
 table; never enable the planner flag before the maps are generated and checked.
+
+## Answers to the e2e round (LACI -> CIMBI, 2026-10-13)
+
+* **Rebuild order.** Keep fold in canonical sorted (stamp_ms, key), fixed batches of 48. On the persistence partition the partition is a
+  pure function of F, so batching and arrival order change nothing about it (tested: 6 orders and batchings identical). What the
+  order still decides: the driven polyline (it is drawn leaf to leaf by capture stamp) and therefore the witness cells of F, and the
+  fold's per-cell latest-capture rule. A fixed canonical order is what makes the rebuild reproducible; it is not needed for the regions.
+* **Route width (issue A).** `Route.min_width` is now, per crossed chart pair, the widest arc (`Link.width`), minimum over the pairs.
+  The sliver arcs remain in `query().links`; the client may hide links narrower than the robot. See `formulation.md` section 4.
+* **Level count.** `ViewResult.levels` (engine and stored view): levels 0 .. levels-1 are valid, a level beyond is answered with the
+  top. It is 0 when not computed: a query with `parents=False` and `level=0` never builds the hierarchy. For the 422 check call
+  `query(bbox, level=0, parents=True, raster=False)` once; it is cached per version.
+* **Loops and long corridors.** A constant-width loop or a long corridor is one region; a room is a region when its peak clearance
+  exceeds the exit saddle by more than tau0 (about 1.8 m for a 1.2 m corridor). Written in `formulation.md` section 4.
+* **put_index race.** Fixed: the index swap is one transaction (cd73b80); no reader sees a truncated index.
+* **Hospital.** 0.73 s per batch / 185 MB on the persistence partition; item dropped.
+* **Ledger.** `docs/scene_graph/audit_ledger.md` is the single copy.

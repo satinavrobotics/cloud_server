@@ -26,6 +26,17 @@ def two_rooms(door=0.9, W=6.0, H=3.0):
     return w, way
 
 
+def room_loop(corridor=1.2):
+    """Four rooms (1.6 - 1.8 m) at the corners of a 6 m square joined by `corridor` wide corridors on x, y = 1 and 5."""
+    w = np.full((int(6.0 / R), int(6.0 / R)), 100, np.uint8)
+    for x0, y0, x1, y1 in ((0.2, 0.2, 2.0, 2.0), (4.2, 0.2, 5.8, 1.8), (4.0, 4.0, 5.8, 5.8), (0.2, 4.2, 1.8, 5.8)):
+        _rect(w, x0, y0, x1, y1, 0)
+    h = corridor / 2
+    _rect(w, 1.0, 1.0 - h, 5.0, 1.0 + h, 0); _rect(w, 1.0, 5.0 - h, 5.0, 5.0 + h, 0)
+    _rect(w, 5.0 - h, 1.0, 5.0 + h, 5.0, 0); _rect(w, 1.0 - h, 1.0, 1.0 + h, 5.0, 0)
+    return w, [(1.0, 1.0), (5.0, 1.0), (5.0, 5.0), (1.0, 5.0), (1.0, 1.6)]
+
+
 def corridor(width=0.55):
     W, H = 9.0, 3.0
     w = np.full((int(H / R), int(W / R)), 100, np.uint8)

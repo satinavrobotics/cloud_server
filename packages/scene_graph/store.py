@@ -814,7 +814,7 @@ class StoredView:
             for j, i in lut.items():
                 if i: idx[sub == j] = i
             rast = OwnerRaster(origin=(2 * lx0 * RES, 2 * ly0 * RES), step=man["params"]["lattice"], index=idx, keys=keys, dependent=dep.copy())
-        return ViewResult(self.version, charts, links, rast)
+        return ViewResult(self.version, charts, links, rast, len(levels))
 
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         """The engine's `snap` from the stored version: nearest navigable cell with the real distance (refused beyond
