@@ -138,11 +138,20 @@ def near_obstacle(rows: Iterable[Mapping[str, Any]], xy: Pt, half_width_m: float
                   lead_m: float = LEAD_M) -> bool:
     """Whether the point `xy` is within `half_width_m` of the obstacle segment of any of `rows`
     (rows without a robot pose have no segment and never match)."""
-    for row in rows:
-        seg = row_segment(row, lead_m)
-        if seg is not None and point_segment_distance(xy, seg[0], seg[1]) <= half_width_m:
+    for seg in near_segments(rows, lead_m):
+        if point_segment_distance(xy, seg[0], seg[1]) <= half_width_m:
             return True
     return False
+
+
+def near_segments(rows: Iterable[Mapping[str, Any]], lead_m: float = LEAD_M) -> List[Tuple[Pt, Pt]]:
+    """The obstacle segments of `rows` (those with a robot pose), computed once: hoist this out of a loop
+    over nodes and test with `near_segments_hit`."""
+    return [s for s in (row_segment(r, lead_m) for r in rows) if s is not None]
+
+
+def near_segments_hit(segments: Sequence[Tuple[Pt, Pt]], xy: Pt, half_width_m: float = HALF_WIDTH_M) -> bool:
+    return any(point_segment_distance(xy, a, b) <= half_width_m for a, b in segments)
 
 
 def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_m: float = HALF_WIDTH_M,
@@ -166,11 +175,7 @@ def overlay(rows: Iterable[Mapping[str, Any]], disc_radius_m: float, half_width_
 
 
 def _ordered_unique(keys: Iterable[Optional[str]]) -> List[str]:
-    seen: List[str] = []
-    for key in keys:
-        if key is not None and key not in seen:
-            seen.append(key)
-    return seen
+    return list(dict.fromkeys(k for k in keys if k is not None))
 
 
 def _sample(a: Pt, b: Pt, step_m: float) -> List[Pt]:

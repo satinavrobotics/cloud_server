@@ -347,10 +347,37 @@ def test_the_upsert_writes_the_geometry_columns_in_column_order():
     assert "prev_x" not in blocked_nodes.UPSERT_SQL
 
 
-def test_a_null_pose_report_does_not_erase_an_earlier_pose():
+def test_a_null_pose_report_does_not_erase_an_earlier_pose_and_pairs_x_y_with_it():
     sql = blocked_nodes.UPSERT_SQL
-    assert "robot_x = COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x)" in sql
-    assert "robot_y = COALESCE(EXCLUDED.robot_y, blocked_graph_nodes.robot_y)" in sql
+    # the earlier pose pair of a block still active is kept as a unit, together with the waypoint it was paired with
+    assert "robot_x = CASE WHEN (blocked_graph_nodes.expires_at > now()" in sql
+    assert "x = CASE WHEN (blocked_graph_nodes.expires_at > now()" in sql
+    assert "THEN blocked_graph_nodes.robot_x" in sql and "THEN blocked_graph_nodes.robot_y" in sql
+    assert "THEN blocked_graph_nodes.x " in sql and "THEN blocked_graph_nodes.y " in sql
+    # never one half of a pose pair: both new values must be present to take the new pose
+    assert "EXCLUDED.robot_x IS NOT NULL AND EXCLUDED.robot_y IS NOT NULL" in sql
+    assert "COALESCE" not in sql
+    assert blocked_nodes.UPSERT_SQL.count("%s") == len(blocked_nodes.upsert_params("M", "9", "operator", 1))
+    assert blocked_nodes.LEGACY_UPSERT_SQL.count("%s") == len(blocked_nodes.legacy_params(
+        blocked_nodes.upsert_params("M", "9", "operator", 1)))
+    assert "robot_x" not in blocked_nodes.LEGACY_UPSERT_SQL
+
+
+def test_excluded_node_ids_matches_row_blocks():
+    rows = [{"graph_node_id": "n1"}, {"graph_node_id": "@1.00,0.00"}]
+    nodes = [{"node_id": "a", "x": 1.2, "y": 0.0}, {"node_id": "b", "x": 5.0, "y": 0.0}, {"node_id": "c"}]
+    assert blocked_nodes.excluded_node_ids(rows, nodes) == {"n1", "a"}
+    assert blocked_nodes.excluded_node_ids(rows, nodes, radius_m=0.1) == {"n1"}
+
+
+def test_near_segments_hoists_the_row_segments():
+    from packages.utils import blocked_geometry as bg
+    rows = [{"x": 6.0, "y": 0.0, "robot_x": 0.0, "robot_y": 0.0}, {"x": 1.0, "y": 1.0}]
+    segs = bg.near_segments(rows)
+    assert len(segs) == 1                       # the row without a pose has none
+    for xy in ((3.0, 0.3), (3.0, 2.0)):
+        assert bg.near_segments_hit(segs, xy) == bg.near_obstacle(rows, xy)
+    assert bg._ordered_unique(["a", None, "b", "a", "c", "b"]) == ["a", "b", "c"]
 
 
 def test_rows_hit_accepts_a_generator_and_matches_route_hits_row():

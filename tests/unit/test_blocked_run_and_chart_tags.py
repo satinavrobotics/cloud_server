@@ -120,32 +120,73 @@ def test_plane_locator_samples_the_owner_plane():
 
 
 class _Reads:
-    def __init__(self, available=True, fail=False):
-        self.available, self.fail = available, fail
+    """owner_plane() like SceneGraphReads: 1 m cells, the left half of the box is A:0, the right B:1.
+    `max_side` makes a box wider or taller than it AreaTooLarge (a 422 the tagger splits on)."""
 
-    async def view(self, map_id, bbox, level, version, raster):
+    def __init__(self, available=True, fail=False, max_side=None):
+        self.available, self.fail, self.max_side, self.calls = available, fail, max_side, []
+
+    async def owner_plane(self, map_id, bbox, level=0):
+        from packages.api.scene_graph_reads import AreaTooLarge
+        self.calls.append(bbox)
         if self.fail:
             raise RuntimeError("store down")
         if not self.available:
-            return {"available": False}
-        return {"available": True, "version": 3,
-                "raster": {"keys": ["A:0", "B:1"], "origin": [bbox.x0, bbox.y0], "step": 1.0}}
-
-    async def raster(self, map_id, bbox, level, version, plane):
-        cols = int(bbox.x1 - bbox.x0)
-        rows = int(bbox.y1 - bbox.y0)
-        index = np.where(np.arange(cols) < cols // 2, 1, 2) * np.ones((rows, 1), dtype=int)
-        return index.astype("<u2").tobytes(), {"X-Raster-Shape": f"{rows},{cols}"}
+            return None
+        x0, y0 = float(np.floor(bbox.x0)), float(np.floor(bbox.y0))
+        cols, rows = int(np.ceil(bbox.x1) - x0), int(np.ceil(bbox.y1) - y0)
+        if self.max_side is not None and max(cols, rows) > self.max_side:
+            raise AreaTooLarge(status_code=422, detail="too many cells")
+        mid = x0 + cols / 2.0
+        index = np.where(x0 + np.arange(cols) + 0.5 < mid, 1, 2) * np.ones((rows, 1), dtype=int)
+        return {"version": 3, "epoch": "e", "bbox": [x0, y0, x0 + cols, y0 + rows], "origin": (x0, y0),
+                "step": 1.0, "shape": (rows, cols), "keys": ["A:0", "B:1"], "index": index.astype("<u2")}
 
 
 def test_add_chart_keys_tags_rows_and_is_best_effort():
     rows = [{"x": 1.0, "y": 1.0, "graph_node_id": "n"}, {"x": 9.0, "y": 1.0, "graph_node_id": "m"}]
-    assert asyncio.run(tags.add_chart_keys(rows, "M", lambda: _Reads()))
+    res = asyncio.run(tags.add_chart_keys(rows, "M", lambda: _Reads()))
+    assert res and res.status == "ok" and res.truncated == 0
     assert [r["chart_keys"] for r in rows] == [["A:0"], ["B:1"]]
     for reads in (_Reads(available=False), _Reads(fail=True)):
         plain = [{"x": 1.0, "y": 1.0, "graph_node_id": "n"}]
-        assert not asyncio.run(tags.add_chart_keys(plain, "M", lambda r=reads: r))
+        res = asyncio.run(tags.add_chart_keys(plain, "M", lambda r=reads: r))
+        assert not res and res.status == "unavailable"
         assert "chart_keys" not in plain[0]
+
+
+def test_add_chart_keys_splits_far_apart_rows_and_reports_what_it_could_not_tag():
+    # box 12 wide > max_side 8: two planes; the one row too big for any plane is counted, not dropped silently
+    rows = [{"x": 1.0, "y": 1.0, "graph_node_id": "n"}, {"x": 40.0, "y": 1.0, "graph_node_id": "m"}]
+    reads = _Reads(max_side=8)
+    res = asyncio.run(tags.add_chart_keys(rows, "M", lambda: reads))
+    assert res.status == "ok" and res.tagged == 2 and all(r["chart_keys"] for r in rows)
+    assert len(reads.calls) == 3                # the refused union, then one plane per half
+    big = [{"x": 0.0, "y": 0.0, "graph_node_id": "@0,0", "robot_x": 30.0, "robot_y": 0.0}, rows[0]]
+    for r in rows:
+        r.pop("chart_keys", None)
+    res = asyncio.run(tags.add_chart_keys(big, "M", lambda: _Reads(max_side=8)))
+    assert res.status == "partial" and res.truncated == 1 and res.tagged == 1
+    assert "chart_keys" not in big[0] and big[1]["chart_keys"]
+    assert res.fields() == {"chart_keys_status": "partial", "chart_keys_truncated": True,
+                            "chart_keys_truncated_count": 1}
+
+
+def test_add_chart_keys_plane_budget_is_a_truncation_not_a_silent_drop(monkeypatch):
+    monkeypatch.setattr(tags, "MAX_PLANES", 2)
+    rows = [{"x": 30.0 * i, "y": 0.0, "graph_node_id": f"n{i}"} for i in range(4)]
+    res = asyncio.run(tags.add_chart_keys(rows, "M", lambda: _Reads(max_side=8)))
+    assert res.status == "partial" and res.tagged == 2 and res.truncated == 2
+    assert sum("chart_keys" in r for r in rows) == 2
+
+
+def test_add_chart_keys_touches_nothing_on_timeout():
+    class Slow(_Reads):
+        async def owner_plane(self, *a, **k):
+            await asyncio.sleep(1)
+    rows = [{"x": 1.0, "y": 1.0, "graph_node_id": "n"}]
+    res = asyncio.run(tags.add_chart_keys(rows, "M", lambda: Slow(), timeout_s=0.05))
+    assert res.status == "unavailable" and "chart_keys" not in rows[0]
 
 
 async def _get(db, url):
@@ -197,6 +238,9 @@ async def test_list_default_is_unchanged_and_chart_keys_are_opt_in(monkeypatch):
     monkeypatch.setattr(api_main, "_scene_graph_reads", lambda: _Reads(fail=True))
     resp = await _get(db, "/api/v1/maps/M/blocked-nodes?with_chart_keys=true")
     assert resp.status_code == 200 and "chart_keys" not in resp.json()["blocked_nodes"][0]
+    assert resp.json()["chart_keys_status"] == "unavailable" and resp.json()["chart_keys_truncated"] is False
+    assert tagged["chart_keys_status"] == "ok" and "chart_keys_status" not in (
+        await _get(db, "/api/v1/maps/M/blocked-nodes")).json()
 
 
 # --- (C) chart keys of run legs ------------------------------------------------------------
@@ -206,7 +250,8 @@ def test_add_leg_chart_keys_tags_legs_by_the_charts_their_line_crosses():
             {"map_id": "M", "from_topomap_node": "n1", "to_topomap_node": "n3"},
             {"map_id": "M", "from_topomap_node": "n1", "to_topomap_node": "gone"},
             {"map_id": "M", "from_topomap_node": None, "to_topomap_node": "n2"}]
-    assert asyncio.run(tags.add_leg_chart_keys(legs, lambda m, n: pos.get((m, n)), lambda: _Reads()))
+    res = asyncio.run(tags.add_leg_chart_keys(legs, lambda m, n: pos.get((m, n)), lambda: _Reads()))
+    assert res and res.status == "ok" and res.truncated == 0
     assert legs[0]["chart_keys"] == ["A:0", "B:1"]
     assert legs[1]["chart_keys"] == ["A:0"]
     assert legs[2]["chart_keys"] is None            # a node without a position
@@ -224,9 +269,25 @@ def test_add_leg_chart_keys_is_best_effort():
         raise RuntimeError("db")
     assert not asyncio.run(tags.add_leg_chart_keys(legs, broken, lambda: _Reads()))
     assert not asyncio.run(tags.add_leg_chart_keys([], xy, lambda: _Reads()))
+
+
+def test_add_leg_chart_keys_node_cap_is_reported_and_the_rest_is_tagged():
+    xy = lambda m, n: (1.0, 1.0)  # noqa: E731
     many = [{"map_id": "M", "from_topomap_node": f"a{i}", "to_topomap_node": f"b{i}"}
-            for i in range(tags.MAX_LEG_NODES)]
-    assert not asyncio.run(tags.add_leg_chart_keys(many, xy, lambda: _Reads()))
+            for i in range(tags.MAX_LEG_NODES // 2 + 5)]
+    res = asyncio.run(tags.add_leg_chart_keys(many, xy, lambda: _Reads()))
+    assert res.status == "partial" and res.truncated == 5 and res.tagged == tags.MAX_LEG_NODES // 2
+    assert sum("chart_keys" in leg for leg in many) == tags.MAX_LEG_NODES // 2
+
+
+def test_add_leg_chart_keys_over_the_read_limit_splits_and_counts():
+    pos = {("M", "a"): (1.0, 1.0), ("M", "b"): (3.0, 1.0), ("M", "c"): (60.0, 1.0), ("M", "d"): (0.0, 0.0)}
+    legs = [{"map_id": "M", "from_topomap_node": "a", "to_topomap_node": "b"},
+            {"map_id": "M", "from_topomap_node": "a", "to_topomap_node": "c"},       # longer than a plane
+            {"map_id": "M", "from_topomap_node": "d", "to_topomap_node": "c"}]
+    res = asyncio.run(tags.add_leg_chart_keys(legs, lambda m, n: pos.get((m, n)), lambda: _Reads(max_side=8)))
+    assert res.status == "partial" and res.truncated == 2 and res.tagged == 1
+    assert legs[0]["chart_keys"] and "chart_keys" not in legs[1] and "chart_keys" not in legs[2]
 
 
 class _LegsDb(_Db):
@@ -274,4 +335,7 @@ async def test_run_legs_endpoint_chart_keys_are_opt_in(monkeypatch):
         finally:
             api_main.service = previous
     assert "chart_keys" not in (await get(""))["items"][0]
-    assert (await get("?with_chart_keys=true"))["items"][0]["chart_keys"] == ["A:0", "B:1"]
+    tagged = await get("?with_chart_keys=true")
+    assert tagged["items"][0]["chart_keys"] == ["A:0", "B:1"]
+    assert tagged["chart_keys_status"] == "ok" and tagged["chart_keys_truncated"] is False
+    assert "chart_keys_status" not in await get("")

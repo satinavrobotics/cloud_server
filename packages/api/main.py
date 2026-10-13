@@ -585,60 +585,80 @@ _scene_reads: Optional[Any] = None
 
 
 def _scene_graph_reads():
-    """The scene-graph read side, built on first use (the engine is imported only when enabled)."""
+    """The scene-graph read side, built on first use (the engine is imported only when enabled).
+    503 + Retry-After while the topomap database client is not up yet (never "no graph")."""
     global _scene_reads
     if _scene_reads is None:
         from packages.api import scene_graph_reads
         from packages.config import SCENE_GRAPH_WORKER_ENABLED
         client = getattr(service, "topomap_db", None)
         if SCENE_GRAPH_WORKER_ENABLED and client is None:
-            return scene_graph_reads.build(False)      # service not up yet: answer unavailable, retry next call
+            raise HTTPException(status_code=503, headers={"Retry-After": str(scene_graph_reads.RETRY_AFTER_S),
+                                                          "Cache-Control": "no-store"},
+                                detail={"error": "scene_graph_unavailable",
+                                        "retry_after_s": scene_graph_reads.RETRY_AFTER_S})
         _scene_reads = scene_graph_reads.build(SCENE_GRAPH_WORKER_ENABLED, client)
     return _scene_reads
 
 
 @app.get("/api/v1/maps/{map_id}/scene-graph")
 async def get_map_scene_graph(map_id: str, bbox: str, level: int = 0, version: Optional[int] = None,
-                              raster: bool = False, response: Response = None):
-    """The high-level chart graph of an area: {available, version, charts, links, raster}. `bbox` is
-    `x0,y0,x1,y1` in map-frame metres. `available: false` when the map has no scene graph (yet).
-    With `raster=true` the response also holds the plane's keys and geometry; fetch the plane from
-    /scene-graph/raster with the same bbox, level and the returned `version`."""
+                              raster: bool = False, epoch: Optional[int] = None,
+                              if_none_match: Optional[str] = Header(None), response: Response = None):
+    """The high-level chart graph of an area: {available, version, epoch, charts, links, raster}. `bbox` is
+    `x0,y0,x1,y1` in map-frame metres (snapped outward to the 6.4 m tile grid; the answer's `bbox` is the
+    snapped one). `available: false` when the map has no scene graph (yet). With `raster=true` the
+    response also holds the plane's keys and geometry; fetch the plane from /scene-graph/raster with the
+    same bbox, level and the returned `version`.
+
+    Responses carry an ETag (epoch, version, level, raster, bbox) and answer 304 to a matching
+    If-None-Match. `epoch` pins the map's incarnation (the `epoch` of an earlier answer): when the map was
+    recreated meanwhile the answer is 409 `detail: {error: "epoch_changed", epoch, current_epoch, version}`
+    (and header X-Scene-Graph-Epoch) with the current one. The epoch is an integer.
+    503 + Retry-After when the store is down (never `available: false`)."""
     _require_service()
     from packages.api import scene_graph_reads
     box = scene_graph_reads.parse_bbox(bbox)
-    out = await _site_call("read scene graph", _scene_graph_reads().view(
-        map_id, box, level, version, raster))
+    out, headers = await _site_call("read scene graph", _scene_graph_reads().view_conditional(
+        map_id, box, level, version, raster, if_none_match, epoch))
+    if out is None:
+        return Response(status_code=304, headers=headers)
     if not out.get("available"):
         response.headers["Cache-Control"] = scene_graph_reads.NO_GRAPH_CACHE
+    else:
+        response.headers.update(headers)
     return out
 
 
 @app.get("/api/v1/maps/{map_id}/scene-graph/raster")
 async def get_map_scene_graph_raster(map_id: str, bbox: str, level: int = 0,
                                      version: Optional[int] = None, plane: str = "owner",
+                                     epoch: Optional[int] = None,
                                      if_none_match: Optional[str] = Header(None)):
     """The owner plane (u16 little-endian, 0 = no chart, i = keys[i-1]) or the `dependent` plane (u8)
     over a bbox, row-major. Shape, origin and step are in the X-Raster-* headers. The bbox is snapped
     outward to the tile grid (see the JSON view's `bbox`). Responses carry an ETag (epoch, version, plane,
     level, bbox) and are revalidated, never `immutable`: a map recreated under the same id restarts at
-    version 1."""
+    version 1. `epoch` pins the incarnation (409 `epoch_changed` when it differs); 503 + Retry-After
+    when the store is down."""
     _require_service()
     from packages.api import scene_graph_reads
     box = scene_graph_reads.parse_bbox(bbox)
     body, headers = await _site_call("read scene graph raster", _scene_graph_reads().raster(
-        map_id, box, level, version, plane, if_none_match))
+        map_id, box, level, version, plane, if_none_match, epoch))
     if body is None:
         return Response(status_code=304, headers=headers)
     return Response(content=body, media_type="application/octet-stream", headers=headers)
 
 
 @app.get("/api/v1/maps/{map_id}/scene-graph/lineage")
-async def get_map_scene_graph_lineage(map_id: str, from_version: int, response: Response = None):
+async def get_map_scene_graph_lineage(map_id: str, from_version: int, epoch: Optional[int] = None,
+                                      response: Response = None):
     """{retired: {old chart key: [successor keys, largest overlap first]}} since `from_version`; the
-    client walks its selected keys forward through it."""
+    client walks its selected keys forward through it. `epoch` pins the incarnation as in the view
+    (409 `epoch_changed`: the keys of the old incarnation mean nothing, restart from the current charts)."""
     _require_service()
-    out = await _site_call("read scene graph lineage", _scene_graph_reads().lineage(map_id, from_version))
+    out = await _site_call("read scene graph lineage", _scene_graph_reads().lineage(map_id, from_version, epoch))
     if not out.get("available"):
         response.headers["Cache-Control"] = "no-store"
     return out
@@ -664,7 +684,8 @@ async def list_blocked_nodes(map_id: str, with_chart_keys: bool = False):
     await blocked_nodes.resolve_run_ids(service.database, rows)
     if with_chart_keys and rows:
         from packages.utils import blocked_chart_tags
-        await blocked_chart_tags.add_chart_keys(rows, map_id, _scene_graph_reads)
+        tagged = await blocked_chart_tags.add_chart_keys(rows, map_id, _scene_graph_reads)
+        return {"map_id": map_id, "blocked_nodes": rows, **tagged.fields()}
     return {"map_id": map_id, "blocked_nodes": rows}
 
 
@@ -2400,7 +2421,9 @@ async def get_run_legs(run_id: uuid.UUID, with_chart_keys: bool = False):
     `{"run_id", "items": [leg...]}`; empty when the run recorded none. 404 if unknown.
     With `with_chart_keys=true` each leg also has `chart_keys`, the scene-graph charts its
     node-to-node line crosses (read time, best effort: absent when the map has no scene graph or
-    it could not be read in time; null for a leg whose node positions are unknown)."""
+    it could not be read in time; null for a leg whose node positions are unknown), and
+    `chart_keys_status` ("ok" | "partial" | "unavailable") and `chart_keys_truncated` (legs left untagged
+    because of the 400-node lookup cap or the scene-graph read limits) at the top level."""
     _require_service()
     out = await _site_call("get run legs", fleet_reads.run_legs_list(service.database, run_id))
     if with_chart_keys and out.get("items"):
@@ -2412,7 +2435,8 @@ async def get_run_legs(run_id: uuid.UUID, with_chart_keys: bool = False):
                 return float(node["x"]), float(node["y"])
             except (TypeError, KeyError, ValueError):
                 return None
-        await blocked_chart_tags.add_leg_chart_keys(out["items"], node_xy, _scene_graph_reads)
+        tagged = await blocked_chart_tags.add_leg_chart_keys(out["items"], node_xy, _scene_graph_reads)
+        out.update(tagged.fields())
     return out
 
 

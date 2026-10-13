@@ -37,7 +37,7 @@ class FakeGraph:
     def __init__(self, calls):
         self.calls = calls
 
-    def query(self, bbox, level, raster):
+    def query(self, bbox, level, raster, parents=True):
         self.calls.append((bbox, level, raster))
         r = None
         if raster:
@@ -130,8 +130,9 @@ def test_version_not_retained_is_404():
 
 def test_lineage():
     r = sgr.SceneGraphReads(lambda mid: {"version": 5}, lambda *a: None, lambda mid, v: {"a:1": ["a:2"]})
-    assert run(r.lineage("m", 2)) == {"available": True, "from_version": 2, "version": 5,
-                                      "retired": {"a:1": ["a:2"]}}
+    out = run(r.lineage("m", 2))
+    assert out.pop("epoch") and out == {"available": True, "from_version": 2, "version": 5,
+                                        "retired": {"a:1": ["a:2"]}}
     none = sgr.SceneGraphReads(lambda mid: {}, lambda *a: None)
     assert run(none.lineage("m", 2))["available"] is False
 
@@ -670,3 +671,171 @@ def test_fake_cache_is_purged_when_meta_disappears():
     state["m"] = {}
     assert run(r.view("m", BBox(0, 0, 1, 1)))["available"] is False
     assert len(r._results) == 0 and len(r._graphs) == 0
+
+
+# ---- review round: snapping, one meta read, ETag/304, epoch pin, 503, parents, bounds ----
+
+@pytest.mark.parametrize("t", [6.4, 0.1, 3.2, 12.8])
+def test_snap_is_idempotent_and_outward_across_the_map(t):
+    r = sgr.SceneGraphReads(lambda m: {}, lambda *a: None, tile_m=t)
+    rng = np.random.default_rng(7)
+    vals = list(rng.uniform(-3000.0, 3000.0, 4000)) + [k * t for k in range(-2000, 2000)] + \
+        [k * t + d for k in (-7, 0, 3, 41, 999) for d in (-1e-9, 1e-9, -1e-4, 1e-4)]
+    for v in vals:
+        for box in (BBox(v, v, v + 1.0, v + 1.0), BBox(v - 5.0, v - 2.0, v, v + 0.0001)):
+            s = r._snap(box)
+            assert r._snap(s) == s, (v, box, s)             # no drift, no extra tile
+            assert s.x0 <= box.x0 + 1e-5 and s.x1 >= box.x1 - 1e-5      # outward (to within the 1e-6-tile tolerance)
+            assert s.x1 - s.x0 - (box.x1 - box.x0) < 2 * t + 1e-5      # and by less than a tile per side
+
+
+def test_snap_known_boundary_values_of_the_6_4_grid():
+    r, _ = reads()
+    for k in (3, 7, 11, 13, 29, 31, 4096):
+        edge = round(k * 6.4, 6)
+        s = r._snap(BBox(edge, edge, edge + 0.5, edge + 0.5))
+        assert s.x0 == edge and s.y0 == edge                         # an edge ON a boundary stays there
+        assert s.x1 == round((k + 1) * 6.4, 6)
+        assert r._snap(s) == s
+
+
+def test_one_meta_read_per_request_and_epoch_comes_from_it():
+    n = []
+    docs_reads = []
+    created = {"version": 3, "generation": 1, "created_ms": 777, "params": {"lattice": 0.1}}
+
+    def meta(mid):
+        n.append(mid)
+        return dict(created)
+    store = NS(meta=meta, docs=NS(meta=lambda mid: docs_reads.append(mid) or created),
+               load=lambda mid, v, tiles=None: FakeGraph([]))
+    r = sgr.from_store(store)
+    b = BBox(0, 0, 1, 1)
+    run(r.view("m", b, raster=True))
+    assert len(n) == 1 and docs_reads == []
+    run(r.raster("m", b))
+    run(r.owner_plane("m", b))
+    assert len(n) == 3 and docs_reads == []       # one per request, never a second one for the epoch
+    out = run(r.view("m", b))
+    assert out["epoch"] == sgr._tag((777, 1))
+
+
+def test_json_view_has_an_etag_and_answers_304():
+    r, calls = reads()
+    out, h = run(r.view_conditional("m", BBox(0, 0, 1, 1), version=3))
+    assert out["available"] and h["ETag"].encode("ascii") and h["X-Scene-Graph-Epoch"] == str(out["epoch"])
+    assert h["Cache-Control"] == f"public, max-age={sgr.REVALIDATE_S}" and len(calls) == 1
+    again, h2 = run(r.view_conditional("m", BBox(0, 0, 1, 1), version=3, if_none_match=f'W/{h["ETag"]}'))
+    assert again is None and h2["ETag"] == h["ETag"] and len(calls) == 1
+    cold, _ = reads()
+    none, _ = run(cold.view_conditional("m", BBox(0, 0, 1, 1), version=3, if_none_match=h["ETag"]))
+    assert none is None and cold._results.__len__() == 0         # nothing computed for a 304
+    # other params -> other ETag
+    _, h3 = run(r.view_conditional("m", BBox(0, 0, 1, 1), version=3, raster=True))
+    _, h4 = run(r.view_conditional("m", BBox(0, 0, 1, 1), version=3, level=1))
+    assert len({h["ETag"], h3["ETag"], h4["ETag"]}) == 3
+    _, cur = run(r.view_conditional("m", BBox(0, 0, 1, 1)))
+    assert cur["Cache-Control"] == "no-cache"
+    # not available: no ETag, the caller sets no-store
+    gone, hg = run(reads(meta={})[0].view_conditional("m", BBox(0, 0, 1, 1), if_none_match="*"))
+    assert gone["available"] is False and hg == {}
+
+
+def test_epoch_pin_409_on_view_raster_and_lineage_carries_the_current_epoch():
+    state = {"epoch": 1000}
+    r = sgr.SceneGraphReads(lambda m: {"version": 1, "params": {"lattice": 0.1}}, lambda *a: FakeGraph([]),
+                            lambda m, v: {}, epoch=lambda m, v: state["epoch"])
+    b = BBox(0, 0, 1, 1)
+    tag = run(r.view("m", b))["epoch"]
+    assert run(r.view("m", b, epoch=tag))["available"]
+    assert run(r.raster("m", b, epoch=tag))[0] is not None
+    assert run(r.lineage("m", 0, epoch=tag))["epoch"] == tag
+    state["epoch"] = 2000                                       # recreated under the same id, back at version 1
+    new = sgr._tag(2000)
+    for call in (lambda: r.view("m", b, epoch=tag), lambda: r.raster("m", b, epoch=tag),
+                 lambda: r.lineage("m", 0, epoch=tag)):
+        with pytest.raises(HTTPException) as e:
+            run(call())
+        assert e.value.status_code == 409
+        assert e.value.detail == {"error": "epoch_changed", "epoch": new, "current_epoch": new, "version": 1}
+        assert e.value.headers["X-Scene-Graph-Epoch"] == str(new)
+    assert run(r.view("m", b, epoch=new))["epoch"] == new       # the restart works
+    # a pin against a map that has no graph at all is a mismatch too (epoch null)
+    with pytest.raises(HTTPException) as e:
+        run(reads(meta={})[0].view("m", b, epoch=5))
+    assert e.value.status_code == 409 and e.value.detail["epoch"] is None
+
+
+def test_transient_store_errors_are_503_with_retry_after_never_no_graph():
+    def boom(*a, **k):
+        raise ConnectionError("arango down")
+    b = BBox(0, 0, 1, 1)
+    cases = {
+        "meta": sgr.SceneGraphReads(boom, lambda *a: None),
+        "load": sgr.SceneGraphReads(lambda m: {"version": 1}, boom),
+        "epoch": sgr.SceneGraphReads(lambda m: {"version": 1}, lambda *a: FakeGraph([]), epoch=boom),
+    }
+    for name, r in cases.items():
+        calls = [lambda r=r: r.view("m", b), lambda r=r: r.raster("m", b), lambda r=r: r.owner_plane("m", b)]
+        if name != "load":                      # lineage needs no graph load
+            calls.append(lambda r=r: r.lineage("m", 0))
+        for call in calls:
+            with pytest.raises(HTTPException) as e:
+                run(call())
+            assert e.value.status_code == 503, name
+            assert e.value.headers["Retry-After"] == str(sgr.RETRY_AFTER_S)
+    lin = sgr.SceneGraphReads(lambda m: {"version": 5}, lambda *a: None, boom)
+    with pytest.raises(HTTPException) as e:
+        run(lin.lineage("m", 1))
+    assert e.value.status_code == 503
+    # a failure is not cached: the store comes back and the same reads answer
+    flaky = {"down": True}
+
+    def meta(m):
+        if flaky["down"]:
+            raise TimeoutError("slow")
+        return {"version": 1, "params": {"lattice": 0.1}}
+    r = sgr.SceneGraphReads(meta, lambda *a: FakeGraph([]))
+    with pytest.raises(HTTPException):
+        run(r.view("m", b))
+    flaky["down"] = False
+    assert run(r.view("m", b))["available"]
+    # a genuine absence is still the contract, and not retained / unknown stay 404
+    assert run(reads(meta={})[0].view("m", b))["available"] is False
+
+
+def test_parents_false_reaches_the_query_only_for_readers_that_ask_and_has_its_own_cache_key():
+    seen = []
+
+    class G:
+        def query(self, bbox, level, raster, parents=True):
+            seen.append(parents)
+            return FakeGraph([]).query(bbox, level, raster)
+    r = sgr.SceneGraphReads(lambda m: {"version": 3, "params": {"lattice": 0.1}}, lambda *a: G())
+    b = BBox(0, 0, 1, 1)
+    run(r.view("m", b))
+    run(r.view("m", b, parents=False))
+    run(r.view("m", b))                                    # cached
+    plane = run(r.owner_plane("m", b))                    # parents=False, cached from above
+    assert seen == [True, False]
+    assert plane["keys"] == ["a:1", "b:1"] and plane["shape"] == (2, 2) and plane["version"] == 3
+    assert plane["index"].dtype == np.uint16 and plane["bbox"] == [0.0, 0.0, 6.4, 6.4]
+    assert run(reads(meta={})[0].owner_plane("m", b)) is None
+
+
+def test_owner_plane_area_cap_is_a_distinguishable_422_and_a_bad_plane_is_refused():
+    r, _ = reads(max_cells=100)
+    with pytest.raises(sgr.AreaTooLarge) as e:
+        run(r.owner_plane("m", BBox(0, 0, 50, 50)))
+    assert e.value.status_code == 422
+
+    class Bad(FakeGraph):
+        def query(self, bbox, level, raster, parents=True):
+            res = super().query(bbox, level, raster)
+            res.raster.index = np.array([[0, 9]], dtype=np.uint16)     # names key 9 of 2
+            return res
+    bad = sgr.SceneGraphReads(lambda m: {"version": 3}, lambda *a: Bad([]))
+    with pytest.raises(HTTPException) as e:
+        run(bad.raster("m", BBox(0, 0, 1, 1)))
+    assert e.value.status_code == 503
+    assert run(bad.raster("m", BBox(0, 0, 1, 1), plane="dependent"))[0] is not None

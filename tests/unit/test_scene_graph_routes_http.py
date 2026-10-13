@@ -256,7 +256,49 @@ async def test_blocked_nodes_chart_keys_degrade_without_graph(blocked, monkeypat
 async def test_blocked_nodes_chart_keys_degrade_on_reads_error(app_state, blocked, monkeypatch):
     async def boom(*a, **k):
         raise RuntimeError("store down")
-    monkeypatch.setattr(app_state, "view", boom)
+    monkeypatch.setattr(app_state, "owner_plane", boom)
     r = await _get("/api/v1/maps/m/blocked-nodes?with_chart_keys=true")
     assert r.status_code == 200
     assert all("chart_keys" not in row for row in r.json()["blocked_nodes"])
+
+
+# ---- review round: JSON ETag/304, epoch pin, 503 ----
+
+async def test_json_view_etag_304_and_epoch_pin(app_state):
+    r = await _get(f"{BASE}?{BBOX}&version=2")
+    assert r.status_code == 200 and r.headers["etag"] and r.json()["epoch"]
+    assert r.headers["x-scene-graph-epoch"] == str(r.json()["epoch"])
+    again = await _get(f"{BASE}?{BBOX}&version=2", headers={"If-None-Match": r.headers["etag"]})
+    assert again.status_code == 304 and again.headers["etag"] == r.headers["etag"] and again.content == b""
+    ok = await _get(f"{BASE}?{BBOX}&epoch={r.json()['epoch']}")
+    assert ok.status_code == 200
+    bad = await _get(f"{BASE}?{BBOX}&epoch=123")
+    assert bad.status_code == 409
+    assert bad.json()["detail"] == {"error": "epoch_changed", "epoch": r.json()["epoch"],
+                                    "current_epoch": r.json()["epoch"], "version": 2}
+    assert isinstance(r.json()["epoch"], int) and bad.headers["x-scene-graph-epoch"] == str(r.json()["epoch"])
+    assert (await _get(f"{BASE}?{BBOX}&epoch=abc")).status_code == 422
+    assert (await _get(f"{BASE}/raster?{BBOX}&epoch=123")).status_code == 409
+    assert (await _get(f"{BASE}/lineage?from_version=0&epoch=123")).status_code == 409
+    assert (await _get(f"{BASE}/lineage?from_version=0&epoch={r.json()['epoch']}")).status_code == 200
+
+
+async def test_store_down_is_503_retry_after_not_a_no_graph_200(monkeypatch):
+    def boom(m):
+        raise ConnectionError("arango down")
+    store = NS_store = SimpleNamespace(meta=boom, load=lambda *a, **k: None)
+    monkeypatch.setattr(main, "service", SimpleNamespace(database=object(), topomap_db=None))
+    monkeypatch.setattr(main, "_scene_reads", sgr.from_store(store))
+    for p in (f"{BASE}?{BBOX}", f"{BASE}/raster?{BBOX}", f"{BASE}/lineage?from_version=0"):
+        r = await _get(p)
+        assert r.status_code == 503 and r.headers["retry-after"] == str(sgr.RETRY_AFTER_S), p
+        assert r.json()["detail"]["error"] == "scene_graph_unavailable"
+
+
+async def test_reads_not_built_yet_is_503_not_unavailable_false(monkeypatch):
+    import packages.config as config
+    monkeypatch.setattr(config, "SCENE_GRAPH_WORKER_ENABLED", True)
+    monkeypatch.setattr(main, "_scene_reads", None)
+    monkeypatch.setattr(main, "service", SimpleNamespace(database=object(), topomap_db=None))
+    r = await _get(f"{BASE}?{BBOX}")
+    assert r.status_code == 503 and r.headers["retry-after"]

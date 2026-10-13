@@ -33,9 +33,16 @@ COLUMNS = ("map_name", "graph_node_id", "edge_from", "edge_to", "source", "robot
            "robot_x", "robot_y")
 
 # A new report on a node already blocked extends its expiry (never shortens it) and keeps
-# the newest report's details; on a row that had expired it starts a new block (created_at).
-# A report without the robot's pose (NULL) never erases an earlier valid one. The table's
-# prev_x/prev_y columns (migration 20261012_01) are reserved and unused: nothing writes or reads them.
+# the newest report's details; on a row that had expired it starts a new block (created_at) from the new
+# report alone. A report without the robot's pose (NULL, or only one of the two) never erases an earlier
+# valid one of a block still active, and the earlier pose keeps the waypoint (x, y) it was reported with: the
+# pose pair robot_x/robot_y and the waypoint pair x/y are each taken from ONE report, and a robot pose is
+# never combined with another report's waypoint (the segment robot -> waypoint would be a made-up line).
+# The table's prev_x/prev_y columns (migration 20261012_01) are reserved and unused.
+_NEW_POSE = "(EXCLUDED.robot_x IS NOT NULL AND EXCLUDED.robot_y IS NOT NULL)"
+_KEEP_OLD_POSE = ("(blocked_graph_nodes.expires_at > now() AND blocked_graph_nodes.robot_x IS NOT NULL "
+                  "AND blocked_graph_nodes.robot_y IS NOT NULL AND blocked_graph_nodes.x IS NOT NULL "
+                  f"AND blocked_graph_nodes.y IS NOT NULL AND NOT {_NEW_POSE})")
 UPSERT_SQL = (
     "INSERT INTO blocked_graph_nodes (map_name, graph_node_id, edge_from, edge_to, source, "
     "robot_name, mission_name, vda_node_id, reason, x, y, robot_x, robot_y, "
@@ -45,10 +52,13 @@ UPSERT_SQL = (
     "ON CONFLICT (map_name, graph_node_id) DO UPDATE SET "
     "edge_from = EXCLUDED.edge_from, edge_to = EXCLUDED.edge_to, source = EXCLUDED.source, "
     "robot_name = EXCLUDED.robot_name, mission_name = EXCLUDED.mission_name, "
-    "vda_node_id = EXCLUDED.vda_node_id, reason = EXCLUDED.reason, x = EXCLUDED.x, "
-    "y = EXCLUDED.y, "
-    "robot_x = COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x), "
-    "robot_y = COALESCE(EXCLUDED.robot_y, blocked_graph_nodes.robot_y), "
+    "vda_node_id = EXCLUDED.vda_node_id, reason = EXCLUDED.reason, "
+    f"x = CASE WHEN {_KEEP_OLD_POSE} THEN blocked_graph_nodes.x ELSE EXCLUDED.x END, "
+    f"y = CASE WHEN {_KEEP_OLD_POSE} THEN blocked_graph_nodes.y ELSE EXCLUDED.y END, "
+    f"robot_x = CASE WHEN {_KEEP_OLD_POSE} THEN blocked_graph_nodes.robot_x "
+    f"WHEN {_NEW_POSE} THEN EXCLUDED.robot_x ELSE NULL END, "
+    f"robot_y = CASE WHEN {_KEEP_OLD_POSE} THEN blocked_graph_nodes.robot_y "
+    f"WHEN {_NEW_POSE} THEN EXCLUDED.robot_y ELSE NULL END, "
     "created_at = CASE WHEN blocked_graph_nodes.expires_at <= now() THEN now() "
     "ELSE blocked_graph_nodes.created_at END, "
     "expires_at = GREATEST(blocked_graph_nodes.expires_at, EXCLUDED.expires_at)")
@@ -62,12 +72,19 @@ ACTIVE_FOR_MAP_SQL = (
 # rule, if a service starts ahead of it).
 _POSE_COLUMNS = ("robot_x", "robot_y")
 LEGACY_UPSERT_SQL = (
-    UPSERT_SQL.replace("x, y, robot_x, robot_y, ", "x, y, ")
-    .replace("%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ",
-             "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, ")
-    .replace("robot_x = COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x), ", "")
-    .replace("robot_y = COALESCE(EXCLUDED.robot_y, blocked_graph_nodes.robot_y), ", "")
-)
+    "INSERT INTO blocked_graph_nodes (map_name, graph_node_id, edge_from, edge_to, source, "
+    "robot_name, mission_name, vda_node_id, reason, x, y, "
+    "expires_at) "
+    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+    "now() + make_interval(secs => %s)) "
+    "ON CONFLICT (map_name, graph_node_id) DO UPDATE SET "
+    "edge_from = EXCLUDED.edge_from, edge_to = EXCLUDED.edge_to, source = EXCLUDED.source, "
+    "robot_name = EXCLUDED.robot_name, mission_name = EXCLUDED.mission_name, "
+    "vda_node_id = EXCLUDED.vda_node_id, reason = EXCLUDED.reason, x = EXCLUDED.x, "
+    "y = EXCLUDED.y, "
+    "created_at = CASE WHEN blocked_graph_nodes.expires_at <= now() THEN now() "
+    "ELSE blocked_graph_nodes.created_at END, "
+    "expires_at = GREATEST(blocked_graph_nodes.expires_at, EXCLUDED.expires_at)")
 LEGACY_ACTIVE_FOR_MAP_SQL = (
     "SELECT " + ", ".join(
         f"NULL::double precision AS {c}" if c in _POSE_COLUMNS else c for c in COLUMNS)
@@ -184,8 +201,12 @@ def run_id_of(row: Mapping[str, Any]) -> Optional[str]:
 # pass's id (or, after a dispatcher restart, adopted by mission and robot): so for a later pass
 # `run_id_of` names a uuid no mission_runs row has.
 RUNS_OF_MISSIONS_SQL = (
-    "SELECT run_id, mission_name, robot_name, started_at FROM mission_runs "
-    "WHERE mission_name = ANY(%s) ORDER BY started_at")
+    "SELECT run_id, mission_name, robot_name, started_at FROM (SELECT run_id, mission_name, robot_name, "
+    "started_at FROM mission_runs WHERE mission_name = ANY(%s) ORDER BY started_at DESC LIMIT %s) newest "
+    "ORDER BY started_at")
+MAX_RESOLVE_ROWS = 500          # rows looked up per call (the rest keep their derived run id)
+MAX_RESOLVE_MISSIONS = 100      # distinct missions in the one query
+MAX_RESOLVE_RUNS = 5000         # newest mission_runs rows read
 
 
 async def resolve_run_ids(database: Any, rows: List[Dict[str, Any]]) -> None:
@@ -194,14 +215,18 @@ async def resolve_run_ids(database: Any, rows: List[Dict[str, Any]]) -> None:
     the report was made (latest `started_at` not after `created_at`, which a re-block resets, so
     the run may be a later one only if the report is newer than it). One query for all rows;
     rows without a derived id are not looked at; any failure leaves the derived ids."""
-    todo = [r for r in rows if r.get("run_id") and r.get("mission_name")]
+    todo = [r for r in rows if r.get("run_id") and r.get("mission_name")][:MAX_RESOLVE_ROWS]
     if not todo:
         return
+    # newest rows first, so a bound drops the oldest missions' lookups, not the live ones
+    ordered = sorted(todo, key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    missions = list(dict.fromkeys(str(r["mission_name"]) for r in ordered))[:MAX_RESOLVE_MISSIONS]
+    wanted = set(missions)
+    todo = [r for r in todo if str(r["mission_name"]) in wanted]
     try:
         async with database.connection() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute(RUNS_OF_MISSIONS_SQL,
-                                     (sorted({str(r["mission_name"]) for r in todo}),))
+                await cursor.execute(RUNS_OF_MISSIONS_SQL, (sorted(missions), MAX_RESOLVE_RUNS))
                 runs = [(str(a), b, c, d) for a, b, c, d in await cursor.fetchall()]
     except Exception as err:  # pylint: disable=broad-except
         logging.getLogger(__name__).warning("Could not resolve run ids of blocked nodes: %s", err)
@@ -352,15 +377,21 @@ def excluded_node_ids(rows: Iterable[Mapping[str, Any]],
     position row every graph node within `radius_m` of it (needs `nodes`, as graph_db
     returns them). Same rule as `row_blocks`."""
     rows = list(rows)
-    out = {str(row["graph_node_id"]) for row in rows
-           if position_of(str(row["graph_node_id"])) is None}
-    positions = [row for row in rows if position_of(str(row["graph_node_id"])) is not None]
-    if positions and nodes is not None:
+    radius_m = MATCH_RADIUS_M if radius_m is None else radius_m
+    out: Set[str] = set()
+    discs: List[Tuple[float, float]] = []          # parsed once, not per node per row
+    for row in rows:
+        gid = str(row["graph_node_id"])
+        pos = position_of(gid)
+        if pos is None:
+            out.add(gid)
+        else:
+            discs.append(pos)
+    if discs and nodes is not None:
         for node in nodes:
-            node_id = str(node.get("node_id", node.get("_key")))
             xy = node_xy(node)
-            if any(row_blocks(row, node_id, xy, radius_m) for row in positions):
-                out.add(node_id)
+            if xy is not None and any(math.hypot(xy[0] - px, xy[1] - py) <= radius_m for px, py in discs):
+                out.add(str(node.get("node_id", node.get("_key"))))
     return out
 
 
