@@ -878,8 +878,9 @@ class ChartGraph(SceneGraph):
     def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
               goal: Optional[Tuple[float, float]] = None) -> Optional[Route]:
         """Shortest lattice route in navigable space (blocked cells removed) between the anchors of charts a and b, or, when
-        `start` / `goal` name a navigable cell, between those cells (no anchor is visited; a point outside navigable space
-        falls back to the anchor of its chart). Searches the chart corridor first and the whole graph if that finds nothing
+        `start` / `goal` name a navigable cell of chart a / b, between those cells (no anchor is visited; a point outside
+        navigable space, or in another chart, falls back to the anchor of its chart). A route inside one chart reads the
+        clearance at that chart's anchor as its width. Searches the chart corridor first and the whole graph if that finds nothing
         or a longer way."""
         self._check()
         s = self._solved
@@ -905,14 +906,14 @@ class ChartGraph(SceneGraph):
             d, pr = dijkstra(g, directed=False, indices=src, return_predecessors=True)
             return d[dst], pr
         best = None
-        keep = self._corridor_charts(ja, jb)
+        keep = self._corridor_charts(ja, jb) if blocked is None else None   # an overlay can send the way outside any corridor
         if keep is not None:
             allowed = alive & np.isin(s.full, list(keep))
             dd, pr = search(allowed)
             if np.isfinite(dd): best = (dd, pr)
-        if best is None or blocked is not None:
+        if best is None:
             dd, pr = search(alive)
-            if np.isfinite(dd) and (best is None or dd < best[0] - 1e-9): best = (dd, pr)
+            if np.isfinite(dd): best = (dd, pr)
         if best is None: return None
         dd, pr = best
         path = [dst]
@@ -943,7 +944,7 @@ class ChartGraph(SceneGraph):
             cand = best.get((min(j0, j1), max(j0, j1)))
             # diagonal-only contact: no link; the two cells decide
             w = min(w, cand if cand is not None else 2.0 * float(min(sp.clr[c0], sp.clr[c1])))
-        return float(w) if math.isfinite(w) else float(2.0 * sp.clr[src])
+        return float(w) if math.isfinite(w) else float(2.0 * sp.clr[s.A[int(s.full[src])]])   # no crossing: the chart's anchor
 
     # ------------------------------------------------------------------ persistence hooks (store.py)
     @property

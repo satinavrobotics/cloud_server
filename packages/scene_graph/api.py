@@ -186,8 +186,8 @@ class SceneGraph:
               goal: Optional[Pt] = None) -> Optional[Route]:
         """Lattice route in navigable space between charts a and b; None when unreachable. It runs from the anchor of a to
         the anchor of b, unless `start` / `goal` (map-frame points, e.g. a Snap's x, y) name the cells to route between:
-        then the route is point to point and no anchor is visited (a point outside navigable space falls back to the anchor
-        of its chart). A region is large, its anchor is not on the way."""
+        then the route is point to point and no anchor is visited. A point outside navigable space, or in a chart other than
+        a / b, falls back to the anchor of its chart. A chart is large, its anchor is not on the way."""
         raise NotImplementedError
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
