@@ -76,6 +76,21 @@ younger than `rebuild_max_age_s`; an old-format record (no `begun_ms`) is restar
 request always starts a fresh generation. A cursor-only persist moves the pending cursor of a
 rebuild too (once the pending generation holds a saved state).
 
+Rebuild order (canonical contract, handoff_laci_morse.md): a rebuild does not fold in scan order. Phase 1 scans
+the nodes in (costmap_stored_ms, key) order WITHOUT fetching PNGs and keeps one small record per node (its stamp,
+key, stored_ms and the node document); phase 2 sorts the records by (stamp_ms, key) and folds them in fixed
+batches of `rebuild_batch` (48) leaves, fetching the PNGs only for the batch being built (plus the prefetch
+pool's own bound). Memory bound: O(nodes) node documents (a few hundred bytes each, never a PNG or a decoded
+window) + 8 bytes per node for the floor array; at most `rebuild_batch` decoded leaves are resident. Incremental
+(non-rebuild) ingest is unchanged. The cursor stays `(costmap_stored_ms, key)`: what is persisted during phase 2
+is the lowest stored_ms among the records not yet folded (everything below it is folded, so a resume rescans from
+there); on resume the leaves the restored pending generation already holds are skipped by key (same stamp, pose,
+footprint, view), so the resumed fold continues the same sorted sequence. A rebuild older than
+`rebuild_max_age_s` still commits what is folded: the unfolded rest is dropped from the plan, the cursor is
+that floor and the leaves above it that were folded are recognised by `seen`; the rest is folded incrementally.
+A PNG that is missing when its turn comes is retried later and folds after its batch (the only departure from the
+sorted order, as before).
+
 Scale: the engine is the only large object a worker holds. With `lazy_load` it is loaded by the
 first fold, not at start (an idle map never loads). `evict()` (called by the runner when its
 resident-engine / byte budget is exceeded) saves what is unsaved and drops the engine of an IDLE
@@ -119,6 +134,7 @@ BACKOFF = "backoff"                 # transient failure (source, save, tiles): s
 NOT_OWNER = "not_owner"             # another process holds the map's writer lock: sleep and retry
 DELETING = "deleting"               # terminal: map is being deleted or gone
 FENCED = "fenced"                   # terminal: save refused (stale version / lost lock)
+NO_STAMP = 1 << 62                  # plan sort key of a node without a usable stamp (a skip: sorts last)
 NEEDS_REBUILD = "needs_rebuild"     # terminal for the worker: params hash / generation changed
 TERMINAL = (DELETING, FENCED, NEEDS_REBUILD)
 
@@ -294,6 +310,16 @@ class _Entry:
 
 
 @dataclass
+class _PlanRec:
+    """One node of a rebuild's plan: sorted by (stamp, key); `persist`: the stamp is a fresh one the worker must keep."""
+    stamp: int                              # epoch ms the leaf is folded under (NO_STAMP: none, adapt skips it)
+    key: str
+    ms: int                                 # costmap_stored_ms
+    node: Mapping[str, Any]
+    persist: bool = False
+
+
+@dataclass
 class _Pending:
     node: Mapping[str, Any]                 # kept to ask for its PNG again without re-reading the node
     ms: int                                 # costmap_stored_ms
@@ -442,6 +468,14 @@ class SceneWorker:
         self._known_cursor: Cursor = ZERO_CURSOR         # the cursor that state was saved with
         self._known_version = 0
         self._known_off = True                           # no skipping: set by start, cleared when usable
+        self._rebuild_known = False                      # a resumed pending generation: skip the leaves it holds
+        # rebuild plan: phase 1 fills `_plan_recs` (key -> rec), sealing sorts it into `_plan`, phase 2 feeds it
+        self._plan_recs: Optional[Dict[str, _PlanRec]] = None
+        self._plan: Optional[List[_PlanRec]] = None
+        self._plan_idx = 0
+        self._plan_suffix: Optional[Any] = None          # array('q'): min stored_ms of _plan[i:]
+        self._plan_min_ms: Optional[int] = None
+        self._plan_persist: set = set()
         self._view_warned = False
         self._tickets: Dict[Tuple[str, int], _Ticket] = {}   # (key, stored_ms) -> prefetched PNG of this step
         self._memory_head: Optional[str] = None      # first leaf of the batch that last ran out of memory
@@ -674,7 +708,21 @@ class SceneWorker:
         more = False
         t_step = self._mono()
         skipped, fetch_error = self._retry_pending()
-        if fetch_error is None and self._leaf_count() < self._batch_max():
+        plan_mode = self._plan_mode()
+        if plan_mode:
+            self._plan_cut_overdue()
+            if fetch_error is None:
+                if self._leaf_count() >= self._batch_max():
+                    more = True
+                else:
+                    if self._plan is None:
+                        more, err = self._plan_scan()
+                        if err is not None:
+                            return err
+                    if self._plan is not None:      # sealed (now or before): fold from the sorted plan
+                        n_skipped, more, fetch_error = self._plan_feed(t_step)
+                        skipped += n_skipped
+        elif fetch_error is None and self._leaf_count() < self._batch_max():
             since = self._scan if self._scan is not None else (
                 max(0, self._candidate[0] - self._margin_ms()), "")
             try:
@@ -786,6 +834,131 @@ class SceneWorker:
                           settled=state == IDLE and self.settled())
 
     # ------------------------------------------------------------------ internals
+
+    # ---- rebuild plan (see "Rebuild order" in the module docstring)
+
+    def _plan_mode(self) -> bool:
+        return self._rebuild_gen is not None and self.config.rebuild_batch > 0
+
+    def _plan_clear(self) -> None:
+        self._plan_recs = self._plan = self._plan_suffix = self._plan_min_ms = None
+        self._plan_idx = 0
+        self._plan_persist.clear()
+
+    def _plan_stamp(self, node: Mapping[str, Any]) -> Tuple[int, bool]:
+        """(stamp ms, keep it), computed once per node in scan order (the session clock learns in that order, as
+        it always did); (NO_STAMP, False) when the node has no usable one: it sorts last and the adapt step skips it with its reason."""
+        layer = scene_leaf.role_layers(node.get("costmap")).get(scene_leaf.ROLE_OCCUPANCY)
+        if not layer:
+            return NO_STAMP, False
+        try:
+            got = scene_leaf.leaf_stamp(node, layer, clock=self.clock,
+                                        receipt_window_s=self.config.receipt_window_s)
+        except Exception:  # noqa: BLE001  a malformed node: adapt gives its reason
+            return NO_STAMP, False
+        if got is None:
+            return NO_STAMP, False
+        return int(got[0]), got[1] not in (scene_leaf.STAMP_STORED, scene_leaf.STAMP_PROVISIONAL)
+
+    def _plan_scan(self) -> Tuple[bool, Optional[StepResult]]:
+        """Phase 1: one page of nodes into the plan (no PNG). (more, BACKOFF result or None). The page that is
+        not full seals the plan: it is sorted by (stamp, key) and phase 2 starts next step."""
+        cfg = self.config
+        since = self._scan if self._scan is not None else (
+            max(0, self._candidate[0] - self._margin_ms()), "")
+        try:
+            nodes = list(self.source.costmap_nodes_since(self.map_id, since[0], since[1], cfg.batch_size))
+        except Exception as exc:
+            self.stats.source_errors += 1
+            self._full_replay = True
+            log.warning("scene worker %s: source failed: %s", self.map_id, exc)
+            return False, StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"source: {exc}")
+        more = len(nodes) >= cfg.batch_size
+        self._scan = self._order(nodes[-1]) if (more and nodes) else None
+        if self._plan_recs is None:
+            self._plan_recs = {}
+        for node in nodes:
+            key, ms = str(node.get("_key", "")), int(node.get("costmap_stored_ms") or 0)
+            have = self._plan_recs.get(key)
+            if have is not None and have.ms >= ms:
+                continue                      # a margin re-read
+            stamp, persist = self._plan_stamp(node)
+            self._plan_recs[key] = _PlanRec(stamp, key, ms, node, persist)
+            if self._plan_min_ms is None or ms < self._plan_min_ms:
+                self._plan_min_ms = ms
+        if not more:
+            self._plan_seal()
+            return True, None
+        return True, None
+
+    def _plan_seal(self) -> None:
+        """Sort the scanned records: the canonical fold order. `_plan_suffix[i]` = lowest stored_ms of
+        records i.. (the cursor floor while they are unfolded)."""
+        from array import array
+        recs = sorted((self._plan_recs or {}).values(), key=lambda r: (r.stamp, r.key))
+        suffix = array("q", bytes(8 * (len(recs) + 1)))
+        low = 1 << 62
+        suffix[len(recs)] = low
+        for i in range(len(recs) - 1, -1, -1):
+            low = min(low, recs[i].ms)
+            suffix[i] = low
+        self._plan, self._plan_suffix, self._plan_idx = recs, suffix, 0
+        self._plan_recs = None
+        self._scan = None
+
+    def _plan_floor_ms(self) -> Optional[int]:
+        """Lowest stored_ms among the plan's records that are not fed to the buffer yet (None: none)."""
+        if self._plan is None:
+            return self._plan_min_ms if self._plan_recs else None
+        if self._plan_idx >= len(self._plan):
+            return None
+        return int(self._plan_suffix[self._plan_idx])
+
+    def _plan_cut_overdue(self) -> None:
+        """A rebuild past `rebuild_max_age_s` is committed at its next save with what it folded. Phase 1: the
+        scan so far is the plan (a stored_ms prefix). Phase 2 (only once something was saved, as before): the
+        unfed rest is dropped and the cursor stays at its floor; the folded leaves above it are in `seen`."""
+        if not self._rebuild_overdue():
+            return
+        if self._plan is None:
+            if self._plan_recs is not None and self._scan is not None:
+                self._plan_seal()
+            return
+        if self._rebuild_saved and self._plan_idx < len(self._plan):
+            floor = self._plan_floor_ms()
+            self._plan_idx = len(self._plan)
+            if floor is not None:
+                self._candidate = min(self._candidate, (floor, ""))
+
+    def _plan_feed(self, t_step: int) -> Tuple[int, bool, Optional[_FetchError]]:
+        """Phase 2: adapt the next records in plan order into the buffer, up to one batch of leaves. The
+        PNGs are fetched here (and prefetched a page ahead). (new terminal skips, more, fetch error)."""
+        cfg, plan, skipped = self.config, self._plan, 0
+        assert plan is not None
+        handled = 0
+        while self._plan_idx < len(plan):
+            need = self._batch_max() - self._leaf_count()
+            if need <= 0:
+                break
+            ahead = plan[self._plan_idx:self._plan_idx + max(need, cfg.batch_size)]
+            self._prefetch([r.node for r in ahead])
+            for rec in ahead[:need]:
+                if cfg.step_budget_s and handled and self._mono() - t_step > cfg.step_budget_s * 1000:
+                    return skipped, True, None
+                node = rec.node
+                if 0 < rec.stamp < NO_STAMP:
+                    node = dict(node)
+                    node[scene_leaf.STAMP_FIELD] = rec.stamp      # fold under the stamp the plan was sorted by
+                    if rec.persist:
+                        self._plan_persist.add(rec.key)
+                try:
+                    outcome = self._adapt(node)
+                except _FetchError as exc:
+                    return skipped, False, exc
+                skipped += self._accept(node, outcome)
+                self._plan_idx += 1
+                handled += 1
+        return skipped, self._plan_idx < len(plan), None
 
     def _margin_ms(self) -> int:
         """How far below the furthest node this poll starts. The whole replay margin is re-read at
@@ -960,6 +1133,8 @@ class SceneWorker:
         self._known, self._known_version = None, version
         self._known_cursor = self._stored_cursor
         self._known_off = rebuilding or version <= 0 or not cfg.skip_folded
+        if rebuilding and self._resume_cursor is not None:
+            self._skip_held_by_pending()
         self._candidate = self._cursor
         self._expected_version = version
         self.stats.version = version
@@ -1228,6 +1403,12 @@ class SceneWorker:
                      self.map_id, reason, request.get("nodes"), gen)
         return None
 
+    def _skip_held_by_pending(self) -> None:
+        """A resumed (or reloaded) pending generation holds leaves in sorted-plan order, which is not a stored_ms
+        prefix: leaves it already holds are skipped by key wherever they sit relative to the cursor."""
+        self._known, self._known_off, self._rebuild_known = None, False, True
+        self._known_cursor = (1 << 62, "")
+
     def _reset_fold_state(self) -> None:
         """Forget everything folded or buffered: the engine is new and every leaf is read again."""
         self._buf.clear()
@@ -1235,6 +1416,8 @@ class SceneWorker:
         self._seen.clear()
         self._dup_counted.clear()
         self._known, self._known_off = None, True      # the engine is new or rewound: fold everything again
+        self._rebuild_known = False
+        self._plan_clear()
         self._pending.clear()
         self._idle_streak = 0
         self._scan = None
@@ -1343,7 +1526,10 @@ class SceneWorker:
         # not trusted yet (< min_obs observations): keeping it would freeze the leaf at "receipt"
         # while the later leaves of the session are corrected. It is never newer than the receipt,
         # so not keeping it only lets a replay pick the better estimate.
-        if info.get("source") not in (scene_leaf.STAMP_STORED, scene_leaf.STAMP_PROVISIONAL):
+        # (a rebuild plan injects its stamp as stored: `_plan_persist` names the ones it computed fresh)
+        fresh = key in self._plan_persist
+        self._plan_persist.discard(key)
+        if fresh or info.get("source") not in (scene_leaf.STAMP_STORED, scene_leaf.STAMP_PROVISIONAL):
             self._new_stamps[key] = int(leaf.stamp_ms)
         if not known:
             self.stats.default_r_d += 1
@@ -1354,12 +1540,12 @@ class SceneWorker:
     def _known_leaves(self) -> Optional[Dict[str, tuple]]:
         """`{key: (stamp_ms, session, x, y, r_d, view)}` of the state this worker started from (read once,
         lazily), or None when skipping is off or the leaves cannot be read (then everything is folded)."""
-        if self._known_off or self._rebuild_gen is not None:
+        if self._known_off or (self._rebuild_gen is not None and not self._rebuild_known):
             return None
         if self._known is None:
             index = None
             try:
-                if self.stored_leaves is not None and self._known_version > 0:
+                if self.stored_leaves is not None and self._known_version > 0 and self._rebuild_gen is None:
                     index = self.stored_leaves(self._known_version)
                 elif self.engine is not None and hasattr(self.engine, "export_state"):
                     index = {r.key: (int(r.t), str(r.session), float(r.x), float(r.y), float(r.r_d),
@@ -1530,7 +1716,8 @@ class SceneWorker:
                 skipped += self._accept(held.node, outcome)
         self.stats.pending = len(self._pending)
         floor = self._candidate[0] - cfg.replay_margin_ms
-        for key in [k for k, ms in self._seen.items() if ms < floor]:
+        # (not while a rebuild plan is being folded: the candidate runs ahead of the unfolded records there)
+        for key in [k for k, ms in self._seen.items() if ms < floor and self._plan is None]:
             del self._seen[key]
             self._dup_counted.pop(key, None)
         for key in [k for k in self._dup_counted if k not in self._seen]:
@@ -1838,6 +2025,7 @@ class SceneWorker:
                 return self._restart_rebuild("engine faulted and the pending generation could not be reloaded")
             self.engine = engine
             self._cursor = self._candidate = self._cursor_of(pend.get("cursor")) or ZERO_CURSOR
+            self._skip_held_by_pending()
             return None
         if self.engine_factory is None:
             return self._fault_give_up("no engine_factory to reload it")
@@ -2021,6 +2209,8 @@ class SceneWorker:
         self._fault_rebuilt = False
         self._recovered("save")
         self._generation, self._rebuild_gen, self._rebuild_saved = gen, None, False
+        self._plan_clear()
+        self._rebuild_known = False
         self._expected_version = int(version)
         self.stats.version = int(version)
         self.stats.rebuilds += 1
@@ -2123,6 +2313,7 @@ class SceneWorker:
         self._commit_failures = self._empty_confirms = 0
         self._fault_rebuilt = False
         self._rebuild_gen = None
+        self._plan_clear()
         self.stats.rebuilds += 1
         self._event("rebuild_completed", reason=self._rebuild_event_reason, version=0,
                     duration_s=round(max(0, self._mono() - self._rebuild_started_ms) / 1000.0, 3))
@@ -2143,6 +2334,9 @@ class SceneWorker:
         (a restart must read it again)."""
         floors = [p.ms for p in self._pending.values()]
         floors += list(self._buffered.values())      # adapted leaves (and skips) not folded yet
+        plan_floor = self._plan_floor_ms()           # a rebuild's records not fed yet (folded out of stored order)
+        if plan_floor is not None:
+            floors.append(plan_floor)
         if floors:
             return min(cursor, (min(floors), ""))
         return cursor

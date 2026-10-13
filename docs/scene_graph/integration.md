@@ -575,11 +575,18 @@ Routes: `GET /maps/{id}/scene-graph?bbox=&level=&version=&raster=&epoch=`, `/sce
   `rebuild_batch`, also recorded in the pending generation for whoever resumes it), with no time-based flush until the
   head of the nodes is reached; the remainder is flushed at the head, and a rebuild older than
   `SCENE_GRAPH_REBUILD_MAX_AGE_S` (900 s) is committed at its next save regardless. The same nodes therefore give
-  the same charts after every rebuild. **Note**: the worker feeds the batches in scan order `(costmap_stored_ms,
-  node key)`; it does not sort by `(stamp_ms, key)` (the store's docstring of `begin_generation` says "leaves sorted
-  by (stamp, key)"). The two orders agree only when the stored order is the capture order, which ties into the
-  stamp-order defect under "Open defects". Live batches differ by design: they fold in arrival order with time- and
-  size-based flushes, so a live-built graph and a rebuilt one over the same leaves can differ in chart partition.
+  the same charts after every rebuild. **Order (2026-10-13)**: a rebuild first scans every node in `(costmap_stored_ms,
+  node key)` order without fetching PNGs (one small record per node: stamp, key, stored_ms, node document), sorts the
+  records by `(stamp_ms, key)` and folds them in that order in batches of 48; a node without a usable stamp sorts
+  last (it is a terminal skip). Memory: O(nodes) node documents + 8 bytes per node; at most one batch of decoded
+  leaves is resident. The cursor stays `(costmap_stored_ms, key)`: while the sorted fold runs, the persisted cursor
+  is the lowest stored_ms among the records not folded yet (everything below it is folded); a resume rescans from
+  there and skips by key the leaves the restored pending generation already holds (same stamp, session, pose,
+  footprint, view). A rebuild past `REBUILD_MAX_AGE_S` commits what it folded, drops the unfolded rest of the plan
+  and ingests it incrementally (the departure from the canonical order, as it always was). A PNG that is missing
+  when its turn comes folds later (after its batch). Live batches differ by design: they fold in arrival order with
+  time- and size-based flushes (with the Morse partition the partition is a pure function of F, so only the driven
+  polyline and the per-cell latest-capture rule depend on the order).
 * **Resume** (store `begin_generation(fresh / params_hash / rebuild_batch)`, `meta()["pending"]` with `cursor` and
   `begun_ms`, `load(pending=True)`; built): a pending generation found at (re)start with the expected params hash is
   continued from its cursor. With a delete request outstanding only if `begun_ms` (the graph-builder's wall clock) is
@@ -649,3 +656,24 @@ statement.
   the current one when no longer retained); `version: 0` = no graph, no refetch, no error.
 * **Selection removed**: chart selection and its lineage re-mapping were dead code and were dropped; lineage is
   served but not consumed by the client.
+
+## At the Morse format bump (TODO, nothing changed yet)
+
+The star engine on v2 still reads `place_mult` / `sight_range`; the Morse engine ignores `place_mult` (deprecated
+no-op) and no longer reads `sight_range`. They are still written everywhere and pinned. When the store format moves
+to the Morse FORMAT (new generation for every map), do these together, not before:
+
+* [ ] `packages/services/graph_builder/scene_host.py` `params_dict()`: stop writing `place_mult` and `sight_range`
+  (the dict is what `EngineState.params` and the params hash are taken over; a change here is a new params hash, so
+  every map rebuilds once: do it in the same release as the format bump).
+* [ ] `tests/unit/test_scene_host.py` (`params_dict(p) == ChartGraph(p).export_state().params`) and
+  `tests/integration/scene_graph/test_scene_graph_e2e.py` (`meta["params"] == params_dict(params)`): the pins to move
+  with the engine's `export_state().params` and the store's `params_hash` / `ChartGraph` re-creation
+  (`packages/scene_graph/store.py`, CIMBI's) at the same time.
+* [ ] `SceneParams` construction in the worker host / adapter (`scene_host.worker_config`, `new_engine`): drop the two
+  arguments once the dataclass fields are gone.
+* [ ] `meta.params` served to clients (`scene_host.py:109` path via `store.meta`) stops carrying them; check the
+  client (`sati-client`) does not read `sight_range`.
+* [ ] `tools/scene_graph_sim/bench_*.py` and the unit tests that build `SceneParams(place_mult=..., sight_range=...)`.
+* [ ] `reads._check`: once `ViewResult.levels` exists on every served view (it does on the Morse tree), the 422 for
+  a level beyond the map's top level is on by itself; nothing to change.

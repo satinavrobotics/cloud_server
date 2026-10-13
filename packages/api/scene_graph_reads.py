@@ -318,6 +318,15 @@ class SceneGraphReads:
         except Exception as exc:  # pylint: disable=broad-except
             raise unavailable(exc, "read") from exc
 
+    @staticmethod
+    def _check_levels(res: Any, level: int) -> None:
+        """422 for a level beyond the map's top level: the engine answers it with the top level (clamped), which a
+        client must not mistake for "that level exists". `res.levels` = number of levels (0 .. levels-1 valid); 0 or
+        absent = not computed (an engine or store view without the field): the 0..MAX_LEVEL range check stands."""
+        n = getattr(res, "levels", 0)
+        if isinstance(n, int) and not isinstance(n, bool) and n > 0 and level >= n:
+            raise HTTPException(status_code=422, detail=f"level must be 0..{n - 1} for this map")
+
     def _guard(self, res: Any, owner_plane: bool) -> None:
         """Limits of one answer. `owner_plane`: the u16 plane is part of what is returned (raster, view with
         raster, owner_plane()): more than MAX_OWNER_KEYS keys, or an index naming a key that is not there,
@@ -375,6 +384,7 @@ class SceneGraphReads:
         if self._matches(if_none_match, etag):
             return None, headers
         res = await self._result(map_id, ep, version, box, level, parents)
+        self._check_levels(res, level)
         self._guard(res, owner_plane=raster)
         out = {"available": True, "map_id": map_id, "version": version, "epoch": _tag(ep), "level": level,
                "bbox": [box.x0, box.y0, box.x1, box.y1],
@@ -396,6 +406,7 @@ class SceneGraphReads:
             return None
         box = self._check(bbox, level, meta)
         res = await self._result(map_id, ep, version, box, level, parents=False)
+        self._check_levels(res, level)
         self._guard(res, owner_plane=True)
         r = res.raster
         if r is None:
@@ -428,6 +439,7 @@ class SceneGraphReads:
         if self._matches(if_none_match, etag):
             return None, headers
         res = await self._result(map_id, ep, version, box, level)
+        self._check_levels(res, level)
         self._guard(res, owner_plane=(plane == "owner"))
         r = res.raster
         if r is None:

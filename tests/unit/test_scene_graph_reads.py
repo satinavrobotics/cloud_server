@@ -217,6 +217,49 @@ def test_level_bounds_are_accepted():
         assert run(r.view("m", BBox(0, 0, 1, 1), level=level))["available"] is True
 
 
+class _LeveledGraph(FakeGraph):
+    """A view that reports `levels` like ViewResult.levels (the engine and the stored view)."""
+    levels = None
+
+    def query(self, bbox, level, raster, parents=True):
+        res = super().query(bbox, level, raster, parents)
+        if self.levels is not None:
+            res.levels = self.levels
+        return res
+
+
+def _counted(count):
+    graph = type("G", (_LeveledGraph,), {"levels": count})
+    m = {"version": 3, "params": {"lattice": 0.1}}
+    return sgr.SceneGraphReads(lambda mid: m, lambda mid, v, b: graph([]))
+
+
+def test_level_beyond_the_view_level_count_is_422():
+    r = _counted(3)
+    for level in (0, 1, 2):                   # count - 1 is the top level: fine
+        assert run(r.view("m", BBox(0, 0, 1, 1), level=level))["level"] == level
+    for level in (3, 4, sgr.MAX_LEVEL, -1):   # count, beyond, and negative: 422, never clamped silently
+        for call in (lambda: r.view("m", BBox(0, 0, 1, 1), level=level),
+                     lambda: r.raster("m", BBox(0, 0, 1, 1), level=level)):
+            with pytest.raises(HTTPException) as e:
+                run(call())
+            assert e.value.status_code == 422
+
+
+def test_single_level_map_answers_level_0_only():
+    r = _counted(1)
+    assert run(r.view("m", BBox(0, 0, 1, 1), level=0))["available"] is True
+    with pytest.raises(HTTPException) as e:
+        run(r.view("m", BBox(0, 0, 1, 1), level=1))
+    assert e.value.status_code == 422
+
+
+def test_absent_or_zero_levels_keeps_the_plain_range_check():
+    for count in (None, 0):
+        r = _counted(count)
+        assert run(r.view("m", BBox(0, 0, 1, 1), level=sgr.MAX_LEVEL))["available"] is True
+
+
 def test_area_cap_applies_to_json_and_raster_before_any_load():
     r, calls = reads(max_cells=100)
     for raster in (True, False):
