@@ -128,6 +128,15 @@ class Route:
     nodes: List[Pt]                    # lattice path (map-frame centres)
     cost: int = 0                      # integer path cost: the length in units of 1e-4 m, each edge rounded up. Among paths of equal
                                        # cost the route is the lexicographic minimum of its (y, x) cell sequence (reproducible)
+    exact: bool = True                 # False: a priced / overlay search over the tile cap returned the corridor's route (valid, maybe
+                                       # costlier than the optimum); the engine's routes are always exact
+
+
+def edge_weight(len_units, deficit_sum, rate):
+    """Integer edge cost of a priced lattice edge (docs/scene_graph/route_safety.md section 1): `len_units` is the Euclidean length
+    in cost units (length / 1e-4 m), `deficit_sum` the sum of the deficits max(0, margin - clearance) of its two cells; works on
+    numbers and arrays. `rate` 0 gives the unpriced weight ceil(len_units - 1e-6), at least 1."""
+    return np.maximum(np.ceil(len_units * (1.0 + rate * deficit_sum / 2.0) - 1e-6), 1.0)
 
 
 @dataclass(frozen=True)

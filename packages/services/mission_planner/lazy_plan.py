@@ -27,7 +27,7 @@ Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.
   the graph (`unavailable`) for `GraphCache` to drop;
 * with `safety` (clearance pricing, `docs/scene_graph/route_safety.md`) the corridor is a seed as under an overlay: the answer is
   the search of the charts that can hold a path of cost <= J_corridor; the clearance comes from the `v` planes of the tile and
-  its 8 neighbours (exact up to one tile of halo, 6.4 m);
+  its 8 neighbours (a halo of cap / RES + 2 cells; exact for min(g, 1 m), so for margins up to 1 m);
 * `max_tiles` caps a request: a bigger corridor raises `CorridorTooLarge` (the planner falls back to the legacy one).
 
 It reads `StoredView` internals (`_own`, `_cache`, `_idx`); that is the cost of a LACI-only phase. Phase 1 gives these
@@ -46,13 +46,15 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from packages.scene_graph.api import Blocked, Route, Safety, Snap
+from packages.scene_graph.api import Blocked, Route, Safety, Snap, edge_weight
 
 ROUTE_UNIT_M = 1e-4              # route cost unit (packages/scene_graph/engine.py)
 RES = 0.05                      # costmap cell; the lattice is 2 x RES (store.py)
 TILE_L = 64                     # lattice cells per tile side (store.py)
 TILE_F = 2 * TILE_L             # costmap cells per tile side
-_CLR_CAP_M = TILE_F * RES       # clearance is exact up to the halo of one tile (S9 of docs/scene_graph/route_safety.md); capped here
+_CLR_CAP_M = 1.0                # clearance is computed exactly up to this (S9 of docs/scene_graph/route_safety.md), capped here;
+                                # pricing is off for a margin above it (scene_route.safety_for)
+_CLR_HALO = int(math.ceil(_CLR_CAP_M / RES)) + 2   # costmap cells read around a tile to know min(g, cap) inside it
 _OFF = 1 << 20                  # linear cell keys: (y + _OFF) * _KW + (x + _OFF), neighbours never wrap
 _KW = 1 << 21
 
@@ -167,7 +169,9 @@ class PlanGraph:
     # ---- plumbing ----------------------------------------------------------------------------
     @property
     def nbytes(self) -> int:
-        return int(self.view.nbytes + self._adj.data.nbytes + self._g.data.nbytes)
+        with self._clr_lock:
+            clr = sum(a.nbytes for a in self._clr.values())
+        return int(self.view.nbytes + self._adj.data.nbytes + self._g.data.nbytes + clr)
 
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         return self.view.snap(x, y, max_dist)
@@ -224,21 +228,29 @@ class PlanGraph:
     def _clearance_tile(self, tx: int, ty: int) -> np.ndarray:
         """[TILE_L, TILE_L] physical clearance (m, capped at `_CLR_CAP_M`) of the lattice cells of tile (tx, ty): the engine's
         `sp.clr` (distance to the nearest blocked or unknown costmap cell, sampled at the even costmap cell) from the stored `v`
-        planes of the tile and its 8 neighbours; an absent tile is unknown, hence blocked."""
+        planes of the tile and a halo of `_CLR_HALO` cells around it (the neighbouring tiles read); an absent tile is unknown,
+        hence blocked. Exact for min(g, cap): a blocked cell within cap of a cell of the tile is inside the window."""
         with self._clr_lock:
             hit = self._clr.get((tx, ty))
             if hit is not None:
                 self._clr.move_to_end((tx, ty))
                 return hit
-        free = np.zeros((3 * TILE_F, 3 * TILE_F), bool)
-        for j in range(3):
-            for i in range(3):
-                t = self._tile(tx + i - 1, ty + j - 1)
-                if t is not None and "v" in t:
-                    v = t["v"]
-                    free[j * TILE_F:(j + 1) * TILE_F, i * TILE_F:(i + 1) * TILE_F] = (v != 255) & (v < 100)
+        halo = _CLR_HALO
+        self.view._need([(tx + i, ty + j) for j in (-1, 0, 1) for i in (-1, 0, 1)])     # the halo reads, checked as one batch
+        size = TILE_F + 2 * halo
+        free = np.zeros((size, size), bool)
+        for j in (-1, 0, 1):
+            for i in (-1, 0, 1):
+                t = self._tile(tx + i, ty + j)
+                if t is None or "v" not in t:
+                    continue
+                # the part of tile (tx + i, ty + j) inside the window, in window coordinates (the tile (tx, ty) starts at `halo`)
+                y0, y1 = max(halo + j * TILE_F, 0), min(halo + (j + 1) * TILE_F, size)
+                x0, x1 = max(halo + i * TILE_F, 0), min(halo + (i + 1) * TILE_F, size)
+                v = t["v"][y0 - (halo + j * TILE_F):y1 - (halo + j * TILE_F), x0 - (halo + i * TILE_F):x1 - (halo + i * TILE_F)]
+                free[y0:y1, x0:x1] = (v != 255) & (v < 100)
         dt = ndimage.distance_transform_edt(free) * RES
-        out = np.minimum(dt[TILE_F:2 * TILE_F:2, TILE_F:2 * TILE_F:2], _CLR_CAP_M)
+        out = np.minimum(dt[halo:halo + TILE_F:2, halo:halo + TILE_F:2], _CLR_CAP_M)
         out.flags.writeable = False
         with self._clr_lock:
             self._clr[(tx, ty)] = out
@@ -418,16 +430,19 @@ class PlanGraph:
                 ok &= (o1 >= 0) & (o2 >= 0)
             a = np.nonzero(ok)[0]
             R.append(node[mi[a]]); C.append(node[q[a]])
-            # the engine's integer edge cost (engine.ROUTE_UNIT_M): length in units of 1e-4 m, rounded up
-            Ln.append(np.full(len(a), max(math.ceil(math.hypot(dy, dx) * h / ROUTE_UNIT_M - 1e-6), 1.0)))
-            if safety is not None:
+            if safety is None:
+                # the engine's integer edge cost (engine.ROUTE_UNIT_M): length in units of 1e-4 m, rounded up
+                Ln.append(np.full(len(a), max(math.ceil(math.hypot(dy, dx) * h / ROUTE_UNIT_M - 1e-6), 1.0)))
+            else:
                 Lm.append(np.full(len(a), math.hypot(dy, dx) * h))
-        R, C, Ln = np.concatenate(R), np.concatenate(C), np.concatenate(Ln)
+        R, C = np.concatenate(R), np.concatenate(C)
         nm = len(mi)
-        if safety is not None:
-            # priced edge cost, the same float operations as ChartGraph._edge_cost
+        if safety is None:
+            Ln = np.concatenate(Ln)
+        else:
+            # priced edge cost: the engine's `edge_weight` on the clearance of the member cells
             dn = np.maximum(0.0, safety.margin - self._clearance(ys[mi], xs[mi]))
-            Ln = np.maximum(np.ceil(np.concatenate(Lm) / ROUTE_UNIT_M * (1.0 + safety.rate * (dn[R] + dn[C]) / 2.0) - 1e-6), 1.0)
+            Ln = edge_weight(np.concatenate(Lm) / ROUTE_UNIT_M, dn[R] + dn[C], safety.rate)
 
         def find(cell):
             p = int(at(np.array([(cell[0] + _OFF) * _KW + (cell[1] + _OFF)], np.int64))[0])
@@ -507,7 +522,7 @@ class PlanGraph:
             if not charts or charts[-1] != kk:
                 charts.append(kk)
         nodes = [((2 * int(x) + 1) * RES, (2 * int(y) + 1) * RES) for y, x in rows[:, 1:].tolist()]
-        return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes, cost=cost)
+        return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes, cost=cost, exact=exact)
 
     def _cell_at(self, p: Optional[Tuple[float, float]], j: int) -> Optional[Tuple[int, int]]:
         """global lattice cell (y, x) containing the point when it is owned by chart j, else None (the anchor is used)"""

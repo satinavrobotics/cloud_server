@@ -31,7 +31,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
-                  SceneParams, Snap, ViewResult)
+                  SceneParams, Snap, ViewResult, edge_weight)
 from . import morse
 from .chart_keys import assign_A, overlaps
 from .leafcover import View as CamView
@@ -964,7 +964,7 @@ class ChartGraph(SceneGraph):
         d = max(0, margin - clearance) of the edge's cells. With rate 0 it is the unpriced cost (the same float operations)."""
         R, C, Ln = s.edges
         d = np.maximum(0.0, safety.margin - s.sp.clr)
-        return np.maximum(np.ceil(Ln / ROUTE_UNIT_M * (1.0 + safety.rate * (d[R] + d[C]) / 2.0) - 1e-6), 1.0)
+        return edge_weight(Ln / ROUTE_UNIT_M, d[R] + d[C], safety.rate)
 
     def deficit_cell(self, ix: int, iy: int, margin: float) -> Optional[float]:
         """max(0, margin - g) of the navigable global lattice cell (ix, iy), None when it is not navigable (api.SceneGraph)."""

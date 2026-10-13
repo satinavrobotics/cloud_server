@@ -3,6 +3,7 @@
 
 P1 reduction (lazy), P2 completeness (lazy), P7 lazy == engine on the nine equality worlds with and without an overlay, P8 halo
 exactness of the clearance at tile edges."""
+import math
 import random
 
 import pytest
@@ -16,7 +17,8 @@ from .test_lazy_plan_equality import ALL, _extent, _overlays, _point_pairs
 
 pytestmark = pytest.mark.unit
 
-SAFETIES = [Safety(0.404, 3.0 / 0.154), Safety(0.6, 40.0)]
+R_C = 0.25 * math.sqrt(2)          # the circumscribed radius of the map's robot: the planner's default margin
+SAFETIES = [Safety(R_C, 1.0 / (R_C - 0.25)), Safety(0.6, 40.0)]       # kappa 1 at the default margin, a steeper one
 
 
 @pytest.fixture(scope="module", params=sorted(ALL))
@@ -140,7 +142,7 @@ def test_p8_lazy_deficit_cell_equals_the_engines_for_every_navigable_cell_includ
     sp = eng._solved.sp
     ix0, iy0 = eng._cx0 // 2, eng._cy0 // 2
     edge = 0
-    for margin in (0.404, 1.3):
+    for margin in (R_C, 1.0):                # the default margin and the clearance cap (_CLR_CAP_M)
         for y, x in zip(sp.ys.tolist(), sp.xs.tolist()):
             ix, iy = x + ix0, y + iy0
             e = eng.deficit_cell(ix, iy, margin)
@@ -227,6 +229,42 @@ def test_the_ellipse_stage_over_the_cap_returns_the_corridor_route_and_says_inex
             assert (r is None) == (e is None)
             if r is not None:
                 seen += 1
-                assert lazy.last["exact"] is False
+                assert lazy.last["exact"] is False and r.exact is False       # the route call carries its own flag
                 assert r.cost >= e.cost and r.nodes and r.cost > 0
     assert seen and any(c is not None for c in calls)
+
+
+# ---- clearance cache: window, batch, bytes ------------------------------------------------------------------
+def test_the_clearance_of_a_tile_is_computed_in_a_window_and_checked_as_one_batch(monkeypatch):
+    from packages.services.mission_planner import lazy_plan
+    from .test_lazy_plan import WORLDS
+    st, eng, _ = _build(WORLDS["grid"]())
+    lazy = open_plan(st, "m", max_tiles=10 ** 6)
+    seen = []
+    real = lazy.view._need
+    monkeypatch.setattr(lazy.view, "_need", lambda tiles: (seen.append(sorted(tiles)), real(tiles))[1])
+    tile = (1, 1)
+    out = lazy._clearance_tile(*tile)
+    assert out.shape == (lazy_plan.TILE_L, lazy_plan.TILE_L) and float(out.max()) <= lazy_plan._CLR_CAP_M
+    assert seen == [sorted((tile[0] + i, tile[1] + j) for j in (-1, 0, 1) for i in (-1, 0, 1))]
+    assert lazy_plan._CLR_HALO == int(math.ceil(lazy_plan._CLR_CAP_M / lazy_plan.RES)) + 2 and lazy_plan._CLR_CAP_M == 1.0
+    lazy._clearance_tile(*tile)                      # cached: no second batch
+    assert len(seen) == 1
+
+
+def test_nbytes_counts_the_clearance_cache():
+    from .test_lazy_plan import WORLDS
+    st, eng, _ = _build(WORLDS["grid"]())
+    lazy = open_plan(st, "m", max_tiles=10 ** 6)
+    before = lazy.nbytes
+    out = lazy._clearance_tile(0, 0)
+    assert lazy.nbytes >= before + out.nbytes
+
+
+def test_a_margin_above_the_cap_is_never_priced_by_the_planner():
+    from packages.services.mission_planner import scene_route as sr
+    st, eng, _ = _build(__import__("tests.unit.test_lazy_plan", fromlist=["WORLDS"]).WORLDS["room_loop"]())
+    lazy = open_plan(st, "m", max_tiles=10 ** 6)
+    assert sr.safety_for(lazy, 1.0, 1.0, 1.0) is not None            # r_c = 0.707
+    assert sr.safety_for(lazy, 2.0, 1.0, 1.0) is None                # r_c = 1.118 > the 1 m cap: unpriced
+    assert sr.safety_for(lazy, 2.0, 2.0, 1.0) is None
