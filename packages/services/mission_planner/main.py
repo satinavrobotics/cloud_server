@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel, Field
 
+from cloud_common.objects.common import Pose2D
 from .server import MapResolutionError, MissionPlannerService
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response,
@@ -81,6 +82,23 @@ class PlanResponse(BaseModel):
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total: waypoints that should be skippable, skippable: how many got a corridor width, unavailable: why the others did not (e.g. 'width_unknown', 'legacy_planner'), else null}")
+
+
+class EnrichRequest(BaseModel):
+    """A route to complete with nodePolicy data."""
+    robot_name: str = Field(..., description="Robot the route is for (its footprint sets the corridor widths)")
+    map_id: str = Field(..., description="Map of the waypoints (their frame)")
+    waypoints: list = Field(..., description="Pose2D waypoints in the map frame; waypoints with origin 'planned' are dropped and re-planned")
+    insert_planned: bool = Field(True, description="Insert planned waypoints between waypoints that are not in the same or a neighbouring chart")
+
+
+class EnrichResponse(BaseModel):
+    success: bool
+    waypoints: list = Field(..., description="The completed route (the input unchanged when the scene graph is not available)")
+    inserted: int = Field(0, description="Planned waypoints inserted")
+    changed: bool = Field(False, description="Whether the route differs from the request's")
+    node_policy: Optional[Dict[str, Any]] = Field(None, description="{total, skippable, unavailable}; see POST /api/v1/plan")
+    graph_version: Optional[int] = None
 
 
 class NavigationResponse(BaseModel):
@@ -323,6 +341,31 @@ async def plan_only(request: PlanRequest):
     except Exception as e:
         logging.error(f"Plan request failed: {e}")
         raise HTTPException(status_code=500, detail=f"Plan request failed: {str(e)}")
+
+
+@app.post("/api/v1/route/enrich", response_model=EnrichResponse)
+async def enrich_route(request: EnrichRequest):
+    """
+    Complete a route with the nodePolicy data the robot needs (docs/node_policies_2026-10-13.md):
+    planned waypoints (origin 'planned', skippable) between waypoints that are not in the same or
+    a neighbouring scene-graph chart, and a corridor width from the scene graph for every waypoint
+    that should be skippable. Without a scene graph the route comes back unchanged with
+    `node_policy.unavailable` saying why; it never fails because of that.
+    """
+    try:
+        waypoints = [Pose2D(**w) for w in request.waypoints]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid waypoints: {e}")
+    try:
+        result = await service.enrich_route(
+            request.robot_name, request.map_id, waypoints, request.insert_planned)
+    except Exception as e:
+        logging.error(f"Route enrich failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Route enrich failed: {str(e)}")
+    return EnrichResponse(
+        success=True, waypoints=[w.dict() for w in result["waypoints"]],
+        inserted=result["inserted"], changed=result["changed"],
+        node_policy=result.get("node_policy"), graph_version=result.get("graph_version"))
 
 
 @app.get("/api/v1/missions/{mission_id}/plan", response_model=NavigationPlanResponse)

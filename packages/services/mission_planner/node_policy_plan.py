@@ -72,12 +72,15 @@ def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float) -> Optional[float]:
 
 def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Iterable[int],
                        robot_width: Optional[float], margin: float, snap_m: float,
-                       budget_s: float = 0.0) -> Dict[str, Any]:
+                       budget_s: float = 0.0, keep_intent: bool = False) -> Dict[str, Any]:
     """Make the `candidates` (waypoint indexes that should be skippable) skippable where the scene
     graph says how much room there is: sets `skippable` and `corridor_width_m` on those poses. A
     waypoint that already carries its own `corridor_width_m` keeps it. The last waypoint, and a
     waypoint without both adjacent legs (the first one: the edge before it starts at the robot,
-    which the route does not know), cannot get a computed corridor. Returns
+    which the route does not know), cannot get a computed corridor. A candidate without a corridor
+    becomes `skippable=False`, except an operator's waypoint with `keep_intent`: it keeps its
+    `skippable=True` (the editor shows what the operator asked; the dispatcher sends it not
+    skippable and logs it). Returns
     {"total": candidates, "skippable": how many are, "unavailable": reason or None}."""
     last = len(poses) - 1
     wanted = sorted({i for i in candidates if 0 <= i < last})
@@ -109,7 +112,8 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                     corridor = corridor_per_side(min(before, after), robot_width, margin)
                 if corridor is None:
                     reason = reason or UNAVAILABLE_WIDTH
-        pose.skippable = corridor is not None
+        if corridor is not None or not keep_intent or pose.origin == common.WAYPOINT_ORIGIN_PLANNED:
+            pose.skippable = corridor is not None
         pose.corridor_width_m = corridor
         done += corridor is not None
     return {"total": len(wanted), "skippable": done, "unavailable": reason}

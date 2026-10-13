@@ -2,7 +2,7 @@
 
 The dispatcher image ships no httpx, so this is its own small
 client on `requests` (already a dependency), run in a thread so it never blocks the event
-loop. Only used to replan a go-to as it starts; every failure is the caller's to log and
+loop. Only used to replan a go-to as it starts and to enrich a route (nodePolicy data); every failure is the caller's to log and
 survive (see Robot._replan_goto)."""
 import asyncio
 from typing import Any, Dict, Optional
@@ -39,3 +39,19 @@ class PlannerClient:
             if value is not None:
                 payload[key] = value
         return await asyncio.get_event_loop().run_in_executor(None, self._post, payload)
+
+    def _post_enrich(self, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        response = requests.post(f"{self.url}/api/v1/route/enrich", json=payload,
+                                 timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    async def enrich_route(self, robot_name: str, map_id: str, waypoints: list,
+                           insert_planned: bool = True,
+                           timeout: Optional[float] = None) -> Dict[str, Any]:
+        """The planner's EnrichResponse (`waypoints`, `inserted`, `changed`, `node_policy`)
+        for a route given as Pose2D dicts. Raises like `plan`."""
+        payload = {"robot_name": robot_name, "map_id": map_id, "waypoints": waypoints,
+                   "insert_planned": insert_planned}
+        return await asyncio.get_event_loop().run_in_executor(
+            None, self._post_enrich, payload, timeout or self.timeout)

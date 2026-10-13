@@ -863,6 +863,29 @@ dispatcher's policy: 0.35 m / heading free on nodes the robot drives through, 0.
 on the last node and on nodes with actions. A positive value is sent as given. A waypoint may
 carry `node_id`, the graph node it was taken from (the planner sets it).
 
+Waypoint skip policy (all optional; left out = the old behaviour, a waypoint is not skippable):
+`skippable` (bool: the robot may skip this waypoint when it is blocked), `max_wait_s` (seconds
+the robot holds at the waypoint before it counts as blocked; default `NODE_POLICY_MAX_WAIT_S`,
+capped at 120), `corridor_width_m` (metres of free ground on each side of the edges before and
+after the waypoint that a skip may use), `origin` (`"user"` or `"planned"`). `max_wait_s` and
+`corridor_width_m` must be finite and >= 0, else 422/400. A skip is sent to the robot only when
+`skippable` is true AND a corridor width is known: the planner fills `corridor_width_m` from the
+map's scene graph when the mission starts (the operator may also give one). Without a scene
+graph, or where the width is unknown, the waypoint is sent not skippable (logged, never an
+error); the last waypoint of a route is never skippable. Go-to missions (`POST /navigate`) get
+every waypoint but the first and the last skippable by the planner.
+
+Planned waypoints: when a mission starts and the map has a scene graph, the planner inserts
+waypoints with `origin: "planned"` (and `skippable: true`, a `corridor_width_m`) between two of
+the operator's consecutive waypoints that are not in the same or a neighbouring chart, so every
+consecutive pair is close enough for the robot to route. They are stored in the mission's
+`mission_tree` before the first order (the route gets longer; `skipped_nodes[].waypoint_index`
+and the order's nodes refer to the stored route). The operator's own waypoints keep their
+fields. A client that edits the route should keep or drop planned waypoints freely: the planner
+drops them and plans them again at the next first start. Missions with `planned_path` get no
+inserted waypoints, and neither does a reroute (`update_nodes`). Switches: `NODE_POLICY_SKIP_ENABLED`,
+`NODE_POLICY_GAP_FILL_ENABLED`.
+
 Status fields the dispatcher owns (an API status update keeps them): `skipped_nodes` (nodes the
 robot skipped as their nodePolicy allowed: `node_id`, `mission_node`, `waypoint_index`,
 `graph_node_id`, `description`), `node_notes` (the robot's advisory per-node notes, newest
@@ -1382,6 +1405,14 @@ interface MissionNode {
       x: number;
       y: number;
       theta: number;
+      map_id?: string;
+      allowedDeviationXY?: number;
+      allowedDeviationTheta?: number;
+      node_id?: string;
+      skippable?: boolean;          // robot may skip it when blocked (needs a corridor width)
+      max_wait_s?: number;          // seconds held before it counts as blocked
+      corridor_width_m?: number;    // per side; the planner fills it from the scene graph
+      origin?: 'user' | 'planned';  // 'planned': inserted by the planner
     }>;
   };
 

@@ -6,7 +6,7 @@ Client library for interacting with the Mission Planner Service.
 """
 
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import httpx
 
@@ -114,6 +114,22 @@ class MissionPlannerClient:
                 payload[key] = value
         response = await self._client.post(
             "/api/v1/plan", json=payload, **({"timeout": timeout} if timeout else {}))
+        response.raise_for_status()
+        return response.json()
+
+    async def enrich_route(self, robot_name: str, map_id: str, waypoints: List[Dict[str, Any]],
+                           insert_planned: bool = True,
+                           timeout: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Complete a route with nodePolicy data (planned waypoints between far-apart operator
+        waypoints, corridor widths from the scene graph). Returns the planner's EnrichResponse:
+        `waypoints`, `inserted`, `changed`, `node_policy`. Raises on HTTP errors.
+        """
+        response = await self._client.post(
+            "/api/v1/route/enrich",
+            json={"robot_name": robot_name, "map_id": map_id, "waypoints": waypoints,
+                  "insert_planned": insert_planned},
+            **({"timeout": timeout} if timeout else {}))
         response.raise_for_status()
         return response.json()
 

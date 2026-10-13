@@ -321,6 +321,80 @@ class MissionPlannerService:
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
         }, None
 
+    async def enrich_route(
+        self, robot_name: str, map_id: str, waypoints: List[common.Pose2D],
+        insert_planned: bool = True,
+    ) -> Dict[str, Any]:
+        """The operator's route with its nodePolicy data completed (docs/node_policies_2026-10-13.md):
+        planned waypoints inserted between two waypoints that are not in the same or a
+        neighbouring chart (`insert_planned`, SCENE_GRAPH needed), and a corridor width from the
+        scene graph for every waypoint that should be skippable but has none. Waypoints already
+        `origin="planned"` are dropped first, so the call is idempotent.
+
+        Never raises for a missing graph: the route comes back as it was, `changed` false and
+        `node_policy.unavailable` saying why. {"waypoints", "inserted", "changed", "node_policy",
+        "graph_version"?}."""
+        original = [w.copy() for w in waypoints]
+        base = [w.copy() for w in waypoints if w.origin != common.WAYPOINT_ORIGIN_PLANNED]
+        wants_corridor = config.NODE_POLICY_SKIP_ENABLED
+        report: Dict[str, Any] = {"total": 0, "skippable": 0, "unavailable": None}
+
+        def unchanged(reason: str) -> Dict[str, Any]:
+            asked = sum(1 for w in original[:-1] if w.skippable and not w.corridor_width_m)
+            return {"waypoints": original, "inserted": 0, "changed": False,
+                    "node_policy": {"total": asked, "skippable": 0, "unavailable": reason}}
+
+        if not config.SCENE_GRAPH_PLANNER_ENABLED:
+            return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
+        gap_fill = insert_planned and config.NODE_POLICY_GAP_FILL_ENABLED and len(base) >= 2
+        if not gap_fill and not wants_corridor:
+            return unchanged(node_policy_plan.UNAVAILABLE_DISABLED)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(config.SCENE_GRAPH_TOTAL_BUDGET_S)
+        try:
+            graph, version = await self._scene_cache.get(map_id, deadline)
+        except scene_route.ChartFallback as fb:
+            self.logger.info(f"Route enrich: no scene graph for {map_id} ({fb.reason})")
+            return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Route enrich: scene graph of {map_id} unavailable ({err!r})")
+            return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
+        robot = await self.get_robot_status(robot_name)
+        robot_width = self._robot_width(robot)
+        snap_m = config.SCENE_GRAPH_START_SNAP_M
+
+        def work() -> Tuple[List[common.Pose2D], int, Dict[str, Any]]:
+            poses, inserted = base, 0
+            if gap_fill:
+                visible = scene_route.blocked_free_los(graph, ([], []))
+                poses, inserted = node_policy_plan.insert_planned(
+                    graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
+                    scene_route.simplify)
+            wanted = [i for i, w in enumerate(poses[:-1])
+                      if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
+            if wants_corridor:
+                rep = node_policy_plan.annotate_corridors(
+                    graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
+                    config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True)
+            else:
+                rep = {"total": len(wanted), "skippable": 0,
+                       "unavailable": node_policy_plan.UNAVAILABLE_DISABLED}
+            return poses, inserted, rep
+
+        try:
+            poses, inserted, report = await asyncio.wait_for(
+                self._plan_pool.submit(work), float(config.SCENE_GRAPH_PLAN_BUDGET_S))
+        except asyncio.TimeoutError:
+            return unchanged("plan_timeout")
+        except scene_route.ChartFallback as fb:
+            return unchanged(fb.reason)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Route enrich failed ({err!r}); route left as it is")
+            return unchanged("error")
+        return {"waypoints": poses, "inserted": inserted,
+                "changed": [w.dict() for w in poses] != [w.dict() for w in original],
+                "node_policy": report, "graph_version": version}
+
     def _node_policy_cfg(self, robot: Optional[robot_object.RobotObjectV1]
                          ) -> Optional[Dict[str, Any]]:
         """Settings of the skip-data pass (scene_route.plan_on_graph), None when switched off."""
