@@ -1,10 +1,9 @@
-"""The canvas grows in every direction while leaves arrive: the solver carries its state across the shift instead of
-re-solving the whole map, and the result still satisfies every invariant (judged by the independent verifier)."""
+"""The canvas grows in every direction while leaves arrive and the result still satisfies every invariant (judged by the
+independent verifier); persistent keys survive the growth."""
 import numpy as np
 import pytest
 
 from packages.scene_graph.api import SceneParams
-from packages.scene_graph.chart_track import Track
 from packages.scene_graph.engine import ChartGraph
 
 from . import chart_worlds as cw
@@ -58,26 +57,6 @@ def test_growth_in_all_four_directions_keeps_every_invariant(room):
         assert any(x > 0 for x in xs) and any(y > 0 for y in ys), "the canvas never grew to the left and to the top"
     else:
         assert all(x == 0 for x in xs) and all(y == 0 for y in ys) and g._V.shape[0] > 2 * 40
-
-
-def test_carried_state_equals_the_old_full_resolve_and_a_scratch_solve(room, monkeypatch):
-    w, leaves, _ = room
-    _, _, new = _run(w, leaves, check=False)
-
-    def old_grow(self, shift, shape):                      # what the engine did before: fresh Track, previous anchors as seeds
-        anchors = [(y + shift[0], x + shift[1]) for y, x in self.anchors]
-        self.__init__(r=self.r, mult=self.mult, h=self.h, sight_range=self.sight_range)
-        self.anchors = anchors
-    monkeypatch.setattr(Track, "grow", old_grow)
-    _, _, old = _run(w, leaves, check=False)
-    assert [a for a, _ in new] == [a for a, _ in old]       # same anchors after every batch, in global cells
-    assert [k for _, k in new] == [k for _, k in old]       # same persistent keys
-    monkeypatch.undo()
-    # from scratch on the same leaves in ONE batch: valid, same number of charts within the history-dependent band
-    s = ChartGraph(SceneParams()); s.fold_many(leaves)
-    g, _, _ = _run(w, leaves, check=False)
-    assert ok(verify(s, w)) and ok(verify(g, w))
-    assert abs(len(g._solved.A) - len(s._solved.A)) <= 2
 
 
 def test_keys_persist_across_growth(room):

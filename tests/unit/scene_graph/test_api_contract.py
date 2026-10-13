@@ -10,10 +10,9 @@ from packages.scene_graph.store import SceneGraphStore
 pytestmark = pytest.mark.unit
 
 
-def test_params_derive_place_and_band():
+def test_params_carry_the_scales():
     p = SceneParams()
-    assert p.place == pytest.approx(0.375) and p.eps == pytest.approx(0.1 / 0.375)
-    assert p.sight_range == 5.0
+    assert (p.robot_half_side, p.lattice, p.sight_range) == (0.25, 0.1, 5.0)
 
 
 def test_leaf_carries_what_the_fold_needs():

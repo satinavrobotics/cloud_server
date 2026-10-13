@@ -25,9 +25,9 @@ sg.anchors, sg.links(), build_levels(sg), Router(sg).cost(node_a, node_b)
 | module | contents |
 |---|---|
 | `api.py` | the contract: `SceneParams`, `Leaf`, `Dirty`, `Chart`, `Link`, `Route`, `ViewResult`, `OwnerRaster`, `SceneGraph` |
-| `engine.py` | `ChartGraph(SceneGraph)`: fold, F(r), local re-solve, links, keys, locate / route / query / corridor / cover |
-| `chart_solver.py`, `chart_track.py` | canonical star-shaped cover and its per-batch local update |
-| `chart_keys.py`, `chart_levels.py` | persistent keys by overlap; hierarchy as a derived view |
+| `engine.py` | `ChartGraph(SceneGraph)`: fold, F(r), one partition per batch, links, keys, locate / route / query / corridor / cover |
+| `morse.py` | the persistence (Morse) partition of F, its arcs and levels: pure functions of F and h, no hidden scale |
+| `chart_keys.py` | persistent keys by overlap |
 | `window.py`, `leafcover.py`, `depth_occupancy.py` | rotated / rescaled windows; minimal leaf set; occupancy from depth |
 | `store.py` | persistence signatures only (not implemented) |
 

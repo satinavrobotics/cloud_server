@@ -400,17 +400,6 @@ def test_unchanged_leaf_segments_are_not_repacked_or_rewritten():
     assert before <= after and len(after - before) == 1     # one segment (all leaves fit in one) changed: only it is new
 
 
-def test_rounds_are_stored_exactly_without_a_range_limit():
-    store, _ = _store()
-    w, leaves = _world("two_rooms")
-    g, v = _grow(store, "m", leaves, 10)
-    st = g.export_state()
-    h = store.load("m")
-    t = store.manifest("m")["tiles"]
-    assert len(t) >= 1 and h._track.rnd_img is not None
-    assert st.rnd.dtype == np.int32
-
-
 def test_replay_with_a_new_cursor_and_canvas_does_not_bump_the_version():
     from tests.unit.scene_graph import chart_worlds as cw
     from packages.scene_graph.api import SceneParams

@@ -10,7 +10,7 @@ from . import chart_worlds as cw
 from .chart_verify import ok, verify
 
 pytestmark = pytest.mark.unit
-P1, P2, P3 = SceneParams(), SceneParams(place_mult=2.0), SceneParams(place_mult=1.75)
+P1, P2, P3 = SceneParams(), SceneParams(sight_range=6.0), SceneParams(sight_range=7.0)
 BATCH = 6
 
 

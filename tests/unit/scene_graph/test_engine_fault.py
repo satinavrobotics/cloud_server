@@ -30,7 +30,8 @@ def state_hash(g):
     for k in sorted(st.chan):
         h.update(k.encode()); h.update(np.ascontiguousarray(st.chan[k][0]).tobytes()); h.update(np.ascontiguousarray(st.chan[k][1]).tobytes())
     h.update(repr([(r.key, r.session, r.t, r.x, r.y, r.r_d) for r in st.leaves]).encode())
-    h.update(repr((st.watermark, st.version, st.cx0, st.cy0, st.keys, st.anchors)).encode())
+    h.update(repr((st.watermark, st.version, st.cx0, st.cy0, st.keys)).encode())
+    if st.plane is not None: h.update(np.ascontiguousarray(st.plane).tobytes())
     q = g.query(BIG, raster=True)
     h.update(repr(sorted((c.key, c.anchor, c.cells) for c in q.charts)).encode())
     h.update(repr(sorted((l.a, l.b, l.length, l.width) for l in q.links)).encode())
@@ -138,10 +139,10 @@ def test_refold_with_a_poison_leaf_is_unchanged_too(leaves):
 
 
 def test_query_without_parents_never_builds_the_hierarchy(leaves, monkeypatch):
-    from packages.scene_graph import engine as eng
+    from packages.scene_graph import morse
     g = ChartGraph(SceneParams()); g.fold_many(leaves)
     calls = []
-    monkeypatch.setattr(eng, "hierarchy", lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(AssertionError("built")))
+    monkeypatch.setattr(morse, "levels", lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(AssertionError("built")))
     g._cache.pop("levels", None)
     q = g.query(BIG, level=0, raster=True, parents=False)
     assert q.charts and not calls

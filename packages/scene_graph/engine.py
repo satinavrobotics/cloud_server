@@ -5,15 +5,18 @@
              which a cell was reported blocked (max-merge); optional channels fold the same way, one plane pair each.
     F(r)     navigable cells: components of (square fits at one of 23 headings  U  driven-and-free W(r)) that touch where a
              robot has been (G). Evidence is the driven polyline of each session, tagged with the half side r_d of its robot.
-    charts   star-shaped cover with an anchor each (chart_solver), re-solved locally per batch (chart_track); persistent keys
-             by overlap with the previous owner plane (chart_keys).
-    links    one per connected stretch of the interface curve of two charts (orthogonal contact); length (the cost) of the shortest route anchor -> contact ->
-             anchor inside the two charts, strict widest-path width, line integral of every channel along that route.
+    charts   the persistence (Morse) partition of F (morse.py): one region per surviving maximum of the distance to the
+             non-navigable cells, a pure function of F; persistent keys by overlap with the previous owner plane (chart_keys).
+    links    one per arc of the interface between two regions; the portal is the crossing attaining the saddle, `width` the
+             physical passage width 2 s + 2 r - h, `length` (the cost) the route anchor -> portal -> anchor inside the two
+             regions, and the line integral of every channel along that route.
+    levels   coarser partitions by merging adjacent regions of persistence below tau_0 * 2^j (nested by construction); a pure
+             function of the charts' clearance and the links' width (morse.levels), so a stored version answers the same.
 The graph carries evidence and length, never a price. Pure numpy / scipy, no I/O.
 
-Not implemented here: sparse / tiled in-memory planes (one dense canvas that grows), local F construction (F is rebuilt for
-the whole canvas per batch; only the chart solve is local), persistence (store.py), the leaf-delete winner plane (refold
-rebuilds the bbox from the leaves the caller supplies).
+Not implemented here: sparse / tiled in-memory planes (one dense canvas that grows), local F construction (F and the partition
+are rebuilt for the whole canvas per batch), persistence (store.py), the leaf-delete winner plane (refold rebuilds the bbox
+from the leaves the caller supplies).
 """
 import hashlib
 import bisect
@@ -25,19 +28,20 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from scipy import ndimage
 from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import breadth_first_order, dijkstra, minimum_spanning_tree
+from scipy.sparse.csgraph import dijkstra
 
 from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, SceneGraph,
                   SceneParams, Snap, ViewResult)
+from . import morse
 from .chart_keys import assign_A, overlaps
-from .chart_levels import hierarchy
-from .chart_track import Track
 from .leafcover import View as CamView
 from .leafcover import select_views
 from .state import EngineState, LeafRecord, StateMismatch
 from .window import to_lattice
 
-RES = 0.05                      # costmap cell (m); the lattice is two cells (SceneParams.lattice = 0.1)
+RES = 0.05                      # costmap cell (m)
+LAT = 2                         # costmap cells per lattice cell (lattice = LAT * RES): the 2:1 assumption lives in this constant
+                                # and in the places that do index arithmetic on it (`// 2`, `2 * x`, tiles in store.py)
 HEADINGS = 23                   # corner shift r * sqrt2 * dtheta < res / 2 at 90 / 23 degrees
 TILE = 64                       # lattice cells per tile side (corridor tiles)
 MARGIN = 40                     # canvas growth margin (full-resolution cells)
@@ -57,18 +61,17 @@ class _Rec:
 @dataclass
 class _Solved:
     """Everything one solved state answers from (image positions are lattice cells of the canvas)."""
-    sp: object
-    A: List[int]
-    own: np.ndarray
-    full: np.ndarray            # chart index per cell (dependents attached), -1 outside F
+    sp: morse.Space             # the cells of F; sp.clr is the physical clearance (m) of each
+    A: List[int]                # anchor cell (index into sp) of each chart
+    full: np.ndarray            # chart index per cell of sp
     keys: List[Key]
     charts: List[Chart]
     links: List[dict]
     edges: Tuple[np.ndarray, np.ndarray, np.ndarray]
     plane: np.ndarray           # canvas image: chart index per lattice cell, -1 outside
-    dep: np.ndarray             # canvas image: cell attached by cost, not seen from its anchor
+    dep: np.ndarray             # canvas image, all False: every cell of a chart is its own (kept for the OwnerRaster contract)
     S: np.ndarray               # driven (body covered) image
-    clr: np.ndarray
+    peak: np.ndarray            # B (distance to the cells outside F) at each chart's anchor: the persistence peak
 
 
 def _square(theta: float, side: float, res: float = RES) -> np.ndarray:
@@ -107,8 +110,8 @@ class ChartGraph(SceneGraph):
     def __init__(self, params: SceneParams = SceneParams()):
         super().__init__(params)
         self.faulted: Optional[BaseException] = None   # set when an exception escaped after the state began to change
-        if params.sight_range < params.place - 1e-12:
-            raise ValueError("sight_range below the place scale")
+        if params.sight_range < params.robot_half_side - 1e-12:
+            raise ValueError("sight_range below the robot half side")
         self.version = 0
         self._h = params.lattice
         self._leaves: Dict[str, _Rec] = {}
@@ -117,7 +120,8 @@ class ChartGraph(SceneGraph):
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
         self._V = self._T = self._B = None
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-        self._track: Optional[Track] = None
+        self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
+        self._dcache = None                     # (free, distance transform of free in cells) of the last F build
         self._key_plane: Optional[np.ndarray] = None
         self._keys: List[Key] = []
         self._solved: Optional[_Solved] = None
@@ -127,11 +131,9 @@ class ChartGraph(SceneGraph):
         self._cache: dict = {}
         self._shift = (0, 0)                    # canvas growth of the batch being solved (lattice cells)
         self._ecache = None                     # (free, square-fits) of the last F build
-        self._dcache = None                     # (free, distance transform of free in cells) of the last F build
         self._pl = None                         # driven evidence of the last F build: last point per session and the G / W / S images
         self._pl_new: List[str] = []            # leaves added since then (appended to a session in capture order => incremental)
         self._pl_full = False                   # a leaf was removed or changed: rebuild the evidence
-        self._wcache: dict = {}                 # widest-path widths by pair content
         self._rcache: dict = {}                 # routes from the anchor inside a chart, by chart content
 
     # ------------------------------------------------------------------ canvas and fold
@@ -546,12 +548,13 @@ class ChartGraph(SceneGraph):
         return G, Wm, S
 
     def _build_F(self, shift: Tuple[int, int] = (0, 0)):
-        r, h = self.params.robot_half_side, self._h
+        """(F, clr, S): the navigable lattice cells, the physical clearance of every lattice cell (distance to the nearest
+        blocked or unknown cell, m) and the driven (body covered) image"""
         V = self._V
         free = (V != 255) & (V < 100)
         sq = self._erode(free, shift)
         clr = self._clearance_cells(free, shift) * RES
-        sq_h, fr_h, clr_h = sq[::2, ::2], free[::2, ::2], clr[::2, ::2]
+        sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
         G, W, S = self._evidence(sq_h.shape, shift)
         cand = sq_h | (W & fr_h)
         lab, _ = ndimage.label(cand, structure=np.ones((3, 3)))
@@ -561,36 +564,23 @@ class ChartGraph(SceneGraph):
 
     # ------------------------------------------------------------------ solve
     def _solve(self, shift: Tuple[int, int], birth: str):
-        p = self.params
         nav, clr, S = self._build_F(shift)
-        if self._track is None:
-            self._track = Track(r=p.robot_half_side, mult=p.place_mult, h=self._h, sight_range=p.sight_range)
-        elif shift != (0, 0) or (self._track.nav is not None and self._track.nav.shape != nav.shape):
-            self._track.grow(shift, nav.shape)          # the canvas grew: carry rows, ownership and anchors, do not re-solve
         if self._key_plane is None:
             self._key_plane = -np.ones(nav.shape, np.int32)
         self._retired_map = {}
         if not nav.any():
             self._retired_map = {self._fmt(k): [] for k in self._keys}
-            self._track = Track(r=p.robot_half_side, mult=p.place_mult, h=self._h, sight_range=p.sight_range)
             self._solved = None; self._keys = []; self._key_plane = -np.ones(nav.shape, np.int32)
             return
-        sp, A, own, rnd = self._track.step(nav, clr)
-        self._solved = self._evaluate(sp, A, own, nav, clr, S, birth)
+        self._solved = self._evaluate(morse.partition(nav, self._h, self._tau), clr, S, birth)
 
-    def _evaluate(self, sp, A, own, nav, clr, S, birth) -> _Solved:
-        H, W = nav.shape
-        edges = self._lattice_edges(sp)
-        R, C, Ln = edges
-        N = sp.N
-        full = own.astype(np.int64).copy()
-        dep = own < 0
-        if dep.any() and (~dep).any():
-            G = coo_matrix((np.concatenate([Ln, Ln]), (np.concatenate([R, C]), np.concatenate([C, R]))), shape=(N, N)).tocsr()
-            _, _, so = dijkstra(G, directed=False, indices=np.nonzero(~dep)[0], min_only=True, return_predecessors=True)
-            ok = dep & (so >= 0); full[ok] = own[so[ok]]
+    def _evaluate(self, part: "morse.Partition", clr, S, birth) -> _Solved:
+        sp, A, h = part.sp, [int(a) for a in part.anchor], self._h
+        H, W = sp.H, sp.W
+        full = part.full.astype(np.int64)
+        sp.clr = clr[sp.ys, sp.xs]
+        edges = self._lattice_edges(sp, h)
         plane = -np.ones((H, W), np.int32); plane[sp.ys, sp.xs] = full
-        depi = np.zeros((H, W), bool); depi[sp.ys[dep & (full >= 0)], sp.xs[dep & (full >= 0)]] = True
         # persistent keys
         cells = [(int(sp.xs[a]), int(sp.ys[a])) for a in A]
         prev_keys = list(self._keys)
@@ -600,24 +590,22 @@ class ChartGraph(SceneGraph):
         for (j, k), n in sorted(ov.items(), key=lambda it: -it[1]):
             if prev_keys[k] in retired_t: succ.setdefault(prev_keys[k], []).append(keys_t[j])
         self._retired_map = {self._fmt(k): [self._fmt(s) for s in succ.get(k, [])] for k in retired_t}
-        kp = -np.ones((H, W), np.int32)
-        kp[sp.ys, sp.xs] = np.where(full >= 0, full, -1)       # chart index; keys list below is in the same order
-        self._key_plane = kp; self._keys = list(keys_t)
+        self._key_plane = plane.copy(); self._keys = list(keys_t)      # chart index per cell; keys in the same order
         keys = [self._fmt(k) for k in keys_t]
         # channels on the lattice
         V = self._V
-        v = V[::2, ::2]
-        ch = {"undriven": (~S).astype(float), "ever_blocked": (self._B[::2, ::2] >= 0).astype(float),
+        v = V[::LAT, ::LAT]
+        ch = {"undriven": (~S).astype(float), "ever_blocked": (self._B[::LAT, ::LAT] >= 0).astype(float),
               "soft": np.where((v > 0) & (v < 100), v / 99.0, 0.0)}
         for name, (cv, _) in self._chan.items():
-            w = cv[::2, ::2]; ch[name] = np.where((w > 0) & (w < 100), w / 99.0, 0.0)
+            w = cv[::LAT, ::LAT]; ch[name] = np.where((w > 0) & (w < 100), w / 99.0, 0.0)
         chv = {k: f[sp.ys, sp.xs] for k, f in ch.items()}
-        links = self._links(sp, A, full, edges, chv)
+        links = self._links(sp, A, full, edges, chv, morse.arcs(sp, part.full, part.f, sp.clr))
         # chart records
         eb = ch["ever_blocked"]
         pose_cell = {}
-        for k, r in self._leaves.items():
-            y = int(math.floor(r.y / RES) - self._cy0) // 2; x = int(math.floor(r.x / RES) - self._cx0) // 2
+        for k, rec in self._leaves.items():
+            y = int(math.floor(rec.y / RES) - self._cy0) // 2; x = int(math.floor(rec.x / RES) - self._cx0) // 2
             if 0 <= y < H and 0 <= x < W and plane[y, x] >= 0 and S[y, x]:
                 pose_cell.setdefault(int(plane[y, x]), []).append((k, y, x))
         charts = []
@@ -628,11 +616,11 @@ class ChartGraph(SceneGraph):
             leaf = None
             if j in pose_cell:
                 leaf = min(pose_cell[j], key=lambda t: ((t[1] - ay) ** 2 + (t[2] - ax) ** 2, t[0]))[0]
-            charts.append(Chart(key=keys[j], anchor=self._cell_xy(ay, ax), cells=int(len(cc)), area_m2=float(len(cc) * self._h ** 2),
+            charts.append(Chart(key=keys[j], anchor=self._cell_xy(ay, ax), cells=int(len(cc)), area_m2=float(len(cc) * h ** 2),
                                 clearance=float(sp.clr[a]), driven_frac=float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0,
                                 ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf))
-        return _Solved(sp=sp, A=list(A), own=own, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
-                       dep=depi, S=S, clr=clr)
+        return _Solved(sp=sp, A=A, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
+                       dep=np.zeros((H, W), bool), S=S, peak=part.f[A])
 
     @staticmethod
     def _fmt(k: tuple) -> Key:
@@ -643,7 +631,7 @@ class ChartGraph(SceneGraph):
         return ((self._cx0 + 2 * x + 1) * RES, (self._cy0 + 2 * y + 1) * RES)
 
     @staticmethod
-    def _lattice_edges(sp):
+    def _lattice_edges(sp, h):
         ys, xs, idx, nav = sp.ys, sp.xs, sp.idx, sp.nav
         R, C, Ln = [], [], []
         for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
@@ -653,98 +641,23 @@ class ChartGraph(SceneGraph):
             a = np.nonzero(ok)[0]; b = idx[y2[a], x2[a]]
             if dy and dx:
                 keep = nav[ys[a], x2[a]] & nav[y2[a], xs[a]]; a, b = a[keep], b[keep]
-            R.append(a); C.append(b); Ln.append(np.full(len(a), math.hypot(dy, dx) * 0.1))
+            R.append(a); C.append(b); Ln.append(np.full(len(a), math.hypot(dy, dx) * h))
         return np.concatenate(R), np.concatenate(C), np.concatenate(Ln)
 
     # ------------------------------------------------------------------ links
-    @staticmethod
-    def _widest_strict(sp, full, A, a, b) -> float:
-        """twice the largest t such that anchors a and b stay connected through cells of chart a U chart b with clr >= t, a diagonal step
-        needing both orthogonal cells in the threshold set too (a squeeze is not a passage of width t).  Both orthogonal cells of a diagonal
-        step are 4-neighbours of both of its ends, so that rule adds no connection to 4-connectivity: the answer is the bottleneck of the
-        widest 4-connected path, read off the maximum spanning tree of the two charts (an edge is as wide as its narrower cell)."""
-        cells = np.nonzero((full == a) | (full == b))[0]
-        n = len(cells)
-        pos = -np.ones(sp.N, np.int64); pos[cells] = np.arange(n)
-        ys, xs, clr = sp.ys[cells], sp.xs[cells], sp.clr[cells]
-        U, V = [], []
-        for dy, dx in ((0, 1), (1, 0)):
-            y2, x2 = ys + dy, xs + dx
-            ok = (y2 < sp.H) & (x2 < sp.W)
-            j = np.full(n, -1, np.int64)
-            nb = sp.idx[y2[ok], x2[ok]]                              # neighbour cell (-1: not in F) -> its place among the two charts
-            j[ok] = np.where(nb >= 0, pos[np.maximum(nb, 0)], -1)
-            m = j >= 0
-            U.append(np.nonzero(m)[0]); V.append(j[m])
-        U, V = np.concatenate(U), np.concatenate(V)
-        ia, ib = int(pos[int(A[a])]), int(pos[int(A[b])])
-        if ia < 0 or ib < 0 or not len(U): return 0.0
-        top = float(clr.max()) + 1.0
-        wgt = top - np.minimum(clr[U], clr[V])                       # positive, smaller = wider
-        g = coo_matrix((wgt, (U, V)), shape=(n, n)).tocsr()
-        tree = minimum_spanning_tree(g)
-        order, pred = breadth_first_order(tree, ia, directed=False, return_predecessors=True)
-        if ib != ia and pred[ib] < 0: return 0.0
-        v, low = ib, float(clr[ib])
-        while v != ia:
-            v = int(pred[v]); low = min(low, float(clr[v]))
-        return 2.0 * low
-
-    def _width(self, sp, full, A, a, b, wnew) -> float:
-        """`_widest_strict`, memoised by everything it reads: the cells of the two charts (relative to their corner), their clearance and the
-        two anchors.  Most pairs are untouched by a batch; a changed cell, clearance or anchor changes the key."""
-        cells = np.nonzero((full == a) | (full == b))[0]
-        ys, xs = sp.ys[cells], sp.xs[cells]
-        y0, x0 = int(ys.min()), int(xs.min())
-        ia, ib = int(A[a]), int(A[b])
-        h = hashlib.blake2b(digest_size=16)
-        h.update((ys - y0).astype(np.int32).tobytes()); h.update((xs - x0).astype(np.int32).tobytes()); h.update(sp.clr[cells].tobytes())
-        h.update(np.array([sp.ys[ia] - y0, sp.xs[ia] - x0, sp.ys[ib] - y0, sp.xs[ib] - x0], np.int32).tobytes())
-        k = h.digest()
-        w = self._wcache.get(k)
-        if w is None:
-            w = self._widest_strict(sp, full, A, a, b)
-        wnew[k] = w
-        return w
-
-    @staticmethod
-    def _stretches(sp, es):
-        """Stretch index of every contact pair of one chart pair: the connected components of the INTERFACE CURVE (each pair
-        is a unit edge between its two cells; two edges are joined when they share an end point). Components of the cell
-        set would merge two stretches that meet only through one cell of a chart poking toward a hole: the intersection of
-        the two closed charts has two components there, and the nerve must count both or it misses the loop around the hole."""
-        parent: Dict[Tuple[int, int], Tuple[int, int]] = {}
-
-        def find(v):
-            r = v
-            while parent.setdefault(r, r) != r: r = parent[r]
-            while parent[v] != r: parent[v], v = r, parent[v]
-            return r
-        ends = []
-        for u, v in es:
-            yu, xu, yv, xv = int(sp.ys[u]), int(sp.xs[u]), int(sp.ys[v]), int(sp.xs[v])
-            if yu == yv: e = ((yu, max(xu, xv)), (yu + 1, max(xu, xv)))     # horizontal neighbours: the vertical edge between them
-            else: e = ((max(yu, yv), xu), (max(yu, yv), xu + 1))             # vertical neighbours: the horizontal edge between them
-            ends.append(e); parent[find(e[0])] = find(e[1])
-        roots: Dict[Tuple[int, int], int] = {}
-        comp = [roots.setdefault(find(e[0]), len(roots)) for e in ends]
-        return comp, len(roots)
-
-    def _links(self, sp, A, full, edges, chv) -> List[dict]:
+    def _links(self, sp, A, full, edges, chv, arcs: "morse.Arcs") -> List[dict]:
+        """One link per arc of the interface. Length: the shortest 8-neighbour route anchor -> portal -> anchor, each half inside
+        its own region (one Dijkstra per region, served from the last batch while the region and its anchor are unchanged)."""
         R, C, Ln = edges
-        wnew: dict = {}
-        N, k = sp.N, len(A)
-        # per chart: shortest routes from the anchor inside the chart (one compact graph per chart)
+        k = len(A)
         ec = np.where(full[R] == full[C], full[R], -1)
         order = np.argsort(ec, kind="stable"); ecs = ec[order]
         cut = np.searchsorted(ecs, np.arange(-1, k + 1))
-        cells_of = [np.nonzero(full == j)[0] for j in range(k)]
+        cells_of = np.split(np.argsort(full, kind="stable"), np.searchsorted(np.sort(full), np.arange(1, k)))
         D, PRED, CJ = [], [], []
         rnew: dict = {}
         for j, a in enumerate(A):
-            cj = cells_of[j]
-            # the routes inside a chart are a function of its cells (relative to their corner) and its anchor: unchanged charts are served
-            # from the last batch; cells are ascending, so a cell's place in the chart is its searchsorted position
+            cj = cells_of[j]                              # cells of the region, ascending
             ys, xs = sp.ys[cj], sp.xs[cj]
             y0, x0 = int(ys.min()), int(xs.min())
             hk = hashlib.blake2b(digest_size=16)
@@ -761,16 +674,6 @@ class ChartGraph(SceneGraph):
             rnew[key] = hit
             D.append(hit[0]); PRED.append(hit[1]); CJ.append(cj)
         self._rcache = rnew
-        pairs: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
-        for dy, dx in ((0, 1), (1, 0)):
-            y2, x2 = sp.ys + dy, sp.xs + dx
-            ok = (y2 < sp.H) & (x2 < sp.W); ok[ok] &= sp.nav[y2[ok], x2[ok]]
-            a_ = np.nonzero(ok)[0]; b_ = sp.idx[y2[a_], x2[a_]]
-            sel = (full[a_] >= 0) & (full[b_] >= 0) & (full[a_] != full[b_])
-            for u, v in zip(a_[sel].tolist(), b_[sel].tolist()):
-                ju, jv = int(full[u]), int(full[v])
-                if ju > jv: u, v, ju, jv = v, u, jv, ju
-                pairs.setdefault((ju, jv), []).append((u, v))
 
         def route(j, cell):
             cj = CJ[j]
@@ -780,29 +683,18 @@ class ChartGraph(SceneGraph):
                 if q < 0: return None
                 p.append(int(cj[q]))
             return p[::-1]
+        h = self._h
         out = []
-        for (a, b), es in sorted(pairs.items()):
-            comp_of, n = self._stretches(sp, es)
-            width = self._width(sp, full, A, a, b, wnew)
-            for comp in range(n):
-                best = None
-                for (u, v), cu in zip(es, comp_of):
-                    if cu != comp: continue
-                    du = D[a][int(np.searchsorted(CJ[a], u))]; dv = D[b][int(np.searchsorted(CJ[b], v))]
-                    tot = du + dv + math.hypot(sp.ys[u] - sp.ys[v], sp.xs[u] - sp.xs[v]) * 0.1
-                    if np.isfinite(tot) and (best is None or tot < best[0]): best = (float(tot), u, v)
-                if best is None: continue
-                tot, u, v = best; pa = route(a, u); pb = route(b, v)
-                if pa is None or pb is None: continue
-                cells = pa + pb[::-1]
-                integ = {}
-                for name, f in chv.items():
-                    acc = 0.0
-                    for x, y in zip(cells[:-1], cells[1:]):
-                        acc += math.hypot(sp.ys[x] - sp.ys[y], sp.xs[x] - sp.xs[y]) * 0.1 * 0.5 * (f[x] + f[y])
-                    integ[name] = acc
-                out.append(dict(a=a, b=b, length=tot, width=width, u=u, v=v, route=cells, integ=integ))
-        self._wcache = wnew
+        for a, b, u, v, s, w in zip(arcs.a.tolist(), arcs.b.tolist(), arcs.p.tolist(), arcs.q.tolist(), arcs.s.tolist(),
+                                    arcs.g.tolist()):
+            du = D[a][int(np.searchsorted(CJ[a], u))]; dv = D[b][int(np.searchsorted(CJ[b], v))]
+            pa = route(a, u); pb = route(b, v)
+            if pa is None or pb is None or not (np.isfinite(du) and np.isfinite(dv)): continue
+            cells = np.array(pa + pb[::-1], np.int64)
+            seg = np.hypot(np.diff(sp.ys[cells]).astype(float), np.diff(sp.xs[cells]).astype(float)) * h * 0.5
+            integ = {name: float((seg * (f[cells[:-1]] + f[cells[1:]])).sum()) for name, f in chv.items()}
+            out.append(dict(a=a, b=b, length=float(du + dv + h), width=2.0 * float(w), saddle=float(s), u=u, v=v,
+                            route=cells.tolist(), integ=integ))
         return out
 
     # ------------------------------------------------------------------ dirty
@@ -1074,17 +966,17 @@ class ChartGraph(SceneGraph):
                          cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
-        s, tr = self._solved, self._track
-        if s is not None and tr is not None:
-            st.anchors = [(int(y), int(x)) for y, x in tr.anchors]
+        s = self._solved
+        if s is not None:
             st.keys = list(self._keys)
-            st.plane = s.plane; st.dep = s.dep; st.rnd = tr.rnd_img
+            st.plane = s.plane
         return st
 
     def import_state(self, st: EngineState, verify: bool = True) -> None:
-        """Resume from `st` on a fresh engine: planes and evidence are taken as they are, then one local re-solve (from the
-        stored anchors, owner and round planes: nothing changed, so it only rebuilds what is derived) restores charts, links
-        and keys. The canvas is padded by MARGIN so that clearance near the stored edge sees unknown, as it did before."""
+        """Resume from `st` on a fresh engine: planes and evidence are taken as they are, then F and the partition are
+        rebuilt (both are functions of the planes and the evidence) and must reproduce the stored owner plane cell for cell;
+        the stored keys are then the keys of the rebuilt charts. The canvas is padded by MARGIN so that the distance to the
+        non-navigable cells near the stored edge sees unknown, as it did before."""
         p = self.params
         if (st.params["robot_half_side"], st.params["lattice"], st.params["place_mult"], st.params["sight_range"]) != \
                 (p.robot_half_side, p.lattice, p.place_mult, p.sight_range):
@@ -1105,59 +997,60 @@ class ChartGraph(SceneGraph):
         self._watermark = tuple(st.watermark)
         self._cache = {}
         self._keys = [tuple(k) for k in st.keys]
-        if not st.anchors or st.plane is None:
-            self._track = None; self._solved = None; self._key_plane = None
+        if not st.keys or st.plane is None:
+            self._solved = None; self._key_plane = None; self._keys = []
             self._sig, self._link_sig = {}, set()
             return
         self._key_plane = padl(st.plane.astype(np.int32), -1)
         nav, clr, S = self._build_F()
-        tr = Track(r=p.robot_half_side, mult=p.place_mult, h=self._h, sight_range=p.sight_range)
-        tr.anchors = [(y + pad // 2, x + pad // 2) for y, x in st.anchors]
-        own0 = np.where(padl(st.dep, False) | (self._key_plane < 0), -1, self._key_plane).astype(np.int32)
-        tr.own_img = own0
-        tr.rnd_img = padl(st.rnd.astype(np.int32), 1 << 30)
-        # restore, do not solve: the anchors are the stored ones and ownership is re-simulated from them; no add / remove /
-        # move is tried, so what was saved is what is loaded (a descent here would walk to another stationary point)
-        sp, A, own, rnd, bad = tr.restore(nav, clr)
-        if own is None:
-            raise StateMismatch("a stored anchor lies outside the navigable space rebuilt from the stored planes")
+        part = morse.partition(nav, self._h, self._tau)
+        plane = -np.ones(nav.shape, np.int32); plane[part.sp.ys, part.sp.xs] = part.full
+        bad = np.nonzero((plane != self._key_plane).ravel())[0]
         if len(bad) and verify:
-            H, W = nav.shape
-            y, x = divmod(int(bad[0]), W)
+            y, x = divmod(int(bad[0]), nav.shape[1])
             gx = (self._cx0 + 2 * x) // (2 * TILE); gy = (self._cy0 + 2 * y) // (2 * TILE)
             raise StateMismatch("owner plane differs from the stored one in %d cells, first in tile %d,%d" % (len(bad), gx, gy))
-        self._track = tr
+        if len(self._keys) != part.K:
+            raise StateMismatch("stored key table has %d keys, the rebuilt partition %d charts" % (len(self._keys), part.K))
         self._retired_map = {}
         keys_in = list(self._keys)
-        self._solved = self._evaluate(sp, A, own, nav, clr, S, "")
+        self._solved = self._evaluate(part, clr, S, "")
         if list(self._keys) != keys_in:
             raise StateMismatch("restored keys differ from the stored key table")
         self._sig, self._link_sig = self._signatures(self._solved)
 
     def check_invariants(self) -> List[str]:
-        """The cheap structural subset a worker can run after a load: every anchor is in its chart and in the navigable
-        space, charts are 4-connected, the anchor's clearance is on the band, and the anchor sees its whole chart (kernel).
-        Returns the violated invariants (empty = fine). Pocket cover is what the solver itself maintains."""
+        """The cheap structural subset a worker can run after a load: the charts cover F exactly, every anchor is in its chart
+        and every chart is 4-connected.
+        Returns the violated invariants (empty = fine)."""
         self._check()
         s = self._solved
         if s is None: return []
         sp = s.sp; out: List[str] = []
+        if (s.full < 0).any() or len(s.full) != sp.N:
+            out.append("a navigable cell has no chart")
         for j, a in enumerate(s.A):
-            mine = np.nonzero(s.own == j)[0]
-            if len(mine) == 0 or s.own[a] != j:
+            if int(s.full[a]) != j:
                 out.append("anchor %s not in its chart" % s.keys[j]); continue
-            if not sp.anchor_ok(mine, a):
-                out.append("anchor %s outside kernel or band" % s.keys[j])
-            m = np.zeros(s.plane.shape, bool); m[sp.ys[mine], sp.xs[mine]] = True
+            m = np.zeros(s.plane.shape, bool); mine = np.nonzero(s.full == j)[0]; m[sp.ys[mine], sp.xs[mine]] = True
             lab, n = ndimage.label(m, structure=ndimage.generate_binary_structure(2, 1))
             if n != 1: out.append("chart %s has %d 4-components" % (s.keys[j], n))
         return out
 
     # ----- query / cover
     def _levels(self):
+        """[level 0 = every chart] + the nested coarser partitions (morse.levels): per level the parent (elder chart index) of
+        every chart and the chart indices that are nodes of the level"""
         if "levels" not in self._cache:
             s = self._solved
-            self._cache["levels"] = hierarchy(len(s.A), s.links)
+            K = len(s.A)
+            rc = np.stack([s.sp.ys[s.A], s.sp.xs[s.A]], 1) if K else np.zeros((0, 2), np.int32)
+            la = np.array([l["a"] for l in s.links], np.int64); lb = np.array([l["b"] for l in s.links], np.int64)
+            hw = np.array([l["saddle"] for l in s.links])
+            lv = [dict(nodes=list(range(K)), parent=list(range(K)))]
+            for par in morse.levels(s.peak, rc, la, lb, hw, self._tau):
+                lv.append(dict(nodes=np.unique(par).tolist(), parent=par.tolist()))
+            self._cache["levels"] = (lv, None, self._tau)
         return self._cache["levels"]
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
@@ -1204,12 +1097,16 @@ class ChartGraph(SceneGraph):
                     links.append(self._link(l, ka, kb))
         else:
             agg: Dict[Tuple[int, int], dict] = {}
+            wide: Dict[Tuple[int, int], float] = {}
             for l in s.links:
                 ga, gb = group[l["a"]], group[l["b"]]
                 if ga == gb: continue
                 key = (min(ga, gb), max(ga, gb))
-                if key not in agg or l["length"] < agg[key]["length"]: agg[key] = dict(l, a=key[0], b=key[1])
-                agg[key]["width"] = max(agg[key]["width"], l["width"])
+                # the shortest member is the route (ties: the smaller portal), the widest member is the passage
+                pk = (l["length"], self._cell_xy(int(s.sp.ys[l["u"]]), int(s.sp.xs[l["u"]])), self._cell_xy(int(s.sp.ys[l["v"]]), int(s.sp.xs[l["v"]])))
+                if key not in agg or pk < agg[key]["_pk"]: agg[key] = dict(l, a=key[0], b=key[1], _pk=pk)
+                wide[key] = max(wide.get(key, 0.0), l["width"])
+            for key, l in agg.items(): l["width"] = wide[key]
             for l in agg.values():
                 ka, kb = s.keys[l["a"]], s.keys[l["b"]]
                 if ka in shown and kb in shown: links.append(self._link(l, ka, kb))

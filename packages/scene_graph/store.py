@@ -29,20 +29,19 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .api import BBox, Chart, Dirty, Leaf, Link, MissingTiles, OwnerRaster, SceneGraph, SceneParams, Snap, ViewResult
-from .chart_levels import hierarchy
+from . import morse
 from .state import EngineState, LeafRecord, StateMismatch  # noqa: F401  (StateMismatch re-exported)
 from .store_backends import ArangoMinioBackend, Blobs, Docs, MemoryBackend  # noqa: F401  (re-exported)
 from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pack_json, params_hash, unpack,
                           unpack_json)
 
-PIPELINE = "charts/1"
+PIPELINE = "morse/1"
 RES = 0.05
 TILE_F = 128                  # costmap cells per tile side (64 lattice cells)
 TILE_L = 64
 SEGMENT = 1024                # leaf records per segment
 SUPER = 8                     # tiles per super-tile side: the unit of a manifest page
-BIG_ROUND = 1 << 30
-FORMAT = 2
+FORMAT = 3
 log = logging.getLogger("scene_graph.store")
 
 
@@ -95,9 +94,6 @@ def tile_arrays(st: EngineState, tx: int, ty: int, ids_lut: Optional[np.ndarray]
         pl = _slice(st.plane, lx0, ly0, TILE_L, -1)
         own = ids_lut[pl]                                  # -1 indexes the trailing 0
         a["own"] = own.astype(np.int32)
-        a["dep"] = _slice(st.dep, lx0, ly0, TILE_L, False).astype(np.uint8)
-        # rounds are stored exactly (int32, "not reached" is the engine's own 1 << 30): no sentinel, no range limit to hit
-        a["rnd"] = _slice(st.rnd, lx0, ly0, TILE_L, BIG_ROUND).astype(np.int32)
         nonempty = nonempty or bool((own > 0).any())
     return a if nonempty else None
 
@@ -124,7 +120,7 @@ def segment_records(arr, meta) -> List[LeafRecord]:
 
 
 def tiles_for(leaves: Sequence[Leaf], params: SceneParams) -> List[Tuple[int, int]]:
-    """Tiles a writer needs resident to fold `leaves`: their footprints expanded by the sight range (the re-solve closure)."""
+    """Tiles a writer needs resident to fold `leaves`: their footprints expanded by the sight range."""
     pad = params.sight_range
     out = set()
     for lf in leaves:
@@ -225,10 +221,9 @@ class SceneGraphStore:
             live[k] = key_ids[k]
         lut = np.append(np.array([live[k] for k in keys], np.int32), np.int32(0)) if keys else None
 
-        # tiles: the dirty ones, or all when there is no base. A cell change at c can change (a) the anchors that read c, all
-        # within sight_range of c, (b) the cells those charts own, within sight_range of their anchors (2 s from c), and
-        # (c) the neighbour that takes a cell over or a redundant anchor that is removed because of it (up to 3 s). Past that
-        # only a chain of removals reaches, each one needing the previous: bounded by the full-hash check below, not assumed.
+        # tiles: the dirty ones, or all when there is no base. The partition is a global function of F, so a changed cell can
+        # re-label cells anywhere; Dirty.bbox is the box of every cell whose value, evidence or chart changed, and a tile
+        # holds nothing else that can differ. The pad is one lattice step; the full-hash check below bounds the rest.
         tx0, ty0, tx1, ty1 = _tile_range(st)
         prev_tiles = dict(prev["tiles"]) if prev else {}
         allc = {(tx, ty) for tx in range(tx0, tx1 + 1) for ty in range(ty0, ty1 + 1)}
@@ -237,7 +232,7 @@ class SceneGraphStore:
         else:
             cand, tiles = set(), dict(prev_tiles)
             if dirty is not None and dirty.bbox is not None:
-                b, pad = dirty.bbox, 3 * sg.params.sight_range + 4 * RES
+                b, pad = dirty.bbox, 4 * RES
                 cand = {t for t in _tiles_in(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad) if t in allc}
         new_blobs: Dict[str, bytes] = {}
         self._pack_tiles(st, lut, cand, gen, tiles, new_blobs)
@@ -271,14 +266,16 @@ class SceneGraphStore:
 
         view = sg.query(BBox(-1e9, -1e9, 1e9, 1e9), level=0, raster=False, parents=False)
         by_key = {c.key: c for c in view.charts}
+        sol = sg._solved                       # the partition's own numbers (B at the anchors, B at the saddles) for the levels
         charts = []
         for j, k in enumerate(keys):
             c = by_key[k]
-            charts.append({"key": k, "id": live[k], "anchor": [c.anchor[0], c.anchor[1]], "cell": [st.anchors[j][0] + st.cy0 // 2, st.anchors[j][1] + st.cx0 // 2],   # GLOBAL lattice (y, x): independent of the canvas
+            charts.append({"key": k, "id": live[k], "peak": float(sol.peak[j]), "anchor": [c.anchor[0], c.anchor[1]], "cell": [int(math.floor(c.anchor[1] / (2 * RES))), int(math.floor(c.anchor[0] / (2 * RES)))],   # GLOBAL lattice (y, x)
                            "cells": c.cells, "area": c.area_m2, "clearance": c.clearance, "driven": c.driven_frac,
                            "ever_blocked": c.ever_blocked_frac, "leaf": c.leaf})
-        links = [{"a": l.a, "b": l.b, "length": l.length, "width": l.width,
-                  "portal": [list(l.portal[0]), list(l.portal[1])], "channels": l.channels} for l in view.links]
+        links = [{"a": l.a, "b": l.b, "length": l.length, "width": l.width, "saddle": float(raw["saddle"]),
+                  "portal": [list(l.portal[0]), list(l.portal[1])], "channels": l.channels}
+                 for l, raw in zip(view.links, sol.links if sol is not None else [])]
         chans = sorted(st.chan)
         pages = {}
         page = lambda sx, sy: pages.setdefault("%d,%d" % (sx, sy), {"tiles": {}, "charts": [], "links": []})
@@ -503,8 +500,7 @@ class SceneGraphStore:
         W, H = (ax1 - ax0 + 1) * TILE_F, (ay1 - ay0 + 1) * TILE_F
         V = np.full((H, W), 255, np.uint8); T = np.full((H, W), -1, np.int64); B = np.full((H, W), -1, np.int64)
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
-        own = np.zeros((H // 2, W // 2), np.int32); dep = np.zeros((H // 2, W // 2), bool)
-        rnd = np.full((H // 2, W // 2), BIG_ROUND, np.int32)
+        own = np.zeros((H // 2, W // 2), np.int32)
         for (tx, ty) in coords:
             t = self._tile(map_id, man, tx, ty)
             y, x = (ty - ay0) * TILE_F, (tx - ax0) * TILE_F; ly, lx = y // 2, x // 2
@@ -513,8 +509,7 @@ class SceneGraphStore:
                 if "c.%s.v" % n in t:
                     chan[n][0][y:y + TILE_F, x:x + TILE_F] = t["c.%s.v" % n]; chan[n][1][y:y + TILE_F, x:x + TILE_F] = t["c.%s.t" % n]
             if "own" in t:
-                own[ly:ly + TILE_L, lx:lx + TILE_L] = t["own"]; dep[ly:ly + TILE_L, lx:lx + TILE_L] = t["dep"].astype(bool)
-                rnd[ly:ly + TILE_L, lx:lx + TILE_L] = t["rnd"]
+                own[ly:ly + TILE_L, lx:lx + TILE_L] = t["own"]
         by_id = {c["id"]: c for c in man["charts"]}
         order = man.get("order")
         charts = [by_id[i] for i in order] if order and len(order) == len(by_id) and set(order) == set(by_id) else list(man["charts"])
@@ -527,17 +522,9 @@ class SceneGraphStore:
             arr, m = unpack(self.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h)))
             leaves += segment_records(arr, m)
         p = man["params"]
-        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, chan=chan,
-                         leaves=leaves, anchors=[tuple(c["cell"]) for c in charts],
-                         keys=[_parse(c["key"]) for c in charts], plane=plane, dep=dep, rnd=rnd,
+        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, chan=chan, leaves=leaves,
+                         keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
-        # stored anchor cells are global lattice coordinates (canvas independent: a loaded engine has another canvas, and a
-        # replay must save identical pages); format 1 stored canvas coordinates and is shifted by the saved canvas origin
-        if man.get("format", FORMAT) >= 2:
-            st.anchors = [(y - st.cy0 // 2, x - st.cx0 // 2) for y, x in st.anchors]
-        else:
-            sx, sy = (man["canvas"][0] - st.cx0) // 2, (man["canvas"][1] - st.cy0) // 2
-            st.anchors = [(y + sy, x + sx) for y, x in st.anchors]
         g = ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"], place_mult=p["place_mult"],
                                    sight_range=p["sight_range"]))
         g.import_state(st, verify=verify)
@@ -733,7 +720,7 @@ class StoredView:
         return self._cache[(tx, ty)]
 
     def _window(self, lx0, ly0, lx1, ly1):
-        """chart index [rows, cols] (-1 none) and dependent plane for the global lattice window [lx0, lx1) x [ly0, ly1)"""
+        """chart index [rows, cols] (-1 none) and dependent plane (all False) for the global lattice window [lx0, lx1) x [ly0, ly1)"""
         H, W = ly1 - ly0, lx1 - lx0
         idx = -np.ones((H, W), np.int32); dep = np.zeros((H, W), bool)
         lut = np.full(max(self._idx, default=0) + 1, -1, np.int32)
@@ -747,7 +734,6 @@ class StoredView:
                 ya, yb = max(ly0, ty * TILE_L), min(ly1, (ty + 1) * TILE_L); xa, xb = max(lx0, tx * TILE_L), min(lx1, (tx + 1) * TILE_L)
                 o = t["own"][ya - ty * TILE_L:yb - ty * TILE_L, xa - tx * TILE_L:xb - tx * TILE_L]
                 idx[ya - ly0:yb - ly0, xa - lx0:xb - lx0] = np.where(o > 0, lut[np.minimum(o, len(lut) - 1)], -1)
-                dep[ya - ly0:yb - ly0, xa - lx0:xb - lx0] = t["dep"][ya - ty * TILE_L:yb - ty * TILE_L, xa - tx * TILE_L:xb - tx * TILE_L].astype(bool)
         return idx, dep
 
     def _extent(self):
@@ -757,10 +743,18 @@ class StoredView:
                 (max(c[0] for c in cs) + 1) * TILE_L, (max(c[1] for c in cs) + 1) * TILE_L)
 
     def _hier(self):
+        """the levels of the engine (`ChartGraph._levels`) from the stored charts and links: the same pure function"""
         if self._levels is None:
-            k = {c["key"]: j for j, c in enumerate(self.man["charts"])}
-            ls = [{"a": k[l["a"]], "b": k[l["b"]], "length": l["length"]} for l in self.man["links"]]
-            self._levels = hierarchy(len(k), ls)[0]
+            ch = self.man["charts"]
+            k = {c["key"]: j for j, c in enumerate(ch)}
+            p = self.man["params"]
+            tau = morse.tau0(p["lattice"]) * morse.BASE_TAU
+            parents = morse.levels(np.array([c["peak"] for c in ch]), np.array([c["cell"] for c in ch], np.int64).reshape(-1, 2),
+                                   np.array([k[l["a"]] for l in self.man["links"]], np.int64),
+                                   np.array([k[l["b"]] for l in self.man["links"]], np.int64),
+                                   np.array([l["saddle"] for l in self.man["links"]]), tau)
+            self._levels = [dict(nodes=list(range(len(ch))), parent=list(range(len(ch))))] + \
+                [dict(nodes=np.unique(par).tolist(), parent=par.tolist()) for par in parents]
         return self._levels
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:
@@ -799,12 +793,15 @@ class StoredView:
                     links.append(Link(l["a"], l["b"], l["length"], l["width"], (tuple(l["portal"][0]), tuple(l["portal"][1])), dict(l["channels"])))
         else:
             agg: Dict[Tuple[int, int], dict] = {}
+            wide: Dict[Tuple[int, int], float] = {}
             for l in lm:
                 ga, gb = group[kidx[l["a"]]], group[kidx[l["b"]]]
                 if ga == gb: continue
                 key = (min(ga, gb), max(ga, gb))
-                if key not in agg or l["length"] < agg[key]["length"]: agg[key] = dict(l, a=charts_m[key[0]]["key"], b=charts_m[key[1]]["key"])
-                agg[key]["width"] = max(agg[key]["width"], l["width"])
+                pk = (l["length"], tuple(l["portal"][0]), tuple(l["portal"][1]))      # as the engine: shortest, ties the smaller portal
+                if key not in agg or pk < agg[key]["_pk"]: agg[key] = dict(l, a=charts_m[key[0]]["key"], b=charts_m[key[1]]["key"], _pk=pk)
+                wide[key] = max(wide.get(key, 0.0), l["width"])
+            for key, l in agg.items(): l["width"] = wide[key]
             for l in agg.values():
                 if l["a"] in shown and l["b"] in shown:
                     links.append(Link(l["a"], l["b"], l["length"], l["width"], (tuple(l["portal"][0]), tuple(l["portal"][1])), dict(l["channels"])))

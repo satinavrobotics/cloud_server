@@ -26,15 +26,12 @@ class BBox:
 class SceneParams:
     robot_half_side: float = 0.25      # r (m), per map, set by the cloud server
     lattice: float = 0.1               # h (m)
-    place_mult: float = 1.5            # s = place_mult * r  (a stated convention, not a topological quantity)
-    sight_range: float = 5.0           # m: an anchor is only credited with cells within this range of it. Tied to the leaf
-                                       # window (10 x 10 m => one leaf never observes beyond 5 m from its pose); bounds the
-                                       # re-solve closure. Part of the params hash: changing it is a new generation.
-
-    @property
-    def place(self) -> float: return self.place_mult * self.robot_half_side
-    @property
-    def eps(self) -> float: return self.lattice / self.place     # centrality band, derived
+    place_mult: float = 1.5            # DEPRECATED, no effect on the partition (morse.py has no placement scale). Still part
+                                       # of the persisted params (graph-builder's `params_dict` pins that set), so it keeps
+                                       # its place in the params hash; remove it with that pin.
+    sight_range: float = 5.0           # m: tied to the leaf window (10 x 10 m => one leaf never observes beyond 5 m from
+                                       # its pose); caps window sizes and pose offsets and bounds `snap`. Part of the params
+                                       # hash: changing it is a new generation.
 
 
 @dataclass(frozen=True)

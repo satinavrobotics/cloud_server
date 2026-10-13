@@ -49,28 +49,7 @@ def test_every_invariant_holds_on_the_structural_worlds(name):
     g, w, _ = built(name)
     r = verify(g, w)
     assert ok(r), r
-    assert r["chi_F"] == EXPECTED_CHI[name] and r["chi_G"] == r["chi_F"]
-    assert r["centre_min"] >= 1 - g.params.eps - 1e-9
-
-
-@pytest.mark.parametrize("name", ["two_rooms", "island"])
-def test_minimal_for_single_removal_or_move(name):
-    g, w, _ = built(name)
-    s = g._solved
-    sp, A = s.sp, s.A
-    own, rnd = sp.full_state(A)
-    for j, a in enumerate(A):
-        if len(A) > 1:
-            A2, o2, _r2, S, _ = sp.apply(A, own, rnd, ("remove", j), local=False)
-            assert not sp.feasible_after(A2, o2, S), "anchor %d is removable" % j
-        mine = np.nonzero(own == j)[0]
-        b, _band = sp.pick(mine)
-        if b is not None and b != a and b not in A:
-            A2, o2, _r2, S, _ = sp.apply(A, own, rnd, ("move", j, b), local=False)
-            if sp.feasible_after(A2, o2, S):
-                aff = np.union1d(S, np.nonzero((own == j) | (o2 == j))[0])
-                old = sp.objective(A, own, aff); new = sp.objective(A2, o2, aff)
-                assert not new < (old[0], old[1] - 1e-9), "anchor %d has a better place" % j
+    assert r["chi_F"] == EXPECTED_CHI[name]
 
 
 @pytest.mark.parametrize("door", [0.4, 0.5, 0.6, 0.9])
@@ -248,7 +227,7 @@ def test_refold_after_a_leaf_is_deleted_equals_a_fresh_fold_without_it():
 
 def test_params_semantics_and_cap_validation():
     p = SceneParams()
-    assert p.place == pytest.approx(0.375) and p.eps == pytest.approx(0.1 / 0.375) and p.sight_range == 5.0
+    assert (p.robot_half_side, p.lattice, p.sight_range) == (0.25, 0.1, 5.0)
     with pytest.raises(ValueError):
         ChartGraph(SceneParams(sight_range=0.2))
     g = ChartGraph()
