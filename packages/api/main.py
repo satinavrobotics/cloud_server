@@ -664,6 +664,98 @@ async def get_map_scene_graph_lineage(map_id: str, from_version: int, epoch: Opt
     return out
 
 
+_occ_reads: Optional[Any] = None
+
+
+def _occupancy_unavailable():
+    from packages.api import occupancy_reads
+    return HTTPException(status_code=503, headers={"Retry-After": str(occupancy_reads.RETRY_AFTER_S),
+                                                   "Cache-Control": "no-store"},
+                         detail={"error": "scene_graph_unavailable",
+                                 "retry_after_s": occupancy_reads.RETRY_AFTER_S})
+
+
+def _occupancy_reads():
+    """The occupancy read side (occupancy plan §4), built on first use. 503 while the scene-graph worker flag is off
+    or the topomap database client is not up (unlike the scene-graph reads, which answer `available: false`)."""
+    global _occ_reads
+    from packages.api import occupancy_reads
+    from packages.config import SCENE_GRAPH_WORKER_ENABLED
+    client = getattr(service, "topomap_db", None)
+    if not SCENE_GRAPH_WORKER_ENABLED or client is None:
+        raise _occupancy_unavailable()
+    if _occ_reads is None:
+        _occ_reads = occupancy_reads.build(client)
+    return _occ_reads
+
+
+def _occupancy_int(text, name):
+    from packages.api import occupancy_reads
+    try:
+        return occupancy_reads.parse_int(text, name)
+    except occupancy_reads.BadRequest as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+async def _occupancy_call(coro):
+    """Await an occupancy_reads call and map its typed errors to the status codes of plan §4."""
+    from packages.api import occupancy_reads as occ
+    try:
+        return await coro
+    except occ.BadRequest as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except occ.NotFound as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except occ.VersionGone as e:
+        raise HTTPException(status_code=410, detail={"error": "version_gone", "current_version": e.current_version})
+    except occ.TooManyChunks as e:
+        raise HTTPException(status_code=413, detail={"error": "too_many_chunks", "count": e.count, "limit": e.limit})
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        # a failing store (Arango / MinIO down, timeout) is a 503 with Retry-After, never a 500 or "no graph"
+        logging.getLogger("ApiDelegationService").warning("occupancy read unavailable: %s: %s", type(exc).__name__, exc)
+        raise _occupancy_unavailable() from exc
+
+
+@app.get("/api/v1/maps/{map_id}/scene-graph/occupancy/extent")
+async def get_map_occupancy_extent(map_id: str, version: Optional[str] = None, response: Response = None):
+    """The occupancy extent of a map (plan §3.4): {version, epoch, generation, cell_m, chunk_m, chunks:
+    [{cx, cy, digest, tiles}]}, non-empty chunks only. `version` pins a version (immutable cache), default the
+    current one (no-cache). 400 malformed version, 404 unknown map or version, 410 pinned version collected,
+    413 over 20 000 chunks, 503 while occupancy serving is unavailable."""
+    from packages.api import occupancy_reads
+    _require_service()
+    reads = _occupancy_reads()
+    v = _occupancy_int(version, "version")
+    out = await _occupancy_call(reads.extent(map_id, v))
+    response.headers["Cache-Control"] = occupancy_reads.PINNED_CACHE if v is not None else occupancy_reads.UNPINNED_CACHE
+    return out
+
+
+@app.get("/api/v1/maps/{map_id}/scene-graph/occupancy/chunk/{cx}/{cy}")
+async def get_map_occupancy_chunk(map_id: str, cx: str, cy: str, version: Optional[str] = None,
+                                  if_none_match: Optional[str] = Header(None)):
+    """One occupancy chunk (plan §3.3) as application/octet-stream. `version` is required (400 without it): a
+    multi-chunk load must come from one version. ETag `"occ.{cx}.{cy}.{digest}"` is content-only, so an unchanged
+    chunk answers 304 across versions. 400 malformed cx/cy/version, 404 unknown map or version, 410 pinned version
+    collected (`detail.current_version`), 503 while occupancy serving is unavailable."""
+    from packages.api import occupancy_reads
+    _require_service()
+    reads = _occupancy_reads()
+    x, y = _occupancy_int(cx, "cx"), _occupancy_int(cy, "cy")
+    v = _occupancy_int(version, "version")
+    if v is None:
+        raise HTTPException(status_code=400, detail="version is required for an occupancy chunk")
+    digest = await _occupancy_call(reads.digest(map_id, v, x, y))
+    etag = '"occ.%d.%d.%s"' % (x, y, digest)
+    headers = {"ETag": etag, "Cache-Control": occupancy_reads.PINNED_CACHE}
+    if if_none_match and any(t.strip().removeprefix("W/") == etag for t in if_none_match.split(",")):
+        return Response(status_code=304, headers=headers)
+    body = await _occupancy_call(reads.chunk(map_id, v, x, y))
+    return Response(content=body, media_type="application/octet-stream", headers=headers)
+
+
 @app.get("/api/v1/maps/{map_id}/blocked-nodes")
 async def list_blocked_nodes(map_id: str, with_chart_keys: bool = False):
     """The map's graph nodes a robot reported blocked whose exclusion has not expired: the

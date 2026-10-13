@@ -6,6 +6,7 @@ nothing from `packages.scene_graph`, so the fold engine is never loaded for occu
 import asyncio
 import hashlib
 import json
+import re
 import struct
 import threading
 from collections import OrderedDict
@@ -20,6 +21,10 @@ CELL_M = 0.05                         # F1
 CHUNK_M = 51.2                        # CHUNK_TILES * TILE_CELLS * CELL_M
 MAX_EXTENT_CHUNKS = 20000             # §4: 413 above this
 DEFAULT_BUDGET = 64 << 20             # §4: chunk LRU byte budget
+RETRY_AFTER_S = 2                     # 503 Retry-After; same value as scene_graph_reads.RETRY_AFTER_S
+PINNED_CACHE = "public, max-age=31536000, immutable"   # §4: a pinned version never changes
+UNPINNED_CACHE = "no-cache"
+_INT_TEXT = re.compile(r"-?\d+\Z")
 
 
 class OccupancyError(Exception):
@@ -163,6 +168,10 @@ class OccupancyReads:
     async def chunk(self, map_id, version, cx, cy):
         return await asyncio.to_thread(self._chunk, map_id, version, cx, cy)
 
+    async def digest(self, map_id, version, cx, cy):
+        """The content digest of chunk (cx, cy) of `version` (§3.2): the ETag's `digest` (§4). Same index as `extent`."""
+        return await asyncio.to_thread(self._digest_of, map_id, version, cx, cy)
+
     # --- sync internals (run in worker threads) ---
 
     def _extent(self, map_id, version):
@@ -179,6 +188,13 @@ class OccupancyReads:
         idx = self._index(map_id, version)
         key = ("chunk", map_id, idx.epoch, idx.version, cx, cy)
         return self._load(self._chunks, key, lambda: self._build_body(map_id, idx, cx, cy))
+
+    def _digest_of(self, map_id, version, cx, cy):
+        _check_int("cx", cx)
+        _check_int("cy", cy)
+        _check_version(version)
+        entry = self._index(map_id, version).chunks.get((cx, cy))
+        return entry[0] if entry is not None else _digest([])     # an absent chunk has no present slots
 
     def _index(self, map_id, version):
         man = self._manifest(map_id, version)
@@ -273,3 +289,19 @@ def unpack(body):
     for slot, _h, off in header["slots"]:
         planes[slot] = body[base + off: base + off + PLANE_BYTES]
     return header, planes
+
+
+def parse_int(text, name):
+    """A path or query integer as sent (str), or None for an absent query parameter. Anything else is BadRequest (400)."""
+    if text is None:
+        return None
+    if not _INT_TEXT.match(text):
+        raise BadRequest("%s must be an integer" % name)
+    return int(text)
+
+
+def build(client):
+    """Occupancy reads for the API service over the store built on the topomap database client. The store is imported
+    here, not at module level, so the module itself stays free of the scene-graph package (R4)."""
+    from packages.scene_graph.store import SceneGraphStore
+    return OccupancyReads(SceneGraphStore.from_client(client))
