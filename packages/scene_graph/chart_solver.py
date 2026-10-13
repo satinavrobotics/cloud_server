@@ -7,7 +7,10 @@
               A function of (F, A) only; a cell reads only cells on drives that end in it.
   solve     = (chart_track.Track.step) add at the largest-clearance cell of the lowest-numbered pocket / off-band anchor, then descend: anchors in
               smallest-chart order, each tries to be removed, else moved to the projected centroid of its chart; a step is taken iff the set stays
-              feasible and strictly lowers (|A|, #dependents, sum of D over owned cells) lexicographically.  Stationary under the proposal map.
+              feasible and strictly lowers (|A|, #dependents, sum of D over owned cells) lexicographically.  The final state is stationary:
+              no removal and no move to the chart's proposal is feasible and lowers that objective, checked from the definition on a fresh
+              solver after every batch (tests/unit/scene_graph/test_stationarity.py).  It does NOT say the proposal has a smaller sum of drive
+              lengths to its own chart than the anchor: such a move can hand cells to a neighbour or break its band, and the anchor then stays.
   locality  = a step re-simulates only the cells that can read a changed cell: the closure of (cells seen by the changed anchors) under 'reads'."""
 import hashlib
 import math

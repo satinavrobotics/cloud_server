@@ -99,7 +99,7 @@ class Track:
         for t_ in added_T: Cm[sp.flat[t_]] = True
         if len(S):
             old_o = np.where(own_base[S] >= 0, np.array(A_base, np.int64)[np.maximum(own_base[S], 0)] if len(A_base) else -1, -1)
-            new_o = np.where(own[S] >= 0, np.array(A, np.int64)[np.maximum(own[S], 0)], -1)
+            new_o = np.where(own[S] >= 0, np.array(A, np.int64)[np.maximum(own[S], 0)], -1) if len(A) else -1   # no anchor yet: nothing is owned
             ch = S[(old_o != new_o) | (rnd_base[S] != rnd[S])]
             Cm[sp.flat[ch]] = True
         # trial memos that survive: every anchor they used still exists unchanged, and they read no changed cell
