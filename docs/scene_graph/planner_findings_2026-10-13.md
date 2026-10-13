@@ -8,10 +8,10 @@ The current record of the planner-upgrade work: status, what was measured or rev
 
 | What | Where | State |
 |---|---|---|
-| Lazy planner (Phase 0 + hardening) | `lazy_plan.py`, `scene_route.py`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load`) | merged into v2 as `09a4e99`; v2 pushed by CIMBI as `origin/feat/scene-graph-v2` @485f39d (includes the merge) |
+| Lazy planner (Phase 0 + hardening) | `lazy_plan.py`, `scene_route.py`, behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load` at the time; now `lazy` with `full_load` as rollback, see section 10) | merged into v2 as `09a4e99`; v2 pushed by CIMBI as `origin/feat/scene-graph-v2` @485f39d (includes the merge) |
 | Store read-path hardening (page cache, cached lut, single-flight tiles, byte-budget cache, leases) | `packages/scene_graph/store.py` | taken by CIMBI as `16aee6a` (cherry-pick of `61e7ca3`, authorship kept) |
 | e2e `GraphCache(lazy=...)` from `SCENE_GRAPH_PLANNER_MODE` | `tests/integration/scene_graph/test_scene_graph_e2e.py` | committed `88a360d`; e2e 32 passed in `full_load` and `lazy` (before the v2 merge); CIMBI re-ran e2e on `16aee6a`: 32 passed |
-| Tests after the v2 merge | targeted (lazy planner, scene_graph, planner route, reads) | 339 passed, 3 skipped (MinIO-only) |
+| Tests after the v2 merge | targeted (lazy planner, scene_graph, planner route, reads) | 339 passed, 3 skipped (MinIO-only), on the v2 merge of 2026-10-13; not re-run since |
 
 Planner flag stays OFF; no database generation was started.
 
@@ -20,7 +20,7 @@ Planner flag stays OFF; no database generation was started.
 `PlanGraph` answers like `store.load(...).route` from stored tiles: same snap, route cells, length, chart sequence
 (`tests/unit/test_lazy_plan.py`, 5 worlds). Reach of a chart cell from its anchor is `2 x chart_radius`
 (`_reach()`); under an overlay the engine searches every chart and the reader searches the anchors inside the
-ellipse `|a-p|+|p-b| <= L + 2 (reach + h)`. Ties among equal-length routes may differ under an overlay (scipy order).
+ellipse `|a-p|+|p-b| <= L + 2 (reach + h)`. Ties among equal-length routes differed under an overlay at the time of writing (scipy order); the canonical tie rule (section 10) removed that, routes are now identical.
 Skipping the overlay ellipse would break engine equality: not adopted.
 
 ## 3. Q1: delivery into `fold_many` is at-least-once (code trace, not run)
@@ -163,17 +163,18 @@ real maps; scipy tie behaviour with integer weights; whether "blocked" counts ar
   worlds of `tests/unit/test_lazy_plan.py`; CIMBI adds engine-side tests.
 * **Consequence for `lazy_plan.py`:** its own tie order (engine index order from `manifest["order"]`, scipy tie
   behaviour; see `planner_upgrade.md` section 0) must follow the same key rule when the engine change lands; the
-  "ties may differ under an overlay" caveat of section 2 is to be re-checked then.
+  "ties may differ under an overlay" caveat of section 2 is to be re-checked then. Done in `b997c66`: `lazy_plan.py`
+  uses the integer cost and the canonical walk; routes are identical with and without an overlay.
 * **Branch state:** v2 has `main` merged (`39fd715`) and `7710d7a` on top: a single alembic head
   (`20261012_01_blocked_geometry` re-parented onto `20261013_01_track_map_frame`; both had been written on
   `20261011_01`, so the merge gave two heads and `alembic upgrade head` would have failed at API start). The live DB is
   at `20261013_01`; `20261012_01` is NOT applied there. The pinned unit image was rebuilt with scipy; full pinned
-  suite 4158 passed / 0 failed, per CIMBI, not re-run by us.
+  suite 4158 passed / 0 failed, per CIMBI after `7710d7a` (2026-10-13), not re-run by us.
 * **Lazy vs engine equality test** (`tests/unit/test_lazy_plan_equality.py`, new, untracked at the time of writing): 9
   worlds (5 + 4 shifted so pairs straddle tile boundaries), anchor, point, straddle and overlay (disc, segment) pairs:
   no length or reachability divergence; chart sequence and cells identical without overlay; with overlay 5 xfails
-  (equal-length ties: cells, once the chart sequence) and 31 xpass, which become plain passes when the canonical tie
-  rule lands (the acceptance check for `lazy_plan.py` following it). `two_rooms` has 2 charts: little route coverage.
+  (equal-length ties: cells, once the chart sequence) and 31 xpass at the time of writing. The xfail markers were
+  removed in `b997c66` with the canonical tie rule; all cases are plain assertions now. `two_rooms` has 2 charts: little route coverage.
 * **Edge statistics storage (decision of the user, 2026-10-13):** statistics should ultimately be stored in ArangoDB,
   on edges. Today observations are in Postgres `edge_observations`, statistics are computed on read and filtered by the
   current Arango edge set. Design draft and consequences: `edge_stats_on_charts_design.md` (section 7) and

@@ -20,7 +20,7 @@ From CIMBI, 2026-10-13. Everything here is on `feat/scene-graph-v2` (the one bra
 ## What to run before merging into feat/scene-graph-v2
 
 1. `tools/scene_graph_e2e/run.sh` from the morse worktree (needs your pydantic-1 python and secrets).
-2. Your scene unit suites (565 passed, 3 skipped on host python in my run; `test_scene_guard` and `test_scene_graph_routes_http` do not
+2. Your scene unit suites (565 passed, 3 skipped on host python in the author's run on 2026-10-13, not re-run since; `test_scene_guard` and `test_scene_graph_routes_http` do not
    import on host python, pre-existing).
 3. The planner width gate once with a real factsheet (rehearsal F-7: 0.1 m widths where a driven path crosses a gap narrower than the
    default r_d allows).

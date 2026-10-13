@@ -1,10 +1,10 @@
 # Scene graph v2: state at end of session and next steps (LACI side)
 
 Branch `feat/scene-graph-v2` (CIMBI's Morse engine with chart_radius, the lazy planner `09a4e99` behind
-`SCENE_GRAPH_PLANNER_MODE=lazy`, the store read-path patch `16aee6a`; `main` merged as `39fd715`, then `7710d7a`:
+`SCENE_GRAPH_PLANNER_MODE=lazy` (default `full_load` when written; now `lazy`, `full_load` is the rollback, set explicitly in the prod `.env`), the store read-path patch `16aee6a`; `main` merged as `39fd715`, then `7710d7a`:
 single alembic head, pinned test image with scipy; HEAD `7710d7a`, origin was @485f39d before those two). Targeted
-tests 339 passed / 3 skipped (MinIO-only) before the main merge; `tools/scene_graph_e2e/run.sh` 32 passed in
-`full_load` and `lazy`; full pinned suite 4158 passed / 0 failed after `7710d7a`, per CIMBI (not re-run by us).
+tests 339 passed / 3 skipped (MinIO-only) on 2026-10-13 before the main merge (not re-run since); `tools/scene_graph_e2e/run.sh` 32 passed in
+`full_load` and `lazy`; full pinned suite 4158 passed / 0 failed after `7710d7a` (2026-10-13), per CIMBI (not re-run by us).
 Findings, decisions and open items of the planner-upgrade work: `planner_findings_2026-10-13.md`.
 Client: `sati-client` commit 7178d1a (tiling, abort/pause, epoch/ETag, stale view) is in; the
 client repo also has unrelated uncommitted edits (DeckGLMap, relief, LiveKit): not ours.
@@ -55,9 +55,9 @@ MEMORY_RETRY_LIMIT, RECEIPT_WINDOW_S 300, SKIP_FOLDED true, DELETE_LOCK_* .
 
 8. Planner upgrade follow-ups (decisions in `planner_findings_2026-10-13.md` section 7): Arango read-model mirror
    (start or not), tile-cache-by-hash (store side done in `16aee6a`) and bounded stage 1. The canonical integer
-   tie-break ask was SENT and AGREED by CIMBI (rule: findings section 10): LACI owes the lazy vs `store.load` equality
-   test on the 5 worlds of `tests/unit/test_lazy_plan.py`, and `lazy_plan.py` follows the same key rule when the
-   engine commit lands (after the readiness gates, not blocking generation).
+   tie-break ask was SENT and AGREED by CIMBI (rule: findings section 10): the lazy vs `store.load` equality
+   test is `tests/unit/test_lazy_plan_equality.py` and `lazy_plan.py` follows the same key rule (`b997c66`); the engine
+   side landed as `88e5651`.
 
 ## Known limitations / open decisions
 - Client: hide links narrower than the robot (slivers stay in `query().links`);

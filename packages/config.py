@@ -15,6 +15,7 @@ service that never touches Arango/MinIO/Postgres does not have to be given their
 Every service image ships this file, mission-dispatch included.
 """
 
+import logging
 import os
 
 
@@ -568,9 +569,13 @@ SCENE_GRAPH_CACHE_MAX_BYTES = int(os.getenv("SCENE_GRAPH_CACHE_MAX_BYTES", "0"))
 # "lazy" opens the manifest only and reads the owner tiles of each request's corridor (docs/scene_graph/
 # planner_upgrade.md, Phase 0). A route whose corridor needs more than LAZY_MAX_TILES tiles falls back
 # `corridor_too_large`; LAZY_TILE_CACHE is the number of owner tiles (about 35 KB each) kept per graph.
-SCENE_GRAPH_PLANNER_MODE = os.getenv("SCENE_GRAPH_PLANNER_MODE", "full_load").strip().lower()
+# Default "lazy" (equal to full_load under the canonical tie rule, tests/unit/test_lazy_plan_equality.py);
+# rollback = SCENE_GRAPH_PLANNER_MODE=full_load.
+SCENE_GRAPH_PLANNER_MODE = os.getenv("SCENE_GRAPH_PLANNER_MODE", "lazy").strip().lower()
 if SCENE_GRAPH_PLANNER_MODE not in ("full_load", "lazy"):
-    SCENE_GRAPH_PLANNER_MODE = "full_load"
+    logging.getLogger(__name__).warning(
+        "unknown SCENE_GRAPH_PLANNER_MODE=%r, using 'lazy' (valid: 'full_load', 'lazy')", SCENE_GRAPH_PLANNER_MODE)
+    SCENE_GRAPH_PLANNER_MODE = "lazy"
 SCENE_GRAPH_LAZY_MAX_TILES = int(os.getenv("SCENE_GRAPH_LAZY_MAX_TILES", "400"))
 SCENE_GRAPH_LAZY_TILE_CACHE = int(os.getenv("SCENE_GRAPH_LAZY_TILE_CACHE", "512"))
 # A store.meta answer is reused this long per map and shared by concurrent requests (one query).
@@ -622,7 +627,6 @@ def _validate_scene_graph_planner() -> None:
             fixed.append(f"{name}={value} -> {default}")
             globals()[name] = default
     if fixed:
-        import logging
         logging.getLogger("config").warning("invalid scene graph planner settings reset: %s",
                                             "; ".join(fixed))
 
@@ -719,7 +723,6 @@ def _validate_scene_graph_worker_scale() -> None:
         fixed.append(f"SCENE_GRAPH_RECEIPT_WINDOW_S={value} -> 300.0")
         globals()["SCENE_GRAPH_RECEIPT_WINDOW_S"] = 300.0
     if fixed:
-        import logging
         logging.getLogger("config").warning("invalid scene graph worker settings reset: %s",
                                             "; ".join(fixed))
 

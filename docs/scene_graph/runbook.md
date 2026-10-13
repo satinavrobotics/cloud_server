@@ -35,7 +35,7 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_CACHE_VERSIONS` | 4 | planner | loaded graphs kept per process in total (LRU over maps) |
 | `SCENE_GRAPH_CACHE_VERSIONS_PER_MAP` | 2 | planner | of one map: the one served and the one being refreshed |
 | `SCENE_GRAPH_CACHE_MAX_BYTES` | 0 (off) | planner | byte budget of the cache over the graphs' reported `nbytes`; the newest graph is always kept. Size it from the container memory limit and the `cache.bytes` the planner reports (section 7); there is no per-cell figure measured on the current engine, see section 8 |
-| `SCENE_GRAPH_PLANNER_MODE` | `full_load` | planner | `full_load`: restore the whole stored version per (map, version). `lazy`: open the manifest only and read the owner tiles of each request's corridor (see "Planner modes" below). Any other value falls back to `full_load`. Rollback is this setting alone |
+| `SCENE_GRAPH_PLANNER_MODE` | `lazy` | planner | `lazy` (default): open the manifest only and read the owner tiles of each request's corridor (see "Planner modes" below). `full_load`: restore the whole stored version per (map, version); the rollback, this setting alone. Any other value logs a warning and falls back to `lazy`. Set it explicitly in the production `.env` |
 | `SCENE_GRAPH_LAZY_MAX_TILES` | 400 | planner | lazy mode: most owner tiles one request may read; more falls back `corridor_too_large` |
 | `SCENE_GRAPH_LAZY_TILE_CACHE` | 512 | planner | lazy mode: owner tiles kept per loaded graph (about 35 KB each by the config comment; not measured here) |
 | `SCENE_GRAPH_META_TTL_S` | 0.75 | planner | a `store.meta` answer is reused this long per map and shared by concurrent requests (one query in flight) |
@@ -45,15 +45,10 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S` / `_DEADLINE_S` | 30.0 / 3600.0 | **API** | delete saga: poll the worker's lock this long per attempt; a busy lock (a fold is running) does not consume `MAP_DELETE_MAX_ATTEMPTS` until it has been busy for the deadline in total |
 | `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag); empty = every map the graph database lists with a stored graph, limited to `CACHE_VERSIONS` maps (the rest are named in a warning); maps with `status.scene_graph_enabled` = false are skipped (a failed registry query loads every map) |
 
-**Planner modes.** `SCENE_GRAPH_PLANNER_MODE=full_load` (default): a cache miss restores the whole stored version
-(`store.load`) and route, snap and line of sight run on the full engine. `lazy`: a cache miss opens the manifest only
-and a request reads the owner tiles of its corridor (bounded LRU of `SCENE_GRAPH_LAZY_TILE_CACHE` tiles per graph),
-with the same 8-neighbour rule and cost; route cells may differ among equal-length routes. A corridor that needs more
-than `SCENE_GRAPH_LAZY_MAX_TILES` tiles falls back `corridor_too_large`; a tile that cannot be read falls back
-`tile_unavailable` and the graph is dropped so the next request re-opens the current version. Both reasons occur in
-lazy mode only. Switching mode is a config change and a planner restart; going back to `full_load` is the rollback and
-touches no data. The planner flag itself is off by default and lazy mode has not run on a production stack
-(`planner_upgrade.md`, Phase 0).
+**Planner modes.** `lazy` is the default (same routes as `full_load`, canonical tie rule); `full_load` is the rollback via
+`SCENE_GRAPH_PLANNER_MODE=full_load` (config change and planner restart, touches no data). Set the mode explicitly in
+the production `.env`. Definition, fallbacks (`corridor_too_large`, `tile_unavailable`, lazy mode only) and wiring:
+`integration.md`, "Planner modes". Lazy mode has not run on a production stack (`planner_upgrade.md`, Phase 0).
 
 Worker robustness settings (graph-builder, read by `scene_host`; forwarded by compose):
 
@@ -100,7 +95,7 @@ healthy (its entrypoint migrates before it serves). graph-builder also gets
 `POSTGRES_DATABASE_{PORT,NAME,USERNAME,PASSWORD}` (`POSTGRES_DATABASE_HOST` falls back to `POSTGRES_HOST`).
 `mission-planner-service` needs the ARANGO_* and MINIO_* secrets (already present). Planner-only additions:
 `SCENE_GRAPH_WIDTH_CHECK_ENABLED` (default false), `SCENE_GRAPH_PREWARM_MAPS` (comma list; default: every listed map
-with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2), `SCENE_GRAPH_PLANNER_MODE` (`full_load`),
+with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2), `SCENE_GRAPH_PLANNER_MODE` (`lazy`),
 `SCENE_GRAPH_LAZY_MAX_TILES` (400), `SCENE_GRAPH_LAZY_TILE_CACHE` (512).
 
 **Postgres connections.** Each owned map holds one dedicated connection (its advisory lock). On top of that a step
@@ -419,7 +414,7 @@ Open defects are kept in `integration.md`, "Open defects"; the operational ones:
   Postgres (throw-away containers, synthetic worlds). The first run on the production stack is still the verification
   of timing, volumes and the fold cost above.
 * **Cold graph load is the planner's weak point in `full_load` mode** (section 8). A tile-lazy planner (Phase 0)
-  exists behind `SCENE_GRAPH_PLANNER_MODE=lazy` (default off); phases 1-3 are plan only (`planner_upgrade.md`).
+  is the default (`SCENE_GRAPH_PLANNER_MODE=lazy`; `full_load` is the rollback); phases 1-3 are plan only (`planner_upgrade.md`).
 * **Bucket-slug collisions.** MinIO buckets are `lower(name)` with `_` -> `-`. Two registered maps that map to one
   bucket (`a_b` / `a-b`, `My_Map` / `my-map`) cannot be told apart: the worker skips both and logs `candidate ...
   matches several registered maps`. Rename one. No event is emitted for this.
