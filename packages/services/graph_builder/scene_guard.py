@@ -7,8 +7,10 @@
 * Lifecycle: `is_deleting()` is True when the map's `mapobjectv1` row is DELETING or DELETED, or
   missing (the same view as `GraphBuilderService.manual_target_state`). The worker checks it
   every step (rate limited) and before every save, so it never recreates `sg_*` or the bucket
-  after the delete saga dropped them. A failing query raises: the worker backs off. A residual
-  window between that check and the write remains: the saga should also take this lock before it drops (integration.md, "Review findings" 6).
+  after the delete saga dropped them. A failing query raises: the worker backs off. The residual
+  window between that check and the write is closed by the saga, which takes this same lock
+  (`scene_graph:<map_id>`, packages/api/map_delete.py) before it drops `sg_*` and the `scene_graph/`
+  objects and waits for a running fold (integration.md, "Review findings" 6).
 
 Synchronous (psycopg 3, as the worker is). The connection factory is injected so the logic is
 testable without a database; `connect_from_conninfo` is the production factory.

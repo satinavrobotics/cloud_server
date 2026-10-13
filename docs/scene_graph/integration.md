@@ -110,48 +110,82 @@ Dropped: "link cost from observation" (edge observations accrue per leaf edge; r
 steps unchanged. The chart route needs all of: a placed robot, a stored graph, snaps within limits, a route, and one
 distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`, `planner_fallback: <reason>`).
 
-1. **Graph**: `SceneGraphStore.meta(map)["version"]` pins the version; `store.load(map, version)` runs in a thread and
-   is cached by `(map, version)` (LRU, `SCENE_GRAPH_CACHE_VERSIONS`). A cold load is waited for at most
-   `SCENE_GRAPH_LOAD_TIMEOUT_S`; it continues in the background (shared by later requests, fills the cache), the
-   request falls back (`load_timeout`).
+0. **Budget**: the whole attempt has ONE monotonic deadline, `SCENE_GRAPH_TOTAL_BUDGET_S` (default 3.5 s, inside the
+   dispatcher's 5 s replan timeout; the legacy planner needs the rest after a fallback). Every stage waits
+   `min(its own limit, what is left)`; with under 0.3 s left at a stage start, or when the deadline is what ended a
+   wait, the request falls back `budget_exhausted` (not the stage's own timeout reason). Nothing of the chart route
+   runs on the default executor: graph loads (2 threads, serialised), store/meta/lag I/O (4 threads, 16 queued or
+   running, then `store_busy`) and plans (2 threads, `SCENE_GRAPH_PLAN_MAX_INFLIGHT` 4, then `planner_busy`) have
+   their own bounded pools; a timed-out call keeps its slot until it ends, so a hung call cannot pile work up.
+1. **Graph**: `SceneGraphStore.meta(map)` (cached `SCENE_GRAPH_META_TTL_S`, 0.75 s, one query in flight per map)
+   pins the version; `store.load(map, version)` runs in a thread. The cache holds graphs by `(map, version)` and
+   names the history the version numbers belong to by the store's **epoch, else its generation**: when a map's token
+   changes or its version regresses, every entry of that map is dropped, so a graph of another history is never
+   served under a version number. Bounds: `SCENE_GRAPH_CACHE_VERSIONS` (4) graphs in all (LRU over maps),
+   `SCENE_GRAPH_CACHE_VERSIONS_PER_MAP` (2), and `SCENE_GRAPH_CACHE_MAX_BYTES` over the graphs' `nbytes` (0 = off;
+   the newest graph is always kept). A cold load is waited for at most `SCENE_GRAPH_LOAD_TIMEOUT_S`; it continues in
+   the background (shared by later requests, fills the cache), the request falls back (`load_timeout`). A failed
+   load backs the map off (5 s doubling to 300 s). **Pre-warm** (`start_scene_prewarm`, only with the planner flag):
+   `SCENE_GRAPH_PREWARM_MAPS`, else every map with a stored graph, minus maps switched off, limited to the cache
+   size, `SCENE_GRAPH_PREWARM_CONCURRENCY` at a time.
 2. **Start/goal**: robot position through `_robot_xy_in_map`, then `snap` with `SCENE_GRAPH_START_SNAP_M` /
    `SCENE_GRAPH_GOAL_SNAP_M`; refused by `snap_problem` (`start_`/`goal_` + `no_navigable_space` | `too_far` |
    `crosses_blocked`).
 3. **Overlay**: active `blocked_graph_nodes` rows (none with `ignore_exclusions`) go through
    `blocked_geometry.overlay(rows, MATCH_RADIUS_M, half_width)` into `Blocked(discs, segments)` and are passed to
    `route()` (`plan_on_graph`). The same overlay is applied in the line-of-sight test of the simplification, so no
-   shortened leg crosses it. A route that exists without the overlay but not with it: `blocked_by_overlay`.
+   shortened leg crosses it. A route that exists without the overlay but not with it: `blocked_by_overlay`. The rows
+   and the version's ingest lag (below) are read concurrently.
 4. **Route**: `route(start_key, goal_key, blocked)`. Lattice route runs anchor to anchor, so the point list is
    `[snapped start] + route.nodes + [snapped goal]`. `None` -> `unreachable`, `MissingTiles` -> `missing_tiles`.
-5. **Waypoints**: `simplify` (line of sight = every half-step sample is a free lattice cell by `snap`, memoised per
-   cell; gap cap `SCENE_GRAPH_MAX_WAYPOINT_GAP_M`; a stub under 0.5 m at the end is merged) -> `build_waypoints` with
-   the nearest leaf within `SCENE_GRAPH_LEAF_SNAP_M` (`graph_db.k_nearest_neighbors`). `planned_path` = those ids
-   and `start_node_id`/`end_node_id` its ends. If any waypoint has no leaf or two share one: fallback
-   (`waypoints_without_distinct_leaf_ids`).
-6. **Budget**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (`plan_timeout`).
+5. **Waypoints**: `simplify` (line of sight = every quarter-step sample is a free lattice cell by `snap`, memoised
+   per cell, corner crossings need both orthogonal neighbours free; gap cap `SCENE_GRAPH_MAX_WAYPOINT_GAP_M`; a stub
+   under 0.5 m at the end is merged) -> leaf ids -> `build_waypoints`. **One kNN (`k=1`) per waypoint**
+   (`graph_db.k_nearest_neighbors`), the nearest leaf within `SCENE_GRAPH_LEAF_SNAP_M`; a database error is
+   `leaf_lookup_error`. Interior waypoints without a leaf or sharing one are dropped where line of sight allows
+   (`repair_leaf_ids`); `planned_path` = the ids and `start_node_id`/`end_node_id` its ends. If a waypoint still has no
+   leaf or two share one: fallback (`waypoints_without_distinct_leaf_ids`).
+6. **Budget of the plan**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (3 s), also
+   bounded by what is left of the total (`plan_timeout`, or `budget_exhausted` when the total was the binding one).
 
 Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `chart_keys`, `graph_version`,
-`planner_fallback` (only when the flag is on and the legacy planner ran; on plan and navigation responses). Reasons
-(meaning and operational reading: `runbook.md` section 7): `robot_unavailable`, `robot_not_placed`,
-`store_unavailable`, `store_timeout`, `store_error`, `no_graph`, `load_timeout`, `load_error`, `stale_graph`,
-`start_*`, `goal_*`, `blocked_by_overlay`, `unreachable`, `missing_tiles`, `too_narrow`,
-`waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`, `plan_timeout`, `error`.
+`planner_fallback` (only when the flag is on and the legacy planner ran; on plan and navigation responses).
+Reasons (meaning and operational reading: `runbook.md` section 7): `budget_exhausted`, `planner_busy`, `store_busy`,
+`executor_closed`, `robot_unavailable`, `robot_not_placed`, `store_unavailable`, `store_timeout`, `store_error`,
+`no_graph`, `load_timeout`, `load_error`, `stale_graph`, `start_*`, `goal_*`, `blocked_by_overlay`, `unreachable`,
+`missing_tiles`, `too_narrow`, `leaf_lookup_error`, `waypoints_without_distinct_leaf_ids`, `blocked_row_on_route`,
+`plan_timeout`, `error`. `get_stats()["scene_graph"]` (flag on) = `{outcomes: {served | reason: count}, cache:
+{graphs, bytes, loading, load_inflight, io_inflight, backed_off_maps}, plan_inflight}`.
 
+* **Waypoint heading**: `theta` of waypoint i is the bearing to waypoint i+1; the **last waypoint repeats the
+  previous bearing**. The plan request carries no goal heading, so there is no `goal_theta`; the final heading is the
+  controller's business. A one-waypoint route has theta 0.
+* **`end_node_id` vs `target_node_position`**: `end_node_id` is the leaf nearest the last waypoint (within
+  `LEAF_SNAP_M`, so up to 1 m off), `target_node_position` is the snapped goal cell centre (within `GOAL_SNAP_M`,
+  1.5 m, of the tap). The two need not coincide (up to about 1 m apart); the legacy planner returns a node and its own
+  position. The goal returned to the dispatcher carries `end_node_id` as node id.
 * **`stale_graph`**: the oldest costmap stored after the loaded version's ingest cursor is older than
-  `SCENE_GRAPH_MAX_VERSION_LAG_S` (default 120, 0 disables). Unknown lag never rejects.
+  `SCENE_GRAPH_MAX_VERSION_LAG_S` (default 120, 0 disables), or a newer version has been known for longer than that
+  while an older cached one is served. Unknown lag never rejects.
 * **Stale-version serving**: when a new version is still loading at the timeout, the newest version already loaded
   for the map is used, bounded by the lag test against that version's own cursor; `load_timeout` is raised only
   with nothing loaded.
-* **`too_narrow`**: `Route.min_width` < factsheet width + `SCENE_GRAPH_WIDTH_MARGIN_M`. `Route.min_width` is the
-  narrowest `Link.width` the route crosses and carries the lattice error (+-0.05 m, half a lattice step), so the rule is
-  `min_width >= 2 r' + 0.05` for an aligned passage and `>= 2 r' sqrt(2) + 0.05` where the robot must turn in place
-  (r' = `r_d`, half the smaller footprint side). Gated by `SCENE_GRAPH_WIDTH_CHECK_ENABLED`, **default off** (enable
-  deliberately after checking known corridors; the margin default in `config.py` is still 0.0, the planner owner
-  decides whether it becomes 0.05); with it off `min_width` is still reported.
+* **`too_narrow` (width rule)**: `Route.min_width` is the narrowest `Link.width` the route crosses and carries the
+  lattice error (+-0.05 m, half a lattice step). What the robot needs, from its factsheet (a missing length is the
+  width): an aligned passage `width + margin` (`= 2 r' + 0.05` for `r'` half the width, margin
+  `SCENE_GRAPH_WIDTH_MARGIN_M` = 0.05), and `hypot(length, width) + margin` where the simplified route turns in place.
+  The aligned bound is tested on the raw route first, the turn bound on the simplified one. A **turn** is a heading
+  change above 30 degrees between consecutive waypoints (`TURN_IN_PLACE_RAD`); the start heading is not considered.
+  The 30 degrees is an assumption about the controller (rotates on the spot above it, steers through below) and is
+  **to be validated against the real controller before `SCENE_GRAPH_WIDTH_CHECK_ENABLED` is switched on**. The gate
+  is **default off**; with it off `min_width` is still reported and the robot's size is not even read.
 * **`blocked_row_on_route`**: the legacy point rule on the final waypoints' leaf ids, applied only to rows without a
   robot pose (those the overlay cannot place); the legacy planner then reports or detours them.
 * The H5 first-node-behind test and the `failed_at` legacy-rule overlay do not apply to chart routes: the route
   starts at the snapped robot position, so there is no node behind it.
+* **Flag**: `SCENE_GRAPH_PLANNER_ENABLED` stays **off by default** in code, compose and `.env.example`. Enable
+  procedure (runbook section 2 step 7): worker verified on the maps that matter, lag under the threshold, optional
+  pre-warm list, width check left off, flag on, restart the planner, watch `outcomes`; rollback = flag off.
 
 ## Order and status (2026-10-13)
 
@@ -162,7 +196,11 @@ Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `char
   overlay checks and `planner_fallback` on plan and navigation responses, blocked overlay wired into `route()`,
   read API and websocket message, planner Dockerfile and compose environment (numpy/scipy in the requirements, MinIO/Arango
   secrets and the planner variables in compose), authorization audit (result: none, below), ingest hardening,
-  operator runbook, end-to-end harness, client wiring (sati-client, see its history).
+  operator runbook, end-to-end harness, client wiring (sati-client, see "Client" below); then the consolidation
+  rounds: planner hardening (one request deadline, bounded pools, cache identity, width rule, leaf repair), worker
+  robustness (poison leaf, faulted engine reload, rebuild resume by `begun_ms`, cursor-only saves), worker scale
+  (step pool, idle eviction, byte cap, PNG prefetch, `/health` snapshot), read API (idempotent snap, epoch pin, JSON
+  ETag, 503s, bounded chart tagging, paired blocked pose), ops (compose forwards every `SCENE_GRAPH_*`).
 * **Done (CIMBI)**: engine behind `api.py`, `store.py` (versioned snapshots, CAS, generations); per-batch cost
   rounds 1 and 2; route passage width (`Route.min_width`), store version semantics (cursor and canvas are not in the
   content hash), `meta()` epoch / `created_ms`, BUILD target `packages/scene_graph`, real-MinIO adapter test.
@@ -183,9 +221,15 @@ Response additions: `planner` (`"scene_graph"` | `"legacy"`), `min_width`, `char
 
 | Owner | Defect | Effect / decision |
 |---|---|---|
-| CIMBI | Fold result depends on capture-stamp order: `min_width` ranges 0.1..0.64 over permutations of the same leaves | breaks the order-independence claim; strict xfail |
-| CIMBI | Restart replay still bumps the version: the canvas is out of `content_hash` now, but each chart's canvas-relative `cell` is still hashed (e2e: `cell` [87, 88] vs [67, 68] after a reload) | a restart publishes a version with no new data; strict xfail |
+| CIMBI | Fold result depends on capture-stamp order: `min_width` ranges 0.1..0.64 over permutations of the same leaves | breaks the order-independence claim; strict xfail in the e2e (a fixed defect fails the run, so the marker gets removed) |
+| CIMBI | Restart replay still bumps the version: the canvas is out of `content_hash` now, but each chart's canvas-relative `cell` is still hashed (e2e: `cell` [87, 88] vs [67, 68] after a reload) | a restart publishes a version with no new data; strict xfail in the e2e |
 | CIMBI | Growth-batch fix; open-field decision | pending |
+| LACI | Blocked-row upsert pose pairing (robot pose and waypoint from one report) is only SQL-tested (unit tests pin the statement text); no e2e against Postgres | verify on the first real stack |
+| LACI | Migration `20261012_01`: `prev_x` / `prev_y` are reserved and unused (nothing writes or reads them); an edge row without a robot pose stays a disc | drop them in a later migration or write them again, if segments for pose-less edge rows are wanted |
+| LACI (deferred by the user) | `r_d` rule: half the smaller footprint side; optimistic for a long robot | to be rethought before the planner serves a robot with length >> width; the planner's turn-in-place rule already uses the length |
+| LACI (deferred by the user) | No authorization on the scene-graph routes (nor on `/maps/{id}/graph`) | design in review finding 13; an API-wide change |
+| LACI | The 30 degree turn threshold of the width rule is unvalidated against the real controller | validate before enabling `SCENE_GRAPH_WIDTH_CHECK_ENABLED` |
+| LACI | Canonical rebuild scan order is `(costmap_stored_ms, node key)`, not `(stamp_ms, key)`; the store documents `rebuild_batch` as "leaves sorted by (stamp, key)" | the two coincide only when stored order equals capture order; related to the stamp-order defect above. Decide with CIMBI which order is canonical |
 
 Fixed since the previous status: `Route.min_width` is the passage width (`Route.min_width` / `ChartGraph.route`; `too_narrow`
 can now be enabled, see the planner section), the canvas is out of `content_hash`, `store.meta()` carries
@@ -252,8 +296,8 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
    NavigationResponse and is a node count). The leg tracker, edge-stats and `_resolve_node_ref` assume
    `waypoints[i] <-> planned_path[i]`, same length, one id each; `leg_tracker.route_table` silently drops topomap
    ids on a length mismatch (degrades to VDA ids only, no crash). Therefore:
-   * waypoints carry `map_id`, x, y, `theta` = path bearing (final = goal heading), `node_id` = nearest leaf within a
-     threshold else None;
+   * waypoints carry `map_id`, x, y, `theta` = path bearing (the last repeats the previous bearing: the request has
+     no goal heading), `node_id` = nearest leaf within a threshold else None;
    * `planned_path` is set only when every waypoint has a leaf id (legacy fallback routes); otherwise None;
    * `min_width`, `chart_keys`, `planner` ("scene_graph" | "legacy") and the graph `version` are added to
      PlanResponse (its constructor lists fields one by one) and NavigationResponse; `failed_at` values, the
@@ -398,9 +442,14 @@ the blocked waypoint; `route_hits_row` tests the route's legs against it; `overl
 2. **Migration `20261012_01_blocked_geometry`** (additive, nullable, no backfill; downgrade drops them). Four
    columns, `robot_x, robot_y, prev_x, prev_y`; only `robot_x/robot_y` are written (robot position in the map frame
    at the report, from the reporting state, taken to the map frame by the order's transform). `prev_x`/`prev_y` are
-   no longer written and nothing reads them. The upsert is `COALESCE(EXCLUDED.robot_x, blocked_graph_nodes.robot_x)`
-   (same for y): a re-report without a position keeps the earlier one. **Deploy order: migration first** (no
-   fallback for an unmigrated database; runbook section 2).
+   no longer written and nothing reads them. A re-report without a position keeps the earlier one
+   (pairing rule below). **Deploy order: migration first** (runbook section 2). A
+   service that runs ahead of it falls back to the column-less statements (`blocked_nodes.LEGACY_*`: the block is
+   stored and read without the robot's pose, the old disc rule, one warning per write) instead of failing.
+   The upsert keeps the pose pair and the waypoint of one report together: a report without a complete robot pose
+   never erases an earlier valid pose of a block that is still active, and then also keeps the waypoint `(x, y)` it
+   was reported with (a robot pose is never combined with another report's waypoint, which would be a made-up
+   segment); on an expired row the new report alone starts the block. Only the SQL text is tested.
 3. `blocked_nodes.rows_hit(..., polyline=)` adds `route_hits_row` to the point rule; the API's
    `_reroute_through_blocked` passes the route's waypoints, the legacy planner's `_path_avoiding` does the same for
    its detour. Rows without a pose: behaviour as before.
@@ -414,10 +463,16 @@ the blocked waypoint; `route_hits_row` tests the route's legs against it; `overl
    adds `chart_keys` per row, best effort (no graph, no pose or a store error leaves it out). **Run legs the same way,
    no migration**: `GET /api/v1/runs/{run_id}/legs?with_chart_keys=true` adds `chart_keys` to each leg: the charts the
    straight line from the position of `from_topomap_node` to that of `to_topomap_node` crosses
-   (`blocked_chart_tags.add_leg_chart_keys`; node positions by `graph_db.get_node`, at most 400 distinct nodes, one
-   owner-plane read per map, 2 s). Absent on every leg when the map has no readable graph, `null` for a leg whose node
-   positions are unknown. The stored legs are untouched, so a legacy run gets keys too. The mission aggregate
-   (`/missions/{name}/legs`) is not tagged.
+   (`blocked_chart_tags.add_leg_chart_keys`; node positions by `graph_db.get_node`). Absent on every leg when the map
+   has no readable graph, `null` for a leg whose node positions are unknown. The stored legs are untouched, so a
+   legacy run gets keys too. The mission aggregate (`/missions/{name}/legs`) is not tagged. **Bounds** (both
+   endpoints): at most 6 owner planes per request (items are grouped into as few planes as the 4 M-cell read cap
+   allows, split by centre on a 422; what does not fit is left untagged), at most 400 distinct topomap nodes looked
+   up for legs, 3 s for the whole tagging. A tagged response carries `chart_keys_status` (`ok` | `partial` |
+   `unavailable`), `chart_keys_truncated` (bool) and `chart_keys_truncated_count` (items left untagged by those
+   limits); for blocked nodes next to `blocked_nodes`, for legs next to `items`. `partial` also covers a map
+   whose planes were partly unreadable; `unavailable` means no graph, a store error or the timeout, and nothing was
+   tagged. The owner plane is sampled with no snapping: a cell outside every chart is no key.
 8. **Edge rows are not segments (documented limit)**: a row with `edge_from`/`edge_to` but no robot pose (reported
    after an offline gap, or written before the pose columns) has only the position of the blocked waypoint, so it is
    a disc (point rule) like any pose-less row. The position of `edge_from` is not in the row (`prev_x`/`prev_y` are not
@@ -427,7 +482,9 @@ the blocked waypoint; `route_hits_row` tests the route's legs against it; `overl
 7. **`run_id` of a blocked row** is derived from `vda_node_id` (`run_id_of`: the dispatcher's run prefix) and
    resolved against `mission_runs` (`resolve_run_ids`: the run of the same mission and robot that started last
    before the report). Exact for the first pass of a mission; a heuristic for repeat passes (the recorder keeps the
-   first pass's row) and for runs adopted after a dispatcher restart. A failed lookup leaves the derived id.
+   first pass's row) and for runs adopted after a dispatcher restart. A failed lookup leaves the derived id. Bounded
+   per call: 500 rows, 100 distinct missions (newest rows first), the newest 5,000 `mission_runs` rows; rows beyond
+   keep the derived id.
 
 ## Rebuild request and per-map switch (2026-10-12)
 
@@ -460,26 +517,63 @@ keeps the previous answer.
 service-level "worker off" would be one event per map on every restart, and it would need a registry query and
 event-DB write from a feature that is off. The existing startup log and the per-map event above cover it.
 
-## Read contract for a map without a graph (2026-10-13)
+## Read contract (2026-10-13)
 
-* `GET /maps/{id}/scene-graph` and `/scene-graph/lineage`: 200 with `available: false` (no graph yet, worker flag
-  off on the API, or a dropped graph); `/scene-graph/raster`: 404. All three answer `Cache-Control: no-store`, since
-  the answer changes the moment a graph is built.
-* `scene_graph_updated` with `version: 0` is the hint "no graph" (an empty rebuild dropped it): clients drop the
-  view; it is not a version to pin.
-* The identity of a version is its **epoch** `(created_ms, generation)` from the manifest, part of the ETag and of
-  every read-cache key: a map recreated under the same id restarts at version 1 but never matches an old ETag.
-  Responses are never `immutable`. A drop (delete saga, empty rebuild) purges the map's read caches.
+Routes: `GET /maps/{id}/scene-graph?bbox=&level=&version=&raster=&epoch=`, `/scene-graph/raster?...&plane=`,
+`/scene-graph/lineage?from_version=&epoch=`. Reads are pinned to one version; one meta read per request.
+
+* **No graph**: `GET /maps/{id}/scene-graph` and `/lineage` answer 200 `available: false` only for genuine absence (no
+  graph yet, a dropped graph) or when the worker flag is off on the API; `/raster`: 404. All three answer
+  `Cache-Control: no-store`, since the answer changes the moment a graph is built. A store failure is **never**
+  `available: false` (below).
+  `scene_graph_updated` with `version: 0` is the websocket hint "no graph" (an empty rebuild dropped it): clients
+  drop the view; it is not a version to pin.
+* **Epoch**: the identity of a version is its epoch `(created_ms, generation)` from the manifest, served as an
+  **integer** (48 bits of a hash, exact in a JS number): body field `epoch` and header `X-Scene-Graph-Epoch`. It is part
+  of the ETag and of every read-cache key: a map recreated under the same id restarts at version 1 but never matches
+  an old ETag. Responses are never `immutable`. A drop (delete saga, empty rebuild) purges the map's read caches.
+* **Pin**: `?epoch=<n>` on all three routes. If the map's current epoch differs: **409** with body
+  `{"detail": {"error": "epoch_changed", "epoch": <current>, "current_epoch": <current>, "version": <current>}}`
+  and header `X-Scene-Graph-Epoch`; the client drops cached views and selections and refetches without a pin.
+  A pin on a map that lost its graph is the same 409 with `epoch: null`.
+* **ETag / 304**: JSON ETag over (epoch, version, level, raster flag, parents flag, snapped bbox); raster ETag over
+  (epoch, version, plane, level, snapped bbox). A matching `If-None-Match` answers 304 with the headers before
+  anything is computed. `Cache-Control`: `no-cache` when the request names no `version`, `public, max-age=60` when
+  it does (the ETag revalidates, the epoch is in it); `no-store` for no-graph, 409 and 503.
+* **503**: a transient Arango/MinIO failure (also while the topomap client is not up yet) is **503** with
+  `Retry-After: 2`, `Cache-Control: no-store` and body `{"detail": {"error": "scene_graph_unavailable",
+  "retry_after_s": 2}}`; clients keep their last view and back off.
+* **Area cap**: the bbox is snapped outward to the 6.4 m store-tile grid (idempotent: a snapped edge snaps to
+  itself) and capped at 4,000,000 lattice cells: **31 snap tiles = 198.4 m a side at 0.1 m** (32 tiles is 4.19 M
+  cells), 422 above. The answer's `bbox` is the snapped box. Also 422: more than 20,000 charts, more than 65,534
+  chart keys in a raster (the u16 plane), `level` outside 0..8, a malformed bbox.
+* **Versions**: `?version=N` above the current or negative: 404 "does not exist"; an older version the store no
+  longer retains: 404 "not retained". 409 "tiles changed" when the snapshot moved under a read (retry). Lineage: 409
+  beyond 256 versions or when the store no longer retains the span (reselect from the current charts).
+* **Internal**: `owner_plane(map, bbox, level)` (used by chart tagging) returns the u16 plane in one request (one
+  meta read, one query, no hierarchy), `None` without a graph, `AreaTooLarge` (a 422 subclass) over the cap so a
+  caller can split the area.
 
 ## Ingest ordering (2026-10-13)
 
-* **Canonical rebuild contract**: a rebuild folds the leaves sorted by `(stamp_ms, key)` in fixed batches of 48
-  (`rebuild_batch`; no time-based flush until the head of the nodes is reached). The same leaves therefore give the same
-  charts after every rebuild. Live batches differ by design: they fold in arrival order with time- and size-based
-  flushes, so a live-built graph and a rebuilt one over the same leaves can differ in chart partition.
-* **Store, planned by the engine and used by the worker for resume** (CIMBI): `begin_generation(fresh / params_hash)`,
-  `meta()["pending"]`, `load(pending=True)`, exported exceptions. Until they land the worker restarts a rebuild from zero
-  after a crash.
+* **Canonical rebuild contract**: a rebuild folds the leaves in fixed batches of `SCENE_GRAPH_REBUILD_BATCH` (48;
+  `rebuild_batch`, also recorded in the pending generation for whoever resumes it), with no time-based flush until the
+  head of the nodes is reached; the remainder is flushed at the head, and a rebuild older than
+  `SCENE_GRAPH_REBUILD_MAX_AGE_S` (900 s) is committed at its next save regardless. The same nodes therefore give
+  the same charts after every rebuild. **Note**: the worker feeds the batches in scan order `(costmap_stored_ms,
+  node key)`; it does not sort by `(stamp_ms, key)` (the store's docstring of `begin_generation` says "leaves sorted
+  by (stamp, key)"). The two orders agree only when the stored order is the capture order, which ties into the
+  stamp-order defect under "Open defects". Live batches differ by design: they fold in arrival order with time- and
+  size-based flushes, so a live-built graph and a rebuilt one over the same leaves can differ in chart partition.
+* **Resume** (store `begin_generation(fresh / params_hash / rebuild_batch)`, `meta()["pending"]` with `cursor` and
+  `begun_ms`, `load(pending=True)`; built): a pending generation found at (re)start with the expected params hash is
+  continued from its cursor. With a delete request outstanding only if `begun_ms` (the graph-builder's wall clock) is
+  not before the request's `at` (the API's wall clock: the generation cannot hold a deleted leaf; a clock-skew
+  caveat, runbook section 9) and it is younger than `REBUILD_MAX_AGE_S`; an old record without `begun_ms`, or
+  another params hash, starts empty. A cursor-only save (skip-only progress, once the cursor is more than the replay
+  margin ahead of the stored one) moves the pending cursor as well.
+* **Debounce**: a delete-triggered rebuild starts once the request has been the newest for
+  `SCENE_GRAPH_REBUILD_DEBOUNCE_S` (30 s); a burst of deletes is one rebuild.
 
 ## Ingest classification (2026-10-13)
 
@@ -488,8 +582,55 @@ event-DB write from a feature that is off. The existing startup log and the per-
   ends FENCED. Reported as `fold_failed` stage `save`, detail `commit: ...`.
 * **Empty rebuild**: after `empty_rebuild_confirmations` (2) caught-up steps with no foldable leaf the worker calls
   `store.drop`, publishes version 0 and emits `rebuild_completed` (`version: 0`); the request is cleared.
-* **`fold_failed` stages**: `fold`, `tiles`, `save`, `load`, and the terminal `deleting`, `fenced`, `needs_rebuild`,
-  `max_maps` (table and alerts: runbook section 5). `max_maps` is the per-process cap on owned maps (default 64; `SCENE_GRAPH_MAX_MAPS`); each owned map holds one Postgres connection.
+* **Fold errors** (`scene_worker._fold`): `LeafError` (validation, nothing mutated) quarantines the leaf it names
+  at once, by key (`fold_failed` stage `poison_leaf`, skip reason `fold_error`, the cursor moves past it); only an
+  error naming no leaf of the batch bisects it; there is no two-failures rule. `EngineFaulted` or any other
+  exception (the engine's state is undefined) drops the engine, reloads it from the store (live version, or the
+  saved pending generation of a rebuild) and re-reads from the durable cursor (stage `engine_faulted`, `consecutive`
+  = faults in a row); `LOAD_FAIL_LIMIT` in a row fall into a rebuild with reason `engine_faulted`, a fault inside that
+  rebuild ends `needs_rebuild`. `MemoryError` leaves the engine intact: backoff, and after
+  `SCENE_GRAPH_MEMORY_RETRY_LIMIT` in a row on the same batch it is bisected and a leaf failing alone is quarantined.
+  A deterministic engine-load failure (corrupt / mismatched stored graph) counted `LOAD_FAIL_LIMIT` times falls into
+  a rebuild; transient ones never count.
+* **`fold_failed` stages**: `fold`, `tiles`, `save`, `load`, `poison_leaf`, `engine_faulted`, and the terminal
+  `deleting`, `fenced`, `needs_rebuild`, `max_maps` (table and alerts: runbook section 5). `max_maps` is the per-process cap on owned maps (default 64; `SCENE_GRAPH_MAX_MAPS`); each owned map holds one Postgres connection.
 * **Registered maps** are matched by bucket slug (lower-case, `_` equal to `-`, `scene_guard.bucket_slug`); two
   registered maps with one slug are both skipped with an error log (no event).
 * **PNG decode** is `zlib` + numpy (no Pillow).
+
+## Worker scale (2026-10-13)
+
+One graph-builder process owns up to `SCENE_GRAPH_MAX_MAPS` maps. The runner thread only schedules; steps run on a
+dedicated pool of `SCENE_GRAPH_WORKER_THREADS` threads (at most one step per map in flight, the due map that has
+waited longest first, a cold engine load never takes the last thread). The engine is the only large object a worker
+holds: with `SCENE_GRAPH_LAZY_LOAD` it is loaded by the first fold; an idle engine (nothing buffered, pending or
+unsaved, quiet for `SCENE_GRAPH_EVICT_IDLE_S`) is saved and dropped when more than
+`SCENE_GRAPH_MAX_RESIDENT_ENGINES` engines (or `SCENE_GRAPH_MAX_RESIDENT_BYTES`, by `ChartGraph.nbytes`) are resident,
+and reloaded by the map's next leaves; if all are active the budget is exceeded and reported (`over_budget`), nothing
+is torn down. PNG fetch + decode of a page runs on a shared bounded prefetch pool
+(`SCENE_GRAPH_PREFETCH_THREADS`, `_QUEUE`) while the worker adapts and folds. State is observable through the
+graph-builder `/health` `scene_graph_worker` block (runbook section 11). Sizing guidance (3-5 KB per navigable
+cell, byte cap against the container limit, threads against cores, MinIO pool of 10, Postgres connections =
+maps + threads + a few): runbook section 8 and section 1. This supersedes every earlier "single-threaded runner"
+statement.
+
+## Client (sati-client, 2026-10-13)
+
+`services/sceneGraphApi.ts`, `hooks/useSceneGraph.ts`, `hooks/useSceneGraphLayer.ts`, `utils/sceneGraph.ts`,
+`components/sceneGraphLayers.ts`; layer toggled in the map window.
+
+* **Request cap**: a view wider than one request (31 snap cells, 198.4 m) is cut along a fixed **192 m** tile grid
+  (30 snap cells, so panning reuses tiles) into at most **4 tiles**, merged into one view; beyond that nothing is
+  fetched and the status is `zoomed_out`: a banner "Scene graph: zoom in to see charts". The level coarsens as the
+  view zooms out.
+* **Aborts and pause**: a new request aborts the one in flight; nothing is fetched (and in-flight reads are aborted)
+  while the tab is hidden, a refetch on return (a 304 when nothing changed).
+* **Failures**: the last view stays on screen (`stale`); a 503 / 429 / 502 / 504 / network failure retries with
+  back-off 1 s doubling to 30 s, honouring `Retry-After`; other failures (422, ...) report and do not retry. A plain
+  409 (tiles changed mid-read) is retried once.
+* **Epoch**: remembered per map and sent as `?epoch=`; a 409 `epoch_changed`, or a websocket hint of another epoch,
+  drops the cached views and the view and refetches from scratch. ETags are replayed per tile for 304.
+* **Hints**: `scene_graph_updated` is debounced and merged; a newer version refetches pinned to it (falling back to
+  the current one when no longer retained); `version: 0` = no graph, no refetch, no error.
+* **Selection removed**: chart selection and its lineage re-mapping were dead code and were dropped; lineage is
+  served but not consumed by the client.

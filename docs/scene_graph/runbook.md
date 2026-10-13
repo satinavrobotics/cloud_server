@@ -4,10 +4,13 @@ Scope: deploy, switch on, watch and roll back the scene graph (ingest worker in 
 route). Design and contracts: `integration.md`. Everything below is checked against the source on
 `feat/scene-graph-v2`. The worker, store, read API, saga and planner are exercised end to end against real ArangoDB / MinIO / Postgres by the e2e harness (`tools/scene_graph_e2e/run.sh`); no production stack has run them yet (see Known limitations).
 
-Components: **graph-builder** runs the ingest worker (one thread, all maps); **api-delegation-service** serves
+Components: **graph-builder** runs the ingest worker (one runner thread schedules every map; the steps run on a
+pool of `SCENE_GRAPH_WORKER_THREADS` threads, one step per map at a time); **api-delegation-service** serves
 `/api/v1/maps/{id}/scene-graph*`, owns the Postgres migrations and the map-delete saga; **mission-planner-service**
-plans on the graph; **mission-dispatch** writes blocked-node rows (needs the migration). State lives in MinIO
-(`scene_graph/` in the map's bucket, source of truth) and ArangoDB (`sg_*_{map}`, rebuildable index).
+plans on the graph; **mission-dispatch** writes blocked-node rows (needs the migration, falls back without it).
+State lives in MinIO (`scene_graph/` in the map's bucket, source of truth) and ArangoDB (`sg_*_{map}`, rebuildable
+index). Sections 11 (worker lifecycle and `/health`) and 12 (read API) are the reference for what the worker and
+the reads do; sections 1-10 are the procedure.
 
 ## 1. Settings
 
@@ -25,14 +28,19 @@ All read once at process start (restart to change). Defaults in `packages/config
 | `SCENE_GRAPH_START_SNAP_M` / `_GOAL_SNAP_M` | 0.5 / 1.5 | planner | how far the robot start / the goal may be moved onto free space |
 | `SCENE_GRAPH_LEAF_SNAP_M` | 1.0 | planner | a waypoint gets a leaf id only when a leaf is within this |
 | `SCENE_GRAPH_MAX_WAYPOINT_GAP_M` | 5.0 | planner | largest gap between waypoints |
-| `SCENE_GRAPH_LOAD_TIMEOUT_S` | 2.0 | planner | one shared deadline for store open + meta + cold graph load; the lag query gets its own |
-| `SCENE_GRAPH_PLAN_BUDGET_S` | 3.0 | planner | snap + route + simplify + leaf lookup (dispatcher replans with a 5 s timeout) |
-| `SCENE_GRAPH_CACHE_VERSIONS` | 4 | planner | loaded graphs kept per process, keyed (map, version) |
-| `SCENE_GRAPH_MAX_VERSION_LAG_S` | 120.0 | planner | graph older than the ingest by more than this -> `stale_graph`; 0 disables |
-| `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.0 | planner | route narrower than factsheet width + margin -> `too_narrow` (only when the check is enabled). `Route.min_width` carries the lattice error (+-0.05 m): when you enable the check set this to 0.05 (half a lattice step); the config default is still 0.0 |
-| `SCENE_GRAPH_WIDTH_CHECK_ENABLED` | false | planner | gates `too_narrow`. Off by default, to be enabled deliberately: `Route.min_width` is now the narrowest `Link.width` the route crosses (fixed in the library), see "Width gate" below |
+| `SCENE_GRAPH_TOTAL_BUDGET_S` | 3.5 | planner | ONE monotonic deadline per chart-route request over every stage (robot, store, graph load, lag, blocked rows, plan). The dispatcher replans with a 5 s timeout and the legacy planner needs the rest after a fallback, so keep this well under 5. Each wait is `min(its own limit, what is left)`; under 0.3 s left the request falls back at once (`budget_exhausted`) |
+| `SCENE_GRAPH_LOAD_TIMEOUT_S` | 2.0 | planner | longest one stage waits for store open + meta + a cold graph load (the load continues in the background); also the wait for the lag query |
+| `SCENE_GRAPH_PLAN_BUDGET_S` | 3.0 | planner | snap + route + simplify + leaf lookup (a wait on the plan thread; the thread keeps running). Also bounded by the total budget |
+| `SCENE_GRAPH_PLAN_MAX_INFLIGHT` | 4 | planner | plans running or hung on the 2-thread plan pool; beyond it a request falls back `planner_busy` |
+| `SCENE_GRAPH_CACHE_VERSIONS` | 4 | planner | loaded graphs kept per process in total (LRU over maps) |
+| `SCENE_GRAPH_CACHE_VERSIONS_PER_MAP` | 2 | planner | of one map: the one served and the one being refreshed |
+| `SCENE_GRAPH_CACHE_MAX_BYTES` | 0 (off) | planner | byte budget of the cache over the graphs' reported `nbytes`; the newest graph is always kept. Size it from the container memory limit (a graph is roughly 3-5 KB per navigable cell, see section 8) |
+| `SCENE_GRAPH_META_TTL_S` | 0.75 | planner | a `store.meta` answer is reused this long per map and shared by concurrent requests (one query in flight) |
+| `SCENE_GRAPH_MAX_VERSION_LAG_S` | 120.0 | planner | graph older than the ingest by more than this -> `stale_graph`; also how long a newer version may have been known (in the store's meta) while an older cached one is served; 0 disables both |
+| `SCENE_GRAPH_WIDTH_MARGIN_M` | 0.05 | planner | added to the robot's needed passage width (the lattice error of `Route.min_width`, lattice / 2). Only used when the check is enabled |
+| `SCENE_GRAPH_WIDTH_CHECK_ENABLED` | false | planner | gates `too_narrow`. Off by default; enable only after the validation in "Width gate" below |
 | `SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S` / `_DEADLINE_S` | 30.0 / 3600.0 | **API** | delete saga: poll the worker's lock this long per attempt; a busy lock (a fold is running) does not consume `MAP_DELETE_MAX_ATTEMPTS` until it has been busy for the deadline in total |
-| `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag); maps with `status.scene_graph_enabled` = false are skipped (a failed registry query loads every map) |
+| `SCENE_GRAPH_PREWARM_MAPS` / `_CONCURRENCY` | "" / 2 | planner | graphs loaded in the background at startup (needs the planner flag); empty = every map the graph database lists with a stored graph, limited to `CACHE_VERSIONS` maps (the rest are named in a warning); maps with `status.scene_graph_enabled` = false are skipped (a failed registry query loads every map) |
 
 Worker robustness settings (graph-builder, read by `scene_host`; forwarded by compose):
 
@@ -46,41 +54,77 @@ Worker robustness settings (graph-builder, read by `scene_host`; forwarded by co
 | `SCENE_GRAPH_REBUILD_DEBOUNCE_S` | 30.0 | a delete-triggered rebuild starts only after this long without a newer request |
 | `SCENE_GRAPH_LOAD_FAIL_LIMIT` | 3 | an engine load failing deterministically this many times falls into a rebuild |
 | `SCENE_GRAPH_STEP_BUDGET_S` / `_SLOW_STEP_S` / `_STATS_LOG_S` | 0 (off) / 30.0 / 60.0 | stop reading nodes in one step after this long / log a step slower than this / one stats line per map this often |
+| `SCENE_GRAPH_MEMORY_RETRY_LIMIT` | 3 | the same batch running out of memory this many times in a row is bisected; the leaf that still fails alone is quarantined |
 
-Not env-configurable (`WorkerConfig`/`RunnerConfig` defaults): nodes read per step 200, PNG retry 2 s / expiry 60 s,
-rebuild-request check 30 s, backoff 10 s, `commit_retries` 5, `empty_rebuild_confirmations` 2, map discovery 60 s,
-terminal retry 60 s, needs_rebuild retry 300 s. Planner `GraphCache` load back-off: 5 s doubling to 300 s per map
-(`BACKOFF_BASE_S` / `BACKOFF_MAX_S`), reset by the next successful load.
+Worker scale (graph-builder, one process, many maps; sizing in section 8):
 
-**Compose.** `mission_dispatch_services.yaml` forwards `SCENE_GRAPH_WORKER_ENABLED` and the worker tuning
-variables to `graph-builder-service` (with `stop_grace_period: 35s`), `SCENE_GRAPH_WORKER_ENABLED` and the delete-lock
-settings to `api-delegation-service`, and the planner variables to `mission-planner-service`, all as
-`${VAR:-default}` with the worker and the planner off. `mission-dispatch` waits for `api-delegation-service` to be
+| Setting | Default | Meaning |
+|---|---|---|
+| `SCENE_GRAPH_WORKER_THREADS` | min(8, CPU count) in code; **4 in compose** (compose cannot compute the CPU count, and an empty value does not parse) | size of the step pool: how many maps fold at once. A cold engine load never takes the last thread, so loaded maps keep running while a big map loads |
+| `SCENE_GRAPH_LAZY_LOAD` | true | a map's engine is loaded by its first fold, not at worker start: an idle map holds no engine |
+| `SCENE_GRAPH_MAX_RESIDENT_ENGINES` | 32 | engines kept in memory at once (0 = no cap) |
+| `SCENE_GRAPH_MAX_RESIDENT_BYTES` | 0 (off) | byte cap over the engines' `nbytes`. **Set this to about 60-70 % of the container memory limit** |
+| `SCENE_GRAPH_EVICT_IDLE_S` | 60.0 | an engine is evicted only after its map was quiet this long (saved first, reloaded by the next leaves) |
+| `SCENE_GRAPH_PREFETCH_THREADS` / `_QUEUE` | 4 / 64 | PNG fetch + decode pool shared by all maps (0 threads = off) and the most PNGs held prefetched at once |
+
+Not env-configurable (`WorkerConfig`/`RunnerConfig` defaults): nodes read per step 200, PNG retry 2 s / expiry = the
+replay margin (60 s, wall clock), poll margin 5 s, PNG re-asks per step 20, rebuild-request check 30 s, backoff 10 s,
+`commit_retries` 5, `empty_rebuild_confirmations` 2, `UPDATED` event at most every 60 s per map, `engine.nbytes`
+refresh 10 s, map discovery 60 s, lock held elsewhere (`not_owner`) retry 30 s, terminal retry 60 s, needs_rebuild
+retry 300 s. Planner `GraphCache`: load back-off 5 s doubling to 300 s per map (`BACKOFF_BASE_S` / `BACKOFF_MAX_S`,
+reset by the next successful load), store open retried after 30 s, loads on a 2-thread pool serialised on one lock,
+store/meta/lag I/O on a 4-thread pool (cap 16 queued or running, then `store_busy`), plan on a 2-thread pool.
+
+**Compose.** `mission_dispatch_services.yaml` forwards every `SCENE_GRAPH_*` variable of `packages/config.py` to the
+service that reads it, all as `${VAR:-default}` with the code's default and the worker and the planner off:
+`SCENE_GRAPH_WORKER_ENABLED`, the worker tuning and the worker scale variables to `graph-builder-service` (with
+`stop_grace_period: 35s`), `SCENE_GRAPH_WORKER_ENABLED` and the delete-lock settings to `api-delegation-service`,
+and the planner variables to `mission-planner-service`. A variable added to `config.py` must be added to compose
+and `.env.example` too (check: `grep -o 'SCENE_GRAPH_[A-Z_]*' packages/config.py | sort -u` against both). `mission-dispatch` waits for `api-delegation-service` to be
 healthy (its entrypoint migrates before it serves). graph-builder also gets
 `POSTGRES_DATABASE_{PORT,NAME,USERNAME,PASSWORD}` (`POSTGRES_DATABASE_HOST` falls back to `POSTGRES_HOST`).
 `mission-planner-service` needs the ARANGO_* and MINIO_* secrets (already present). Planner-only additions:
 `SCENE_GRAPH_WIDTH_CHECK_ENABLED` (default false), `SCENE_GRAPH_PREWARM_MAPS` (comma list; default: every listed map
-with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2); all three are forwarded by compose.
+with a stored graph), `SCENE_GRAPH_PREWARM_CONCURRENCY` (2).
 
-**Postgres connections.** Each owned map holds one dedicated connection (its advisory lock), plus two per graph-builder
-process (lifecycle/guard and event writes): connections needed = owned maps + 2, against the server's
-`max_connections` (shared with the API pool, dispatcher and planner). With many maps cap what one process owns with
-`SCENE_GRAPH_MAX_MAPS` (default 64; maps over the cap are reported once as `fold_failed` stage `max_maps` and not
-ingested), and size `max_connections` for it.
+**Postgres connections.** Each owned map holds one dedicated connection (its advisory lock). On top of that a step
+that does not hold its lock yet, and the discovery, open short-lived connections: with the step pool up to
+`SCENE_GRAPH_WORKER_THREADS` at once, plus a few fixed ones (footprint lookups, event writes). Budget
+`max_connections` for maps + threads + a few, per graph-builder process, shared with the API pool, dispatcher and
+planner. With many maps cap what one process owns with `SCENE_GRAPH_MAX_MAPS` (default 64; maps over the cap are
+reported once as `fold_failed` stage `max_maps` and not ingested; a map whose lock another replica holds does not
+count against the cap).
+
+**MinIO connections.** minio-py's default HTTP pool keeps 10 connections per host and the code does not enlarge it.
+Step threads, prefetch threads (`PREFETCH_THREADS`) and the store's own I/O share it per process: with
+`WORKER_THREADS + PREFETCH_THREADS` well above 10 expect urllib3 "Connection pool is full, discarding connection"
+warnings (harmless but slower, a connection is opened per overflow request). Keep the sum near 10 or raise the pool
+in a follow-up.
 
 **Width gate.** With `SCENE_GRAPH_WIDTH_CHECK_ENABLED=true` the planner compares `Route.min_width` (the narrowest
-`Link.width` the route crosses; carries the lattice error of +-0.05 m) with the robot: `min_width >= 2 r' + margin` for
-a passage the robot drives straight through (r' = half the footprint's smaller side, the `r_d` rule), and
-`min_width >= 2 r' sqrt(2) + margin` where it must turn in place, margin 0.05 (`SCENE_GRAPH_WIDTH_MARGIN_M`). The planner
-today applies the first form against the factsheet width; the turn-in-place bound is for judging a map by hand. The
-flag is not enabled by default; check a few known corridors first (`min_width` is reported in every plan response).
+`Link.width` the route crosses; it carries the lattice error of +-0.05 m) with what the planning robot needs
+(factsheet width and length; a missing length is taken as the width):
+
+* a passage the robot drives straight through: `min_width >= width + margin` (= `2 r' + 0.05` for r' half the
+  width);
+* a route that must turn in place: `min_width >= hypot(length, width) + margin` (the circumscribed circle).
+
+`margin` is `SCENE_GRAPH_WIDTH_MARGIN_M` (default 0.05, the lattice error). The aligned form is checked on the raw
+route first (no need to simplify a route that is too narrow even straight); the turn form on the simplified
+waypoints. A turn is any heading change above **30 degrees** between two consecutive waypoints
+(`TURN_IN_PLACE_RAD`); the start heading is not known to the planner and is not considered. The 30 degrees is an
+assumption about the controller (it may rotate on the spot at a waypoint above it and steers through below it) and
+**has not been validated against the real controller**: do that before enabling the flag. Procedure: with the flag
+off every plan response already reports `min_width`; compare it with a few corridors you know the robot passes
+(and ones it refuses), check a route with a sharp corner in a narrow passage, then enable on one planner instance.
+`too_narrow` falls back to the legacy planner, so a wrong threshold costs planner coverage, not a stuck robot.
 
 ## 2. Deploy order
 
 Each step gates the next. Flags stay false until the step that names them.
 
 1. **Images.** numpy 1.26.4 + scipy 1.11.4 in graph-builder, planner and API; each image copies `packages/scene_graph/`.
-2. **Migration first.** `20261012_01_blocked_geometry` (four nullable `blocked_graph_nodes` columns, `prev_x`/`prev_y` reserved and unused). It
+2. **Migration first.** `20261012_01_blocked_geometry` (four nullable `blocked_graph_nodes` columns; `prev_x`/`prev_y` are reserved and unused, nothing writes or reads them). It
    runs when the API container starts (`packages.api.entrypoint`: `alembic upgrade head` under the `migrations`
    advisory lock). Start/update `api-delegation-service` first and wait for healthy. Check:
    `SELECT column_name FROM information_schema.columns WHERE table_name='blocked_graph_nodes' AND column_name IN ('robot_x','robot_y','prev_x','prev_y');` (4 rows; only `robot_x`/`robot_y` are read or written).
@@ -104,8 +148,18 @@ Each step gates the next. Flags stay false until the step that names them.
    switch every other map off first (section 3): the default is "all maps".
 6. **Verify** (section 6) on at least one real map: worker started, `MAP.SCENE_GRAPH_UPDATED` events, read API
    `available: true`, no `fold_failed`, reasonable lag.
-7. **Planner last.** `SCENE_GRAPH_PLANNER_ENABLED=true` on mission-planner-service. Watch `planner` /
-   `planner_fallback` on plan and navigation responses and the planner log line `Chart planner not used (<reason>)`.
+7. **Planner last.** `SCENE_GRAPH_PLANNER_ENABLED` stays **false by default** (code, compose and `.env.example`) and is
+   switched on deliberately, after step 6 on the maps that matter and with their lag under
+   `SCENE_GRAPH_MAX_VERSION_LAG_S`:
+   1. Optional: list the maps in `SCENE_GRAPH_PREWARM_MAPS` so the first request after the restart does not meet a
+      cold load (a 90 x 90 m map loads in about 30 s, longer than `LOAD_TIMEOUT_S`).
+   2. Leave `SCENE_GRAPH_WIDTH_CHECK_ENABLED=false` (section 1, "Width gate").
+   3. Set `SCENE_GRAPH_PLANNER_ENABLED=true` on mission-planner-service and recreate it (all settings are read at
+      start).
+   4. Watch `planner` / `planner_fallback` on plan and navigation responses, the planner log line
+      `Chart planner not used (<reason>)` and `get_stats()["scene_graph"]` (section 7): `outcomes` should be
+      dominated by `served`; anything else is a fallback to the legacy planner and costs coverage only.
+   5. Rollback is section 4, first row (flag false, restart): immediate.
 
 ## 3. Per-map switch and rebuild trigger
 
@@ -158,9 +212,9 @@ Every payload has `map_name`. Not stored/emitted when the event DB write fails (
 
 | Event (severity) | Payload | Meaning | Recommended alert |
 |---|---|---|---|
-| `MAP.SCENE_GRAPH_UPDATED` (info) | `version`, `leaves_folded`, `charts_changed` | a version was saved and published (at most one per publish interval per map). Also once after a rebuild commit with `leaves_folded: 0` | None per event. **Absence** is the signal: uploads flowing for a map but no UPDATED for > 5 min -> ingest stalled |
+| `MAP.SCENE_GRAPH_UPDATED` (info) | `version`, `leaves_folded`, `charts_changed` | a version was saved and published. The event is **throttled to one per 60 s per map** (the leaves folded in between are summed into the next one); the websocket publish is not throttled. Also once after a rebuild commit with `leaves_folded: 0` | None per event. **Absence** is the signal: uploads flowing for a map but no UPDATED for > 5 min -> ingest stalled |
 | `MAP.SCENE_GRAPH_FOLD_FAILED` (warning) | `stage`, `detail` (300 chars), `consecutive` | see stage table | by stage, below |
-| `MAP.SCENE_GRAPH_REBUILD_STARTED` (info) | `reason` | pending generation begun (`needs_rebuild` = params hash, `nodes_deleted`, `manual`/other = request text) | none; info |
+| `MAP.SCENE_GRAPH_REBUILD_STARTED` (info) | `reason`, `resumed` (only when true) | pending generation begun (`needs_rebuild` = params hash, `nodes_deleted`, `engine_faulted`, `manual`/other = request text); `resumed: true` = an interrupted pending generation was continued from its cursor | none; info |
 | `MAP.SCENE_GRAPH_REBUILD_COMPLETED` (info) | `reason`, `version`, `duration_s` | pending generation committed; readers switched | alert if no COMPLETED follows a STARTED within your budget (no duration measured yet; start at 1 h). **`version == 0`: ticket** (below) |
 | `MAP.SCENE_GRAPH_DISABLED_SKIPPED` (info) | `reason` | map skipped (`map_not_enabled`; `worker_disabled` is reserved in the schema, never emitted: with the flag off no worker runs) | alert only for a map you did not switch off |
 
@@ -176,24 +230,30 @@ next UPDATED is the recovery):
 | `deleting` (terminal) | registry row DELETING or missing | worker closed, retried after 60 s | ignore during a map delete; otherwise ticket (registry row missing for a live bucket) |
 | `needs_rebuild` (terminal) | params hash or generation mismatch the worker could not rebuild itself | retried after 300 s | ticket. Should not occur with the production wiring (the worker rebuilds params changes itself) |
 | `max_maps` | the process already owns its maximum of maps (default 64); this map is not ingested (reported once) | none | ticket: raise `SCENE_GRAPH_MAX_MAPS` (mind Postgres connections, section 1) or disable unused maps |
+| `poison_leaf` | the engine rejected one leaf in validation (`LeafError`, nothing mutated); `detail` = `<node key>: <reason>` | that leaf is quarantined at once (counted as skip `fold_error`, the cursor moves past it) and the rest of the batch is folded; there is no two-failures rule. Reported per leaf, `consecutive` is always 1 | ticket per leaf: the node's costmap is unfoldable; the graph lacks that one leaf. Many in a row = bad data source |
+| `engine_faulted` | `fold_many` raised after the engine began to mutate (`EngineFaulted`, or any non-`LeafError` exception): its state is undefined; `consecutive` counts faults in a row without a good fold | the engine is dropped, reloaded from the store (live version, or the saved pending generation of a rebuild) and the leaves since the durable cursor are read again. `LOAD_FAIL_LIMIT` in a row fall into a rebuild (reason `engine_faulted`); a fault inside that rebuild ends `needs_rebuild` | `consecutive >= 2` ticket (engine bug on that map's data), reaching a `needs_rebuild` page |
 
 **Empty rebuild (`REBUILD_COMPLETED` with `version: 0`)**: a rebuild found no foldable leaf (every node deleted, or
 none has a usable occupancy costmap) twice in a row and dropped the stored graph. Reads now say `available: false` and
 the planner reports `no_graph`. Expected after deleting all nodes of a map; otherwise check the map's nodes /
 costmaps. Alert on `version = 0` in the payload.
 
-Only logs, no event or endpoint: skip counters (`no_occupancy_layer`, `no_pose`, `no_origin`, `no_stamp`, `bad_png`,
-`size_mismatch`, `bad_resolution`, `png_missing_expired`), `default_r_d` (footprint unknown), fold timings, pending
-PNGs, version lag. Grep the graph-builder log for `scene worker <map>` / `scene runner <map>`.
+Log-only: `default_r_d` (footprint unknown) and fold timings. Skip counters (`no_occupancy_layer`, `no_pose`,
+`no_origin`, `no_stamp`, `bad_png`, `size_mismatch`, `bad_resolution`, `png_missing_expired`, `fold_error`), pending
+PNGs and version lag are per map in graph-builder `/health` (section 11). Grep the graph-builder log for
+`scene worker <map>` / `scene runner <map>`.
 
 ## 6. Verification checklist
 
 1. graph-builder log: `scene graph worker started`. `scene graph worker not started: <ExcType>: ...` means the worker
    is **off** and the service runs without it (import, store or Postgres failure; the flag is true).
-2. Within a minute of an upload: `MAP.SCENE_GRAPH_UPDATED` for the map.
-3. `GET /api/v1/maps/{map}/scene-graph?bbox=x0,y0,x1,y1` (map-frame metres, snapped to a 6.4 m grid, max 4,000,000
-   lattice cells, level 0-8): `available: true`, `version` rising with uploads. `/scene-graph/raster` (u16 owner
-   plane, ETag) and `/scene-graph/lineage?from_version=N` (409 beyond 256 versions or when too old: reselect).
+2. Within a minute of an upload: `MAP.SCENE_GRAPH_UPDATED` for the map (events are throttled to one per 60 s per map;
+   the first one is immediate; `/health` `maps.<map>.version` rises on every publish).
+3. `GET /api/v1/maps/{map}/scene-graph?bbox=x0,y0,x1,y1` (map-frame metres, snapped outward to a 6.4 m grid, at most
+   4,000,000 lattice cells = 31 x 31 snap tiles = 198.4 m a side at 0.1 m, 422 above; level 0-8): `available: true`,
+   `version` rising with uploads, `epoch` an integer (also header `X-Scene-Graph-Epoch`). `/scene-graph/raster` (u16
+   owner plane, ETag) and `/scene-graph/lineage?from_version=N` (409 beyond 256 versions or when too old: reselect).
+   Full contract: section 12.
 4. Planner (flag on): a plan response has `planner: "scene_graph"`, `graph_version`, `chart_keys`, `min_width`; or
    `planner: "legacy"` with `planner_fallback` (section 7).
 5. Delete saga on a test map: it takes the worker's `scene_graph:<map>` lock (polls up to
@@ -203,10 +263,20 @@ PNGs, version lag. Grep the graph-builder log for `scene worker <map>` / `scene 
 ## 7. Planner fallback reasons (`planner_fallback`)
 
 Present only when the planner flag is on and the legacy planner served the request. The legacy result is always
-valid; a fallback is a cost, not an outage. Each is also logged as `Chart planner not used (<reason>)`.
+valid; a fallback is a cost, not an outage. Each is also logged as `Chart planner not used (<reason>)` and counted in
+the planner's `get_stats()["scene_graph"]`: `outcomes` (`served` or a reason -> count since start), `cache`
+(`graphs`, `bytes`, `loading`, `load_inflight`, `io_inflight`, `backed_off_maps`) and `plan_inflight`.
+
+Budget: one deadline of `SCENE_GRAPH_TOTAL_BUDGET_S` (3.5 s) covers every stage of the attempt, inside the
+dispatcher's 5 s replan timeout; the rest is the legacy planner's. A stage that would wait past the deadline reports
+`budget_exhausted` instead of its own timeout reason.
 
 | Reason | Meaning | Operational reading |
 |---|---|---|
+| `budget_exhausted` | the request's total budget (3.5 s) ran out in some stage, or under 0.3 s was left at a stage start | slow store/DB/robot lookup or a heavy plan. Persistent: look at which stage is slow (planner log, `outcomes`), not at this reason |
+| `planner_busy` | `SCENE_GRAPH_PLAN_MAX_INFLIGHT` plans are running or hung on the plan pool (a timed-out plan keeps its slot until it ends) | plans slower than arrivals, or a hung engine call; legacy serves meanwhile |
+| `store_busy` | the I/O pool (store open / meta / lag query) has 16 calls queued or running | Arango/MinIO stalled; check their health |
+| `executor_closed` | a pool was shut down | planner is stopping; ignore during a restart |
 | `robot_unavailable` | robot status not found | robot offline/unknown; legacy will fail the same way |
 | `robot_not_placed` | robot has no pose in this map | localise the robot; legacy reports it to the caller |
 | `store_unavailable` | scene graph store could not be built (retried after 30 s) | planner lacks ARANGO_*/MINIO_* env or store down |
@@ -214,26 +284,46 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | `no_graph` | map has no saved version | map not enabled, never ingested, or emptied (version 0 rebuild) |
 | `load_timeout` | cold graph load took > `LOAD_TIMEOUT_S`; it continues in the background and fills the cache | only when no older version of the map is cached (first request after restart; pre-warm avoids it). A newer version is loaded in the background (single flight) while the newest cached one is served, bounded by `stale_graph`. Persistent on a quiet map = graph too large for the timeout |
 | `load_error` | `store.load` raised, or the map is in load back-off after a failed load (5 s doubling to 300 s; no new load per request; an older cached version is served meanwhile) | store/snapshot problem; see worker `save` failures and planner log (`scene graph load ... failed`) |
-| `stale_graph` | oldest costmap stored after the version's cursor is older than `MAX_VERSION_LAG_S` | worker behind, stalled, or map switched off while uploads continue. Unknown lag (no cursor, query error) never rejects |
+| `stale_graph` | the oldest costmap stored after the version's cursor is older than `MAX_VERSION_LAG_S`; or a newer version has been known for longer than that while an older cached one is served | worker behind, stalled, or map switched off while uploads continue. Unknown lag (no cursor, query error) never rejects |
 | `start_no_navigable_space` / `goal_no_navigable_space` | no free cell near the point | robot pose or goal outside mapped free space |
 | `start_too_far` / `goal_too_far` | nearest free cell beyond the snap limit (0.5 m / 1.5 m) | pose inaccurate or goal tapped in a wall; raise snap only with care |
 | `start_crosses_blocked` / `goal_crosses_blocked` | the snap would cross a known blocked cell | robot/goal inside an ever-blocked region |
 | `blocked_by_overlay` | route exists without the active blocked-node rows, not with them | an active block (expiry pending) stands in the way; legacy then reports `blocked_nodes` |
 | `unreachable` | no route in the chart graph | real disconnection, or map not yet fully ingested |
 | `missing_tiles` | the corridor needs tiles not loaded | snapshot incomplete/inconsistent; investigate the version |
-| `too_narrow` | `min_width` < robot factsheet width + margin; **inactive unless `SCENE_GRAPH_WIDTH_CHECK_ENABLED`** (see "Width gate") | route has a passage narrower than this robot (width only, not length) |
-| `waypoints_without_distinct_leaf_ids` | a waypoint has no leaf within 1.0 m, or two waypoints share one | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
+| `too_narrow` | `min_width` < what the robot needs (width + margin straight, `hypot(length, width)` + margin where it turns); **inactive unless `SCENE_GRAPH_WIDTH_CHECK_ENABLED`** (see "Width gate") | route has a passage this robot cannot take |
+| `leaf_lookup_error` | the nearest-leaf query (one kNN per waypoint) raised | Arango problem; see planner log (`scene graph leaf lookup failed`) |
+| `waypoints_without_distinct_leaf_ids` | after dropping interior waypoints where line of sight allows, a waypoint still has no leaf within 1.0 m, or two share one | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
 | `blocked_row_on_route` | a blocked row without a robot pose (old disc rule) hits the final waypoints | legacy planner reports/detours it |
-| `plan_timeout` | snap + route + simplify + leaf lookup > `PLAN_BUDGET_S` (the thread keeps running) | map/route too large for the budget; see capacity |
+| `plan_timeout` | snap + route + simplify + leaf lookup > `PLAN_BUDGET_S` (the thread keeps running and holds its slot) | map/route too large for the budget; see capacity |
 | `error` | unexpected exception (logged with repr) | read the planner log |
+
+Response notes: the last waypoint repeats the previous waypoint's bearing (the request carries no goal heading, so
+there is no `goal_theta`); `end_node_id` is the leaf nearest the last waypoint (within `LEAF_SNAP_M`, up to 1 m
+away) and `target_node_position` the snapped goal cell centre (within `GOAL_SNAP_M` of the tap), so the two may
+differ by up to about 1 m (the legacy planner returns a node and its own position).
 
 ## 8. Capacity and timing
 
 * **Ingest cadence.** Reads 200 nodes per step; folds when 6 leaves wait or the oldest waited 5 s; a backlog goes 48
   leaves per fold. Saves are floored at 5 s apart per map, and also when 50 unsaved leaves / 30 s / idle. A
   publish therefore comes at most every 5 s per map, usually slower under load.
-* **One thread, all maps.** The runner steps maps round-robin, one batch each. One slow fold delays every other map
-  by that fold. Max `SCENE_GRAPH_MAX_MAPS` (64) maps in memory.
+* **Many maps, bounded memory.** Maps are stepped on a pool of `SCENE_GRAPH_WORKER_THREADS` threads (one step per
+  map at a time, the due map that has waited longest first), so one slow fold delays only the maps that need that
+  thread, not all of them. At most `SCENE_GRAPH_MAX_MAPS` (64) workers per process; engines resident in memory are
+  bounded separately (idle eviction after `EVICT_IDLE_S`, `MAX_RESIDENT_ENGINES`, `MAX_RESIDENT_BYTES`; an engine
+  with unsaved folds is saved before it is dropped, never lost). When every resident engine is active the budget is
+  exceeded and `over_budget` shows in `/health` instead of anything being torn down.
+* **Sizing (estimates, not measurements of this service).**
+  * Memory: about 3-5 KB per navigable lattice cell per resident engine (a 90 x 90 m map at 0.1 m is on the order of
+    2 GB, see integration.md "Measurements"). Set `MAX_RESIDENT_BYTES` to roughly 60-70 % of the graph-builder
+    container's memory limit: the rest is for the fold's temporaries (a fold can need a multiple of the engine),
+    decoded PNGs (`PREFETCH_QUEUE` x a costmap) and the process. A cap above the container limit means an OOM kill
+    instead of an eviction. `MemoryError` inside a fold is handled (backoff, then bisect), an OOM kill is not.
+  * `WORKER_THREADS` vs cores: each fold is mostly CPU-bound numpy/scipy; more threads than physical cores only
+    interleave them (and multiply peak memory, since every running fold has temporaries). The default is
+    `min(8, cores)`.
+  * Connections: Postgres = owned maps + threads + a few; MinIO's default pool is 10 per host (section 1).
 * **Fold cost (CIMBI prototype, per-leaf local update, `sight_range` 5 m; not the production `fold_many`).** Walled
   floors 4.2k / 12.6k / 31k cells: 0.44 / 0.73 / 0.71 s per leaf. A 48-leaf batch at that rate is about 20-35 s, above
   the 10 s budget: expect `slow fold` warnings on backlog; raising `BATCH_BUDGET_S` only silences them. Estimates,
@@ -242,22 +332,43 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
   finish. Keep such maps disabled and the planner away from them until CIMBI's sight-range cap lands.
 * **Backfill of an existing map** is hours at the builder's cost (big batches, resumable). Rebuild cost is the same
   full refold; there is no per-extent re-solve.
-* **Planner.** Warm path must fit 3 s (5 s dispatcher timeout). A cold load is waited for 2 s; a new version loads in the
-  background while the older cached one is served (2 versions per map, cache of 4 versions per process). Read API: result cache 96 MiB, 2 loaded graphs,
-  8 tile views.
+* **Planner.** The whole chart-route attempt must fit 3.5 s (5 s dispatcher timeout); the plan itself 3 s of that.
+  A cold load is waited for at most 2 s; a new version loads in the background while the older cached one is served
+  (2 versions per map, 4 per process, optional byte cap). Cold load is the planner's real cost today: whole-map
+  writer engine, 28.5 s for 90 x 90 m (integration.md "Measurements"); pre-warm and the stale-version serving cover
+  it. Read API: result cache 96 MiB / 64 results, 2 loaded graphs, 8 tile views.
 * **Restart replay.** The cursor is the lower of the in-memory copy and the store's; replay margin
-  `SCENE_GRAPH_REPLAY_MARGIN_S` (60 s); a replay that folds nothing new no longer publishes a version; a rebuild
-  restarts from zero.
+  `SCENE_GRAPH_REPLAY_MARGIN_S` (60 s); a replay that folds nothing new should not publish a version, but it
+  currently does (open defect, integration.md); a rebuild restarts from zero unless it can be resumed (section 11).
 
 ## 9. Known limitations
 
-* **No authorization** on the three scene-graph routes (nor a rate limit); they follow `/maps/{id}/graph`.
+Open defects (owner, effect, e2e marker) are kept in `integration.md`, "Open defects"; the operational ones:
+
+* **Restart replay bumps the version (CIMBI).** Each chart's canvas-relative `cell` is still part of the content
+  hash, so an engine reloaded from tiles hashes differently and a restart publishes a version with the same charts
+  and links. Harmless (one extra version, planner/clients reload); do not alert on a version bump after a restart.
+  Strict xfail in the e2e.
+* **Fold result depends on capture-stamp order (CIMBI).** The same leaves in another stamp order can give another
+  chart partition and `min_width` (0.1 .. 0.64 m over permutations in the e2e). A rebuild is deterministic for
+  the same data (same scan order, fixed batches), but a live-built graph and a rebuilt one can differ. Strict xfail.
+* **Blocked-row pose pairing is only SQL-tested.** The upsert keeps the robot pose and the waypoint it was reported
+  with as one pair (a robot pose is never combined with another report's waypoint); the unit tests pin the SQL text,
+  and no e2e test runs it against Postgres.
+* **Migration `20261012_01` `prev_x` / `prev_y`** are reserved columns: nothing writes or reads them (an edge row
+  without a robot pose stays a disc).
+* **No authorization** on the three scene-graph routes (nor a rate limit); they follow `/maps/{id}/graph`. The
+  design is written down (integration.md, finding 13) and deferred by the owner as an API-wide change.
 * **`r_d` rule**: half of the *smaller* footprint side; unknown footprint (-1) uses 0.25 m and is counted
-  (`default_r_d`, log only). Optimistic for a long robot: a passage it cannot turn in can look navigable, and
-  `too_narrow` uses the same width-only rule. Revisit before enabling the planner for a robot with length >> width.
+  (`default_r_d`, log only). Optimistic for a long robot: a passage it cannot turn in can look navigable at ingest,
+  and `Route.min_width` is compared with the same width (the planner's turn rule, enabled with the width check,
+  does use the length). Decision deferred by the owner; revisit before enabling the planner for a robot with
+  length >> width.
 * **Not run on production.** Worker, store, guard, saga and planner pass the e2e harness against real ArangoDB / MinIO /
   Postgres (throw-away containers, synthetic worlds). The first run on the production stack is still the verification
   of timing, volumes and the fold cost above.
+* **Cold graph load is the planner's weak point**: whole-map writer engine, seconds to tens of seconds (section 8).
+  A tile-lazy planner is planned (`planner_upgrade.md`), not built.
 * **Bucket-slug collisions.** MinIO buckets are `lower(name)` with `_` -> `-`. Two registered maps that map to one
   bucket (`a_b` / `a-b`, `My_Map` / `my-map`) cannot be told apart: the worker skips both and logs `candidate ...
   matches several registered maps`. Rename one. No event is emitted for this.
@@ -265,8 +376,14 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
   old version is served, and only after it do deletions disappear from the planner. Realign triggers no rebuild.
 * **Stale leaf stamps.** A leaf folded under a provisional receipt-time stamp can be folded again under an earlier
   corrected one; it can look "too new" in cells it won until newer data arrives.
-* **No metrics endpoint**; stats are in process memory. The cursor store is process-local (the durable cursor is in
-  `sg_meta`).
+* **Delete-triggered rebuild resume and clock skew.** A pending generation is resumed only when its `begun_ms` (the
+  graph-builder's wall clock) is not before the delete request's `at` (the API's wall clock): two clocks compared.
+  On one host (the compose default, `network_mode: host`) that is exact. With split hosts, if the graph-builder
+  clock runs *ahead* of the API clock by more than the time between the generation's start and the delete, a
+  generation that predates the delete can be resumed and keep the deleted leaf until the next rebuild (the other
+  direction only restarts a resumable generation: safe, slower). Keep both hosts on NTP.
+* **Metrics are `/health` and `get_stats()` only**; no Prometheus endpoint. Counters are per process and reset on
+  restart. The cursor store is process-local (the durable cursor is in `sg_meta`).
 * **Per-map switch has no API**, only SQL; no `scene_graph_enabled` event on a service-level disable.
 * **Planner flag is global**, not per map; maps without a graph just fall back (`no_graph`).
 
@@ -285,12 +402,137 @@ valid; a fallback is a cost, not an outage. Each is also logged as `Chart planne
 | Deleted nodes still visible in the chart graph | `scene_graph_needs_rebuild` on the map status; API worker flag | wait for rebuild; check REBUILD_STARTED/COMPLETED; set manually if absent |
 | REBUILD_STARTED without COMPLETED | worker log `generation commit failed (n/5)`, fold failures | store problem; after 5 commit failures it ends `fenced` and restarts the rebuild |
 | Read API `available: false` | API worker flag; map has a saved version; worker state | enable flag on the API; ingest the map |
-| Read API 422 "bbox is N cells" / "N charts" | request size | smaller bbox or higher level |
+| Read API 422 "bbox is N cells" / "N charts" | request size (over 198.4 m a side at 0.1 m, snapped) | smaller bbox or higher level; the client tiles (section 12) |
 | Read API 409 "tiles changed" / lineage 409 | version moved during the read / span > 256 / too old | retry; for lineage reselect from current charts |
+| Read API 409 `epoch_changed` | the map was recreated or its graph dropped and rebuilt since the `?epoch=` the client sent | drop cached views and selections, refetch without a pin (clients do this themselves) |
+| Read API 503 + `Retry-After: 2` | store (Arango/MinIO) down or timing out; never "no graph" | fix the store; clients back off and keep their last view |
+| Read API 404 on `?version=N` | N does not exist yet, or is no longer retained | read without `version` |
 | Planner always `load_timeout` | no cached version yet: map size, MinIO latency, pre-warm failed (planner log) | wait for the background load, set `SCENE_GRAPH_PREWARM_MAPS`, or raise `LOAD_TIMEOUT_S` within the 5 s dispatcher budget |
+| Planner `budget_exhausted` / `planner_busy` / `store_busy` often | `get_stats()["scene_graph"]` (`io_inflight`, `plan_inflight`, `outcomes`); planner log; store latency | slow Arango/MinIO/Postgres or a hung plan: fix the dependency; pools drain by themselves, a restart clears hung threads |
 | Planner always `stale_graph` | lag: worker stalled, behind, or map disabled while uploads continue | fix ingest, re-enable the map, or (last resort) `MAX_VERSION_LAG_S` higher / 0 |
 | Planner `store_unavailable` | planner env has ARANGO_*/MINIO_*; retry is every 30 s | fix env/network, restart planner |
 | Route clips a known obstacle / robot refuses leg | active `blocked-nodes` rows (`GET /api/v1/maps/{id}/blocked-nodes?with_chart_keys=true`; run legs: `GET /api/v1/runs/{id}/legs?with_chart_keys=true`); migration applied | clear/expire row; check migration |
 | Blocked rows missing pose (disc rule only) | columns NULL: rows written before the migration or without localization | none; expire naturally |
 | Map delete stuck at `scene_graph` | `scene_graph: lock ...` in the map's `delete_error`, `delete_attempts` not rising; the worker holds the lock during a long fold | retried with backoff without consuming attempts until `SCENE_GRAPH_DELETE_LOCK_DEADLINE_S`; if persistent, disable the map and wait for release (~2 min) |
 | Open-field map extremely slow / `slow fold` warnings | fold times in the log | disable the map; keep the planner off for it |
+| graph-builder OOM-killed / restarts under many maps | `/health` `resident.bytes` vs `max_bytes`, container memory limit | set `SCENE_GRAPH_MAX_RESIDENT_BYTES` below the limit (section 8), lower `WORKER_THREADS` |
+| `/health` `resident.over_budget: true` | every resident engine is active; nothing is evicted | expected under sustained load of many maps; raise the cap/limit or reduce `WORKER_THREADS` |
+| `fold_failed` stage `poison_leaf` | `detail` names the node key | the leaf is already quarantined and skipped; inspect that node's costmap, or ignore a single one |
+| `fold_failed` stage `engine_faulted` repeating, then REBUILD_STARTED reason `engine_faulted` | worker log traceback | report to CIMBI with the map; the worker reloaded/rebuilt itself; `needs_rebuild` terminal means the rebuild faulted too |
+
+## 11. Worker lifecycle and `/health`
+
+How the ingest worker behaves; everything here is per map, inside one graph-builder process.
+
+**Ingest.** Nodes are read in `(costmap_stored_ms, node key)` order past the cursor, minus the replay margin
+(`SCENE_GRAPH_REPLAY_MARGIN_S`, 60 s, full margin at start / after a failure / every `REPLAY_RECHECK_S`; other polls
+re-read 5 s). A node whose PNG is confirmed missing stays pending, is asked again every 2 s and is dropped after 60 s
+of wall clock (`png_missing_expired`); the persisted cursor stays below the oldest pending node. A PNG fetch that
+raises (MinIO down) is not a verdict: reading stops at that node and backs off. Leaves are buffered and folded in one
+`fold_many` per batch (6 .. 48 leaves, or the oldest waited 5 s).
+
+**Saves and cursor.** A version is the return of `store.save`; saves are floored at the publish interval. The cursor
+is saved with the version. Skip-only progress (nothing to save) moves the cursor in memory and becomes durable as a
+cursor-only save once it is more than the replay margin ahead of the stored one; the store updates `meta.cursor` in
+place, so it is cheap. During a rebuild the same cursor-only save moves the *pending* generation's cursor (once the
+pending generation holds a saved state).
+
+**Rebuild** (params-hash change, node delete, `engine_faulted`, manual request):
+
+1. A new generation is begun (`begin_generation`); readers and the planner keep the old version.
+2. Every leaf is folded again into the pending generation in **fixed batches of `SCENE_GRAPH_REBUILD_BATCH` (48)**,
+   with no time-based flush until the head of the nodes is reached, so the same nodes give the same chart partition
+   after every rebuild. (The scan order is `(costmap_stored_ms, key)`; a live-built graph folds in arrival order with
+   time-based flushes and can differ from a rebuilt one.)
+3. Committed (`commit_generation`) when the scan reached the head and nothing is buffered or pending; a rebuild
+   older than `SCENE_GRAPH_REBUILD_MAX_AGE_S` (900 s) is committed at its next save even if uploads keep arriving.
+4. The request key is cleared only if its `at` is unchanged (a delete that arrived mid-rebuild causes one more).
+   An empty rebuild (no foldable leaf twice in a row) drops the graph and reports version 0 (section 5).
+
+A **delete-triggered** rebuild is debounced: it starts only after the request has been the newest for
+`SCENE_GRAPH_REBUILD_DEBOUNCE_S` (30 s; a burst of deletes is one rebuild). A pending generation found at
+(re)start is **resumed from its cursor** when it has the expected params hash and, if a delete request exists,
+only when its `begun_ms` is not before the request's `at` (it cannot hold a deleted leaf; store clock vs API clock,
+see Known limitations) **and** it is younger than `REBUILD_MAX_AGE_S`; an old-format record without `begun_ms`, an
+older generation or one with another params hash starts empty. A mid-run request always starts a fresh generation.
+`REBUILD_STARTED` carries `resumed: true` when it continued one.
+
+**Failures.**
+
+| Failure | Handling |
+|---|---|
+| Engine load fails deterministically (corrupt / mismatched stored graph: `StateMismatch`, `TooOld`, `KeyError`, `ValueError`, ...) | `fold_failed` events (stage `load`), retried every 10 s; after `SCENE_GRAPH_LOAD_FAIL_LIMIT` (3) in a row the worker falls into a rebuild instead of loading the whole map every backoff (or `needs_rebuild` when it cannot rebuild). Transient failures (store down) never count |
+| `LeafError` (one leaf rejected in validation, nothing mutated) | that leaf is quarantined **immediately by the key the error names** (event `fold_failed` stage `poison_leaf`), the rest of the batch is folded. No two-failures rule. Only an error naming no leaf of the batch bisects it |
+| `EngineFaulted` or any other exception from a fold (engine state undefined) | stage `engine_faulted`: engine dropped, reloaded from the store (live version, or the saved pending generation of a rebuild), reads rewind to the durable cursor. `LOAD_FAIL_LIMIT` faults in a row without a good fold -> rebuild with reason `engine_faulted`; a fault inside that rebuild (or no way to rebuild) -> `NEEDS_REBUILD` |
+| `MemoryError` | nothing changed: backoff and retry; the same batch failing `SCENE_GRAPH_MEMORY_RETRY_LIMIT` (3) in a row is bisected and a leaf that still fails alone is quarantined like a poison leaf (`memory_isolations` counter) |
+| Save fails | folded state kept in memory, retried every 10 s (stage `save`) |
+| Fenced (lock lost, stale expected version, generation superseded) | terminal: worker closed, lock released, map retried after 60 s |
+
+**Eviction.** An idle engine (nothing buffered, pending or unsaved) of a map quiet for `EVICT_IDLE_S` is saved and
+dropped when the resident count or bytes exceed the caps; the next leaves reload it from the store. Seen-map, cursors
+and rebuild state are kept, so nothing is re-folded.
+
+### `/health` `scene_graph_worker` (graph-builder, `GET /health`)
+
+`{enabled, running, workers, maps, pool, resident, prefetch}`; `{enabled: false, running: false}` when the worker is
+off, `{enabled: true, error}` when the snapshot itself failed.
+
+| Field | Meaning |
+|---|---|
+| `maps.<map>.state` | last step state: `worked`, `idle`, `backoff`, `not_owner`, `deleting`, `fenced`, `needs_rebuild` |
+| `maps.<map>.last_step_age_s` | seconds since the map was last stepped (a large value on a worked map = starved or stuck) |
+| `maps.<map>.version`, `pending`, `buffered`, `version_lag_s`, `skipped{}` | published version, nodes waiting for a PNG, leaves waiting for a batch, age of the oldest unsaved fold, skip counters by reason |
+| `maps.<map>.resident`, `resident_bytes` | an engine is in memory; its `nbytes` (null = unknown, 0 when not resident) |
+| `maps.<map>.loads`, `evictions`, `prefetch_hits` | engine loads through the factory, evictions, leaves whose PNG came from the prefetch pool |
+| `pool.threads`, `inflight`, `queue_depth`, `cold_inflight` | step pool size; steps running; due maps that found no free thread at the last tick; running steps that are cold engine loads |
+| `resident.engines`, `bytes`, `bytes_unknown`, `max_engines`, `max_bytes`, `evictions`, `over_budget` | engines in memory and their bytes (`bytes_unknown` = engines that cannot say), the caps, evictions so far, every resident engine active so the cap is exceeded |
+| `prefetch.threads`, `max_pending`, `outstanding`, `queue_depth`, `submitted`, `rejected`, `hits` | PNG prefetch pool (absent when `PREFETCH_THREADS=0`) |
+
+Reading it: `pool.queue_depth` persistently above 0 with `inflight == threads` means more due maps than threads
+(raise `WORKER_THREADS` if cores allow, else it is just load); `cold_inflight` equal to `threads - 1` for long is a
+big map loading; `resident.bytes` near `max_bytes` with rising `evictions` is the cap working.
+
+## 12. Read API contract (api-delegation-service)
+
+Routes: `GET /api/v1/maps/{id}/scene-graph?bbox=&level=&version=&raster=&epoch=`, `.../scene-graph/raster?bbox=&level=
+&version=&plane=owner|dependent&epoch=`, `.../scene-graph/lineage?from_version=&epoch=`. No authorization (section 9).
+
+| Topic | Behaviour |
+|---|---|
+| `available` | `false` (200) only for genuine absence: the map has no saved graph (never built, dropped by an empty rebuild) or `SCENE_GRAPH_WORKER_ENABLED` is off on the API. Raster: 404. All three answer `Cache-Control: no-store` in that case. A store failure is never `available: false` |
+| Epoch | an integer (48-bit hash of the incarnation `(created_ms, generation)`), in the body (`epoch`) and header `X-Scene-Graph-Epoch`; a map recreated under the same id restarts at version 1 with another epoch |
+| `?epoch=` pin | a pin that no longer matches is **409** with body `{"detail": {"error": "epoch_changed", "epoch": <current>, "current_epoch": <current>, "version": <current>}}` (+ header, `no-store`); also on a map that lost its graph (`epoch: null`) |
+| ETag / 304 | JSON ETag over (epoch, version, level, raster flag, parents flag, snapped bbox); raster ETag over (epoch, version, plane, level, snapped bbox). A matching `If-None-Match` answers 304 before anything is computed, with the headers |
+| Cache-Control | no `version` in the request: `no-cache` (revalidate every time); with `version`: `public, max-age=60`; never `immutable` (the URL does not carry the epoch). Map without a graph: `no-store`. 503 and 409: `no-store` |
+| 503 | transient store/object-store failure (also the topomap client not up yet): `Retry-After: 2`, body `{"detail": {"error": "scene_graph_unavailable", "retry_after_s": 2}}` |
+| Area cap | the bbox is snapped outward to the 6.4 m tile grid and capped at 4,000,000 lattice cells: **31 snap tiles = 198.4 m a side at 0.1 m** (32 would be 4.19 M cells); 422 above. Also 422: more than 20,000 charts in the answer, more than 65,534 chart keys in a raster (u16 plane), `level` outside 0..8 |
+| Versions | `?version=N` above the current or negative: 404 `does not exist`; an older version that is no longer retained: 404 `not retained`. 409 "tiles changed" when the snapshot moved under a read: retry |
+| Lineage | 409 when `from_version` is more than 256 versions behind or the store no longer retains the span: reselect from current charts |
+| Caches | per process: results 64 / 96 MiB, loaded graphs 2, tile views 8, lineages 32; all purged for a map when its graph disappears; keys carry the epoch |
+
+**Chart keys on blocked nodes and run legs** (`GET /api/v1/maps/{id}/blocked-nodes?with_chart_keys=true`,
+`GET /api/v1/runs/{id}/legs?with_chart_keys=true`). Derived at read time, nothing is stored. Best effort, bounded:
+at most 6 owner planes are read per request (rows/legs are grouped into as few planes as the area cap allows;
+what does not fit is left untagged), at most 400 distinct topomap nodes are looked up for legs, and the whole
+tagging has a 3 s timeout. The response carries `chart_keys_status` (`ok`: everything tagged or nothing to tag;
+`partial`: some items untagged because of the limits; `unavailable`: no graph, a store error or the timeout, nothing
+tagged), `chart_keys_truncated` (bool) and `chart_keys_truncated_count`. For blocked nodes they are top-level
+fields next to `blocked_nodes`; for run legs top-level next to `items`. A leg with unknown node positions has
+`chart_keys: null`. The mission aggregate (`/missions/{name}/legs`) is not tagged. A cell outside every chart tags as
+no key (no snapping to the nearest navigable cell).
+
+**Blocked-node rows.** `run_id` is derived from the VDA node id and resolved against `mission_runs` with bounds:
+at most 500 rows, 100 distinct missions and the newest 5,000 runs per call (newest rows first; the rest keep the
+derived id). The upsert pairs the poses: the robot pose (`robot_x`/`robot_y`) and the waypoint (`x`/`y`) of a row
+always come from one report. A re-report without a pose, while the block is still active and holds a complete
+pose pair, keeps the earlier pair (including its waypoint); on an expired row the new report alone starts the block.
+Without the migration the dispatcher writes and reads the column-less statements (disc rule, one warning per write).
+
+**Clients (sati-client).** The map window draws the chart layer from these routes: a view wider than one request
+(31 snap cells, ~198 m) is cut along a fixed 192 m tile grid into at most 4 tiles, more than that shows the banner
+"Scene graph: zoom in to see charts" and fetches nothing; a newer request aborts the one in flight, nothing is
+fetched while the browser tab is hidden (refetch on return, a 304 when unchanged); a 503 / network failure keeps the
+last view on screen (`stale`) and retries with back-off (1 s doubling to 30 s, honouring `Retry-After`); the epoch is
+remembered per map and sent as `?epoch=` (a 409 `epoch_changed`, or a websocket hint of another epoch, drops cached
+views and refetches); a `scene_graph_updated` hint with `version: 0` means "no graph". Chart selection was removed
+(it was unused).

@@ -233,8 +233,20 @@ services:
       - SCENE_GRAPH_STEP_BUDGET_S=${SCENE_GRAPH_STEP_BUDGET_S:-0.0}
       - SCENE_GRAPH_SLOW_STEP_S=${SCENE_GRAPH_SLOW_STEP_S:-30.0}
       - SCENE_GRAPH_STATS_LOG_S=${SCENE_GRAPH_STATS_LOG_S:-60.0}
-      # Postgres connections held: one per owned map + 2 (lifecycle + lock), against max_connections.
-      # Cap the maps one process owns with SCENE_GRAPH_MAX_MAPS (runbook section 1).
+      - SCENE_GRAPH_MEMORY_RETRY_LIMIT=${SCENE_GRAPH_MEMORY_RETRY_LIMIT:-3}
+      # Scale (runbook sections 1 and 8). WORKER_THREADS: maps folded at once. The code default is
+      # min(8, CPU count) when the variable is unset; compose cannot compute that and an empty value
+      # would not parse, so it defaults to 4 here. Set MAX_RESIDENT_BYTES to ~60-70% of this
+      # container's memory limit (0 = no byte cap).
+      - SCENE_GRAPH_WORKER_THREADS=${SCENE_GRAPH_WORKER_THREADS:-4}
+      - SCENE_GRAPH_LAZY_LOAD=${SCENE_GRAPH_LAZY_LOAD:-true}
+      - SCENE_GRAPH_MAX_RESIDENT_ENGINES=${SCENE_GRAPH_MAX_RESIDENT_ENGINES:-32}
+      - SCENE_GRAPH_MAX_RESIDENT_BYTES=${SCENE_GRAPH_MAX_RESIDENT_BYTES:-0}
+      - SCENE_GRAPH_EVICT_IDLE_S=${SCENE_GRAPH_EVICT_IDLE_S:-60.0}
+      - SCENE_GRAPH_PREFETCH_THREADS=${SCENE_GRAPH_PREFETCH_THREADS:-4}
+      - SCENE_GRAPH_PREFETCH_QUEUE=${SCENE_GRAPH_PREFETCH_QUEUE:-64}
+      # Postgres connections held: one per owned map + one transient per running step thread + a few
+      # fixed ones, against max_connections. Cap the maps one process owns with SCENE_GRAPH_MAX_MAPS.
       - DISTANCE_THRESHOLD=${SIMILARITY_DISTANCE_THRESHOLD:-5.0}
       - RADIUS_THRESHOLD=${GRAPH_BUILDER_RADIUS_THRESHOLD:-2.0}
       - DEFAULT_MAP_ID=${IMAGE_DB_DEFAULT_MAP:-default}
@@ -299,9 +311,15 @@ services:
       - SCENE_GRAPH_MAX_WAYPOINT_GAP_M=${SCENE_GRAPH_MAX_WAYPOINT_GAP_M:-5.0}
       - SCENE_GRAPH_LOAD_TIMEOUT_S=${SCENE_GRAPH_LOAD_TIMEOUT_S:-2.0}
       - SCENE_GRAPH_PLAN_BUDGET_S=${SCENE_GRAPH_PLAN_BUDGET_S:-3.0}
+      # One deadline over every stage of the chart route; the dispatcher's replan timeout is 5 s.
+      - SCENE_GRAPH_TOTAL_BUDGET_S=${SCENE_GRAPH_TOTAL_BUDGET_S:-3.5}
+      - SCENE_GRAPH_PLAN_MAX_INFLIGHT=${SCENE_GRAPH_PLAN_MAX_INFLIGHT:-4}
       - SCENE_GRAPH_CACHE_VERSIONS=${SCENE_GRAPH_CACHE_VERSIONS:-4}
+      - SCENE_GRAPH_CACHE_VERSIONS_PER_MAP=${SCENE_GRAPH_CACHE_VERSIONS_PER_MAP:-2}
+      - SCENE_GRAPH_CACHE_MAX_BYTES=${SCENE_GRAPH_CACHE_MAX_BYTES:-0}
+      - SCENE_GRAPH_META_TTL_S=${SCENE_GRAPH_META_TTL_S:-0.75}
       - SCENE_GRAPH_MAX_VERSION_LAG_S=${SCENE_GRAPH_MAX_VERSION_LAG_S:-120.0}
-      - SCENE_GRAPH_WIDTH_MARGIN_M=${SCENE_GRAPH_WIDTH_MARGIN_M:-0.0}
+      - SCENE_GRAPH_WIDTH_MARGIN_M=${SCENE_GRAPH_WIDTH_MARGIN_M:-0.05}
       - SCENE_GRAPH_WIDTH_CHECK_ENABLED=${SCENE_GRAPH_WIDTH_CHECK_ENABLED:-false}
       - SCENE_GRAPH_PREWARM_MAPS=${SCENE_GRAPH_PREWARM_MAPS:-}
       - SCENE_GRAPH_PREWARM_CONCURRENCY=${SCENE_GRAPH_PREWARM_CONCURRENCY:-2}
