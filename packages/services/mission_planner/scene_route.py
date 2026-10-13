@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from cloud_common.objects import common
+from packages.services.mission_planner import node_policy_plan
 
 Pt = Tuple[float, float]
 
@@ -216,6 +217,8 @@ class ChartPlan:
     min_width: float
     goal_xy: Pt                        # snapped goal cell centre
     repeated_leaf_ids: bool = False    # some consecutive waypoints share a leaf id (not mergeable)
+    # nodePolicy skip data: {"total", "skippable", "unavailable"}; None when it was not asked for
+    node_policy: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -711,13 +714,15 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
                   start_snap_m: float, goal_snap_m: float, max_gap_m: float,
                   robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
-                  robot_length_m: Optional[float] = None) -> ChartPlan:
+                  robot_length_m: Optional[float] = None,
+                  node_policy_cfg: Optional[Dict[str, Any]] = None) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
     try:
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
-                              max_gap_m, robot_width_m, width_margin_m, robot_length_m)
+                              max_gap_m, robot_width_m, width_margin_m, robot_length_m,
+                              node_policy_cfg)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -727,14 +732,18 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
                    start_snap_m: float, goal_snap_m: float, max_gap_m: float,
                    robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
-                   robot_length_m: Optional[float] = None) -> ChartPlan:
+                   robot_length_m: Optional[float] = None,
+                   node_policy_cfg: Optional[Dict[str, Any]] = None) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
     optional): the route is `too_narrow` when its narrowest passage is under `required_width` (the
     width, or the footprint diagonal when the simplified route turns in place, plus
     `width_margin_m`); the caller gates it by SCENE_GRAPH_WIDTH_CHECK_ENABLED. `node_of` may raise:
-    that is `leaf_lookup_error`, a point with no leaf near it returns None."""
+    that is `leaf_lookup_error`, a point with no leaf near it returns None. `node_policy_cfg`
+    ({robot_width, margin, snap_m, budget_s}): every waypoint but the first and the last is made
+    skippable where the graph gives the room around it (go-here, product rule 1); the outcome is
+    `ChartPlan.node_policy`."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -800,6 +809,12 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)], allow_repeats=True)
     if planned is None:
         raise ChartFallback("waypoints_without_distinct_leaf_ids")
+    report = None
+    if node_policy_cfg is not None:
+        report = node_policy_plan.annotate_corridors(
+            graph, poses, range(1, len(poses) - 1), node_policy_cfg.get("robot_width"),
+            node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
+            node_policy_cfg.get("budget_s", 0.0))
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
-                     repeated_leaf_ids=len(set(planned)) != len(planned))
+                     repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report)

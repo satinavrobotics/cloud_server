@@ -108,6 +108,9 @@ class OrderPolicy(pydantic.BaseModel):
 
     node_policy_mode: str = NodePolicyMode.FACTSHEET
     node_policy_max_wait_s: float = NODE_POLICY_MAX_WAIT_DEFAULT_S
+    # Kill switch for skippable=true: off, every nodePolicy goes out skippable=false and
+    # without a corridor, whatever the waypoints ask for.
+    node_policy_skip_enabled: bool = True
 
     # A mission's timeout does not run while its robot is offline: a route the robot
     # carries out on its own is not a stalled one.
@@ -175,6 +178,8 @@ def from_env() -> OrderPolicy:
 
         node_policy_max_wait_s=_float("NODE_POLICY_MAX_WAIT_S",
                                       defaults.node_policy_max_wait_s),
+        node_policy_skip_enabled=_bool("NODE_POLICY_SKIP_ENABLED",
+                                       defaults.node_policy_skip_enabled),
         timeout_pause_offline=_bool("MISSION_TIMEOUT_PAUSE_OFFLINE",
                                     defaults.timeout_pause_offline),
         blocked_node_exclusion_min=_float("BLOCKED_NODE_EXCLUSION_MIN",

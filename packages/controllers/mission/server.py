@@ -880,6 +880,7 @@ class Robot:
         resumed = self._current_mission.status.start_timestamp is not None
         await self._settle_route_rev()
         await self._replan_goto()
+        await self._enrich_routes()
         # The run id must exist (and be persisted) before the first order goes out.
         if not await self._assign_run_id():
             return
@@ -1005,6 +1006,68 @@ class Robot:
                 self._mission_writer_id())
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not store the replanned route ({err})")
+
+    async def _enrich_routes(self):
+        """Complete the route nodes of a mission that has not started with their nodePolicy
+        data (docs/node_policies_2026-10-13.md): the planner inserts planned waypoints between
+        two of the operator's that are not in the same or a neighbouring scene-graph chart and
+        gives the waypoints that should be skippable a corridor width. The result is written
+        into the stored mission_tree before the first order, so order ids, waypoint offsets,
+        resume and skipped-node reports all see one route. Only before the first start (never
+        on a resume: waypoint indexes must not shift under a running mission), never for a
+        go-to (the planner marked its waypoints itself). Never blocks the mission: the planner
+        being down or without a scene graph only logs, and the route is used as it is."""
+        mission = self._current_mission
+        if mission.kind == "goto" or mission.status.start_timestamp is not None or \
+                self._robot_object is None:
+            return
+        planner = getattr(self._robot_server, "mission_planner", None)
+        if planner is None:
+            return
+        # A route paired with planned_path (topomap ids) must keep its length.
+        insert = not mission.planned_path
+        changed = False
+        for node in mission.mission_tree:
+            if node.type != mission_object.MissionNodeType.ROUTE or node.route is None:
+                continue
+            waypoints = node.route.waypoints
+            maps = {w.map_id for w in waypoints}
+            if len(maps) != 1 or "" in maps:
+                continue            # mapless (robot frame) or mixed: no scene graph to ask
+            if not (config.NODE_POLICY_GAP_FILL_ENABLED and insert and len(waypoints) >= 2) and \
+                    not any(w.skippable or w.origin == "planned" for w in waypoints):
+                continue
+            try:
+                result = await planner.enrich_route(
+                    self._name, next(iter(maps)), [w.dict() for w in waypoints],
+                    insert_planned=insert, timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
+                route = mission_object.MissionRouteNodeV1(waypoints=result["waypoints"])
+                report = result.get("node_policy") or {}
+                inserted = int(result.get("inserted") or 0)
+                if result.get("changed") and route != node.route:
+                    node.route = route
+                    changed = True
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"[{mission.name}] Could not enrich route {node.name} ({err}); "
+                             "using it as it is")
+                continue
+            self.mission_info(
+                f"Route {node.name}: {inserted} planned waypoints inserted; "
+                f"{report.get('skippable', 0)} of {report.get('total', 0)} skippable"
+                + (f" (not skippable: {report['unavailable']})"
+                   if report.get("unavailable") else ""))
+        if not changed:
+            return
+        mission.route_rev += 1
+        mission.status.applied_route_rev = mission.route_rev
+        try:
+            await self._database.update_spec_fields(
+                api_objects.MissionObjectV1, mission.name,
+                {"mission_tree": json.loads(mission.spec.json())["mission_tree"],
+                 "route_rev": mission.route_rev},
+                self._mission_writer_id())
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not store the enriched route ({err})")
 
     async def _settle_route_rev(self):
         """The tree this mission is about to be sent from is the stored one, so every reroute
@@ -1672,6 +1735,25 @@ class Robot:
         return any(a.action_type == types.NODE_POLICY_ACTION_TYPE
                    for a in self._robot_object.status.factsheet.custom_actions or [])
 
+    def _note_unusable_skips(self, mission_node: mission_object.MissionNodeV1,
+                             route: mission_object.MissionRouteNodeV1) -> None:
+        """Log (never refuse) the waypoints that ask to be skippable but carry no corridor
+        width: they are sent skippable=false (nothing known about the ground around them)."""
+        asked = [j for j, w in enumerate(route.waypoints[:-1]) if w.skippable]
+        if not asked:
+            return
+        policy = order_policy.current()
+        if not policy.node_policy_skip_enabled:
+            self.mission_info(f"Route {mission_node.name}: {len(asked)} waypoints ask to be "
+                              "skippable; NODE_POLICY_SKIP_ENABLED is off, none is")
+            return
+        bare = [j for j in asked if not (route.waypoints[j].corridor_width_m or 0) > 0]
+        if bare:
+            self.warning(f"[{self._current_mission.name}] Route {mission_node.name}: "
+                         f"{len(bare)} of {len(asked)} skippable waypoints have no corridor "
+                         f"width (no scene graph or width unknown); sent not skippable: "
+                         f"{bare[:10]}")
+
     async def _build_order(self, mission_node: mission_object.MissionNodeV1, idx: int,
                            waypoint_offset: int) \
             -> Optional[Tuple[types.VDA5050Order, mission_object.MissionSentOrderV1]]:
@@ -1694,9 +1776,12 @@ class Robot:
             record.frame = self._last_route_frame
             self.mission_info(f"Sending mission route node {mission_node.name}"
                               f"{f' from waypoint {offset}' if offset else ''}")
+            sends_policy = self._sends_node_policy()
+            if sends_policy:
+                self._note_unusable_skips(mission_node, route)
             return types.VDA5050Order.from_route(route, self._robot_object,
                                                  self._order_prefix(), idx,
-                                                 node_policy=self._sends_node_policy()), \
+                                                 node_policy=sends_policy), \
                 record
         record = mission_object.MissionSentOrderV1(order_id=order_id)
         if mission_node.type == mission_object.MissionNodeType.MOVE and \

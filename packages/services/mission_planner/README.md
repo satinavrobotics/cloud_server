@@ -25,6 +25,23 @@ The mission dispatcher calls it when a go-to (`kind: "goto"`) starts, to replan 
 pose. A first path node that is behind the robot (the robot is closer to the second node than the
 first node is) is dropped, in `/plan` and in `/navigate` alike.
 
+With the scene-graph planner the response also has `node_policy: {total, skippable, unavailable}`
+and every waypoint but the first and the last carries `skippable: true` and `corridor_width_m`
+(per side, from the engine's route width of the two legs around it minus the robot's width and the
+lattice margin), or `skippable: false` with `unavailable` saying why (`robot_width_unknown`,
+`width_unknown`, `legacy_planner`). See `docs/node_policies_2026-10-13.md`.
+
+### POST /api/v1/route/enrich
+
+Completes an operator's route with nodePolicy data. Body: `robot_name`, `map_id`, `waypoints`
+(Pose2D list, map frame), `insert_planned` (default true). Waypoints with `origin: "planned"` are
+dropped first; then planned waypoints (`origin: "planned"`, `skippable: true`) are inserted between
+two consecutive waypoints that are not in the same or a neighbouring chart, and every waypoint
+that is skippable gets its `corridor_width_m`. Returns `{success, waypoints, inserted, changed,
+node_policy, graph_version}`; without a scene graph the route comes back unchanged (`changed:
+false`, `node_policy.unavailable: "no_scene_graph"`). The mission dispatcher calls it once, before
+the first order of a mission (`NODE_POLICY_ENRICH_TIMEOUT_S`).
+
 ### POST /api/v1/navigate
 
 Plan and execute a navigation mission.
