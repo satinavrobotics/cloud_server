@@ -15,6 +15,7 @@ service that never touches Arango/MinIO/Postgres does not have to be given their
 Every service image ships this file, mission-dispatch included.
 """
 
+import logging
 import os
 
 
@@ -572,8 +573,7 @@ SCENE_GRAPH_CACHE_MAX_BYTES = int(os.getenv("SCENE_GRAPH_CACHE_MAX_BYTES", "0"))
 # rollback = SCENE_GRAPH_PLANNER_MODE=full_load.
 SCENE_GRAPH_PLANNER_MODE = os.getenv("SCENE_GRAPH_PLANNER_MODE", "lazy").strip().lower()
 if SCENE_GRAPH_PLANNER_MODE not in ("full_load", "lazy"):
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
+    logging.getLogger(__name__).warning(
         "unknown SCENE_GRAPH_PLANNER_MODE=%r, using 'lazy' (valid: 'full_load', 'lazy')", SCENE_GRAPH_PLANNER_MODE)
     SCENE_GRAPH_PLANNER_MODE = "lazy"
 SCENE_GRAPH_LAZY_MAX_TILES = int(os.getenv("SCENE_GRAPH_LAZY_MAX_TILES", "400"))
@@ -627,7 +627,6 @@ def _validate_scene_graph_planner() -> None:
             fixed.append(f"{name}={value} -> {default}")
             globals()[name] = default
     if fixed:
-        import logging
         logging.getLogger("config").warning("invalid scene graph planner settings reset: %s",
                                             "; ".join(fixed))
 
@@ -724,7 +723,6 @@ def _validate_scene_graph_worker_scale() -> None:
         fixed.append(f"SCENE_GRAPH_RECEIPT_WINDOW_S={value} -> 300.0")
         globals()["SCENE_GRAPH_RECEIPT_WINDOW_S"] = 300.0
     if fixed:
-        import logging
         logging.getLogger("config").warning("invalid scene graph worker settings reset: %s",
                                             "; ".join(fixed))
 

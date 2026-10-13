@@ -6,8 +6,14 @@ restored, no canvas is allocated; the work and the memory of a request scale wit
 
 `route` is the engine's search made sparse. Stage 1 is `ChartGraph._corridor_charts` (shortest chart path on the link
 graph, plus its neighbours). Stage 2 is the engine's lattice search restricted to those charts: the same 8-neighbour
-rule (a diagonal needs both orthogonal cells navigable, cost hypot * lattice), the same blocked-overlay mask (cell
-centres), scipy Dijkstra over nodes in the same row-major order, so equal length and the same cells.
+rule (a diagonal needs both orthogonal cells navigable), the same blocked-overlay mask (cell centres) and the same
+integer edge cost (ceil(hypot * lattice / ROUTE_UNIT_M) units of 1e-4 m, `engine.ROUTE_UNIT_M`), so the minimal cost is
+exact and `Route.cost` is the engine's. Ties are broken by the engine's canonical rule, not by a solver's predecessor
+order: one Dijkstra from the goal, then a walk from the start that takes, among the neighbours on a shortest path, the
+smallest cell index. Nodes are in row-major (y, x) order, so the route is the lexicographically smallest (y, x)
+sequence among the minimal-cost paths, and the cells equal `ChartGraph.route`'s with or without an overlay
+(`tests/unit/test_lazy_plan_equality.py`). Stage 1 (the chart corridor) only selects charts; its path choice does not
+affect the cells of the result.
 
 Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.py`:
 * under an overlay the engine searches the whole graph; a lazy reader searches the charts that can hold a route no longer
@@ -156,9 +162,6 @@ class PlanGraph:
 
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         return self.view.snap(x, y, max_dist)
-
-    def locate(self, x: float, y: float, max_dist: Optional[float] = None) -> Optional[str]:
-        return self.snap(x, y, max_dist).key
 
     def _read(self, tx: int, ty: int) -> Optional[Dict[str, np.ndarray]]:
         """The owner tile (tx, ty), single flight: concurrent requests read different tiles in parallel and the same tile

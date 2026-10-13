@@ -168,7 +168,7 @@ def test_no_overlay_cells_equal(cases):
         _check_cells(r)
 
 
-# ---- overlay: length unconditional; sequence / cells xfail until the canonical tie rule lands ----------------
+# ---- overlay: length, chart sequence and cells all equal (canonical tie rule) -------------------------------
 @pytest.mark.parametrize("ov", ["disc", "segment"])
 def test_overlay_length_and_reachability_equal(cases, ov):
     for r in _sel(cases[1], (ov,)):
