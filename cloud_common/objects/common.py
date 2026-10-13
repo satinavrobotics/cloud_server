@@ -18,6 +18,7 @@ SPDX-License-Identifier: Apache-2.0
 """
 import datetime
 import enum
+import math
 from typing import Any, Literal, Optional
 
 import pydantic
@@ -143,6 +144,47 @@ class Pose2D(pydantic.BaseModel):
                     "(set by the planner). Lets a node the robot reports blocked be kept "
                     "out of new routes.",
         default=None)
+    skippable: Optional[bool] = pydantic.Field(
+        description="May the robot skip this waypoint when it is blocked (nodePolicy "
+                    "skippable)? Unset: no. Sent as skippable only together with a "
+                    "corridor width (corridor_width_m); never on the last waypoint.",
+        default=None)
+    max_wait_s: Optional[float] = pydantic.Field(
+        description="Seconds the robot holds at this waypoint when it is blocked before it "
+                    "counts as blocked (nodePolicy maxWaitS). Unset: the dispatcher's "
+                    "default; clamped to what the robot accepts.",
+        default=None)
+    corridor_width_m: Optional[float] = pydantic.Field(
+        description="Metres of free ground on each side of the edges before and after this "
+                    "waypoint that a skip may use (nodePolicy corridorWidth). Set by the "
+                    "planner from the scene graph; a value given here is used as it is. "
+                    "Without it the waypoint is not skippable.",
+        default=None)
+    origin: Optional[str] = pydantic.Field(
+        description="Who put this waypoint in the route: unset/\"user\" (the operator) or "
+                    "\"planned\" (inserted by the server's planner between the operator's "
+                    "waypoints). A client may draw planned waypoints differently.",
+        default=None)
+
+    @pydantic.validator("max_wait_s", "corridor_width_m")
+    def _finite_non_negative(cls, value, field):
+        if value is None:
+            return value
+        if not math.isfinite(value) or value < 0:
+            raise ICSUsageError(f"{field.name} must be a finite number >= 0, got {value}")
+        return value
+
+    @pydantic.validator("origin")
+    def _known_origin(cls, value):
+        if value is not None and value not in WAYPOINT_ORIGINS:
+            raise ICSUsageError(
+                f"origin must be one of {', '.join(WAYPOINT_ORIGINS)}, got {value!r}")
+        return value
+
+
+WAYPOINT_ORIGIN_USER = "user"
+WAYPOINT_ORIGIN_PLANNED = "planned"
+WAYPOINT_ORIGINS = (WAYPOINT_ORIGIN_USER, WAYPOINT_ORIGIN_PLANNED)
 
 
 def handle_response(response):

@@ -167,6 +167,16 @@ class VDA5050Action(pydantic.BaseModel):
         return {param.key: param.value for param in self.actionParameters}
 
 
+def waypoint_node_policy(node_id: str, pose2d, policy: OrderPolicy) -> VDA5050Action:
+    """The nodePolicy action of a route waypoint (see VDA5050Order.from_route)."""
+    max_wait = getattr(pose2d, "max_wait_s", None)
+    corridor = getattr(pose2d, "corridor_width_m", None)
+    skippable = bool(policy.node_policy_skip_enabled and getattr(pose2d, "skippable", None))
+    return VDA5050Action.node_policy(
+        node_id, max_wait_s=policy.node_policy_max_wait_s if max_wait is None else max_wait,
+        skippable=skippable, corridor_width_m=corridor if skippable else None)
+
+
 class VDA5050ActionState(pydantic.BaseModel):
     """VDA5050 Action State, sent from the client to the server"""
     actionId: str
@@ -412,8 +422,10 @@ class VDA5050Order(pydantic.BaseModel):
                    policy: Optional[OrderPolicy] = None) -> "VDA5050Order":
         """The order of a route node. With `node_policy`, every node the robot drives
         through (not the start node, not the last one) carries a nodePolicy action: how
-        long to hold at it when it is blocked. Nothing is skippable yet (that needs graph
-        metadata on which nodes a route does not depend on)."""
+        long to hold at it when it is blocked. A waypoint is skippable only when it says so
+        (`skippable`) AND carries a usable `corridor_width_m` (the planner sets it from the
+        scene graph) and the policy allows skipping; otherwise it is sent skippable=false
+        with no corridor. `max_wait_s` of a waypoint overrides the policy's default."""
         policy = policy or current_order_policy()
         # Create an initial node from the robots current position
         # The route's waypoints on a map carry the robot's name of it (the dispatcher relabels
@@ -431,8 +443,7 @@ class VDA5050Order(pydantic.BaseModel):
                                                mission_node_id, final=j == last,
                                                policy=policy)
                 if node_policy and j != last:
-                    node.actions.append(VDA5050Action.node_policy(
-                        node.nodeId, max_wait_s=policy.node_policy_max_wait_s))
+                    node.actions.append(waypoint_node_policy(node.nodeId, pose2d, policy))
                 nodes.append(node)
             edges += [VDA5050Edge.from_mission_order(mission_id,
                                                      e * 2 + 1, mission_node_id)

@@ -1672,6 +1672,25 @@ class Robot:
         return any(a.action_type == types.NODE_POLICY_ACTION_TYPE
                    for a in self._robot_object.status.factsheet.custom_actions or [])
 
+    def _note_unusable_skips(self, mission_node: mission_object.MissionNodeV1,
+                             route: mission_object.MissionRouteNodeV1) -> None:
+        """Log (never refuse) the waypoints that ask to be skippable but carry no corridor
+        width: they are sent skippable=false (nothing known about the ground around them)."""
+        asked = [j for j, w in enumerate(route.waypoints[:-1]) if w.skippable]
+        if not asked:
+            return
+        policy = order_policy.current()
+        if not policy.node_policy_skip_enabled:
+            self.mission_info(f"Route {mission_node.name}: {len(asked)} waypoints ask to be "
+                              "skippable; NODE_POLICY_SKIP_ENABLED is off, none is")
+            return
+        bare = [j for j in asked if not (route.waypoints[j].corridor_width_m or 0) > 0]
+        if bare:
+            self.warning(f"[{self._current_mission.name}] Route {mission_node.name}: "
+                         f"{len(bare)} of {len(asked)} skippable waypoints have no corridor "
+                         f"width (no scene graph or width unknown); sent not skippable: "
+                         f"{bare[:10]}")
+
     async def _build_order(self, mission_node: mission_object.MissionNodeV1, idx: int,
                            waypoint_offset: int) \
             -> Optional[Tuple[types.VDA5050Order, mission_object.MissionSentOrderV1]]:
@@ -1694,9 +1713,12 @@ class Robot:
             record.frame = self._last_route_frame
             self.mission_info(f"Sending mission route node {mission_node.name}"
                               f"{f' from waypoint {offset}' if offset else ''}")
+            sends_policy = self._sends_node_policy()
+            if sends_policy:
+                self._note_unusable_skips(mission_node, route)
             return types.VDA5050Order.from_route(route, self._robot_object,
                                                  self._order_prefix(), idx,
-                                                 node_policy=self._sends_node_policy()), \
+                                                 node_policy=sends_policy), \
                 record
         record = mission_object.MissionSentOrderV1(order_id=order_id)
         if mission_node.type == mission_object.MissionNodeType.MOVE and \
