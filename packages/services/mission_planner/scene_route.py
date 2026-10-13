@@ -711,7 +711,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     discs, segments = overlay
     blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
     try:
-        route = graph.route(snap_a.key, snap_b.key, blocked)
+        route = graph.route(snap_a.key, snap_b.key, blocked, start=(snap_a.x, snap_a.y),
+                            goal=(snap_b.x, snap_b.y))
     except MissingTiles as err:
         raise ChartFallback("missing_tiles") from err
     if route is None or not route.nodes:
@@ -719,7 +720,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             # unreachable only because of the overlay? say so (the legacy planner then reports the
             # blocking rows as failed_at "blocked_nodes").
             try:
-                free = graph.route(snap_a.key, snap_b.key, None)
+                free = graph.route(snap_a.key, snap_b.key, None, start=(snap_a.x, snap_a.y),
+                                   goal=(snap_b.x, snap_b.y))
             except MissingTiles:
                 free = None
             if free is not None and free.nodes:
@@ -730,7 +732,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     if check_width and min_width < required_width(robot_width_m, robot_length_m, False,
                                                   width_margin_m):
         raise ChartFallback("too_narrow")       # not even aligned: no need to simplify
-    # The lattice route runs anchor to anchor; the real ends are the snapped start and goal cells.
+    # The lattice route runs from the snapped start cell to the snapped goal cell (point to point); the
+    # prepend/append only matters when an end falls back to its chart anchor.
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
     visible = blocked_free_los(graph, overlay)
     pts = simplify(pts, visible, max_gap_m)

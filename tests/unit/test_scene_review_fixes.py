@@ -434,8 +434,10 @@ def test_a_rebuild_interrupted_mid_way_resumes_from_the_pending_cursor_real_stor
     drive(worker(store, src, ChartGraph(SceneParams()), clock=clock))
     p2 = SceneParams(robot_half_side=0.3)
     w1 = _params_rebuild_worker(store, src, p2, clock)
-    for _ in range(3):                         # a few pending saves, then the process dies
+    for _ in range(40):                        # (scan, then sorted folds) until a pending save exists; the process dies
         w1.step()
+        if w1.stats.saves >= 1:
+            break
     pend = store.meta("m")["pending"]
     assert pend["cursor"] is not None and w1.stats.saves >= 1 and w1.stats.rebuilds == 0
     w1.guard.release("m")
@@ -533,8 +535,10 @@ def test_real_store_resume_of_a_delete_triggered_rebuild_follows_begun_ms():
     at = datetime.datetime.fromtimestamp((now[0] - 5_000) / 1000.0, datetime.timezone.utc).isoformat()
     req = {"at": at, "reason": "nodes_deleted", "nodes": 1}
     w1 = rebuilder(req)
-    for _ in range(3):
+    for _ in range(40):
         w1.step()
+        if w1.stats.saves >= 1:
+            break
     pend = store.meta("m")["pending"]
     assert pend["begun_ms"] == now[0] and pend["cursor"] is not None and w1.stats.rebuilds == 0
     w1.guard.release("m")

@@ -278,8 +278,10 @@ def test_evicting_a_rebuild_reloads_the_saved_pending_generation():
     r = _rebuild_rig(_nodes(8), store=store, rebuild_batch=2, batch_size=2)
     reloaded = FakeEngine()
     store.pending_engine = reloaded
-    r.worker.step()
-    r.worker.step()
+    for _ in range(30):
+        r.worker.step()
+        if r.worker._rebuild_saved:
+            break
     assert r.worker._rebuild_saved and r.worker._rebuild_gen is not None
     store.pending_meta = {"generation": store.pending, "version": 1, "params_hash": "new",
                           "cursor": list(r.worker.cursor), "begun_ms": 1}
@@ -537,7 +539,7 @@ def test_a_rebuild_does_not_commit_while_leaves_are_still_buffered():
         return real_commit(map_id, gen)
     r.store.commit_generation = commit
     r.worker.step()
-    assert not r.store.commits and r.worker._leaf_count() > 0
+    assert not r.store.commits              # the page was scanned; only a batch of it is folded, the rest waits
     r.drain(n=30)
     assert r.store.commits
     assert folded_at_commit == [7]

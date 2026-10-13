@@ -571,8 +571,10 @@ def test_fault_during_a_rebuild_reloads_the_saved_pending_generation():
     r = _rebuild_rig(_nodes(8), store=store, rebuild_batch=2, batch_size=2)   # pages of 2: the head is far
     reloaded = FakeEngine()
     store.pending_engine = reloaded
-    r.worker.step()
-    r.worker.step()
+    for _ in range(30):                      # the scan of the pages, then the first sorted fold + pending save
+        r.worker.step()
+        if r.worker._rebuild_saved:
+            break
     assert r.worker._rebuild_saved
     store.pending_meta = {"generation": store.pending, "version": 1, "params_hash": "new",
                           "cursor": list(r.worker.cursor), "begun_ms": 1}
@@ -700,7 +702,7 @@ def test_cursor_only_save_also_moves_the_pending_cursor_of_a_rebuild():
     saves_seen = []
     for _ in range(30):
         res = r.worker.step()
-        saves_seen = list(store.pending_saves)
+        saves_seen = list(getattr(store, "pending_saves", []))   # (none while the plan is scanned)
         if store.commits or res.state in sw.TERMINAL:
             break
     only = [c for c, changed in saves_seen if changed == []]

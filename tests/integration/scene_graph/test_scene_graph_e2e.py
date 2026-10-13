@@ -627,7 +627,9 @@ def test_fold_result_holds_its_invariants_for_any_stamp_order():
 def test_partition_of_the_room_loop_does_not_depend_on_the_arrival_order():
     """The persistence partition is a function of the folded evidence: the same leaves (stamps
     kept) handed over in any order, in one batch or several, give the same charts and links, and
-    the room loop is four charts, four links, a route that goes through the corridors."""
+    the room loop is four persistence regions joined by four corridor links, a route that goes
+    through three rooms. (Charts are bounded at 0.4 x sight_range, so a room may hold several:
+    the structure is asserted on regions, not on the chart count.)"""
     import random
     from packages.scene_graph.api import BBox, SceneParams
     from packages.scene_graph.engine import ChartGraph
@@ -641,6 +643,11 @@ def test_partition_of_the_room_loop_does_not_depend_on_the_arrival_order():
         charts = sorted((at[c.key], c.cells) for c in v.charts)
         links = sorted((min(at[l.a], at[l.b]), max(at[l.a], at[l.b]), round(l.width, 2)) for l in v.links)
         return charts, links, v
+
+    def structure(v):
+        region = {c.key: c.region for c in v.charts}
+        between = [l for l in v.links if region[l.a] != region[l.b]]
+        return region, len(set(region.values())), len(between)
     ref_charts = ref_links = None
     for trial in range(6):
         order = list(range(len(leaves)))
@@ -657,13 +664,17 @@ def test_partition_of_the_room_loop_does_not_depend_on_the_arrival_order():
         charts, links, view = describe(g)
         if ref_charts is None:
             ref_charts, ref_links = charts, links
-            assert len(charts) == 4 and len(links) == 4, (charts, links)
+            _, n_regions, n_between = structure(view)
+            assert n_regions == 4 and n_between == 4, (n_regions, n_between, charts, links)
         assert (charts, links) == (ref_charts, ref_links), f"trial {trial} differs from trial 0"
         assert all(l.width >= W.CORRIDOR - 0.1 for l in view.links)
         a, b = g.snap(1.0, 1.0, 0.5), g.snap(5.0, 5.0, 1.5)
         route = g.route(a.key, b.key)
         assert route is not None and route.min_width >= need
-        assert len(route.charts) == 3, route.charts      # corner room, a neighbour room, corner room
+        region, _, _ = structure(view)
+        rooms = [region[k] for k in route.charts]
+        rooms = [r for i, r in enumerate(rooms) if i == 0 or r != rooms[i - 1]]
+        assert len(rooms) == 3, rooms                    # corner room, a neighbour room, corner room
 
 
 # ------------------------------------------------------------------------------ planner
