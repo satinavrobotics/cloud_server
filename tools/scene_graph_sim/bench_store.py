@@ -64,8 +64,7 @@ def synthetic(side_m=400):
     plane = -np.ones((H2, H2), np.int32); plane[(V[::2, ::2] == 0)] = 0
     st = EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0, V=V, T=T, B=B,
                      leaves=[LeafRecord("n%d" % i, "s", t0 + i * 1000, float(i), 0.0, 0.25) for i in range(5000)],
-                     anchors=[(0, 0)], keys=[("n0", 0)], plane=plane, dep=np.zeros((H2, H2), bool),
-                     rnd=np.where(plane >= 0, 1, 1 << 30).astype(np.int32), watermark=(t0, "n0"))
+                     keys=[("n0", 0)], plane=plane, watermark=(t0, "n0"))
 
     class G:
         params = SceneParams(); export_state = staticmethod(lambda: st)
@@ -96,8 +95,7 @@ def leaves(n=100_000):
     H2 = V.shape[0] // 2
     plane = np.zeros((H2, H2), np.int32)
     st = EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0, V=V, T=T, B=B,
-                     leaves=recs, anchors=[(0, 0)], keys=[("n0", 0)], plane=plane, dep=np.zeros((H2, H2), bool),
-                     rnd=np.ones((H2, H2), np.int32), watermark=(t0, "n0"))
+                     leaves=recs, keys=[("n0", 0)], plane=plane, watermark=(t0, "n0"))
 
     class G:
         params = SceneParams(); export_state = staticmethod(lambda: st)

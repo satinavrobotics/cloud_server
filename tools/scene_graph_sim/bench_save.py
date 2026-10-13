@@ -41,7 +41,6 @@ class FakeSG:
         yy, xx = np.mgrid[0:h, 0:h]
         self.plane = ((yy * side // h) * side + (xx * side // h)).astype(np.int32)
         self.plane[self.plane >= N_CH] = N_CH - 1
-        self.dep = np.zeros((h, h), bool); self.rnd = np.ones((h, h), np.int32)
         self.keys = [("k%06d" % (i // 3), i % 3) for i in range(N_CH)]
         pitch = h // side
         self.anchors = [((i // side) * pitch + pitch // 2, (i % side) * pitch + pitch // 2) for i in range(N_CH)]
@@ -52,8 +51,8 @@ class FakeSG:
 
     def export_state(self):
         return EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0,
-                           V=self.V, T=self.T, B=self.B, leaves=list(self.leaves), anchors=self.anchors, keys=self.keys,
-                           plane=self.plane, dep=self.dep, rnd=self.rnd, version=self.version, watermark=self.watermark)
+                           V=self.V, T=self.T, B=self.B, leaves=list(self.leaves), keys=self.keys,
+                           plane=self.plane, version=self.version, watermark=self.watermark)
 
     def query(self, bbox, level=0, raster=True, **kw):
         h = SIDE // 2; side = int(np.ceil(np.sqrt(N_CH))); pitch = h // side

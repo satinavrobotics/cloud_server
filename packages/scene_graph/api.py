@@ -75,15 +75,17 @@ class Chart:
     ever_blocked_frac: float           # share of cells reported blocked in any leaf
     leaf: Optional[str] = None         # a driven leaf of this chart nearest its anchor (thumbnails), None if never driven
     parent: Dict[int, Key] = field(default_factory=dict)   # level -> parent key (derived view)
+    peak: float = 0.0                  # B at the anchor: the persistence peak (distance to the non-navigable cells, m)
 
 
 @dataclass
 class Link:
     a: Key; b: Key
     length: float                      # cost of the link = length (m) along the shortest route inside the two charts
-    width: float                       # widest path (maximin clearance x 2), +-h/2
+    width: float                       # twice the largest physical clearance over the crossings of this arc (m)
     portal: Tuple[Pt, Pt]
     channels: Dict[str, float] = field(default_factory=dict)   # line integral per channel along that route
+    saddle: float = 0.0                # B at the widest crossing of the pair (m): with `peak`, all the levels need
 
 
 @dataclass

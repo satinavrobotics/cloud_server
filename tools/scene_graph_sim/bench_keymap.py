@@ -38,7 +38,6 @@ class Fake:
             m = (ty == a) & (tx == b)
             plane[m] = ((a * TS + b) * CPT + ((xx[m] % 64) * CPT // 64 + 1) % CPT).astype(np.int32)
         self.plane = plane
-        self.dep = np.zeros((h, h), bool); self.rnd = np.ones((h, h), np.int32)
         self.keys = [("b%d" % (i // CPT), i % CPT) for i in range(n_ch)]
         self.anchors = [((i // CPT // TS) * 64 + 32, (i // CPT % TS) * 64 + (i % CPT) * (64 // CPT) + 8) for i in range(n_ch)]
         self.leaves = [LeafRecord("lf%d" % i, "s", 1_700_000_000_000 + i, 1.0, 1.0, 0.25) for i in range(1000)]
@@ -46,8 +45,8 @@ class Fake:
 
     def export_state(self):
         return EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0,
-                           V=self.V, T=self.T, B=self.B, leaves=self.leaves, anchors=self.anchors, keys=self.keys,
-                           plane=self.plane, dep=self.dep, rnd=self.rnd, version=self.version, watermark=self.watermark)
+                           V=self.V, T=self.T, B=self.B, leaves=self.leaves, keys=self.keys,
+                           plane=self.plane, version=self.version, watermark=self.watermark)
 
     def query(self, bbox, level=0, raster=True, **kw):
         ch = [Chart("%s:%d" % k, ((2 * x + 1) * 0.05, (2 * y + 1) * 0.05), 100, 1.0, 0.5, 0.5, 0.0, None)

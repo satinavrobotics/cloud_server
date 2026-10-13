@@ -266,16 +266,14 @@ class SceneGraphStore:
 
         view = sg.query(BBox(-1e9, -1e9, 1e9, 1e9), level=0, raster=False, parents=False)
         by_key = {c.key: c for c in view.charts}
-        sol = sg._solved                       # the partition's own numbers (B at the anchors, B at the saddles) for the levels
         charts = []
         for j, k in enumerate(keys):
             c = by_key[k]
-            charts.append({"key": k, "id": live[k], "peak": float(sol.peak[j]), "anchor": [c.anchor[0], c.anchor[1]], "cell": [int(math.floor(c.anchor[1] / (2 * RES))), int(math.floor(c.anchor[0] / (2 * RES)))],   # GLOBAL lattice (y, x)
+            charts.append({"key": k, "id": live[k], "peak": c.peak, "anchor": [c.anchor[0], c.anchor[1]], "cell": [int(math.floor(c.anchor[1] / (2 * RES))), int(math.floor(c.anchor[0] / (2 * RES)))],   # GLOBAL lattice (y, x)
                            "cells": c.cells, "area": c.area_m2, "clearance": c.clearance, "driven": c.driven_frac,
                            "ever_blocked": c.ever_blocked_frac, "leaf": c.leaf})
-        links = [{"a": l.a, "b": l.b, "length": l.length, "width": l.width, "saddle": float(raw["saddle"]),
-                  "portal": [list(l.portal[0]), list(l.portal[1])], "channels": l.channels}
-                 for l, raw in zip(view.links, sol.links if sol is not None else [])]
+        links = [{"a": l.a, "b": l.b, "length": l.length, "width": l.width, "saddle": l.saddle,
+                  "portal": [list(l.portal[0]), list(l.portal[1])], "channels": l.channels} for l in view.links]
         chans = sorted(st.chan)
         pages = {}
         page = lambda sx, sy: pages.setdefault("%d,%d" % (sx, sy), {"tiles": {}, "charts": [], "links": []})
@@ -777,12 +775,12 @@ class StoredView:
             c = charts_m[nd]
             parents = {L: charts_m[int(levels[L]["parent"][nd])]["key"] for L in range(1, len(levels))}
             if level == 0:
-                charts.append(Chart(c["key"], tuple(c["anchor"]), c["cells"], c["area"], c["clearance"], c["driven"], c["ever_blocked"], c["leaf"], parents))
+                charts.append(Chart(c["key"], tuple(c["anchor"]), c["cells"], c["area"], c["clearance"], c["driven"], c["ever_blocked"], c["leaf"], parents, c["peak"]))
             else:
                 cs = [charts_m[j] for j in members]; cells = sum(x["cells"] for x in cs)
                 charts.append(Chart(c["key"], tuple(c["anchor"]), cells, cells * h2, c["clearance"],
                                     sum(x["driven"] * x["cells"] for x in cs) / max(cells, 1),
-                                    sum(x["ever_blocked"] * x["cells"] for x in cs) / max(cells, 1), c["leaf"], parents))
+                                    sum(x["ever_blocked"] * x["cells"] for x in cs) / max(cells, 1), c["leaf"], parents, c["peak"]))
         shown = {c.key for c in charts}
         kidx = {c["key"]: j for j, c in enumerate(charts_m)}
         links: List[Link] = []
@@ -790,21 +788,22 @@ class StoredView:
         if level == 0:
             for l in lm:
                 if l["a"] in shown and l["b"] in shown:
-                    links.append(Link(l["a"], l["b"], l["length"], l["width"], (tuple(l["portal"][0]), tuple(l["portal"][1])), dict(l["channels"])))
+                    links.append(Link(l["a"], l["b"], l["length"], l["width"], (tuple(l["portal"][0]), tuple(l["portal"][1])), dict(l["channels"]), l["saddle"]))
         else:
             agg: Dict[Tuple[int, int], dict] = {}
             wide: Dict[Tuple[int, int], float] = {}
+            sad: Dict[Tuple[int, int], float] = {}
             for l in lm:
                 ga, gb = group[kidx[l["a"]]], group[kidx[l["b"]]]
                 if ga == gb: continue
                 key = (min(ga, gb), max(ga, gb))
                 pk = (l["length"], tuple(l["portal"][0]), tuple(l["portal"][1]))      # as the engine: shortest, ties the smaller portal
                 if key not in agg or pk < agg[key]["_pk"]: agg[key] = dict(l, a=charts_m[key[0]]["key"], b=charts_m[key[1]]["key"], _pk=pk)
-                wide[key] = max(wide.get(key, 0.0), l["width"])
-            for key, l in agg.items(): l["width"] = wide[key]
+                wide[key] = max(wide.get(key, 0.0), l["width"]); sad[key] = max(sad.get(key, 0.0), l["saddle"])
+            for key, l in agg.items(): l["width"] = wide[key]; l["saddle"] = sad[key]
             for l in agg.values():
                 if l["a"] in shown and l["b"] in shown:
-                    links.append(Link(l["a"], l["b"], l["length"], l["width"], (tuple(l["portal"][0]), tuple(l["portal"][1])), dict(l["channels"])))
+                    links.append(Link(l["a"], l["b"], l["length"], l["width"], (tuple(l["portal"][0]), tuple(l["portal"][1])), dict(l["channels"]), l["saddle"]))
         rast = None
         if raster and sub.size:
             keys = [c.key for c in charts]

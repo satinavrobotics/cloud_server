@@ -618,7 +618,8 @@ class ChartGraph(SceneGraph):
                 leaf = min(pose_cell[j], key=lambda t: ((t[1] - ay) ** 2 + (t[2] - ax) ** 2, t[0]))[0]
             charts.append(Chart(key=keys[j], anchor=self._cell_xy(ay, ax), cells=int(len(cc)), area_m2=float(len(cc) * h ** 2),
                                 clearance=float(sp.clr[a]), driven_frac=float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0,
-                                ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf))
+                                ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf,
+                                peak=float(part.f[a])))
         return _Solved(sp=sp, A=A, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
                        dep=np.zeros((H, W), bool), S=S, peak=part.f[A])
 
@@ -1081,13 +1082,13 @@ class ChartGraph(SceneGraph):
             for L_ in range(1, len(levels)):
                 parents[L_] = s.keys[int(levels[L_]["parent"][n])]
             if level == 0:
-                charts.append(Chart(c.key, c.anchor, c.cells, c.area_m2, c.clearance, c.driven_frac, c.ever_blocked_frac, c.leaf, parents))
+                charts.append(Chart(c.key, c.anchor, c.cells, c.area_m2, c.clearance, c.driven_frac, c.ever_blocked_frac, c.leaf, parents, c.peak))
             else:
                 cs = [s.charts[j] for j in members]
                 cells = sum(x.cells for x in cs)
                 charts.append(Chart(c.key, c.anchor, cells, cells * self._h ** 2, c.clearance,
                                     sum(x.driven_frac * x.cells for x in cs) / max(cells, 1),
-                                    sum(x.ever_blocked_frac * x.cells for x in cs) / max(cells, 1), c.leaf, parents))
+                                    sum(x.ever_blocked_frac * x.cells for x in cs) / max(cells, 1), c.leaf, parents, c.peak))
         shown = {c.key for c in charts}
         links = []
         if level == 0:
@@ -1098,6 +1099,7 @@ class ChartGraph(SceneGraph):
         else:
             agg: Dict[Tuple[int, int], dict] = {}
             wide: Dict[Tuple[int, int], float] = {}
+            sad: Dict[Tuple[int, int], float] = {}
             for l in s.links:
                 ga, gb = group[l["a"]], group[l["b"]]
                 if ga == gb: continue
@@ -1105,8 +1107,8 @@ class ChartGraph(SceneGraph):
                 # the shortest member is the route (ties: the smaller portal), the widest member is the passage
                 pk = (l["length"], self._cell_xy(int(s.sp.ys[l["u"]]), int(s.sp.xs[l["u"]])), self._cell_xy(int(s.sp.ys[l["v"]]), int(s.sp.xs[l["v"]])))
                 if key not in agg or pk < agg[key]["_pk"]: agg[key] = dict(l, a=key[0], b=key[1], _pk=pk)
-                wide[key] = max(wide.get(key, 0.0), l["width"])
-            for key, l in agg.items(): l["width"] = wide[key]
+                wide[key] = max(wide.get(key, 0.0), l["width"]); sad[key] = max(sad.get(key, 0.0), l["saddle"])
+            for key, l in agg.items(): l["width"] = wide[key]; l["saddle"] = sad[key]
             for l in agg.values():
                 ka, kb = s.keys[l["a"]], s.keys[l["b"]]
                 if ka in shown and kb in shown: links.append(self._link(l, ka, kb))
@@ -1126,7 +1128,7 @@ class ChartGraph(SceneGraph):
     def _link(self, l: dict, ka: Key, kb: Key) -> Link:
         s = self._solved
         pu = self._cell_xy(int(s.sp.ys[l["u"]]), int(s.sp.xs[l["u"]])); pv = self._cell_xy(int(s.sp.ys[l["v"]]), int(s.sp.xs[l["v"]]))
-        return Link(a=ka, b=kb, length=l["length"], width=l["width"], portal=(pu, pv), channels=dict(l["integ"]))
+        return Link(a=ka, b=kb, length=l["length"], width=l["width"], portal=(pu, pv), channels=dict(l["integ"]), saddle=l["saddle"])
 
     def cover(self, keys: Sequence[Key], k: int = 2) -> Tuple[List[str], float, bool]:
         """Minimal set of leaf keys whose camera views k-cover the given charts and the blocked cells bounding them."""

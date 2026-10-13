@@ -9,9 +9,7 @@ docker exec -i docker_compose-graph-builder-service-1 python - office8 /tmp/sg_e
 docker cp docker_compose-graph-builder-service-1:/tmp/sg_export/. data/office8/
 python seed_test_arango.py office8
 
-# 2. replay the leaves, write PNG frames (map by owner, anchors, links), pipeline.png and metrics.csv
-python run_sim.py office8 --every 10 --tau 1.5 --radius 0.25        # --shuffle SEED to change the order
-python run_worlds.py [name ...]                                       # synthetic reference worlds
-python store_test_arango.py office8                                   # sg_* collections + SHORTEST_PATH
+# 2. fold the leaves through the engine and print what it makes (charts, links, time; --verify runs the verifier)
+python run_engine.py office8 --every 6 --verify
 ```
 `out/` and `data/` are not committed.
