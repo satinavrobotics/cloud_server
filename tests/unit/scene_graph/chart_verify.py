@@ -4,18 +4,25 @@ distance to the non-navigable cells B itself. `verify` returns the number of vio
 
 cover        the charts are exactly F: every cell of F in exactly one chart, no other cell in any
 chart4       every chart is 4-connected
-anchor       the anchor is in its chart and has the chart's maximal B
+anchor       the anchor is in its chart; the first anchor of a persistence region has (within one lattice step) the
+             region's maximal B
+radius       every cell is within geodesic distance 0.4 sight_range of its anchor, along cells of its own chart
+voronoi      every cell is at least as near (geodesic, inside its persistence region) to its own anchor as to any other
+             anchor of the region: the chart is the Voronoi cell
+packing      two anchors of one region are further apart than the radius (geodesic, inside the region)
 planar       chi(F) = sum_i (1 - holes_i) - arcs + junctions, the Euler identity of the planar map of the partition
              (arcs: maximal chains of interface edges through corners of map degree 2; junction: interior corner with >= 3
              interface edges)
 portal       every link's portal is a 4-adjacent pair, one cell in each chart, and the link is at least as wide as 2 min(clr)
              at the portal (clr: physical clearance, the distance to the nearest blocked or unknown cell, recomputed here)
 width        the widest link of a chart pair is 2 * the largest min(clr) over the 4-adjacent cell pairs between the charts
-saddle       no crossing of a chart pair has min(B) above the maximin of B between the anchors inside the union of the two
-             charts (independent flood fill): the saddle is the widest path
-persist      at every level, adjacent regions have persistence min(peak) - saddle >= tau_j (tau_0 = 2 sqrt(2) h, doubling)
+persist      at every level above the charts, adjacent regions have persistence min(peak) - saddle >= tau_0 = 2 sqrt(2) h
+             (a level above the charts is a union of persistence regions, so never crosses a pass cheaper than tau_0)
 nesting      every region of level j-1 lies in exactly one region of level j; the last level has one region per component
+region       a chart lies in exactly one persistence region (Chart.region), and the regions are exactly the level-1 image
+             of the charts grouped by region
 """
+import heapq
 import math
 
 import numpy as np
@@ -94,15 +101,27 @@ def crossings(lab, B):
     return out
 
 
-def maximin(mask, B, u, v):
-    vals = np.unique(B[mask])
-    lo, hi, best = 0, len(vals) - 1, -np.inf
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        lab, _ = ndimage.label(mask & (B >= vals[mid] - 1e-12), structure=C4)
-        if lab[u] > 0 and lab[u] == lab[v]: best = vals[mid]; lo = mid + 1
-        else: hi = mid - 1
-    return float(best)
+def geodesic(mask, sources, h, cap=math.inf):
+    """distance (m) from the nearest of `sources` (list of (y, x)) to every cell of `mask`, along 8-neighbour steps inside
+    `mask` (a diagonal needs both orthogonal cells in `mask`); inf where unreached or beyond `cap`"""
+    H, W = mask.shape
+    d = np.full(mask.shape, np.inf)
+    pq = []
+    for s in sources:
+        d[s] = 0.0; heapq.heappush(pq, (0.0, s))
+    while pq:
+        dd, (y, x) = heapq.heappop(pq)
+        if dd > d[y, x]: continue
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if not (dy or dx): continue
+                y2, x2 = y + dy, x + dx
+                if not (0 <= y2 < H and 0 <= x2 < W) or not mask[y2, x2]: continue
+                if dy and dx and not (mask[y, x2] and mask[y2, x]): continue
+                nd = dd + math.hypot(dy, dx) * h
+                if nd < d[y2, x2] - 1e-12 and nd <= cap + 1e-9:
+                    d[y2, x2] = nd; heapq.heappush(pq, (nd, (y2, x2)))
+    return d
 
 
 def _image(g, level):
@@ -119,7 +138,8 @@ def verify(g, world=None, r=None, bbox=None):
     r = p.robot_half_side if r is None else r
     lab0, keys0, v0 = _image(g, 0)
     out = dict(charts=len(v0.charts), links=len(v0.links))
-    out.update(cover=0, chart4=0, anchor=0, planar=0, portal=0, width=0, saddle=0, persist=0, nesting=0, holes=0, levels=0, chi_F=0)
+    out.update(cover=0, chart4=0, anchor=0, radius=0, voronoi=0, packing=0, planar=0, portal=0, width=0, persist=0, nesting=0,
+               region=0, holes=0, levels=0, chi_F=0)
     if lab0 is None:
         return out
     ra = v0.raster
@@ -136,13 +156,31 @@ def verify(g, world=None, r=None, bbox=None):
         anchor[kpos[c.key]] = (int(math.floor((c.anchor[1] - ra.origin[1]) / ra.step)),
                                int(math.floor((c.anchor[0] - ra.origin[0]) / ra.step)))
     holes = 0
+    region = {kpos[c.key]: c.region for c in v0.charts}
+    radius = max(0.4 * p.sight_range, h)                 # written from the definition: chart radius 0.4 sight_range
     for j in range(len(keys0)):
         m = lab0 == j
         if not m.any(): out["anchor"] += 1; continue
         if ndimage.label(m, structure=C4)[1] != 1: out["chart4"] += 1
         holes += _holes(m)
         ay, ax = anchor[j]
-        if lab0[ay, ax] != j or B[ay, ax] < B[m].max() - 1e-9: out["anchor"] += 1
+        if lab0[ay, ax] != j: out["anchor"] += 1; continue
+        d = geodesic(m, [(ay, ax)], h)
+        out["radius"] += int((d[m] > radius + 1e-9).any())
+    regs = {}
+    for j, k in region.items(): regs.setdefault(k, []).append(j)
+    for k, js in regs.items():
+        rmask = np.isin(lab0, js)
+        top = B[rmask].max()
+        if max(B[anchor[j]] for j in js) < top - h - 1e-9: out["anchor"] += 1
+        dists = {j: geodesic(rmask, [anchor[j]], h) for j in js}
+        for j in js:
+            m = lab0 == j
+            others = [dists[i] for i in js if i != j]
+            if others and (dists[j][m] > np.min(others, axis=0)[m] + 1e-9).any(): out["voronoi"] += 1
+        for a_i in range(len(js)):
+            for b_i in range(a_i):
+                if dists[js[a_i]][anchor[js[b_i]]] <= radius + 1e-9: out["packing"] += 1
     # planar identity
     comps = ndimage.label(F, structure=C4)[1]
     chi_F = comps - (ndimage.label(np.pad(~F, 1, constant_values=True), structure=C8)[1] - 1)
@@ -163,9 +201,7 @@ def verify(g, world=None, r=None, bbox=None):
         out["portal"] += int(not good)
         best[(a, b)] = max(best.get((a, b), -1.0), l.width)
     for (a, b), w in best.items():
-        m = maximin((lab0 == a) | (lab0 == b), B, anchor[a], anchor[b])
         if abs(w - 2 * max(crc[(a, b)])) > TOL: out["width"] += 1
-        if max(cr[(a, b)]) > m + 1e-9: out["saddle"] += 1
     # levels: persistence and nesting
     tau0 = 2.0 * math.sqrt(2.0) * h
     top = max((max(c.parent) for c in v0.charts if c.parent), default=0)
@@ -176,16 +212,21 @@ def verify(g, world=None, r=None, bbox=None):
         K = int(img.max()) + 1 if (img >= 0).any() else 0
         peak = {j: float(B[img == j].max()) for j in range(K)}
         for (a, b), cs in crossings(img, B).items():
-            if min(peak[a], peak[b]) - max(cs) < tau0 * (2 ** lvl) - TOL: out["persist"] += 1
+            if lvl >= 1 and min(peak[a], peak[b]) - max(cs) < tau0 - TOL: out["persist"] += 1
         if prev is not None:
             for j in np.unique(prev[prev >= 0]):
                 if len(np.unique(img[prev == j])) != 1: out["nesting"] += 1
         prev = img
     if (prev >= 0).any():
         out["nesting"] += int(len(np.unique(prev[prev >= 0])) != comps)
+    if top >= 1:                                    # charts of one persistence region are in one owner of the first level
+        img1 = _image(g, 1)[0]
+        for k, js in regs.items():
+            if len(np.unique(img1[np.isin(lab0, js)])) != 1: out["region"] += 1
     out["holes"] = int(holes)
     return out
 
 
 def ok(res):
-    return all(res[k] == 0 for k in ("cover", "chart4", "anchor", "planar", "portal", "width", "saddle", "persist", "nesting"))
+    return all(res[k] == 0 for k in ("cover", "chart4", "anchor", "radius", "voronoi", "packing", "planar", "portal", "width",
+                                     "persist", "nesting", "region"))

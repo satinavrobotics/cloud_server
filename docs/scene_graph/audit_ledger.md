@@ -159,6 +159,8 @@ Branch `feat/scene-graph-v2` (shared worktree), author CIMBIBOY unless noted; br
 | 5182820 (LACI), merged | e2e fixture: four-room loop world (a constant-width ring is one region), room-loop determinism test | e2e on the persistence partition | run.sh 32/32 twice (LACI) |
 | `_route_width` (morse) | widest arc per crossed chart pair; `ViewResult.levels` | LACI issue A: a hugging path read a 0.1 - 0.3 m sliver as the passage; level count for read validation | room loop, 8 shuffled-stamp orders: min_width 0.1 - 0.3 -> 1.2 m; 180 unit tests |
 
+| charts (morse) | persistence regions cut into charts of radius 0.4 x sight_range; `route(start, goal)`; FORMAT 4 / `morse/2` | regions alone: 40-80 % of a floor, planner detour through two anchors up to 4x (p90 1.3 - 2.3x) | 7 real floors x 2 batchings 0 violations (`radius`, `packing`, `voronoi`, `region` added to the verifier), gates hall 45k 0.069 s / field 86k 0.108 s, navigation sweep rho 1.5 - 3.5 |
+
 ### Claims refuted or corrected on the way (traceability)
 
 | claim | by | outcome |
@@ -170,6 +172,8 @@ Branch `feat/scene-graph-v2` (shared worktree), author CIMBIBOY unless noted; br
 | "regions by top-component label" / "regions are disks" | Morse research and theory | refuted: steepest parent + merge; regions may have holes |
 | "noise floor = h" | Morse research and theory | overstated: 2 sqrt(2) h, attained |
 | "width = 2 s + 2 r - h" | morse implementation | refuted (3-cell witness strip): physical clearance at the widest crossing |
+| "locality of the nets is a property of the greedy order" | charts (morse) | refuted as the cause: the instability that moved 20 of 30 charts for a 6-cell change was the multi-source search's tie order, not the seeds (0 of 30 seeds moved); a canonical (distance, anchor order) tie rule restored 0.8 m locality |
+| "hash priority is needed for stable anchors" | charts (morse) | refuted: room order with scan-order ties is as stable (key persistence 0.97 - 0.98 against 0.97 - 0.98) and keeps translation invariance |
 | "arcs of one pair with no obstacle between them are one opening" (chord test) | morse implementation | refuted: two doors in one wall whose interface lies beside the wall have a free chord; replaced by the widest arc per pair |
 | "region count within 0.5x-1.5x of the old charts" | morse implementation | not met (2-4x coarser); judged correct, recorded as a semantic change |
 

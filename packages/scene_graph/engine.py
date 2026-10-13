@@ -71,7 +71,8 @@ class _Solved:
     plane: np.ndarray           # canvas image: chart index per lattice cell, -1 outside
     dep: np.ndarray             # canvas image, all False: every cell of a chart is its own (kept for the OwnerRaster contract)
     S: np.ndarray               # driven (body covered) image
-    peak: np.ndarray            # B (distance to the cells outside F) at each chart's anchor: the persistence peak
+    peak: np.ndarray            # largest B (distance to the cells outside F) in each chart: the persistence peak
+    region: np.ndarray          # persistence region (0..) each chart was cut from
 
 
 def _square(theta: float, side: float, res: float = RES) -> np.ndarray:
@@ -121,6 +122,8 @@ class ChartGraph(SceneGraph):
         self._V = self._T = self._B = None
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
+        self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
+        self._radius = max(morse.CHART_RADIUS * params.sight_range, params.lattice)   # chart diameter <= 0.8 sight_range
         self._dcache = None                     # (free, distance transform of free in cells) of the last F build
         self._key_plane: Optional[np.ndarray] = None
         self._keys: List[Key] = []
@@ -587,7 +590,10 @@ class ChartGraph(SceneGraph):
             self._retired_map = {self._fmt(k): [] for k in self._keys}
             self._solved = None; self._keys = []; self._key_plane = -np.ones(nav.shape, np.int32)
             return
-        self._solved = self._evaluate(morse.partition(nav, self._h, self._tau), clr, S, birth)
+        self._solved = self._evaluate(self._partition(nav), clr, S, birth)
+
+    def _partition(self, nav: np.ndarray) -> "morse.Partition":
+        return morse.partition(nav, self._h, self._tau, radius=self._radius, cache=self._ccache)
 
     def _evaluate(self, part: "morse.Partition", clr, S, birth) -> _Solved:
         sp, A, h = part.sp, [int(a) for a in part.anchor], self._h
@@ -624,6 +630,8 @@ class ChartGraph(SceneGraph):
             if 0 <= y < H and 0 <= x < W and plane[y, x] >= 0 and S[y, x]:
                 pose_cell.setdefault(int(plane[y, x]), []).append((k, y, x))
         charts = []
+        peaks = np.full(len(A), -1.0)
+        np.maximum.at(peaks, full, part.f)
         order = np.argsort(full, kind="stable"); cut = np.searchsorted(full[order], np.arange(len(A) + 1))
         for j, a in enumerate(A):
             cc = order[cut[j]:cut[j + 1]]
@@ -634,9 +642,9 @@ class ChartGraph(SceneGraph):
             charts.append(Chart(key=keys[j], anchor=self._cell_xy(ay, ax), cells=int(len(cc)), area_m2=float(len(cc) * h ** 2),
                                 clearance=float(sp.clr[a]), driven_frac=float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0,
                                 ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf,
-                                peak=float(part.f[a])))
+                                peak=float(peaks[j]), region=int(part.region[j])))
         return _Solved(sp=sp, A=A, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
-                       dep=np.zeros((H, W), bool), S=S, peak=part.f[A])
+                       dep=np.zeros((H, W), bool), S=S, peak=peaks, region=part.region)
 
     @staticmethod
     def _fmt(k: tuple) -> Key:
@@ -1034,7 +1042,7 @@ class ChartGraph(SceneGraph):
             return
         self._key_plane = padl(st.plane.astype(np.int32), -1)
         nav, clr, S = self._build_F()
-        part = morse.partition(nav, self._h, self._tau)
+        part = self._partition(nav)
         plane = -np.ones(nav.shape, np.int32); plane[part.sp.ys, part.sp.xs] = part.full
         bad = np.nonzero((plane != self._key_plane).ravel())[0]
         if len(bad) and verify:
@@ -1079,7 +1087,7 @@ class ChartGraph(SceneGraph):
             la = np.array([l["a"] for l in s.links], np.int64); lb = np.array([l["b"] for l in s.links], np.int64)
             hw = np.array([l["saddle"] for l in s.links])
             lv = [dict(nodes=list(range(K)), parent=list(range(K)))]
-            for par in morse.levels(s.peak, rc, la, lb, hw, self._tau):
+            for par in morse.cell_levels(s.peak, rc, s.region, la, lb, hw, self._tau):
                 lv.append(dict(nodes=np.unique(par).tolist(), parent=par.tolist()))
             self._cache["levels"] = (lv, None, self._tau)
         return self._cache["levels"]
@@ -1113,13 +1121,14 @@ class ChartGraph(SceneGraph):
             for L_ in range(1, len(levels)):
                 parents[L_] = s.keys[int(levels[L_]["parent"][n])]
             if level == 0:
-                charts.append(Chart(c.key, c.anchor, c.cells, c.area_m2, c.clearance, c.driven_frac, c.ever_blocked_frac, c.leaf, parents, c.peak))
+                charts.append(Chart(c.key, c.anchor, c.cells, c.area_m2, c.clearance, c.driven_frac, c.ever_blocked_frac, c.leaf, parents, c.peak, c.region))
             else:
                 cs = [s.charts[j] for j in members]
                 cells = sum(x.cells for x in cs)
                 charts.append(Chart(c.key, c.anchor, cells, cells * self._h ** 2, c.clearance,
                                     sum(x.driven_frac * x.cells for x in cs) / max(cells, 1),
-                                    sum(x.ever_blocked_frac * x.cells for x in cs) / max(cells, 1), c.leaf, parents, c.peak))
+                                    sum(x.ever_blocked_frac * x.cells for x in cs) / max(cells, 1), c.leaf, parents,
+                                    max(x.peak for x in cs), c.region))
         shown = {c.key for c in charts}
         links = []
         if level == 0:

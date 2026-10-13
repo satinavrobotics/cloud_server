@@ -30,8 +30,9 @@ class SceneParams:
                                        # of the persisted params (graph-builder's `params_dict` pins that set), so it keeps
                                        # its place in the params hash; remove it with that pin.
     sight_range: float = 5.0           # m: tied to the leaf window (10 x 10 m => one leaf never observes beyond 5 m from
-                                       # its pose); caps window sizes and pose offsets and bounds `snap`. Part of the params
-                                       # hash: changing it is a new generation.
+                                       # its pose); caps window sizes and pose offsets, bounds `snap`, and sets the chart
+                                       # radius (0.4 x sight_range, morse.CHART_RADIUS). Part of the params hash: changing it
+                                       # is a new generation.
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,8 @@ class Chart:
     ever_blocked_frac: float           # share of cells reported blocked in any leaf
     leaf: Optional[str] = None         # a driven leaf of this chart nearest its anchor (thumbnails), None if never driven
     parent: Dict[int, Key] = field(default_factory=dict)   # level -> parent key (derived view)
-    peak: float = 0.0                  # B at the anchor: the persistence peak (distance to the non-navigable cells, m)
+    peak: float = 0.0                  # largest B in the chart: the persistence peak (distance to the non-navigable cells, m)
+    region: int = 0                    # persistence region (0..) this chart was cut from (charts of one region never cross a pass)
 
 
 @dataclass
