@@ -128,7 +128,8 @@ class Field:
         return out
 
     def samples(self, pts: List[Pt], step: float = 0.01):
-        """(clearance, piece length) of the samples of a polyline"""
+        """(clearance, piece length) of the samples of a polyline: every `step` along it, every vertex, and the last point
+        (weight 0), the same as `accept_route_safety.Reference.j_cont`"""
         xs, ys, sg = [], [], []
         for a, b in zip(pts[:-1], pts[1:]):
             n = max(1, int(math.ceil(math.dist(a, b) / step)))
@@ -136,6 +137,9 @@ class Field:
             xs.append(a[0] + t * (b[0] - a[0]))
             ys.append(a[1] + t * (b[1] - a[1]))
             sg.append(np.full(n, math.dist(a, b) / n))
+        xs.append(np.array([pts[-1][0]]))
+        ys.append(np.array([pts[-1][1]]))
+        sg.append(np.zeros(1))
         xs, ys, sg = np.concatenate(xs), np.concatenate(ys), np.concatenate(sg)
         return self.clearance(xs, ys), sg
 
