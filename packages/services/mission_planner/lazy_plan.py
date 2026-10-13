@@ -165,9 +165,14 @@ class PlanGraph:
             keep |= nxt
         return keep
 
+    def _reach(self) -> float:
+        """how far a chart's cell lies from its anchor: the anchor is the chart's centre and every cell is within chart_radius
+        of the net point, so within 2 x chart_radius (the chart diameter) of the anchor"""
+        return 2.0 * float(self.params.chart_radius)
+
     def _ellipse(self, src, dst, length: float) -> Set[int]:
         h = float(self.params.lattice)
-        r = 0.4 * float(self.params.sight_range) + h
+        r = self._reach() + h
         a = np.array([(2 * src[1] + 1) * RES, (2 * src[0] + 1) * RES])
         b = np.array([(2 * dst[1] + 1) * RES, (2 * dst[0] + 1) * RES])
         d = np.hypot(*(self._anchor - a).T) + np.hypot(*(self._anchor - b).T)
@@ -175,9 +180,9 @@ class PlanGraph:
 
     # ---- stage 2 -----------------------------------------------------------------------------
     def _tiles_for(self, keep: Iterable[int]) -> List[Tuple[int, int]]:
-        """lattice tiles that hold every cell of the charts (a chart reaches 0.4 sight range from its anchor) and the cells
+        """lattice tiles that hold every cell of the charts (a chart reaches its diameter from its anchor) and the cells
         4-adjacent to them (the orthogonals of a diagonal step)"""
-        r = int(math.ceil(0.4 * float(self.params.sight_range) / float(self.params.lattice))) + 2
+        r = int(math.ceil(self._reach() / float(self.params.lattice))) + 2
         c = self._cell[sorted(keep)]
         out: Set[Tuple[int, int]] = set()
         for (cy, cx) in c.tolist():

@@ -227,9 +227,9 @@ def test_refold_after_a_leaf_is_deleted_equals_a_fresh_fold_without_it():
 
 def test_params_semantics_and_cap_validation():
     p = SceneParams()
-    assert (p.robot_half_side, p.lattice, p.sight_range) == (0.25, 0.1, 5.0)
+    assert (p.robot_half_side, p.lattice, p.chart_radius) == (0.25, 0.1, 2.0)
     with pytest.raises(ValueError):
-        ChartGraph(SceneParams(sight_range=0.2))
+        ChartGraph(SceneParams(chart_radius=0.2))
     g = ChartGraph()
     assert g.fold_many([]).changed == [] and g.locate(0, 0) is None and g.route("a", "b") is None and g.query(ALL).charts == []
 
@@ -257,13 +257,13 @@ def test_snap_reports_the_real_distance_and_never_hides_a_wall():
     for d in np.arange(0.2, 6.0, 0.2):
         q = g.snap(px - d, py, max_dist=0.5)
         if q.key is None and q.distance != float("inf"):
-            assert q.distance > 0.5 and q.distance <= g.params.sight_range
+            assert q.distance > 0.5 and q.distance <= 2 * g.params.chart_radius
             assert g.locate(px - d, py, max_dist=0.5) is None
             assert g.locate(px - d, py, max_dist=q.distance + 0.01) == g.snap(px - d, py).key
             break
     else:
         pytest.fail("no refused snap with a finite distance found")
-    # locate with no limit equals the old behaviour (within sight_range)
+    # locate with no limit equals the old behaviour (within the chart diameter)
     assert g.locate(ax, ay) == s.key
 
 

@@ -105,8 +105,7 @@ class SceneWorkerHost:
 
 def params_dict(params: Any) -> dict:
     """The params as the store persists them (`EngineState.params`); the hash is taken over this."""
-    return dict(robot_half_side=params.robot_half_side, lattice=params.lattice,
-                place_mult=params.place_mult, sight_range=params.sight_range)
+    return dict(robot_half_side=params.robot_half_side, lattice=params.lattice, chart_radius=params.chart_radius)
 
 
 def expected_params_hash(params: Any) -> str:

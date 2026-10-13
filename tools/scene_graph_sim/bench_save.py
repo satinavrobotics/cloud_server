@@ -50,7 +50,7 @@ class FakeSG:
         self.changed = []
 
     def export_state(self):
-        return EngineState(params=dict(robot_half_side=0.25, lattice=0.1, place_mult=1.5, sight_range=5.0), cx0=0, cy0=0,
+        return EngineState(params=dict(robot_half_side=0.25, lattice=0.1, chart_radius=2.0), cx0=0, cy0=0,
                            V=self.V, T=self.T, B=self.B, leaves=list(self.leaves), keys=self.keys,
                            plane=self.plane, version=self.version, watermark=self.watermark)
 

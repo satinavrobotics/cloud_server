@@ -24,7 +24,7 @@ class LeafRecord:
 
 @dataclass
 class EngineState:
-    params: Dict[str, float]                       # robot_half_side, lattice, place_mult (deprecated), sight_range
+    params: Dict[str, float]                       # robot_half_side, lattice, chart_radius
     cx0: int                                       # global full-resolution index of canvas cell (0, 0); even
     cy0: int
     V: np.ndarray                                  # u8 [H, W] value, 255 unknown

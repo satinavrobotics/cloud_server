@@ -12,7 +12,7 @@ pytestmark = pytest.mark.unit
 
 def test_params_carry_the_scales():
     p = SceneParams()
-    assert (p.robot_half_side, p.lattice, p.sight_range) == (0.25, 0.1, 5.0)
+    assert (p.robot_half_side, p.lattice, p.chart_radius) == (0.25, 0.1, 2.0)
 
 
 def test_leaf_carries_what_the_fold_needs():

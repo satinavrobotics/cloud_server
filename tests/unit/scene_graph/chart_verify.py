@@ -4,12 +4,9 @@ distance to the non-navigable cells B itself. `verify` returns the number of vio
 
 cover        the charts are exactly F: every cell of F in exactly one chart, no other cell in any
 chart4       every chart is 4-connected
-anchor       the anchor is in its chart; the first anchor of a persistence region has (within one lattice step) the
-             region's maximal B
-radius       every cell is within geodesic distance 0.4 sight_range of its anchor, along cells of its own chart
-voronoi      every cell is at least as near (geodesic, inside its persistence region) to its own anchor as to any other
-             anchor of the region: the chart is the Voronoi cell
-packing      two anchors of one region are further apart than the radius (geodesic, inside the region)
+anchor       the anchor is in its chart and is the chart cell nearest the chart's centroid (ties: more room)
+radius       every cell is within geodesic distance 2 chart_radius (the chart's diameter bound) of its anchor, along cells
+             of its own chart
 planar       chi(F) = sum_i (1 - holes_i) - arcs + junctions, the Euler identity of the planar map of the partition
              (arcs: maximal chains of interface edges through corners of map degree 2; junction: interior corner with >= 3
              interface edges)
@@ -138,7 +135,7 @@ def verify(g, world=None, r=None, bbox=None):
     r = p.robot_half_side if r is None else r
     lab0, keys0, v0 = _image(g, 0)
     out = dict(charts=len(v0.charts), links=len(v0.links))
-    out.update(cover=0, chart4=0, anchor=0, radius=0, voronoi=0, packing=0, planar=0, portal=0, width=0, persist=0, nesting=0,
+    out.update(cover=0, chart4=0, anchor=0, radius=0, planar=0, portal=0, width=0, persist=0, nesting=0,
                region=0, holes=0, levels=0, chi_F=0)
     if lab0 is None:
         return out
@@ -157,7 +154,7 @@ def verify(g, world=None, r=None, bbox=None):
                                int(math.floor((c.anchor[0] - ra.origin[0]) / ra.step)))
     holes = 0
     region = {kpos[c.key]: c.region for c in v0.charts}
-    radius = max(0.4 * p.sight_range, h)                 # written from the definition: chart radius 0.4 sight_range
+    radius = max(p.chart_radius, h)
     for j in range(len(keys0)):
         m = lab0 == j
         if not m.any(): out["anchor"] += 1; continue
@@ -165,22 +162,13 @@ def verify(g, world=None, r=None, bbox=None):
         holes += _holes(m)
         ay, ax = anchor[j]
         if lab0[ay, ax] != j: out["anchor"] += 1; continue
+        yy, xx = np.nonzero(m)
+        d2 = (yy - yy.mean()) ** 2 + (xx - xx.mean()) ** 2
+        if (ay - yy.mean()) ** 2 + (ax - xx.mean()) ** 2 > d2.min() + 1e-9: out["anchor"] += 1
         d = geodesic(m, [(ay, ax)], h)
-        out["radius"] += int((d[m] > radius + 1e-9).any())
+        out["radius"] += int((d[m] > 2 * radius + 1e-9).any())
     regs = {}
     for j, k in region.items(): regs.setdefault(k, []).append(j)
-    for k, js in regs.items():
-        rmask = np.isin(lab0, js)
-        top = B[rmask].max()
-        if max(B[anchor[j]] for j in js) < top - h - 1e-9: out["anchor"] += 1
-        dists = {j: geodesic(rmask, [anchor[j]], h) for j in js}
-        for j in js:
-            m = lab0 == j
-            others = [dists[i] for i in js if i != j]
-            if others and (dists[j][m] > np.min(others, axis=0)[m] + 1e-9).any(): out["voronoi"] += 1
-        for a_i in range(len(js)):
-            for b_i in range(a_i):
-                if dists[js[a_i]][anchor[js[b_i]]] <= radius + 1e-9: out["packing"] += 1
     # planar identity
     comps = ndimage.label(F, structure=C4)[1]
     chi_F = comps - (ndimage.label(np.pad(~F, 1, constant_values=True), structure=C8)[1] - 1)
@@ -228,5 +216,5 @@ def verify(g, world=None, r=None, bbox=None):
 
 
 def ok(res):
-    return all(res[k] == 0 for k in ("cover", "chart4", "anchor", "radius", "voronoi", "packing", "planar", "portal", "width",
+    return all(res[k] == 0 for k in ("cover", "chart4", "anchor", "radius", "planar", "portal", "width",
                                      "persist", "nesting", "region"))

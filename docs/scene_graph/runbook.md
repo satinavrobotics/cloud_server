@@ -187,7 +187,7 @@ Both live in `mapobjectv1.status` (jsonb). There is no API for either yet; use S
   unique per request (it is the compare-and-clear token). `reason` is free text, echoed in the rebuild events.
   A map with no saved graph (version 0) simply starts fresh and the request is cleared. A crash mid-rebuild leaves
   the key, so the restart rebuilds again.
-* A params change (`SceneParams`: `robot_half_side`, `lattice`, `place_mult`, `sight_range`, or the store pipeline
+* A params change (`SceneParams`: `robot_half_side`, `lattice`, `chart_radius`, or the store pipeline
   version) changes the params hash; the worker detects it at start and rebuilds the same way
   (`reason: "needs_rebuild"`).
 * There is no supported standalone "drop the graph" tool; the graph is removed by the map delete saga only.

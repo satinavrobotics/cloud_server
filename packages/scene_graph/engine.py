@@ -46,6 +46,8 @@ HEADINGS = 23                   # corner shift r * sqrt2 * dtheta < res / 2 at 9
 TILE = 64                       # lattice cells per tile side (corridor tiles)
 MARGIN = 40                     # canvas growth margin (full-resolution cells)
 RESERVED = ("undriven", "ever_blocked", "soft")
+MAX_WINDOW_M = 20.0         # input validation: a leaf window side above this is refused
+POSE_SLACK_M = 5.0          # input validation: a pose may lie this far outside its window's footprint
 
 
 @dataclass
@@ -111,8 +113,8 @@ class ChartGraph(SceneGraph):
     def __init__(self, params: SceneParams = SceneParams()):
         super().__init__(params)
         self.faulted: Optional[BaseException] = None   # set when an exception escaped after the state began to change
-        if params.sight_range < params.robot_half_side - 1e-12:
-            raise ValueError("sight_range below the robot half side")
+        if params.chart_radius < params.robot_half_side - 1e-12:
+            raise ValueError("chart_radius below the robot half side")
         self.version = 0
         self._h = params.lattice
         self._leaves: Dict[str, _Rec] = {}
@@ -123,7 +125,7 @@ class ChartGraph(SceneGraph):
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
         self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
-        self._radius = max(morse.CHART_RADIUS * params.sight_range, params.lattice)   # chart diameter <= 0.8 sight_range
+        self._radius = max(params.chart_radius, params.lattice)
         self._dcache = None                     # (free, distance transform of free in cells) of the last F build
         self._key_plane: Optional[np.ndarray] = None
         self._keys: List[Key] = []
@@ -216,9 +218,9 @@ class ChartGraph(SceneGraph):
 
     def _prepare(self, leaves: Sequence[Leaf]) -> list:
         """VALIDATION PHASE. Check and rasterise every leaf of the batch before anything is mutated: a LeafError here leaves
-        the engine bit-identical, so the caller may retry or bisect the batch. A window side is capped at 4 x sight_range
-        (a leaf window is 2 x sight_range by convention: 10 x 10 m; 4 x leaves room for other sensors)."""
-        cap_m = 4.0 * self.params.sight_range
+        the engine bit-identical, so the caller may retry or bisect the batch. A window side is capped at MAX_WINDOW_M
+        (a leaf window is 10 x 10 m by convention; the cap leaves room for other sensors)."""
+        cap_m = MAX_WINDOW_M
         out: list = []; seen: Dict[str, Leaf] = {}
         fin = lambda v: isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool) and math.isfinite(v)
         for lf in leaves:
@@ -247,7 +249,7 @@ class ChartGraph(SceneGraph):
             if lf.resolution <= 0: bad("resolution must be > 0")
             if lf.r_d <= 0: bad("r_d must be > 0")
             if max(w.shape) * lf.resolution > cap_m:
-                bad(f"window side {max(w.shape) * lf.resolution:.1f} m exceeds {cap_m:.1f} m (4 x sight_range)")
+                bad(f"window side {max(w.shape) * lf.resolution:.1f} m exceeds {cap_m:.1f} m (MAX_WINDOW_M)")
             for name, cv in (lf.channels or {}).items():
                 if name in RESERVED or cv is None: continue
                 if not isinstance(cv, np.ndarray) or cv.ndim != 2 or cv.dtype != np.uint8 or cv.shape != w.shape:
@@ -259,11 +261,11 @@ class ChartGraph(SceneGraph):
             except Exception as e:                                   # noqa: BLE001 - any resampling failure is the leaf's
                 bad(f"cannot resample the window: {e!r}")
             # a pose joins the driven polyline: it must belong to its window. The convention is a window centred on the pose
-            # (+- sight_range); one sight_range of slack around the footprint admits an off-centre window, nothing more
-            sr = self.params.sight_range
+            # (+- 5 m); POSE_SLACK_M of slack around the footprint admits an off-centre window, nothing more
+            sr = POSE_SLACK_M
             ex = max(gx * RES - lf.x, lf.x - (gx + wl.shape[1]) * RES, gy * RES - lf.y, lf.y - (gy + wl.shape[0]) * RES)
             if ex > sr:
-                bad(f"pose is {ex:.1f} m outside its window's footprint (bound: sight_range {sr:.1f} m)")
+                bad(f"pose is {ex:.1f} m outside its window's footprint (bound: {sr:.1f} m)")
             out.append((lf, wl, gx, gy, chans))
         return out
 
@@ -794,7 +796,7 @@ class ChartGraph(SceneGraph):
 
     def snap(self, x: float, y: float, max_dist: Optional[float] = None) -> Snap:
         """The navigable cell nearest (x, y) with the real distance; refused (key None) beyond `max_dist`, never beyond
-        sight_range. `crosses_blocked`: the straight segment to it passes a known blocked cell."""
+        the chart diameter (2 x chart_radius). `crosses_blocked`: the straight segment to it passes a known blocked cell."""
         self._check()
         far = Snap(None, None, None, math.inf)
         s = self._solved
@@ -808,7 +810,8 @@ class ChartGraph(SceneGraph):
         if j < 0: return far
         px, py = self._cell_xy(ty, tx)
         dist = math.hypot(px - x, py - y)
-        limit = self.params.sight_range if max_dist is None else min(max_dist, self.params.sight_range)
+        diameter = 2.0 * self.params.chart_radius                  # a goal further than a chart from navigable space is not in the graph
+        limit = diameter if max_dist is None else min(max_dist, diameter)
         n = max(2, int(dist / (RES / 2)) + 1)
         t = np.linspace(0.0, 1.0, n)
         gx = np.floor((x + (px - x) * t) / RES).astype(int) - self._cx0
@@ -880,8 +883,9 @@ class ChartGraph(SceneGraph):
         """Shortest lattice route in navigable space (blocked cells removed) between the anchors of charts a and b, or, when
         `start` / `goal` name a navigable cell of chart a / b, between those cells (no anchor is visited; a point outside
         navigable space, or in another chart, falls back to the anchor of its chart). A route inside one chart reads the
-        clearance at that chart's anchor as its width. Searches the chart corridor first and the whole graph if that finds nothing
-        or a longer way."""
+        clearance at that chart's anchor as its width. Searches the chart corridor (the chart path and its neighbours) and returns
+        what that finds; the whole graph only when the corridor finds nothing or an overlay is given. The corridor result is not
+        proved shortest: on 840 real pairs p90 1.00, worst 1.40 x the true shortest."""
         self._check()
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
@@ -1001,8 +1005,7 @@ class ChartGraph(SceneGraph):
         """The resumable state, by reference (the arrays are not copied: the store slices them into tiles)."""
         self._check()
         p = self.params
-        st = EngineState(params=dict(robot_half_side=p.robot_half_side, lattice=p.lattice, place_mult=p.place_mult,
-                                     sight_range=p.sight_range),
+        st = EngineState(params=dict(robot_half_side=p.robot_half_side, lattice=p.lattice, chart_radius=p.chart_radius),
                          cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
@@ -1018,8 +1021,8 @@ class ChartGraph(SceneGraph):
         the stored keys are then the keys of the rebuilt charts. The canvas is padded by MARGIN so that the distance to the
         non-navigable cells near the stored edge sees unknown, as it did before."""
         p = self.params
-        if (st.params["robot_half_side"], st.params["lattice"], st.params["place_mult"], st.params["sight_range"]) != \
-                (p.robot_half_side, p.lattice, p.place_mult, p.sight_range):
+        if (st.params["robot_half_side"], st.params["lattice"], st.params["chart_radius"]) != \
+                (p.robot_half_side, p.lattice, p.chart_radius):
             raise ValueError("state was made with other parameters")
         if self._V is not None:
             raise ValueError("import_state needs a fresh engine")

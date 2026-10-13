@@ -51,8 +51,8 @@ def _owners(view):
 @pytest.mark.parametrize("make", [_hall, _field], ids=["hall", "field"])
 def test_incremental_dirty_set_equals_full_hash_and_owner_changes_stay_inside_the_pad(make):
     world, way, (rect, cway) = make()
-    params = SceneParams(sight_range=2.0)
-    pad = 3 * params.sight_range
+    params = SceneParams(chart_radius=0.8)
+    pad = 6.0                                         # the bound the regions alone met (3 x the old sight range of 2 m)
     leaves = cw.drive(world, way, win=80, step=1.0)
     w2 = world.copy(); cw._rect(w2, *rect, 100)
     later = cw.drive(w2, cway, win=80, step=0.5, session="s2", t0=10_000_000, r_d=0.25)
@@ -77,4 +77,4 @@ def test_incremental_dirty_set_equals_full_hash_and_owner_changes_stay_inside_th
         prev_known, prev_owner = known, owner
     assert inc.coverage_mismatches == 0
     assert worst <= pad + 4 * RES, (worst, pad)
-    print(f"{make.__name__}: farthest owner change {worst:.2f} m from a changed input cell (sight_range {params.sight_range}, pad {pad})")
+    print(f"{make.__name__}: farthest owner change {worst:.2f} m from a changed input cell (chart_radius {params.chart_radius}, pad {pad})")

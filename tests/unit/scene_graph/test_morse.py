@@ -227,10 +227,15 @@ def test_charts_cover_pack_and_stay_inside_their_region(seed):
         m = lab == j
         assert ndimage.label(m)[1] == 1 or ndimage.label(m, structure=np.ones((3, 3)))[1] == 1     # connected (8-neighbour lattice)
         ay, ax = int(sp.ys[p.anchor[j]]), int(sp.xs[p.anchor[j]])
-        assert lab[ay, ax] == j
-        assert geodesic(m, [(ay, ax)], H)[m].max() <= RADIUS + 1e-9      # covering, inside the chart
+        sy, sx = int(sp.ys[p.seed[j]]), int(sp.xs[p.seed[j]])
+        assert lab[ay, ax] == j and lab[sy, sx] == j
+        assert geodesic(m, [(sy, sx)], H)[m].max() <= RADIUS + 1e-9      # covering, inside the chart, from the net point
+        assert geodesic(m, [(ay, ax)], H)[m].max() <= 2 * RADIUS + 1e-9  # the centre: within the diameter
+        cy, cx = np.nonzero(m)[0].mean(), np.nonzero(m)[1].mean()
+        d2 = (np.nonzero(m)[0] - cy) ** 2 + (np.nonzero(m)[1] - cx) ** 2
+        assert (ay - cy) ** 2 + (ax - cx) ** 2 <= d2.min() + 1e-9        # the centre is the cell nearest the centroid
     for k in range(p.regions):
-        anchors = [(int(sp.ys[p.anchor[j]]), int(sp.xs[p.anchor[j]])) for j in np.nonzero(p.region == k)[0]]
+        anchors = [(int(sp.ys[p.seed[j]]), int(sp.xs[p.seed[j]])) for j in np.nonzero(p.region == k)[0]]
         d = [geodesic(reg == k, [a], H) for a in anchors]
         for i in range(len(anchors)):
             for j in range(i):

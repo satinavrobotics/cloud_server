@@ -120,8 +120,9 @@ def test_a_pose_must_belong_to_its_window():
     with pytest.raises(LeafError, match="outside its window"):
         g.fold_many([far])
     assert g.export_state().V is None                                # nothing was folded
-    # at the footprint edge plus one sight range: accepted; a bit beyond: refused
-    sr = g.params.sight_range
+    # at the footprint edge plus the pose slack: accepted; a bit beyond: refused
+    from packages.scene_graph.engine import POSE_SLACK_M
+    sr = POSE_SLACK_M
     wl = leaf.window_u8.shape[1] * leaf.resolution
     x_edge = leaf.origin[0] + wl + sr - 1e-6
     ok_leaf = dataclasses.replace(leaf, key="edge", x=x_edge)

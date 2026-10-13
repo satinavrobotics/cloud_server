@@ -21,7 +21,7 @@
 
 Charts: with a radius each region is cut into geodesic Voronoi cells of a greedy net taken in the order of room (`subdivide`):
 every cell is within `radius` of its anchor, anchors of a region are further than `radius` apart, no chart crosses a pass.
-The engine's radius is CHART_RADIUS * sight_range; `levels` above the charts are `cell_levels`.
+The engine's radius is SceneParams.chart_radius; `levels` above the charts are `cell_levels`.
 
 Counting identity (any tie order): chi(F) = #maxima - sum(saddle multiplicities) (B has no minima). Nothing here reads a chart
 index, a leaf or the canvas: the engine calls `partition` once per batch.
@@ -38,7 +38,6 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 TAU0_FACTOR = 2.0 * math.sqrt(2.0)
-CHART_RADIUS = 0.4                  # chart radius = CHART_RADIUS * sight_range: diameter 0.8 of what one leaf observes
 BASE_TAU = 1                        # the base partition merges persistence below BASE_TAU * tau_0; level j: * 2^j
 TOL = 1e-9                          # persistence comparisons: p < tau - TOL merges (p exactly tau is kept apart)
 BIG = np.iinfo(np.int64).max
@@ -238,6 +237,19 @@ def anchors(sp: Space, lab: np.ndarray, f: np.ndarray, K: int) -> np.ndarray:
     return out
 
 
+def centres(sp: Space, lab: np.ndarray, f: np.ndarray, K: int) -> np.ndarray:
+    """cell index of the centre of each of the K charts: the chart cell nearest the chart's centroid (ties: more room, then
+    (row, col)). The net point that a chart was cut around sits where the cut put it, often at the side of a small chart; the
+    centre is what stands for the chart."""
+    cnt = np.bincount(lab, minlength=K)
+    cy = np.bincount(lab, weights=sp.ys, minlength=K) / np.maximum(cnt, 1)
+    cx = np.bincount(lab, weights=sp.xs, minlength=K) / np.maximum(cnt, 1)
+    d2 = np.round((sp.ys - cy[lab]) ** 2 + (sp.xs - cx[lab]) ** 2, 9)
+    o = np.lexsort((np.arange(sp.N), -f, d2, lab))
+    first = np.concatenate([[True], lab[o][1:] != lab[o][:-1]])
+    return o[first].astype(np.int64)
+
+
 # ---------------------------------------------------------------------------------------------------------------- partition
 @dataclass
 class Partition:
@@ -250,6 +262,7 @@ class Partition:
     merges: int
     region: np.ndarray          # persistence region (index 0..R-1, rank order of the peaks) of each chart
     regions: int
+    seed: np.ndarray            # cell index of the net point each chart was cut around (== anchor without a radius)
 
 
 def edges8(sp: Space, h: float, region: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -280,13 +293,14 @@ def edges8(sp: Space, h: float, region: Optional[np.ndarray] = None) -> Tuple[np
 
 def subdivide(sp: Space, f: np.ndarray, region: np.ndarray, radius: float, h: float,
               cache: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """(chart per cell, anchor cell per chart): every persistence region cut into geodesic Voronoi cells of a greedy net.
+    """(chart per cell, net point cell per chart): every persistence region cut into geodesic Voronoi cells of a greedy net.
     Cells are taken in the order of room (B quantised to the lattice step, ties in scan order: translation invariant, and
     stable when the canvas grows, which keeps the relative scan order); a
     cell with no net point within geodesic `radius` INSIDE ITS REGION becomes one. Hence every cell of a region is within
-    `radius` of an anchor (covering), anchors of one region are further than `radius` apart (packing), the first anchor of a
-    region is a cell of maximal room, and no chart crosses a pass. Charts are the Voronoi cells of the anchors (geodesic in
-    the region): connected, and every cell reaches its anchor without leaving its chart. `cache` (a dict the caller keeps
+    `radius` of a net point (covering), net points of one region are further than `radius` apart (packing), the first net
+    point of a region is a cell of maximal room, and no chart crosses a pass. Charts are the Voronoi cells of the net points
+    (geodesic in the region): connected, and every cell reaches its net point without leaving its chart. The anchor of a
+    chart is its centre (`centres`), not the net point. `cache` (a dict the caller keeps
     between calls) serves a region whose cells and room are unchanged from the last call; it holds the last call's regions only."""
     N = sp.N
     R, C, L = edges8(sp, h, region)
@@ -366,7 +380,7 @@ def partition(F: np.ndarray, h: float, tau: float, radius: Optional[float] = Non
     sp = Space.of(F)
     if sp.N == 0:
         z = np.zeros(0, np.int64)
-        return Partition(sp, np.zeros(0), np.zeros(0, np.int32), 0, z, 0, 0, z, 0)
+        return Partition(sp, np.zeros(0), np.zeros(0, np.int32), 0, z, 0, 0, z, 0, z)
     f = distance(sp, h)
     rank = ranks(f)
     bid, roots = raw_basins(sp, rank)
@@ -381,9 +395,10 @@ def partition(F: np.ndarray, h: float, tau: float, radius: Optional[float] = Non
     reg = new[surv[bid]].astype(np.int32)
     if radius is None:
         a = anchors(sp, reg, f, len(keep))
-        return Partition(sp, f, reg, len(keep), a, R, len(tree), np.arange(len(keep)), len(keep))
-    full, a = subdivide(sp, f, reg, radius, h, cache)
-    return Partition(sp, f, full, len(a), a, R, len(tree), reg[a].astype(np.int64), len(keep))
+        return Partition(sp, f, reg, len(keep), a, R, len(tree), np.arange(len(keep)), len(keep), a)
+    full, seeds = subdivide(sp, f, reg, radius, h, cache)
+    return Partition(sp, f, full, len(seeds), centres(sp, full, f, len(seeds)), R, len(tree), reg[seeds].astype(np.int64),
+                     len(keep), seeds)
 
 
 # ---------------------------------------------------------------------------------------------------------------- interface

@@ -331,7 +331,7 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
    **Node delete** happens in the API process: capture the leaves' window extents before delete and deliver them to
    the worker (outbox table or NOTIFY). **Realign** rewrites no node poses (only `map_sessions`' transform): no
    rebuild trigger (to verify against `plan_realign`); only the legacy pose-rewrite tool needs a rebuild.
-   A params change (robot size, sight range) is a new generation: background rebuild, old version served until the
+   A params change (robot size, chart radius) is a new generation: background rebuild, old version served until the
    atomic switch.
 7. **Raster over HTTP.** Browser decoders reduce 16-bit PNG to 8 bits: serve raw little-endian u16 with a small
    header (octet-stream), with ETag/version.

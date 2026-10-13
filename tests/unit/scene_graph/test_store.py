@@ -253,7 +253,7 @@ def test_params_mismatch_is_a_new_generation_not_an_in_place_load():
     w, leaves = _world("two_rooms")
     g, v = _grow(store, "m", leaves[:10], 10)
     man = store.manifest("m")
-    assert man["params_hash"] == store.meta("m")["params_hash"] and man["params"]["sight_range"] == 5.0
+    assert man["params_hash"] == store.meta("m")["params_hash"] and man["params"]["chart_radius"] == 2.0
 
 
 class _FakeDb:
