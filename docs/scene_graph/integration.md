@@ -46,8 +46,10 @@ formats). LACI: everything else here (ingest worker, read API, client, planner, 
 * **Keys are persistent chart keys with lineage** (0.95 key persistence on office8, `formulation.md` statement 11). A key can retire, split or merge,
   so the API and websocket carry a lineage map (retired key -> successor keys) with each version, and the client
   re-maps selections and saved goals through it. Stable-id-forever is not promised.
-* **Pricing is not built.** Today the route minimises geometric length (`Route.length`) inside the corridor; the
-  agreed design (integer cost, canonical ties, `planner_findings_2026-10-13.md` sections 4 and 10) is a later format
+* **Clearance pricing is built; rate pricing is not.** `route(..., safety=Safety(margin, rate))` prices the clearance deficit
+  (`route_safety.md`; the planner uses it on the lazy graph and for the nodePolicy routes through `SCENE_GRAPH_SAFETY_KAPPA`, default
+  1, 0 disables it): `Route.cost` is the priced integer cost, `Route.length` the geometric length, ties canonical on the cost.
+  Pricing the observation rates (counts, posterior, `now`; `planner_findings_2026-10-13.md` sections 4 and 10) is a later format
   step. The state planes are V (value), T (capture time of the winner), B (latest time reported blocked) and channels.
 * **Blocked** = costmap lethal in the graph (B plane, time-valued); robot `blocked_graph_nodes` rows are a transient
   overlay at plan time (`blocked_geometry.overlay`). No event delivery from the dispatcher.

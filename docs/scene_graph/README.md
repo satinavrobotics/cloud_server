@@ -73,10 +73,11 @@ parameter. The engine's window cap (20 m side) and pose slack (5 m) are validati
 * **E2E harness:** `tools/scene_graph_e2e/run.sh`, 32 passed in both planner modes while both existed (on `4104b8d`; not re-run on `a93a696`).
 * **Pinned unit suite:** 4212 passed on the production pins (py3.10, pydantic 1.9.0), on `4104b8d`.
 * **Measurements:** `formulation.md` statements 25-27 (cost, anchor-chain stretch, route quality) and statement 28 (ties).
+* **Clearance pricing:** `route_safety.md` (statements 29-31; `tools/scene_graph_sim/accept_route_safety.py`, the acceptance gates).
 
 ## 5. Gaps, CIMBI side
 
-1. **Rate pricing / count planes.** Not built. Design, with the planner side's conditions: `formulation.md` section 6. Needs
+1. **Rate pricing / count planes.** Not built (clearance pricing is: `route_safety.md`). Design, with the planner side's conditions: `formulation.md` section 6. Needs
    per-leaf-key dedup in the engine (delivery is at-least-once) and a versioned count object outside the tiles.
 2. **Exact locality** of the chart partition under incremental folds: measured (0.8 m hall, 2.65 m field), not proved.
 3. **Corridor optimality:** the corridor search is not proved shortest (worst 1.40 x on 840 real pairs, p90 1.00). Under an overlay

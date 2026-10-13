@@ -179,3 +179,9 @@ real maps; scipy tie behaviour with integer weights; whether "blocked" counts ar
   on edges. Today observations are in Postgres `edge_observations`, statistics are computed on read and filtered by the
   current Arango edge set. Design draft and consequences: `edge_stats_on_charts_design.md` (section 7) and
   `docs/tracking_redesign_2026-10-13.md` (D1: poses stored, chart pair on read). Not started.
+* **Clearance pricing built (2026-10-13).** Spec, derivation record, acceptance gates and ledger: `route_safety.md`.
+  `route(..., safety=Safety(margin, rate))` and `deficit_cell` on the engine and on `PlanGraph` (clearance of a tile from the `v`
+  planes of the tile and its neighbours, no stored data); the planner and the nodePolicy routes price with
+  `SCENE_GRAPH_SAFETY_KAPPA` (default 1, 0 disables; margin = the robot's circumscribed radius, no tolerance) and pull with a
+  cost-aware line of sight. This is the clearance part of section 4's pricing (integer weights, whole-graph search in the engine, the
+  lazy ellipse bounded by the corridor's priced cost); the rate pricing (counts, `now`) is not built.
