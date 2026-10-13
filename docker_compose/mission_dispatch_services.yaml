@@ -234,6 +234,8 @@ services:
       - SCENE_GRAPH_SLOW_STEP_S=${SCENE_GRAPH_SLOW_STEP_S:-30.0}
       - SCENE_GRAPH_STATS_LOG_S=${SCENE_GRAPH_STATS_LOG_S:-60.0}
       - SCENE_GRAPH_MEMORY_RETRY_LIMIT=${SCENE_GRAPH_MEMORY_RETRY_LIMIT:-3}
+      - SCENE_GRAPH_RECEIPT_WINDOW_S=${SCENE_GRAPH_RECEIPT_WINDOW_S:-300.0}
+      - SCENE_GRAPH_SKIP_FOLDED=${SCENE_GRAPH_SKIP_FOLDED:-true}
       # Scale (runbook sections 1 and 8). WORKER_THREADS: maps folded at once. The code default is
       # min(8, CPU count) when the variable is unset; compose cannot compute that and an empty value
       # would not parse, so it defaults to 4 here. Set MAX_RESIDENT_BYTES to ~60-70% of this

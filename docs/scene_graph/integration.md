@@ -144,7 +144,10 @@ distinct leaf id per waypoint. Anything else is a fallback (`planner: "legacy"`,
    (`graph_db.k_nearest_neighbors`), the nearest leaf within `SCENE_GRAPH_LEAF_SNAP_M`; a database error is
    `leaf_lookup_error`. Interior waypoints without a leaf or sharing one are dropped where line of sight allows
    (`repair_leaf_ids`); `planned_path` = the ids and `start_node_id`/`end_node_id` its ends. If a waypoint still has no
-   leaf or two share one: fallback (`waypoints_without_distinct_leaf_ids`).
+   leaf: fallback (`waypoints_without_distinct_leaf_ids`, now only "a waypoint has no leaf within `LEAF_SNAP_M`").
+   Repeats are not a fallback: `collapse_repeated_leaf_ids` merges consecutive waypoints on one leaf where line of
+   sight allows, a whole route on one leaf becomes `[start, goal]`, and an unmergeable repeat is served as is
+   (`build_waypoints(allow_repeats=True)`; edge statistics ignore `src == dst`).
 6. **Budget of the plan**: snap + route + simplify + leaf lookup within `SCENE_GRAPH_PLAN_BUDGET_S` (3 s), also
    bounded by what is left of the total (`plan_timeout`, or `budget_exhausted` when the total was the binding one).
 
@@ -400,7 +403,19 @@ Verified in code unless marked. Supersedes earlier statements here and in `hando
 * `Leaf.r_d` is evidence only (W(r) needs r_d >= r); `SceneParams.robot_half_side` per map partitions free space.
   Only 100/255 block; 1..99 is the soft channel (`occupancy_depth` has only 0/100/255).
 * `cover()` view: from the node's depth record via `leafcover.view_from_node(key, pose, camera.T_base_cam, camera.fx,
-  camera.width, camera.valid_range_m[1], h=0.1, p=0.2)`; no extra node field. Piece 8 is unblocked.
+  camera.width, camera.valid_range_m[1], h=0.1, p=0.2)`; no extra node field. The adapter (`build_view`) fills
+  `Leaf.view`; the graph_db `costmap_since` projection (`COSTMAP_SINCE_FIELDS`) carries `depth` for it. A node without
+  a depth record or with an unusable camera block is folded with `view=None` (counted `views_missing` /
+  `view_failures`), never skipped. Piece 8 is unblocked.
+* Receipt rule: `costmap_stored_ms` is a leaf's receipt only within `SCENE_GRAPH_RECEIPT_WINDOW_S` (300 s) of the
+  node's own time (`timestamp`, else `capture_time`); else the node's own time is used (a backfilled layer is a
+  bulk write). The backfill tool reports such nodes as `far`.
+* Restart replay: with `SCENE_GRAPH_SKIP_FOLDED` the worker skips leaves the stored state holds (same key, stamp,
+  session, pose, `r_d`, view; stored at or before the state's cursor): skip reason `already_folded`; a caught-up
+  restart folds and saves nothing. Status counters: `skipped{}`, `already_folded`, `default_r_d`, `views_built`,
+  `views_missing`, `view_failures`. The `updated` fleet event is trailing-edge throttled
+  (`updated_event_interval_s`, 60 s) and carries the cumulative `skipped` payload. `default_r_d` = no
+  `robotobjectv1` factsheet row yet (or -1 sizes), or a node without `robot_name`: the default footprint is used.
 * Backfill: `occupancy_depth` written on 7 maps / 438 nodes via `set_node_costmaps` (verified, restore path in
   CIMBI's scratchpad); `office8` has `occupancy`.
 

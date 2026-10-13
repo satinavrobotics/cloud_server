@@ -49,6 +49,8 @@ Worker robustness settings (graph-builder, read by `scene_host`; forwarded by co
 | `SCENE_GRAPH_MAX_MAPS` | 64 | maps one process owns at once (each holds a Postgres connection); more are reported once as `fold_failed` stage `max_maps` |
 | `SCENE_GRAPH_SAVE_EVERY_LEAVES` / `_SAVE_EVERY_S` | 50 / 30.0 | save a snapshot after this many folded leaves / seconds (never faster than the publish interval) |
 | `SCENE_GRAPH_REPLAY_MARGIN_S` / `_REPLAY_RECHECK_S` | 60.0 / 60.0 | how far below the furthest node a restart re-reads (late visible costmaps); the whole margin is re-read at most this often |
+| `SCENE_GRAPH_RECEIPT_WINDOW_S` | 300.0 | `costmap_stored_ms` is a leaf's receipt time only within this many seconds of the node's own time (`timestamp`, else `capture_time`); farther away it is a bulk write (a backfilled `occupancy_depth`), and the node's own time is used. `<= 0` always trusts it; NaN / inf fall back to 300 |
+| `SCENE_GRAPH_SKIP_FOLDED` | true | restart replay skips leaves the stored state already holds (key, stamp, session, pose, `r_d`, view; stored at or before the state's cursor): skip reason `already_folded`. `false` folds the replay margin again |
 | `SCENE_GRAPH_REBUILD_MAX_AGE_S` | 900.0 | a rebuild older than this is committed at its next save even if uploads keep arriving |
 | `SCENE_GRAPH_REBUILD_BATCH` | 48 | leaves per fold inside a rebuild (the canonical batching, see integration.md "Ingest ordering") |
 | `SCENE_GRAPH_REBUILD_DEBOUNCE_S` | 30.0 | a delete-triggered rebuild starts only after this long without a newer request |
@@ -136,11 +138,13 @@ Each step gates the next. Flags stay false until the step that names them.
 4. **Backfill before the first ingest.** Nodes without `costmap_stored_ms` are invisible to the worker. The tool ships
    in the **graph-builder** image (it needs `scene_leaf`, ARANGO_*, MINIO_*; the API image has none of the three):
    `docker compose -f docker_compose/mission_dispatch_services.yaml exec graph-builder-service python -m tools.scene_costmap_stored_backfill`
-   (dry run, prints per map `nodes/already/to_stamp/stamped/skipped/sources`, progress lines on stderr), then
+   (dry run, prints per map `nodes/already/to_stamp/stamped/skipped/far/sources`, progress lines on stderr), then
    `... --apply [--map ID ...] [--batch 500]`. Idempotent, resumable. The time of a node is its own `timestamp`
    (millisecond resolution, receipt order); MinIO last-modified (1 s resolution) is only the fallback for nodes
    without one and is calibrated to the node-timestamp axis by the median offset of a sample, so MinIO is hardly
-   touched. Nodes with a timestamp are stamped first, so an interrupted run keeps them. `skipped` = nodes with no
+   touched. A node already stamped is left alone even when its stamp is far from its own time (more than
+   `SCENE_GRAPH_RECEIPT_WINDOW_S`: a layer written long after capture); the report counts those as `far`
+   (the worker uses the node's own time as their receipt, so they need no fix). Nodes with a timestamp are stamped first, so an interrupted run keeps them. `skipped` = nodes with no
    usable time: never ingested. If a worker already ingested a map before the backfill, force a rebuild of that map
    afterwards (section 3). Check that the tool is runnable in an image:
    `docker run --rm --entrypoint python graph_builder_service:latest -c "import tools.scene_costmap_stored_backfill"`.
@@ -203,7 +207,9 @@ graph of every map you care about is at least at the latest upload (lag under `S
 | Schema | do not downgrade unless required | the migration is additive/nullable; old code ignores the columns. `downgrade` drops them (rows lose robot pose, back to the disc rule) |
 
 A restart of graph-builder is safe at any point: the advisory lock goes with the connection, the cursor is stored with
-every version, unsaved folds are re-read (fold is idempotent). `stop()` waits up to 30 s for a running fold (compose gives the container `stop_grace_period: 35s`).
+every version, unsaved folds are re-read (fold is idempotent). A restart of a caught-up worker folds nothing and saves nothing:
+the replay margin is re-read, but every leaf the stored state holds is skipped as `already_folded` (with
+`SKIP_FOLDED=true`; the stored leaves are read from the manifest segments, no engine load). `stop()` waits up to 30 s for a running fold (compose gives the container `stop_grace_period: 35s`).
 
 ## 5. Events (`fleet_events`, source `graph_builder`, no robot)
 
@@ -212,7 +218,7 @@ Every payload has `map_name`. Not stored/emitted when the event DB write fails (
 
 | Event (severity) | Payload | Meaning | Recommended alert |
 |---|---|---|---|
-| `MAP.SCENE_GRAPH_UPDATED` (info) | `version`, `leaves_folded`, `charts_changed` | a version was saved and published. The event is **throttled to one per 60 s per map** (the leaves folded in between are summed into the next one); the websocket publish is not throttled. Also once after a rebuild commit with `leaves_folded: 0` | None per event. **Absence** is the signal: uploads flowing for a map but no UPDATED for > 5 min -> ingest stalled |
+| `MAP.SCENE_GRAPH_UPDATED` (info) | `version`, `leaves_folded`, `charts_changed`, `skipped` | a version was saved and published. The event is **trailing-edge throttled** to one per 60 s per map (worker config `updated_event_interval_s`, not an env var): a save inside the interval is held (latest version, charts and leaves summed) and emitted when the interval is over, so the last save is never lost; the websocket publish is not throttled. A save that only moved the cursor (the store kept the version) announces nothing. The payload also carries `skipped` (cumulative skip counters of the worker by reason, omitted when all are zero) Also once after a rebuild commit with `leaves_folded: 0` | None per event. **Absence** is the signal: uploads flowing for a map but no UPDATED for > 5 min -> ingest stalled |
 | `MAP.SCENE_GRAPH_FOLD_FAILED` (warning) | `stage`, `detail` (300 chars), `consecutive` | see stage table | by stage, below |
 | `MAP.SCENE_GRAPH_REBUILD_STARTED` (info) | `reason`, `resumed` (only when true) | pending generation begun (`needs_rebuild` = params hash, `nodes_deleted`, `engine_faulted`, `manual`/other = request text); `resumed: true` = an interrupted pending generation was continued from its cursor | none; info |
 | `MAP.SCENE_GRAPH_REBUILD_COMPLETED` (info) | `reason`, `version`, `duration_s` | pending generation committed; readers switched | alert if no COMPLETED follows a STARTED within your budget (no duration measured yet; start at 1 h). **`version == 0`: ticket** (below) |
@@ -238,9 +244,18 @@ none has a usable occupancy costmap) twice in a row and dropped the stored graph
 the planner reports `no_graph`. Expected after deleting all nodes of a map; otherwise check the map's nodes /
 costmaps. Alert on `version = 0` in the payload.
 
-Log-only: `default_r_d` (footprint unknown) and fold timings. Skip counters (`no_occupancy_layer`, `no_pose`,
-`no_origin`, `no_stamp`, `bad_png`, `size_mismatch`, `bad_resolution`, `png_missing_expired`, `fold_error`), pending
-PNGs and version lag are per map in graph-builder `/health` (section 11). Grep the graph-builder log for
+Fold timings are log-only. Skip counters (`no_occupancy_layer`, `no_pose`,
+`no_origin`, `no_stamp`, `bad_png`, `size_mismatch`, `bad_resolution`, `png_missing_expired`, `fold_error`,
+`already_folded`), pending PNGs and version lag, and the counters `already_folded`, `default_r_d`, `views_built`,
+`views_missing`, `view_failures` are per map in graph-builder `/health` (section 11) and in the periodic stats log.
+The first skip of each reason (not `already_folded`) is logged with the node key; the rest are only counted.
+`already_folded` is not an error: the stored state already holds that leaf (restart replay).
+`default_r_d` counts leaves folded with the default footprint (0.25 m): the node's robot has no `robotobjectv1`
+factsheet row yet (or `length` / `width` is -1), or the node has no `robot_name`. Production check:
+`SELECT name, status->'factsheet'->>'length', status->'factsheet'->>'width', status->'factsheet'->>'height' FROM robotobjectv1 WHERE name IN ('formidable-peacock','masked-frigatebird');`
+(the worker asks again after `footprint_retry_s`). Views: `views_built` leaves have a camera view for `cover()`,
+`views_missing` have no depth record (robot-costmap maps: expected), `view_failures` have a depth record with an
+unusable camera block (leaf still folded, without a view; first one logged). Grep the graph-builder log for
 `scene worker <map>` / `scene runner <map>`.
 
 ## 6. Verification checklist
@@ -293,7 +308,7 @@ dispatcher's 5 s replan timeout; the rest is the legacy planner's. A stage that 
 | `missing_tiles` | the corridor needs tiles not loaded | snapshot incomplete/inconsistent; investigate the version |
 | `too_narrow` | `min_width` < what the robot needs (width + margin straight, `hypot(length, width)` + margin where it turns); **inactive unless `SCENE_GRAPH_WIDTH_CHECK_ENABLED`** (see "Width gate") | route has a passage this robot cannot take |
 | `leaf_lookup_error` | the nearest-leaf query (one kNN per waypoint) raised | Arango problem; see planner log (`scene graph leaf lookup failed`) |
-| `waypoints_without_distinct_leaf_ids` | after dropping interior waypoints where line of sight allows, a waypoint still has no leaf within 1.0 m, or two share one | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
+| `waypoints_without_distinct_leaf_ids` | after dropping interior waypoints where line of sight allows, a waypoint still has no leaf within `LEAF_SNAP_M` (1.0 m). Waypoints that share a leaf no longer cause it: consecutive repeats are merged where line of sight allows, a route on one leaf becomes `[start, goal]`, an unmergeable repeat is served as is (the name is historic) | sparse leaf coverage on the route; raise `LEAF_SNAP_M` or map more |
 | `blocked_row_on_route` | a blocked row without a robot pose (old disc rule) hits the final waypoints | legacy planner reports/detours it |
 | `plan_timeout` | snap + route + simplify + leaf lookup > `PLAN_BUDGET_S` (the thread keeps running and holds its slot) | map/route too large for the budget; see capacity |
 | `error` | unexpected exception (logged with repr) | read the planner log |
@@ -345,7 +360,9 @@ differ by up to about 1 m (the legacy planner returns a node and its own positio
 
 Open defects (owner, effect, e2e marker) are kept in `integration.md`, "Open defects"; the operational ones:
 
-* **Restart replay bumps the version (CIMBI).** Each chart's canvas-relative `cell` is still part of the content
+* **Restart replay bumps the version (CIMBI) when it folds.** A restart of a caught-up worker folds nothing
+  (`already_folded`, `SKIP_FOLDED=true`) and saves nothing, so it publishes no version. When leaves are folded again
+  (skip off, a changed leaf, a rebuild), each chart's canvas-relative `cell` is still part of the content
   hash, so an engine reloaded from tiles hashes differently and a restart publishes a version with the same charts
   and links. Harmless (one extra version, planner/clients reload); do not alert on a version bump after a restart.
   Strict xfail in the e2e.
@@ -360,7 +377,7 @@ Open defects (owner, effect, e2e marker) are kept in `integration.md`, "Open def
 * **No authorization** on the three scene-graph routes (nor a rate limit); they follow `/maps/{id}/graph`. The
   design is written down (integration.md, finding 13) and deferred by the owner as an API-wide change.
 * **`r_d` rule**: half of the *smaller* footprint side; unknown footprint (-1) uses 0.25 m and is counted
-  (`default_r_d`, log only). Optimistic for a long robot: a passage it cannot turn in can look navigable at ingest,
+  (`default_r_d`, in `/health` and the log). Optimistic for a long robot: a passage it cannot turn in can look navigable at ingest,
   and `Route.min_width` is compared with the same width (the planner's turn rule, enabled with the width check,
   does use the length). Decision deferred by the owner; revisit before enabling the planner for a robot with
   length >> width.
@@ -482,6 +499,7 @@ off, `{enabled: true, error}` when the snapshot itself failed.
 | `maps.<map>.state` | last step state: `worked`, `idle`, `backoff`, `not_owner`, `deleting`, `fenced`, `needs_rebuild` |
 | `maps.<map>.last_step_age_s` | seconds since the map was last stepped (a large value on a worked map = starved or stuck) |
 | `maps.<map>.version`, `pending`, `buffered`, `version_lag_s`, `skipped{}` | published version, nodes waiting for a PNG, leaves waiting for a batch, age of the oldest unsaved fold, skip counters by reason |
+| `maps.<map>.already_folded`, `default_r_d`, `views_built`, `views_missing`, `view_failures` | leaves skipped because the stored state holds them; leaves folded with the default footprint; leaves folded with a camera view / without a depth record / with an unusable camera block |
 | `maps.<map>.resident`, `resident_bytes` | an engine is in memory; its `nbytes` (null = unknown, 0 when not resident) |
 | `maps.<map>.loads`, `evictions`, `prefetch_hits` | engine loads through the factory, evictions, leaves whose PNG came from the prefetch pool |
 | `pool.threads`, `inflight`, `queue_depth`, `cold_inflight` | step pool size; steps running; due maps that found no free thread at the last tick; running steps that are cold engine loads |
