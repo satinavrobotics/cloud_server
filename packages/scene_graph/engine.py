@@ -46,6 +46,7 @@ HEADINGS = 23                   # corner shift r * sqrt2 * dtheta < res / 2 at 9
 TILE = 64                       # lattice cells per tile side (corridor tiles)
 MARGIN = 40                     # canvas growth margin (full-resolution cells)
 RESERVED = ("undriven", "ever_blocked", "soft")
+ROUTE_UNIT_M = 1e-4        # route cost unit: an edge costs ceil(length / unit) so path costs are exact integers
 MAX_WINDOW_M = 20.0         # input validation: a leaf window side above this is refused
 POSE_SLACK_M = 5.0          # input validation: a pose may lie this far outside its window's footprint
 
@@ -702,13 +703,17 @@ class ChartGraph(SceneGraph):
         self._rcache = rnew
 
         def route(j, cell):
-            cj = CJ[j]
-            p = [cell]
-            while p[-1] != int(A[j]):
-                q = PRED[j][int(np.searchsorted(cj, p[-1]))]
+            """cells of the shortest route anchor -> cell inside chart j: followed in the chart's own index space (one
+            lookup in, one out) and mapped back to cell indices at the end"""
+            cj, pr = CJ[j], PRED[j]
+            goal = int(np.searchsorted(cj, A[j]))
+            q = int(np.searchsorted(cj, cell))
+            p = [q]
+            while q != goal:
+                q = int(pr[q])
                 if q < 0: return None
-                p.append(int(cj[q]))
-            return p[::-1]
+                p.append(q)
+            return cj[p[::-1]].tolist()
         h = self._h
         out = []
         for a, b, u, v, s, w in zip(arcs.a.tolist(), arcs.b.tolist(), arcs.p.tolist(), arcs.q.tolist(), arcs.s.tolist(),
@@ -885,7 +890,9 @@ class ChartGraph(SceneGraph):
         navigable space, or in another chart, falls back to the anchor of its chart). A route inside one chart reads the
         clearance at that chart's anchor as its width. Searches the chart corridor (the chart path and its neighbours) and returns
         what that finds; the whole graph only when the corridor finds nothing or an overlay is given. The corridor result is not
-        proved shortest: on 840 real pairs p90 1.00, worst 1.40 x the true shortest."""
+        proved shortest: on 840 real pairs p90 1.00, worst 1.40 x the true shortest. The path is minimal in integer cost
+        (`Route.cost`); among equal-cost paths it is the lexicographic minimum of its (y, x) cell sequence, so every reader of the
+        same cells returns the same route. `Route.length` is the geometric length of that path."""
         self._check()
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
@@ -902,32 +909,42 @@ class ChartGraph(SceneGraph):
             alive = ~bm[sp.ys, sp.xs]
         if not alive[src] or not alive[dst]: return None
 
+        W = self._cache.get("route_w")                       # integer edge cost: the length in units of ROUTE_UNIT_M, rounded up
+        if W is None:
+            W = self._cache["route_w"] = np.maximum(np.ceil(Ln / ROUTE_UNIT_M - 1e-6), 1.0)
+
         def search(allowed):
+            """(cost src -> dst, graph, distance of every cell to dst); all integers held exactly in float64"""
             ok = allowed[R] & allowed[C]
-            n_ = N
-            g = coo_matrix((np.concatenate([Ln[ok], Ln[ok]]), (np.concatenate([R[ok], C[ok]]), np.concatenate([C[ok], R[ok]]))),
-                           shape=(n_, n_)).tocsr()
-            d, pr = dijkstra(g, directed=False, indices=src, return_predecessors=True)
-            return d[dst], pr
+            g = coo_matrix((np.concatenate([W[ok], W[ok]]), (np.concatenate([R[ok], C[ok]]), np.concatenate([C[ok], R[ok]]))),
+                           shape=(N, N)).tocsr()
+            d = dijkstra(g, directed=False, indices=dst)
+            return d[src], g, d
         best = None
         keep = self._corridor_charts(ja, jb) if blocked is None else None   # an overlay can send the way outside any corridor
         if keep is not None:
-            allowed = alive & np.isin(s.full, list(keep))
-            dd, pr = search(allowed)
-            if np.isfinite(dd): best = (dd, pr)
+            best = search(alive & np.isin(s.full, list(keep)))
+            if not np.isfinite(best[0]): best = None
         if best is None:
-            dd, pr = search(alive)
-            if np.isfinite(dd): best = (dd, pr)
-        if best is None: return None
-        dd, pr = best
-        path = [dst]
-        while path[-1] != src: path.append(int(pr[path[-1]]))
-        path = path[::-1]
+            best = search(alive)
+            if not np.isfinite(best[0]): return None
+        cost, g, d = best
+        # Canonical path among the minimal-cost ones: from the start, the neighbour on a shortest path with the smallest cell
+        # index. Cells are row-major, so that is the lexicographic minimum of the (y, x) sequence of the path: a rule of the
+        # geometry alone (no chart key, history or implementation order), the same for any reader of the same cells.
+        path = [src]
+        while path[-1] != dst:
+            u = path[-1]
+            lo, hi = g.indptr[u], g.indptr[u + 1]
+            nb = g.indices[lo:hi]
+            path.append(int(nb[(g.data[lo:hi] + d[nb]) == d[u]].min()))
         charts: List[Key] = []
         for c in path:
             kk = s.keys[int(s.full[c])]
             if not charts or charts[-1] != kk: charts.append(kk)
-        return Route(charts=charts, length=float(dd), min_width=self._route_width(path, src),
+        pa = np.array(path)
+        length = float(np.hypot(np.diff(sp.ys[pa]), np.diff(sp.xs[pa])).sum() * self._h)
+        return Route(charts=charts, length=length, min_width=self._route_width(path, src), cost=int(cost),
                      nodes=[self._cell_xy(int(sp.ys[c]), int(sp.xs[c])) for c in path])
 
     def _route_width(self, path: List[int], src: int) -> float:

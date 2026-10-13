@@ -125,6 +125,8 @@ class Route:
     length: float
     min_width: float                   # narrowest passage along the route: per crossed chart pair its widest arc (slivers beside a passage do not count)
     nodes: List[Pt]                    # lattice path (map-frame centres)
+    cost: int = 0                      # integer path cost: the length in units of 1e-4 m, each edge rounded up. Among paths of equal
+                                       # cost the route is the lexicographic minimum of its (y, x) cell sequence (reproducible)
 
 
 @dataclass

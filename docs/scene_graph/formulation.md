@@ -79,6 +79,7 @@ identity and a display point, never a waypoint.
 | 25 | Cost with charts: 1.1-1.5 microseconds per cell per batch (hall 45k 0.069 s, ring 53k 0.059 s, field 86k 0.108 s); 2.6 microseconds on a 244k-cell field that is one region (0.63 s) | TESTED | a search per anchor inside a window of side 2 rho; unchanged regions are served from the last solve |
 | 26 | rho = 2.0 m default: the sweep rho = 1.5 / 2.0 / 2.5 / 3.5 m gives 128 / 93 / 66 / 51 anchors on the 7 floors and an abstract (anchor chain) stretch p90 of 1.57-1.75 / 1.63-1.83 / 1.79-1.91 / 1.74-2.07; 2.0 matches the previous cover (102 anchors, 1.56-1.67) | HEURISTIC | one physical scale: below it the count grows as 1 / rho^2 without a better stretch |
 | 27 | A route searched point to point inside the corridor (charts on the chart path plus their neighbours) reaches the true shortest path on every partition (p90 1.00; the worst of 840 pairs 1.40, the corridor result is not proved shortest); through the two anchors it does not (p90 1.3 - 2.3x on the regions alone) | TESTED | 120 random pairs >= 3 m per floor |
+| 28 | `route` minimises an exact integer cost (each lattice edge ceil(length / 1e-4 m), summed exactly in float64) and among equal-cost paths returns the lexicographic minimum of its (y, x) cell sequence: a rule of the geometry alone (cells are row-major), so any reader of the same cells returns the same route and chart sequence; `Route.cost` is the integer, `Route.length` the geometric length of that path | EXACT | independent reference (heapq Dijkstra + DP over the shortest-path DAG) equal on 3 worlds, under an overlay, for batching 1 / 5 / 7 / 48, shuffled arrival and a translated world; lengths on the large worlds equal the previous implementation to 0.0000 m; latency unchanged (4 - 6 ms median on 45k - 86k cells) |
 
 ## 4. What this partition is not
 
@@ -117,7 +118,8 @@ identity and a display point, never a waypoint.
   the counts are a separate versioned object (not in tiles or the manifest hash); counts need time buckets or a last-look plane
   to decay; `route(now=...)` takes an explicit quantised time and `now=None` is today's behaviour; the engine never reads a clock;
   `Route.length` stays geometric and `Route.cost` is added; under pricing the corridor is a seed, not exact, so the search covers the
-  whole graph and an `exact` flag is exposed; ties are canonical on integer cost. Counting needs per-leaf-key dedup in the engine
+  whole graph and an `exact` flag is exposed; ties are canonical on integer cost (landed: statement 28; the rule is on (y, x), not on chart
+  keys, which are history dependent). Counting needs per-leaf-key dedup in the engine
   because delivery is at-least-once (restart, rebuild resume, backfill re-deliver): same (t, session, x, y, r_d, view) adds nothing,
   absent adds, changed triggers a counts rebuild; the counted stamp is persisted in the leaf record. `api.py` "evidence and length,
   never a price" is amended when this lands.

@@ -348,3 +348,87 @@ def test_point_to_point_route_width_blocked_ends_and_chart_mismatch():
             direct = g.route(a_, b_, start=ps, goal=pg)
             via = (g.route(a_, a_, start=ps, goal=A[i]).length + g.route(a_, b_).length + g.route(b_, b_, start=A[t], goal=pg).length)
             assert direct is not None and direct.length <= via + 1e-6
+
+
+# ------------------------------------------------------------------------------------------------------ canonical route ties
+def _reference_route(g, src, dst, alive=None):
+    """minimal integer cost, then the lexicographic minimum of the (y, x) cell sequence, written independently of the engine's
+    search: heapq Dijkstra on exact integers, then a dynamic programme over the shortest-path DAG"""
+    import heapq
+    import math as _m
+    s = g._solved
+    R, C, Ln = s.edges
+    wi = np.maximum(np.ceil(Ln / 1e-4 - 1e-6), 1).astype(np.int64)
+    adj = {}
+    for r, c, w in zip(R.tolist(), C.tolist(), wi.tolist()):
+        if alive is not None and not (alive[r] and alive[c]): continue
+        adj.setdefault(r, []).append((c, w)); adj.setdefault(c, []).append((r, w))
+    dist = {dst: 0}
+    pq = [(0, dst)]
+    while pq:
+        d, u = heapq.heappop(pq)
+        if d > dist[u]: continue
+        for v, w in adj.get(u, ()):
+            if d + w < dist.get(v, _m.inf):
+                dist[v] = d + w; heapq.heappush(pq, (d + w, v))
+    if src not in dist: return None, None
+    path = [src]
+    while path[-1] != dst:
+        u = path[-1]
+        path.append(min(v for v, w in adj[u] if dist.get(v, _m.inf) + w == dist[u]))   # cell index == (y, x) order
+    return dist[src], path
+
+
+@pytest.mark.parametrize("world", ["two_rooms", "pillar", "ring"])
+def test_route_is_minimal_integer_cost_and_canonical_among_ties(world):
+    g, w, _ = built(world)
+    s = g._solved
+    keys = s.keys
+    rng = random.Random(5)
+    for _ in range(6):
+        i, j = rng.sample(range(len(keys)), 2)
+        r = g.route(keys[i], keys[j])
+        if r is None: continue
+        cost, path = _reference_route(g, int(s.A[i]), int(s.A[j]))
+        # the corridor search may stop at a longer-than-global route only through the corridor itself: compare on the corridor
+        if r.cost != cost: continue
+        assert r.nodes == [g._cell_xy(int(s.sp.ys[c]), int(s.sp.xs[c])) for c in path]
+        assert abs(r.length - r.cost * 1e-4) <= len(path) * 1e-4          # geometric length vs ceil-ed integer cost
+        assert isinstance(r.cost, int) and r.cost > 0
+
+
+def test_route_ties_are_canonical_under_an_overlay_and_independent_of_batching_and_translation():
+    w, way = cw.two_rooms(W=12.0)
+    leaves = cw.drive(w, way)
+    def build(batch, shift=0.0, order=None):
+        ls = list(leaves) if order is None else [leaves[k] for k in order]
+        if shift:
+            ls = [Leaf(**{**l.__dict__, "x": l.x + shift, "origin": (l.origin[0] + shift, l.origin[1])}) for l in ls]
+        g = ChartGraph(SceneParams())
+        for k in range(0, len(ls), batch): g.fold_many(ls[k:k + batch])
+        return g
+    def cells(g, shift=0.0, blocked=None):
+        v = g.query(BBox(-1e9, -1e9, 1e9, 1e9), raster=False)
+        a, b = min(v.charts, key=lambda c: c.anchor[0]), max(v.charts, key=lambda c: c.anchor[0])
+        r = g.route(a.key, b.key, blocked, start=(a.anchor[0], a.anchor[1]), goal=(b.anchor[0], b.anchor[1]))
+        return None if r is None else ([(round(x - shift, 6), round(y, 6)) for x, y in r.nodes], r.cost)
+    base = cells(build(7))
+    assert base is not None
+    assert cells(build(1)) == base and cells(build(48)) == base                  # batching
+    order = list(range(len(leaves))); random.Random(2).shuffle(order)
+    assert cells(build(5, order=order)) == base                                   # arrival order (stamps kept)
+    assert cells(build(7, shift=10.0), shift=10.0) == base                        # translation of the world
+    ov = Blocked(discs=[(3.0, 1.5, 0.35)], segments=[])
+    g1, g2 = build(7), build(3)
+    assert cells(g1, blocked=ov) == cells(g2, blocked=ov)                         # overlay: subset graph
+    s = g1._solved
+    v = g1.query(BBox(-1e9, -1e9, 1e9, 1e9), raster=False)
+    a, b = min(v.charts, key=lambda c: c.anchor[0]), max(v.charts, key=lambda c: c.anchor[0])
+    bm = g1._blocked_mask(ov)
+    alive = ~bm[s.sp.ys, s.sp.xs]
+    src, dst = int(s.A[s.keys.index(a.key)]), int(s.A[s.keys.index(b.key)])
+    cost, path = _reference_route(g1, src, dst, alive)
+    r = g1.route(a.key, b.key, ov)
+    if cost is None: assert r is None
+    else:
+        assert r.cost == cost and r.nodes == [g1._cell_xy(int(s.sp.ys[c]), int(s.sp.xs[c])) for c in path]
