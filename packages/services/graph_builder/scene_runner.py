@@ -152,7 +152,10 @@ class SceneRunner:
         resident, total, unknown = 0, 0, 0
         for map_id in list(self._known):
             at = self._last_step_at.get(map_id)
+            settled = getattr(self._workers.get(map_id), "settled", None)
             entry: Dict[str, Any] = {"state": self.last_state.get(map_id),
+                                     "settled": bool(settled()) if callable(settled)
+                                     and map_id not in self._inflight else False,
                                      "last_step_age_s": None if at is None else round(max(0.0, now - at), 1)}
             worker = self._workers.get(map_id)
             stats = getattr(worker, "stats", None)

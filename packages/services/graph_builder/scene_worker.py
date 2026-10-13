@@ -277,6 +277,7 @@ class StepResult:
     version: Optional[int] = None           # set when this step saved
     sleep_s: float = 0.0
     detail: str = ""
+    settled: bool = False                   # IDLE and truly caught up: see SceneWorker.settled()
 
 
 @dataclass
@@ -462,6 +463,7 @@ class SceneWorker:
         self._cursor: Cursor = ZERO_CURSOR           # committed (durable) cursor
         self._candidate: Cursor = ZERO_CURSOR        # furthest processed, waiting for a save
         self._scan: Optional[Cursor] = None          # position inside a multi-page scan
+        self._dup_counted: Dict[str, int] = {}       # key -> stored_ms already counted in stats.duplicates
         self._seen: Dict[str, int] = {}              # key -> stored_ms already handled terminally
         self._pending: Dict[str, _Pending] = {}      # key -> node whose PNG is confirmed missing
         self._idle_streak = 0                        # consecutive idle steps (idle sleep backoff)
@@ -557,6 +559,17 @@ class SceneWorker:
         """No engine in memory: the next fold (or this step, for a worker that was never started) loads
         one. The runner admits only some of these at a time so loads never take every thread."""
         return self.engine is None and self.state not in TERMINAL
+
+    def settled(self) -> bool:
+        """Caught up for good: running, the last scan reached the newest node, and nothing is buffered,
+        waiting for a PNG, prefetched, holding a stamp, folded-but-unsaved or mid-rebuild. An IDLE step
+        alone does not mean this (a trickle leaf waits for its batch, a PNG is retried, a save is
+        rate limited): use this to decide "everything ingested"."""
+        return (self._started and self.state not in TERMINAL
+                and self._head and not self._buf and not self._buffered and not self._pending
+                and not self._tickets and not self._new_stamps and self._dirty is None
+                and self.stats.unsaved_leaves == 0 and self._rebuild_gen is None
+                and self._scan is None)
 
     def evictable(self) -> bool:
         """An engine is held and dropping it loses nothing but the load time: nothing is buffered, waiting
@@ -769,7 +782,8 @@ class SceneWorker:
             if waiting and self._buf_since_ms is not None:     # a trickle: wake when its wait is up
                 left = self._batch_wait_s() - (self._mono() - self._buf_since_ms) / 1000.0
                 sleep = min(sleep, max(left, 0.05))
-        return StepResult(state, folded=folded, skipped=skipped, version=saved, sleep_s=sleep)
+        return StepResult(state, folded=folded, skipped=skipped, version=saved, sleep_s=sleep,
+                          settled=state == IDLE and self.settled())
 
     # ------------------------------------------------------------------ internals
 
@@ -1219,6 +1233,7 @@ class SceneWorker:
         self._buf.clear()
         self._buffered.clear()
         self._seen.clear()
+        self._dup_counted.clear()
         self._known, self._known_off = None, True      # the engine is new or rewound: fold everything again
         self._pending.clear()
         self._idle_streak = 0
@@ -1276,7 +1291,9 @@ class SceneWorker:
         if key in self._pending and not retry:  # asked again by _retry_pending, on its own clock
             return "duplicate"
         if self._seen.get(key) == ms:
-            self.stats.duplicates += 1
+            if self._dup_counted.get(key) != ms:    # each node (key, stored_ms) counts once, not per poll
+                self._dup_counted[key] = ms
+                self.stats.duplicates += 1
             return "duplicate"
         layer = scene_leaf.role_layers(node.get("costmap")).get(scene_leaf.ROLE_OCCUPANCY)
         if not layer:
@@ -1515,6 +1532,9 @@ class SceneWorker:
         floor = self._candidate[0] - cfg.replay_margin_ms
         for key in [k for k, ms in self._seen.items() if ms < floor]:
             del self._seen[key]
+            self._dup_counted.pop(key, None)
+        for key in [k for k in self._dup_counted if k not in self._seen]:
+            del self._dup_counted[key]
         return skipped, error
 
     def _keep_stamps(self) -> Optional[StepResult]:

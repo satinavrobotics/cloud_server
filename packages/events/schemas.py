@@ -423,6 +423,7 @@ class SceneGraphUpdated(Payload):
     version: int
     leaves_folded: Optional[int] = None
     charts_changed: Optional[int] = None
+    skipped: Optional[Dict[str, int]] = None    # terminal skip reasons counted so far (worker stats)
 
 
 class SceneGraphFoldFailed(Payload):
@@ -445,6 +446,7 @@ class SceneGraphRebuild(Payload):
     reason: str
     version: Optional[int] = None
     duration_s: Optional[float] = None
+    resumed: Optional[bool] = None      # STARTED: continued a saved pending generation
 
 
 class SceneGraphSkipped(Payload):
