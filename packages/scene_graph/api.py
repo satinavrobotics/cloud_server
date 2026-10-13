@@ -6,7 +6,8 @@ No I/O here (see `store.py`), no config import.
 
 Terms: a **chart** is the set of free cells owned by one anchor (the mcmap); every cell of it is a straight drive from
 its anchor. A **link** joins two charts that share boundary. A chart **key** never changes while the chart lives.
-The graph carries evidence and length, never a price: consumers weigh channels themselves.
+The graph carries evidence and length. A consumer may ask `route` to price clearance with `Safety` (docs/scene_graph/route_safety.md);
+pricing of observation rates (counts, posterior) is not built: consumers weigh those channels themselves.
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -129,6 +130,21 @@ class Route:
                                        # cost the route is the lexicographic minimum of its (y, x) cell sequence (reproducible)
 
 
+@dataclass(frozen=True)
+class Safety:
+    """Clearance pricing of a route. With deficit d(c) = max(0, margin - g(c)) (g: physical clearance of lattice cell c, m), an edge of
+    Euclidean length l between cells a and b costs l * (1 + rate * (d(a) + d(b)) / 2). `margin` (m) is the clearance from which a
+    cell is free of charge; `rate` (1/m) the cost multiplier per metre of deficit. rate = 0 is the unpriced route, identical to `safety=None`."""
+    margin: float
+    rate: float
+
+    def __post_init__(self):
+        if not self.margin > 0.0:
+            raise ValueError("Safety.margin must be > 0, got %r" % (self.margin,))
+        if not self.rate >= 0.0:
+            raise ValueError("Safety.rate must be >= 0, got %r" % (self.rate,))
+
+
 @dataclass
 class Blocked:
     discs: List[Tuple[float, float, float]] = field(default_factory=list)            # x, y, radius
@@ -181,11 +197,20 @@ class SceneGraph:
         raise NotImplementedError
 
     def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Pt] = None,
-              goal: Optional[Pt] = None) -> Optional[Route]:
+              goal: Optional[Pt] = None, safety: Optional[Safety] = None) -> Optional[Route]:
         """Lattice route in navigable space between charts a and b; None when unreachable. It runs from the anchor of a to
         the anchor of b, unless `start` / `goal` (map-frame points, e.g. a Snap's x, y) name the cells to route between:
         then the route is point to point and no anchor is visited. A point outside navigable space, or in a chart other than
-        a / b, falls back to the anchor of its chart. A chart is large, its anchor is not on the way."""
+        a / b, falls back to the anchor of its chart. A chart is large, its anchor is not on the way.
+
+        The route minimises the objective J, the sum of the integer edge costs (units of 1e-4 m, each edge rounded up):
+        its Euclidean length, or with `safety` the length priced by the clearance deficit (see `Safety`). `Route.cost` is
+        the integer value of J, `Route.length` the geometric length of the path. `safety=None` is the unpriced route."""
+        raise NotImplementedError
+
+    def deficit_cell(self, ix: int, iy: int, margin: float) -> Optional[float]:
+        """max(0, margin - g) for the navigable global lattice cell (ix, iy) (centre ((ix + .5) h, (iy + .5) h)), g its physical
+        clearance (m); None when the cell is not navigable."""
         raise NotImplementedError
 
     def query(self, bbox: BBox, level: int = 0, raster: bool = True, parents: bool = True) -> ViewResult:

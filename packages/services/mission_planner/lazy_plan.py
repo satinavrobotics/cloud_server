@@ -25,6 +25,9 @@ Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.
   implies): the optimum is never longer, so the answer is unchanged and the graph built is smaller;
 * tile reads are single flight per tile (no global lock); a tile that cannot be read raises `TileUnavailable` and flags
   the graph (`unavailable`) for `GraphCache` to drop;
+* with `safety` (clearance pricing, `docs/scene_graph/route_safety.md`) the corridor is a seed as under an overlay: the answer is
+  the search of the charts that can hold a path of cost <= J_corridor; the clearance comes from the `v` planes of the tile and
+  its 8 neighbours (exact up to one tile of halo, 6.4 m);
 * `max_tiles` caps a request: a bigger corridor raises `CorridorTooLarge` (the planner falls back to the legacy one).
 
 It reads `StoredView` internals (`_own`, `_cache`, `_idx`); that is the cost of a LACI-only phase. Phase 1 gives these
@@ -39,14 +42,17 @@ from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
+from scipy import ndimage
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from packages.scene_graph.api import Blocked, Route, Snap
+from packages.scene_graph.api import Blocked, Route, Safety, Snap
 
 ROUTE_UNIT_M = 1e-4              # route cost unit (packages/scene_graph/engine.py)
 RES = 0.05                      # costmap cell; the lattice is 2 x RES (store.py)
 TILE_L = 64                     # lattice cells per tile side (store.py)
+TILE_F = 2 * TILE_L             # costmap cells per tile side
+_CLR_CAP_M = TILE_F * RES       # clearance is exact up to the halo of one tile (S9 of docs/scene_graph/route_safety.md); capped here
 _OFF = 1 << 20                  # linear cell keys: (y + _OFF) * _KW + (x + _OFF), neighbours never wrap
 _KW = 1 << 21
 
@@ -154,6 +160,9 @@ class PlanGraph:
                                                                     np.concatenate([ab[pos, 1], ab[pos, 0]]))), shape=(k, k))
         self._g.sort_indices()       # the engine's dense matrix reaches Dijkstra with sorted columns: same tie-breaks
         self.last: Dict[str, Any] = {}
+        self._clr: "OrderedDict[Tuple[int, int], np.ndarray]" = OrderedDict()   # tile -> clearance (m, capped) of its lattice cells
+        self._clr_max = max(8, int(tile_cache))
+        self._clr_lock = threading.Lock()       # guards the dict only: the computation is pure and may run twice
 
     # ---- plumbing ----------------------------------------------------------------------------
     @property
@@ -210,6 +219,52 @@ class PlanGraph:
         if t is None or "own" not in t:
             return False
         return bool(t["own"][iy % TILE_L, ix % TILE_L] > 0)
+
+    # ---- clearance (route pricing) ---------------------------------------------------------------
+    def _clearance_tile(self, tx: int, ty: int) -> np.ndarray:
+        """[TILE_L, TILE_L] physical clearance (m, capped at `_CLR_CAP_M`) of the lattice cells of tile (tx, ty): the engine's
+        `sp.clr` (distance to the nearest blocked or unknown costmap cell, sampled at the even costmap cell) from the stored `v`
+        planes of the tile and its 8 neighbours; an absent tile is unknown, hence blocked."""
+        with self._clr_lock:
+            hit = self._clr.get((tx, ty))
+            if hit is not None:
+                self._clr.move_to_end((tx, ty))
+                return hit
+        free = np.zeros((3 * TILE_F, 3 * TILE_F), bool)
+        for j in range(3):
+            for i in range(3):
+                t = self._tile(tx + i - 1, ty + j - 1)
+                if t is not None and "v" in t:
+                    v = t["v"]
+                    free[j * TILE_F:(j + 1) * TILE_F, i * TILE_F:(i + 1) * TILE_F] = (v != 255) & (v < 100)
+        dt = ndimage.distance_transform_edt(free) * RES
+        out = np.minimum(dt[TILE_F:2 * TILE_F:2, TILE_F:2 * TILE_F:2], _CLR_CAP_M)
+        out.flags.writeable = False
+        with self._clr_lock:
+            self._clr[(tx, ty)] = out
+            while len(self._clr) > self._clr_max:
+                self._clr.popitem(last=False)
+        return out
+
+    def _clearance(self, ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
+        """clearance (m, capped) of the global lattice cells (ys, xs)"""
+        out = np.empty(len(ys))
+        ty, tx = ys // TILE_L, xs // TILE_L
+        code = (ty + _OFF) * _KW + (tx + _OFF)
+        for c in np.unique(code):
+            m = code == c
+            i = int(np.nonzero(m)[0][0])
+            out[m] = self._clearance_tile(int(tx[i]), int(ty[i]))[ys[m] % TILE_L, xs[m] % TILE_L]
+        return out
+
+    def deficit_cell(self, ix: int, iy: int, margin: float) -> Optional[float]:
+        """max(0, margin - g) of the navigable global lattice cell (ix, iy), None when it is not navigable (as the engine's;
+        exact for margin <= `_CLR_CAP_M`)."""
+        t = self._tile(ix // TILE_L, iy // TILE_L)
+        if t is None or "own" not in t or not t["own"][iy % TILE_L, ix % TILE_L] > 0:
+            return None
+        g = float(self._clearance_tile(ix // TILE_L, iy // TILE_L)[iy % TILE_L, ix % TILE_L])
+        return max(0.0, float(margin) - g)
 
     # ---- stage 1 -----------------------------------------------------------------------------
     def _path(self, ja: int, jb: int) -> Optional[List[int]]:
@@ -316,10 +371,13 @@ class PlanGraph:
                 out.append((tx, ty))
         return out
 
-    def _search(self, keep: Set[int], src_cell, dst_cell, blocked: Optional[Blocked], limit: Optional[float] = None):
-        """(length, path as (chart, y, x) rows, tiles) of the lattice route inside `keep`, or None. `limit`, when given,
+    def _search(self, keep: Set[int], src_cell, dst_cell, blocked: Optional[Blocked], limit: Optional[float] = None,
+                safety: Optional[Safety] = None, jlimit: Optional[float] = None):
+        """(length, path as (chart, y, x) rows, tiles, cost) of the lattice route inside `keep`, or None. `limit`, when given,
         is a proved upper bound of the answer (a route of that length exists in `keep`): cells and tiles that no route
-        of that length can use are left out and Dijkstra stops there; the answer, and its tie-breaks, are unchanged."""
+        of that length can use are left out and Dijkstra stops there; the answer, and its tie-breaks, are unchanged.
+        With `safety` the edge cost is the priced one (as `ChartGraph._edge_cost`); `limit` is then the geometric bound
+        (metres) and `jlimit` the bound of the cost J (integer units) that Dijkstra stops at."""
         tiles = self._tiles_for(keep)
         if limit is not None:
             a, b = self._centre(src_cell), self._centre(dst_cell)
@@ -348,7 +406,7 @@ class PlanGraph:
         def at(k):                                         # position of linear keys in `key` (-1 absent)
             p = np.minimum(np.searchsorted(key, k), n - 1)
             return np.where(key[p] == k, p, -1)
-        R, C, Ln = [], [], []
+        R, C, Ln, Lm = [], [], [], []
         mi = np.nonzero(member)[0]
         base = key[mi]
         for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
@@ -362,8 +420,14 @@ class PlanGraph:
             R.append(node[mi[a]]); C.append(node[q[a]])
             # the engine's integer edge cost (engine.ROUTE_UNIT_M): length in units of 1e-4 m, rounded up
             Ln.append(np.full(len(a), max(math.ceil(math.hypot(dy, dx) * h / ROUTE_UNIT_M - 1e-6), 1.0)))
+            if safety is not None:
+                Lm.append(np.full(len(a), math.hypot(dy, dx) * h))
         R, C, Ln = np.concatenate(R), np.concatenate(C), np.concatenate(Ln)
         nm = len(mi)
+        if safety is not None:
+            # priced edge cost, the same float operations as ChartGraph._edge_cost
+            dn = np.maximum(0.0, safety.margin - self._clearance(ys[mi], xs[mi]))
+            Ln = np.maximum(np.ceil(np.concatenate(Lm) / ROUTE_UNIT_M * (1.0 + safety.rate * (dn[R] + dn[C]) / 2.0) - 1e-6), 1.0)
 
         def find(cell):
             p = int(at(np.array([(cell[0] + _OFF) * _KW + (cell[1] + _OFF)], np.int64))[0])
@@ -375,8 +439,8 @@ class PlanGraph:
         # one Dijkstra from the goal, then the canonical walk from the start (engine.ChartGraph.route): the neighbour on a
         # shortest path with the smallest cell index; nodes are in row-major (y, x) order, so this is the lexicographic
         # minimum of the (y, x) sequence among the minimal-cost paths.
-        dist = dijkstra(g, directed=False, indices=d,
-                        **({} if limit is None else {"limit": limit / ROUTE_UNIT_M + 1.0}))
+        stop = jlimit if jlimit is not None else (None if limit is None else limit / ROUTE_UNIT_M + 1.0)
+        dist = dijkstra(g, directed=False, indices=d, **({} if stop is None else {"limit": stop}))
         if not np.isfinite(dist[s]):
             return None
         path = [s]
@@ -392,8 +456,12 @@ class PlanGraph:
 
     # ---- route -------------------------------------------------------------------------------
     def route(self, a: str, b: str, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
-              goal: Optional[Tuple[float, float]] = None) -> Optional[Route]:
-        """`ChartGraph.route` from the stored tiles it needs (see the module docstring for the differences)."""
+              goal: Optional[Tuple[float, float]] = None, safety: Optional[Safety] = None) -> Optional[Route]:
+        """`ChartGraph.route` from the stored tiles it needs (see the module docstring for the differences). With `safety`
+        the objective is the priced cost J (`Route.cost`): the corridor route is the seed, the answer the search of the
+        charts that can hold a path of cost <= J_corridor (length <= J_corridor * 1e-4 m, S10), like an overlay."""
+        if safety is not None and safety.rate == 0.0:
+            safety = None                                        # no price: today's route, the corridor included (S8)
         ja, jb = self._index.get(a), self._index.get(b)
         if ja is None or jb is None:
             return None
@@ -405,23 +473,28 @@ class PlanGraph:
         found, rings, whole, exact, tiles = None, 0, path is None, True, 0
         if path is not None:
             for hops in ((1, 2, 3) if overlay else (1,)):     # the engine's corridor; under an overlay widen until one exists
-                rings, found = hops, self._search(self._rings(path, hops), src, dst, blocked)
+                rings, found = hops, self._search(self._rings(path, hops), src, dst, blocked, safety=safety)
                 if found is not None or not overlay:
                     break
-            if overlay and found is not None:
+            if (overlay or safety is not None) and found is not None:
                 # The engine searches every chart. Any route of length <= L lies in the charts whose anchors are within
                 # |a - p| + |p - b| <= L + 2 (chart radius + lattice) (a lattice step is at least the Euclidean one):
-                # search those, the answer is the engine's.
-                slack = 1 + ROUTE_UNIT_M / float(self.params.lattice)   # a min-cost path may be this much longer than found
-                keep = self._ellipse(src, dst, found[0] * slack) | self._rings(path, rings)
+                # search those, the answer is the engine's. Under `safety` L is J_corridor * 1e-4 (J >= length / 1e-4, S7).
+                if safety is None:
+                    slack = 1 + ROUTE_UNIT_M / float(self.params.lattice)   # a min-cost path may be this much longer than found
+                    bound, jlimit = found[0] * slack, None
+                else:
+                    bound, jlimit = found[3] * ROUTE_UNIT_M, found[3] * (1 + 1e-9) + 1e-9
+                keep = self._ellipse(src, dst, bound) | self._rings(path, rings)
                 try:
-                    # the corridor's own route (length found[0]) is in `keep`: it bounds the optimum from above
-                    found = self._search(keep, src, dst, blocked, limit=found[0] * slack * (1 + 1e-9) + 1e-9) or found
+                    # the corridor's own route is in `keep`: it bounds the optimum from above
+                    found = self._search(keep, src, dst, blocked, limit=bound * (1 + 1e-9) + 1e-9, safety=safety,
+                                         jlimit=jlimit) or found
                 except CorridorTooLarge:
                     exact = False                              # the corridor's route stands: valid, maybe longer
         if found is None:
             whole = True                                       # nothing in the corridor: the engine searches every chart
-            found = self._search(set(range(len(self.keys))), src, dst, blocked)
+            found = self._search(set(range(len(self.keys))), src, dst, blocked, safety=safety)
         if found is not None:
             tiles = found[2]
         self.last = dict(rings=rings, whole=whole, exact=exact, tiles=tiles)

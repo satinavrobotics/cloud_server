@@ -12,7 +12,7 @@
              regions, and the line integral of every channel along that route.
     levels   coarser partitions by merging adjacent regions of persistence below tau_0 * 2^j (nested by construction); a pure
              function of the charts' clearance and the links' width (morse.levels), so a stored version answers the same.
-The graph carries evidence and length, never a price. Pure numpy / scipy, no I/O.
+The graph carries evidence and length; `route` can price clearance (api.Safety). Pure numpy / scipy, no I/O.
 
 Not implemented here: sparse / tiled in-memory planes (one dense canvas that grows), local F construction (F and the partition
 are rebuilt for the whole canvas per batch), persistence (store.py), the leaf-delete winner plane (refold rebuilds the bbox
@@ -30,7 +30,7 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, SceneGraph,
+from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
                   SceneParams, Snap, ViewResult)
 from . import morse
 from .chart_keys import assign_A, overlaps
@@ -884,7 +884,7 @@ class ChartGraph(SceneGraph):
         return c if c >= 0 else None
 
     def route(self, a: Key, b: Key, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
-              goal: Optional[Tuple[float, float]] = None) -> Optional[Route]:
+              goal: Optional[Tuple[float, float]] = None, safety: Optional[Safety] = None) -> Optional[Route]:
         """Shortest lattice route in navigable space (blocked cells removed) between the anchors of charts a and b, or, when
         `start` / `goal` name a navigable cell of chart a / b, between those cells (no anchor is visited; a point outside
         navigable space, or in another chart, falls back to the anchor of its chart). A route inside one chart reads the
@@ -892,8 +892,11 @@ class ChartGraph(SceneGraph):
         what that finds; the whole graph only when the corridor finds nothing or an overlay is given. The corridor result is not
         proved shortest: on 840 real pairs p90 1.00, worst 1.40 x the true shortest. The path is minimal in integer cost
         (`Route.cost`); among equal-cost paths it is the lexicographic minimum of its (y, x) cell sequence, so every reader of the
-        same cells returns the same route. `Route.length` is the geometric length of that path."""
+        same cells returns the same route. `Route.length` is the geometric length of that path.
+        With `safety` the edge cost is the length priced by the clearance deficit (`_edge_cost`), J = `Route.cost`; the corridor
+        is then not used (it is a length bound, not a bound of J): the whole graph is searched."""
         self._check()
+        if safety is not None and safety.rate == 0.0: safety = None          # no price: today's route, the corridor included (S8)
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
         sp = s.sp; ja, jb = s.keys.index(a), s.keys.index(b)
@@ -909,9 +912,16 @@ class ChartGraph(SceneGraph):
             alive = ~bm[sp.ys, sp.xs]
         if not alive[src] or not alive[dst]: return None
 
-        W = self._cache.get("route_w")                       # integer edge cost: the length in units of ROUTE_UNIT_M, rounded up
-        if W is None:
-            W = self._cache["route_w"] = np.maximum(np.ceil(Ln / ROUTE_UNIT_M - 1e-6), 1.0)
+        if safety is None:
+            W = self._cache.get("route_w")                   # integer edge cost: the length in units of ROUTE_UNIT_M, rounded up
+            if W is None:
+                W = self._cache["route_w"] = np.maximum(np.ceil(Ln / ROUTE_UNIT_M - 1e-6), 1.0)
+        else:
+            key = (safety.margin, safety.rate)
+            hit = self._cache.get("route_ws")                # only the last (margin, rate) is kept
+            if hit is None or hit[0] != key:
+                hit = self._cache["route_ws"] = (key, self._edge_cost(s, safety))
+            W = hit[1]
 
         def search(allowed):
             """(cost src -> dst, graph, distance of every cell to dst); all integers held exactly in float64"""
@@ -921,7 +931,8 @@ class ChartGraph(SceneGraph):
             d = dijkstra(g, directed=False, indices=dst)
             return d[src], g, d
         best = None
-        keep = self._corridor_charts(ja, jb) if blocked is None else None   # an overlay can send the way outside any corridor
+        # an overlay can send the way outside any corridor, and so can a price
+        keep = self._corridor_charts(ja, jb) if blocked is None and safety is None else None
         if keep is not None:
             best = search(alive & np.isin(s.full, list(keep)))
             if not np.isfinite(best[0]): best = None
@@ -946,6 +957,26 @@ class ChartGraph(SceneGraph):
         length = float(np.hypot(np.diff(sp.ys[pa]), np.diff(sp.xs[pa])).sum() * self._h)
         return Route(charts=charts, length=length, min_width=self._route_width(path, src), cost=int(cost),
                      nodes=[self._cell_xy(int(sp.ys[c]), int(sp.xs[c])) for c in path])
+
+    @staticmethod
+    def _edge_cost(s: "_Solved", safety: Safety) -> np.ndarray:
+        """Integer edge cost under `safety`: ceil(l / unit * (1 + rate * (d(a) + d(b)) / 2) - 1e-6), at least 1, with the deficit
+        d = max(0, margin - clearance) of the edge's cells. With rate 0 it is the unpriced cost (the same float operations)."""
+        R, C, Ln = s.edges
+        d = np.maximum(0.0, safety.margin - s.sp.clr)
+        return np.maximum(np.ceil(Ln / ROUTE_UNIT_M * (1.0 + safety.rate * (d[R] + d[C]) / 2.0) - 1e-6), 1.0)
+
+    def deficit_cell(self, ix: int, iy: int, margin: float) -> Optional[float]:
+        """max(0, margin - g) of the navigable global lattice cell (ix, iy), None when it is not navigable (api.SceneGraph)."""
+        self._check()
+        s = self._solved
+        if s is None: return None
+        sp = s.sp
+        y, x = iy - self._cy0 // 2, ix - self._cx0 // 2
+        if not (0 <= y < sp.H and 0 <= x < sp.W): return None
+        c = int(sp.idx[y, x])
+        if c < 0: return None
+        return max(0.0, float(margin) - float(sp.clr[c]))
 
     def _route_width(self, path: List[int], src: int) -> float:
         """Passage width of a route: the narrowest crossing of the chart sequence, each pair of consecutive charts taken at its
