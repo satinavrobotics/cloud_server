@@ -1,4 +1,4 @@
-"""GraphCache in lazy mode (SCENE_GRAPH_PLANNER_MODE=lazy): opens a `PlanGraph` (manifest only), caches it per version,
+"""GraphCache in lazy mode (what the service always uses): opens a `PlanGraph` (manifest only), caches it per version,
 `blocked_free_los` asks it `free_cell`, and a graph that could not read a tile is dropped so the next `get` re-opens the
 map's current version."""
 import pytest

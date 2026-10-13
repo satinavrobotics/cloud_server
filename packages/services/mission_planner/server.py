@@ -122,7 +122,7 @@ class MissionPlannerService:
             max_stale_s=config.SCENE_GRAPH_MAX_VERSION_LAG_S,
             meta_ttl_s=config.SCENE_GRAPH_META_TTL_S,
             max_bytes=config.SCENE_GRAPH_CACHE_MAX_BYTES,
-            lazy=config.SCENE_GRAPH_PLANNER_MODE == "lazy",
+            lazy=True,
             lazy_kw=dict(max_tiles=config.SCENE_GRAPH_LAZY_MAX_TILES,
                          tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE))
         self._plan_pool = scene_route.BoundedPool(
