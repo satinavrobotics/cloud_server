@@ -18,7 +18,7 @@ that code next to the engine.
 * **Engine order matters**: chart indices must follow `manifest["order"]` (engine order), not the id-sorted charts:
   Dijkstra ties break by index (3 of 64 chart paths differed on the ring world before).
 * **Overlay**: the engine searches every chart; the lazy reader searches the charts whose anchors lie in the ellipse
-  `|a-p|+|p-b| <= L + 2 (0.4 sight + h)` for the corridor's length L, which holds every route of length <= L
+  `|a-p|+|p-b| <= L + 2 (reach + h)`, reach = 2 x chart_radius (a chart's cells lie within its diameter of the anchor), for the corridor's length L, which holds every route of length <= L
   (exact, not a heuristic). Costly when the corridor is badly blocked (150 m world: 309 tiles, 0.8 s).
 * **min_width** equals the engine where the chart pair has a link; a diagonal-only contact reads the charts' anchor
   clearance (needs the clearance plane, Phase 3).
