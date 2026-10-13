@@ -462,3 +462,95 @@ def test_a_stale_pending_of_other_params_is_discarded_not_extended_real_store():
     meta = store.meta("m")
     assert w2.stats.rebuilds == 1 and meta["generation"] > stale_gen
     assert w2.stats.folded >= len(NODES) - 1       # folded from zero into an empty generation
+
+
+# ---- engine contract: LeafError / EngineFaulted / begun_ms, against the REAL engine and store
+
+def test_real_engine_rejects_an_oversize_leaf_by_key_and_the_worker_quarantines_it():
+    import dataclasses
+    import numpy as np
+    huge = dataclasses.replace(LEAVES[0], key="huge", window_u8=np.full((500, 500), 255, np.uint8))
+    nodes = NODES + [ts.node_of(huge, len(NODES))]
+    by_key = dict(BY_KEY, huge=huge)
+    events = []
+    store = real_store()
+    eng = ChartGraph(SceneParams())
+    w = worker(store, ts.Source(nodes), eng, fetch=lambda m, k, layer: ts.png(by_key[k].window_u8),
+               on_event=lambda k, p: events.append((k, p)),
+               cfg=sw.WorkerConfig(batch_size=len(nodes), min_save_interval_s=0, save_every_leaves=1))
+    assert drive(w).state == sw.IDLE
+    assert eng.faulted is None and w.engine is eng            # a rejected leaf touches nothing
+    assert w.stats.skipped[sw.SKIP_FOLD_ERROR] == 1
+    assert any(k == "fold_failed" and p["stage"] == "poison_leaf" and "huge" in p["detail"] for k, p in events)
+    assert w.stats.folded == len(LEAVES)
+    assert ts.shape(store.load("m")) == ts.shape(ts.direct(LEAVES))
+
+
+def test_real_engine_fault_is_recovered_by_reloading_from_the_real_store():
+    half = len(NODES) // 2
+    src = ts.Source(NODES[:half])
+    store = real_store()
+    loads = []
+
+    def factory(v):
+        loads.append(v)
+        return store.load("m", v)
+    cfg = sw.WorkerConfig(batch_size=10, min_save_interval_s=0, save_every_leaves=1)
+    w = worker(store, src, ChartGraph(SceneParams()), engine_factory=factory, cfg=cfg)
+    assert drive(w).state == sw.IDLE
+    first = w.engine
+
+    def boom(*a, **k):
+        raise RuntimeError("solver blew up")
+    first._mutate = boom
+    for n in NODES[half:]:
+        src.nodes[n["_key"]] = n
+    res = w.step()
+    assert res.state == sw.BACKOFF and first.faulted is not None
+    assert w.engine is not first and w.engine.faulted is None and loads == [store.meta("m")["version"]]
+    assert drive(w).state == sw.IDLE
+    assert w.stats.fold_failures == 0
+    assert ts.shape(store.load("m")) == ts.shape(ts.direct(LEAVES))
+
+
+def test_real_store_resume_of_a_delete_triggered_rebuild_follows_begun_ms():
+    from tests.unit.test_scene_worker import RequestGuard
+    be = MemoryBackend()
+    now = [ts.T0 + 10_000_000]
+    store = SceneGraphStore(be, be, clock=lambda: now[0] / 1000.0)
+    src = ts.Source(NODES)
+    p2 = SceneParams(robot_half_side=0.3)
+    clock = now
+
+    def rebuilder(request):
+        g = RequestGuard()
+        g.request = request
+        return _params_rebuild_worker_g(store, src, p2, clock, g)
+
+    drive(worker(store, src, ChartGraph(SceneParams()), clock=clock))
+    # a delete request made BEFORE the rebuild began; the worker's own wall clock is the store's
+    import datetime
+    at = datetime.datetime.fromtimestamp((now[0] - 5_000) / 1000.0, datetime.timezone.utc).isoformat()
+    req = {"at": at, "reason": "nodes_deleted", "nodes": 1}
+    w1 = rebuilder(req)
+    for _ in range(3):
+        w1.step()
+    pend = store.meta("m")["pending"]
+    assert pend["begun_ms"] == now[0] and pend["cursor"] is not None and w1.stats.rebuilds == 0
+    w1.guard.release("m")
+    now[0] += 60_000                                  # young: resumed
+    w2 = rebuilder(req)
+    w2.step()
+    assert w2._resume_cursor is not None and tuple(w2._resume_cursor) == tuple(pend["cursor"])
+    w2.guard.release("m")
+    now[0] += 1_000_000                               # older than rebuild_max_age_s: restarted from nothing
+    w3 = rebuilder(req)
+    w3.step()
+    assert w3._resume_cursor is None
+    assert drive(w3).state == sw.IDLE and w3.stats.rebuilds == 1
+
+
+def _params_rebuild_worker_g(store, src, p2, clock, guard):
+    return worker(store, src, ChartGraph(SceneParams()), new_engine=lambda: ChartGraph(p2), clock=clock, guard=guard,
+                  cfg=sw.WorkerConfig(batch_size=4, min_save_interval_s=0, save_every_leaves=1, rebuild_batch=4,
+                                      rebuild_debounce_s=0, expected_params_hash=scene_host.expected_params_hash(p2)))

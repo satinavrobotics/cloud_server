@@ -20,6 +20,13 @@ Per step
        stays below the oldest, so a restart re-reads it. A fetch that RAISES (MinIO down) is not a
        verdict: the step stops reading at that node and backs off, nothing past it is handled.
     4. one `engine.fold_many(leaves)` per batch; `MissingTiles` -> load tiles, retry once.
+       `LeafError` (validation, nothing mutated): the leaf it names is quarantined at once and the
+       rest folded (no key of the batch: bisected). Any other exception (`EngineFaulted`, a solver
+       error: the engine is undefined): the engine is dropped, reloaded from the store at the live
+       version (or from the saved pending generation of a rebuild) and the leaves since the
+       durable cursor are read again; `load_fail_limit` faults in a row without a good fold fall
+       into a rebuild, a fault inside that rebuild (or no way to rebuild) ends in NEEDS_REBUILD.
+       `MemoryError` (nothing changed) is a plain backoff.
     5. publish = `store.save(...)`, rate limited (every N leaves / T seconds / on idle, never
        faster than a minimum interval). The version exists only as the return of save.
     6. `publish(version, dirty)` callback with the Dirty merged since the last save.
@@ -61,6 +68,13 @@ version (a load that raced the lock) is reloaded through the factory. `engine.ve
 fold counter of the engine and is NOT compared with the store's snapshot version (they are
 different counters).
 
+Rebuild resume: a worker (re)starting finds a pending generation of the expected params and
+continues it from its cursor. When a delete request exists too, only if the pending record's
+`begun_ms` (store clock) is not before the request's `at` (it cannot hold a deleted leaf) and is
+younger than `rebuild_max_age_s`; an old-format record (no `begun_ms`) is restarted. A mid-run
+request always starts a fresh generation. A cursor-only persist moves the pending cursor of a
+rebuild too (once the pending generation holds a saved state).
+
 Terminal states are logged at warning; `SceneRunner` reports them once per transition as a
 `fold_failed` event (`stage` = the state).
 
@@ -69,13 +83,16 @@ generation])` raising `SaveFenced` / the configured `fence_errors` on mismatch; 
 carrying `version`, `generation`, `params_hash` and optionally `cursor`.
 """
 import inspect
+import json
 import logging
+from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence,
                     Tuple)
 
-from packages.scene_graph.api import BBox, Dirty, MissingTiles
+from packages.scene_graph import StateMismatch, TooOld
+from packages.scene_graph.api import BBox, Dirty, EngineFaulted, LeafError, MissingTiles
 
 from . import scene_adapter, scene_clock, scene_leaf
 
@@ -180,8 +197,10 @@ class WorkerConfig:
     # engine load that fails deterministically this many times in a row falls into a rebuild (or
     # NEEDS_REBUILD when the worker cannot rebuild)
     load_fail_limit: int = 3
-    # a fold that fails twice in a row with a batch of several leaves is bisected to the poison leaf
-    poison_single_limit: int = 5            # a lone leaf failing this many times in a row is quarantined
+    # A leaf the engine rejects in validation (LeafError, nothing mutated) is quarantined at once: by the
+    # key the error names, else by bisecting the batch. Any other exception from fold_many leaves the engine
+    # in an undefined state (EngineFaulted): it is dropped and reloaded from the store; `load_fail_limit`
+    # such faults in a row (no good fold between) fall into a rebuild, or end in NEEDS_REBUILD.
     # per step: stop reading nodes after this much time / this many PNG re-asks (0: unbounded)
     step_budget_s: float = 0.0
     png_retries_per_step: int = 20
@@ -332,6 +351,8 @@ class SceneWorker:
         self._load_failures = 0                      # consecutive deterministic engine-load failures
         self._load_gave_up = False
         self._quarantined: List[str] = []            # keys the last fold isolated as poison
+        self._fault_streak = 0                       # consecutive folds that faulted the engine (reset by a good fold)
+        self._fault_rebuilt = False                  # a fault already led to a rebuild that has not committed yet
         self._stored_cursor: Cursor = ZERO_CURSOR    # the cursor the store holds (sg_meta)
         self._resume_cursor: Optional[Cursor] = None # set by a rebuild that resumed a pending generation
         self._request_seen: Optional[str] = None     # `at` of the delete request being debounced
@@ -555,7 +576,10 @@ class SceneWorker:
         once it is more than the persist margin ahead of the stored one. The store moves
         `meta.cursor` in place when only the cursor changed (same version), so this is cheap."""
         cfg = self.config
-        if self._rebuild_gen is not None or not self._started or self._expected_version <= 0:
+        rebuilding = self._rebuild_gen is not None
+        # a pending generation moves its cursor the same way (store.save of an unchanged state), but only
+        # once it holds a saved state: the store refuses to save an empty engine
+        if (rebuilding and not self._rebuild_saved) or not self._started or self._expected_version <= 0:
             return None
         margin = cfg.cursor_persist_margin_ms if cfg.cursor_persist_margin_ms is not None \
             else cfg.replay_margin_ms
@@ -570,8 +594,9 @@ class SceneWorker:
         if res is not None:
             return res
         kwargs: Dict[str, Any] = {}
-        if self._generation is not None:
-            kwargs["generation"] = self._generation
+        gen = self._rebuild_gen if rebuilding else self._generation
+        if gen is not None:
+            kwargs["generation"] = gen
         try:
             empty = Dirty(bbox=None, changed=[], retired={}, links=[], watermark=self._watermark)
             version = self.store.save(self.map_id, self.engine, empty,
@@ -584,8 +609,8 @@ class SceneWorker:
             return None
         self._stored_cursor = target
         self._last_save_ms = self._mono()
-        if version is not None and int(version) != self._expected_version:
-            self._expected_version = self.stats.version = int(version)
+        if not rebuilding and version is not None and int(version) != self._expected_version:
+            self._expected_version = self.stats.version = int(version)    # (a pending save answers its own counter)
         return None
 
     def _lifecycle(self, force: bool, where: str) -> Optional[StepResult]:
@@ -640,9 +665,9 @@ class SceneWorker:
             if not self._can_rebuild():
                 self._warn_cannot_rebuild("params_hash")
                 return self._terminal(NEEDS_REBUILD, "params_hash")
-            # a pending generation of the expected params is resumed from its cursor, unless a
-            # delete request exists (the pending state may hold leaves deleted since)
-            err = self._begin_rebuild("needs_rebuild", resume_ok=request is None)
+            # a pending generation of the expected params is resumed from its cursor; with a delete
+            # request only when it began after the request and is younger than rebuild_max_age_s
+            err = self._begin_rebuild("needs_rebuild", request=None, resume_ok=True, covers=request)
             if err is not None:
                 self.guard.release(self.map_id)
                 return err
@@ -657,7 +682,8 @@ class SceneWorker:
             if rebuilding:
                 self._rebuild_request = request     # this rebuild covers it; cleared at commit
             elif self._can_rebuild() and version > 0:
-                err = self._begin_rebuild(str(request.get("reason") or "nodes_deleted"), request)
+                err = self._begin_rebuild(str(request.get("reason") or "nodes_deleted"), request,
+                                          resume_ok=True)
                 if err is not None:
                     self.guard.release(self.map_id)
                     return err
@@ -704,15 +730,14 @@ class SceneWorker:
             log.warning("scene worker %s: %s needs a rebuild but this worker cannot rebuild (no "
                         "new_engine / begin_generation)", self.map_id, what)
 
-    # exceptions of the store that retrying cannot change (a corrupt / mismatched stored graph)
-    _DETERMINISTIC = ("StateMismatch", "FileNotFoundError", "KeyError", "ValueError", "TooOld",
-                      "JSONDecodeError", "UnpackError", "IndexError", "AssertionError")
+    # exceptions of the store that retrying cannot change (a corrupt / mismatched stored graph). ValueError
+    # covers the engine's "state was made with other parameters" and json.JSONDecodeError (a subclass).
+    _DETERMINISTIC = (StateMismatch, TooOld, FileNotFoundError, KeyError, ValueError, json.JSONDecodeError,
+                      IndexError, AssertionError)
 
     @classmethod
     def _deterministic(cls, exc: BaseException) -> bool:
-        if any(c.__name__ in cls._DETERMINISTIC for c in type(exc).__mro__):
-            return True
-        return "other parameters" in str(exc)
+        return isinstance(exc, cls._DETERMINISTIC)
 
     def _ensure_engine(self, version: int) -> Optional[StepResult]:
         """The engine for the stored `version`, built now that the writer lock is held. A engine
@@ -888,19 +913,52 @@ class SceneWorker:
             if not docs.cas_meta(self.map_id, meta["version"], new):
                 raise SaveFenced("lost the compare-and-set clearing the pending generation")
 
+    @staticmethod
+    def _request_ms(request: Mapping[str, Any]) -> Optional[int]:
+        """Epoch ms of a rebuild request's `at` (an ISO timestamp; naive means UTC), None when unreadable."""
+        try:
+            at = datetime.fromisoformat(str(request.get("at")))
+        except (TypeError, ValueError):
+            return None
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        return int(at.timestamp() * 1000)
+
+    def _may_resume(self, pend: Mapping[str, Any], request: Optional[Mapping[str, Any]]) -> bool:
+        """Whether the pending generation may be extended. Without a delete request: yes (a params
+        rebuild that was interrupted). With one: only when the pending generation began (`begun_ms`, the
+        store's clock) after the request was made, so it cannot hold a leaf deleted by it, and is younger
+        than `rebuild_max_age_s`; an old-format pending record (no `begun_ms`) restarts."""
+        if request is None:
+            return True
+        begun = pend.get("begun_ms")
+        if begun is None:
+            return False
+        try:
+            begun = int(begun)
+        except (TypeError, ValueError):
+            return False
+        max_age = self.config.rebuild_max_age_s
+        if max_age > 0 and self.now_ms() - begun >= max_age * 1000:
+            return False
+        at = self._request_ms(request)
+        return at is not None and begun >= at
+
     def _begin_rebuild(self, reason: str, request: Optional[Mapping[str, Any]] = None,
-                       resume_ok: bool = False) -> Optional[StepResult]:
+                       resume_ok: bool = False, covers: Optional[Mapping[str, Any]] = None) -> Optional[StepResult]:
         """Begin a pending generation, switch to a fresh engine and announce it. None on success,
         a BACKOFF result when begin_generation failed (the caller decides about the lock).
         With `resume_ok` a pending generation of the expected params that holds a cursor is
-        resumed (its engine restored, the scan continues from its cursor); otherwise the pending
-        generation starts EMPTY (a stale one is never extended)."""
+        resumed (its engine restored, the scan continues from its cursor) when `_may_resume` allows
+        it for the delete request (`request`, or `covers` for a params rebuild that answers one);
+        otherwise the pending generation starts EMPTY (a stale one is never extended)."""
         engine, resumed = None, None
-        if resume_ok and request is None:
+        if resume_ok:
             pend = self._store_pending()
             expected = self.config.expected_params_hash
             if (pend and expected is not None and pend.get("params_hash") == expected
-                    and pend.get("cursor") is not None and self._cursor_of(pend.get("cursor")) is not None):
+                    and pend.get("cursor") is not None and self._cursor_of(pend.get("cursor")) is not None
+                    and self._may_resume(pend, request if request is not None else covers)):
                 engine = self._load_pending()
                 if engine is not None:
                     resumed = self._cursor_of(pend.get("cursor"))
@@ -1196,27 +1254,39 @@ class SceneWorker:
 
     def _fold(self, leaves: List[Any]) -> Optional[StepResult]:
         cfg = self.config
+        if self.engine is None:
+            # dropped after a fault and the reload failed then: load it again before folding
+            res = self._reload_engine()
+            if res is not None:
+                return res
         t0 = self._mono()
         failure = self._try_fold(leaves)
         if failure is None:
-            self._fold_timed(len(leaves), (self._mono() - t0) / 1000.0)
-            self._recovered("fold", "tiles")
-            return None
+            return self._folded(len(leaves), t0)
         kind, exc = failure
         if kind == "tiles":
             self._failed("tiles", "missing tiles")
             return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail="missing tiles")
-        log.error("scene worker %s: fold failed", self.map_id, exc_info=exc)
-        self._failed("fold", f"{type(exc).__name__}: {exc}")
-        # a poison leaf would block the map for good: after two failures in a row, find it
-        limit = 2 if len(leaves) > 1 else max(2, cfg.poison_single_limit)
-        if self._fail_stage == "fold" and self._fail_count >= limit:
-            return self._isolate(leaves, exc)
-        return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc}")
+        if kind == "leaf":
+            # LeafError: raised before anything was mutated, the engine is bit-identical: the leaf is
+            # the cause, quarantine it and fold the rest
+            return self._quarantine_leaves(leaves, exc, t0)
+        if kind == "memory":
+            log.error("scene worker %s: fold ran out of memory (nothing changed)", self.map_id, exc_info=exc)
+            self._failed("fold", f"MemoryError: {exc}")
+            return StepResult(BACKOFF, sleep_s=cfg.backoff_s, detail=f"fold: {exc!r}")
+        return self._engine_fault(exc)
+
+    def _folded(self, n: int, t0: int) -> None:
+        self._fold_timed(n, (self._mono() - t0) / 1000.0)
+        self._fault_streak = 0
+        self._recovered("fold", "tiles")
+        return None
 
     def _try_fold(self, leaves: List[Any]) -> Optional[Tuple[str, Optional[BaseException]]]:
-        """One fold_many (tiles loaded and retried once). None on success, else ("tiles", None)
-        or ("error", exc)."""
+        """One fold_many (tiles loaded and retried once). None on success, else ("tiles", None),
+        ("leaf", LeafError: nothing mutated), ("memory", MemoryError: nothing changed) or
+        ("fault", exc: EngineFaulted or anything raised after the engine began to mutate)."""
         for attempt in (0, 1):
             try:
                 dirty = self.engine.fold_many(leaves)
@@ -1233,45 +1303,156 @@ class SceneWorker:
                 except Exception:
                     log.exception("scene worker %s: tile load failed", self.map_id)
                     break
+            except LeafError as exc:
+                return "leaf", exc
+            except MemoryError as exc:
+                return "memory", exc
             except Exception as exc:
-                return "error", exc
+                return "fault", exc
         return "tiles", None
 
+    def _quarantine(self, leaf: Any, exc: BaseException) -> None:
+        key = str(getattr(leaf, "key", "?"))
+        self._quarantined.append(key)
+        log.error("scene worker %s: leaf %s cannot be folded, quarantined: %s", self.map_id, key, exc)
+        self._event("fold_failed", stage="poison_leaf", detail=f"{key}: {exc}"[:300], consecutive=1)
+
+    def _quarantine_leaves(self, leaves: List[Any], exc: BaseException, t0: int) -> Optional[StepResult]:
+        """`exc` is a LeafError of the batch. The leaf it names (`exc.key`) is quarantined (skip reason
+        `fold_error`, an event, the cursor moves past it) and the rest folded; the next LeafError of the
+        rest names the next one. A key that matches no leaf of the batch falls back to bisecting."""
+        remaining = list(leaves)
+        while True:
+            key = getattr(exc, "key", None)
+            bad = next((l for l in remaining if key is not None and str(getattr(l, "key", None)) == str(key)), None)
+            if bad is None:
+                return self._isolate(remaining, exc)
+            remaining = [l for l in remaining if l is not bad]
+            self._quarantine(bad, exc)
+            if not remaining:
+                return self._folded(0, t0)
+            failure = self._try_fold(remaining)
+            if failure is None:
+                return self._folded(len(remaining), t0)
+            kind, exc = failure
+            if kind == "tiles":
+                self._failed("tiles", "missing tiles")
+                return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail="missing tiles")
+            if kind == "memory":
+                self._failed("fold", f"MemoryError: {exc}")
+                return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"fold: {exc!r}")
+            if kind == "fault":
+                return self._engine_fault(exc)
+
     def _isolate(self, leaves: List[Any], first: BaseException) -> Optional[StepResult]:
-        """Bisect a batch that keeps failing: fold the halves, recursing into a failing one, until
-        the leaf that cannot be folded is alone. It is quarantined (skip reason `fold_error`, an
-        event, the cursor moves past it); everything else of the batch is folded."""
-        bad: List[Any] = []
+        """A LeafError that names no leaf of the batch: bisect (the engine is untouched by every
+        LeafError, so the halves can be retried) until the leaf that is rejected is alone; it is
+        quarantined. A fault met on the way is the engine's (not a leaf's): handled as such."""
+        bad: List[Tuple[Any, BaseException]] = []
+        fault: List[BaseException] = []
 
         def walk(chunk: List[Any]) -> Optional[str]:
+            if fault:
+                return None
             failure = self._try_fold(chunk)
             if failure is None:
                 return None
-            if failure[0] == "tiles":
+            kind, exc = failure
+            if kind == "tiles":
                 return "tiles"
+            if kind == "memory":
+                return "memory"
+            if kind == "fault":
+                fault.append(exc)
+                return None
             if len(chunk) == 1:
-                bad.append((chunk[0], failure[1]))
+                bad.append((chunk[0], exc))
                 return None
             mid = len(chunk) // 2
             return walk(chunk[:mid]) or walk(chunk[mid:])
 
+        t0 = self._mono()
         stop = walk(list(leaves))
         for leaf, exc in bad:
-            key = str(getattr(leaf, "key", "?"))
-            self._quarantined.append(key)
-            log.error("scene worker %s: leaf %s cannot be folded, quarantined: %s: %s",
-                      self.map_id, key, type(exc).__name__, exc)
-            self._event("fold_failed", stage="poison_leaf", detail=f"{key}: {type(exc).__name__}: {exc}"[:300],
-                        consecutive=1)
+            self._quarantine(leaf, exc)
+        if fault:
+            return self._engine_fault(fault[0])
         if stop is not None:
-            self._failed("tiles", "missing tiles")
-            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail="missing tiles")
+            self._failed("fold" if stop == "memory" else "tiles", f"{stop}")
+            return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"fold: {stop}")
         if not bad:
-            # the batch folded in pieces (the failure was not tied to one leaf): carry on
+            # the batch folded in pieces (the rejection was not tied to one leaf): carry on
             log.warning("scene worker %s: batch of %d folded in pieces after %s", self.map_id,
-                        len(leaves), type(first).__name__)
-        self._recovered("fold", "tiles")
-        return None
+                        len(leaves), first)
+        return self._folded(len(leaves) - len(bad), t0)
+
+    # ---- a faulted engine
+
+    def _engine_fault(self, exc: BaseException) -> StepResult:
+        """fold_many raised after (or while) mutating: the engine's state is undefined (EngineFaulted
+        for every call after it). Drop it, rewind to the last durable cursor and reload it from the
+        store. `load_fail_limit` faults in a row without a good fold between: a rebuild, or, when a
+        rebuild already ran for this fault or none is possible, NEEDS_REBUILD (never a loop)."""
+        cfg = self.config
+        self._fault_streak += 1
+        self.stats.fold_failures = self._fault_streak
+        cause = exc.cause if isinstance(exc, EngineFaulted) and exc.cause is not None else exc
+        detail = f"{type(cause).__name__}: {cause}"
+        log.error("scene worker %s: engine faulted (%d in a row): %s", self.map_id, self._fault_streak,
+                  detail, exc_info=exc)
+        self._event("fold_failed", stage="engine_faulted", detail=detail[:300], consecutive=self._fault_streak)
+        self._drop_engine()
+        if self._fault_streak >= max(1, cfg.load_fail_limit):
+            return self._fault_give_up(detail)
+        return self._reload_engine() or StepResult(BACKOFF, sleep_s=cfg.backoff_s,
+                                                   detail=f"fold: engine faulted, reloaded: {detail}")
+
+    def _drop_engine(self) -> None:
+        """Forget the engine and everything folded into it that the store does not hold: the leaves are
+        read again from the durable cursor (`_cursor` only moved past leaves that were saved)."""
+        keep = self._cursor
+        self.engine, self._loaded_version = None, None
+        self._reset_fold_state()
+        self._cursor = self._candidate = keep
+
+    def _reload_engine(self) -> Optional[StepResult]:
+        """A new engine from the store: the live version, or the saved pending generation of a rebuild.
+        None when the engine is ready; a StepResult when it could not be (the next fold tries again)."""
+        if self._rebuild_gen is not None:
+            if not self._rebuild_saved:
+                self.engine = self.new_engine()      # nothing of this generation was ever saved
+                self._cursor = self._candidate = ZERO_CURSOR
+                return None
+            pend = self._store_pending() or {}
+            engine = self._load_pending() if pend.get("generation") in (None, self._rebuild_gen) else None
+            if engine is None:
+                return self._restart_rebuild("engine faulted and the pending generation could not be reloaded")
+            self.engine = engine
+            self._cursor = self._candidate = self._cursor_of(pend.get("cursor")) or ZERO_CURSOR
+            return None
+        if self.engine_factory is None:
+            return self._fault_give_up("no engine_factory to reload it")
+        err = self._ensure_engine(self._expected_version)
+        if err is None:
+            return None
+        if self._load_gave_up:
+            self._load_gave_up, self._load_failures = False, 0
+            return self._fault_give_up("the stored graph cannot be loaded")
+        return err
+
+    def _fault_give_up(self, detail: str) -> StepResult:
+        if self._rebuild_gen is not None or self._fault_rebuilt or not self._can_rebuild():
+            self.rebuild_reason = "engine_faulted"
+            if not self._can_rebuild():
+                self._warn_cannot_rebuild("engine fault")
+            return self._terminal(NEEDS_REBUILD, f"engine_faulted: {detail}")
+        err = self._begin_rebuild("engine_faulted")
+        if err is not None:
+            return err
+        self._fault_rebuilt = True
+        self._fault_streak = 0
+        self._reset_fold_state()
+        return StepResult(WORKED, detail=f"engine faulted: rebuilding ({detail})")
 
     def _fold_timed(self, leaves: int, seconds: float) -> None:
         st = self.stats
@@ -1412,6 +1593,7 @@ class SceneWorker:
         except Exception as exc:
             return self._commit_failed(exc)
         self._commit_failures = 0
+        self._fault_rebuilt = False
         self._recovered("save")
         self._generation, self._rebuild_gen, self._rebuild_saved = gen, None, False
         self._expected_version = int(version)
@@ -1514,6 +1696,7 @@ class SceneWorker:
             log.warning("scene worker %s: empty rebuild and the store cannot drop: request cleared, "
                         "the previous graph stays", self.map_id)
         self._commit_failures = self._empty_confirms = 0
+        self._fault_rebuilt = False
         self._rebuild_gen = None
         self.stats.rebuilds += 1
         self._event("rebuild_completed", reason=self._rebuild_event_reason, version=0,

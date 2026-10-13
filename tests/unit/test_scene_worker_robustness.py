@@ -2,6 +2,7 @@
 classification, poison leaves, PNG expiry, durable skip cursor, replay margin, runner / health."""
 import pytest
 
+from packages.scene_graph import EngineFaulted, LeafError, StateMismatch, TooOld
 from packages.scene_graph.api import BBox, Dirty
 from packages.services.graph_builder import scene_runner as sr
 from packages.services.graph_builder import scene_worker as sw
@@ -37,6 +38,18 @@ class PendingStore(FakeStore):
         self.pending = self.meta_doc.get("generation", 1) + 1
         self.pending_meta = None
         return self.pending
+
+    def save(self, map_id, sg, dirty, *, expected_version, cursor, generation=None):
+        """A save into the pending generation does not move the live version (the real store's contract)."""
+        if generation is None or generation == self.meta_doc.get("generation", 1):
+            return super().save(map_id, sg, dirty, expected_version=expected_version, cursor=cursor,
+                                generation=generation)
+        self.save_generations = getattr(self, "save_generations", []) + [generation]
+        if expected_version != self.v:
+            raise sw.SaveFenced("expected %s, store has %s" % (expected_version, self.v))
+        self.saves.append((self.v, cursor, list(dirty.changed)))
+        self.pending_saves = getattr(self, "pending_saves", []) + [(cursor, list(dirty.changed))]
+        return len(self.pending_saves)
 
     def load(self, map_id, version=None, tiles=None, pending=False):
         assert pending
@@ -125,16 +138,85 @@ def test_stale_pending_with_other_params_is_discarded_fresh():
     assert r.fresh.batches == [["n000", "n001", "n002"]]
 
 
-def test_delete_request_rebuild_never_resumes_pending():
-    store = PendingStore(version=5, meta={"params_hash": "new", "generation": 1},
-                         pending={"generation": 2, "version": 3, "params_hash": "new",
-                                  "cursor": [4000, "n003"]})
+def _at_ms(iso):
+    import datetime
+    return int(datetime.datetime.fromisoformat(iso).timestamp() * 1000)
+
+
+def _request_pending_rig(begun_ms, now_offset_ms, params_changed=True):
+    """A pending generation of the expected params with a delete request on the map: `begun_ms` is
+    given relative to the request's `at`, the worker's wall clock `now_offset_ms` after it."""
     from tests.unit.test_scene_worker import RequestGuard, REQ
+    at = _at_ms(REQ["at"])
+    pending = {"generation": 2, "version": 3, "params_hash": "new", "cursor": [4000, "n003"],
+               "begun_ms": None if begun_ms is None else at + begun_ms}
+    meta = {"params_hash": "old" if params_changed else "new", "generation": 1}
+    store = PendingStore(version=5, meta=meta, pending=pending)
     r = _rebuild_rig(_nodes(3), store=store)
     r.guard = RequestGuard()
     r.guard.request = REQ
+    r.clock.t = at + now_offset_ms
+    r.worker = r.make()
+    store.pending_engine = r.fresh
+    return r, store
+
+
+@pytest.mark.parametrize("params_changed", [True, False])
+def test_delete_request_rebuild_resumes_a_pending_that_began_after_it_and_is_young(params_changed):
+    r, store = _request_pending_rig(begun_ms=30_000, now_offset_ms=120_000, params_changed=params_changed)
+    r.worker.step()
+    assert store.begin_calls and store.begin_calls[0]["fresh"] is False
+    assert store.loaded_pending == 1 and r.worker.engine is r.fresh
+    assert r.worker._resume_cursor == (4000, "n003")
+    r.drain()
+    assert store.commits and r.guard.request is None   # the resumed rebuild answers the request at its commit
+
+
+def test_delete_request_rebuild_restarts_when_the_pending_is_older_than_the_max_age():
+    r, store = _request_pending_rig(begun_ms=30_000, now_offset_ms=30_000 + 901_000)
+    r.worker.step()
+    assert store.begin_calls[0]["fresh"] is True and store.loaded_pending == 0
+
+
+def test_delete_request_rebuild_resumes_just_inside_the_max_age():
+    r, store = _request_pending_rig(begun_ms=30_000, now_offset_ms=30_000 + 899_000)
+    r.worker.step()
+    assert store.begin_calls[0]["fresh"] is False and store.loaded_pending == 1
+
+
+def test_delete_request_rebuild_restarts_when_the_pending_began_before_the_request():
+    r, store = _request_pending_rig(begun_ms=-5_000, now_offset_ms=60_000)    # it may hold the deleted leaves
+    r.worker.step()
+    assert store.begin_calls[0]["fresh"] is True and store.loaded_pending == 0
+
+
+def test_delete_request_rebuild_restarts_on_an_old_format_pending_without_begun_ms():
+    r, store = _request_pending_rig(begun_ms=None, now_offset_ms=60_000)
+    r.worker.step()
+    assert store.begin_calls[0]["fresh"] is True and store.loaded_pending == 0
+
+
+def test_params_rebuild_without_a_request_resumes_whatever_begun_ms_says():
+    store = PendingStore(version=5, meta={"params_hash": "old", "generation": 1},
+                         pending={"generation": 2, "version": 3, "params_hash": "new",
+                                  "cursor": [4000, "n003"], "begun_ms": 1})     # ancient, but nothing was deleted
+    r = _rebuild_rig(_nodes(3), store=store)
+    store.pending_engine = r.fresh
+    r.worker.step()
+    assert store.begin_calls[0]["fresh"] is False and store.loaded_pending == 1
+
+
+def test_a_mid_run_delete_request_never_resumes_a_pending_it_left_behind():
+    from tests.unit.test_scene_worker import RequestGuard, REQ
+    r, store = _request_pending_rig(begun_ms=30_000, now_offset_ms=120_000, params_changed=False)
+    r.guard.request = None
     r.worker = r.make()
     r.worker.step()
+    assert not store.begin_calls
+    r.guard.request = REQ
+    r.clock.advance(31)
+    store.pending_meta["cursor"] = [4000, "n003"]
+    r.drain(5)
     assert store.begin_calls and store.begin_calls[0]["fresh"] is True
 
 
@@ -169,10 +251,6 @@ def test_old_store_api_clears_a_stale_pending_before_begin():
 
 
 # ---- 4. engine load failures
-
-class StateMismatch(Exception):
-    pass
-
 
 def _load_rig(exc, can_rebuild, **cfgkw):
     store = FakeStore(version=5, meta={"params_hash": "same", "generation": 1})
@@ -254,27 +332,267 @@ def test_transient_load_failure_keeps_retrying():
 
 # ---- 5. poison leaf
 
-def test_poison_leaf_is_bisected_quarantined_and_the_rest_folded():
+def _picky(r, bad, make_exc):
+    real = r.engine.fold_many
+    r.engine.calls = []
+
+    def picky(leaves):
+        r.engine.calls.append([l.key for l in leaves])
+        if any(l.key in bad for l in leaves):
+            raise make_exc()
+        return real(leaves)
+    r.engine.fold_many = picky
+    return real
+
+
+def test_leaf_error_quarantines_the_named_leaf_at_once_and_folds_the_rest():
     events = []
     cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=1)
     r = Rig(_nodes(6), cfg=cfg, on_event=lambda k, p: events.append((k, p)))
-    real = r.engine.fold_many
-
-    def picky(leaves):
-        if any(l.key == "n002" for l in leaves):
-            raise RuntimeError("cannot fold n002")
-        return real(leaves)
-    r.engine.fold_many = picky
-    assert r.worker.step().state == sw.BACKOFF      # 1st failure
-    r.clock.advance(11)
+    engine = r.engine
+    _picky(r, {"n002"}, lambda: LeafError("n002", "window is not finite"))
+    res = r.worker.step()
+    assert res.state != sw.BACKOFF                           # no failure round, no bisect
     r.drain()
+    assert r.worker.engine is engine                         # LeafError leaves the engine alone: not reloaded
     assert r.worker.stats.skipped[sw.SKIP_FOLD_ERROR] == 1
-    folded = sorted(k for b in r.engine.batches for k in b)
-    assert folded == ["n000", "n001", "n003", "n004", "n005"]
+    assert engine.calls == [["n000", "n001", "n002", "n003", "n004", "n005"],
+                            ["n000", "n001", "n003", "n004", "n005"]]    # one retry without the named leaf
+    assert sorted(k for b in engine.batches for k in b) == ["n000", "n001", "n003", "n004", "n005"]
     assert r.worker.cursor == (1000 + 5 * 1000, "n005")      # the map moved on
     assert any(k == "fold_failed" and p["stage"] == "poison_leaf" and "n002" in p["detail"]
                for k, p in events)
-    assert r.worker.stats.folded == 5
+    assert r.worker.stats.folded == 5 and r.worker.stats.fold_failures == 0
+
+
+def test_several_leaf_errors_in_one_batch_are_quarantined_one_by_one():
+    r = Rig(_nodes(5), cfg=sw.WorkerConfig(min_save_interval_s=0))
+    bad = {"n001", "n003"}
+    real = r.engine.fold_many
+
+    def picky(leaves):
+        for l in leaves:                  # the engine names the FIRST bad leaf only
+            if l.key in bad:
+                raise LeafError(l.key, "bad")
+        return real(leaves)
+    r.engine.fold_many = picky
+    r.drain()
+    assert sorted(r.worker._quarantined) == []        # reset per step; the stats hold the count
+    assert r.worker.stats.skipped[sw.SKIP_FOLD_ERROR] == 2
+    assert sorted(k for b in r.engine.batches for k in b) == ["n000", "n002", "n004"]
+
+
+def test_leaf_error_without_a_key_of_the_batch_is_bisected_to_the_leaf():
+    events = []
+    cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=1)
+    r = Rig(_nodes(6), cfg=cfg, on_event=lambda k, p: events.append((k, p)))
+    engine = r.engine
+    _picky(r, {"n002"}, lambda: LeafError(None, "the batch needs a canvas above the bound"))
+    r.drain()
+    assert r.worker.engine is engine
+    assert r.worker.stats.skipped[sw.SKIP_FOLD_ERROR] == 1
+    assert sorted(k for b in engine.batches for k in b) == ["n000", "n001", "n003", "n004", "n005"]
+    assert r.worker.cursor == (1000 + 5 * 1000, "n005")
+    assert any(k == "fold_failed" and p["stage"] == "poison_leaf" and "n002" in p["detail"] for k, p in events)
+
+
+def test_a_plain_error_is_never_bisected_it_faults_the_engine():
+    events = []
+    cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=1)
+    r = Rig(_nodes(6), cfg=cfg, on_event=lambda k, p: events.append((k, p)),
+            engine_factory=lambda v: FakeEngine())
+    bad_engine = r.engine
+    _picky(r, {"n002"}, lambda: ValueError("looks like a leaf problem, is not"))
+    res = r.worker.step()
+    assert res.state == sw.BACKOFF
+    assert r.worker.engine is not bad_engine                 # dropped and reloaded
+    assert r.worker.stats.skipped[sw.SKIP_FOLD_ERROR] == 0
+    assert len(bad_engine.calls) == 1                        # no probing of halves
+    assert any(k == "fold_failed" and p["stage"] == "engine_faulted" for k, p in events)
+
+
+# ---- 5b. a faulted engine is dropped and reloaded
+
+def _fault_rig(nodes, factory, **kw):
+    cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=1, load_fail_limit=3,
+                          rebuild_debounce_s=0, **kw.pop("cfgkw", {}))
+    return Rig(nodes, cfg=cfg, engine_factory=factory, **kw)
+
+
+def test_engine_faulted_error_reloads_at_the_expected_version_and_refolds_from_the_durable_cursor():
+    loads, engines = [], []
+
+    def factory(version):
+        loads.append(version)
+        eng = FakeEngine()
+        engines.append(eng)
+        return eng
+    r = _fault_rig(_nodes(3), factory)
+    r.drain()                                          # n000..n002 folded and saved
+    saved_cursor, saved_v = r.worker.cursor, r.store.v
+    r.source.add(make_node("n010", 50_000))
+    r.engine.raise_once = EngineFaulted(RuntimeError("solver"))
+    assert r.worker.step().state == sw.BACKOFF
+    assert loads == [saved_v] and r.worker.engine is engines[0]
+    assert r.worker.cursor == saved_cursor             # never past what the store holds
+    r.drain()
+    assert r.worker.stats.fold_failures == 0
+    folded = sorted(k for b in engines[0].batches for k in b)
+    assert "n010" in folded                            # and nothing was skipped by the dropped state
+    assert r.store.saves[-1][2][-1] == "n010"
+
+
+def test_unsaved_folds_of_a_faulted_engine_are_read_again():
+    engines = []
+
+    def factory(version):
+        engines.append(FakeEngine())
+        return engines[-1]
+    cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=100, save_every_s=1e9, save_when_idle=False,
+                          batch_min_leaves=1)
+    r = Rig(_nodes(2), cfg=cfg, engine_factory=factory)
+    r.worker.step()                                    # n000, n001 folded in memory, not saved
+    assert r.store.saves == [] and r.worker.stats.unsaved_leaves == 2
+    r.source.add(make_node("n005", 20_000))
+    r.engine.raise_once = RuntimeError("solver")
+    assert r.worker.step().state == sw.BACKOFF
+    assert r.worker.stats.unsaved_leaves == 0 and r.worker._dirty is None
+    cfg.save_when_idle = True
+    r.drain()
+    assert sorted(k for b in engines[0].batches for k in b) == ["n000", "n001", "n005"]
+    assert r.store.saves, "the re-folded leaves were saved"
+
+
+def test_a_failed_reload_after_a_fault_is_retried_and_counts_as_a_load_failure():
+    calls = {"n": 0}
+
+    def factory(version):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ConnectionError("minio down")
+        return FakeEngine()
+    r = _fault_rig(_nodes(2), factory)
+    r.engine.raise_once = RuntimeError("solver")
+    assert r.worker.step().state == sw.BACKOFF
+    assert r.worker.engine is None
+    r.drain()
+    assert calls["n"] == 2 and r.worker.engine is not None and r.store.saves
+
+
+def test_repeated_faults_fall_into_a_rebuild_and_a_fault_in_it_is_terminal():
+    events = []
+
+    def factory(version):
+        e = FakeEngine()
+        e.raise_once = RuntimeError("solver")
+        return e
+    cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=1, load_fail_limit=3,
+                          rebuild_debounce_s=0, expected_params_hash="same")
+    store = FakeStore(version=5, meta={"params_hash": "same", "generation": 1})
+    bad = FakeEngine()
+    bad.raise_once = RuntimeError("solver")
+
+    def always_faulting():
+        e = FakeEngine()
+        e.fold_many = lambda leaves: (_ for _ in ()).throw(RuntimeError("solver"))
+        return e
+    r = Rig(_nodes(2), store=store, cfg=cfg, engine_factory=factory, new_engine=always_faulting,
+            on_event=lambda k, p: events.append((k, p)))
+    r.engine.fold_many = lambda leaves: (_ for _ in ()).throw(RuntimeError("solver"))
+    states = []
+    for _ in range(40):
+        res = r.worker.step()
+        states.append(res.state)
+        if res.state in sw.TERMINAL:
+            break
+    assert states[-1] == sw.NEEDS_REBUILD, states            # bounded: never an endless reload loop
+    assert r.worker.rebuild_reason == "engine_faulted"
+    assert any(k == "rebuild_started" and p["reason"] == "engine_faulted" for k, p in events)
+    assert len(states) < 15 and not r.guard.locked
+
+
+def test_repeated_faults_without_a_rebuild_path_end_in_needs_rebuild():
+    r = _fault_rig(_nodes(2), lambda v: _FaultyEngine())
+    r.engine.fold_many = _FaultyEngine().fold_many
+    states = [r.worker.step().state for _ in range(3)]
+    assert states == [sw.BACKOFF, sw.BACKOFF, sw.NEEDS_REBUILD]
+    assert r.worker.rebuild_reason == "engine_faulted"
+
+
+class _FaultyEngine(FakeEngine):
+    def fold_many(self, leaves):
+        raise RuntimeError("solver")
+
+
+def test_a_good_fold_resets_the_fault_count():
+    n = {"i": 0}
+
+    def factory(version):
+        return FakeEngine()
+    r = _fault_rig(_nodes(2), factory)
+    for i in range(4):                                   # more faults than the limit, each followed by a good fold
+        r.engine = r.worker.engine
+        r.worker.engine.raise_once = RuntimeError("solver %d" % i)
+        r.source.add(make_node("x%d" % i, 100_000 + i * 1000))
+        r.clock.advance(1)
+        assert r.worker.step().state == sw.BACKOFF
+        r.drain()
+        assert r.worker._fault_streak == 0
+    assert r.worker.state == ""
+
+
+def test_a_fault_without_an_engine_factory_rebuilds_when_it_can_else_ends():
+    cfg = sw.WorkerConfig(min_save_interval_s=0, save_every_leaves=1, rebuild_debounce_s=0,
+                          expected_params_hash="same")
+    store = FakeStore(version=5, meta={"params_hash": "same", "generation": 1})
+    fresh = FakeEngine()
+    r = Rig(_nodes(2), store=store, cfg=cfg, new_engine=lambda: fresh)
+    r.engine.raise_once = RuntimeError("solver")
+    r.drain(20)
+    assert store.commits and fresh.batches            # a fresh generation of everything
+    r2 = Rig(_nodes(2), cfg=sw.WorkerConfig(min_save_interval_s=0))
+    r2.engine.raise_once = RuntimeError("solver")
+    assert r2.worker.step().state == sw.NEEDS_REBUILD
+
+
+def test_memory_error_keeps_the_engine_and_does_not_count_as_a_fault():
+    r = _fault_rig(_nodes(2), lambda v: pytest.fail("must not reload"))
+    engine = r.engine
+    for _ in range(5):
+        engine.raise_once = MemoryError("allocation")
+        assert r.worker.step().state == sw.BACKOFF
+    assert r.worker.engine is engine and r.worker._fault_streak == 0
+    r.drain()
+    assert engine.batches == [["n000", "n001"]]
+
+
+def test_fault_during_a_rebuild_reloads_the_saved_pending_generation():
+    store = PendingStore(version=5, meta={"params_hash": "old", "generation": 1})
+    r = _rebuild_rig(_nodes(8), store=store, rebuild_batch=2, batch_size=2)   # pages of 2: the head is far
+    reloaded = FakeEngine()
+    store.pending_engine = reloaded
+    r.worker.step()
+    r.worker.step()
+    assert r.worker._rebuild_saved
+    store.pending_meta = {"generation": store.pending, "version": 1, "params_hash": "new",
+                          "cursor": list(r.worker.cursor), "begun_ms": 1}
+    r.fresh.raise_once = RuntimeError("solver")
+    assert r.worker.step().state == sw.BACKOFF
+    assert store.loaded_pending == 1 and r.worker.engine is reloaded
+    r.drain(30)
+    assert store.commits
+
+
+def test_a_fault_before_the_first_pending_save_restarts_with_an_empty_engine():
+    r = _rebuild_rig(_nodes(4))
+    bad, good = FakeEngine(), FakeEngine()
+    bad.raise_once = RuntimeError("solver")
+    engines = [bad, good]
+    r.worker.new_engine = lambda: engines.pop(0)
+    assert r.worker.step().state == sw.BACKOFF
+    assert r.worker.engine is good
+    r.drain(30)
+    assert r.store.commits and good.batches and bad.batches == []
 
 
 # ---- 6/7. png expiry
@@ -373,6 +691,31 @@ def test_cursor_only_save_not_made_before_the_margin():
     r = Rig([make_node("s0", 10_000, costmap={}), make_node("s1", 20_000, costmap={})], cfg=cfg)
     r.drain()
     assert r.store.saves == []
+
+
+def test_cursor_only_save_also_moves_the_pending_cursor_of_a_rebuild():
+    store = PendingStore(version=5, meta={"params_hash": "old", "generation": 1})
+    nodes = _nodes(2) + [make_node("s%d" % i, 100_000 + i * 100_000, costmap={}) for i in range(4)]
+    r = _rebuild_rig(nodes, store=store, batch_size=2, rebuild_batch=2)
+    saves_seen = []
+    for _ in range(30):
+        res = r.worker.step()
+        saves_seen = list(store.pending_saves)
+        if store.commits or res.state in sw.TERMINAL:
+            break
+    only = [c for c, changed in saves_seen if changed == []]
+    assert only, "skip-only progress of a rebuild was never made durable"
+    assert only[0][0] > 60_000 and r.worker.state == ""
+    assert store.commits                                # and the live version was never touched meanwhile
+
+
+def test_cursor_only_persist_of_a_rebuild_waits_for_the_first_pending_save():
+    store = PendingStore(version=5, meta={"params_hash": "old", "generation": 1})
+    nodes = [make_node("s%d" % i, 100_000 + i * 100_000, costmap={}) for i in range(6)]
+    r = _rebuild_rig(nodes, store=store, batch_size=2, rebuild_batch=2)
+    for _ in range(3):
+        r.worker.step()
+    assert getattr(store, "pending_saves", []) == []     # the store cannot save an empty engine
 
 
 # ---- 9. fenced commit

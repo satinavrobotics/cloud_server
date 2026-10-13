@@ -554,11 +554,30 @@ def test_backlog_is_coalesced_up_to_max_in_one_fold():
 def test_fold_failure_keeps_buffered_leaves_and_retries():
     cfg = sw.WorkerConfig(batch_min_leaves=2, batch_max_leaves=10, min_save_interval_s=0)
     r = Rig(_nodes(3), cfg=cfg)
-    r.engine.raise_once = RuntimeError("solver")
+    r.engine.raise_once = MemoryError("allocation")      # nothing changed: the engine is kept, the batch retried
+    engine = r.engine
     assert r.worker.step().state == sw.BACKOFF
-    assert r.worker.cursor == sw.ZERO_CURSOR
+    assert r.worker.cursor == sw.ZERO_CURSOR and r.worker.engine is engine
     r.drain()
     assert r.engine.batches == [["n000", "n001", "n002"]]
+
+
+def test_fold_fault_drops_the_engine_and_reloads_it_from_the_store():
+    loads = []
+    reloaded = FakeEngine()
+
+    def factory(version):
+        loads.append(version)
+        return reloaded
+    cfg = sw.WorkerConfig(batch_min_leaves=2, batch_max_leaves=10, min_save_interval_s=0)
+    r = Rig(_nodes(3), cfg=cfg, engine_factory=factory)
+    first = r.engine
+    first.raise_once = RuntimeError("solver")
+    assert r.worker.step().state == sw.BACKOFF
+    assert r.worker.engine is reloaded and loads == [r.store.v]      # the live version the store holds
+    assert r.worker.cursor == sw.ZERO_CURSOR
+    r.drain()
+    assert first.batches == [] and reloaded.batches == [["n000", "n001", "n002"]]
 
 
 def test_slow_fold_logs_a_warning_with_map_leaves_seconds(caplog):
@@ -652,14 +671,14 @@ def test_events_updated_and_fold_failed_with_consecutive_count():
     def flaky(leaves):
         state["n"] += 1
         if state["n"] <= 3:
-            raise RuntimeError("solver blew up")
+            raise MemoryError("solver blew up")
         return real(leaves)
     r.engine.fold_many = flaky
     for _ in range(3):
         assert r.worker.step().state == sw.BACKOFF
     failed = [p for k, p in events if k == "fold_failed"]
     assert [p["consecutive"] for p in failed] == [1, 2]          # 1, 2, (3 held back), 4, 8 ...
-    assert failed[0]["stage"] == "fold" and "solver blew up" in failed[0]["detail"]
+    assert failed[0]["stage"] == "fold" and "solver blew up" in failed[0]["detail"]   # a MemoryError: nothing changed
     r.drain()
     upd = [p for k, p in events if k == "updated"]
     assert len(upd) == 1 and upd[0]["leaves_folded"] == 1 and upd[0]["charts_changed"] == 1
