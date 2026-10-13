@@ -1,0 +1,42 @@
+{
+ "Officemap": {
+  "charts": 14,
+  "islands": 1,
+  "links": 15
+ },
+ "office01": {
+  "charts": 15,
+  "islands": 3,
+  "links": 16
+ },
+ "office03": {
+  "charts": 8,
+  "islands": 1,
+  "links": 6
+ },
+ "office04": {
+  "charts": 16,
+  "islands": 4,
+  "links": 15
+ },
+ "office5": {
+  "charts": 5,
+  "islands": 0,
+  "links": 5
+ },
+ "office6": {
+  "charts": 14,
+  "islands": 0,
+  "links": 17
+ },
+ "office7": {
+  "charts": 14,
+  "islands": 0,
+  "links": 17
+ },
+ "office8": {
+  "charts": 12,
+  "islands": 0,
+  "links": 15
+ }
+}

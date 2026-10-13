@@ -6,9 +6,11 @@ between the two most distant charts are reported. Nothing is written.
 
     python -m tools.scene_graph_check_generation --map ID [--map ID ...]
     python -m tools.scene_graph_check_generation --all                  # every map with a stored graph
-    python -m tools.scene_graph_check_generation --map ID --expect expected.json
+    python -m tools.scene_graph_check_generation --map ID --expect tools/scene_graph_expected.json
 
-`expected.json`: {"<map id>": {"charts": 12, "links": 15}, ...} (counts of the base level; a differing count is a failure).
+`--expect`: {"<map id>": {"charts": 12, "links": 15, "islands": 0}, ...}: counts of the base level and of the charts outside the
+largest link component (islands). A differing count is a failure. The route check runs between the two most distant charts of
+the largest component only: islands are free cells no route can reach (kept in the graph, marked, reported in "islands").
 Exit code 0: every map passed. Run where ARANGO_* and MINIO_* are set (the graph-builder container).
 """
 import argparse
@@ -23,7 +25,36 @@ from packages.scene_graph.store import FORMAT, PIPELINE, SceneGraphStore
 BIG = BBox(-1e9, -1e9, 1e9, 1e9)
 
 
-def check_map(store: Any, map_id: str, expect: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+def link_components(charts: List[Any], links: List[Any]) -> List[List[str]]:
+    """the connected components of the chart graph (charts as nodes, links as edges), largest first, each a sorted key list.
+    A chart in a component of its own cannot be reached by any route: its free cells touch the rest only at a corner, and
+    routes do not squeeze through corners (4-connectivity)."""
+    par = {c.key: c.key for c in charts}
+
+    def find(k):
+        while par[k] != k:
+            par[k] = par[par[k]]
+            k = par[k]
+        return k
+    for l in links:
+        if l.a in par and l.b in par:
+            par[find(l.a)] = find(l.b)
+    groups: Dict[str, List[str]] = {}
+    for c in charts:
+        groups.setdefault(find(c.key), []).append(c.key)
+    return sorted((sorted(g) for g in groups.values()), key=lambda g: (-len(g), g[0]))
+
+
+def islands(charts: List[Any], links: List[Any]) -> List[Dict[str, Any]]:
+    """the charts outside the largest link component: unreachable free space, reported as a field of the check (kept in the
+    graph and marked, not dropped): key, cells, anchor"""
+    comps = link_components(charts, links)
+    main = set(comps[0]) if comps else set()
+    return [{"key": c.key, "cells": c.cells, "anchor": [round(c.anchor[0], 2), round(c.anchor[1], 2)]}
+            for c in charts if c.key not in main]
+
+
+def check_map(store: Any, map_id: str, expect: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One map's report: `problems` is empty when everything checked out."""
     out: Dict[str, Any] = {"map": map_id, "problems": []}
     meta = store.meta(map_id)
@@ -55,14 +86,18 @@ def check_map(store: Any, map_id: str, expect: Optional[Dict[str, int]] = None) 
         out.update(width_min=round(w[0], 2), width_median=round(w[len(w) // 2], 2))
     out["driven_frac_mean"] = round(sum(c.driven_frac * c.cells for c in v.charts) / max(sum(c.cells for c in v.charts), 1), 3)
     out["untraversed_charts"] = sum(1 for c in v.charts if c.driven_frac == 0.0)
-    if len(v.charts) >= 2:                                    # one route between the two most distant anchors
-        best = max(((math.dist(a.anchor, b.anchor), a, b) for i, a in enumerate(v.charts) for b in v.charts[i + 1:]),
-                   key=lambda t: t[0])
+    isl = islands(v.charts, v.links)
+    out["islands"] = {"count": len(isl), "cells": sum(i["cells"] for i in isl), "charts": isl}
+    main = set(link_components(v.charts, v.links)[0]) if v.charts else set()
+    reach = [c for c in v.charts if c.key in main]
+    if len(reach) >= 2:                                       # one route between the two most distant REACHABLE anchors
+        best = max(((math.dist(a.anchor, b.anchor), a, b) for i, a in enumerate(reach) for b in reach[i + 1:]), key=lambda t: t[0])
         r = g.route(best[1].key, best[2].key)
-        out["route"] = None if r is None else {"charts": len(r.charts), "length": round(r.length, 1), "min_width": round(r.min_width, 2)}
-        if r is None: out["problems"].append("no route between the two most distant charts")
+        out["route"] = None if r is None else {"charts": len(r.charts), "length": round(r.length, 1), "min_width": round(r.min_width, 2),
+                                               "cost": r.cost}
+        if r is None: out["problems"].append("no route between the two most distant reachable charts")
     if expect:
-        for k, got in (("charts", out["charts"]), ("links", out["links"])):
+        for k, got in (("charts", out["charts"]), ("links", out["links"]), ("islands", out["islands"]["count"])):
             if k in expect and expect[k] != got:
                 out["problems"].append(f"{k}: {got}, expected {expect[k]}")
     return out
