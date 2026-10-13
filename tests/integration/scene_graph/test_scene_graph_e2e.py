@@ -194,7 +194,8 @@ class Env:
                 return False
             st = worker.stats
             return (self.host.runner.last_state.get(map_id) == "idle" and st.folded + st.already_folded >= folded
-                    and st.unsaved_leaves == 0 and worker.state == "" and st.version >= 1)
+                    and st.unsaved_leaves == 0 and worker.state == "" and st.version >= 1
+                    and worker.settled())     # nothing buffered / pending / dirty, cursor at head
         return check
 
     def cleanup(self) -> None:
