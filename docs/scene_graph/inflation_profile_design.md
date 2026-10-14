@@ -127,21 +127,18 @@ Not shown: robot outcomes (stops, recoveries) as a function of the profile; beha
 window, Smac 2D, MPPI and goal-tolerance settings (section 10). The scripts expect the maps JSON that `extract.py` and
 `build_data.py` build from the local read API; the data is not stored in the repository.
 
-## 10. Robot values needed (to settle section 4 and the claim that pricing reaches the driven path)
+## 10. Robot values needed
 
-From the robot's Nav2 configuration, as the exact YAML sections or values:
+Settled, no more needed: inflation radius 0.8 m, cost scaling factor 6.0, inscribed radius 0.25 m, circumscribed radius 0.35 m,
+Smac 2D then MPPI (confirmed by the planner owner).
 
-1. **Local costmap** (the rolling costmap Smac 2D plans on): `rolling_window`, `width`, `height`, `resolution`, `update_frequency`,
-   `plugins`; `inflation_layer`: `inflation_radius`, `cost_scaling_factor`, `inflate_unknown`, `inflate_around_unknown`;
-   `robot_radius` or `footprint` (with the reference frame); obstacle layer: `obstacle_max_range`, `raytrace_max_range`,
-   marking and clearing settings; `track_unknown_space`. The same for the global costmap if Smac uses it.
-2. **Planner server, Smac 2D:** `tolerance`, `allow_unknown`, `downsample_costmap` and factor, `max_iterations`,
-   `max_planning_time`, `cost_travel_multiplier`, `use_final_approach_orientation`, smoother settings.
-3. **Controller, MPPI:** `time_steps`, `model_dt`, `batch_size`, speed limits, the critic list and the weights of
-   `CostCritic`, `ObstaclesCritic` (cost weight, repulsion, collision cost, margin), `PathFollowCritic`, `PathAlignCritic`,
-   `PathAngleCritic`, `GoalCritic`, `ConstraintCritic`; `goal_checker` (`xy_goal_tolerance`, `yaw_goal_tolerance`),
-   `progress_checker`.
-4. **Waypoint handling:** per-leg navigate-to-pose versus through-poses; how VDA5050 nodes become goals; what a `skippable` node
-   does when its goal is blocked (wait time, skip); recovery behaviours and retry counts.
-5. **Footprint facts:** footprint polygon or radius, base frame at the rotation centre or not, factsheet length / width, and
-   the speed limits (for the later time-based comparison).
+Still needed, from the robot's Nav2 configuration:
+
+1. **Local costmap rolling window** width and height (m) and resolution: to confirm the 5 m waypoint gap cap fits inside it.
+2. **Which costmap the inflation values belong to** (local rolling or global) and whether Smac 2D plans on that one.
+3. Optional: `xy_goal_tolerance` of the goal checker (how strictly the robot reaches a waypoint).
+
+Not needed for this change (an earlier version of this section listed about fifty parameters; retracted 2026-10-14): MPPI critic
+weights and horizon, Smac 2D internals, obstacle-layer ranges and clearing, `inflate_unknown`, skip / recovery / retry behaviour,
+speed limits. They would only help to *predict* how far the driven path changes; the change does not depend on that, and the
+2026-10-13 run (driven path within a median 0.13-0.17 m of the waypoint polyline) already bounds it.
