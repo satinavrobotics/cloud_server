@@ -134,6 +134,8 @@ class MissionPlannerService:
         self._priced_inexact = 0
         self._priced_exp = 0                  # of those, priced with the exponential profile
         self._waypoints_below_floor = 0       # interior planner waypoints below the profile's floor (a count, nothing moved)
+        # served chart plans by the source of their turn-cost lambda (scene_route.turn_lambda: factsheet | config | off)
+        self._turn_sources: Dict[str, int] = {}
 
         self._prewarm_task: Optional["asyncio.Task"] = None
 
@@ -287,6 +289,7 @@ class MissionPlannerService:
             return str(nodes[0].get("node_id"))
 
         check_width = config.SCENE_GRAPH_WIDTH_CHECK_ENABLED
+        turn = self._robot_turn(robot)
         plan_wait, budget_bound = stage(config.SCENE_GRAPH_PLAN_BUDGET_S)
         plan_fut = self._plan_pool.submit(
             lambda: scene_route.plan_on_graph(
@@ -297,7 +300,7 @@ class MissionPlannerService:
                 config.SCENE_GRAPH_WIDTH_MARGIN_M,
                 self._robot_length(robot),
                 self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width,
-                config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0))
+                config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0, turn=turn))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -312,18 +315,24 @@ class MissionPlannerService:
             if hit:
                 return None, "blocked_row_on_route"
         ids = plan.planned_path
-        if plan.pricing is not None:
+        self._turn_sources[turn["source"]] = self._turn_sources.get(turn["source"], 0) + 1
+        if plan.pricing is not None and plan.pricing["rate"] == 0.0:
+            self.logger.info(
+                "Turn-cost plan map=%s graph_version=%s cost=%d exact=%s turn_lambda=%.3f turn_source=%s turn_reason=%s tiles=%s",
+                map_id, version, plan.pricing["cost"], plan.pricing["exact"], turn["lambda_m_per_rad"], turn["source"],
+                turn["reason"] or "-", (getattr(graph, "last", None) or {}).get("tiles"))
+        elif plan.pricing is not None:
             self._priced_plans += 1
             self._priced_inexact += 0 if plan.pricing["exact"] else 1
             self._priced_exp += 1 if plan.pricing["profile"] == "exp" else 0
             self._waypoints_below_floor += plan.pricing["waypoints_below_floor"]
             self.logger.info(
                 "Priced plan map=%s graph_version=%s kappa=%s margin=%.4f rate=%.3f margin_source=%s cost=%d exact=%s "
-                "profile=%s k=%s origin=%s reach=%.3f waypoints_below_floor=%d tiles=%s",
+                "profile=%s k=%s origin=%s reach=%.3f waypoints_below_floor=%d turn_lambda=%.3f turn_source=%s turn_reason=%s tiles=%s",
                 map_id, version, plan.pricing["kappa"], plan.pricing["margin"], plan.pricing["rate"],
                 plan.pricing["margin_source"], plan.pricing["cost"], plan.pricing["exact"],
                 plan.pricing["profile"], plan.pricing["k"], plan.pricing["origin"], plan.pricing["reach"],
-                plan.pricing["waypoints_below_floor"],
+                plan.pricing["waypoints_below_floor"], turn["lambda_m_per_rad"], turn["source"], turn["reason"] or "-",
                 (getattr(graph, "last", None) or {}).get("tiles"))
         # Note: end_node_id is the LEAF nearest the goal waypoint (within LEAF_SNAP_M, up to 1 m
         # off), target_node_position the snapped goal cell centre (within GOAL_SNAP_M of the tap):
@@ -389,8 +398,8 @@ class MissionPlannerService:
         robot = await self.get_robot_status(robot_name)
         robot_width = self._robot_width(robot)
         snap_m = config.SCENE_GRAPH_START_SNAP_M
-        safety = scene_route.safety_for(graph, robot_width, self._robot_length(robot),
-                                        config.SCENE_GRAPH_SAFETY_KAPPA)    # the planner's clearance pricing
+        safety = scene_route.safety_for(graph, robot_width, self._robot_length(robot), config.SCENE_GRAPH_SAFETY_KAPPA,
+                                        self._robot_turn(robot)["lambda_m_per_rad"])   # the planner's pricing and turn cost
 
         max_points = config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0
         routes = node_policy_plan.LegRoutes() if max_points > 0 else None
@@ -460,6 +469,13 @@ class MissionPlannerService:
         except (TypeError, ValueError):
             return None
         return width if math.isfinite(width) and width > 0.0 else None
+
+    @staticmethod
+    def _robot_turn(robot: Optional[robot_object.RobotObjectV1]) -> Dict[str, Any]:
+        """The turn-cost record of the planning robot (scene_route.turn_record from its factsheet's speed_max and
+        angular_speed_max): lambda 0 while SCENE_GRAPH_TURN_COST_ENABLED is off."""
+        return scene_route.turn_record(getattr(getattr(robot, "status", None), "factsheet", None),
+                                       config.SCENE_GRAPH_TURN_COST_ENABLED, config.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD)
 
     @staticmethod
     def _robot_length(robot: Optional[robot_object.RobotObjectV1]) -> Optional[float]:
@@ -1594,6 +1610,7 @@ class MissionPlannerService:
                 "priced_plans_inexact": self._priced_inexact,
                 "priced_plans_exp": self._priced_exp,
                 "waypoints_below_floor": self._waypoints_below_floor,
+                "turn_sources": dict(self._turn_sources),
             }
         return stats
 

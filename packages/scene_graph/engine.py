@@ -33,6 +33,7 @@ from scipy.sparse.csgraph import dijkstra
 from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
                   SceneParams, Snap, ViewResult, edge_weight)
 from . import morse
+from . import turn as turn_search
 from .chart_keys import assign_A, overlaps
 from .leafcover import View as CamView
 from .leafcover import select_views
@@ -984,9 +985,12 @@ class ChartGraph(SceneGraph):
         (`Route.cost`); among equal-cost paths it is the lexicographic minimum of its (y, x) cell sequence, so every reader of the
         same cells returns the same route. `Route.length` is the geometric length of that path.
         With `safety` the edge cost is the length priced by the clearance deficit (`_edge_cost`), J = `Route.cost`; the corridor
-        is then not used (it is a length bound, not a bound of J): the whole graph is searched."""
+        is then not used (it is a length bound, not a bound of J): the whole graph is searched. With `safety.turn` > 0 every change
+        of heading adds its turn cost to J (`turn.route`: the exact (cell, heading) search on the cells that can hold a route no
+        costlier than a known one); the tie rule is the same."""
         self._check()
-        if safety is not None and safety.rate == 0.0: safety = None          # no price: today's route, the corridor included (S8)
+        turn = 0.0 if safety is None else float(safety.turn)
+        if safety is not None and safety.rate == 0.0 and turn == 0.0: safety = None   # no price: today's route, the corridor included (S8)
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
         sp = s.sp; ja, jb = s.keys.index(a), s.keys.index(b)
@@ -1002,12 +1006,12 @@ class ChartGraph(SceneGraph):
             alive = ~bm[sp.ys, sp.xs]
         if not alive[src] or not alive[dst]: return None
 
-        if safety is None:
+        if safety is None or safety.rate == 0.0:
             W = self._cache.get("route_w")                   # integer edge cost: the length in units of ROUTE_UNIT_M, rounded up
             if W is None:
                 W = self._cache["route_w"] = np.maximum(np.ceil(Ln / ROUTE_UNIT_M - 1e-6), 1.0)
         else:
-            key = safety                                     # frozen, hashable: margin, rate, k, origin
+            key = (safety.margin, safety.rate, safety.k, safety.origin)   # what the weights depend on (not `turn`)
             hit = self._cache.get("route_ws")                # only the last Safety is kept
             if hit is None or hit[0] != key:
                 hit = self._cache["route_ws"] = (key, self._edge_cost(s, safety))
@@ -1039,6 +1043,12 @@ class ChartGraph(SceneGraph):
             lo, hi = g.indptr[u], g.indptr[u + 1]
             nb = g.indices[lo:hi]
             path.append(int(nb[(g.data[lo:hi] + d[nb]) == d[u]].min()))
+        if turn > 0.0:
+            # the plain optimum above is the whole graph's (no corridor under `safety`): P0 of the turn search, d its distances to dst
+            ok = alive[R] & alive[C]
+            tg = turn_search.Graph(N, R[ok], C[ok], W[ok], turn_search.heading(sp.ys[C[ok]] - sp.ys[R[ok]], sp.xs[C[ok]] - sp.xs[R[ok]]),
+                                   sp.ys, sp.xs, plain=g)
+            cost, path = turn_search.route(tg, src, dst, path, int(cost), turn_search.table(turn), d_t=d)
         charts: List[Key] = []
         for c in path:
             kk = s.keys[int(s.full[c])]

@@ -6,9 +6,11 @@ No I/O here (see `store.py`), no config import.
 
 Terms: a **chart** is the set of free cells owned by one anchor (the mcmap); every cell of it is a straight drive from
 its anchor. A **link** joins two charts that share boundary. A chart **key** never changes while the chart lives.
-The graph carries evidence and length. A consumer may ask `route` to price clearance with `Safety` (docs/scene_graph/route_safety.md);
-pricing of observation rates (counts, posterior) is not built: consumers weigh those channels themselves.
+The graph carries evidence and length. A consumer may ask `route` to price clearance with `Safety` (docs/scene_graph/route_safety.md),
+and to charge for turning (`Safety.turn`, docs/scene_graph/close_evidence_and_turn_cost_design.md part B); pricing
+of observation rates (counts, posterior) is not built: consumers weigh those channels themselves.
 """
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -156,6 +158,13 @@ def edge_weight(len_units, deficit_sum, rate):
     return np.maximum(np.ceil(len_units * (1.0 + rate * deficit_sum / 2.0) - 1e-6), 1.0)
 
 
+def turn_weight(turn, steps):
+    """Integer turn cost (units of 1e-4 m) of a heading change between two consecutive lattice edges: `steps` multiples of pi / 4
+    (0..4, the change wrapped to [0, pi]), `turn` (m per radian) the price of a radian: ceil(turn * |dtheta| / 1e-4 - 1e-6), 0 for no
+    change. The one formula the engine, the lazy reader and the references share; works on numbers and arrays."""
+    return np.maximum(np.ceil(turn * (np.asarray(steps, float) * (math.pi / 4.0)) / 1e-4 - 1e-6), 0.0)
+
+
 @dataclass(frozen=True)
 class Safety:
     """Clearance pricing of a route, two tiers of one type. The price p(c) of a lattice cell c (g: its physical clearance, m) is
@@ -163,20 +172,28 @@ class Safety:
     Hinge tier (k None): p = max(0, margin - g), `margin` (m) the clearance from which a cell is free of charge, `rate` (1/m) the
     multiplier per metre of deficit. Exponential tier (k set; docs/scene_graph/inflation_profile_design.md): p = exp(-k (g - origin))
     for g < margin (= the reach of the robot's inflation), 0 beyond; `rate` is then the dimensionless multiplier kappa. Below
-    `origin` the same formula continues (no kink). rate = 0 is the unpriced route, identical to `safety=None`."""
+    `origin` the same formula continues (no kink). rate = 0 is the unpriced route, identical to `safety=None`.
+    Turn cost (`turn`, m per radian, docs/scene_graph/close_evidence_and_turn_cost_design.md B.1): every change of heading between two
+    consecutive lattice edges adds `turn_weight(turn, steps)`; the start and the goal heading are free. It applies on top of the
+    weights above, also at rate 0 (the length plus the turn cost; `margin` is then not read). rate = 0 and turn = 0 is `safety=None`."""
     margin: float
     rate: float
     k: Optional[float] = None
     origin: Optional[float] = None
+    turn: float = 0.0
 
     # the exponential tier is bounded so that every weight is a finite integer held exactly in float64: exp(k * origin) <= e^10
     MAX_K_ORIGIN = 10.0
+    # a turn of pi costs at most 5 m (157 080 units): a corrupt robot value cannot make a weight overflow
+    MAX_TURN = 5.0
 
     def __post_init__(self):
         if not self.margin > 0.0:
             raise ValueError("Safety.margin must be > 0, got %r" % (self.margin,))
         if not self.rate >= 0.0:
             raise ValueError("Safety.rate must be >= 0, got %r" % (self.rate,))
+        if not (0.0 <= self.turn <= self.MAX_TURN):          # also NaN
+            raise ValueError("Safety.turn must be finite, in [0, %g], got %r" % (self.MAX_TURN, self.turn))
         if (self.k is None) != (self.origin is None):
             raise ValueError("Safety.k and Safety.origin are set together")
         if self.k is not None:

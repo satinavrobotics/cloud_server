@@ -48,3 +48,15 @@ def test_the_harness_passes_every_gate_on_a_synthetic_export(tmp_path, monkeypat
     assert "ALL GATES PASS" in out
     for gid in ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "B1", "B2", "C1", "C2", "C3", "C3c"):
         assert any(line.startswith(gid + " ") and "PASS" in line for line in out.splitlines()), (gid, out)
+
+
+def test_the_harness_passes_every_gate_with_the_turn_cost(tmp_path, monkeypatch, capsys):
+    _export(str(tmp_path), cw.room_loop())
+    mod = _load()
+    monkeypatch.setattr(sys, "argv", ["accept", "--data", str(tmp_path), "--pairs", "10", "--seed", "3", "--turn-lambda", "0.5"])
+    code = mod.main()
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "turn lambda 0.500 m/rad" in out and "heading changes per 10 m" in out
+    for gid in ("A1", "A3", "A5", "A6", "B1", "B2", "C2", "C3", "C3c"):
+        assert any(line.startswith(gid + " ") and "PASS" in line for line in out.splitlines()), (gid, out)

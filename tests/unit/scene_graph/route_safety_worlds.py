@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy import ndimage
 
-from packages.scene_graph.api import Safety
+from packages.scene_graph.api import Safety, turn_weight
 from packages.scene_graph.engine import ChartGraph
 
 from . import chart_worlds as cw
@@ -129,6 +129,72 @@ class Reference:
             u = path[-1]
             path.append(min(v for v in self.neighbours(u, alive) if dist.get(v, math.inf) + self.weight(u, v, safety) == dist[u]))
         return dist[src], path
+
+    @staticmethod
+    def turn_units(p: Tuple[int, int], q: Tuple[int, int], r: Tuple[int, int], turn: float) -> int:
+        """turn cost of the corner p -> q -> r: the wrapped heading change from atan2, in multiples of pi / 4, priced by
+        `api.turn_weight` (the one formula; the heading arithmetic here is the reference's own)"""
+        a1 = math.atan2(q[0] - p[0], q[1] - p[1])
+        a2 = math.atan2(r[0] - q[0], r[1] - q[1])
+        d = abs((a2 - a1 + math.pi) % (2 * math.pi) - math.pi)
+        return int(turn_weight(turn, int(round(d / (math.pi / 4)))))
+
+    def turn_cost(self, cells: List[Tuple[int, int]], safety: Safety) -> int:
+        """J of a cell path under `safety` with its turn term (rate 0: the unpriced weights)"""
+        sf = safety if safety.rate > 0 else None
+        return self.path_cost(cells, sf) + sum(self.turn_units(p, q, r, safety.turn)
+                                               for p, q, r in zip(cells[:-2], cells[1:-1], cells[2:]))
+
+    def dijkstra_turn(self, src: Tuple[int, int], dst: Tuple[int, int], safety: Safety,
+                      alive: Optional[np.ndarray] = None) -> Tuple[Optional[int], Optional[List[Tuple[int, int]]]]:
+        """(minimal J with the turn term, the canonical path): heapq over (cell, incoming step) states, backwards from the goal (any
+        heading), then the walk from the start (free heading) that takes the smallest (y, x) next cell on a minimal path"""
+        sf = safety if safety.rate > 0 else None
+        steps = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx]
+        if src == dst:
+            return 0, [src]
+
+        tus = {(hu, hv): self.turn_units((0, 0), hu, (hu[0] + hv[0], hu[1] + hv[1]), safety.turn) for hu in steps for hv in steps}
+
+        def tu(hu, hv):
+            return tus[(hu, hv)]
+        dist: Dict[Tuple[Tuple[int, int], Tuple[int, int]], int] = {}
+        pq = []
+        for h in steps:
+            dist[(dst, h)] = 0
+            pq.append((0, dst, h))
+        heapq.heapify(pq)
+        while pq:
+            d, v, hv = heapq.heappop(pq)
+            if d > dist[(v, hv)]:
+                continue
+            u = (v[0] - hv[0], v[1] - hv[1])
+            if not (0 <= u[0] < self.nav.shape[0] and 0 <= u[1] < self.nav.shape[1]) or not self.nav[u] \
+                    or (alive is not None and not alive[u]) or v not in self.neighbours(u, alive):
+                continue
+            w = self.weight(u, v, sf)
+            for hu in steps:
+                nd = d + w + tu(hu, hv)
+                if nd < dist.get((u, hu), math.inf):
+                    dist[(u, hu)] = nd
+                    heapq.heappush(pq, (nd, u, hu))
+        inf = math.inf
+
+        def D(c, h):
+            return dist.get((c, h), inf)
+        cand = [(self.weight(src, v, sf) + D(v, (v[0] - src[0], v[1] - src[1])), v) for v in self.neighbours(src, alive)]
+        if not cand or min(cand)[0] == inf:
+            return None, None
+        cost = min(c for c, _ in cand)
+        path = [src, min(v for c, v in cand if c == cost)]
+        h = (path[1][0] - src[0], path[1][1] - src[1])
+        while path[-1] != dst:
+            u = path[-1]
+            nxt = min(v for v in self.neighbours(u, alive)
+                      if self.weight(u, v, sf) + tu(h, (v[0] - u[0], v[1] - u[1])) + D(v, (v[0] - u[0], v[1] - u[1])) == D(u, h))
+            h = (nxt[0] - u[0], nxt[1] - u[1])
+            path.append(nxt)
+        return int(cost), path
 
     def endpoints(self, a: str, b: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
         s = self.s

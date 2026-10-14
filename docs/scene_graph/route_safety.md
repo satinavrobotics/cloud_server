@@ -2,7 +2,8 @@
 
 Status: implemented, 2026-10-13, on the tile-lazy planner (the only planner mode: `full_load` no longer exists; the engine's
 `route` is the reference implementation the lazy reader is tested against). Owners: CIMBI (engine, `packages/scene_graph`), LACI
-(planner, `packages/services/mission_planner`). Statements 29-31 of `formulation.md` point here.
+(planner, `packages/services/mission_planner`). Statements 29-31 of `formulation.md` point here. The turn cost (2026-10-14, branch
+`feat/turn-cost`, off by default) adds a term to the objective: section 9.
 
 ## 0. Problem and evidence
 
@@ -40,7 +41,8 @@ section 7), margin m = r_c = 0.354 m, kappa 1:
 * Pricing is off (`safety = None`) when `m - r <= h / sqrt2 = 0.0707 m` (S14) or `m > CAP = 1 m` (S9).
 * Edge (a, b), Euclidean step `l`: `w_ab = max(ceil(l / 1e-4 * (1 + mu * (d(a) + d(b)) / 2) - 1e-6), 1)` (integer, units of 1e-4 m;
   the `1e-6` is the guard the unpriced weight already has against float noise just above an integer).
-* `J(path) = sum w_ab` is `Route.cost`; `Route.length` stays geometric.
+* `J(path) = sum w_ab` is `Route.cost`; `Route.length` stays geometric. With a turn cost (`Safety.turn` = lambda > 0, section 9)
+  `J(path) = sum w_ab + sum over corners turn_weight(lambda, |dtheta| / (pi / 4))`; lambda 0 is this section unchanged.
 
 ## 2. Statements (derivation record)
 
@@ -282,3 +284,71 @@ polyline is evaluated in the continuum.
 **L5. Not re-run in this change.** S2 (158 of 200 pairs, the 2.2-2.35 x detours), the S12 observed maximum 0.0707 m, and the
 B-plane slack-field comparison of section 6 (research script, a different sampling) come from the research scripts of the session
 (not in the repository); the derivations of section 2 do not depend on them.
+
+## 9. Turn cost (2026-10-14, branch `feat/turn-cost`, off by default)
+
+Design and research: `close_evidence_and_turn_cost_design.md` part B. Statements as tested on the branch.
+
+**Objective.** `J(path) = sum w_ab + sum over corners turn_weight(lambda, k)`, `w_ab` the integer weight of section 1 (unpriced at
+rate 0), k = |dtheta| / (pi / 4) in 0..4 the wrapped heading change between two consecutive lattice edges, `turn_weight(lambda, k) =
+ceil(lambda * k * pi / 4 / 1e-4 - 1e-6)` (`api.turn_weight`, the one formula of the engine, the lazy reader and both references).
+lambda (m per rad) is `Safety.turn` (validated finite, in [0, 5]: at most 157 080 units per corner). The start and the goal heading are
+free. The search state is (cell, incoming heading); the weights are non-negative integers, so Dijkstra on that expanded graph is exact.
+
+| # | Statement | Mark |
+|---|---|---|
+| T1 | `turn = 0` is the route of sections 1-8, bit for bit, and takes the same code path (the turn search is not entered; the engine's weight cache key is `(margin, rate, k, origin)`, so lambda never evicts it). `Safety(m, 0.0, turn=0)` is `safety=None` (S8 unchanged). | EXACT, TESTED |
+| T2 | `turn > 0` at rate 0 is the length plus the turn cost (`margin` not read); the corridor is then not used (as under a price). | DEFINITION |
+| T3 | Ties: among the paths of minimal J the lexicographic minimum of the (y, x) cell sequence (headings are not part of the order: a step's heading is fixed by its two cells). The walk from the start takes the smallest next cell whose `w + turn + D(next state) = D(state)`, D the distance to any goal state. | EXACT, TESTED |
+| T4 | Restriction: the incumbent J_inc is the plain route P0 (the optimum of section 1) plus its turn cost, or the expanded optimum on the cells within 3 lattice steps of P0 when cheaper. A path of cost <= J_inc only passes cells c with `d(s,c) + d(c,t) <= J_inc`, d the plain distances (the turn term is >= 0): the expanded search on those cells is the whole graph's optimum. If P0 has no turn, P0 is the answer (its cost is a lower bound and it is canonical). | EXACT, TESTED (equal to the whole-graph expanded search) |
+| T5 | The lazy reader loads the charts and tiles of the Euclidean ellipse `|c-a| + |c-b| <= J_inc * 1e-4 m` (S7, S10) and applies T4 inside; over `max_tiles` it returns the incumbent with `exact = False` (`CorridorTooLarge` and `tile_unavailable` of the earlier stages unchanged). | EXACT, TESTED |
+| T6 | Monotone: for lambda_1 < lambda_2 the optima's total turning satisfies `Theta_2 <= Theta_1 + 1e-4 (m_1 + m_2) / (lambda_2 - lambda_1)` (m turns; each turn weight rounds up by < 1 unit). | EXACT (exchange argument), TESTED |
+| T7 | The string pull (`priced_visible`, S11) has no turn term; at rate 0 the pull is the plain line of sight, as today. The nodePolicy cut likewise. | DEFINITION |
+
+**Implementation.** `packages/scene_graph/turn.py` (the expanded search, incumbent, restriction; shared), `engine.ChartGraph.route`
+(whole graph: P0 from the plain search, then `turn.route`), `lazy_plan.PlanGraph._turn` (band incumbent on the band's tiles, then the
+exact stage on the ellipse's tiles). Planner: `scene_route.turn_lambda(factsheet, enabled, operator)` and `turn_record` (lambda =
+`speed_max / angular_speed_max`, clamp [0, 5], else `SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD`, else 0; switch
+`SCENE_GRAPH_TURN_COST_ENABLED`, default false), `safety_for(..., turn)`, `plan_on_graph(..., turn=record)`; the server passes the
+robot's record to plan, navigate and enrich / gap-fill. `ChartPlan.pricing["turn"] = {lambda_m_per_rad, source, speed_max,
+angular_speed_max, reason}`; at rate 0 with a turn the record has `rate` 0, `margin` None, `profile` "none" and the log line is
+`Turn-cost plan ...`; the `Priced plan ...` line carries `turn_lambda`, `turn_source`, `turn_reason`; `/stats` counts served plans by
+source in `scene_graph.turn_sources` and `priced_plans` counts rate > 0 only.
+
+**Tests.** `tests/unit/scene_graph/test_turn_cost.py` (engine: the value object and the weight, T1 reduction and code path, T2/T3
+against `Reference.dijkstra_turn` (heapq over (cell, step) states, its own atan2 heading arithmetic) with and without an overlay, point
+to point, T4 restricted == whole-graph expanded search, T6 monotone turning, determinism over batching / order / translation,
+alternating lambdas), `tests/unit/test_lazy_turn_cost.py` (lazy: lambda 0 never enters `_turn`, lazy == engine on the nine equality
+worlds with and without disc / segment overlays, == the reference, cold == warm, the cap: raise or a valid route with its own J, the exact
+stage over the cap keeps the incumbent and says inexact), `tests/unit/test_scene_route_turn.py` (the factsheet function: missing,
+negative, NaN, inf, zero, clamp, operator fallback, switch; settings parse; `safety_for`; the pricing record; no priced pull at rate 0;
+the service: lambda into the route, response, log line, stats, StatsResponse; enrich), and the harness smoke with `--turn-lambda`.
+
+**Acceptance on office8** (`accept_route_safety.py --data <office8 export> --turn-lambda L`, 150 pairs, seed 7, kappa 1): every gate
+passes at L = 0.25, 0.5 and 1.0 (A1 including turn 0 == the priced route and plan; A3 against the reference's own (cell, heading)
+search; A5 lazy == engine; A6 cold == warm; B1, B2, C2 with the turn cost of the comparison route added to their bounds).
+
+| lambda (m/rad) | lattice heading changes per 10 m | lattice rad/m | waypoint changes per 10 m | waypoint rad/m | plan warm p50 / p95 / p99 (ms) | plan cold p50 / p95 / p99 (ms) |
+|---|---|---|---|---|---|---|
+| 0 (priced route of today) | 16.7 | 1.35 | 5.6 | 0.323 | 4.3 / 6.9 / 8.3 | 9.6 / 12.4 / 13.9 |
+| 0.25 | 5.6 | 0.44 | 4.7 | 0.306 | 8.4 / 13.9 / 15.8 | 13.5 / 19.2 / 21.8 |
+| 0.5 | 5.5 | 0.43 | 4.6 | 0.301 | 9.8 / 14.7 / 20.8 | 14.8 / 20.0 / 22.1 |
+| 1.0 | 5.4 | 0.42 | 4.6 | 0.298 | 10.4 / 17.0 / 19.6 | 14.8 / 21.3 / 24.8 |
+
+The lattice length is unchanged at the median (+0.00%), +1.59% at most. The clearance statistics of the pulled plans move slightly
+(median minimum clearance 0.292 -> 0.283 / 0.269 / 0.269 m, routes under r 33 -> 34 / 34 / 37, unsafe length 0.62 -> 0.69 / 0.72 /
+0.75 m at lambda 0.25 / 0.5 / 1.0): the turn term trades a little clearance for fewer corners, as the objective says.
+
+**Worst case on the 117 070-cell synthetic map** (`inflation_efficiency.py --sizes 50x25 --pairs 30 --min-pair-m 30 --turn-lambda L`,
+production path: fold, store, restored engine and `PlanGraph`; pairs median 36.7 m, max 48.9 m; hinge kappa 1; lazy == engine 30 of 30
+at every L). Without the turn cost the same world's hinge route is engine p99 61 ms, lazy 96 ms, lazy cold 111 ms.
+
+| lambda | engine route p50 / p95 / p99 / max | lazy route warm | lazy route cold | lazy plan warm | lazy plan cold | above 0.5 s |
+|---|---|---|---|---|---|---|
+| 0.5 | 205 / 283 / 301 / 304 | 218 / 376 / 414 / 421 | 237 / 392 / 397 / 399 | 203 / 376 / 405 / 409 | 225 / 361 / 384 / 392 | 0 of 30 everywhere |
+| 0.5, rate 0 | 184 / 270 / 290 / 296 | 185 / 306 / 312 / 314 | 200 / 329 / 349 / 355 | 189 / 316 / 328 / 330 | 199 / 326 / 344 / 349 | 0 of 30 everywhere |
+| 1.0 | 229 / 374 / 415 / 425 | 244 / 404 / 462 / 486 | 268 / 480 / 498 / 502 | 254 / 429 / 456 / 467 | 259 / 430 / 512 / 541 | 1 of 30 (cold) |
+| 5.0 (the clamp) | 480 / 678 / 702 / 705 | 529 / 762 / 787 / 789 | 530 / 774 / 790 / 796 | 532 / 778 / 814 / 826 | 541 / 779 / 810 / 818 | 12-17 of 30 |
+
+The plan budget (`SCENE_GRAPH_PLAN_BUDGET_S`, 3 s) is not reached; the 0.5 s allowance of the design (B.5) holds to lambda 0.5 and is
+exceeded from lambda 1.0 on this map: the plain-distance ellipse grows with lambda * the optimum's turning (the gap J* - d(s, t)).

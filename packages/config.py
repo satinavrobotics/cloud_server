@@ -679,6 +679,12 @@ SCENE_GRAPH_NEAR_FOV_DEG = _opt_float("SCENE_GRAPH_NEAR_FOV_DEG")
 # NEAR_MIN_CLEARANCE_M (optional, needs NEAR_RANGE_M): "away from walls" - a held region stays held only when a cell of its connected
 # component is farther than this (m) from every other blocked or unknown cell; wall rims are released. Empty = every held cell holds.
 SCENE_GRAPH_NEAR_MIN_CLEARANCE_M = _opt_float("SCENE_GRAPH_NEAR_MIN_CLEARANCE_M")
+# Turn cost of the scene-graph route (docs/scene_graph/close_evidence_and_turn_cost_design.md B.1, B.6): every change of heading of
+# the lattice route costs lambda * |dtheta| (lambda in m per radian) on top of the priced length. lambda is per robot, from its
+# factsheet: speed_max / angular_speed_max, clamped to [0, 5]. LAMBDA_M_PER_RAD (empty = unset) is used only for a robot whose
+# factsheet lacks one of the two; neither: no turn cost for that plan. ENABLED is the switch: off (the default), no plan has a turn cost.
+SCENE_GRAPH_TURN_COST_ENABLED = _env_bool("SCENE_GRAPH_TURN_COST_ENABLED", "false")
+SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = _opt_float("SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
