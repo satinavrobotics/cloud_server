@@ -235,9 +235,9 @@ class Reference:
                 float(sg[c < self.margin].sum()))
 
 
-def build(data: str, r: float):
+def build(data: str, r: float, **params):
     leaves = bench.load_leaves(data)
-    g = ChartGraph(SceneParams(robot_half_side=r))
+    g = ChartGraph(SceneParams(robot_half_side=r, **params))
     be = MemoryBackend()
     st = SceneGraphStore(be, be)
     version = None

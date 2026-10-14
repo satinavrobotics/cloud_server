@@ -106,6 +106,15 @@ def _line(y0: int, x0: int, y1: int, x1: int):
     return y0 + ((y1 - y0) * k * 2 + n) // (2 * n), x0 + ((x1 - x0) * k * 2 + n) // (2 * n)
 
 
+def _state_params(p: SceneParams) -> dict:
+    """the parameters stored with a state; the close-evidence keys appear only when the rule is on (an off store is unchanged)"""
+    out = dict(robot_half_side=p.robot_half_side, lattice=p.lattice, chart_radius=p.chart_radius)
+    if p.near_range_m is not None:
+        out["near_range_m"] = p.near_range_m
+        if p.near_fov_deg is not None: out["near_fov_deg"] = p.near_fov_deg
+    return out
+
+
 class ChartGraph(SceneGraph):
     # A safety bound, not geometry: the dense canvas allocates ~17 B per full-resolution cell, so one leaf with an absurd pose
     # must be refused (LeafError) instead of allocating gigabytes. 2**28 cells = 0.67 km^2 at 0.05 m = ~4.5 GB of planes.
@@ -123,6 +132,7 @@ class ChartGraph(SceneGraph):
         self._leaf_recs: Dict[str, LeafRecord] = {}       # exported records, reused until the leaf changes
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
         self._V = self._T = self._B = None
+        self._Fn = None                         # close-evidence plane (params.near_range_m set): latest FREE time from within range
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
         self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
@@ -167,11 +177,13 @@ class ChartGraph(SceneGraph):
         H, W, oy, ox, h, w = plan["H"], plan["W"], plan["oy"], plan["ox"], plan["h"], plan["w"]
         if plan["fresh"]:
             return dict(V=np.full((H, W), 255, np.uint8), T=-np.ones((H, W), np.int64), B=-np.ones((H, W), np.int64),
+                        Fn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
                         chan={}, kp=None)
 
         def grow(a, fill):
             b = np.full((H, W), fill, a.dtype); b[oy:oy + h, ox:ox + w] = a; return b
         out = dict(V=grow(self._V, 255), T=grow(self._T, -1), B=grow(self._B, -1),
+                   Fn=None if self._Fn is None else grow(self._Fn, -1),
                    chan={k: (grow(v, 255), grow(t, -1)) for k, (v, t) in self._chan.items()}, kp=None)
         if self._key_plane is not None:
             kp = np.full((H // 2, W // 2), -1, self._key_plane.dtype)
@@ -180,6 +192,7 @@ class ChartGraph(SceneGraph):
 
     def _commit_canvas(self, plan, arrays) -> Tuple[int, int]:
         self._V, self._T, self._B, self._chan = arrays["V"], arrays["T"], arrays["B"], arrays["chan"]
+        self._Fn = arrays["Fn"]
         if arrays["kp"] is not None: self._key_plane = arrays["kp"]
         self._cx0, self._cy0 = plan["cx0"], plan["cy0"]
         return (0, 0) if plan["fresh"] else (plan["oy"] // 2, plan["ox"] // 2)
@@ -190,7 +203,7 @@ class ChartGraph(SceneGraph):
         return (0, 0) if plan is None else self._commit_canvas(plan, self._grow_canvas(plan))
 
     @staticmethod
-    def _fold_into(V, T, w, gx, gy, cx0, cy0, t, B=None):
+    def _fold_into(V, T, w, gx, gy, cx0, cy0, t, B=None, Fn=None, pose=None):
         H, W = V.shape
         ox, oy = gx - cx0, gy - cy0
         ys0, xs0 = max(0, oy), max(0, ox); ys1, xs1 = min(H, oy + w.shape[0]), min(W, ox + w.shape[1])
@@ -206,6 +219,20 @@ class ChartGraph(SceneGraph):
             new_b = bl & (t > Bc)
             Bc[bl] = np.maximum(Bc[bl], t)
             win = win | new_b
+        if Fn is not None:
+            # close evidence: a FREE report counts only from a capture pose within range (and, with a fov, inside the cone
+            # or within 0.3 m): `pose` = (x, y, yaw, range_m, fov_rad or None) in the map frame. Max-merge like B.
+            px, py, yaw, rng, fov = pose
+            ys = (np.arange(ys0, ys1) + cy0 + 0.5) * RES; xs = (np.arange(xs0, xs1) + cx0 + 0.5) * RES
+            dy, dx = (ys - py)[:, None], (xs - px)[None, :]
+            near = np.hypot(dy, dx) <= rng
+            if fov is not None:
+                dev = np.abs((np.arctan2(dy, dx) - yaw + np.pi) % (2 * np.pi) - np.pi)
+                near &= (dev <= fov / 2) | (np.hypot(dy, dx) < 0.3)
+            fr = kn & (sub < 100) & near
+            Fc = Fn[ys0:ys1, xs0:xs1]
+            win = win | (fr & (t > Fc))
+            Fc[fr] = np.maximum(Fc[fr], t)
         if not win.any(): return None                                   # a replay of what is folded changes nothing
         ys, xs = np.nonzero(win)
         return (int(xs.min()) + xs0, int(ys.min()) + ys0, int(xs.max()) + 1 + xs0, int(ys.max()) + 1 + ys0)
@@ -329,6 +356,7 @@ class ChartGraph(SceneGraph):
             x1, y1 = min(region[2] - self._cx0, self._V.shape[1]), min(region[3] - self._cy0, self._V.shape[0])
             if x0 < x1 and y0 < y1:
                 self._V[y0:y1, x0:x1] = 255; self._T[y0:y1, x0:x1] = -1; self._B[y0:y1, x0:x1] = -1
+                if self._Fn is not None: self._Fn[y0:y1, x0:x1] = -1
                 for v, t in self._chan.values():
                     v[y0:y1, x0:x1] = 255; t[y0:y1, x0:x1] = -1
         touched = None                                   # global full-resolution cells whose value, time or blocked time changed
@@ -339,7 +367,12 @@ class ChartGraph(SceneGraph):
             g = (b[0] + self._cx0, b[1] + self._cy0, b[2] + self._cx0, b[3] + self._cy0)
             touched = g if touched is None else (min(touched[0], g[0]), min(touched[1], g[1]), max(touched[2], g[2]), max(touched[3], g[3]))
         for lf, w, gx, gy, chans in prepared:
-            grow_touched(self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B))
+            pose = None
+            if self._Fn is not None:
+                p = self.params
+                pose = (lf.x, lf.y, lf.yaw, p.near_range_m, None if p.near_fov_deg is None else math.radians(p.near_fov_deg))
+            grow_touched(self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B,
+                                         self._Fn, pose))
             for name, cw in chans.items():
                 if name not in self._chan:
                     self._chan[name] = (np.full(self._V.shape, 255, np.uint8), -np.ones(self._V.shape, np.int64))
@@ -571,6 +604,8 @@ class ChartGraph(SceneGraph):
         blocked or unknown cell, m) and the driven (body covered) image"""
         V = self._V
         free = (V != 255) & (V < 100)
+        if self._Fn is not None:
+            free &= ~((self._B >= 0) & (self._B > self._Fn))      # close evidence: blocked more recently than seen free from close
         sq = self._erode(free, shift)
         clr = self._clearance_cells(free, shift) * RES
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
@@ -1062,8 +1097,8 @@ class ChartGraph(SceneGraph):
         """The resumable state, by reference (the arrays are not copied: the store slices them into tiles)."""
         self._check()
         p = self.params
-        st = EngineState(params=dict(robot_half_side=p.robot_half_side, lattice=p.lattice, chart_radius=p.chart_radius),
-                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, chan=dict(self._chan),
+        st = EngineState(params=_state_params(p),
+                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
         s = self._solved
@@ -1078,9 +1113,10 @@ class ChartGraph(SceneGraph):
         the stored keys are then the keys of the rebuilt charts. The canvas is padded by MARGIN so that the distance to the
         non-navigable cells near the stored edge sees unknown, as it did before."""
         p = self.params
-        if (st.params["robot_half_side"], st.params["lattice"], st.params["chart_radius"]) != \
-                (p.robot_half_side, p.lattice, p.chart_radius):
-            raise ValueError("state was made with other parameters")
+        if st.params != _state_params(p):
+            raise ValueError("state was made with other parameters (%r, this engine %r): a store written with the close-evidence "
+                             "rule (near_range_m) needs an engine with the same near_range_m / near_fov_deg, and vice versa"
+                             % (st.params, _state_params(p)))
         if self._V is not None:
             raise ValueError("import_state needs a fresh engine")
         pad = MARGIN
@@ -1088,6 +1124,7 @@ class ChartGraph(SceneGraph):
         padl = lambda a, fill: np.pad(a, pad // 2, constant_values=fill)
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
         self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
+        self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
         self._chan = {k: (padf(v, 255), padf(t, -1)) for k, (v, t) in st.chan.items()}
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,
                                     None if l.view is None else CamView(l.key, *l.view)) for l in st.leaves}

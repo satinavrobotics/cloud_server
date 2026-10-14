@@ -30,6 +30,10 @@ class SceneParams:
     chart_radius: float = 2.0          # m: the one scene-dependent scale. Every chart is within this geodesic distance of its
                                        # net point (diameter <= 2 x chart_radius); `snap` is bounded by the chart diameter.
                                        # Part of the params hash: changing it is a new generation.
+    near_range_m: Optional[float] = None   # close evidence: a FREE report clears a cell blocked by a later-or-equal report only
+                                           # when captured from a pose within this range (m). None = off (latest value wins).
+    near_fov_deg: Optional[float] = None   # with near_range_m: also inside this cone around the base yaw (forward camera
+                                           # assumed) or within 0.3 m. None = distance only.
 
 
 @dataclass(frozen=True)
