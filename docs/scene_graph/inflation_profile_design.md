@@ -167,3 +167,12 @@ for few waypoints (shifts above 0.5 m: 0-8% of the affected ones, about 0.1% of 
 Decided with the planner owner (2026-10-14): guard only, floor `r_global`, count and do not move (section 4).
 Also noted: the kappa that matches the robot's own Smac (5.0) is far above the budget-derived 0.75; the
 two act at different levels (inside a leg versus which doors and where waypoints go) and need not be equal.
+
+## 12. Open items (to be confirmed by the planner owner on the robot side)
+
+| # | Item | Why it matters | Known so far |
+|---|---|---|---|
+| 1 | **Goal tolerance in use**: 0.35 m (server side, per the planner owner) or 0.5 m (`general_goal_checker.xy_goal_tolerance` in `tier1/navigation_common.yaml`) | how strictly a waypoint is reached; bounds the effect of any waypoint-position rule and of the guard count | both values are far above the lattice quantisation (0.071 m); the guard result in section 4 holds for either |
+| 2 | Whether formidable-peacock runs the **scratch Odin override** (inflation 0.8 / 6.0, global `footprint_padding` 0.05, `cost_travel_multiplier` 5.0) or the tier-1 files (inflation 0.55, footprint 0.76 x 0.68) | `reach`, `k` and `r_global` of the per-robot profile; the floor | values given by the planner owner match the override |
+| 3 | The effective `r_global` of the robot actually deployed (footprint inscribed radius + padding) | the guard's floor (0.30 m in the override) | 0.30 m in the override file |
+| 4 | Smac 2D `tolerance` in the live parameters (0.5 m in the repository) | whether a goal on an invalid cell is accepted | repository value only |
