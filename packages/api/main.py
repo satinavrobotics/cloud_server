@@ -23,7 +23,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, map_events, session_trace, sites
+from packages.api import drive_stats, edge_stats, map_events, mapping_stats, session_trace, sites
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -1025,6 +1025,34 @@ async def map_drive_stats(map_id: str, request: Request, robot: Optional[str] = 
     body, etag = await _site_call("map drive stats", drive_stats.drive_stats(
         service.database, service.graph_db, reads, map_id, fleet_reads.parse_ts(from_, "from"),
         fleet_reads.parse_ts(to, "to"), robot, min_speed))
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=60"}
+    if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+@app.get("/api/v1/maps/{map_id}/mapping-stats")
+async def map_mapping_stats(map_id: str, request: Request, robot: Optional[str] = None):
+    """How long the mapping of a map took: `{map_id, graph_version, cell_m, origin, step, tile_fields:
+    ["ix", "iy", "seconds", "nodes"], headline: {sessions, wall_s, paused_s, active_s, mapped_area_m2,
+    seconds_per_m2, minutes_per_100m2, scene_graph_area_m2, nodes, images, ...}, sessions: [{session_id, robot,
+    started_at, ended_at, wall_s, paused_s, active_s, nodes, images, ...}], tiles: [[ix, iy, seconds, nodes]...]
+    (0.1 m cells like drive-stats), regions: [{key, seconds, cells, area_m2, seconds_per_m2, nodes, visited}],
+    source, window}`. Active time = wall - paused of the map's mapping sessions (open ones up to now); the
+    seconds between consecutive nodes of a session are spread along the segment between them. `robot` filters
+    the sessions. ETag + `Cache-Control: private, max-age=60`; 304 on a matching If-None-Match. 404 unknown map.
+    Contract: docs/mapping_stats_2026-10-14.md."""
+    _require_service()
+    try:
+        reads = _scene_graph_reads()
+    except HTTPException:
+        reads = None
+    try:
+        occupancy = _occupancy_reads()
+    except HTTPException:
+        occupancy = None
+    body, etag = await _site_call("map mapping stats", mapping_stats.mapping_stats(
+        service.database, service.graph_db, reads, occupancy, map_id, robot))
     headers = {"ETag": etag, "Cache-Control": "private, max-age=60"}
     if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
         return Response(status_code=304, headers=headers)

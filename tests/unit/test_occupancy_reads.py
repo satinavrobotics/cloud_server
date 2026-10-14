@@ -280,3 +280,22 @@ def test_importing_the_module_does_not_load_the_engine():
             "print('packages.scene_graph' in sys.modules)\n" % str(path))
     out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "False"
+
+
+# ---- known area (mapping stats) ----
+
+def test_known_area_counts_free_and_blocked_and_caches():
+    a = np.full((128, 128), 255, np.uint8)
+    a[:10, :10] = 0                      # 100 free
+    a[10:12, :10] = 100                  # 20 blocked
+    b = np.full((128, 128), 255, np.uint8)
+    b[0, :7] = 0
+    st = make_store({(0, 0): a, (-1, 2): b})
+    reads = occ.OccupancyReads(st)
+    out = run(reads.known_area(MAP))
+    assert (out["free"], out["blocked"], out["tiles"], out["version"]) == (107, 20, 2, 1)
+    assert out["bbox"] == [-6.4, 0.0, 6.4, 19.2]
+    calls = st.v_calls
+    assert run(reads.known_area(MAP)) == out and st.v_calls == calls
+    with pytest.raises(occ.NotFound):
+        run(reads.known_area("nope"))

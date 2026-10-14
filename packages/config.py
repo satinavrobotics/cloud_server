@@ -548,6 +548,10 @@ DRIVE_STATS_MIN_SPEED_MS = float(os.getenv("DRIVE_STATS_MIN_SPEED_MS", "0.05"))
 DRIVE_STATS_LEG_MAX_M = float(os.getenv("DRIVE_STATS_LEG_MAX_M", "10.0"))
 DRIVE_STATS_CACHE_TTL_S = float(os.getenv("DRIVE_STATS_CACHE_TTL_S", "120.0"))
 DRIVE_STATS_CACHE_ENTRIES = int(os.getenv("DRIVE_STATS_CACHE_ENTRIES", "16"))
+# GET /api/v1/maps/{id}/mapping-stats (docs/mapping_stats_2026-10-14.md): time between two consecutive
+# nodes of a mapping session longer than MAPPING_STATS_MAX_GAP_S (after the paused seconds are taken out)
+# is not attributed to space (the robot stood, the uploads stalled); it still counts in the active time.
+MAPPING_STATS_MAX_GAP_S = float(os.getenv("MAPPING_STATS_MAX_GAP_S", "60.0"))
 EDGE_STATS_MAX_DURATION_S = float(os.getenv("EDGE_STATS_MAX_DURATION_S", "3600.0"))
 EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", "5.0"))
 EDGE_STATS_MIN_SPEED_MPS = float(os.getenv("EDGE_STATS_MIN_SPEED_MPS", "0.02"))
