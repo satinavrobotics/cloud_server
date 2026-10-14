@@ -28,16 +28,20 @@ def main():
     ap.add_argument("--rdet", type=float, default=1.5)
     ap.add_argument("--away", type=float, default=0.25)
     ap.add_argument("--half-side", type=float, default=0.25)
+    ap.add_argument("--fov-deg", type=float, default=0.0,
+                    help="if > 0, a free report counts as close evidence only inside this horizontal field of view around the base yaw "
+                         "(the robot's ground-support channel only judges cells its camera swept; the export has no camera view, "
+                         "so a forward camera is ASSUMED)")
     a = ap.parse_args()
     leaves, _, eng = A.build(a.data, a.half_side)
     H, W = eng._V.shape
     cx0, cy0 = eng._cx0, eng._cy0
-    recs = sorted(((lf.stamp_ms, lf.x, lf.y) + eng._fold_leaf(lf)[:3] for lf in leaves), key=lambda r: r[0])
+    recs = sorted(((lf.stamp_ms, lf.x, lf.y) + eng._fold_leaf(lf)[:3] + (lf.yaw,) for lf in leaves), key=lambda r: r[0])
     sh = (H, W)
     V = np.full(sh, 255, np.uint8); T = -np.ones(sh, np.int64)
     B = -np.ones(sh, np.int64); Fn = -np.ones(sh, np.int64)
     ncl = np.zeros(sh, np.int32); ncb = np.zeros(sh, np.int32); nfa = np.zeros(sh, np.int32); nfb = np.zeros(sh, np.int32)
-    for t, x, y, gx, gy, w in recs:
+    for t, x, y, gx, gy, w, yaw in recs:
         h, wd = w.shape
         oy, ox = gy - cy0, gx - cx0
         y0, x0, y1, x1 = max(0, oy), max(0, ox), min(H, oy + h), min(W, ox + wd)
@@ -47,6 +51,10 @@ def main():
         d = np.hypot(((np.arange(y0, y1) + cy0 + 0.5) * RES - y)[:, None], ((np.arange(x0, x1) + cx0 + 0.5) * RES - x)[None, :])
         sl = (slice(y0, y1), slice(x0, x1))
         kn, bl, close = sub != 255, sub >= 100, d <= a.rdet
+        if a.fov_deg > 0:
+            bear = np.arctan2((np.arange(y0, y1) + cy0 + 0.5)[:, None] * RES - y, (np.arange(x0, x1) + cx0 + 0.5)[None, :] * RES - x)
+            dev = np.abs((bear - yaw + np.pi) % (2 * np.pi) - np.pi)
+            close &= (dev <= np.radians(a.fov_deg) / 2) | (d < 0.3)
         Tc, Vc = T[sl], V[sl]
         win = kn & ((Tc < 0) | (t > Tc) | ((t == Tc) & (sub > Vc)))
         Tc[win] = t; Vc[win] = sub[win]
@@ -68,7 +76,7 @@ def main():
     lab, n = ndimage.label(flip, structure=np.ones((3, 3)))
     far = np.array(ndimage.maximum(dist, lab, range(1, n + 1))) if n else np.array([])
     rim = int((flip & (dist <= 0.10)).sum())
-    print("leaves %d  span %.2f h  r_det %.2f m" % (len(leaves), (recs[-1][0] - recs[0][0]) / 3.6e6, a.rdet))
+    print("leaves %d  span %.2f h  r_det %.2f m  fov %s" % (len(leaves), (recs[-1][0] - recs[0][0]) / 3.6e6, a.rdet, "any" if a.fov_deg <= 0 else "%.0f deg (assumed forward)" % a.fov_deg))
     print("free cells %d | turn blocked %d (%.1f%%), %d on a wall rim (<= 10 cm), components %d" % (
         free.sum(), flip.sum(), 100 * flip.sum() / free.sum(), rim, n))
     print("navigable lattice cells (0.1 m): %d -> %d (%.1f%%)" % (keep_old.sum(), keep_new.sum(),

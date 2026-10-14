@@ -37,8 +37,23 @@ Both planes merge by max, so the fold stays commutative, associative and idempot
 A sequential statement of the same idea, "a far free report does not override a close lethal one", is **not** a valid fold: a far
 free at t2 folded before a close lethal at t1 (t1 < t2) gives the opposite result to the reverse order.
 
-`r_det` is a property of the robot's costmap (its obstacle detection range), so it should come from the robot's costmap
-parameters, not from a constant. The 1.5 m below is the value reported for the stairs, not a verified parameter.
+`r_det` is a property of the robot's costmap, so it should come from the robot's own parameters, not from a constant.
+
+**Exact source (robot repo `deployment_ws/src/sati_ros_navstack`, file
+`sati_nav_stack_bringup/config/services/navstack_sati_odin.yaml`, key `support.commit_radius_m: 1.5`, since 2026-09-20):** the
+costmap's ground-support channel (negative obstacles, stairwells; ROADMAP Stage 3, ON since 2026-09-18) marks a cell lethal only
+when it is **within `commit_radius_m` of base_link**, the camera swept it, its ground was never seen over `min_looks: 5` looks
+and occupancy calls it free. Notes from the same file: the value was 2.0 then 1.5; "the stairwell margin at 1.5 m is NOT
+re-measured"; the camera cone is about 95 x 83 degrees and `support_swept` exempts cells the cone never reached. So:
+
+* a **free report from beyond 1.5 m** says nothing about a support-lethal cell: the channel does not judge it;
+* a free report from within 1.5 m but **outside the camera cone** also says nothing (not swept); distance alone over-counts it;
+* occupancy lethals from the lidar (`obstacle_max_range 9.0`, `raytrace_max_range 10.0`, lidar layer config in `navigation_lidar.yaml`
+  and `lidar_obstacle_layer.yaml`) are visible far away: that is why 20% of the stairs' lethal reports come from beyond 1.5 m
+  (A.5), and why a lethal from far is still evidence, as the rule says.
+
+The fold has the leaf's base pose and yaw (and an optional camera `view` with `fov`, `rng`); the office8 export has no `view`
+(`None` on all 97 leaves). A cone test therefore needs either the export to carry the view or an assumed forward camera.
 
 What it does not change: how a cell reported blocked and never free is treated by the driven-witness cells (`W & free` in
 `_build_F`): a body that stood on a cell still proves it free. Needs a stored plane (a format step, a rebuild); not built.
@@ -58,6 +73,10 @@ Capture pose distance, today's fold order, `r_det` 1.5 m. The replay's folded `V
 | 150 sample routes (priced lattice route, same pairs) | 69 same, 47 change, 34 start or goal no longer navigable |
 
 Sensitivity to `r_det`: cells that turn blocked 3612 / 2685 / 1444 at 1.0 / 1.5 / 2.0 m; components away from walls 16 / 15 / 6.
+
+Sensitivity to the camera cone (`--fov-deg 95`, a forward camera ASSUMED, a free report counts only inside the cone or within
+0.3 m): 3520 cells turn blocked (16.4%), navigable F 2143 -> 1757 (-18.0%), 16 components away from walls with 1277 cells (3.19 m2).
+The cone makes a retraction rarer, so more stays blocked.
 
 ### A.4 The 15 components away from walls
 
@@ -121,8 +140,7 @@ What this data can and cannot separate:
 
 Recommendation: option 1. The largest component is the stairs and a per-cell confirmation count (option 2) would leave 11% of
 the stairs free, so the extra parameter buys ghost protection at the price of the hazard it is meant for. The ghost cost of
-option 1 is real but not demonstrated on this map: the unconfirmed components are small (190 cells away from the stairs, 0.5 m2
-in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
+option 1 is real but not demonstrated on this map: the other 14 components are small (404 cells, 1.0 m2 in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
 
 ### A.7 What is not shown
 
@@ -189,9 +207,46 @@ map a whole-graph expanded search is 319 ms plus 235 ms of build and 89 MB trans
 * concurrent plans multiply the transient memory (`plan_inflight`); not measured;
 * both `engine.ChartGraph.route` and `lazy_plan.PlanGraph._search`, and the harness `Reference`, must carry the same change.
 
+### B.5 Corridor- or ellipse-restricted search: design and cost on the largest map
+
+Design (exact, no heuristic): the production priced search already restricts to an ellipse. For the expanded search:
+
+1. the plain priced route P0 (as today); its priced cost plus the turn cost of its headings is an incumbent `J_inc >= J*`;
+2. optional tighter incumbent: the expanded search on the cells within 3 lattice cells of P0 (a thin band), cost `J_band`;
+3. the ellipse `E = {c : |s-c| + |c-t| <= J_inc * 1e-4 m}` (euclidean). Every priced edge weight is at least its length over
+   1e-4 m and the turn term is non-negative, so a path of total cost <= J_inc has length <= J_inc * 1e-4 m and lies in E:
+   **the restriction is exact**;
+4. the expanded (cell, heading) search on E only; the expanded CSR is built per request for E only.
+
+Measured (`tools/scene_graph_sim/turn_cost_restricted.py`, research lattice, scipy, lambda 0.5, pairs >= 3 m, with the band):
+
+| map | cells | pairs, route length median / max (m) | ellipse cells median (of map) | exact stage p50 / p95 / p99 (ms) | plain whole-graph search (ms) | whole-graph expanded optimum |
+|---|---|---|---|---|---|---|
+| office8 (real) | 2 143 | 30, 4.5 / 7.9 | 1 384 (65%) | 6.1 / 9.5 / 14.7 | 0.3 | equal in 30 of 30 |
+| Hospital (real, the largest real map here) | 17 114 | 30, 6.6 / 15.7 | 2 348 (14%) | 13.3 / 40.4 / 46.3 | 1.3 | equal in 30 of 30 |
+| synthetic 50 x 25 m (the 112k-cell size of B.3) | 117 070 | 15, 21.8 / 39.7 | 34 189 (29%) | 190 / 481 / 509 | 25.8 | equal in 15 of 15 (earlier run, no band) |
+
+The restricted result equals the whole-graph expanded optimum in every comparison (0 mismatches). Without the band the incumbent
+is loose (median 1.6 m above the optimum, because the plain route zigzags) and the ellipse is larger (office8 83% of the map).
+
+On the 117k-cell map the exact stage is above the 0.3 s allowance for long routes (p95 481 ms); only the median fits. There is
+no exact cut beyond the ellipse. The options, with their cost:
+
+| option | exact | time (117k cells, ms) | cost above the optimum | notes |
+|---|---|---|---|---|
+| exact ellipse (above) | yes | p50 190, p95 481 | 0 | fine on every real map measured; a 40 m route on a 100k-cell map exceeds the allowance |
+| band only (cells within 0.3 m of P0), flagged inexact like the priced corridor seed | no | p50 31, p95 41, max 48 | median 0, p95 0.5 m, max 0.79 m of cost; equal in 9 of 15 | same `exact` flag the priced search already exposes |
+| exact ellipse for routes whose ellipse is below a cell cap, band otherwise | exact when small | bounded by the cap | 0 below the cap | one more number (the cap); not measured |
+
+Transient memory: the expanded CSR of the ellipse, about 2.2 M edges (about 25 MB) at the median on the 117k-cell map and 1.5 MB at
+the office8 size; concurrent plans multiply it (`plan_inflight`).
+
+Not measured here: the production engine and lazy reader (no `PlanGraph` integration), real corridor seeding, cold tile reads,
+the turn term inside `priced_visible` for the pull.
+
 ### B.4 What is not shown
 
-Research lattice, not the production engine; one map; the pull has no turn term (a shortcut is accepted by visibility and priced
+Research lattice, not the production engine; one real map for the quality results; the pull has no turn term (a shortcut is accepted by visibility and priced
 length only); the start heading is free (the robot's yaw is available and could be used); lambda is an assumption until the robot
 values arrive.
 
@@ -214,15 +269,14 @@ is not measured.
 
 ## D. Open items
 
+Resolved by Laci 2026-10-14: goal tolerance is 0.35 m; the Odin override is live; the Smac tolerance is dropped from the list.
+
 | # | Item | Owner | Blocks |
 |---|---|---|---|
-| 1 | Nominal speed `v_nom` and maximum turning speed `omega_max` of the robot | Laci | lambda (B.1) |
-| 2 | Goal tolerance: 0.35 m (server) or 0.5 m (repo) | Laci | part C merge distance |
-| 3 | Is the Odin override live (inflation 0.8, scaling 6.0, global inscribed 0.30)? | Laci | per-robot profile values |
-| 4 | Smac planner tolerance (0.5 in the repo) as run | Laci | whether waypoint shifts matter |
-| 5 | The costmap obstacle detection range of the robot (for `r_det`) | Laci | A.2 |
-| 6 | ~~Where are the stairs~~: the largest component of A.4 (x 1.3, y -3.5; extent x -0.4 to 2.4, y -4.5 to -2.8) is the stairs (user, 2026-10-14). The other 14 components are unconfirmed | user | A.6 for the rest |
-| 7 | Optional: one more session driving within 1.5 m of the unconfirmed components after a quiet period (ghost check) | user | A.6 |
-| 8 | Decision on A.6 (recommended: option 1) before any new plane or rebuild | Laci | the format step |
-| 9 | Production-engine measurement of the turn cost on the corridor or ellipse subgraph (B.3) | lattice_cimbi | an engine change |
-| 10 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 once 3 and 4 are answered |
+| 1 | Nominal speed `v_nom` and maximum turning speed `omega_max` of the robot | Laci | lambda (B.1); the sweep 0.25 to 1.0 m/rad is the working range |
+| 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2). Open: whether to test the camera cone (needs the leaf `view` or an assumed forward camera) | Laci | the exact rule; the plane `Fnear` |
+| 3 | Stairs versus ghost for the components of A.4. Component 1 (largest, x 1.3 y -3.5) is the stairs (user, 2026-10-14). The other 14 components (about 400 cells, 1.0 m2) are **open** | Laci / user | the choice of A.6, recommended option 1 |
+| 4 | Optional: one more session within 1.5 m of the unconfirmed components after a quiet period | user | ghost check |
+| 5 | Decision on A.6 and an explicit go before any new plane or rebuild | Laci | the format step; not built |
+| 6 | The expanded search on the production corridor/ellipse (engine and lazy reader), with the cap or band option of B.5 chosen | lattice_cimbi after Laci | an engine change; not started |
+| 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |
