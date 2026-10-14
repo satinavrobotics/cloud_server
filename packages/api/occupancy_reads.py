@@ -172,6 +172,12 @@ class OccupancyReads:
         """The content digest of chunk (cx, cy) of `version` (§3.2): the ETag's `digest` (§4). Same index as `extent`."""
         return await asyncio.to_thread(self._digest_of, map_id, version, cx, cy)
 
+    async def known_area(self, map_id, version=None):
+        """Known cells of the fused occupancy of `version` (default current): {version, tiles, free, blocked, bbox}.
+        Free is v == 0, blocked v == 100, 255 (and anything else) is not known. `bbox` is [x0, y0, x1, y1] in metres
+        around the present tiles. Cached per (map, epoch, version) with the indexes; reads every present tile once."""
+        return await asyncio.to_thread(self._known_area, map_id, version)
+
     # --- sync internals (run in worker threads) ---
 
     def _extent(self, map_id, version):
@@ -188,6 +194,29 @@ class OccupancyReads:
         idx = self._index(map_id, version)
         key = ("chunk", map_id, idx.epoch, idx.version, cx, cy)
         return self._load(self._chunks, key, lambda: self._build_body(map_id, idx, cx, cy))
+
+    def _known_area(self, map_id, version):
+        _check_version(version)
+        idx = self._index(map_id, version)
+        if idx.entries > MAX_EXTENT_CHUNKS:
+            raise TooManyChunks(idx.entries)
+        key = ("area", map_id, idx.epoch, idx.version)
+
+        def build():
+            free = blocked = tiles = 0
+            tx0 = ty0 = tx1 = ty1 = None
+            for _digest_, slots in idx.chunks.values():
+                for _slot, tx, ty, _h in slots:
+                    v = np.frombuffer(self._plane(map_id, idx, tx, ty), dtype=np.uint8)
+                    free += int(np.count_nonzero(v == 0))
+                    blocked += int(np.count_nonzero(v == 100))
+                    tiles += 1
+                    tx0, ty0 = (tx, ty) if tx0 is None else (min(tx0, tx), min(ty0, ty))
+                    tx1, ty1 = (tx, ty) if tx1 is None else (max(tx1, tx), max(ty1, ty))
+            side = TILE_CELLS * CELL_M
+            bbox = None if tiles == 0 else [round(v * side, 6) for v in (tx0, ty0, tx1 + 1, ty1 + 1)]
+            return {"version": idx.version, "tiles": tiles, "free": free, "blocked": blocked, "bbox": bbox}, 256
+        return self._load(self._indexes, key, build)
 
     def _digest_of(self, map_id, version, cx, cy):
         _check_int("cx", cx)
