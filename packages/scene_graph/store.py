@@ -38,7 +38,10 @@ from .store_codec import (canonical_json, compress_object, effective_v, hash_arr
                           unpack_json)
 
 PIPELINE = "morse/2"
-PIPELINE_NEAR = PIPELINE + "+near1"   # stores made with SceneParams.near_range_m: one more tile plane `fn`, params carry the rule
+# The token names the tile planes a store carries beyond morse/2: +near1 = `fn` (SceneParams.near_range_m), +near2 = `fn` and `hold`
+# (near_min_clearance_m too: the away-from-walls filter needs components that cross tiles, so the engine stores its result).
+PIPELINE_NEAR = PIPELINE + "+near1"
+PIPELINE_NEAR_HOLD = PIPELINE + "+near2"
 RES = 0.05
 RESIDENT_MARGIN_M = 5.0      # a partially resident writer keeps this margin of tiles around a leaf's window
 TILE_F = 128                  # costmap cells per tile side (64 lattice cells)
@@ -62,6 +65,7 @@ class DirtyCoverageError(Exception):
 
 
 def _pipeline(params: dict) -> str:
+    if "near_min_clearance_m" in params: return PIPELINE_NEAR_HOLD
     return PIPELINE_NEAR if "near_range_m" in params else PIPELINE
 
 
@@ -93,6 +97,7 @@ def tile_arrays(st: EngineState, tx: int, ty: int, ids_lut: Optional[np.ndarray]
     x0, y0 = tx * TILE_F - st.cx0, ty * TILE_F - st.cy0
     a = {"v": _slice(st.V, x0, y0, TILE_F, 255), "t": _slice(st.T, x0, y0, TILE_F, -1), "b": _slice(st.B, x0, y0, TILE_F, -1)}
     if st.Fn is not None: a["fn"] = _slice(st.Fn, x0, y0, TILE_F, -1)
+    if st.Hold is not None: a["hold"] = _slice(st.Hold, x0, y0, TILE_F, False).astype(np.uint8)
     nonempty = bool((a["v"] != 255).any() or (a["t"] >= 0).any() or (a["b"] >= 0).any())
     for name, (v, t) in sorted(st.chan.items()):
         cv, ct = _slice(v, x0, y0, TILE_F, 255), _slice(t, x0, y0, TILE_F, -1)
@@ -611,6 +616,7 @@ class SceneGraphStore:
         W, H = (ax1 - ax0 + 1) * TILE_F, (ay1 - ay0 + 1) * TILE_F
         V = np.full((H, W), 255, np.uint8); T = np.full((H, W), -1, np.int64); B = np.full((H, W), -1, np.int64)
         Fn = np.full((H, W), -1, np.int64) if "near_range_m" in man["params"] else None
+        Hold = np.zeros((H, W), bool) if "near_min_clearance_m" in man["params"] else None
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
         own = np.zeros((H // 2, W // 2), np.int32)
         for (tx, ty) in coords:
@@ -619,6 +625,7 @@ class SceneGraphStore:
             y, x = (ty - ay0) * TILE_F, (tx - ax0) * TILE_F; ly, lx = y // 2, x // 2
             V[y:y + TILE_F, x:x + TILE_F] = t["v"]; T[y:y + TILE_F, x:x + TILE_F] = t["t"]; B[y:y + TILE_F, x:x + TILE_F] = t["b"]
             if Fn is not None and "fn" in t: Fn[y:y + TILE_F, x:x + TILE_F] = t["fn"]
+            if Hold is not None and "hold" in t: Hold[y:y + TILE_F, x:x + TILE_F] = t["hold"] != 0
             for n in man["channels"]:
                 if "c.%s.v" % n in t:
                     chan[n][0][y:y + TILE_F, x:x + TILE_F] = t["c.%s.v" % n]; chan[n][1][y:y + TILE_F, x:x + TILE_F] = t["c.%s.t" % n]
@@ -636,7 +643,7 @@ class SceneGraphStore:
             arr, m = unpack(self.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h)))
             leaves += segment_records(arr, m)
         p = man["params"]
-        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, chan=chan, leaves=leaves,
+        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, Hold=Hold, chan=chan, leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
         g = ChartGraph(SceneParams(**p))

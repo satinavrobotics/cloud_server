@@ -48,8 +48,8 @@ refuted claims: `audit_ledger.md`. The 2026-10-13 artifact with the figures: htt
 | Migration | `packages/api/migrations/versions/20261012_01_blocked_geometry.py` | LACI |
 
 Constants that matter: `FORMAT = 4`, `PIPELINE = "morse/2"` (store; `"morse/2+near1"` for a store made with the close-evidence
-rule), `LAT = 2` (costmap cells per lattice cell, engine), `RES = 0.05` m costmap cell. `SceneParams` = `robot_half_side`,
-`lattice`, `chart_radius` and the optional `near_range_m` / `near_fov_deg` (close evidence, None = off; `api.py`); nothing else is a
+rule, `"morse/2+near2"` with its away-from-walls filter: one more tile plane `hold`), `LAT = 2` (costmap cells per lattice cell, engine), `RES = 0.05` m costmap cell. `SceneParams` = `robot_half_side`,
+`lattice`, `chart_radius` and the optional `near_range_m` / `near_fov_deg` / `near_min_clearance_m` (close evidence and its away-from-walls filter, None = off; `api.py`); nothing else is a
 scene parameter. The engine's window cap (20 m side) and pose slack (5 m) are validation constants, not tunables.
 
 ## 3. Live state (2026-10-14)
@@ -61,7 +61,7 @@ The deployed commit of each service, the deploy log and the live run of 2026-10-
   (`tools/scene_graph_check_generation.py --all --expect tools/scene_graph_expected.json`; Hospital pinned 2026-10-14: 54 / 97 / 23; office7 re-pinned the same day to 16 / 15 / 3 because the live run grew the map to version 5).
 * Planner: the lazy tile planner only (`full_load` removed 2026-10-13); chart route first, the legacy planner as fallback;
   clearance pricing on, linear hinge, `SCENE_GRAPH_SAFETY_KAPPA=1.0`; the width gate is off.
-* Off in production: the exponential price profile (`SCENE_GRAPH_INFLATION_*` empty) and close evidence (`SCENE_GRAPH_NEAR_*` empty).
+* Off in production: the exponential price profile (`SCENE_GRAPH_INFLATION_*` empty) and close evidence and its filter (`SCENE_GRAPH_NEAR_*` empty).
 * Not built: the turn cost and the waypoint merge (`close_evidence_and_turn_cost_design.md` parts B and C), rate pricing
   (`formulation.md` section 6).
 * Rollback: `scripts/deploy.sh rollback <service>` puts the last pre-deploy image tag back (`runbook.md` section 2, "Deploying").

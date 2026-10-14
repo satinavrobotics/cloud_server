@@ -24,7 +24,8 @@ python run_engine.py office8 --every 6 --verify
 | `inflation_campaign.py`, `inflation_campaign_report.py`, `inflation_efficiency.py`, `inflation_operational.py` | the validation campaign of the exponential tier (grid, perturbation, synthetic worlds, operational pairs) | `docs/scene_graph/inflation_profile_validation.md` |
 | `research/inflation/` | the research scripts behind `inflation_profile_design.md` (budget sweep, two-pass floor, waypoint rule) | `docs/scene_graph/inflation_profile_design.md` |
 | `close_evidence_replay.py` | independent replay of the close-evidence rule on a leaf export, with the component table | `docs/scene_graph/close_evidence_and_turn_cost_design.md` A.3, A.4 |
-| `close_evidence_engine_check.py` | the same numbers through the engine (`near_range_m`), store save and load included | same, A.6b |
+| `close_evidence_engine_check.py` | the same numbers through the engine (`near_range_m`, `--min-clearance` for the away-from-walls filter) | same, A.6b, A.6c |
+| `close_evidence_route_changes.py` | what the rule and the filter do to routes: navigable cells, held components, 150 pairs same / changed / lost, through the production store and lazy reader | same, A.6c |
 | `turn_cost_prototype.py` | turn-cost search on the research lattice: forms and lambda sweep | same, B.2 |
 | `turn_cost_restricted.py` | the exact ellipse-restricted turn-cost search: exactness and cost on the real and synthetic maps | same, B.5 |
 

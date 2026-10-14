@@ -112,6 +112,30 @@ def _state_params(p: SceneParams) -> dict:
     if p.near_range_m is not None:
         out["near_range_m"] = p.near_range_m
         if p.near_fov_deg is not None: out["near_fov_deg"] = p.near_fov_deg
+        if p.near_min_clearance_m is not None: out["near_min_clearance_m"] = p.near_min_clearance_m
+    return out
+
+
+def _away_from_walls(held: np.ndarray, blocked: np.ndarray, min_clearance: float) -> np.ndarray:
+    """The `held` cells (full-resolution bool plane) that survive the away-from-walls filter: the 8-connected components of `held`
+    with at least one cell farther than `min_clearance` m (euclidean, cells x RES) from every `blocked` cell (V >= 100, unknown
+    included). Exact, and local: the distance of a component cell matters only when it is <= min_clearance, and the blocked cell
+    that decides it then lies within ceil(min_clearance / RES) cells of the component, i.e. inside the component's bounding box
+    padded by that many cells (+ 2). A cropped distance transform is never below the full one and equals it for every cell within
+    min_clearance of a blocked cell, so `any(d > min_clearance)` is the same in the crop as on the whole canvas."""
+    lab, n = ndimage.label(held, structure=np.ones((3, 3)))
+    out = np.zeros(held.shape, bool)
+    if not n: return out
+    pad = int(math.ceil(min_clearance / RES)) + 2
+    H, W = held.shape
+    for i, sl in enumerate(ndimage.find_objects(lab), 1):
+        y0, y1 = max(sl[0].start - pad, 0), min(sl[0].stop + pad, H)
+        x0, x1 = max(sl[1].start - pad, 0), min(sl[1].stop + pad, W)
+        blk = blocked[y0:y1, x0:x1]
+        comp = lab[y0:y1, x0:x1] == i
+        # no blocked cell in the crop: every cell of the component is farther than the pad from all of them
+        if not blk.any() or (ndimage.distance_transform_edt(~blk) * RES)[comp].max() > min_clearance:
+            out[sl] |= lab[sl] == i
     return out
 
 
@@ -133,6 +157,8 @@ class ChartGraph(SceneGraph):
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
         self._V = self._T = self._B = None
         self._Fn = None                         # close-evidence plane (params.near_range_m set): latest FREE time from within range
+        self._hold = None                       # cells the rule holds blocked, after the away-from-walls filter (only with that filter)
+        self._hold_prev = (None, 0, 0)          # (_hold, cx0, cy0) before the batch being folded: the dirty box includes its changes
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
         self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
@@ -334,6 +360,7 @@ class ChartGraph(SceneGraph):
         # ---- mutation: from here an escaping exception leaves the state undefined => the engine is FAULTED
         old = self._solved
         old_sig, old_link_sig, old_keys = dict(self._sig), set(self._link_sig), list(self._keys)
+        self._hold_prev = (self._hold, self._cx0, self._cy0)
         try:
             return self._mutate(leaves, bbox, prepared, bounds, region, plan, grown, old, old_sig, old_link_sig, old_keys)
         except BaseException as e:                                   # noqa: BLE001
@@ -605,7 +632,12 @@ class ChartGraph(SceneGraph):
         V = self._V
         free = (V != 255) & (V < 100)
         if self._Fn is not None:
-            free &= ~((self._B >= 0) & (self._B > self._Fn))      # close evidence: blocked more recently than seen free from close
+            # close evidence: blocked more recently than seen free from close (and, with near_min_clearance_m, away from walls)
+            held = (V < 100) & (self._B >= 0) & (self._B > self._Fn)
+            if self.params.near_min_clearance_m is not None:
+                held = _away_from_walls(held, V >= 100, self.params.near_min_clearance_m) if held.any() else held
+                self._hold = held
+            free &= ~held
         sq = self._erode(free, shift)
         clr = self._clearance_cells(free, shift) * RES
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
@@ -809,6 +841,10 @@ class ChartGraph(SceneGraph):
             rb = (region[0] * RES, region[1] * RES, region[2] * RES, region[3] * RES)
             x0 = rb[0] if x0 is None else min(x0, rb[0]); y0 = rb[1] if y0 is None else min(y0, rb[1])
             x1 = rb[2] if x1 is None else max(x1, rb[2]); y1 = rb[3] if y1 is None else max(y1, rb[3])
+        hb = self._hold_changed_box()
+        if hb is not None:
+            x0 = hb[0] if x0 is None else min(x0, hb[0]); y0 = hb[1] if y0 is None else min(y0, hb[1])
+            x1 = hb[2] if x1 is None else max(x1, hb[2]); y1 = hb[3] if y1 is None else max(y1, hb[3])
         if changed_cells is not None and changed_cells.any():
             ys, xs = np.nonzero(changed_cells)
             cb = ((self._cx0 + 2 * xs.min()) * RES, (self._cy0 + 2 * ys.min()) * RES,
@@ -817,6 +853,25 @@ class ChartGraph(SceneGraph):
             x1 = cb[2] if x1 is None else max(x1, cb[2]); y1 = cb[3] if y1 is None else max(y1, cb[3])
         bb = None if x0 is None else BBox(x0, y0, x1, y1)
         return Dirty(bbox=bb, changed=changed, retired=retired, links=links, watermark=self._watermark)
+
+    def _hold_changed_box(self) -> Optional[Tuple[float, float, float, float]]:
+        """Map-frame box of the cells whose held state changed in this solve (away-from-walls filter only). A component can
+        gain or lose its far cell from a window elsewhere, so a held cell may change outside every folded window and chart."""
+        new = self._hold
+        if new is None: return None
+        old, ocx, ocy = self._hold_prev
+        diff = new
+        if old is not None:
+            oy, ox = ocy - self._cy0, ocx - self._cx0
+            if oy >= 0 and ox >= 0 and oy + old.shape[0] <= new.shape[0] and ox + old.shape[1] <= new.shape[1]:
+                diff = new.copy()
+                diff[oy:oy + old.shape[0], ox:ox + old.shape[1]] ^= old
+            else:
+                diff = np.ones(new.shape, bool)             # the canvas shrank (never happens): everything may have changed
+        if not diff.any(): return None
+        ys, xs = np.nonzero(diff)
+        return ((self._cx0 + int(xs.min())) * RES, (self._cy0 + int(ys.min())) * RES,
+                (self._cx0 + int(xs.max()) + 1) * RES, (self._cy0 + int(ys.max()) + 1) * RES)
 
     @staticmethod
     def _hash(key: Key) -> int:
@@ -1098,7 +1153,8 @@ class ChartGraph(SceneGraph):
         self._check()
         p = self.params
         st = EngineState(params=_state_params(p),
-                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, chan=dict(self._chan),
+                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Hold=self._hold,
+                         chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
         s = self._solved
@@ -1115,7 +1171,7 @@ class ChartGraph(SceneGraph):
         p = self.params
         if st.params != _state_params(p):
             raise ValueError("state was made with other parameters (%r, this engine %r): a store written with the close-evidence "
-                             "rule (near_range_m) needs an engine with the same near_range_m / near_fov_deg, and vice versa"
+                             "rule (near_range_m) needs an engine with the same near_range_m / near_fov_deg / near_min_clearance_m, and vice versa"
                              % (st.params, _state_params(p)))
         if self._V is not None:
             raise ValueError("import_state needs a fresh engine")
@@ -1125,6 +1181,7 @@ class ChartGraph(SceneGraph):
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
         self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
         self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
+        self._hold = None
         self._chan = {k: (padf(v, 255), padf(t, -1)) for k, (v, t) in st.chan.items()}
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,
                                     None if l.view is None else CamView(l.key, *l.view)) for l in st.leaves}
@@ -1137,9 +1194,14 @@ class ChartGraph(SceneGraph):
         if not st.keys or st.plane is None:
             self._solved = None; self._key_plane = None; self._keys = []
             self._sig, self._link_sig = {}, set()
+            if p.near_min_clearance_m is not None: self._build_F()      # the hold plane of the planes (an export must carry it)
             return
         self._key_plane = padl(st.plane.astype(np.int32), -1)
         nav, clr, S = self._build_F()
+        if st.Hold is not None and verify and self._hold is not None:
+            if not np.array_equal(padf(st.Hold, False), self._hold):
+                raise StateMismatch("hold plane differs from the one rebuilt in %d cells"
+                                    % int((padf(st.Hold, False) != self._hold).sum()))
         part = self._partition(nav)
         plane = -np.ones(nav.shape, np.int32); plane[part.sp.ys, part.sp.xs] = part.full
         bad = np.nonzero((plane != self._key_plane).ravel())[0]

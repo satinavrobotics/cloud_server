@@ -184,7 +184,8 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     from . import scene_events, scene_guard, scene_runner, scene_sources, scene_worker
 
     from packages import config as _cfg
-    params = SceneParams(near_range_m=_cfg.SCENE_GRAPH_NEAR_RANGE_M, near_fov_deg=_cfg.SCENE_GRAPH_NEAR_FOV_DEG)
+    params = SceneParams(near_range_m=_cfg.SCENE_GRAPH_NEAR_RANGE_M, near_fov_deg=_cfg.SCENE_GRAPH_NEAR_FOV_DEG,
+                         near_min_clearance_m=_cfg.SCENE_GRAPH_NEAR_MIN_CLEARANCE_M)
     store = SceneGraphStore.from_client(service.topomap_db)
     guard = scene_guard.PgGuard(scene_guard.connect_from_conninfo(conninfo or default_conninfo()))
     fetch_png = scene_sources.png_fetcher(service.image_db)

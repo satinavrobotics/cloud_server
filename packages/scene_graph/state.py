@@ -32,6 +32,8 @@ class EngineState:
     B: np.ndarray                                  # i8 [H, W] latest capture time reported blocked, -1 none
     chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     Fn: Optional[np.ndarray] = None                # i8 [H, W] latest FREE time from within near range; only with near_range_m
+    Hold: Optional[np.ndarray] = None              # bool [H, W] cells the rule holds blocked after the away-from-walls filter; only with
+                                                   # near_min_clearance_m (a derived plane, stored so tile readers need no component pass)
     leaves: List[LeafRecord] = field(default_factory=list)
     keys: List[Tuple[str, int]] = field(default_factory=list)         # chart keys (birth leaf, n), chart order
     plane: Optional[np.ndarray] = None             # i4 [H/2, W/2] chart index per lattice cell, -1 outside F
