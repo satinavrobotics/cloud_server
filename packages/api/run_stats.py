@@ -24,9 +24,11 @@ Definitions (all counts are runs unless stated):
                   reported separately (count, median)
   recovery        over the legs (run_legs) of the scope's runs: median / P95 of recovery_s over
                   legs with recoveries > 0; share_of_time = sum(recovery_s) / sum(duration_s)
-  safety          events attributed to the map by run_id, or (run-less events) by robot and time
-                  overlap with a run of the scope, classified by SAFETY_CLASSES. Nothing about
-                  collisions or geofences is derived: only these recorded events are counted.
+  safety          safety EPISODES attributed to the map (map_events.py: the event's run, else the
+                  robot's map session open at that time) with ts in [from, to) (by event time, not
+                  by run start), classified by SAFETY_CLASSES; a repeated ROBOT.ERROR_RAISED
+                  counts once until cleared. Nothing about collisions or geofences is derived:
+                  only these recorded events are counted.
 """
 
 import datetime
@@ -35,32 +37,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from packages import config
-from packages.api import fleet_reads
+from packages.api import fleet_reads, map_events
 from packages.events.codes import EventCode
 
 UTC = datetime.timezone.utc
 
 FAILURE_STATES: Tuple[str, ...] = ("FAILED", "TIMEOUT", "ABORTED")
 TAKEOVER_ERROR = "operatorTakeover"
-CLASSES: Tuple[str, ...] = ("safety_reflex", "blocked", "skipped", "link_loss")
-
-# (event code, payload error_type or None for any, class). The only place that decides what
-# counts as a safety event.
-SAFETY_CLASSES: Tuple[Tuple[str, Optional[str], str], ...] = (
-    (EventCode.ROBOT_ERROR_RAISED.value, "safetyReflexError", "safety_reflex"),
-    (EventCode.MISSION_EDGE_BLOCKED.value, None, "blocked"),
-    (EventCode.NAV_GOAL_BLOCKED.value, None, "blocked"),
-    (EventCode.MISSION_NODE_SKIPPED.value, None, "skipped"),
-    (EventCode.ROBOT_HEARTBEAT_LOST.value, None, "link_loss"),
-)
-_TYPED_CODES = {code for code, et, _ in SAFETY_CLASSES if et is not None}
-
-
-def classify_event(code: str, error_type: Optional[str]) -> Optional[str]:
-    for c, et, cls in SAFETY_CLASSES:
-        if c == code and (et is None or et == error_type):
-            return cls
-    return None
+# Safety classes, attribution and episode counting live in map_events.py (one helper for run-stats
+# and the events endpoints); re-exported here.
+CLASSES = map_events.CLASSES
+SAFETY_CLASSES = map_events.SAFETY_CLASSES
+classify_event = map_events.classify_event
 
 
 def _num(value: Any, digits: int = 3) -> Optional[float]:
@@ -97,13 +85,6 @@ async def run_stats(db: Any, map_id: str, start: Optional[datetime.datetime] = N
     async def rows(cur, sql, params):
         await cur.execute(sql, params)
         return await cur.fetchall()
-
-    typed = sorted(_TYPED_CODES)
-    safety_codes = sorted({c for c, _, _ in SAFETY_CLASSES})
-    safety_types = sorted({et for _, et, _ in SAFETY_CLASSES if et})
-    safety_filter = ("e.code = ANY(%s) AND (NOT (e.code = ANY(%s)) "
-                     "OR e.payload->>'error_type' = ANY(%s)) AND e.ts >= %s AND e.ts < %s")
-    safety_params = (safety_codes, typed, safety_types, start, ev_end)
 
     async with fleet_reads.read_cursor(db) as cur:
         by_state = dict(await rows(cur, scope + " SELECT state, count(*) FROM scope "
@@ -148,15 +129,7 @@ async def run_stats(db: Any, map_id: str, start: Optional[datetime.datetime] = N
             "percentile_cont(0.95) WITHIN GROUP (ORDER BY l.recovery_s) FILTER (WHERE l.recoveries > 0), "
             "coalesce(sum(l.recovery_s), 0), coalesce(sum(l.duration_s), 0) "
             "FROM run_legs l JOIN scope s ON s.run_id = l.run_id"), sp)
-        safety_rows = await rows(cur, scope + (
-            " SELECT code, error_type, count(*) FROM ("
-            "SELECT e.code, e.payload->>'error_type' AS error_type FROM fleet_events e "
-            "JOIN scope s ON e.run_id = s.run_id WHERE " + safety_filter
-            + " UNION ALL "
-            "SELECT e.code, e.payload->>'error_type' FROM fleet_events e JOIN scope s "
-            "ON e.run_id IS NULL AND e.robot_name = s.robot_name AND e.ts >= s.started_at "
-            "AND e.ts <= coalesce(s.ended_at, now()) WHERE " + safety_filter
-            + ") x GROUP BY code, error_type"), sp + safety_params + safety_params)
+        by_class, by_code = await map_events.safety_counts(cur, map_id, start, end, robot)
         ((no_map,),) = await rows(cur, (
             "SELECT count(*) FROM mission_runs WHERE map_id IS NULL AND started_at >= %s "
             "AND started_at < %s AND archived_at IS NULL" + (" AND robot_name = %s" if robot else "")),
@@ -171,16 +144,6 @@ async def run_stats(db: Any, map_id: str, start: Optional[datetime.datetime] = N
     cancels = max(n["CANCELED"] - takeovers, 0)
     teleop = int(teleop)
     interventions = cancels + teleop + takeovers
-
-    by_class = {c: 0 for c in CLASSES}
-    by_code: Dict[str, int] = {}
-    for code, error_type, count in safety_rows:
-        cls = classify_event(code, error_type)
-        if cls is None:
-            continue
-        key = f"{code}:{error_type}" if code in _TYPED_CODES else code
-        by_class[cls] += int(count)
-        by_code[key] = by_code.get(key, 0) + int(count)
 
     recorded = first_teleop is not None and first_teleop <= start
     notes: List[str] = []

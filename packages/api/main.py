@@ -23,7 +23,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, session_trace, sites
+from packages.api import drive_stats, edge_stats, map_events, session_trace, sites
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -584,6 +584,51 @@ async def map_run_stats(
     start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
     return await _site_call("map run stats", run_stats.run_stats(
         service.database, map_id, start, end, robot))
+
+
+@app.get("/api/v1/maps/{map_id}/events-summary")
+async def map_events_summary(
+    map_id: str,
+    from_: Optional[str] = Query(None, alias="from", description="Window start (ISO-8601 with time "
+                                 "zone); default `to` minus 30 days"),
+    to: Optional[str] = Query(None, description="Window end (exclusive); default now"),
+    robot: Optional[str] = Query(None, description="Only this robot"),
+    limit: Optional[int] = Query(None, description="Entries in each `top` list, 1-50, default 10"),
+):
+    """The most usual events of the map (episodes, not repeats) and its safety events:
+    `{map_id, window, total_episodes, by_severity, top: [{code, severity, class, count, share,
+    last_ts, runs, robots}], safety: {episodes, by_class, top}, attribution: {by_run, by_session,
+    unattributed}, data_quality: {notes}}`. An event belongs to the map of its run, else of the
+    robot's map session open at that time. Definitions: packages/api/map_events.py and
+    docs/map_events_2026-10-14.md. Cached 30 s. An unknown map answers zeros."""
+    _require_service()
+    run_stats.require_map_id(map_id)
+    return await _site_call("map events summary", map_events.events_summary(
+        service.database, map_id, fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to"),
+        robot, limit))
+
+
+@app.get("/api/v1/maps/{map_id}/events")
+async def map_events_list(
+    map_id: str,
+    from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
+    code: Optional[str] = Query(None, description="One event code; ROBOT.ERROR_RAISED[:error_type]"),
+    class_: Optional[str] = Query(None, alias="class", description="safety_reflex | blocked | skipped | "
+                                  "link_loss | recovery | error | other"),
+    scope: Optional[str] = Query(None, description="`safety`: only the safety classes "
+                                 "(safety_reflex, blocked, skipped, link_loss); `class` filters further"),
+    robot: Optional[str] = None, limit: Optional[int] = Query(None, description="1-200, default 50"),
+    cursor: Optional[str] = None,
+):
+    """The map's events (the events-summary universe, episodes) newest first, keyset paginated:
+    `{items: [{ts, event_id, code, error_type, severity, class, robot, run_id, session_id,
+    mission_name, detail, attribution}], next}`; pass `next` back as `cursor`. Contract:
+    docs/map_events_2026-10-14.md."""
+    _require_service()
+    run_stats.require_map_id(map_id)
+    return await _site_call("map events", map_events.list_events(
+        service.database, map_id, fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to"),
+        code, class_, robot, limit, cursor, scope))
 
 
 @app.patch("/api/v1/maps/{map_id}")

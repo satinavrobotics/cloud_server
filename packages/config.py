@@ -263,6 +263,13 @@ FLEET_TIMELINE_MAX_POINTS = int(os.getenv("FLEET_TIMELINE_MAX_POINTS", "2000"))
 # 14 h after its start, is not operating time; docs/map_run_stats_2026-10-14.md).
 RUN_STATS_DEFAULT_DAYS = int(os.getenv("RUN_STATS_DEFAULT_DAYS", "30"))
 RUN_STATS_MAX_RUN_S = int(os.getenv("RUN_STATS_MAX_RUN_S", "7200"))
+# GET /api/v1/maps/{map}/events-summary and /events (packages/api/map_events.py): answers are
+# cached this many seconds per (map, window, filters); an episode (a RAISED/ENTERED event) counts
+# as a repeat of an earlier one when the earlier one lies within MAP_EVENTS_EPISODE_LOOKBACK_DAYS
+# before the window start and was not cleared in between.
+MAP_EVENTS_CACHE_TTL_S = float(os.getenv("MAP_EVENTS_CACHE_TTL_S", "30"))
+MAP_EVENTS_CACHE_ENTRIES = int(os.getenv("MAP_EVENTS_CACHE_ENTRIES", "64"))
+MAP_EVENTS_EPISODE_LOOKBACK_DAYS = int(os.getenv("MAP_EVENTS_EPISODE_LOOKBACK_DAYS", "7"))
 # TELEOP.SESSION_STARTED (packages/api/teleop.py): a robot's room token within this many seconds
 # of its previous one (same robot and room) belongs to the same session and records nothing.
 TELEOP_SESSION_GAP_S = int(os.getenv("TELEOP_SESSION_GAP_S", "1800"))
