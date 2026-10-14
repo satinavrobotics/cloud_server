@@ -1,0 +1,86 @@
+"""Dry-run preview of a route (docs/route_preview_2026-10-14.md): what the mission dispatcher's route enrichment
+would store for these waypoints (planned waypoints, corridor widths, lattice trajectory), computed by the planner's
+`POST /api/v1/route/enrich` and returned without storing anything. No database access, no events."""
+import logging
+import math
+from typing import Any, Dict, List, Optional
+
+from cloud_common.objects import common
+from packages import config
+
+_log = logging.getLogger("RoutePreview")
+
+PLANNER_SCENE_GRAPH = "scene_graph"
+PLANNER_NONE = "none"
+REASON_PLANNER_UNAVAILABLE = "planner_unavailable"
+REASON_NO_SCENE_GRAPH = "no_scene_graph"
+
+
+class PreviewError(Exception):
+    """A request the preview refuses: `status` is the HTTP status (400 invalid, 413 too many waypoints)."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+def build_route(map_id: str, raw: List[Dict[str, Any]], return_leg: bool) -> List[common.Pose2D]:
+    """The operator's waypoints as Pose2D in map `map_id` (planned ones dropped: the planner re-plans them), with
+    the way back appended when `return_leg`: the same waypoints in reverse order (the last one is the turning point,
+    not repeated), heading turned by pi. The mission model has no return route of its own, so the preview treats
+    a return as outbound plus its mirror, which is one ordinary route to the planner."""
+    if not isinstance(map_id, str) or not map_id.strip():
+        raise PreviewError(400, "map_id is required")
+    if not raw:
+        raise PreviewError(400, "waypoints must not be empty")
+    if len(raw) > config.ROUTE_PREVIEW_MAX_WAYPOINTS:
+        raise PreviewError(413, f"at most {config.ROUTE_PREVIEW_MAX_WAYPOINTS} waypoints")
+    poses: List[common.Pose2D] = []
+    for i, item in enumerate(raw):
+        try:
+            pose = common.Pose2D(**{**item, "map_id": map_id})
+        except Exception as err:  # pylint: disable=broad-except
+            raise PreviewError(400, f"waypoint {i} is invalid: {err}") from err
+        if not (math.isfinite(pose.x) and math.isfinite(pose.y) and math.isfinite(pose.theta)):
+            raise PreviewError(400, f"waypoint {i} has a non-finite coordinate")
+        if pose.origin != common.WAYPOINT_ORIGIN_PLANNED:
+            poses.append(pose)
+    if not poses:
+        raise PreviewError(400, "waypoints must contain at least one non-planned waypoint")
+    if return_leg:
+        for pose in reversed(poses[:-1]):
+            back = pose.copy()
+            back.theta = math.atan2(math.sin(pose.theta + math.pi), math.cos(pose.theta + math.pi))
+            poses.append(back)
+    return poses
+
+
+async def preview(planner: Any, map_id: str, raw: List[Dict[str, Any]], return_leg: bool = False,
+                  robot_name: Optional[str] = None) -> Dict[str, Any]:
+    """The response of POST /api/v1/route/preview. Raises PreviewError for a refused request; a planner that is
+    down, slow or without a scene graph is an answer (planner "none" with a reason), never an exception."""
+    poses = build_route(map_id, raw, return_leg)
+    waypoints = [p.dict() for p in poses]
+    asked = sum(1 for p in poses[:-1] if p.skippable and not p.corridor_width_m)
+    none = {"waypoints": waypoints, "trajectory": [], "issues": [],
+            "node_policy": {"total": asked, "skippable": 0, "unavailable": None},
+            "planner": PLANNER_NONE, "reason": REASON_PLANNER_UNAVAILABLE, "graph_version": None}
+    if planner is None:
+        return none
+    try:
+        result = await planner.enrich_route(
+            robot_name or "", map_id, waypoints, insert_planned=True,
+            timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
+        returned = list(result["waypoints"])
+    except Exception as err:  # pylint: disable=broad-except
+        _log.warning("Route preview: planner call failed (%r)", err)
+        return none
+    policy = dict(result.get("node_policy") or none["node_policy"])
+    if result.get("graph_version") is None:
+        # the planner answered without a scene graph (or gave up): the route came back as it was
+        reason = policy.get("unavailable") or REASON_NO_SCENE_GRAPH
+        return {**none, "waypoints": returned or waypoints, "node_policy": policy, "reason": reason}
+    return {"waypoints": returned, "trajectory": list(result.get("trajectory") or []),
+            "issues": list(result.get("issues") or []), "node_policy": policy,
+            "planner": PLANNER_SCENE_GRAPH, "reason": None, "graph_version": result.get("graph_version")}

@@ -601,6 +601,8 @@ NODE_POLICY_SKIP_ENABLED = _env_bool("NODE_POLICY_SKIP_ENABLED", "true")
 NODE_POLICY_GAP_FILL_ENABLED = _env_bool("NODE_POLICY_GAP_FILL_ENABLED", "true")
 NODE_POLICY_WIDTH_BUDGET_S = float(os.getenv("NODE_POLICY_WIDTH_BUDGET_S", "1.0"))
 NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "5.0"))
+# Most waypoints one POST /api/v1/route/preview accepts (docs/route_preview_2026-10-14.md); over it: 413.
+ROUTE_PREVIEW_MAX_WAYPOINTS = int(os.getenv("ROUTE_PREVIEW_MAX_WAYPOINTS", "100"))
 # The planner's dense lattice path per leg between the waypoints (docs/plan_trajectory_2026-10-14.md), returned with a plan
 # and stored on the mission's route for the client to draw. MAX_POINTS: cap on the points of one route's trajectory (after
 # straight runs are collapsed); over it the trajectory is omitted, never truncated. Display data only, never sent to the robot.

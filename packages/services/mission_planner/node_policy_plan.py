@@ -31,6 +31,8 @@ class LegRoutes:
     def __init__(self) -> None:
         self.nodes: Dict[Tuple[Pt, Pt], List[Pt]] = {}
         self.widths: Dict[Tuple[Pt, Pt], Optional[float]] = {}
+        # why a leg (a, b) could not be routed: "outside_graph" (a point does not snap), "unreachable" (no route), "error"
+        self.failed: Dict[Tuple[Pt, Pt], str] = {}
 
 
 def corridor_per_side(width: Optional[float], robot_width: Optional[float],
@@ -75,10 +77,14 @@ def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None,
         sa = graph.snap(a[0], a[1], snap_m)
         sb = graph.snap(b[0], b[1], snap_m)
         if sa.key is None or sb.key is None:
+            if routes is not None:
+                routes.failed.setdefault(key, "outside_graph")
             return None
         route = graph.route(sa.key, sb.key, None, start=(sa.x, sa.y), goal=(sb.x, sb.y),
                             **({} if safety is None else {"safety": safety}))
         if route is None:
+            if routes is not None:
+                routes.failed.setdefault(key, "unreachable")
             return None
         width = float(route.min_width)
         width = width if math.isfinite(width) and width > 0 else None
@@ -88,6 +94,8 @@ def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None,
                 routes.nodes[key] = [tuple(p) for p in route.nodes]
         return width
     except Exception:  # pylint: disable=broad-except
+        if routes is not None:
+            routes.failed.setdefault(key, "error")
         return None
 
 
@@ -182,14 +190,20 @@ def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
         sb = graph.snap(b.x, b.y, snap_m)
         # a pair in one chart gets no planned waypoint, but with `routes` it is routed once for its trajectory
         # (the width of its leg needs the same route)
-        if sa.key is None or sb.key is None or (sa.key == sb.key and routes is None):
+        whole = ((a.x, a.y), (b.x, b.y))
+        if sa.key is None or sb.key is None:
+            if routes is not None:
+                routes.failed[whole] = "outside_graph"
+            return []
+        if sa.key == sb.key and routes is None:
             return []
         route = graph.route(sa.key, sb.key, None, start=(sa.x, sa.y), goal=(sb.x, sb.y),
                             **({} if safety is None else {"safety": safety}))
         if route is None:
+            if routes is not None:
+                routes.failed[whole] = "unreachable"
             return []
         nodes = [tuple(p) for p in route.nodes]
-        whole = ((a.x, a.y), (b.x, b.y))
         if routes is not None and nodes:
             routes.nodes[whole] = nodes
             width = float(route.min_width)
@@ -198,6 +212,8 @@ def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
             return []
         owners = [graph.snap(x, y).key for (x, y) in nodes]
     except Exception:  # pylint: disable=broad-except
+        if routes is not None:
+            routes.failed.setdefault(((a.x, a.y), (b.x, b.y)), "error")
         return []
     if len(nodes) < 3 or len(set(owners)) <= 2:
         return []
