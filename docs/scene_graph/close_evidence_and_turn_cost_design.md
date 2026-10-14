@@ -166,6 +166,43 @@ option 1 is real but not demonstrated on this map: the other 14 components are s
   (deficit of every navigable cell, the occupancy plane), the checker accepts a rule-on store, config parse.
 * Not built: the generation check of `tools/scene_graph_expected.json` is unchanged (the pins are counts, valid for a rule-off store).
 
+### A.6c Decisions recorded (2026-10-14, relayed from Laci)
+
+* **Chosen setting: the rule applies only to patches away from walls** (the option that changes the navigable space by -8.8% on
+  office8, 2143 -> 1955 lattice cells, against -11.9% when it applies to every blocked cell). Definition: take the cells that the
+  latest value calls free and the rule holds (`B > Fn`), form their 8-connected components, and keep a component only if one of its
+  cells is farther than 0.25 m from the remaining blocked or unknown cells; the rest (wall rims) stay free as today. **Not built yet:**
+  the merged engine applies the rule to every held cell. Not switched on.
+* **The camera cone is not used** (`near_fov_deg` stays unset). The robot's ground-support channel judges only cells its camera swept
+  (cone about 95 x 83 degrees, `support_swept`), so a free report from within 1.5 m but outside the cone says nothing for it, and
+  distance alone over-counts such a report as close evidence (a cell next to the path could be freed by a robot that never looked at
+  it). It is not used because the export carries no camera view (a forward camera would be assumed), the cone makes retraction rarer
+  (3520 cells held, navigable -18.0% instead of -11.9%), and the distance-only rule is the one that was replayed, reproduced in the
+  engine and tested. This is a known difference from the robot's channel, on the unsafe side only for a free report that the camera
+  did not see.
+* Switching the rule on and rebuilding the maps: not approved at the time of writing.
+
+### A.6d Stairs versus ghost for the 14 unconfirmed components: recommendation and evidence
+
+Nothing in the stored map is changed. Per component (office8, one 6-minute session, `close_evidence_replay.py`): close = capture pose
+within 1.5 m. "Close free" = free reports from close captures per cell.
+
+| class | components (cells) | evidence | reading |
+|---|---|---|---|
+| A: free from close earlier, lethal after | 2 (135), 4 (72), 8 (8), 10 (6), 12 (1), 15 (1): 223 cells | close free 1.2 to 5.5 per cell (0.2 for component 1, the stairs), looked at from close by 98-100% of their cells | the cell was seen free from close and became lethal later: something appeared there. Ghost candidates, not hazards of the map |
+| B: lethal from close, never free from close | 6 (11), 14 (1): 12 cells | 2.0 to 4.0 close lethal reports per cell, close free 0.0 to 0.2 | hazard-like, like the stairs, small |
+| C: weakly observed | 3 (106), 5 (43), 7 (9), 9 (8), 11 (2), 13 (1): 169 cells | 0 to 1.3 close lethal reports per cell; components 3, 5, 9, 11, 13 were looked at from close by 0 to 62% of their cells | not confirmed either way: lethal seen mostly from beyond 1.5 m |
+
+Component 1, the stairs: close free 0.2 per cell, 4.3 close captures per cell with 95% lethal, 79% of its cells never seen free from close.
+
+**Recommendation: keep the rule as accepted (hold until a close free look) for all 14.** Reasons: the held area is 1.0 m2 of 22.8 m2
+(4%) and is not a route the robots use today; the cost of a wrong hold is bounded and self-correcting, because the first close free
+look retracts it (class A will, if it was transient); the cost of a wrong release is the fall hazard of class B and of component 1. What the
+data cannot settle is whether class A and C are real: one pass within 1.5 m of the listed places after a quiet period decides it
+(a ghost clears by itself, a hazard stays lethal on the second close look). Places (map frame, m): A: (1.6, -0.4), (2.0, 0.6),
+(-4.7, -4.8), (0.3, 0.5), (-4.9, -5.0), (-2.7, 1.4); B: (0.2, -4.2), (0.4, -3.8); C: (-1.6, -5.0), (0.7, -4.2), (-1.5, 1.4),
+(-3.6, 1.6), (-4.5, -5.2), (0.5, -4.3). No change to the stored map and no component is released by hand.
+
 ### A.7 What is not shown
 
 Only office8, one session. No other map's leaf data was used. The rule was replayed, not run in the engine. `r_det` is not read
@@ -340,7 +377,7 @@ registration (B.6, per robot, with a fallback); the search allowance is 0.5 s an
 | 1 | Review B.6: lambda = `speed_max / angular_speed_max`, clamp [0, 5], fallback off or the operator value, record fields | Laci | the planner code for lambda |
 | 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2); the camera cone needs the leaf `view` or an assumed forward camera | Laci | the value of `near_range_m` and `near_fov_deg` |
 | 3 | Stairs versus ghost for the 14 unconfirmed components of A.4 (the largest, x 1.3 y -3.5, is the stairs, confirmed by the user) | Laci / user | A.6, recommended option 1 |
-| 4 | Whether the rule applies to every blocked cell or only away from walls (rim cells thicken walls by up to 10 cm: navigable F -11.9% everywhere, -8.8% away from walls only) | Laci | A.2 |
+| 4 | ~~Rim cells~~: decided, away from walls only (A.6c); the filter is not built | lattice_cimbi | the engine change before the rule is switched on |
 | 5 | Switching the rule on in production (`SCENE_GRAPH_NEAR_RANGE_M`): a rebuild of every map; value from the robot's `support.commit_radius_m` (1.5 m), the cone or not (item 2), and the decision of A.6 (item 3) | Laci / user | the live use of A |
 | 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader (B.5), with lambda per robot (B.6) | lattice_cimbi | an engine change; not started |
 | 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |
