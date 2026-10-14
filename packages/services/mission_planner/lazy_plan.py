@@ -47,6 +47,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from packages.scene_graph.api import Blocked, Route, Safety, Snap, edge_weight
+from packages.scene_graph.store_codec import read_planes
 
 ROUTE_UNIT_M = 1e-4              # route cost unit (packages/scene_graph/engine.py)
 RES = 0.05                      # costmap cell; the lattice is 2 x RES (store.py)
@@ -97,7 +98,7 @@ class _TileCache(dict):
 
     def __setitem__(self, k, v):
         if v is not None:
-            v = {n: v[n] for n in ("own", "v") if n in v}
+            v = read_planes(v)
         with self._lock:
             super().__setitem__(k, v)
             self._order[k] = None
@@ -202,7 +203,7 @@ class PlanGraph:
         try:
             v = self.view.store._tile(self.view.map_id, self.view.man, tx, ty)
             c[key] = v
-            flight.value = v if v is None else {n: v[n] for n in ("own", "v") if n in v}
+            flight.value = v if v is None else read_planes(v)
             return flight.value
         except BaseException as err:             # pylint: disable=broad-except
             if isinstance(err, Exception):
@@ -338,7 +339,7 @@ class PlanGraph:
     def _cells(self, tiles: List[Tuple[int, int]]):
         """linear key, chart index, global (y, x) of every owned cell of the tiles, ascending by key (row-major)"""
         self.view._need(tiles)
-        ks, ch, ys, xs = [], [], [], []
+        ch, ys, xs = [], [], []
         lut = self._lut
         for (tx, ty) in tiles:
             t = self._tile(tx, ty)

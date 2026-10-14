@@ -39,7 +39,7 @@ sys.path[:0] = [HERE, os.path.dirname(os.path.dirname(HERE))]
 
 import bench_route_safety as bench  # noqa: E402
 from packages import config  # noqa: E402
-from packages.scene_graph.api import Safety, SceneParams  # noqa: E402
+from packages.scene_graph.api import SceneParams  # noqa: E402
 from packages.scene_graph.engine import RES, ChartGraph  # noqa: E402
 from packages.scene_graph.store import MemoryBackend, SceneGraphStore  # noqa: E402
 from packages.services.mission_planner import scene_route as sr  # noqa: E402

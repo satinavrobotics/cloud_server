@@ -638,6 +638,12 @@ def _opt_float(name: str) -> Optional[float]:
 SCENE_GRAPH_INFLATION_RADIUS_M = _opt_float("SCENE_GRAPH_INFLATION_RADIUS_M")
 SCENE_GRAPH_INFLATION_SCALING = _opt_float("SCENE_GRAPH_INFLATION_SCALING")
 SCENE_GRAPH_GLOBAL_INSCRIBED_M = _opt_float("SCENE_GRAPH_GLOBAL_INSCRIBED_M")
+# Close evidence (docs/scene_graph/close_evidence_and_turn_cost_design.md part A): a cell the costmap marked lethal stays blocked
+# until a free report from a capture pose within NEAR_RANGE_M of it (the robot's support.commit_radius_m, 1.5 m, is the reference).
+# Empty = off (the latest report wins). Read by the graph-builder when it makes an engine; changing it is a new generation of every
+# map (the params hash changes). NEAR_FOV_DEG (optional): a free report counts only inside this horizontal cone of the base yaw.
+SCENE_GRAPH_NEAR_RANGE_M = _opt_float("SCENE_GRAPH_NEAR_RANGE_M")
+SCENE_GRAPH_NEAR_FOV_DEG = _opt_float("SCENE_GRAPH_NEAR_FOV_DEG")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps

@@ -1,7 +1,8 @@
 # Inflation price profile: implementation and validation (experimental, 2026-10-14)
 
-Branch `exp/inflation-profile` (from main `cef2c43`), nothing pushed, merged or deployed. Specification:
-`inflation_profile_design.md` sections 1-7, 11, 12 (the design file lives in the design worktree, not on main). This file states
+Merged into `main` and deployed on 2026-10-14 (planner `cac9f03`) with the exponential tier **off**: the three environment variables
+are empty, so the live objective is still the linear hinge at kappa 1. The research scripts of the design are in
+`tools/scene_graph_sim/research/inflation/`. Specification: `inflation_profile_design.md` sections 1-7, 11, 12. This file states
 what was built, every test of the campaign with its number and verdict, the exact commands, and what the numbers do and do not
 support.
 

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from cloud_common.objects.common import Pose2D

@@ -255,7 +255,7 @@ def perturb_task(arg):
     Gc = csr(m, weights(m, phin, kappa))
     rng = np.random.default_rng(1234)
     n = changed = 0
-    dj, dj_rel, bound_ex, bound_lip, ok_ex, ok_lip, per_m = [], [], [], [], 0, 0, []
+    dj, bound_ex, bound_lip, ok_ex, ok_lip, per_m = [], [], [], [], 0, 0, []
     lip = k * math.exp(k * origin)                      # the steepest slope of phi (at g = 0), the step at reach excluded
     for seed in SEEDS:
         for a, b in pairs_of(m, seed, 40):

@@ -1,4 +1,4 @@
-# Scene graph and planning: entry point (state 2026-10-13, code at `a93a696` on `main`)
+# Scene graph and planning: entry point (state 2026-10-14, `main`; the deployed commit is in `pipeline_state_2026-10-14.md`)
 
 Read this first. It says what is built, where each part lives, what runs live, and what is still open, on both sides:
 **CIMBI** (algorithm, store, checker: `packages/scene_graph`, `tools/scene_graph_check_generation.py`) and **LACI**
@@ -22,6 +22,9 @@ A hierarchical topological graph of the robot's free space, built from its costm
   `length` (geometric m), `cost` (integer, 1e-4 m units, each edge rounded up), `min_width` (narrowest crossed passage).
   Equal-cost routes resolve to the lexicographic minimum of their (y, x) cell sequence (`88e5651`).
 
+The planner prices a route by clearance (`route_safety.md`): `length x (1 + mu x mean deficit)` with the linear hinge, kappa 1; the
+exponential profile (`inflation_profile_design.md`) is in the code and off.
+
 Definitions and the verification status of every statement: `formulation.md` (EXACT / TESTED / HEURISTIC). The derivation and
 refuted claims: `audit_ledger.md`. The 2026-10-13 artifact with the figures: https://claude.ai/artifact/2zJP73VSBuxEaHs9W2ga2q
 
@@ -37,30 +40,31 @@ refuted claims: `audit_ledger.md`. The 2026-10-13 artifact with the figures: htt
 | Backfill of `costmap_stored_ms` | `tools/scene_costmap_stored_backfill.py` | LACI tool |
 | Ingest worker, adapter, host | `packages/services/graph_builder/scene_*.py` | LACI |
 | Read API | `packages/api/scene_graph_reads.py` | LACI |
-| Planner: snap, route, width gate, fallbacks | `packages/services/mission_planner/scene_route.py`, `server.py` | LACI |
+| Planner: snap, route, pricing, width gate, fallbacks | `packages/services/mission_planner/scene_route.py`, `server.py`, `node_policy_plan.py` | LACI |
+| Pricing (`Safety`, `edge_weight`, hinge and exponential tier) | `packages/scene_graph/api.py`, `engine.py` (`_edge_cost`), `lazy_plan.py` | CIMBI + LACI |
+| Close-evidence rule (planes `B`, `Fn`; tile reader `effective_v`) | `engine.py` (`_fold_into`, `_build_F`), `store.py`, `store_codec.py` (`effective_v`, `read_planes`) | CIMBI |
 | Lazy planner (tile-loaded `PlanGraph`) | `packages/services/mission_planner/lazy_plan.py` (the only planner mode; `full_load` removed 2026-10-13) | LACI |
 | Config and flags | `packages/config.py` (`SCENE_GRAPH_*`), `docker_compose/mission_dispatch_services.yaml`, `.env.example` | both |
 | Migration | `packages/api/migrations/versions/20261012_01_blocked_geometry.py` | LACI |
 
-Constants that matter: `FORMAT = 4`, `PIPELINE = "morse/2"` (store), `LAT = 2` (costmap cells per lattice cell, engine),
-`RES = 0.05` m costmap cell. `SceneParams` = `robot_half_side`, `lattice`, `chart_radius` (`api.py`); nothing else is a scene
-parameter. The engine's window cap (20 m side) and pose slack (5 m) are validation constants, not tunables.
+Constants that matter: `FORMAT = 4`, `PIPELINE = "morse/2"` (store; `"morse/2+near1"` for a store made with the close-evidence
+rule), `LAT = 2` (costmap cells per lattice cell, engine), `RES = 0.05` m costmap cell. `SceneParams` = `robot_half_side`,
+`lattice`, `chart_radius` and the optional `near_range_m` / `near_fov_deg` (close evidence, None = off; `api.py`); nothing else is a
+scene parameter. The engine's window cap (20 m side) and pose slack (5 m) are validation constants, not tunables.
 
-## 3. Live state (as reported by LACI, 2026-10-13)
+## 3. Live state (2026-10-14)
 
-* `main` = `feat/scene-graph-v2` = `a93a696`. Production runs it on graph-builder, API and planner.
-* Worker: all 8 live office maps ingesting (`office5`, `office6`, `office7`, `office8`, `office01`, `office03`, `office04`,
-  `Officemap`). Hospital and the two stray test maps are switched off (`scene_graph_enabled=false`).
-* Stored graphs: checker `--all --expect tools/scene_graph_expected.json` gives 8 of 8 (LACI, reported). Pinned counts
-  (charts / links / islands): office8 12/15/0, office01 15/16/3, Officemap 14/15/1, office03 8/6/1, office04 16/15/4,
-  office5 5/5/0, office6 14/17/0, office7 14/17/0.
-* Planner: `SCENE_GRAPH_PLANNER_ENABLED=true`, mode `full_load` at the time (lazy since 2026-10-13 19:00 UTC; 445 route pairs identical on 8 real maps; `full_load` removed), `SCENE_GRAPH_CACHE_VERSIONS=8` (it was 4, which pre-warmed only 4
-  of 8 maps), all 8 maps pre-warmed at 16:19 UTC (LACI, reported). Hospital and the two test maps are skipped by pre-warm and fall
-  back to the legacy planner. The width gate (`SCENE_GRAPH_WIDTH_CHECK_ENABLED`) is off.
-* Rollback tags on the production hosts: `:pre-scenev2-20261013` (before the first deploy), `:pre-7655b10` (before the hash fix),
-  `:pre-a93a696` (graph-builder image, before the 16:19 UTC rebuild; the other two were also tagged on API and planner images).
-* Production read-only facts (LACI, 2026-10-13): alembic head `20261012_01_blocked_geometry` applied; factsheets: `formidable-peacock`
-  0.5 x 0.5 m, `masked-frigatebird` and `subtle-pelican` have none (default footprint, counted in `default_r_d`).
+The deployed commit of each service, the deploy log and the live run of 2026-10-13 are in `pipeline_state_2026-10-14.md`
+(sections 1, 4 and 7, and its addendum); the planner reports its commit as `build_sha` on `GET /stats`.
+
+* Maps: all 9 (8 office maps and Hospital, enabled 2026-10-13 23:56 UTC) are in the graph; the checker passes
+  (`tools/scene_graph_check_generation.py --all --expect tools/scene_graph_expected.json`; Hospital is not pinned in the expectations file yet).
+* Planner: the lazy tile planner only (`full_load` removed 2026-10-13); chart route first, the legacy planner as fallback;
+  clearance pricing on, linear hinge, `SCENE_GRAPH_SAFETY_KAPPA=1.0`; the width gate is off.
+* Off in production: the exponential price profile (`SCENE_GRAPH_INFLATION_*` empty) and close evidence (`SCENE_GRAPH_NEAR_*` empty).
+* Not built: the turn cost and the waypoint merge (`close_evidence_and_turn_cost_design.md` parts B and C), rate pricing
+  (`formulation.md` section 6).
+* Rollback: `scripts/deploy.sh rollback <service>` puts the last pre-deploy image tag back (`runbook.md` section 2, "Deploying").
 
 ## 4. What is verified, and how
 
@@ -71,58 +75,57 @@ parameter. The engine's window cap (20 m side) and pose slack (5 m) are validati
 * **Store:** load equals save, replay does not bump the version, kill and restart give the same leaf set, delete saga leaves
   nothing (rehearsal on the throw-away stack with the real worker on the captured leaves of all 9 maps).
 * **E2E harness:** `tools/scene_graph_e2e/run.sh`, 32 passed in both planner modes while both existed (on `4104b8d`; not re-run on `a93a696`).
-* **Pinned unit suite:** 4212 passed on the production pins (py3.10, pydantic 1.9.0), on `4104b8d`.
+* **Pinned unit suite:** the full default selection of `scripts/run_unit_tests_pinned.sh` (py3.10, pydantic 1.9.0); a deploy is refused for a commit without a recorded passing run (`runbook.md` section 2, "Deploying"). The counts are in `pipeline_state_2026-10-14.md`.
 * **Measurements:** `formulation.md` statements 25-27 (cost, anchor-chain stretch, route quality) and statement 28 (ties).
-* **Clearance pricing:** `route_safety.md` (statements 29-31; `tools/scene_graph_sim/accept_route_safety.py`, the acceptance gates).
+* **Clearance pricing:** `route_safety.md` (statements 29-31; `tools/scene_graph_sim/accept_route_safety.py`, the acceptance gates, with `--profile exp` for the exponential tier, see `inflation_profile_validation.md`).
+* **Close evidence:** `close_evidence_and_turn_cost_design.md` part A; `tests/unit/scene_graph/test_close_evidence.py` (rule off identical, arrival-order independence, semantics, store round trip, tile readers equal the engine); replay and engine reproduction on office8 (`tools/scene_graph_sim/close_evidence_replay.py`, `close_evidence_engine_check.py`).
 
 ## 5. Gaps, CIMBI side
 
-1. **Rate pricing / count planes.** Not built (clearance pricing is: `route_safety.md`). Design, with the planner side's conditions: `formulation.md` section 6. Needs
-   per-leaf-key dedup in the engine (delivery is at-least-once) and a versioned count object outside the tiles.
-2. **Exact locality** of the chart partition under incremental folds: measured (0.8 m hall, 2.65 m field), not proved.
-3. **Corridor optimality:** the corridor search is not proved shortest (worst 1.40 x on 840 real pairs, p90 1.00). Under an overlay
-   the search covers the whole graph.
-4. **Chart 4-connectivity** is tested, not proved.
-5. **Width evidence and F-7:** office03's only inter-part route crosses a 0.10 m link of 3.0 m. The engine reports it; whether it is a
+1. **Rate pricing / count planes.** Not built (clearance pricing is: `route_safety.md`). Design, with the planner side's conditions:
+   `formulation.md` section 6. Needs per-leaf-key dedup in the engine (delivery is at-least-once) and a versioned count object outside the tiles.
+2. **Stale free evidence** (a cell reported lethal and later free from far away, the office8 stairs): the close-evidence rule is in the
+   engine, off by default (`close_evidence_and_turn_cost_design.md` part A). Open there: stairs versus ghost for 14 unconfirmed
+   components, and whether the rule applies to wall rims; enabling it rebuilds every map.
+3. **Turn cost and waypoint merge.** Designed and prototyped on a research lattice (`close_evidence_and_turn_cost_design.md` parts B, C);
+   not in the engine. The robot's speeds come from registration (B.6), pending the nominal values.
+4. **Exact locality** of the chart partition under incremental folds: measured (0.8 m hall, 2.65 m field), not proved.
+5. **Corridor optimality:** the corridor search is not proved shortest (worst 1.40 x on 840 real pairs, p90 1.00). Under an overlay
+   or a price the search covers the whole graph.
+6. **Chart 4-connectivity** is tested, not proved.
+7. **Width evidence and F-7:** office03's only inter-part route crosses a 0.10 m link of 3.0 m. The engine reports it; whether it is a
    real passage or a driven-evidence sliver is open (no controller claim is made).
-6. **Real data:** all evidence is from one site (8 indoor office floors). Corridors, doors and outdoor ground are synthetic only.
-7. **Islands:** charts outside the largest link component are kept and marked (decision: keep). Their cause: free cells touching the
+8. **Real data:** evidence is from one site (8 indoor office floors and one simulated hospital). Corridors, doors and outdoor ground are
+   synthetic only.
+9. **Islands:** charts outside the largest link component are kept and marked (decision: keep). Their cause: free cells touching the
    rest only at a corner (routing is 4-connected).
-8. **Dead plane:** `OwnerRaster.dependent` is always all-False and still served; removal waits for the client's agreement.
-9. **Stale CIMBI docs** (list in section 7).
+10. **Dead plane:** `OwnerRaster.dependent` is always all-False and still served; removal waits for the client's agreement.
+11. **Stale CIMBI docs** (list in section 7).
 
 ## 6. Gaps, LACI side
 
-1. **Lazy planner tie alignment.** `lazy_plan.py` must choose the same route as the engine (integer cost, then (y, x)). Done on
-   branch `cleanup/lazy-tie-rule` at commit `b997c66` (off `a93a696`, not pushed): aligned to integer cost then (y, x), the 5 xfails removed,
-   `SCENE_GRAPH_PLANNER_MODE` defaulted to `lazy` then (`full_load` existed until its removal on 2026-10-13). Verified: lazy equality, lazy plan
-   and cache-lazy 130 passed; scene graph and planner subset 292 passed, 3 skipped (MinIO). NOT yet run: the Docker e2e in lazy mode
-   and the pydantic 1.x unit suite. Production has been lazy since 2026-10-13 19:00 UTC (445 route pairs identical on 8 real maps); `full_load` removed. Review and merge: LACI.
-2. **Width gate.** Off. Not validated against the live controller (the 30 degree turn rule is an assumption; see `runbook.md`
-   section 1, "Width gate"). Needs a real factsheet for the two robots without one, and a live comparison before it is switched on.
-3. **Planner flag on production** runs the scene-graph route with the legacy planner as fallback; coverage of the fallbacks has to
-   be watched (`runbook.md` section 7). Canary history (LACI, all UTC, 2026-10-13):
-   * worker first enabled with only office8 switched on, the other maps `scene_graph_enabled=false`;
-   * office7 re-enabled next, then all 8 office maps together on the user's go; Hospital and the two test maps stay off;
-   * planner flag turned on after the user's "i allow planner flag" (recreate at 16:16); pre-warm and cache-size fix at 16:19;
-   * observed so far: one office7 `/api/v1/plan` at 16:25:07 (plan only), no fallback line logged, so served by the chart planner by
-     inference. Fallback-reason coverage is still UNOBSERVED.
-   * Gap: `GET /stats` on the planner drops the `scene_graph` outcomes block (StatsResponse filters it), so served and fallback counts
-     cannot be read from outside. A small fix, not made.
-4. **Client leftovers:** `meta.params` read (the client must not read removed parameters) and the dead `dependent` plane. On hold
+1. **Width gate.** Off. Not validated against the live controller (the 30 degree turn rule is an assumption; see `runbook.md`
+   section 1, "Width gate"). Needs a real factsheet for the robots without one, and a live comparison before it is switched on.
+2. **Fallback coverage.** The planner flag is on; of the 16 plans of the live run of 2026-10-13 all were served by the chart planner
+   (`pipeline_state_2026-10-14.md` section 4). `GET /stats` reports the `scene_graph` outcomes and cache and the `build_sha`; the
+   pricing counters (`priced_plans`, `priced_plans_inexact`) are there too. A longer run is the evidence still wanted.
+3. **No per-request A/B.** kappa is a process setting; a baseline needs a restart (`pipeline_state_2026-10-14.md` section 6).
+4. **Deploy chain.** `scripts/deploy.sh` gates on a recorded test run and verifies the planner's `build_sha`; the other services'
+   images are not labelled (`pipeline_state_2026-10-14.md` section 6).
+5. **Client leftovers:** `meta.params` read (the client must not read removed parameters) and the dead `dependent` plane. On hold
    until the client agrees.
-5. **Checker in the live image:** `a93a696` is deployed; the expectations file is not in the image until `63b54e4` is merged and
-   graph-builder rebuilt (until then the `--expect` run needs `docker cp tools/scene_graph_expected.json` into the container). The
-   docs branch adds the file and the rules. Merge to `main` waits for the user's go.
-6. **Production checks still open:** whether the factsheets for the two robots are to be added (default footprint until then), and the
-   `default_r_d` counter review.
-7. **Occupancy view proposal** (`occupancy_view_proposal.md`, untracked in the shared worktree, LACI's draft): not decided.
+6. **Production checks open:** the factsheets of the robots without one (default footprint until then, counted in `default_r_d`;
+   speed fields are needed for the turn cost, `close_evidence_and_turn_cost_design.md` B.6).
+7. **Occupancy view** (`occupancy_view_proposal.md`): the read API is deployed (`pipeline_state_2026-10-14.md` section 1).
 
 ## 7. Documents: what is current, and what is stale
 
 Current and authoritative:
 * `README.md` (this file), `formulation.md`, `audit_ledger.md`, `runbook.md` (operations, section 6a islands and the checker),
   `planner_upgrade.md` and `planner_findings_2026-10-13.md` (planner side).
+* `route_safety.md` (clearance pricing), `inflation_profile_design.md` and `inflation_profile_validation.md` (the exponential tier,
+  off), `close_evidence_and_turn_cost_design.md` (close evidence merged and off; turn cost and waypoint merge designed),
+  `pipeline_state_2026-10-14.md` (state record: deployed commits, live run, open items, deploy record).
 
 Stale, to be corrected (not rewritten here):
 * `handoff_next_session.md`: lists steps already done (merge, generation, pinned run); its "remaining steps" are out of date.
@@ -135,8 +138,8 @@ Stale, to be corrected (not rewritten here):
 ## 8. How to resume (new person)
 
 1. Read section 1 and `formulation.md`. The statements marked EXACT are the ones to rely on; TESTED and HEURISTIC are not.
-2. Run the unit suites: `tests/unit/scene_graph` (host, 202 passed, 3 skipped at `7655b10`; re-count on the branch) and `scripts/run_unit_tests_pinned.sh tests/unit -m unit` (the
-   production pins; scipy must be in the image).
+2. Run the unit suites: `tests/unit/scene_graph` on the host, and `scripts/run_unit_tests_pinned.sh` with no arguments (the production
+   pins; scipy must be in the image; arguments replace the default selection).
 3. E2E on the throw-away stack: `tools/scene_graph_e2e/run.sh` (needs docker and the pinned venv).
 4. Read-only prod check: `docker exec <graph-builder> python -m tools.scene_graph_check_generation --all --expect tools/scene_graph_expected.json`.
 5. Do not write to production (rebuild, generation, flags) without the user's explicit go in the session; the operational steps are

@@ -34,7 +34,7 @@ from .api import BBox, Chart, Dirty, Leaf, Link, MissingTiles, OwnerRaster, Scen
 from . import morse
 from .state import EngineState, LeafRecord, StateMismatch  # noqa: F401  (StateMismatch re-exported)
 from .store_backends import ArangoMinioBackend, Blobs, Docs, MemoryBackend  # noqa: F401  (re-exported)
-from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pack_json, params_hash, unpack,
+from .store_codec import (canonical_json, compress_object, effective_v, hash_arrays, pack, pack_json, params_hash, unpack,
                           unpack_json)
 
 PIPELINE = "morse/2"
@@ -646,14 +646,15 @@ class SceneGraphStore:
         return g
 
     def tile_v_plane(self, map_id: str, version: int, tx: int, ty: int) -> Optional[np.ndarray]:
-        """The occupancy plane `v` of tile (tx, ty) of `version` as a read-only uint8 [TILE_F, TILE_F] array at the costmap
+        """The occupancy plane of tile (tx, ty) of `version` (`effective_v`: the stored `v`, with cells the close-evidence rule holds
+        blocked read as blocked) as a read-only uint8 [TILE_F, TILE_F] array at the costmap
         resolution (RES, 0.05 m): costmap cell (row, col) of the tile is global cell (ty * TILE_F + row, tx * TILE_F + col),
         spanning [col * RES, (col + 1) * RES) on x. `None` when the tile holds nothing in that version. Read-only and safe under
         concurrent reads (the tile cache and its single flight of `_tile`)."""
         man = self.manifest(map_id, version)
         t = self._tile(map_id, man, tx, ty)
         if t is None: return None
-        v = t["v"].view()
+        v = effective_v(t).view()
         v.flags.writeable = False
         return v
 
@@ -989,7 +990,7 @@ class StoredView:
             tile = self._own(a, b)
             if tile is None: continue
             m = (gx // TILE_F == a) & (gy // TILE_F == b)
-            v = tile["v"][gy[m] - b * TILE_F, gx[m] - a * TILE_F]
+            v = effective_v(tile)[gy[m] - b * TILE_F, gx[m] - a * TILE_F]
             if ((v >= 100) & (v != 255)).any(): crosses = True; break
         j = int(idx[ty - ly0, tx - lx0])
         return Snap(self.keys[j] if dist <= limit else None, px, py, dist, crosses)

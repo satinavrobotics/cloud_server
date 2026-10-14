@@ -68,3 +68,27 @@ def unpack_json(blob: bytes):
     if blob[:4] != b"SGJ1":
         raise ValueError("not a scene-graph page")
     return json.loads(zlib.decompress(blob[4:]))
+
+
+def effective_v(t: dict) -> np.ndarray:
+    """The occupancy plane of a stored tile as navigable-space construction reads it. Without the close-evidence rule that is `v`.
+    With it (the tile carries `fn`) a cell that `v` calls free but whose latest blocked time `b` is newer than its latest close
+    free report `fn` reads blocked (100): the same cells `ChartGraph._build_F` removes from free space, so a reader that works
+    from tiles (clearance, line of sight, snap) sees what the engine saw. The stored `v` is untouched (the fold continues from it)."""
+    v, fn = t["v"], t.get("fn")
+    if fn is None:
+        return v
+    held = (v < 100) & (t["b"] >= 0) & (t["b"] > fn)
+    if not held.any():
+        return v
+    out = v.copy()
+    out[held] = 100
+    return out
+
+
+def read_planes(t: dict) -> dict:
+    """The planes a tile reader keeps (`own`, and the occupancy as `effective_v`), from a decoded tile."""
+    out = {n: t[n] for n in ("own",) if n in t}
+    if "v" in t:
+        out["v"] = effective_v(t)
+    return out

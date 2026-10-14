@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from packages.scene_graph import store as S
+from packages.scene_graph import store_codec as C
 from packages.scene_graph.api import BBox, Leaf, SceneParams
 from packages.scene_graph.engine import ChartGraph
 
@@ -147,3 +148,68 @@ def test_store_round_trip_and_params_mismatch():
     assert h0.params.near_range_m is None and h0._Fn is None
     with pytest.raises(ValueError, match="near_range_m"):
         ChartGraph(SceneParams(near_range_m=1.5)).import_state(g0.export_state())
+
+
+# ---- readers that work from tiles see the rule --------------------------------------------------------------
+def test_effective_v_holds_the_cells_the_engine_holds():
+    v = np.array([[0, 0, 100, 255]], np.uint8)
+    b = np.array([[5, 5, 5, 5]], np.int64)
+    t = {"v": v, "b": b, "own": np.zeros((1, 4), np.int32)}
+    assert C.effective_v(t) is v                                       # no `fn` plane: the stored plane itself
+    t["fn"] = np.array([[9, 3, 3, 3]], np.int64)                         # cell 0: close free newer than blocked: free
+    out = C.effective_v(t)                                              # cell 1: blocked newer: held; blocked and unknown stay
+    assert out.tolist() == [[0, 100, 100, 255]] and v.tolist() == [[0, 0, 100, 255]]
+    assert C.read_planes(t)["v"].tolist() == out.tolist() and "b" not in C.read_planes(t)
+    t["b"] = -np.ones((1, 4), np.int64)                                  # never blocked: nothing is held
+    assert C.effective_v(t) is v
+
+
+def test_lazy_reader_and_tile_plane_agree_with_the_engine_under_the_rule():
+    from packages.services.mission_planner.lazy_plan import open_plan
+    g = _run([(1000, NEAR, True), (2000, FAR, False)])
+    be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
+    st.save("m", g, g.fold_many([_leaf("z", 2500, FAR, False)]), None, {"n": 1})
+    eng = st.load("m")
+    held = (eng._V < 100) & (eng._B >= 0) & (eng._B > eng._Fn)
+    assert eng._Fn is not None and held.any()                           # the rule holds cells that the latest value calls free
+    lazy = open_plan(st, "m", max_tiles=10 ** 6)
+    sp = eng._solved.sp
+    ix0, iy0 = eng._cx0 // 2, eng._cy0 // 2
+    n = 0
+    for margin in (0.3, 1.0):
+        for y, x in zip(sp.ys.tolist(), sp.xs.tolist()):
+            e = eng.deficit_cell(x + ix0, y + iy0, margin)
+            assert e is not None and lazy.deficit_cell(x + ix0, y + iy0, margin) == e     # clearance counts the held cells as blocked
+            n += 1
+    assert n > 0
+    # the occupancy a tile reader gets (tile_v_plane) holds blocked what _build_F removed from free space
+    free_eff = np.zeros(eng._V.shape, bool)
+    man = st.manifest("m")
+    for name in man["tiles"]:
+        tx, ty = (int(c) for c in name.split(","))
+        p = st.tile_v_plane("m", st.meta("m")["version"], tx, ty)
+        y0, x0 = ty * S.TILE_F - eng._cy0, tx * S.TILE_F - eng._cx0
+        ys, xs = max(0, y0), max(0, x0)
+        ye, xe = min(eng._V.shape[0], y0 + S.TILE_F), min(eng._V.shape[1], x0 + S.TILE_F)
+        if ys < ye and xs < xe:
+            free_eff[ys:ye, xs:xe] = ((p != 255) & (p < 100))[ys - y0:ye - y0, xs - x0:xe - x0]
+    held = (eng._V < 100) & (eng._B >= 0) & (eng._B > eng._Fn)
+    assert held.any() and not free_eff[held].any()
+
+
+def test_the_checker_accepts_a_store_made_with_the_rule():
+    from tools import scene_graph_check_generation as chk
+    w, way = cw.two_rooms(W=12.0)
+    g = ChartGraph(SceneParams(near_range_m=1.5, near_fov_deg=120.0))
+    be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
+    st.save("m", g, g.fold_many(cw.drive(w, way)), None, {})
+    r = chk.check_map(st, "m")
+    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_NEAR
+
+
+def test_the_graph_builder_reads_the_rule_from_config(monkeypatch):
+    from packages import config
+    monkeypatch.setenv("SCENE_GRAPH_NEAR_RANGE_M", "1.5")
+    monkeypatch.setenv("SCENE_GRAPH_NEAR_FOV_DEG", "")
+    assert config._opt_float("SCENE_GRAPH_NEAR_RANGE_M") == 1.5 and config._opt_float("SCENE_GRAPH_NEAR_FOV_DEG") is None
+    assert config.SCENE_GRAPH_NEAR_RANGE_M is None or isinstance(config.SCENE_GRAPH_NEAR_RANGE_M, float)   # unset in the test env

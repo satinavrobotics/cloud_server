@@ -1,9 +1,11 @@
 # Close evidence for blocked cells, a turn cost for routes, and a waypoint merge (design, 2026-10-14)
 
-Status: **plan and prototype only.** Nothing here is built, merged or deployed; no stored format changes; the exponential
-inflation tier stays off. Direction was accepted by Laci for parts A and B; part C is a separate item; part D lists what is open.
-Written by the lattice_cimbi session. Every number comes from the two scripts named below, run on the office8 leaf export
-(97 leaves, one session of 6 minutes; no other map's leaf export is available to these scripts).
+Status (2026-10-14): **part A (close evidence) is in the engine, merged and off by default** (`SceneParams.near_range_m`, environment
+`SCENE_GRAPH_NEAR_RANGE_M` empty); parts B (turn cost) and C (waypoint merge) are designed and prototyped on a research lattice, **not
+built**. The exponential inflation tier stays off. Direction was accepted by Laci for A and B; the user accepted the engine
+prototype and asked for it to be merged and deployed. Written by the lattice_cimbi session. Every number below comes from the
+scripts named below, run on the office8 leaf export (97 leaves, one session of 6 minutes; no other map's leaf export is available
+to these scripts).
 
 ```
 python tools/scene_graph_sim/close_evidence_replay.py --data <office8 export> [--rdet 1.5] [--away 0.25]
@@ -142,18 +144,27 @@ Recommendation: option 1. The largest component is the stairs and a per-cell con
 the stairs free, so the extra parameter buys ghost protection at the price of the hazard it is meant for. The ghost cost of
 option 1 is real but not demonstrated on this map: the other 14 components are small (404 cells, 1.0 m2 in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
 
-### A.6b Prototype in the engine (branch `proto/close-evidence-plane`, tip a54f576, local)
+### A.6b What is built (merged into `main`, off by default)
 
-One commit on main cac9f03, not pushed: `SceneParams.near_range_m` and `near_fov_deg` (both None = off, bit-identical to today);
-a new int64 plane `Fn` (allocated only when on; grown, shifted and cropped like `B`); `_fold_into(..., Fn, pose)`; `_build_F`
-excludes cells with `B >= 0 and B > Fn` from `free` (the driven-witness logic unchanged); a tile plane `fn` and params in the
-manifest. Format decision of the prototype: `FORMAT` stays 4, a rule-on store adds the `fn` tile plane and carries the params;
-`PIPELINE` is `morse/2` off and `morse/2+near1` on; a rule-off store is byte-identical to today's; a mismatch in either direction
-raises a `ValueError` naming `near_range_m` at `import_state`. `tools/scene_graph_check_generation.py` compares the manifest
-pipeline to `PIPELINE` and would flag a rule-on manifest (not changed). It reproduces the replay exactly (free cells 21518, turn
-blocked 2685, navigable 2143 -> 1889; with a 95 degree cone 3520 and 2143 -> 1757). Tests: 8 new (rule off identical, 4 arrival
-orders x 3 batch sizes identical, the four semantic cases plus tie and cone, store round trip and both mismatch errors); full pinned
-suite 4669 passed, 4 skipped. The branch is a prototype: it is **not** to be merged without Laci's explicit go.
+* `SceneParams.near_range_m` and `near_fov_deg` (both None = off, bit-identical to the latest-value fold); a new int64 plane `Fn`
+  (allocated only when on; grown, shifted and cropped like `B`); `_fold_into(..., Fn, pose)`; `_build_F` excludes cells with
+  `B >= 0 and B > Fn` from `free` (the driven-witness logic unchanged).
+* Store: `FORMAT` stays 4. A rule-on store adds the tile plane `fn` and carries the rule in its `params`; `PIPELINE` is `morse/2`
+  off and `morse/2+near1` on; a rule-off store is byte-identical to today's. A params mismatch in either direction raises a
+  `ValueError` naming `near_range_m` at `import_state`; `store.load()` builds the engine from the manifest params.
+* Readers that work from tiles see the rule: `store_codec.effective_v` reads a cell as blocked when `v` is free and `b > fn`
+  (the same cells `_build_F` removes); `lazy_plan` keeps `read_planes` (so its clearance, line of sight and snap agree with the
+  engine), and `SceneGraphStore.tile_v_plane` (the occupancy view) returns the effective plane. Without this a planner built on tiles
+  would measure clearance through the cells the engine held blocked.
+* Wiring: `SCENE_GRAPH_NEAR_RANGE_M` / `SCENE_GRAPH_NEAR_FOV_DEG` (config, compose, `.env.example`, `runbook.md` section 1) are read
+  by the graph-builder's `scene_host`; the planner needs no setting. Switching it on is a params change: every map is rebuilt in a new
+  generation (`runbook.md` section 3). `tools/scene_graph_check_generation.py` expects `morse/2+near1` for a store that carries the rule.
+* Reproduction: `tools/scene_graph_sim/close_evidence_engine_check.py` prints, on office8 at 1.5 m, free cells 21518, turn blocked 2685,
+  navigable 2143 -> 1889 (with a 95 degree cone 3520 and 2143 -> 1757). `close_evidence_replay.py` is the independent replay and the
+  component table of A.4. Tests: `tests/unit/scene_graph/test_close_evidence.py` (12): rule off identical, 4 arrival orders x 3 batch
+  sizes identical, the semantic cases plus tie and cone, store round trip and both mismatch errors, the tile readers equal the engine
+  (deficit of every navigable cell, the occupancy plane), the checker accepts a rule-on store, config parse.
+* Not built: the generation check of `tools/scene_graph_expected.json` is unchanged (the pins are counts, valid for a rule-off store).
 
 ### A.7 What is not shown
 
@@ -327,9 +338,9 @@ registration (B.6, per robot, with a fallback); the search allowance is 0.5 s an
 | # | Item | Owner | Blocks |
 |---|---|---|---|
 | 1 | Review B.6: lambda = `speed_max / angular_speed_max`, clamp [0, 5], fallback off or the operator value, record fields | Laci | the planner code for lambda |
-| 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2); the camera cone needs the leaf `view` or an assumed forward camera | Laci | the exact rule |
+| 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2); the camera cone needs the leaf `view` or an assumed forward camera | Laci | the value of `near_range_m` and `near_fov_deg` |
 | 3 | Stairs versus ghost for the 14 unconfirmed components of A.4 (the largest, x 1.3 y -3.5, is the stairs, confirmed by the user) | Laci / user | A.6, recommended option 1 |
 | 4 | Whether the rule applies to every blocked cell or only away from walls (rim cells thicken walls by up to 10 cm: navigable F -11.9% everywhere, -8.8% away from walls only) | Laci | A.2 |
-| 5 | Explicit go before the `Fn` plane enters main, or any stored-format change (prototype: branch `proto/close-evidence-plane`) | Laci | the format step |
-| 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader | lattice_cimbi after Laci | an engine change; not started |
+| 5 | Switching the rule on in production (`SCENE_GRAPH_NEAR_RANGE_M`): a rebuild of every map; value from the robot's `support.commit_radius_m` (1.5 m), the cone or not (item 2), and the decision of A.6 (item 3) | Laci / user | the live use of A |
+| 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader (B.5), with lambda per robot (B.6) | lattice_cimbi | an engine change; not started |
 | 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |
