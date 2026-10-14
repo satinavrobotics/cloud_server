@@ -12,7 +12,7 @@ robot's own inflation profile, drops the route-level two-pass floor, and adds a 
 |---|---|---|
 | Price profile | `phi(g) = (r_c - g)+ / (r_c - r)`, linear, ends at r_c = 0.354 m | `phi(g) = exp(-k (g - r))` for `g < reach`, 0 beyond; k, reach, r from the robot |
 | Below the inscribed radius | priced by the same linear function (steeper) | the exponential **continues**; bounded by `exp(k r)` (4.48 for k = 6, r = 0.25) at g = 0 |
-| Hard floor | none at r (witness cells with g < r are in F) | **no route-level floor**; a **waypoint-level** floor instead (section 4) |
+| Hard floor | none at r (witness cells with g < r are in F) | **no route-level floor**; a **waypoint guard** that only counts (section 4) |
 | Weight | `ceil(len/1e-4 (1 + kappa mean deficit) - 1e-6)` | `ceil(len/1e-4 (1 + kappa mean phi) - 1e-6)` |
 | kappa | 1.0, fixed | fleet default 0.75; per (map, robot) value by the budget sweep, capped at 2 |
 | 1 m cap, near-r no-pricing rule | present | retired while `reach <= 1.0 m` (the clearance cap of the lazy reader) |
@@ -45,37 +45,27 @@ the live values are the ones to use).
 Per-robot hard floor: the map's graph F is built for the map's `r`. A robot with a larger `r_in` masks cells with `g < r_in`
 at plan time (clearance is available in the reader); a smaller robot cannot use cells outside F. Long robots are a future item.
 
-## 4. The waypoint rule (replaces the two-pass floor)
+## 4. The waypoint guard (decided 2026-10-14: guard only, nothing is moved)
 
-The robot receives only waypoints (VDA5050 nodes) and plans its own leg to the next one with Smac 2D on its rolling local costmap;
-MPPI tracks that path. The route price therefore acts on the robot through waypoint positions, spacing and door choice. The dense
-lattice path is display data (`plan trajectory`, 7c34b3c) and is not driven.
+The robot receives only waypoints (VDA5050 nodes) and plans its own leg to the next one with Smac 2D on its global costmap; MPPI
+tracks that path. The route price therefore acts on the robot through waypoint positions, spacing and door choice. The dense
+lattice path is display data (`plan trajectory`, 7c34b3c) and is never part of the order (test `test_order_ignores_trajectory`).
 
-**Rule.** No planner-placed waypoint sits on a cell with `g < r_in + h/sqrt2` (`h` = lattice step; 0.321 m for r_in 0.25). The margin
-`h/sqrt2` is the lattice clearance quantisation (S12): a lattice value at or above it guarantees `g_continuum >= r_in`.
-At the robot's inflation `252 exp(-k (r_in + h/sqrt2 - r_in)) = 252 exp(-0.424) = 165 < 253`, so the leg goal is a valid
-Smac cell with margin.
+**Decision.** Waypoints are not moved, skipped or inserted by any clearance rule. The pricing record counts the interior planned
+waypoints whose lattice clearance is below the floor, so the question "do goal-blocked events or recoveries line up with such
+waypoints?" can be answered from production data.
 
-**Algorithm** (inside the cost-aware pull, per kept vertex):
-
-1. Candidate vertices are the points of the lattice path. A candidate `p_k` is admissible only if `g(p_k) >= r_in + h/sqrt2`.
-2. From the kept point `p_i` take the farthest admissible `p_k` that is visible, within the gap cap and no dearer than the
-   lattice sub-path (`J(segment) <= J(sub-path)`), exactly as today. The change is the admissibility test on `p_k`.
-3. A vertex that falls on a witness stretch is therefore **shifted along the lattice path** to the nearest admissible cell
-   before or after it; the segment test keeps visibility and the price test keeps `J(final) <= J(lattice)` (A7).
-4. If no admissible cell exists between two kept points inside the gap cap, the waypoint is **skipped** (nothing is inserted); the
-   stretch is left to the robot's leg planner. A witness stretch longer than the cap cannot be skipped and is reported
-   (`pricing.waypoint_floor_exceeded`).
-5. Never moved: the robot's start pose, the operator's goal and operator waypoints. An operator waypoint or goal with
-   `g < r_in + h/sqrt2` is kept and flagged in the pricing record (`operator_waypoint_below_floor`); the goal snap may move a goal
-   to the nearest admissible cell inside `SCENE_GRAPH_GOAL_SNAP_M` only where the operator allows snapping.
-6. Planned waypoints inserted by the gap fill (`node_policy_plan`) follow the same rule.
-
-**Interaction with the robot's leg.** Smac 2D rejects cells at cost >= 253 (within the inscribed radius of a lethal cell it
-observes); it is cost-aware on the same inflation profile, so inside a leg it already prefers room. A waypoint on a witness cell
-is the one place the cloud can hand the robot an invalid goal (the 2026-10-13 `GOAL_BLOCKED`, at 0.35 m, was a lethal the stored map
-did not have, not this case). Shifting or skipping such waypoints keeps every goal valid and leaves the crossing of a witness
-stretch, if the live lethal is still there, to Smac; if the lethal is stale the robot's costmap clears it and the leg passes.
+* **Floor** = `r_global`, the inscribed radius of the robot's global costmap (footprint inscribed radius plus its
+  `footprint_padding`; 0.30 m for the first robot), taken from the per-robot profile (tier 2). No `h/sqrt2` margin.
+  When `r_global` is unknown the floor is the geometric inscribed radius `r_in`.
+* **Counted**: interior waypoints placed by the planner (including gap-fill waypoints). Not counted: the start pose, the goal,
+  operator waypoints (an operator waypoint or goal below the floor is flagged separately).
+* **Why a guard**: measured on 120 routes per map at kappa 0.75, 1.6-3.5% of interior waypoints (office maps, 0 on Hospital) are
+  below 0.30 m, and a move to the nearest admissible path cell is within the robot's goal tolerance (0.35 to 0.5 m) for 83-100% of
+  them; Smac's planner tolerance (0.5 m) already accepts a goal on an invalid cell within 0.5 m (section 11).
+* **Revisit trigger**: only if recovery or `GOAL_BLOCKED` events line up with waypoints counted below the floor. Then the rule of
+  an earlier version of this section (shift along the lattice path to the nearest admissible cell, skip when none fits inside the gap
+  cap, never move operator waypoints or the goal) is the starting point; it is not implemented or proposed now.
 
 ## 5. kappa and the budget
 
@@ -89,15 +79,15 @@ stretch, if the live lethal is still there, to Smac; if the lethal is stale the 
 ## 6. Gates (changes to the acceptance harness)
 
 * A1-A7, B1, B2: unchanged statements (valid for any phi >= 0). A1 reduction becomes "kappa 0 equals the unpriced route".
-* New W1: no planner-placed waypoint below `r_in + h/sqrt2` (endpoints and operator waypoints excepted), on all maps.
-* New W2: the shortened or shifted polyline still satisfies A7 (`J(final) <= J(lattice)`).
+* New W1: the pricing record reports `waypoints_below_floor` (count) and the floor used; no waypoint position differs from the
+  position the same route had without the guard (the guard never moves anything).
 * New P1: `phi` is continuous at `r` (no step), monotone non-increasing, `phi(0) = exp(k r)`.
 * C3 cold-cache gate unchanged; reach 0.8 needs the halo of the 1.0 m cap, which exists.
 
 ## 7. Pricing record
 
-Per plan: kappa, margin source, profile source, `r_in`, `r_c`, `reach`, `k`, cost, exactness, tiles (as today), plus
-`waypoints_shifted`, `waypoints_skipped`, `operator_waypoint_below_floor`.
+Per plan: kappa, margin source, profile source, `r_in`, `r_c`, `r_global`, `reach`, `k`, cost, exactness, tiles (as today), plus
+`waypoints_below_floor` (interior planned waypoints with lattice clearance below `r_global`) and `operator_waypoint_below_floor`.
 
 ## 8. Separate engine item (not part of this change): lethal marks inside the swept body
 
@@ -174,7 +164,6 @@ In that override:
 Reading: the shift the rule makes is, for 83-100% of the affected waypoints, smaller than the robot's own goal tolerance, and Smac's
 planner tolerance (0.5 m) already accepts a goal on an invalid cell within 0.5 m. The rule therefore changes the robot's driven path
 for few waypoints (shifts above 0.5 m: 0-8% of the affected ones, about 0.1% of all waypoints). Its value is a guard, not a driver.
-Recommendation to the planner owner: either keep it as a guard with the floor taken from the robot's own `r_global` (tier 2), or
-record the count in the pricing record without moving anything and revisit when recoveries or `GOAL_BLOCKED` events correlate with
-waypoints below the floor. Also noted: the kappa that matches the robot's own Smac (5.0) is far above the budget-derived 0.75; the
+Decided with the planner owner (2026-10-14): guard only, floor `r_global`, count and do not move (section 4).
+Also noted: the kappa that matches the robot's own Smac (5.0) is far above the budget-derived 0.75; the
 two act at different levels (inside a leg versus which doors and where waypoints go) and need not be equal.
