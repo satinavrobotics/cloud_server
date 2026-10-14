@@ -397,10 +397,33 @@ corner remain.
 Statement: two consecutive interior waypoints closer than the goal tolerance carry no information the robot can act on (it
 accepts a goal within the tolerance). Replace them by their midpoint when both neighbouring chords are visible and the priced
 cost of the new polyline is not larger than the cost of the replaced one; otherwise keep both. It is a post-step to
-`simplify`; the search, the format and the stored route are not touched. It is not built and the interaction with the turn cost
-is not measured.
+`simplify`; the search, the format and the stored route are not touched. It is superseded by C.2.
 
 ---
+
+## C.2 Waypoints as guidance with a cost budget (replaces the merge; built, off by default)
+
+The exact merge of part C (never costlier) changes 2 of 150 plans on office8: the price bends the corner away from obstacles, so the
+midpoint chord is dearer in 62 of 68 visible cases. The statement is a budget, not a merge:
+
+* **Choose the fewest waypoints such that the total slack of the chords is at most `delta`**, a chord's slack being
+  `max(0, c(i, j) - P(i, j))` (priced chord cost minus the priced cost of the lattice sub-path it replaces), every chord visible and
+  within `SCENE_GRAPH_MAX_WAYPOINT_GAP_M`. Hence `J(final) <= J(lattice) + delta`. Today's pull is `delta = 0` without the minimal-link
+  property: the greedy pull is not minimal-link, so the exact result at `delta = 0` can have fewer waypoints at no more cost.
+* **Built:** `scene_route.fewest_waypoints` (dynamic program over (point, slack in whole cm, rounded up), O(n * window * D); ties: fewest
+  waypoints, least slack, lexicographically smallest indices), `SCENE_GRAPH_WAYPOINT_BUDGET_M` (empty = off, the greedy pull and its
+  code path unchanged; finite and <= 1.0, else off with a warning), also used by the gap fill between operator waypoints. Start, goal
+  and operator waypoints never move. The last chord may exceed the gap cap by `MIN_END_STUB_M` (what the end-stub merge allows the
+  greedy pull); the end-stub merge is then judged against the budget. The plan carries `waypoint_budget` ({`waypoint_budget_m`,
+  `waypoints_removed` against the greedy pull of the same plan}); `/stats` has `scene_graph.waypoints_removed`. The turn cost is
+  independent.
+* **Measured in the production planner** (office8, 150 pairs seed 7, kappa 1, `accept_route_safety.py --waypoint-budget 0.35`, gates
+  W1-W3 pass): segments per route 4.17 -> 3.32; routes with a segment under 0.5 m 92 -> 61; polyline length ratio (budget / greedy) mean
+  0.996; mean budget used 4.4 cm (max 34.7 cm); plan time p50/p99 3.4/7.2 ms greedy, 18/80 ms budget (warm, in-memory). The research
+  prototype's 56 -> 18 counted segments of its own lattice-path polylines (no leaf-id repair, no end-stub merge, no gap cap); the
+  production figures differ for that reason and are the ones to use.
+* **Open (robot side):** whether the robots honour the VDA5050 node `allowedDeviationXY`, and whether the navigator can mark a node
+  reached by cost-to-go progress; the value `delta` (0.35 m, the goal tolerance, is the reference).
 
 ## D. Open items
 

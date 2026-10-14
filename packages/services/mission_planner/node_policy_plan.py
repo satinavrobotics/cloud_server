@@ -226,7 +226,7 @@ def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
         lo, hi = (i, k) if i <= k else (k, i)
         return len(set(owners[lo:hi + 1])) <= 2
 
-    if safety is not None and safety.rate > 0.0:                      # a turn cost alone leaves the cut as it is
+    if safety is not None and safety.rate > 0.0 and not getattr(simplify, "unpriced_visible", False):   # a turn cost alone leaves the cut as it is
         from packages.services.mission_planner import scene_route    # not at module level: scene_route imports this module
         visible = scene_route.priced_visible(visible, graph, nodes, safety)
     kept = simplify(nodes, lambda p, q: window_ok(p, q) and visible(p, q), max_gap)

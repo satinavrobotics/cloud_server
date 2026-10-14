@@ -134,6 +134,7 @@ class MissionPlannerService:
         self._priced_inexact = 0
         self._priced_exp = 0                  # of those, priced with the exponential profile
         self._waypoints_below_floor = 0       # interior planner waypoints below the profile's floor (a count, nothing moved)
+        self._waypoints_removed = 0           # waypoints the budgeted pull saved against the greedy pull (SCENE_GRAPH_WAYPOINT_BUDGET_M)
         # served chart plans by the source of their turn-cost lambda (scene_route.turn_lambda: factsheet | config | off)
         self._turn_sources: Dict[str, int] = {}
 
@@ -300,7 +301,8 @@ class MissionPlannerService:
                 config.SCENE_GRAPH_WIDTH_MARGIN_M,
                 self._robot_length(robot),
                 self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width,
-                config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0, turn=turn))
+                config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0, turn=turn,
+                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -315,6 +317,11 @@ class MissionPlannerService:
             if hit:
                 return None, "blocked_row_on_route"
         ids = plan.planned_path
+        if plan.waypoint_budget is not None:
+            self._waypoints_removed += plan.waypoint_budget["waypoints_removed"]
+            self.logger.info("Waypoint budget plan map=%s graph_version=%s waypoint_budget_m=%.3f waypoints_removed=%d waypoints=%d",
+                             map_id, version, plan.waypoint_budget["waypoint_budget_m"],
+                             plan.waypoint_budget["waypoints_removed"], len(plan.waypoints))
         self._turn_sources[turn["source"]] = self._turn_sources.get(turn["source"], 0) + 1
         if plan.pricing is not None and plan.pricing["rate"] == 0.0:
             self.logger.info(
@@ -347,6 +354,7 @@ class MissionPlannerService:
             "min_width": plan.min_width, "chart_keys": plan.charts,
             "graph_version": version,
             **({"pricing": plan.pricing} if plan.pricing is not None else {}),
+            **({"waypoint_budget": plan.waypoint_budget} if plan.waypoint_budget is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
             **({"trajectory": plan.trajectory} if plan.trajectory else {}),
         }, None
@@ -408,9 +416,11 @@ class MissionPlannerService:
             poses, inserted = base, 0
             if gap_fill:
                 visible = scene_route.blocked_free_los(graph, ([], []))
+                pull = (scene_route.budget_pull(graph, safety, config.SCENE_GRAPH_WAYPOINT_BUDGET_M)
+                        if config.SCENE_GRAPH_WAYPOINT_BUDGET_M else scene_route.simplify)
                 poses, inserted = node_policy_plan.insert_planned(
                     graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
-                    scene_route.simplify, safety, routes)
+                    pull, safety, routes)
             wanted = [i for i, w in enumerate(poses[:-1])
                       if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
             if wants_corridor:
@@ -1611,6 +1621,7 @@ class MissionPlannerService:
                 "priced_plans_exp": self._priced_exp,
                 "waypoints_below_floor": self._waypoints_below_floor,
                 "turn_sources": dict(self._turn_sources),
+                "waypoints_removed": self._waypoints_removed,
             }
         return stats
 

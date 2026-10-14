@@ -685,6 +685,10 @@ SCENE_GRAPH_NEAR_MIN_CLEARANCE_M = _opt_float("SCENE_GRAPH_NEAR_MIN_CLEARANCE_M"
 # factsheet lacks one of the two; neither: no turn cost for that plan. ENABLED is the switch: off (the default), no plan has a turn cost.
 SCENE_GRAPH_TURN_COST_ENABLED = _env_bool("SCENE_GRAPH_TURN_COST_ENABLED", "false")
 SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = _opt_float("SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD")
+# Waypoint budget (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2): the planner's string pull is replaced by the exact
+# fewest-waypoints path whose total priced-cost excess over the lattice path is at most this many metres (final cost <= lattice +
+# budget). Empty / <= 0 = off (the greedy pull, unchanged); validated below: finite and at most 1.0, else off.
+SCENE_GRAPH_WAYPOINT_BUDGET_M = _opt_float("SCENE_GRAPH_WAYPOINT_BUDGET_M")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
@@ -725,6 +729,11 @@ def _validate_scene_graph_planner() -> None:
     if not (0.0 <= value <= 10.0):                               # also NaN
         fixed.append(f"SCENE_GRAPH_SAFETY_KAPPA={value} -> 1.0")
         globals()["SCENE_GRAPH_SAFETY_KAPPA"] = 1.0
+    value = SCENE_GRAPH_WAYPOINT_BUDGET_M
+    if value is not None and not (0.0 < value <= 1.0):          # also NaN; <= 0 is simply off
+        if value > 0.0 or value != value:
+            fixed.append(f"SCENE_GRAPH_WAYPOINT_BUDGET_M={value} -> off")
+        globals()["SCENE_GRAPH_WAYPOINT_BUDGET_M"] = None
     if fixed:
         logging.getLogger("config").warning("invalid scene graph planner settings reset: %s",
                                             "; ".join(fixed))

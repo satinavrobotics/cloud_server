@@ -3,6 +3,7 @@
     python tools/scene_graph_sim/accept_route_safety.py --data DIR [--pairs 150] [--seed 7] [--kappa 1] [--robot-half-side 0.25]
                                                          [--width W [--length L]]
                                                          [--profile exp --k 6 --reach 0.8 --origin 0.3] [--turn-lambda L]
+                                                         [--waypoint-budget M]
 
 `--profile exp` runs the same gates for the exponential price profile (docs/scene_graph/inflation_profile_design.md): the
 tier is selected through the SCENE_GRAPH_INFLATION_* settings (config attributes set here), kappa = `--kappa` (the planner's
@@ -16,6 +17,11 @@ that turn = 0 is the priced route and plan bit for bit; A3 compares with the ref
 walk, its own heading arithmetic); B1, B2 and C2 add the turn cost T (m) of the comparison route to their bounds (the objective is
 then L + mu A + T). The heading changes per 10 m and the turning (rad/m) of the lattice routes and of the waypoint polylines are
 reported at lambda 0 and at L.
+
+`--waypoint-budget M` (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2) also plans every pair with the budgeted pull
+(`plan_on_graph(waypoint_budget_m=M)`) and adds the gates W1 (final polyline in F), W2 (J(final) <= J(lattice) + M + n * 1e-4) and W3
+(never more waypoints than the greedy pull of the same pair), and reports segments per route, routes with a segment under 0.5 m, the
+polyline length ratio, the mean budget used and the plan time against the greedy pull.
 
 Production path, built once: the export's leaves are folded in the engine, saved to a `SceneGraphStore(MemoryBackend)` (batches of 6, as
 the worker saves), the restored engine (`store.load`) is the reference and `open_plan` the planner's tile-lazy `PlanGraph`. The same
@@ -356,6 +362,7 @@ def main() -> int:
     ap.add_argument("--near-range", type=float, default=None, help="close-evidence rule (SceneParams.near_range_m), m; default off")
     ap.add_argument("--near-min-clearance", type=float, default=None,
                     help="with --near-range: the away-from-walls filter (SceneParams.near_min_clearance_m), m; default off")
+    ap.add_argument("--waypoint-budget", type=float, default=0.0, help="waypoint budget (m of priced cost); 0 = not measured")
     ap.add_argument("--turn-lambda", type=float, default=0.0, help="turn cost (m per rad) on the priced side; 0 = none")
     args = ap.parse_args()
     t_start = time.perf_counter()
@@ -396,13 +403,13 @@ def main() -> int:
             pairs.append((sa, sb))
     gap = config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M
 
-    def plan(graph, p, q, kappa, times=None, turn=None):
+    def plan(graph, p, q, kappa, times=None, turn=None, budget=0.0):
         t = time.perf_counter()
         turn = (turn_rec if kappa > 0.0 else None) if turn is None else turn
         try:
             out = sr.plan_on_graph(graph, "m", p, q, ([], []), node_of, config.SCENE_GRAPH_START_SNAP_M,
                                    config.SCENE_GRAPH_GOAL_SNAP_M, gap, args.width, 0.05, args.length, None, kappa, False,
-                                   turn=turn)
+                                   turn=turn, waypoint_budget_m=budget)
         except sr.ChartFallback as err:
             out = err.reason
         if times is not None:
@@ -565,6 +572,51 @@ def main() -> int:
          "%d plans leave F (1 cm samples), %d with J(final) > J(lattice) + n * 1e-4" % (len(out_f), len(over)),
          "S11: a shortcut is accepted only if visible and J(segment) <= J(sub-path), so J(final) <= J(lattice); tolerance n * 1e-4 m")
 
+    wb = float(args.waypoint_budget)
+    wb_lines = []
+    if wb > 0.0:
+        for sa, sb in pairs:
+            plan(lazy, (sa.x, sa.y), (sb.x, sb.y), args.kappa, budget=wb)       # warm the caches the same way
+        tw = []
+        plansw = [plan(lazy, (sa.x, sa.y), (sb.x, sb.y), args.kappa, tw, budget=wb) for sa, sb in pairs]
+        w_out, w_over, w_more, used, seg_g, seg_w, short_g, short_w, len_g, len_w = [], [], [], [], [], [], 0, 0, [], []
+        for i in range(len(pairs)):
+            g_, w_ = plans1[i], plansw[i]
+            if isinstance(g_, str) or isinstance(w_, str) or pri_l[i] is None:
+                continue
+            sa, sb = pairs[i]
+            pts_g, pts_w = wp(g_), wp(w_)
+            lattice = [(sa.x, sa.y)] + [tuple(n) for n in pri_l[i].nodes] + [(sb.x, sb.y)]
+            if not ref.all_samples_in_f(pts_w):
+                w_out.append(i)
+            j_w, _ = ref.sampled_cost(pts_w, SAMPLE_COARSE)
+            j_lat, _ = ref.sampled_cost(lattice, SAMPLE_COARSE)
+            if j_w > j_lat + wb + (len(lattice) - 1) * U:
+                w_over.append(i)
+            if len(pts_w) > len(pts_g):
+                w_more.append(i)
+            used.append(max(0.0, j_w - j_lat))
+            seg_g.append(len(pts_g) - 1)
+            seg_w.append(len(pts_w) - 1)
+            short_g += any(math.dist(a_, b_) < 0.5 for a_, b_ in zip(pts_g[:-1], pts_g[1:]))
+            short_w += any(math.dist(a_, b_) < 0.5 for a_, b_ in zip(pts_w[:-1], pts_w[1:]))
+            len_g.append(sum(math.dist(a_, b_) for a_, b_ in zip(pts_g[:-1], pts_g[1:])))
+            len_w.append(sum(math.dist(a_, b_) for a_, b_ in zip(pts_w[:-1], pts_w[1:])))
+        gate("W1", "budget waypoints in F", not w_out, "%d plans leave F (1 cm samples)" % len(w_out),
+             "chords are visible (free-space line of sight); tolerance 0")
+        gate("W2", "budget cost bound", not w_over,
+             "%d / %d with J(final) > J(lattice) + %.2f + n * 1e-4" % (len(w_over), len(used), wb),
+             "C.2: the slacks of the chords sum to at most the budget (rounded up), so J(final) <= J(lattice) + budget; "
+             "tolerance n * 1e-4 m (sampled cost)")
+        gate("W3", "never more waypoints", not w_more, "%d / %d plans with more waypoints than the greedy pull" % (len(w_more), len(used)),
+             "the greedy pull's polyline is feasible at slack 0, so the exact minimum is at most its waypoints")
+        wb_lines.append("waypoint budget %.2f m over %d plans: segments per route %.2f -> %.2f, routes with a segment < 0.5 m %d -> %d, "
+                        "polyline length ratio (budget / greedy) mean %.4f, mean budget used %.1f cm (max %.1f cm), plan time p50/p99 "
+                        "greedy %.1f/%.1f ms, budget %.1f/%.1f ms" % (
+                            wb, len(used), float(np.mean(seg_g)), float(np.mean(seg_w)), short_g, short_w,
+                            float(np.mean([w / g for w, g in zip(len_w, len_g) if g > 0])), 100 * float(np.mean(used)),
+                            100 * max(used), pct(t1, 50) * 1e3, pct(t1, 99) * 1e3, pct(tw, 50) * 1e3, pct(tw, 99) * 1e3))
+
     # ---- B ----------------------------------------------------------------------------------------------------------------
     b1, b2 = [], []
     ratios = []
@@ -653,6 +705,8 @@ def main() -> int:
         print("turning, priced route at lambda 0 -> %.3f m/rad: lattice %.1f -> %.1f heading changes per 10 m, %.2f -> %.2f rad/m; "
               "waypoints %.1f -> %.1f changes per 10 m, %.3f -> %.3f rad/m; lattice length +%.2f%% median, +%.2f%% max"
               % (lam, c0_, c1_, t0_, t1_, w0_, w1_, u0_, u1_, 100 * float(np.median(dl)), 100 * max(dl)))
+    for line in wb_lines:
+        print(line)
     print("B1/B2 for a price phi >= 0 (phi = the hinge deficit or exp(-k (g - origin)) below reach; kappa = rate), o the length optimum, "
           "P the priced route, A = sum l phi_mean, n edges:")
     print("  J = L + kappa A (up to the n * 1e-4 rounding), J(P) <= J(o) and L(P) >= L(o) - n 1e-4 give "

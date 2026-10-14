@@ -226,6 +226,8 @@ class ChartPlan:
     # the lattice path cut per leg (trajectory.split): [{from_index, to_index, points}], None when off, over the cap
     # or not derivable
     trajectory: Optional[List[Dict[str, Any]]] = None
+    # the waypoint budget's record {waypoint_budget_m, waypoints_removed (against the greedy pull of the same plan)}; None when off
+    waypoint_budget: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -851,14 +853,12 @@ def _pricing_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Opt
 PRICE_SAMPLE_M = 0.025          # spacing of the samples that measure the priced cost of a straight segment
 
 
-def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: Sequence[Pt],
-                   safety: Any) -> Callable[[Pt, Pt], bool]:
-    """Cost-aware line of sight (S11): `visible(a, b)` AND the priced cost of the segment (a, b) is at most that of the
-    lattice sub-path between the two points (both found in `lattice_pts`, the route's points). The cost of a straight
-    piece is its length times the mean of 1 + rate * deficit over samples every `PRICE_SAMPLE_M` (at the middle of equal
-    sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell counts as clearance 0); the
-    sub-path is measured the same way between its consecutive points. Then the final polyline costs no more than the
-    lattice path. A point that is not on the route is judged by `visible` alone."""
+def chord_cost(graph: Any, safety: Any) -> Callable[[Pt, Pt], float]:
+    """The priced cost of a straight piece (a, b): its length times the mean of 1 + rate * deficit over samples every
+    `PRICE_SAMPLE_M` (at the middle of equal sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell
+    counts as clearance 0); the plain length when no clearance price is active (`safety` None or rate 0)."""
+    if safety is None or float(safety.rate) <= 0.0:
+        return math.dist
     h = float(graph.params.lattice)
     mu = float(safety.rate)
     price_cell = getattr(graph, "price_cell", None)
@@ -887,6 +887,18 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
             acc += factor(a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
         return length * acc / n
 
+    return cost
+
+
+def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: Sequence[Pt],
+                   safety: Any) -> Callable[[Pt, Pt], bool]:
+    """Cost-aware line of sight (S11): `visible(a, b)` AND the priced cost of the segment (a, b) is at most that of the
+    lattice sub-path between the two points (both found in `lattice_pts`, the route's points). The cost of a straight
+    piece is its length times the mean of 1 + rate * deficit over samples every `PRICE_SAMPLE_M` (at the middle of equal
+    sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell counts as clearance 0); the
+    sub-path is measured the same way between its consecutive points. Then the final polyline costs no more than the
+    lattice path. A point that is not on the route is judged by `visible` alone."""
+    cost = chord_cost(graph, safety)
     pts: List[Pt] = []
     for p in lattice_pts:
         if not pts or p != pts[-1]:
@@ -909,6 +921,84 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
         return cost(a, b) <= sub * (1.0 + 1e-9) + 1e-9
 
     return priced
+
+
+def fewest_waypoints(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float,
+                     cost: Callable[[Pt, Pt], float], budget_m: float, end_extra: float = 0.0) -> List[Pt]:
+    """Fewest waypoints under a cost budget (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2), exact.
+
+    `points` are the lattice path p_0..p_{n-1} (consecutive duplicates dropped), `visible` the free-space line of sight,
+    `cost` the priced cost of a chord (`chord_cost`), P(i, j) the cost of the lattice sub-path (prefix sums of `cost` over
+    consecutive points). A chord (i, j) is allowed when it is visible and at most `max_gap` long (<= 0: no cap), or when
+    j = i + 1 (the lattice step is always reachable, as in `simplify`); its slack is max(0, cost(i, j) - P(i, j)), rounded
+    up to whole centimetres. The result is a path 0 -> n-1 with the fewest chords whose slacks sum to at most `budget_m`;
+    a dynamic program over (point, slack used in cm), O(n * window * D). Ties: fewest waypoints, then least slack, then the
+    lexicographically smallest index sequence (deterministic).
+
+    Cost bound: the cost of a chord is at most P(i, j) + its slack, and the chords partition the lattice path, so
+    J(final) = sum cost(chord) <= sum P(chord) + sum slack = J(lattice) + sum slack <= J(lattice) + budget_m. The rounding is
+    upward, so the true slack never exceeds the counted one. With a budget of 0 only chords no dearer than their lattice
+    sub-path are used (the cost bound of `priced_visible`), and the result has the fewest waypoints under that rule: the
+    greedy string pull is not minimal-link, so it can keep more. A larger budget never gives more waypoints.
+    The chord that ends at the last point may be `end_extra` longer than `max_gap` (the string pull's end-stub merge,
+    `MIN_END_STUB_M`, does the same)."""
+    pts: List[Pt] = []
+    for p in points:
+        if not pts or p != pts[-1]:
+            pts.append(p)
+    if len(pts) <= 2:
+        return pts
+    n = len(pts)
+    budget = max(0, int(math.ceil(max(0.0, budget_m) * 100.0 - 1e-9)))
+    arc = [0.0]
+    prefix = [0.0]
+    for k in range(1, n):
+        arc.append(arc[-1] + math.dist(pts[k - 1], pts[k]))
+        prefix.append(prefix[-1] + cost(pts[k - 1], pts[k]))
+    # best[j][s] = (chords, indices) of the best way to reach point j having used s cm of slack
+    best: List[Dict[int, Tuple[int, Tuple[int, ...]]]] = [dict() for _ in range(n)]
+    best[0][0] = (0, (0,))
+    for i in range(n - 1):
+        if max_gap > 0:
+            end = max(i + 1, min(n - 1, bisect.bisect_right(arc, arc[i] + max_gap) - 1))
+            while end < n - 1 and math.dist(pts[i], pts[end + 1]) <= max_gap:
+                end += 1
+        else:
+            end = n - 1
+        candidates = list(range(i + 1, end + 1))
+        if max_gap > 0 and end < n - 1 and math.dist(pts[i], pts[n - 1]) <= max_gap + end_extra:
+            candidates.append(n - 1)
+        for j in candidates:
+            if j == i + 1:
+                slack = 0
+            else:
+                if not visible(pts[i], pts[j]):
+                    continue
+                over = cost(pts[i], pts[j]) - (prefix[j] - prefix[i])
+                slack = 0 if over <= (prefix[j] - prefix[i]) * 1e-9 + 1e-9 else int(math.ceil(over * 100.0 - 1e-9))
+            if slack > budget:
+                continue
+            target = best[j]
+            for s, (count, path) in best[i].items():
+                ns = s + slack
+                if ns > budget:
+                    continue
+                cand = (count + 1, path + (j,))
+                if ns not in target or cand < target[ns]:
+                    target[ns] = cand
+    _, _, path = min((count, s, path) for s, (count, path) in best[n - 1].items())
+    return [pts[k] for k in path]
+
+
+def budget_pull(graph: Any, safety: Any, budget_m: float) -> Callable[..., List[Pt]]:
+    """A `simplify` replacement for the gap fill (`node_policy_plan.insert_planned`): `fewest_waypoints` with this budget.
+    It takes the plain line of sight (`unpriced_visible`): the price is in the budget."""
+    cost = chord_cost(graph, safety)
+
+    def pull(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float) -> List[Pt]:
+        return fewest_waypoints(points, visible, max_gap, cost, budget_m)
+    pull.unpriced_visible = True  # type: ignore[attr-defined]
+    return pull
 
 
 def waypoints_below_floor(graph: Any, poses: Sequence[Any], safety: Any, floor: Optional[float]) -> int:
@@ -936,14 +1026,15 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   robot_length_m: Optional[float] = None,
                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                   width_check: bool = True, trajectory_max_points: int = 0,
-                  turn: Optional[Dict[str, Any]] = None) -> ChartPlan:
+                  turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
     try:
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
-                              node_policy_cfg, safety_kappa, width_check, trajectory_max_points, turn)
+                              node_policy_cfg, safety_kappa, width_check, trajectory_max_points, turn,
+                              waypoint_budget_m)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -956,7 +1047,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    robot_length_m: Optional[float] = None,
                    node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                    width_check: bool = True, trajectory_max_points: int = 0,
-                   turn: Optional[Dict[str, Any]] = None) -> ChartPlan:
+                   turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -973,7 +1064,9 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     `width_check` False, which only gates the `too_narrow` comparison. `trajectory_max_points` > 0 adds
     `ChartPlan.trajectory`, the lattice path cut at the output waypoints (omitted when it has more points). `turn` is the robot's
     `turn_record` (None: no turn cost): its lambda goes into the route's `Safety` and the record into `ChartPlan.pricing`; the
-    string pull has no turn term (a shortcut is judged by visibility and the priced cost only)."""
+    string pull has no turn term (a shortcut is judged by visibility and the priced cost only). `waypoint_budget_m` > 0 replaces
+    the string pull by `fewest_waypoints` with that slack budget (the line of sight is then the plain one, the price is in
+    the budget); 0 = the string pull, unchanged."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -1017,13 +1110,32 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
     lattice = list(pts)                    # the dense path, before the waypoints are picked from it
     visible = blocked_free_los(graph, overlay)
+    plain = visible
     if safety is not None and safety.rate > 0.0:
         visible = priced_visible(visible, graph, pts, safety)
-    pts = simplify(pts, visible, max_gap_m)
+    budget_record = None
+    if waypoint_budget_m > 0.0:
+        pulled = fewest_waypoints(pts, plain, max_gap_m, chord_cost(graph, safety), waypoint_budget_m, MIN_END_STUB_M)
+        budget_record = {"waypoint_budget_m": waypoint_budget_m,
+                         "waypoints_removed": max(0, len(simplify(pts, visible, max_gap_m)) - len(pulled))}
+        pts = pulled
+    else:
+        pts = simplify(pts, visible, max_gap_m)
     # The gap cap can leave a stub of a few lattice steps at the end (two waypoints on one leaf =
     # a zero-length leg): merge it into the previous leg when that stays in line of sight.
-    while len(pts) >= 3 and math.dist(pts[-2], pts[-1]) < MIN_END_STUB_M \
-            and visible(pts[-3], pts[-1]):
+    # With the waypoint budget the merge is judged against the budget instead: visible, and the polyline stays within
+    # J(lattice) + budget.
+    if budget_record is not None:
+        cost = chord_cost(graph, safety)
+        j_limit = sum(cost(p, q) for p, q in zip(lattice[:-1], lattice[1:])) + waypoint_budget_m
+
+        def stub_ok(k: int) -> bool:
+            rest = pts[:k] + pts[k + 1:]
+            return plain(pts[k - 1], pts[k + 1]) and sum(cost(p, q) for p, q in zip(rest[:-1], rest[1:])) <= j_limit
+    else:
+        def stub_ok(k: int) -> bool:
+            return visible(pts[k - 1], pts[k + 1])
+    while len(pts) >= 3 and math.dist(pts[-2], pts[-1]) < MIN_END_STUB_M and stub_ok(len(pts) - 2):
         del pts[-2]
     if check_width and min_width < required_width(robot_width_m, robot_length_m,
                                                   turns_in_place(pts), width_margin_m):
@@ -1075,4 +1187,4 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
-                     trajectory=legs)
+                     trajectory=legs, waypoint_budget=budget_record)
