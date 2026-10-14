@@ -141,7 +141,7 @@ class StatsResponse(BaseModel):
     knn_k: int
     range_search_radius: float
     build_sha: str = Field("unknown", description="Commit the running image was built from (scripts/deploy.sh GIT_SHA -> BUILD_SHA); deploy.sh verifies it")
-    scene_graph: Optional[Dict[str, Any]] = Field(None, description="Scene graph planner counters (outcomes, cache, plan_inflight); present only when the planner flag is on")
+    scene_graph: Optional[Dict[str, Any]] = Field(None, description="Scene graph planner counters (outcomes, cache, plan_inflight, priced plans, turn_sources: served plans by the source of the turn-cost lambda); present only when the planner flag is on")
 
 
 class NavigationPlanResponse(BaseModel):

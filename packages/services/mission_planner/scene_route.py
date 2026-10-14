@@ -19,7 +19,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from cloud_common.objects import common
@@ -220,7 +220,8 @@ class ChartPlan:
     # nodePolicy skip data: {"total", "skippable", "unavailable"}; None when it was not asked for
     node_policy: Optional[Dict[str, Any]] = None
     # clearance pricing of this plan: {kappa, margin, rate, margin_source ("factsheet" | "map_r"), cost (Route.cost), exact
-    # (the route call's own flag)}; None when the plan is not priced
+    # (the route call's own flag), turn (`turn_record`)}; None when the plan is neither priced nor turn-costed (rate 0 and a
+    # turn cost: the clearance fields are 0 / None, profile "none")
     pricing: Optional[Dict[str, Any]] = None
     # the lattice path cut per leg (trajectory.split): [{from_index, to_index, points}], None when off, over the cap
     # or not derivable
@@ -751,8 +752,69 @@ def _exp_safety(graph: Any, robot_width_m: Optional[float], robot_length_m: Opti
         return None
 
 
+def _number(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def turn_lambda(factsheet: Any, enabled: bool, operator: Optional[float]) -> Tuple[float, str, str]:
+    """(lambda m per rad, source, reason) of the turn cost of a robot's plans (docs/scene_graph/close_evidence_and_turn_cost_design.md
+    B.6); pure: the caller passes SCENE_GRAPH_TURN_COST_ENABLED (`enabled`) and SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD (`operator`).
+    Off (0, "off", "disabled") unless `enabled`. Otherwise speed_max / angular_speed_max of the factsheet (`RobotTypeIdentifierV1`;
+    -1 until the robot sent them) when both are finite and > 0, clamped to [0, Safety.MAX_TURN]: source "factsheet"; else `operator`
+    when set (finite, >= 0; clamped): source "config"; else 0, source "off". `reason` is empty for the factsheet and names the
+    missing field(s) otherwise. No speed is assumed."""
+    from packages.scene_graph.api import Safety
+    if not enabled:
+        return 0.0, "off", "disabled"
+    got = {}
+    for name in ("speed_max", "angular_speed_max"):
+        v = _number(getattr(factsheet, name, None))
+        got[name] = v if v is not None and math.isfinite(v) and v > 0.0 else None
+    if None not in got.values():
+        return min(max(got["speed_max"] / got["angular_speed_max"], 0.0), Safety.MAX_TURN), "factsheet", ""
+    reason = ", ".join(n for n, v in got.items() if v is None) + " missing"
+    op = operator
+    if op is not None and math.isfinite(op) and op >= 0.0:
+        return min(float(op), Safety.MAX_TURN), "config", reason
+    if op is not None:
+        reason += "; SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD=%r ignored" % (op,)
+    return 0.0, "off", reason
+
+
+def turn_record(factsheet: Any, enabled: bool, operator: Optional[float]) -> Dict[str, Any]:
+    """The `turn` entry of the pricing record: {lambda_m_per_rad, source, speed_max, angular_speed_max, reason} (`turn_lambda`; the
+    two fields as read from the factsheet, None when absent)."""
+    lam, source, reason = turn_lambda(factsheet, enabled, operator)
+    return {"lambda_m_per_rad": lam, "source": source, "speed_max": _number(getattr(factsheet, "speed_max", None)),
+            "angular_speed_max": _number(getattr(factsheet, "angular_speed_max", None)), "reason": reason}
+
+
+# the turn entry of a plan whose caller gave no robot (tools, tests): no turn cost
+TURN_NOT_GIVEN = {"lambda_m_per_rad": 0.0, "source": "off", "speed_max": None, "angular_speed_max": None, "reason": "no robot"}
+
+
 def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
-               kappa: float) -> Any:
+               kappa: float, turn: float = 0.0) -> Any:
+    """The `Safety` of a plan: the clearance pricing (`_pricing_for`) with the turn cost `turn` (m per rad, `turn_lambda`) on
+    top. Pricing off and `turn` > 0: Safety(margin = the clearance cap, rate 0, turn), the length plus the turn cost (the margin
+    is not read at rate 0). None for a graph without `deficit_cell` (a graph that cannot take a Safety), or no price and no turn."""
+    if not callable(getattr(graph, "deficit_cell", None)):
+        return None
+    priced = _pricing_for(graph, robot_width_m, robot_length_m, kappa)
+    if not turn > 0.0:
+        return priced
+    if priced is not None:
+        return replace(priced, turn=float(turn))
+    from packages.scene_graph.api import Safety
+    from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
+    return Safety(margin=_CLR_CAP_M, rate=0.0, turn=float(turn))
+
+
+def _pricing_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
+                 kappa: float) -> Any:
     """The `Safety` (clearance pricing, docs/scene_graph/route_safety.md section 1) of a plan, or None for the
     legacy shortest route: kappa <= 0, or a graph without `deficit_cell`. Two tiers. Exponential
     (docs/scene_graph/inflation_profile_design.md, experimental): when SCENE_GRAPH_INFLATION_RADIUS_M and
@@ -873,14 +935,15 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                   robot_length_m: Optional[float] = None,
                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
-                  width_check: bool = True, trajectory_max_points: int = 0) -> ChartPlan:
+                  width_check: bool = True, trajectory_max_points: int = 0,
+                  turn: Optional[Dict[str, Any]] = None) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
     try:
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
-                              node_policy_cfg, safety_kappa, width_check, trajectory_max_points)
+                              node_policy_cfg, safety_kappa, width_check, trajectory_max_points, turn)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -892,7 +955,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                    robot_length_m: Optional[float] = None,
                    node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
-                   width_check: bool = True, trajectory_max_points: int = 0) -> ChartPlan:
+                   width_check: bool = True, trajectory_max_points: int = 0,
+                   turn: Optional[Dict[str, Any]] = None) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -907,7 +971,9 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     above the map's inscribed radius; otherwise the route is the shortest, as with 0) and makes the line of sight
     cost-aware (`priced_visible`); the footprint (`robot_width_m`, `robot_length_m`) then gives the margin even with
     `width_check` False, which only gates the `too_narrow` comparison. `trajectory_max_points` > 0 adds
-    `ChartPlan.trajectory`, the lattice path cut at the output waypoints (omitted when it has more points)."""
+    `ChartPlan.trajectory`, the lattice path cut at the output waypoints (omitted when it has more points). `turn` is the robot's
+    `turn_record` (None: no turn cost): its lambda goes into the route's `Safety` and the record into `ChartPlan.pricing`; the
+    string pull has no turn term (a shortcut is judged by visibility and the priced cost only)."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -920,7 +986,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         raise ChartFallback("goal_" + problem)
     discs, segments = overlay
     blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
-    safety = safety_for(graph, robot_width_m, robot_length_m, safety_kappa)
+    turn = dict(TURN_NOT_GIVEN) if turn is None else dict(turn)
+    safety = safety_for(graph, robot_width_m, robot_length_m, safety_kappa, turn["lambda_m_per_rad"])
     try:
         route = graph.route(snap_a.key, snap_b.key, blocked, start=(snap_a.x, snap_a.y),
                             goal=(snap_b.x, snap_b.y), **({} if safety is None else {"safety": safety}))
@@ -950,7 +1017,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
     lattice = list(pts)                    # the dense path, before the waypoints are picked from it
     visible = blocked_free_los(graph, overlay)
-    if safety is not None:
+    if safety is not None and safety.rate > 0.0:
         visible = priced_visible(visible, graph, pts, safety)
     pts = simplify(pts, visible, max_gap_m)
     # The gap cap can leave a stub of a few lattice steps at the end (two waypoints on one leaf =
@@ -991,7 +1058,11 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
             node_policy_cfg.get("budget_s", 0.0), safety=safety)
     pricing = None
-    if safety is not None:
+    if safety is not None and safety.rate == 0.0:            # a turn cost alone: no clearance fields
+        pricing = {"kappa": 0.0, "margin": None, "rate": 0.0, "margin_source": None, "cost": int(route.cost),
+                   "exact": bool(getattr(route, "exact", True)), "profile": "none", "k": None, "origin": None, "reach": None,
+                   "floor": None, "waypoints_below_floor": 0, "turn": turn}
+    elif safety is not None:
         known = robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0
         exp = safety.k is not None
         floor = safety.origin if exp else inscribed_radius(graph, robot_width_m, robot_length_m)
@@ -1000,7 +1071,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    "exact": bool(getattr(route, "exact", True)),
                    "profile": "exp" if exp else "hinge", "k": safety.k, "origin": safety.origin, "reach": safety.margin,
                    "floor": floor,
-                   "waypoints_below_floor": waypoints_below_floor(graph, poses, safety, floor)}
+                   "waypoints_below_floor": waypoints_below_floor(graph, poses, safety, floor), "turn": turn}
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,

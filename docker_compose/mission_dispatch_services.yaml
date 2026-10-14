@@ -338,6 +338,10 @@ services:
       - SCENE_GRAPH_INFLATION_RADIUS_M=${SCENE_GRAPH_INFLATION_RADIUS_M:-}
       - SCENE_GRAPH_INFLATION_SCALING=${SCENE_GRAPH_INFLATION_SCALING:-}
       - SCENE_GRAPH_GLOBAL_INSCRIBED_M=${SCENE_GRAPH_GLOBAL_INSCRIBED_M:-}
+      # Turn cost of the chart route (docs/scene_graph/close_evidence_and_turn_cost_design.md B.6): off by default; on, lambda per
+      # robot = factsheet speed_max / angular_speed_max, LAMBDA_M_PER_RAD (empty = unset) only for an incomplete factsheet
+      - SCENE_GRAPH_TURN_COST_ENABLED=${SCENE_GRAPH_TURN_COST_ENABLED:-false}
+      - SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD=${SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD:-}
       # the commit this image was built from (scripts/deploy.sh exports GIT_SHA); shown by /stats as build_sha
       - BUILD_SHA=${GIT_SHA:-unknown}
       - NODE_POLICY_SKIP_ENABLED=${NODE_POLICY_SKIP_ENABLED:-true}

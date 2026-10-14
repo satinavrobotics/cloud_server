@@ -354,7 +354,8 @@ def test_the_plan_reports_its_pricing(graphs):
             assert not isinstance(plan_, str)
             pr = plan_.pricing
             assert set(pr) == {"kappa", "margin", "rate", "margin_source", "cost", "exact", "profile", "k", "origin", "reach", "floor",
-                               "waypoints_below_floor"}
+                               "waypoints_below_floor", "turn"}
+            assert pr["turn"] == sr.TURN_NOT_GIVEN                         # no robot given: no turn cost
             assert pr["profile"] == "hinge" and pr["k"] is None and pr["origin"] is None and pr["reach"] == pr["margin"]
             assert pr["kappa"] == 2.0 and pr["margin_source"] == source and pr["exact"] is True
             assert pr["margin"] == pytest.approx(margin) and pr["rate"] == pytest.approx(2.0 / (margin - 0.25))
