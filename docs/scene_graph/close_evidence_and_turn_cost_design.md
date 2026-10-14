@@ -367,6 +367,24 @@ is not measured.
 
 ---
 
+## C.2 Proposal: waypoints as guidance with a cost budget (replaces the merge; not built, awaiting a decision)
+
+The exact merge of part C (never costlier) changes 2 of 150 plans on office8: the price bends the corner away from obstacles, so the
+midpoint chord is dearer in 62 of 68 visible cases. The principled statement is a budget, not a merge:
+
+* **Choose the fewest waypoints such that the polyline costs at most `J* + delta`**, `J*` the exact priced optimum, every chord in free
+  space (today's pull is `delta = 0`). An exact dynamic program over the lattice path (a resource-constrained shortest path).
+* **Convergence:** the planner has the priced distance to the goal `d(c, goal)`. Waypoint `i` is passed when the robot's cost-to-go is
+  `<= d(w_i, goal) + epsilon`; touching is not needed, and the value is non-increasing along any progressing motion.
+* **Bounded wandering:** every path of cost `<= J* + delta` lies in the graph-distance ellipse `{c : d(s,c) + d(c,goal) <= J* + delta}`
+  (the ellipse of B.5). Leaving it (cost so far + cost-to-go `> J* + delta`) is the replan trigger for dynamic objects and plan changes.
+* **Measured** (office8, 150 routes, kappa 1, research prototype on the lattice path, not in the planner): segments per route
+  4.09 (delta 0, optimal min-link) -> 3.74 (5 cm) -> 3.40 (20 cm) -> 3.23 (35 cm); routes with a segment under 0.5 m 56 -> 35 -> 22 -> 18;
+  mean budget used 0.8, 4, 8 cm; polyline length ratio 0.998.
+* **Open (robot side, to ask the robot team):** whether the robots honour the VDA5050 node `allowedDeviationXY` (the natural carrier of the
+  tube), and whether the navigator can mark a node reached by cost-to-go progress. Value of `delta`: the goal tolerance 0.35 m is the
+  natural choice. Laci's session was not reachable when this was written (2026-10-14, 22:10 UTC).
+
 ## D. Open items
 
 Resolved by Laci 2026-10-14: goal tolerance 0.35 m; the Odin override is live; the Smac tolerance is dropped; robot speeds come from
