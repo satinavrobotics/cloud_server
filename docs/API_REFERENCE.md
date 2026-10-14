@@ -224,6 +224,55 @@ Response:
 
 ---
 
+### Map Mapping Statistics
+
+#### `GET /api/v1/maps/{map_id}/mapping-stats`
+
+How long the mapping of a map took: totals, per session, per m^2 and per 0.1 m cell. Read only. Rules, definitions and the
+live cross-check: `docs/mapping_stats_2026-10-14.md`. Query (optional): `robot` (exact name; filters the sessions, not the area).
+
+```json
+{
+  "map_id": "office7", "graph_version": 5, "cell_m": 0.1, "step": 0.1, "origin": [-6.4, -6.4],
+  "tile_fields": ["ix", "iy", "seconds", "nodes"],
+  "headline": {"sessions": 3, "sessions_open": 0, "wall_s": 576.9, "paused_s": 4.9, "active_s": 572.0, "active_h": 0.159,
+               "mapped_area_m2": 67.99, "free_area_m2": 53.53, "blocked_area_m2": 14.46, "scene_graph_area_m2": 23.41,
+               "seconds_per_m2": 8.41, "minutes_per_100m2": 14.0,
+               "seconds_per_m2_scene_graph": 24.43, "minutes_per_100m2_scene_graph": 40.7,
+               "nodes": 105, "images": 105, "attributed_s": 438.8},
+  "sessions": [{"session_id": "e9727ca2-...", "robot": "formidable-peacock", "started_at": "...", "ended_at": "...",
+                "open": false, "paused_now": false, "wall_s": 487.6, "paused_s": 4.9, "active_s": 482.7,
+                "attributed_s": 405.3, "nodes": 95, "images": 95, "node_count_recorded": 95, "area_added_m2": null,
+                "time_source": "nodes", "timestamp_source": "robot_capture", "nodes_without_time": 0,
+                "nodes_outside_session": 0, "gap_s": 0.0,
+                "pairs": {"pairs": 94, "pairs_attributed": 94, "pairs_missing": 0, "pairs_gap": 0, "pairs_jump": 0,
+                          "pairs_long": 0, "pairs_reversed": 0}}],
+  "tiles": [[64, 64, 1.52, 1]],
+  "regions": [{"key": "b63f0f5e-...:10", "seconds": 115.5, "cells": 162, "area_m2": 1.62, "seconds_per_m2": 71.29,
+               "nodes": 25, "visited": 51}],
+  "source": {"sessions_nodes": 2, "sessions_track": 0, "sessions_without_data": 1, "nodes_without_time": 0,
+             "nodes_outside_session": 0, "occupancy": "ok", "occupancy_version": 5, "occupancy_tiles": 6,
+             "charts": 16, "charts_status": "ok", "scene_graph": "ok"},
+  "window": {"robot": null, "max_gap_s": 60.0, "max_speed": 2.0, "max_segment_m": 10.0, "now": null}
+}
+```
+
+* **Time:** `active_s = wall_s - paused_s` over the map's mapping sessions (open ones counted up to `window.now`); pauses
+  from the `MAP.SESSION_PAUSED/_RESUMED` events. `sessions[].time_source` is `nodes`, `track` or `none`.
+* **Area:** `mapped_area_m2` = known (free + blocked) fused-occupancy cells x 0.05^2; `scene_graph_area_m2` = summed chart
+  area. `seconds_per_m2 = active_s / mapped_area_m2`; null (with `source.occupancy` `unavailable`/`none`) when unknown.
+  `sessions[].area_added_m2` is always null.
+* **Tile index:** identical to drive-stats (0.1 m cells, `origin` a multiple of 6.4 m; `[0, 0]` and absolute without a scene
+  graph). `seconds` = mapping time attributed to the cell (consecutive node pairs spread along the straight segment, paused
+  seconds excluded, pairs over `max_gap_s`, jumps and segments over `max_segment_m` dropped); `nodes` = nodes in the cell.
+* **Regions:** per chart of the current graph version: `seconds`, `nodes`, `cells` (0.1 m cells), `area_m2`,
+  `seconds_per_m2`, `visited` (cells with time).
+* Headers: `ETag`, `Cache-Control: private, max-age=60`; 304 on a matching `If-None-Match`; server cache 120 s per (map, robot).
+* Errors: 404 unknown map, 503 when the database cannot be read in time. Missing occupancy / scene graph only null the
+  affected figures.
+
+---
+
 ### Map Location and Relocalization
 
 Details: `docs/satinav-maps-redesign.md` §12 and §16.
