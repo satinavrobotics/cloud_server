@@ -1,5 +1,6 @@
 """Full-app HTTP tests of the occupancy routes (plan §4, L-2): the real `app` and the real `packages/api/occupancy_reads.py`
 over the `FakeStore` of test_occupancy_reads (manifest + tile_v_plane). Only the delegation service object is stubbed."""
+import importlib
 import os
 from types import SimpleNamespace
 
@@ -10,7 +11,6 @@ import httpx  # noqa: E402
 import pytest  # noqa: E402
 
 import packages.api.main as main  # noqa: E402
-import packages.config as config  # noqa: E402
 from packages.api import occupancy_reads as occ  # noqa: E402
 from tests.unit.test_occupancy_reads import MAP, FakeStore, plane  # noqa: E402
 
@@ -31,7 +31,9 @@ def occ_state(monkeypatch):
     store.save({(0, 0): plane(1), (8, 0): plane(2)})
     store.save({(0, 0): plane(1), (8, 0): plane(3)})
     reads = occ.OccupancyReads(store)
-    monkeypatch.setattr(config, "SCENE_GRAPH_WORKER_ENABLED", True)
+    # main does `from packages.config import ...` at call time, so patch whatever module sys.modules holds NOW
+    # (test_config drops packages.config from sys.modules, which leaves the import-time `config` stale).
+    monkeypatch.setattr(importlib.import_module("packages.config"), "SCENE_GRAPH_WORKER_ENABLED", True)
     monkeypatch.setattr(main, "service", SimpleNamespace(database=object(), topomap_db=object()))
     monkeypatch.setattr(main, "_occ_reads", reads)
     return store
@@ -143,7 +145,7 @@ async def test_absent_chunk_is_200_with_no_slots(occ_state):
 # ---- 503 when the flag is off ----
 
 async def test_flag_off_is_503(monkeypatch):
-    monkeypatch.setattr(config, "SCENE_GRAPH_WORKER_ENABLED", False)
+    monkeypatch.setattr(importlib.import_module("packages.config"), "SCENE_GRAPH_WORKER_ENABLED", False)
     monkeypatch.setattr(main, "_occ_reads", None)
     monkeypatch.setattr(main, "service", SimpleNamespace(database=object(), topomap_db=object()))
     for path in ("/extent", "/chunk/0/0?version=1"):
