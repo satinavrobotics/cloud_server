@@ -35,7 +35,7 @@ robot's own inflation profile, drops the route-level two-pass floor, and adds a 
 | Tier | Source | Gives | Used when |
 |---|---|---|---|
 | 1 geometry | factsheet length / width now, footprint polygon when present | `r_in` (inscribed radius of the footprint at its reference point), `r_c` (largest vertex distance) | always |
-| 2 robot costmap | the robot's own inflation settings | `reach` = inflation radius, `k` = cost scaling factor | when readable |
+| 2 robot costmap | the robot's own **global** costmap (the one Smac 2D plans on) | `reach` = inflation radius, `k` = cost scaling factor, `r_global` = its inscribed radius (footprint inscribed radius + `footprint_padding`) | when readable |
 | 3 fallback | geometry only | the geometric hinge `r_in -> r_c` (today's live behaviour) | tier 2 unknown; no invented numbers |
 | 0 map | `SceneParams.robot_half_side` | `r_in` | footprint unknown |
 
@@ -142,3 +142,39 @@ Not needed for this change (an earlier version of this section listed about fift
 weights and horizon, Smac 2D internals, obstacle-layer ranges and clearing, `inflate_unknown`, skip / recovery / retry behaviour,
 speed limits. They would only help to *predict* how far the driven path changes; the change does not depend on that, and the
 2026-10-13 run (driven path within a median 0.13-0.17 m of the waypoint polyline) already bounds it.
+
+## 11. Facts from the robot's navstack configuration (repository, not the live robot)
+
+Source: `deployment_ws/src/sati_ros_navstack/sati_nav_stack_bringup/config/nav2/` (`tier1/navigation_common.yaml`,
+`tier1/navigation_sati.yaml`, `tier2/scratch_odin_critic_integration.yaml`). The values Laci gave (inflation radius 0.8, scaling 6.0)
+occur in the **scratch Odin override** (a "scratch experiment, untested on hardware" layer, loaded by default by the Odin launch),
+not in the tier-1 files (inflation radius 0.55, footprint 0.76 x 0.68). Whether the live robot runs that override is to be confirmed.
+In that override:
+
+| Item | Value | Consequence |
+|---|---|---|
+| Which costmap Smac 2D plans on | the **global** costmap (planner_server owns it); a point robot, cell cost >= 253 blocked, `allow_unknown: false` | answers Laci's question; inflation 0.8 / 6.0 in the global costmap is the one that matters |
+| Inscribed radius of the global costmap | **0.30 m**: footprint +-0.25 plus `footprint_padding: 0.05` (NS-58); the local costmap and MPPI keep 0.25 | the profile starts at `g = 0.30`, not 0.25, for the planner's view; Smac refuses cells within 0.30 m of lethal |
+| Unknown cells | blocked for Smac (`allow_unknown false`, plus an "unknown ring" of 0.31 m near the robot) | agrees with our convention (unknown counted blocked in `g`) |
+| Smac 2D height | `cost_travel_multiplier: 5.0` (default 2.0): a cell's step costs `1 + 5 * cost/252` | the robot's own kappa inside a leg is 5; the config says it prefers detours up to about 2x over skimming a wall |
+| Planner `tolerance` | 0.5 m (`tier1/navigation_common.yaml`) | a goal on an invalid cell is tolerated within 0.5 m |
+| Goal checker `xy_goal_tolerance` | 0.5 m in the repository (`general_goal_checker`); 0.35 m according to the planner owner (server side) | a waypoint counts as reached within 0.35 to 0.5 m |
+| Body reference | `base_body` (centre of the 0.5 m body), axle frame offset handled by the stack | consistent with centre-based clearance |
+
+### Waypoint rule against these tolerances (`wp_rule.py`, kappa 0.75, 120 routes per map, interior waypoints of the pulled route)
+
+| Floor | office8 | office7 | office6 | Hospital |
+|---|---|---|---|---|
+| 0.30 m (robot's global inscribed): waypoints below it | 14 / 626 (2.2%) | 11 / 684 (1.6%) | 24 / 692 (3.5%) | 0 / 428 |
+| 0.321 m (design: 0.25 + h/sqrt2) | 21 (3.4%) | 27 (3.9%) | 55 (7.9%) | 0 |
+| 0.371 m (0.30 + h/sqrt2) | 54 (8.6%) | 84 (12.3%) | 104 (15.0%) | 2 (0.5%) |
+| shift to the nearest admissible path cell, floor 0.30: median / p90 / max | 0.14 / 0.32 / 0.36 m | 0.10 / 0.30 / 0.30 | 0.20 / 0.41 / 1.20 | none |
+| of those shifts, within 0.35 m / within 0.5 m | 86% / 100% | 100% / 100% | 83% / 92% | none |
+
+Reading: the shift the rule makes is, for 83-100% of the affected waypoints, smaller than the robot's own goal tolerance, and Smac's
+planner tolerance (0.5 m) already accepts a goal on an invalid cell within 0.5 m. The rule therefore changes the robot's driven path
+for few waypoints (shifts above 0.5 m: 0-8% of the affected ones, about 0.1% of all waypoints). Its value is a guard, not a driver.
+Recommendation to the planner owner: either keep it as a guard with the floor taken from the robot's own `r_global` (tier 2), or
+record the count in the pricing record without moving anything and revisit when recoveries or `GOAL_BLOCKED` events correlate with
+waypoints below the floor. Also noted: the kappa that matches the robot's own Smac (5.0) is far above the budget-derived 0.75; the
+two act at different levels (inside a leg versus which doors and where waypoints go) and need not be equal.
