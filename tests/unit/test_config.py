@@ -18,10 +18,13 @@ def _reload_config(env_overrides: dict):
     Reload packages.config with a specific set of environment variables.
     Returns the reloaded module.
     """
-    # Remove cached module so the import-time validation runs again
-    for key in list(sys.modules.keys()):
-        if "packages.config" in key:
-            del sys.modules[key]
+    # Remove cached module so the import-time validation runs again; the originals are put back in the
+    # finally block (other tests and product modules hold references to them and patch them)
+    import packages
+    saved = {k: v for k, v in sys.modules.items() if k == "packages.config" or k.startswith("packages.config.")}
+    saved_attr = getattr(packages, "config", None)
+    for key in saved:
+        del sys.modules[key]
 
     env_backup = {k: os.environ.get(k) for k in env_overrides}
     os.environ.update({k: v for k, v in env_overrides.items() if v is not None})
@@ -39,10 +42,14 @@ def _reload_config(env_overrides: dict):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = original
-        # Remove cached module again so later tests start fresh
-        for key in list(sys.modules.keys()):
-            if "packages.config" in key:
-                del sys.modules[key]
+        # Put the original module objects back (never leave a fresh copy that tests patch while the code reads another)
+        for key in [k for k in sys.modules if k == "packages.config" or k.startswith("packages.config.")]:
+            del sys.modules[key]
+        sys.modules.update(saved)
+        if saved_attr is not None:
+            packages.config = saved_attr
+        elif hasattr(packages, "config"):
+            del packages.config
 
 
 # ---- Required secrets must be set -------------------------------------------
