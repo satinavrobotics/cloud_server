@@ -520,6 +520,19 @@ RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
 # too: the session was paused or the robot stood still, so its time is no traversal time (legs are
 # not filtered by a minimum speed).
 EDGE_STATS_WINDOW = int(os.getenv("EDGE_STATS_WINDOW", "20"))
+
+# GET /api/v1/maps/{id}/drive-stats (docs/drive_stats_2026-10-14.md): per-tile / per-region driving
+# statistics from the recorded map-frame track. A consecutive pair of track rows further apart than
+# DRIVE_STATS_MAX_GAP_S, faster than DRIVE_STATS_MAX_SPEED_MS (a pose jump) or not moving forward in
+# time is not a movement; a pair slower than min_speed (default DRIVE_STATS_MIN_SPEED_MS) is "stopped".
+# At most DRIVE_STATS_MAX_ROWS track rows are read (the newest; the answer says `partial`).
+DRIVE_STATS_MAX_ROWS = int(os.getenv("DRIVE_STATS_MAX_ROWS", "2000000"))
+DRIVE_STATS_MAX_GAP_S = float(os.getenv("DRIVE_STATS_MAX_GAP_S", "5.0"))
+DRIVE_STATS_MAX_SPEED_MS = float(os.getenv("DRIVE_STATS_MAX_SPEED_MS", "2.0"))
+DRIVE_STATS_MIN_SPEED_MS = float(os.getenv("DRIVE_STATS_MIN_SPEED_MS", "0.05"))
+DRIVE_STATS_LEG_MAX_M = float(os.getenv("DRIVE_STATS_LEG_MAX_M", "10.0"))
+DRIVE_STATS_CACHE_TTL_S = float(os.getenv("DRIVE_STATS_CACHE_TTL_S", "120.0"))
+DRIVE_STATS_CACHE_ENTRIES = int(os.getenv("DRIVE_STATS_CACHE_ENTRIES", "16"))
 EDGE_STATS_MAX_DURATION_S = float(os.getenv("EDGE_STATS_MAX_DURATION_S", "3600.0"))
 EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", "5.0"))
 EDGE_STATS_MIN_SPEED_MPS = float(os.getenv("EDGE_STATS_MIN_SPEED_MPS", "0.02"))

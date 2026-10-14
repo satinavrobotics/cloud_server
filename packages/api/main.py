@@ -23,7 +23,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin
-from packages.api import edge_stats, session_trace, sites
+from packages.api import drive_stats, edge_stats, session_trace, sites
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -938,6 +938,33 @@ async def map_edge_stats(map_id: str, robot: Optional[str] = None,
     _require_service()
     return await _site_call("map edge stats", edge_stats.edge_stats(
         service.database, service.graph_db, map_id, robot, min_count, limit, offset))
+
+
+@app.get("/api/v1/maps/{map_id}/drive-stats")
+async def map_drive_stats(map_id: str, request: Request, robot: Optional[str] = None,
+                          min_speed: Optional[float] = None,
+                          from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None):
+    """Per-tile (0.1 m = one scene-graph owner-raster cell) and per-region (chart) driving statistics from
+    the robots' recorded map-frame trajectories: `{map_id, graph_version, cell_m, origin, step, tile_fields,
+    tiles: [[ix, iy, n, len_m, time_s, recovery_s, stopped_s]...], regions: [{key, n, len_m, time_s,
+    recovery_s, stopped_s, cells, visited}], source, window}`. `ix, iy` count cells from `origin`
+    (a multiple of 6.4 m; [0, 0] and absolute when the map has no scene graph). `from`/`to` (ISO-8601 with
+    time zone) bound the rows, `robot` filters, `min_speed` (m/s, default 0.05) is the speed below which
+    a movement counts as stopped. Runs without a stored map-frame track fall back to their legs
+    (`source`). ETag + `Cache-Control: private, max-age=60`; 304 on a matching If-None-Match.
+    404 unknown map; 422 bad query. Contract: docs/drive_stats_2026-10-14.md."""
+    _require_service()
+    try:
+        reads = _scene_graph_reads()
+    except HTTPException:
+        reads = None
+    body, etag = await _site_call("map drive stats", drive_stats.drive_stats(
+        service.database, service.graph_db, reads, map_id, fleet_reads.parse_ts(from_, "from"),
+        fleet_reads.parse_ts(to, "to"), robot, min_speed))
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=60"}
+    if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
 
 
 @app.get("/api/v1/maps/{map_id}/sessions/{session_id}/placement-suggestions")

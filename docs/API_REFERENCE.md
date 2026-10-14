@@ -179,6 +179,51 @@ Load a topological map from the graph database.
 
 ---
 
+### Map Drive Statistics
+
+#### `GET /api/v1/maps/{map_id}/drive-stats`
+
+Per-tile and per-region driving statistics (speed, time lost, coverage) of a map, from the robots' recorded
+map-frame trajectories. Read only. Full rules, limits and the live cross-check: `docs/drive_stats_2026-10-14.md`.
+
+Query (all optional): `from`, `to` (ISO-8601 with time zone; rows with `from <= ts < to`), `robot` (exact name),
+`min_speed` (m/s, 0..1, default 0.05: a movement slower than this counts as stopped time).
+
+Response:
+
+```json
+{
+  "map_id": "office7", "graph_version": 5, "cell_m": 0.1, "step": 0.1, "origin": [-6.4, -6.4],
+  "tile_fields": ["ix", "iy", "n", "len_m", "time_s", "recovery_s", "stopped_s"],
+  "tiles": [[64, 64, 3, 0.412, 2.35, 0.0, 1.5]],
+  "regions": [{"key": "b63f0f5e-...:0", "n": 57, "len_m": 178.04, "time_s": 1455.6, "recovery_s": 119.8,
+               "stopped_s": 400.1, "cells": 366, "visited": 233}],
+  "source": {"track_runs": 48, "track_rows": 7516, "track_segments": 7464, "track_pairs_rejected": 4,
+             "leg_runs": 31, "leg_rows": 61, "legs_skipped": 0, "legs_dropped_run_has_track": 94,
+             "recovery_unattributed_s": 3.1, "partial": false, "tiles_track": 939, "tiles_leg_only": 94,
+             "scene_graph": "ok"},
+  "window": {"from": null, "to": null, "robot": null, "min_speed": 0.05, "max_gap_s": 5.0, "max_speed": 2.0}
+}
+```
+
+* **Tile index:** a tile is one 0.1 m cell of the scene-graph owner raster. `ix = floor(x / 0.1) - round(origin_x / 0.1)`,
+  `iy` likewise (can be negative only without a scene graph). `origin` is the lower-left of the data on the
+  scene-graph tile grid (a multiple of 6.4 m), so `owner[iy, ix]` of a raster whose origin equals `origin` is the tile's
+  chart; for a raster with another origin `O` (also a multiple of 6.4 m) use `ix + round((origin_x - O_x) / 0.1)`.
+  Without a scene graph (`source.scene_graph` is `none` or `error`) `origin` is `[0, 0]`, `ix, iy` are absolute
+  `floor(x / 0.1)` and `regions` is `[]`. A 5 cm occupancy cell `(i, j)` lies in tile `(i // 2, j // 2)` of the same lattice.
+* **Tile fields:** `n` = distinct runs that crossed the tile (coverage); `len_m` driven length, `time_s` time spent
+  (including stopped and recovery time), `recovery_s` time inside NAV recoveries, `stopped_s` time in movements slower than
+  `min_speed`. Mean speed of a tile = `len_m / time_s`; time lost = `recovery_s` + `stopped_s` (they can overlap).
+* **Regions:** per chart key of the current graph version: `n` distinct runs, the summed fields, `cells` the chart's size
+  in 0.1 m cells, `visited` how many of them have drive data.
+* `source.partial` true: more than `DRIVE_STATS_MAX_ROWS` (2,000,000) track rows matched, the newest were used.
+* Headers: `ETag`, `Cache-Control: private, max-age=60`; 304 on a matching `If-None-Match`. Results are cached
+  server-side for 120 s per (map, window, robot, min_speed).
+* Errors: 404 unknown map, 422 bad `from`/`to`/`min_speed`, 503 when the database cannot be read in time.
+
+---
+
 ### Map Location and Relocalization
 
 Details: `docs/satinav-maps-redesign.md` §12 and §16.
