@@ -327,7 +327,7 @@ async def test_the_planner_service_passes_kappa_and_the_footprint_even_with_the_
     monkeypatch.setattr(sr, "plan_on_graph", fake)
     svc = _service(FakeStore(FakeGraph()))
     await svc_plan(svc)
-    width, _margin, length, _policy, kappa, check = seen["args"][-6:]
+    width, _margin, length, _policy, kappa, check = seen["args"][-7:-1]
     assert (width, length, kappa, check) == (0.5, 0.8, 6.0, False)         # the gate stays off, the footprint arrives
     svc.cleanup()
 

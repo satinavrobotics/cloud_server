@@ -31,6 +31,31 @@ and every waypoint but the first and the last carries `skippable: true` and `cor
 lattice margin), or `skippable: false` with `unavailable` saying why (`robot_width_unknown`,
 `width_unknown`, `legacy_planner`). See `docs/node_policies_2026-10-13.md`.
 
+### Trajectory (the planner's full path)
+
+The scene-graph planner finds its route on a 0.1 m lattice and keeps only the simplified waypoints. The dense path
+is returned as display data so the client can draw it instead of straight lines between waypoints:
+
+```json
+"trajectory": [
+  {"from_index": 0, "to_index": 1, "points": [[0.55, 0.55], [9.45, 0.55], [9.55, 0.65], [9.55, 0.95]]},
+  {"from_index": 1, "to_index": 2, "points": [[9.55, 0.95], [9.55, 9.45]]}
+]
+```
+
+One entry per leg (`from_index` / `to_index` index the route's `waypoints`, `to_index = from_index + 1`), in route
+order; `points` are `[x, y]` in the map frame, rounded to the cm, only the direction changes of the lattice path (the
+polyline through them is the lattice path exactly), the first and last point are the leg's waypoints. A leg may be
+missing (the planner did not route that pair): draw it straight. The key is absent when the legacy planner served the
+plan, the planner has no scene graph, `PLAN_TRAJECTORY_ENABLED` is off, or the whole route has more than
+`PLAN_TRAJECTORY_MAX_POINTS` (3000) points (omitted whole, never truncated). It is never sent to the robot and not part
+of the route's resume digest. Where: `POST /api/v1/plan`, `POST /api/v1/route/enrich`, the planner's navigate response, and
+the gateway's `POST /api/v1/navigate` carry `trajectory`; stored missions carry it as
+`mission_tree[].route.trajectory` (a go-to from creation and again after the dispatcher replans it at start; an operator's
+route once the dispatcher enriched it before the first order). A client that edits a route (`PUT /missions`) and sends
+the route back without `trajectory`, or with legs whose ends no longer sit at their waypoints, loses it (stale legs are
+dropped on load, never an error). See `docs/plan_trajectory_2026-10-14.md`.
+
 ### POST /api/v1/route/enrich
 
 Completes an operator's route with nodePolicy data. Body: `robot_name`, `map_id`, `waypoints`

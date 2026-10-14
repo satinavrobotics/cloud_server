@@ -82,6 +82,7 @@ class PlanResponse(BaseModel):
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total: waypoints that should be skippable, skippable: how many got a corridor width, unavailable: why the others did not (e.g. 'width_unknown', 'legacy_planner'), else null}")
+    trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
 class EnrichRequest(BaseModel):
@@ -99,6 +100,7 @@ class EnrichResponse(BaseModel):
     changed: bool = Field(False, description="Whether the route differs from the request's")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="{total, skippable, unavailable}; see POST /api/v1/plan")
     graph_version: Optional[int] = None
+    trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
 class NavigationResponse(BaseModel):
@@ -123,6 +125,7 @@ class NavigationResponse(BaseModel):
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total, skippable, unavailable}; see POST /api/v1/plan")
+    trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
 # HealthResponse is now imported from packages.utils.service_utils
@@ -337,6 +340,7 @@ async def plan_only(request: PlanRequest):
             graph_version=result.get("graph_version"),
             planner_fallback=result.get("planner_fallback"),
             node_policy=result.get("node_policy"),
+            trajectory=result.get("trajectory"),
         )
     except HTTPException:
         raise
@@ -367,7 +371,8 @@ async def enrich_route(request: EnrichRequest):
     return EnrichResponse(
         success=True, waypoints=[w.dict() for w in result["waypoints"]],
         inserted=result["inserted"], changed=result["changed"],
-        node_policy=result.get("node_policy"), graph_version=result.get("graph_version"))
+        node_policy=result.get("node_policy"), graph_version=result.get("graph_version"),
+        trajectory=result.get("trajectory"))
 
 
 @app.get("/api/v1/missions/{mission_id}/plan", response_model=NavigationPlanResponse)

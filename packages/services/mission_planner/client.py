@@ -123,7 +123,7 @@ class MissionPlannerClient:
         """
         Complete a route with nodePolicy data (planned waypoints between far-apart operator
         waypoints, corridor widths from the scene graph). Returns the planner's EnrichResponse:
-        `waypoints`, `inserted`, `changed`, `node_policy`. Raises on HTTP errors.
+        `waypoints`, `inserted`, `changed`, `node_policy`, `trajectory` (per-leg lattice path, may be absent). Raises on HTTP errors.
         """
         response = await self._client.post(
             "/api/v1/route/enrich",
