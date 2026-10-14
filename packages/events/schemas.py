@@ -136,6 +136,17 @@ class CancelRequested(Payload):
     actor: str
 
 
+class TeleopSessionStarted(Payload):
+    """TELEOP.SESSION_STARTED. No token, room name or operator identity (the room is the
+    operator's email): `room_hash` is the first 12 hex digits of sha256(room), enough to tell
+    sessions of different operators apart."""
+    role: str                              # token role that triggered it ("robot")
+    room_hash: str
+    map_id: Optional[str] = None           # the map of the robot's open session at that time
+    session_id: Optional[str] = None       # that open map session
+    mission_name: Optional[str] = None     # the robot's RUNNING mission, if any
+
+
 class StateChanged(Payload):
     old: Optional[str] = None
     new: str

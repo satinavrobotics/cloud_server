@@ -311,8 +311,9 @@ async def list_runs(db: Any, *, robot: Optional[str] = None, site: Optional[str]
                     mission: Optional[str] = None, archived: Optional[str] = "exclude",
                     start: Optional[datetime.datetime] = None,
                     end: Optional[datetime.datetime] = None, cursor: Optional[str] = None,
-                    limit: int = DEFAULT_LIMIT) -> Dict[str, Any]:
+                    limit: int = DEFAULT_LIMIT, map_id: Optional[str] = None) -> Dict[str, Any]:
     """Runs newest first (by started_at); `from`/`to` bound started_at: [from, to).
+    `map_id`: runs whose `map_id` (the map of the robot's open session at the run's start) is this.
     `mission`: runs of that mission and of its reruns (`<mission>-rerun-<n>[-rerun-<n>...]`).
     `archived`: exclude (default) | include | only."""
     check_choice(state, "state", RUN_STATES)
@@ -322,7 +323,7 @@ async def list_runs(db: Any, *, robot: Optional[str] = None, site: Optional[str]
     after = decode_cursor("runs", cursor)
     where, params = [], []
     for column, value in (("robot_name", robot), ("site_id", site), ("state", state),
-                          ("sw_version", sw_version)):
+                          ("sw_version", sw_version), ("map_id", map_id)):
         if value is not None:
             where.append(f"{column} = %s")
             params.append(value)

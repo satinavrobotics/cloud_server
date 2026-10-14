@@ -74,6 +74,7 @@ class EventCode(str, enum.Enum):
     MISSION_NODE_SKIPPED = "MISSION.NODE_SKIPPED"
     MISSION_NODE_NOTE = "MISSION.NODE_NOTE"
     MISSION_FRAME_OFFSET_SUSPECTED = "MISSION.FRAME_OFFSET_SUSPECTED"
+    TELEOP_SESSION_STARTED = "TELEOP.SESSION_STARTED"
 
 
 class Severity(str, enum.Enum):
@@ -217,6 +218,10 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MISSION_NODE_NOTE: CodeMeta(_S.INFO, True, schemas.NodeNote, _D),
     _C.MISSION_FRAME_OFFSET_SUSPECTED: CodeMeta(_S.WARNING, True, schemas.FrameOffsetSuspected,
                                                 _D),
+    # A teleoperation/video session started: a robot obtained its LiveKit room token from the
+    # self-hosted token service (packages/api/teleop.py, internal route). Robot set, run_id =
+    # the robot's RUNNING mission if any; discriminator `teleop:<room_hash>:<ts>`.
+    _C.TELEOP_SESSION_STARTED: CodeMeta(_S.INFO, True, schemas.TeleopSessionStarted, _A),
 }
 
 

@@ -29,6 +29,8 @@ VALID_PAYLOADS = {
                                   "offset_map": {"dx": 0.1, "dy": -0.05}},
     EventCode.MISSION_FRAME_OFFSET_SUSPECTED: {"mission_name": "m1", "n": 5, "mean_dx": 0.3,
                                                "mean_dy": 0.0, "consistency": 0.95},
+    EventCode.TELEOP_SESSION_STARTED: {"role": "robot", "room_hash": "0123456789ab",
+                                       "map_id": "m", "mission_name": "m1"},
     EventCode.ROBOT_STATE_CHANGED: {"old": "IDLE", "new": "ON_TASK"},
     EventCode.ROBOT_ONLINE: {"connection_state": "ONLINE"},
     EventCode.ROBOT_OFFLINE: {"connection_state": "CONNECTIONBROKEN"},
