@@ -102,9 +102,11 @@ What this data can and cannot separate:
 * **Cannot:** static versus moved. One 6-minute session, all captures within 0.1 h; there is no second pass over the same spot,
   and nothing after the close captures that came close again. A person who stood there for 5 consecutive captures and left looks
   the same as a hazard.
-* **Component 1** (668 cells, 1.67 m2): lethal in 95% of 4.3 close captures per cell and 5 consecutive; not closer than 0.97 m
-  to any pose; 20% of its lethal reports come from beyond 1.5 m. Consistent with a real object that the costmap sees mostly when
-  close. Not a clean 1.5 m stair signature.
+* **Component 1** (668 cells, 1.67 m2) **is the stairs** (confirmed by the user, 2026-10-14). Lethal in 95% of 4.3 close captures
+  per cell, 5 consecutive; not closer than 0.97 m to any pose; 20% of its lethal reports come from beyond 1.5 m (up to 6 m), so
+  the costmap sees the stairs mostly from close but not only: `r_det` is a soft range, not a strict 1.5 m limit. Today 86 of its
+  196 lattice cells (0.1 m, 0.86 m2) are inside the navigable space; the rule removes them. The other components are not
+  confirmed (the user confirmed the larger one only).
 * **Components 3, 5, 7, 9, 11, 13** (about 170 cells): at most 1.8 close captures per cell. Held blocked by the rule while
   nobody ever looked from close; they are unconfirmed either way.
 
@@ -113,14 +115,14 @@ What this data can and cannot separate:
 | Option | Effect on the 15 components | Cost |
 |---|---|---|
 | 1. The rule as stated (hard until a close free report) | all 1072 cells stay blocked | ghosts persist; needs a way to be re-observed |
-| 2. The rule only where the lethal is **confirmed from close**: at least k close lethal reports per cell, k = 3 | components 1, 2, 4, 10, 14 (882 cells, 82%) stay blocked; 190 cells are left as today | one more number (k); counts needed (a count plane, or per-leaf dedup) |
+| 2. The rule only where the lethal is **confirmed from close**: at least k close lethal reports per cell, k = 3 | components 1, 2, 4, 10, 14 (882 cells, 82%) stay blocked; 190 cells are left as today; **75 cells (11%) of the stairs themselves have fewer than 3 close lethal reports and would stay free** | one more number (k); counts needed (a count plane, or per-leaf dedup); a per-cell count is ragged on a real hazard, a neighbourhood count would be needed |
 | 3. Price it (rate pricing, §6 of `formulation.md`, cap p 0.75) | routes avoid it but may enter | not safe for a fall hazard |
 | 4. Fix at the source (the robot's costmap persistence of stairs) | none in the server | outside this repo's scope; the orchestrator is not changed for this |
 
-Recommendation: option 1 is the principled rule; option 2 limits the ghost cost at the price of a parameter and a count plane.
-The data cannot choose between them; **one more session over the same area, with the robot driving within 1.5 m of component 1
-after a quiet period, would** (a stair stays lethal, a ghost is retracted by `Fnear`). Where the real stairs are is also not yet
-confirmed against these components.
+Recommendation: option 1. The largest component is the stairs and a per-cell confirmation count (option 2) would leave 11% of
+the stairs free, so the extra parameter buys ghost protection at the price of the hazard it is meant for. The ghost cost of
+option 1 is real but not demonstrated on this map: the unconfirmed components are small (190 cells away from the stairs, 0.5 m2
+in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
 
 ### A.7 What is not shown
 
@@ -219,8 +221,8 @@ is not measured.
 | 3 | Is the Odin override live (inflation 0.8, scaling 6.0, global inscribed 0.30)? | Laci | per-robot profile values |
 | 4 | Smac planner tolerance (0.5 in the repo) as run | Laci | whether waypoint shifts matter |
 | 5 | The costmap obstacle detection range of the robot (for `r_det`) | Laci | A.2 |
-| 6 | Where are the stairs, and are the components of A.4 (largest at x -0.4 to 2.4, y -4.5 to -2.8) stairs, furniture or ghosts | Laci / user | A.6 option choice |
-| 7 | One more session driving within 1.5 m of component 1 after a quiet period | user | A.6 |
-| 8 | Stairs-versus-ghost decision (A.6) before any new plane or rebuild | Laci | the format step |
+| 6 | ~~Where are the stairs~~: the largest component of A.4 (x 1.3, y -3.5; extent x -0.4 to 2.4, y -4.5 to -2.8) is the stairs (user, 2026-10-14). The other 14 components are unconfirmed | user | A.6 for the rest |
+| 7 | Optional: one more session driving within 1.5 m of the unconfirmed components after a quiet period (ghost check) | user | A.6 |
+| 8 | Decision on A.6 (recommended: option 1) before any new plane or rebuild | Laci | the format step |
 | 9 | Production-engine measurement of the turn cost on the corridor or ellipse subgraph (B.3) | lattice_cimbi | an engine change |
 | 10 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 once 3 and 4 are answered |
