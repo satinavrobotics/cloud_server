@@ -252,6 +252,7 @@ services:
       - SCENE_GRAPH_PREFETCH_QUEUE=${SCENE_GRAPH_PREFETCH_QUEUE:-64}
       - SCENE_GRAPH_NEAR_RANGE_M=${SCENE_GRAPH_NEAR_RANGE_M:-}
       - SCENE_GRAPH_NEAR_FOV_DEG=${SCENE_GRAPH_NEAR_FOV_DEG:-}
+      - SCENE_GRAPH_NEAR_MIN_CLEARANCE_M=${SCENE_GRAPH_NEAR_MIN_CLEARANCE_M:-}
       # Postgres connections held: one per owned map + one transient per running step thread + a few
       # fixed ones, against max_connections. Cap the maps one process owns with SCENE_GRAPH_MAX_MAPS.
       - DISTANCE_THRESHOLD=${SIMILARITY_DISTANCE_THRESHOLD:-5.0}

@@ -34,6 +34,18 @@ class SceneParams:
                                            # when captured from a pose within this range (m). None = off (latest value wins).
     near_fov_deg: Optional[float] = None   # with near_range_m: also inside this cone around the base yaw (forward camera
                                            # assumed) or within 0.3 m. None = distance only.
+    near_min_clearance_m: Optional[float] = None   # with near_range_m: "away from walls". A held cell stays held only as part of an
+                                           # 8-connected component of held cells with a cell farther than this (m) from every other
+                                           # blocked or unknown cell; wall rims (components within it everywhere) read as without
+                                           # the rule. None = every held cell is held.
+
+    def __post_init__(self):
+        mc = self.near_min_clearance_m
+        if mc is not None:
+            if self.near_range_m is None:
+                raise ValueError("SceneParams.near_min_clearance_m needs near_range_m")
+            if not (0.0 < mc < float("inf")):
+                raise ValueError("SceneParams.near_min_clearance_m must be finite and > 0, got %r" % (mc,))
 
 
 @dataclass(frozen=True)

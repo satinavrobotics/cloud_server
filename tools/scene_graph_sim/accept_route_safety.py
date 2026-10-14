@@ -83,6 +83,20 @@ class Reference:
         Hn, Wn = self.nav.shape
         V = eng._V
         free = (V != 255) & (V < 100)
+        self.held = None
+        if eng._Fn is not None:
+            # the close-evidence rule, again and independently: components and one distance transform over the whole canvas
+            # (the engine crops one per component)
+            held = free & (eng._B >= 0) & (eng._B > eng._Fn)
+            mc = eng.params.near_min_clearance_m
+            if mc is not None and held.any():
+                far = ndimage.distance_transform_edt(~(V >= 100)) * RES > mc
+                lab, n = ndimage.label(held, structure=np.ones((3, 3)))
+                keep = np.zeros(n + 1, bool)
+                keep[np.unique(lab[held & far])] = True
+                held = held & keep[lab] & (lab > 0)
+            self.held = held
+            free = free & ~held
         self.dt = ndimage.distance_transform_edt(free) * RES            # full-resolution clearance, computed once
         self.fy0, self.fx0 = eng._cy0, eng._cx0
         clr = np.zeros((Hn, Wn))
@@ -264,9 +278,13 @@ def main() -> int:
     ap.add_argument("--k", type=float, default=6.0)
     ap.add_argument("--reach", type=float, default=0.8)
     ap.add_argument("--origin", type=float, default=None, help="default: the footprint's inscribed radius, else r")
+    ap.add_argument("--near-range", type=float, default=None, help="close-evidence rule (SceneParams.near_range_m), m; default off")
+    ap.add_argument("--near-min-clearance", type=float, default=None,
+                    help="with --near-range: the away-from-walls filter (SceneParams.near_min_clearance_m), m; default off")
     args = ap.parse_args()
     t_start = time.perf_counter()
-    leaves, st, eng = build(args.data, args.robot_half_side)
+    leaves, st, eng = build(args.data, args.robot_half_side, near_range_m=args.near_range,
+                            near_min_clearance_m=args.near_min_clearance)
     lazy = open_plan(st, "m", max_tiles=config.SCENE_GRAPH_LAZY_MAX_TILES, tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE)
     if args.profile == "exp":
         config.SCENE_GRAPH_INFLATION_RADIUS_M = args.reach
@@ -417,6 +435,10 @@ def main() -> int:
          "o = length optimum (reference, base weights): cost(o) <= cost(P) and L/U <= cost <= L/U + n give L(priced) >= L(o) - "
          "n_priced * 1e-4 m (n = edges)")
     diff = [i for i in range(len(pairs)) if not same(base_l[i], base_e[i]) or not same(pri_l[i], pri_e[i])]
+    if ref.held is not None and args.near_min_clearance is not None:
+        gate("N1", "engine hold == independent filter", eng._hold is not None and np.array_equal(eng._hold, ref.held),
+             "%d cells held, %d components" % (int(ref.held.sum()), ndimage.label(ref.held, structure=np.ones((3, 3)))[1]),
+             "the engine's cropped components equal a whole-canvas filter")
     gate("A5", "lazy == engine", not diff, "%d / %d pairs differ (baseline and priced)" % (len(diff), len(pairs)),
          "both minimise J_int and share the canonical tie rule: nodes and cost equal; tolerance 0")
     det = [i for i in range(len(pairs)) if not same(pri_l[i], cold_pri[i])]

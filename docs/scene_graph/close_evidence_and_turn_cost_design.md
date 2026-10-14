@@ -144,7 +144,7 @@ Recommendation: option 1. The largest component is the stairs and a per-cell con
 the stairs free, so the extra parameter buys ghost protection at the price of the hazard it is meant for. The ghost cost of
 option 1 is real but not demonstrated on this map: the other 14 components are small (404 cells, 1.0 m2 in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
 
-### A.6b What is built (merged into `main`, off by default)
+### A.6b What is built (merged into `main`, off by default; the filter of A.6c is on a branch)
 
 * `SceneParams.near_range_m` and `near_fov_deg` (both None = off, bit-identical to the latest-value fold); a new int64 plane `Fn`
   (allocated only when on; grown, shifted and cropped like `B`); `_fold_into(..., Fn, pose)`; `_build_F` excludes cells with
@@ -165,6 +165,54 @@ option 1 is real but not demonstrated on this map: the other 14 components are s
   sizes identical, the semantic cases plus tie and cone, store round trip and both mismatch errors, the tile readers equal the engine
   (deficit of every navigable cell, the occupancy plane), the checker accepts a rule-on store, config parse.
 * Not built: the generation check of `tools/scene_graph_expected.json` is unchanged (the pins are counts, valid for a rule-off store).
+
+### A.6c Away from walls (chosen by Laci, 2026-10-14; built on branch `feat/close-evidence-away-from-walls`, not merged, off by default)
+
+Decision: of the options in A.6, keep the rule of option 1 and drop its rims. The held cells (`V < 100`, `B >= 0 and B > Fn`)
+form 8-connected components; a component is KEPT only if at least one of its cells is farther than `near_min_clearance_m`
+(0.25 m, euclidean, costmap cells x 0.05 m) from the remaining blocked or unknown cells (`V >= 100`, 255 counts); a component
+that stays within that distance everywhere is a wall rim and is released: read as free, exactly as without the rule. A kept
+component is held whole, its rim cells included (a stair's edge beside a wall stays blocked).
+
+What it adds, and where:
+
+* `SceneParams.near_min_clearance_m` (None = off, valid only with `near_range_m`; stored with the params only when set, so the
+  params hash and the `import_state` mismatch check (both directions) cover it). The fold (`B`, `Fn`) is unchanged and commutative.
+* `engine._away_from_walls`, called from `_build_F` once per solve: components of the whole canvas, then per component a
+  distance transform of the bounding box padded by `ceil(min_clearance / RES) + 2` cells. Exact: a component cell's distance
+  matters only when it is <= `min_clearance`, and the blocked cell that decides it then lies within that many cells of the
+  component, inside the padded box; a cropped transform is never below the full one and equals it for every cell within
+  `min_clearance` of a blocked cell, so "some cell farther than `min_clearance`" is the same in the crop and on the canvas.
+  The result is the plane `hold` (`EngineState.Hold`), which `_build_F` uses and which is stored.
+* Store: one more tile plane `hold` (uint8) only with the filter; `PIPELINE` token `morse/2+near2` (the token names the
+  planes: `+near1` = `fn`, `+near2` = `fn` + `hold`); a rule-on, filter-off store is `+near1`, with the tiles, pages, segments and
+  params hash of the merged build byte for byte (checked on office8: off, rule, rule + cone). `FORMAT` stays 4. A reader that
+  does not know `hold` would take the tile-local `b > fn` and hold the rims again, so the token changes: the checker and the
+  params hash tell the stores apart.
+* Readers: components cross tile edges, so a tile cannot recompute the filter. `store_codec.effective_v` takes `hold` when the
+  tile has it (else `b > fn`, as before); `lazy_plan`, `tile_v_plane` and the snap go through it unchanged. `import_state` rebuilds
+  `hold` from the planes and refuses a stored one that differs (`StateMismatch`); the owner-plane check covers the rest.
+* The dirty box (`Dirty.bbox`, what an incremental save rewrites) includes the cells whose held state changed: a window far
+  from a component can decide its far cell, so its rim cells change outside every folded window and chart.
+* Wiring: `SCENE_GRAPH_NEAR_MIN_CLEARANCE_M` (`config`, compose, `.env.example`, `runbook.md` section 1) to the graph-builder's
+  `scene_host`, like `SCENE_GRAPH_NEAR_RANGE_M`. Switching it on is a params change: every map is rebuilt in a new generation.
+  `tools/scene_graph_check_generation.py` accepts a store made with it (pipeline `+near2`, params key).
+
+Measured on office8 (97 leaves, `near_range_m` 1.5, filter 0.25 m):
+
+| | rule only | rule + filter |
+|---|---|---|
+| cells held (components) | 2685 (318) | 1072 (15) |
+| navigable lattice cells (0.1 m) | 2143 -> 1889 (-11.9%) | 2143 -> 1955 (-8.8%) |
+| 150 pairs (seed 7, >= 3 m apart, drawn from the rule-off graph, unpriced production route) | 103 same, 13 changed (mean length x 1.023), 34 start or goal no longer navigable, 0 unroutable | 121 same, 4 changed (x 1.059), 25 start or goal no longer navigable, 0 unroutable |
+
+`accept_route_safety.py --near-range 1.5 --near-min-clearance 0.25` (150 pairs, kappa 1): every gate passes, A5 (lazy == engine)
+0 / 150, and a gate N1 compares the engine's mask with an independent whole-canvas filter (1072 cells, 15 components, equal).
+The default run (no flags) is unchanged. Other maps were not measured: only the office8 leaf export exists here. To run the
+same numbers on another map, export its leaves (read-only; `tools/scene_graph_sim/README.md`):
+`docker exec -i docker_compose-graph-builder-service-1 python - <map> /tmp/sg_export < tools/scene_graph_sim/export_live.py`,
+`docker cp docker_compose-graph-builder-service-1:/tmp/sg_export/. tools/scene_graph_sim/data/<map>/`, then
+`python tools/scene_graph_sim/close_evidence_route_changes.py --data tools/scene_graph_sim/data/<map> --rdet 1.5 --min-clearance 0.25`.
 
 ### A.7 What is not shown
 

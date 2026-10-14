@@ -665,6 +665,9 @@ SCENE_GRAPH_GLOBAL_INSCRIBED_M = _opt_float("SCENE_GRAPH_GLOBAL_INSCRIBED_M")
 # map (the params hash changes). NEAR_FOV_DEG (optional): a free report counts only inside this horizontal cone of the base yaw.
 SCENE_GRAPH_NEAR_RANGE_M = _opt_float("SCENE_GRAPH_NEAR_RANGE_M")
 SCENE_GRAPH_NEAR_FOV_DEG = _opt_float("SCENE_GRAPH_NEAR_FOV_DEG")
+# NEAR_MIN_CLEARANCE_M (optional, needs NEAR_RANGE_M): "away from walls" - a held region stays held only when a cell of its connected
+# component is farther than this (m) from every other blocked or unknown cell; wall rims are released. Empty = every held cell holds.
+SCENE_GRAPH_NEAR_MIN_CLEARANCE_M = _opt_float("SCENE_GRAPH_NEAR_MIN_CLEARANCE_M")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
