@@ -1,4 +1,9 @@
 {
+ "Hospital": {
+  "charts": 54,
+  "islands": 23,
+  "links": 97
+ },
  "Officemap": {
   "charts": 14,
   "islands": 1,
@@ -30,9 +35,9 @@
   "links": 17
  },
  "office7": {
-  "charts": 14,
-  "islands": 0,
-  "links": 17
+  "charts": 16,
+  "islands": 3,
+  "links": 15
  },
  "office8": {
   "charts": 12,

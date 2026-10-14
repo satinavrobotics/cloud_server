@@ -98,3 +98,23 @@ p90 1.064 / max 1.233 (vertex-sampled). The pinned full unit suite passed on the
 | 2026-10-13 20:44 | `6879628` | planner deployed with `--no-pull`; healthy; first priced plans served |
 | 2026-10-13 23:24 | `2938605` | planner deployed from `origin/main` with the gate; healthy; tags pruned; the identity check **failed**: `/stats` did not report `build_sha` (the response model dropped it) |
 | 2026-10-13 23:30 | `662bfe8` | fix: `build_sha` declared in `StatsResponse`; test requires every `get_stats()` key to be a model field. Pushed, full pinned suite 4537 passed / 4 skipped, deployed from `origin/main`, healthy, `/stats` reports `build_sha` 662bfe8, 1 more rollback tag pruned |
+
+## 8. Addendum (later on 2026-10-14): what was merged and deployed after this record
+
+Written by the lattice_cimbi session. Sections 1 to 7 above are the state at the time of the first write-up and are kept as written.
+
+| Time (UTC) | Commit | Service | Result |
+|---|---|---|---|
+| 20:34 | `cac9f03` | mission-planner-service | the exponential price tier in the code, off (`SCENE_GRAPH_INFLATION_*` empty); healthy; `/stats` `build_sha` `cac9f03` |
+| 20:51 | `a4a0728` | mission-planner-service | close-evidence rule in the engine and the tile readers, off (`SCENE_GRAPH_NEAR_*` empty); healthy; `build_sha` `a4a0728` |
+| 20:52 | `a4a0728` | graph-builder-service | healthy; checker 8 of 9: `office7` failed its pins (16 charts, 15 links, 3 islands against 14 / 17 / 0, stored version 5: the map grew in the live run, no code or params change, pipeline `morse/2`) |
+| after | the commit that re-pins office7 and Hospital | graph-builder-service | see `~/.cache/satina-deploy.log` for the sha and the checker result |
+
+* Pinned unit suite on `a4a0728`: 4673 passed, 4 skipped (production pins, default selection); the acceptance harness on office8
+  (`accept_route_safety.py`, 150 pairs, kappa 1): all gates pass, unchanged.
+* The expectations file now pins `office7` at 16 / 15 / 3 and `Hospital` at 54 / 97 / 23 (a deliberate re-pin: the data changed, the code did not).
+* Open item 1 of section 6 (stale free evidence): the mechanism is built and off by default (`close_evidence_and_turn_cost_design.md`
+  part A); what remains is the decision to switch it on (a rebuild of every map). New open items: the turn cost (part B) and the waypoint
+  merge (part C) are designed, not built; the robot's speeds are read from the registration factsheet (B.6), the nominal values are to be added.
+* Branch hygiene of 2026-10-14: the branches `exp/inflation-profile`, `design/inflation-profile`, `design/close-evidence-turn-cost`,
+  `proto/close-evidence-plane` and `integrate/close-evidence` are merged into `main` and removed.

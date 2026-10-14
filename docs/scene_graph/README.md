@@ -58,7 +58,7 @@ The deployed commit of each service, the deploy log and the live run of 2026-10-
 (sections 1, 4 and 7, and its addendum); the planner reports its commit as `build_sha` on `GET /stats`.
 
 * Maps: all 9 (8 office maps and Hospital, enabled 2026-10-13 23:56 UTC) are in the graph; the checker passes
-  (`tools/scene_graph_check_generation.py --all --expect tools/scene_graph_expected.json`; Hospital is not pinned in the expectations file yet).
+  (`tools/scene_graph_check_generation.py --all --expect tools/scene_graph_expected.json`; Hospital pinned 2026-10-14: 54 / 97 / 23; office7 re-pinned the same day to 16 / 15 / 3 because the live run grew the map to version 5).
 * Planner: the lazy tile planner only (`full_load` removed 2026-10-13); chart route first, the legacy planner as fallback;
   clearance pricing on, linear hinge, `SCENE_GRAPH_SAFETY_KAPPA=1.0`; the width gate is off.
 * Off in production: the exponential price profile (`SCENE_GRAPH_INFLATION_*` empty) and close evidence (`SCENE_GRAPH_NEAR_*` empty).
