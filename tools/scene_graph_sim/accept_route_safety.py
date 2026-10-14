@@ -2,6 +2,13 @@
 
     python tools/scene_graph_sim/accept_route_safety.py --data DIR [--pairs 150] [--seed 7] [--kappa 1] [--robot-half-side 0.25]
                                                          [--width W [--length L]]
+                                                         [--profile exp --k 6 --reach 0.8 --origin 0.3]
+
+`--profile exp` runs the same gates for the exponential price profile (docs/scene_graph/inflation_profile_design.md): the
+tier is selected through the SCENE_GRAPH_INFLATION_* settings (config attributes set here), kappa = `--kappa` (the planner's
+0.5 default is not applied), so the production selection `safety_for` is on the path. The reference prices with its own
+independent formula exp(-k (g - origin)) for g < reach, and the deficit d of the notation below is then the price phi.
+C2 (continuum value, a bound of the hinge's Lipschitz deficit) is not evaluated for the exponential tier.
 
 Production path, built once: the export's leaves are folded in the engine, saved to a `SceneGraphStore(MemoryBackend)` (batches of 6, as
 the worker saves), the restored engine (`store.load`) is the reference and `open_plan` the planner's tile-lazy `PlanGraph`. The same
@@ -15,6 +22,7 @@ w = max(ceil(l / U * (1 + mu * (d_a + d_b) / 2) - 1e-6), 1), J_int = sum w (`Rou
 A = sum l * (d_a + d_b) / 2. Every gate states its derivation and its numeric tolerance in the output.
 """
 import argparse
+import dataclasses
 import math
 import os
 import sys
@@ -57,9 +65,19 @@ def gate(gid: str, name: str, ok: bool, measured: str, rule: str) -> None:
 class Reference:
     """Independent lattice model of the restored engine: owner plane, clearance, edge list, weights, canonical walk."""
 
-    def __init__(self, eng: ChartGraph, margin: float, rate: float):
+    def pricef(self, g):
+        """independent price of clearance g: the hinge deficit or exp(-k (g - origin)) for g < reach (not Safety.price)"""
+        g = np.asarray(g, float)
+        if self.k is None:
+            return np.maximum(0.0, self.margin - g)
+        out = np.zeros(g.shape)
+        m = g < self.margin
+        out[m] = np.exp(-self.k * (g[m] - self.origin))
+        return out
+
+    def __init__(self, eng: ChartGraph, margin: float, rate: float, k: Optional[float] = None, origin: Optional[float] = None):
         s = eng._solved
-        self.eng, self.margin, self.rate = eng, margin, rate
+        self.eng, self.margin, self.rate, self.k, self.origin = eng, margin, rate, k, origin
         self.plane = s.plane
         self.nav = self.plane >= 0
         Hn, Wn = self.nav.shape
@@ -71,7 +89,7 @@ class Reference:
         sub = self.dt[::2, ::2][:Hn, :Wn]
         clr[:sub.shape[0], :sub.shape[1]] = sub
         self.clr = clr
-        self.deficit = np.maximum(0.0, margin - clr)
+        self.deficit = self.pricef(clr)
         ys, xs = np.nonzero(self.nav)
         self.ys, self.xs = ys, xs
         self.N = len(ys)
@@ -173,7 +191,7 @@ class Reference:
                 c = self.cell((x, y))
                 if c is None:
                     inside = False
-                    acc += 1.0 + self.rate * self.margin
+                    acc += 1.0 + self.rate * float(self.pricef(0.0))
                 else:
                     acc += 1.0 + self.rate * self.deficit[self.ys[c], self.xs[c]]
             tot += length * acc / n
@@ -213,7 +231,7 @@ class Reference:
         sg.append(np.zeros(1))
         xs, ys, sg = np.concatenate(xs), np.concatenate(ys), np.concatenate(sg)
         c = self.clearance_at(xs, ys)
-        return (float(sg.sum() + self.rate * (np.maximum(0.0, self.margin - c) * sg).sum()), float(sg.sum()), float(c.min()),
+        return (float(sg.sum() + self.rate * (self.pricef(c) * sg).sum()), float(sg.sum()), float(c.min()),
                 float(sg[c < self.margin].sum()))
 
 
@@ -242,16 +260,25 @@ def main() -> int:
     ap.add_argument("--robot-half-side", type=float, default=0.25)
     ap.add_argument("--width", type=float, default=None, help="planning robot width (m); default: margin = r * sqrt(2)")
     ap.add_argument("--length", type=float, default=None)
+    ap.add_argument("--profile", choices=("hinge", "exp"), default="hinge")
+    ap.add_argument("--k", type=float, default=6.0)
+    ap.add_argument("--reach", type=float, default=0.8)
+    ap.add_argument("--origin", type=float, default=None, help="default: the footprint's inscribed radius, else r")
     args = ap.parse_args()
     t_start = time.perf_counter()
     leaves, st, eng = build(args.data, args.robot_half_side)
     lazy = open_plan(st, "m", max_tiles=config.SCENE_GRAPH_LAZY_MAX_TILES, tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE)
+    if args.profile == "exp":
+        config.SCENE_GRAPH_INFLATION_RADIUS_M = args.reach
+        config.SCENE_GRAPH_INFLATION_SCALING = args.k
+        config.SCENE_GRAPH_GLOBAL_INSCRIBED_M = args.origin
+        config.SCENE_GRAPH_SAFETY_KAPPA_EXPLICIT = True
     safety = sr.safety_for(eng, args.width, args.length, args.kappa)
-    if safety is None:
-        print("no pricing (kappa <= 0 or margin <= r)")
+    if safety is None or (args.profile == "exp") != (safety.k is not None):
+        print("no pricing / wrong tier (kappa <= 0, margin <= r, or an invalid exp profile)")
         return 1
     m, mu, r = safety.margin, safety.rate, args.robot_half_side
-    ref = Reference(eng, m, mu)
+    ref = Reference(eng, m, mu, safety.k, safety.origin)
     sp = eng._solved.sp
     xy = np.array([eng._cell_xy(int(sp.ys[i]), int(sp.xs[i])) for i in range(sp.N)])
     leaf_xy = np.array([(l.x, l.y) for l in leaves])
@@ -290,10 +317,10 @@ def main() -> int:
     for sa, sb in pairs:
         base_l.append(route(lazy, sa, sb, None))
         pri_l.append(route(lazy, sa, sb, safety))
-        zero_l.append(route(lazy, sa, sb, Safety(m, 0.0)))
+        zero_l.append(route(lazy, sa, sb, dataclasses.replace(safety, rate=0.0)))
         base_e.append(route(eng, sa, sb, None))
         pri_e.append(route(eng, sa, sb, safety))
-        zero_e.append(route(eng, sa, sb, Safety(m, 0.0)))
+        zero_e.append(route(eng, sa, sb, dataclasses.replace(safety, rate=0.0)))
     # ---- plans (waypoints) at kappa 0, legacy defaults and kappa --------------------------------------------------------
     plans0, plans1, plans_default = [], [], []
     for sa, sb in pairs:                                  # first pass fills the tile and clearance caches
@@ -345,7 +372,7 @@ def main() -> int:
                 or (not isinstance(plans0[i], str) and (wp(plans0[i]) != wp(plans_default[i])))]
     gate("A1", "reduction", not bad and not bad_plan,
          "%d / %d routes differ, %d plans differ" % (len(bad), len(pairs), len(bad_plan)),
-         "S8: Safety(m, 0.0) and kappa 0 are the baseline, bit for bit (nodes, cost); tolerance 0")
+         "S8: rate 0 (same k, origin) and kappa 0 are the baseline, bit for bit (nodes, cost); tolerance 0")
     rb = {i for i, r_ in enumerate(base_l) if r_ is not None}
     rp = {i for i, r_ in enumerate(pri_l) if r_ is not None}
     sb_ = {i for i, p_ in enumerate(plans0) if not isinstance(p_, str)}
@@ -451,7 +478,8 @@ def main() -> int:
         med.append(jp / jb)
         if jp > jb * METRICATION + mu * QUANT_M * lp:
             viol.append(i)
-    gate("C2", "continuum value", not viol,
+    if safety.k is None:
+      gate("C2", "continuum value", not viol,
          "%d / %d violate J_cont(priced) <= %.4f J_cont(base) + mu * %.4f * L(priced); median ratio %.3f" % (
              len(viol), len(med), METRICATION, QUANT_M, float(np.median(med)) if med else float("nan")),
          "J_lat(P) <= J_lat(B) (S7) and J_lat vs J_cont differ by the 8-neighbour metrication 1.0824 (S12) and, in the deficit term, "
@@ -486,6 +514,10 @@ def main() -> int:
         print("%-8s %12.2f %10.3f %6d %10.2f %9.2f" % row)
     print("length ratio priced / production baseline route (median / p90 / max): %.3f / %.3f / %.3f" % (
         float(np.median(ratios)), pct(ratios, 90), max(ratios)))
+    print("B1/B2 for a price phi >= 0 (phi = the hinge deficit or exp(-k (g - origin)) below reach; kappa = rate), o the length optimum, "
+          "P the priced route, A = sum l phi_mean, n edges:")
+    print("  J = L + kappa A (up to the n * 1e-4 rounding), J(P) <= J(o) and L(P) >= L(o) - n 1e-4 give "
+          "A(P) <= A(o) + n 1e-4 / kappa (B1); with A(P) >= 0, L(P) <= L(o) + kappa A(o) = L(o) (1 + kappa phibar_o) + n 1e-4 (B2)")
     print()
     for gid, name, ok, measured, rule in RESULTS:
         print("%-3s %-22s %s  %s" % (gid, name, "PASS" if ok else "FAIL", measured))
