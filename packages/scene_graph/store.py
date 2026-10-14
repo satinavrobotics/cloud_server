@@ -38,6 +38,7 @@ from .store_codec import (canonical_json, compress_object, hash_arrays, pack, pa
                           unpack_json)
 
 PIPELINE = "morse/2"
+PIPELINE_NEAR = PIPELINE + "+near1"   # stores made with SceneParams.near_range_m: one more tile plane `fn`, params carry the rule
 RES = 0.05
 RESIDENT_MARGIN_M = 5.0      # a partially resident writer keeps this margin of tiles around a leaf's window
 TILE_F = 128                  # costmap cells per tile side (64 lattice cells)
@@ -58,6 +59,10 @@ class TooOld(Exception):
 
 class DirtyCoverageError(Exception):
     """strict mode: an incremental save missed tiles that a full hash shows changed (the pad is too small)."""
+
+
+def _pipeline(params: dict) -> str:
+    return PIPELINE_NEAR if "near_range_m" in params else PIPELINE
 
 
 def _fmt(k) -> str:
@@ -87,6 +92,7 @@ def tile_arrays(st: EngineState, tx: int, ty: int, ids_lut: Optional[np.ndarray]
     """every plane of tile (tx, ty) in global tile coordinates, or None when the tile holds nothing"""
     x0, y0 = tx * TILE_F - st.cx0, ty * TILE_F - st.cy0
     a = {"v": _slice(st.V, x0, y0, TILE_F, 255), "t": _slice(st.T, x0, y0, TILE_F, -1), "b": _slice(st.B, x0, y0, TILE_F, -1)}
+    if st.Fn is not None: a["fn"] = _slice(st.Fn, x0, y0, TILE_F, -1)
     nonempty = bool((a["v"] != 255).any() or (a["t"] >= 0).any() or (a["b"] >= 0).any())
     for name, (v, t) in sorted(st.chan.items()):
         cv, ct = _slice(v, x0, y0, TILE_F, 255), _slice(t, x0, y0, TILE_F, -1)
@@ -181,8 +187,9 @@ class SceneGraphStore:
     @staticmethod
     def params_hash(params: SceneParams) -> str:
         """The hash save() stamps on a version made with `params` (what begin_generation compares a pending against)."""
-        return params_hash(dict(robot_half_side=params.robot_half_side, lattice=params.lattice,
-                                chart_radius=params.chart_radius), PIPELINE)
+        from .engine import _state_params
+        d = _state_params(params)
+        return params_hash(d, _pipeline(d))
 
     @classmethod
     def from_client(cls, client, **kw):
@@ -222,7 +229,7 @@ class SceneGraphStore:
         st = sg.export_state()
         if st.V is None:
             raise ValueError("nothing to save: the engine has no state")
-        if pend and pending.get("params_hash") and pending["params_hash"] != params_hash(st.params, PIPELINE):
+        if pend and pending.get("params_hash") and pending["params_hash"] != params_hash(st.params, _pipeline(st.params)):
             raise ValueError("the engine's parameters differ from the pending generation's: begin_generation(params_hash=...)")
         # a pending manifest is the base of an incremental save only if this engine continues it (its leaves and watermark
         # are not behind it); a replay from cursor 0 into a pending holding an older attempt rewrites every tile instead of
@@ -321,8 +328,8 @@ class SceneGraphStore:
             h, blob = pack_json(pg)
             page_hashes[name] = h; new_blobs["g%d/p/%s" % (gen, h)] = blob
         pages_now = {name: (pg, page_hashes[name]) for name, pg in pages.items()}
-        body = {"format": FORMAT, "pipeline": PIPELINE, "generation": gen, "params": st.params,
-                "params_hash": params_hash(st.params, PIPELINE), "cursor": cursor, "watermark": list(st.watermark),
+        body = {"format": FORMAT, "pipeline": _pipeline(st.params), "generation": gen, "params": st.params,
+                "params_hash": params_hash(st.params, _pipeline(st.params)), "cursor": cursor, "watermark": list(st.watermark),
                 "engine_version": st.version, "canvas": [st.cx0, st.cy0, int(st.V.shape[0]), int(st.V.shape[1])],
                 "tile_cells": TILE_F, "channels": chans, "next_id": next_id, "pages": page_hashes,
                 "order": [live[k] for k in keys],          # chart ids in ENGINE order: ties in the solver break by anchor order
@@ -600,10 +607,10 @@ class SceneGraphStore:
             ax1 = max(c[0] for c in coords); ay1 = max(c[1] for c in coords)
         else:
             p = man["params"]
-            return ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"],
-                                          chart_radius=p["chart_radius"]))
+            return ChartGraph(SceneParams(**p))
         W, H = (ax1 - ax0 + 1) * TILE_F, (ay1 - ay0 + 1) * TILE_F
         V = np.full((H, W), 255, np.uint8); T = np.full((H, W), -1, np.int64); B = np.full((H, W), -1, np.int64)
+        Fn = np.full((H, W), -1, np.int64) if "near_range_m" in man["params"] else None
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
         own = np.zeros((H // 2, W // 2), np.int32)
         for (tx, ty) in coords:
@@ -611,6 +618,7 @@ class SceneGraphStore:
                 t = self._tile(map_id, man, tx, ty)
             y, x = (ty - ay0) * TILE_F, (tx - ax0) * TILE_F; ly, lx = y // 2, x // 2
             V[y:y + TILE_F, x:x + TILE_F] = t["v"]; T[y:y + TILE_F, x:x + TILE_F] = t["t"]; B[y:y + TILE_F, x:x + TILE_F] = t["b"]
+            if Fn is not None and "fn" in t: Fn[y:y + TILE_F, x:x + TILE_F] = t["fn"]
             for n in man["channels"]:
                 if "c.%s.v" % n in t:
                     chan[n][0][y:y + TILE_F, x:x + TILE_F] = t["c.%s.v" % n]; chan[n][1][y:y + TILE_F, x:x + TILE_F] = t["c.%s.t" % n]
@@ -628,11 +636,10 @@ class SceneGraphStore:
             arr, m = unpack(self.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h)))
             leaves += segment_records(arr, m)
         p = man["params"]
-        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, chan=chan, leaves=leaves,
+        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, chan=chan, leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
-        g = ChartGraph(SceneParams(robot_half_side=p["robot_half_side"], lattice=p["lattice"],
-                                   chart_radius=p["chart_radius"]))
+        g = ChartGraph(SceneParams(**p))
         g.import_state(st, verify=verify)
         if [_fmt(k) for k in g._keys] != [c["key"] for c in charts]:
             raise StateMismatch("restored keys differ from the stored key table")

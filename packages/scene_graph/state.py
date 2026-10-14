@@ -31,6 +31,7 @@ class EngineState:
     T: np.ndarray                                  # i8 [H, W] capture time of the winning leaf, -1 none
     B: np.ndarray                                  # i8 [H, W] latest capture time reported blocked, -1 none
     chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    Fn: Optional[np.ndarray] = None                # i8 [H, W] latest FREE time from within near range; only with near_range_m
     leaves: List[LeafRecord] = field(default_factory=list)
     keys: List[Tuple[str, int]] = field(default_factory=list)         # chart keys (birth leaf, n), chart order
     plane: Optional[np.ndarray] = None             # i4 [H/2, W/2] chart index per lattice cell, -1 outside F
