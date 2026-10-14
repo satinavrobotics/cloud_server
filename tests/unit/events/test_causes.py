@@ -15,6 +15,12 @@ def err(error_type, description="", level="WARNING"):
 RULE_CASES = {
     "operator_canceled": CauseInput(outcome="CANCELED", errors=[err("motorFault")]),
     "estop": CauseInput(outcome="FAILED", errors=[err("safety", "Emergency stop pressed")]),
+    "safety_reflex": CauseInput(outcome="FAILED", nav_reasoning="Safety reflex latched"),
+    "base_not_responding": CauseInput(
+        outcome="FAILED", nav_reasoning="Robot base not responding (no /esp32/odom for 4 s)"),
+    "order_not_accepted": CauseInput(
+        outcome="FAILED", nav_reasoning="Robot did not accept the dispatched order (x)"),
+    "not_placed": CauseInput(outcome="FAILED", nav_reasoning="robot is not placed on map m"),
     "heartbeat_lost": CauseInput(outcome="FAILED", heartbeat_lost=True,
                                  nav_reasoning="Low battery, heading home"),
     "low_battery": CauseInput(outcome="FAILED", errors=[err("batteryLow", "", "FATAL")]),

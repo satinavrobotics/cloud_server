@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, ValidationError
 import uvicorn
 
 from packages.api.server import ApiDelegationService
-from packages.api import fleet_reads, maps, recorder_health, recording, run_admin
+from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
 from packages.api import edge_stats, session_trace, sites
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
@@ -565,6 +565,25 @@ async def get_map(map_id: str):
                                                                service.mapping_switch,
                                                                result.get("type")))
     return result
+
+
+@app.get("/api/v1/maps/{map_id}/run-stats")
+async def map_run_stats(
+    map_id: str,
+    from_: Optional[str] = Query(None, alias="from",
+                                 description="Runs that started at or after this (ISO-8601 with "
+                                             "time zone); default `to` minus 30 days"),
+    to: Optional[str] = Query(None, description="Runs that started before this; default now"),
+    robot: Optional[str] = Query(None, description="Only this robot"),
+):
+    """Operating metrics of the map over its non-archived mission runs (success rate,
+    interventions, hours, durations, recoveries, safety events, causes). Definitions:
+    packages/api/run_stats.py and docs/map_run_stats_2026-10-14.md. An unknown map answers zeros."""
+    _require_service()
+    run_stats.require_map_id(map_id)
+    start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
+    return await _site_call("map run stats", run_stats.run_stats(
+        service.database, map_id, start, end, robot))
 
 
 @app.patch("/api/v1/maps/{map_id}")
@@ -1895,6 +1914,26 @@ async def create_livekit_token(request: CreateTokenRequest):
     return CreateTokenResponse(**result)
 
 
+class TeleopTokenIssued(BaseModel):
+    role: str
+    participantName: str
+    roomName: str
+
+
+@app.post("/internal/teleop/token-issued")
+async def teleop_token_issued(body: TeleopTokenIssued, request: Request):
+    """From the livekit-sfu-tokens service (loopback only, not under /api/): a robot token was
+    issued. Writes TELEOP.SESSION_STARTED when it starts a session (packages/api/teleop.py).
+    `{"recorded": bool}`; no token or room name is read back or stored."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="loopback only")
+    _require_service()
+    recorded = await teleop.record_token_issued(
+        service.database, body.role, body.participantName, body.roomName)
+    return {"recorded": recorded}
+
+
 # ==================== Robot Operations ====================
 
 async def _robot_views(robots: List[RobotObjectV1],
@@ -2506,6 +2545,8 @@ async def list_runs(
     state: Optional[str] = Query(None, description="RUNNING, COMPLETED, FAILED, CANCELED, "
                                                    "ABORTED or TIMEOUT"),
     sw_version: Optional[str] = Query(None, description="Robot build id at run start"),
+    map: Optional[str] = Query(None, description="Map name: runs whose map_id (the map of the "
+                                                 "robot's open session at the run's start) is this"),
     mission: Optional[str] = Query(None, description="Mission name: runs whose mission_name "
                                                      "is exactly this, or this followed by "
                                                      "one or more `-rerun-<digits>` (reruns)"),
@@ -2523,7 +2564,7 @@ async def list_runs(
     return await _site_call("list runs", fleet_reads.list_runs(
         service.database, robot=robot, site=site, state=state, sw_version=sw_version,
         mission=mission, archived=archived, start=start, end=end, cursor=cursor,
-        limit=limit))
+        limit=limit, map_id=map))
 
 
 @app.post("/api/v1/runs/archive")

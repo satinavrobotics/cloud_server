@@ -11,6 +11,7 @@ docs/livekit_sfu/README.md.
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from packages.utils.livekit_tokens import mint_room_token
@@ -39,6 +40,29 @@ MAX_NAME_LENGTH = 128
 # Connected participants are not dropped when their token expires (verified on
 # the SFU); the TTL only bounds how long a leaked token can be used to join.
 DEFAULT_OPERATOR_TTL = 3600
+
+
+# The API records the teleop session (packages/api/teleop.py); this service has no database.
+TELEOP_NOTIFY_URL = os.getenv("TELEOP_NOTIFY_URL",
+                              "http://127.0.0.1:8000/internal/teleop/token-issued")
+
+
+def notify_token_issued(role: str, participant_name: str, room_name: str,
+                        url: Optional[str] = None) -> bool:
+    """Tell the API that a robot token was issued (sync; runs in a worker thread after the
+    response). Only robot tokens name a robot; operator tokens are not sent. Never raises and
+    never carries the token. An empty TELEOP_NOTIFY_URL turns it off."""
+    url = TELEOP_NOTIFY_URL if url is None else url
+    if role != "robot" or not url:
+        return False
+    try:
+        import requests
+        response = requests.post(url, json={"role": role, "participantName": participant_name,
+                                            "roomName": room_name}, timeout=2)
+        return response.ok
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("LiveKitSfuTokenService").debug("teleop notify failed: %s", exc)
+        return False
 
 
 class UnknownRoleError(ValueError):

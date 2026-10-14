@@ -94,7 +94,7 @@ async def test_run_start_and_finish_write_row_and_events_together(tmp_path):
 @pytest.mark.parametrize("state_, reason, outcome, cause", [
     (State.FAILED, fr.MISSION_TIMEOUT_REASON, "TIMEOUT", "DISPATCH.TIMEOUT"),
     (State.CANCELED, None, "CANCELED", "OPERATOR.CANCELED"),
-    (State.FAILED, "Robot did not accept the dispatched order", "FAILED", "UNKNOWN"),
+    (State.FAILED, "Robot did not accept the dispatched order", "FAILED", "DISPATCH.ORDER_NOT_ACCEPTED"),
     (State.FAILED, "Localization lost near dock", "FAILED", "NAV.LOCALIZATION_LOST"),
 ])
 async def test_terminal_outcome_and_cause(tmp_path, state_, reason, outcome, cause):

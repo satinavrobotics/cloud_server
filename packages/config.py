@@ -258,6 +258,14 @@ FLEET_READ_STATEMENT_TIMEOUT_MS = int(os.getenv("FLEET_READ_STATEMENT_TIMEOUT_MS
 # Timeline caps: points per track (robot_state / diagnostics / trajectory; longer series are
 # downsampled) and events per run (the rest is cut, with a `*_truncated` flag).
 FLEET_TIMELINE_MAX_POINTS = int(os.getenv("FLEET_TIMELINE_MAX_POINTS", "2000"))
+# GET /api/v1/maps/{map}/run-stats (packages/api/run_stats.py): default window in days, and the
+# run length above which a run is left out of the operating hours (a hung run, e.g. a cancel
+# 14 h after its start, is not operating time; docs/map_run_stats_2026-10-14.md).
+RUN_STATS_DEFAULT_DAYS = int(os.getenv("RUN_STATS_DEFAULT_DAYS", "30"))
+RUN_STATS_MAX_RUN_S = int(os.getenv("RUN_STATS_MAX_RUN_S", "7200"))
+# TELEOP.SESSION_STARTED (packages/api/teleop.py): a robot's room token within this many seconds
+# of its previous one (same robot and room) belongs to the same session and records nothing.
+TELEOP_SESSION_GAP_S = int(os.getenv("TELEOP_SESSION_GAP_S", "1800"))
 FLEET_TIMELINE_MAX_EVENTS = int(os.getenv("FLEET_TIMELINE_MAX_EVENTS", "5000"))
 # GET /api/v1/runs/{id}/track: at most this many points (1 Hz = a 5.5 h run); more are strided.
 FLEET_TRACK_MAX_POINTS = int(os.getenv("FLEET_TRACK_MAX_POINTS", "20000"))

@@ -1065,6 +1065,42 @@ outside any leg), `time_recovery_s` (overlaps stopped time), `recovery_count`, `
 `expected_s`, `actual_vs_expected` (time of the legs that have an expected time over their
 expected sum), `pass_durations_s` (`[{pass, legs, duration_s}]`).
 
+#### Per-map operating statistics
+
+`GET /api/v1/runs` also takes `map=<name>`: runs whose `map_id` (the map of the robot's open
+session at the run's start) is that map.
+
+**`GET /api/v1/maps/{map_id}/run-stats?from=&to=&robot=`** -- operating metrics of the map's
+non-archived runs that started in `[from, to)` (ISO-8601 with time zone; default: the last 30
+days), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls.
+
+```
+{"map_id", "window": {"from", "to"}, "robot": null | str,
+ "runs": {"finished", "completed", "failed", "timeout", "aborted", "canceled", "running"},
+ "success_rate": float|null,        // completed / (completed+failed+timeout+aborted)
+ "intervention": {"count", "cancels", "teleop", "takeovers", "rate_per_hour": float|null,
+                  "free_success_rate": float|null, "free_runs"},
+ "hours": float,                    // operating time, see docs/map_run_stats_2026-10-14.md
+ "duration_s": {"median", "p95", "n"},   // COMPLETED runs
+ "timeout": {"count", "median_s"},
+ "abort_rate": float|null,          // (failed+timeout+aborted) / finished
+ "recovery": {"legs", "legs_with_recovery", "median_s", "p95_s", "total_s",
+              "share_of_time", "share_of_legs"},
+ "safety": {"by_class": {"safety_reflex", "blocked", "skipped", "link_loss"},
+            "by_code": {"<code>[:<error_type>]": n}, "total"},
+ "by_cause": {"<abort_cause>": n},  // finished runs that did not complete
+ "data_quality": {"runs_without_map", "teleop_recorded": bool, "hours_excluded_runs",
+                  "max_run_s", "notes": [str]}}
+```
+
+Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-10-14.md`.
+
+**`TELEOP.SESSION_STARTED`** (event, info, source `api`): a robot obtained its LiveKit room
+token from the self-hosted token service. Payload `{role, room_hash, map_id, session_id,
+mission_name}` (no token, room name or identity); `run_id` is the robot's RUNNING mission.
+The token service tells the API over the loopback-only `POST /internal/teleop/token-issued`
+(not under `/api/`, not proxied).
+
 ---
 
 ### Detection Results

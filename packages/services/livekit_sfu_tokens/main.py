@@ -20,12 +20,12 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .server import (
     DASHBOARD_IDENTITY_PREFIX, DEFAULT_OPERATOR_TTL, InvalidIdentityError, LiveKitSfuTokenService,
-    MAX_NAME_LENGTH, ROLE_GRANTS, UnknownRoleError,
+    MAX_NAME_LENGTH, ROLE_GRANTS, UnknownRoleError, notify_token_issued,
 )
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response, configure_service_logging
@@ -105,14 +105,18 @@ async def health():
 
 
 @app.post("/api/createToken", response_model=CreateTokenResponse)
-async def create_token(request: CreateTokenRequest):
+async def create_token(request: CreateTokenRequest, background: BackgroundTasks):
     """Create a token whose permissions are decided by the requested role."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
-        return service.create_token(request.participantName, request.roomName, request.role)
+        result = service.create_token(request.participantName, request.roomName, request.role)
     except (UnknownRoleError, InvalidIdentityError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    # After the answer, best effort: the API records TELEOP.SESSION_STARTED (no token is sent).
+    background.add_task(notify_token_issued, request.role, request.participantName,
+                        request.roomName)
+    return result
 
 
 @app.post("/api/operator/createToken", response_model=CreateTokenResponse)

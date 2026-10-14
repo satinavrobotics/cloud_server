@@ -49,6 +49,15 @@ CAUSE_CODES: Tuple[CauseCode, ...] = (
     CauseCode("HW.SENSOR_FAULT", "HW", "Sensor fault", None),
     CauseCode("SW.NODE_CRASH", "SW", "Software node crash", "A robot software node died."),
     CauseCode("SYSTEM.THERMAL", "SYSTEM", "Overheating", "The robot's compute overheated."),
+    # Added 2026-10-14 (migration 20261014_01_run_cause_codes), for failure texts seen live.
+    CauseCode("SAFETY.REFLEX_LATCHED", "SAFETY", "Safety reflex latched",
+              "The robot's safety reflex stopped it and stayed latched."),
+    CauseCode("HW.BASE_NOT_RESPONDING", "HW", "Robot base not responding",
+              "The robot's base controller stopped reporting (e.g. no odometry)."),
+    CauseCode("DISPATCH.ORDER_NOT_ACCEPTED", "DISPATCH", "Order not accepted",
+              "The robot kept reporting another order and never adopted the dispatched one."),
+    CauseCode("MAP.NOT_PLACED", "MAP", "Robot not placed on the map",
+              "The robot has no placed session on the map of the route."),
     CauseCode(UNKNOWN, "UNKNOWN", "Unknown cause", "No rule matched."),
 )
 
@@ -112,6 +121,15 @@ class Rule:
 RULES: Tuple[Rule, ...] = (
     Rule("operator_canceled", "OPERATOR.CANCELED", lambda f: f.outcome == "CANCELED"),
     Rule("estop", "OPERATOR.ESTOP", lambda f: f.mentions(r"e-?stop|emergency[ _.-]?stop")),
+    Rule("safety_reflex", "SAFETY.REFLEX_LATCHED",
+         lambda f: "safetyreflexerror" in f.error_types or f.mentions(r"safety[ _-]?reflex")),
+    Rule("base_not_responding", "HW.BASE_NOT_RESPONDING",
+         lambda f: "robotbasenotreadyerror" in f.error_types
+         or f.mentions(r"robot base not responding")),
+    Rule("order_not_accepted", "DISPATCH.ORDER_NOT_ACCEPTED",
+         lambda f: f.mentions(r"did not accept the dispatched order")),
+    Rule("not_placed", "MAP.NOT_PLACED",
+         lambda f: f.mentions(r"not placed on map|no placed session")),
     Rule("heartbeat_lost", "COMMS.HEARTBEAT_LOST", lambda f: f.heartbeat_lost),
     Rule("low_battery", "POWER.LOW_BATTERY",
          lambda f: f.mentions(r"battery[ _.-]?(low|critical|empty)|low[ _.-]?battery")),
