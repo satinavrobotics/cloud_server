@@ -347,7 +347,9 @@ class MissionPlannerService:
 
         Never raises for a missing graph: the route comes back as it was, `changed` false and
         `node_policy.unavailable` saying why. {"waypoints", "inserted", "changed", "node_policy",
-        "graph_version"?}."""
+        "graph_version"?, "trajectory"?, "issues"?}. `issues` ([{from_index, to_index, reason}], reason
+        outside_graph | unreachable | error) lists the legs of the returned waypoints the planner could
+        not route; present (maybe empty) only when the plan ran with the leg cache (trajectory on)."""
         original = [w.copy() for w in waypoints]
         # Planned waypoints are dropped to be re-planned only when this call re-plans them: with
         # insert_planned off (a route paired with topomap ids must keep its length) or gap
@@ -420,9 +422,16 @@ class MissionPlannerService:
                 trajectory_legs = trajectory.capped(trajectory.from_routes(routes.nodes, poses), max_points)
             except Exception as err:  # pylint: disable=broad-except
                 self.logger.warning(f"Route enrich: trajectory not derived ({err!r})")
+        issues = []
+        if routes is not None:
+            for k in range(len(poses) - 1):
+                reason = routes.failed.get(((poses[k].x, poses[k].y), (poses[k + 1].x, poses[k + 1].y)))
+                if reason:
+                    issues.append({"from_index": k, "to_index": k + 1, "reason": reason})
         return {"waypoints": poses, "inserted": inserted,
                 "changed": [w.dict() for w in poses] != [w.dict() for w in original],
                 "node_policy": report, "graph_version": version,
+                **({"issues": issues} if routes is not None else {}),
                 **({"trajectory": trajectory_legs} if trajectory_legs else {})}
 
     def _node_policy_cfg(self, robot: Optional[robot_object.RobotObjectV1]

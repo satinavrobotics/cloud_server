@@ -411,6 +411,45 @@ Request exploration action for a robot.
 
 ---
 
+#### POST /api/v1/route/preview
+
+Dry-run preview of a route for the mission editor (docs/route_preview_2026-10-14.md). Runs the planner's route enrichment (the same
+call the dispatcher makes before a mission's first start) and returns the result; nothing is stored and no event is written.
+
+**Request:**
+```json
+{
+  "map_id": "office",
+  "waypoints": [{"x": 1.0, "y": 2.0, "theta": 0.0, "skippable": true, "max_wait_s": 10, "corridor_width_m": 0.3, "origin": "user"}],
+  "return": false,
+  "robot_name": "carter01"
+}
+```
+`map_id` and `waypoints` are required (map frame; every waypoint gets `map_id`). `return: true` appends the way back (the
+waypoints in reverse order, heading + pi, the last waypoint not repeated). `robot_name` (optional) gives the robot footprint width for
+corridor widths. Waypoints with `origin: "planned"` are dropped and re-planned.
+
+**Response (200):**
+```json
+{
+  "waypoints": [{"x": 1.0, "y": 2.0, "origin": null}, {"x": 4.0, "y": 2.0, "origin": "planned", "skippable": true, "corridor_width_m": 0.2}],
+  "trajectory": [{"from_index": 0, "to_index": 1, "points": [[1.0, 2.0], [4.0, 2.0]]}],
+  "node_policy": {"total": 1, "skippable": 1, "unavailable": null},
+  "issues": [{"from_index": 1, "to_index": 2, "reason": "unreachable"}],
+  "planner": "scene_graph",
+  "reason": null,
+  "graph_version": 12
+}
+```
+`trajectory` has the shape of the stored one (`[]` when none; a leg may be missing: draw it straight). `issues` lists the legs of
+`waypoints` the planner could not route (`outside_graph`, `unreachable`, `error`). `planner` is `scene_graph` or `none`; with `none` the
+waypoints come back as sent (return mirrored), `trajectory` and `issues` are empty and `reason` says why (`planner_unavailable`,
+`no_scene_graph`, `plan_timeout`, `disabled`, `error`). **Status:** 200 (also when the planner is down), 400 invalid body (empty
+waypoints, bad pose, non-finite value, unknown `origin`), 413 more than 100 waypoints (`ROUTE_PREVIEW_MAX_WAYPOINTS`), 422 missing
+`map_id`/`waypoints`. Time budget: `NODE_POLICY_ENRICH_TIMEOUT_S` (5 s).
+
+---
+
 ### Robot Management
 
 #### `GET /api/v1/robots`

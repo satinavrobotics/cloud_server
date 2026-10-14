@@ -24,6 +24,7 @@ import uvicorn
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin
 from packages.api import edge_stats, session_trace, sites
+from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
 from packages.api.mission_index import mission_ahead
@@ -1785,6 +1786,47 @@ async def _mission_queue_position(robot_name: str, mission_name: str):
         logging.getLogger("ApiDelegationService").warning(
             f"Queue position of {mission_name} unavailable: {err}")
         return None, None
+
+
+class RoutePreviewRequest(BaseModel):
+    """Dry-run route preview (docs/route_preview_2026-10-14.md)."""
+    map_id: str = Field(..., description="Map of the waypoints (their frame)")
+    waypoints: List[Dict[str, Any]] = Field(
+        ..., description="Pose2D waypoints in the map frame: x, y; optional theta, skippable, max_wait_s, "
+                         "corridor_width_m, origin (waypoints with origin 'planned' are dropped and re-planned)")
+    return_: bool = Field(False, alias="return", description="Append the way back: the waypoints mirrored "
+                          "(reverse order, heading + pi, the last waypoint is the turning point)")
+    robot_name: Optional[str] = Field(None, description="Robot whose footprint width sets the corridor widths")
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+class RoutePreviewResponse(BaseModel):
+    waypoints: List[Dict[str, Any]] = Field(..., description="The route as the dispatcher would store it (planned waypoints inserted, origin 'planned')")
+    trajectory: List[Dict[str, Any]] = Field(default_factory=list, description="[{from_index, to_index, points: [[x, y], ...]}] as on the stored route; [] when none; a leg may be missing")
+    node_policy: Dict[str, Any] = Field(..., description="{total, skippable, unavailable}")
+    issues: List[Dict[str, Any]] = Field(default_factory=list, description="[{from_index, to_index, reason}] legs the planner could not route: outside_graph | unreachable | error")
+    planner: str = Field(..., description="'scene_graph' or 'none' (no preview data: see reason)")
+    reason: Optional[str] = Field(None, description="Why planner is 'none': planner_unavailable | no_scene_graph | plan_timeout | disabled | error | ...")
+    graph_version: Optional[int] = None
+
+
+@app.post("/api/v1/route/preview", response_model=RoutePreviewResponse)
+async def route_preview(request: RoutePreviewRequest):
+    """
+    Dry-run preview of a route for the mission editor: the planner's enrichment (planned waypoints,
+    corridor widths, lattice trajectory, unroutable legs) WITHOUT storing anything. 400 for an invalid
+    route, 413 above ROUTE_PREVIEW_MAX_WAYPOINTS (100); a planner that is down or has no scene graph is a
+    200 with planner 'none' and a reason.
+    """
+    _require_service()
+    try:
+        result = await route_preview_module.preview(
+            service.mission_planner, request.map_id, request.waypoints, request.return_, request.robot_name)
+    except route_preview_module.PreviewError as err:
+        raise HTTPException(status_code=err.status, detail=err.detail)
+    return RoutePreviewResponse(**result)
 
 
 @app.post("/api/v1/navigate/waypoints", response_model=DirectWaypointsResponse)

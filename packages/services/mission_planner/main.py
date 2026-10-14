@@ -100,6 +100,7 @@ class EnrichResponse(BaseModel):
     changed: bool = Field(False, description="Whether the route differs from the request's")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="{total, skippable, unavailable}; see POST /api/v1/plan")
     graph_version: Optional[int] = None
+    issues: Optional[list] = Field(None, description="Legs of `waypoints` the planner could not route: [{from_index, to_index, reason}], reason 'outside_graph' | 'unreachable' | 'error'. Null when not computed (no scene graph, trajectory off)")
     trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
@@ -372,7 +373,7 @@ async def enrich_route(request: EnrichRequest):
         success=True, waypoints=[w.dict() for w in result["waypoints"]],
         inserted=result["inserted"], changed=result["changed"],
         node_policy=result.get("node_policy"), graph_version=result.get("graph_version"),
-        trajectory=result.get("trajectory"))
+        trajectory=result.get("trajectory"), issues=result.get("issues"))
 
 
 @app.get("/api/v1/missions/{mission_id}/plan", response_model=NavigationPlanResponse)
