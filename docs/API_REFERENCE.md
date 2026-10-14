@@ -1140,6 +1140,40 @@ days), optionally of one robot. 422 for `from >= to`; an unknown map answers zer
 
 Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-10-14.md`.
 
+**`GET /api/v1/maps/{map_id}/events-summary?from=&to=&robot=&limit=10`** -- the most usual events
+of the map and its safety events, as episodes (a repeated error counts once). Window `[from, to)`,
+default the last 30 days; `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
+an unknown map answers zeros. Cached 30 s.
+
+```
+{"map_id", "window": {"from", "to"}, "robot": null | str,
+ "total_episodes": int,
+ "by_severity": {"info"|"warning"|"error": n},
+ "top": [{"code": "NAV.RECOVERY_ENTERED" | "ROBOT.ERROR_RAISED:<error_type>" | ...,
+          "severity", "class": "safety_reflex|blocked|skipped|link_loss|recovery|error|other",
+          "count", "share": float|null, "last_ts": ISO-8601 UTC, "runs": n, "robots": [str]}],
+ "safety": {"episodes", "by_class": {"safety_reflex", "blocked", "skipped", "link_loss"},
+            "top": [same shape]},
+ "attribution": {"by_run", "by_session", "unattributed"},
+ "data_quality": {"notes": [str]}}
+```
+
+**`GET /api/v1/maps/{map_id}/events?from=&to=&code=&class=&scope=&robot=&limit=50&cursor=`** -- the
+same events one by one, newest first. `code` is one event code (`ROBOT.ERROR_RAISED[:error_type]`),
+`class` one of the classes above, `scope=safety` restricts to the four safety classes (`class` then
+filters further; a non-safety class gives an empty list), `limit` 1-200. Pass `next` back as `cursor`
+(keyset on `(ts, event_id)`); 422 for unknown code/class/scope or a bad cursor.
+
+```
+{"items": [{"ts", "event_id", "code", "error_type": str|null, "severity", "class", "robot",
+            "run_id": uuid|null, "session_id": uuid|null, "mission_name": str|null,
+            "detail": str|null, "attribution": "run"|"session"}],
+ "next": str|null}
+```
+
+Attribution, episode rule and the event universe: `docs/map_events_2026-10-14.md`. run-stats'
+`safety` uses the same helper.
+
 **`TELEOP.SESSION_STARTED`** (event, info, source `api`): a robot obtained its LiveKit room
 token from the self-hosted token service. Payload `{role, room_hash, map_id, session_id,
 mission_name}` (no token, room name or identity); `run_id` is the robot's RUNNING mission.

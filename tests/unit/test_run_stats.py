@@ -66,6 +66,13 @@ class FakeDb:
 
 
 def stats_respond(sql, params):
+    if "FROM att WHERE map" in sql:
+        T = T0
+        return [("ROBOT.ERROR_RAISED", "safetyReflexError", "error", 2, T, 1, ["r1"]),
+                ("MISSION.EDGE_BLOCKED", "", "warning", 3, T, 1, ["r1"]),
+                ("NAV.GOAL_BLOCKED", "", "warning", 4, T, 1, ["r1"]),
+                ("MISSION.NODE_SKIPPED", "", "warning", 1, T, 1, ["r1"]),
+                ("ROBOT.HEARTBEAT_LOST", "", "error", 1, T, 0, ["r1"])]
     if "GROUP BY state" in sql:
         return [("COMPLETED", 73), ("FAILED", 5), ("CANCELED", 10)]
     if "FILTER (WHERE state = 'COMPLETED')" in sql:
@@ -84,10 +91,6 @@ def stats_respond(sql, params):
         return [(70,)]
     if "FROM run_legs" in sql:
         return [(100, 10, 4.0, 40.0, 100.0, 1000.0)]
-    if "UNION ALL" in sql:
-        return [("ROBOT.ERROR_RAISED", "safetyReflexError", 2), ("MISSION.EDGE_BLOCKED", None, 3),
-                ("NAV.GOAL_BLOCKED", None, 4), ("MISSION.NODE_SKIPPED", None, 1),
-                ("ROBOT.HEARTBEAT_LOST", None, 1)]
     if "map_id IS NULL" in sql:
         return [(0,)]
     raise AssertionError(sql)
@@ -124,7 +127,7 @@ async def test_no_runs_gives_nulls_not_errors():
             return [(None, None, None, 0)]
         if "FROM run_legs" in sql:
             return [(0, 0, None, None, 0, 0)]
-        if "UNION ALL" in sql:
+        if "FROM att WHERE map" in sql:
             return []
         if "SELECT min(ts)" in sql:
             return [(None,)]

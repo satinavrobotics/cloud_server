@@ -22,7 +22,7 @@ map (`runs_without_map`) belong to no map.
 | rate_per_hour | interventions / hours |
 | duration_s | median and P95 of `ended_at - started_at` over COMPLETED runs; `timeout` separately (count, median) |
 | recovery | over the legs of the scope's runs: median/P95 of `recovery_s` for legs with `recoveries > 0`; `share_of_time` = sum(recovery_s)/sum(duration_s); `share_of_legs` = legs with recovery / legs |
-| safety | events counted by `SAFETY_CLASSES` in `run_stats.py`: `ROBOT.ERROR_RAISED` with `error_type` `safetyReflexError` (safety_reflex); `MISSION.EDGE_BLOCKED`, `NAV.GOAL_BLOCKED` (blocked); `MISSION.NODE_SKIPPED` (skipped); `ROBOT.HEARTBEAT_LOST` (link_loss). Attributed by `run_id`, or for events without one by robot and time inside a run of the scope. No collision or geofence data is invented. |
+| safety | safety EPISODES of the map with event `ts` in `[from, to)` (not by run start), attributed and counted as in docs/map_events_2026-10-14.md (run, else the robot's open map session; a repeated `ROBOT.ERROR_RAISED` counts once until cleared). Classes (`SAFETY_CLASSES`, `map_events.py`): `ROBOT.ERROR_RAISED` `safetyReflexError` (safety_reflex); `MISSION.EDGE_BLOCKED`, `NAV.GOAL_BLOCKED` (blocked); `MISSION.NODE_SKIPPED` (skipped); `ROBOT.HEARTBEAT_LOST` (link_loss). No collision or geofence data is invented. |
 | by_cause | `abort_cause` of finished runs that did not complete (null = UNKNOWN) |
 
 ## Teleop signal
