@@ -71,10 +71,23 @@ waypoints?" can be answered from production data.
 
 * Budget statistic (decided): **mean length increase <= 5%** against the kappa 0 route (the extra driving per mission, additive,
   stable at n = 120); tail guard **p90 <= 10%**.
-* Fleet default **0.75** meets both on all four maps (office8 mean 3.8%, p90 7.5%; office7 4.6%, 9.2%; office6 4.6%, 9.2%;
-  Hospital 0.9%, 4.7%) and reduces robot cost per metre by 39 / 39 / 39 / 60%.
-* Per (map, robot profile): the largest grid value (0.25, 0.5, 0.75, 1, 1.5, 2) meeting both rules, capped at 2.
-  A sweep takes seconds per map; it is run when the graph version or the robot profile changes and stored with the profile.
+* The result depends on where the profile starts. The first sweep (`sweep.py`) started the exponential at the map's inscribed
+  radius 0.25 m and gave a fleet default of 0.75. The robot's global costmap starts it at its own inscribed radius `r_global`
+  (0.30 m with `footprint_padding` 0.05; section 11), which prices more cells. Re-run with the origin at 0.30 (`sweep30.py`,
+  `budget30.py`), same 120 pairs per map:
+
+| kappa | office8 mean / p90 | office7 mean / p90 | office6 mean / p90 | Hospital mean / p90 | robot cost reduction (office / Hospital) |
+|---|---|---|---|---|---|
+| 0.50 | 3.3% / 7.0% | 4.2% / 8.6% | 4.4% / 9.6% | 0.9% / 4.4% | 33% / 56% |
+| 0.75 | 5.2% / 9.9% | 5.9% / 12.0% | 6.2% / 12.3% | 1.3% / 5.0% | 42% / 68% |
+| 1.00 | 6.7% / 12.7% | 7.0% / 13.5% | 7.6% / 14.6% | 1.8% / 6.5% | 47% / 75% |
+
+* **Fleet default 0.5** meets both rules on all four maps with the origin at `r_global` = 0.30 (0.75 meets them only with the
+  origin at 0.25: it exceeds the mean budget on the three office maps, 5.2 / 5.9 / 6.2%).
+* Per (map, robot profile): the largest grid value (0.25, 0.5, 0.75, 1, 1.5, 2) meeting both rules, capped at 2; Hospital allows
+  2 and above (the budget does not bind in open space). A sweep takes seconds per map; it is run when the graph version or the
+  robot profile changes and stored with the profile. The origin of the exponent is part of the profile (`r_global`), so a change of
+  padding changes the calibrated kappa.
 
 ## 6. Gates (changes to the acceptance harness)
 
