@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from cloud_common.objects import common
-from packages.services.mission_planner import node_policy_plan
+from packages.services.mission_planner import node_policy_plan, trajectory
 
 Pt = Tuple[float, float]
 
@@ -222,6 +222,9 @@ class ChartPlan:
     # clearance pricing of this plan: {kappa, margin, rate, margin_source ("factsheet" | "map_r"), cost (Route.cost), exact
     # (the route call's own flag)}; None when the plan is not priced
     pricing: Optional[Dict[str, Any]] = None
+    # the lattice path cut per leg (trajectory.split): [{from_index, to_index, points}], None when off, over the cap
+    # or not derivable
+    trajectory: Optional[List[Dict[str, Any]]] = None
 
 
 class BoundedPool:
@@ -806,14 +809,14 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                   robot_length_m: Optional[float] = None,
                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
-                  width_check: bool = True) -> ChartPlan:
+                  width_check: bool = True, trajectory_max_points: int = 0) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
     try:
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
-                              node_policy_cfg, safety_kappa, width_check)
+                              node_policy_cfg, safety_kappa, width_check, trajectory_max_points)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -825,7 +828,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    robot_width_m: Optional[float] = None, width_margin_m: float = 0.0,
                    robot_length_m: Optional[float] = None,
                    node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
-                   width_check: bool = True) -> ChartPlan:
+                   width_check: bool = True, trajectory_max_points: int = 0) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -839,7 +842,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     `safety_kappa` > 0 prices the route's clearance (`safety_for`: it needs the graph's `deficit_cell` and a margin
     above the map's inscribed radius; otherwise the route is the shortest, as with 0) and makes the line of sight
     cost-aware (`priced_visible`); the footprint (`robot_width_m`, `robot_length_m`) then gives the margin even with
-    `width_check` False, which only gates the `too_narrow` comparison."""
+    `width_check` False, which only gates the `too_narrow` comparison. `trajectory_max_points` > 0 adds
+    `ChartPlan.trajectory`, the lattice path cut at the output waypoints (omitted when it has more points)."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -880,6 +884,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     # The lattice route runs from the snapped start cell to the snapped goal cell (point to point); the
     # prepend/append only matters when an end falls back to its chart anchor.
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
+    lattice = list(pts)                    # the dense path, before the waypoints are picked from it
     visible = blocked_free_los(graph, overlay)
     if safety is not None:
         visible = priced_visible(visible, graph, pts, safety)
@@ -908,6 +913,13 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)], allow_repeats=True)
     if planned is None:
         raise ChartFallback("waypoints_without_distinct_leaf_ids")
+    legs = None
+    if trajectory_max_points > 0:
+        try:
+            legs = trajectory.capped(trajectory.split(lattice, [(p.x, p.y) for p in poses]),
+                                     trajectory_max_points)
+        except Exception as err:  # pylint: disable=broad-except
+            _log.warning("trajectory not derived (%s)", err)
     report = None
     if node_policy_cfg is not None:
         report = node_policy_plan.annotate_corridors(
@@ -922,4 +934,5 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    "exact": bool(getattr(route, "exact", True))}
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
-                     repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing)
+                     repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
+                     trajectory=legs)

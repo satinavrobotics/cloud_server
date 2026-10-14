@@ -122,6 +122,11 @@ class NavigationResponse(BaseModel):
                           "the go-to starts when that one has finished")
     error: Optional[str] = None
     failed_at: Optional[str] = None
+    trajectory: Optional[List[Dict[str, Any]]] = Field(
+        None, description="The planner's dense path per leg between the go-to route's consecutive waypoints: "
+                          "[{from_index, to_index, points: [[x, y], ...]}], map frame. Display data; a leg may be "
+                          "missing (draw it straight); absent for the legacy planner. The same data is stored on the "
+                          "mission's route node (mission_tree[].route.trajectory)")
 
 
 class DirectWaypointsRequest(BaseModel):

@@ -524,8 +524,9 @@ def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
     # Unset optional waypoint fields are left out, so adding one to Pose2D does not
     # change the digest of a route stored before it existed (a mission in flight at
     # deploy would otherwise read as rerouted and its progress be ignored).
+    # `trajectory` is display data (the planner's dense path): adding or refreshing it must not read as a reroute.
     return hashlib.sha1(
-        route.json(sort_keys=True, exclude_none=True).encode()).hexdigest()[:16]
+        route.json(sort_keys=True, exclude_none=True, exclude={"trajectory"}).encode()).hexdigest()[:16]
 
 
 # Precomputed once: handle_instant_action() and _order_action_state() test every action
@@ -985,7 +986,8 @@ class Robot:
                 map_id=goal.get("map_id"), robot_x=pose.x, robot_y=pose.y)
             if not plan.get("success") or not plan.get("waypoints"):
                 raise RuntimeError(plan.get("error") or "the planner returned no route")
-            route = mission_object.MissionRouteNodeV1(waypoints=plan["waypoints"])
+            route = mission_object.MissionRouteNodeV1(waypoints=plan["waypoints"],
+                                                      trajectory=plan.get("trajectory"))
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not replan the go-to ({err}); "
                          "using the route stored when it was submitted")
@@ -1046,7 +1048,8 @@ class Robot:
                 result = await planner.enrich_route(
                     self._name, next(iter(maps)), [w.dict() for w in waypoints],
                     insert_planned=insert, timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
-                route = mission_object.MissionRouteNodeV1(waypoints=result["waypoints"])
+                route = mission_object.MissionRouteNodeV1(waypoints=result["waypoints"],
+                                                          trajectory=result.get("trajectory"))
                 report = result.get("node_policy") or {}
                 inserted = int(result.get("inserted") or 0)
             except Exception as err:  # pylint: disable=broad-except
@@ -1061,7 +1064,8 @@ class Robot:
                 self.mission_info(f"Route {node.name} was edited while it was enriched; "
                                   "not applying the planner's answer")
                 continue
-            if result.get("changed") and route != node.route:
+            # a trajectory alone (waypoints as they were) is also worth storing
+            if (result.get("changed") or route.trajectory) and route != node.route:
                 node.route = route
                 changed = True
             self.mission_info(
@@ -1910,8 +1914,10 @@ class Robot:
             changed = []
             for new_node in message.mission_tree:
                 for n in mission.mission_tree:
+                    # waypoints only: the trajectory is display data (a client that does not know it
+                    # sends the route without it)
                     if n.name == new_node.name and new_node.route is not None and \
-                            n.route != new_node.route:
+                            n.route.waypoints != new_node.route.waypoints:
                         self._note_replaced_route(n)
                         n.route = new_node.route
                         changed.append(str(n.name))

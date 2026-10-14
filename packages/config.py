@@ -601,6 +601,11 @@ NODE_POLICY_SKIP_ENABLED = _env_bool("NODE_POLICY_SKIP_ENABLED", "true")
 NODE_POLICY_GAP_FILL_ENABLED = _env_bool("NODE_POLICY_GAP_FILL_ENABLED", "true")
 NODE_POLICY_WIDTH_BUDGET_S = float(os.getenv("NODE_POLICY_WIDTH_BUDGET_S", "1.0"))
 NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "5.0"))
+# The planner's dense lattice path per leg between the waypoints (docs/plan_trajectory_2026-10-14.md), returned with a plan
+# and stored on the mission's route for the client to draw. MAX_POINTS: cap on the points of one route's trajectory (after
+# straight runs are collapsed); over it the trajectory is omitted, never truncated. Display data only, never sent to the robot.
+PLAN_TRAJECTORY_ENABLED = _env_bool("PLAN_TRAJECTORY_ENABLED", "true")
+PLAN_TRAJECTORY_MAX_POINTS = int(os.getenv("PLAN_TRAJECTORY_MAX_POINTS", "3000"))
 # Clearance pricing of the scene-graph route (docs/scene_graph/route_safety.md). KAPPA is the cost multiplier added at the
 # inscribed floor (a cell whose clearance is the map's robot half side costs 1 + KAPPA times its length; cells at or above
 # the planning robot's circumscribed radius cost their length); 0 disables the pricing (the shortest route). Out of range:

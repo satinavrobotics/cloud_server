@@ -23,6 +23,16 @@ UNAVAILABLE_LEGACY = "legacy_planner"
 UNAVAILABLE_DISABLED = "disabled"
 
 
+class LegRoutes:
+    """What one planning call learned about its legs, so no leg is routed twice and the trajectory costs no route
+    call of its own: `nodes[(a, b)]` is the lattice path from waypoint xy `a` to `b` (the engine's route, or the
+    piece of a longer one that a planned waypoint cut), `widths[(a, b)]` its `Route.min_width` (None: no route)."""
+
+    def __init__(self) -> None:
+        self.nodes: Dict[Tuple[Pt, Pt], List[Pt]] = {}
+        self.widths: Dict[Tuple[Pt, Pt], Optional[float]] = {}
+
+
 def corridor_per_side(width: Optional[float], robot_width: Optional[float],
                       margin: float = 0.0) -> Optional[float]:
     """The `corridorWidth` (per side of the edge) for a passage of full physical width `width`:
@@ -56,7 +66,11 @@ def leg_widths(graph: Any, pts: Sequence[Pt], snap_m: float, budget_s: float = 0
     return out
 
 
-def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None) -> Optional[float]:
+def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None,
+               routes: Optional[LegRoutes] = None) -> Optional[float]:
+    key = ((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
+    if routes is not None and key in routes.widths:
+        return routes.widths[key]
     try:
         sa = graph.snap(a[0], a[1], snap_m)
         sb = graph.snap(b[0], b[1], snap_m)
@@ -67,14 +81,20 @@ def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None) -> O
         if route is None:
             return None
         width = float(route.min_width)
-        return width if math.isfinite(width) and width > 0 else None
+        width = width if math.isfinite(width) and width > 0 else None
+        if routes is not None:
+            routes.widths[key] = width
+            if route.nodes and key not in routes.nodes:
+                routes.nodes[key] = [tuple(p) for p in route.nodes]
+        return width
     except Exception:  # pylint: disable=broad-except
         return None
 
 
 def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Iterable[int],
                        robot_width: Optional[float], margin: float, snap_m: float,
-                       budget_s: float = 0.0, keep_intent: bool = False, safety: Any = None) -> Dict[str, Any]:
+                       budget_s: float = 0.0, keep_intent: bool = False, safety: Any = None,
+                       routes: Optional[LegRoutes] = None) -> Dict[str, Any]:
     """Make the `candidates` (waypoint indexes that should be skippable) skippable where the scene
     graph says how much room there is: sets `skippable` and `corridor_width_m` on those poses. A
     waypoint that already carries its own `corridor_width_m` keeps it. The last waypoint, and a
@@ -83,7 +103,8 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
     becomes `skippable=False`, except an operator's waypoint with `keep_intent`: it keeps its
     `skippable=True` (the editor shows what the operator asked; the dispatcher sends it not
     skippable and logs it). Returns
-    {"total": candidates, "skippable": how many are, "unavailable": reason or None}."""
+    {"total": candidates, "skippable": how many are, "unavailable": reason or None}. With `routes`, a leg
+    already routed is not routed again, and the legs routed here are added to it."""
     last = len(poses) - 1
     wanted = sorted({i for i in candidates if 0 <= i < last})
     # Only the legs next to a candidate that has no corridor of its own are routed.
@@ -99,7 +120,7 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                 widths[leg] = None
                 continue
             widths[leg] = _leg_width(graph, (poses[leg].x, poses[leg].y),
-                                     (poses[leg + 1].x, poses[leg + 1].y), snap_m, safety)
+                                     (poses[leg + 1].x, poses[leg + 1].y), snap_m, safety, routes)
     reason: Optional[str] = None
     done = 0
     for i in wanted:
@@ -127,21 +148,22 @@ def _bearing(a: Pt, b: Pt) -> float:
 
 def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt, Pt], bool],
                    max_gap: float, snap_m: float, simplify: Callable[..., List[Pt]],
-                   safety: Any = None) -> Tuple[List[common.Pose2D], int]:
+                   safety: Any = None, routes: Optional[LegRoutes] = None) -> Tuple[List[common.Pose2D], int]:
     """`poses` with planned waypoints between every two consecutive ones that are not in the same
     or a neighbouring chart. The planned points come from the engine's route between the two, cut
     (line of sight, gap cap) so that each consecutive pair touches at most two charts; they are
     `origin="planned"`, `skippable=True` (the caller adds the corridors) and take no field of
     the operator's waypoints. Pairs that do not snap or route are left as they are. Returns
     (new list, number inserted); the input is not modified. With `safety` the route and the cut use the
-    planner's clearance pricing (the cut accepts a shortcut only if it costs no more than the lattice path)."""
+    planner's clearance pricing (the cut accepts a shortcut only if it costs no more than the lattice path).
+    With `routes` the lattice path of every pair routed here is recorded, cut at the planned points."""
     out: List[common.Pose2D] = []
     inserted = 0
     for k, pose in enumerate(poses):
         out.append(pose)
         if k + 1 >= len(poses):
             break
-        extra = _between(graph, pose, poses[k + 1], visible, max_gap, snap_m, simplify, safety)
+        extra = _between(graph, pose, poses[k + 1], visible, max_gap, snap_m, simplify, safety, routes)
         for j, (x, y) in enumerate(extra):
             nxt = extra[j + 1] if j + 1 < len(extra) else (poses[k + 1].x, poses[k + 1].y)
             out.append(common.Pose2D(
@@ -153,17 +175,27 @@ def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt
 
 def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
              visible: Callable[[Pt, Pt], bool], max_gap: float, snap_m: float,
-             simplify: Callable[..., List[Pt]], safety: Any = None) -> List[Pt]:
+             simplify: Callable[..., List[Pt]], safety: Any = None,
+             routes: Optional[LegRoutes] = None) -> List[Pt]:
     try:
         sa = graph.snap(a.x, a.y, snap_m)
         sb = graph.snap(b.x, b.y, snap_m)
-        if sa.key is None or sb.key is None or sa.key == sb.key:
+        # a pair in one chart gets no planned waypoint, but with `routes` it is routed once for its trajectory
+        # (the width of its leg needs the same route)
+        if sa.key is None or sb.key is None or (sa.key == sb.key and routes is None):
             return []
         route = graph.route(sa.key, sb.key, None, start=(sa.x, sa.y), goal=(sb.x, sb.y),
                             **({} if safety is None else {"safety": safety}))
-        if route is None or len(set(route.charts)) <= 2:
+        if route is None:
             return []
         nodes = [tuple(p) for p in route.nodes]
+        whole = ((a.x, a.y), (b.x, b.y))
+        if routes is not None and nodes:
+            routes.nodes[whole] = nodes
+            width = float(route.min_width)
+            routes.widths[whole] = width if math.isfinite(width) and width > 0 else None
+        if sa.key == sb.key or len(set(route.charts)) <= 2:
+            return []
         owners = [graph.snap(x, y).key for (x, y) in nodes]
     except Exception:  # pylint: disable=broad-except
         return []
@@ -182,4 +214,12 @@ def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
         from packages.services.mission_planner import scene_route    # not at module level: scene_route imports this module
         visible = scene_route.priced_visible(visible, graph, nodes, safety)
     kept = simplify(nodes, lambda p, q: window_ok(p, q) and visible(p, q), max_gap)
+    if routes is not None and len(kept) > 2:
+        # the whole-route entry is replaced by its pieces; the widths of the pieces are not known
+        routes.nodes.pop(whole, None)
+        routes.widths.pop(whole, None)
+        stops = [(a.x, a.y)] + [tuple(p) for p in kept[1:-1]] + [(b.x, b.y)]
+        cuts = [0] + [index[tuple(p)] for p in kept[1:-1]] + [len(nodes) - 1]
+        for k in range(len(stops) - 1):
+            routes.nodes[(stops[k], stops[k + 1])] = nodes[cuts[k]:cuts[k + 1] + 1]
     return [tuple(p) for p in kept[1:-1]]

@@ -19,7 +19,7 @@ from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import blocked_geometry, blocked_nodes
 from packages import config
-from packages.services.mission_planner import node_policy_plan, scene_route
+from packages.services.mission_planner import node_policy_plan, scene_route, trajectory
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -294,7 +294,8 @@ class MissionPlannerService:
                 self._robot_width(robot),
                 config.SCENE_GRAPH_WIDTH_MARGIN_M,
                 self._robot_length(robot),
-                self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width))
+                self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width,
+                config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -331,6 +332,7 @@ class MissionPlannerService:
             "graph_version": version,
             **({"pricing": plan.pricing} if plan.pricing is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
+            **({"trajectory": plan.trajectory} if plan.trajectory else {}),
         }, None
 
     async def enrich_route(
@@ -381,19 +383,22 @@ class MissionPlannerService:
         safety = scene_route.safety_for(graph, robot_width, self._robot_length(robot),
                                         config.SCENE_GRAPH_SAFETY_KAPPA)    # the planner's clearance pricing
 
+        max_points = config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0
+        routes = node_policy_plan.LegRoutes() if max_points > 0 else None
+
         def work() -> Tuple[List[common.Pose2D], int, Dict[str, Any]]:
             poses, inserted = base, 0
             if gap_fill:
                 visible = scene_route.blocked_free_los(graph, ([], []))
                 poses, inserted = node_policy_plan.insert_planned(
                     graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
-                    scene_route.simplify, safety)
+                    scene_route.simplify, safety, routes)
             wanted = [i for i, w in enumerate(poses[:-1])
                       if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
             if wants_corridor:
                 rep = node_policy_plan.annotate_corridors(
                     graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
-                    config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety)
+                    config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes)
             else:
                 rep = {"total": len(wanted), "skippable": 0,
                        "unavailable": node_policy_plan.UNAVAILABLE_DISABLED}
@@ -409,9 +414,16 @@ class MissionPlannerService:
         except Exception as err:  # pylint: disable=broad-except
             self.logger.warning(f"Route enrich failed ({err!r}); route left as it is")
             return unchanged("error")
+        trajectory_legs = None
+        if routes is not None:
+            try:
+                trajectory_legs = trajectory.capped(trajectory.from_routes(routes.nodes, poses), max_points)
+            except Exception as err:  # pylint: disable=broad-except
+                self.logger.warning(f"Route enrich: trajectory not derived ({err!r})")
         return {"waypoints": poses, "inserted": inserted,
                 "changed": [w.dict() for w in poses] != [w.dict() for w in original],
-                "node_policy": report, "graph_version": version}
+                "node_policy": report, "graph_version": version,
+                **({"trajectory": trajectory_legs} if trajectory_legs else {})}
 
     def _node_policy_cfg(self, robot: Optional[robot_object.RobotObjectV1]
                          ) -> Optional[Dict[str, Any]]:
@@ -907,6 +919,7 @@ class MissionPlannerService:
         mode: mission_object.MissionMode = mission_object.MissionMode.MAPPED,
         register_map: bool = True,
         goal: Optional[Dict[str, Any]] = None,
+        trajectory: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[Optional[mission_object.MissionObjectV1], Optional[str]]:
         """
         Create a mission object with waypoints.
@@ -941,7 +954,7 @@ class MissionPlannerService:
                     name="navigate_to_target",
                     parent="root",
                     route=mission_object.MissionRouteNodeV1(
-                        waypoints=waypoints
+                        waypoints=waypoints, trajectory=trajectory
                     )
                 )
             ]
@@ -1320,6 +1333,7 @@ class MissionPlannerService:
             planned_path=path,
             register_map=register_map,
             goal=goal,
+            trajectory=result.get("trajectory"),
         )
         if error:
             result["error"] = error

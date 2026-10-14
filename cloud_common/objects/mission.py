@@ -138,6 +138,23 @@ class MissionConstantNodeV1(pydantic.BaseModel):
         True, description="The node's initial state, either True or False, upon activation.")
 
 
+TRAJECTORY_END_TOL_M = 0.02
+
+
+class RouteTrajectoryLegV1(pydantic.BaseModel):
+    """The planner's dense path from waypoint `from_index` to waypoint `to_index` (indexes into
+    the route node's waypoints), as [x, y] map-frame points, cm-rounded, direction changes only."""
+    from_index: int
+    to_index: int
+    points: List[List[float]]
+
+    @pydantic.validator("points")
+    def _points_are_pairs(cls, value):
+        if len(value) < 2 or any(len(p) != 2 for p in value):
+            raise ValueError("a trajectory leg needs >= 2 [x, y] points")
+        return value
+
+
 class MissionRouteNodeV1(pydantic.BaseModel):
     """
     This route leaf node specifies a sequence of waypoints that the robot should execute.
@@ -149,10 +166,37 @@ class MissionRouteNodeV1(pydantic.BaseModel):
     """
     waypoints: List[common.Pose2D] = pydantic.Field(
         description="Describes a list of pose2D waypoints")
+    trajectory: Optional[List[RouteTrajectoryLegV1]] = pydantic.Field(
+        default=None,
+        description="Display data, never sent to the robot: the planner's dense path between "
+                    "consecutive waypoints, one entry per leg it knows (docs/plan_trajectory_2026-10-14.md). "
+                    "Legs whose ends no longer match their waypoints are dropped on load.")
 
     @property
     def size(self):
         return len(self.waypoints)
+
+    @pydantic.root_validator(skip_on_failure=True)
+    def _drop_stale_trajectory(cls, values):
+        """A leg whose index pair is out of range or whose ends are not at its waypoints (the
+        route was edited by a client that kept the old trajectory) is dropped, never an error."""
+        legs = values.get("trajectory")
+        waypoints = values.get("waypoints")
+        if not legs:
+            values["trajectory"] = None
+            return values
+        kept = []
+        for leg in legs:
+            i, j = leg.from_index, leg.to_index
+            if not (0 <= i < j < len(waypoints)):
+                continue
+            a, b = waypoints[i], waypoints[j]
+            first, last = leg.points[0], leg.points[-1]
+            if abs(first[0] - a.x) <= TRAJECTORY_END_TOL_M and abs(first[1] - a.y) <= TRAJECTORY_END_TOL_M \
+                    and abs(last[0] - b.x) <= TRAJECTORY_END_TOL_M and abs(last[1] - b.y) <= TRAJECTORY_END_TOL_M:
+                kept.append(leg)
+        values["trajectory"] = kept or None
+        return values
 
     @pydantic.validator("waypoints")
     def _validate_at_least_one_waypoint(cls, value):
