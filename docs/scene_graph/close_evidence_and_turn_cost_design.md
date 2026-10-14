@@ -142,6 +142,19 @@ Recommendation: option 1. The largest component is the stairs and a per-cell con
 the stairs free, so the extra parameter buys ghost protection at the price of the hazard it is meant for. The ghost cost of
 option 1 is real but not demonstrated on this map: the other 14 components are small (404 cells, 1.0 m2 in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
 
+### A.6b Prototype in the engine (branch `proto/close-evidence-plane`, tip a54f576, local)
+
+One commit on main cac9f03, not pushed: `SceneParams.near_range_m` and `near_fov_deg` (both None = off, bit-identical to today);
+a new int64 plane `Fn` (allocated only when on; grown, shifted and cropped like `B`); `_fold_into(..., Fn, pose)`; `_build_F`
+excludes cells with `B >= 0 and B > Fn` from `free` (the driven-witness logic unchanged); a tile plane `fn` and params in the
+manifest. Format decision of the prototype: `FORMAT` stays 4, a rule-on store adds the `fn` tile plane and carries the params;
+`PIPELINE` is `morse/2` off and `morse/2+near1` on; a rule-off store is byte-identical to today's; a mismatch in either direction
+raises a `ValueError` naming `near_range_m` at `import_state`. `tools/scene_graph_check_generation.py` compares the manifest
+pipeline to `PIPELINE` and would flag a rule-on manifest (not changed). It reproduces the replay exactly (free cells 21518, turn
+blocked 2685, navigable 2143 -> 1889; with a 95 degree cone 3520 and 2143 -> 1757). Tests: 8 new (rule off identical, 4 arrival
+orders x 3 batch sizes identical, the four semantic cases plus tie and cone, store round trip and both mismatch errors); full pinned
+suite 4669 passed, 4 skipped. The branch is a prototype: it is **not** to be merged without Laci's explicit go.
+
 ### A.7 What is not shown
 
 Only office8, one session. No other map's leaf data was used. The rule was replayed, not run in the engine. `r_det` is not read
@@ -160,8 +173,7 @@ the lattice step (a bending energy `kappa^2` of a polyline corner would). `lambd
 rotating (J = v * T for a stop-and-turn robot); MPPI blends turns, so it is an upper bound. The previous bounds B1/B2 carry an
 added `lambda * total turning of the length optimum` term.
 
-Until Laci supplies `v_nom` and `omega_max`, the working range is lambda 0.25 to 1.0 m/rad (0.5 corresponds to 0.5 m/s over 1 rad/s,
-an assumption, not a robot value).
+Lambda is a per-robot value, see B.6. No speed is hard-coded; the 0.5 m/rad of the prototypes is a sweep value, not a robot value.
 
 ### B.2 Prototype results (office8, 150 pairs seed 7, kappa 1 hinge, research lattice, then the production string pull)
 
@@ -229,20 +241,60 @@ Measured (`tools/scene_graph_sim/turn_cost_restricted.py`, research lattice, sci
 The restricted result equals the whole-graph expanded optimum in every comparison (0 mismatches). Without the band the incumbent
 is loose (median 1.6 m above the optimum, because the plain route zigzags) and the ellipse is larger (office8 83% of the map).
 
-On the 117k-cell map the exact stage is above the 0.3 s allowance for long routes (p95 481 ms); only the median fits. There is
-no exact cut beyond the ellipse. The options, with their cost:
+Laci's decision (2026-10-14): the search time allowance is 0.5 s and the search is exact, no cap and no band. The plain
+euclidean ellipse is not enough on the largest map (pairs >= 30 m: stage p95 557 ms, max 585 ms, 10 of 30 plans above 0.5 s). The
+exact fix is a tighter ellipse built from **priced graph distances**:
 
-| option | exact | time (117k cells, ms) | cost above the optimum | notes |
-|---|---|---|---|---|
-| exact ellipse (above) | yes | p50 190, p95 481 | 0 | fine on every real map measured; a 40 m route on a 100k-cell map exceeds the allowance |
-| band only (cells within 0.3 m of P0), flagged inexact like the priced corridor seed | no | p50 31, p95 41, max 48 | median 0, p95 0.5 m, max 0.79 m of cost; equal in 9 of 15 | same `exact` flag the priced search already exposes |
-| exact ellipse for routes whose ellipse is below a cell cap, band otherwise | exact when small | bounded by the cap | 0 below the cap | one more number (the cap); not measured |
+`E = {c : d(s,c) + d(c,t) <= J_inc}`, d the plain priced distance (two plain searches, which the production priced search
+already needs one of). Exact: a path of total cost <= J_inc through c costs at least d(s,c) + d(c,t), because the turn term is
+non-negative. It is much tighter than the euclidean ellipse in a cluttered map.
 
-Transient memory: the expanded CSR of the ellipse, about 2.2 M edges (about 25 MB) at the median on the 117k-cell map and 1.5 MB at
-the office8 size; concurrent plans multiply it (`plan_inflight`).
+Worst case re-measured on the synthetic 50 x 25 m map (117 070 cells), pairs >= 30 m apart (median 33.5 m, max 46.8 m), with the
+band incumbent and the graph-distance ellipse, lambda 0.5, whole plan = plain whole-graph search + restricted stage:
+
+| | ellipse cells median / p95 | restricted stage p50 / p95 / p99 / max (ms) | whole plan p50 / p95 / p99 / max (ms) | above 0.5 s | optimum equal to the whole-graph expanded search |
+|---|---|---|---|---|---|
+| euclidean ellipse (before) | 62 067 / 103 897 | 346 / 557 / 578 / 585 | 374 / 582 / 598 / 603 | 10 of 30 | not run |
+| **graph-distance ellipse (exact)** | 26 168 / 45 496 | 195 / 279 / 320 / 337 | 216 / 296 / 337 / 354 | **0 of 30** | 12 of 12 (second run) |
+| Hospital (17 114 cells, graph-distance) | 1 502 / 4 920 | 13 / 34 / 41 / 43 | 15 / 35 / 43 / 45 | 0 of 30 | 30 of 30 |
+
+On the largest map the worst case is 354 ms of the 500 ms allowance (the plain search is whole-graph here; the production corridor
+seed makes it cheaper). Research lattice, scipy, build of the expanded CSR in numpy per request; the production lazy reader is not
+measured, and tile reads come on top (cold). Transient memory is the expanded CSR of the ellipse: about 1.7 M edges (about 20 MB)
+at the median on the 117k-cell map.
+
+Concurrent plans multiply the transient memory (`plan_inflight`); not measured.
 
 Not measured here: the production engine and lazy reader (no `PlanGraph` integration), real corridor seeding, cold tile reads,
 the turn term inside `priced_visible` for the pull.
+
+### B.6 Lambda per robot, from registration
+
+Fields (robot object `status.factsheet`, `cloud_common/objects/robot.py::RobotTypeIdentifierV1`, stored as reported by
+`FACTSHEET_PHYSICAL_FIELDS`; -1 until the robot has sent them):
+
+| field | VDA5050 | use |
+|---|---|---|
+| `speed_max` (m/s) | `physicalParameters.speedMax` | v |
+| `angular_speed_max` (rad/s) | `physicalParameters.angularSpeedMax` (VDA5050 2.1) | omega |
+
+`lambda = speed_max / angular_speed_max` (m per rad). The factsheet has no nominal (operating) speed, only the maximum, so lambda is
+the ratio of the two maxima: the rotation time of the robot expressed as travel distance at maximum speed. If the robot is
+commanded below its maximum speed the true ratio is smaller; the maxima are the registered values, nothing is guessed.
+
+Validity: both fields finite and above 0 (the registration code already rejects non-positive values, `smallest valid` 1e-9);
+lambda is clamped to the range [0, 5] m/rad so a corrupt factsheet cannot make weights overflow (5 m/rad x pi = 157 000 units).
+
+**Fallback when a field is missing** (-1, None, or not finite): no turn cost for that plan, i.e. today's route exactly (lambda 0).
+An operator may set `SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD` (unset by default) to a number that is then used when the factsheet is
+incomplete; it is never a speed and is not read when the factsheet is complete. Nothing is hard-coded.
+
+**Pricing record** (the existing per-plan record, `scene_route` pricing dict, log line and `/stats`): a `turn` entry
+`{lambda_m_per_rad, source, speed_max, angular_speed_max, reason}` with `source` one of `factsheet`, `config`, `off`; `reason` is
+empty or names the missing field (`angular_speed_max missing`). `/stats` counts plans by source so a robot that always falls back is
+visible. The route cache key includes lambda (like the frozen `Safety`), so two robots with different lambda never share a result.
+
+Not built: the fields are read nowhere in the planner yet.
 
 ### B.4 What is not shown
 
@@ -269,14 +321,15 @@ is not measured.
 
 ## D. Open items
 
-Resolved by Laci 2026-10-14: goal tolerance is 0.35 m; the Odin override is live; the Smac tolerance is dropped from the list.
+Resolved by Laci 2026-10-14: goal tolerance 0.35 m; the Odin override is live; the Smac tolerance is dropped; robot speeds come from
+registration (B.6, per robot, with a fallback); the search allowance is 0.5 s and the search is exact (B.5, no cap, no band).
 
 | # | Item | Owner | Blocks |
 |---|---|---|---|
-| 1 | Nominal speed `v_nom` and maximum turning speed `omega_max` of the robot | Laci | lambda (B.1); the sweep 0.25 to 1.0 m/rad is the working range |
-| 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2). Open: whether to test the camera cone (needs the leaf `view` or an assumed forward camera) | Laci | the exact rule; the plane `Fnear` |
-| 3 | Stairs versus ghost for the components of A.4. Component 1 (largest, x 1.3 y -3.5) is the stairs (user, 2026-10-14). The other 14 components (about 400 cells, 1.0 m2) are **open** | Laci / user | the choice of A.6, recommended option 1 |
-| 4 | Optional: one more session within 1.5 m of the unconfirmed components after a quiet period | user | ghost check |
-| 5 | Decision on A.6 and an explicit go before any new plane or rebuild | Laci | the format step; not built |
-| 6 | The expanded search on the production corridor/ellipse (engine and lazy reader), with the cap or band option of B.5 chosen | lattice_cimbi after Laci | an engine change; not started |
+| 1 | Review B.6: lambda = `speed_max / angular_speed_max`, clamp [0, 5], fallback off or the operator value, record fields | Laci | the planner code for lambda |
+| 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2); the camera cone needs the leaf `view` or an assumed forward camera | Laci | the exact rule |
+| 3 | Stairs versus ghost for the 14 unconfirmed components of A.4 (the largest, x 1.3 y -3.5, is the stairs, confirmed by the user) | Laci / user | A.6, recommended option 1 |
+| 4 | Whether the rule applies to every blocked cell or only away from walls (rim cells thicken walls by up to 10 cm: navigable F -11.9% everywhere, -8.8% away from walls only) | Laci | A.2 |
+| 5 | Explicit go before the `Fn` plane enters main, or any stored-format change (prototype: branch `proto/close-evidence-plane`) | Laci | the format step |
+| 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader | lattice_cimbi after Laci | an engine change; not started |
 | 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |

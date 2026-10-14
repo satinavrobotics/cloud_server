@@ -8,6 +8,9 @@ Given a priced lattice (nav mask, clearance) it runs, per random pair >= 3 m apa
      edge weight is >= its length / 1e-4 m and the turn term is >= 0 (so the restriction is exact, not a heuristic);
   3b. (--band) a tighter incumbent first: the expanded search on the cells within 3 lattice cells of P0 (cost J_band >= J*), then
       E from J_band instead of J_inc;
+  3c. (--graph-ellipse) E from priced graph distances instead of euclidean ones: E = {c : d(s,c) + d(c,t) <= J_inc}, with d the plain
+      priced distance (two plain searches). Still exact: a path of cost <= J_inc through c costs at least d(s,c) + d(c,t) because the
+      turn term is non-negative; and much tighter than the euclidean ellipse in a cluttered map;
   4. the expanded (cell, heading) search on E only;
 and, when the whole map is small enough, the expanded search on the whole graph to compare costs (they must be equal).
 
@@ -120,6 +123,8 @@ def main():
     ap.add_argument("--synthetic")
     ap.add_argument("--pairs", type=int, default=20)
     ap.add_argument("--lam", type=float, default=0.5)
+    ap.add_argument("--min-dist", type=float, default=3.0, help="smallest euclidean distance of a pair (m); 30 probes the worst case on 50 x 25 m")
+    ap.add_argument("--graph-ellipse", action="store_true", help="ellipse from priced graph distances (exact, tighter)")
     ap.add_argument("--band", action="store_true", help="tighten the ellipse with a thin-band expanded search around the plain route")
     ap.add_argument("--whole-max", type=int, default=15000, help="compare with the whole-graph expanded search up to this many cells")
     a = ap.parse_args()
@@ -132,7 +137,7 @@ def main():
     while len(rows) < a.pairs:
         s, t = (int(v) for v in rng.integers(0, Lt.N, 2))
         e = math.dist(Lt.xy[s], Lt.xy[t])
-        if e < 3.0:
+        if e < a.min_dist:
             continue
         d, pred = dijkstra(Lt.plain, directed=True, indices=s, return_predecessors=True)
         if not np.isfinite(d[t]):
@@ -160,7 +165,11 @@ def main():
             jb, _ = Lt.search(s, t, a.lam, bandsel)
             t_band = time.perf_counter() - tb0 + (tb0 - t0)
             jinc = min(jinc, int(jb))
-        sel = (np.hypot(Lt.xy[:, 0] - Lt.xy[s, 0], Lt.xy[:, 1] - Lt.xy[s, 1]) + np.hypot(Lt.xy[:, 0] - Lt.xy[t, 0], Lt.xy[:, 1] - Lt.xy[t, 1])) <= jinc * U + 1e-9
+        if a.graph_ellipse:
+            dt_ = dijkstra(Lt.plain, directed=True, indices=t)
+            sel = (d + dt_) <= jinc
+        else:
+            sel = (np.hypot(Lt.xy[:, 0] - Lt.xy[s, 0], Lt.xy[:, 1] - Lt.xy[s, 1]) + np.hypot(Lt.xy[:, 0] - Lt.xy[t, 0], Lt.xy[:, 1] - Lt.xy[t, 1])) <= jinc * U + 1e-9
         t_sel = time.perf_counter() - t0
         t1 = time.perf_counter()
         j_e, nnz = Lt.search(s, t, a.lam, sel)
@@ -184,6 +193,9 @@ def main():
         gap = [x[9] - x[5] for x in rows]
         print("band only (inexact, J_band >= J*): p50 %.1f p95 %.1f max %.1f ms | cost above the optimum: median %d, p95 %d, max %d units (1e-4 m); equal in %d of %d"
               % (np.percentile(tb, 50), np.percentile(tb, 95), max(tb), np.median(gap), np.percentile(gap, 95), max(gap), sum(g == 0 for g in gap), len(gap)))
+    tot = r[:, 3] + r[:, 4]
+    print("whole plan = plain whole-graph search + restricted turn-cost stage: p50 %.0f p95 %.0f p99 %.0f max %.0f ms; above 0.5 s: %d of %d"
+          % (np.percentile(tot, 50), np.percentile(tot, 95), np.percentile(tot, 99), tot.max(), int((tot > 500).sum()), len(tot)))
     imp = [x[6] - x[5] for x in rows]
     print("incumbent minus optimum (units 1e-4 m): median %d max %d | whole-graph comparison: %s"
           % (np.median(imp), max(imp), "%d mismatches in %d" % (mism, len(rows)) if Lt.N <= a.whole_max else "not run (map too large)"))
