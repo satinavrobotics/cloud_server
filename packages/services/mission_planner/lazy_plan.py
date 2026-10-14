@@ -269,14 +269,23 @@ class PlanGraph:
             out[m] = self._clearance_tile(int(tx[i]), int(ty[i]))[ys[m] % TILE_L, xs[m] % TILE_L]
         return out
 
+    def price_cell(self, ix: int, iy: int, safety: Safety) -> Optional[float]:
+        """`safety.price(g)` of the navigable global lattice cell (ix, iy), None when it is not navigable (as the engine's;
+        exact for a margin <= `_CLR_CAP_M`)."""
+        g = self._clearance_cell(ix, iy)
+        return None if g is None else float(safety.price(g))
+
     def deficit_cell(self, ix: int, iy: int, margin: float) -> Optional[float]:
         """max(0, margin - g) of the navigable global lattice cell (ix, iy), None when it is not navigable (as the engine's;
         exact for margin <= `_CLR_CAP_M`)."""
+        g = self._clearance_cell(ix, iy)
+        return None if g is None else max(0.0, float(margin) - g)
+
+    def _clearance_cell(self, ix: int, iy: int) -> Optional[float]:
         t = self._tile(ix // TILE_L, iy // TILE_L)
         if t is None or "own" not in t or not t["own"][iy % TILE_L, ix % TILE_L] > 0:
             return None
-        g = float(self._clearance_tile(ix // TILE_L, iy // TILE_L)[iy % TILE_L, ix % TILE_L])
-        return max(0.0, float(margin) - g)
+        return float(self._clearance_tile(ix // TILE_L, iy // TILE_L)[iy % TILE_L, ix % TILE_L])
 
     # ---- stage 1 -----------------------------------------------------------------------------
     def _path(self, ja: int, jb: int) -> Optional[List[int]]:
@@ -441,7 +450,7 @@ class PlanGraph:
             Ln = np.concatenate(Ln)
         else:
             # priced edge cost: the engine's `edge_weight` on the clearance of the member cells
-            dn = np.maximum(0.0, safety.margin - self._clearance(ys[mi], xs[mi]))
+            dn = safety.price(self._clearance(ys[mi], xs[mi]))
             Ln = edge_weight(np.concatenate(Lm) / ROUTE_UNIT_M, dn[R] + dn[C], safety.rate)
 
         def find(cell):

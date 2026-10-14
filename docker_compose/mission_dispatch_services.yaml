@@ -330,7 +330,12 @@ services:
       - SCENE_GRAPH_WIDTH_MARGIN_M=${SCENE_GRAPH_WIDTH_MARGIN_M:-0.05}
       - SCENE_GRAPH_WIDTH_CHECK_ENABLED=${SCENE_GRAPH_WIDTH_CHECK_ENABLED:-false}
       # Clearance pricing of the chart route (docs/scene_graph/route_safety.md); 0 = the shortest route
-      - SCENE_GRAPH_SAFETY_KAPPA=${SCENE_GRAPH_SAFETY_KAPPA:-1.0}
+      # empty = 1.0 (hinge tier) or 0.5 (exponential tier), see below
+      - SCENE_GRAPH_SAFETY_KAPPA=${SCENE_GRAPH_SAFETY_KAPPA:-}
+      # EXPERIMENTAL robot-inflation price profile (docs/scene_graph/inflation_profile_design.md); radius and scaling both set = exponential tier, empty = hinge
+      - SCENE_GRAPH_INFLATION_RADIUS_M=${SCENE_GRAPH_INFLATION_RADIUS_M:-}
+      - SCENE_GRAPH_INFLATION_SCALING=${SCENE_GRAPH_INFLATION_SCALING:-}
+      - SCENE_GRAPH_GLOBAL_INSCRIBED_M=${SCENE_GRAPH_GLOBAL_INSCRIBED_M:-}
       # the commit this image was built from (scripts/deploy.sh exports GIT_SHA); shown by /stats as build_sha
       - BUILD_SHA=${GIT_SHA:-unknown}
       - NODE_POLICY_SKIP_ENABLED=${NODE_POLICY_SKIP_ENABLED:-true}

@@ -17,6 +17,7 @@ Every service image ships this file, mission-dispatch included.
 
 import logging
 import os
+from typing import Optional
 
 
 def require_secret(name: str) -> str:
@@ -614,7 +615,29 @@ PLAN_TRAJECTORY_MAX_POINTS = int(os.getenv("PLAN_TRAJECTORY_MAX_POINTS", "3000")
 # reset to the default with one warning. The range [0, 10] is the measured plateau (docs/scene_graph/route_safety.md S13),
 # not a bound of the theory. The planner prices on the tile-lazy graph (lazy_plan.PlanGraph) with the clearance read from
 # the stored v planes; pricing is off when the margin exceeds 1 m (the clearance cap) or is within the lattice quantisation of r.
-SCENE_GRAPH_SAFETY_KAPPA = float(os.getenv("SCENE_GRAPH_SAFETY_KAPPA", "1.0"))
+# Empty / unset = the default 1.0, and "not explicit": the exponential tier below then uses 0.5 (docs/scene_graph/inflation_profile_design.md s5).
+SCENE_GRAPH_SAFETY_KAPPA_EXPLICIT = bool(os.getenv("SCENE_GRAPH_SAFETY_KAPPA", "").strip())
+SCENE_GRAPH_SAFETY_KAPPA = float(os.getenv("SCENE_GRAPH_SAFETY_KAPPA", "").strip() or "1.0")
+
+
+def _opt_float(name: str) -> Optional[float]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logging.getLogger("config").warning("%s=%r is not a number; ignored", name, raw)
+        return None
+
+
+# Robot-inflation price profile (EXPERIMENTAL, docs/scene_graph/inflation_profile_design.md): the exponential tier of the
+# clearance pricing, price(g) = exp(-SCALING (g - ORIGIN)) for g < RADIUS, else 0, edge multiplier 1 + kappa * mean price. Used
+# only when RADIUS and SCALING are both set and valid (RADIUS in (0, 1.0] m, the lazy reader's clearance cap; SCALING > 0; ORIGIN
+# > 0); otherwise (empty = unset) the linear hinge above is used. ORIGIN default: the footprint's inscribed radius, else the map's r.
+SCENE_GRAPH_INFLATION_RADIUS_M = _opt_float("SCENE_GRAPH_INFLATION_RADIUS_M")
+SCENE_GRAPH_INFLATION_SCALING = _opt_float("SCENE_GRAPH_INFLATION_SCALING")
+SCENE_GRAPH_GLOBAL_INSCRIBED_M = _opt_float("SCENE_GRAPH_GLOBAL_INSCRIBED_M")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps

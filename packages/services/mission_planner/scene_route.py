@@ -716,16 +716,57 @@ def required_width(robot_width_m: float, robot_length_m: Optional[float], turns:
     return w + max(0.0, float(margin_m))
 
 
+def inscribed_radius(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float]) -> Optional[float]:
+    """The robot's inscribed radius r_in: half the smaller side of the factsheet footprint (the width alone while the length is
+    unknown), else the map's r (`robot_half_side`); None when neither is a usable number."""
+    if robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0:
+        side = float(robot_width_m)
+        if robot_length_m is not None and math.isfinite(robot_length_m) and robot_length_m > 0.0:
+            side = min(side, float(robot_length_m))
+        return side / 2.0
+    r = getattr(getattr(graph, "params", None), "robot_half_side", None)
+    return float(r) if r is not None and 0.0 < float(r) < math.inf else None
+
+
+def _exp_safety(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float], kappa: float) -> Any:
+    """The exponential tier (inflation_profile_design.md) from the SCENE_GRAPH_INFLATION_* settings, or None when it is not
+    configured or invalid (a warning for an invalid one: the caller then prices with the hinge)."""
+    from packages import config
+    from packages.scene_graph.api import Safety
+    from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
+    reach, k = config.SCENE_GRAPH_INFLATION_RADIUS_M, config.SCENE_GRAPH_INFLATION_SCALING
+    if reach is None or k is None:
+        return None
+    origin = config.SCENE_GRAPH_GLOBAL_INSCRIBED_M
+    if origin is None:
+        origin = inscribed_radius(graph, robot_width_m, robot_length_m)
+    # the kappa of the exponential tier is 0.5 unless the operator set SCENE_GRAPH_SAFETY_KAPPA
+    kap = float(kappa) if config.SCENE_GRAPH_SAFETY_KAPPA_EXPLICIT else 0.5
+    try:
+        if origin is None or not reach <= _CLR_CAP_M:
+            raise ValueError("origin %r unknown or reach %r above the clearance cap %r" % (origin, reach, _CLR_CAP_M))
+        return Safety(margin=float(reach), rate=kap, k=float(k), origin=float(origin))
+    except ValueError as err:
+        _log.warning("inflation profile invalid (%s); pricing with the hinge", err)
+        return None
+
+
 def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
                kappa: float) -> Any:
     """The `Safety` (clearance pricing, docs/scene_graph/route_safety.md section 1) of a plan, or None for the
-    legacy shortest route: kappa <= 0, a graph without `deficit_cell`, a margin that does not exceed the map's inscribed
-    radius r by more than the lattice clearance quantisation h / sqrt(2) (S12: the price would be noise, and the rate
-    kappa / (margin - r) unbounded), or a margin above the clearance cap of the lazy reader (`lazy_plan._CLR_CAP_M`,
-    1 m: pricing is off beyond it). margin = r_c, the circumscribed radius hypot(length, width) / 2 of the planning
-    robot (the length is the width while unknown), r * sqrt(2) while the width is unknown; rate = kappa / (margin - r)."""
+    legacy shortest route: kappa <= 0, or a graph without `deficit_cell`. Two tiers. Exponential
+    (docs/scene_graph/inflation_profile_design.md, experimental): when SCENE_GRAPH_INFLATION_RADIUS_M and
+    SCENE_GRAPH_INFLATION_SCALING are set and valid (`_exp_safety`). Otherwise the hinge: None also for a margin that does not
+    exceed the map's inscribed radius r by more than the lattice clearance quantisation h / sqrt(2) (S12: the price would be
+    noise, and the rate kappa / (margin - r) unbounded), or above the clearance cap of the lazy reader
+    (`lazy_plan._CLR_CAP_M`, 1 m: pricing is off beyond it). margin = r_c, the circumscribed radius hypot(length, width) / 2
+    of the planning robot (the length is the width while unknown), r * sqrt(2) while the width is unknown;
+    rate = kappa / (margin - r)."""
     if not kappa > 0.0 or not callable(getattr(graph, "deficit_cell", None)):
         return None
+    exp = _exp_safety(graph, robot_width_m, robot_length_m, kappa)
+    if exp is not None:
+        return exp
     r = getattr(getattr(graph, "params", None), "robot_half_side", None)
     if r is None or not (0.0 < float(r) < math.inf):
         return None
@@ -757,15 +798,20 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
     sub-path is measured the same way between its consecutive points. Then the final polyline costs no more than the
     lattice path. A point that is not on the route is judged by `visible` alone."""
     h = float(graph.params.lattice)
-    mu, margin = float(safety.rate), float(safety.margin)
+    mu = float(safety.rate)
+    price_cell = getattr(graph, "price_cell", None)
     memo: Dict[Tuple[int, int], float] = {}
 
     def factor(x: float, y: float) -> float:
         c = (int(math.floor(x / h)), int(math.floor(y / h)))
         f = memo.get(c)
         if f is None:
-            d = graph.deficit_cell(c[0], c[1], margin)
-            f = memo[c] = 1.0 + mu * (margin if d is None else d)
+            if callable(price_cell):
+                d = price_cell(c[0], c[1], safety)
+            else:                                    # a graph that only has the hinge's deficit_cell
+                d = graph.deficit_cell(c[0], c[1], float(safety.margin))
+            # a non-navigable cell counts as clearance 0
+            f = memo[c] = 1.0 + mu * (float(safety.price(0.0)) if d is None else d)
         return f
 
     def cost(a: Pt, b: Pt) -> float:
@@ -801,6 +847,24 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
         return cost(a, b) <= sub * (1.0 + 1e-9) + 1e-9
 
     return priced
+
+
+def waypoints_below_floor(graph: Any, poses: Sequence[Any], safety: Any, floor: Optional[float]) -> int:
+    """Number of interior planner-placed waypoints (in `_plan_on_graph` every interior waypoint is one) whose lattice clearance is below `floor` (a guard that only counts: no
+    waypoint is moved). The start, the goal and operator waypoints are not counted; a waypoint on a non-navigable cell counts
+    (clearance 0). The clearance is read through `deficit_cell` at margin `_CLR_CAP_M` (g = cap - deficit, exact below the cap)."""
+    if floor is None or not callable(getattr(graph, "deficit_cell", None)):
+        return 0
+    from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
+    h = float(graph.params.lattice)
+    n = 0
+    for w in poses[1:-1]:
+        if getattr(w, "origin", None) == common.WAYPOINT_ORIGIN_USER:
+            continue
+        d = graph.deficit_cell(int(math.floor(w.x / h)), int(math.floor(w.y / h)), _CLR_CAP_M)
+        if d is None or _CLR_CAP_M - d < floor - 1e-9:
+            n += 1
+    return n
 
 
 def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
@@ -929,9 +993,14 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     pricing = None
     if safety is not None:
         known = robot_width_m is not None and math.isfinite(robot_width_m) and robot_width_m > 0.0
-        pricing = {"kappa": float(safety_kappa), "margin": safety.margin, "rate": safety.rate,
+        exp = safety.k is not None
+        floor = safety.origin if exp else inscribed_radius(graph, robot_width_m, robot_length_m)
+        pricing = {"kappa": float(safety.rate if exp else safety_kappa), "margin": safety.margin, "rate": safety.rate,
                    "margin_source": "factsheet" if known else "map_r", "cost": int(route.cost),
-                   "exact": bool(getattr(route, "exact", True))}
+                   "exact": bool(getattr(route, "exact", True)),
+                   "profile": "exp" if exp else "hinge", "k": safety.k, "origin": safety.origin, "reach": safety.margin,
+                   "floor": floor,
+                   "waypoints_below_floor": waypoints_below_floor(graph, poses, safety, floor)}
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,

@@ -132,6 +132,8 @@ class MissionPlannerService:
         # plans served with clearance pricing, and those whose search hit the tile cap (route not proved optimal)
         self._priced_plans = 0
         self._priced_inexact = 0
+        self._priced_exp = 0                  # of those, priced with the exponential profile
+        self._waypoints_below_floor = 0       # interior planner waypoints below the profile's floor (a count, nothing moved)
 
         self._prewarm_task: Optional["asyncio.Task"] = None
 
@@ -313,10 +315,15 @@ class MissionPlannerService:
         if plan.pricing is not None:
             self._priced_plans += 1
             self._priced_inexact += 0 if plan.pricing["exact"] else 1
+            self._priced_exp += 1 if plan.pricing["profile"] == "exp" else 0
+            self._waypoints_below_floor += plan.pricing["waypoints_below_floor"]
             self.logger.info(
-                "Priced plan map=%s graph_version=%s kappa=%s margin=%.4f rate=%.3f margin_source=%s cost=%d exact=%s tiles=%s",
+                "Priced plan map=%s graph_version=%s kappa=%s margin=%.4f rate=%.3f margin_source=%s cost=%d exact=%s "
+                "profile=%s k=%s origin=%s reach=%.3f waypoints_below_floor=%d tiles=%s",
                 map_id, version, plan.pricing["kappa"], plan.pricing["margin"], plan.pricing["rate"],
                 plan.pricing["margin_source"], plan.pricing["cost"], plan.pricing["exact"],
+                plan.pricing["profile"], plan.pricing["k"], plan.pricing["origin"], plan.pricing["reach"],
+                plan.pricing["waypoints_below_floor"],
                 (getattr(graph, "last", None) or {}).get("tiles"))
         # Note: end_node_id is the LEAF nearest the goal waypoint (within LEAF_SNAP_M, up to 1 m
         # off), target_node_position the snapped goal cell centre (within GOAL_SNAP_M of the tap):
@@ -1585,6 +1592,8 @@ class MissionPlannerService:
                 "plan_inflight": self._plan_pool.inflight,
                 "priced_plans": self._priced_plans,
                 "priced_plans_inexact": self._priced_inexact,
+                "priced_plans_exp": self._priced_exp,
+                "waypoints_below_floor": self._waypoints_below_floor,
             }
         return stats
 

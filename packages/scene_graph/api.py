@@ -134,24 +134,49 @@ class Route:
 
 def edge_weight(len_units, deficit_sum, rate):
     """Integer edge cost of a priced lattice edge (docs/scene_graph/route_safety.md section 1): `len_units` is the Euclidean length
-    in cost units (length / 1e-4 m), `deficit_sum` the sum of the deficits max(0, margin - clearance) of its two cells; works on
-    numbers and arrays. `rate` 0 gives the unpriced weight ceil(len_units - 1e-6), at least 1."""
+    in cost units (length / 1e-4 m), `deficit_sum` the sum of the prices (`Safety.price`: the hinge deficit max(0, margin -
+    clearance), or the exponential profile) of its two cells; works on numbers and arrays. `rate` 0 gives the unpriced weight
+    ceil(len_units - 1e-6), at least 1."""
     return np.maximum(np.ceil(len_units * (1.0 + rate * deficit_sum / 2.0) - 1e-6), 1.0)
 
 
 @dataclass(frozen=True)
 class Safety:
-    """Clearance pricing of a route. With deficit d(c) = max(0, margin - g(c)) (g: physical clearance of lattice cell c, m), an edge of
-    Euclidean length l between cells a and b costs l * (1 + rate * (d(a) + d(b)) / 2). `margin` (m) is the clearance from which a
-    cell is free of charge; `rate` (1/m) the cost multiplier per metre of deficit. rate = 0 is the unpriced route, identical to `safety=None`."""
+    """Clearance pricing of a route, two tiers of one type. The price p(c) of a lattice cell c (g: its physical clearance, m) is
+    `price(g)`; an edge of Euclidean length l between cells a and b costs l * (1 + rate * (p(a) + p(b)) / 2) (`edge_weight`).
+    Hinge tier (k None): p = max(0, margin - g), `margin` (m) the clearance from which a cell is free of charge, `rate` (1/m) the
+    multiplier per metre of deficit. Exponential tier (k set; docs/scene_graph/inflation_profile_design.md): p = exp(-k (g - origin))
+    for g < margin (= the reach of the robot's inflation), 0 beyond; `rate` is then the dimensionless multiplier kappa. Below
+    `origin` the same formula continues (no kink). rate = 0 is the unpriced route, identical to `safety=None`."""
     margin: float
     rate: float
+    k: Optional[float] = None
+    origin: Optional[float] = None
+
+    # the exponential tier is bounded so that every weight is a finite integer held exactly in float64: exp(k * origin) <= e^10
+    MAX_K_ORIGIN = 10.0
 
     def __post_init__(self):
         if not self.margin > 0.0:
             raise ValueError("Safety.margin must be > 0, got %r" % (self.margin,))
         if not self.rate >= 0.0:
             raise ValueError("Safety.rate must be >= 0, got %r" % (self.rate,))
+        if (self.k is None) != (self.origin is None):
+            raise ValueError("Safety.k and Safety.origin are set together")
+        if self.k is not None:
+            for name, v in (("margin", self.margin), ("rate", self.rate), ("k", self.k), ("origin", self.origin)):
+                if not (0.0 <= v < float("inf")):
+                    raise ValueError("Safety.%s must be finite, got %r" % (name, v))
+            if not (self.k > 0.0 and self.origin > 0.0):
+                raise ValueError("Safety.k and Safety.origin must be > 0, got %r, %r" % (self.k, self.origin))
+            if self.k * self.origin > self.MAX_K_ORIGIN:
+                raise ValueError("Safety: k * origin must be <= %g, got %r" % (self.MAX_K_ORIGIN, self.k * self.origin))
+
+    def price(self, g):
+        """price of clearance `g` (m; a number or an array), >= 0. The one formula the engine, the lazy reader and the line of sight share."""
+        if self.k is None:
+            return np.maximum(0.0, self.margin - g)
+        return np.where(g < self.margin, np.exp(-self.k * (g - self.origin)), 0.0)
 
 
 @dataclass

@@ -353,7 +353,9 @@ def test_the_plan_reports_its_pricing(graphs):
         for plan_, source, margin in ((known, "factsheet", math.hypot(0.8, 0.5) / 2), (unknown, "map_r", 0.25 * math.sqrt(2))):
             assert not isinstance(plan_, str)
             pr = plan_.pricing
-            assert set(pr) == {"kappa", "margin", "rate", "margin_source", "cost", "exact"}
+            assert set(pr) == {"kappa", "margin", "rate", "margin_source", "cost", "exact", "profile", "k", "origin", "reach", "floor",
+                               "waypoints_below_floor"}
+            assert pr["profile"] == "hinge" and pr["k"] is None and pr["origin"] is None and pr["reach"] == pr["margin"]
             assert pr["kappa"] == 2.0 and pr["margin_source"] == source and pr["exact"] is True
             assert pr["margin"] == pytest.approx(margin) and pr["rate"] == pytest.approx(2.0 / (margin - 0.25))
             assert isinstance(pr["cost"], int) and pr["cost"] >= 0
