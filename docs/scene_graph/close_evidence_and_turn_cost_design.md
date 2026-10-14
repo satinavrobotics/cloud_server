@@ -1,8 +1,9 @@
 # Close evidence for blocked cells, a turn cost for routes, and a waypoint merge (design, 2026-10-14)
 
 Status (2026-10-14): **part A (close evidence) is in the engine, merged and off by default** (`SceneParams.near_range_m`, environment
-`SCENE_GRAPH_NEAR_RANGE_M` empty); parts B (turn cost) and C (waypoint merge) are designed and prototyped on a research lattice, **not
-built**. The exponential inflation tier stays off. Direction was accepted by Laci for A and B; the user accepted the engine
+`SCENE_GRAPH_NEAR_RANGE_M` empty); **part B (turn cost) is built on branch `feat/turn-cost`, off by default**
+(`SCENE_GRAPH_TURN_COST_ENABLED` false; not merged, not deployed; B.5, B.6, `route_safety.md` section 9); part C (waypoint merge) is
+designed and prototyped on a research lattice, not built. The exponential inflation tier stays off. Direction was accepted by Laci for A and B; the user accepted the engine
 prototype and asked for it to be merged and deployed. Written by the lattice_cimbi session. Every number below comes from the
 scripts named below, run on the office8 leaf export (97 leaves, one session of 6 minutes; no other map's leaf export is available
 to these scripts).
@@ -276,8 +277,26 @@ at the median on the 117k-cell map.
 
 Concurrent plans multiply the transient memory (`plan_inflight`); not measured.
 
-Not measured here: the production engine and lazy reader (no `PlanGraph` integration), real corridor seeding, cold tile reads,
-the turn term inside `priced_visible` for the pull.
+Not measured here: the turn term inside `priced_visible` for the pull (it is not built: the pull has no turn term).
+
+**Measured in production (branch `feat/turn-cost`, 2026-10-14).** The design above is built in `engine.ChartGraph.route` and
+`lazy_plan.PlanGraph.route` (`packages/scene_graph/turn.py`): incumbent = P0 plus its turn cost or the band optimum (3 cells), then
+the graph-distance ellipse (the lazy reader loads the tiles of the Euclidean ellipse of J_inc, which contains it, and keeps the
+tile cap). Equal to an independent (cell, heading) reference and to the whole-graph expanded search in every test. On office8
+(`accept_route_safety.py --turn-lambda 0.5`, 150 pairs): lattice heading changes per 10 m 16.7 -> 5.5 (the canonical-tie route; the
+prototype's 5.5 reproduced), 1.35 -> 0.43 rad/m; waypoints 5.6 -> 4.6 per 10 m, 0.323 -> 0.301 rad/m; plan p99 warm 8.3 -> 20.8 ms,
+cold 13.9 -> 22.1 ms; all gates pass at 0.25, 0.5, 1.0. Worst case on the 117 070-cell synthetic map (`inflation_efficiency.py
+--sizes 50x25 --pairs 30 --min-pair-m 30 --turn-lambda L`, the production lazy reader and engine, hinge kappa 1, pairs median 36.7 m):
+
+| lambda | engine route p99 / max (ms) | lazy route warm p99 / max | lazy plan cold p99 / max | above 0.5 s |
+|---|---|---|---|---|
+| 0.5 | 301 / 304 | 414 / 421 | 384 / 392 | 0 of 30 |
+| 1.0 | 415 / 425 | 462 / 486 | 512 / 541 | 1 of 30 (cold) |
+| 5.0 (clamp) | 702 / 705 | 787 / 789 | 810 / 818 | 12-17 of 30 |
+
+So the 0.5 s allowance holds to lambda 0.5 on the largest map and not from lambda 1.0: the gap J* - d(s, t) grows with lambda, and with
+it the plain-distance ellipse. Full table: `route_safety.md` section 9. Concurrent plans still multiply the transient memory; not
+measured.
 
 ### B.6 Lambda per robot, from registration
 
@@ -305,7 +324,12 @@ incomplete; it is never a speed and is not read when the factsheet is complete. 
 empty or names the missing field (`angular_speed_max missing`). `/stats` counts plans by source so a robot that always falls back is
 visible. The route cache key includes lambda (like the frozen `Safety`), so two robots with different lambda never share a result.
 
-Not built: the fields are read nowhere in the planner yet.
+Status (2026-10-14): **built on branch `feat/turn-cost`, off by default** (`SCENE_GRAPH_TURN_COST_ENABLED`, default false: lambda 0,
+source `off`, reason `disabled` for every plan, so the change alters nothing until it is switched on). `scene_route.turn_lambda`
+(pure: factsheet, switch, operator value) and `turn_record`; the server passes the record to plan, navigate and enrich / gap-fill;
+`/stats` `scene_graph.turn_sources`. The record is on `ChartPlan.pricing["turn"]`; with a turn and no price (kappa 0, or pricing
+impossible) the plan is still turn-costed and its record says `rate` 0, `profile` "none". The edge-weight cache of the engine is keyed
+by what the weights depend on (margin, rate, k, origin), not lambda; no route result is cached anywhere.
 
 ### B.4 What is not shown
 
@@ -342,5 +366,5 @@ registration (B.6, per robot, with a fallback); the search allowance is 0.5 s an
 | 3 | Stairs versus ghost for the 14 unconfirmed components of A.4 (the largest, x 1.3 y -3.5, is the stairs, confirmed by the user) | Laci / user | A.6, recommended option 1 |
 | 4 | Whether the rule applies to every blocked cell or only away from walls (rim cells thicken walls by up to 10 cm: navigable F -11.9% everywhere, -8.8% away from walls only) | Laci | A.2 |
 | 5 | Switching the rule on in production (`SCENE_GRAPH_NEAR_RANGE_M`): a rebuild of every map; value from the robot's `support.commit_radius_m` (1.5 m), the cone or not (item 2), and the decision of A.6 (item 3) | Laci / user | the live use of A |
-| 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader (B.5), with lambda per robot (B.6) | lattice_cimbi | an engine change; not started |
+| 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader (B.5), with lambda per robot (B.6) | lattice_cimbi | built on branch `feat/turn-cost`, off by default; needs review, merge, and a decision to switch it on. The 0.5 s allowance holds to lambda 0.5 on the 117k-cell map, not from 1.0 (B.5): either accept that, cap lambda lower than 5, or tighten the ellipse (a lower bound of the turning still needed) |
 | 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |

@@ -2,13 +2,20 @@
 
     python tools/scene_graph_sim/accept_route_safety.py --data DIR [--pairs 150] [--seed 7] [--kappa 1] [--robot-half-side 0.25]
                                                          [--width W [--length L]]
-                                                         [--profile exp --k 6 --reach 0.8 --origin 0.3]
+                                                         [--profile exp --k 6 --reach 0.8 --origin 0.3] [--turn-lambda L]
 
 `--profile exp` runs the same gates for the exponential price profile (docs/scene_graph/inflation_profile_design.md): the
 tier is selected through the SCENE_GRAPH_INFLATION_* settings (config attributes set here), kappa = `--kappa` (the planner's
 0.5 default is not applied), so the production selection `safety_for` is on the path. The reference prices with its own
 independent formula exp(-k (g - origin)) for g < reach, and the deficit d of the notation below is then the price phi.
 C2 (continuum value, a bound of the hinge's Lipschitz deficit) is not evaluated for the exponential tier.
+
+`--turn-lambda L` (m per rad, docs/scene_graph/close_evidence_and_turn_cost_design.md B.5) adds the turn cost to the priced side: the
+routes take `Safety(..., turn=L)` and the plans a turn record of lambda L, so every gate runs on the turn-cost route. A1 also checks
+that turn = 0 is the priced route and plan bit for bit; A3 compares with the reference's own (cell, heading) search (scipy, canonical
+walk, its own heading arithmetic); B1, B2 and C2 add the turn cost T (m) of the comparison route to their bounds (the objective is
+then L + mu A + T). The heading changes per 10 m and the turning (rad/m) of the lattice routes and of the waypoint polylines are
+reported at lambda 0 and at L.
 
 Production path, built once: the export's leaves are folded in the engine, saved to a `SceneGraphStore(MemoryBackend)` (batches of 6, as
 the worker saves), the restored engine (`store.load`) is the reference and `open_plan` the planner's tile-lazy `PlanGraph`. The same
@@ -39,7 +46,7 @@ sys.path[:0] = [HERE, os.path.dirname(os.path.dirname(HERE))]
 
 import bench_route_safety as bench  # noqa: E402
 from packages import config  # noqa: E402
-from packages.scene_graph.api import SceneParams  # noqa: E402
+from packages.scene_graph.api import SceneParams, turn_weight  # noqa: E402
 from packages.scene_graph.engine import RES, ChartGraph  # noqa: E402
 from packages.scene_graph.store import MemoryBackend, SceneGraphStore  # noqa: E402
 from packages.services.mission_planner import scene_route as sr  # noqa: E402
@@ -95,7 +102,7 @@ class Reference:
         self.N = len(ys)
         self.idx = -np.ones((Hn, Wn), np.int64)
         self.idx[ys, xs] = np.arange(self.N)
-        R, C, L = [], [], []
+        R, C, L, D = [], [], [], []
         for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
             y2, x2 = ys + dy, xs + dx
             ok = (y2 >= 0) & (y2 < Hn) & (x2 >= 0) & (x2 < Wn)
@@ -106,7 +113,9 @@ class Reference:
             R.append(a)
             C.append(self.idx[y2[a], x2[a]])
             L.append(np.full(len(a), math.hypot(dy, dx) * H))
+            D.append(np.full(len(a), math.atan2(dy, dx)))
         self.R, self.C, self.L = np.concatenate(R), np.concatenate(C), np.concatenate(L)
+        self.ang = np.concatenate(D)                                       # direction of the edge R -> C (rad)
         d = self.deficit[ys, xs]
         self.w_base = np.maximum(np.ceil(self.L / U - 1e-6), 1.0)
         self.w_priced = np.maximum(np.ceil(self.L / U * (1.0 + rate * (d[self.R] + d[self.C]) / 2.0) - 1e-6), 1.0)
@@ -144,6 +153,52 @@ class Reference:
             nb = g.indices[lo:hi]
             path.append(int(nb[(g.data[lo:hi] + d[nb]) == d[u]].min()))
         return int(d[s]), path
+
+    def turn_units(self, cells, lam: float) -> int:
+        """turn cost (units) of a cell path: per corner the heading change from atan2, wrapped, in multiples of pi / 4"""
+        tot = 0
+        for p, q, r in zip(cells[:-2], cells[1:-1], cells[2:]):
+            a1 = math.atan2(int(self.ys[q]) - int(self.ys[p]), int(self.xs[q]) - int(self.xs[p]))
+            a2 = math.atan2(int(self.ys[r]) - int(self.ys[q]), int(self.xs[r]) - int(self.xs[q]))
+            tot += int(turn_weight(lam, int(round(abs((a2 - a1 + math.pi) % (2 * math.pi) - math.pi) / (math.pi / 4)))))
+        return tot
+
+    def route_turn(self, src_pt, dst_pt, lam: float):
+        """(J_int with the turn cost, cells) of the canonical optimum over (cell, incoming heading) states: the priced edge weights
+        plus `api.turn_weight` of the heading change at every corner (start and goal heading free); one Dijkstra on the reversed
+        expanded graph from the goal states, then the walk from the start that takes the smallest next cell on a minimal path"""
+        s, t = self.cell(src_pt), self.cell(dst_pt)
+        if s is None or t is None:
+            return None, None
+        if s == t:
+            return 0, [s]
+        R, C = np.r_[self.R, self.C], np.r_[self.C, self.R]
+        W = np.r_[self.w_priced, self.w_priced]
+        h = np.round(np.r_[self.ang, self.ang + math.pi] / (math.pi / 4)).astype(int) % 8
+        dif = np.abs(np.arange(8)[:, None] - np.arange(8)[None, :])
+        tab = turn_weight(lam, np.minimum(dif, 8 - dif))                  # [incoming, outgoing]
+        hin = np.arange(8)
+        frm = (R[:, None] * 8 + hin).ravel()
+        to = np.repeat(C * 8 + h, 8)
+        w = (W[:, None] + tab[hin[None, :], h[:, None]]).ravel()
+        n = 8 * self.N
+        rev = coo_matrix((w, (to, frm)), shape=(n, n)).tocsr()
+        D = dijkstra(rev, directed=True, indices=t * 8 + hin, min_only=True)
+        out = {}
+        for e in range(len(R)):
+            out.setdefault(int(R[e]), []).append((int(C[e]), int(h[e]), float(W[e])))
+        cand = [(w_ + D[v * 8 + hv], v, hv) for v, hv, w_ in out.get(s, [])]
+        cost = min((c for c, _, _ in cand), default=math.inf)
+        if not np.isfinite(cost):
+            return None, None
+        v, hv = min((v, hv) for c, v, hv in cand if c == cost)
+        path = [s, v]
+        while path[-1] != t:
+            u = path[-1]
+            nxt = [(v2, h2) for v2, h2, w_ in out[u] if w_ + tab[hv, h2] + D[v2 * 8 + h2] == D[u * 8 + hv]]
+            v, hv = min(nxt)
+            path.append(v)
+        return int(cost), path
 
     def cells_of(self, nodes) -> List[int]:
         return [self.cell(p) for p in nodes]
@@ -247,6 +302,26 @@ def build(data: str, r: float, **params):
     return leaves, st, eng
 
 
+def turning(seqs):
+    """(heading changes per 10 m, turning rad/m) over polylines, as `turn_cost_prototype.stats`: every change of direction between
+    two consecutive non-degenerate segments counts, its wrapped angle is the turning; both per total length"""
+    length = n = 0
+    total = 0.0
+    for pts in seqs:
+        p = np.asarray(pts, float)
+        d = np.diff(p, axis=0)
+        length += float(np.hypot(d[:, 0], d[:, 1]).sum())
+        d = d[np.hypot(d[:, 0], d[:, 1]) > 1e-9]
+        if len(d) < 2:
+            continue
+        a = np.diff(np.arctan2(d[:, 1], d[:, 0]))
+        a = np.abs((a + np.pi) % (2 * np.pi) - np.pi)
+        a = a[a > 1e-6]
+        n += len(a)
+        total += float(a.sum())
+    return (10.0 * n / length, total / length) if length else (float("nan"), float("nan"))
+
+
 def pct(a, q):
     return float(np.percentile(np.asarray(a, float), q)) if len(a) else float("nan")
 
@@ -264,6 +339,7 @@ def main() -> int:
     ap.add_argument("--k", type=float, default=6.0)
     ap.add_argument("--reach", type=float, default=0.8)
     ap.add_argument("--origin", type=float, default=None, help="default: the footprint's inscribed radius, else r")
+    ap.add_argument("--turn-lambda", type=float, default=0.0, help="turn cost (m per rad) on the priced side; 0 = none")
     args = ap.parse_args()
     t_start = time.perf_counter()
     leaves, st, eng = build(args.data, args.robot_half_side)
@@ -279,6 +355,10 @@ def main() -> int:
         return 1
     m, mu, r = safety.margin, safety.rate, args.robot_half_side
     ref = Reference(eng, m, mu, safety.k, safety.origin)
+    lam = float(args.turn_lambda)
+    plain_safety = safety                                    # the priced route without a turn term (lambda 0)
+    safety = dataclasses.replace(safety, turn=lam)
+    turn_rec = {"lambda_m_per_rad": lam, "source": "config", "speed_max": None, "angular_speed_max": None, "reason": "harness"}
     sp = eng._solved.sp
     xy = np.array([eng._cell_xy(int(sp.ys[i]), int(sp.xs[i])) for i in range(sp.N)])
     leaf_xy = np.array([(l.x, l.y) for l in leaves])
@@ -298,11 +378,13 @@ def main() -> int:
             pairs.append((sa, sb))
     gap = config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M
 
-    def plan(graph, p, q, kappa, times=None):
+    def plan(graph, p, q, kappa, times=None, turn=None):
         t = time.perf_counter()
+        turn = (turn_rec if kappa > 0.0 else None) if turn is None else turn
         try:
             out = sr.plan_on_graph(graph, "m", p, q, ([], []), node_of, config.SCENE_GRAPH_START_SNAP_M,
-                                   config.SCENE_GRAPH_GOAL_SNAP_M, gap, args.width, 0.05, args.length, None, kappa, False)
+                                   config.SCENE_GRAPH_GOAL_SNAP_M, gap, args.width, 0.05, args.length, None, kappa, False,
+                                   turn=turn)
         except sr.ChartFallback as err:
             out = err.reason
         if times is not None:
@@ -314,13 +396,18 @@ def main() -> int:
 
     # ---- routes ---------------------------------------------------------------------------------------------------------
     base_l, pri_l, base_e, pri_e, zero_l, zero_e = [], [], [], [], [], []
+    pri0_l, turn0_l, turn0_e = [], [], []
     for sa, sb in pairs:
+        if lam > 0.0:
+            pri0_l.append(route(lazy, sa, sb, plain_safety))
+            turn0_l.append(route(lazy, sa, sb, dataclasses.replace(safety, turn=0.0)))
+            turn0_e.append(route(eng, sa, sb, dataclasses.replace(safety, turn=0.0)))
         base_l.append(route(lazy, sa, sb, None))
         pri_l.append(route(lazy, sa, sb, safety))
-        zero_l.append(route(lazy, sa, sb, dataclasses.replace(safety, rate=0.0)))
+        zero_l.append(route(lazy, sa, sb, dataclasses.replace(safety, rate=0.0, turn=0.0)))
         base_e.append(route(eng, sa, sb, None))
         pri_e.append(route(eng, sa, sb, safety))
-        zero_e.append(route(eng, sa, sb, dataclasses.replace(safety, rate=0.0)))
+        zero_e.append(route(eng, sa, sb, dataclasses.replace(safety, rate=0.0, turn=0.0)))
     # ---- plans (waypoints) at kappa 0, legacy defaults and kappa --------------------------------------------------------
     plans0, plans1, plans_default = [], [], []
     for sa, sb in pairs:                                  # first pass fills the tile and clearance caches
@@ -336,6 +423,12 @@ def main() -> int:
                                                   config.SCENE_GRAPH_GOAL_SNAP_M, gap))
         except sr.ChartFallback as err:
             plans_default.append(err.reason)
+    plans1_0 = []                                         # the priced plans without the turn term (lambda 0 record)
+    if lam > 0.0:
+        zero_rec = dict(turn_rec, lambda_m_per_rad=0.0)
+        for sa, sb in pairs:
+            plans1_0.append(plan(lazy, (sa.x, sa.y), (sb.x, sb.y), args.kappa, turn=zero_rec))
+        plans1_none = [plan(lazy, (sa.x, sa.y), (sb.x, sb.y), args.kappa, turn=dict(sr.TURN_NOT_GIVEN)) for sa, sb in pairs]
     cold = open_plan(st, "m", max_tiles=config.SCENE_GRAPH_LAZY_MAX_TILES, tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE)
     cold_pri = [route(cold, sa, sb, safety) for sa, sb in pairs]
 
@@ -370,9 +463,16 @@ def main() -> int:
     bad = [i for i in range(len(pairs)) if not same(zero_l[i], base_l[i]) or not same(zero_e[i], base_e[i])]
     bad_plan = [i for i in range(len(pairs)) if (isinstance(plans0[i], str) != isinstance(plans_default[i], str))
                 or (not isinstance(plans0[i], str) and (wp(plans0[i]) != wp(plans_default[i])))]
+    if lam > 0.0:
+        # turn 0 is the priced route and the priced plan of today, bit for bit
+        bad += [i for i in range(len(pairs)) if not same(turn0_l[i], pri0_l[i]) or not same(turn0_e[i], pri0_l[i])]
+        bad_plan += [i for i in range(len(pairs)) if (isinstance(plans1_0[i], str) != isinstance(plans1_none[i], str))
+                     or (not isinstance(plans1_0[i], str) and (wp(plans1_0[i]) != wp(plans1_none[i])
+                                                               or plans1_0[i].pricing["cost"] != plans1_none[i].pricing["cost"]))]
     gate("A1", "reduction", not bad and not bad_plan,
          "%d / %d routes differ, %d plans differ" % (len(bad), len(pairs), len(bad_plan)),
-         "S8: rate 0 (same k, origin) and kappa 0 are the baseline, bit for bit (nodes, cost); tolerance 0")
+         "S8: rate 0 (same k, origin) and kappa 0 are the baseline, bit for bit (nodes, cost)%s; tolerance 0"
+         % ("; turn 0 is the priced route and plan" if lam > 0.0 else ""))
     rb = {i for i, r_ in enumerate(base_l) if r_ is not None}
     rp = {i for i, r_ in enumerate(pri_l) if r_ is not None}
     sb_ = {i for i, p_ in enumerate(plans0) if not isinstance(p_, str)}
@@ -383,18 +483,21 @@ def main() -> int:
     mism, nopt, dom = [], 0, []
     for i in n_ok:
         sa, sb = pairs[i]
-        cost, path = ref.route((sa.x, sa.y), (sb.x, sb.y), "priced")
+        if lam > 0.0:
+            cost, path = ref.route_turn((sa.x, sa.y), (sb.x, sb.y), lam)
+        else:
+            cost, path = ref.route((sa.x, sa.y), (sb.x, sb.y), "priced")
         got = pri_l[i]
         if cost is None or got is None or got.cost != cost or ref.cells_of(got.nodes) != path:
             mism.append(i)
-        j_base_priced = ref.j_int(base_l[i].nodes, "priced")
+        j_base_priced = ref.j_int(base_l[i].nodes, "priced") + (ref.turn_units(ref.cells_of(base_l[i].nodes), lam) if lam else 0)
         if got is not None and got.cost > j_base_priced:
             dom.append(i)
         nopt += 1
     gate("A3", "lattice optimality", not mism and not dom,
          "%d / %d differ from the reference, %d with J(priced) > J(baseline cells, priced weights)" % (len(mism), nopt, len(dom)),
-         "S7: Dijkstra is exact for non-negative additive integer weights; J_int(priced) == reference, <= J_int(baseline cells); "
-         "tolerance 0")
+         "S7: Dijkstra is exact for non-negative additive integer weights%s; J_int(priced) == reference, <= J_int(baseline cells); "
+         "tolerance 0" % (" (on (cell, heading) states, turn cost included)" if lam > 0.0 else ""))
     # the length optimum (independent reference, base weights): the production baseline route is the corridor route, which is not
     # proved shortest (formulation.md statement 27), so A4 and B compare with this one
     opt: Dict[int, Tuple[float, float, int]] = {}
@@ -402,7 +505,7 @@ def main() -> int:
         sa, sb = pairs[i]
         _, path = ref.route((sa.x, sa.y), (sb.x, sb.y), "base")
         L_o, A_o = ref.path_stats(path)
-        opt[i] = (L_o, A_o, len(path) - 1)
+        opt[i] = (L_o, A_o, len(path) - 1, ref.turn_units(path, lam) * U if lam > 0.0 else 0.0)
     short, worst = [], 0.0
     for i in n_ok:
         n_p = len(pri_l[i].nodes) - 1
@@ -444,22 +547,23 @@ def main() -> int:
     b1, b2 = [], []
     ratios = []
     for i in n_ok:
-        Lb, Ab, n_b = opt[i]
+        Lb, Ab, n_b, T_o = opt[i]                         # T_o: the turn cost (m) of the length optimum, 0 without a turn term
         Lp, Ap = ref.length_and_intrusion(pri_l[i].nodes)
         n = max(n_b, len(pri_l[i].nodes) - 1)
         tol = n * U
-        if Ap > Ab + tol / mu + 1e-9:
+        if Ap > Ab + (tol + T_o) / mu + 1e-9:
             b1.append(i)
         dbar = Ab / Lb if Lb > 0 else 0.0
-        if Lp > Lb * (1.0 + mu * dbar) + tol + 1e-9:
+        if Lp > Lb * (1.0 + mu * dbar) + tol + T_o + 1e-9:
             b2.append(i)
         Lc = base_l[i].length
         ratios.append(Lp / Lc if Lc > 0 else 1.0)
     gate("B1", "intrusion", not b1, "%d / %d violate A(priced) <= A(o) + n * 1e-4 / mu (o = length optimum)" % (len(b1), len(n_ok)),
          "mu A_new + L_new <= mu A_o + L_o (priced optimality) and L_new >= L_o - n*1e-4 (A4): A_new <= A_o + n * 1e-4 / mu "
-         "(n = max edges of the two)")
+         "(n = max edges of the two)%s" % ("; with the turn term + T_o / mu (T_new >= 0)" if lam > 0.0 else ""))
     gate("B2", "detour", not b2, "%d / %d violate L(priced) <= L(o) (1 + mu dbar_o) + n * 1e-4" % (len(b2), len(n_ok)),
-         "L_new + mu A_new <= L_o + mu A_o and A_new >= 0: L_new <= L_o (1 + mu A_o / L_o) (+ rounding n * 1e-4)")
+         "L_new + mu A_new <= L_o + mu A_o and A_new >= 0: L_new <= L_o (1 + mu A_o / L_o) (+ rounding n * 1e-4)%s"
+         % ("; with the turn term + T_o" if lam > 0.0 else ""))
 
     # ---- C ----------------------------------------------------------------------------------------------------------------
     r0 = {p_ for p_ in plans0 if isinstance(p_, str)}
@@ -476,14 +580,16 @@ def main() -> int:
         jb, lb, _, _ = ref.j_cont(wp(plans0[i]))
         jp, lp, _, _ = ref.j_cont(wp(plans1[i]))
         med.append(jp / jb)
-        if jp > jb * METRICATION + mu * QUANT_M * lp:
+        t_b = ref.turn_units(ref.cells_of(base_l[i].nodes), lam) * U if lam > 0.0 and base_l[i] is not None else 0.0
+        if jp > jb * METRICATION + mu * QUANT_M * lp + t_b:
             viol.append(i)
     if safety.k is None:
       gate("C2", "continuum value", not viol,
          "%d / %d violate J_cont(priced) <= %.4f J_cont(base) + mu * %.4f * L(priced); median ratio %.3f" % (
              len(viol), len(med), METRICATION, QUANT_M, float(np.median(med)) if med else float("nan")),
          "J_lat(P) <= J_lat(B) (S7) and J_lat vs J_cont differ by the 8-neighbour metrication 1.0824 (S12) and, in the deficit term, "
-         "twice the clearance quantisation h / sqrt 2 = 0.1414 m per metre times mu")
+         "twice the clearance quantisation h / sqrt 2 = 0.1414 m per metre times mu%s"
+         % ("; with the turn term + T(baseline lattice route)" if lam > 0.0 else ""))
     budget = config.SCENE_GRAPH_PLAN_BUDGET_S
     p99 = pct(t1, 99)
     gate("C3", "plan time (ALLOWANCE)", p99 <= PLAN_P99_ALLOWANCE * budget,
@@ -501,9 +607,9 @@ def main() -> int:
          "(an ALLOWANCE, not derived; no network I/O: the live tile read latency comes on top)" % (PLAN_P99_ALLOWANCE * budget))
 
     # ---- report -----------------------------------------------------------------------------------------------------------
-    print("### %s: %d leaves, N=%d F cells, %d charts; r=%.3f m=%.3f mu=%.2f/m (kappa %.2f); %d pairs seed %d; routable %d" % (
-        os.path.basename(os.path.normpath(args.data)), len(leaves), sp.N, len(eng._solved.A), r, m, mu, args.kappa,
-        len(pairs), args.seed, len(n_ok)))
+    print("### %s: %d leaves, N=%d F cells, %d charts; r=%.3f m=%.3f mu=%.2f/m (kappa %.2f); turn lambda %.3f m/rad; %d pairs seed %d; "
+          "routable %d" % (os.path.basename(os.path.normpath(args.data)), len(leaves), sp.N, len(eng._solved.A), r, m, mu, args.kappa,
+                           lam, len(pairs), args.seed, len(n_ok)))
     rows = []
     for name, plans in (("kappa 0", plans0), ("priced", plans1)):
         vals = [ref.j_cont(wp(p_)) for p_ in plans if not isinstance(p_, str)]
@@ -514,6 +620,17 @@ def main() -> int:
         print("%-8s %12.2f %10.3f %6d %10.2f %9.2f" % row)
     print("length ratio priced / production baseline route (median / p90 / max): %.3f / %.3f / %.3f" % (
         float(np.median(ratios)), pct(ratios, 90), max(ratios)))
+    if lam > 0.0:
+        lat0 = [r_.nodes for r_ in pri0_l if r_ is not None]
+        lat1 = [r_.nodes for r_ in pri_l if r_ is not None]
+        wp0 = [wp(p_) for p_ in plans1_0 if not isinstance(p_, str)]
+        wp1 = [wp(p_) for p_ in plans1 if not isinstance(p_, str)]
+        (c0_, t0_), (c1_, t1_) = turning(lat0), turning(lat1)
+        (w0_, u0_), (w1_, u1_) = turning(wp0), turning(wp1)
+        dl = [(b_.length / a_.length - 1.0) for a_, b_ in zip(pri0_l, pri_l) if a_ is not None and b_ is not None and a_.length > 0]
+        print("turning, priced route at lambda 0 -> %.3f m/rad: lattice %.1f -> %.1f heading changes per 10 m, %.2f -> %.2f rad/m; "
+              "waypoints %.1f -> %.1f changes per 10 m, %.3f -> %.3f rad/m; lattice length +%.2f%% median, +%.2f%% max"
+              % (lam, c0_, c1_, t0_, t1_, w0_, w1_, u0_, u1_, 100 * float(np.median(dl)), 100 * max(dl)))
     print("B1/B2 for a price phi >= 0 (phi = the hinge deficit or exp(-k (g - origin)) below reach; kappa = rate), o the length optimum, "
           "P the priced route, A = sum l phi_mean, n edges:")
     print("  J = L + kappa A (up to the n * 1e-4 rounding), J(P) <= J(o) and L(P) >= L(o) - n 1e-4 give "
