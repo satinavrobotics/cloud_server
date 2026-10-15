@@ -152,9 +152,9 @@ def test_g_ignoring_val_in_the_lazy_reader_is_detected(monkeypatch):
     mutant = PlanGraph(st.view("m"), max_tiles=10 ** 6)                  # ... one that drops the plane does not
     with pytest.raises(AssertionError):
         _compare("grid", eng, mutant, 22)
-    # and the direct reading differs too (every node reads unvalidated)
+    # and the direct reading differs too (every node of the mutant reads validated)
     tiles = sorted(tuple(int(v) for v in n.split(",")) for n in st.manifest("m")["tiles"])
-    assert not mutant._cells(tiles)[4].any() and ok._cells(tiles)[4].any()
+    assert mutant._cells(tiles)[4].all() and not ok._cells(tiles)[4].all()
 
 
 # ---- the detour world and the tile cap ---------------------------------------------------------------------------
@@ -189,3 +189,28 @@ def test_over_the_tile_cap_the_corridor_route_stands_and_is_flagged_inexact():
             inexact += 1
             assert r.unvalidated >= f.unvalidated             # valid, never better than the optimum, and said so
     assert inexact
+
+
+def test_a_rule_store_of_the_earlier_token_is_read_without_validity_not_wrongly(monkeypatch):
+    """a +near4 store (not yet rebuilt) has no `val`: the lazy reader reads every node as validated, so the flag changes nothing"""
+    from packages.scene_graph import store as S
+    w, way = ALL["grid"]()
+    leaves = cw.drive(w, way)
+    be = MemoryBackend()
+    st = SceneGraphStore(be, be)
+    g = ChartGraph(SceneParams(near_range_m=NEAR))
+    with monkeypatch.context() as m:
+        m.setattr(S, "PIPELINE_NEAR_VAL", "morse/2+near4")
+        v = None
+        for i in range(0, len(leaves), 9):
+            v = st.save("m", g, g.fold_many(leaves[i:i + 9]), v, {"n": 1})
+    assert st.manifest("m")["pipeline"] == "morse/2+near4"
+    lazy = PlanGraph(st.view("m"), max_tiles=10 ** 6)
+    assert not lazy._has_val
+    plain = PlanGraph(st.view("m"), max_tiles=10 ** 6)
+    for a, b, s_, g_ in _cases(g, "grid", 8):
+        r = lazy.route(a, b, None, s_, g_, safety=VF)
+        base = plain.route(a, b, None, s_, g_)
+        assert (r is None) == (base is None)
+        if r is not None:
+            assert [tuple(p) for p in r.nodes] == [tuple(p) for p in base.nodes] and r.unvalidated is None

@@ -3,7 +3,9 @@
 Status (2026-10-14): **part A (close evidence) is in the engine, merged and off by default** (`SceneParams.near_range_m`, environment
 `SCENE_GRAPH_NEAR_RANGE_M` empty); **part B (turn cost) is built on branch `feat/turn-cost`, off by default**
 (`SCENE_GRAPH_TURN_COST_ENABLED` false; not merged, not deployed; B.5, B.6, `route_safety.md` section 9); part C (waypoint merge) is
-designed and prototyped on a research lattice, not built. The exponential inflation tier stays off. Direction was accepted by Laci for A and B; the user accepted the engine
+designed and prototyped on a research lattice, not built; **part G (validated-first planning) is built on branch `feat/validated-first`**
+(2026-10-15, planner switch `SCENE_GRAPH_VALIDATED_FIRST` off by default, store token `morse/2+near5`: every rule-on map is rebuilt on deploy, G.3).
+The exponential inflation tier stays off. Direction was accepted by Laci for A and B; the user accepted the engine
 prototype and asked for it to be merged and deployed. Written by the lattice_cimbi session. Every number below comes from the
 scripts named below, run on the office8 leaf export (97 leaves, one session of 6 minutes; no other map's leaf export is available
 to these scripts).
@@ -579,6 +581,157 @@ All 8 long plans (38 m median) are served with no fallback, with the live pricin
 O(n^2) cost of the waypoint budget on long open routes (p50 618 ms against 72 ms for the greedy pull); candidate thinning (C.2b) brings it to 74 ms
 (chart radius 2 m) and 99 ms (6 m). Larger charts cut the chart count by 7.5 times at no change in plan time; the route search does not depend on them.
 
+## G. Validated-first planning (2026-10-15; built on branch `feat/validated-first`, planner switch off by default, store token `morse/2+near5`)
+
+### G.1 The problem and the definitions
+
+The close-evidence rule (A) decides which free cells are trustworthy for the STRUCTURE (F); the planner routes through any free-looking cell of
+F, including cells that were only ever seen free from far away and never validated by a close look or by the robot driving over them. On sparsely
+driven maps most of F is unvalidated (office5 72 %, office03 60 % measured before this work; G.5 below) and a random route there touches
+unvalidated cells in every case. The rule asked for: untraversed space stays off the plan until a close look or a traversal validates it (or a
+close lethal report invalidates it, which A already does by holding the cell, so it is not in F).
+
+* A costmap cell is VALIDATED when it was reported free from a capture pose within `near_range_m` (the existing plane `Fn` >= 0, which also
+  honours `near_fov_deg`), or the robot's body covered it (the existing driven image `S` of `_evidence`; the witness cells are inside it).
+  A close lethal report is NOT validation.
+* A lattice NODE (a 0.1 m block of 2 x 2 costmap cells) is validated when any cell of its block is: `ChartGraph._validated_nodes`.
+* An EDGE is unvalidated when either end node is unvalidated.
+
+### G.2 The formulation (lexicographic, exact)
+
+Minimise the number c of unvalidated edges first, then the cost J (the priced length plus the turn cost, an integer in units of 1e-4 m).
+Realised as one ordinary shortest-path problem with the integer edge weight
+
+    w'(e) = w(e) + P * [e unvalidated],      P = 1 + (sum of all edge weights of the graph) + (n - 2) * t_max
+
+(n nodes, t_max the largest cost of one corner, 0 without a turn cost). With no turn cost this is exactly "P = 1 + the sum of all edge weights".
+
+Exactness (proved in the docstring of `packages/scene_graph/validated.py`; tested by brute force):
+
+1. Removing a cycle from a walk never increases c nor J (it deletes edges of weight >= 1; the turn cost is a metric on headings, so the one
+   direct turn at the junction costs no more than the turns around the cycle). So the lexicographic optimum over all walks is a simple path.
+2. A simple path uses each edge at most once and has at most n - 2 corners, so J < P.
+3. For simple paths A, B: c_A < c_B gives w'(A) < P (c_A + 1) <= P c_B <= w'(B); c_A = c_B gives w'(A) < w'(B) iff J_A < J_B. So on simple paths the
+   order of w' is the lexicographic order (c, J), and a walk with a cycle costs at least its simple path. Dijkstra is exact for non-negative
+   integer weights (held exactly in float64, G.4), hence the w'-optimum is the (c, J)-optimum.
+4. The set of w'-minimal paths does not depend on P (any P > J of a simple path gives the same set), so the canonical tie rule (the
+   lexicographic minimum of the (y, x) cell sequence) applies unchanged and the engine (P from the whole graph) and the lazy reader (P from the
+   cells it loaded) return the same cells. The turn search (`turn.py`) takes w' as its edge weights; its table is the separate additive term and
+   is kept as it is. Given a route of w'-cost T with c unvalidated edges, its cost is J = T - P c; `Route.cost` stays J (no penalty in it) and
+   `Route.unvalidated` / `unvalidated_m` carry the count and the metres.
+
+Switching off (the default, `SCENE_GRAPH_VALIDATED_FIRST` false): `Safety.validated_first` is False, no weight changes (`route_w` is the
+integer length, tested against the unchanged weights and the independent reference) and `Route.unvalidated` is None. If a start or goal node is
+unvalidated the route exists and carries the edges at its end in the count: nothing is refused, and a route that exists today exists with the flag
+on (every edge keeps a finite weight; measured: 0 unroutable of 900 pairs in G.5).
+
+The lazy reader (`PlanGraph._route_vf`): the corridor search seeds it. When the corridor's route has c = 0 it is a (0, J) route, so the optimum has
+c = 0 and cost <= J and lies in the charts that can hold such a path: the existing ellipse search with the same bound. When c > 0 a route with
+fewer unvalidated edges can be arbitrarily longer, so no geometric bound exists and every chart is searched; over the tile cap
+(`SCENE_GRAPH_LAZY_MAX_TILES`) the corridor's route stands, `exact` is False and the plan says so. With a turn cost the same whole-graph search
+runs the engine's sequence (plain optimum, then `turn.route`).
+
+### G.3 Storage and token (decision)
+
+* New uint8 tile plane `val`: the VALIDATED NODE flag of the tile's 64 x 64 lattice cells (the same grid as `own`), not a per-cell validity: the planner
+  needs nodes, and the engine derives them from `Fn` and the driven image, which a tile cannot recompute (the driven evidence is not in the
+  tiles). 4 KB before compression. Written only with `near_range_m` (like `fn`, `bn`, `hold`); the engine keeps it in `EngineState.Val`, checks it
+  on `import_state` against the rebuilt one (`StateMismatch`), and its dirty box (`_val_changed_box`) is part of `Dirty.bbox`, so an incremental
+  save covers a node that changed far from the folded window (a driven chord reaches back to the previous pose; tested with `strict=True,
+  verify_every=1`). The tile reader keeps `val` (`read_planes`).
+* Token `morse/2+near5` = the planes of `+near3` / `+near4` (`hold` only with `near_min_clearance_m`, as before) and `val`. `_pipeline` returns it for
+  every store made with `near_range_m`; the rule-off token `morse/2` is unchanged and so are the bytes of every plane that existed. `+near3` and
+  `+near4` are no longer written (the names stay defined; nothing is added to `RETIRED_PIPELINES`): `load` refuses such a store with a `ValueError`
+  that names the missing plane, and the checker (`tools/scene_graph_check_generation.py`) reports it as `pipeline morse/2+near4 !=
+  morse/2+near5 (... the worker rebuilds the map in a new generation)` instead of raising. The lazy reader reads a store of the earlier tokens
+  without validity (every node validated): the flag is then inert, never wrong.
+* **Deploy consequence: every rule-on map is rebuilt.** The token is part of the params hash (`params_hash(params, pipeline)`); the worker compares
+  the stored `params_hash` with the one its engine expects at start (`scene_worker`, `expected_params_hash`), finds a difference on every `+near3|4`
+  map, and rebuilds it in a new generation (`reason: needs_rebuild`; readers and the planner keep the old version until the commit). The live maps
+  are all `+near4`: nine rebuilds, the same operation as switching the rule on or changing it (A.6e). Rule-off maps are not touched. Merging
+  alone rebuilds nothing; deploying the graph-builder image does. Deploy the graph-builder first and wait for the generations
+  (`runbook.md` section 3); the planner switch means nothing before a map has its `val` plane.
+
+### G.4 Float64 bound
+
+Every distance is at most P (n + 1) + sum w; `validated.penalise` raises when that reaches 2**53 (9.0e15). Measured on the live graphs (read-only, from the
+stored cells) and on a synthetic 117 000-cell graph (4 edges per node, two orthogonal and two diagonal, weights 1000 and 1415):
+
+| graph | sum w | lambda (m/rad) | P | bound P (n + 1) + sum w | share of 2**53 |
+|---|---|---|---|---|---|
+| Hospital, 17 114 nodes, 66 223 edges, priced kappa 1 | 8.18e7 | 0 | 8.18e7 | 1.4e12 | 1.6e-4 |
+| same | 8.18e7 | 0.4 | 2.97e8 | 5.1e12 | 5.6e-4 |
+| same | 8.18e7 | 5 (the largest `Safety` allows) | 2.77e9 | 4.7e13 | 5.3e-3 |
+| office8, 1 973 nodes, priced | 9.4e6 | 0 / 0.4 / 5 | 9.4e6 / 3.4e7 / 3.2e8 | 1.8e10 / 6.7e10 / 6.3e11 | <= 7e-5 |
+| synthetic 117 000 nodes, unpriced | 5.65e8 | 0 / 0.4 / 5 | 5.7e8 / 2.0e9 / 1.9e10 | 6.6e13 / 2.4e14 / 2.2e15 | 7e-3 / 2.6e-2 / 0.25 |
+| synthetic 117 000 nodes, every edge priced 10 x | 5.65e9 | 0 / 0.4 / 5 | 5.7e9 / 7.1e9 / 2.4e10 | 6.6e14 / 8.3e14 / 2.8e15 | 0.07 / 0.09 / 0.31 |
+
+The bound holds everywhere with a factor 3 or more to spare, also at the largest turn price, so no other encoding (two phases) is needed. The
+guard stays for a map of several million cells.
+
+### G.5 Measurement
+
+**Acceptance harness** (`accept_route_safety.py --data <office8 export> --validated-first`, 150 pairs, seed 7, kappa 1; with `--near-range 1.5
+--near-min-clearance 0.25`, with `--near-range 0.5`, and with `--near-range 0.5 --turn-lambda 0.4`): ALL GATES PASS in the three runs.
+A1 to A7, N1, C1, C3, C3c are unchanged; A3 compares the production route with the harness `Reference` (its own validity, node by node; its own
+penalty P = 1 + the sum of its priced weights; for a turn cost an expanded graph with its own bound): same cells, same J, same count on 150 of
+150 pairs. B1, B2, C2 assume that the route minimises the priced cost alone and are replaced by V2 (never more unvalidated edges than the priced route,
+never unroutable) and V3 (at an equal count, the same J). The test reference (`route_safety_worlds.Reference.lex_dijkstra`) uses pair distances
+compared lexicographically, with no penalty constant at all; a brute force over every simple path of small random graphs agrees with the
+production weights. Office8 is nearly fully validated at 1.5 m (98.5 % of F; 4 of 150 routes touch an unvalidated edge); at 0.5 m (a forced
+sparse case) the routes with unvalidated edges go 73 -> 66 and the unvalidated edges per route 3.7 -> 2.2 (4.1 -> 2.2 with lambda 0.4).
+
+**The live maps** (`tools/scene_graph_sim/validated_first_live.py`, read-only: a `python -` in the graph-builder container, the branch's modules
+served from memory; the stores are read under their `+near4` token and the `val` nodes rebuilt as the writer will store them; 100 random pairs >= 3 m per
+map that the baseline route connects, seed 7; engine routes). Validated share of F (nodes) and the planner's default pricing (kappa 1 hinge;
+before = the priced route, after = the same price validated-first). "S/G unvalidated" = pairs whose start or goal node is unvalidated;
+unvalidated edges and metres are sums over the 100 routes.
+
+| map | nodes | validated | largest validated piece | same route | changed (len x median / max) | S/G unvalidated | unroutable | routes with unvalidated edges | unvalidated edges | unvalidated metres |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Hospital | 17 114 | 28.8 % | 14.8 % | 13 | 87 (1.049 / 1.665) | 92 | 0 | 95 -> 94 | 3742 -> 2203 | 431 -> 275 |
+| Officemap | 2 109 | 77.2 % | 77.1 % | 66 | 34 (1.028 / 1.960) | 45 | 0 | 46 -> 45 | 648 -> 389 | 76 -> 46 |
+| office01 | 2 153 | 79.3 % | 79.1 % | 54 | 46 (1.032 / 2.359) | 43 | 0 | 53 -> 43 | 773 -> 250 | 90 -> 32 |
+| office03 | 1 385 | 39.6 % | 32.1 % | 57 | 43 (1.000 / 1.040) | 91 | 0 | 96 -> 96 | 2409 -> 2290 | 293 -> 282 |
+| office04 | 2 157 | 91.8 % | 91.8 % | 89 | 11 (1.000 / 1.058) | 20 | 0 | 20 -> 20 | 159 -> 134 | 19 -> 16 |
+| office5 | 865 | 28.4 % | 28.4 % | 44 | 56 (1.021 / 1.293) | 100 | 0 | 100 -> 100 | 2496 -> 2340 | 324 -> 314 |
+| office6 | 1 967 | 94.7 % | 94.7 % | 100 | 0 | 13 | 0 | 13 -> 13 | 68 -> 68 | 7.8 -> 7.8 |
+| office7 | 2 129 | 92.7 % | 92.7 % | 77 | 23 (1.000 / 1.153) | 23 | 0 | 24 -> 23 | 155 -> 104 | 17.8 -> 13.1 |
+| office8 | 1 973 | 98.5 % | 98.5 % | 98 | 2 (1.000 / 1.000) | 3 | 0 | 3 -> 3 | 9 -> 7 | 1.1 -> 0.9 |
+
+The same table without the clearance price (unpriced route against unpriced validated-first) differs by a few pairs only (Hospital 13 same, 87
+changed 1.049 / 1.665, 3828 -> 2203 edges; office01 43 same, 57 changed 1.020 / 2.261, 888 -> 250; office5 50 same, 50 changed 1.025 / 1.293, 2539 -> 2340).
+Engine route time, mean per pair: 0.4 to 2.7 ms after, 0.4 to 2.5 ms before (largest on Hospital).
+
+Reading: where the drive covers the map (office04, 6, 7, 8) little changes. Where it does not, the unvalidated edges that remain are mostly the
+ends of routes whose start or goal is itself in unvalidated space (a random node of Hospital, office03 and office5 is unvalidated in 92, 91 and
+100 of 100 pairs), plus stretches no validated route avoids. Where a detour exists the rule takes it: office01 loses 68 % of its unvalidated
+edges, Officemap 40 %, Hospital 41 %, at a median route length +3 to +5 % and a worst case of 2.4 x. Maps that lose plannable space: Hospital,
+office5, office03 (28 to 40 % of F validated; the piece plans reach without any unvalidated edge is 15 to 32 % of F); no route became unroutable.
+
+**Plan time** (`outdoor_world.py --w 60 --h 40 --pairs 8 --min-pair-m 20 --near-range 1.5 --near-min-clearance 0.25 [--validated-first]`: the whole
+`plan_on_graph` with pricing and the waypoint budget 0.35 m, in-memory store, 8 pairs of 38 m median; the drive covers 100 % of F, so the ellipse
+search of G.2 runs). Chart radius 2 m, p50 / p95 / max: 81 / 164 / 190 ms off, 75 / 169 / 191 ms on; radius 6 m: 92 / 163 / 182 ms off,
+97 / 168 / 188 ms on. The same world with `--near-range 0.3 --radii 2` (53 % of F validated; the whole-graph search of G.2 runs): 73 / 138 /
+160 ms off, 654 / 968 / 1015 ms on, and the 8 routes are 195 m (median) instead of 38 m, with 2 unvalidated edges left (the start or goal end).
+
+### G.6 What is NOT shown
+
+* No robot outcome data: nothing here says that a validated route is driven more reliably than an unvalidated one, only that the plan avoids
+  space nobody looked at closely or drove.
+* A start or goal in unvalidated space is planned, not refused; the plan reports `validated_first {unvalidated_edges, unvalidated_m, exact}` (and
+  the planner logs it), and the dispatcher's reaction to the count (refuse, warn, ask for a mapping pass) is not designed.
+* The strict lexicographic rule puts no price on the detour: one unvalidated edge outweighs any length. On the outdoor world at 53 % validated
+  the plans are 5 x longer and the search 9 x slower (above), and on the live maps a route can be up to 2.4 x longer. A bounded variant (accept an
+  unvalidated stretch when the validated detour costs more than a limit, or price an unvalidated edge) is a different objective and is not built.
+* The waypoint pull is not validity-aware: it simplifies the lattice route by line of sight in F, so a polyline can cross unvalidated cells the
+  lattice route avoided. Measured on office8 at 0.5 m: 33 of 150 plans cross more unvalidated length than their lattice route (0.30 m mean
+  against 0.24 m). The gap-fill and corridor routes of the route enrichment take the flag with their lattice routes (the same `Safety`) and have the same pull.
+* Over the tile cap the validated-first search returns the corridor's route (valid, maybe with more unvalidated edges), `exact` False.
+* The live maps were routed with the engine, not the lazy reader (their stores are still `+near4`); engine == lazy is the equality tests on the nine
+  worlds (with and without an overlay, at tile edges, with a price and with a turn cost).
+* The live `val` was rebuilt in memory; after the rebuild it is the stored plane, which the writer checks equal to the rebuilt one on every load.
+
 ## D. Open items
 
 Resolved by Laci 2026-10-14: goal tolerance 0.35 m; the Odin override is live; the Smac tolerance is dropped; robot speeds come from
@@ -593,3 +746,4 @@ registration (B.6, per robot, with a fallback); the search allowance is 0.5 s an
 | 5 | Switching the rule on in production (`SCENE_GRAPH_NEAR_RANGE_M`): a rebuild of every map; value from the robot's `support.commit_radius_m` (1.5 m), the cone or not (item 2), and the decision of A.6 (item 3) | Laci / user | the live use of A |
 | 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader (B.5), with lambda per robot (B.6) | lattice_cimbi | built on branch `feat/turn-cost`, off by default; needs review, merge, and a decision to switch it on. The 0.5 s allowance holds to lambda 0.5 on the 117k-cell map, not from 1.0 (B.5): either accept that, cap lambda lower than 5, or tighten the ellipse (a lower bound of the turning still needed) |
 | 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |
+| 8 | Validated-first (G): merge, deploy the graph-builder (nine rebuilds, G.3), then decide on `SCENE_GRAPH_VALIDATED_FIRST`; the detour has no price (G.6), the pull is not validity-aware, the dispatcher's reaction to the count is not designed | Laci | the live use of G |

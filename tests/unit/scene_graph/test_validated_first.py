@@ -405,7 +405,7 @@ def test_f_a_store_without_the_rule_reads_every_node_as_validated():
     st, _, _ = _stored(detour_world(), params=SceneParams())
     lazy = PlanGraph(st.view("m"), max_tiles=10 ** 6)
     tiles = sorted(tuple(int(q) for q in n.split(",")) for n in st.manifest("m")["tiles"])
-    assert lazy._cells(tiles)[4].all() and not lazy._has_val
+    assert lazy._cells(tiles)[4].all() and not lazy._has_val       # nothing to read: every node counts as validated
 
 
 # ---- (g) the bound ------------------------------------------------------------------------------------------------

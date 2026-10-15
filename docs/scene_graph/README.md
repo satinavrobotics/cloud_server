@@ -47,8 +47,9 @@ refuted claims: `audit_ledger.md`. The 2026-10-13 artifact with the figures: htt
 | Config and flags | `packages/config.py` (`SCENE_GRAPH_*`), `docker_compose/mission_dispatch_services.yaml`, `.env.example` | both |
 | Migration | `packages/api/migrations/versions/20261012_01_blocked_geometry.py` | LACI |
 
-Constants that matter: `FORMAT = 4`, `PIPELINE = "morse/2"` (store; `"morse/2+near3"` for a store made with the close-evidence
-rule (tile planes `fn`, `bn`), `"morse/2+near4"` with its away-from-walls filter: one more tile plane `hold`), `LAT = 2` (costmap cells per lattice cell, engine), `RES = 0.05` m costmap cell. `SceneParams` = `robot_half_side`,
+Constants that matter: `FORMAT = 4`, `PIPELINE = "morse/2"` (store; `"morse/2+near5"` for a store made with the close-evidence
+rule (tile planes `fn`, `bn`, `val`, and `hold` with its away-from-walls filter; on branch `feat/validated-first`, design part G: the live stores are still the
+earlier `"morse/2+near3"` / `"morse/2+near4"` until the graph-builder is deployed and rebuilds them), `LAT = 2` (costmap cells per lattice cell, engine), `RES = 0.05` m costmap cell. `SceneParams` = `robot_half_side`,
 `lattice`, `chart_radius` and the optional `near_range_m` / `near_fov_deg` / `near_min_clearance_m` (close evidence and its away-from-walls filter, None = off; `api.py`); nothing else is a
 scene parameter. The engine's window cap (20 m side) and pose slack (5 m) are validation constants, not tunables.
 

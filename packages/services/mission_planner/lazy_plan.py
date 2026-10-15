@@ -53,6 +53,7 @@ from scipy.sparse.csgraph import dijkstra
 from packages.scene_graph import turn as turn_search
 from packages.scene_graph import validated
 from packages.scene_graph.api import Blocked, Route, Safety, Snap, edge_weight
+from packages.scene_graph.store import PIPELINE_NEAR_VAL
 from packages.scene_graph.store_codec import read_planes
 
 ROUTE_UNIT_M = 1e-4              # route cost unit (packages/scene_graph/engine.py)
@@ -135,7 +136,9 @@ class PlanGraph:
         self.params = SimpleNamespace(**view.params)
         self.max_tiles = int(max_tiles)
         self.unavailable = False                # set when a tile could not be read (see TileUnavailable)
-        self._has_val = "near_range_m" in view.params      # the store carries the validity plane `val` (made with the close-evidence rule)
+        # the store carries the validity plane `val`: made with the close-evidence rule under the token that adds it. A rule store of an
+        # earlier token (+near3 / +near4, not yet rebuilt) has none: validated-first is then inert (every node reads validated), not wrong
+        self._has_val = "near_range_m" in view.params and view.man.get("pipeline") == PIPELINE_NEAR_VAL
         self._mu = threading.Lock()             # guards `_inflight` only; no I/O runs under it
         self._inflight: Dict[Tuple[int, int], _Flight] = {}
         view._own = self._read                  # the view's own readers (snap, windows) share the single flight
@@ -360,7 +363,7 @@ class PlanGraph:
             gy, gx = iy + ty * TILE_L, ix + tx * TILE_L
             ys.append(gy); xs.append(gx)
             ch.append(lut[np.minimum(o[iy, ix], len(lut) - 1)])
-            vl.append(t["val"][iy, ix] != 0 if "val" in t else np.full(len(iy), not self._has_val))
+            vl.append(t["val"][iy, ix] != 0 if "val" in t else np.ones(len(iy), bool))
         if not ys:
             e = np.zeros(0, np.int64)
             return e, e.astype(np.int32), e, e, e.astype(bool)
