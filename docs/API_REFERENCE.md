@@ -187,7 +187,9 @@ Per-tile and per-region driving statistics (speed, time lost, coverage) of a map
 map-frame trajectories. Read only. Full rules, limits and the live cross-check: `docs/drive_stats_2026-10-14.md`.
 
 Query (all optional): `from`, `to` (ISO-8601 with time zone; rows with `from <= ts < to`), `robot` (exact name),
-`min_speed` (m/s, 0..1, default 0.05: a movement slower than this counts as stopped time).
+`min_speed` (m/s, 0..1, default 0.05: a movement slower than this counts as stopped time),
+`series=day` (opt-in; adds a per-UTC-day `series` block over `from`/`to`, default the last 30 days, at most 120 days:
+`docs/map_series_2026-10-15.md`).
 
 Response:
 
@@ -229,7 +231,9 @@ Response:
 #### `GET /api/v1/maps/{map_id}/mapping-stats`
 
 How long the mapping of a map took: totals, per session, per m^2 and per 0.1 m cell. Read only. Rules, definitions and the
-live cross-check: `docs/mapping_stats_2026-10-14.md`. Query (optional): `robot` (exact name; filters the sessions, not the area).
+live cross-check: `docs/mapping_stats_2026-10-14.md`. Query (optional): `robot` (exact name; filters the sessions, not the area), `series=session` (opt-in `series` block, one
+point per mapping session, newest 30). Each session now also has `new_cells`, `area_added_m2` and `minutes_per_100m2`
+(estimates, see `docs/map_series_2026-10-15.md`).
 
 ```json
 {
@@ -1204,13 +1208,18 @@ days), optionally of one robot. 422 for `from >= to`; an unknown map answers zer
                   "max_run_s", "notes": [str]}}
 ```
 
+Opt-in `series=day|run` adds a `series` block of arrays aligned with `t` (one point per UTC day of the window, at most
+120, or the newest 60 finished runs, oldest first); without the parameter nothing changes. Shapes:
+`docs/map_series_2026-10-15.md`. 422 for another value or a window over 120 days with `series=day`.
+
 Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-10-14.md`. `efficiency`
 (null when the map has no legs or the computation failed; a note says which): `docs/path_efficiency_2026-10-15.md`.
 
 **`GET /api/v1/maps/{map_id}/events-summary?from=&to=&robot=&limit=10`** -- the most usual events
 of the map and its safety events, as episodes (a repeated error counts once). Window `[from, to)`,
 default the last 30 days; `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
-an unknown map answers zeros. Cached 30 s.
+an unknown map answers zeros. Cached 30 s. Opt-in `series=day` adds `series: {bucket, t, total, safety,
+by_code}` per UTC day (`docs/map_series_2026-10-15.md`).
 
 ```
 {"map_id", "window": {"from", "to"}, "robot": null | str,

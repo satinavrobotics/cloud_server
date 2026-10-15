@@ -231,7 +231,8 @@ class TestEndpoint:
         assert h["nodes"] == 5 and h["images"] == 10
         assert len(body["sessions"]) == 1                                   # the operate session is not counted
         sess = body["sessions"][0]
-        assert sess["active_s"] == 540 and sess["attributed_s"] == 40 and sess["area_added_m2"] is None
+        assert sess["active_s"] == 540 and sess["attributed_s"] == 40 and sess["area_added_m2"] == 12.5 and sess["new_cells"] > 0
+        assert sess["minutes_per_100m2"] == 72.0       # the only session: all of the mapped area
         assert sum(t[2] for t in body["tiles"]) == pytest.approx(40.0, abs=0.1)
         assert sum(t[3] for t in body["tiles"]) == 5 and all(len(t) == 4 for t in body["tiles"])
         assert body["origin"] == [0.0, 0.0] and body["graph_version"] == 7

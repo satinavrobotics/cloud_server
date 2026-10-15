@@ -179,6 +179,14 @@ async def grouped(cur: Any, map_id: str, start: datetime.datetime, end: datetime
     return await _all(cur, cte + _GROUP_SQL, params + [map_id])
 
 
+async def daily_counts(cur: Any, map_id: str, start: datetime.datetime, end: datetime.datetime,
+                       robot: Optional[str], codes: Sequence[str]) -> List[Sequence[Any]]:
+    """Episodes of the map in [start, end) per UTC day: rows (date, code, error_type, n). One query."""
+    cte, params = _attributed_cte(map_id, start, end, robot, codes)
+    return await _all(cur, cte + "SELECT (ts AT TIME ZONE 'UTC')::date, code, ekey, count(*) FROM att "
+                      "WHERE map = %s GROUP BY 1, 2, 3", params + [map_id])
+
+
 async def attribution(cur: Any, map_id: str, start: datetime.datetime, end: datetime.datetime,
                       robot: Optional[str], codes: Sequence[str]) -> Dict[str, int]:
     """How the map's episodes were attributed, plus `unattributed`: episodes of the robots that
