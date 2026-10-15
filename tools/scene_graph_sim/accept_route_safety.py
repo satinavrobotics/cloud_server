@@ -3,7 +3,7 @@
     python tools/scene_graph_sim/accept_route_safety.py --data DIR [--pairs 150] [--seed 7] [--kappa 1] [--robot-half-side 0.25]
                                                          [--width W [--length L]]
                                                          [--profile exp --k 6 --reach 0.8 --origin 0.3] [--turn-lambda L]
-                                                         [--waypoint-budget M]
+                                                         [--waypoint-budget M [--waypoint-apex]]
 
 `--profile exp` runs the same gates for the exponential price profile (docs/scene_graph/inflation_profile_design.md): the
 tier is selected through the SCENE_GRAPH_INFLATION_* settings (config attributes set here), kappa = `--kappa` (the planner's
@@ -22,6 +22,12 @@ reported at lambda 0 and at L.
 (`plan_on_graph(waypoint_budget_m=M)`) and adds the gates W1 (final polyline in F), W2 (J(final) <= J(lattice) + M + n * 1e-4) and W3
 (never more waypoints than the greedy pull of the same pair), and reports segments per route, routes with a segment under 0.5 m, the
 polyline length ratio, the mean budget used and the plan time against the greedy pull.
+
+`--waypoint-apex` (needs `--waypoint-budget` and `--turn-lambda`; design C.2 "Apex candidates") also plans every pair with the apex
+candidates (`waypoint_apex=True`, R = the turn lambda) and adds the gates W4 (apex plan in F and J(final) <= J(lattice) + M + n * 1e-4)
+and W5 (never more waypoints than the budget-only plan); it reports, budget-only against budget + apex (and against the variant
+that keeps the vertex on a tie), segments per route, the interior waypoints' minimum clearance per route (median, p10), waypoints
+under r, the turning at the waypoints (rad per m), the polyline length ratio, the continuum J ratio and the plan time.
 
 Production path, built once: the export's leaves are folded in the engine, saved to a `SceneGraphStore(MemoryBackend)` (batches of 6, as
 the worker saves), the restored engine (`store.load`) is the reference and `open_plan` the planner's tile-lazy `PlanGraph`. The same
@@ -363,6 +369,7 @@ def main() -> int:
     ap.add_argument("--near-min-clearance", type=float, default=None,
                     help="with --near-range: the away-from-walls filter (SceneParams.near_min_clearance_m), m; default off")
     ap.add_argument("--waypoint-budget", type=float, default=0.0, help="waypoint budget (m of priced cost); 0 = not measured")
+    ap.add_argument("--waypoint-apex", action="store_true", help="also measure the apex candidates (needs --waypoint-budget, --turn-lambda)")
     ap.add_argument("--turn-lambda", type=float, default=0.0, help="turn cost (m per rad) on the priced side; 0 = none")
     args = ap.parse_args()
     t_start = time.perf_counter()
@@ -403,13 +410,13 @@ def main() -> int:
             pairs.append((sa, sb))
     gap = config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M
 
-    def plan(graph, p, q, kappa, times=None, turn=None, budget=0.0):
+    def plan(graph, p, q, kappa, times=None, turn=None, budget=0.0, apex=False):
         t = time.perf_counter()
         turn = (turn_rec if kappa > 0.0 else None) if turn is None else turn
         try:
             out = sr.plan_on_graph(graph, "m", p, q, ([], []), node_of, config.SCENE_GRAPH_START_SNAP_M,
                                    config.SCENE_GRAPH_GOAL_SNAP_M, gap, args.width, 0.05, args.length, None, kappa, False,
-                                   turn=turn, waypoint_budget_m=budget)
+                                   turn=turn, waypoint_budget_m=budget, waypoint_apex=apex)
         except sr.ChartFallback as err:
             out = err.reason
         if times is not None:
@@ -616,6 +623,65 @@ def main() -> int:
                             wb, len(used), float(np.mean(seg_g)), float(np.mean(seg_w)), short_g, short_w,
                             float(np.mean([w / g for w, g in zip(len_w, len_g) if g > 0])), 100 * float(np.mean(used)),
                             100 * max(used), pct(t1, 50) * 1e3, pct(t1, 99) * 1e3, pct(tw, 50) * 1e3, pct(tw, 99) * 1e3))
+
+    if args.waypoint_apex:
+        if wb <= 0.0 or lam <= 0.0:
+            print("--waypoint-apex needs --waypoint-budget and --turn-lambda")
+            return 1
+        variants = {}
+        for label, ties in (("apex", True), ("apex, vertex on a tie", False)):
+            sr.APEX_TIES_TO_APEX = ties
+            for sa, sb in pairs:
+                plan(lazy, (sa.x, sa.y), (sb.x, sb.y), args.kappa, budget=wb, apex=True)
+            ta = []
+            variants[label] = ([plan(lazy, (sa.x, sa.y), (sb.x, sb.y), args.kappa, ta, budget=wb, apex=True) for sa, sb in pairs], ta)
+        sr.APEX_TIES_TO_APEX = True
+        plansa, ta = variants["apex"]
+        a_out, a_over, a_more = [], [], []
+        for i in range(len(pairs)):
+            w_, a_ = plansw[i], plansa[i]
+            if isinstance(w_, str) or isinstance(a_, str) or pri_l[i] is None:
+                continue
+            sa, sb = pairs[i]
+            pts_a = wp(a_)
+            lattice = [(sa.x, sa.y)] + [tuple(n) for n in pri_l[i].nodes] + [(sb.x, sb.y)]
+            if not ref.all_samples_in_f(pts_a):
+                a_out.append(i)
+            j_a, _ = ref.sampled_cost(pts_a, SAMPLE_COARSE)
+            j_lat, _ = ref.sampled_cost(lattice, SAMPLE_COARSE)
+            if j_a > j_lat + wb + (len(lattice) - 1) * U:
+                a_over.append(i)
+            if len(pts_a) > len(wp(w_)):
+                a_more.append(i)
+        gate("W4", "apex waypoints in F, cost bound", not a_out and not a_over,
+             "%d plans leave F (1 cm samples), %d with J(final) > J(lattice) + %.2f + n * 1e-4" % (len(a_out), len(a_over), wb),
+             "C.2 apex: chords visible; an apex stands at its corner's index, so the chords' slacks still sum to at most the budget")
+        gate("W5", "apex never more waypoints", not a_more, "%d plans with more waypoints than the budget-only plan" % len(a_more),
+             "the vertex path stays feasible when a corner gets a second, alternative node")
+        rows = [("budget only", plansw, tw)] + [(k, v[0], v[1]) for k, v in variants.items()]
+        ok = [i for i in range(len(pairs)) if pri_l[i] is not None and not any(isinstance(r_[1][i], str) for r_ in rows)]
+        print("apex candidates, R = lambda %.2f m/rad, budget %.2f m, %d plans:" % (lam, wb, len(ok)))
+        for label, pl, tt in rows:
+            seqs = [wp(pl[i]) for i in ok]
+            segs = [len(q_) - 1 for q_ in seqs]
+            inner = [[float(ref.clearance_at(x_, y_)) for (x_, y_) in q_[1:-1]] for q_ in seqs]
+            mins = [min(c_) for c_ in inner if c_]
+            under = sum(1 for c_ in inner for v_ in c_ if v_ < r - 1e-9)
+            lens = [sum(math.dist(a_, b_) for a_, b_ in zip(q_[:-1], q_[1:])) for q_ in seqs]
+            lens_ref = [sum(math.dist(a_, b_) for a_, b_ in zip(wp(plansw[i])[:-1], wp(plansw[i])[1:])) for i in ok]
+            js = [ref.j_cont(q_)[0] for q_ in seqs]
+            js_ref = [ref.j_cont(wp(plansw[i]))[0] for i in ok]
+            _, turn_w = turning(seqs)
+            used = sum(1 for i in ok if pl[i].waypoint_apex and pl[i].waypoint_apex["apexes_used"])
+            apexes = sum(pl[i].waypoint_apex["apexes_used"] for i in ok if pl[i].waypoint_apex)
+            corners = sum(pl[i].waypoint_apex["corners"] for i in ok if pl[i].waypoint_apex)
+            cands = sum(pl[i].waypoint_apex["candidates"] for i in ok if pl[i].waypoint_apex)
+            print("  %-22s segments/route %.3f; interior min clearance median %.3f p10 %.3f m; waypoints under r=%.2f: %d; turning "
+                  "%.4f rad/m; length ratio %.4f; J ratio %.4f; plan time p50/p99 %.1f/%.1f ms; corners %d, with an apex candidate %d, apexes %d in %d routes"
+                  % (label, float(np.mean(segs)), float(np.median(mins)), pct(mins, 10), r, under, turn_w,
+                     float(np.mean([a_ / b_ for a_, b_ in zip(lens, lens_ref) if b_ > 0])),
+                     float(np.mean([a_ / b_ for a_, b_ in zip(js, js_ref) if b_ > 0])), pct(tt, 50) * 1e3, pct(tt, 99) * 1e3,
+                     corners, cands, apexes, used))
 
     # ---- B ----------------------------------------------------------------------------------------------------------------
     b1, b2 = [], []

@@ -689,6 +689,11 @@ SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = _opt_float("SCENE_GRAPH_TURN_LAMBDA_M_PER_RA
 # fewest-waypoints path whose total priced-cost excess over the lattice path is at most this many metres (final cost <= lattice +
 # budget). Empty / <= 0 = off (the greedy pull, unchanged); validated below: finite and at most 1.0, else off.
 SCENE_GRAPH_WAYPOINT_BUDGET_M = _opt_float("SCENE_GRAPH_WAYPOINT_BUDGET_M")
+# Apex candidates of the waypoint budget (design C.2, "Apex candidates"): at a corner of the pulled polyline the budget solver may
+# put the waypoint at the apex of a fillet arc of radius lambda (the robot's v / omega) instead of on the corner vertex, where the
+# clearance is least (never closer to obstacles than the vertex, within 0.35 m of it, same budget bound). Effective only with
+# SCENE_GRAPH_WAYPOINT_BUDGET_M set and a turn lambda > 0 for the plan's robot. Off (the default) = the budget plans, unchanged.
+SCENE_GRAPH_WAYPOINT_APEX_ENABLED = _env_bool("SCENE_GRAPH_WAYPOINT_APEX_ENABLED", "false")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps

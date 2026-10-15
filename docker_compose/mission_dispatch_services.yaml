@@ -340,6 +340,8 @@ services:
       - SCENE_GRAPH_INFLATION_SCALING=${SCENE_GRAPH_INFLATION_SCALING:-}
       # waypoint budget (close_evidence_and_turn_cost_design.md C.2): metres of priced cost the pull may spend to drop waypoints; empty = off
       - SCENE_GRAPH_WAYPOINT_BUDGET_M=${SCENE_GRAPH_WAYPOINT_BUDGET_M:-}
+      # apex candidates of the waypoint budget (C.2): needs the budget and a turn lambda > 0; off by default
+      - SCENE_GRAPH_WAYPOINT_APEX_ENABLED=${SCENE_GRAPH_WAYPOINT_APEX_ENABLED:-false}
       - SCENE_GRAPH_GLOBAL_INSCRIBED_M=${SCENE_GRAPH_GLOBAL_INSCRIBED_M:-}
       # Turn cost of the chart route (docs/scene_graph/close_evidence_and_turn_cost_design.md B.6): off by default; on, lambda per
       # robot = factsheet speed_max / angular_speed_max, LAMBDA_M_PER_RAD (empty = unset) only for an incomplete factsheet

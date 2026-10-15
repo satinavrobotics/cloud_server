@@ -134,6 +134,7 @@ class MissionPlannerService:
         self._priced_inexact = 0
         self._priced_exp = 0                  # of those, priced with the exponential profile
         self._waypoints_below_floor = 0       # interior planner waypoints below the profile's floor (a count, nothing moved)
+        self._apexes_used = 0                 # corner waypoints placed on a fillet apex (SCENE_GRAPH_WAYPOINT_APEX_ENABLED)
         self._waypoints_removed = 0           # waypoints the budgeted pull saved against the greedy pull (SCENE_GRAPH_WAYPOINT_BUDGET_M)
         # served chart plans by the source of their turn-cost lambda (scene_route.turn_lambda: factsheet | config | off)
         self._turn_sources: Dict[str, int] = {}
@@ -302,7 +303,8 @@ class MissionPlannerService:
                 self._robot_length(robot),
                 self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width,
                 config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0, turn=turn,
-                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0))
+                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0,
+                waypoint_apex=config.SCENE_GRAPH_WAYPOINT_APEX_ENABLED))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -322,6 +324,11 @@ class MissionPlannerService:
             self.logger.info("Waypoint budget plan map=%s graph_version=%s waypoint_budget_m=%.3f waypoints_removed=%d waypoints=%d",
                              map_id, version, plan.waypoint_budget["waypoint_budget_m"],
                              plan.waypoint_budget["waypoints_removed"], len(plan.waypoints))
+        if plan.waypoint_apex is not None:
+            self._apexes_used += plan.waypoint_apex["apexes_used"]
+            self.logger.info("Waypoint apex plan map=%s graph_version=%s corners=%d apexes_used=%d waypoints=%d",
+                             map_id, version, plan.waypoint_apex["corners"], plan.waypoint_apex["apexes_used"],
+                             len(plan.waypoints))
         self._turn_sources[turn["source"]] = self._turn_sources.get(turn["source"], 0) + 1
         if plan.pricing is not None and plan.pricing["rate"] == 0.0:
             self.logger.info(
@@ -355,6 +362,7 @@ class MissionPlannerService:
             "graph_version": version,
             **({"pricing": plan.pricing} if plan.pricing is not None else {}),
             **({"waypoint_budget": plan.waypoint_budget} if plan.waypoint_budget is not None else {}),
+            **({"waypoint_apex": plan.waypoint_apex} if plan.waypoint_apex is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
             **({"trajectory": plan.trajectory} if plan.trajectory else {}),
         }, None
@@ -1622,6 +1630,7 @@ class MissionPlannerService:
                 "waypoints_below_floor": self._waypoints_below_floor,
                 "turn_sources": dict(self._turn_sources),
                 "waypoints_removed": self._waypoints_removed,
+                "apexes_used": self._apexes_used,
             }
         return stats
 

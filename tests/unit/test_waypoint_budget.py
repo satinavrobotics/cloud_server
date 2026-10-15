@@ -147,3 +147,157 @@ def test_config_default_off_and_validation(monkeypatch, caplog):
         monkeypatch.setattr(config, "SCENE_GRAPH_WAYPOINT_BUDGET_M", float(raw))
         config._validate_scene_graph_planner()
         assert config.SCENE_GRAPH_WAYPOINT_BUDGET_M == kept
+
+
+# ---- apex candidates (C.2, "Apex candidates") ---------------------------------------------------------------------------
+
+def _near_wall_clearance(p):
+    """a synthetic clearance: the distance to the line y = 1.6 (obstacle above), capped at 1"""
+    return min(1.0, abs(1.6 - p[1]))
+
+
+def _l_lattice():
+    return [(round(0.1 * k, 3), 0.0) for k in range(11)] + [(1.0, round(0.1 * k, 3)) for k in range(1, 11)]
+
+
+def _l_visible(a, b):                         # the L corridor: y <= 0.05 or x >= 0.95 (the inside of the corner is blocked)
+    n = max(1, int(math.dist(a, b) / 0.01))
+    for k in range(n + 1):
+        x, y = a[0] + k / n * (b[0] - a[0]), a[1] + k / n * (b[1] - a[1])
+        if not (y <= 0.05 + 1e-9 or x >= 0.95 - 1e-9):
+            return False
+    return True
+
+
+def test_apex_replaces_a_corner_vertex_by_the_arc_apex_on_the_inward_bisector():
+    lattice = _l_lattice()                         # a right angle at (1, 0): turn 90 degrees, inward is up-left
+    clearance = lambda p: min(1.0, math.dist(p, (1.4, -0.4)))    # noqa: E731  an obstacle beyond the corner: apex is farther
+    info = {}
+    out = sr.fewest_waypoints(lattice, _l_visible, 0.0, math.dist, 0.35, 0.0, 0.1, clearance, None, info)
+    assert info == {"corners": 1, "candidates": 1, "apexes_used": 1}
+    assert len(out) == 3 and out[0] == (0.0, 0.0) and out[-1] == (1.0, 1.0)
+    d = 0.1 * (1.0 / math.cos(math.pi / 4) - 1.0)
+    assert out[1] == pytest.approx((1.0 - d / math.sqrt(2), d / math.sqrt(2)), abs=1e-5)
+    assert clearance(out[1]) >= clearance((1.0, 0.0))
+    # a corner whose apex would be closer to the obstacle keeps the vertex
+    near = lambda p: min(1.0, math.dist(p, (0.9, 0.1)))   # noqa: E731
+    info = {}
+    out = sr.fewest_waypoints(lattice, _l_visible, 0.0, math.dist, 0.35, 0.0, 0.1, near, None, info)
+    assert out[1] == (1.0, 0.0) and info == {"corners": 1, "candidates": 0, "apexes_used": 0}
+
+
+def test_apex_radius_is_clipped_to_the_goal_tolerance_and_the_chord_half():
+    lattice = _l_lattice()
+    _, apex = sr.apex_candidates(lattice, _l_visible, 0.0, 50.0, lambda p: 1.0 - 0.1 * p[0])
+    (a,) = apex.values()
+    assert math.dist(a, (1.0, 0.0)) <= 0.35 + 1e-9
+    short = [(0.0, 0.0), (0.1, 0.0), (0.2, 0.0), (0.2, 0.1), (0.2, 0.2)]
+    _, apex = sr.apex_candidates(short, lambda u, v: u[0] == v[0] or u[1] == v[1], 0.0, 50.0, lambda p: 1.0 - 0.1 * p[0])
+    (a,) = apex.values()                                       # t <= half of the 0.2 m chord: R <= 0.1 / tan(45 degrees)
+    assert math.dist(a, (0.2, 0.0)) == pytest.approx(0.1 * (math.sqrt(2) - 1.0), abs=1e-5)
+
+
+def test_apex_off_radius_zero_or_no_corner_is_the_budget_solver():
+    rnd = random.Random(21)
+    better = lambda p: 1.0 + p[0]          # noqa: E731
+    for _ in range(80):
+        lattice = _walk(rnd, rnd.randint(3, 30))
+        for f in (math.dist, _wild_cost):
+            plain = sr.fewest_waypoints(lattice, _visible, 0.0, f, 0.35)
+            assert sr.fewest_waypoints(lattice, _visible, 0.0, f, 0.35, 0.0, 0.0, better) == plain
+            assert sr.fewest_waypoints(lattice, _visible, 0.0, f, 0.35, 0.0, 0.5, None) == plain
+    straight = [(round(0.1 * k, 3), 0.0) for k in range(20)]
+    info = {}
+    out = sr.fewest_waypoints(straight, ALWAYS, 0.0, math.dist, 0.35, 0.0, 0.5, better, None, info)
+    assert out == [(0.0, 0.0), (1.9, 0.0)] and info == {"corners": 0, "candidates": 0, "apexes_used": 0}
+
+
+def test_apex_properties_cost_bound_visibility_clearance_and_determinism():
+    rnd = random.Random(5)
+    used = 0
+    for _ in range(200):
+        lattice = _walk(rnd, rnd.randint(4, 40))
+        for f in (math.dist, _wild_cost):
+            j_lat = _cost_sum(f, lattice)
+            for budget in (0.0, 0.2, 0.35):
+                info = {}
+                out = sr.fewest_waypoints(lattice, _visible, 1.5, f, budget, 0.0, 0.6, _near_wall_clearance, None, info)
+                assert out == sr.fewest_waypoints(lattice, _visible, 1.5, f, budget, 0.0, 0.6, _near_wall_clearance)
+                assert out[0] == lattice[0] and out[-1] == lattice[-1]
+                assert _cost_sum(f, out) <= j_lat + budget + 1e-9
+                for a, b in zip(out[:-1], out[1:]):
+                    assert _visible(a, b) or (a in lattice and b in lattice and b == lattice[lattice.index(a) + 1])
+                off = [p for p in out if p not in lattice]
+                assert len(off) == info["apexes_used"]
+                used += len(off)
+                for apex_pt in off:
+                    near = min(lattice, key=lambda p: math.dist(p, apex_pt))
+                    assert _near_wall_clearance(apex_pt) >= _near_wall_clearance(near) - 0.1 - 1e-9
+                    assert math.dist(apex_pt, near) <= sr.APEX_TOL_M + 1e-6
+                plain = sr.fewest_waypoints(lattice, _visible, 1.5, f, budget)
+                assert len(out) <= len(plain)         # apex nodes are alternatives: the plain path stays feasible
+    assert used > 0
+
+
+def test_apex_a_larger_radius_never_lowers_the_clearance_of_a_corner_waypoint():
+    lattice = _l_lattice()
+    clearance = lambda p: 1.0 / (1.0 + math.dist(p, (1.6, -0.6)))   # noqa: E731  increases toward the inside
+    prev = -1.0
+    for radius in (0.0, 0.1, 0.2, 0.4, 0.8, 1.6):
+        out = sr.fewest_waypoints(lattice, _l_visible, 0.0, math.dist, 0.35, 0.0, radius, clearance)
+        assert len(out) == 3
+        c = clearance(out[1])
+        assert c >= prev - 1e-9 and c >= clearance((1.0, 0.0)) - 1e-9
+        prev = c
+
+
+def _apex_plan(g, p, q, ov, lam, apex, budget=0.35, kappa=1.0):
+    ids = iter("n%d" % i for i in range(10 ** 5))
+    seen = {}
+    turn = {"lambda_m_per_rad": lam, "source": "config", "speed_max": None, "angular_speed_max": None, "reason": ""}
+    try:
+        return sr.plan_on_graph(g, "m", p, q, ov, lambda x, y: seen.setdefault((round(x, 3), round(y, 3)), next(ids)),
+                                0.5, 1.5, 0.0, None, 0.05, None, None, kappa, True, 100000, turn, budget, apex)
+    except sr.ChartFallback as err:
+        return err.reason
+
+
+def test_apex_planner_off_is_identical_and_on_keeps_the_guarantees(graphs):
+    name, eng, lazy = graphs
+    rnd = random.Random(14)
+    from packages.scene_graph.api import Blocked
+    checked = 0
+    lam = 0.67
+    for g in (eng, lazy):
+        sf = sr.safety_for(g, None, None, 1.0, lam)
+        for p, q in _trial_pairs(eng, 10, 23):
+            for ov in _safety._overlays(p, q, rnd)[:2]:
+                base = _apex_plan(g, p, q, ov, lam, False)
+                on = _apex_plan(g, p, q, ov, lam, True)
+                if isinstance(base, str) or isinstance(on, str):
+                    continue
+                assert base.waypoint_apex is None
+                zero = _apex_plan(g, p, q, ov, 0.0, True)
+                zero_off = _apex_plan(g, p, q, ov, 0.0, False)
+                assert not isinstance(zero, str) and zero.waypoint_apex is None and _wp(zero) == _wp(zero_off)
+                assert _wp(on) == _wp(_apex_plan(g, p, q, ov, lam, True))
+                assert on.waypoint_apex["apexes_used"] <= on.waypoint_apex["corners"]
+                assert len(on.waypoints) <= len(base.waypoints) + 1
+                sa, sb = g.snap(p[0], p[1], 0.5), g.snap(q[0], q[1], 0.5)
+                bl = Blocked(discs=list(ov[0]), segments=list(ov[1])) if (ov[0] or ov[1]) else None
+                route = g.route(sa.key, sb.key, bl, (sa.x, sa.y), (sb.x, sb.y), safety=sf)
+                lattice = [(sa.x, sa.y)] + [tuple(n) for n in route.nodes] + [(sb.x, sb.y)]
+                j_lat, _ = _polyline_cost(g, lattice, sf)
+                j_fin, inside = _polyline_cost(g, _wp(on), sf)
+                assert inside, (name, p, q)
+                assert j_fin <= j_lat + 0.35 + 1e-6
+                checked += 1
+    assert checked
+
+
+def test_apex_config_default_off_and_server_pass_through():
+    import inspect
+    from packages.services.mission_planner import server
+    assert config.SCENE_GRAPH_WAYPOINT_APEX_ENABLED is False
+    src = inspect.getsource(server)
+    assert "waypoint_apex=config.SCENE_GRAPH_WAYPOINT_APEX_ENABLED" in src and '"apexes_used"' in src
