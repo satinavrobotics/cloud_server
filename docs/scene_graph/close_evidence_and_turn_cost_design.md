@@ -563,6 +563,22 @@ one) and its middle, the apex, lies on the inward bisector `R (1 / cos(theta / 2
   trajectory on those plans. Recommendation: defer. A different formulation (round the corners of the chosen polyline after the
   solve) would be a separate design.
 
+## E. Conceptual outdoor test (forest and meadow, 2026-10-15)
+
+`tools/scene_graph_sim/outdoor_world.py`: a 60 x 40 m world (forest block of stems of 0.10 to 0.35 m radius at 0.08 per m2, a stream band with two
+2 m crossings, meadow boulders; no walls, outside the array unknown), a depth-first tour of a 1 m grid of free spots as the drive (4329 leaves at
+3 m, 10 m windows), folded in batches of 48 through `ChartGraph`, saved to a `MemoryBackend` store, loaded by the lazy planner. Concept only: no
+robot, no motion model.
+
+| chart radius | charts | links | levels | F cells | fold + save | load |
+|---|---|---|---|---|---|---|
+| 2 m | 648 | 1714 | 6 | 220 563 | 29.6 s | 1.6 s |
+| 6 m | 86 | 239 | 6 | 220 563 | 22.9 s | 1.4 s |
+
+All 8 long plans (38 m median) are served with no fallback, with the live pricing, the turn cost and the waypoint budget. The test found the
+O(n^2) cost of the waypoint budget on long open routes (p50 618 ms against 72 ms for the greedy pull); candidate thinning (C.2b) brings it to 74 ms
+(chart radius 2 m) and 99 ms (6 m). Larger charts cut the chart count by 7.5 times at no change in plan time; the route search does not depend on them.
+
 ## D. Open items
 
 Resolved by Laci 2026-10-14: goal tolerance 0.35 m; the Odin override is live; the Smac tolerance is dropped; robot speeds come from

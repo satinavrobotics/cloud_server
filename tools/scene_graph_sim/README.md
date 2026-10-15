@@ -26,6 +26,7 @@ python run_engine.py office8 --every 6 --verify
 | `close_evidence_replay.py` | independent replay of the close-evidence rule on a leaf export, with the component table | `docs/scene_graph/close_evidence_and_turn_cost_design.md` A.3, A.4 |
 | `close_evidence_engine_check.py` | the same numbers through the engine (`near_range_m`, `--min-clearance` for the away-from-walls filter, `--old-rule` to hold by the latest lethal from any distance for comparison) | same, A.6b, A.6c |
 | `close_evidence_route_changes.py` | what the rule and the filter do to routes: navigable cells, held components, 150 pairs same / changed / lost, through the production store and lazy reader | same, A.6c |
+| `outdoor_world.py`, `outdoor_world_export.py` | conceptual forest + meadow world through the production path (fold, charts at two radii, plans with the live pricing, turn cost and waypoint budget); the export writes one JSON for a viewer | `docs/scene_graph/close_evidence_and_turn_cost_design.md` E |
 | `turn_cost_prototype.py` | turn-cost search on the research lattice: forms and lambda sweep | same, B.2 |
 | `turn_cost_restricted.py` | the exact ellipse-restricted turn-cost search: exactness and cost on the real and synthetic maps | same, B.5 |
 
