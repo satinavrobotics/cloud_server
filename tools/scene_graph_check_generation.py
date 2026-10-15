@@ -79,7 +79,11 @@ def check_map(store: Any, map_id: str, expect: Optional[Dict[str, Any]] = None) 
         out["problems"].append(f"params lack {e}")
     if meta.get("pending"):
         out["problems"].append("a generation is still pending")
-    g = store.load(map_id)
+    try:
+        g = store.load(map_id)
+    except ValueError as err:                  # a pipeline the code does not read (an older token): said, not a traceback
+        out["problems"].append(f"load refused: {err}")
+        return out
     v = g.query(BIG, level=0, raster=False)
     out.update(charts=len(v.charts), links=len(v.links), levels=v.levels)
     bad = g.check_invariants()

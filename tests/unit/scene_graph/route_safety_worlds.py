@@ -45,10 +45,10 @@ def random_world(seed: int, W: float = 8.0, Hh: float = 6.0):
     return w, way
 
 
-def engine_of(world_way, batch: int = 9) -> ChartGraph:
+def engine_of(world_way, batch: int = 9, params=None) -> ChartGraph:
     w, way = world_way
     leaves = cw.drive(w, way)
-    g = ChartGraph()
+    g = ChartGraph() if params is None else ChartGraph(params)
     for i in range(0, len(leaves), batch):
         g.fold_many(leaves[i:i + batch])
     return g
@@ -71,6 +71,27 @@ class Reference:
         free = (V != 255) & (V < 100)
         self.clr = (ndimage.distance_transform_edt(free) * RES)[::2, ::2]       # g(c), m, unknown counted blocked
         self.nav = s.sp.idx >= 0
+        self.val = self._validity(g) if g._Fn is not None else None             # validated nodes (design G.1), None: rule off
+
+    @staticmethod
+    def _validity(g: ChartGraph) -> np.ndarray:
+        """validated lattice nodes written out cell by cell: a node is validated when a costmap cell of its 2 x 2 block has a close free
+        report (Fn >= 0) or the body covered it (the engine's driven image, `g._pl["S"]`)"""
+        fn, drv = g._Fn, g._pl["S"]
+        out = np.zeros(drv.shape, bool)
+        for y in range(drv.shape[0]):
+            for x in range(drv.shape[1]):
+                blk = fn[2 * y:2 * y + 2, 2 * x:2 * x + 2]
+                out[y, x] = bool(drv[y, x]) or bool((blk >= 0).any())
+        return out
+
+    def flag(self, a: Tuple[int, int], b: Tuple[int, int]) -> int:
+        """1 when the edge a - b has an unvalidated end node (validated-first), else 0"""
+        return int(not (self.val[a] and self.val[b]))
+
+    def pair(self, a: Tuple[int, int], b: Tuple[int, int], safety: Optional[Safety]) -> Tuple[int, int]:
+        """the lexicographic edge weight of validated-first: (unvalidated flag, priced weight); no penalty constant anywhere"""
+        return (self.flag(a, b), self.weight(a, b, safety))
 
     def deficit(self, y: int, x: int, margin: float) -> float:
         return max(0.0, margin - float(self.clr[y, x]))
@@ -208,3 +229,90 @@ class Reference:
         """A = sum over edges of l * (d(a) + d(b)) / 2 (m^2): the intrusion area of a lattice path"""
         return sum(math.hypot(p[0] - q[0], p[1] - q[1]) * H * (self.deficit(*p, margin) + self.deficit(*q, margin)) / 2.0
                    for p, q in zip(cells[:-1], cells[1:]))
+
+    # ---- validated-first (design G): the lexicographic (unvalidated edges, J) optimum, with tuple distances and no penalty constant ----
+    def lex_dijkstra(self, src: Tuple[int, int], dst: Tuple[int, int], safety: Optional[Safety],
+                     alive: Optional[np.ndarray] = None):
+        """((count, J), canonical path): heapq Dijkstra whose distances are pairs added componentwise and compared lexicographically
+        (valid: both components are non-negative); the canonical walk takes the smallest (y, x) next cell on a minimal path"""
+        dist: Dict[Tuple[int, int], Tuple[int, int]] = {dst: (0, 0)}
+        pq = [((0, 0), dst)]
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d > dist[u]:
+                continue
+            for v in self.neighbours(u, alive):
+                e = self.pair(u, v, safety)
+                nd = (d[0] + e[0], d[1] + e[1])
+                if nd < dist.get(v, (math.inf, math.inf)):
+                    dist[v] = nd
+                    heapq.heappush(pq, (nd, v))
+        if src not in dist:
+            return None, None
+        path = [src]
+        while path[-1] != dst:
+            u = path[-1]
+            path.append(min(v for v in self.neighbours(u, alive)
+                            if v in dist and (dist[v][0] + self.pair(u, v, safety)[0], dist[v][1] + self.pair(u, v, safety)[1]) == dist[u]))
+        return dist[src], path
+
+    def lex_dijkstra_turn(self, src: Tuple[int, int], dst: Tuple[int, int], safety: Safety,
+                          alive: Optional[np.ndarray] = None):
+        """`dijkstra_turn` with pair distances: ((count, J incl. turns), canonical path)"""
+        sf = safety if safety.rate > 0 else None
+        steps = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1) if dy or dx]
+        if src == dst:
+            return (0, 0), [src]
+        tus = {(hu, hv): self.turn_units((0, 0), hu, (hu[0] + hv[0], hu[1] + hv[1]), safety.turn) for hu in steps for hv in steps}
+        inf = (math.inf, math.inf)
+        dist: Dict[Tuple[Tuple[int, int], Tuple[int, int]], Tuple[int, int]] = {}
+        pq = []
+        for h in steps:
+            dist[(dst, h)] = (0, 0)
+            pq.append(((0, 0), dst, h))
+        heapq.heapify(pq)
+        while pq:
+            d, v, hv = heapq.heappop(pq)
+            if d > dist[(v, hv)]:
+                continue
+            u = (v[0] - hv[0], v[1] - hv[1])
+            if not (0 <= u[0] < self.nav.shape[0] and 0 <= u[1] < self.nav.shape[1]) or not self.nav[u] \
+                    or (alive is not None and not alive[u]) or v not in self.neighbours(u, alive):
+                continue
+            e = self.pair(u, v, sf)
+            for hu in steps:
+                nd = (d[0] + e[0], d[1] + e[1] + tus[(hu, hv)])
+                if nd < dist.get((u, hu), inf):
+                    dist[(u, hu)] = nd
+                    heapq.heappush(pq, (nd, u, hu))
+
+        def D(c, h):
+            return dist.get((c, h), inf)
+        cand = []
+        for v in self.neighbours(src, alive):
+            e = self.pair(src, v, sf)
+            dv = D(v, (v[0] - src[0], v[1] - src[1]))
+            cand.append(((e[0] + dv[0], e[1] + dv[1]), v))
+        if not cand or min(cand)[0] == inf:
+            return None, None
+        best = min(c for c, _ in cand)
+        path = [src, min(v for c, v in cand if c == best)]
+        h = (path[1][0] - src[0], path[1][1] - src[1])
+        while path[-1] != dst:
+            u = path[-1]
+            want = D(u, h)
+            opts = []
+            for v in self.neighbours(u, alive):
+                hv = (v[0] - u[0], v[1] - u[1])
+                e, dv = self.pair(u, v, sf), D(v, hv)
+                if (e[0] + dv[0], e[1] + tus[(h, hv)] + dv[1]) == want:
+                    opts.append(v)
+            nxt = min(opts)
+            h = (nxt[0] - u[0], nxt[1] - u[1])
+            path.append(nxt)
+        return best, path
+
+    def unvalidated_of(self, cells: List[Tuple[int, int]]) -> Tuple[int, float]:
+        """(edges with an unvalidated end node, their length in m) of a cell path"""
+        bad = [(p, q) for p, q in zip(cells[:-1], cells[1:]) if self.flag(p, q)]
+        return len(bad), sum(math.hypot(p[0] - q[0], p[1] - q[1]) for p, q in bad) * H
