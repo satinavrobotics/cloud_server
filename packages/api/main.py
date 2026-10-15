@@ -23,7 +23,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, map_events, mapping_stats, session_trace, sites
+from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, sites
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -577,13 +577,16 @@ async def map_run_stats(
     robot: Optional[str] = Query(None, description="Only this robot"),
 ):
     """Operating metrics of the map over its non-archived mission runs (success rate,
-    interventions, hours, durations, recoveries, safety events, causes). Definitions:
-    packages/api/run_stats.py and docs/map_run_stats_2026-10-14.md. An unknown map answers zeros."""
+    interventions, hours, durations, recoveries, safety events, causes) and `efficiency` (the path
+    the robots drove against the lattice plan path). Definitions: packages/api/run_stats.py,
+    docs/map_run_stats_2026-10-14.md and docs/path_efficiency_2026-10-15.md. An unknown map answers zeros."""
     _require_service()
     run_stats.require_map_id(map_id)
     start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
-    return await _site_call("map run stats", run_stats.run_stats(
+    out = await _site_call("map run stats", run_stats.run_stats(
         service.database, map_id, start, end, robot))
+    # + `efficiency`: driven path vs the lattice plan path (path_efficiency.py; cached, never fails run-stats)
+    return await path_efficiency.attach(out, service.database, map_id, start, end, robot)
 
 
 @app.get("/api/v1/maps/{map_id}/events-summary")
@@ -2695,7 +2698,7 @@ async def get_run_timeline(run_id: uuid.UUID):
 
 
 @app.get("/api/v1/runs/{run_id}/legs")
-async def get_run_legs(run_id: uuid.UUID, with_chart_keys: bool = False):
+async def get_run_legs(run_id: uuid.UUID, with_chart_keys: bool = False, with_efficiency: bool = False):
     """The legs of one run in order: each robot move from one topomap node to the next, with
     robot-clock start/end, duration, distances, expected time, recoveries and blocks.
     `{"run_id", "items": [leg...]}`; empty when the run recorded none. 404 if unknown.
@@ -2703,9 +2706,16 @@ async def get_run_legs(run_id: uuid.UUID, with_chart_keys: bool = False):
     node-to-node line crosses (read time, best effort: absent when the map has no scene graph or
     it could not be read in time; null for a leg whose node positions are unknown), and
     `chart_keys_status` ("ok" | "partial" | "unavailable") and `chart_keys_truncated` (legs left untagged
-    because of the 400-node lookup cap or the scene-graph read limits) at the top level."""
+    because of the 400-node lookup cap or the scene-graph read limits) at the top level.
+    With `with_efficiency=true` each leg also has `plan_m` (lattice plan path length), `plan_source`
+    (trajectory | straight | stale | null), `driven_m` (map-frame track length), `driven_excl_recovery_m`,
+    `path_ratio` (plan_m / driven_m) and `efficiency_excluded` (why the leg has no driven path), and the
+    top level has `efficiency` (the run's block). docs/path_efficiency_2026-10-15.md."""
     _require_service()
     out = await _site_call("get run legs", fleet_reads.run_legs_list(service.database, run_id))
+    if with_efficiency:
+        out.update(await _site_call("get run leg efficiency",
+                                    path_efficiency.annotate_legs(service.database, run_id, out["items"])))
     if with_chart_keys and out.get("items"):
         from packages.utils import blocked_chart_tags
 

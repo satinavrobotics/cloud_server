@@ -1130,7 +1130,11 @@ recording level except `off` (legs are kept like events, indefinitely). The run'
 `summary_metrics` is filled from them when the run ends.
 
 **`GET /api/v1/runs/{run_id}/legs`** -- the run's legs in order: `{"run_id", "items": [leg...]}`
-(empty when none were recorded). 404 for an unknown run. A leg:
+(empty when none were recorded). 404 for an unknown run. With `?with_efficiency=true` every leg also has
+`plan_m`, `plan_source` (`trajectory`|`straight`|`stale`|null), `driven_m`, `driven_excl_recovery_m`,
+`path_ratio` (`plan_m / driven_m`) and `efficiency_excluded` (`no_track`|`gap`|`incomplete_track`|`no_plan`|`short`|null),
+and the top level has `efficiency` (the run's block, same shape as run-stats' below); see
+`docs/path_efficiency_2026-10-15.md`. A leg:
 
 | Field | Meaning |
 |---|---|
@@ -1183,11 +1187,25 @@ days), optionally of one robot. 422 for `from >= to`; an unknown map answers zer
  "safety": {"by_class": {"safety_reflex", "blocked", "skipped", "link_loss"},
             "by_code": {"<code>[:<error_type>]": n}, "total"},
  "by_cause": {"<abort_cause>": n},  // finished runs that did not complete
+ "efficiency": null | {              // path driven vs the lattice plan path (cached 120 s)
+   "basis": "trajectory", "runs", "legs",   // legs planned by a stored plan trajectory, with a track
+   "driven_m", "planned_m",
+   "ratio": float|null,            // planned/driven: 1.0 = drove the plan, lower = detours (null under 3 legs)
+   "extra_pct": float|null,        // (driven/planned - 1) * 100
+   "p10", "median", "p90",         // of the per-leg ratio (p10 = the worst-tail legs)
+   "excluding_recovery": {"driven_m", "recovery_m", "ratio", "extra_pct"},
+   "time": {"legs", "actual_s", "expected_s", "ratio", "ratio_excl_recovery"},   // expected/actual, all legs
+   "by_plan": {"trajectory": {"legs", "driven_m", "planned_m", "ratio", "extra_pct"},
+               "straight":   {...}},      // legs with a track but no usable trajectory (lower-bound plan)
+   "source": {"track_legs", "leg_only", "trajectory_legs", "straight_legs", "stale_trajectory_legs"},
+   "excluded": {"no_track", "gap", "incomplete_track", "no_plan", "short"},
+   "data_quality": {"legs_read", "truncated", "notes": [str]}},
  "data_quality": {"runs_without_map", "teleop_recorded": bool, "hours_excluded_runs",
                   "max_run_s", "notes": [str]}}
 ```
 
-Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-10-14.md`.
+Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-10-14.md`. `efficiency`
+(null when the map has no legs or the computation failed; a note says which): `docs/path_efficiency_2026-10-15.md`.
 
 **`GET /api/v1/maps/{map_id}/events-summary?from=&to=&robot=&limit=10`** -- the most usual events
 of the map and its safety events, as episodes (a repeated error counts once). Window `[from, to)`,
