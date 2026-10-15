@@ -5,9 +5,10 @@ plane). This script reads them anyway for the measurement: it lets `load` accept
 stored close-evidence planes (`Fn`) and the leaf poses, exactly what the writer would store under morse/2+near5. Nothing is written to
 ArangoDB or MinIO, no map is rebuilt.
 
-    docker run --rm --network host --env-file <(docker exec docker_compose-graph-builder-service-1 printenv | grep -E '^(ARANGO|MINIO)_') \\
-        -v $PWD:/w:ro -w /w -e PYTHONPATH=/w -e PYTHONDONTWRITEBYTECODE=1 graph_builder_service:latest \\
-        python tools/scene_graph_sim/validated_first_live.py [--pairs 100] [--seed 7] [--map NAME ...]
+    docker exec -i docker_compose-graph-builder-service-1 python - --pairs 100 < payload.py
+
+where payload.py is this file behind a prelude that serves the branch's modules from memory (nothing is written in the container); or,
+inside a checkout with the stores' environment, `python tools/scene_graph_sim/validated_first_live.py [--pairs 100] [--seed 7] [--map NAME ...]`.
 
 For each map, --pairs random start/goal lattice cells >= 3 m apart that the baseline route connects, and two configurations: `length` (no
 clearance price: the unpriced route against the validated-first one) and `priced` (the planner's default hinge price, kappa 1, against the
@@ -24,7 +25,10 @@ import time
 
 import numpy as np
 
-sys.path[:0] = [os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))]
+try:
+    sys.path[:0] = [os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))]
+except NameError:                                  # read from stdin by `python -` (docker exec -i): the code is on the path already
+    pass
 
 from packages.scene_graph import store as store_mod  # noqa: E402
 from packages.scene_graph import validated  # noqa: E402
@@ -123,7 +127,7 @@ def main() -> int:
                                lost, unr, tb, ta, nb, na, mb, ma, 1e3 * float(np.mean(t_a)), 1e3 * float(np.mean(t_b))))
     print("validated share of F (nodes), largest validated 8-connected piece, charts")
     for m, token, n, v, bg, k in shares:
-        print("  %-12s %-16s %6d nodes %3d charts  validated %5.1f%%  largest validated piece %5.1f%%" % (m, token, n, 100 * v, 100 * bg, k))
+        print("  %-12s %-16s %6d nodes %3d charts  validated %5.1f%%  largest validated piece %5.1f%%" % (m, token, n, k, 100 * v, 100 * bg))
     for name, rs in rows.items():
         print("\nconfig %s (before -> after validated-first)" % name)
         print("%-12s %5s | %5s | %4s %-11s | %9s | %8s | %-11s | %-17s | %-19s | %-11s" % (
