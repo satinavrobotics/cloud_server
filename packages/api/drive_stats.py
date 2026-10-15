@@ -32,7 +32,7 @@ import numpy as np
 from fastapi import HTTPException
 
 from packages import config
-from packages.api import fleet_reads, maps
+from packages.api import fleet_reads, maps, series_axis
 
 logger = logging.getLogger("ApiDelegationService.drive_stats")
 
@@ -463,6 +463,66 @@ def compute(loaded: Loaded, node_xy: Callable[[], Dict[str, Tuple[float, float]]
     return merged, src, tt, tl
 
 
+def series_day(loaded: Loaded, p: Params, axis: Sequence[datetime.datetime]) -> Dict[str, Any]:
+    """The `series` block (docs/map_series_2026-10-15.md): per UTC day of `axis`, from the stored map-frame tracks
+    only (legs of runs without a track carry no timestamps). A movement belongs to the day it STARTED.
+    `new_tiles` = 0.1 m cells visited that day and on no earlier day OF THE SERIES WINDOW ("first visited" is
+    relative to the window, not to all time); `cumulative_tiles` is their running sum (cells visited so far in the
+    window). Days without movement: 0 for len_m / time_s / new_tiles, null for the speed and the shares."""
+    n = len(axis)
+    out: Dict[str, Any] = {"bucket": "day", "t": [t.isoformat() for t in axis], "len_m": [0.0] * n,
+                           "time_s": [0.0] * n, "moving_speed_mps": [None] * n, "recovery_share": [None] * n,
+                           "stopped_share": [None] * n, "new_tiles": [0] * n, "cumulative_tiles": [0] * n,
+                           "source": {"basis": "track", "track_rows": len(loaded.track_rows),
+                                      "partial": loaded.partial,
+                                      "leg_only_runs_not_in_series": len({l[0] for l in loaded.legs})}}
+    rows = loaded.track_rows
+    if rows:
+        codes: Dict[Any, int] = {}
+        run = np.array([codes.setdefault(r[0], len(codes)) for r in rows], np.int64)
+        grp_codes: Dict[Any, int] = {}
+        grp = np.array([grp_codes.setdefault((r[4], r[5]), len(grp_codes)) for r in rows], np.int64)
+        ts = np.array([r[1] for r in rows], float)
+        x = np.array([r[2] for r in rows], float)
+        y = np.array([r[3] for r in rows], float)
+        order = np.lexsort((ts, run))
+        seg, _ = track_segments(run[order], grp[order], ts[order], x[order], y[order], p)
+        intervals: Dict[int, List[Tuple[float, float]]] = collections.defaultdict(list)
+        for rid, t_exit, dur in loaded.recoveries:
+            if rid in codes and dur is not None and dur > 0:
+                intervals[codes[rid]].append((t_exit - dur, t_exit))
+        rec, _lost = recovery_overlap(seg, intervals)
+        dt = seg.t1 - seg.t0
+        dist = np.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0)
+        moving = dist >= p.min_speed * dt
+        stopped = np.where(moving, 0.0, dt)
+        idx = np.floor((seg.t0 - axis[0].timestamp()) / 86400.0).astype(np.int64)
+        ok = (idx >= 0) & (idx < n)
+        seen = np.empty(0, np.int64)
+        for i in range(n):
+            sel = np.nonzero(ok & (idx == i))[0]
+            if not sel.size:
+                out["cumulative_tiles"][i] = int(seen.size)
+                continue
+            time_s = float(dt[sel].sum())
+            mov = sel[moving[sel]]
+            out["len_m"][i] = round(float(dist[sel].sum()), 2)
+            out["time_s"][i] = round(time_s, 1)
+            if mov.size and dt[mov].sum() > 0:
+                out["moving_speed_mps"][i] = round(float(dist[mov].sum() / dt[mov].sum()), 3)
+            if time_s > 0:
+                out["recovery_share"][i] = round(float(rec[sel].sum()) / time_s, 4)
+                out["stopped_share"][i] = round(float(stopped[sel].sum()) / time_s, 4)
+            acc = Accumulator(1)
+            z = np.zeros(sel.size)
+            acc.add(np.zeros(sel.size, np.int64), seg.x0[sel], seg.y0[sel], seg.x1[sel], seg.y1[sel], dt[sel], z, z)
+            day_keys = acc.tiles().key
+            out["new_tiles"][i] = int(np.setdiff1d(day_keys, seen, assume_unique=True).size)
+            seen = np.union1d(seen, day_keys)
+            out["cumulative_tiles"][i] = int(seen.size)
+    return out
+
+
 def origin_cells(key: np.ndarray, scene_graph: bool) -> Tuple[int, int]:
     """Origin of the tile indices, in absolute cells: (0, 0) without a scene graph, else the lower-left of the
     data on the scene-graph tile grid (multiples of 64 cells = 6.4 m)."""
@@ -546,14 +606,20 @@ def parse_min_speed(value: Optional[float]) -> float:
 
 async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optional[datetime.datetime] = None,
                       end: Optional[datetime.datetime] = None, robot: Optional[str] = None,
-                      min_speed: Optional[float] = None, cache: Optional[ResultCache] = None
-                      ) -> Tuple[bytes, str]:
-    """(JSON body, ETag) of GET /api/v1/maps/{map_id}/drive-stats. 404 unknown map; 422 bad query."""
+                      min_speed: Optional[float] = None, cache: Optional[ResultCache] = None,
+                      series: Optional[str] = None) -> Tuple[bytes, str]:
+    """(JSON body, ETag) of GET /api/v1/maps/{map_id}/drive-stats. 404 unknown map; 422 bad query.
+    `series="day"` adds the per-day `series` block over the window (default the last RUN_STATS_DEFAULT_DAYS days)."""
     p = Params(min_speed=parse_min_speed(min_speed))
     if start is not None and end is not None and end <= start:
         raise HTTPException(422, "to must be after from")
     cache = CACHE if cache is None else cache
-    key = (map_id, start, end, robot or None, p.min_speed)
+    key = (map_id, start, end, robot or None, p.min_speed) + ((series,) if series else ())
+    s_start, s_end = start, end
+    if series:
+        s_end = end or datetime.datetime.now(datetime.timezone.utc)
+        s_start = start or s_end - datetime.timedelta(days=config.RUN_STATS_DEFAULT_DAYS)
+        axis = series_axis.day_axis(s_start, s_end)     # 422 for a window over 120 days, before any query
 
     async def run() -> Tuple[bytes, str]:
         try:
@@ -586,6 +652,10 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
                   "robot": robot or None, "min_speed": p.min_speed, "max_gap_s": p.max_gap_s,
                   "max_speed": p.max_speed}
         body = build_body(map_id, tiles, src, regions, origin, version, window)
+        if series:
+            sloaded = loaded if (s_start, s_end) == (start, end) else await load(db, map_id, s_start, s_end, robot)
+            body["series"] = await asyncio.to_thread(series_day, sloaded, p, axis)
+            body["series"]["window"] = {"from": s_start.isoformat(), "to": s_end.isoformat()}
         raw = json.dumps(body, separators=(",", ":")).encode()
         return raw, '"' + hashlib.sha1(raw).hexdigest()[:20] + '"'
     return await cache.get(key, run)

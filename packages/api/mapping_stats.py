@@ -242,6 +242,12 @@ def compute(loaded: Loaded, p: ds.Params, max_gap_s: float) -> Dict[str, Any]:
                       open=1 if tm["open"] else 0, track=1 if src == "track" else 0,
                       node_src=1 if src == "nodes" else 0, empty=1 if not rows and not trk else 0)
     tiles = acc.tiles()
+    # cells first covered by each session (sessions are in start order, so the session code is chronological)
+    first = np.full(len(tiles), len(per), np.int64)
+    if tiles.pair_tile.size:
+        np.minimum.at(first, tiles.pair_tile, tiles.pair_run)
+    for entry, count in zip(per, np.bincount(first, minlength=len(per) + 1)[:len(per)]):
+        entry["new_cells"] = int(count)
     nodes_key = np.concatenate(node_keys) if node_keys else np.empty(0, np.int64)
     nk, nn = np.unique(nodes_key, return_counts=True)
     return {"per": per, "tiles": tiles, "node_key": nk, "node_n": nn, "totals": totals}
@@ -376,6 +382,14 @@ def build_body(map_id: str, comp: Dict[str, Any], area: Dict[str, Any], area_sta
         return round(active / a, 2) if a else None
 
     spm = per_m2(mapped)
+    # Per-session area: the mapped area split by the share of path cells each session covered FIRST (an estimate:
+    # the path is thin, the area is the occupancy's). Null without a mapped area or without any covered cell.
+    total_new = sum(s.get("new_cells", 0) for s in comp["per"])
+    for s in comp["per"]:
+        s["minutes_per_100m2"] = None
+        if mapped and total_new and s.get("new_cells"):
+            s["area_added_m2"] = round(mapped * s["new_cells"] / total_new, 2)
+            s["minutes_per_100m2"] = round(s["active_s"] / s["area_added_m2"] * 100 / 60.0, 1)
     spm_sg = per_m2(chart_m2)
     ax, ay = ds.key_cells(keys)
     rows = [[int(a), int(b), round(float(s), 2), int(n)] for a, b, s, n in zip(ax - origin[0], ay - origin[1], seconds, nodes)]
@@ -402,16 +416,28 @@ def build_body(map_id: str, comp: Dict[str, Any], area: Dict[str, Any], area_sta
             "window": window}
 
 
+SERIES_SESSIONS = 30
+
+
+def session_series(per: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """One point per mapping session (the newest SERIES_SESSIONS, oldest first), parallel arrays."""
+    last = list(per)[-SERIES_SESSIONS:]
+    return {"bucket": "session", "t": [s["started_at"] for s in last], "session_id": [s["session_id"] for s in last],
+            "active_s": [s["active_s"] for s in last], "nodes": [s["nodes"] for s in last],
+            "minutes_per_100m2": [s.get("minutes_per_100m2") for s in last]}
+
+
 # --- the endpoint --------------------------------------------------------------------------------
 
 async def mapping_stats(db: Any, graph: Any, reads: Any, occupancy: Any, map_id: str, robot: Optional[str] = None,
-                        cache: Optional[ds.ResultCache] = None, now: Optional[datetime.datetime] = None
-                        ) -> Tuple[bytes, str]:
-    """(JSON body, ETag) of GET /api/v1/maps/{map_id}/mapping-stats. 404 unknown map."""
+                        cache: Optional[ds.ResultCache] = None, now: Optional[datetime.datetime] = None,
+                        series: Optional[str] = None) -> Tuple[bytes, str]:
+    """(JSON body, ETag) of GET /api/v1/maps/{map_id}/mapping-stats. 404 unknown map.
+    `series="session"` adds the per-session `series` block (the newest SERIES_SESSIONS sessions)."""
     cache = CACHE if cache is None else cache
     p = ds.Params()
     max_gap = config.MAPPING_STATS_MAX_GAP_S
-    key = (map_id, robot or None)
+    key = (map_id, robot or None) + ((series,) if series else ())
 
     async def run() -> Tuple[bytes, str]:
         clock = now or datetime.datetime.now(datetime.timezone.utc)
@@ -451,6 +477,8 @@ async def mapping_stats(db: Any, graph: Any, reads: Any, occupancy: Any, map_id:
                   "now": clock.isoformat() if comp["totals"]["open"] else None}
         body = build_body(map_id, comp, area, area_status, chart_m2, charts, chart_status, regions, rstatus, version,
                           origin, keys, seconds, nodes, window)
+        if series:
+            body["series"] = session_series(comp["per"])
         raw = json.dumps(body, separators=(",", ":")).encode()
         return raw, '"' + hashlib.sha1(raw).hexdigest()[:20] + '"'
     return await cache.get(key, run)

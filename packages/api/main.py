@@ -24,6 +24,7 @@ import uvicorn
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
 from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, sites
+from packages.api import map_series, series_axis
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -575,6 +576,8 @@ async def map_run_stats(
                                              "time zone); default `to` minus 30 days"),
     to: Optional[str] = Query(None, description="Runs that started before this; default now"),
     robot: Optional[str] = Query(None, description="Only this robot"),
+    series: Optional[str] = Query(None, description="Opt-in time series: `day` (one point per UTC day of "
+                                  "the window, at most 120) or `run` (the newest 60 finished runs)"),
 ):
     """Operating metrics of the map over its non-archived mission runs (success rate,
     interventions, hours, durations, recoveries, safety events, causes) and `efficiency` (the path
@@ -582,11 +585,17 @@ async def map_run_stats(
     docs/map_run_stats_2026-10-14.md and docs/path_efficiency_2026-10-15.md. An unknown map answers zeros."""
     _require_service()
     run_stats.require_map_id(map_id)
+    series = series_axis.check_series(series, ("day", "run"))
     start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
+    if series == "day":
+        series_axis.day_axis(*run_stats.resolve_window(start, end))     # 422 before any query
     out = await _site_call("map run stats", run_stats.run_stats(
         service.database, map_id, start, end, robot))
     # + `efficiency`: driven path vs the lattice plan path (path_efficiency.py; cached, never fails run-stats)
-    return await path_efficiency.attach(out, service.database, map_id, start, end, robot)
+    out = await path_efficiency.attach(out, service.database, map_id, start, end, robot)
+    if series:   # + `series` (map_series.py; opt-in, cached)
+        out = await map_series.attach_run_stats(out, service.database, map_id, start, end, robot, series)
+    return out
 
 
 @app.get("/api/v1/maps/{map_id}/events-summary")
@@ -597,6 +606,8 @@ async def map_events_summary(
     to: Optional[str] = Query(None, description="Window end (exclusive); default now"),
     robot: Optional[str] = Query(None, description="Only this robot"),
     limit: Optional[int] = Query(None, description="Entries in each `top` list, 1-50, default 10"),
+    series: Optional[str] = Query(None, description="Opt-in: `day` adds a per-UTC-day series "
+                                  "{t, total, safety, by_code}"),
 ):
     """The most usual events of the map (episodes, not repeats) and its safety events:
     `{map_id, window, total_episodes, by_severity, top: [{code, severity, class, count, share,
@@ -606,9 +617,16 @@ async def map_events_summary(
     docs/map_events_2026-10-14.md. Cached 30 s. An unknown map answers zeros."""
     _require_service()
     run_stats.require_map_id(map_id)
-    return await _site_call("map events summary", map_events.events_summary(
-        service.database, map_id, fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to"),
-        robot, limit))
+    series = series_axis.check_series(series, ("day",))
+    start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
+    if series:
+        series_axis.day_axis(*map_events.resolve_window(start, end))    # 422 before any query
+    out = await _site_call("map events summary", map_events.events_summary(
+        service.database, map_id, start, end, robot, limit))
+    if series:
+        out = await _site_call("map events series", map_series.attach_events(
+            out, service.database, map_id, start, end, robot))
+    return out
 
 
 @app.get("/api/v1/maps/{map_id}/events")
@@ -1010,7 +1028,9 @@ async def map_edge_stats(map_id: str, robot: Optional[str] = None,
 @app.get("/api/v1/maps/{map_id}/drive-stats")
 async def map_drive_stats(map_id: str, request: Request, robot: Optional[str] = None,
                           min_speed: Optional[float] = None,
-                          from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None):
+                          from_: Optional[str] = Query(None, alias="from"), to: Optional[str] = None,
+                          series: Optional[str] = Query(None, description="Opt-in: `day` adds a per-UTC-day "
+                                                        "series (window default: the last 30 days)")):
     """Per-tile (0.1 m = one scene-graph owner-raster cell) and per-region (chart) driving statistics from
     the robots' recorded map-frame trajectories: `{map_id, graph_version, cell_m, origin, step, tile_fields,
     tiles: [[ix, iy, n, len_m, time_s, recovery_s, stopped_s]...], regions: [{key, n, len_m, time_s,
@@ -1021,13 +1041,14 @@ async def map_drive_stats(map_id: str, request: Request, robot: Optional[str] = 
     (`source`). ETag + `Cache-Control: private, max-age=60`; 304 on a matching If-None-Match.
     404 unknown map; 422 bad query. Contract: docs/drive_stats_2026-10-14.md."""
     _require_service()
+    series = series_axis.check_series(series, ("day",))
     try:
         reads = _scene_graph_reads()
     except HTTPException:
         reads = None
     body, etag = await _site_call("map drive stats", drive_stats.drive_stats(
         service.database, service.graph_db, reads, map_id, fleet_reads.parse_ts(from_, "from"),
-        fleet_reads.parse_ts(to, "to"), robot, min_speed))
+        fleet_reads.parse_ts(to, "to"), robot, min_speed, series=series))
     headers = {"ETag": etag, "Cache-Control": "private, max-age=60"}
     if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
         return Response(status_code=304, headers=headers)
@@ -1035,7 +1056,9 @@ async def map_drive_stats(map_id: str, request: Request, robot: Optional[str] = 
 
 
 @app.get("/api/v1/maps/{map_id}/mapping-stats")
-async def map_mapping_stats(map_id: str, request: Request, robot: Optional[str] = None):
+async def map_mapping_stats(map_id: str, request: Request, robot: Optional[str] = None,
+                            series: Optional[str] = Query(None, description="Opt-in: `session` adds "
+                                                          "{t, active_s, nodes, minutes_per_100m2} per session")):
     """How long the mapping of a map took: `{map_id, graph_version, cell_m, origin, step, tile_fields:
     ["ix", "iy", "seconds", "nodes"], headline: {sessions, wall_s, paused_s, active_s, mapped_area_m2,
     seconds_per_m2, minutes_per_100m2, scene_graph_area_m2, nodes, images, ...}, sessions: [{session_id, robot,
@@ -1046,6 +1069,7 @@ async def map_mapping_stats(map_id: str, request: Request, robot: Optional[str] 
     the sessions. ETag + `Cache-Control: private, max-age=60`; 304 on a matching If-None-Match. 404 unknown map.
     Contract: docs/mapping_stats_2026-10-14.md."""
     _require_service()
+    series = series_axis.check_series(series, ("session",))
     try:
         reads = _scene_graph_reads()
     except HTTPException:
@@ -1055,7 +1079,8 @@ async def map_mapping_stats(map_id: str, request: Request, robot: Optional[str] 
     except HTTPException:
         occupancy = None
     body, etag = await _site_call("map mapping stats", mapping_stats.mapping_stats(
-        service.database, service.graph_db, reads, occupancy, map_id, robot))
+        service.database, service.graph_db, reads, occupancy, map_id, robot,
+        series=series))
     headers = {"ETag": etag, "Cache-Control": "private, max-age=60"}
     if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
         return Response(status_code=304, headers=headers)
