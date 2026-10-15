@@ -125,7 +125,8 @@ Current and authoritative:
   `planner_upgrade.md` and `planner_findings_2026-10-13.md` (planner side).
 * `route_safety.md` (clearance pricing), `inflation_profile_design.md` and `inflation_profile_validation.md` (the exponential tier,
   off), `close_evidence_and_turn_cost_design.md` (close evidence merged and off; turn cost and waypoint merge designed),
-  `pipeline_state_2026-10-14.md` (state record: deployed commits, live run, open items, deploy record).
+  `pipeline_state_2026-10-14.md` (state record: deployed commits, live run, open items, deploy record),
+  `robot_interface_proposals.md` (robot interface: waypoint authority, order trimming, replan trigger, factsheets; proposals, nothing built).
 
 Stale, to be corrected (not rewritten here):
 * `handoff_next_session.md`: lists steps already done (merge, generation, pinned run); its "remaining steps" are out of date.
