@@ -548,6 +548,19 @@ DRIVE_STATS_MIN_SPEED_MS = float(os.getenv("DRIVE_STATS_MIN_SPEED_MS", "0.05"))
 DRIVE_STATS_LEG_MAX_M = float(os.getenv("DRIVE_STATS_LEG_MAX_M", "10.0"))
 DRIVE_STATS_CACHE_TTL_S = float(os.getenv("DRIVE_STATS_CACHE_TTL_S", "120.0"))
 DRIVE_STATS_CACHE_ENTRIES = int(os.getenv("DRIVE_STATS_CACHE_ENTRIES", "16"))
+# Robot path efficiency (packages/api/path_efficiency.py, docs/path_efficiency_2026-10-15.md): a leg shorter
+# than EFFICIENCY_MIN_LEG_M of plan is left out of the ratios (too noisy); a leg whose track covers less than
+# EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory whose waypoint
+# distance differs from the leg's recorded straight_m by more than EFFICIENCY_STALE_TOL_M is stale (the route was
+# replanned); ratios need EFFICIENCY_MIN_LEGS legs; at most EFFICIENCY_MAX_LEGS legs are read (the answer says
+# so); answers are cached EFFICIENCY_CACHE_TTL_S seconds.
+EFFICIENCY_MIN_LEG_M = float(os.getenv("EFFICIENCY_MIN_LEG_M", "0.2"))
+EFFICIENCY_MIN_COVERAGE = float(os.getenv("EFFICIENCY_MIN_COVERAGE", "0.8"))
+EFFICIENCY_STALE_TOL_M = float(os.getenv("EFFICIENCY_STALE_TOL_M", "0.03"))
+EFFICIENCY_MIN_LEGS = int(os.getenv("EFFICIENCY_MIN_LEGS", "3"))
+EFFICIENCY_MAX_LEGS = int(os.getenv("EFFICIENCY_MAX_LEGS", "200000"))
+EFFICIENCY_CACHE_TTL_S = float(os.getenv("EFFICIENCY_CACHE_TTL_S", "120.0"))
+EFFICIENCY_CACHE_ENTRIES = int(os.getenv("EFFICIENCY_CACHE_ENTRIES", "32"))
 # GET /api/v1/maps/{id}/mapping-stats (docs/mapping_stats_2026-10-14.md): time between two consecutive
 # nodes of a mapping session longer than MAPPING_STATS_MAX_GAP_S (after the paused seconds are taken out)
 # is not attributed to space (the robot stood, the uploads stalled); it still counts in the active time.
