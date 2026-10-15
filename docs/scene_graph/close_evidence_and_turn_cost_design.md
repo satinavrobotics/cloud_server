@@ -179,7 +179,7 @@ the text is kept as it was written.
   (deficit of every navigable cell, the occupancy plane), the checker accepts a rule-on store, config parse.
 * Not built: the generation check of `tools/scene_graph_expected.json` is unchanged (the pins are counts, valid for a rule-off store).
 
-### A.6c Away from walls (chosen by Laci, 2026-10-14; built on branch `feat/close-evidence-away-from-walls`, not merged, off by default)
+### A.6c Away from walls (chosen by Laci, 2026-10-14; built, on `main` and live since 2026-10-14)
 
 Decision: of the options in A.6, keep the rule of option 1 and drop its rims. The held cells (`V < 100`, `B >= 0 and B > Fn`)
 form 8-connected components; a component is KEPT only if at least one of its cells is farther than `near_min_clearance_m`
@@ -227,7 +227,7 @@ same numbers on another map, export its leaves (read-only; `tools/scene_graph_si
 `docker cp docker_compose-graph-builder-service-1:/tmp/sg_export/. tools/scene_graph_sim/data/<map>/`, then
 `python tools/scene_graph_sim/close_evidence_route_changes.py --data tools/scene_graph_sim/data/<map> --rdet 1.5 --min-clearance 0.25`.
 
-### A.6e Ghost fix: lethal evidence only from within range (2026-10-15, branch `feat/close-lethal-hold`, off by default)
+### A.6e Ghost fix: lethal evidence only from within range (2026-10-15; on `main`, live: generation 3 of every map)
 
 The problem. The held test used `B`, the latest time ANY lethal report arrived, from any distance. A cell whose only lethal
 evidence came from beyond `r_det` (a person seen from 4 m who then left, retracted by a free report from 4 m) was held as well:
@@ -268,6 +268,43 @@ no lethal report from within range ever covered are no longer held). Gates:
 `accept_route_safety.py --near-range 1.5 --near-min-clearance 0.25` all pass (A5 lazy == engine 0 / 150, N1 776 cells and 12
 components equal to the independent filter), the default run is unchanged. `close_evidence_replay.py` (independent replay) now
 holds by `Bn` too and reports the same 1471 and 776 / 12.
+
+### A.6f Decisions recorded (2026-10-14, relayed from Laci; the cone variant is not used)
+
+* **Chosen setting: the rule applies only to patches away from walls** (the option that changes the navigable space by -8.8% on
+  office8, 2143 -> 1955 lattice cells, against -11.9% when it applies to every blocked cell). Definition: take the cells that the
+  latest value calls free and the rule holds (`B > Fn`), form their 8-connected components, and keep a component only if one of its
+  cells is farther than 0.25 m from the remaining blocked or unknown cells; the rest (wall rims) stay free as today. **Not built yet:**
+  the merged engine applies the rule to every held cell. Not switched on.
+* **The camera cone is not used** (`near_fov_deg` stays unset). The robot's ground-support channel judges only cells its camera swept
+  (cone about 95 x 83 degrees, `support_swept`), so a free report from within 1.5 m but outside the cone says nothing for it, and
+  distance alone over-counts such a report as close evidence (a cell next to the path could be freed by a robot that never looked at
+  it). It is not used because the export carries no camera view (a forward camera would be assumed), the cone makes retraction rarer
+  (3520 cells held, navigable -18.0% instead of -11.9%), and the distance-only rule is the one that was replayed, reproduced in the
+  engine and tested. This is a known difference from the robot's channel, on the unsafe side only for a free report that the camera
+  did not see.
+* Switching the rule on and rebuilding the maps: not approved at the time of writing.
+
+### A.6g Stairs versus ghost for the 14 unconfirmed components: recommendation and evidence
+
+Nothing in the stored map is changed. Per component (office8, one 6-minute session, `close_evidence_replay.py`): close = capture pose
+within 1.5 m. "Close free" = free reports from close captures per cell.
+
+| class | components (cells) | evidence | reading |
+|---|---|---|---|
+| A: free from close earlier, lethal after | 2 (135), 4 (72), 8 (8), 10 (6), 12 (1), 15 (1): 223 cells | close free 1.2 to 5.5 per cell (0.2 for component 1, the stairs), looked at from close by 98-100% of their cells | the cell was seen free from close and became lethal later: something appeared there. Ghost candidates, not hazards of the map |
+| B: lethal from close, never free from close | 6 (11), 14 (1): 12 cells | 2.0 to 4.0 close lethal reports per cell, close free 0.0 to 0.2 | hazard-like, like the stairs, small |
+| C: weakly observed | 3 (106), 5 (43), 7 (9), 9 (8), 11 (2), 13 (1): 169 cells | 0 to 1.3 close lethal reports per cell; components 3, 5, 9, 11, 13 were looked at from close by 0 to 62% of their cells | not confirmed either way: lethal seen mostly from beyond 1.5 m |
+
+Component 1, the stairs: close free 0.2 per cell, 4.3 close captures per cell with 95% lethal, 79% of its cells never seen free from close.
+
+**Recommendation: keep the rule as accepted (hold until a close free look) for all 14.** Reasons: the held area is 1.0 m2 of 22.8 m2
+(4%) and is not a route the robots use today; the cost of a wrong hold is bounded and self-correcting, because the first close free
+look retracts it (class A will, if it was transient); the cost of a wrong release is the fall hazard of class B and of component 1. What the
+data cannot settle is whether class A and C are real: one pass within 1.5 m of the listed places after a quiet period decides it
+(a ghost clears by itself, a hazard stays lethal on the second close look). Places (map frame, m): A: (1.6, -0.4), (2.0, 0.6),
+(-4.7, -4.8), (0.3, 0.5), (-4.9, -5.0), (-2.7, 1.4); B: (0.2, -4.2), (0.4, -3.8); C: (-1.6, -5.0), (0.7, -4.2), (-1.5, 1.4),
+(-3.6, 1.6), (-4.5, -5.2), (0.5, -4.3). No change to the stored map and no component is released by hand.
 
 ### A.7 What is not shown
 
@@ -455,7 +492,7 @@ cost of the new polyline is not larger than the cost of the replaced one; otherw
 
 ---
 
-## C.2 Waypoints as guidance with a cost budget (replaces the merge; built, off by default)
+## C.2 Waypoints as guidance with a cost budget (replaces the merge; built, on `main`, live at 0.35 m since 2026-10-15)
 
 The exact merge of part C (never costlier) changes 2 of 150 plans on office8: the price bends the corner away from obstacles, so the
 midpoint chord is dearer in 62 of 68 visible cases. The statement is a budget, not a merge:
@@ -479,7 +516,7 @@ midpoint chord is dearer in 62 of 68 visible cases. The statement is a budget, n
 * **Open (robot side):** whether the robots honour the VDA5050 node `allowedDeviationXY`, and whether the navigator can mark a node
   reached by cost-to-go progress; the value `delta` (0.35 m, the goal tolerance, is the reference).
 
-### C.2b Candidate thinning (speed; built, always on with the budget)
+### C.2b Candidate thinning (speed; built, on `main`, always on with the budget)
 
 The DP evaluated about 19,000 chords per plan on a 25-40 m open route (n about 380 lattice points x up to 50 candidates inside the 5 m
 gap cap): plan time p50 570-620 ms against 72 ms for the greedy pull (forest world, 220k cells). Now the DP runs over a thinned candidate
@@ -496,7 +533,7 @@ time p50/p99 24/77 ms -> about 9/19 ms; waypoint count equal to the full DP in 1
 segments per route 3.153 -> 3.180. Spacing 5 m / 1.25 m instead of 0.5 m gave 139 / 141 equal; RDP tolerance 0.025 m gave no change
 (the extra waypoints are on collinear points, not on a bend). Gates A1-A7, W1-W5 pass.
 
-### C.2a Apex candidates (built on branch `feat/waypoint-apex`, off by default; recommended to defer)
+### C.2a Apex candidates (on `main`, off by default; measured no effect, deferred)
 
 A waypoint on a corner vertex sits where the clearance is least and forces a stop-and-turn. For a corner V of the greedy pull
 (turn theta >= 20 degrees) a fillet arc of radius R is tangent at `t = R tan(theta / 2)` along both chords (`t` at most half of the shorter
@@ -536,7 +573,7 @@ registration (B.6, per robot, with a fallback); the search allowance is 0.5 s an
 | 1 | Review B.6: lambda = `speed_max / angular_speed_max`, clamp [0, 5], fallback off or the operator value, record fields | Laci | the planner code for lambda |
 | 2 | `r_det` source: `support.commit_radius_m` 1.5 in `navstack_sati_odin.yaml` (A.2); the camera cone needs the leaf `view` or an assumed forward camera | Laci | the value of `near_range_m` and `near_fov_deg` |
 | 3 | Stairs versus ghost for the 14 unconfirmed components of A.4 (the largest, x 1.3 y -3.5, is the stairs, confirmed by the user) | Laci / user | A.6, recommended option 1 |
-| 4 | Whether the rule applies to every blocked cell or only away from walls (rim cells thicken walls by up to 10 cm: navigable F -11.9% everywhere, -8.8% away from walls only) | Laci | A.2 |
+| 4 | ~~Rim cells~~: decided, away from walls only (A.6c); the filter is not built | lattice_cimbi | the engine change before the rule is switched on |
 | 5 | Switching the rule on in production (`SCENE_GRAPH_NEAR_RANGE_M`): a rebuild of every map; value from the robot's `support.commit_radius_m` (1.5 m), the cone or not (item 2), and the decision of A.6 (item 3) | Laci / user | the live use of A |
 | 6 | The expanded search with the graph-distance ellipse in the engine and the lazy reader (B.5), with lambda per robot (B.6) | lattice_cimbi | built on branch `feat/turn-cost`, off by default; needs review, merge, and a decision to switch it on. The 0.5 s allowance holds to lambda 0.5 on the 117k-cell map, not from 1.0 (B.5): either accept that, cap lambda lower than 5, or tighten the ellipse (a lower bound of the turning still needed) |
 | 7 | The exponential inflation tier remains off (no environment set) | Laci | live comparison at kappa 0.5, origin 0.30 |

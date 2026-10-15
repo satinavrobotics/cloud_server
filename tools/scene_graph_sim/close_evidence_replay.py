@@ -42,6 +42,7 @@ def main():
     V = np.full(sh, 255, np.uint8); T = -np.ones(sh, np.int64)
     B = -np.ones(sh, np.int64); Bn = -np.ones(sh, np.int64); Fn = -np.ones(sh, np.int64)
     ncl = np.zeros(sh, np.int32); ncb = np.zeros(sh, np.int32); nfa = np.zeros(sh, np.int32); nfb = np.zeros(sh, np.int32)
+    lastc = -np.ones(sh, np.int8)        # the value class of each cell's latest CLOSE capture: 1 lethal, 0 free, -1 never close
     for t, x, y, gx, gy, w, yaw in recs:
         h, wd = w.shape
         oy, ox = gy - cy0, gx - cx0
@@ -64,6 +65,7 @@ def main():
         Nc[kn & bl & close] = np.maximum(Nc[kn & bl & close], t)    # lethal from within r_det: the only true lethal evidence
         Fc[kn & ~bl & close] = np.maximum(Fc[kn & ~bl & close], t)
         ncl[sl] += kn & close; ncb[sl] += kn & bl & close; nfa[sl] += kn & ~close; nfb[sl] += kn & bl & ~close
+        lc = lastc[sl]; lc[kn & close] = np.where(bl[kn & close], 1, 0)
     free = (V != 255) & (V < 100)
     flip = free & (Bn >= 0) & (Bn > Fn)
     assert (V == eng._V).all(), "replay differs from the engine's folded V"
@@ -90,14 +92,17 @@ def main():
         ys, xs = np.nonzero(m)
         px, py = (xs.mean() + cx0) * RES, (ys.mean() + cy0) * RES
         k = m.sum()
+        seen = lastc[m] >= 0
         rows.append((k, px, py, far[c - 1], ncl[m].sum() / k, ncb[m].sum() / max(ncl[m].sum(), 1), nfa[m].sum() / k,
-                     nfb[m].sum() / max(nfa[m].sum(), 1), float((Fn[m] < 0).mean()), float(np.hypot(poses[:, 0] - px, poses[:, 1] - py).min())))
+                     nfb[m].sum() / max(nfa[m].sum(), 1), float((Fn[m] < 0).mean()), float(np.hypot(poses[:, 0] - px, poses[:, 1] - py).min()),
+                     (ncl[m].sum() - ncb[m].sum()) / k, float(seen.mean()), float((lastc[m][seen] == 1).mean()) if seen.any() else float("nan")))
     rows.sort(key=lambda r: -r[0])
     print("components with a cell > %.2f m from a blocked cell: %d, %d cells (%.2f m2)" % (
         a.away, len(rows), sum(r[0] for r in rows), sum(r[0] for r in rows) * RES * RES))
-    print("%2s %5s %6s %6s %5s | close caps/cell lethal | far caps/cell lethal | never seen free from close | nearest pose" % ("#", "cells", "x", "y", "maxd"))
+    print("%2s %5s %6s %6s %5s | close caps/cell lethal | far caps/cell lethal | never seen free from close | nearest pose | close free/cell | cells looked at from close | of those, latest close look lethal"
+          % ("#", "cells", "x", "y", "maxd"))
     for i, r in enumerate(rows, 1):
-        print("%2d %5d %6.1f %6.1f %5.2f | %9.1f %11.2f | %8.1f %9.2f | %26.2f | %.2f m" % ((i,) + r))
+        print("%2d %5d %6.1f %6.1f %5.2f | %9.1f %11.2f | %8.1f %9.2f | %26.2f | %.2f m | %15.1f | %26.2f | %.2f" % ((i,) + r))
 
 
 if __name__ == "__main__":
