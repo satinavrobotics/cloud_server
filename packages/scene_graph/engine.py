@@ -52,6 +52,20 @@ MAX_WINDOW_M = 20.0         # input validation: a leaf window side above this is
 POSE_SLACK_M = 5.0          # input validation: a pose may lie this far outside its window's footprint
 
 
+def block_min(a: np.ndarray) -> np.ndarray:
+    """The minimum of `a` over each LAT x LAT block of costmap cells (block (i, j) covers rows i*LAT.., cols j*LAT..): a lattice cell
+    represents its whole block, so its PRICING clearance is the worst of the cells it covers (never clearer than any of them). The
+    shape is ceil(H / LAT) x ceil(W / LAT), like `a[::LAT, ::LAT]`; an incomplete trailing block is the minimum of the cells it has."""
+    out = a[::LAT, ::LAT].copy()
+    for dy in range(LAT):
+        for dx in range(LAT):
+            if dy or dx:
+                v = a[dy::LAT, dx::LAT]
+                o = out[:v.shape[0], :v.shape[1]]
+                np.minimum(o, v, out=o)
+    return out
+
+
 @dataclass
 class _Rec:
     session: str
@@ -65,7 +79,8 @@ class _Rec:
 @dataclass
 class _Solved:
     """Everything one solved state answers from (image positions are lattice cells of the canvas)."""
-    sp: morse.Space             # the cells of F; sp.clr is the physical clearance (m) of each
+    sp: morse.Space             # the cells of F; sp.clr is the physical clearance (m) of each (top-left cell: structure, widths, stored);
+                                # sp.clr_price is the block minimum over the cell's 2 x 2 costmap cells (route pricing only)
     A: List[int]                # anchor cell (index into sp) of each chart
     full: np.ndarray            # chart index per cell of sp
     keys: List[Key]
@@ -651,6 +666,7 @@ class ChartGraph(SceneGraph):
             free &= ~held
         sq = self._erode(free, shift)
         clr = self._clearance_cells(free, shift) * RES
+        self._clr_price_h = block_min(clr)          # pricing only; `clr_h` (top-left) feeds the partition, charts and link widths
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
         G, W, S, P = self._evidence(sq_h.shape, shift)
         # the body stood at a leaf pose: the cells W proves there are free even where the window is unknown (a camera blind spot
@@ -681,6 +697,7 @@ class ChartGraph(SceneGraph):
         H, W = sp.H, sp.W
         full = part.full.astype(np.int64)
         sp.clr = clr[sp.ys, sp.xs]
+        sp.clr_price = self._clr_price_h[sp.ys, sp.xs]
         edges = self._lattice_edges(sp, h)
         plane = -np.ones((H, W), np.int32); plane[sp.ys, sp.xs] = full
         # persistent keys
@@ -1073,7 +1090,7 @@ class ChartGraph(SceneGraph):
         """Integer edge cost under `safety`: ceil(l / unit * (1 + rate * (d(a) + d(b)) / 2) - 1e-6), at least 1, with the deficit
         d = max(0, margin - clearance) of the edge's cells. With rate 0 it is the unpriced cost (the same float operations)."""
         R, C, Ln = s.edges
-        d = safety.price(s.sp.clr)
+        d = safety.price(s.sp.clr_price)
         return edge_weight(Ln / ROUTE_UNIT_M, d[R] + d[C], safety.rate)
 
     def price_cell(self, ix: int, iy: int, safety: Safety) -> Optional[float]:
@@ -1095,7 +1112,7 @@ class ChartGraph(SceneGraph):
         if not (0 <= y < sp.H and 0 <= x < sp.W): return None
         c = int(sp.idx[y, x])
         if c < 0: return None
-        return float(sp.clr[c])
+        return float(sp.clr_price[c])
 
     def _route_width(self, path: List[int], src: int) -> float:
         """Passage width of a route: the narrowest crossing of the chart sequence, each pair of consecutive charts taken at its

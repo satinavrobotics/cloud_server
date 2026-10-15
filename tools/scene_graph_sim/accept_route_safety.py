@@ -81,6 +81,16 @@ def gate(gid: str, name: str, ok: bool, measured: str, rule: str) -> None:
     RESULTS.append((gid, name, bool(ok), measured, rule))
 
 
+def _block_min(a):
+    """minimum over each 2 x 2 block of cells (a lattice node's clearance), written here from the definition"""
+    out = a[::2, ::2].copy()
+    for dy, dx in ((0, 1), (1, 0), (1, 1)):
+        v = a[dy::2, dx::2]
+        o = out[:v.shape[0], :v.shape[1]]
+        np.minimum(o, v, out=o)
+    return out
+
+
 class Reference:
     """Independent lattice model of the restored engine: owner plane, clearance, edge list, weights, canonical walk."""
 
@@ -119,7 +129,7 @@ class Reference:
         self.dt = ndimage.distance_transform_edt(free) * RES            # full-resolution clearance, computed once
         self.fy0, self.fx0 = eng._cy0, eng._cx0
         clr = np.zeros((Hn, Wn))
-        sub = self.dt[::2, ::2][:Hn, :Wn]
+        sub = _block_min(self.dt)[:Hn, :Wn]       # a node's clearance: the minimum over its 2 x 2 costmap cells
         clr[:sub.shape[0], :sub.shape[1]] = sub
         self.clr = clr
         self.deficit = self.pricef(clr)

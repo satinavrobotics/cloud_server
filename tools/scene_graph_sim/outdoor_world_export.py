@@ -81,7 +81,8 @@ def main():
     b2 = blocked5[:rows * 2, :cols * 2].reshape(rows, 2, cols, 2).any(axis=(1, 3))
     occ[f2] = 1; occ[b2] = 2
     dt = ndimage.distance_transform_edt(free5) * 0.05
-    clr = np.minimum(255, np.round(dt[0:rows * 2:2, 0:cols * 2:2] * 100)).astype(np.uint8)
+    d4 = dt[:rows * 2, :cols * 2].reshape(rows, 2, cols, 2).min(axis=(1, 3))       # a node's clearance: the minimum over its 2 x 2 cells
+    clr = np.minimum(255, np.round(d4 * 100)).astype(np.uint8)
     sp = eng._solved.sp
     F = np.zeros((rows, cols), bool)
     gy, gx = sp.ys + eng._cy0 // 2, sp.xs + eng._cx0 // 2

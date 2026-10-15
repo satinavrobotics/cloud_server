@@ -233,7 +233,7 @@ class PlanGraph:
     # ---- clearance (route pricing) ---------------------------------------------------------------
     def _clearance_tile(self, tx: int, ty: int) -> np.ndarray:
         """[TILE_L, TILE_L] physical clearance (m, capped at `_CLR_CAP_M`) of the lattice cells of tile (tx, ty): the engine's
-        `sp.clr` (distance to the nearest blocked or unknown costmap cell, sampled at the even costmap cell) from the stored `v`
+        `sp.clr_price` (distance to the nearest blocked or unknown costmap cell, minimum over the 2 x 2 costmap cells of the lattice cell) from the stored `v`
         planes of the tile and a halo of `_CLR_HALO` cells around it (the neighbouring tiles read); an absent tile is unknown,
         hence blocked. Exact for min(g, cap): a blocked cell within cap of a cell of the tile is inside the window."""
         with self._clr_lock:
@@ -256,7 +256,12 @@ class PlanGraph:
                 v = t["v"][y0 - (halo + j * TILE_F):y1 - (halo + j * TILE_F), x0 - (halo + i * TILE_F):x1 - (halo + i * TILE_F)]
                 free[y0:y1, x0:x1] = (v != 255) & (v < 100)
         dt = ndimage.distance_transform_edt(free) * RES
-        out = np.minimum(dt[halo:halo + TILE_F:2, halo:halo + TILE_F:2], _CLR_CAP_M)
+        # block minimum (the engine's `block_min`): the lattice cell covers the 2 x 2 costmap cells at its even origin; the halo
+        # (>= 2 cells) holds the odd row/column of the last block
+        blk = dt[halo:halo + TILE_F:2, halo:halo + TILE_F:2]
+        for dy, dx in ((0, 1), (1, 0), (1, 1)):
+            blk = np.minimum(blk, dt[halo + dy:halo + dy + TILE_F:2, halo + dx:halo + dx + TILE_F:2])
+        out = np.minimum(blk, _CLR_CAP_M)
         out.flags.writeable = False
         with self._clr_lock:
             self._clr[(tx, ty)] = out
