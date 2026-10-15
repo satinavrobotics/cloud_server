@@ -743,7 +743,7 @@ search of G.2 runs). Chart radius 2 m, p50 / p95 / max: 74 / 141 / 162 ms off, 7
 * A start or goal in unvalidated space is planned, not refused; the plan reports `validated_first {unvalidated_edges, unvalidated_m, exact}` (and
   the planner logs it), and the dispatcher's reaction to the count (refuse, warn, ask for a mapping pass) is not designed.
 * The strict lexicographic rule puts no price on the detour: one unvalidated edge outweighs any length. On the outdoor world at 53 % validated
-  the plans are 5 x longer and the search 9 x slower (above), and on the live maps a route can be up to 2.4 x longer. A bounded variant (accept an
+  the plans are 5 x longer and the search 8 x slower (above), and on the live maps a route can be up to 2.4 x longer. A bounded variant (accept an
   unvalidated stretch when the validated detour costs more than a limit, or price an unvalidated edge) is a different objective and is not built.
 * The waypoint pull is not validity-aware: it simplifies the lattice route by line of sight in F, so a polyline can cross unvalidated cells the
   lattice route avoided. Measured on office8 at 0.5 m: 25 of 150 plans cross more unvalidated length than their lattice route (0.27 m mean
