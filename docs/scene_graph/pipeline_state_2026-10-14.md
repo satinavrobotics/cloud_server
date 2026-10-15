@@ -137,3 +137,17 @@ Written by the lattice_cimbi session. Sections 1 to 7 above are the state at the
   `tools/scene_graph_sim/export_live.py` and run `close_evidence_replay.py`); the 14 unconfirmed office8 components; no robot-outcome data yet;
   order trimming, replan trigger and the factsheets of two robots are proposals (`robot_interface_proposals.md`).
 
+## 10. Addendum (2026-10-15 02:56 UTC): deployed commit d25077f
+
+| Time (UTC) | Commit | Service | What |
+|---|---|---|---|
+| 02:55 | `d25077f` | planner | block-minimum pricing (design F); validated-first planning code (design G), switch off (`SCENE_GRAPH_VALIDATED_FIRST=false`) |
+| 02:56 | `d25077f` | graph-builder | every rule-on map rebuilt to generation 4 (`morse/2+near5`, validity plane `val`); checker 9 of 9; no stale pending records |
+
+* Planner healthy, `build_sha` `d25077f`, 8 graphs warm, turn cost and waypoint budget unchanged.
+* Pinned unit suite on the merged tree: 5055 passed, 4 skipped (agent run recorded for `d25077f`).
+* Validated-first is OFF. Measured (design G.4, live stores, 100 pairs per map): no route became unroutable; it lengthens routes
+  (Hospital median 1.049, maximum 1.67; outdoor world 38 m to 196 m median and about 8x slower search when strict). Do not switch it on
+  before the bounded variant (a detour price for unvalidated edges, not built).
+* Open: the robot-side reaction to unvalidated routes; the waypoint pull is not validity-aware (G.6); no robot outcome data yet.
+

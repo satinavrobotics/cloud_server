@@ -58,13 +58,14 @@ scene parameter. The engine's window cap (20 m side) and pose slack (5 m) are va
 The deployed commit of each service, the deploy log and the live run of 2026-10-13 are in `pipeline_state_2026-10-14.md`
 (sections 1, 4 and 7, and its addenda); the planner reports its commit as `build_sha` on `GET /stats`.
 
-* Maps: all 9 are in the graph at generation 3 (pipeline `morse/2+near4`); the checker passes 9 of 9 against the re-pinned expectations.
+* Maps: all 9 are in the graph at generation 4 (pipeline `morse/2+near5`, rebuilt 2026-10-15 02:56 UTC); the checker passes 9 of 9 against the re-pinned expectations.
 * Planner: the lazy tile planner only; chart route first, the legacy planner as fallback; clearance pricing at `SCENE_GRAPH_SAFETY_KAPPA`
   1.0 (linear hinge); **turn cost on** (`SCENE_GRAPH_TURN_COST_ENABLED`, lambda from the registered `speed_max / angular_speed_max`,
   operator fallback 0.5 m/rad); **waypoint budget 0.35 m on** with candidate thinning; the width gate is off.
 * Graph-builder: **close evidence on** (`SCENE_GRAPH_NEAR_RANGE_M` 1.5, `SCENE_GRAPH_NEAR_MIN_CLEARANCE_M` 0.25): a cell is held only on
   lethal reported from within 1.5 m (true evidence), away from walls.
-* Off: the exponential price profile, the apex candidates (`SCENE_GRAPH_WAYPOINT_APEX_ENABLED`, measured no effect, deferred).
+* Pricing: a lattice node is priced at the worst of its four 5 cm cells (block minimum, design F); structure and widths keep the top-left sample (stored data unchanged).
+* Off: the exponential price profile, the apex candidates (`SCENE_GRAPH_WAYPOINT_APEX_ENABLED`, measured no effect, deferred), and validated-first planning (`SCENE_GRAPH_VALIDATED_FIRST`, design G: the strict rule has no detour price, see G.6).
 * Not built: order trimming and the replan trigger (`robot_interface_proposals.md`), rate pricing (`formulation.md` section 6).
 * Rollback: `scripts/deploy.sh rollback <service>` puts the last pre-deploy image tag back (`runbook.md` section 2, "Deploying").
 
