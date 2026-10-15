@@ -118,3 +118,22 @@ Written by the lattice_cimbi session. Sections 1 to 7 above are the state at the
   merge (part C) are designed, not built; the robot's speeds are read from the registration factsheet (B.6), the nominal values are to be added.
 * Branch hygiene of 2026-10-14: the branches `exp/inflation-profile`, `design/inflation-profile`, `design/close-evidence-turn-cost`,
   `proto/close-evidence-plane` and `integrate/close-evidence` are merged into `main` and removed.
+
+## 9. Addendum (2026-10-15): live features, generation 3, what is deployed
+
+| Time (UTC) | Commit | Service | What |
+|---|---|---|---|
+| 2026-10-14 21:43 | `1beabfd` | planner, graph-builder | away-from-walls filter in the code, off |
+| 2026-10-14 21:57 | `1beabfd` | graph-builder | close evidence on (env set by the user): every map rebuilt to generation 2 |
+| 2026-10-14 22:07 to 22:23 | `d071bd6`, `72f056a` | planner | turn cost (on, env set by the user), waypoint budget 0.35 m (on) |
+| 2026-10-15 01:15 | `e17d22c` | graph-builder, planner | the lethal-from-within-range rule: every map rebuilt to generation 3 (`morse/2+near4`) |
+| 2026-10-15 01:29 | `828a442` | graph-builder | the ArangoDB meta write is a REPLACE (a rebuild left a stale `pending` record on every map; cleared with `tools/scene_graph_clear_stale_pending.py`) |
+| 2026-10-15 01:37 | `eb4cf5c` | planner, graph-builder | waypoint candidate thinning (long open routes 618 -> 74 ms), apex candidates (off), checker pins re-pinned; checker 9 of 9 |
+
+* Pinned unit suite at `eb4cf5c`: 4968 passed, 4 skipped. Acceptance gates on office8 pass (A1-A7, B, C, W1-W5, N1).
+* Navigable change against the rule-off graph at generation 3: Hospital and office5 0%, office01 -0.6%, Officemap -3.2%, office03 -6.5%,
+  office04 -7.4%, office8 -7.9%, office7 -9.1%, office6 -17.0%. Only office8 was analysed at capture level (the leaf export exists there only).
+* Open: `office6` -17% and `office7` -9.1% are not understood at capture level (export their leaves with
+  `tools/scene_graph_sim/export_live.py` and run `close_evidence_replay.py`); the 14 unconfirmed office8 components; no robot-outcome data yet;
+  order trimming, replan trigger and the factsheets of two robots are proposals (`robot_interface_proposals.md`).
+

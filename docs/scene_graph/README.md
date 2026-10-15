@@ -52,18 +52,19 @@ rule (tile planes `fn`, `bn`), `"morse/2+near4"` with its away-from-walls filter
 `lattice`, `chart_radius` and the optional `near_range_m` / `near_fov_deg` / `near_min_clearance_m` (close evidence and its away-from-walls filter, None = off; `api.py`); nothing else is a
 scene parameter. The engine's window cap (20 m side) and pose slack (5 m) are validation constants, not tunables.
 
-## 3. Live state (2026-10-14)
+## 3. Live state (2026-10-15)
 
 The deployed commit of each service, the deploy log and the live run of 2026-10-13 are in `pipeline_state_2026-10-14.md`
-(sections 1, 4 and 7, and its addendum); the planner reports its commit as `build_sha` on `GET /stats`.
+(sections 1, 4 and 7, and its addenda); the planner reports its commit as `build_sha` on `GET /stats`.
 
-* Maps: all 9 (8 office maps and Hospital, enabled 2026-10-13 23:56 UTC) are in the graph; the checker passes
-  (`tools/scene_graph_check_generation.py --all --expect tools/scene_graph_expected.json`; re-pinned 2026-10-15 to the stores of the close-lethal rule with the away-from-walls filter, generation 3: Hospital 54 / 97 / 23, Officemap 18 / 15 / 4, office01 16 / 17 / 3, office03 10 / 9 / 1, office04 16 / 14 / 4, office5 5 / 5 / 0, office6 13 / 12 / 1, office7 13 / 11 / 3, office8 12 / 13 / 0).
-* Planner: the lazy tile planner only (`full_load` removed 2026-10-13); chart route first, the legacy planner as fallback;
-  clearance pricing on, linear hinge, `SCENE_GRAPH_SAFETY_KAPPA=1.0`; the width gate is off.
-* Off in production: the exponential price profile (`SCENE_GRAPH_INFLATION_*` empty) and close evidence and its filter (`SCENE_GRAPH_NEAR_*` empty).
-* Not built: the turn cost and the waypoint merge (`close_evidence_and_turn_cost_design.md` parts B and C), rate pricing
-  (`formulation.md` section 6).
+* Maps: all 9 are in the graph at generation 3 (pipeline `morse/2+near4`); the checker passes 9 of 9 against the re-pinned expectations.
+* Planner: the lazy tile planner only; chart route first, the legacy planner as fallback; clearance pricing at `SCENE_GRAPH_SAFETY_KAPPA`
+  1.0 (linear hinge); **turn cost on** (`SCENE_GRAPH_TURN_COST_ENABLED`, lambda from the registered `speed_max / angular_speed_max`,
+  operator fallback 0.5 m/rad); **waypoint budget 0.35 m on** with candidate thinning; the width gate is off.
+* Graph-builder: **close evidence on** (`SCENE_GRAPH_NEAR_RANGE_M` 1.5, `SCENE_GRAPH_NEAR_MIN_CLEARANCE_M` 0.25): a cell is held only on
+  lethal reported from within 1.5 m (true evidence), away from walls.
+* Off: the exponential price profile, the apex candidates (`SCENE_GRAPH_WAYPOINT_APEX_ENABLED`, measured no effect, deferred).
+* Not built: order trimming and the replan trigger (`robot_interface_proposals.md`), rate pricing (`formulation.md` section 6).
 * Rollback: `scripts/deploy.sh rollback <service>` puts the last pre-deploy image tag back (`runbook.md` section 2, "Deploying").
 
 ## 4. What is verified, and how
@@ -84,11 +85,11 @@ The deployed commit of each service, the deploy log and the live run of 2026-10-
 
 1. **Rate pricing / count planes.** Not built (clearance pricing is: `route_safety.md`). Design, with the planner side's conditions:
    `formulation.md` section 6. Needs per-leaf-key dedup in the engine (delivery is at-least-once) and a versioned count object outside the tiles.
-2. **Stale free evidence** (a cell reported lethal and later free from far away, the office8 stairs): the close-evidence rule is in the
-   engine, off by default (`close_evidence_and_turn_cost_design.md` part A). Open there: stairs versus ghost for 14 unconfirmed
-   components, and whether the rule applies to wall rims; enabling it rebuilds every map.
-3. **Turn cost and waypoint merge.** Designed and prototyped on a research lattice (`close_evidence_and_turn_cost_design.md` parts B, C);
-   not in the engine. The robot's speeds come from registration (B.6), pending the nominal values.
+2. **Stale free evidence** (a cell reported lethal and later free from far away, the office8 stairs): the close-evidence rule is live
+   (`close_evidence_and_turn_cost_design.md` part A). Open there: the 14 unconfirmed components on office8 (one more pass within 1.5 m would
+   settle them) and the other maps, which were not analysed at capture level.
+3. **Turn cost and waypoint budget.** Built and live (`close_evidence_and_turn_cost_design.md` parts B, C.2). Lambda comes from the robot's
+   registration (B.6); two robots lack the fields (`robot_interface_proposals.md` section 4).
 4. **Exact locality** of the chart partition under incremental folds: measured (0.8 m hall, 2.65 m field), not proved.
 5. **Corridor optimality:** the corridor search is not proved shortest (worst 1.40 x on 840 real pairs, p90 1.00). Under an overlay
    or a price the search covers the whole graph.
