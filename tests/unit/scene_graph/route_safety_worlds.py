@@ -61,6 +61,16 @@ def pairs(g: ChartGraph, n: int, seed: int) -> List[Tuple[str, str]]:
     return allp[:n]
 
 
+def _block_min(a):
+    """minimum over each 2 x 2 block of cells (a lattice node's clearance), written here from the definition"""
+    out = a[::2, ::2].copy()
+    for dy, dx in ((0, 1), (1, 0), (1, 1)):
+        v = a[dy::2, dx::2]
+        o = out[:v.shape[0], :v.shape[1]]
+        np.minimum(o, v, out=o)
+    return out
+
+
 class Reference:
     """Independent clearance, edges and priced cost of one engine state (lattice cells are addressed (y, x) in the canvas)."""
 
@@ -69,7 +79,7 @@ class Reference:
         self.g, self.s = g, s
         V = g._V
         free = (V != 255) & (V < 100)
-        self.clr = (ndimage.distance_transform_edt(free) * RES)[::2, ::2]       # g(c), m, unknown counted blocked
+        self.clr = _block_min(ndimage.distance_transform_edt(free) * RES)       # block minimum; g(c), m, unknown counted blocked
         self.nav = s.sp.idx >= 0
         self.val = self._validity(g) if g._Fn is not None else None             # validated nodes (design G.1), None: rule off
 
