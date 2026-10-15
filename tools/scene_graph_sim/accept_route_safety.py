@@ -18,6 +18,14 @@ walk, its own heading arithmetic); B1, B2 and C2 add the turn cost T (m) of the 
 then L + mu A + T). The heading changes per 10 m and the turning (rad/m) of the lattice routes and of the waypoint polylines are
 reported at lambda 0 and at L.
 
+`--validated-first` (needs `--near-range`; design part G) routes the priced side validated-first (`Safety.validated_first`): the fewest
+edges with an unvalidated end node, then the priced cost J. The reference computes the validity of every node itself (the close-evidence
+free times Fn and the driven image S, node by node) and the optimum with its own penalised weights (P = 1 + the sum of its own priced
+weights, a turn-cost version with the expanded graph); A3 then demands the same (count, J, cells). Gates that assume the priced route
+minimises J alone (B1, B2, C2) are replaced by V2 (never more unvalidated edges than the priced route, never unroutable) and V3 (at an
+equal count the cost is the priced optimum's). The final waypoint polylines are only reported against the validity (the pull is not
+validity-aware: design G.6).
+
 `--waypoint-budget M` (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2) also plans every pair with the budgeted pull
 (`plan_on_graph(waypoint_budget_m=M)`) and adds the gates W1 (final polyline in F), W2 (J(final) <= J(lattice) + M + n * 1e-4) and W3
 (never more waypoints than the greedy pull of the same pair), and reports segments per route, routes with a segment under 0.5 m, the
@@ -142,6 +150,17 @@ class Reference:
             D.append(np.full(len(a), math.atan2(dy, dx)))
         self.R, self.C, self.L = np.concatenate(R), np.concatenate(C), np.concatenate(L)
         self.ang = np.concatenate(D)                                       # direction of the edge R -> C (rad)
+        self.val = None
+        if eng._Fn is not None:
+            # validated lattice nodes, written again: a close free report (Fn >= 0) in any of the four costmap cells of the node, or the
+            # body covered it (the driven image of the engine's evidence)
+            fn = eng._Fn >= 0
+            v = np.zeros((Hn, Wn), bool)
+            for oy in (0, 1):
+                for ox in (0, 1):
+                    sub = fn[oy::2, ox::2][:Hn, :Wn]
+                    v[:sub.shape[0], :sub.shape[1]] |= sub
+            self.val = v | eng._pl["S"][:Hn, :Wn]
         d = self.deficit[ys, xs]
         self.w_base = np.maximum(np.ceil(self.L / U - 1e-6), 1.0)
         self.w_priced = np.maximum(np.ceil(self.L / U * (1.0 + rate * (d[self.R] + d[self.C]) / 2.0) - 1e-6), 1.0)
@@ -180,6 +199,36 @@ class Reference:
             path.append(int(nb[(g.data[lo:hi] + d[nb]) == d[u]].min()))
         return int(d[s]), path
 
+    def unvalidated_edges(self, cells) -> int:
+        """edges of a cell path (indices into ys / xs) with an unvalidated end node"""
+        v = [bool(self.val[self.ys[c], self.xs[c]]) for c in cells]
+        return sum(1 for a, b in zip(v[:-1], v[1:]) if not (a and b))
+
+    def _flags(self) -> np.ndarray:
+        return ~(self.val[self.ys[self.R], self.xs[self.R]] & self.val[self.ys[self.C], self.xs[self.C]])
+
+    def route_vf(self, src_pt, dst_pt):
+        """(J_int, cells, unvalidated edges) of the validated-first optimum: priced weights plus P = 1 + their sum on every edge with an
+        unvalidated end (so one unvalidated edge outweighs any path's priced cost), one Dijkstra from the goal, the canonical walk"""
+        s, t = self.cell(src_pt), self.cell(dst_pt)
+        if s is None or t is None:
+            return None, None, None
+        P = 1 + int(self.w_priced.sum())
+        assert float(P) * (self.N + 1) + float(self.w_priced.sum()) < 2.0 ** 53
+        w = self.w_priced + float(P) * self._flags()
+        g = coo_matrix((np.r_[w, w], (np.r_[self.R, self.C], np.r_[self.C, self.R])), shape=(self.N, self.N)).tocsr()
+        d = dijkstra(g, directed=False, indices=t)
+        if not np.isfinite(d[s]):
+            return None, None, None
+        path = [s]
+        while path[-1] != t:
+            u = path[-1]
+            lo, hi = g.indptr[u], g.indptr[u + 1]
+            nb = g.indices[lo:hi]
+            path.append(int(nb[(g.data[lo:hi] + d[nb]) == d[u]].min()))
+        n = self.unvalidated_edges(path)
+        return int(d[s]) - P * n, path, n
+
     def turn_units(self, cells, lam: float) -> int:
         """turn cost (units) of a cell path: per corner the heading change from atan2, wrapped, in multiples of pi / 4"""
         tot = 0
@@ -189,17 +238,24 @@ class Reference:
             tot += int(turn_weight(lam, int(round(abs((a2 - a1 + math.pi) % (2 * math.pi) - math.pi) / (math.pi / 4)))))
         return tot
 
-    def route_turn(self, src_pt, dst_pt, lam: float):
+    def route_turn(self, src_pt, dst_pt, lam: float, vf: bool = False):
         """(J_int with the turn cost, cells) of the canonical optimum over (cell, incoming heading) states: the priced edge weights
         plus `api.turn_weight` of the heading change at every corner (start and goal heading free); one Dijkstra on the reversed
         expanded graph from the goal states, then the walk from the start that takes the smallest next cell on a minimal path"""
         s, t = self.cell(src_pt), self.cell(dst_pt)
         if s is None or t is None:
-            return None, None
+            return (None, None, None) if vf else (None, None)
         if s == t:
-            return 0, [s]
+            return (0, [s], 0) if vf else (0, [s])
         R, C = np.r_[self.R, self.C], np.r_[self.C, self.R]
-        W = np.r_[self.w_priced, self.w_priced]
+        w1 = self.w_priced
+        P = 0
+        if vf:
+            # directed edges used at most once on a path of the expanded graph: P exceeds twice the weights plus a corner per edge
+            P = 1 + 2 * (int(self.w_priced.sum()) + len(self.R) * int(turn_weight(lam, 4)))
+            assert float(P) * (8 * self.N + 1) < 2.0 ** 53
+            w1 = self.w_priced + float(P) * self._flags()
+        W = np.r_[w1, w1]
         h = np.round(np.r_[self.ang, self.ang + math.pi] / (math.pi / 4)).astype(int) % 8
         dif = np.abs(np.arange(8)[:, None] - np.arange(8)[None, :])
         tab = turn_weight(lam, np.minimum(dif, 8 - dif))                  # [incoming, outgoing]
@@ -216,7 +272,7 @@ class Reference:
         cand = [(w_ + D[v * 8 + hv], v, hv) for v, hv, w_ in out.get(s, [])]
         cost = min((c for c, _, _ in cand), default=math.inf)
         if not np.isfinite(cost):
-            return None, None
+            return (None, None, None) if vf else (None, None)
         v, hv = min((v, hv) for c, v, hv in cand if c == cost)
         path = [s, v]
         while path[-1] != t:
@@ -224,6 +280,9 @@ class Reference:
             nxt = [(v2, h2) for v2, h2, w_ in out[u] if w_ + tab[hv, h2] + D[v2 * 8 + h2] == D[u * 8 + hv]]
             v, hv = min(nxt)
             path.append(v)
+        if vf:
+            n = self.unvalidated_edges(path)
+            return int(cost) - P * n, path, n
         return int(cost), path
 
     def cells_of(self, nodes) -> List[int]:
@@ -371,7 +430,13 @@ def main() -> int:
     ap.add_argument("--waypoint-budget", type=float, default=0.0, help="waypoint budget (m of priced cost); 0 = not measured")
     ap.add_argument("--waypoint-apex", action="store_true", help="also measure the apex candidates (needs --waypoint-budget, --turn-lambda)")
     ap.add_argument("--turn-lambda", type=float, default=0.0, help="turn cost (m per rad) on the priced side; 0 = none")
+    ap.add_argument("--validated-first", action="store_true",
+                    help="route the priced side validated-first (Safety.validated_first; needs --near-range): fewest unvalidated edges, then J")
     args = ap.parse_args()
+    if args.validated_first and args.near_range is None:
+        print("--validated-first needs --near-range (the validity plane exists only with the close-evidence rule)")
+        return 1
+    vfl = bool(args.validated_first)
     t_start = time.perf_counter()
     leaves, st, eng = build(args.data, args.robot_half_side, near_range_m=args.near_range,
                             near_min_clearance_m=args.near_min_clearance)
@@ -388,8 +453,8 @@ def main() -> int:
     m, mu, r = safety.margin, safety.rate, args.robot_half_side
     ref = Reference(eng, m, mu, safety.k, safety.origin)
     lam = float(args.turn_lambda)
-    plain_safety = safety                                    # the priced route without a turn term (lambda 0)
-    safety = dataclasses.replace(safety, turn=lam)
+    plain_safety = dataclasses.replace(safety, validated_first=vfl)       # the priced route without a turn term (lambda 0)
+    safety = dataclasses.replace(safety, turn=lam, validated_first=vfl)
     turn_rec = {"lambda_m_per_rad": lam, "source": "config", "speed_max": None, "angular_speed_max": None, "reason": "harness"}
     sp = eng._solved.sp
     xy = np.array([eng._cell_xy(int(sp.ys[i]), int(sp.xs[i])) for i in range(sp.N)])
@@ -412,6 +477,7 @@ def main() -> int:
 
     def plan(graph, p, q, kappa, times=None, turn=None, budget=0.0, apex=False):
         t = time.perf_counter()
+        config.SCENE_GRAPH_VALIDATED_FIRST = vfl and kappa > 0.0          # the planner's switch: the priced plans only; kappa 0 is the baseline
         turn = (turn_rec if kappa > 0.0 else None) if turn is None else turn
         try:
             out = sr.plan_on_graph(graph, "m", p, q, ([], []), node_of, config.SCENE_GRAPH_START_SNAP_M,
@@ -428,18 +494,21 @@ def main() -> int:
 
     # ---- routes ---------------------------------------------------------------------------------------------------------
     base_l, pri_l, base_e, pri_e, zero_l, zero_e = [], [], [], [], [], []
-    pri0_l, turn0_l, turn0_e = [], [], []
+    pri0_l, turn0_l, turn0_e, pnv_l = [], [], [], []
+    no_vf = dataclasses.replace(safety, validated_first=False)
     for sa, sb in pairs:
+        if vfl:
+            pnv_l.append(route(lazy, sa, sb, no_vf))              # the same price (and turn cost) without the validity term
         if lam > 0.0:
             pri0_l.append(route(lazy, sa, sb, plain_safety))
             turn0_l.append(route(lazy, sa, sb, dataclasses.replace(safety, turn=0.0)))
             turn0_e.append(route(eng, sa, sb, dataclasses.replace(safety, turn=0.0)))
         base_l.append(route(lazy, sa, sb, None))
         pri_l.append(route(lazy, sa, sb, safety))
-        zero_l.append(route(lazy, sa, sb, dataclasses.replace(safety, rate=0.0, turn=0.0)))
+        zero_l.append(route(lazy, sa, sb, dataclasses.replace(safety, rate=0.0, turn=0.0, validated_first=False)))
         base_e.append(route(eng, sa, sb, None))
         pri_e.append(route(eng, sa, sb, safety))
-        zero_e.append(route(eng, sa, sb, dataclasses.replace(safety, rate=0.0, turn=0.0)))
+        zero_e.append(route(eng, sa, sb, dataclasses.replace(safety, rate=0.0, turn=0.0, validated_first=False)))
     # ---- plans (waypoints) at kappa 0, legacy defaults and kappa --------------------------------------------------------
     plans0, plans1, plans_default = [], [], []
     for sa, sb in pairs:                                  # first pass fills the tile and clearance caches
@@ -450,6 +519,7 @@ def main() -> int:
         p, q = (sa.x, sa.y), (sb.x, sb.y)
         plans0.append(plan(lazy, p, q, 0.0, t0))
         plans1.append(plan(lazy, p, q, args.kappa, t1))
+        config.SCENE_GRAPH_VALIDATED_FIRST = False
         try:
             plans_default.append(sr.plan_on_graph(lazy, "m", p, q, ([], []), node_of, config.SCENE_GRAPH_START_SNAP_M,
                                                   config.SCENE_GRAPH_GOAL_SNAP_M, gap))
@@ -515,21 +585,33 @@ def main() -> int:
     mism, nopt, dom = [], 0, []
     for i in n_ok:
         sa, sb = pairs[i]
-        if lam > 0.0:
+        cnt = None
+        if vfl:
+            if lam > 0.0:
+                cost, path, cnt = ref.route_turn((sa.x, sa.y), (sb.x, sb.y), lam, vf=True)
+            else:
+                cost, path, cnt = ref.route_vf((sa.x, sa.y), (sb.x, sb.y))
+        elif lam > 0.0:
             cost, path = ref.route_turn((sa.x, sa.y), (sb.x, sb.y), lam)
         else:
             cost, path = ref.route((sa.x, sa.y), (sb.x, sb.y), "priced")
         got = pri_l[i]
-        if cost is None or got is None or got.cost != cost or ref.cells_of(got.nodes) != path:
+        if cost is None or got is None or got.cost != cost or ref.cells_of(got.nodes) != path or (vfl and got.unvalidated != cnt):
             mism.append(i)
         j_base_priced = ref.j_int(base_l[i].nodes, "priced") + (ref.turn_units(ref.cells_of(base_l[i].nodes), lam) if lam else 0)
-        if got is not None and got.cost > j_base_priced:
+        if vfl:       # lexicographic dominance: (unvalidated edges, J) of the route is at most that of the baseline cells
+            if got is not None and (got.unvalidated, got.cost) > (ref.unvalidated_edges(ref.cells_of(base_l[i].nodes)), j_base_priced):
+                dom.append(i)
+        elif got is not None and got.cost > j_base_priced:
             dom.append(i)
         nopt += 1
     gate("A3", "lattice optimality", not mism and not dom,
-         "%d / %d differ from the reference, %d with J(priced) > J(baseline cells, priced weights)" % (len(mism), nopt, len(dom)),
+         "%d / %d differ from the reference, %d with %s > %s of the baseline cells" % (
+             len(mism), nopt, len(dom), "(unvalidated edges, J)" if vfl else "J(priced)", "(unvalidated edges, J)" if vfl else "J(priced weights)"),
          "S7: Dijkstra is exact for non-negative additive integer weights%s; J_int(priced) == reference, <= J_int(baseline cells); "
-         "tolerance 0" % (" (on (cell, heading) states, turn cost included)" if lam > 0.0 else ""))
+         "tolerance 0%s" % (" (on (cell, heading) states, turn cost included)" if lam > 0.0 else "",
+                            "; validated-first: the reference has its own validity and penalty P = 1 + sum of its weights, and (count, J, cells) must "
+                            "all agree; the dominance is lexicographic" if vfl else ""))
     # the length optimum (independent reference, base weights): the production baseline route is the corridor route, which is not
     # proved shortest (formulation.md statement 27), so A4 and B compare with this one
     opt: Dict[int, Tuple[float, float, int]] = {}
@@ -684,26 +766,51 @@ def main() -> int:
                      corners, cands, apexes, used))
 
     # ---- B ----------------------------------------------------------------------------------------------------------------
-    b1, b2 = [], []
     ratios = []
-    for i in n_ok:
-        Lb, Ab, n_b, T_o = opt[i]                         # T_o: the turn cost (m) of the length optimum, 0 without a turn term
-        Lp, Ap = ref.length_and_intrusion(pri_l[i].nodes)
-        n = max(n_b, len(pri_l[i].nodes) - 1)
-        tol = n * U
-        if Ap > Ab + (tol + T_o) / mu + 1e-9:
-            b1.append(i)
-        dbar = Ab / Lb if Lb > 0 else 0.0
-        if Lp > Lb * (1.0 + mu * dbar) + tol + T_o + 1e-9:
-            b2.append(i)
-        Lc = base_l[i].length
-        ratios.append(Lp / Lc if Lc > 0 else 1.0)
-    gate("B1", "intrusion", not b1, "%d / %d violate A(priced) <= A(o) + n * 1e-4 / mu (o = length optimum)" % (len(b1), len(n_ok)),
-         "mu A_new + L_new <= mu A_o + L_o (priced optimality) and L_new >= L_o - n*1e-4 (A4): A_new <= A_o + n * 1e-4 / mu "
-         "(n = max edges of the two)%s" % ("; with the turn term + T_o / mu (T_new >= 0)" if lam > 0.0 else ""))
-    gate("B2", "detour", not b2, "%d / %d violate L(priced) <= L(o) (1 + mu dbar_o) + n * 1e-4" % (len(b2), len(n_ok)),
-         "L_new + mu A_new <= L_o + mu A_o and A_new >= 0: L_new <= L_o (1 + mu A_o / L_o) (+ rounding n * 1e-4)%s"
-         % ("; with the turn term + T_o" if lam > 0.0 else ""))
+    if not vfl:
+        b1, b2 = [], []
+        for i in n_ok:
+            Lb, Ab, n_b, T_o = opt[i]                         # T_o: the turn cost (m) of the length optimum, 0 without a turn term
+            Lp, Ap = ref.length_and_intrusion(pri_l[i].nodes)
+            n = max(n_b, len(pri_l[i].nodes) - 1)
+            tol = n * U
+            if Ap > Ab + (tol + T_o) / mu + 1e-9:
+                b1.append(i)
+            dbar = Ab / Lb if Lb > 0 else 0.0
+            if Lp > Lb * (1.0 + mu * dbar) + tol + T_o + 1e-9:
+                b2.append(i)
+            Lc = base_l[i].length
+            ratios.append(Lp / Lc if Lc > 0 else 1.0)
+        gate("B1", "intrusion", not b1, "%d / %d violate A(priced) <= A(o) + n * 1e-4 / mu (o = length optimum)" % (len(b1), len(n_ok)),
+             "mu A_new + L_new <= mu A_o + L_o (priced optimality) and L_new >= L_o - n*1e-4 (A4): A_new <= A_o + n * 1e-4 / mu "
+             "(n = max edges of the two)%s" % ("; with the turn term + T_o / mu (T_new >= 0)" if lam > 0.0 else ""))
+        gate("B2", "detour", not b2, "%d / %d violate L(priced) <= L(o) (1 + mu dbar_o) + n * 1e-4" % (len(b2), len(n_ok)),
+             "L_new + mu A_new <= L_o + mu A_o and A_new >= 0: L_new <= L_o (1 + mu A_o / L_o) (+ rounding n * 1e-4)%s"
+             % ("; with the turn term + T_o" if lam > 0.0 else ""))
+    else:
+        # B1 / B2 and C2 assume the route minimises the priced cost alone; V2 and V3 are the validated-first statements
+        v2, v3 = [], []
+        pc, vc = [], []
+        for i in n_ok:
+            pn, pv = pnv_l[i], pri_l[i]
+            cn = ref.unvalidated_edges(ref.cells_of(pn.nodes))
+            if pv is None or pv.unvalidated > cn:
+                v2.append(i)
+            elif pv.unvalidated == cn and pv.cost != pn.cost:
+                v3.append(i)
+            pc.append(cn)
+            vc.append(-1 if pv is None else pv.unvalidated)
+            if pv is not None and base_l[i].length > 0:
+                ratios.append(pv.length / base_l[i].length)
+        gate("V2", "never more unvalidated edges, never unroutable", not v2,
+             "%d / %d routes with more unvalidated edges than the priced route (or none); unvalidated edges per route: priced %.2f mean, "
+             "validated-first %.2f mean; routes with any: %d -> %d" % (
+                 len(v2), len(n_ok), float(np.mean(pc)), float(np.mean(vc)), sum(1 for c_ in pc if c_), sum(1 for c_ in vc if c_)),
+             "the priced route is one candidate of the lexicographic minimisation (count first), and every edge keeps a finite weight")
+        gate("V3", "equal count, equal cost", not v3,
+             "%d / %d routes with the same count as the priced route but a different J" % (len(v3), len(n_ok)),
+             "at an equal count the validated-first optimum minimises J among the routes of that count, the priced optimum minimises J "
+             "overall and is such a route: the two J are equal")
 
     # ---- C ----------------------------------------------------------------------------------------------------------------
     r0 = {p_ for p_ in plans0 if isinstance(p_, str)}
@@ -723,7 +830,7 @@ def main() -> int:
         t_b = ref.turn_units(ref.cells_of(base_l[i].nodes), lam) * U if lam > 0.0 and base_l[i] is not None else 0.0
         if jp > jb * METRICATION + mu * QUANT_M * lp + t_b:
             viol.append(i)
-    if safety.k is None:
+    if safety.k is None and not vfl:
       gate("C2", "continuum value", not viol,
          "%d / %d violate J_cont(priced) <= %.4f J_cont(base) + mu * %.4f * L(priced); median ratio %.3f" % (
              len(viol), len(med), METRICATION, QUANT_M, float(np.median(med)) if med else float("nan")),
@@ -773,6 +880,33 @@ def main() -> int:
               % (lam, c0_, c1_, t0_, t1_, w0_, w1_, u0_, u1_, 100 * float(np.median(dl)), 100 * max(dl)))
     for line in wb_lines:
         print(line)
+    if vfl:
+        def unval_m(pts):
+            """length (m) of a polyline over unvalidated lattice nodes (1 cm samples); a point outside F counts as unvalidated"""
+            tot = 0.0
+            for a_, b_ in zip(pts[:-1], pts[1:]):
+                n_ = max(1, int(math.ceil(math.dist(a_, b_) / SAMPLE_FINE)))
+                for k_ in range(n_):
+                    t_ = (k_ + 0.5) / n_
+                    iy = int(math.floor((a_[1] + t_ * (b_[1] - a_[1])) / H)) - ref.fy0 // 2
+                    ix = int(math.floor((a_[0] + t_ * (b_[0] - a_[0])) / H)) - ref.fx0 // 2
+                    if not (0 <= iy < ref.val.shape[0] and 0 <= ix < ref.val.shape[1]) or not ref.val[iy, ix]:
+                        tot += math.dist(a_, b_) / n_
+            return tot
+        both = [i for i in n_ok if pri_l[i] is not None and pnv_l[i] is not None]
+        u_pr = [unval_m([tuple(n_) for n_ in pnv_l[i].nodes]) for i in both]
+        u_vf = [unval_m([tuple(n_) for n_ in pri_l[i].nodes]) for i in both]
+        print("validated-first, %d routes: unvalidated length of the lattice route, priced %.2f m mean (%d routes touch) -> validated-first %.2f m mean "
+              "(%d routes touch); route length ratio validated-first / priced median %.3f max %.3f" % (
+                  len(both), float(np.mean(u_pr)), sum(1 for u in u_pr if u > 0), float(np.mean(u_vf)), sum(1 for u in u_vf if u > 0),
+                  float(np.median([pri_l[i].length / pnv_l[i].length for i in both])),
+                  max(pri_l[i].length / pnv_l[i].length for i in both)))
+        pl = [i for i in both if not isinstance(plans1[i], str)]
+        up = [unval_m(wp(plans1[i])) for i in pl]
+        ul = [unval_m([tuple(n_) for n_ in pri_l[i].nodes]) for i in pl]
+        print("  the waypoint polylines (the pull is not validity-aware, design G.6): unvalidated length %.2f m mean against %.2f m for their lattice "
+              "routes; %d of %d plans cross more unvalidated length than the lattice route (by more than 5 cm)" % (
+                  float(np.mean(up)), float(np.mean(ul)), sum(1 for a_, b_ in zip(up, ul) if a_ > b_ + 0.05), len(pl)))
     print("B1/B2 for a price phi >= 0 (phi = the hinge deficit or exp(-k (g - origin)) below reach; kappa = rate), o the length optimum, "
           "P the priced route, A = sum l phi_mean, n edges:")
     print("  J = L + kappa A (up to the n * 1e-4 rounding), J(P) <= J(o) and L(P) >= L(o) - n 1e-4 give "
