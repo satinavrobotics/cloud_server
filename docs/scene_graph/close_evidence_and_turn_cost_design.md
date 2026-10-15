@@ -700,7 +700,7 @@ penalty P = 1 + the sum of its priced weights; for a turn cost an expanded graph
 never unroutable) and V3 (at an equal count, the same J). The test reference (`route_safety_worlds.Reference.lex_dijkstra`) uses pair distances
 compared lexicographically, with no penalty constant at all; a brute force over every simple path of small random graphs agrees with the
 production weights. Office8 is nearly fully validated at 1.5 m (98.5 % of F; 4 of 150 routes touch an unvalidated edge); at 0.5 m (a forced
-sparse case) the routes with unvalidated edges go 73 -> 66 and the unvalidated edges per route 3.7 -> 2.2 (4.1 -> 2.2 with lambda 0.4).
+sparse case) the routes with unvalidated edges go 68 -> 66 and the unvalidated edges per route 3.7 -> 2.2 (also with lambda 0.4).
 
 **The live maps** (`tools/scene_graph_sim/validated_first_live.py`, read-only: a `python -` in the graph-builder container, the branch's modules
 served from memory; the stores are read under their `+near4` token and the `val` nodes rebuilt as the writer will store them; 100 random pairs >= 3 m per
@@ -710,31 +710,31 @@ unvalidated edges and metres are sums over the 100 routes.
 
 | map | nodes | validated | largest validated piece | same route | changed (len x median / max) | S/G unvalidated | unroutable | routes with unvalidated edges | unvalidated edges | unvalidated metres |
 |---|---|---|---|---|---|---|---|---|---|---|
-| Hospital | 17 114 | 28.8 % | 14.8 % | 13 | 87 (1.049 / 1.665) | 92 | 0 | 95 -> 94 | 3742 -> 2203 | 431 -> 275 |
-| Officemap | 2 109 | 77.2 % | 77.1 % | 66 | 34 (1.028 / 1.960) | 45 | 0 | 46 -> 45 | 648 -> 389 | 76 -> 46 |
-| office01 | 2 153 | 79.3 % | 79.1 % | 54 | 46 (1.032 / 2.359) | 43 | 0 | 53 -> 43 | 773 -> 250 | 90 -> 32 |
-| office03 | 1 385 | 39.6 % | 32.1 % | 57 | 43 (1.000 / 1.040) | 91 | 0 | 96 -> 96 | 2409 -> 2290 | 293 -> 282 |
-| office04 | 2 157 | 91.8 % | 91.8 % | 89 | 11 (1.000 / 1.058) | 20 | 0 | 20 -> 20 | 159 -> 134 | 19 -> 16 |
-| office5 | 865 | 28.4 % | 28.4 % | 44 | 56 (1.021 / 1.293) | 100 | 0 | 100 -> 100 | 2496 -> 2340 | 324 -> 314 |
-| office6 | 1 967 | 94.7 % | 94.7 % | 100 | 0 | 13 | 0 | 13 -> 13 | 68 -> 68 | 7.8 -> 7.8 |
-| office7 | 2 129 | 92.7 % | 92.7 % | 77 | 23 (1.000 / 1.153) | 23 | 0 | 24 -> 23 | 155 -> 104 | 17.8 -> 13.1 |
-| office8 | 1 973 | 98.5 % | 98.5 % | 98 | 2 (1.000 / 1.000) | 3 | 0 | 3 -> 3 | 9 -> 7 | 1.1 -> 0.9 |
+| Hospital | 17 114 | 28.8 % | 14.8 % | 15 | 85 (1.049 / 1.665) | 92 | 0 | 95 -> 94 | 3718 -> 2203 | 429 -> 275 |
+| Officemap | 2 109 | 77.2 % | 77.1 % | 62 | 38 (1.016 / 1.957) | 45 | 0 | 46 -> 45 | 649 -> 389 | 76 -> 46 |
+| office01 | 2 153 | 79.3 % | 79.1 % | 55 | 45 (1.024 / 2.354) | 43 | 0 | 51 -> 43 | 729 -> 250 | 85 -> 32 |
+| office03 | 1 385 | 39.6 % | 32.1 % | 14 | 86 (1.000 / 1.040) | 91 | 0 | 96 -> 96 | 2495 -> 2290 | 302 -> 285 |
+| office04 | 2 157 | 91.8 % | 91.8 % | 89 | 11 (1.016 / 1.048) | 20 | 0 | 20 -> 20 | 166 -> 134 | 20 -> 16 |
+| office5 | 865 | 28.4 % | 28.4 % | 50 | 50 (1.021 / 1.293) | 100 | 0 | 100 -> 100 | 2475 -> 2340 | 323 -> 314 |
+| office6 | 1 967 | 94.7 % | 94.7 % | 95 | 5 (0.992 / 0.996) | 13 | 0 | 13 -> 13 | 73 -> 68 | 8.1 -> 7.8 |
+| office7 | 2 129 | 92.7 % | 92.7 % | 78 | 22 (1.000 / 1.139) | 23 | 0 | 23 -> 23 | 156 -> 104 | 17.8 -> 13.1 |
+| office8 | 1 973 | 98.5 % | 98.5 % | 98 | 2 (1.011 / 1.013) | 3 | 0 | 3 -> 3 | 9 -> 7 | 1.1 -> 0.9 |
 
 The same table without the clearance price (unpriced route against unpriced validated-first) differs by a few pairs only (Hospital 13 same, 87
 changed 1.049 / 1.665, 3828 -> 2203 edges; office01 43 same, 57 changed 1.020 / 2.261, 888 -> 250; office5 50 same, 50 changed 1.025 / 1.293, 2539 -> 2340).
-Engine route time, mean per pair: 0.4 to 2.7 ms after, 0.4 to 2.5 ms before (largest on Hospital).
+Engine route time, mean per pair: 0.3 to 3.0 ms after, 0.3 to 2.5 ms before (largest on Hospital). The clearance price here is the block minimum of part F.
 
 Reading: where the drive covers the map (office04, 6, 7, 8) little changes. Where it does not, the unvalidated edges that remain are mostly the
 ends of routes whose start or goal is itself in unvalidated space (a random node of Hospital, office03 and office5 is unvalidated in 92, 91 and
-100 of 100 pairs), plus stretches no validated route avoids. Where a detour exists the rule takes it: office01 loses 68 % of its unvalidated
-edges, Officemap 40 %, Hospital 41 %, at a median route length +3 to +5 % and a worst case of 2.4 x. Maps that lose plannable space: Hospital,
+100 of 100 pairs), plus stretches no validated route avoids. Where a detour exists the rule takes it: office01 loses 66 % of its unvalidated
+edges, Officemap 40 %, Hospital 41 %, at a median route length +2 to +5 % on the routes that change and a worst case of 2.4 x. Maps that lose plannable space: Hospital,
 office5, office03 (28 to 40 % of F validated; the piece plans reach without any unvalidated edge is 15 to 32 % of F); no route became unroutable.
 
 **Plan time** (`outdoor_world.py --w 60 --h 40 --pairs 8 --min-pair-m 20 --near-range 1.5 --near-min-clearance 0.25 [--validated-first]`: the whole
 `plan_on_graph` with pricing and the waypoint budget 0.35 m, in-memory store, 8 pairs of 38 m median; the drive covers 100 % of F, so the ellipse
-search of G.2 runs). Chart radius 2 m, p50 / p95 / max: 81 / 164 / 190 ms off, 75 / 169 / 191 ms on; radius 6 m: 92 / 163 / 182 ms off,
-97 / 168 / 188 ms on. The same world with `--near-range 0.3 --radii 2` (53 % of F validated; the whole-graph search of G.2 runs): 73 / 138 /
-160 ms off, 654 / 968 / 1015 ms on, and the 8 routes are 195 m (median) instead of 38 m, with 2 unvalidated edges left (the start or goal end).
+search of G.2 runs). Chart radius 2 m, p50 / p95 / max: 74 / 141 / 162 ms off, 79 / 164 / 199 ms on; radius 6 m: 103 / 187 / 210 ms off,
+114 / 176 / 190 ms on. The same world with `--near-range 0.3 --radii 2` (53 % of F validated; the whole-graph search of G.2 runs): 84 / 152 /
+164 ms off, 654 / 1039 / 1104 ms on, and the 8 routes are 196 m (median) instead of 38 m, with 2 unvalidated edges left (the start or goal end).
 
 ### G.6 What is NOT shown
 
@@ -746,8 +746,8 @@ search of G.2 runs). Chart radius 2 m, p50 / p95 / max: 81 / 164 / 190 ms off, 7
   the plans are 5 x longer and the search 9 x slower (above), and on the live maps a route can be up to 2.4 x longer. A bounded variant (accept an
   unvalidated stretch when the validated detour costs more than a limit, or price an unvalidated edge) is a different objective and is not built.
 * The waypoint pull is not validity-aware: it simplifies the lattice route by line of sight in F, so a polyline can cross unvalidated cells the
-  lattice route avoided. Measured on office8 at 0.5 m: 33 of 150 plans cross more unvalidated length than their lattice route (0.30 m mean
-  against 0.24 m). The gap-fill and corridor routes of the route enrichment take the flag with their lattice routes (the same `Safety`) and have the same pull.
+  lattice route avoided. Measured on office8 at 0.5 m: 25 of 150 plans cross more unvalidated length than their lattice route (0.27 m mean
+  against 0.24 m; 29 of 150 with a turn cost). The gap-fill and corridor routes of the route enrichment take the flag with their lattice routes (the same `Safety`) and have the same pull.
 * Over the tile cap the validated-first search returns the corridor's route (valid, maybe with more unvalidated edges), `exact` False.
 * The live maps were routed with the engine, not the lazy reader (their stores are still `+near4`); engine == lazy is the equality tests on the nine
   worlds (with and without an overlay, at tile edges, with a price and with a turn cost).
