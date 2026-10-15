@@ -5,24 +5,24 @@
   "links": 97
  },
  "Officemap": {
-  "charts": 14,
-  "islands": 1,
+  "charts": 18,
+  "islands": 4,
   "links": 15
  },
  "office01": {
-  "charts": 15,
+  "charts": 16,
   "islands": 3,
-  "links": 16
+  "links": 17
  },
  "office03": {
-  "charts": 8,
+  "charts": 10,
   "islands": 1,
-  "links": 6
+  "links": 9
  },
  "office04": {
   "charts": 16,
   "islands": 4,
-  "links": 15
+  "links": 14
  },
  "office5": {
   "charts": 5,
@@ -30,18 +30,18 @@
   "links": 5
  },
  "office6": {
-  "charts": 14,
-  "islands": 0,
-  "links": 17
+  "charts": 13,
+  "islands": 1,
+  "links": 12
  },
  "office7": {
-  "charts": 16,
+  "charts": 13,
   "islands": 3,
-  "links": 15
+  "links": 11
  },
  "office8": {
   "charts": 12,
   "islands": 0,
-  "links": 15
+  "links": 13
  }
 }

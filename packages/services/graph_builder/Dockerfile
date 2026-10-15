@@ -44,7 +44,7 @@ COPY packages/topomap_dbs/ /app/packages/topomap_dbs/
 # Operator tool (needs scene_leaf, image_db, ARANGO_*, MINIO_* of this image):
 #   docker compose exec graph-builder-service python -m tools.scene_costmap_stored_backfill [--map ID] [--apply]
 #   docker compose exec graph-builder-service python -m tools.scene_graph_check_generation --all   (read-only check after a generation)
-COPY tools/__init__.py tools/scene_costmap_stored_backfill.py tools/scene_graph_check_generation.py tools/scene_graph_expected.json /app/tools/
+COPY tools/__init__.py tools/scene_costmap_stored_backfill.py tools/scene_graph_check_generation.py tools/scene_graph_clear_stale_pending.py tools/scene_graph_expected.json /app/tools/
 
 # Set Python path and disable bytecode caching
 ENV PYTHONPATH=/app
