@@ -32,6 +32,11 @@ Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.
   incumbent J_inc is P0 with its turn cost or the expanded optimum on a band of 3 cells around P0 (tiles of the band only), and the
   exact (cell, heading) search runs on the cells of the ellipse |c - a| + |c - b| <= J_inc * 1e-4 m that also satisfy
   d(a, c) + d(c, b) <= J_inc (`packages/scene_graph/turn.py`); over the tile cap the incumbent is returned and `exact` is False;
+* with `safety.validated_first` (docs/scene_graph/close_evidence_and_turn_cost_design.md part G, `packages/scene_graph/validated.py`) the
+  weights are penalised by the engine's function (w' = w + P * [an end node is unvalidated], the node flag from the stored `val` plane): the
+  route has the fewest unvalidated edges and then the least J. A corridor route without unvalidated edges is seeded into the same ellipse
+  search; otherwise every chart is searched (no geometric bound exists), and over the tile cap the corridor's route stands with `exact` False
+  (`_route_vf`). A store without the plane (no close-evidence rule, or an earlier pipeline token) reads every node as validated: the flag is inert;
 * `max_tiles` caps a request: a bigger corridor raises `CorridorTooLarge` (the planner falls back to the legacy one).
 
 It reads `StoredView` internals (`_own`, `_cache`, `_idx`); that is the cost of a LACI-only phase. Phase 1 gives these

@@ -1032,7 +1032,10 @@ class ChartGraph(SceneGraph):
         With `safety` the edge cost is the length priced by the clearance deficit (`_edge_cost`), J = `Route.cost`; the corridor
         is then not used (it is a length bound, not a bound of J): the whole graph is searched. With `safety.turn` > 0 every change
         of heading adds its turn cost to J (`turn.route`: the exact (cell, heading) search on the cells that can hold a route no
-        costlier than a known one); the tie rule is the same."""
+        costlier than a known one); the tie rule is the same.
+        With `safety.validated_first` (and a validity plane, i.e. the close-evidence rule) the edge weight is penalised, w' = w + P * [an
+        end node is unvalidated] (`validated.py`): the route has the fewest unvalidated edges of all routes and, among those, the least
+        J; `Route.cost` is still J, `Route.unvalidated` / `unvalidated_m` the count and the length. The whole graph is searched."""
         self._check()
         turn = 0.0 if safety is None else float(safety.turn)
         vf = safety is not None and safety.validated_first and self._val is not None    # validated-first needs the validity plane
