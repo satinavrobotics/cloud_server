@@ -503,3 +503,22 @@ def test_a_level_beyond_the_top_is_the_top_in_the_engine_and_in_the_stored_view(
             assert sig(a) == sig(g.query(BIG, top, raster=False))
     assert sig(g.query(BIG, top + 2, raster=False)) != sig(g.query(BIG, 0, raster=False))   # not the level-0 charts
     assert sig(g.query(BIG, -3, raster=False)) == sig(g.query(BIG, 0, raster=False))
+
+
+def test_the_arango_meta_write_replaces_the_document():
+    """UPDATE merges the top-level keys, so the `pending` record that `commit_generation` leaves out would survive; the write must
+    replace the document (verified against ArangoDB 2026-10-15: UPDATE kept `pending`, REPLACE removed it)."""
+    q = ArangoMinioBackend.CAS_UPDATE
+    assert "REPLACE d WITH" in q and "UPDATE" not in q and "d.version == @exp" in q
+
+
+def test_clearing_stale_pending_only_touches_a_committed_generation():
+    from tools import scene_graph_clear_stale_pending as t
+    live, stale, ahead = {"version": 3, "generation": 3}, {"version": 3, "generation": 3, "pending": {"generation": 3}}, \
+        {"version": 3, "generation": 3, "pending": {"generation": 4}}
+    assert not t.stale(live) and t.stale(stale) and not t.stale(ahead)
+    be = MemoryBackend()
+    be.cas_meta("a", None, dict(stale)); be.cas_meta("b", None, dict(ahead))
+    st = SceneGraphStore(be, be)
+    assert t.main(["--apply"], store=st, maps=["a", "b"]) == 0
+    assert "pending" not in be.meta("a") and be.meta("b")["pending"]["generation"] == 4

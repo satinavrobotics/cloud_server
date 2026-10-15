@@ -244,6 +244,10 @@ Both live in `mapobjectv1.status` (jsonb). There is no API for either yet; use S
   (`reason: "needs_rebuild"`). The pipeline version is part of it: the close-evidence tokens are `morse/2+near3` (rule only) and
   `morse/2+near4` (rule + filter); the earlier `+near1` / `+near2` stores (held by the latest lethal from any distance) are rebuilt,
   never reused, and a direct load of one raises a `ValueError` saying so. Changing the rule's meaning rebuilds every rule-on map.
+* After a rebuild commits (`commit_generation`) the `pending` record is removed from the map's meta. Until 2026-10-15 the ArangoDB write
+  was an UPDATE that merges top-level keys, so the record stayed (harmless to readers, but the checker reports "a generation is still
+  pending"); the write is a REPLACE now. Maps rebuilt before that keep a stale record until
+  `python -m tools.scene_graph_clear_stale_pending --apply` is run in the graph-builder container (dry run without `--apply`).
 * There is no supported standalone "drop the graph" tool; the graph is removed by the map delete saga only.
 
 ## 4. Rollout and rollback

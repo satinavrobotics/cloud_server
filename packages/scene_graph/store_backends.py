@@ -78,8 +78,11 @@ class ArangoMinioBackend:
     `.image._bucket_name`, `.image._ensure_map_bucket`). Writes only under `scene_graph/` of the map's bucket and to
     the three per-map collections."""
 
+    # REPLACE, not UPDATE: the meta document is replaced as a whole, as `MemoryBackend.cas_meta` does. An UPDATE merges the top-level
+    # keys, so a key the new meta leaves out (the `pending` record after `commit_generation`) would survive for ever (found on the
+    # first rebuild of every map, 2026-10-15: all maps kept a stale `pending`; docs/scene_graph/runbook.md section 3).
     CAS_UPDATE = ("FOR d IN @@c FILTER d._key == 'meta' AND d.version == @exp "
-                  "UPDATE d WITH @meta IN @@c OPTIONS {mergeObjects: false} RETURN NEW._key")
+                  "REPLACE d WITH MERGE(@meta, {_key: d._key}) IN @@c RETURN NEW._key")
 
     def __init__(self, client):
         self.c = client
