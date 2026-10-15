@@ -43,8 +43,13 @@ PIPELINE = "morse/2"
 # close), +near4 = `fn`, `bn` and `hold` (near_min_clearance_m too: the away-from-walls filter needs components that cross tiles,
 # so the engine stores its result). +near1 / +near2 were the earlier rule (held by the latest lethal time from ANY distance, `b`):
 # its stores hold ghosts the new rule does not, so those tokens are no longer defined and such a store is refused, never read.
+# +near5 = every plane of +near3 / +near4 (`hold` only with near_min_clearance_m, as before) and `val`, the uint8 lattice plane of
+# VALIDATED nodes (validated-first planning, design G): a store made with the close-evidence rule now always carries it, so +near3 and
+# +near4 are no longer WRITTEN; a store with either token is refused by `load` and rebuilt by the worker in a new generation (the token is
+# part of the params hash). The names stay defined so that a refusal can say what the old store lacked.
 PIPELINE_NEAR = PIPELINE + "+near3"
 PIPELINE_NEAR_HOLD = PIPELINE + "+near4"
+PIPELINE_NEAR_VAL = PIPELINE + "+near5"
 RETIRED_PIPELINES = (PIPELINE + "+near1", PIPELINE + "+near2")
 RES = 0.05
 RESIDENT_MARGIN_M = 5.0      # a partially resident writer keeps this margin of tiles around a leaf's window
@@ -69,8 +74,7 @@ class DirtyCoverageError(Exception):
 
 
 def _pipeline(params: dict) -> str:
-    if "near_min_clearance_m" in params: return PIPELINE_NEAR_HOLD
-    return PIPELINE_NEAR if "near_range_m" in params else PIPELINE
+    return PIPELINE_NEAR_VAL if "near_range_m" in params else PIPELINE
 
 
 def _fmt(k) -> str:
@@ -103,6 +107,7 @@ def tile_arrays(st: EngineState, tx: int, ty: int, ids_lut: Optional[np.ndarray]
     if st.Fn is not None: a["fn"] = _slice(st.Fn, x0, y0, TILE_F, -1)
     if st.Bn is not None: a["bn"] = _slice(st.Bn, x0, y0, TILE_F, -1)
     if st.Hold is not None: a["hold"] = _slice(st.Hold, x0, y0, TILE_F, False).astype(np.uint8)
+    if st.Val is not None: a["val"] = _slice(st.Val, tx * TILE_L - st.cx0 // 2, ty * TILE_L - st.cy0 // 2, TILE_L, False).astype(np.uint8)
     nonempty = bool((a["v"] != 255).any() or (a["t"] >= 0).any() or (a["b"] >= 0).any())
     for name, (v, t) in sorted(st.chan.items()):
         cv, ct = _slice(v, x0, y0, TILE_F, 255), _slice(t, x0, y0, TILE_F, -1)
@@ -611,9 +616,9 @@ class SceneGraphStore:
             if missing:      # a writer re-solves from all of F: fail loudly, naming what it lacks; reads use view(tiles=)
                 raise MissingTiles(missing)
         if man.get("pipeline") in RETIRED_PIPELINES or (man.get("pipeline") is not None and man["pipeline"] != _pipeline(man["params"])):
-            raise ValueError("store of map %s was made with pipeline %s, this code reads %s: the close-evidence rule changed "
-                             "(lethal evidence only from within range); the map must be rebuilt in a new generation, not resumed"
-                             % (map_id, man.get("pipeline"), _pipeline(man["params"])))
+            raise ValueError("store of map %s was made with pipeline %s, this code reads %s: the stored planes differ (+near5 adds the "
+                             "validated-node plane `val`; +near1 / +near2 held by lethal evidence from any distance); the map must be "
+                             "rebuilt in a new generation, not resumed" % (map_id, man.get("pipeline"), _pipeline(man["params"])))
         names = list(man["tiles"])
         coords = [tuple(int(v) for v in n.split(",")) for n in names]
         if coords:
@@ -627,6 +632,7 @@ class SceneGraphStore:
         Fn = np.full((H, W), -1, np.int64) if "near_range_m" in man["params"] else None
         Bn = np.full((H, W), -1, np.int64) if "near_range_m" in man["params"] else None
         Hold = np.zeros((H, W), bool) if "near_min_clearance_m" in man["params"] else None
+        Val = np.zeros((H // 2, W // 2), bool) if "near_range_m" in man["params"] else None
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
         own = np.zeros((H // 2, W // 2), np.int32)
         for (tx, ty) in coords:
@@ -637,6 +643,7 @@ class SceneGraphStore:
             if Fn is not None and "fn" in t: Fn[y:y + TILE_F, x:x + TILE_F] = t["fn"]
             if Bn is not None and "bn" in t: Bn[y:y + TILE_F, x:x + TILE_F] = t["bn"]
             if Hold is not None and "hold" in t: Hold[y:y + TILE_F, x:x + TILE_F] = t["hold"] != 0
+            if Val is not None and "val" in t: Val[ly:ly + TILE_L, lx:lx + TILE_L] = t["val"] != 0
             for n in man["channels"]:
                 if "c.%s.v" % n in t:
                     chan[n][0][y:y + TILE_F, x:x + TILE_F] = t["c.%s.v" % n]; chan[n][1][y:y + TILE_F, x:x + TILE_F] = t["c.%s.t" % n]
@@ -654,7 +661,7 @@ class SceneGraphStore:
             arr, m = unpack(self.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h)))
             leaves += segment_records(arr, m)
         p = man["params"]
-        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, Bn=Bn, Hold=Hold, chan=chan, leaves=leaves,
+        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, Bn=Bn, Hold=Hold, Val=Val, chan=chan, leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
         g = ChartGraph(SceneParams(**p))

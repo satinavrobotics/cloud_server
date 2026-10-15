@@ -330,6 +330,10 @@ class MissionPlannerService:
                              map_id, version, plan.waypoint_apex["corners"], plan.waypoint_apex["apexes_used"],
                              len(plan.waypoints))
         self._turn_sources[turn["source"]] = self._turn_sources.get(turn["source"], 0) + 1
+        if plan.validated is not None:
+            self.logger.info("Validated-first plan map=%s graph_version=%s unvalidated_edges=%d unvalidated_m=%.3f exact=%s tiles=%s",
+                             map_id, version, plan.validated["unvalidated_edges"], plan.validated["unvalidated_m"],
+                             plan.validated["exact"], (getattr(graph, "last", None) or {}).get("tiles"))
         if plan.pricing is not None and plan.pricing["rate"] == 0.0:
             self.logger.info(
                 "Turn-cost plan map=%s graph_version=%s cost=%d exact=%s turn_lambda=%.3f turn_source=%s turn_reason=%s tiles=%s",
@@ -361,6 +365,7 @@ class MissionPlannerService:
             "min_width": plan.min_width, "chart_keys": plan.charts,
             "graph_version": version,
             **({"pricing": plan.pricing} if plan.pricing is not None else {}),
+            **({"validated_first": plan.validated} if plan.validated is not None else {}),
             **({"waypoint_budget": plan.waypoint_budget} if plan.waypoint_budget is not None else {}),
             **({"waypoint_apex": plan.waypoint_apex} if plan.waypoint_apex is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),

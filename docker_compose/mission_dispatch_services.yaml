@@ -347,6 +347,9 @@ services:
       # robot = factsheet speed_max / angular_speed_max, LAMBDA_M_PER_RAD (empty = unset) only for an incomplete factsheet
       - SCENE_GRAPH_TURN_COST_ENABLED=${SCENE_GRAPH_TURN_COST_ENABLED:-false}
       - SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD=${SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD:-}
+      # Validated-first planning (docs/scene_graph/close_evidence_and_turn_cost_design.md part G): off by default (plans bit-identical);
+      # on, the chart route avoids edges with an unvalidated end node (no close look, never driven) whenever a validated route exists
+      - SCENE_GRAPH_VALIDATED_FIRST=${SCENE_GRAPH_VALIDATED_FIRST:-false}
       # the commit this image was built from (scripts/deploy.sh exports GIT_SHA); shown by /stats as build_sha
       - BUILD_SHA=${GIT_SHA:-unknown}
       - NODE_POLICY_SKIP_ENABLED=${NODE_POLICY_SKIP_ENABLED:-true}

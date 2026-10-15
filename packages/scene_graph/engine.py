@@ -34,6 +34,7 @@ from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafErr
                   SceneParams, Snap, ViewResult, edge_weight)
 from . import morse
 from . import turn as turn_search
+from . import validated
 from .chart_keys import assign_A, overlaps
 from .leafcover import View as CamView
 from .leafcover import select_views
@@ -161,6 +162,8 @@ class ChartGraph(SceneGraph):
         self._Bn = None                         # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
         self._hold = None                       # cells the rule holds blocked, after the away-from-walls filter (only with that filter)
         self._hold_prev = (None, 0, 0)          # (_hold, cx0, cy0) before the batch being folded: the dirty box includes its changes
+        self._val = None                        # validated lattice nodes (bool [H/2, W/2], only with near_range_m): see `_validated_nodes`
+        self._val_prev = (None, 0, 0)           # (_val, cx0, cy0) before the batch being folded: the dirty box includes its changes
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
         self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
@@ -371,6 +374,7 @@ class ChartGraph(SceneGraph):
         old = self._solved
         old_sig, old_link_sig, old_keys = dict(self._sig), set(self._link_sig), list(self._keys)
         self._hold_prev = (self._hold, self._cx0, self._cy0)
+        self._val_prev = (self._val, self._cx0, self._cy0)
         try:
             return self._mutate(leaves, bbox, prepared, bounds, region, plan, grown, old, old_sig, old_link_sig, old_keys)
         except BaseException as e:                                   # noqa: BLE001
@@ -636,6 +640,17 @@ class ChartGraph(SceneGraph):
         self._pl = dict(shape=shape, G=G, W=Wm, S=S, P=Pm, last=last)
         return G, Wm, S, Pm
 
+    def _validated_nodes(self, S: np.ndarray) -> np.ndarray:
+        """bool [H/2, W/2]: the lattice nodes that are VALIDATED (design G.1): any of the 2 x 2 costmap cells of the node was reported free
+        from a capture pose within the near range (`Fn` >= 0), or the robot's body covered the node (the driven image `S`). A close lethal
+        report is not validation. The canvas origin is even, so the blocks align with the lattice."""
+        seen = self._Fn >= 0
+        H, W = seen.shape
+        if H & 1 or W & 1:
+            seen = np.pad(seen, ((0, H & 1), (0, W & 1)))
+        blk = seen.reshape(seen.shape[0] // 2, 2, seen.shape[1] // 2, 2).any(axis=(1, 3))
+        return blk[:S.shape[0], :S.shape[1]] | S
+
     def _build_F(self, shift: Tuple[int, int] = (0, 0)):
         """(F, clr, S): the navigable lattice cells, the physical clearance of every lattice cell (distance to the nearest
         blocked or unknown cell, m) and the driven (body covered) image"""
@@ -653,6 +668,7 @@ class ChartGraph(SceneGraph):
         clr = self._clearance_cells(free, shift) * RES
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
         G, W, S, P = self._evidence(sq_h.shape, shift)
+        if self._Fn is not None: self._val = self._validated_nodes(S)
         # the body stood at a leaf pose: the cells W proves there are free even where the window is unknown (a camera blind spot
         # under the robot); a REPORTED blocked cell stays blocked. Along the chord between two poses only known-free cells count.
         cand = sq_h | (W & fr_h) | (P & (V == 255)[::LAT, ::LAT])
@@ -852,10 +868,10 @@ class ChartGraph(SceneGraph):
             rb = (region[0] * RES, region[1] * RES, region[2] * RES, region[3] * RES)
             x0 = rb[0] if x0 is None else min(x0, rb[0]); y0 = rb[1] if y0 is None else min(y0, rb[1])
             x1 = rb[2] if x1 is None else max(x1, rb[2]); y1 = rb[3] if y1 is None else max(y1, rb[3])
-        hb = self._hold_changed_box()
-        if hb is not None:
-            x0 = hb[0] if x0 is None else min(x0, hb[0]); y0 = hb[1] if y0 is None else min(y0, hb[1])
-            x1 = hb[2] if x1 is None else max(x1, hb[2]); y1 = hb[3] if y1 is None else max(y1, hb[3])
+        for hb in (self._hold_changed_box(), self._val_changed_box()):
+            if hb is not None:
+                x0 = hb[0] if x0 is None else min(x0, hb[0]); y0 = hb[1] if y0 is None else min(y0, hb[1])
+                x1 = hb[2] if x1 is None else max(x1, hb[2]); y1 = hb[3] if y1 is None else max(y1, hb[3])
         if changed_cells is not None and changed_cells.any():
             ys, xs = np.nonzero(changed_cells)
             cb = ((self._cx0 + 2 * xs.min()) * RES, (self._cy0 + 2 * ys.min()) * RES,
@@ -883,6 +899,25 @@ class ChartGraph(SceneGraph):
         ys, xs = np.nonzero(diff)
         return ((self._cx0 + int(xs.min())) * RES, (self._cy0 + int(ys.min())) * RES,
                 (self._cx0 + int(xs.max()) + 1) * RES, (self._cy0 + int(ys.max()) + 1) * RES)
+
+    def _val_changed_box(self) -> Optional[Tuple[float, float, float, float]]:
+        """Map-frame box of the lattice nodes whose validity changed in this solve: a driven chord reaches back to the previous pose, so a
+        node can change outside every folded window."""
+        new = self._val
+        if new is None: return None
+        old, ocx, ocy = self._val_prev
+        diff = new
+        if old is not None:
+            oy, ox = (ocy - self._cy0) // 2, (ocx - self._cx0) // 2
+            if oy >= 0 and ox >= 0 and oy + old.shape[0] <= new.shape[0] and ox + old.shape[1] <= new.shape[1]:
+                diff = new.copy()
+                diff[oy:oy + old.shape[0], ox:ox + old.shape[1]] ^= old
+            else:
+                diff = np.ones(new.shape, bool)
+        if not diff.any(): return None
+        ys, xs = np.nonzero(diff)
+        return ((self._cx0 + 2 * int(xs.min())) * RES, (self._cy0 + 2 * int(ys.min())) * RES,
+                (self._cx0 + 2 * int(xs.max()) + 2) * RES, (self._cy0 + 2 * int(ys.max()) + 2) * RES)
 
     @staticmethod
     def _hash(key: Key) -> int:
@@ -1000,7 +1035,8 @@ class ChartGraph(SceneGraph):
         costlier than a known one); the tie rule is the same."""
         self._check()
         turn = 0.0 if safety is None else float(safety.turn)
-        if safety is not None and safety.rate == 0.0 and turn == 0.0: safety = None   # no price: today's route, the corridor included (S8)
+        vf = safety is not None and safety.validated_first and self._val is not None    # validated-first needs the validity plane
+        if safety is not None and safety.rate == 0.0 and turn == 0.0 and not vf: safety = None   # no price: today's route, the corridor included (S8)
         s = self._solved
         if s is None or a not in s.keys or b not in s.keys: return None
         sp = s.sp; ja, jb = s.keys.index(a), s.keys.index(b)
@@ -1026,6 +1062,17 @@ class ChartGraph(SceneGraph):
             if hit is None or hit[0] != key:
                 hit = self._cache["route_ws"] = (key, self._edge_cost(s, safety))
             W = hit[1]
+        P, vn = 0, None
+        if vf:
+            # validated-first: w' = w + P * [an end node is unvalidated] (validated.py: the lexicographic (count, J) optimum, exact)
+            tab = turn_search.table(turn) if turn > 0.0 else None
+            vkey = (safety.margin, safety.rate, safety.k, safety.origin, validated.tmax(tab))
+            hit = self._cache.get("route_wvf")
+            if hit is None or hit[0] != vkey:
+                vnode = self._val[sp.ys, sp.xs]
+                Wp, P_ = validated.penalise(W, validated.edge_flags(vnode, R, C), N, vkey[-1])
+                hit = self._cache["route_wvf"] = (vkey, Wp, P_, vnode)
+            W, P, vn = hit[1], hit[2], hit[3]
 
         def search(allowed):
             """(cost src -> dst, graph, distance of every cell to dst); all integers held exactly in float64"""
@@ -1065,8 +1112,12 @@ class ChartGraph(SceneGraph):
             if not charts or charts[-1] != kk: charts.append(kk)
         pa = np.array(path)
         length = float(np.hypot(np.diff(sp.ys[pa]), np.diff(sp.xs[pa])).sum() * self._h)
+        unval = unval_m = None
+        if vf:
+            unval, unval_m = validated.path_summary(vn[pa], sp.ys[pa], sp.xs[pa], self._h)
+            cost = validated.split(cost, P, unval)
         return Route(charts=charts, length=length, min_width=self._route_width(path, src), cost=int(cost),
-                     nodes=[self._cell_xy(int(sp.ys[c]), int(sp.xs[c])) for c in path])
+                     nodes=[self._cell_xy(int(sp.ys[c]), int(sp.xs[c])) for c in path], unvalidated=unval, unvalidated_m=unval_m)
 
     @staticmethod
     def _edge_cost(s: "_Solved", safety: Safety) -> np.ndarray:
@@ -1173,7 +1224,7 @@ class ChartGraph(SceneGraph):
         self._check()
         p = self.params
         st = EngineState(params=_state_params(p),
-                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Bn=self._Bn, Hold=self._hold,
+                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Bn=self._Bn, Hold=self._hold, Val=self._val,
                          chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
@@ -1202,7 +1253,7 @@ class ChartGraph(SceneGraph):
         self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
         if p.near_range_m is not None and (st.Fn is None or st.Bn is None):
             raise ValueError("state has no close-evidence planes (Fn, Bn): it was made before the lethal-from-within-range rule "
-                             "(pipeline morse/2+near3|near4) and must be rebuilt, not resumed")
+                             "(pipeline morse/2+near5 carries them; +near3 / +near4 do not) and must be rebuilt, not resumed")
         self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
         self._Bn = None if p.near_range_m is None else padf(st.Bn, -1)
         self._hold = None
@@ -1218,7 +1269,7 @@ class ChartGraph(SceneGraph):
         if not st.keys or st.plane is None:
             self._solved = None; self._key_plane = None; self._keys = []
             self._sig, self._link_sig = {}, set()
-            if p.near_min_clearance_m is not None: self._build_F()      # the hold plane of the planes (an export must carry it)
+            if p.near_range_m is not None: self._build_F()      # the hold and validity planes of the planes (an export must carry them)
             return
         self._key_plane = padl(st.plane.astype(np.int32), -1)
         nav, clr, S = self._build_F()
@@ -1226,6 +1277,9 @@ class ChartGraph(SceneGraph):
             if not np.array_equal(padf(st.Hold, False), self._hold):
                 raise StateMismatch("hold plane differs from the one rebuilt in %d cells"
                                     % int((padf(st.Hold, False) != self._hold).sum()))
+        if st.Val is not None and verify and self._val is not None:
+            if not np.array_equal(padl(st.Val, False), self._val):
+                raise StateMismatch("validity plane differs from the one rebuilt in %d nodes" % int((padl(st.Val, False) != self._val).sum()))
         part = self._partition(nav)
         plane = -np.ones(nav.shape, np.int32); plane[part.sp.ys, part.sp.xs] = part.full
         bad = np.nonzero((plane != self._key_plane).ravel())[0]

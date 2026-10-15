@@ -230,6 +230,9 @@ class ChartPlan:
     waypoint_budget: Optional[Dict[str, Any]] = None
     # the apex candidates' record {corners (corners of the greedy pull), apexes_used (waypoints placed on an apex)}; None when off
     waypoint_apex: Optional[Dict[str, Any]] = None
+    # validated-first (SCENE_GRAPH_VALIDATED_FIRST): {unvalidated_edges, unvalidated_m (the lattice edges of the route with an
+    # unvalidated end node: the least any route has), exact}; None when the route was not planned validated-first
+    validated: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -801,20 +804,32 @@ TURN_NOT_GIVEN = {"lambda_m_per_rad": 0.0, "source": "off", "speed_max": None, "
 
 
 def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
-               kappa: float, turn: float = 0.0) -> Any:
+               kappa: float, turn: float = 0.0, validated_first: Optional[bool] = None) -> Any:
     """The `Safety` of a plan: the clearance pricing (`_pricing_for`) with the turn cost `turn` (m per rad, `turn_lambda`) on
     top. Pricing off and `turn` > 0: Safety(margin = the clearance cap, rate 0, turn), the length plus the turn cost (the margin
-    is not read at rate 0). None for a graph without `deficit_cell` (a graph that cannot take a Safety), or no price and no turn."""
+    is not read at rate 0). None for a graph without `deficit_cell` (a graph that cannot take a Safety), or no price and no turn.
+    `validated_first` (default `config.SCENE_GRAPH_VALIDATED_FIRST`) sets `Safety.validated_first`: a Safety exists then even without
+    a price or a turn (rate 0: the length, routed validated-first)."""
     if not callable(getattr(graph, "deficit_cell", None)):
         return None
+    from packages import config
+    vf = config.SCENE_GRAPH_VALIDATED_FIRST if validated_first is None else bool(validated_first)
     priced = _pricing_for(graph, robot_width_m, robot_length_m, kappa)
-    if not turn > 0.0:
-        return priced
-    if priced is not None:
-        return replace(priced, turn=float(turn))
     from packages.scene_graph.api import Safety
     from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
-    return Safety(margin=_CLR_CAP_M, rate=0.0, turn=float(turn))
+    if turn > 0.0:
+        priced = replace(priced, turn=float(turn)) if priced is not None else Safety(margin=_CLR_CAP_M, rate=0.0, turn=float(turn))
+    if vf:
+        priced = replace(priced, validated_first=True) if priced is not None else Safety(margin=_CLR_CAP_M, rate=0.0, validated_first=True)
+    return priced
+
+
+def priced_only(safety: Any) -> Any:
+    """`safety` without the validated-first flag, None when nothing else is left (no price, no turn cost): what the pricing record,
+    the line of sight and the waypoint pull see; validated-first changes the route search only."""
+    if safety is None or not safety.validated_first:
+        return safety
+    return None if safety.rate == 0.0 and not safety.turn > 0.0 else replace(safety, validated_first=False)
 
 
 def _pricing_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
@@ -1387,6 +1402,11 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
             node_policy_cfg.get("budget_s", 0.0), safety=safety)
     pricing = None
+    validated = None
+    if getattr(route, "unvalidated", None) is not None:
+        validated = {"unvalidated_edges": int(route.unvalidated), "unvalidated_m": round(float(route.unvalidated_m), 3),
+                     "exact": bool(getattr(route, "exact", True))}
+    safety = priced_only(safety)
     if safety is not None and safety.rate == 0.0:            # a turn cost alone: no clearance fields
         pricing = {"kappa": 0.0, "margin": None, "rate": 0.0, "margin_source": None, "cost": int(route.cost),
                    "exact": bool(getattr(route, "exact", True)), "profile": "none", "k": None, "origin": None, "reach": None,
@@ -1404,4 +1424,4 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
-                     trajectory=legs, waypoint_budget=budget_record, waypoint_apex=apex_record)
+                     trajectory=legs, waypoint_budget=budget_record, waypoint_apex=apex_record, validated=validated)

@@ -685,6 +685,12 @@ SCENE_GRAPH_NEAR_MIN_CLEARANCE_M = _opt_float("SCENE_GRAPH_NEAR_MIN_CLEARANCE_M"
 # factsheet lacks one of the two; neither: no turn cost for that plan. ENABLED is the switch: off (the default), no plan has a turn cost.
 SCENE_GRAPH_TURN_COST_ENABLED = _env_bool("SCENE_GRAPH_TURN_COST_ENABLED", "false")
 SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = _opt_float("SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD")
+# Validated-first planning (docs/scene_graph/close_evidence_and_turn_cost_design.md part G): the chart route minimises the number of
+# lattice edges with an unvalidated end node (a node no close free report and no driven body has validated) first, and the priced cost
+# second; untraversed space stays off the plan whenever a route through validated space exists. Needs a store made with the close-evidence
+# rule (SCENE_GRAPH_NEAR_RANGE_M: pipeline morse/2+near5, the `val` tile plane); on a store without it the switch changes nothing.
+# Planner switch, off by default: off, the plans are bit-identical to the unswitched planner.
+SCENE_GRAPH_VALIDATED_FIRST = _env_bool("SCENE_GRAPH_VALIDATED_FIRST", "false")
 # Waypoint budget (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2): the planner's string pull is replaced by the exact
 # fewest-waypoints path whose total priced-cost excess over the lattice path is at most this many metres (final cost <= lattice +
 # budget). Empty / <= 0 = off (the greedy pull, unchanged); validated below: finite and at most 1.0, else off.
