@@ -579,6 +579,27 @@ All 8 long plans (38 m median) are served with no fallback, with the live pricin
 O(n^2) cost of the waypoint budget on long open routes (p50 618 ms against 72 ms for the greedy pull); candidate thinning (C.2b) brings it to 74 ms
 (chart radius 2 m) and 99 ms (6 m). Larger charts cut the chart count by 7.5 times at no change in plan time; the route search does not depend on them.
 
+## F. Node clearance: block minimum (pricing only; built, 2026-10-15)
+
+**Problem.** A lattice node is a 0.1 m cell, a 2 x 2 block of 5 cm costmap cells. Its clearance (and so its price) was the clearance of the top-left 5 cm cell only (`clr[::LAT, ::LAT]`). The other three cells can be up to 0.035 m closer to an obstacle, so a route wrapped a corner closer than its price assumed.
+
+**Formulation.** A node represents its block, so its pricing clearance is the minimum of the clearance of the four 5 cm cells it covers: `g_price(node) = min over the block`. This is pessimistic by construction: a route is never priced as clearer than its worst covered cell, and the error against the exact clearance at the block centre is at most 0.035 m (half the block diagonal, 0.05 sqrt 2 / 2), by the triangle inequality. It changes no stored data: the clearance is computed at query time from the stored owner / occupancy planes, F is unchanged.
+
+**A deliberate split, not a second notion by accident.** Two quantities answer two questions.
+- `sp.clr` (top-left sample) is unchanged. It feeds the Morse partition, the charts' `clearance`, the link widths and the passage width of a route. These measure geometry, are a fact of the fold and are stored; they are byte-identical to before (the link-width test `test_link_width_is_the_door_within_half_a_lattice_step` is unchanged and passes).
+- `sp.clr_price` (block minimum, `engine.block_min`) is used only for pricing: `Safety.price` inputs (`_edge_cost`), `price_cell` / `deficit_cell`, and the lazy reader's `_clearance_tile` (the same minimum of four sub-sampled planes of its halo window, bit-identical with the engine: tests P7 / P8). Pricing must be conservative for a route that covers a block; widths and structure need not be.
+
+**Measured** (office8, 150 pairs seed 7, kappa 1 hinge, default plans; interior waypoints, exact full-resolution clearance at the waypoint; r_c = 0.354 m):
+
+| | corner waypoints | below r_c | median clearance | p10 clearance |
+|---|---|---|---|---|
+| top-left (before) | 476 | 17.0 % | 0.403 m | 0.318 m |
+| block minimum | 514 | 9.1 % | 0.412 m | 0.354 m |
+
+Continuum cost J (full-resolution field) of the new plan over the old, 150 pairs: median 0.9998, range 0.936 to 1.022; 42 of 150 plans identical. All acceptance gates pass (A1 to A7, B1, B2, C1 to C3c) with the Reference using the same minimum. Forest world (60 x 40 m, 8 pairs): charts and links identical (648 / 1714 and 86 / 239), plan time p50 (this change vs main) 74 vs 89 ms and 109 vs 91 ms (radius 2 / 6 m), the same order. The office8 store built on this branch and on main is blob-for-blob identical (SHA-256 of all 181 tile and manifest blobs, the manifests' `created_ms` clock aside).
+
+**Not shown.** No live check on a robot; the corner table is one map (and the numbers differ somewhat from an earlier single-sample estimate, 16.8 % to 8.7 %, because the waypoint set and the clearance sampling differ); the exact bound 0.035 m is tested on the random worlds against the nearest blocked cell centre, not against the true continuous obstacle surface (the costmap's own 0.05 m quantisation remains). The nodes at an odd canvas edge use the cells they have (the lazy reader sees outside cells as blocked), but such nodes are not navigable.
+
 ## D. Open items
 
 Resolved by Laci 2026-10-14: goal tolerance 0.35 m; the Odin override is live; the Smac tolerance is dropped; robot speeds come from
