@@ -425,6 +425,23 @@ midpoint chord is dearer in 62 of 68 visible cases. The statement is a budget, n
 * **Open (robot side):** whether the robots honour the VDA5050 node `allowedDeviationXY`, and whether the navigator can mark a node
   reached by cost-to-go progress; the value `delta` (0.35 m, the goal tolerance, is the reference).
 
+### C.2b Candidate thinning (speed; built, always on with the budget)
+
+The DP evaluated about 19,000 chords per plan on a 25-40 m open route (n about 380 lattice points x up to 50 candidates inside the 5 m
+gap cap): plan time p50 570-620 ms against 72 ms for the greedy pull (forest world, 220k cells). Now the DP runs over a thinned candidate
+set (`scene_route.thin_indices`): the first and last point, the greedy pull's vertices, the points an iterative Ramer-Douglas-Peucker
+pass keeps at tolerance `WAYPOINT_THIN_FRACTION` x lattice (0.5 x 0.1 = 0.05 m), and a point at least every `THIN_SPACING_M` (0.5 m; a
+chord may leave a straight run anywhere, the collinear points are what RDP drops and the optimum sometimes uses). Every chord's slack is
+still measured against the original lattice sub-path (prefix sums over all points), so `J(final) <= J(lattice) + budget` is exact; thinning
+only removes options, so the count is at least the full DP's and, with the pull's vertices kept, at most the pull's. If the thinned set
+has no path the full DP runs. `WAYPOINT_THIN_FRACTION = 0` is the full DP.
+
+Measured: forest world 60 x 40 m, 8 pairs of 20+ m: plan time p50/p95/max 571/731/808 ms -> 74/132/151 ms (chart radius 2 m), 546/766/833
+-> 99/159/177 ms (6 m); one of 8 plans has one more waypoint than the full DP (6 instead of 5). office8, 150 pairs (budget only): plan
+time p50/p99 24/77 ms -> about 9/19 ms; waypoint count equal to the full DP in 146 of 150 plans, one more in 4 (2.7 %), never fewer;
+segments per route 3.153 -> 3.180. Spacing 5 m / 1.25 m instead of 0.5 m gave 139 / 141 equal; RDP tolerance 0.025 m gave no change
+(the extra waypoints are on collinear points, not on a bend). Gates A1-A7, W1-W5 pass.
+
 ### C.2a Apex candidates (built on branch `feat/waypoint-apex`, off by default; recommended to defer)
 
 A waypoint on a corner vertex sits where the clearance is least and forces a stop-and-turn. For a corner V of the greedy pull
@@ -446,6 +463,9 @@ one) and its middle, the apex, lies on the inward bisector `R (1 / cos(theta / 2
   0.300 / 0.300 m; waypoints under r (0.25 m) 1 / 1; polyline turning 0.2715 / 0.2699 rad per m; polyline length ratio 1.0000 / 0.9997;
   J ratio 1.0000 / 1.0002; plan time p50/p99 23.4/73.5 / 25.2/87.5 ms. 335 corners of the greedy pull, 264 with a candidate, 11 apexes
   used in 10 of 150 routes (1 when the vertex wins ties).
+  With the candidate thinning of C.2b (the shipped DP): segments 3.180 / 3.180, interior clearance median 0.381 / 0.381 m, p10
+  0.300 / 0.300 m, waypoints under r 2 / 2, turning 0.2787 / 0.2767 rad per m, apexes used 17 in 15 routes, plan time p50/p99
+  10.3/21.9 / 10.5/24.8 ms.
 * **Why so little:** the budget solver does not keep the greedy pull's corners (3.15 segments against the pull's 3.73), so a candidate at
   a corner of the pull is rarely at a kept corner; and where a kept corner wraps an obstacle the inward bisector points at the obstacle,
   so the clearance rule rejects the apex. The measured effect on clearance is nil; the cost is a larger DP and the loss of the

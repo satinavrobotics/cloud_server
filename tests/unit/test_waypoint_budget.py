@@ -301,3 +301,37 @@ def test_apex_config_default_off_and_server_pass_through():
     assert config.SCENE_GRAPH_WAYPOINT_APEX_ENABLED is False
     src = inspect.getsource(server)
     assert "waypoint_apex=config.SCENE_GRAPH_WAYPOINT_APEX_ENABLED" in src and '"apexes_used"' in src
+
+
+# ---- candidate thinning ---------------------------------------------------------------------------------------------------
+
+def test_thinned_candidates_keep_the_cost_bound_and_never_beat_the_full_dp_nor_lose_to_the_pull():
+    rnd = random.Random(31)
+    more = 0
+    for _ in range(120):
+        lattice = _walk(rnd, rnd.randint(4, 60))
+        for f in (math.dist, _wild_cost):
+            j_lat = _cost_sum(f, lattice)
+            for budget in (0.0, 0.35):
+                for gap in (0.0, 1.5):
+                    full = sr.fewest_waypoints(lattice, _visible, gap, f, budget)
+                    thin = sr.fewest_waypoints(lattice, _visible, gap, f, budget, 0.0, 0.0, None, _visible, None, 0.05)
+                    assert thin == sr.fewest_waypoints(lattice, _visible, gap, f, budget, 0.0, 0.0, None, _visible, None, 0.05)
+                    assert thin[0] == lattice[0] and thin[-1] == lattice[-1]
+                    assert _cost_sum(f, thin) <= j_lat + budget + 1e-9
+                    assert len(thin) >= len(full)
+                    for a, b in zip(thin[:-1], thin[1:]):
+                        assert b == lattice[lattice.index(a) + 1] or _visible(a, b)
+                    if f is math.dist:
+                        pull = sr.simplify(lattice, _visible, gap)
+                        assert len(thin) <= len(pull)
+                    more += len(thin) > len(full)
+    assert more >= 0
+
+
+def test_thin_indices_are_sorted_keep_the_ends_the_pull_and_the_spacing():
+    pts = [(round(0.1 * k, 3), 0.0) for k in range(60)] + [(5.9, round(0.1 * k, 3)) for k in range(1, 30)]
+    idx = sr.thin_indices(pts, 0.05, [30], 5.0)
+    assert idx == sorted(set(idx)) and idx[0] == 0 and idx[-1] == len(pts) - 1 and 30 in idx and 59 in idx
+    assert all(math.dist(pts[a], pts[b]) <= sr.THIN_SPACING_M + 1e-9 for a, b in zip(idx[:-1], idx[1:]))
+    assert len(idx) < len(pts)

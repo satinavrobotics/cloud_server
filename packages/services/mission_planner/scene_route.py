@@ -925,6 +925,11 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
     return priced
 
 
+# Candidate thinning of the budget solver (`thin_indices`): the chords of the DP run between the indices kept by a Ramer-Douglas-Peucker
+# simplification of the lattice path with tolerance THIN_FRACTION * lattice (m), plus the greedy pull's vertices, plus enough points
+# to respect the gap cap. 0 = every lattice point is a candidate (the full DP). The cost accounting is not thinned.
+WAYPOINT_THIN_FRACTION = 0.5
+THIN_SPACING_M = 0.5             # candidates are at most this far apart (a chord may leave a straight run at any of its points)
 APEX_TOL_M = 0.35                # an apex candidate lies at most this far from its corner vertex (the goal tolerance)
 # Among paths with equal waypoints and slack the apex wins over the vertex of its corner (its clearance is at least the vertex's by
 # construction; the slack is clamped at 0, so a chord that cuts the corner ties with the vertex's lattice chord). False: the vertex wins.
@@ -932,20 +937,80 @@ APEX_TIES_TO_APEX = True
 APEX_MIN_TURN_RAD = math.radians(20.0)      # a vertex of the greedy pull is a corner when the pull turns by at least this
 
 
+def thin_eps(graph: Any) -> float:
+    """The candidate-thinning tolerance (m) of the budget solver for `graph`: `WAYPOINT_THIN_FRACTION` of its lattice step."""
+    return max(0.0, float(WAYPOINT_THIN_FRACTION)) * float(getattr(getattr(graph, "params", None), "lattice", 0.0) or 0.0)
+
+
+def greedy_pull_indices(pts: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float) -> List[int]:
+    """Lattice indices of the vertices of `simplify(pts, visible, max_gap)` (`pts` without consecutive duplicates)."""
+    where: List[int] = []
+    pos = 0
+    for q in simplify(pts, visible, max_gap):
+        pos = pts.index(q, pos)
+        where.append(pos)
+    return where
+
+
+def thin_indices(pts: Sequence[Pt], eps: float, keep: Sequence[int], max_gap: float) -> List[int]:
+    """Sorted candidate indices of the budget solver: the first, the last, the `keep` indices, the points an iterative
+    Ramer-Douglas-Peucker pass keeps at tolerance `eps` (a dropped point is within `eps` of the chord of its neighbours), and, where
+    two consecutive candidates are farther apart than `THIN_SPACING_M` (and `max_gap`), the farthest later point within that
+    (repeated): consecutive candidates are within the gap cap, and a straight run keeps a point every `THIN_SPACING_M`, where the
+    optimum may leave it. Deterministic."""
+    n = len(pts)
+    mark = [False] * n
+    mark[0] = mark[n - 1] = True
+    for k in keep:
+        mark[k] = True
+    stack = [(0, n - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b - a < 2:
+            continue
+        ax, ay = pts[a]
+        dx, dy = pts[b][0] - ax, pts[b][1] - ay
+        norm = math.hypot(dx, dy)
+        far, fd = -1, eps
+        for m in range(a + 1, b):
+            if norm > 0.0:
+                d = abs(dx * (pts[m][1] - ay) - dy * (pts[m][0] - ax)) / norm
+            else:
+                d = math.dist(pts[m], pts[a])
+            if d > fd:
+                far, fd = m, d
+        if far >= 0:
+            mark[far] = True
+            stack.append((a, far))
+            stack.append((far, b))
+    out = [k for k in range(n) if mark[k]]
+    if THIN_SPACING_M > 0:
+        step = min(max_gap, THIN_SPACING_M) if max_gap > 0 else THIN_SPACING_M
+        full: List[int] = []
+        for a, b in zip(out[:-1], out[1:]):
+            full.append(a)
+            while math.dist(pts[a], pts[b]) > step and b - a > 1:
+                m = b - 1
+                while m > a + 1 and math.dist(pts[a], pts[m]) > step:
+                    m -= 1
+                full.append(m)
+                a = m
+        full.append(out[-1])
+        out = full
+    return out
+
+
 def apex_candidates(pts: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float, radius: float,
-                    clearance: Callable[[Pt], float], tol: float = APEX_TOL_M) -> Tuple[int, Dict[int, Pt]]:
+                    clearance: Callable[[Pt], float], tol: float = APEX_TOL_M,
+                    pull_idx: Optional[Sequence[int]] = None) -> Tuple[int, Dict[int, Pt]]:
     """(corners, {lattice index k: apex point}) of the lattice path `pts` (no consecutive duplicates). A corner is an interior vertex
     of the greedy pull `simplify(pts, visible, max_gap)` where the pull turns by theta >= `APEX_MIN_TURN_RAD`. Its fillet arc of
     radius R is tangent at t = R tan(theta / 2) along both chords of the pull and its middle, the apex, lies on the inward bisector at
     R (1 / cos(theta / 2) - 1) from the vertex V. R is `radius`, clipped so that t is at most half of the shorter adjacent chord
     and the apex is at most `tol` from V. The apex is a candidate when its clearance is at least that of V (never closer to
     obstacles than the vertex; a point on a non-navigable cell has clearance 0, so it is never one when V is navigable)."""
-    pull = simplify(pts, visible, max_gap)
-    where: List[int] = []
-    pos = 0
-    for q in pull:
-        pos = pts.index(q, pos)
-        where.append(pos)
+    where = list(pull_idx) if pull_idx is not None else greedy_pull_indices(pts, visible, max_gap)
+    pull = [pts[k] for k in where]
     corners = 0
     out: Dict[int, Pt] = {}
     for m in range(1, len(pull) - 1):
@@ -980,7 +1045,7 @@ def fewest_waypoints(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], ma
                      cost: Callable[[Pt, Pt], float], budget_m: float, end_extra: float = 0.0,
                      apex_radius: float = 0.0, clearance: Optional[Callable[[Pt], float]] = None,
                      corner_visible: Optional[Callable[[Pt, Pt], bool]] = None,
-                     info: Optional[Dict[str, int]] = None) -> List[Pt]:
+                     info: Optional[Dict[str, int]] = None, thin_eps: float = 0.0) -> List[Pt]:
     """Fewest waypoints under a cost budget (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2), exact.
 
     `points` are the lattice path p_0..p_{n-1} (consecutive duplicates dropped), `visible` the free-space line of sight,
@@ -998,6 +1063,13 @@ def fewest_waypoints(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], ma
     greedy string pull is not minimal-link, so it can keep more. A larger budget never gives more waypoints.
     The chord that ends at the last point may be `end_extra` longer than `max_gap` (the string pull's end-stub merge,
     `MIN_END_STUB_M`, does the same).
+
+    Candidate thinning (`thin_eps` > 0): the DP runs over the indices of `thin_indices` only (the greedy pull's vertices are among
+    them, `corner_visible` or `visible` judging it), but every chord's slack is still measured against the ORIGINAL lattice sub-path
+    P(i, j) (prefix sums over all points), so the argument above is unchanged and J(final) <= J(lattice) + budget_m holds exactly:
+    thinning only removes options. The waypoint count is then the minimum over the thinned set (not below the full DP's; with the
+    pull's vertices kept, still not above the pull's when `corner_visible` is the priced line of sight). If the thinned set leaves no
+    path (a chord between consecutive candidates not visible), the full DP is run. Off (0): every point is a candidate.
 
     Apex candidates (`apex_radius` > 0 and `clearance`, C.2 "Apex candidates"): every corner k of the greedy pull
     (`apex_candidates`, judged with `corner_visible`, default `visible`) gets a second node A_k, the apex of the fillet arc of radius
@@ -1021,44 +1093,73 @@ def fewest_waypoints(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], ma
         return pts
     n = len(pts)
     apex: Dict[int, Pt] = {}
+    pull_idx = greedy_pull_indices(pts, corner_visible or visible, max_gap) if thin_eps > 0.0 or (
+        apex_radius > 0.0 and clearance is not None) else None
     if apex_radius > 0.0 and clearance is not None:
-        corners, apex = apex_candidates(pts, corner_visible or visible, max_gap, apex_radius, clearance)
+        corners, apex = apex_candidates(pts, corner_visible or visible, max_gap, apex_radius, clearance, pull_idx=pull_idx)
         if info is not None:
             info["corners"], info["candidates"] = corners, len(apex)
-    pad = APEX_TOL_M if apex else 0.0
     budget = max(0, int(math.ceil(max(0.0, budget_m) * 100.0 - 1e-9)))
     arc = [0.0]
     prefix = [0.0]
     for k in range(1, n):
         arc.append(arc[-1] + math.dist(pts[k - 1], pts[k]))
         prefix.append(prefix[-1] + cost(pts[k - 1], pts[k]))
+    if thin_eps > 0.0:
+        cand = thin_indices(pts, thin_eps, pull_idx, max_gap)
+        out = _budget_dp(pts, cand, apex, arc, prefix, visible, max_gap, cost, budget, end_extra, info)
+        if out is not None:
+            return out
+    return _budget_dp(pts, list(range(n)), apex, arc, prefix, visible, max_gap, cost, budget, end_extra, info)
+
+
+def _budget_dp(pts: Sequence[Pt], cand: Sequence[int], apex: Dict[int, Pt], arc: Sequence[float], prefix: Sequence[float],
+               visible: Callable[[Pt, Pt], bool], max_gap: float, cost: Callable[[Pt, Pt], float], budget: int,
+               end_extra: float, info: Optional[Dict[str, int]]) -> Optional[List[Pt]]:
+    """The dynamic program of `fewest_waypoints` over the candidate indices `cand` (sorted, first and last included); None when no
+    path reaches the last point."""
+    n = len(pts)
+    pad = APEX_TOL_M if apex else 0.0
     # best[2k + kind][s] = (chords, codes) of the best way to reach node (k, kind) (kind 1 = the apex) having used s cm of slack
     flip = 1 if APEX_TIES_TO_APEX else 0           # the path holds ranks 2k + (kind ^ flip): the smaller rank wins a tie
     best: List[Dict[int, Tuple[int, Tuple[int, ...]]]] = [dict() for _ in range(2 * n)]
     best[0][0] = (0, (flip,))
-    for i in range(n - 1):
+    for i in cand[:-1]:
         for kind in ((0, 1) if i in apex else (0,)):
             if not best[2 * i + kind]:
                 continue
             src = apex[i] if kind else pts[i]
+            reach = max_gap + pad if kind == 0 else max_gap + APEX_TOL_M     # window of the chords of this source
             if max_gap > 0:
-                end = max(i + 1, min(n - 1, bisect.bisect_right(arc, arc[i] + max_gap + pad) - 1))
-                while end < n - 1 and math.dist(src, pts[end + 1]) <= max_gap + pad:
+                end = max(i + 1, min(n - 1, bisect.bisect_right(arc, arc[i] + max_gap) - 1))
+                while end < n - 1 and math.dist(src, pts[end + 1]) <= max_gap:
                     end += 1
+                end_w = end
+                if pad or kind:                          # a chord to an apex node may be a little longer than the arc window
+                    end_w = max(end, min(n - 1, bisect.bisect_right(arc, arc[i] + reach) - 1))
+                    while end_w < n - 1 and math.dist(src, pts[end_w + 1]) <= reach:
+                        end_w += 1
             else:
-                end = n - 1
-            candidates = list(range(i + 1, end + 1))
-            if max_gap > 0 and end < n - 1 and math.dist(src, pts[n - 1]) <= max_gap + end_extra:
-                candidates.append(n - 1)
+                end = end_w = n - 1
+            lo = bisect.bisect_right(cand, i)
+            candidates = cand[lo:bisect.bisect_right(cand, end_w)]
+            last = max_gap > 0 and end < n - 1 and math.dist(src, pts[n - 1]) <= max_gap + end_extra
+            if last and (not candidates or candidates[-1] != n - 1):
+                candidates = candidates + [n - 1]
+            elif not candidates and lo < len(cand):
+                candidates = [cand[lo]]                  # the next candidate is tried even beyond the window
+            nxt = cand[lo] if lo < len(cand) else -1
             for j in candidates:
                 for tkind in ((0, 1) if j in apex else (0,)):
                     dst = apex[j] if tkind else pts[j]
                     if kind == 0 and tkind == 0 and j == i + 1:
                         slack = 0
                     else:
-                        if (kind or tkind or pad) and max_gap > 0 \
+                        if (kind or tkind) and max_gap > 0 \
                                 and math.dist(src, dst) > max_gap + (end_extra if j == n - 1 else 0.0):
                             continue
+                        if kind == 0 and tkind == 0 and j > end and j != nxt and not (j == n - 1 and last):
+                            continue                     # a vertex chord stays inside the window of the plain solver
                         if not visible(src, dst):
                             continue
                         ref = prefix[j] - prefix[i]
@@ -1071,9 +1172,11 @@ def fewest_waypoints(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], ma
                         ns = s + slack
                         if ns > budget:
                             continue
-                        cand = (count + 1, path + (2 * j + (tkind ^ flip),))
-                        if ns not in target or cand < target[ns]:
-                            target[ns] = cand
+                        new = (count + 1, path + (2 * j + (tkind ^ flip),))
+                        if ns not in target or new < target[ns]:
+                            target[ns] = new
+    if not best[2 * (n - 1)]:
+        return None
     _, _, path = min((count, s, path) for s, (count, path) in best[2 * (n - 1)].items())
     if info is not None:
         info["apexes_used"] = sum(1 for c in path if (c & 1) ^ flip)
@@ -1086,7 +1189,7 @@ def budget_pull(graph: Any, safety: Any, budget_m: float) -> Callable[..., List[
     cost = chord_cost(graph, safety)
 
     def pull(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float) -> List[Pt]:
-        return fewest_waypoints(points, visible, max_gap, cost, budget_m)
+        return fewest_waypoints(points, visible, max_gap, cost, budget_m, thin_eps=thin_eps(graph))
     pull.unpriced_visible = True  # type: ignore[attr-defined]
     return pull
 
@@ -1227,7 +1330,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         apex_info: Dict[str, int] = {}
         radius = float(turn["lambda_m_per_rad"]) if waypoint_apex else 0.0
         pulled = fewest_waypoints(pts, plain, max_gap_m, chord_cost(graph, safety), waypoint_budget_m, MIN_END_STUB_M,
-                                  radius, cell_clearance(graph) if radius > 0.0 else None, visible, apex_info)
+                                  radius, cell_clearance(graph) if radius > 0.0 else None, visible, apex_info, thin_eps(graph))
         if radius > 0.0:
             apex_record = dict(apex_info)
         budget_record = {"waypoint_budget_m": waypoint_budget_m,
