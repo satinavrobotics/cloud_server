@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from packages.scene_graph import turn as turn_search
+from packages.scene_graph import weights
 from packages.scene_graph.api import BBox, Blocked, Leaf, Safety, SceneParams, turn_weight
 from packages.scene_graph.engine import ChartGraph
 
@@ -166,7 +167,8 @@ def test_t3_the_restricted_search_equals_the_whole_graph_expanded_search(name):
     sp = s.sp
     R, C, _ = s.edges
     for sf in TURNS[1:3]:
-        W = g._edge_cost(s, sf)
+        d = sf.price(sp.clr_price)
+        W = weights.edge_costs(s.edges[2], d[R] + d[C], sf.rate)
         tg = turn_search.Graph(sp.N, R, C, W, turn_search.heading(sp.ys[C] - sp.ys[R], sp.xs[C] - sp.xs[R]), sp.ys, sp.xs)
         tab = turn_search.table(sf.turn)
         everything = np.ones(sp.N, bool)
@@ -262,4 +264,4 @@ def test_t5_alternating_lambdas_never_see_each_others_answer():
     for lam in (0.5, 0.0, 2.0, 0.5, 2.0, 0.0):
         r = g.route(a, b, safety=Safety(R_C, MU, turn=lam))
         assert (r.nodes, r.cost) == (fresh[lam].nodes, fresh[lam].cost)
-    assert g._cache["route_ws"][0] == (R_C, MU, None, None)              # the weights do not depend on lambda: one entry
+    assert g._cache["route_w"][0][0] == MU                               # the weights do not depend on lambda: the rate keys them

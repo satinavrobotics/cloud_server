@@ -602,7 +602,9 @@ Continuum cost J (full-resolution field) of the new plan over the old, 150 pairs
 
 **Not shown.** No live check on a robot; the corner table is one map (and the numbers differ somewhat from an earlier single-sample estimate, 16.8 % to 8.7 %, because the waypoint set and the clearance sampling differ); the exact bound 0.035 m is tested on the random worlds against the nearest blocked cell centre, not against the true continuous obstacle surface (the costmap's own 0.05 m quantisation remains). The nodes at an odd canvas edge use the cells they have (the lazy reader sees outside cells as blocked), but such nodes are not navigable.
 
-## G. Validated-first planning (2026-10-15; built on branch `feat/validated-first`, planner switch off by default, store token `morse/2+near5`)
+## G. Validated-first planning
+
+(Note 2026-10-15: the token is now `morse/2+close`; `+near3/+near4/+near5` are retired. The waypoint pull is validity-aware (G.6 below predates it). Reviewer verdict in `handover_2026-10-15.md` section 10: keep off, do not extend, decision open.) (2026-10-15; built on branch `feat/validated-first`, planner switch off by default, store token `morse/2+near5`)
 
 ### G.1 The problem and the definitions
 

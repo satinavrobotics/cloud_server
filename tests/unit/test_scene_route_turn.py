@@ -54,7 +54,8 @@ def test_unsent_factsheet_and_no_robot():
 def test_the_operator_value_is_used_only_for_an_incomplete_factsheet():
     assert turn_lambda(NS(speed_max=1.0, angular_speed_max=-1), operator=0.3) == (0.3, "config", "angular_speed_max missing")
     assert turn_lambda(NS(speed_max=1.0, angular_speed_max=4.0), operator=0.3) == (0.25, "factsheet", "")   # never read then
-    assert turn_lambda(None, operator=9.0)[:2] == (5.0, "config")
+    assert turn_lambda(None, operator=9.0)[:2] == (0.7, "config")         # the fallback is capped at 0.7 m/rad
+    assert turn_lambda(None, operator=0.5)[:2] == (0.5, "config")
     assert turn_lambda(None, operator=0.0)[:2] == (0.0, "config")
     for bad in (-0.5, float("nan"), float("inf")):
         lam, source, reason = turn_lambda(None, operator=bad)
@@ -77,13 +78,13 @@ def test_the_turn_record():
 def test_the_settings_parse_with_the_turn_cost_off_by_default():
     from .test_config import _reload_config
     cfg = _reload_config({"SCENE_GRAPH_TURN_COST_ENABLED": None, "SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD": None})
-    assert cfg.SCENE_GRAPH_TURN_COST_ENABLED is False and cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD is None
+    assert cfg.SCENE_GRAPH_TURN_COST_ENABLED is False and cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD == 0.7   # the fallback default
     cfg = _reload_config({"SCENE_GRAPH_TURN_COST_ENABLED": "true", "SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD": "0.4"})
     assert cfg.SCENE_GRAPH_TURN_COST_ENABLED is True and cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD == 0.4
     cfg = _reload_config({"SCENE_GRAPH_TURN_COST_ENABLED": "false", "SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD": "fast"})
-    assert cfg.SCENE_GRAPH_TURN_COST_ENABLED is False and cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD is None
+    assert cfg.SCENE_GRAPH_TURN_COST_ENABLED is False and cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD == 0.7
     cfg = _reload_config({"SCENE_GRAPH_TURN_COST_ENABLED": None, "SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD": ""})
-    assert cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD is None
+    assert cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD == 0.7
 
 
 # ---- safety_for and plan_on_graph ---------------------------------------------------------------------------
@@ -281,3 +282,9 @@ def test_compose_passes_the_settings_off_by_default():
         with open(os.path.join(root, doc), encoding="utf-8") as fh:
             text = fh.read()
         assert "SCENE_GRAPH_TURN_COST_ENABLED" in text and "SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD" in text, doc
+
+
+def test_fallback_default_and_cap_come_from_config():
+    from packages import config as cfg
+    assert cfg.TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD == 0.7
+    assert cfg.SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD <= 0.7

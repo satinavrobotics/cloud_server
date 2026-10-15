@@ -684,35 +684,27 @@ SCENE_GRAPH_INFLATION_RADIUS_M = _opt_float("SCENE_GRAPH_INFLATION_RADIUS_M")
 SCENE_GRAPH_INFLATION_SCALING = _opt_float("SCENE_GRAPH_INFLATION_SCALING")
 SCENE_GRAPH_GLOBAL_INSCRIBED_M = _opt_float("SCENE_GRAPH_GLOBAL_INSCRIBED_M")
 # Close evidence (docs/scene_graph/close_evidence_and_turn_cost_design.md part A): a cell the costmap marked lethal stays blocked
-# until a free report from a capture pose within NEAR_RANGE_M of it (the robot's support.commit_radius_m, 1.5 m, is the reference).
-# Empty = off (the latest report wins). Read by the graph-builder when it makes an engine; changing it is a new generation of every
-# map (the params hash changes). NEAR_FOV_DEG (optional): a free report counts only inside this horizontal cone of the base yaw.
+# until a free report from a capture pose within NEAR_RANGE_M of it. The deployed value is 1.3 m (the close-evidence certainty
+# radius). Empty = off (the latest report wins). Read by the graph-builder when it makes an engine; changing it is a new generation
+# of every map (the params hash changes). The near-field cone was removed (the design rejected it).
 SCENE_GRAPH_NEAR_RANGE_M = _opt_float("SCENE_GRAPH_NEAR_RANGE_M")
-SCENE_GRAPH_NEAR_FOV_DEG = _opt_float("SCENE_GRAPH_NEAR_FOV_DEG")
 # NEAR_MIN_CLEARANCE_M (optional, needs NEAR_RANGE_M): "away from walls" - a held region stays held only when a cell of its connected
 # component is farther than this (m) from every other blocked or unknown cell; wall rims are released. Empty = every held cell holds.
 SCENE_GRAPH_NEAR_MIN_CLEARANCE_M = _opt_float("SCENE_GRAPH_NEAR_MIN_CLEARANCE_M")
 # Turn cost of the scene-graph route (docs/scene_graph/close_evidence_and_turn_cost_design.md B.1, B.6): every change of heading of
 # the lattice route costs lambda * |dtheta| (lambda in m per radian) on top of the priced length. lambda is per robot, from its
-# factsheet: speed_max / angular_speed_max, clamped to [0, 5]. LAMBDA_M_PER_RAD (empty = unset) is used only for a robot whose
-# factsheet lacks one of the two; neither: no turn cost for that plan. ENABLED is the switch: off (the default), no plan has a turn cost.
+# factsheet: speed_max / angular_speed_max, clamped to [0, 5]. For a robot whose factsheet lacks one of the two, the fallback lambda
+# is used: LAMBDA_M_PER_RAD, default 0.7 m/rad, and never above TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD (0.7; a larger value is capped).
+# ENABLED is the switch: off (the default), no plan has a turn cost.
+TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD = 0.7
 SCENE_GRAPH_TURN_COST_ENABLED = _env_bool("SCENE_GRAPH_TURN_COST_ENABLED", "false")
-SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = _opt_float("SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD")
-# Validated-first planning (docs/scene_graph/close_evidence_and_turn_cost_design.md part G): the chart route minimises the number of
-# lattice edges with an unvalidated end node (a node no close free report and no driven body has validated) first, and the priced cost
-# second; untraversed space stays off the plan whenever a route through validated space exists. Needs a store made with the close-evidence
-# rule (SCENE_GRAPH_NEAR_RANGE_M: pipeline morse/2+near5, the `val` tile plane); on a store without it the switch changes nothing.
-# Planner switch, off by default: off, the plans are bit-identical to the unswitched planner.
-SCENE_GRAPH_VALIDATED_FIRST = _env_bool("SCENE_GRAPH_VALIDATED_FIRST", "false")
+_turn_fallback = _opt_float("SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD")
+SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = min(TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD if _turn_fallback is None else _turn_fallback,
+                                        TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD)
 # Waypoint budget (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2): the planner's string pull is replaced by the exact
 # fewest-waypoints path whose total priced-cost excess over the lattice path is at most this many metres (final cost <= lattice +
 # budget). Empty / <= 0 = off (the greedy pull, unchanged); validated below: finite and at most 1.0, else off.
 SCENE_GRAPH_WAYPOINT_BUDGET_M = _opt_float("SCENE_GRAPH_WAYPOINT_BUDGET_M")
-# Apex candidates of the waypoint budget (design C.2, "Apex candidates"): at a corner of the pulled polyline the budget solver may
-# put the waypoint at the apex of a fillet arc of radius lambda (the robot's v / omega) instead of on the corner vertex, where the
-# clearance is least (never closer to obstacles than the vertex, within 0.35 m of it, same budget bound). Effective only with
-# SCENE_GRAPH_WAYPOINT_BUDGET_M set and a turn lambda > 0 for the plan's robot. Off (the default) = the budget plans, unchanged.
-SCENE_GRAPH_WAYPOINT_APEX_ENABLED = _env_bool("SCENE_GRAPH_WAYPOINT_APEX_ENABLED", "false")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps

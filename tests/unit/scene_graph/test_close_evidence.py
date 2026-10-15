@@ -82,19 +82,6 @@ def test_time_order_not_arrival_order():
     assert not _nav(_run([(1000, NEAR, True), (1000, NEAR, False)]))
 
 
-def test_fov_cone_requires_facing():
-    # NEAR is east of the patch: yaw 0 looks away from it, yaw pi looks at it
-    g = ChartGraph(SceneParams(near_range_m=1.5, near_fov_deg=90.0))
-    g.fold_many([_leaf("a", 1000, NEAR, True, yaw=np.pi), _leaf("b", 2000, NEAR, False, yaw=0.0)])
-    assert not _nav(g)                                  # lethal seen facing it: true evidence; the free looking away is not
-    g.fold_many([_leaf("c", 3000, NEAR, False, yaw=np.pi)])
-    assert _nav(g)
-    # a lethal reported while looking away is not true evidence (outside the cone): the latest value decides, a free retracts it
-    h = ChartGraph(SceneParams(near_range_m=1.5, near_fov_deg=90.0))
-    h.fold_many([_leaf("a", 1000, NEAR, True, yaw=0.0), _leaf("b", 2000, NEAR, False, yaw=0.0)])
-    assert _nav(h)
-
-
 def _two_pass():
     w, way = cw.pillar_room()
     lethal = w.copy(); lethal[int(1.0 / R):int(2.0 / R), int(1.0 / R):int(2.0 / R)] = 100
@@ -166,7 +153,7 @@ def test_store_round_trip_and_params_mismatch():
     assert all((_norm(h)[1][k] == _norm(g)[1][k]).all() for k in ('V', 'T', 'B', 'Fn', 'Bn'))
     assert not _nav(h) and int(h._build_F((0, 0))[0].sum()) == int(g._build_F((0, 0))[0].sum())
     assert st.meta("m")["params_hash"] == S.SceneGraphStore.params_hash(g.params)
-    assert st.manifest("m")["pipeline"] == S.PIPELINE_NEAR_VAL == "morse/2+near5"
+    assert st.manifest("m")["pipeline"] == S.PIPELINE_CLOSE == "morse/2+close"
     with pytest.raises(ValueError, match="near_range_m"):       # an engine without the rule refuses the state
         ChartGraph(SceneParams()).import_state(g.export_state())
     # the reverse: a store made without the rule loads as an engine without it, and a rule-on engine refuses its state
@@ -183,7 +170,7 @@ def test_a_store_of_the_earlier_rule_is_refused_not_misread(monkeypatch):
     # a store written under a retired token (held by the latest lethal time from any distance) must not be resumed: its
     # pipeline token (hence its params_hash) differs, so the worker rebuilds, and load / import_state say why
     g = _run([(1000, NEAR, True), (2000, FAR, False)])
-    for old, name, mc in (("morse/2+near1", "PIPELINE_NEAR_VAL", None), ("morse/2+near2", "PIPELINE_NEAR_VAL", 0.25), ("morse/2+near3", "PIPELINE_NEAR_VAL", None), ("morse/2+near4", "PIPELINE_NEAR_VAL", 0.25)):
+    for old, name, mc in (("morse/2+near1", "PIPELINE_CLOSE", None), ("morse/2+near2", "PIPELINE_CLOSE", 0.25), ("morse/2+near3", "PIPELINE_CLOSE", None), ("morse/2+near4", "PIPELINE_CLOSE", 0.25)):
         gg = ChartGraph(SceneParams(near_range_m=1.5, near_min_clearance_m=mc))
         gg.fold_many([_leaf("a", 1000, NEAR, True), _leaf("b", 2000, FAR, False)])
         be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
@@ -251,18 +238,17 @@ def test_lazy_reader_and_tile_plane_agree_with_the_engine_under_the_rule():
 def test_the_checker_accepts_a_store_made_with_the_rule():
     from tools import scene_graph_check_generation as chk
     w, way = cw.two_rooms(W=12.0)
-    g = ChartGraph(SceneParams(near_range_m=1.5, near_fov_deg=120.0))
+    g = ChartGraph(SceneParams(near_range_m=1.5))
     be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
     st.save("m", g, g.fold_many(cw.drive(w, way)), None, {})
     r = chk.check_map(st, "m")
-    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_NEAR_VAL == "morse/2+near5"
+    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_CLOSE == "morse/2+close"
 
 
 def test_the_graph_builder_reads_the_rule_from_config(monkeypatch):
     from packages import config
     monkeypatch.setenv("SCENE_GRAPH_NEAR_RANGE_M", "1.5")
-    monkeypatch.setenv("SCENE_GRAPH_NEAR_FOV_DEG", "")
-    assert config._opt_float("SCENE_GRAPH_NEAR_RANGE_M") == 1.5 and config._opt_float("SCENE_GRAPH_NEAR_FOV_DEG") is None
+    assert config._opt_float("SCENE_GRAPH_NEAR_RANGE_M") == 1.5
     assert config.SCENE_GRAPH_NEAR_RANGE_M is None or isinstance(config.SCENE_GRAPH_NEAR_RANGE_M, float)   # unset in the test env
 
 
@@ -317,9 +303,9 @@ def test_filter_params_are_validated_and_stored_only_when_set():
         with pytest.raises(ValueError, match="near_min_clearance_m"):
             SceneParams(near_range_m=1.5, near_min_clearance_m=bad)
     assert "near_min_clearance_m" not in ChartGraph(SceneParams(near_range_m=1.5)).export_state().params
-    g = ChartGraph(SceneParams(near_range_m=1.5, near_fov_deg=90.0, near_min_clearance_m=0.25))
+    g = ChartGraph(SceneParams(near_range_m=1.5, near_min_clearance_m=0.25))
     assert g.export_state().params == dict(robot_half_side=0.25, lattice=0.1, chart_radius=2.0, near_range_m=1.5,
-                                           near_fov_deg=90.0, near_min_clearance_m=0.25)
+                                           near_min_clearance_m=0.25)
     assert S.SceneGraphStore.params_hash(SceneParams(near_range_m=1.5)) != S.SceneGraphStore.params_hash(
         SceneParams(near_range_m=1.5, near_min_clearance_m=0.25))
 
@@ -358,7 +344,7 @@ def test_filter_off_is_the_rule_alone():
     be = S.MemoryBackend(); store = S.SceneGraphStore(be, be)
     store.save("m", a, a.fold_many([]), None, {"n": 1})
     man = store.manifest("m")
-    assert man["pipeline"] == S.PIPELINE_NEAR_VAL
+    assert man["pipeline"] == S.PIPELINE_CLOSE
     assert man["params"] == {"robot_half_side": 0.25, "lattice": 0.1, "chart_radius": 2.0, "near_range_m": 1.5}
 
 
@@ -439,7 +425,7 @@ def test_filter_store_round_trip_and_params_mismatch():
     assert all((_norm(h)[1][k] == _norm(g)[1][k]).all() for k in ("V", "T", "B", "Fn", "hold"))
     assert int(h._build_F((0, 0))[0].sum()) == int(g._build_F((0, 0))[0].sum())
     man = store.manifest("m")
-    assert man["pipeline"] == S.PIPELINE_NEAR_VAL and man["params"]["near_min_clearance_m"] == MC
+    assert man["pipeline"] == S.PIPELINE_CLOSE and man["params"]["near_min_clearance_m"] == MC
     assert store.meta("m")["params_hash"] == S.SceneGraphStore.params_hash(g.params)
     # an engine with the rule but no filter refuses the state, and the filter engine refuses a rule-only state
     with pytest.raises(ValueError, match="near_min_clearance_m"):
@@ -461,7 +447,7 @@ def test_filter_the_checker_accepts_a_store_made_with_it():
     be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
     st.save("m", g, g.fold_many(cw.drive(w, way)), None, {})
     r = chk.check_map(st, "m")
-    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_NEAR_VAL
+    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_CLOSE
     assert r["params"]["near_min_clearance_m"] == 0.25
 
 
@@ -493,7 +479,7 @@ def test_rule_only_tile_readers_equal_the_engine_across_a_tile_edge():
     be = S.MemoryBackend(); store = S.SceneGraphStore(be, be)
     store.save("m", g, g.fold_many([]), None, {"n": 1})
     man = store.manifest("m")
-    assert man["pipeline"] == S.PIPELINE_NEAR_VAL and "bn" in store._tile("m", man, 0, 0)
+    assert man["pipeline"] == S.PIPELINE_CLOSE and "bn" in store._tile("m", man, 0, 0)
     eng = store.load("m")
     held = (eng._V < 100) & (eng._Bn >= 0) & (eng._Bn > eng._Fn)
     assert held.sum() == 20 * 22

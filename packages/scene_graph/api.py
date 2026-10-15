@@ -34,8 +34,6 @@ class SceneParams:
                                        # Part of the params hash: changing it is a new generation.
     near_range_m: Optional[float] = None   # close evidence: a FREE report clears a cell blocked by a later-or-equal report only
                                            # when captured from a pose within this range (m). None = off (latest value wins).
-    near_fov_deg: Optional[float] = None   # with near_range_m: also inside this cone around the base yaw (forward camera
-                                           # assumed) or within 0.3 m. None = distance only.
     near_min_clearance_m: Optional[float] = None   # with near_range_m: "away from walls". A held cell stays held only as part of an
                                            # 8-connected component of held cells with a cell farther than this (m) from every other
                                            # blocked or unknown cell; wall rims (components within it everywhere) read as without
@@ -148,10 +146,6 @@ class Route:
                                        # cost the route is the lexicographic minimum of its (y, x) cell sequence (reproducible)
     exact: bool = True                 # False: a priced / overlay search over the tile cap returned the corridor's route (valid, maybe
                                        # costlier than the optimum); the engine's routes are always exact
-    unvalidated: Optional[int] = None  # validated-first (`Safety.validated_first`): the edges of the route with an unvalidated end node
-                                       # (the minimum over all routes); None when the search was not validated-first or the graph
-                                       # carries no validity plane. `cost` is then still the priced cost J, without the penalty
-    unvalidated_m: Optional[float] = None   # the length (m) of those edges
 
 
 def edge_weight(len_units, deficit_sum, rate):
@@ -179,17 +173,12 @@ class Safety:
     `origin` the same formula continues (no kink). rate = 0 is the unpriced route, identical to `safety=None`.
     Turn cost (`turn`, m per radian, docs/scene_graph/close_evidence_and_turn_cost_design.md B.1): every change of heading between two
     consecutive lattice edges adds `turn_weight(turn, steps)`; the start and the goal heading are free. It applies on top of the
-    weights above, also at rate 0 (the length plus the turn cost; `margin` is then not read). rate = 0 and turn = 0 is `safety=None`
-    unless `validated_first`.
-    Validated-first (`validated_first`, docs/scene_graph/close_evidence_and_turn_cost_design.md part G, `packages/scene_graph/validated.py`):
-    among all routes the one with the fewest edges that have an unvalidated end node, and among those the cheapest J (priced length plus
-    turn cost). It needs the validity plane (a store made with the close-evidence rule); without it the flag changes nothing."""
+    weights above, also at rate 0 (the length plus the turn cost; `margin` is then not read). rate = 0 and turn = 0 is `safety=None`."""
     margin: float
     rate: float
     k: Optional[float] = None
     origin: Optional[float] = None
     turn: float = 0.0
-    validated_first: bool = False
 
     # the exponential tier is bounded so that every weight is a finite integer held exactly in float64: exp(k * origin) <= e^10
     MAX_K_ORIGIN = 10.0

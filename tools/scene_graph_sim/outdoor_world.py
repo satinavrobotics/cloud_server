@@ -7,11 +7,9 @@ A drive (a depth-first tour of a 1 m grid of free spots, one leaf every STEP m, 
 cost and the waypoint budget. It reports the structure (charts, links, levels, islands), the sizes and the timings for two chart radii.
 
     python tools/scene_graph_sim/outdoor_world.py [--w 100 --h 60 --stems 0.08 --step 3 --radii 2,6 --pairs 12]
-                                                  [--near-range 1.5 [--near-min-clearance 0.25]] [--validated-first]
+                                                  [--near-range 1.5 [--near-min-clearance 0.25]]
 
-`--near-range` builds the world with the close-evidence rule (the stored `val` plane exists); `--validated-first` (needs it) plans with
-`SCENE_GRAPH_VALIDATED_FIRST` on (design G): the plan time is then the validated-first search, and the unvalidated edges of the lattice
-routes are reported.
+`--near-range` builds the world with the close-evidence rule.
 """
 import argparse
 import math
@@ -113,11 +111,7 @@ def main():
     ap.add_argument("--min-pair-m", type=float, default=30.0)
     ap.add_argument("--near-range", type=float, default=None, help="close-evidence rule (SceneParams.near_range_m), m")
     ap.add_argument("--near-min-clearance", type=float, default=None)
-    ap.add_argument("--validated-first", action="store_true", help="plan with SCENE_GRAPH_VALIDATED_FIRST on (needs --near-range)")
     a = ap.parse_args()
-    if a.validated_first and a.near_range is None:
-        ap.error("--validated-first needs --near-range")
-    config.SCENE_GRAPH_VALIDATED_FIRST = bool(a.validated_first)
     t0 = time.perf_counter()
     w = make_world(a.w, a.h, a.stems)
     way, nfree, nvis = tour(w, a.w, a.h)
@@ -154,7 +148,6 @@ def main():
             if len(pairs) >= a.pairs:
                 break
         times, ok, fb, lens, wps = [], 0, {}, [], []
-        unval, inexact = [], 0
         for p, q in pairs:
             t3 = time.perf_counter()
             try:
@@ -162,9 +155,6 @@ def main():
                                         config.SCENE_GRAPH_GOAL_SNAP_M, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, None, 0.05, None, None,
                                         1.0, False, waypoint_budget_m=0.35)
                 ok += 1
-                if plan.validated is not None:
-                    unval.append(plan.validated["unvalidated_edges"])
-                    inexact += not plan.validated["exact"]
                 pts = [(x.x, x.y) for x in plan.waypoints]
                 lens.append(sum(math.dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1)))
                 wps.append(len(pts))
@@ -175,10 +165,6 @@ def main():
               "served %d, fallbacks %s | time p50/p95/max %.0f/%.0f/%.0f ms | route %.0f m median, %.1f waypoints median" % (
                   rad, len(v.charts), len(v.links), v.levels, sp.N, t_fold, t_load, nbytes / 1e6, len(pairs), ok, fb or "none",
                   1e3 * pct(times, 50), 1e3 * pct(times, 95), 1e3 * max(times) if times else 0, pct(lens, 50), pct(wps, 50)))
-        if a.near_range is not None:
-            print("    validated nodes %.1f%% of F | validated-first %s%s" % (
-                100 * float(eng._val[sp.ys, sp.xs].mean()), "on" if a.validated_first else "off",
-                "; unvalidated edges per route median %.0f, max %d, inexact (tile cap) %d" % (pct(unval, 50), max(unval), inexact) if unval else ""))
 
 
 if __name__ == "__main__":

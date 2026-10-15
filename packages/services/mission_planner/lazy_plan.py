@@ -32,11 +32,6 @@ Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.
   incumbent J_inc is P0 with its turn cost or the expanded optimum on a band of 3 cells around P0 (tiles of the band only), and the
   exact (cell, heading) search runs on the cells of the ellipse |c - a| + |c - b| <= J_inc * 1e-4 m that also satisfy
   d(a, c) + d(c, b) <= J_inc (`packages/scene_graph/turn.py`); over the tile cap the incumbent is returned and `exact` is False;
-* with `safety.validated_first` (docs/scene_graph/close_evidence_and_turn_cost_design.md part G, `packages/scene_graph/validated.py`) the
-  weights are penalised by the engine's function (w' = w + P * [an end node is unvalidated], the node flag from the stored `val` plane): the
-  route has the fewest unvalidated edges and then the least J. A corridor route without unvalidated edges is seeded into the same ellipse
-  search; otherwise every chart is searched (no geometric bound exists), and over the tile cap the corridor's route stands with `exact` False
-  (`_route_vf`). A store without the plane (no close-evidence rule, or an earlier pipeline token) reads every node as validated: the flag is inert;
 * `max_tiles` caps a request: a bigger corridor raises `CorridorTooLarge` (the planner falls back to the legacy one).
 
 It reads `StoredView` internals (`_own`, `_cache`, `_idx`); that is the cost of a LACI-only phase. Phase 1 gives these
@@ -56,12 +51,11 @@ from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from packages.scene_graph import turn as turn_search
-from packages.scene_graph import validated
-from packages.scene_graph.api import Blocked, Route, Safety, Snap, edge_weight
-from packages.scene_graph.store import PIPELINE_NEAR_VAL
+from packages.scene_graph import weights
+from packages.scene_graph.api import Blocked, Route, Safety, Snap
 from packages.scene_graph.store_codec import read_planes
 
-ROUTE_UNIT_M = 1e-4              # route cost unit (packages/scene_graph/engine.py)
+ROUTE_UNIT_M = weights.ROUTE_UNIT_M  # route cost unit (packages/scene_graph/weights.py)
 RES = 0.05                      # costmap cell; the lattice is 2 x RES (store.py)
 TILE_L = 64                     # lattice cells per tile side (store.py)
 TILE_F = 2 * TILE_L             # costmap cells per tile side
@@ -142,8 +136,6 @@ class PlanGraph:
         self.max_tiles = int(max_tiles)
         self.unavailable = False                # set when a tile could not be read (see TileUnavailable)
         # the store carries the validity plane `val`: made with the close-evidence rule under the token that adds it. A rule store of an
-        # earlier token (+near3 / +near4, not yet rebuilt) has none: validated-first is then inert (every node reads validated), not wrong
-        self._has_val = "near_range_m" in view.params and view.man.get("pipeline") == PIPELINE_NEAR_VAL
         self._mu = threading.Lock()             # guards `_inflight` only; no I/O runs under it
         self._inflight: Dict[Tuple[int, int], _Flight] = {}
         view._own = self._read                  # the view's own readers (snap, windows) share the single flight
@@ -357,10 +349,9 @@ class PlanGraph:
         return sorted(t for t in out if "%d,%d" % t in have)
 
     def _cells(self, tiles: List[Tuple[int, int]]):
-        """linear key, chart index, global (y, x) and validity (the stored `val` plane; True everywhere for a store without it) of every
-        owned cell of the tiles, ascending by key (row-major)"""
+        """linear key, chart index and global (y, x) of every owned cell of the tiles, ascending by key (row-major)"""
         self.view._need(tiles)
-        ch, ys, xs, vl = [], [], [], []
+        ch, ys, xs = [], [], []
         lut = self._lut
         for (tx, ty) in tiles:
             t = self._tile(tx, ty)
@@ -373,14 +364,13 @@ class PlanGraph:
             gy, gx = iy + ty * TILE_L, ix + tx * TILE_L
             ys.append(gy); xs.append(gx)
             ch.append(lut[np.minimum(o[iy, ix], len(lut) - 1)])
-            vl.append(t["val"][iy, ix] != 0 if "val" in t else np.ones(len(iy), bool))
         if not ys:
             e = np.zeros(0, np.int64)
-            return e, e.astype(np.int32), e, e, e.astype(bool)
-        ys, xs, ch, vl = np.concatenate(ys), np.concatenate(xs), np.concatenate(ch), np.concatenate(vl)
+            return e, e.astype(np.int32), e, e
+        ys, xs, ch = np.concatenate(ys), np.concatenate(xs), np.concatenate(ch)
         key = (ys + _OFF) * _KW + (xs + _OFF)
         o = np.argsort(key, kind="stable")
-        return key[o], ch[o], ys[o], xs[o], vl[o]
+        return key[o], ch[o], ys[o], xs[o]
 
     @staticmethod
     def _alive(blocked: Optional[Blocked], ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
@@ -416,8 +406,8 @@ class PlanGraph:
         return out
 
     def _search(self, keep: Set[int], src_cell, dst_cell, blocked: Optional[Blocked], limit: Optional[float] = None,
-                safety: Optional[Safety] = None, jlimit: Optional[float] = None, turn: Optional[tuple] = None, vf: bool = False):
-        """(length, path as (chart, y, x) rows, tiles, cost, unvalidated, unvalidated_m) of the lattice route inside `keep`, or None. `limit`, when given,
+                safety: Optional[Safety] = None, jlimit: Optional[float] = None, turn: Optional[tuple] = None):
+        """(length, path as (chart, y, x) rows, tiles, cost) of the lattice route inside `keep`, or None. `limit`, when given,
         is a proved upper bound of the answer (a route of that length exists in `keep`): cells and tiles that no route
         of that length can use are left out and Dijkstra stops there; the answer, and its tie-breaks, are unchanged.
         With `safety` the edge cost is the priced one (as `ChartGraph._edge_cost`); `limit` is then the geometric bound
@@ -426,10 +416,7 @@ class PlanGraph:
         only, `keep` ignored); (table, "exact", J_inc): the turn-cost optimum, exact when a route of total cost J_inc exists in
         `keep` and `limit` is J_inc * 1e-4 (`turn_search.Graph.restricted`); (table, "full", None): the engine's sequence on the graph
         of `keep` (the plain optimum P0, then `turn_search.route`). The cost is then the total J.
-        With `vf` (validated-first, validated.py) the weights are penalised (w' = w + P * [unvalidated]) by the same function as the
-        engine's; the search is then the lexicographic (count, J) optimum, `cost` is J (the penalty taken out) and the last two fields
-        the unvalidated edge count and length (m); otherwise they are None. The modes "band" and "exact" are not used with `vf`: their
-        incumbent bounds would mix penalties of different graphs."""
+        """
         band = None
         if turn is not None and turn[1] == "band":
             band = turn[2][:, 1:]
@@ -446,12 +433,12 @@ class PlanGraph:
             tiles = self._within(tiles, a, b, limit)
         if len(tiles) > self.max_tiles:
             raise CorridorTooLarge(len(tiles), self.max_tiles)
-        key, ch, ys, xs, vld = self._cells(tiles)
+        key, ch, ys, xs = self._cells(tiles)
         if limit is not None and len(key):
             # the plane keeps the cells of the ellipse and one lattice step around it (the orthogonals of a diagonal)
             cx, cy = (2 * xs + 1) * RES, (2 * ys + 1) * RES
             near = np.hypot(cx - a[0], cy - a[1]) + np.hypot(cx - b[0], cy - b[1]) <= limit + 2 * float(self.params.lattice) + 1e-6
-            key, ch, ys, xs, vld = key[near], ch[near], ys[near], xs[near], vld[near]
+            key, ch, ys, xs = key[near], ch[near], ys[near], xs[near]
         n = len(key)
         if n == 0:
             return None
@@ -485,23 +472,16 @@ class PlanGraph:
             R.append(node[mi[a]]); C.append(node[q[a]])
             if turn is not None:
                 Hd.append(np.full(len(a), int(turn_search.heading(dy, dx))))
-            if safety is None or safety.rate == 0.0:
-                # the engine's integer edge cost (engine.ROUTE_UNIT_M): length in units of 1e-4 m, rounded up
-                Ln.append(np.full(len(a), max(math.ceil(math.hypot(dy, dx) * h / ROUTE_UNIT_M - 1e-6), 1.0)))
-            else:
-                Lm.append(np.full(len(a), math.hypot(dy, dx) * h))
+            Lm.append(np.full(len(a), math.hypot(dy, dx) * h))
         R, C = np.concatenate(R), np.concatenate(C)
         nm = len(mi)
-        if safety is None or safety.rate == 0.0:
-            Ln = np.concatenate(Ln)
-        else:
-            # priced edge cost: the engine's `edge_weight` on the clearance of the member cells
+        # the integer edge costs: the engine's own choice (weights.py)
+        rate = 0.0 if safety is None else float(safety.rate)
+        dsum = None
+        if rate:
             dn = safety.price(self._clearance(ys[mi], xs[mi]))
-            Ln = edge_weight(np.concatenate(Lm) / ROUTE_UNIT_M, dn[R] + dn[C], safety.rate)
-        pen, vm = 0, None
-        if vf:
-            vm = vld[mi]
-            Ln, pen = validated.penalise(Ln, validated.edge_flags(vm, R, C), nm, validated.tmax(turn[0]) if turn is not None else 0.0)
+            dsum = dn[R] + dn[C]
+        Ln = weights.edge_costs(np.concatenate(Lm), dsum, rate)
 
         def find(cell):
             p = int(at(np.array([(cell[0] + _OFF) * _KW + (cell[1] + _OFF)], np.int64))[0])
@@ -531,7 +511,7 @@ class PlanGraph:
                 return None
             rows = mi[np.array(got[1])]
             length = float(np.hypot(np.diff(ys[rows]), np.diff(xs[rows])).sum() * h)
-            return (length, np.stack([ch[rows], ys[rows], xs[rows]], 1), len(tiles)) + self._tail(got[0], pen, vm, np.array(got[1]), ys[mi], xs[mi], h)
+            return length, np.stack([ch[rows], ys[rows], xs[rows]], 1), len(tiles), int(got[0])
         # one Dijkstra from the goal, then the canonical walk from the start (engine.ChartGraph.route): the neighbour on a
         # shortest path with the smallest cell index; nodes are in row-major (y, x) order, so this is the lexicographic
         # minimum of the (y, x) sequence among the minimal-cost paths.
@@ -548,16 +528,7 @@ class PlanGraph:
         pa = np.array(path)
         rows = mi[pa]
         length = float(np.hypot(np.diff(ys[rows]), np.diff(xs[rows])).sum() * h)
-        return (length, np.stack([ch[rows], ys[rows], xs[rows]], 1), len(tiles)) + self._tail(dist[s], pen, vm, pa, ys[mi], xs[mi], h)
-
-    @staticmethod
-    def _tail(total, pen, vm, pa, ys, xs, h):
-        """(cost, unvalidated edges, unvalidated length m) of a found path of local nodes `pa`: without validated-first the cost as it is
-        and None, None; with it the w' cost split into J and the count (validated.py)"""
-        if vm is None:
-            return int(total), None, None
-        count, metres = validated.path_summary(vm[pa], ys[pa], xs[pa], h)
-        return validated.split(total, pen, count), count, metres
+        return length, np.stack([ch[rows], ys[rows], xs[rows]], 1), len(tiles), int(dist[s])
 
     # ---- route -------------------------------------------------------------------------------
     def route(self, a: str, b: str, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
@@ -567,8 +538,7 @@ class PlanGraph:
         charts that can hold a path of cost <= J_corridor (length <= J_corridor * 1e-4 m, S10), like an overlay. With
         `safety.turn` > 0 that answer is P0 of the turn-cost search (`_turn`)."""
         turn = 0.0 if safety is None else float(safety.turn)
-        vf = safety is not None and safety.validated_first and self._has_val     # validated-first needs the validity plane
-        if safety is not None and safety.rate == 0.0 and turn == 0.0 and not vf:
+        if safety is not None and safety.rate == 0.0 and turn == 0.0:
             safety = None                                        # no price: today's route, the corridor included (S8)
         ja, jb = self._index.get(a), self._index.get(b)
         if ja is None or jb is None:
@@ -579,9 +549,7 @@ class PlanGraph:
         overlay = blocked is not None and bool(blocked.discs or blocked.segments)
         path = self._path(ja, jb)
         found, rings, whole, exact, tiles = None, 0, path is None, True, 0
-        if vf:
-            found, rings, whole, exact = self._route_vf(path, src, dst, blocked, safety, turn, overlay)
-        elif path is not None:
+        if path is not None:
             for hops in ((1, 2, 3) if overlay else (1,)):     # the engine's corridor; under an overlay widen until one exists
                 rings, found = hops, self._search(self._rings(path, hops), src, dst, blocked, safety=safety)
                 if found is not None or not overlay:
@@ -602,61 +570,24 @@ class PlanGraph:
                                          jlimit=jlimit) or found
                 except CorridorTooLarge:
                     exact = False                              # the corridor's route stands: valid, maybe longer
-        if found is None and not vf:
+        if found is None:
             whole = True                                       # nothing in the corridor: the engine searches every chart
             found = self._search(set(range(len(self.keys))), src, dst, blocked, safety=safety)
-        if found is not None and turn > 0.0 and not vf:
+        if found is not None and turn > 0.0:
             found, exact = self._turn(found, src, dst, blocked, safety, path, rings, exact)
         if found is not None:
             tiles = found[2]
         self.last = dict(rings=rings, whole=whole, exact=exact, tiles=tiles)
         if found is None:
             return None
-        length, rows, _, cost, unval, unval_m = found
+        length, rows, _, cost = found
         charts: List[str] = []
         for j in rows[:, 0].tolist():
             kk = self.keys[j]
             if not charts or charts[-1] != kk:
                 charts.append(kk)
         nodes = [((2 * int(x) + 1) * RES, (2 * int(y) + 1) * RES) for y, x in rows[:, 1:].tolist()]
-        return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes, cost=cost, exact=exact,
-                     unvalidated=unval, unvalidated_m=unval_m)
-
-    def _route_vf(self, path, src, dst, blocked: Optional[Blocked], safety: Safety, turn: float, overlay: bool):
-        """(found, rings, whole, exact) of a validated-first route (`Safety.validated_first`; the engine searches every chart). The corridor
-        search seeds it. When the corridor's route has no unvalidated edge it is a (0, J_corridor) route, so the optimum has count 0 and
-        cost <= J_corridor and lies in the charts that can hold such a path (the ellipse of an overlay or a price), searched with the
-        same bound. Otherwise a route with fewer unvalidated edges may be arbitrarily longer: every chart is searched (no bound; the
-        tile cap raises CorridorTooLarge, the corridor's route then stands, valid but maybe with more unvalidated edges or costlier, and
-        `exact` is False). With a turn cost the same whole-graph search runs the engine's sequence (plain optimum, then the turn search):
-        the incumbent bounds of `_turn` would mix the penalties of different graphs."""
-        found, rings, exact = None, 0, True
-        allc = set(range(len(self.keys)))
-        if path is not None:
-            for hops in ((1, 2, 3) if overlay else (1,)):
-                rings, found = hops, self._search(self._rings(path, hops), src, dst, blocked, safety=safety, vf=True)
-                if found is not None:
-                    break
-        tab = turn_search.table(turn) if turn > 0.0 else None
-        if found is not None and found[4] == 0 and tab is None:
-            bound, jlimit = found[3] * ROUTE_UNIT_M, found[3] * (1 + 1e-9) + 1e-9
-            keep = self._ellipse(src, dst, bound) | self._rings(path, rings)
-            try:
-                found = self._search(keep, src, dst, blocked, limit=bound * (1 + 1e-9) + 1e-9, safety=safety, jlimit=jlimit,
-                                     vf=True) or found
-            except CorridorTooLarge:
-                exact = False
-            return found, rings, False, exact
-        try:
-            got = self._search(allc, src, dst, blocked, safety=safety, vf=True,
-                               turn=None if tab is None else (tab, "full", None))
-            if got is not None or found is None:
-                return got, rings, True, exact
-        except CorridorTooLarge:
-            exact = False
-        if found is not None and tab is not None:         # the corridor's plain route, charged its turns
-            found = found[:3] + (found[3] + turn_search.path_turn(found[1][:, 1], found[1][:, 2], tab),) + found[4:]
-        return found, rings, True, exact
+        return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes, cost=cost, exact=exact)
 
     def _turn(self, found, src, dst, blocked: Optional[Blocked], safety: Safety, path: Optional[List[int]], rings: int,
               exact: bool):
@@ -667,7 +598,7 @@ class PlanGraph:
         tab = turn_search.table(safety.turn)
         rows0, cost0 = found[1], int(found[3])
         j0 = cost0 + turn_search.path_turn(rows0[:, 1], rows0[:, 2], tab)
-        best = (found[0], rows0, found[2], j0, None, None)
+        best = (found[0], rows0, found[2], j0)
         if j0 == cost0:
             return best, exact                                # no turn on the plain optimum: it is the answer (turn.py)
         try:

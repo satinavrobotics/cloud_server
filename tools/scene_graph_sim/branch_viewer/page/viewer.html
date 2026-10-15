@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scene Graph Branch Viewer</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+__CSS__
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Scene graph branch viewer</h1>
+    <p class="note">Each git ref played over the same captures, through its own adapter and engine. The robot moves along its recorded poses. For each capture the route is the planner's route from the robot's current pose to the chosen goal (five recorded places along the drive; the goal is always marked). The free space is coloured by clearance (or by the planner's price). Map, clearance, price and charts are all for the same capture as the robot. The checks are listed below.</p>
+  </header>
+
+  <table id="summary"></table>
+
+  <div class="controls">
+    <label>map <select id="map"></select></label>
+    <label>branch <select id="branch"></select></label>
+    <label>goal <select id="goal"></select></label>
+    <button id="play">play</button>
+    <label>speed <select id="speed"><option value="600">slow</option><option value="300" selected>normal</option><option value="120">fast</option></select></label>
+    <label>capture <input id="slider" type="range" min="0" max="1" step="1" value="0"></label>
+    <span class="mono" id="when"></span>
+  </div>
+
+  <div class="controls">
+    <label>colour the free space by <select id="colour"><option value="clr" selected>clearance (whole free space)</option><option value="price">planner price (zero beyond reach)</option></select></label>
+    <label><input type="checkbox" id="l_band" checked> excluded band</label>
+    <label><input type="checkbox" id="l_obs" checked> lethal and held lethal</label>
+    <label><input type="checkbox" id="l_unk" checked> unknown</label>
+    <label><input type="checkbox" id="l_route" checked> route corridor (0.5 m)</label>
+    <label><input type="checkbox" id="l_trail" checked> robot path</label>
+    <label><input type="checkbox" id="l_charts" checked> charts and links</label>
+  </div>
+
+  <div class="stage"><canvas id="cv"></canvas></div>
+
+  <p class="result" id="result"></p>
+
+  <div class="legend">
+    <span><i class="sw" style="background:linear-gradient(90deg,#96190f,#f09632,#ffec96,#dfeee0)"></i>clearance of free cells: dark red = 0.25 m (the robot touches), yellow = 0.8 m, pale = 2 m or more</span>
+    <span><i class="sw" style="background:linear-gradient(90deg,#ffffff,#ffec96,#f09632,#96190f)"></i>planner price (log scale, the run's maximum = dark red): white = no charge</span>
+    <span><i class="sw" style="background:#bcd4ea"></i>excluded: the 0.5 m square does not fit (hard)</span>
+    <span><i class="sw" style="background:#111111"></i>lethal (latest report: occupied)</span>
+    <span><i class="sw" style="background:#4b2c6e"></i>lethal held by a later close look (1.5 m)</span>
+    <span><i class="sw" style="background:#d6d6d6"></i>unknown, never reported</span>
+    <span><i class="sw" style="background:rgba(200,30,30,0.35)"></i>route corridor to the goal (0.5 m); solid line = centre</span>
+    <span><i class="sw" style="background:#2e8b57"></i>goal (always shown; green ring)</span>
+    <span><i class="sw" style="background:#111111;opacity:0.85"></i>robot footprint now (0.5 m square, white line = heading)</span>
+    <span><i class="dot" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#1e6fc8"></i>chart anchors; blue lines = links between charts</span>
+  </div>
+
+  <article>
+    <p class="note"><b>Checks.</b> start_snap: the route begins within 0.5 m of the robot. goal_snap: it ends within 0.5 m of the last pose. nodes_nav: every node is on a navigable cell. segments_nav: sampled points of every segment are navigable. length: the route is at least the straight-line distance between its ends. no_route, start_not_navigable and goal_not_navigable are reported as they happen. A capture with a failing check shows its reasons in red.</p>
+  </article>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+__JS__
+</script>
+</body>
+</html>

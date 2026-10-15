@@ -12,7 +12,6 @@ already rely on (docs/scene_graph/integration.md, "Planner contract"):
   `waypoints[i]` with `planned_path[i]` and drops topomap ids on any length mismatch.
 """
 import asyncio
-import bisect
 import logging
 import math
 import threading
@@ -23,51 +22,14 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from cloud_common.objects import common
+from packages import config
 from packages.services.mission_planner import node_policy_plan, trajectory
+from packages.services.mission_planner.waypoints import fewest_waypoints, simplify, thin_eps  # noqa: F401  (re-exported)
 
 Pt = Tuple[float, float]
 
 PLANNER_SCENE_GRAPH = "scene_graph"
 PLANNER_LEGACY = "legacy"
-
-
-def simplify(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool],
-             max_gap: float) -> List[Pt]:
-    """Greedy string pulling: from each kept point go to the farthest later point that is visible
-    from it and at most `max_gap` away (straight line). The first and last points are always kept;
-    with `max_gap` <= 0 no cap applies. Consecutive duplicates are dropped. The candidates of a
-    step are the points up to the first one beyond `max_gap`; they are tried from the far end and
-    the first visible one wins (the same point the ascending scan ends on, with far fewer
-    `visible` calls on a free corridor). The window end starts at a bisect over the cumulative arc
-    length (a chord is never longer than its arc, so every point within `max_gap` of arc is inside)
-    and is extended by chord tests, which are cheap next to a line of sight."""
-    pts: List[Pt] = []
-    for p in points:
-        if not pts or p != pts[-1]:
-            pts.append(p)
-    if len(pts) <= 2:
-        return pts
-    last = len(pts) - 1
-    arc = [0.0]
-    for k in range(1, len(pts)):
-        arc.append(arc[-1] + math.dist(pts[k - 1], pts[k]))
-    kept = [pts[0]]
-    i = 0
-    while i < last:
-        if max_gap > 0:
-            end = max(i + 1, min(last, bisect.bisect_right(arc, arc[i] + max_gap) - 1))
-            while end < last and math.dist(pts[i], pts[end + 1]) <= max_gap:
-                end += 1
-        else:
-            end = last
-        best = i + 1                       # the next lattice point is always reachable
-        for k in range(end, i + 1, -1):
-            if visible(pts[i], pts[k]):
-                best = k
-                break
-        kept.append(pts[best])
-        i = best
-    return kept
 
 
 def build_waypoints(points: Sequence[Pt], map_id: str,
@@ -228,11 +190,6 @@ class ChartPlan:
     trajectory: Optional[List[Dict[str, Any]]] = None
     # the waypoint budget's record {waypoint_budget_m, waypoints_removed (against the greedy pull of the same plan)}; None when off
     waypoint_budget: Optional[Dict[str, Any]] = None
-    # the apex candidates' record {corners (corners of the greedy pull), apexes_used (waypoints placed on an apex)}; None when off
-    waypoint_apex: Optional[Dict[str, Any]] = None
-    # validated-first (SCENE_GRAPH_VALIDATED_FIRST): {unvalidated_edges, unvalidated_m (the lattice edges of the route with an
-    # unvalidated end node: the least any route has), exact}; None when the route was not planned validated-first
-    validated: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -770,9 +727,9 @@ def turn_lambda(factsheet: Any, enabled: bool, operator: Optional[float]) -> Tup
     """(lambda m per rad, source, reason) of the turn cost of a robot's plans (docs/scene_graph/close_evidence_and_turn_cost_design.md
     B.6); pure: the caller passes SCENE_GRAPH_TURN_COST_ENABLED (`enabled`) and SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD (`operator`).
     Off (0, "off", "disabled") unless `enabled`. Otherwise speed_max / angular_speed_max of the factsheet (`RobotTypeIdentifierV1`;
-    -1 until the robot sent them) when both are finite and > 0, clamped to [0, Safety.MAX_TURN]: source "factsheet"; else `operator`
-    when set (finite, >= 0; clamped): source "config"; else 0, source "off". `reason` is empty for the factsheet and names the
-    missing field(s) otherwise. No speed is assumed."""
+    -1 until the robot sent them) when both are finite and > 0, clamped to [0, Safety.MAX_TURN]: source "factsheet"; else the fallback
+    `operator` when set (finite, >= 0), capped at config.TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD (0.7): source "config"; else 0,
+    source "off". `reason` is empty for the factsheet and names the missing field(s) otherwise. No speed is assumed."""
     from packages.scene_graph.api import Safety
     if not enabled:
         return 0.0, "off", "disabled"
@@ -785,7 +742,7 @@ def turn_lambda(factsheet: Any, enabled: bool, operator: Optional[float]) -> Tup
     reason = ", ".join(n for n, v in got.items() if v is None) + " missing"
     op = operator
     if op is not None and math.isfinite(op) and op >= 0.0:
-        return min(float(op), Safety.MAX_TURN), "config", reason
+        return min(float(op), config.TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD), "config", reason
     if op is not None:
         reason += "; SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD=%r ignored" % (op,)
     return 0.0, "off", reason
@@ -804,32 +761,18 @@ TURN_NOT_GIVEN = {"lambda_m_per_rad": 0.0, "source": "off", "speed_max": None, "
 
 
 def safety_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
-               kappa: float, turn: float = 0.0, validated_first: Optional[bool] = None) -> Any:
+               kappa: float, turn: float = 0.0) -> Any:
     """The `Safety` of a plan: the clearance pricing (`_pricing_for`) with the turn cost `turn` (m per rad, `turn_lambda`) on
     top. Pricing off and `turn` > 0: Safety(margin = the clearance cap, rate 0, turn), the length plus the turn cost (the margin
-    is not read at rate 0). None for a graph without `deficit_cell` (a graph that cannot take a Safety), or no price and no turn.
-    `validated_first` (default `config.SCENE_GRAPH_VALIDATED_FIRST`) sets `Safety.validated_first`: a Safety exists then even without
-    a price or a turn (rate 0: the length, routed validated-first)."""
+    is not read at rate 0). None for a graph without `deficit_cell` (a graph that cannot take a Safety), or no price and no turn."""
     if not callable(getattr(graph, "deficit_cell", None)):
         return None
-    from packages import config
-    vf = config.SCENE_GRAPH_VALIDATED_FIRST if validated_first is None else bool(validated_first)
     priced = _pricing_for(graph, robot_width_m, robot_length_m, kappa)
     from packages.scene_graph.api import Safety
     from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
     if turn > 0.0:
         priced = replace(priced, turn=float(turn)) if priced is not None else Safety(margin=_CLR_CAP_M, rate=0.0, turn=float(turn))
-    if vf:
-        priced = replace(priced, validated_first=True) if priced is not None else Safety(margin=_CLR_CAP_M, rate=0.0, validated_first=True)
     return priced
-
-
-def priced_only(safety: Any) -> Any:
-    """`safety` without the validated-first flag, None when nothing else is left (no price, no turn cost): what the pricing record,
-    the line of sight and the waypoint pull see; validated-first changes the route search only."""
-    if safety is None or not safety.validated_first:
-        return safety
-    return None if safety.rate == 0.0 and not safety.turn > 0.0 else replace(safety, validated_first=False)
 
 
 def _pricing_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Optional[float],
@@ -940,264 +883,6 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
     return priced
 
 
-# Candidate thinning of the budget solver (`thin_indices`): the chords of the DP run between the indices kept by a Ramer-Douglas-Peucker
-# simplification of the lattice path with tolerance THIN_FRACTION * lattice (m), plus the greedy pull's vertices, plus enough points
-# to respect the gap cap. 0 = every lattice point is a candidate (the full DP). The cost accounting is not thinned.
-WAYPOINT_THIN_FRACTION = 0.5
-THIN_SPACING_M = 0.5             # candidates are at most this far apart (a chord may leave a straight run at any of its points)
-APEX_TOL_M = 0.35                # an apex candidate lies at most this far from its corner vertex (the goal tolerance)
-# Among paths with equal waypoints and slack the apex wins over the vertex of its corner (its clearance is at least the vertex's by
-# construction; the slack is clamped at 0, so a chord that cuts the corner ties with the vertex's lattice chord). False: the vertex wins.
-APEX_TIES_TO_APEX = True
-APEX_MIN_TURN_RAD = math.radians(20.0)      # a vertex of the greedy pull is a corner when the pull turns by at least this
-
-
-def thin_eps(graph: Any) -> float:
-    """The candidate-thinning tolerance (m) of the budget solver for `graph`: `WAYPOINT_THIN_FRACTION` of its lattice step."""
-    return max(0.0, float(WAYPOINT_THIN_FRACTION)) * float(getattr(getattr(graph, "params", None), "lattice", 0.0) or 0.0)
-
-
-def greedy_pull_indices(pts: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float) -> List[int]:
-    """Lattice indices of the vertices of `simplify(pts, visible, max_gap)` (`pts` without consecutive duplicates)."""
-    where: List[int] = []
-    pos = 0
-    for q in simplify(pts, visible, max_gap):
-        pos = pts.index(q, pos)
-        where.append(pos)
-    return where
-
-
-def thin_indices(pts: Sequence[Pt], eps: float, keep: Sequence[int], max_gap: float) -> List[int]:
-    """Sorted candidate indices of the budget solver: the first, the last, the `keep` indices, the points an iterative
-    Ramer-Douglas-Peucker pass keeps at tolerance `eps` (a dropped point is within `eps` of the chord of its neighbours), and, where
-    two consecutive candidates are farther apart than `THIN_SPACING_M` (and `max_gap`), the farthest later point within that
-    (repeated): consecutive candidates are within the gap cap, and a straight run keeps a point every `THIN_SPACING_M`, where the
-    optimum may leave it. Deterministic."""
-    n = len(pts)
-    mark = [False] * n
-    mark[0] = mark[n - 1] = True
-    for k in keep:
-        mark[k] = True
-    stack = [(0, n - 1)]
-    while stack:
-        a, b = stack.pop()
-        if b - a < 2:
-            continue
-        ax, ay = pts[a]
-        dx, dy = pts[b][0] - ax, pts[b][1] - ay
-        norm = math.hypot(dx, dy)
-        far, fd = -1, eps
-        for m in range(a + 1, b):
-            if norm > 0.0:
-                d = abs(dx * (pts[m][1] - ay) - dy * (pts[m][0] - ax)) / norm
-            else:
-                d = math.dist(pts[m], pts[a])
-            if d > fd:
-                far, fd = m, d
-        if far >= 0:
-            mark[far] = True
-            stack.append((a, far))
-            stack.append((far, b))
-    out = [k for k in range(n) if mark[k]]
-    if THIN_SPACING_M > 0:
-        step = min(max_gap, THIN_SPACING_M) if max_gap > 0 else THIN_SPACING_M
-        full: List[int] = []
-        for a, b in zip(out[:-1], out[1:]):
-            full.append(a)
-            while math.dist(pts[a], pts[b]) > step and b - a > 1:
-                m = b - 1
-                while m > a + 1 and math.dist(pts[a], pts[m]) > step:
-                    m -= 1
-                full.append(m)
-                a = m
-        full.append(out[-1])
-        out = full
-    return out
-
-
-def apex_candidates(pts: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float, radius: float,
-                    clearance: Callable[[Pt], float], tol: float = APEX_TOL_M,
-                    pull_idx: Optional[Sequence[int]] = None) -> Tuple[int, Dict[int, Pt]]:
-    """(corners, {lattice index k: apex point}) of the lattice path `pts` (no consecutive duplicates). A corner is an interior vertex
-    of the greedy pull `simplify(pts, visible, max_gap)` where the pull turns by theta >= `APEX_MIN_TURN_RAD`. Its fillet arc of
-    radius R is tangent at t = R tan(theta / 2) along both chords of the pull and its middle, the apex, lies on the inward bisector at
-    R (1 / cos(theta / 2) - 1) from the vertex V. R is `radius`, clipped so that t is at most half of the shorter adjacent chord
-    and the apex is at most `tol` from V. The apex is a candidate when its clearance is at least that of V (never closer to
-    obstacles than the vertex; a point on a non-navigable cell has clearance 0, so it is never one when V is navigable)."""
-    where = list(pull_idx) if pull_idx is not None else greedy_pull_indices(pts, visible, max_gap)
-    pull = [pts[k] for k in where]
-    corners = 0
-    out: Dict[int, Pt] = {}
-    for m in range(1, len(pull) - 1):
-        prev, v, nxt = pull[m - 1], pull[m], pull[m + 1]
-        l_in, l_out = math.dist(prev, v), math.dist(v, nxt)
-        if l_in <= 0.0 or l_out <= 0.0:
-            continue
-        u_in = ((v[0] - prev[0]) / l_in, (v[1] - prev[1]) / l_in)
-        u_out = ((nxt[0] - v[0]) / l_out, (nxt[1] - v[1]) / l_out)
-        theta = math.acos(max(-1.0, min(1.0, u_in[0] * u_out[0] + u_in[1] * u_out[1])))
-        if theta < APEX_MIN_TURN_RAD:
-            continue
-        corners += 1
-        half = theta / 2.0
-        c = math.cos(half)
-        if c <= 1e-6:
-            continue
-        rise = 1.0 / c - 1.0                       # apex distance per unit radius
-        r = min(float(radius), 0.5 * min(l_in, l_out) / math.tan(half), tol / rise)
-        bx, by = u_out[0] - u_in[0], u_out[1] - u_in[1]
-        norm = math.hypot(bx, by)
-        if not r > 0.0 or norm <= 0.0:
-            continue
-        d = r * rise
-        apex = (round(v[0] + d * bx / norm, 6), round(v[1] + d * by / norm, 6))
-        if apex != v and clearance(apex) >= clearance(v) - 1e-12:
-            out[where[m]] = apex
-    return corners, out
-
-
-def fewest_waypoints(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float,
-                     cost: Callable[[Pt, Pt], float], budget_m: float, end_extra: float = 0.0,
-                     apex_radius: float = 0.0, clearance: Optional[Callable[[Pt], float]] = None,
-                     corner_visible: Optional[Callable[[Pt, Pt], bool]] = None,
-                     info: Optional[Dict[str, int]] = None, thin_eps: float = 0.0) -> List[Pt]:
-    """Fewest waypoints under a cost budget (docs/scene_graph/close_evidence_and_turn_cost_design.md C.2), exact.
-
-    `points` are the lattice path p_0..p_{n-1} (consecutive duplicates dropped), `visible` the free-space line of sight,
-    `cost` the priced cost of a chord (`chord_cost`), P(i, j) the cost of the lattice sub-path (prefix sums of `cost` over
-    consecutive points). A chord (i, j) is allowed when it is visible and at most `max_gap` long (<= 0: no cap), or when
-    j = i + 1 (the lattice step is always reachable, as in `simplify`); its slack is max(0, cost(i, j) - P(i, j)), rounded
-    up to whole centimetres. The result is a path 0 -> n-1 with the fewest chords whose slacks sum to at most `budget_m`;
-    a dynamic program over (point, slack used in cm), O(n * window * D). Ties: fewest waypoints, then least slack, then the
-    lexicographically smallest index sequence (deterministic).
-
-    Cost bound: the cost of a chord is at most P(i, j) + its slack, and the chords partition the lattice path, so
-    J(final) = sum cost(chord) <= sum P(chord) + sum slack = J(lattice) + sum slack <= J(lattice) + budget_m. The rounding is
-    upward, so the true slack never exceeds the counted one. With a budget of 0 only chords no dearer than their lattice
-    sub-path are used (the cost bound of `priced_visible`), and the result has the fewest waypoints under that rule: the
-    greedy string pull is not minimal-link, so it can keep more. A larger budget never gives more waypoints.
-    The chord that ends at the last point may be `end_extra` longer than `max_gap` (the string pull's end-stub merge,
-    `MIN_END_STUB_M`, does the same).
-
-    Candidate thinning (`thin_eps` > 0): the DP runs over the indices of `thin_indices` only (the greedy pull's vertices are among
-    them, `corner_visible` or `visible` judging it), but every chord's slack is still measured against the ORIGINAL lattice sub-path
-    P(i, j) (prefix sums over all points), so the argument above is unchanged and J(final) <= J(lattice) + budget_m holds exactly:
-    thinning only removes options. The waypoint count is then the minimum over the thinned set (not below the full DP's; with the
-    pull's vertices kept, still not above the pull's when `corner_visible` is the priced line of sight). If the thinned set leaves no
-    path (a chord between consecutive candidates not visible), the full DP is run. Off (0): every point is a candidate.
-
-    Apex candidates (`apex_radius` > 0 and `clearance`, C.2 "Apex candidates"): every corner k of the greedy pull
-    (`apex_candidates`, judged with `corner_visible`, default `visible`) gets a second node A_k, the apex of the fillet arc of radius
-    `apex_radius` through the vertex, as an ALTERNATIVE to the vertex p_k at the same lattice index: a path uses p_k or A_k, never
-    both. A chord from or to A_k needs the line of sight, the gap cap on its real length and the same slack rule, with the lattice
-    sub-path of the two indices as the reference: A_k stands at index k, so the chords of a path still partition the index range
-    0..n-1 and cost(chord) <= P(chord) + slack(chord) holds term by term; the argument above, hence J(final) <= J(lattice) + budget_m,
-    is unchanged. A_k is a candidate only when its clearance is at least that of p_k (so a corner waypoint is never closer to an
-    obstacle than the vertex it replaces). Without a candidate the nodes and the result are those of the plain solver. Ties:
-    fewest waypoints, then least slack, then (`APEX_TIES_TO_APEX`) the apex of a corner before its vertex, then the lexicographically
-    smallest sequence of (index, apex-or-vertex) ranks. The slack of a chord that cuts the corner is clamped at 0, like the vertex's,
-    so without that rule the vertex would win every such tie and the apex would never be used. The apex is not a point of the lattice path: a plan that uses one
-    has no `trajectory`. `info`, when given, gets {"corners" (of the greedy pull), "candidates" (corners that got an apex node), "apexes_used"}."""
-    pts: List[Pt] = []
-    for p in points:
-        if not pts or p != pts[-1]:
-            pts.append(p)
-    if info is not None:
-        info.update({"corners": 0, "candidates": 0, "apexes_used": 0})
-    if len(pts) <= 2:
-        return pts
-    n = len(pts)
-    apex: Dict[int, Pt] = {}
-    pull_idx = greedy_pull_indices(pts, corner_visible or visible, max_gap) if thin_eps > 0.0 or (
-        apex_radius > 0.0 and clearance is not None) else None
-    if apex_radius > 0.0 and clearance is not None:
-        corners, apex = apex_candidates(pts, corner_visible or visible, max_gap, apex_radius, clearance, pull_idx=pull_idx)
-        if info is not None:
-            info["corners"], info["candidates"] = corners, len(apex)
-    budget = max(0, int(math.ceil(max(0.0, budget_m) * 100.0 - 1e-9)))
-    arc = [0.0]
-    prefix = [0.0]
-    for k in range(1, n):
-        arc.append(arc[-1] + math.dist(pts[k - 1], pts[k]))
-        prefix.append(prefix[-1] + cost(pts[k - 1], pts[k]))
-    if thin_eps > 0.0:
-        cand = thin_indices(pts, thin_eps, pull_idx, max_gap)
-        out = _budget_dp(pts, cand, apex, arc, prefix, visible, max_gap, cost, budget, end_extra, info)
-        if out is not None:
-            return out
-    return _budget_dp(pts, list(range(n)), apex, arc, prefix, visible, max_gap, cost, budget, end_extra, info)
-
-
-def _budget_dp(pts: Sequence[Pt], cand: Sequence[int], apex: Dict[int, Pt], arc: Sequence[float], prefix: Sequence[float],
-               visible: Callable[[Pt, Pt], bool], max_gap: float, cost: Callable[[Pt, Pt], float], budget: int,
-               end_extra: float, info: Optional[Dict[str, int]]) -> Optional[List[Pt]]:
-    """The dynamic program of `fewest_waypoints` over the candidate indices `cand` (sorted, first and last included); None when no
-    path reaches the last point."""
-    n = len(pts)
-    pad = APEX_TOL_M if apex else 0.0
-    # best[2k + kind][s] = (chords, codes) of the best way to reach node (k, kind) (kind 1 = the apex) having used s cm of slack
-    flip = 1 if APEX_TIES_TO_APEX else 0           # the path holds ranks 2k + (kind ^ flip): the smaller rank wins a tie
-    best: List[Dict[int, Tuple[int, Tuple[int, ...]]]] = [dict() for _ in range(2 * n)]
-    best[0][0] = (0, (flip,))
-    for i in cand[:-1]:
-        for kind in ((0, 1) if i in apex else (0,)):
-            if not best[2 * i + kind]:
-                continue
-            src = apex[i] if kind else pts[i]
-            reach = max_gap + pad if kind == 0 else max_gap + APEX_TOL_M     # window of the chords of this source
-            if max_gap > 0:
-                end = max(i + 1, min(n - 1, bisect.bisect_right(arc, arc[i] + max_gap) - 1))
-                while end < n - 1 and math.dist(src, pts[end + 1]) <= max_gap:
-                    end += 1
-                end_w = end
-                if pad or kind:                          # a chord to an apex node may be a little longer than the arc window
-                    end_w = max(end, min(n - 1, bisect.bisect_right(arc, arc[i] + reach) - 1))
-                    while end_w < n - 1 and math.dist(src, pts[end_w + 1]) <= reach:
-                        end_w += 1
-            else:
-                end = end_w = n - 1
-            lo = bisect.bisect_right(cand, i)
-            candidates = cand[lo:bisect.bisect_right(cand, end_w)]
-            last = max_gap > 0 and end < n - 1 and math.dist(src, pts[n - 1]) <= max_gap + end_extra
-            if last and (not candidates or candidates[-1] != n - 1):
-                candidates = candidates + [n - 1]
-            elif not candidates and lo < len(cand):
-                candidates = [cand[lo]]                  # the next candidate is tried even beyond the window
-            nxt = cand[lo] if lo < len(cand) else -1
-            for j in candidates:
-                for tkind in ((0, 1) if j in apex else (0,)):
-                    dst = apex[j] if tkind else pts[j]
-                    if kind == 0 and tkind == 0 and j == i + 1:
-                        slack = 0
-                    else:
-                        if (kind or tkind) and max_gap > 0 \
-                                and math.dist(src, dst) > max_gap + (end_extra if j == n - 1 else 0.0):
-                            continue
-                        if kind == 0 and tkind == 0 and j > end and j != nxt and not (j == n - 1 and last):
-                            continue                     # a vertex chord stays inside the window of the plain solver
-                        if not visible(src, dst):
-                            continue
-                        ref = prefix[j] - prefix[i]
-                        over = cost(src, dst) - ref
-                        slack = 0 if over <= ref * 1e-9 + 1e-9 else int(math.ceil(over * 100.0 - 1e-9))
-                    if slack > budget:
-                        continue
-                    target = best[2 * j + tkind]
-                    for s, (count, path) in best[2 * i + kind].items():
-                        ns = s + slack
-                        if ns > budget:
-                            continue
-                        new = (count + 1, path + (2 * j + (tkind ^ flip),))
-                        if ns not in target or new < target[ns]:
-                            target[ns] = new
-    if not best[2 * (n - 1)]:
-        return None
-    _, _, path = min((count, s, path) for s, (count, path) in best[2 * (n - 1)].items())
-    if info is not None:
-        info["apexes_used"] = sum(1 for c in path if (c & 1) ^ flip)
-    return [apex[c >> 1] if (c & 1) ^ flip else pts[c >> 1] for c in path]
-
-
 def budget_pull(graph: Any, safety: Any, budget_m: float) -> Callable[..., List[Pt]]:
     """A `simplify` replacement for the gap fill (`node_policy_plan.insert_planned`): `fewest_waypoints` with this budget.
     It takes the plain line of sight (`unpriced_visible`): the price is in the budget."""
@@ -1207,20 +892,6 @@ def budget_pull(graph: Any, safety: Any, budget_m: float) -> Callable[..., List[
         return fewest_waypoints(points, visible, max_gap, cost, budget_m, thin_eps=thin_eps(graph))
     pull.unpriced_visible = True  # type: ignore[attr-defined]
     return pull
-
-
-def cell_clearance(graph: Any) -> Optional[Callable[[Pt], float]]:
-    """The lattice clearance (m, capped at `lazy_plan._CLR_CAP_M`; 0 on a non-navigable cell) of a point, read through
-    `deficit_cell` as in `waypoints_below_floor`; None for a graph without it."""
-    if not callable(getattr(graph, "deficit_cell", None)):
-        return None
-    from packages.services.mission_planner.lazy_plan import _CLR_CAP_M
-    h = float(graph.params.lattice)
-
-    def clearance(p: Pt) -> float:
-        d = graph.deficit_cell(int(math.floor(p[0] / h)), int(math.floor(p[1] / h)), _CLR_CAP_M)
-        return 0.0 if d is None else _CLR_CAP_M - d
-    return clearance
 
 
 def waypoints_below_floor(graph: Any, poses: Sequence[Any], safety: Any, floor: Optional[float]) -> int:
@@ -1248,8 +919,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   robot_length_m: Optional[float] = None,
                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                   width_check: bool = True, trajectory_max_points: int = 0,
-                  turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0,
-                  waypoint_apex: bool = False) -> ChartPlan:
+                  turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
@@ -1257,7 +927,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
                               node_policy_cfg, safety_kappa, width_check, trajectory_max_points, turn,
-                              waypoint_budget_m, waypoint_apex)
+                              waypoint_budget_m)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -1270,8 +940,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    robot_length_m: Optional[float] = None,
                    node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                    width_check: bool = True, trajectory_max_points: int = 0,
-                   turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0,
-                   waypoint_apex: bool = False) -> ChartPlan:
+                   turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -1290,9 +959,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     `turn_record` (None: no turn cost): its lambda goes into the route's `Safety` and the record into `ChartPlan.pricing`; the
     string pull has no turn term (a shortcut is judged by visibility and the priced cost only). `waypoint_budget_m` > 0 replaces
     the string pull by `fewest_waypoints` with that slack budget (the line of sight is then the plain one, the price is in
-    the budget); 0 = the string pull, unchanged. `waypoint_apex` (only with a budget and a turn lambda > 0, `fewest_waypoints`):
-    a corner waypoint may sit at the apex of a fillet arc of radius lambda; `ChartPlan.waypoint_apex` is the record; the plan
-    then has no `trajectory` when it uses one (an apex is not on the lattice path)."""
+    the budget); 0 = the string pull, unchanged."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -1340,14 +1007,9 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     if safety is not None and safety.rate > 0.0:
         visible = priced_visible(visible, graph, pts, safety)
     budget_record = None
-    apex_record = None
     if waypoint_budget_m > 0.0:
-        apex_info: Dict[str, int] = {}
-        radius = float(turn["lambda_m_per_rad"]) if waypoint_apex else 0.0
         pulled = fewest_waypoints(pts, plain, max_gap_m, chord_cost(graph, safety), waypoint_budget_m, MIN_END_STUB_M,
-                                  radius, cell_clearance(graph) if radius > 0.0 else None, visible, apex_info, thin_eps(graph))
-        if radius > 0.0:
-            apex_record = dict(apex_info)
+                                  thin_eps(graph))
         budget_record = {"waypoint_budget_m": waypoint_budget_m,
                          "waypoints_removed": max(0, len(simplify(pts, visible, max_gap_m)) - len(pulled))}
         pts = pulled
@@ -1402,11 +1064,6 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
             node_policy_cfg.get("budget_s", 0.0), safety=safety)
     pricing = None
-    validated = None
-    if getattr(route, "unvalidated", None) is not None:
-        validated = {"unvalidated_edges": int(route.unvalidated), "unvalidated_m": round(float(route.unvalidated_m), 3),
-                     "exact": bool(getattr(route, "exact", True))}
-    safety = priced_only(safety)
     if safety is not None and safety.rate == 0.0:            # a turn cost alone: no clearance fields
         pricing = {"kappa": 0.0, "margin": None, "rate": 0.0, "margin_source": None, "cost": int(route.cost),
                    "exact": bool(getattr(route, "exact", True)), "profile": "none", "k": None, "origin": None, "reach": None,
@@ -1424,4 +1081,4 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
-                     trajectory=legs, waypoint_budget=budget_record, waypoint_apex=apex_record, validated=validated)
+                     trajectory=legs, waypoint_budget=budget_record)

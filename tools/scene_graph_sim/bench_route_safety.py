@@ -44,6 +44,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+
+from packages.scene_graph import weights  # noqa: E402
 from scipy import ndimage
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -247,7 +249,8 @@ def run(args) -> None:
         """priced weights, length corridor: the engine's private helpers, nothing re-implemented"""
         ja, jb = s.keys.index(ka), s.keys.index(kb)
         keep = g._corridor_charts(ja, jb)
-        W = ChartGraph._edge_cost(s, safety)
+        d = safety.price(s.sp.clr_price)
+        W = weights.edge_costs(s.edges[2], d[s.edges[0]] + d[s.edges[1]], safety.rate)
         R, C, _ = s.edges
         ok = np.isin(s.full[R], list(keep)) & np.isin(s.full[C], list(keep))
         G = coo_matrix((np.r_[W[ok], W[ok]], (np.r_[R[ok], C[ok]], np.r_[C[ok], R[ok]])), shape=(sp.N, sp.N)).tocsr()
