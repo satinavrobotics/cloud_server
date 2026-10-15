@@ -158,6 +158,7 @@ class ChartGraph(SceneGraph):
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
         self._V = self._T = self._B = None
         self._Fn = None                         # close-evidence plane (params.near_range_m set): latest FREE time from within range
+        self._Bn = None                         # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
         self._hold = None                       # cells the rule holds blocked, after the away-from-walls filter (only with that filter)
         self._hold_prev = (None, 0, 0)          # (_hold, cx0, cy0) before the batch being folded: the dirty box includes its changes
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
@@ -205,12 +206,14 @@ class ChartGraph(SceneGraph):
         if plan["fresh"]:
             return dict(V=np.full((H, W), 255, np.uint8), T=-np.ones((H, W), np.int64), B=-np.ones((H, W), np.int64),
                         Fn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
+                        Bn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
                         chan={}, kp=None)
 
         def grow(a, fill):
             b = np.full((H, W), fill, a.dtype); b[oy:oy + h, ox:ox + w] = a; return b
         out = dict(V=grow(self._V, 255), T=grow(self._T, -1), B=grow(self._B, -1),
                    Fn=None if self._Fn is None else grow(self._Fn, -1),
+                   Bn=None if self._Bn is None else grow(self._Bn, -1),
                    chan={k: (grow(v, 255), grow(t, -1)) for k, (v, t) in self._chan.items()}, kp=None)
         if self._key_plane is not None:
             kp = np.full((H // 2, W // 2), -1, self._key_plane.dtype)
@@ -219,7 +222,7 @@ class ChartGraph(SceneGraph):
 
     def _commit_canvas(self, plan, arrays) -> Tuple[int, int]:
         self._V, self._T, self._B, self._chan = arrays["V"], arrays["T"], arrays["B"], arrays["chan"]
-        self._Fn = arrays["Fn"]
+        self._Fn, self._Bn = arrays["Fn"], arrays["Bn"]
         if arrays["kp"] is not None: self._key_plane = arrays["kp"]
         self._cx0, self._cy0 = plan["cx0"], plan["cy0"]
         return (0, 0) if plan["fresh"] else (plan["oy"] // 2, plan["ox"] // 2)
@@ -230,7 +233,7 @@ class ChartGraph(SceneGraph):
         return (0, 0) if plan is None else self._commit_canvas(plan, self._grow_canvas(plan))
 
     @staticmethod
-    def _fold_into(V, T, w, gx, gy, cx0, cy0, t, B=None, Fn=None, pose=None):
+    def _fold_into(V, T, w, gx, gy, cx0, cy0, t, B=None, Fn=None, pose=None, Bn=None):
         H, W = V.shape
         ox, oy = gx - cx0, gy - cy0
         ys0, xs0 = max(0, oy), max(0, ox); ys1, xs1 = min(H, oy + w.shape[0]), min(W, ox + w.shape[1])
@@ -248,7 +251,8 @@ class ChartGraph(SceneGraph):
             win = win | new_b
         if Fn is not None:
             # close evidence: a FREE report counts only from a capture pose within range (and, with a fov, inside the cone
-            # or within 0.3 m): `pose` = (x, y, yaw, range_m, fov_rad or None) in the map frame. Max-merge like B.
+            # or within 0.3 m): `pose` = (x, y, yaw, range_m, fov_rad or None) in the map frame. Max-merge like B. The same
+            # condition makes a LETHAL report true evidence (Bn): a lethal from beyond the range is ordinary latest-value evidence.
             px, py, yaw, rng, fov = pose
             ys = (np.arange(ys0, ys1) + cy0 + 0.5) * RES; xs = (np.arange(xs0, xs1) + cx0 + 0.5) * RES
             dy, dx = (ys - py)[:, None], (xs - px)[None, :]
@@ -260,6 +264,11 @@ class ChartGraph(SceneGraph):
             Fc = Fn[ys0:ys1, xs0:xs1]
             win = win | (fr & (t > Fc))
             Fc[fr] = np.maximum(Fc[fr], t)
+            if Bn is not None:
+                Nc = Bn[ys0:ys1, xs0:xs1]
+                ln = kn & (sub >= 100) & near
+                win = win | (ln & (t > Nc))
+                Nc[ln] = np.maximum(Nc[ln], t)
         if not win.any(): return None                                   # a replay of what is folded changes nothing
         ys, xs = np.nonzero(win)
         return (int(xs.min()) + xs0, int(ys.min()) + ys0, int(xs.max()) + 1 + xs0, int(ys.max()) + 1 + ys0)
@@ -384,7 +393,7 @@ class ChartGraph(SceneGraph):
             x1, y1 = min(region[2] - self._cx0, self._V.shape[1]), min(region[3] - self._cy0, self._V.shape[0])
             if x0 < x1 and y0 < y1:
                 self._V[y0:y1, x0:x1] = 255; self._T[y0:y1, x0:x1] = -1; self._B[y0:y1, x0:x1] = -1
-                if self._Fn is not None: self._Fn[y0:y1, x0:x1] = -1
+                if self._Fn is not None: self._Fn[y0:y1, x0:x1] = -1; self._Bn[y0:y1, x0:x1] = -1
                 for v, t in self._chan.values():
                     v[y0:y1, x0:x1] = 255; t[y0:y1, x0:x1] = -1
         touched = None                                   # global full-resolution cells whose value, time or blocked time changed
@@ -400,7 +409,7 @@ class ChartGraph(SceneGraph):
                 p = self.params
                 pose = (lf.x, lf.y, lf.yaw, p.near_range_m, None if p.near_fov_deg is None else math.radians(p.near_fov_deg))
             grow_touched(self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B,
-                                         self._Fn, pose))
+                                         self._Fn, pose, self._Bn))
             for name, cw in chans.items():
                 if name not in self._chan:
                     self._chan[name] = (np.full(self._V.shape, 255, np.uint8), -np.ones(self._V.shape, np.int64))
@@ -633,8 +642,9 @@ class ChartGraph(SceneGraph):
         V = self._V
         free = (V != 255) & (V < 100)
         if self._Fn is not None:
-            # close evidence: blocked more recently than seen free from close (and, with near_min_clearance_m, away from walls)
-            held = (V < 100) & (self._B >= 0) & (self._B > self._Fn)
+            # close evidence: reported lethal from within range more recently than seen free from within range (and, with
+            # near_min_clearance_m, away from walls). A lethal from beyond the range is not true evidence: a later free retracts it.
+            held = (V < 100) & (self._Bn >= 0) & (self._Bn > self._Fn)
             if self.params.near_min_clearance_m is not None:
                 held = _away_from_walls(held, V >= 100, self.params.near_min_clearance_m) if held.any() else held
                 self._hold = held
@@ -1163,7 +1173,7 @@ class ChartGraph(SceneGraph):
         self._check()
         p = self.params
         st = EngineState(params=_state_params(p),
-                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Hold=self._hold,
+                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Bn=self._Bn, Hold=self._hold,
                          chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
@@ -1190,7 +1200,11 @@ class ChartGraph(SceneGraph):
         padl = lambda a, fill: np.pad(a, pad // 2, constant_values=fill)
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
         self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
+        if p.near_range_m is not None and (st.Fn is None or st.Bn is None):
+            raise ValueError("state has no close-evidence planes (Fn, Bn): it was made before the lethal-from-within-range rule "
+                             "(pipeline morse/2+near3|near4) and must be rebuilt, not resumed")
         self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
+        self._Bn = None if p.near_range_m is None else padf(st.Bn, -1)
         self._hold = None
         self._chan = {k: (padf(v, 255), padf(t, -1)) for k, (v, t) in st.chan.items()}
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,

@@ -72,16 +72,20 @@ def unpack_json(blob: bytes):
 
 def effective_v(t: dict) -> np.ndarray:
     """The occupancy plane of a stored tile as navigable-space construction reads it. Without the close-evidence rule that is `v`.
-    With it (the tile carries `fn`) a cell that `v` calls free but whose latest blocked time `b` is newer than its latest close
-    free report `fn` reads blocked (100): the same cells `ChartGraph._build_F` removes from free space, so a reader that works
-    from tiles (clearance, line of sight, snap) sees what the engine saw. With the away-from-walls filter the tile carries the
-    engine's final mask `hold` (its components cross tile edges, so a tile cannot recompute it) and that mask is used instead.
-    The stored `v` is untouched (the fold continues from it)."""
+    With it (the tile carries `fn` and `bn`) a cell that `v` calls free but whose latest lethal time FROM WITHIN RANGE `bn` is newer
+    than its latest close free report `fn` reads blocked (100): the same cells `ChartGraph._build_F` removes from free space, so a
+    reader that works from tiles (clearance, line of sight, snap) sees what the engine saw. With the away-from-walls filter the tile
+    carries the engine's final mask `hold` (its components cross tile edges, so a tile cannot recompute it) and that mask is used
+    instead. The stored `v` is untouched (the fold continues from it). A tile with `fn` but neither `hold` nor `bn` (a store of the
+    earlier rule, which the pipeline token refuses) reads as `v`: there is no fallback to the latest blocked time `b`."""
     v, fn = t["v"], t.get("fn")
     if fn is None:
         return v
     hold = t.get("hold")
-    held = (v < 100) & ((hold != 0) if hold is not None else (t["b"] >= 0) & (t["b"] > fn))
+    bn = t.get("bn")
+    if hold is not None: held = (v < 100) & (hold != 0)
+    elif bn is not None: held = (v < 100) & (bn >= 0) & (bn > fn)
+    else: return v
     if not held.any():
         return v
     out = v.copy()

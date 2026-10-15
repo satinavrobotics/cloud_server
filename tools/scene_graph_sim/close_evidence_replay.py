@@ -1,7 +1,8 @@
 """Replay of the close-evidence rule on a leaf export (design: docs/scene_graph/close_evidence_and_turn_cost_design.md, part A).
 
-Per cell, over the leaves in capture order: `V` latest known value (today's fold), `B` latest blocked time, `Fnear` latest free
-time from a capture pose within r_det. A cell is blocked by the rule when it is free today and B > Fnear. Reports the cells that
+Per cell, over the leaves in capture order: `V` latest known value (today's fold), `B` latest blocked time, `Bn` latest blocked time
+from a capture pose within r_det, `Fnear` latest free time from within r_det. A cell is blocked by the rule when it is free today and
+Bn >= 0 and Bn > Fnear. Reports the cells that
 turn blocked, the navigable (production `_build_F`) change, and for every component with a cell farther than --away m from a
 blocked cell: its size, place, the lethal share of its close and its far captures, the share of its cells never seen free from
 close, and the nearest robot pose. Read-only; NOT the engine's fold and not a format.
@@ -39,7 +40,7 @@ def main():
     recs = sorted(((lf.stamp_ms, lf.x, lf.y) + eng._fold_leaf(lf)[:3] + (lf.yaw,) for lf in leaves), key=lambda r: r[0])
     sh = (H, W)
     V = np.full(sh, 255, np.uint8); T = -np.ones(sh, np.int64)
-    B = -np.ones(sh, np.int64); Fn = -np.ones(sh, np.int64)
+    B = -np.ones(sh, np.int64); Bn = -np.ones(sh, np.int64); Fn = -np.ones(sh, np.int64)
     ncl = np.zeros(sh, np.int32); ncb = np.zeros(sh, np.int32); nfa = np.zeros(sh, np.int32); nfb = np.zeros(sh, np.int32)
     for t, x, y, gx, gy, w, yaw in recs:
         h, wd = w.shape
@@ -58,12 +59,13 @@ def main():
         Tc, Vc = T[sl], V[sl]
         win = kn & ((Tc < 0) | (t > Tc) | ((t == Tc) & (sub > Vc)))
         Tc[win] = t; Vc[win] = sub[win]
-        Bc, Fc = B[sl], Fn[sl]
+        Bc, Nc, Fc = B[sl], Bn[sl], Fn[sl]
         Bc[kn & bl] = np.maximum(Bc[kn & bl], t)
+        Nc[kn & bl & close] = np.maximum(Nc[kn & bl & close], t)    # lethal from within r_det: the only true lethal evidence
         Fc[kn & ~bl & close] = np.maximum(Fc[kn & ~bl & close], t)
         ncl[sl] += kn & close; ncb[sl] += kn & bl & close; nfa[sl] += kn & ~close; nfb[sl] += kn & bl & ~close
     free = (V != 255) & (V < 100)
-    flip = free & (B >= 0) & (B > Fn)
+    flip = free & (Bn >= 0) & (Bn > Fn)
     assert (V == eng._V).all(), "replay differs from the engine's folded V"
     keep_old = eng._build_F((0, 0))[0]
     Vs = eng._V

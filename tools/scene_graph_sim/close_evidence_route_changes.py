@@ -47,7 +47,7 @@ def _nav_cell(eng, ix, iy):
 def _held(eng):
     """(cells, components) the rule holds in `eng`, after the filter when it has one"""
     if eng._Fn is None: return 0, 0
-    h = eng._hold if eng._hold is not None else (eng._V < 100) & (eng._B >= 0) & (eng._B > eng._Fn)
+    h = eng._hold if eng._hold is not None else (eng._V < 100) & (eng._Bn >= 0) & (eng._Bn > eng._Fn)
     return int(h.sum()), int(ndimage.label(h, structure=np.ones((3, 3)))[1])
 
 

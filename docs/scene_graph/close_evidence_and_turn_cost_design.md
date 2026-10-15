@@ -28,6 +28,15 @@ channel; it does not gate `F`. So a cell reported lethal once is free again afte
 
 ### A.2 The rule (colleague's proposal, stated so that it stays a fold)
 
+**Current statement (A.6e, 2026-10-15).** The support channel's lethal and its free are both trustworthy only within `r_det`
+(`near_range_m`). Per cell keep three max-merge planes: `B` (latest capture time that reported the cell blocked, from any
+distance: exists, feeds `ever_blocked` and the statistics), `Fnear` (latest capture time that reported it free **from a capture
+pose within `r_det`**, and inside the optional cone) and `Bn` (latest capture time that reported it **lethal from a capture pose
+within `r_det`**, same condition). A cell is held when its latest value is free and `Bn >= 0 and Bn > Fnear` (ties: held). A lethal
+from beyond `r_det` is ordinary latest-value evidence: any later free report from anywhere retracts it. The paragraphs below are the
+first statement of the rule, which used `B` for the held test and said "a lethal report is evidence from anywhere"; that is what
+A.6e replaces.
+
 A free report is evidence only from where the sensor could have seen the hazard; a lethal report is evidence from anywhere.
 Per cell keep two max-merge planes:
 
@@ -145,7 +154,10 @@ Recommendation: option 1. The largest component is the stairs and a per-cell con
 the stairs free, so the extra parameter buys ghost protection at the price of the hazard it is meant for. The ghost cost of
 option 1 is real but not demonstrated on this map: the other 14 components are small (404 cells, 1.0 m2 in total). A second session would show whether any of them is a ghost; it is no longer needed to decide for the stairs.
 
-### A.6b What is built (merged into `main`, off by default; the filter of A.6c is on a branch)
+### A.6b What is built (merged into `main`, off by default; the filter of A.6c is on a branch; held by `Bn`, not `B`, since A.6e)
+
+Read `B >= 0 and B > Fn` below as `Bn >= 0 and Bn > Fn` and the pipeline tokens `+near1` / `+near2` as `+near3` / `+near4` (A.6e);
+the text is kept as it was written.
 
 * `SceneParams.near_range_m` and `near_fov_deg` (both None = off, bit-identical to the latest-value fold); a new int64 plane `Fn`
   (allocated only when on; grown, shifted and cropped like `B`); `_fold_into(..., Fn, pose)`; `_build_F` excludes cells with
@@ -214,6 +226,48 @@ same numbers on another map, export its leaves (read-only; `tools/scene_graph_si
 `docker exec -i docker_compose-graph-builder-service-1 python - <map> /tmp/sg_export < tools/scene_graph_sim/export_live.py`,
 `docker cp docker_compose-graph-builder-service-1:/tmp/sg_export/. tools/scene_graph_sim/data/<map>/`, then
 `python tools/scene_graph_sim/close_evidence_route_changes.py --data tools/scene_graph_sim/data/<map> --rdet 1.5 --min-clearance 0.25`.
+
+### A.6e Ghost fix: lethal evidence only from within range (2026-10-15, branch `feat/close-lethal-hold`, off by default)
+
+The problem. The held test used `B`, the latest time ANY lethal report arrived, from any distance. A cell whose only lethal
+evidence came from beyond `r_det` (a person seen from 4 m who then left, retracted by a free report from 4 m) was held as well:
+a ghost that no free report from beyond range could clear and that only a close look would. The support channel does not judge
+cells beyond `commit_radius_m` (A.2), so a lethal from there is no more "true" than a free from there.
+
+The rule. A new int64 plane `Bn` (-1 = none): the latest capture time that reported the cell lethal from a capture pose within
+`near_range_m` (the same distance and optional cone condition as `Fn`). Max-merge, so the fold stays commutative, associative and
+idempotent. Held = latest value free and `Bn >= 0 and Bn > Fn` (ties: held); the away-from-walls filter then applies to that held
+set exactly as before. `B` is unchanged. Cases: lethal beyond range then free beyond range: free (was held); lethal within range,
+free beyond range: held; lethal within range, free within range later: free; lethal beyond range only, never freed: the latest
+value, blocked.
+
+What changed. Engine: `_Bn` (allocated only when the rule is on; grown, shifted, cropped and reset in the refold region like
+`_Fn`), `_fold_into(..., Bn)`, `_build_F` uses `Bn`, `EngineState.Bn`. Store: tile plane `bn` beside `fn` (only when on),
+`FORMAT` stays 4, **pipeline tokens `morse/2+near3` (rule only: `fn`, `bn`) and `morse/2+near4` (rule + filter: `fn`, `bn`,
+`hold`)**; `+near1` / `+near2` are no longer defined (`store.RETIRED_PIPELINES`, kept only to be refused). `effective_v` takes
+`hold` when the tile has it, else `bn > fn` when `bn` is present, else reads `v` (no fallback to `b > fn`). No setting changed.
+
+Rebuild consequence. The semantics of the stored held set changed, so a store of the earlier rule is not reused: its pipeline token
+differs, hence its params hash, so the worker rebuilds every rule-on map in a new generation (`runbook.md` section 3) when the new
+code starts. Reading such a store directly (`SceneGraphStore.load`, `import_state`) raises a `ValueError` saying it was made before
+this rule and must be rebuilt; it is never silently mis-read. A rule-off store is untouched (byte-identical, `morse/2`).
+
+Measured on office8 (97 leaves, `near_range_m` 1.5, no cone; `close_evidence_engine_check.py`, `--old-rule` for the previous rule):
+
+| | old rule (`B`) | new rule (`Bn`) |
+|---|---|---|
+| cells held, rule only (components) | 2685 (318) | 1471 (143) |
+| navigable lattice cells (0.1 m), rule only | 2143 -> 1889 (-11.9%) | 2143 -> 1919 (-10.5%) |
+| cells held with the filter 0.25 m (components) | 1072 (15) | 776 (12) |
+| navigable lattice cells with the filter | 2143 -> 1955 (-8.8%) | 2143 -> 1973 (-7.9%) |
+| 150 pairs rule only: same / changed / start or goal lost / unroutable | 103 / 13 / 34 / 0 | 109 / 14 / 27 / 0 |
+| 150 pairs rule + filter | 121 / 4 / 25 / 0 | 123 / 6 / 21 / 0 |
+
+The stairs component (x 1.2, y -3.5) stays held: 641 of its 668 cells under the old rule (the 27 cells
+no lethal report from within range ever covered are no longer held). Gates:
+`accept_route_safety.py --near-range 1.5 --near-min-clearance 0.25` all pass (A5 lazy == engine 0 / 150, N1 776 cells and 12
+components equal to the independent filter), the default run is unchanged. `close_evidence_replay.py` (independent replay) now
+holds by `Bn` too and reports the same 1471 and 776 / 12.
 
 ### A.7 What is not shown
 

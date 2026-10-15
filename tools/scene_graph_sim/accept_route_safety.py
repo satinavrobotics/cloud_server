@@ -100,7 +100,7 @@ class Reference:
         if eng._Fn is not None:
             # the close-evidence rule, again and independently: components and one distance transform over the whole canvas
             # (the engine crops one per component)
-            held = free & (eng._B >= 0) & (eng._B > eng._Fn)
+            held = free & (eng._Bn >= 0) & (eng._Bn > eng._Fn)
             mc = eng.params.near_min_clearance_m
             if mc is not None and held.any():
                 far = ndimage.distance_transform_edt(~(V >= 100)) * RES > mc
