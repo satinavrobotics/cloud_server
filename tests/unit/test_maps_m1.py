@@ -578,6 +578,100 @@ class TestCreate:
         code, _ = await _status(maps.create_map(None, ["yard"], PUB))
         assert code == 422
 
+    async def test_scene_graph_params_default_when_absent(self, fdb):
+        out = await maps.create_map(None, {"name": "a", "type": "local"}, PUB)
+        want = {"schema_version": 1, "chart_radius_m": 2.0, "close_evidence_range_m": 1.3,
+                "robot_half_side_m": 0.25, "place_rule": False}
+        assert out["scene_graph_params"] == want
+        assert fdb.maps["a"]["spec"]["scene_graph_params"] == want
+
+    async def test_scene_graph_params_stored_and_partial_defaults(self, fdb):
+        out = await maps.create_map(None, {"name": "a", "type": "local",
+                                           "scene_graph_params": {"chart_radius_m": 3.5}}, PUB)
+        assert out["scene_graph_params"] == {"schema_version": 1, "chart_radius_m": 3.5,
+                                             "close_evidence_range_m": 1.3,
+                                             "robot_half_side_m": 0.25, "place_rule": False}
+
+    async def test_scene_graph_params_null_range_means_off(self, fdb):
+        out = await maps.create_map(None, {"name": "a", "type": "local", "scene_graph_params":
+                                           {"close_evidence_range_m": None}}, PUB)
+        assert out["scene_graph_params"]["close_evidence_range_m"] is None
+        assert fdb.maps["a"]["spec"]["scene_graph_params"]["close_evidence_range_m"] is None
+
+    @pytest.mark.parametrize("params,field", [
+        ({"chart_radius_m": 0.24}, "__root__"),
+        ({"chart_radius_m": 0.0}, "chart_radius_m"),
+        ({"chart_radius_m": 0.5, "robot_half_side_m": 0.6}, "__root__"),
+        ({"robot_half_side_m": 0}, "robot_half_side_m"),
+        ({"robot_half_side_m": -0.1}, "robot_half_side_m"),
+        ({"place_rule": "maybe"}, "place_rule"),
+        ({"chart_radius_m": 5.01}, "chart_radius_m"),
+        ({"chart_radius_m": "x"}, "chart_radius_m"),
+        ({"chart_radius_m": float("nan")}, "chart_radius_m"),
+        ({"chart_radius_m": None}, "chart_radius_m"),
+        ({"close_evidence_range_m": 0}, "close_evidence_range_m"),
+        ({"close_evidence_range_m": -1.0}, "close_evidence_range_m"),
+        ({"close_evidence_range_m": 3.01}, "close_evidence_range_m"),
+        ({"schema_version": 2}, "schema_version"),
+        ({"near_min_clearance_m": 0.5}, "near_min_clearance_m"),
+    ])
+    async def test_invalid_scene_graph_params_is_422(self, fdb, params, field):
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "scene_graph_params": params}, PUB))
+        assert code == 422 and detail[0]["loc"][-1] == field and "a" not in fdb.maps
+
+    @staticmethod
+    def _robot(fdb, name, length, width):
+        from cloud_common.objects.robot import RobotTypeIdentifierV1
+        fdb.robots[name] = RobotObjectV1(name=name, status=RobotStatusV1(
+            factsheet=RobotTypeIdentifierV1(length=length, width=width)))
+
+    async def test_robot_name_sets_half_of_the_smaller_side(self, fdb):
+        self._robot(fdb, "r1", 1.2, 0.7)
+        out = await maps.create_map(None, {"name": "a", "type": "local", "robot_name": "r1"}, PUB)
+        assert out["scene_graph_params"]["robot_half_side_m"] == 0.35
+        assert fdb.maps["a"]["spec"]["scene_graph_params"]["robot_half_side_m"] == 0.35
+        assert "robot_name" not in fdb.maps["a"]["spec"]
+
+    async def test_robot_name_keeps_the_other_params(self, fdb):
+        self._robot(fdb, "r1", 1.2, 0.7)
+        out = await maps.create_map(None, {"name": "a", "type": "local", "robot_name": "r1",
+                                           "scene_graph_params": {"chart_radius_m": 3.0,
+                                                                  "place_rule": True}}, PUB)
+        p = out["scene_graph_params"]
+        assert (p["chart_radius_m"], p["place_rule"], p["robot_half_side_m"]) == (3.0, True, 0.35)
+
+    async def test_unknown_robot_is_404(self, fdb):
+        code, _ = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "ghost"}, PUB))
+        assert code == 404 and "a" not in fdb.maps
+
+    async def test_footprint_not_reported_is_409_not_a_default(self, fdb):
+        self._robot(fdb, "r1", -1, -1)
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "r1"}, PUB))
+        assert code == 409 and "footprint" in detail and "a" not in fdb.maps
+
+    async def test_robot_name_and_explicit_half_side_is_422(self, fdb):
+        self._robot(fdb, "r1", 1.2, 0.7)
+        code, _ = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "r1",
+                   "scene_graph_params": {"robot_half_side_m": 0.3}}, PUB))
+        assert code == 422 and "a" not in fdb.maps
+
+    async def test_footprint_larger_than_chart_radius_is_422(self, fdb):
+        self._robot(fdb, "big", 6.0, 6.0)   # half side 3.0
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "big",
+                   "scene_graph_params": {"chart_radius_m": 2.0}}, PUB))
+        assert code == 422 and "chart_radius_m" in detail[0]["msg"] and "a" not in fdb.maps
+
+    async def test_effective_params_of_an_old_row(self):
+        from cloud_common.objects.map import effective_scene_graph_params
+        old = MapSpecV1(type="local")
+        assert old.scene_graph_params is None
+        assert effective_scene_graph_params(old).chart_radius_m == 2.0
+
 
 def _obj(name, lifecycle="ALIVE", **kw):
     status = kw.pop("status", {})
