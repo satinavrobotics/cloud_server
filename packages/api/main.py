@@ -127,6 +127,8 @@ class NavigationResponse(BaseModel):
     footprint: Optional[Dict[str, Any]] = Field(
         None, description="Robot-vs-map footprint check {robot_half_side_m, map_half_side_m, chart_radius_m, status, message}; "
                           "status 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings) | 'exceeds_chart' (refused, failed_at 'footprint')")
+    goal_far: Optional[Dict[str, Any]] = Field(
+        None, description="Goal-far notice, present when the route's goal is far from verified space: {goal_xy [x, y] as asked, free_xy [x, y] the nearest free cell the route ends at, distance_from_free_m, limit_m (the map's close-evidence range), unverified_length_m (metres of the route not validated by close evidence; null = unknown, the store has no validity plane; never 0 for unknown)}; null otherwise")
     trajectory: Optional[List[Dict[str, Any]]] = Field(
         None, description="The planner's dense path per leg between the go-to route's consecutive waypoints: "
                           "[{from_index, to_index, points: [[x, y], ...]}], map frame. Display data; a leg may be "

@@ -469,6 +469,13 @@ side against the half side the map was built for. `status` is `ok`, `larger_than
 failure, `success: false`, `failed_at: "footprint"`, `error` = `message`, with no legacy fallback. Absent for
 the legacy planner and for maps without scene-graph parameters.
 
+They also carry `goal_far` when the route's goal is far from verified space (the goal lies beyond the map's
+close-evidence range from free space; it is planned to the nearest free cell, not refused):
+`{goal_xy, free_xy, distance_from_free_m, limit_m, unverified_length_m}`, `goal_xy` and `free_xy` as `[x, y]`.
+`unverified_length_m` is the metres of the route not validated by close evidence, or `null` when the store has
+no validity plane (unknown; it is never reported as 0). Absent (`null`) when the goal is within range or for the
+legacy planner.
+
 **Error Response:**
 ```json
 {
