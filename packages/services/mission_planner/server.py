@@ -19,7 +19,7 @@ from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
 from packages.utils import blocked_geometry, blocked_nodes
 from packages import config
-from packages.services.mission_planner import node_policy_plan, scene_route, trajectory
+from packages.services.mission_planner import footprint_check, node_policy_plan, scene_route, trajectory
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -43,6 +43,8 @@ class RobotNotPlacedError(ValueError):
 # find_closest_node_to_robot's error text for RobotNotPlacedError (-> failed_at
 # "robot_not_placed", 409 at POST /api/v1/navigate).
 NOT_PLACED_PREFIX = "not placed: "
+# _chart_route's reason for a robot larger than the map's chart radius: plan_route refuses instead of falling back
+REASON_FOOTPRINT = "footprint_exceeds_chart"
 
 
 def _is_real_map(map_id: Optional[str]) -> bool:
@@ -250,6 +252,11 @@ class MissionPlannerService:
         except RobotNotPlacedError:
             return None, "robot_not_placed"       # the legacy path reports it to the caller
         graph, version = await self._scene_cache.get(map_id, deadline)
+        footprint = footprint_check.footprint_check(graph, self._robot_width(robot), self._robot_length(robot))
+        if ctx is not None and footprint is not None:
+            ctx["footprint"] = footprint
+        if footprint is not None and footprint["status"] == footprint_check.EXCEEDS_CHART:
+            return None, REASON_FOOTPRINT       # a refusal, not a fallback: plan_route reports it
 
         # the version's ingest lag (a DB query on the I/O pool) and the blocked rows (Postgres)
         # are independent: ask both at once; an unknown lag never rejects
@@ -353,6 +360,7 @@ class MissionPlannerService:
             "planner": scene_route.PLANNER_SCENE_GRAPH,
             "min_width": plan.min_width, "chart_keys": plan.charts,
             "graph_version": version,
+            **({"footprint": footprint} if footprint is not None else {}),
             **({"pricing": plan.pricing} if plan.pricing is not None else {}),
             **({"waypoint_budget": plan.waypoint_budget} if plan.waypoint_budget is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
@@ -1221,6 +1229,13 @@ class MissionPlannerService:
             chart, reason = await self._try_chart_route(
                 robot_name, map_id, target_x, target_y, robot_pose, ignore_exclusions, ctx)
             known_robot = ctx.get("robot")
+            if reason == REASON_FOOTPRINT:
+                result["footprint"] = ctx["footprint"]
+                result["error"] = ctx["footprint"]["message"]
+                result["failed_at"] = "footprint"
+                return result
+            if ctx.get("footprint") is not None:
+                result["footprint"] = ctx["footprint"]
             self._chart_outcomes[reason or "served"] = \
                 self._chart_outcomes.get(reason or "served", 0) + 1
             if chart is not None:
