@@ -27,6 +27,14 @@ def robot_place_scales(half_side_m: float):
     return half_side_m * SQRT2, 2.0 * half_side_m
 
 
+def place_params_from_half_side(half_side_m: float):
+    """(place_peak_m, place_path_m) for SceneParams from the robot's half side: the single derivation both the builder and the
+    engine use, so a map's place thresholds are never typed twice."""
+    if not (0.0 < half_side_m < float("inf")):
+        raise ValueError("robot half side must be finite and > 0, got %r" % (half_side_m,))
+    return robot_place_scales(half_side_m)
+
+
 def geodesic_span(ys: np.ndarray, xs: np.ndarray, h: float) -> float:
     """The longest shortest-path distance (m) between two cells of a set, moving between 8-neighbours (a diagonal step costs
     sqrt(2) h). Only the largest connected piece of the set is measured; 0 for fewer than two cells."""

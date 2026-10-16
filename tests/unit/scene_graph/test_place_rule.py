@@ -28,6 +28,13 @@ def test_robot_scales_are_circumscribed_radius_and_side():
     assert math.isclose(peak, 0.25 * math.sqrt(2)) and math.isclose(path, 0.5)
 
 
+def test_place_params_derive_from_the_half_side_once():
+    peak, path = place.place_params_from_half_side(0.25)
+    assert (peak, path) == place.robot_place_scales(0.25)
+    with pytest.raises(ValueError):
+        place.place_params_from_half_side(0.0)
+
+
 def test_geodesic_span_of_a_straight_strip_is_its_length():
     ys, xs = _strip(6)
     assert math.isclose(place.geodesic_span(ys, xs, 0.1), 0.5)
