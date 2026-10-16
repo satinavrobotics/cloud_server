@@ -303,8 +303,8 @@ graph-builder, dispatch, planner; with 2e0b63a).
   one query (`map_sessions` ⋈ `mapobjectv1` ⋈ `robotobjectv1`), cached 1 s per robot, so a
   pause/finish takes effect within ~1 s without a second LISTEN connection. Nodes **and** images
   go to the session's map; the payload `map_id` is ignored (images used to land in `default`).
-  Dropped, with a reason: `no_session`, `map_deleting`, `map_missing`, `operate_session` and
-  `session_paused` (since §14.17: only an unpaused mapping session takes data), `session_unplaced`,
+  Dropped, with a reason: `no_session`, `map_deleting`, `map_missing`, and
+  `session_paused` (since §14.17 an unpaused session takes data; since 2026-10-16 an operate session too, `operate_session` retired), `session_unplaced`,
   `datum_changed` (a session whose robot datum changed since
   it started and cannot be re-anchored: a local map, or a datum in another UTM zone; on a geo
   map a restart is re-anchored, see §13.4),
@@ -968,10 +968,10 @@ only an unpaused mapping session takes data.*
 
 An audit of the mapping / operate session lifecycle; the behaviour changes:
 
-- **Ingest (decision B).** Nothing is written to a map during an operate session: graph-builder
-  drops a node / image / depth of a robot whose open session is an operate session
-  (`operate_session`) or a paused mapping session (`session_paused`), reported like the other
-  rejections (`MAP.INGEST_REJECTED`). Only an open, unpaused, placed mapping session adds data.
+- **Ingest (decision B, reversed 2026-10-16).** graph-builder now also stores a node / image /
+  depth / costmap of a robot whose open session is an OPERATE session (it was dropped as
+  `operate_session`); a paused session (`session_paused`) is still dropped, reported as
+  `MAP.INGEST_REJECTED`. Only an open, unpaused, placed session adds data.
 - **A start during a pending SLAM save.** A finish saves the SLAM map in the background (minutes)
   and, when the save ends, PUTs the previous intent back with `topomap: false` (mapping API). A
   new session started (or resumed) meanwhile was silently killed by that PUT and its SLAM start

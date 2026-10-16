@@ -5,15 +5,14 @@ graph-builder no longer writes to the robot's old `current_map` (removed in U6) 
 and stops it through the robot's orchestrator, packages/api/mapping_switch.py; it may also be
 started by hand there). Every node and image from that robot goes to the map of the robot's
 **open session** (`map_sessions`, one per robot at most) using that session's map_T_session,
-whatever state the map is in, when that session is an unpaused MAPPING session (an operate session
-adds no data, decision B 2026-10-09). A `session_id` in the payload is not checked (the robot does
+whatever state the map is in, when that session is unpaused (mapping or operate: since 2026-10-16 an
+operate session takes data too; it was dropped as `operate_session` before). A `session_id` in the payload is not checked (the robot does
 not know cloud sessions; a different one is only logged at debug). Otherwise it is dropped:
 
     reason            when
     no_session        the robot has no open session (no current map)
     map_deleting      the map is being deleted (object lifecycle DELETING)
     map_missing       the session names a map without a Postgres row
-    operate_session   its session is an operate session (the robot uses the map, adds nothing)
     session_paused    its mapping session is paused (a node still in flight after the pause)
     session_unplaced  its session is not placed (maps §14: no transform yet, until the robot is
                       placed on the map; any session after the robot's run frame reset, until it
@@ -94,14 +93,13 @@ REJECT_EVENT_INTERVAL_S = 60.0
 
 NO_SESSION = "no_session"
 SESSION_UNPLACED = "session_unplaced"
-OPERATE_SESSION = "operate_session"
 SESSION_PAUSED = "session_paused"
 MAP_DELETING = "map_deleting"
 MAP_MISSING = "map_missing"
 DATUM_CHANGED = "datum_changed"
 LOOKUP_FAILED = "lookup_failed"
 BUFFER_FULL = "buffer_full"
-REASONS = (NO_SESSION, MAP_DELETING, MAP_MISSING, OPERATE_SESSION, SESSION_PAUSED,
+REASONS = (NO_SESSION, MAP_DELETING, MAP_MISSING, SESSION_PAUSED,
            SESSION_UNPLACED, DATUM_CHANGED, LOOKUP_FAILED, BUFFER_FULL)
 
 # One row per robot at most (partial unique index map_sessions_one_open_per_robot).
@@ -170,8 +168,8 @@ class Resolution:
 
 def decide(robot_name: str, session: Optional[OpenSession],
            payload_session_id: Any = None) -> Resolution:
-    """The ingest rule (pure): see the module docstring. Only an unpaused mapping session
-    takes data; the map's state and a differing payload session_id do not reject."""
+    """The ingest rule (pure): see the module docstring. Only an unpaused, placed session
+    (mapping or operate) takes data; the map's state and a differing payload session_id do not reject."""
     psid = str(payload_session_id) if payload_session_id not in (None, "") else None
     if session is None:
         return Resolution(robot_name, None, NO_SESSION, psid)
@@ -179,8 +177,6 @@ def decide(robot_name: str, session: Optional[OpenSession],
         reason = MAP_MISSING
     elif session.map_lifecycle == "DELETING":
         reason = MAP_DELETING
-    elif session.purpose == map_sessions.OPERATE:
-        reason = OPERATE_SESSION
     elif session.paused:
         reason = SESSION_PAUSED
     elif not session.aligned:

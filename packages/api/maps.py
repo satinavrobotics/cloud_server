@@ -54,8 +54,8 @@ Start rules:
 
 A session that is not placed keeps nothing (graph-builder rejects its nodes with
 `session_unplaced`; its service still runs), gets no route orders on that map and no planned paths.
-graph-builder also keeps nothing from an OPERATE session (`operate_session`) or a PAUSED one
-(`session_paused`): only an open, unpaused, placed mapping session adds data.
+graph-builder also keeps nothing from a PAUSED session (`session_paused`): only an open,
+unpaused, placed session (mapping or operate) adds data.
 
 Map lifecycle: draft -> mapping <-> paused -> ready (finish) -> archived -> ready|draft
 (restore). Only MAPPING sessions move it; operate sessions leave the map state alone. A finish
