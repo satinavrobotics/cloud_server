@@ -409,8 +409,7 @@ class MapIngestRejected(Payload):
     not_mapping_session, map_not_mapping, session_mismatch. Rate-limited per robot and reason:
     `dropped_nodes` / `dropped_images` count every drop since `since` (the first drop not yet
     reported). `reason`: no_session, map_deleting, session_unplaced (maps §14: not placed yet),
-    operate_session (an operate session adds no data), session_paused (a paused mapping
-    session), map_missing, datum_changed (not re-anchorable: local map, other UTM
+    session_paused (a paused session; `operate_session` was retired 2026-10-16: operate sessions take data), map_missing, datum_changed (not re-anchorable: local map, other UTM
     zone), lookup_failed, buffer_full (an image / depth / costmap that would wait for its node
     found the upload buffer at its cap; never for nodes). `dropped_depth` (3D reconstruction R2): depth images dropped (absent
     on events written before R2); `dropped_costmap`: costmap layers dropped (absent on older
