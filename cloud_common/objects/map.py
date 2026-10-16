@@ -80,6 +80,70 @@ class ApproxLocationV1(pydantic.BaseModel):
         ..., description="When the server stored it (UTC).")
 
 
+# Scene-graph parameters chosen when a map is created. The bounds are not validated limits: the
+# measured values are the defaults; the upper bounds are the scene-graph side's proposals.
+SCENE_GRAPH_PARAMS_VERSION = 1
+CHART_RADIUS_DEFAULT_M = 2.0
+CHART_RADIUS_MAX_M = 5.0     # proposal
+CLOSE_EVIDENCE_RANGE_DEFAULT_M = 1.3
+CLOSE_EVIDENCE_RANGE_MAX_M = 3.0   # proposal
+ROBOT_HALF_SIDE_DEFAULT_M = 0.25
+
+
+class SceneGraphParamsV1(pydantic.BaseModel):
+    """How a map's scene graph is built (packages/scene_graph, SceneParams.chart_radius and
+    .near_range_m). Chosen at map creation and immutable: the builder copies the values into the
+    graph's manifest when it first creates it, and the manifest wins from then on.
+
+    Strict types: the float fields take an int or a float (stored as float) but not a bool or a
+    string, place_rule only a bool, schema_version only an int.
+
+    Rolling deploys: Extra.forbid also applies when the builder reads stored rows
+    (graph_builder/scene_host.spec_params). Adding a key therefore needs every reader deployed
+    before the API starts writing it, else an older builder raises on the new rows. If that
+    ordering becomes a burden, a separate lenient read model (Extra.ignore) for readers is the
+    way out; the request model stays forbid."""
+    schema_version: pydantic.conint(strict=True, ge=1, le=SCENE_GRAPH_PARAMS_VERSION) = pydantic.Field(
+        SCENE_GRAPH_PARAMS_VERSION,
+        description="Version of this object's layout.")
+    chart_radius_m: float = pydantic.Field(
+        CHART_RADIUS_DEFAULT_M, gt=0, le=CHART_RADIUS_MAX_M,
+        description="Partition scale of the map (m): every chart is within this geodesic distance "
+                    "of its net point. At least robot_half_side_m.")
+    close_evidence_range_m: Optional[float] = pydantic.Field(
+        CLOSE_EVIDENCE_RANGE_DEFAULT_M, gt=0, le=CLOSE_EVIDENCE_RANGE_MAX_M,
+        description="Close-evidence sight range (m), also the map's goal acceptance distance. "
+                    "null: close evidence off (goal acceptance then uses the global "
+                    "SCENE_GRAPH_GOAL_SNAP_M).")
+    robot_half_side_m: float = pydantic.Field(
+        ROBOT_HALF_SIDE_DEFAULT_M, gt=0,
+        description="Half the robot's footprint side (m), the engine's robot_half_side. Taken from "
+                    "the robot's factsheet footprint at map creation only, never overridden "
+                    "afterwards.")
+    place_rule: pydantic.StrictBool = pydantic.Field(
+        False, description="When true the engine also writes place_peak_m and place_path_m, "
+                            "derived from robot_half_side_m (scene_graph/place.py).")
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+    @pydantic.validator("chart_radius_m", "close_evidence_range_m", "robot_half_side_m",
+                        pre=True, allow_reuse=True)
+    def _number_not_bool_or_str(cls, value):  # noqa: N805 - pydantic v1 validator
+        # bool is an int subclass and v1 coerces "2.0" and True to floats: refuse both
+        if value is None:
+            return value   # close_evidence_range_m: null = off (the others reject it as required)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError("must be a number")
+        return float(value)
+
+    @pydantic.root_validator(skip_on_failure=True)
+    def _chart_covers_robot(cls, values):  # noqa: N805 - pydantic v1 validator
+        if values["chart_radius_m"] < values["robot_half_side_m"]:
+            raise ValueError("chart_radius_m must be at least robot_half_side_m")
+        return values
+
+
 def has_real_datum(latitude: Optional[float], longitude: Optional[float]) -> bool:
     """A datum that anchors a map: both coordinates set and not the (0, 0) placeholder."""
     return (latitude is not None and longitude is not None
@@ -135,6 +199,10 @@ class MapSpecV1(pydantic.BaseModel):
                            "robot's orchestrator (packages/api/mapping_switch.py). Set at "
                            "creation, immutable, cleared when the map is converted to geo. "
                            "Rows written before it existed read False.")
+    scene_graph_params: Optional[SceneGraphParamsV1] = pydantic.Field(
+        None, description="Scene-graph build parameters chosen at creation, immutable. None: a "
+                          "legacy map, built with the global scene-graph config and the robot's "
+                          "live footprint (not the defaults of SceneGraphParamsV1).")
     approx_location: Optional[ApproxLocationV1] = pydantic.Field(
         None, description="Approximate WGS84 location of a 'local' map (a hint, never a datum). "
                           "None on geo maps and until set.")

@@ -2640,6 +2640,30 @@ For questions or issues, please refer to the service logs or contact the backend
 
 
 
+#### Scene-graph parameters: `scene_graph_params` and `robot_name` on `POST /api/v1/maps`
+
+`POST /api/v1/maps` accepts two optional fields that fix how the map's scene graph is built. They are stored in the map spec (Postgres `MapSpecV1.scene_graph_params`), cannot be changed afterwards (`PATCH` does not accept them), and are returned by `GET /api/v1/maps` and `GET /api/v1/maps/{map_id}`.
+
+`scene_graph_params`: object, every key optional (a missing key, or a missing object, takes the default, and the defaults are stored):
+
+| Key | Type | Default | Valid |
+|---|---|---|---|
+| `schema_version` | int | 1 | 1 (a JSON integer, not a bool) |
+| `chart_radius_m` | float (m) | 2.0 | > 0, <= 5.0, and >= `robot_half_side_m` |
+| `close_evidence_range_m` | float (m) or `null` | 1.3 | > 0, <= 3.0; `null` = close evidence off (goal acceptance then uses the global `SCENE_GRAPH_GOAL_SNAP_M`) |
+| `robot_half_side_m` | float (m) | 0.25 | > 0; normally set by `robot_name`, see below |
+| `place_rule` | bool | false | stored; the engine does not act on it yet |
+
+The 5.0 and 3.0 upper bounds are proposals, not validated limits. Unknown keys are 422.
+
+Types are strict: the float keys take a JSON number (an integer is stored as a float, `3` becomes `3.0`) but not a boolean or a string (`true`, `"2.0"` are 422); `place_rule` takes only `true`/`false` (`1`, `"yes"` are 422); `schema_version` only an integer. NaN and infinity are 422. All of these are located at `["body", "scene_graph_params", "<key>"]`.
+
+`robot_name`: optional, a non-empty string without leading or trailing spaces (`""`, `" r1"` and non-strings are 422 at `["body", "robot_name"]`; `null` is the same as absent). The server reads that robot's factsheet `length`/`width` and stores `robot_half_side_m` = half of the smaller side (the builder's rule, `scene_adapter.half_side`; to be rethought). `robot_name` is not stored. Do not send `robot_half_side_m` together with it: 422 at `["body", "robot_name"]`, before any database access (an explicit `null` there is invalid on its own). Errors: 404 unknown robot; 409 the robot has not reported its footprint yet (no silent default, the value is fixed for the map); 422 if the half side exceeds `chart_radius_m`, with the same shape whether the half side came from `robot_name` or from the request: `loc` `["body", "scene_graph_params"]` and a message naming `chart_radius_m` and `robot_half_side_m`.
+
+`scene_graph_params` is `null` on a legacy map (created before this existed, not the defaults): it is built with the builder's global config and the robot's live footprint. A map that has it is built with its stored values, and the graph's manifest keeps them from the first build on.
+
+Example: `{"name": "hall", "type": "local", "robot_name": "r1", "scene_graph_params": {"chart_radius_m": 3.0, "close_evidence_range_m": null}}`.
+
 #### SLAM maps: `slam_map` on `POST /api/v1/maps`
 
 `POST /api/v1/maps` accepts `slam_map: bool` (default `false`); `true` only with `type: "local"` (else 422, `loc` `["body","slam_map"]`). Map views and lists return `slam_map`. It can be changed with `PATCH /api/v1/maps/{id}` `{"slam_map": true|false}` (local map only; 409 for a geo map, an open or paused mapping session, or a SLAM save still pending; `null` is 422; returns the map view; `MAP.SLAM_CHANGED`), and `POST /api/v1/maps/{id}/type` to `geo` clears it (a note is added to `warnings`).

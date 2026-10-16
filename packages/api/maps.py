@@ -133,7 +133,7 @@ import pydantic
 from fastapi import HTTPException
 
 from cloud_common.objects.map import (
-    MAP_STATES, MAP_TYPES, MapObjectV1, MapSpecV1, MapStatusV1, effective_state,
+    MAP_STATES, MAP_TYPES, MapObjectV1, MapSpecV1, MapStatusV1, SceneGraphParamsV1, effective_state,
     effective_type, has_real_datum,
 )
 from cloud_common.objects.object import ObjectLifecycleV1
@@ -197,6 +197,8 @@ class CreateMapRequest(pydantic.BaseModel):
     type: str
     description: Optional[str] = None
     slam_map: bool = False
+    scene_graph_params: Optional[SceneGraphParamsV1] = None   # None: the defaults, stored as such
+    robot_name: Optional[pydantic.StrictStr] = None   # sets scene_graph_params.robot_half_side_m from its footprint
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -214,6 +216,18 @@ class CreateMapRequest(pydantic.BaseModel):
     def _type(cls, value):  # noqa: N805
         if value not in MAP_TYPES:
             raise ValueError(f"type must be one of {', '.join(MAP_TYPES)}")
+        return value
+
+    @pydantic.validator("robot_name")
+    def _robot_name(cls, value, values):  # noqa: N805
+        # located at robot_name, before any DB access; an explicit null is the same as absent
+        if value is None:
+            return value
+        if not value or value != value.strip():
+            raise ValueError("robot_name must be non-empty, without leading or trailing spaces")
+        given = values.get("scene_graph_params")
+        if given is not None and "robot_half_side_m" in given.__fields_set__:
+            raise ValueError("give robot_name or scene_graph_params.robot_half_side_m, not both")
         return value
 
     @pydantic.validator("slam_map")
@@ -358,8 +372,15 @@ class StartSessionRequest(pydantic.BaseModel):
 
 
 def _unprocessable(exc: pydantic.ValidationError) -> HTTPException:
-    return HTTPException(422, [{"loc": ["body", *err["loc"]], "msg": err["msg"],
-                                "type": err["type"]} for err in exc.errors()])
+    # a model-level (root) error of a nested model is located at the nested field itself, the same
+    # place as the footprint check of robot_name (a top-level root error keeps "__root__")
+    def loc(err):
+        parts = list(err["loc"])
+        if len(parts) > 1 and parts[-1] == "__root__":
+            parts.pop()
+        return ["body", *parts]
+    return HTTPException(422, [{"loc": loc(err), "msg": err["msg"], "type": err["type"]}
+                               for err in exc.errors()])
 
 
 def parse_body(model: Any, data: Any) -> Any:
@@ -769,6 +790,31 @@ def map_view(obj: MapObjectV1) -> Dict[str, Any]:
     return data
 
 
+async def _params_from_footprint(db: Any, req: CreateMapRequest, params: SceneGraphParamsV1
+                                 ) -> SceneGraphParamsV1:
+    """`params` with robot_half_side_m taken from `req.robot_name`'s factsheet, by the rule the
+    builder uses (half of the smaller side). Never a silent default: a footprint that has not
+    arrived is a 409, because the value is fixed for the life of the map."""
+    try:
+        from packages.services.graph_builder.scene_adapter import half_side   # lazy: needs numpy
+    except ImportError as exc:
+        raise HTTPException(503, "the footprint rule (scene_adapter.half_side) is unavailable; "
+                                 "create the map without robot_name") from exc
+    robot = await _robot_or_404(db, req.robot_name)
+    factsheet = getattr(getattr(robot, "status", None), "factsheet", None)
+    half, known = half_side(getattr(factsheet, "length", None), getattr(factsheet, "width", None))
+    if not known:
+        raise HTTPException(409, f"Robot '{req.robot_name}' has not reported its footprint "
+                                 "(factsheet length/width); try again when it is online")
+    try:
+        return SceneGraphParamsV1(**{**params.dict(), "robot_half_side_m": half})
+    except pydantic.ValidationError as exc:
+        raise HTTPException(422, [{"loc": ["body", "scene_graph_params"], "type": "value_error",
+                                   "msg": "; ".join(e["msg"] for e in exc.errors())
+                                           + f" (robot half side {half:g} m from '{req.robot_name}')"}]
+                            ) from exc
+
+
 def _robots_phrase(sessions: List[Mapping[str, Any]]) -> str:
     parts = [f"{s['robot_name']} ({'mapping' if ms.purpose_of(s) == ms.MAPPING else 'using'})"
              for s in sorted(sessions, key=lambda s: str(s["robot_name"]))]
@@ -782,8 +828,16 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
                      ) -> Dict[str, Any]:
     """A new draft map. 409 if the name exists (or is being deleted), if it collides with an
     existing map's MinIO bucket, or if ArangoDB already holds nodes under it (a map without a
-    Postgres row: adopt it with POST /map/load, or delete it first)."""
+    Postgres row: adopt it with POST /map/load, or delete it first).
+
+    `robot_name` (optional) fixes scene_graph_params.robot_half_side_m from that robot's
+    factsheet footprint, by the builder's own rule (scene_adapter.half_side): 404 for an unknown
+    robot, 409 if its footprint has not arrived; 422 (in CreateMapRequest, before any DB access) if
+    the request also sets robot_half_side_m. The robot lookup comes before the name-conflict checks."""
     req = parse_body(CreateMapRequest, data)
+    sg_params = req.scene_graph_params or SceneGraphParamsV1()
+    if req.robot_name is not None:
+        sg_params = await _params_from_footprint(db, req, sg_params)
     if arango_node_count is not None:
         try:
             nodes = await asyncio.to_thread(arango_node_count, req.name)
@@ -794,7 +848,8 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
             raise HTTPException(409, f"ArangoDB already has {nodes} nodes for map "
                                      f"'{req.name}' (no Postgres row); choose another name")
     spec = json.loads(MapSpecV1(description=req.description, type=req.type,
-                                        slam_map=req.slam_map).json())
+                                        slam_map=req.slam_map,
+                                        scene_graph_params=sg_params).json())
     status = json.loads(MapStatusV1(state=DRAFT).json())
     now = _utcnow()
     async with open_store(db, publisher_id) as store:
