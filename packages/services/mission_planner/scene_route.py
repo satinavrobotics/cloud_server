@@ -134,6 +134,21 @@ SNAP_TOO_FAR = "too_far"
 SNAP_CROSSES_BLOCKED = "crosses_blocked"
 
 
+def unverified_length_m(graph: Any, nodes: List[Pt]) -> Optional[float]:
+    """Metres of the route's lattice path that close evidence does not validate: PlanGraph.unverified_length over the path's
+    global cells (ix, iy) = floor(centre / lattice). None when the graph cannot say (no such method, or a store made without
+    the close-evidence rule: its validity plane does not exist), not "the whole route"."""
+    fn = getattr(graph, "unverified_length", None)
+    lattice = getattr(getattr(graph, "params", None), "lattice", None)
+    if fn is None or not lattice:
+        return None
+    cells = [(math.floor(x / lattice), math.floor(y / lattice)) for x, y in nodes]
+    try:
+        return float(fn(cells))
+    except ValueError:
+        return None
+
+
 def snap_problem(snap: Any, max_dist: float) -> Optional[str]:
     """None when `snap` (the library's Snap: key, distance, crosses_blocked) may be used, else the
     reason. The planner never moves a point across a known blocked cell or further than `max_dist`
@@ -191,7 +206,8 @@ class ChartPlan:
     # the waypoint budget's record {waypoint_budget_m, waypoints_removed (against the greedy pull of the same plan)}; None when off
     waypoint_budget: Optional[Dict[str, Any]] = None
     # the goal lies beyond goal_snap_m from free space: {goal_xy (the tap), free_xy (the snapped free cell), distance_from_free_m,
-    # unverified_length_m (the straight leg from free_xy to the tap: not verified by close evidence), limit_m}; None when within
+    # unverified_length_m (metres of the route not validated by close evidence, PlanGraph.unverified_length; None when the store
+    # has no validity plane), limit_m}; None when within
     goal_far: Optional[Dict[str, Any]] = None
 
 
@@ -979,7 +995,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     goal_far = None
     if snap_b.distance > goal_snap_m:
         goal_far = {"goal_xy": (float(goal_xy[0]), float(goal_xy[1])), "free_xy": (snap_b.x, snap_b.y),
-                    "distance_from_free_m": float(snap_b.distance), "unverified_length_m": float(snap_b.distance),
+                    "distance_from_free_m": float(snap_b.distance), "unverified_length_m": None,
                     "limit_m": float(goal_snap_m)}
     discs, segments = overlay
     blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
@@ -1089,6 +1105,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    "profile": "exp" if exp else "hinge", "k": safety.k, "origin": safety.origin, "reach": safety.margin,
                    "floor": floor,
                    "waypoints_below_floor": waypoints_below_floor(graph, poses, safety, floor), "turn": turn}
+    if goal_far is not None:
+        goal_far["unverified_length_m"] = unverified_length_m(graph, route.nodes)
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,

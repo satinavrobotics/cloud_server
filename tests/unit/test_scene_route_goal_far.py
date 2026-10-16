@@ -51,7 +51,8 @@ def test_a_goal_beyond_the_limit_is_planned_with_the_far_notice(graph):
             far = plan.goal_far
             assert far is not None
             assert far["goal_xy"] == pytest.approx(goal)
-            assert far["distance_from_free_m"] == pytest.approx(far["unverified_length_m"])
+            # the route's unverified metres (None: this test world's store has no close-evidence validity plane)
+            assert far["unverified_length_m"] is None or far["unverified_length_m"] >= 0.0
             assert far["distance_from_free_m"] == pytest.approx(math.dist(far["goal_xy"], far["free_xy"]), abs=1e-6)
             assert far["limit_m"] == 0.05
             assert plan.waypoints and plan.goal_xy == pytest.approx(far["free_xy"])
@@ -70,3 +71,32 @@ def test_a_goal_within_the_limit_has_no_notice(graph):
             assert plan.goal_far is None
             return
     pytest.skip("no start/goal pair in the grid world plans")
+
+
+def test_the_route_unverified_length_goes_through_plangraph_in_global_cells():
+    seen = {}
+
+    class Graph:
+        params = type("P", (), {"lattice": 0.1})()
+
+        def unverified_length(self, cells):
+            seen["cells"] = cells
+            return 1.25
+
+    nodes = [(0.05, 0.05), (0.15, 0.05), (0.25, 0.15)]
+    assert sr.unverified_length_m(Graph(), nodes) == 1.25
+    assert seen["cells"] == [(0, 0), (1, 0), (2, 1)]          # floor(centre / lattice)
+
+
+def test_no_validity_plane_or_no_method_is_unknown_not_the_whole_route():
+    class NoPlane:
+        params = type("P", (), {"lattice": 0.1})()
+
+        def unverified_length(self, cells):
+            raise ValueError("no validity plane")
+
+    class NoMethod:
+        params = type("P", (), {"lattice": 0.1})()
+
+    assert sr.unverified_length_m(NoPlane(), [(0.05, 0.05)]) is None
+    assert sr.unverified_length_m(NoMethod(), [(0.05, 0.05)]) is None
