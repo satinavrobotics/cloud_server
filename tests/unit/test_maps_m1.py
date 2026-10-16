@@ -599,9 +599,9 @@ class TestCreate:
         assert fdb.maps["a"]["spec"]["scene_graph_params"]["close_evidence_range_m"] is None
 
     @pytest.mark.parametrize("params,field", [
-        ({"chart_radius_m": 0.24}, "__root__"),
+        ({"chart_radius_m": 0.24}, "scene_graph_params"),
         ({"chart_radius_m": 0.0}, "chart_radius_m"),
-        ({"chart_radius_m": 0.5, "robot_half_side_m": 0.6}, "__root__"),
+        ({"chart_radius_m": 0.5, "robot_half_side_m": 0.6}, "scene_graph_params"),
         ({"robot_half_side_m": 0}, "robot_half_side_m"),
         ({"robot_half_side_m": -0.1}, "robot_half_side_m"),
         ({"place_rule": "maybe"}, "place_rule"),
@@ -666,11 +666,88 @@ class TestCreate:
                    "scene_graph_params": {"chart_radius_m": 2.0}}, PUB))
         assert code == 422 and "chart_radius_m" in detail[0]["msg"] and "a" not in fdb.maps
 
-    async def test_effective_params_of_an_old_row(self):
-        from cloud_common.objects.map import effective_scene_graph_params
-        old = MapSpecV1(type="local")
-        assert old.scene_graph_params is None
-        assert effective_scene_graph_params(old).chart_radius_m == 2.0
+    @pytest.mark.parametrize("params,field", [
+        ({"chart_radius_m": True}, "chart_radius_m"),
+        ({"chart_radius_m": "2.0"}, "chart_radius_m"),
+        ({"robot_half_side_m": True}, "robot_half_side_m"),
+        ({"robot_half_side_m": "0.25"}, "robot_half_side_m"),
+        ({"close_evidence_range_m": True}, "close_evidence_range_m"),
+        ({"close_evidence_range_m": "1.3"}, "close_evidence_range_m"),
+        ({"chart_radius_m": float("inf")}, "chart_radius_m"),
+        ({"close_evidence_range_m": float("nan")}, "close_evidence_range_m"),
+        ({"place_rule": "yes"}, "place_rule"),
+        ({"place_rule": 1}, "place_rule"),
+        ({"place_rule": None}, "place_rule"),
+        ({"schema_version": True}, "schema_version"),
+        ({"schema_version": 1.0}, "schema_version"),
+        ({"schema_version": "1"}, "schema_version"),
+    ])
+    async def test_scene_graph_params_are_strictly_typed(self, fdb, params, field):
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "scene_graph_params": params}, PUB))
+        assert code == 422 and detail[0]["loc"] == ["body", "scene_graph_params", field]
+        assert "a" not in fdb.maps
+
+    async def test_int_numbers_are_accepted_and_stored_as_floats(self, fdb):
+        out = await maps.create_map(None, {"name": "a", "type": "local", "scene_graph_params": {
+            "chart_radius_m": 3, "close_evidence_range_m": 2, "robot_half_side_m": 1}}, PUB)
+        stored = fdb.maps["a"]["spec"]["scene_graph_params"]
+        assert all(isinstance(stored[k], float) for k in
+                   ("chart_radius_m", "close_evidence_range_m", "robot_half_side_m"))
+        assert out["scene_graph_params"]["chart_radius_m"] == 3.0
+
+    def test_stored_row_reads_back_strictly(self):
+        from cloud_common.objects.map import SceneGraphParamsV1
+        raw = json.loads(SceneGraphParamsV1(close_evidence_range_m=None).json())
+        assert SceneGraphParamsV1(**raw).dict() == SceneGraphParamsV1(
+            close_evidence_range_m=None).dict()
+
+    async def test_half_side_over_radius_has_one_422_shape(self, fdb):
+        self._robot(fdb, "big", 6.0, 6.0)
+        _, with_robot = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "big",
+                   "scene_graph_params": {"chart_radius_m": 2.0}}, PUB))
+        _, explicit = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "scene_graph_params": {
+                "chart_radius_m": 2.0, "robot_half_side_m": 3.0}}, PUB))
+        for detail in (with_robot, explicit):
+            assert detail[0]["loc"] == ["body", "scene_graph_params"]
+            assert "chart_radius_m" in detail[0]["msg"] and "robot_half_side_m" in detail[0]["msg"]
+
+    async def test_robot_name_with_explicit_half_side_is_422_at_robot_name(self, fdb):
+        # with no such robot: the 422 comes before any DB access (an explicit null half side is
+        # itself invalid, so it is rejected at its own field)
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "ghost",
+                   "scene_graph_params": {"robot_half_side_m": 0.3}}, PUB))
+        assert code == 422 and detail[0]["loc"] == ["body", "robot_name"]
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": "ghost",
+                   "scene_graph_params": {"robot_half_side_m": None}}, PUB))
+        assert code == 422 and detail[0]["loc"] == ["body", "scene_graph_params", "robot_half_side_m"]
+
+    @pytest.mark.parametrize("robot_name", ["", " ", " r1", "r1 ", 5, True])
+    async def test_bad_robot_name_is_422(self, fdb, robot_name):
+        self._robot(fdb, "r1", 1.2, 0.7)
+        code, detail = await _status(maps.create_map(
+            None, {"name": "a", "type": "local", "robot_name": robot_name}, PUB))
+        assert code == 422 and detail[0]["loc"] == ["body", "robot_name"] and "a" not in fdb.maps
+
+    @pytest.mark.parametrize("sgp", [None, {}])
+    async def test_null_robot_name_is_absent(self, fdb, sgp):
+        out = await maps.create_map(None, {"name": "a", "type": "local", "robot_name": None,
+                                           "scene_graph_params": sgp}, PUB)
+        assert out["scene_graph_params"]["robot_half_side_m"] == 0.25
+
+    @pytest.mark.parametrize("sgp", [None, {}])
+    async def test_robot_name_with_null_or_empty_params(self, fdb, sgp):
+        self._robot(fdb, "r1", 1.2, 0.7)
+        out = await maps.create_map(None, {"name": "a", "type": "local", "robot_name": "r1",
+                                           "scene_graph_params": sgp}, PUB)
+        assert out["scene_graph_params"]["robot_half_side_m"] == 0.35
+
+    def test_old_row_has_no_params(self):
+        assert MapSpecV1(type="local").scene_graph_params is None
 
 
 def _obj(name, lifecycle="ALIVE", **kw):

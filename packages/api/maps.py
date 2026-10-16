@@ -198,7 +198,7 @@ class CreateMapRequest(pydantic.BaseModel):
     description: Optional[str] = None
     slam_map: bool = False
     scene_graph_params: Optional[SceneGraphParamsV1] = None   # None: the defaults, stored as such
-    robot_name: Optional[str] = None   # sets scene_graph_params.robot_half_side_m from its footprint
+    robot_name: Optional[pydantic.StrictStr] = None   # sets scene_graph_params.robot_half_side_m from its footprint
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -216,6 +216,18 @@ class CreateMapRequest(pydantic.BaseModel):
     def _type(cls, value):  # noqa: N805
         if value not in MAP_TYPES:
             raise ValueError(f"type must be one of {', '.join(MAP_TYPES)}")
+        return value
+
+    @pydantic.validator("robot_name")
+    def _robot_name(cls, value, values):  # noqa: N805
+        # located at robot_name, before any DB access; an explicit null is the same as absent
+        if value is None:
+            return value
+        if not value or value != value.strip():
+            raise ValueError("robot_name must be non-empty, without leading or trailing spaces")
+        given = values.get("scene_graph_params")
+        if given is not None and "robot_half_side_m" in given.__fields_set__:
+            raise ValueError("give robot_name or scene_graph_params.robot_half_side_m, not both")
         return value
 
     @pydantic.validator("slam_map")
@@ -360,8 +372,15 @@ class StartSessionRequest(pydantic.BaseModel):
 
 
 def _unprocessable(exc: pydantic.ValidationError) -> HTTPException:
-    return HTTPException(422, [{"loc": ["body", *err["loc"]], "msg": err["msg"],
-                                "type": err["type"]} for err in exc.errors()])
+    # a model-level (root) error of a nested model is located at the nested field itself, the same
+    # place as the footprint check of robot_name (a top-level root error keeps "__root__")
+    def loc(err):
+        parts = list(err["loc"])
+        if len(parts) > 1 and parts[-1] == "__root__":
+            parts.pop()
+        return ["body", *parts]
+    return HTTPException(422, [{"loc": loc(err), "msg": err["msg"], "type": err["type"]}
+                               for err in exc.errors()])
 
 
 def parse_body(model: Any, data: Any) -> Any:
@@ -776,10 +795,6 @@ async def _params_from_footprint(db: Any, req: CreateMapRequest, params: SceneGr
     """`params` with robot_half_side_m taken from `req.robot_name`'s factsheet, by the rule the
     builder uses (half of the smaller side). Never a silent default: a footprint that has not
     arrived is a 409, because the value is fixed for the life of the map."""
-    if req.scene_graph_params is not None and "robot_half_side_m" in req.scene_graph_params.__fields_set__:
-        raise HTTPException(422, [{"loc": ["body", "robot_name"], "type": "value_error",
-                                   "msg": "give robot_name or scene_graph_params.robot_half_side_m, "
-                                          "not both"}])
     try:
         from packages.services.graph_builder.scene_adapter import half_side   # lazy: needs numpy
     except ImportError as exc:
@@ -817,8 +832,8 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
 
     `robot_name` (optional) fixes scene_graph_params.robot_half_side_m from that robot's
     factsheet footprint, by the builder's own rule (scene_adapter.half_side): 404 for an unknown
-    robot, 409 if its footprint has not arrived, 422 if the request also sets
-    robot_half_side_m."""
+    robot, 409 if its footprint has not arrived; 422 (in CreateMapRequest, before any DB access) if
+    the request also sets robot_half_side_m. The robot lookup comes before the name-conflict checks."""
     req = parse_body(CreateMapRequest, data)
     sg_params = req.scene_graph_params or SceneGraphParamsV1()
     if req.robot_name is not None:
