@@ -77,7 +77,16 @@
     }
     ctx.putImageData(img, 0, 0);
     if ($("l_charts").checked) {
-      M.charts[i].forEach(function (c) { var p = toPx(c[0], c[1]); ctx.fillStyle = "#1e6fc8"; ctx.beginPath(); ctx.arc(p[0], p[1], 2.5, 0, 6.3); ctx.fill(); });
+      M.charts[i].forEach(function (c, k) {
+        var p = toPx(c[0], c[1]);
+        if (M.frontier && M.frontier[i] && M.frontier[i][k]) {
+          // frontier anchor: not plannable yet (outside the validated set). A light shaded halo and a hollow ring, not a solid dot.
+          ctx.fillStyle = "rgba(30,111,200,0.16)"; ctx.beginPath(); ctx.arc(p[0], p[1], 7, 0, 6.3); ctx.fill();
+          ctx.strokeStyle = "#1e6fc8"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(p[0], p[1], 4.5, 0, 6.3); ctx.stroke();
+          return;
+        }
+        ctx.fillStyle = "#1e6fc8"; ctx.beginPath(); ctx.arc(p[0], p[1], 2.5, 0, 6.3); ctx.fill();
+      });
     }
   }
   function drawRoute(route) {
@@ -99,7 +108,8 @@
     var P = M.poses;
     if ($("l_trail").checked) {
       ctx.strokeStyle = "#7a7a7a"; ctx.lineWidth = 1.5; ctx.beginPath();
-      for (var j = 0; j <= i; j++) { var p = toPx(P[j][0], P[j][1]); if (j) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }
+      // no segment between two captures of different sessions: the robot was moved between them (runs without `sessions` draw as before)
+      for (var j = 0; j <= i; j++) { var p = toPx(P[j][0], P[j][1]); if (j && (!M.sessions || M.sessions[j] === M.sessions[j - 1])) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }
       ctx.stroke();
     }
     var q = P[i], h = 0.25, cs = Math.cos(q[2]), sn = Math.sin(q[2]);

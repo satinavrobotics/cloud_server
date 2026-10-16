@@ -3,7 +3,7 @@
 Runs in its own process with the tree on the path, so each git ref uses its own adapter, engine and planner (run.py starts it).
 The run holds, for every capture: the robot pose, the map state (5 cm, run-length encoded), the navigable clearance and the
 price changes (sparse, against the previous capture), the charts, and for each goal the route from the robot's pose and its
-checks. Only the changes are stored for price and clearance, so the file stays small.
+checks. `sessions` gives each capture's session id (in capture order): the viewer breaks the trail where it changes. Only the changes are stored for price and clearance, so the file stays small.
 """
 import json
 import os
@@ -26,9 +26,12 @@ def _set_environment(exponential):
 
 
 def _load_leaves(map_dir, adapter):
+    # the occupancy role is picked by the live worker's rule (scene_leaf.LAYER_PRIORITY): `occupancy`, else `occupancy_depth`
+    from packages.services.graph_builder import scene_leaf
     with open(os.path.join(map_dir, "nodes.json")) as f:
         docs = json.load(f)
-    docs = sorted([d for d in docs if "costmap" in d and "occupancy" in d["costmap"]], key=lambda d: d["session_node_id"])
+    docs = sorted([d for d in docs if scene_leaf.role_layers(d.get("costmap")).get(scene_leaf.ROLE_OCCUPANCY)],
+                  key=lambda d: d["session_node_id"])
     leaves = []
     for d in docs:
         with open(os.path.join(map_dir, d["_key"] + ".png"), "rb") as f:
@@ -74,6 +77,7 @@ def run(tree, map_dir, out_path, exponential):
     n = len(leaves)
 
     poses = []
+    sessions = [lf.session for lf in leaves]
     routes = [[None] * n for _ in goals]
     route_checks = [[None] * n for _ in goals]
     states, origins, shapes = [], [], []
@@ -147,7 +151,7 @@ def run(tree, map_dir, out_path, exponential):
         prev_c, prev_p = c_plane, p_plane
 
     with open(out_path, "w") as f:
-        json.dump(dict(poses=poses, goals=goals, routes=routes, checks=route_checks,
+        json.dump(dict(poses=poses, sessions=sessions, goals=goals, routes=routes, checks=route_checks,
                        crop=dict(H=int(r1 - r0), W=int(c1 - c0), ox=int(gx0 + c0), oy=int(gy0 + r0)),
                        states=state_rle, deltas=deltas, charts=charts, pmax=peak, clr_max=S.CLR_MAX_M,
                        kappa=kappa, exponential=bool(exponential)), f, separators=(",", ":"))

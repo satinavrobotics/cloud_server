@@ -628,3 +628,18 @@ last view on screen (`stale`) and retries with back-off (1 s doubling to 30 s, h
 remembered per map and sent as `?epoch=` (a 409 `epoch_changed`, or a websocket hint of another epoch, drops cached
 views and refetches); a `scene_graph_updated` hint with `version: 0` means "no graph". Chart selection was removed
 (it was unused).
+
+## 13. Branch viewer and live export (offline tools)
+
+Two tools under `tools/scene_graph_sim/` compare a git ref's scene graph against a live map. They read only; neither writes to ArangoDB or MinIO.
+
+**`export_live.py`** copies one map's topo nodes and occupancy PNGs out of the running graph-builder container:
+
+    docker exec -i docker_compose-graph-builder-service-1 python - <map> <outdir> < tools/scene_graph_sim/export_live.py
+    docker cp docker_compose-graph-builder-service-1:<outdir>/. tools/scene_graph_sim/data/<map>/
+
+It writes `nodes.json` and `<node key>.png` into `<outdir>`. The PNG is the layer the live worker uses: `occupancy`, else `occupancy_depth` (backfilled nodes), chosen by `scene_leaf.role_layers`. The script exits 1 and prints the keys when a node has no occupancy-role layer (`no_layer`) or its PNG cannot be fetched from MinIO (`missing_png`); such nodes are left out of `nodes.json`. Exit 0 means every node with a costmap was exported. Run the export with the graph-builder image's packages tree on the working directory (`WORKDIR /app`).
+
+**`branch_viewer/run.py`** plays one or more git refs over an exported map and writes `branch_viewer.html` and `branch_viewer.json` (`--map <name> --ref <ref> --data tools/scene_graph_sim/data`). Its loader takes the same occupancy layer as the live worker, so a node that the export reports as `no_layer` is also left out of the viewer.
+
+**Trail break.** The run stores each capture's session id (`sessions`, in capture order). The viewer draws the robot's grey trail with no segment between two captures of different sessions, because the robot was moved between them. Runs without `sessions` draw the full trail.
