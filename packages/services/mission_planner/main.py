@@ -82,6 +82,7 @@ class PlanResponse(BaseModel):
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total: waypoints that should be skippable, skippable: how many got a corridor width, unavailable: why the others did not (e.g. 'width_unknown', 'legacy_planner'), else null}")
+    footprint: Optional[Dict[str, Any]] = Field(None, description="Robot-vs-map footprint check: {robot_half_side_m (null while the robot's footprint is unknown), map_half_side_m, chart_radius_m, status: 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings; the plan proceeds) | 'exceeds_chart' (plan refused, failed_at 'footprint'), message}; null for a legacy planner or a map without scene-graph parameters")
     trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
@@ -126,6 +127,7 @@ class NavigationResponse(BaseModel):
     graph_version: Optional[int] = Field(None, description="Scene-graph version the route was planned on")
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total, skippable, unavailable}; see POST /api/v1/plan")
+    footprint: Optional[Dict[str, Any]] = Field(None, description="Robot-vs-map footprint check: {robot_half_side_m (null while the robot's footprint is unknown), map_half_side_m, chart_radius_m, status: 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings; the plan proceeds) | 'exceeds_chart' (plan refused, failed_at 'footprint'), message}; null for a legacy planner or a map without scene-graph parameters")
     trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
@@ -342,6 +344,7 @@ async def plan_only(request: PlanRequest):
             planner_fallback=result.get("planner_fallback"),
             node_policy=result.get("node_policy"),
             trajectory=result.get("trajectory"),
+            footprint=result.get("footprint"),
         )
     except HTTPException:
         raise

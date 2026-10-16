@@ -461,6 +461,14 @@ repeated submit returns the first answer (`Idempotent-Replayed: true`) without a
 mission; without the header every request makes its own. With the scene-graph planner the
 response also has `trajectory` (the planner's dense path per leg, see "Route trajectory" below).
 
+Scene-graph plans (`POST /api/v1/navigate`, planner `POST /api/v1/plan`) also carry `footprint`:
+`{robot_half_side_m, map_half_side_m, chart_radius_m, status, message}`, the robot's half smaller factsheet
+side against the half side the map was built for. `status` is `ok`, `larger_than_map` or `unknown_footprint`
+(`robot_half_side_m` null; both warnings, the plan proceeds, with the map's value when unknown), or
+`exceeds_chart` (robot half side above the map's chart radius): then the plan is refused as any planning
+failure, `success: false`, `failed_at: "footprint"`, `error` = `message`, with no legacy fallback. Absent for
+the legacy planner and for maps without scene-graph parameters.
+
 **Error Response:**
 ```json
 {

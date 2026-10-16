@@ -124,6 +124,9 @@ class NavigationResponse(BaseModel):
                           "the go-to starts when that one has finished")
     error: Optional[str] = None
     failed_at: Optional[str] = None
+    footprint: Optional[Dict[str, Any]] = Field(
+        None, description="Robot-vs-map footprint check {robot_half_side_m, map_half_side_m, chart_radius_m, status, message}; "
+                          "status 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings) | 'exceeds_chart' (refused, failed_at 'footprint')")
     trajectory: Optional[List[Dict[str, Any]]] = Field(
         None, description="The planner's dense path per leg between the go-to route's consecutive waypoints: "
                           "[{from_index, to_index, points: [[x, y], ...]}], map frame. Display data; a leg may be "
