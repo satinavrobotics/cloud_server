@@ -20,7 +20,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from packages.scene_graph.api import BBox, SceneParams
-from packages.scene_graph.store import FORMAT, PIPELINE, PIPELINE_CLOSE, SceneGraphStore
+from packages.scene_graph.store import FORMAT, PIPELINE, PIPELINE_VALID, SceneGraphStore
 
 BIG = BBox(-1e9, -1e9, 1e9, 1e9)
 
@@ -66,7 +66,7 @@ def check_map(store: Any, map_id: str, expect: Optional[Dict[str, Any]] = None) 
     out.update(format=man.get("format"), pipeline=man.get("pipeline"))
     if man.get("format") != FORMAT: out["problems"].append(f"format {man.get('format')} != {FORMAT}")
     p = meta.get("params") or {}
-    expected = PIPELINE_CLOSE if "near_range_m" in p else PIPELINE
+    expected = PIPELINE_VALID if "near_range_m" in p else PIPELINE
     if man.get("pipeline") != expected:
         out["problems"].append(f"pipeline {man.get('pipeline')} != {expected}"
                                + (" (the earlier rule tokens +near3 / +near4 have no validity plane `val`: the worker rebuilds the map in a new generation)"

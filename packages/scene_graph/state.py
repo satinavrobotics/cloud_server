@@ -35,6 +35,8 @@ class EngineState:
     Bn: Optional[np.ndarray] = None                # i8 [H, W] latest LETHAL time from within near range (the held test); only with near_range_m
     Hold: Optional[np.ndarray] = None              # bool [H, W] cells the rule holds blocked after the away-from-walls filter; only with
                                                    # near_min_clearance_m (a derived plane, stored so tile readers need no component pass)
+    Val: Optional[np.ndarray] = None               # bool [H/2, W/2] validity per lattice cell; only with near_range_m. A derived plane
+                                                   # (engine `_build_F`), stored so tile readers need no close-evidence arithmetic
     leaves: List[LeafRecord] = field(default_factory=list)
     keys: List[Tuple[str, int]] = field(default_factory=list)         # chart keys (birth leaf, n), chart order
     plane: Optional[np.ndarray] = None             # i4 [H/2, W/2] chart index per lattice cell, -1 outside F

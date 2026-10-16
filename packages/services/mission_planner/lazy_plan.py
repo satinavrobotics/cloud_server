@@ -135,7 +135,6 @@ class PlanGraph:
         self.params = SimpleNamespace(**view.params)
         self.max_tiles = int(max_tiles)
         self.unavailable = False                # set when a tile could not be read (see TileUnavailable)
-        # the store carries the validity plane `val`: made with the close-evidence rule under the token that adds it. A rule store of an
         self._mu = threading.Lock()             # guards `_inflight` only; no I/O runs under it
         self._inflight: Dict[Tuple[int, int], _Flight] = {}
         view._own = self._read                  # the view's own readers (snap, windows) share the single flight
@@ -231,6 +230,31 @@ class PlanGraph:
         if t is None or "own" not in t:
             return False
         return bool(t["own"][iy % TILE_L, ix % TILE_L] > 0)
+
+    def valid_cell(self, ix: int, iy: int) -> bool:
+        """Whether lattice cell (ix, iy) (global) is VALID: seen free from within the close-evidence range and not held, or driven
+        (the stored `val` plane, which the engine computes as `ChartGraph._val_h`). An absent tile is not valid. Rule stores only."""
+        t = self._tile(ix // TILE_L, iy // TILE_L)
+        if t is None or "val" not in t:
+            return False
+        return bool(t["val"][iy % TILE_L, ix % TILE_L])
+
+    def unverified_length(self, cells: List[Tuple[int, int]]) -> float:
+        """Metres of the route `cells` (global lattice cells (ix, iy), consecutive ones 8-adjacent) that are unverified. Each
+        segment joins two consecutive cells; its length is the lattice step `params.lattice` (from the store manifest) times
+        sqrt(2) for a diagonal and 1 otherwise, the length `Route.length` uses. A segment is classified by its midpoint cell: the
+        lattice cell that contains the midpoint of the two centres (a half-cell tie rounds down, by floor division). It is
+        unverified when that cell is not valid (`valid_cell`). Rule stores only: a store made without near_range_m has no
+        validity plane, so the answer would be all unverified, and it is refused instead."""
+        if "near_range_m" not in self.view.params:
+            raise ValueError("unverified_length needs a store made with the close-evidence rule (near_range_m): this one has no "
+                             "validity plane")
+        h = float(self.params.lattice)
+        total = 0.0
+        for (x0, y0), (x1, y1) in zip(cells, cells[1:]):
+            if not self.valid_cell((x0 + x1) // 2, (y0 + y1) // 2):
+                total += h * math.hypot(x1 - x0, y1 - y0)
+        return total
 
     # ---- clearance (route pricing) ---------------------------------------------------------------
     def _clearance_tile(self, tx: int, ty: int) -> np.ndarray:

@@ -11,7 +11,7 @@ import pytest
 from packages.scene_graph import place
 from packages.scene_graph.api import SceneParams
 from packages.scene_graph.engine import _state_params
-from packages.scene_graph.store import PIPELINE, PIPELINE_CLOSE, PIPELINE_PLACE, _pipeline
+from packages.scene_graph.store import PIPELINE, PIPELINE_CLOSE, PIPELINE_PLACE, PIPELINE_VALID, _pipeline
 
 pytestmark = pytest.mark.unit
 
@@ -87,7 +87,7 @@ def test_params_place_values_are_both_or_neither_and_positive():
 
 def test_pipeline_token_is_unchanged_when_the_rule_is_off():
     assert _pipeline({"robot_half_side": 0.25, "lattice": 0.1, "chart_radius": 2.0}) == PIPELINE
-    assert _pipeline({"near_range_m": 1.3}) == PIPELINE_CLOSE
+    assert _pipeline({"near_range_m": 1.3}) == PIPELINE_VALID  # the rule-on token now carries val (store.PIPELINE_VALID)
     assert _pipeline({"near_range_m": 1.3, "place_peak_m": 0.354, "place_path_m": 0.5}) == PIPELINE_PLACE
     assert "place_peak_m" not in _state_params(SceneParams(near_range_m=1.3))
 

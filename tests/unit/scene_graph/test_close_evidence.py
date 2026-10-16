@@ -153,7 +153,7 @@ def test_store_round_trip_and_params_mismatch():
     assert all((_norm(h)[1][k] == _norm(g)[1][k]).all() for k in ('V', 'T', 'B', 'Fn', 'Bn'))
     assert not _nav(h) and int(h._build_F((0, 0))[0].sum()) == int(g._build_F((0, 0))[0].sum())
     assert st.meta("m")["params_hash"] == S.SceneGraphStore.params_hash(g.params)
-    assert st.manifest("m")["pipeline"] == S.PIPELINE_CLOSE == "morse/2+close"
+    assert st.manifest("m")["pipeline"] == S.PIPELINE_VALID == "morse/2+close+valid"  # rule-on stores carry val
     with pytest.raises(ValueError, match="near_range_m"):       # an engine without the rule refuses the state
         ChartGraph(SceneParams()).import_state(g.export_state())
     # the reverse: a store made without the rule loads as an engine without it, and a rule-on engine refuses its state
@@ -170,7 +170,7 @@ def test_a_store_of_the_earlier_rule_is_refused_not_misread(monkeypatch):
     # a store written under a retired token (held by the latest lethal time from any distance) must not be resumed: its
     # pipeline token (hence its params_hash) differs, so the worker rebuilds, and load / import_state say why
     g = _run([(1000, NEAR, True), (2000, FAR, False)])
-    for old, name, mc in (("morse/2+near1", "PIPELINE_CLOSE", None), ("morse/2+near2", "PIPELINE_CLOSE", 0.25), ("morse/2+near3", "PIPELINE_CLOSE", None), ("morse/2+near4", "PIPELINE_CLOSE", 0.25)):
+    for old, name, mc in (("morse/2+near1", "PIPELINE_VALID", None), ("morse/2+near2", "PIPELINE_VALID", 0.25), ("morse/2+near3", "PIPELINE_VALID", None), ("morse/2+near4", "PIPELINE_VALID", 0.25)):  # the rule-on token is PIPELINE_VALID (it carries val): the retired tokens are patched in under that name
         gg = ChartGraph(SceneParams(near_range_m=1.5, near_min_clearance_m=mc))
         gg.fold_many([_leaf("a", 1000, NEAR, True), _leaf("b", 2000, FAR, False)])
         be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
@@ -242,7 +242,7 @@ def test_the_checker_accepts_a_store_made_with_the_rule():
     be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
     st.save("m", g, g.fold_many(cw.drive(w, way)), None, {})
     r = chk.check_map(st, "m")
-    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_CLOSE == "morse/2+close"
+    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_VALID == "morse/2+close+valid"  # rule-on stores carry val
 
 
 def test_the_graph_builder_reads_the_rule_from_config(monkeypatch):
@@ -344,7 +344,7 @@ def test_filter_off_is_the_rule_alone():
     be = S.MemoryBackend(); store = S.SceneGraphStore(be, be)
     store.save("m", a, a.fold_many([]), None, {"n": 1})
     man = store.manifest("m")
-    assert man["pipeline"] == S.PIPELINE_CLOSE
+    assert man["pipeline"] == S.PIPELINE_VALID  # rule-on stores carry val: PIPELINE_VALID
     assert man["params"] == {"robot_half_side": 0.25, "lattice": 0.1, "chart_radius": 2.0, "near_range_m": 1.5}
 
 
@@ -425,7 +425,7 @@ def test_filter_store_round_trip_and_params_mismatch():
     assert all((_norm(h)[1][k] == _norm(g)[1][k]).all() for k in ("V", "T", "B", "Fn", "hold"))
     assert int(h._build_F((0, 0))[0].sum()) == int(g._build_F((0, 0))[0].sum())
     man = store.manifest("m")
-    assert man["pipeline"] == S.PIPELINE_CLOSE and man["params"]["near_min_clearance_m"] == MC
+    assert man["pipeline"] == S.PIPELINE_VALID and man["params"]["near_min_clearance_m"] == MC  # rule-on stores carry val: PIPELINE_VALID
     assert store.meta("m")["params_hash"] == S.SceneGraphStore.params_hash(g.params)
     # an engine with the rule but no filter refuses the state, and the filter engine refuses a rule-only state
     with pytest.raises(ValueError, match="near_min_clearance_m"):
@@ -447,7 +447,7 @@ def test_filter_the_checker_accepts_a_store_made_with_it():
     be = S.MemoryBackend(); st = S.SceneGraphStore(be, be)
     st.save("m", g, g.fold_many(cw.drive(w, way)), None, {})
     r = chk.check_map(st, "m")
-    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_CLOSE
+    assert r["problems"] == [] and r["pipeline"] == S.PIPELINE_VALID  # rule-on stores carry val: PIPELINE_VALID
     assert r["params"]["near_min_clearance_m"] == 0.25
 
 
@@ -479,7 +479,7 @@ def test_rule_only_tile_readers_equal_the_engine_across_a_tile_edge():
     be = S.MemoryBackend(); store = S.SceneGraphStore(be, be)
     store.save("m", g, g.fold_many([]), None, {"n": 1})
     man = store.manifest("m")
-    assert man["pipeline"] == S.PIPELINE_CLOSE and "bn" in store._tile("m", man, 0, 0)
+    assert man["pipeline"] == S.PIPELINE_VALID and "bn" in store._tile("m", man, 0, 0)  # rule-on stores carry val: PIPELINE_VALID
     eng = store.load("m")
     held = (eng._V < 100) & (eng._Bn >= 0) & (eng._Bn > eng._Fn)
     assert held.sum() == 20 * 22

@@ -94,8 +94,9 @@ def effective_v(t: dict) -> np.ndarray:
 
 
 def read_planes(t: dict) -> dict:
-    """The planes a tile reader keeps (`own`, and the occupancy as `effective_v`), from a decoded tile."""
-    out = {n: t[n] for n in ("own",) if n in t}
+    """The planes a tile reader keeps (`own`, `val` (the validity plane, rule-on stores), and the occupancy as `effective_v`),
+    from a decoded tile."""
+    out = {n: t[n] for n in ("own", "val") if n in t}
     if "v" in t:
         out["v"] = effective_v(t)
     return out

@@ -37,15 +37,20 @@ from .store_backends import ArangoMinioBackend, Blobs, Docs, MemoryBackend  # no
 from .store_codec import (canonical_json, compress_object, effective_v, hash_arrays, pack, pack_json, params_hash, unpack,
                           unpack_json)
 
-# The pipeline token names the tile planes a store carries. morse/2: the rule is off (the latest value wins). morse/2+close: the
-# close-evidence rule is on (SceneParams.near_range_m): the planes `fn` (latest FREE time from within range), `bn` (latest LETHAL time
-# from within range) and `hold` (only with near_min_clearance_m: the away-from-walls result, which the engine stores because its
-# components cross tiles). Earlier rule-on tokens (+near1 .. +near5) held other evidence (and +near5 a validity plane that is no longer
-# written); a store with any of them is refused by `load` and the worker rebuilds the map in a new generation (the token is part of
-# the params hash).
+# The pipeline token names the tile planes a store carries (the token is part of the params hash; a store whose token is not the
+# one this code writes for its params is refused by `load`, and the worker rebuilds the map in a new generation: no fallback).
+#   morse/2          the rule is off (the latest value wins): v, t, b, the channels, own.
+#   morse/2+close    the close-evidence rule (SceneParams.near_range_m) adds fn (latest FREE time from within range), bn (latest LETHAL
+#                    time from within range) and hold (only with near_min_clearance_m: the away-from-walls result, which the engine
+#                    stores because its components cross tiles). Not written any more: a rule store carries val (next line).
+#   morse/2+close+valid     the rule plus val (uint8 lattice plane, 1 = valid: seen free from within range and not held, or driven).
+#                    Written for every map made with the rule. Validity is what the planner's unverified length reads.
+#   morse/2+close+valid+place  the place rule (SceneParams.place_peak_m) on top: the owner plane carries its regions.
+# Earlier rule-on tokens (+near1 .. +near5) held other evidence; they are retired.
 PIPELINE = "morse/2"
 PIPELINE_CLOSE = PIPELINE + "+close"
-PIPELINE_PLACE = PIPELINE_CLOSE + "+place"   # the place rule (SceneParams.place_peak_m): the owner plane carries its regions
+PIPELINE_VALID = PIPELINE_CLOSE + "+valid"
+PIPELINE_PLACE = PIPELINE_VALID + "+place"   # the place rule (SceneParams.place_peak_m): the owner plane carries its regions
 RETIRED_PIPELINES = tuple(PIPELINE + "+near%d" % k for k in range(1, 6))
 RES = 0.05
 RESIDENT_MARGIN_M = 5.0      # a partially resident writer keeps this margin of tiles around a leaf's window
@@ -72,7 +77,7 @@ class DirtyCoverageError(Exception):
 def _pipeline(params: dict) -> str:
     if "place_peak_m" in params:
         return PIPELINE_PLACE
-    return PIPELINE_CLOSE if "near_range_m" in params else PIPELINE
+    return PIPELINE_VALID if "near_range_m" in params else PIPELINE
 
 
 def _fmt(k) -> str:
@@ -105,13 +110,16 @@ def tile_arrays(st: EngineState, tx: int, ty: int, ids_lut: Optional[np.ndarray]
     if st.Fn is not None: a["fn"] = _slice(st.Fn, x0, y0, TILE_F, -1)
     if st.Bn is not None: a["bn"] = _slice(st.Bn, x0, y0, TILE_F, -1)
     if st.Hold is not None: a["hold"] = _slice(st.Hold, x0, y0, TILE_F, False).astype(np.uint8)
+    lx0, ly0 = tx * TILE_L - st.cx0 // 2, ty * TILE_L - st.cy0 // 2
     nonempty = bool((a["v"] != 255).any() or (a["t"] >= 0).any() or (a["b"] >= 0).any())
+    if st.Val is not None:
+        a["val"] = _slice(st.Val, lx0, ly0, TILE_L, False).astype(np.uint8)
+        nonempty = nonempty or bool(a["val"].any())
     for name, (v, t) in sorted(st.chan.items()):
         cv, ct = _slice(v, x0, y0, TILE_F, 255), _slice(t, x0, y0, TILE_F, -1)
         if (cv != 255).any() or (ct >= 0).any():
             a["c.%s.v" % name], a["c.%s.t" % name] = cv, ct; nonempty = True
     if st.plane is not None and ids_lut is not None:
-        lx0, ly0 = tx * TILE_L - st.cx0 // 2, ty * TILE_L - st.cy0 // 2
         pl = _slice(st.plane, lx0, ly0, TILE_L, -1)
         own = ids_lut[pl]                                  # -1 indexes the trailing 0
         a["own"] = own.astype(np.int32)
@@ -628,6 +636,7 @@ class SceneGraphStore:
         Fn = np.full((H, W), -1, np.int64) if "near_range_m" in man["params"] else None
         Bn = np.full((H, W), -1, np.int64) if "near_range_m" in man["params"] else None
         Hold = np.zeros((H, W), bool) if "near_min_clearance_m" in man["params"] else None
+        Val = np.zeros((H // 2, W // 2), bool) if "near_range_m" in man["params"] else None
         chan = {n: (np.full((H, W), 255, np.uint8), np.full((H, W), -1, np.int64)) for n in man["channels"]}
         own = np.zeros((H // 2, W // 2), np.int32)
         for (tx, ty) in coords:
@@ -643,6 +652,7 @@ class SceneGraphStore:
                     chan[n][0][y:y + TILE_F, x:x + TILE_F] = t["c.%s.v" % n]; chan[n][1][y:y + TILE_F, x:x + TILE_F] = t["c.%s.t" % n]
             if "own" in t:
                 own[ly:ly + TILE_L, lx:lx + TILE_L] = t["own"]
+            if Val is not None and "val" in t: Val[ly:ly + TILE_L, lx:lx + TILE_L] = t["val"] != 0
         by_id = {c["id"]: c for c in man["charts"]}
         order = man.get("order")
         charts = [by_id[i] for i in order] if order and len(order) == len(by_id) and set(order) == set(by_id) else list(man["charts"])
@@ -655,7 +665,8 @@ class SceneGraphStore:
             arr, m = unpack(self.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h)))
             leaves += segment_records(arr, m)
         p = man["params"]
-        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, Bn=Bn, Hold=Hold, chan=chan, leaves=leaves,
+        st = EngineState(params=p, cx0=ax0 * TILE_F, cy0=ay0 * TILE_F, V=V, T=T, B=B, Fn=Fn, Bn=Bn, Hold=Hold, Val=Val, chan=chan,
+                         leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
         g = ChartGraph(SceneParams(**p))

@@ -94,6 +94,7 @@ class _Solved:
     S: np.ndarray               # driven (body covered) image
     peak: np.ndarray            # largest B (distance to the cells outside F) in each chart: the persistence peak
     region: np.ndarray          # persistence region (0..) each chart was cut from
+    val: Optional[np.ndarray]   # bool, as plane: the validity of each lattice cell (close-evidence rule only, else None)
 
 
 def _square(theta: float, side: float, res: float = RES) -> np.ndarray:
@@ -172,6 +173,7 @@ class ChartGraph(SceneGraph):
         self._Bn = None                         # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
         self._hold = None                       # cells the rule holds blocked, after the away-from-walls filter (only with that filter)
         self._hold_prev = (None, 0, 0)          # (_hold, cx0, cy0) before the batch being folded: the dirty box includes its changes
+        self._val_h = None                      # validity per lattice cell (close-evidence rule only), set by `_build_F`
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
         self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
@@ -646,22 +648,32 @@ class ChartGraph(SceneGraph):
 
     def _build_F(self, shift: Tuple[int, int] = (0, 0)):
         """(F, clr, S): the navigable lattice cells, the physical clearance of every lattice cell (distance to the nearest
-        blocked or unknown cell, m) and the driven (body covered) image"""
+        blocked or unknown cell, m) and the driven (body covered) image. With the close-evidence rule it also sets `_val_h`, the
+        validity of each lattice cell: valid = (seen free from within range and not held) or driven (G | W | P of the evidence).
+        Validity is sticky: a far report changes V but not the close-free stamp Fn, so a far lethal cannot erase it (a
+        driven cell is valid unobserved). The lattice sample is the top-left costmap cell, as for F's own free cells (the
+        one-tree validity decision)."""
         V = self._V
         free = (V != 255) & (V < 100)
+        hold_v = None
         if self._Fn is not None:
             # close evidence: reported lethal from within range more recently than seen free from within range (and, with
             # near_min_clearance_m, away from walls). A lethal from beyond the range is not true evidence: a later free retracts it.
-            held = (V < 100) & (self._Bn >= 0) & (self._Bn > self._Fn)
+            lethal = (self._Bn >= 0) & (self._Bn > self._Fn)
+            held = (V < 100) & lethal
             if self.params.near_min_clearance_m is not None:
                 held = _away_from_walls(held, V >= 100, self.params.near_min_clearance_m) if held.any() else held
                 self._hold = held
             free &= ~held
+            # the validity test: a blocked cell is held by a close lethal newer than the close free whatever V says (V is that
+            # lethal, or a later far report); a free cell is held exactly as above
+            hold_v = np.where(V < 100, held, lethal)
         sq = self._erode(free, shift)
         clr = self._clearance_cells(free, shift) * RES
         self._clr_price_h = block_min(clr)          # pricing only; `clr_h` (top-left) feeds the partition, charts and link widths
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
         G, W, S, P = self._evidence(sq_h.shape, shift)
+        self._val_h = None if hold_v is None else ((self._Fn >= 0)[::LAT, ::LAT] & ~hold_v[::LAT, ::LAT]) | (G | W | P)
         # the body stood at a leaf pose: the cells W proves there are free even where the window is unknown (a camera blind spot
         # under the robot); a REPORTED blocked cell stays blocked. Along the chord between two poses only known-free cells count.
         cand = sq_h | (W & fr_h) | (P & (V == 255)[::LAT, ::LAT])
@@ -753,7 +765,7 @@ class ChartGraph(SceneGraph):
                                 ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf,
                                 peak=float(peaks[j]), region=int(part.region[j])))
         return _Solved(sp=sp, A=A, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
-                       dep=np.zeros((H, W), bool), S=S, peak=peaks, region=part.region)
+                       dep=np.zeros((H, W), bool), S=S, peak=peaks, region=part.region, val=self._val_h)
 
     @staticmethod
     def _fmt(k: tuple) -> Key:
@@ -1196,7 +1208,7 @@ class ChartGraph(SceneGraph):
         p = self.params
         st = EngineState(params=_state_params(p),
                          cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Bn=self._Bn, Hold=self._hold,
-                         chan=dict(self._chan),
+                         Val=self._val_h, chan=dict(self._chan),
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
         s = self._solved
@@ -1222,9 +1234,9 @@ class ChartGraph(SceneGraph):
         padl = lambda a, fill: np.pad(a, pad // 2, constant_values=fill)
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
         self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
-        if p.near_range_m is not None and (st.Fn is None or st.Bn is None):
-            raise ValueError("state has no close-evidence planes (Fn, Bn): it was made before the lethal-from-within-range rule "
-                             "(pipeline morse/2+close carries them; the earlier rule-on tokens do not) and must be rebuilt, not resumed")
+        if p.near_range_m is not None and (st.Fn is None or st.Bn is None or st.Val is None):
+            raise ValueError("state has no close-evidence planes (Fn, Bn, Val): it was made before the validity plane (pipeline "
+                             "morse/2+valid carries it; the earlier rule-on tokens do not) and must be rebuilt, not resumed")
         self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
         self._Bn = None if p.near_range_m is None else padf(st.Bn, -1)
         self._hold = None
@@ -1240,7 +1252,8 @@ class ChartGraph(SceneGraph):
         if not st.keys or st.plane is None:
             self._solved = None; self._key_plane = None; self._keys = []
             self._sig, self._link_sig = {}, set()
-            if p.near_range_m is not None: self._build_F()      # the hold and validity planes of the planes (an export must carry them)
+            if p.near_range_m is not None:                      # the hold and validity planes of the planes (an export must carry them)
+                self._build_F(); self._verify_val(st, verify)
             return
         self._key_plane = padl(st.plane.astype(np.int32), -1)
         nav, clr, S = self._build_F()
@@ -1248,6 +1261,7 @@ class ChartGraph(SceneGraph):
             if not np.array_equal(padf(st.Hold, False), self._hold):
                 raise StateMismatch("hold plane differs from the one rebuilt in %d cells"
                                     % int((padf(st.Hold, False) != self._hold).sum()))
+        self._verify_val(st, verify)
         part = self._partition(nav)
         plane = -np.ones(nav.shape, np.int32); plane[part.sp.ys, part.sp.xs] = part.full
         bad = np.nonzero((plane != self._key_plane).ravel())[0]
@@ -1263,6 +1277,14 @@ class ChartGraph(SceneGraph):
         if list(self._keys) != keys_in:
             raise StateMismatch("restored keys differ from the stored key table")
         self._sig, self._link_sig = self._signatures(self._solved)
+
+    def _verify_val(self, st: EngineState, verify: bool) -> None:
+        """The stored validity plane must be the one rebuilt from the planes and the evidence (the close-evidence rule only):
+        the store's tile readers answer validity from it, so a stored plane that differs would be read as the engine's."""
+        if verify and st.Val is not None and self._val_h is not None:
+            want = np.pad(st.Val, MARGIN // 2, constant_values=False)
+            if not np.array_equal(want, self._val_h):
+                raise StateMismatch("validity plane differs from the one rebuilt in %d cells" % int((want != self._val_h).sum()))
 
     def check_invariants(self) -> List[str]:
         """The cheap structural subset a worker can run after a load: the charts cover F exactly, every anchor is in its chart
