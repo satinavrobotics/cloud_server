@@ -57,6 +57,7 @@ class FakeConn:
     def __init__(self, specs):
         self.specs = specs
         self.updates = 0
+        self.notifies = []      # (channel, payload) of each pg_notify, delivered at commit in the real database
 
     @contextlib.contextmanager
     def transaction(self):
@@ -64,6 +65,9 @@ class FakeConn:
 
     def execute(self, sql, args):
         conn = self
+        if "pg_notify" in sql:
+            self.notifies.append(tuple(args))
+            return type("C", (), {"rowcount": 1})()
         if sql.startswith("SELECT"):
             names = args["names"]
             rows = [(n, s) for n, s in sorted(self.specs.items()) if not names or n in names]
@@ -118,3 +122,38 @@ def test_race_lost(capsys):
 def test_map_id_filter(capsys):
     _, _, lines = run(["--map-id", "b"], {"a": {}, "b": {}}, {}, capsys)
     assert len(lines) == 1 and '"map_id": "b"' in lines[0]
+
+
+def test_notify_sent_when_updated():
+    specs = {"a": {}}
+    conn = FakeConn(specs)
+    assert t.apply_pin(conn, "a", {"z": 1}) is True
+    assert conn.notifies == [("mapobjectv1", f"{t.PUBLISHER_ID} a ALIVE")]
+
+
+def test_no_notify_when_guard_blocks():
+    specs = {"a": {"scene_graph_params": {"y": 2}}}
+    conn = FakeConn(specs)
+    assert t.apply_pin(conn, "a", {"z": 1}) is False
+    assert conn.notifies == []
+
+
+def test_notify_payload_parses_like_watcher():
+    # PostgresWatcher: publisher, rest = payload.split(" ", 1); name, lifecycle = rest.rsplit(" ", 1)
+    import uuid
+    specs = {"my map name": {}}
+    conn = FakeConn(specs)
+    t.apply_pin(conn, "my map name", {"z": 1})
+    (channel, payload), = conn.notifies
+    publisher, rest = payload.split(" ", 1)
+    name, lifecycle = rest.rsplit(" ", 1)
+    assert channel == t.MAP_TABLE == "mapobjectv1"
+    assert uuid.UUID(publisher) == t.PUBLISHER_ID
+    assert (name, lifecycle) == ("my map name", "ALIVE")
+
+
+def test_apply_notifies_only_pinned_maps(capsys):
+    specs = {"a": {}, "b": {"scene_graph_params": {"x": 1}}}
+    conn = FakeConn(specs)
+    t.main(["--apply"], conn=conn, store=FakeStore({"a": {"params": OFF}, "b": {"params": OFF}}))
+    assert [p.split(" ")[1] for _, p in conn.notifies] == ["a"]

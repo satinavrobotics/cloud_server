@@ -27,13 +27,22 @@ not depend on it.
 import argparse
 import json
 import sys
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import pydantic
 
-from cloud_common.objects.map import SceneGraphParamsV1
+from cloud_common.objects.map import MapObjectV1, SceneGraphParamsV1
+from cloud_common.objects.object import ObjectLifecycleV1
 
-MAP_TABLE = "mapobjectv1"
+MAP_TABLE = MapObjectV1.table_name()
+ALIVE = ObjectLifecycleV1.ALIVE.value
+# Same channel and payload as packages/api/maps.py SqlStore._notify (the channel is MAP_TABLE there too) and
+# PostgresDatabase._notify: "<publisher uuid> <name> <lifecycle>", so running services' watchers refresh the map.
+# This tool is its own publisher (a fresh uuid per process, as the API does for one-off writes), so no listener
+# takes the notification for its own change.
+PUBLISHER_ID = uuid.uuid4()
+NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
 SELECT_SQL = ("SELECT name, spec FROM " + MAP_TABLE + " WHERE lifecycle = 'ALIVE'"
               " AND (%(names)s::text[] IS NULL OR name = ANY(%(names)s::text[])) ORDER BY name")
 # the guard is in the WHERE clause: only a spec still without params is touched
@@ -78,10 +87,14 @@ def plan_map(map_id: str, spec: Optional[dict], manifest_params: Any, has_manife
 
 
 def apply_pin(conn: Any, map_id: str, params: dict) -> bool:
-    """One transaction; True when the row was updated (False: a spec got params in the meantime)."""
+    """One transaction: the guarded UPDATE and, only when it changed the row, the map NOTIFY (committed with it).
+    True when the row was updated (False: a spec got params in the meantime, nothing is notified)."""
     with conn.transaction():
         cur = conn.execute(UPDATE_SQL, {"name": map_id, "params": json.dumps(params)})
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        conn.execute(NOTIFY_SQL, (MAP_TABLE, "%s %s %s" % (PUBLISHER_ID, map_id, ALIVE)))
+        return True
 
 
 def main(argv: Optional[List[str]] = None, conn: Any = None, store: Any = None) -> int:
