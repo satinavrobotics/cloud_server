@@ -10,10 +10,11 @@ worker's advisory lock) and the guard's connections when its loop ends, so they 
 from the caller's thread while a step may still be using them. Only when the thread is not alive
 (never started, or already ended) does `stop()` close them itself.
 """
+import dataclasses
 import logging
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple
 
 log = logging.getLogger("GraphBuilderService.scene_host")
 
@@ -199,22 +200,47 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     database = getattr(service, "database", None)
     sink = scene_events.make_event_sink(database, loop) if database is not None and loop is not None else None
 
+    def spec_params(map_id: str) -> Tuple[Any, Optional[float]]:
+        """`(SceneParams, half_side)` of a map. A map whose spec has `scene_graph_params` (fixed at creation) gets its
+        chart_radius, close-evidence range and robot half side from it; a map from before the object keeps the global
+        config params and its legacy per-robot footprint (half_side None). RAISES when the spec cannot be read: the runner
+        backs off and builds the worker again."""
+        raw = guard.scene_graph_params(map_id)
+        if raw is None:
+            return params, None
+        from cloud_common.objects.map import SceneGraphParamsV1
+        from packages.scene_graph.place import place_params_from_half_side
+        spec = SceneGraphParamsV1(**raw)
+        near = spec.close_evidence_range_m
+        # place rule (off unless the spec turns it on): both thresholds come from the one derivation in scene_graph/place.py
+        peak, path = place_params_from_half_side(spec.robot_half_side_m) if spec.place_rule else (None, None)
+        mapped = SceneParams(chart_radius=spec.chart_radius_m, robot_half_side=spec.robot_half_side_m,
+                             near_range_m=near,
+                             near_min_clearance_m=_cfg.SCENE_GRAPH_NEAR_MIN_CLEARANCE_M if near is not None else None,
+                             place_peak_m=peak, place_path_m=path)
+        return mapped, spec.robot_half_side_m
+
     def make_worker(map_id: str) -> Any:
         # No engine here: the worker builds it through `engine_factory` once it HOLDS the map's
         # writer lock (a replica that does not own the map loads nothing), pinned to the stored
         # version it read under that lock. A params change never reaches the factory: the worker
         # starts a new generation with `new_engine` instead.
+        map_params, half_side = spec_params(map_id)
+        # the stored params_hash is the map's own: its worker config must expect that hash, not the global one
+        map_cfg = dataclasses.replace(cfg, expected_params_hash=expected_params_hash(map_params))
+
         def load(version: int) -> Any:
-            return store.load(map_id, version) if version else ChartGraph(params)
+            return store.load(map_id, version) if version else ChartGraph(map_params)
 
         return scene_worker.SceneWorker(
             map_id, source=service.graph_db, fetch_png=fetch_png, footprint=footprint,
-            engine_factory=load, store=store, cursor_store=cursors, guard=guard, config=cfg,
+            engine_factory=load, store=store, cursor_store=cursors, guard=guard, config=map_cfg,
             now_ms=lambda: int(time.time() * 1000),
             mono_ms=lambda: int(time.monotonic() * 1000),
             stored_leaves=lambda version: stored_leaf_index(store, map_id, version),
             publish=scene_events.make_publish(service.update_publisher, loop, map_id),
-            new_engine=lambda: ChartGraph(params), fence_errors=(StaleVersion,), prefetch=prefetch,
+            new_engine=lambda: ChartGraph(map_params), fence_errors=(StaleVersion,), prefetch=prefetch,
+            half_side=half_side,
             on_event=(lambda kind, payload: sink(map_id, kind, payload)) if sink else None)
 
     switched_off: set = set()

@@ -46,6 +46,10 @@ CLEAR_REBUILD_SQL = ("UPDATE mapobjectv1 SET status = status - %s WHERE name = %
 # the global setting (the worker only runs when SCENE_GRAPH_WORKER_ENABLED is on).
 DISABLED_SQL = ("SELECT name FROM mapobjectv1 WHERE name = ANY(%s) "
                 "AND lifecycle <> 'DELETED' AND status->%s = 'false'::jsonb")
+# The map spec's scene_graph_params object (packages/api/maps.py create_map stores it; a map from before the object
+# existed has none and keeps its manifest / live footprint, see scene_host.make_worker).
+SCENE_GRAPH_PARAMS_SQL = ("SELECT spec->'scene_graph_params' FROM mapobjectv1 WHERE name = %s "
+                          "AND lifecycle <> 'DELETED' AND lifecycle <> 'DELETING'")
 
 
 def bucket_slug(map_id: str) -> str:
@@ -132,6 +136,19 @@ class PgGuard:
             if transient and conn is not None:
                 self._close(conn)
         return row is None or row[0] == "DELETING"
+
+    def scene_graph_params(self, map_id: str) -> Optional[Dict[str, Any]]:
+        """The map's stored `scene_graph_params` object, None when the spec has none (a map from before the object).
+        RAISES when the query fails (the caller keeps what it had)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(SCENE_GRAPH_PARAMS_SQL, (map_id,)).fetchone()
+        finally:
+            self._close(conn)
+        value = row[0] if row else None
+        if isinstance(value, str):
+            value = json.loads(value)
+        return value if isinstance(value, dict) else None
 
     def registered_maps(self, candidates: Iterable[str]) -> List[str]:
         """The candidates (bucket-derived ids) that are registered, live maps: a positive check.

@@ -190,6 +190,9 @@ class ChartPlan:
     trajectory: Optional[List[Dict[str, Any]]] = None
     # the waypoint budget's record {waypoint_budget_m, waypoints_removed (against the greedy pull of the same plan)}; None when off
     waypoint_budget: Optional[Dict[str, Any]] = None
+    # the goal lies beyond goal_snap_m from free space: {goal_xy (the tap), free_xy (the snapped free cell), distance_from_free_m,
+    # unverified_length_m (the straight leg from free_xy to the tap: not verified by close evidence), limit_m}; None when within
+    goal_far: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -966,10 +969,18 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     problem = snap_problem(snap_a, start_snap_m)
     if problem:
         raise ChartFallback("start_" + problem)
-    snap_b = graph.snap(goal_xy[0], goal_xy[1], goal_snap_m)
-    problem = snap_problem(snap_b, goal_snap_m)
+    # A goal is not refused for its distance from free space: beyond goal_snap_m (the map's close-evidence range) it is
+    # planned with a `goal_far` notice. Refused only when the engine finds no free cell in reach, or the nearest one is
+    # cut off by a known blocked cell.
+    snap_b = graph.snap(goal_xy[0], goal_xy[1])
+    problem = snap_problem(snap_b, math.inf)
     if problem:
         raise ChartFallback("goal_" + problem)
+    goal_far = None
+    if snap_b.distance > goal_snap_m:
+        goal_far = {"goal_xy": (float(goal_xy[0]), float(goal_xy[1])), "free_xy": (snap_b.x, snap_b.y),
+                    "distance_from_free_m": float(snap_b.distance), "unverified_length_m": float(snap_b.distance),
+                    "limit_m": float(goal_snap_m)}
     discs, segments = overlay
     blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
     turn = dict(TURN_NOT_GIVEN) if turn is None else dict(turn)
@@ -1081,4 +1092,4 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
-                     trajectory=legs, waypoint_budget=budget_record)
+                     trajectory=legs, waypoint_budget=budget_record, goal_far=goal_far)

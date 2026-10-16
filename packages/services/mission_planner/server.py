@@ -295,7 +295,7 @@ class MissionPlannerService:
         plan_fut = self._plan_pool.submit(
             lambda: scene_route.plan_on_graph(
                 graph, map_id, tuple(start_xy), (target_x, target_y), overlay, node_of,
-                config.SCENE_GRAPH_START_SNAP_M, config.SCENE_GRAPH_GOAL_SNAP_M,
+                config.SCENE_GRAPH_START_SNAP_M, self._goal_snap_m(graph),
                 config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M,
                 self._robot_width(robot),
                 config.SCENE_GRAPH_WIDTH_MARGIN_M,
@@ -357,7 +357,15 @@ class MissionPlannerService:
             **({"waypoint_budget": plan.waypoint_budget} if plan.waypoint_budget is not None else {}),
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
             **({"trajectory": plan.trajectory} if plan.trajectory else {}),
+            **({"goal_far": plan.goal_far} if plan.goal_far is not None else {}),
         }, None
+
+    @staticmethod
+    def _goal_snap_m(graph: Any) -> float:
+        """The goal's acceptance distance from free space: the map's close-evidence range (set at map creation, fixed for
+        the map); a map with close evidence off uses SCENE_GRAPH_GOAL_SNAP_M."""
+        near = getattr(getattr(graph, "params", None), "near_range_m", None)
+        return float(near) if near is not None else config.SCENE_GRAPH_GOAL_SNAP_M
 
     async def enrich_route(
         self, robot_name: str, map_id: str, waypoints: List[common.Pose2D],

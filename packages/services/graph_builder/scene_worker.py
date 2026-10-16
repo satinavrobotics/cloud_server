@@ -454,13 +454,17 @@ class SceneWorker:
                  loaded_version: Optional[int] = None,
                  mono_ms: Optional[Callable[[], int]] = None,
                  prefetch: Optional[PngPrefetch] = None,
-                 stored_leaves: Optional[Callable[[int], Optional[Mapping[str, tuple]]]] = None) -> None:
+                 stored_leaves: Optional[Callable[[int], Optional[Mapping[str, tuple]]]] = None,
+                 half_side: Optional[float] = None) -> None:
         if engine is None and engine_factory is None:
             raise ValueError("SceneWorker needs an engine or an engine_factory")
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
         self.engine, self.store, self.cursor_store, self.guard = engine, store, cursor_store, guard
         self.engine_factory, self._loaded_version = engine_factory, loaded_version
         self.prefetch = prefetch
+        # the map's fixed robot half side (its spec's robot_half_side_m, set at creation): when given, every node is folded
+        # with it and the live footprint is not read; None = the legacy per-robot footprint (a map from before the spec)
+        self._half_side = half_side
         # `stored_leaves(version) -> {key: (stamp_ms, session, x, y, r_d, view)}` of a stored version (the
         # leaf segments of its manifest: no engine load); None = read them from the engine when it is loaded
         self.stored_leaves = stored_leaves
@@ -1447,6 +1451,8 @@ class SceneWorker:
         return int(node.get("costmap_stored_ms") or 0), str(node.get("_key", ""))
 
     def _robot_half_side(self, node: Mapping[str, Any]) -> Tuple[float, bool]:
+        if self._half_side is not None:
+            return self._half_side, True
         robot = next((str(node[f]) for f in self.config.robot_fields if node.get(f)), "")
         now = self._mono()
         hit = self._footprints.get(robot)
