@@ -33,6 +33,7 @@ from scipy.sparse.csgraph import dijkstra
 from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
                   SceneParams, Snap, ViewResult)
 from . import morse
+from .place import place_regions
 from . import turn as turn_search
 from . import weights
 from .chart_keys import assign_A, overlaps
@@ -129,6 +130,8 @@ def _state_params(p: SceneParams) -> dict:
     if p.near_range_m is not None:
         out["near_range_m"] = p.near_range_m
         if p.near_min_clearance_m is not None: out["near_min_clearance_m"] = p.near_min_clearance_m
+    if p.place_peak_m is not None:
+        out["place_peak_m"] = p.place_peak_m; out["place_path_m"] = p.place_path_m
     return out
 
 
@@ -680,7 +683,25 @@ class ChartGraph(SceneGraph):
         self._solved = self._evaluate(self._partition(nav), clr, S, birth)
 
     def _partition(self, nav: np.ndarray) -> "morse.Partition":
+        if self.params.place_peak_m is not None:
+            nav = self._place_filter(nav)
         return morse.partition(nav, self._h, self._tau, radius=self._radius, cache=self._ccache)
+
+    def _place_filter(self, nav: np.ndarray) -> np.ndarray:
+        """The navigable set without the regions that are not places (scene_graph/place.py). Every path that cuts charts goes
+        through here (solve, load verification, export), so the stored owner plane is the filtered set."""
+        sp = morse.Space.of(nav)
+        if sp.N == 0:
+            return nav
+        if self._pl is None or self._pl["G"].shape != nav.shape:
+            raise RuntimeError("place rule: the driven planes are not aligned with the navigable set")
+        f = morse.distance(sp, self._h)
+        region = morse.partition(nav, self._h, self._tau).full        # persistence regions (no radius): one id per cell
+        driven = (self._pl["G"] | self._pl["W"])[sp.ys, sp.xs]
+        keep = place_regions(f, region, driven, sp.ys, sp.xs, self._h, self.params.place_peak_m, self.params.place_path_m)
+        out = nav.copy()
+        out[sp.ys[~keep], sp.xs[~keep]] = False
+        return out
 
     def _evaluate(self, part: "morse.Partition", clr, S, birth) -> _Solved:
         sp, A, h = part.sp, [int(a) for a in part.anchor], self._h

@@ -45,6 +45,7 @@ from .store_codec import (canonical_json, compress_object, effective_v, hash_arr
 # the params hash).
 PIPELINE = "morse/2"
 PIPELINE_CLOSE = PIPELINE + "+close"
+PIPELINE_PLACE = PIPELINE_CLOSE + "+place"   # the place rule (SceneParams.place_peak_m): the owner plane carries its regions
 RETIRED_PIPELINES = tuple(PIPELINE + "+near%d" % k for k in range(1, 6))
 RES = 0.05
 RESIDENT_MARGIN_M = 5.0      # a partially resident writer keeps this margin of tiles around a leaf's window
@@ -69,6 +70,8 @@ class DirtyCoverageError(Exception):
 
 
 def _pipeline(params: dict) -> str:
+    if "place_peak_m" in params:
+        return PIPELINE_PLACE
     return PIPELINE_CLOSE if "near_range_m" in params else PIPELINE
 
 

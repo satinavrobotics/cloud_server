@@ -38,6 +38,11 @@ class SceneParams:
                                            # 8-connected component of held cells with a cell farther than this (m) from every other
                                            # blocked or unknown cell; wall rims (components within it everywhere) read as without
                                            # the rule. None = every held cell is held.
+    place_peak_m: Optional[float] = None   # place rule (scene_graph/place.py): a persistence region of the navigable set is a place
+                                           # when its peak clearance reaches this (m). Set from the robot's circumscribed radius
+                                           # (docs: the robot fits at the peak). Both place_* values or neither; None = off.
+    place_path_m: Optional[float] = None   # place rule: or when its driven footprint spans at least this path length (m), the robot
+                                           # has traversed it. Set from the robot's length.
 
     def __post_init__(self):
         mc = self.near_min_clearance_m
@@ -46,6 +51,11 @@ class SceneParams:
                 raise ValueError("SceneParams.near_min_clearance_m needs near_range_m")
             if not (0.0 < mc < float("inf")):
                 raise ValueError("SceneParams.near_min_clearance_m must be finite and > 0, got %r" % (mc,))
+        if (self.place_peak_m is None) != (self.place_path_m is None):
+            raise ValueError("SceneParams.place_peak_m and place_path_m are set together or not at all")
+        for name, v in (("place_peak_m", self.place_peak_m), ("place_path_m", self.place_path_m)):
+            if v is not None and not (0.0 < v < float("inf")):
+                raise ValueError("SceneParams.%s must be finite and > 0, got %r" % (name, v))
 
 
 @dataclass(frozen=True)
