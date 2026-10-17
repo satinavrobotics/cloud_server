@@ -80,6 +80,13 @@ class TestIngest:
         svc._processing = set()
         svc._robot_runs = {}
         svc._legacy_epochs = {}
+        svc._incomplete = set()
+        svc._complete_cache = NodeIdCache(10)
+        svc._claim_events = {}
+        svc._run_probed = set()
+        svc._run_probe_retry = {}
+        svc._claim_waiters = threading.BoundedSemaphore(2)
+        svc.claim_wait_s = 0.1
         svc.image_buffer = MagicMock()
         svc.image_buffer.take.return_value = []
         svc.image_buffer_timeout = 1

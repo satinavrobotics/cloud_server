@@ -88,6 +88,7 @@ class FakeService:
     def connect_mqtt(self): pass
     def set_event_loop(self, loop): pass
     def disconnect_mqtt(self): self.disconnected = True
+    def close(self): pass
     def _cleanup_old_mappings(self): pass
     async def flush_rejects(self): pass
 

@@ -389,21 +389,59 @@ is built for it; robots that send nothing new keep working.
   the payload's), and `:{run_id}` appended when the robot sends one. The same robot node always
   has the same id, so uploads find it again after a restart.
 - **Duplicate nodes.** A node whose id is stored already (in memory, the node-id LRU
-  `NODE_EXISTS_CACHE_SIZE`, or ArangoDB) is a no-op: first write wins (a resend with another pose or
-  metadata does not change the node), no `add_node`, no new edges, no `node_count`, no WebSocket
-  `node_added`; counted in `nodes_duplicate`. Buffered images / depth / costmaps are still attached.
-  If the first attempt stored the node but failed on its edges or on counting, a resend does not
-  repair that.
+  `NODE_EXISTS_CACHE_SIZE`, or ArangoDB) and complete is a no-op: first write wins (a resend with
+  another pose or metadata does not change the node), no `add_node`, no new edges, no
+  `node_count`, no WebSocket `node_added`; counted in `nodes_duplicate`. Buffered images / depth /
+  costmaps are still attached.
+- **Complete nodes.** A new node is written with `ingest_complete: false` and set to `true` only
+  after its edges are in and `node_count` was bumped. A resend of a node that is stored but not
+  complete (edges or count failed, or graph-builder died in between) is repaired: its missing
+  edges are created and it is counted once, then marked complete. A node document *without* the
+  field was stored before the marker existed and counts as complete, so existing graphs are never
+  re-processed. New edges get the deterministic `_key` `"{from}:{to}"` and are inserted with
+  `overwrite_mode="ignore"`, so a repair never duplicates an edge; edges of older nodes keep their
+  auto keys. Residuals: if the count succeeded but writing the marker failed (or graph-builder
+  died between the count and the marker), a later repair counts the node again, so `node_count`
+  can be 1 too high for that node. A repair's `edges_created` also counts the edges that already
+  existed and were ignored. If the edges fail on the first attempt the node is not counted or
+  published until its resend repairs it. If only the count fails, the node is published at once
+  and a repair in the same process does not publish (or log its mission waypoint) a second time;
+  after a restart the repair does. A manual `POST /node` (no session) has no marker.
+- **Concurrent resends.** A resend that arrives while the same node is being stored waits (a
+  worker thread blocked on an event, no lock, no polling; at most `NODE_CLAIM_WAIT_S` = 15 s; at most `NODE_CLAIM_WAIT_THREADS` = 8 resends wait at once,
+  the rest are dropped as duplicates immediately, and node storing runs on its own pool of that
+  size + 4 so waiters never starve the attempt they wait for)
+  until that attempt is finished, then looks again: a finished node makes it a duplicate, a failed
+  attempt lets it store or repair the node. After the timeout it is dropped as a duplicate.
+- **ArangoDB errors.** When an existence lookup fails the node is neither absent nor present:
+  nothing is written and the error is counted (`errors`); a part is buffered. The robot's resend
+  or the buffer cleanup settles it.
 - **Parts after a restart.** An image is stored at once when its node exists in ArangoDB; a depth
   or costmap record is set on the existing document. Only a node that does not exist yet makes an
   upload wait in the buffer (30 s).
-- **`run_id` (optional, all four payloads).** Any string that is stable for one robot run /
-  topomap run and changes when the robot restarts and restarts its `session_node_id` counter.
-  A changed `run_id` resets the robot's state (as a smaller id used to); a lower `session_node_id`
-  with the same `run_id` is just a resend. Without `run_id` the old heuristic remains: a smaller
-  id than seen before is a reset (a resend of an older node looks the same). Robots that restart
-  their counter should send `run_id`: otherwise, after a graph-builder restart, the new run's
-  nodes would be taken for duplicates of the old run's.
+- **`run_id` (optional, all four payloads).** A string that identifies the robot's node-id
+  *sequence*: created once, persisted, surviving robot restarts, changed only when the ids are
+  deliberately reset. The same `run_id` with higher ids is a continuation, also across a Finish
+  and a new cloud session. A changed `run_id` resets the robot's state (as a smaller id used to);
+  a lower `session_node_id` with the same `run_id` is just a resend.
+- **Mixed `run_id` presence.** A node may have been stored with or without it. A message is looked
+  up under the ids it could have: the payload's run, the robot's last-known run, and no run (a
+  node message with a `run_id` only under its own; an upload of a run other than the robot's
+  current one only under its own). Memory is checked first, then ArangoDB per candidate, stopping
+  at the first hit. After a restart the robot's last run is looked up once per robot (one unindexed
+  scan of the robot's nodes in the session; a failed lookup is retried after 30 s, not on every
+  message) when a message lacks `run_id`. A robot known to use `run_id`
+  never gets the legacy reset below from a message without one. A `run_id` that appears
+  mid-stream loses nothing: the earlier run-less nodes are found as duplicates. Limit: if the
+  first `run_id` coincides with a counter reset, the new run's ids can be taken for the run-less
+  nodes' ids by an upload. Buffered uploads carrying another `run_id` than the node are
+  discarded when the node arrives.
+- **Legacy robots (no `run_id` ever): limits.** The fallback is the old heuristic: a smaller id
+  than any seen before is a restart. It is not deterministic across a graph-builder restart (the
+  reset token is memory only; after a restart a restarted counter looks like duplicates), a resend
+  of an older backlog is not deduplicated (it is taken for a restart and creates new nodes), and a
+  resend that straddles a Finish / new cloud session creates a second node in the new session's
+  map (the cloud session is part of the id). Robots should send `run_id`.
 
 ## How It Works
 

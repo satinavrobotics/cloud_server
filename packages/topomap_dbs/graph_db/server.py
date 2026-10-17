@@ -434,6 +434,8 @@ class GraphDatabaseService:
         self,
         edges: List[Dict[str, Any]],
         map_id: Optional[str] = None,
+        deterministic_keys: bool = False,
+        raise_on_error: bool = False,
     ) -> int:
         """
         Insert multiple edges in a single ArangoDB request.
@@ -441,6 +443,13 @@ class GraphDatabaseService:
         Args:
             edges: List of dicts, each with 'from_node_id', 'to_node_id', and optional 'metadata'.
             map_id: Map ID (uses default collection if not provided)
+            deterministic_keys: give each edge the `_key` `edge_key(from, to)` and insert with
+                overwrite_mode="ignore": an edge that exists already is left as it is, so
+                inserting the same edges again (a repair) creates no duplicates. Such an edge
+                counts as inserted. Default False: auto-generated keys, as before.
+            raise_on_error: raise instead of returning 0 when the request fails, and raise
+                (RuntimeError) when any single edge fails, so the caller can tell a failure from
+                "no edges". Default False: failures are logged and 0 is returned, as before.
 
         Returns:
             Number of edges successfully inserted
@@ -471,22 +480,37 @@ class GraphDatabaseService:
                 metadata = edge.get('metadata')
                 if metadata:
                     doc.update(metadata)
+                if deterministic_keys:
+                    doc['_key'] = self.edge_key(edge['from_node_id'], edge['to_node_id'])
                 docs.append(doc)
 
+            options = {'overwrite_mode': 'ignore'} if deterministic_keys else {}
             if map_id:
                 collection = self.db.collection(edge_collection_name)
-                results = collection.insert_many(docs, silent=False)
+                results = collection.insert_many(docs, silent=False, **options)
             else:
                 edge_collection = self.graph.edge_collection(self.edge_collection)
-                results = edge_collection.insert_many(docs, silent=False)
+                results = edge_collection.insert_many(docs, silent=False, **options)
 
             inserted = sum(1 for r in results if not isinstance(r, Exception))
             self.logger.debug(f"✅ Bulk inserted {inserted}/{len(docs)} edges in {edge_collection_name}")
+            if raise_on_error and inserted < len(docs):
+                failed = next(r for r in results if isinstance(r, Exception))
+                raise RuntimeError(f"{len(docs) - inserted}/{len(docs)} edges failed: {failed}")
             return inserted
 
         except Exception as e:
             self.logger.error(f"Failed to bulk insert edges: {e}")
+            if raise_on_error:
+                raise
             return 0
+
+    @staticmethod
+    def edge_key(from_node_id: Union[int, str], to_node_id: Union[int, str]) -> str:
+        """The deterministic `_key` of the edge from -> to (`add_edges_bulk`
+        deterministic_keys): "{from}:{to}". Valid in ArangoDB for the ids used here (UUIDs,
+        ints); at most 254 bytes."""
+        return f"{from_node_id}:{to_node_id}"
 
     def node_exists(self, map_id: str, node_id: Union[int, str]) -> bool:
         """
@@ -494,8 +518,10 @@ class GraphDatabaseService:
         builds the flattened record).
 
         Returns:
-            True if the node exists; False if it does not, the map has no node collection, or
-            the lookup failed (logged)
+            True if the node exists; False if it does not or the map has no node collection.
+
+        Raises:
+            Exception: the lookup itself failed (logged): "unknown", which is not "absent"
         """
         try:
             node_collection_name = f"nodes_{map_id}"
@@ -504,7 +530,58 @@ class GraphDatabaseService:
             return bool(self.db.collection(node_collection_name).has(str(node_id)))
         except Exception as e:
             self.logger.error(f"Failed to check node {node_id} in map {map_id}: {e}")
-            return False
+            raise
+
+    NODE_INGEST_INCOMPLETE_AQL = (
+        "FOR d IN @@col FILTER d._key == @key RETURN d.ingest_complete == false")
+    NODE_RUN_ID_AQL = (
+        "FOR d IN @@col FILTER d.robot_name == @robot AND d.session_id == @session "
+        "AND d.run_id != null SORT d.created_at DESC LIMIT 1 RETURN d.run_id")
+
+    def node_ingest_incomplete(self, map_id: str, node_id: Union[int, str]) -> bool:
+        """The node's document carries `ingest_complete: false` (graph-builder wrote the node
+        but did not finish its edges / count). A node without the field (stored before the
+        marker existed) is complete. False for a missing node or map.
+
+        Raises:
+            Exception: the lookup failed (logged)
+        """
+        try:
+            if not self.db.has_collection(f"nodes_{map_id}"):
+                return False
+            cursor = self.db.aql.execute(self.NODE_INGEST_INCOMPLETE_AQL, bind_vars={
+                "@col": f"nodes_{map_id}", "key": str(node_id)})
+            return any(r is True for r in cursor)
+        except Exception as e:
+            self.logger.error(f"Failed to read the ingest marker of node {node_id} in {map_id}: {e}")
+            raise
+
+    def mark_node_complete(self, map_id: str, node_id: Union[int, str]) -> bool:
+        """Set `ingest_complete: true` on a node (its edges are in and it is counted). False
+        (logged) when the node or map does not exist or on any failure."""
+        return self._update_node_attribute(
+            self.SET_NODE_COMPLETE_AQL, map_id, node_id, {}, "ingest_complete")
+
+    SET_NODE_COMPLETE_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {ingest_complete: true} IN @@col RETURN NEW._key")
+
+    def last_run_id(self, map_id: str, robot_name: str, session_id: str) -> Optional[str]:
+        """The `run_id` of the robot's newest node in a cloud session that has one, else None.
+        A scan of the map's nodes: graph-builder asks once per robot after a restart.
+
+        Raises:
+            Exception: the lookup failed (logged)
+        """
+        try:
+            if not self.db.has_collection(f"nodes_{map_id}"):
+                return None
+            cursor = self.db.aql.execute(self.NODE_RUN_ID_AQL, bind_vars={
+                "@col": f"nodes_{map_id}", "robot": robot_name, "session": str(session_id)})
+            return next(iter(cursor), None)
+        except Exception as e:
+            self.logger.error(f"Failed to look up the run of {robot_name} in {map_id}: {e}")
+            raise
 
     def get_node(
         self,

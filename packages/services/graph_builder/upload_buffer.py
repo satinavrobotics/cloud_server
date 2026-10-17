@@ -145,10 +145,11 @@ class NodeUploadBuffer:
             return None if self.put(key, sub, entry) else DROPPED
 
     def take(self, key: NodeKey, timeout: float,
-             session_id: Optional[str] = None) -> List[Any]:
+             session_id: Optional[str] = None, run_id: Optional[str] = None) -> List[Any]:
         """Remove and return the entries buffered for a node that are younger than `timeout`
         seconds and (when `session_id` is given) carry that `session_id`; the rest are logged
-        and discarded."""
+        and discarded. `run_id` (the node's): an entry that carries another `run_id` is from
+        another run of the robot and is discarded too; an entry without one is taken."""
         with self.lock:
             subs = self.entries.pop(key, None)
             if not subs:
@@ -166,6 +167,11 @@ class NodeUploadBuffer:
             elif session_id is not None and entry.get("session_id") != session_id:
                 self._log.warning(f"Buffered {self.kind} of ({robot_name}, {session_node_id}, "
                                   f"{sub}) is from another session; discarded")
+            elif (run_id is not None and isinstance(entry, dict)
+                  and entry.get("run_id") is not None and entry.get("run_id") != run_id):
+                self._log.warning(f"Buffered {self.kind} of ({robot_name}, {session_node_id}, "
+                                  f"{sub}) is from another run ({entry.get('run_id')} != "
+                                  f"{run_id}); discarded")
             else:
                 taken.append(entry)
         return taken

@@ -147,6 +147,7 @@ async def lifespan(app: FastAPI):
             logging.error(f"Scene graph worker shutdown failed: {e}")
     if service:
         service.disconnect_mqtt()
+        service.close()
     logging.info("👋 Graph Builder Service shutting down")
 
 
