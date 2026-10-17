@@ -500,6 +500,38 @@ class ReconstructionFailed(Payload):
     message: Optional[str] = None
 
 
+class SemanticStarted(Payload):
+    """MAP.SEMANTIC_STARTED (packages/api/semantic.py): the service's first progress callback."""
+    map_name: str
+    job_id: str
+    params: Dict[str, Any] = {}
+    nodes_with_depth: Optional[int] = None
+    attempt: Optional[int] = None
+
+
+class SemanticFinished(Payload):
+    """MAP.SEMANTIC_FINISHED: the job's outputs were verified and committed; it is the map's
+    current semantic layer."""
+    map_name: str
+    job_id: str
+    instances: Optional[int] = None
+    label_voxels: Optional[int] = None
+    frames_used: Optional[int] = None
+    dynamic_frames: Optional[int] = None
+    depth_source: Optional[str] = None
+    duration_s: Optional[float] = None
+
+
+class SemanticFailed(Payload):
+    """MAP.SEMANTIC_FAILED: the job ended without a result (same `reason`s as
+    ReconstructionFailed). The previous result is untouched."""
+    map_name: str
+    job_id: str
+    reason: str
+    stage: Optional[str] = None
+    message: Optional[str] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel

@@ -41,7 +41,7 @@ from packages.config import (
     SCENE_GRAPH_WORKER_ENABLED,
 )
 from packages.api.map_delete import MapDeleter
-from packages.api import localization_view, maps, reconstruction
+from packages.api import localization_view, maps, reconstruction, semantic
 from packages.api.mapping_switch import MappingSwitch
 from packages.api.slam_save_state import PgSlamStateStore
 from packages.api.orchestrator_maps import OrchestratorMaps
@@ -706,8 +706,22 @@ class ApiDelegationService:
             minio_access_key or require_secret("MINIO_ACCESS_KEY"),
             minio_secret_key or require_secret("MINIO_SECRET_KEY"))
 
+        # Semantic layer gateway (docs/semantic/design.md): same shape, own table and service.
+        self.semantic = semantic.create_gateway(
+            self.database, self.graph_db, self.image_db,
+            minio_access_key or require_secret("MINIO_ACCESS_KEY"),
+            minio_secret_key or require_secret("MINIO_SECRET_KEY"))
+
+        async def mark_jobs_deleting(cursor, map_id):
+            return {"reconstruction": await reconstruction.mark_map_deleting(cursor, map_id),
+                    "semantic": await semantic.mark_map_deleting(cursor, map_id)}
+
+        async def after_jobs_marked(map_id, marked):
+            await self.reconstruction.after_map_delete_marked(map_id, marked["reconstruction"])
+            await self.semantic.after_map_delete_marked(map_id, marked["semantic"])
+
         # WP11 F1: DELETE /maps/{id} marks the map DELETING; this cleans up in the background.
-        # The mark also cancels the map's active reconstruction job (same transaction).
+        # The mark also cancels the map's active reconstruction and semantic jobs (same transaction).
         scene_drop, scene_active = self._scene_graph_delete_hooks()
         self.map_deleter = MapDeleter(
             self.database,
@@ -715,8 +729,8 @@ class ApiDelegationService:
             lambda map_id: self.image_db.delete_map(map_id),
             max_attempts=MAP_DELETE_MAX_ATTEMPTS, backoff_s=MAP_DELETE_BACKOFF_S,
             backoff_max_s=MAP_DELETE_BACKOFF_MAX_S,
-            on_mark=reconstruction.mark_map_deleting,
-            after_mark=self.reconstruction.after_map_delete_marked,
+            on_mark=mark_jobs_deleting,
+            after_mark=after_jobs_marked,
             scene_drop=scene_drop, scene_active=scene_active,
             scene_lock_timeout_s=SCENE_GRAPH_DELETE_LOCK_TIMEOUT_S,
             scene_lock_deadline_s=SCENE_GRAPH_DELETE_LOCK_DEADLINE_S)

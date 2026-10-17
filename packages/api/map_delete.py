@@ -85,6 +85,8 @@ SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
 # Its 3D reconstruction jobs (R3, docs/reconstruction/design.md §8.5) too; their files go with
 # the bucket.
 RECONSTRUCTIONS_SQL = "DELETE FROM map_reconstructions WHERE map_name = %s"
+# Its semantic-layer jobs (docs/semantic/design.md) the same way.
+SEMANTICS_SQL = "DELETE FROM map_semantics WHERE map_name = %s"
 # Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
 EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
 # Its blocked-node exclusions (migration 20261008_01_blocked_graph_nodes) too.
@@ -438,6 +440,7 @@ class MapDeleter:
                 if removed:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
                     await cursor.execute(RECONSTRUCTIONS_SQL, (map_id,))
+                    await cursor.execute(SEMANTICS_SQL, (map_id,))
                     await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
                     await cursor.execute(BLOCKED_NODES_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,

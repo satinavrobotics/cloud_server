@@ -530,6 +530,12 @@ services:
       - RECONSTRUCTION_CALLBACK_SECRET=${RECONSTRUCTION_CALLBACK_SECRET:-}
       - RECONSTRUCTION_CALLBACK_BASE_URL=${RECONSTRUCTION_CALLBACK_BASE_URL:-http://localhost:8000}
       - RECONSTRUCTION_MINIO_ENDPOINT=${RECONSTRUCTION_MINIO_ENDPOINT:-localhost:9000}
+      # Semantic layer gateway (docs/semantic/design.md); the service is deployed from semantic_service.yaml.
+      - SEMANTIC_SERVICE_URL=${SEMANTIC_SERVICE_URL:-}
+      - SEMANTIC_SERVICE_KEY=${SEMANTIC_SERVICE_KEY:-}
+      - SEMANTIC_CALLBACK_SECRET=${SEMANTIC_CALLBACK_SECRET:-}
+      - SEMANTIC_CALLBACK_BASE_URL=${SEMANTIC_CALLBACK_BASE_URL:-http://localhost:8000}
+      - SEMANTIC_MINIO_ENDPOINT=${SEMANTIC_MINIO_ENDPOINT:-localhost:9000}
     # Optional: the SFU key pair lets DELETE /api/v1/robots/{name} remove the robot's LiveKit participant.
     env_file:
       - path: livekit_sfu.env

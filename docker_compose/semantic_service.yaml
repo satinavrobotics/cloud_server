@@ -1,0 +1,31 @@
+# Semantic layer service (docs/semantic/design.md, contract cloud_semantic/CONTRACT.md).
+# Its own compose project; the code lives in web_stack/cloud_semantic (image built there:
+# docker build -t sem-service:1.0.0 cloud_semantic). Same host as the API: host networking, bound to
+# 127.0.0.1:8010. The API's SEMANTIC_SERVICE_URL points here and it reads the same SEMANTIC_SERVICE_KEY from .env.
+#
+#   docker compose -p sem -f semantic_service.yaml up -d
+#
+# Models (EoMT ADE20K panoptic, Depth-Anything-3) are NOT baked in: mount the Hugging Face cache at /models
+# (SEM_MODELS_DIR). Offline: no model download at run time. The model child process takes the GPU only while
+# a job runs, guarded by free VRAM (SEM_GPU_MIN_FREE_MIB), so it can share the card with the reconstruction service.
+services:
+  semantic-service:
+    image: ${SEM_IMAGE:-sem-service:1.0.0}
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    mem_limit: 12g
+    memswap_limit: 12g
+    environment:
+      - SEM_SERVICE_KEY=${SEMANTIC_SERVICE_KEY:?set SEMANTIC_SERVICE_KEY in .env}
+      - SEM_HOST=127.0.0.1
+      - SEM_PORT=8010
+      - HF_HOME=/models
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      - sem-spool:/var/lib/sem/spool
+      - ${SEM_MODELS_DIR:-/home/satiadmin/.cache/huggingface}:/models:ro
+
+volumes:
+  sem-spool:

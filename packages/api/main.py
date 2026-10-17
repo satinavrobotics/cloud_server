@@ -343,6 +343,7 @@ async def lifespan(app: FastAPI):
     # 3D reconstruction dispatcher (R3); only when the service is configured, one leader per
     # cluster (advisory lock).
     service.reconstruction.start_dispatcher()
+    service.semantic.start_dispatcher()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -360,6 +361,7 @@ async def lifespan(app: FastAPI):
         service.stop_watchers()
         await service.map_deleter.stop()
         await service.reconstruction.stop()
+        await service.semantic.stop()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
@@ -1484,6 +1486,74 @@ async def reconstruction_callback(job_id: str, kind: str, body: Dict[str, Any],
         raise HTTPException(status_code=404, detail="unknown callback")
     service.reconstruction.authorize(job_id, authorization)
     status, answer = await _site_call(f"reconstruction {kind}", handlers[kind](job_id, body))
+    return JSONResponse(status_code=status, content=answer)
+
+
+# ==================== Semantic layer ====================
+# docs/semantic/design.md, contract cloud_semantic/CONTRACT.md; the logic is
+# packages/api/semantic.py. Same error codes as reconstruction (no_semantic in place of
+# no_reconstruction). Independent of the reconstruction: a job never waits for it.
+
+@app.post("/api/v1/maps/{map_id}/semantic", status_code=202)
+async def start_map_semantic(map_id: str, body: Optional[Dict[str, Any]] = None):
+    """Start the map's semantic analysis. Body optional: {vocabulary?, depth_source?, every?,
+    max_depth_m?, min_voxels?}. 202 + the job (queued); never automatic."""
+    _require_service()
+    return await _site_call("start semantic", service.semantic.start(
+        map_id, body, recording.request_actor()))
+
+
+@app.get("/api/v1/maps/{map_id}/semantic")
+async def get_map_semantic(map_id: str):
+    """{map_name, configured, semantic, job}: the current result (with `stale`, file URLs) and
+    the active job, or the newest job if it failed or was cancelled after the result."""
+    _require_service()
+    return await _site_call("read semantic", service.semantic.status(map_id))
+
+
+@app.post("/api/v1/maps/{map_id}/semantic/cancel")
+async def cancel_map_semantic(map_id: str):
+    _require_service()
+    return await _site_call("cancel semantic", service.semantic.cancel(map_id))
+
+
+@app.delete("/api/v1/maps/{map_id}/semantic", status_code=204)
+async def delete_map_semantic(map_id: str):
+    """Delete the current result (its files go) and cancel an active job."""
+    _require_service()
+    await _site_call("delete semantic", service.semantic.delete(map_id))
+    return Response(status_code=204)
+
+
+@app.get("/api/v1/maps/{map_id}/semantic/files/{name}")
+async def get_map_semantic_file(map_id: str, name: str, v: Optional[str] = None,
+                                if_none_match: Optional[str] = Header(None)):
+    """instances.json | labels.bin | dynamic.zip | meta.json of the current result. ETag = the
+    job id; with `?v=<job id>` the response is cached forever."""
+    _require_service()
+    info = await _site_call("read semantic file", service.semantic.open_file(map_id, name))
+    etag = f'"{info["job_id"]}"'
+    cache = ("public, max-age=31536000, immutable" if v == info["job_id"] else "no-cache")
+    headers = {"ETag": etag, "Cache-Control": cache}
+    if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
+        return Response(status_code=304, headers=headers)
+    if info.get("bytes") is not None:
+        headers["Content-Length"] = str(info["bytes"])
+    stream = service.semantic.objects.stream(info["bucket"], info["key"])
+    return StreamingResponse(stream, media_type=info["content_type"], headers=headers)
+
+
+@app.post("/internal/semantic/jobs/{job_id}/{kind}")
+async def semantic_callback(job_id: str, kind: str, body: Dict[str, Any],
+                            authorization: Optional[str] = Header(None)):
+    _require_service()
+    handlers = {"progress": service.semantic.on_progress,
+                "finish": service.semantic.on_finish,
+                "fail": service.semantic.on_fail}
+    if kind not in handlers:
+        raise HTTPException(status_code=404, detail="unknown callback")
+    service.semantic.authorize(job_id, authorization)
+    status, answer = await _site_call(f"semantic {kind}", handlers[kind](job_id, body))
     return JSONResponse(status_code=status, content=answer)
 
 

@@ -133,6 +133,15 @@ VALID_PAYLOADS = {
     EventCode.MAP_RECONSTRUCTION_FAILED: {"map_name": "lab", "job_id": "j1",
                                           "reason": "url_expired", "stage": "integrating",
                                           "message": "GET depth returned 403"},
+    EventCode.MAP_SEMANTIC_STARTED: {"map_name": "lab", "job_id": "j1",
+                                     "params": {"depth_source": "sensor"},
+                                     "nodes_with_depth": 412, "attempt": 1},
+    EventCode.MAP_SEMANTIC_FINISHED: {"map_name": "lab", "job_id": "j1", "instances": 127,
+                                      "label_voxels": 48000, "frames_used": 296,
+                                      "dynamic_frames": 12, "depth_source": "sensor",
+                                      "duration_s": 61.0},
+    EventCode.MAP_SEMANTIC_FAILED: {"map_name": "lab", "job_id": "j1", "reason": "error",
+                                    "stage": "segmenting", "message": "boom"},
 }
 
 
@@ -149,8 +158,9 @@ def test_codes_are_str_enums_with_spec_values():
 def test_severity_and_source_values_match_schema():
     assert [s.value for s in Severity] == ["info", "warning", "error", "critical"]
     # graph_builder: migration 20260929_01_maps_m2 widens fleet_events_source_check;
-    # reconstruction: 20261003_01_map_reconstructions.
-    assert [s.value for s in Source] == ["dispatch", "api", "graph_builder", "reconstruction"]
+    # reconstruction: 20261003_01_map_reconstructions; semantic: 20261015_01_map_semantics.
+    assert [s.value for s in Source] == ["dispatch", "api", "graph_builder", "reconstruction",
+                                         "semantic"]
 
 
 def test_meta_for_accepts_plain_string():

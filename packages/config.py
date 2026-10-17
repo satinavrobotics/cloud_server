@@ -337,6 +337,27 @@ RECONSTRUCTION_TOPVIEW_MEM_MB = int(os.getenv("RECONSTRUCTION_TOPVIEW_MEM_MB", "
 RECONSTRUCTION_TOPVIEW_TIMEOUT_S = int(os.getenv("RECONSTRUCTION_TOPVIEW_TIMEOUT_S", "600"))
 RECONSTRUCTION_WORK_DIR = _env_or_none("RECONSTRUCTION_WORK_DIR")
 
+# ==================== Semantic layer gateway (API) ====================
+# docs/semantic/design.md (packages/api/semantic.py). Same shape as the reconstruction gateway above: the
+# work runs in an external GPU service (cloud_semantic), the API owns the job. Unset service URL, key or
+# callback secret = feature off (POST .../semantic answers 503 not_configured).
+SEMANTIC_SERVICE_URL = _env_or_none("SEMANTIC_SERVICE_URL")
+SEMANTIC_SERVICE_KEY = _env_or_none("SEMANTIC_SERVICE_KEY")
+SEMANTIC_CALLBACK_SECRET = _env_or_none("SEMANTIC_CALLBACK_SECRET")
+# How the service reaches the API's /internal/semantic/... callbacks.
+SEMANTIC_CALLBACK_BASE_URL = os.getenv("SEMANTIC_CALLBACK_BASE_URL", "http://localhost:8000")
+# MinIO host:port as the SERVICE sees it (presigned URLs are signed for this host).
+SEMANTIC_MINIO_ENDPOINT = os.getenv("SEMANTIC_MINIO_ENDPOINT", "localhost:9000")
+SEMANTIC_MINIO_SECURE = os.getenv("SEMANTIC_MINIO_SECURE", "false").lower() in ("true", "1", "yes")
+SEMANTIC_STAGING_BUCKET = os.getenv("SEMANTIC_STAGING_BUCKET", "sem-staging")
+SEMANTIC_URL_EXPIRY_S = int(os.getenv("SEMANTIC_URL_EXPIRY_S", "14400"))
+SEMANTIC_JOB_TIMEOUT_S = int(os.getenv("SEMANTIC_JOB_TIMEOUT_S", "3600"))
+SEMANTIC_QUEUE_TIMEOUT_S = int(os.getenv("SEMANTIC_QUEUE_TIMEOUT_S", "1800"))
+SEMANTIC_MAX_INFLIGHT = int(os.getenv("SEMANTIC_MAX_INFLIGHT", "1"))
+SEMANTIC_MAX_DEPTH_M = float(os.getenv("SEMANTIC_MAX_DEPTH_M", "10.0"))
+# Camera frames one job may use; `every` is chosen so a map stays below it unless the request sets it.
+SEMANTIC_MAX_FRAMES = int(os.getenv("SEMANTIC_MAX_FRAMES", "400"))
+
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
 

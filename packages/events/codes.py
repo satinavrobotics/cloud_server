@@ -64,6 +64,9 @@ class EventCode(str, enum.Enum):
     MAP_RECONSTRUCTION_STARTED = "MAP.RECONSTRUCTION_STARTED"
     MAP_RECONSTRUCTION_FINISHED = "MAP.RECONSTRUCTION_FINISHED"
     MAP_RECONSTRUCTION_FAILED = "MAP.RECONSTRUCTION_FAILED"
+    MAP_SEMANTIC_STARTED = "MAP.SEMANTIC_STARTED"
+    MAP_SEMANTIC_FINISHED = "MAP.SEMANTIC_FINISHED"
+    MAP_SEMANTIC_FAILED = "MAP.SEMANTIC_FAILED"
     MAP_NODES_DELETED = "MAP.NODES_DELETED"
     MAP_SCENE_GRAPH_UPDATED = "MAP.SCENE_GRAPH_UPDATED"
     MAP_SCENE_GRAPH_FOLD_FAILED = "MAP.SCENE_GRAPH_FOLD_FAILED"
@@ -93,6 +96,9 @@ class Source(str, enum.Enum):
     # 3D reconstruction R3: MAP.RECONSTRUCTION_* (packages/api/reconstruction.py, the gateway
     # in the API). Allowed from migration 20261003_01_map_reconstructions on.
     RECONSTRUCTION = "reconstruction"
+    # Semantic layer: MAP.SEMANTIC_* (packages/api/semantic.py). Allowed from migration
+    # 20261015_01_map_semantics on.
+    SEMANTIC = "semantic"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,6 +115,7 @@ _D = Source.DISPATCH
 _A = Source.API
 _G = Source.GRAPH_BUILDER
 _R = Source.RECONSTRUCTION
+_SEM = Source.SEMANTIC
 
 # The discriminator is required wherever two events with the same code, robot and
 # timestamp can legitimately differ (several errors or nodes in one message), and
@@ -195,6 +202,11 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MAP_RECONSTRUCTION_STARTED: CodeMeta(_S.INFO, True, schemas.ReconstructionStarted, _R),
     _C.MAP_RECONSTRUCTION_FINISHED: CodeMeta(_S.INFO, True, schemas.ReconstructionFinished,
                                              _R),
+    # Semantic layer (docs/semantic/design.md): same shape, discriminator
+    # `map:<name>:semantic:<job_id>:<state>`.
+    _C.MAP_SEMANTIC_STARTED: CodeMeta(_S.INFO, True, schemas.SemanticStarted, _SEM),
+    _C.MAP_SEMANTIC_FINISHED: CodeMeta(_S.INFO, True, schemas.SemanticFinished, _SEM),
+    _C.MAP_SEMANTIC_FAILED: CodeMeta(_S.WARNING, True, schemas.SemanticFailed, _SEM),
     _C.MAP_NODES_DELETED: CodeMeta(_S.INFO, True, schemas.MapNodesDeleted, _A),
     _C.MAP_RECONSTRUCTION_FAILED: CodeMeta(_S.WARNING, True, schemas.ReconstructionFailed, _R),
     # Scene graph (docs/scene_graph/integration.md, ops/events). Source graph_builder, no robot;
