@@ -466,7 +466,8 @@ else the spool_state's). `pending` is `depth > 0`; `known` is false when there i
 that run with an integer depth (then `pending` is false and `depth` null). The API's Finish of a
 mapping session polls it (packages/api/ingest_backlog.py) and waits for `depth == 0`: 409
 `backlog_pending` after 60 s without progress (depth falls, `highest_complete_id` rises, or
-`open_trackers` falls) or 10 min in all; `?force=true` finishes anyway. `highest_complete_id` is
+`open_trackers` falls); a drain that keeps progressing is not cut off, only by a hard ceiling of
+30 min in all (`FINISH_BACKLOG_MAX_S`, reason `cap`); `?force=true` finishes anyway. `highest_complete_id` is
 only a liveness signal there, never the gate (it is a maximum, not a prefix). A paused session
 refuses uploads (`session_paused`, retryable), so its backlog does not drain.
 `POST /api/v1/maps/{id}/sessions` with `replace: true` runs the same wait on the mapping session it
@@ -553,6 +554,27 @@ latest again). A completion of any other run (a late part or node of a supersede
 acked but never changes `ingest_state`. A node whose handler fails or is cancelled after the
 bundle was announced and before its first ack is answered `rejected: store_failed, resend: node`;
 a tracker that never got an ack is dropped after 2 x `INGEST_ACK_PART_TIMEOUT_S`.
+
+**`ingest_mode`.** Topic `robot/<robot_name>/ingest_mode`, QoS 1, **retained**:
+`{"v": 1, "robot_name", "register_map"?: <bool>, "ts"}`, the `register_map` flag of the robot's
+RUNNING mission (the robot's order parser drops it). It is a sibling of `ingest_state`, not a field
+of it, so that publishing it can never overwrite the retained `highest_complete_id` (before a seed
+or without a completed bundle there is no honest value to put next to it). `register_map: false`:
+the mission does not register the map, every node would be answered `rejected: no_session`, so the
+robot may skip spooling. `true`: as before. **A missing field, or a missing/unreadable topic, is
+"unknown": spool as before.** It is never `false` unless a RUNNING mission says so; a mission that
+ends, or a failed lookup, never produces `false` (a failed lookup publishes nothing). A periodic
+task (every 2 s) reads the RUNNING missions and publishes only on change (no flapping); a robot
+that had a value and has no RUNNING mission any more gets the payload without `register_map`. After
+a restart the retained values are read (at any time, not only in the `ingest_state` settle window,
+for robots this process has not published for) so a stale `false`, even one delivered late, is
+cleared at the next tick unless a RUNNING mission says `false`. A value counts as published only
+once the MQTT client accepted it (queued while disconnected counts); with no client, a full queue
+or an error the next tick retries. Publishing failures are counted (`acks_failed` /
+`acks_dropped`) and never break ingest. Counter: `ingest_mode_published`.
+**Lag invariant for the robot:** after a mission ends, a `false` can stay up to ~2 s (one tick)
+(longer while the broker is unreachable). The robot must therefore re-read `ingest_mode` when a
+mapping session starts, and treat `false` as authoritative only for the mission it belongs to.
 
 **`run_id` guard.** A cloud session binds the first `run_id` it sees (found with the newest stored
 node of the session that has one, else the first message's; remembered per session id, at most

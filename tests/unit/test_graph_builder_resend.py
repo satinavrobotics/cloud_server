@@ -220,7 +220,8 @@ class TestSubscriptions:
         topics = {c.args[0]: c.kwargs["qos"] for c in client.register_callback.call_args_list}
         assert topics == {"robot/node_update": 1, "robot/image_upload": 1,
                           "robot/depth_upload": 1, "robot/costmap_upload": 1,
-                          "robot/+/ingest_state": 1, "robot/+/spool_state": 1}
+                          "robot/+/ingest_state": 1, "robot/+/ingest_mode": 1,
+                          "robot/+/spool_state": 1}
 
     def test_clean_session_with_a_fresh_client_id_by_default(self):
         kw = self._connect(False).call_args.kwargs

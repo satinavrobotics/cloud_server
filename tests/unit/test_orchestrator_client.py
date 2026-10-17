@@ -69,6 +69,32 @@ async def test_localization_reads_and_the_switch():
     assert json.loads(body) == {"mode": "relocalization", "map": "cloud-yard", "topomap": False}
 
 
+async def _timeouts_of(call):
+    timeouts = []
+    client = client_for(lambda request: httpx.Response(200, json={}), timeouts)
+    await call(client)
+    return timeouts
+
+
+async def test_topomap_stop_through_put_localization_waits_long():
+    from packages import config
+    long = max(config.ORCHESTRATOR_START_TIMEOUT_S, config.ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S)
+    assert long == config.ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S > config.ORCHESTRATOR_START_TIMEOUT_S
+    assert await _timeouts_of(lambda c: c.put_localization("odometry", topomap=False)) == [long]
+    # on / unchanged / no topomap key: the plain start timeout
+    for kw in ({"topomap": True}, {"topomap": None}, {}):
+        assert await _timeouts_of(lambda c: c.put_localization("odometry", **kw)) == [
+            config.ORCHESTRATOR_START_TIMEOUT_S]
+
+
+async def test_service_stop_timeouts():
+    from packages import config
+    assert await _timeouts_of(lambda c: c.stop("topomap")) == [config.ORCHESTRATOR_STOP_TIMEOUT_S]
+    assert await _timeouts_of(lambda c: c.stop("topomap", 75.0)) == [75.0]
+    assert await _timeouts_of(lambda c: c.stop("topomap", timeout=5.0)) == [5.0]
+    assert await _timeouts_of(lambda c: c.start("topomap")) == [config.ORCHESTRATOR_START_TIMEOUT_S]
+
+
 def test_problem_of_a_partial_answer():
     assert oc.problem_of({"problem": {"status_code": 504, "detail": "late"}}) == "504: late"
     assert oc.problem_of({"problem": "x"}) == "x"

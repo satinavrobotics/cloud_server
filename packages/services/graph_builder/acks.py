@@ -85,6 +85,10 @@ def state_topic(robot_name: str) -> str:
     return f"robot/{robot_name}/ingest_state"
 
 
+def mode_topic(robot_name: str) -> str:
+    return f"robot/{robot_name}/ingest_mode"
+
+
 def parse_parts(value: Any) -> Optional[List[Part]]:
     """The node_update's `parts` manifest as ordered, distinct (kind, sub) pairs. None: absent
     (or not a list); a list may be empty. Entries that are not {"kind": image|depth|costmap,
@@ -147,9 +151,11 @@ class AckManager:
         self._states: "OrderedDict[str, _State]" = OrderedDict()
         self._runs: "OrderedDict[str, List[Optional[str]]]" = OrderedDict()  # robot -> runs seen
         self._spool: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        # robot -> the register_map last published on ingest_mode (True / False / None = unknown)
+        self._modes: "OrderedDict[str, Optional[bool]]" = OrderedDict()
         for name in ("acks_sent", "acks_failed", "acks_dropped", "acks_coalesced",
                      "acks_invalid_robot", "ack_trackers_evicted", "ack_timeouts",
-                     "ingest_state_published"):
+                     "ingest_state_published", "ingest_mode_published"):
             stats.setdefault(name, 0)
 
     # --- events ----------------------------------------------------------------------------
@@ -326,6 +332,61 @@ class AckManager:
                 state.dirty = True
             return highest > local
 
+    def seed_mode(self, robot: Any, payload: Any) -> None:
+        """A retained ingest_mode read at startup: remembered as what the robot currently sees
+        (nothing is published), so `note_mode` corrects a stale value, e.g. a `false` left by a
+        mission that ended while this service was down."""
+        if not valid_topic_level(robot) or not isinstance(payload, Mapping):
+            return
+        value = payload.get("register_map")
+        with self._lock:
+            if robot not in self._modes:
+                self._modes[robot] = value if isinstance(value, bool) else None
+                self._cap_modes()
+
+    def note_mode(self, robot: Any, register_map: Optional[bool]) -> bool:
+        """The register_map of the robot's active mission (None: no mission known / unknown).
+        Publishes the retained `ingest_mode` only when it differs from what was last published,
+        so it never flaps; the first note of an unseeded robot with None publishes nothing (the
+        robot already reads a missing topic as unknown). The value is remembered only once the
+        publish was accepted by the MQTT client (queued counts; no client / full queue / error /
+        bad rc does not): otherwise the previous state is restored, so the next call retries.
+        Never raises. Returns whether it published."""
+        if register_map is not None and not isinstance(register_map, bool):
+            register_map = None
+        if not valid_topic_level(robot):
+            return False
+        out: List[Tuple[str, str, bool]] = []
+        with self._lock:
+            if robot not in self._modes and register_map is None:
+                return False
+            if self._modes.get(robot) == register_map and robot in self._modes:
+                return False
+            had = robot in self._modes
+            previous = self._modes.get(robot)
+            self._modes[robot] = register_map
+            self._modes.move_to_end(robot)
+            self._cap_modes()
+            body = {"v": 1, "robot_name": robot, "ts": self._wall_ms()}
+            if register_map is not None:
+                body["register_map"] = register_map
+            out.append((mode_topic(robot), json.dumps(body), True))
+        accepted = self._send(out)
+        if not all(accepted):
+            with self._lock:  # not handed to MQTT: forget it, the next refresh retries
+                if self._modes.get(robot) == register_map:
+                    if had:
+                        self._modes[robot] = previous
+                    else:
+                        self._modes.pop(robot, None)
+            return False
+        return True
+
+    def mode_robots(self) -> List[str]:
+        """Robots whose last published register_map is known (True / False)."""
+        with self._lock:
+            return [r for r, v in self._modes.items() if v is not None]
+
     def note_spool(self, robot: Any, payload: Any) -> bool:
         """The robot's retained spool_state, the latest per robot."""
         if not valid_topic_level(robot) or not isinstance(payload, Mapping):
@@ -410,6 +471,14 @@ class AckManager:
             del runs[:-_RUNS_SEEN_CAP]
         self._runs.move_to_end(robot)
         self._cap(self._runs)
+
+    def _cap_modes(self) -> None:
+        """Bound `_modes`, evicting unknown / True entries before a False one: forgetting a False
+        would leave a stale retained `false` on the broker (silent loss of a mapping run)."""
+        while len(self._modes) > _ROBOT_CAP:
+            victim = next((r for r, v in self._modes.items() if v is not False),
+                          next(iter(self._modes)))
+            del self._modes[victim]
 
     @staticmethod
     def _cap(table: "OrderedDict") -> None:
@@ -499,9 +568,12 @@ class AckManager:
 
     # --- publishing (outside the lock) ----------------------------------------------------
 
-    def _send(self, out: List[Tuple[str, str, bool]]) -> None:
-        """Hand the messages to MQTT (QoS 1). Never raises; failures are counted."""
+    def _send(self, out: List[Tuple[str, str, bool]]) -> List[bool]:
+        """Hand the messages to MQTT (QoS 1). Never raises; failures are counted. Returns, per
+        message, whether MQTT accepted it (rc 0, or NO_CONN where paho queues it)."""
+        accepted: List[bool] = []
         for topic, body, retain in out:
+            accepted.append(False)
             try:
                 rc = self._publish(topic, body, 1, retain)
             except Exception as exc:  # noqa: BLE001 - an ack must never break ingest
@@ -517,6 +589,10 @@ class AckManager:
                 self.stats["acks_failed"] += 1
                 logger.warning("Publishing to %s returned rc=%s", topic, rc)
             elif retain:
-                self.stats["ingest_state_published"] += 1
+                accepted[-1] = True
+                self.stats["ingest_mode_published" if topic.endswith("/ingest_mode")
+                           else "ingest_state_published"] += 1
             else:
+                accepted[-1] = True
                 self.stats["acks_sent"] += 1
+        return accepted

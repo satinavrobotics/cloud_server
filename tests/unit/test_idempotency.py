@@ -397,3 +397,16 @@ async def test_store_complete_release_purge_params():
         (idempotency.RELEASE_SQL, ("k", "", "r", "h")),
         (idempotency.PURGE_SQL, (60,)),
     ]
+
+
+async def test_store_lease_is_long_only_for_the_replace_session_route():
+    replace = "POST /api/v1/maps/{map_id}/sessions"
+    for route, lease in ((replace, 3000), ("POST /api/v1/missions", 120)):
+        conn = ScriptedConn([(True,)])
+        store = IdempotencyStore(conn, ttl_s=86400, lease_s=120, long_lease_s=3000)
+        await store.claim("k", route, "h")
+        assert conn.executed[0][1] == ("k", "", route, "h", 86400, lease)
+    # without a long lease every route keeps the default
+    conn = ScriptedConn([(True,)])
+    await IdempotencyStore(conn, ttl_s=1, lease_s=120).claim("k", replace, "h")
+    assert conn.executed[0][1][-1] == 120

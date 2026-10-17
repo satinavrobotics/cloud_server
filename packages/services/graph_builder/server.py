@@ -111,6 +111,8 @@ RUN_GUARD_BACKOFF_S = 30.0
 # Robot topics of the ingest contract (the robot's spool_state, our retained ingest_state).
 INGEST_STATE_TOPIC = "robot/+/ingest_state"
 SPOOL_STATE_TOPIC = "robot/+/spool_state"
+# Retained {"v":1,"robot_name","register_map"?,"ts"} of the robot's active mission (acks.py).
+INGEST_MODE_TOPIC = "robot/+/ingest_mode"
 
 
 def _run_id_of(payload: Dict[str, Any]) -> Optional[str]:
@@ -496,6 +498,8 @@ class GraphBuilderService:
             # spool state.
             self.mqtt_client.register_callback(INGEST_STATE_TOPIC,
                                                self._on_ingest_state_message, qos=UPLOAD_QOS)
+            self.mqtt_client.register_callback(INGEST_MODE_TOPIC,
+                                               self._on_ingest_mode_message, qos=UPLOAD_QOS)
             self.mqtt_client.register_callback(SPOOL_STATE_TOPIC,
                                                self._on_spool_state_message, qos=UPLOAD_QOS)
 
@@ -551,6 +555,40 @@ class GraphBuilderService:
             self.acks.seed_state(self._robot_of_topic(msg), json.loads(msg.payload.decode('utf-8')))
         except Exception as e:  # noqa: BLE001 - an empty (cleared) or foreign payload
             self.logger.debug(f"Ignored ingest_state on {msg.topic}: {e}")
+
+    def _on_ingest_mode_message(self, client, userdata, msg):
+        """robot/+/ingest_mode (paho thread): remember the retained value, so a stale one is
+        corrected by the next `refresh_ingest_mode`. Not limited to the startup settle window
+        (unlike ingest_state): a retained `false` that arrives late must still be cleared, and
+        `seed_mode` ignores robots whose value this service already published."""
+        try:
+            self.acks.seed_mode(self._robot_of_topic(msg), json.loads(msg.payload.decode('utf-8')))
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Ignored ingest_mode on {msg.topic}: {e}")
+
+    async def refresh_ingest_mode(self) -> None:
+        """Periodic (main.py): publish each robot's active-mission `register_map` on the retained
+        ingest_mode when it changed. A robot with a RUNNING mission: its flag; a robot published
+        before that has none now: unknown (field absent). A failed lookup changes nothing, and
+        nothing here can break ingest."""
+        try:
+            missions = await self.database.list_objects(
+                MissionObjectV1,
+                MissionQueryParamsV1(robot=None, state=MissionStateV1.RUNNING, started_after=None,
+                                     started_before=None, most_recent=None))
+            current: Dict[str, bool] = {}
+            for mission in missions or []:
+                robot = getattr(mission, "robot", None)
+                flag = getattr(mission, "register_map", None)
+                if isinstance(robot, str) and isinstance(flag, bool) and robot not in current:
+                    current[robot] = flag
+            for robot, flag in current.items():
+                self.acks.note_mode(robot, flag)
+            for robot in self.acks.mode_robots():
+                if robot not in current:
+                    self.acks.note_mode(robot, None)
+        except Exception as e:  # noqa: BLE001
+            self.logger.warning(f"ingest_mode refresh failed: {e}")
 
     def _on_spool_state_message(self, client, userdata, msg):
         """robot/+/spool_state (paho thread): keep the robot's latest, for the stats."""

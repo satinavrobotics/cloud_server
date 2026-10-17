@@ -140,6 +140,16 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(1)
             await service.flush_acks()
 
+    async def _periodic_ingest_mode():
+        # The active mission's register_map on the retained ingest_mode (robot ingest contract).
+        while True:
+            await asyncio.sleep(2)
+            await service.refresh_ingest_mode()
+
+    # Off by default: the robot team does not subscribe to ingest_mode (they asked for per-node
+    # rejection instead), so a retained value nobody reads could only go stale.
+    if os.getenv("INGEST_MODE_PUBLISH", "false").lower() in ("1", "true", "yes"):
+        asyncio.create_task(_periodic_ingest_mode())
     asyncio.create_task(_periodic_cleanup())
     asyncio.create_task(_periodic_reject_flush())
     asyncio.create_task(_periodic_ack_flush())

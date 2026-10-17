@@ -57,6 +57,7 @@ from packages.utils import map_sessions
 
 from packages.config import (
     ORCHESTRATOR_QUERY_TIMEOUT_S, ORCHESTRATOR_START_TIMEOUT_S, ORCHESTRATOR_STOP_TIMEOUT_S,
+    ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S,
 )
 
 logger = logging.getLogger("ApiDelegationService.orchestrator_client")
@@ -165,8 +166,9 @@ class OrchestratorClient:
     async def start(self, name: str) -> Dict[str, Any]:
         return await self._call("POST", f"/services/{_seg(name)}/start", ORCHESTRATOR_START_TIMEOUT_S)
 
-    async def stop(self, name: str) -> Dict[str, Any]:
-        return await self._call("POST", f"/services/{_seg(name)}/stop", ORCHESTRATOR_STOP_TIMEOUT_S)
+    async def stop(self, name: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+        return await self._call("POST", f"/services/{_seg(name)}/stop",
+                                ORCHESTRATOR_STOP_TIMEOUT_S if timeout is None else timeout)
 
     async def list_maps(self, cloud_map_id: Optional[str]) -> List[Dict[str, Any]]:
         """The stored maps linked to this cloud map (GET /maps/list?cloud_map_id=X); all stored
@@ -202,7 +204,8 @@ class OrchestratorClient:
                                topomap: Optional[bool] = None) -> Dict[str, Any]:
         """PUT /localization?wait=&partial=ok {mode, map, topomap}. A switch takes 4-8 s (a
         relocalization with `wait` up to the robot's own timeout): the timeout is the start
-        timeout. `topomap` (None: left as it is) starts / stops the topomap uploader.
+        timeout (the topomap stop's when `topomap` is False: the robot may drain its spool
+        first). `topomap` (None: left as it is) starts / stops the topomap uploader.
 
         partial=ok: an error means nothing the orchestrator owns changed; a later step that
         failed after the switch or the stored intent is a 200 with `problem` (problem_of())."""
@@ -211,7 +214,9 @@ class OrchestratorClient:
             body["map"] = map_name
         if topomap is not None:
             body["topomap"] = topomap
-        out = await self._call("PUT", "/localization", ORCHESTRATOR_START_TIMEOUT_S,
+        timeout = (max(ORCHESTRATOR_START_TIMEOUT_S, ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S)
+                   if topomap is False else ORCHESTRATOR_START_TIMEOUT_S)
+        out = await self._call("PUT", "/localization", timeout,
                                params={"wait": "true" if wait else "false", "partial": "ok"},
                                json_body=body)
         return out if isinstance(out, dict) else {}

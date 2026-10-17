@@ -155,10 +155,12 @@ INGEST_STATE_SEED_SETTLE_S = float(os.getenv("INGEST_STATE_SEED_SETTLE_S", "5.0"
 INGEST_MQTT_MAX_QUEUED = max(0, int(os.getenv("INGEST_MQTT_MAX_QUEUED", "10000")))
 # Finish of a mapping session waits for the robot's upload backlog (spool_state.depth == 0 for
 # its current run, packages/api/ingest_backlog.py): polled every POLL_S; 409 backlog_pending after
-# NO_PROGRESS_S without progress or MAX_S in all; `force=true` skips the wait.
+# NO_PROGRESS_S without progress (`stalled`); a drain that keeps making progress is waited for up to
+# MAX_S, a HARD CEILING (`cap`, 30 min): the proxy timeouts of the finish / pause / resume / session
+# routes (sati-client nginx, 2000 s) must stay above it. `force=true` skips the wait.
 FINISH_BACKLOG_POLL_S = max(0.05, float(os.getenv("FINISH_BACKLOG_POLL_S", "2")))
 FINISH_BACKLOG_NO_PROGRESS_S = max(0.0, float(os.getenv("FINISH_BACKLOG_NO_PROGRESS_S", "60")))
-FINISH_BACKLOG_MAX_S = max(0.0, float(os.getenv("FINISH_BACKLOG_MAX_S", "600")))
+FINISH_BACKLOG_MAX_S = max(0.0, float(os.getenv("FINISH_BACKLOG_MAX_S", "1800")))
 # Opt-in MQTT persistent session for graph-builder: a stable client id and clean_session=False,
 # so the broker queues QoS 1 uploads (node_update / image / depth / costmap) while it is down.
 # Off by default: the queue is bounded by the broker's own limits (mosquitto max_queued_messages
@@ -203,6 +205,10 @@ MAPPING_SERVICE_CANDIDATES = {
 ORCHESTRATOR_QUERY_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_QUERY_TIMEOUT_S", "3.0"))
 ORCHESTRATOR_START_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_START_TIMEOUT_S", "30.0"))
 ORCHESTRATOR_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_STOP_TIMEOUT_S", "15.0"))
+# Stopping the topomap (PUT /localization {"topomap": false}, or /services/<topomap>/stop) can
+# make the robot drain its upload spool first: up to 30 s of drain plus the process stop (SIGTERM
+# grace 30 s) is about 65 s there, so a little longer. Only the topomap stop waits this long.
+ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S", "75.0"))
 # A synchronous POST /localization/save (the orchestrator proxy) waits for the driver's save_map:
 # the orchestrator gives up after 600 s (mapping.save_timeout_sec), so a little longer.
 ORCHESTRATOR_SAVE_TIMEOUT_S = float(os.getenv("ORCHESTRATOR_SAVE_TIMEOUT_S", "660.0"))
@@ -327,6 +333,8 @@ SCENE_GRAPH_DELETE_LOCK_DEADLINE_S = float(os.getenv("SCENE_GRAPH_DELETE_LOCK_DE
 # route can take), and how often a worker purges expired keys (seconds).
 IDEMPOTENCY_TTL_S = int(os.getenv("IDEMPOTENCY_TTL_S", str(24 * 3600)))
 IDEMPOTENCY_LEASE_S = int(os.getenv("IDEMPOTENCY_LEASE_S", "120"))
+# Lease for POST /api/v1/maps/{id}/sessions only (waits up to FINISH_BACKLOG_MAX_S = 30 min).
+IDEMPOTENCY_LONG_LEASE_S = int(os.getenv("IDEMPOTENCY_LONG_LEASE_S", "3000"))
 IDEMPOTENCY_PURGE_INTERVAL_S = float(os.getenv("IDEMPOTENCY_PURGE_INTERVAL_S", "600"))
 
 # ==================== 3D reconstruction gateway (API, R3) ====================

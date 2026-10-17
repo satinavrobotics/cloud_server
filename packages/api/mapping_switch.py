@@ -84,6 +84,7 @@ from packages.api import orchestrator_client as oc
 from packages.api.orchestrator_services import pick_service
 from packages.config import (
     MAPPING_SERVICE_CANDIDATES, MAPPING_STATE_TTL_S, ORCHESTRATOR_QUERY_TIMEOUT_S,
+    ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S,
     ORCHESTRATOR_SAVE_POLL_S, SLAM_SAVE_MAX_ATTEMPTS, SLAM_SAVE_POLL_ERRORS, SLAM_SAVE_START_TRIES,
     ORCHESTRATOR_SAVE_POLL_TOTAL_S, ORCHESTRATOR_SAVE_RETRY_S, ORCHESTRATOR_SAVE_THEN_S,
 )
@@ -951,7 +952,8 @@ class MappingSwitch:
                     actions.append(service_action(action_name(svc), STOP, "already"))
                     continue
                 try:
-                    await (client.start(orch) if on else client.stop(orch))
+                    await (client.start(orch) if on else client.stop(
+                        orch, ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S if svc == TOPO else None))
                     actions.append(service_action(orch, action, "done"))
                 except oc.OrchestratorError as exc:
                     # start: 409 already running; stop: 404 "not currently running"

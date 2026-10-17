@@ -960,3 +960,178 @@ class TestBegunNodeNeverLeaks:
         m.flush()
         assert m.snapshot()["ack_trackers"] == 0
         m.node_abandoned("r1", "A", 1, [IMG], "s")  # nothing left: no ack, no error
+
+
+class TestIngestMode:
+    """The retained `robot/<robot>/ingest_mode` carrying the active mission's register_map
+    (a sibling of ingest_state, so it never rewrites the retained high-water mark)."""
+
+    @staticmethod
+    def _mgr(rc=0, raises=None):
+        pub = FakeMQTT(rc=rc, raises=raises)
+        stats = {}
+        m = acks.AckManager(lambda t, b, q, r: pub.publish(t, b, q, r).rc, stats, clock=Clock())
+        return m, pub, stats
+
+    @staticmethod
+    def modes(pub, robot="r1"):
+        return [x for x in pub.messages if x.topic == f"robot/{robot}/ingest_mode"]
+
+    def test_false_and_true_are_published_retained(self):
+        m, pub, stats = self._mgr()
+        assert m.note_mode("r1", False) is True
+        msg = self.modes(pub)[-1]
+        assert msg.retain and msg.qos == 1
+        assert msg.body["v"] == 1 and msg.body["register_map"] is False
+        assert m.note_mode("r1", True) is True
+        assert self.modes(pub)[-1].body["register_map"] is True
+        assert stats["ingest_mode_published"] == 2
+
+    def test_unchanged_value_is_not_republished(self):
+        m, pub, _ = self._mgr()
+        for _ in range(5):
+            m.note_mode("r1", False)
+        assert len(self.modes(pub)) == 1
+
+    def test_change_republishes_and_mission_end_goes_unknown(self):
+        m, pub, _ = self._mgr()
+        m.note_mode("r1", False)
+        m.note_mode("r1", None)  # mission ended: unknown = field absent
+        last = self.modes(pub)[-1]
+        assert last.retain and "register_map" not in last.body
+        m.note_mode("r1", None)
+        assert len(self.modes(pub)) == 2
+
+    def test_no_mission_known_publishes_nothing(self):
+        m, pub, _ = self._mgr()
+        assert m.note_mode("r1", None) is False
+        assert pub.messages == []
+
+    def test_invalid_robot_or_value_is_ignored_safely(self):
+        m, pub, _ = self._mgr()
+        assert m.note_mode("a/b", False) is False
+        m.note_mode("r1", "yes")  # not a bool -> unknown -> nothing
+        assert pub.messages == []
+
+    def test_stale_retained_false_is_corrected_after_restart(self):
+        m, pub, _ = self._mgr()
+        m.seed_mode("r1", {"v": 1, "register_map": False})
+        assert pub.messages == []
+        m.note_mode("r1", False)  # mission still running: no change
+        assert pub.messages == []
+        assert m.mode_robots() == ["r1"]
+        m.note_mode("r1", None)  # nothing running: the stale false is cleared
+        assert "register_map" not in self.modes(pub)[-1].body
+
+    def test_seeding_the_mode_does_not_regress_highest_complete_id(self):
+        m, pub, _ = self._mgr()
+        m.seed_state("r1", {"run_id": "A", "highest_complete_id": 40})
+        m.seed_mode("r1", {"register_map": False})
+        m.note_mode("r1", True)
+        m.node_ok("r1", "A", 41, acks.ACCEPTED, "s", [])
+        assert m.snapshot()["ingest_state"]["r1"] == {"run_id": "A", "highest_complete_id": 41}
+        assert all("register_map" not in s.body for s in pub.states())
+        assert pub.states()[-1].body["highest_complete_id"] == 41
+
+    def test_ingest_state_and_acks_unchanged(self):
+        m, pub, _ = self._mgr()
+        m.note_mode("r1", False)
+        m.node_ok("r1", "A", 1, acks.ACCEPTED, "s", [])
+        assert len(pub.acks()) == 1 and len(pub.states()) == 1
+        assert set(pub.states()[0].body) == {"v", "robot_name", "run_id", "highest_complete_id",
+                                             "ts"}
+
+    def test_publish_failures_never_raise(self):
+        for kw in ({"raises": RuntimeError("boom")}, {"rc": 15}, {"rc": 1}):
+            m, _, stats = self._mgr(**kw)
+            m.note_mode("r1", False)
+            assert sum(stats.get(k, 0) for k in ("acks_failed", "acks_dropped")) == 1
+
+    def test_failed_publish_is_retried_on_the_next_note(self):
+        for kw in ({"raises": RuntimeError("boom")}, {"rc": 15}, {"rc": 1}):
+            m, pub, _ = self._mgr(**kw)
+            assert m.note_mode("r1", False) is False
+            assert m.mode_robots() == []  # not remembered as published
+            pub.raises, pub.rc = None, 0
+            assert m.note_mode("r1", False) is True
+            assert self.modes(pub)[-1].body["register_map"] is False
+
+    def test_no_client_then_client_publishes_and_failed_clear_is_retried(self):
+        state = {"rc": None}  # no client yet
+        pub = FakeMQTT()
+        m = acks.AckManager(lambda t, b, q, r: state["rc"] if state["rc"] != 0
+                            else pub.publish(t, b, q, r).rc, {}, clock=Clock())
+        assert m.note_mode("r1", False) is False
+        state["rc"] = 4  # NO_CONN with a client: paho queues it, accepted
+        assert m.note_mode("r1", False) is True
+        state["rc"] = None
+        assert m.note_mode("r1", None) is False  # clear dropped: still False, retried
+        assert m.mode_robots() == ["r1"]
+        state["rc"] = 0
+        assert m.note_mode("r1", None) is True
+        assert "register_map" not in self.modes(pub)[-1].body
+
+    def test_late_retained_false_is_seeded_and_cleared(self):
+        m, pub, _ = self._mgr()
+        m.note_mode("r2", True)
+        m.seed_mode("r1", {"register_map": False})  # arrives after the first refresh
+        assert sorted(m.mode_robots()) == ["r1", "r2"]
+        m.seed_mode("r2", {"register_map": False})  # our own newer value wins
+        m.note_mode("r1", None)
+        assert "register_map" not in self.modes(pub, "r1")[-1].body
+        assert len(self.modes(pub, "r2")) == 1
+
+    def test_cap_eviction_keeps_false(self):
+        m, pub, _ = self._mgr()
+        with patch.object(acks, "_ROBOT_CAP", 3):
+            m.seed_mode("keep", {"register_map": False})
+            for i in range(5):
+                m.seed_mode(f"u{i}", {"v": 1})
+            m.seed_mode("t", {"register_map": True})
+            assert "keep" in m.mode_robots()
+            m.note_mode("keep", None)
+            assert "register_map" not in self.modes(pub, "keep")[-1].body
+
+
+class TestRefreshIngestMode:
+    @staticmethod
+    def _svc(missions=None, error=None):
+        service = _service()
+        pub = FakeMQTT()
+        service.acks = acks.AckManager(lambda t, b, q, r: pub.publish(t, b, q, r).rc,
+                                       service.stats)
+        service.database = SimpleNamespace(list_objects=AsyncMock(
+            return_value=missions, side_effect=error))
+        return service, pub
+
+    @staticmethod
+    def _m(robot, flag):
+        return SimpleNamespace(robot=robot, register_map=flag)
+
+    def test_running_missions_publish_flag_and_end_clears_it(self):
+        service, pub = self._svc([self._m("r1", False), self._m("r2", True)])
+        asyncio.run(service.refresh_ingest_mode())
+        got = {m.topic: m.body.get("register_map") for m in pub.messages}
+        assert got == {"robot/r1/ingest_mode": False, "robot/r2/ingest_mode": True}
+        asyncio.run(service.refresh_ingest_mode())  # no flapping
+        assert len(pub.messages) == 2
+        service.database.list_objects.return_value = [self._m("r2", True)]
+        asyncio.run(service.refresh_ingest_mode())
+        assert "register_map" not in pub.messages[-1].body
+        assert pub.messages[-1].topic == "robot/r1/ingest_mode"
+
+    def test_dropped_publish_is_retried_by_the_next_refresh(self):
+        service, pub = self._svc([self._m("r1", False)])
+        pub.rc = 1
+        asyncio.run(service.refresh_ingest_mode())
+        assert service.acks.mode_robots() == []
+        pub.rc = 0
+        asyncio.run(service.refresh_ingest_mode())
+        assert pub.messages[-1].body["register_map"] is False
+
+    def test_lookup_failure_changes_nothing_and_does_not_raise(self):
+        service, pub = self._svc([self._m("r1", False)])
+        asyncio.run(service.refresh_ingest_mode())
+        service.database.list_objects.side_effect = RuntimeError("db down")
+        asyncio.run(service.refresh_ingest_mode())
+        assert len(pub.messages) == 1

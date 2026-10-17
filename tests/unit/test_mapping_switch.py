@@ -46,6 +46,7 @@ class FakeOrch:
         self.reachable = reachable
         self.fail = fail or {}        # (op, name) -> OrchestratorError
         self.calls = []
+        self.stop_timeouts = []       # (service, timeout passed to client.stop)
         self.db = None                # set by prepare(): the DB whose transactions must be closed
         self.delay = 0.0
         # SLAM through the localization facade: `slam` is the slam mode (and, for the tests, the
@@ -103,8 +104,9 @@ class FakeClient:
         self.orch.services[name] = True
         return {"success": True}
 
-    async def stop(self, name):
+    async def stop(self, name, timeout=None):
         self.orch._enter("stop", name)
+        self.orch.stop_timeouts.append((name, timeout))
         if not self.orch.services.get(name):
             raise oc.OrchestratorError(oc.HTTP, "not currently running", status=404)
         self.orch.services[name] = False
@@ -486,6 +488,18 @@ class TestStop:
         assert a == {"service": "topomap", "action": "stop", "ok": True,
                      "label": "Topomap service stopped", "detail": None}
         assert orch.services["topomap"] is False
+
+    async def test_only_the_topomap_stop_waits_long(self):
+        from packages import config
+        orch = FakeOrch(services=("topomap", "grid"), running=["topomap", "grid"])
+        await make_switch({"r1": orch}).stop(robot(), ["topo", "grid"])
+        assert orch.stop_timeouts == [("topomap", config.ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S),
+                                      ("grid", None)]
+
+    async def test_start_is_unaffected(self):
+        orch = FakeOrch(services=("topomap",))
+        [a] = await make_switch({"r1": orch}).start(robot(), ["topo"])
+        assert a["ok"] and orch.stop_timeouts == []
 
     async def test_not_running_is_fine(self):
         [a] = await make_switch({"r1": FakeOrch()}).stop(robot(), ["topo"])

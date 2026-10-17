@@ -59,7 +59,7 @@ def feed(snaps):
 
 
 def opts(clock, **kw):
-    return {"poll_s": 2, "no_progress_s": 60, "max_s": 600, "clock": clock, "sleep": clock.sleep,
+    return {"poll_s": 2, "no_progress_s": 60, "max_s": 1800, "clock": clock, "sleep": clock.sleep,
             **kw}
 
 
@@ -163,13 +163,21 @@ class TestWait:
         assert r["state"] == ib.STALLED and r["backlog"]["depth"] == 3
         assert 60 <= r["waited_s"] < 64
 
-    async def test_progress_restarts_the_no_progress_timer_until_the_cap(self):
+    async def test_steady_progress_is_waited_for_until_the_hard_ceiling(self):
         c = Clock()
 
         async def fetch(robot):  # one node less every 30 s: never stalled
             return snap(1000 - int((c.t - 1000) // 30))
         r = await ib.wait_for_backlog("r1", fetch, **opts(c))
-        assert r["state"] == ib.CAP and 600 <= r["waited_s"] < 604
+        assert r["state"] == ib.CAP and 1800 <= r["waited_s"] < 1804
+
+    async def test_a_steady_drain_past_the_old_10_min_cap_still_drains(self):
+        c = Clock()
+
+        async def fetch(robot):  # one node less every 30 s, empty after 15 min
+            return snap(max(0, 30 - int((c.t - 1000) // 30)))
+        r = await ib.wait_for_backlog("r1", fetch, **opts(c))
+        assert r["state"] == ib.DRAINED and 900 <= r["waited_s"] < 904
 
     async def test_a_completed_id_or_fewer_open_trackers_are_progress(self):
         for key in ("done", "open_"):

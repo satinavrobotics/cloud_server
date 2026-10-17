@@ -64,6 +64,10 @@ GUARDED_ROUTES: Tuple[Tuple[str, str], ...] = (
     ("POST", "/api/v1/runs/archive"),
 )
 
+# Routes whose request can legitimately run far longer than the default lease (the replace-session
+# route waits for the robot's upload backlog, up to 30 min): they get `long_lease_s`.
+LONG_LEASE_ROUTES = frozenset({"POST /api/v1/maps/{map_id}/sessions"})
+
 TABLE = "idempotency_keys"
 CLAIM_SQL = (
     f"INSERT INTO {TABLE} AS k (key, actor, route, request_hash) VALUES (%s, %s, %s, %s) "
@@ -105,10 +109,12 @@ class IdempotencyStore:
     psycopg AsyncConnection that commits on a clean exit (PostgresDatabase.connection)."""
 
     def __init__(self, connection: Callable[[], AsyncContextManager[Any]], *,
-                 ttl_s: int, lease_s: int, actor: str = ANONYMOUS_ACTOR):
+                 ttl_s: int, lease_s: int, long_lease_s: Optional[int] = None,
+                 actor: str = ANONYMOUS_ACTOR):
         self._connection = connection
         self.ttl_s = int(ttl_s)
         self.lease_s = int(lease_s)
+        self.long_lease_s = int(long_lease_s) if long_lease_s is not None else self.lease_s
         self.actor = actor
 
     async def _execute(self, sql: str, params: Tuple[Any, ...]) -> Tuple[int, Optional[tuple]]:
@@ -118,12 +124,15 @@ class IdempotencyStore:
                 row = await cursor.fetchone() if cursor.description else None
                 return cursor.rowcount, row
 
+    def lease_for(self, route: str) -> int:
+        return self.long_lease_s if route in LONG_LEASE_ROUTES else self.lease_s
+
     async def claim(self, key: str, route: str, request_hash: str) -> Claim:
         # A second pass only if the row vanished between the two statements (its request
         # failed and released it): then the key is free again.
         for _ in range(2):
             _, row = await self._execute(CLAIM_SQL, (key, self.actor, route, request_hash,
-                                                     self.ttl_s, self.lease_s))
+                                                     self.ttl_s, self.lease_for(route)))
             if row is not None:
                 return Claim(NEW)
             _, row = await self._execute(LOOKUP_SQL, (key, self.actor, route))

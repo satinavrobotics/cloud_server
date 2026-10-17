@@ -46,7 +46,7 @@ from packages.config import (
     POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_USERNAME, postgres_database_password, require_secret,
     POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_PORT,
     DEFAULT_MAP_ID, PORT_API_DELEGATION, DEFAULT_HOST, LOG_LEVEL_DEFAULT,
-    IDEMPOTENCY_TTL_S, IDEMPOTENCY_LEASE_S, IDEMPOTENCY_PURGE_INTERVAL_S,
+    IDEMPOTENCY_TTL_S, IDEMPOTENCY_LEASE_S, IDEMPOTENCY_LONG_LEASE_S, IDEMPOTENCY_PURGE_INTERVAL_S,
 )
 from cloud_common.objects.robot import (
     EDITABLE_ROBOT_SPEC_FIELDS, FACTSHEET_PHYSICAL_FIELDS, ROBOT_SERVER_OWNED_SPEC_FIELDS, CustomActionV1,
@@ -391,7 +391,8 @@ def _idempotency_store() -> Optional[IdempotencyStore]:
     if service is None or not service.database.is_running():
         return None
     return IdempotencyStore(service.database.connection, ttl_s=IDEMPOTENCY_TTL_S,
-                            lease_s=IDEMPOTENCY_LEASE_S)
+                            lease_s=IDEMPOTENCY_LEASE_S,
+                            long_lease_s=IDEMPOTENCY_LONG_LEASE_S)
 
 
 # WP11 F3: Idempotency-Key on the side-effecting routes (packages/api/idempotency.py). Without
@@ -1250,8 +1251,8 @@ async def map_session_action(map_id: str, session_id: str, action: str, force: b
     the action. The response adds `robot_actions` (what was done on the robot), `robot_notified`
     (false when one failed), `mapping_warning` and `mapping_state`.
 
-    `finish` of a mapping session waits for the robot's upload backlog (up to 10 minutes, 60 s
-    without progress): 409 `{error: "backlog_pending", backlog}`; `?force=true` finishes anyway
+    `finish` of a mapping session waits for the robot's upload backlog (60 s without progress, or a
+    30 min hard ceiling for a drain that keeps progressing): 409 `{error: "backlog_pending", backlog}`; `?force=true` finishes anyway
     (the response's `backlog_skipped` says what was pending). `backlog` is "unknown" when the
     robot's backlog could not be read (no wait)."""
     _require_service()

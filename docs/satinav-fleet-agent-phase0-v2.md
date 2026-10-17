@@ -572,7 +572,7 @@ As built (branch `phase0/wp11-fixes`, not yet deployed; API only):
   8 guarded routes, only when `Idempotency-Key` is sent. It reuses phase0_core's
   `idempotency_keys` (the migration adds `completed_at` as the in-progress marker and `actor`
   default ''). A concurrent duplicate gets 409 + `Retry-After: 1`; 5xx responses are not stored;
-  a stale in-progress key (`IDEMPOTENCY_LEASE_S`, 120 s) can be taken over; expired keys
+  a stale in-progress key (`IDEMPOTENCY_LEASE_S`, 120 s; 3000 s `IDEMPOTENCY_LONG_LEASE_S` for the replace-session route only, whose backlog wait can take 30 min) can be taken over; expired keys
   (`IDEMPOTENCY_TTL_S`, 24 h) are ignored and purged every `IDEMPOTENCY_PURGE_INTERVAL_S`.
 
 **WP12: Backfill (day 4)** — dropped 2026-09-25 (not needed).

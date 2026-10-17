@@ -73,7 +73,8 @@ Finish waits for the robot's upload backlog (packages/api/ingest_backlog.py): a 
 spooled and uploads after the finish is refused (`no_session`) and lost. Mapping sessions only;
 the wait polls graph-builder for the robot's `spool_state.depth` of its current run and ends at 0,
 before the robot's lock and the transaction. 409 `{error: backlog_pending, reason, backlog}` after
-FINISH_BACKLOG_NO_PROGRESS_S (60) without progress or FINISH_BACKLOG_MAX_S (600) in all;
+FINISH_BACKLOG_NO_PROGRESS_S (60) without progress (reason `stalled`; a drain that keeps progressing
+is waited for) or the hard ceiling FINISH_BACKLOG_MAX_S (1800, reason `cap`);
 `?force=true` finishes anyway (`backlog_skipped`: the snapshot). An unknown backlog (older robot,
 no spool_state, graph-builder unreachable) does not wait (`backlog: "unknown"`); a finished session
 never waits. A session finished, paused or resumed during the wait is a 409.
@@ -86,7 +87,8 @@ mapping services of a session (`services`, today `topo` = the orchestrator's `to
 `sim_topomap`) run on the robot's orchestrator. Opening a mapping session STARTS them, resuming
 starts them again, pausing and finishing STOP them (unless another open, unpaused mapping session
 of the robot runs them), deleting the robot stops them. The orchestrator call (up to
-ORCHESTRATOR_START_TIMEOUT_S) is NEVER made inside a DB transaction (it would hold row locks
+ORCHESTRATOR_START_TIMEOUT_S; the topomap's stop up to ORCHESTRATOR_TOPOMAP_STOP_TIMEOUT_S,
+75 s: the robot may drain its upload spool first) is NEVER made inside a DB transaction (it would hold row locks
 that mission-dispatch and other writers wait on): the change is committed first, then the
 services are started / stopped. The switching NEVER blocks or undoes the user's action: no
 502/504/409, no compensating close / pause; whatever failed (robot offline, orchestrator
@@ -2941,8 +2943,8 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          ) -> Dict[str, Any]:
     """pause / resume / finish (see the module docstring). Finish of a MAPPING session first waits
     for the robot's upload backlog (`backlog_fetch(robot)`, packages/api/ingest_backlog.py; None
-    = no gate): before the robot's lock and the transaction, at most FINISH_BACKLOG_MAX_S and
-    FINISH_BACKLOG_NO_PROGRESS_S without progress, then 409 {error: backlog_pending, backlog}.
+    = no gate): before the robot's lock and the transaction, FINISH_BACKLOG_NO_PROGRESS_S without
+    progress (`stalled`) or the hard ceiling FINISH_BACKLOG_MAX_S (`cap`), then 409 {error: backlog_pending, backlog}.
     `force` skips the wait (`backlog_skipped` in the response); an unknown backlog (older robot,
     graph-builder unreachable) does not wait (`backlog: "unknown"`); a finished session never
     waits; one finished, or paused / resumed, during the wait is a 409. `on_finished(session)` is awaited
@@ -3038,7 +3040,8 @@ async def _wait_for_backlog(db: Any, map_name: str, session_id: str,
             "message": (f"Robot '{robot_name}' still has {snap.get('depth')} spooled node(s) to "
                         f"upload; {verb.rstrip('e')}ing now would lose them. "
                         + ("The session is paused, so the cloud refuses them: resume it, or "
-                           if paused else "Retry later, or ")
+                           if paused else (f"The drain is progressing but hit the {round(result['waited_s'])} s ceiling: retry to keep waiting, or "
+                              if state == ingest_backlog.CAP else "Retry later, or "))
                         + f"{verb} with force=true to discard them.")})
     now = await _peek_session(db, map_name, session_id)
     if now is not None and now["ended_at"] is not None:  # finished meanwhile: _session_action

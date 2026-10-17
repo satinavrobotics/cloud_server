@@ -9,7 +9,8 @@ current run. graph-builder serves it at GET /ingest/backlog/{robot} (acks.AckMan
 did not answer). Progress = `depth` falls, `highest_complete_id` rises or `open_trackers` falls.
 Outcomes (`state`): drained | unknown (nothing to wait for: older robot, no spool_state of the
 current run, graph-builder unreachable at the first look) | stalled (no progress for
-`no_progress_s`) | cap (`max_s` in all). A later failed poll counts as no progress.
+`no_progress_s`) | cap (`max_s`: a hard ceiling, 30 min by default, reached only by a drain that
+keeps making progress; a steady drain is never cut off earlier). A later failed poll counts as no progress.
 """
 import asyncio
 import logging
