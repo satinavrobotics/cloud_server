@@ -234,6 +234,7 @@ def _gb(row=None, mission=None):
     service._publish_image_update = AsyncMock()
     service._ensure_robot_exists = AsyncMock(return_value=True)
     service.graph_db.add_node = Mock(return_value=True)
+    service.graph_db.node_exists = Mock(return_value=False)  # nothing is stored yet
     service.graph_db.nodes_in_range = Mock(return_value=([], []))
     service.graph_db.add_edges_bulk = Mock(return_value=0)
     service.image_db.store_image = Mock(return_value=True)

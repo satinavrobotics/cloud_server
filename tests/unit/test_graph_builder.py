@@ -28,6 +28,7 @@ def with_session(service, row=None):
     service.sessions = ingest.SessionResolver(fetch, ttl=0)
     service._count_nodes = AsyncMock()
     service._write_event = AsyncMock()
+    service.graph_db.node_exists = Mock(return_value=False)  # nothing is stored yet
     return service
 
 
@@ -1259,6 +1260,7 @@ class TestGraphBuilderProcessTopology:
     def _make_service(self, mock_topomap):
         service = GraphBuilderService()
         service.graph_db.add_node = Mock(return_value=True)
+        service.graph_db.node_exists = Mock(return_value=False)
         service.graph_db.add_edge = Mock(return_value=True)
         service.graph_db.nodes_in_range = Mock(return_value=([], []))
         return service

@@ -7,7 +7,10 @@ started by hand there). Every node and image from that robot goes to the map of 
 **open session** (`map_sessions`, one per robot at most) using that session's map_T_session,
 whatever state the map is in, when that session is unpaused (mapping or operate: since 2026-10-16 an
 operate session takes data too; it was dropped as `operate_session` before). A `session_id` in the payload is not checked (the robot does
-not know cloud sessions; a different one is only logged at debug). Otherwise it is dropped:
+not know cloud sessions; a different one is only logged at debug). The open session's id (not
+the payload's) is part of the node's deterministic global id (server.py `_node_global_id`), so a
+resent node or part is recognised. A payload's optional `run_id` (the robot's run) tells a robot
+restart from a resend. Otherwise it is dropped:
 
     reason            when
     no_session        the robot has no open session (no current map)

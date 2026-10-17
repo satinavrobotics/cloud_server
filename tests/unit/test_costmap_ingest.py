@@ -660,20 +660,14 @@ class TestNodeRecordRace:
         await upload(dict(payload))
         assert fake.records == [] and ("r1", 7) in buffer
 
-    async def test_resent_node_waits_for_its_new_document(self):
+    async def test_resent_node_is_a_duplicate_and_records_go_to_its_document(self):
+        # (it used to be stored again under a new id: ids are deterministic since phase 1)
         service, fake, upload, payload, sub, saved, buffer = self._service("costmap")
         fake.release.set()
         await service._handle_node_update(dict(NODE))
         first = service.graph_db.add_node.call_args.kwargs["node_id"]
-        fake.release.clear()
-        fake.entered.clear()
-        node_task = asyncio.create_task(service._handle_node_update(dict(NODE)))
-        try:
-            assert await asyncio.to_thread(fake.entered.wait, 10)
-            await upload(dict(payload))
-            assert fake.records == []  # not set on the first node's document either
-        finally:
-            fake.release.set()
-        await asyncio.wait_for(node_task, 10)
-        second = service.graph_db.add_node.call_args.kwargs["node_id"]
-        assert second != first and fake.records == [(second, sub)]
+        service.graph_db.add_node.reset_mock()
+        await service._handle_node_update(dict(NODE))
+        service.graph_db.add_node.assert_not_called()
+        await upload(dict(payload))
+        assert fake.records == [(first, sub)]

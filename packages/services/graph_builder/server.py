@@ -26,6 +26,26 @@ stranded between them. Images need only the node's global id (they go to MinIO b
 is written); depth and costmap records go onto the ArangoDB node and so wait until `add_node`
 succeeded (`_stored_nodes`). The buffers are bounded (config.UPLOAD_BUFFER_MAX_*): an upload
 that does not fit is dropped and reported as `buffer_full`.
+
+Resent and buffered robot uploads (phase 1): the uploads are subscribed at QoS 1 (and, opt-in
+with GRAPH_BUILDER_MQTT_PERSISTENT_SESSION, over a persistent MQTT session), so a robot may send
+them again and the broker may redeliver. The global node id is deterministic,
+uuid5(robot, the open cloud session's id, session_node_id[, run]), so the same robot node always
+has the same id:
+- A node that is stored already (in memory, in the node-id LRU, or found in ArangoDB) is a
+  duplicate: first write wins (a resend with other pose / metadata does not update the node),
+  no add_node, no edges, no node_count, no WebSocket publish (`_process_topology` returns None,
+  stats `nodes_duplicate`). Buffered parts for it are still attached.
+- An image, depth or costmap upload finds its node by that id in ArangoDB when the memory
+  lacks it (a graph-builder restart), and is stored at once; it waits in the buffer only for a
+  node that does not exist yet.
+- An optional `run_id` in node_update / image / depth / costmap payloads identifies the robot's
+  run. A change of the robot's run_id is a session reset (mappings and buffers of the old run are
+  dropped, ids of the new run differ because the run is part of the id); a smaller
+  session_node_id with the same run_id is only a resend. Without run_id the old heuristic (a
+  smaller id than seen before) is the fallback: it cannot tell a resend from a restart, so such
+  robots get the old reset behaviour (and, after a graph-builder restart, a restarted counter
+  would look like duplicates): robots should send run_id.
 """
 
 import logging
@@ -51,12 +71,26 @@ from packages.topomap_dbs.client import TopomapDatabaseClient
 from packages.config import (
     MQTT_KEEPALIVE,
     MINIO_HOST, MINIO_PORT, MINIO_SECURE,
-    UPLOAD_BUFFER_MAX_BYTES, UPLOAD_BUFFER_MAX_ENTRIES,
+    UPLOAD_BUFFER_MAX_BYTES, UPLOAD_BUFFER_MAX_ENTRIES, NODE_EXISTS_CACHE_SIZE,
+    GRAPH_BUILDER_MQTT_PERSISTENT_SESSION, GRAPH_BUILDER_MQTT_CLIENT_ID,
 )
 from packages.events.emit import Event, emit
 from packages.services.graph_builder import ingest
 from packages.utils import capture_time
-from packages.services.graph_builder.upload_buffer import DROPPED, NodeUploadBuffer
+from packages.services.graph_builder.upload_buffer import DROPPED, NodeIdCache, NodeUploadBuffer
+
+# Namespace of the deterministic global node ids (uuid5): never change it, the ids of stored
+# nodes derive from it.
+NODE_ID_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "nodes.graph-builder.satinavrobotics.com")
+# The QoS the upload topics are subscribed at.
+UPLOAD_QOS = 1
+
+
+def _run_id_of(payload: Dict[str, Any]) -> Optional[str]:
+    """The payload's optional `run_id` (one robot process run / topomap run) as a string, or
+    None (absent or empty: an older robot)."""
+    run_id = payload.get('run_id')
+    return None if run_id is None or run_id == "" else str(run_id)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,6 +302,18 @@ class GraphBuilderService:
         self._stored_nodes: Dict[Tuple[str, Any],
                                  Tuple[str, str, Optional[str], Dict[str, float]]] = {}
 
+        # Nodes known to exist in ArangoDB, (map, global id) (LRU): a resent node is a no-op, an
+        # upload of a node stored before a restart is stored directly. Positives only.
+        self._node_cache = NodeIdCache(NODE_EXISTS_CACHE_SIZE)
+        # Nodes being stored right now, (map, global id): a concurrent resend is a duplicate.
+        self._processing: Set[Tuple[str, str]] = set()
+        # robot -> the run_id of its last node_update (reset detection). Under _upload_lock.
+        self._robot_runs: Dict[str, str] = {}
+        # robot -> a token set when the fallback heuristic (no run_id, a smaller session_node_id)
+        # saw a reset: it goes into the robot's node ids so the new run's nodes do not collide
+        # with the old run's. In memory only: robots should send run_id.
+        self._legacy_epochs: Dict[str, str] = {}
+
         # Robot registration cache
         # Set of robot names that are known to exist in Mission Dispatch
         self.known_robots: Set[str] = set()
@@ -282,6 +328,7 @@ class GraphBuilderService:
             "session_mappings": 0,
             "robots_auto_created": 0,
             "nodes_rejected": 0,
+            "nodes_duplicate": 0,
             "images_rejected": 0,
             "reject_events_written": 0,
             "reject_events_failed": 0,
@@ -346,23 +393,33 @@ class GraphBuilderService:
         """
         try:
             # Create shared MQTT client
-            client_id = f"graph_builder_{datetime.now().timestamp()}"
+            # A persistent session (opt-in) needs a stable client id; otherwise a fresh one
+            # and a clean session, as before.
+            persistent = GRAPH_BUILDER_MQTT_PERSISTENT_SESSION
+            client_id = (GRAPH_BUILDER_MQTT_CLIENT_ID if persistent
+                         else f"graph_builder_{datetime.now().timestamp()}")
             self.mqtt_client = MQTTClient(
                 client_id=client_id,
                 broker=self.mqtt_host,
                 port=self.mqtt_port,
-                keepalive=MQTT_KEEPALIVE
+                keepalive=MQTT_KEEPALIVE,
+                clean_session=not persistent,
             )
 
-            # Register callbacks
-            self.mqtt_client.register_callback(self.mqtt_topic, self._on_node_update_message)
-            self.mqtt_client.register_callback(self.mqtt_image_topic, self._on_image_upload_message)
+            # Register callbacks. All uploads are subscribed at QoS 1: a robot publishing at
+            # QoS 1 gets the broker's redelivery while this client is connected (the granted
+            # QoS is the lower of the two); the handlers are idempotent for the duplicates.
+            self.mqtt_client.register_callback(self.mqtt_topic, self._on_node_update_message,
+                                               qos=UPLOAD_QOS)
+            self.mqtt_client.register_callback(self.mqtt_image_topic,
+                                               self._on_image_upload_message, qos=UPLOAD_QOS)
             if self.mqtt_depth_topic:
                 self.mqtt_client.register_callback(self.mqtt_depth_topic,
-                                                   self._on_depth_upload_message)
+                                                   self._on_depth_upload_message, qos=UPLOAD_QOS)
             if self.mqtt_costmap_topic:
                 self.mqtt_client.register_callback(self.mqtt_costmap_topic,
-                                                   self._on_costmap_upload_message, qos=1)
+                                                   self._on_costmap_upload_message,
+                                                   qos=UPLOAD_QOS)
 
             # Connect and start background loop
             self.mqtt_client.connect()
@@ -488,20 +545,56 @@ class GraphBuilderService:
             self.logger.error(f"Failed to look up active mission for '{robot_name}': {e}")
         return None, True
 
-    def _mapped_node(self, node_key: Tuple[str, Any],
-                     session_id: Optional[str]) -> Optional[Tuple[str, str]]:
+    def _mapped_node(self, node_key: Tuple[str, Any], session_id: Optional[str],
+                     run_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
         """(global id, map) of a node already mapped in this session (its images can be
-        stored), else None. Call under _upload_lock."""
+        stored), else None. A `run_id` that differs from the robot's current run: None (the
+        mapping is from an earlier run). Call under _upload_lock."""
+        if self._stale_run(node_key[0], run_id):
+            return None
         mapping = self.session_to_global_map.get(node_key)
         if mapping and mapping[3] == session_id:
             return mapping[0], mapping[2]
         return None
 
-    def _stored_node(self, node_key: Tuple[str, Any],
-                     session_id: Optional[str]) -> Optional[Tuple[str, str, Dict[str, float]]]:
+    def _stale_run(self, robot_name: str, run_id: Optional[str]) -> bool:
+        """The upload's `run_id` is not the robot's current run (call under _upload_lock)."""
+        current = self._robot_runs.get(robot_name)
+        return run_id is not None and current is not None and run_id != current
+
+    def _node_global_id(self, robot_name: str, session_id: Optional[str],
+                        session_node_id: Any, run_id: Optional[str] = None) -> str:
+        """The global id of a robot's node: uuid5 of robot, the cloud session's id and the
+        robot's node id, so a resend (or an upload after a restart) names the same node. A run
+        (the payload's `run_id`, else the token of a fallback-detected reset) is part of the key,
+        so a restarted robot's nodes do not collide with the old run's. No session: a fresh
+        UUID4 (only the manual / test paths)."""
+        if session_id is None:
+            return self._generate_global_node_id()
+        name = f"{robot_name}:{session_id}:{session_node_id}"
+        run = run_id or self._legacy_epochs.get(robot_name)
+        if run:
+            name += f":{run}"
+        return str(uuid.uuid5(NODE_ID_NAMESPACE, name))
+
+    async def _existing_node(self, map_id: str, global_id: str) -> bool:
+        """The node's document exists in ArangoDB: the LRU first, else a lookup (thread)."""
+        key = (map_id, global_id)
+        if key in self._node_cache:
+            return True
+        if await asyncio.to_thread(self.graph_db.node_exists, map_id, global_id):
+            self._node_cache.add(key)
+            return True
+        return False
+
+    def _stored_node(self, node_key: Tuple[str, Any], session_id: Optional[str],
+                     run_id: Optional[str] = None
+                     ) -> Optional[Tuple[str, str, Dict[str, float]]]:
         """(global id, map, map_T_session the node was stored with) of a node of this session
-        whose ArangoDB document exists (depth and costmap records can be set on it), else None.
-        Call under _upload_lock."""
+        whose ArangoDB document exists (depth and costmap records can be set on it), else None
+        (also for a `run_id` that is not the robot's current run). Call under _upload_lock."""
+        if self._stale_run(node_key[0], run_id):
+            return None
         stored = self._stored_nodes.get(node_key)
         if stored and stored[2] == session_id:
             return stored[0], stored[1], stored[3]
@@ -574,27 +667,33 @@ class GraphBuilderService:
         """
         Build topological graph from a node-update payload.
 
-        Validates fields, assigns a global node UUID, creates edges to nearby nodes,
-        and writes the node and edges to the graph database.
+        Validates fields, derives the global node id (deterministic: `_node_global_id`),
+        creates edges to nearby nodes, and writes the node and edges to the graph database.
+
+        A node that is already stored (the robot resent it, or an MQTT redelivery) is a
+        duplicate: first write wins, so nothing is written (no add_node over a node the scene
+        workers may have enriched, no new edges), nothing is counted in the session and None is
+        returned (`_attach_duplicate`). Known nodes are found in memory, in the node-id LRU, or
+        by an ArangoDB lookup (after a restart).
 
         Args:
-            payload: The incoming MQTT node-update dict (robot-frame x, y, yaw).
+            payload: The incoming MQTT node-update dict (robot-frame x, y, yaw; optional
+                    `run_id`, which tells a restarted robot run from a resend).
             map_id: The session's map (required; there is no default map any more). Any
                     ``map_id`` key present in the payload is ignored.
             transform: The session's map_T_session; the stored `pose` is the payload pose in
                     the map frame. None: identity.
-            session_id: The session; stored on the node with `robot_pose` (the payload pose).
+            session_id: The cloud session (of the open mapping session, not the payload's);
+                    stored on the node with `robot_pose` (the payload pose).
 
         Returns (global_node_id, x, y, yaw, map_id, edges, session_node_id, robot_name), with
-        x, y, yaw in the map frame, or None on failure.
+        x, y, yaw in the map frame, or None on failure or for a duplicate.
         """
         session_node_id = payload.get('session_node_id')
         robot_name = payload.get('robot_name')
         rx = payload.get('x')
         ry = payload.get('y')
         ryaw = payload.get('yaw', payload.get('theta', 0.0))
-        camera_metadata = payload.get('camera_metadata', [])
-        metadata = dict(payload.get('metadata') or {})
 
         if session_node_id is None or robot_name is None or rx is None or ry is None:
             self.logger.error("Missing required fields: session_node_id, robot_name, x, y")
@@ -610,11 +709,89 @@ class GraphBuilderService:
 
         self.logger.info(f"📨 Received node update from {robot_name}, session_node_id={session_node_id}")
 
-        global_node_id = self._generate_global_node_id()
+        session_key = (robot_name, session_node_id)
+        with self._upload_lock:
+            self._detect_and_clear_session_reset(robot_name, session_node_id, _run_id_of(payload))
+            global_node_id = self._node_global_id(robot_name, session_id, session_node_id,
+                                                  _run_id_of(payload))
+            claim = (map_id, global_node_id)
+            stored = self._stored_nodes.get(session_key)
+            known = ((stored is not None and stored[0] == global_node_id
+                      and stored[2] == session_id) or claim in self._node_cache)
+            busy = claim in self._processing
+            if session_id is not None and not known and not busy:
+                self._processing.add(claim)
+
+        if session_id is None:  # manual / test path: a fresh id, nothing to deduplicate
+            return self._store_node(payload, map_id, transform, session_id, x, y, yaw,
+                                    global_node_id)
+
+        if busy:  # the same node is being stored by another worker thread
+            self.stats["nodes_duplicate"] += 1
+            self.logger.debug(f"Node {global_node_id} is being stored already; resend ignored")
+            return None
+        try:
+            if not known and self.graph_db.node_exists(map_id, global_node_id):
+                known = True
+            if known:
+                return self._attach_duplicate(session_key, global_node_id, map_id, transform,
+                                              session_id)
+            return self._store_node(payload, map_id, transform, session_id, x, y, yaw,
+                                    global_node_id)
+        finally:
+            with self._upload_lock:
+                self._processing.discard(claim)
+
+    def _attach_duplicate(self, session_key: Tuple[str, Any], global_node_id: str, map_id: str,
+                          transform: Dict[str, float], session_id: str) -> None:
+        """A resent node that is stored already: no write, no edges, no count, no WebSocket
+        update. Only what a later upload needs is restored in memory (mapping, `_stored_nodes`:
+        e.g. after a restart) and anything buffered for the node is saved. Always None."""
+        with self._upload_lock:
+            mapping = self.session_to_global_map.get(session_key)
+            if mapping is None or mapping[0] != global_node_id or mapping[3] != session_id:
+                self.session_to_global_map[session_key] = (global_node_id, datetime.now(),
+                                                           map_id, session_id)
+                self.stats["session_mappings"] += 1
+            stored = self._stored_nodes.get(session_key)
+            if stored is None or stored[0] != global_node_id or stored[2] != session_id:
+                self._stored_nodes[session_key] = (global_node_id, map_id, session_id, transform)
+            else:
+                transform = stored[3]
+            buffered_images = self.image_buffer.take(session_key, self.image_buffer_timeout,
+                                                     session_id)
+            buffered_depth = self.depth_buffer.take(session_key, self.image_buffer_timeout,
+                                                    session_id)
+            buffered_costmap = self.costmap_buffer.take(session_key, self.image_buffer_timeout,
+                                                        session_id)
+        self._node_cache.add((map_id, global_node_id))
+        self.stats["nodes_duplicate"] += 1
+        self.logger.debug(f"Node {global_node_id} {session_key} is stored already; resend "
+                          "ignored (first write wins)")
+        if buffered_images:
+            self._save_images(global_node_id, map_id, buffered_images)
+        if buffered_depth:
+            self._save_depth(global_node_id, map_id, buffered_depth, transform, session_id)
+        if buffered_costmap:
+            self._save_costmap(global_node_id, map_id, buffered_costmap, transform, session_id)
+        return None
+
+    def _store_node(self, payload: Dict[str, Any], map_id: str, transform: Dict[str, float],
+                    session_id: Optional[str], x: float, y: float, yaw: float,
+                    global_node_id: str) -> Optional[Tuple]:
+        """The write path of `_process_topology` for a node that is not stored yet: map it,
+        take the images buffered for it, find its edges, add the node, then take the depth and
+        costmap records and insert the edges."""
+        session_node_id = payload.get('session_node_id')
+        robot_name = payload.get('robot_name')
+        rx = payload.get('x')
+        ry = payload.get('y')
+        ryaw = payload.get('yaw', payload.get('theta', 0.0))
+        camera_metadata = payload.get('camera_metadata', [])
+        metadata = dict(payload.get('metadata') or {})
 
         session_key = (robot_name, session_node_id)
         with self._upload_lock:
-            self._detect_and_clear_session_reset(robot_name, session_node_id)
             # A re-sent node: its records wait for this node's document.
             self._stored_nodes.pop(session_key, None)
             self.session_to_global_map[session_key] = (global_node_id, datetime.now(), map_id,
@@ -631,6 +808,8 @@ class GraphBuilderService:
         if session_id is not None:
             metadata['session_id'] = session_id
             metadata['robot_pose'] = {'x': rx, 'y': ry, 'yaw': ryaw}
+        if _run_id_of(payload) is not None:
+            metadata['run_id'] = _run_id_of(payload)
 
         if buffered_images:
             self.logger.info(f"Found {len(buffered_images)} buffered images for node {global_node_id}")
@@ -670,6 +849,8 @@ class GraphBuilderService:
                                                     session_id)
             buffered_costmap = self.costmap_buffer.take(session_key, self.image_buffer_timeout,
                                                         session_id)
+        if session_id is not None:
+            self._node_cache.add((map_id, global_node_id))
 
         inserted = self.graph_db.add_edges_bulk(edges, map_id=map_id)
         self.stats["edges_created"] += inserted
@@ -771,7 +952,13 @@ class GraphBuilderService:
         nodes went to the robot's old current_map).
 
         Payload: session_node_id, robot_name, camera_name, image_data (base64), and optionally
-        content_type, timestamp, yaw_offset, session_id (M3 robots).
+        content_type, timestamp, yaw_offset, session_id (M3 robots), run_id (the robot's run: an
+        upload of an earlier run does not match this run's node).
+
+        The node is found by its deterministic id (see `_node_global_id`): in memory, in the
+        node-id LRU or in ArangoDB (after a restart, or a node another worker stored); only a
+        node that does not exist yet makes the image wait. An image resent is stored again
+        under the same MinIO key (idempotent).
         """
         try:
             session_node_id = payload.get('session_node_id')
@@ -781,6 +968,7 @@ class GraphBuilderService:
             content_type = payload.get('content_type', 'image/jpeg')
             timestamp = payload.get('timestamp')
             yaw_offset = payload.get('yaw_offset', 0.0)
+            run_id = _run_id_of(payload)
 
             if session_node_id is None or robot_name is None or camera_name is None or image_data_b64 is None:
                 self.logger.error("Missing required fields in image upload: session_node_id, robot_name, camera_name, image_data")
@@ -800,6 +988,7 @@ class GraphBuilderService:
                 'data': image_data_b64,
                 'content_type': content_type,
                 'session_id': session.session_id,  # NodeUploadBuffer.take checks it
+                'run_id': run_id,  # a reset keeps the new run's buffered uploads
                 'metadata': {
                     'camera_name': camera_name,
                     'timestamp': timestamp,
@@ -811,11 +1000,20 @@ class GraphBuilderService:
             }
 
             # Node update already received in this session: save to the node's map. Else
-            # (the robot sends images first) buffer it until the node arrives.
+            # (the robot sends images first) buffer it until the node arrives. A node stored
+            # before a restart is not in memory: it is found in ArangoDB by its deterministic
+            # id (MinIO needs only the id), so the image is stored without waiting.
             node_key = (robot_name, session_node_id)
+            with self._upload_lock:
+                known = self._mapped_node(node_key, session.session_id, run_id)
+            if known is None and session.session_id is not None:
+                gid = self._node_global_id(robot_name, session.session_id, session_node_id,
+                                           run_id)
+                if await self._existing_node(session.map_name, gid):
+                    known = (gid, session.map_name)
             target = self.image_buffer.put_unless(
                 node_key, camera_name, image_dict,
-                lambda: self._mapped_node(node_key, session.session_id))
+                lambda: self._mapped_node(node_key, session.session_id, run_id) or known)
             if target is DROPPED:
                 await self._reject_buffer_full(resolution, "image")
             elif target is not None:
@@ -882,12 +1080,23 @@ class GraphBuilderService:
                 await self._reject(resolution, spec.kind)
                 return
             session = resolution.session
+            run_id = _run_id_of(payload)
             entry = {spec.sub_key: sub, "data": payload[spec.data_key], "parsed": parsed,
-                     "session_id": session.session_id}
+                     "session_id": session.session_id, "run_id": run_id}
 
+            # The record goes onto the node's document: a node stored before a restart is not
+            # in memory, so its document is looked up (by the deterministic id) before buffering.
             node_key = (robot_name, session_node_id)
+            with self._upload_lock:
+                known = self._stored_node(node_key, session.session_id, run_id)
+            if known is None and session.session_id is not None:
+                gid = self._node_global_id(robot_name, session.session_id, session_node_id,
+                                           run_id)
+                if await self._existing_node(session.map_name, gid):
+                    known = (gid, session.map_name, session.map_t_session)
             target = getattr(self, f"{spec.kind}_buffer").put_unless(
-                node_key, sub, entry, lambda: self._stored_node(node_key, session.session_id))
+                node_key, sub, entry,
+                lambda: self._stored_node(node_key, session.session_id, run_id) or known)
             if target is DROPPED:
                 await self._reject_buffer_full(resolution, spec.kind)
             elif target is not None:
@@ -1315,51 +1524,72 @@ class GraphBuilderService:
     
     # ==================== Helper Methods ====================
 
-    def _detect_and_clear_session_reset(self, robot_name: str, session_node_id: int):
+    def _detect_and_clear_session_reset(self, robot_name: str, session_node_id: int,
+                                        run_id: Optional[str] = None):
         """
-        Detect if a new topomap session has started for this robot.
+        Detect if a new topomap run has started for this robot.
 
-        If a smaller session_node_id arrives than what we have seen before,
-        it indicates the robot has restarted its topomap session.
-        Clear all old mappings and buffered uploads for this robot. Call under _upload_lock.
+        With a `run_id` (robots that send it) a reset is a change of the robot's run_id: a
+        lower session_node_id with the same run_id is a resend or a redelivery and wipes
+        nothing. Without one, the fallback heuristic applies: a smaller session_node_id than
+        any seen before for the robot means the robot restarted its counter (a resend of an
+        older node looks the same, so it also resets, as before); the robot's later node ids
+        then carry a new epoch token.
+        On a reset all old mappings and buffered uploads for this robot are cleared (the new
+        run's own uploads that already arrived stay). Call under _upload_lock.
 
         Args:
             robot_name: Name of the robot
             session_node_id: Current session node ID
+            run_id: The payload's run_id, if any
         """
-        # Find the maximum session_node_id we've seen for this robot
-        max_session_id = -1
-        for (r_name, s_id), _ in self.session_to_global_map.items():
-            if r_name == robot_name:
-                max_session_id = max(max_session_id, s_id)
+        keep = None
+        if run_id is not None:
+            previous = self._robot_runs.get(robot_name)
+            self._robot_runs[robot_name] = run_id
+            if previous is None or previous == run_id:
+                return
+            reason = f"run_id {previous} -> {run_id}"
+            keep = lambda entry: isinstance(entry, dict) and entry.get("run_id") == run_id  # noqa: E731
+        else:
+            # (A lower id may be a resend, but without a run_id it cannot be told from a
+            # restart, and ignoring a restart would drop the new run's nodes as duplicates.)
+            # Find the maximum session_node_id we've seen for this robot
+            max_session_id = -1
+            for (r_name, s_id), _ in self.session_to_global_map.items():
+                if r_name == robot_name:
+                    max_session_id = max(max_session_id, s_id)
 
-        # If current session_node_id is smaller than max, we've detected a session reset
-        if max_session_id >= 0 and session_node_id < max_session_id:
-            self.logger.warning(
-                f"🔄 Session reset detected for {robot_name}: "
-                f"session_node_id={session_node_id} < max_seen={max_session_id}. "
-                f"Clearing old mappings and buffered images."
-            )
+            # If current session_node_id is smaller than max, we've detected a session reset
+            if not (max_session_id >= 0 and session_node_id < max_session_id):
+                return
+            reason = f"session_node_id={session_node_id} < max_seen={max_session_id}"
+            self._legacy_epochs[robot_name] = uuid.uuid4().hex[:8]
 
-            # Clear session mappings for this robot
-            keys_to_remove = [
-                key for key in self.session_to_global_map.keys()
-                if key[0] == robot_name
-            ]
-            for key in keys_to_remove:
-                del self.session_to_global_map[key]
-                self._stored_nodes.pop(key, None)
-                self.stats["session_mappings"] -= 1
+        self.logger.warning(
+            f"🔄 Session reset detected for {robot_name}: {reason}. "
+            f"Clearing old mappings and buffered images."
+        )
 
-            # Clear buffered uploads for this robot
-            image_nodes = self.image_buffer.clear_robot(robot_name)
-            self.depth_buffer.clear_robot(robot_name)
-            self.costmap_buffer.clear_robot(robot_name)
+        # Clear session mappings for this robot
+        keys_to_remove = [
+            key for key in self.session_to_global_map.keys()
+            if key[0] == robot_name
+        ]
+        for key in keys_to_remove:
+            del self.session_to_global_map[key]
+            self._stored_nodes.pop(key, None)
+            self.stats["session_mappings"] -= 1
 
-            self.logger.info(
-                f"✅ Cleared {len(keys_to_remove)} session mappings and "
-                f"{image_nodes} buffered images for {robot_name}"
-            )
+        # Clear buffered uploads for this robot
+        image_nodes = self.image_buffer.clear_robot(robot_name, keep)
+        self.depth_buffer.clear_robot(robot_name, keep)
+        self.costmap_buffer.clear_robot(robot_name, keep)
+
+        self.logger.info(
+            f"✅ Cleared {len(keys_to_remove)} session mappings and "
+            f"{image_nodes} buffered images for {robot_name}"
+        )
 
     def _generate_global_node_id(self) -> str:
         """

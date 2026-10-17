@@ -1557,6 +1557,23 @@ async def semantic_callback(job_id: str, kind: str, body: Dict[str, Any],
     return JSONResponse(status_code=status, content=answer)
 
 
+# ==================== Map view settings ====================
+# packages/api/map_view_settings.py: the vertical range of the map's 3D view and the semantic classes
+# left out, per map (the client's map window). 404 map_not_found / 409 map_deleting / 422 bad body.
+
+@app.get("/api/v1/maps/{map_id}/view_settings")
+async def get_map_view_settings(map_id: str):
+    _require_service()
+    return await _site_call("read view settings", service.view_settings.get(map_id))
+
+
+@app.put("/api/v1/maps/{map_id}/view_settings")
+async def put_map_view_settings(map_id: str, body: Dict[str, Any]):
+    """The whole document: {ignored_classes, height_min_m, height_max_m}. Replaces the stored one."""
+    _require_service()
+    return await _site_call("save view settings", service.view_settings.put(map_id, body))
+
+
 # ==================== Fleet Settings ====================
 # A single operator-editable settings object, always stored under
 # GLOBAL_SETTINGS_NAME — see cloud_common/objects/settings.py for why this is

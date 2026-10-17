@@ -369,6 +369,42 @@ the node is still being written is buffered and stored with it. A dropped one co
 `buffered_costmap`. Several layers (or cameras) buffered for one node are written to its
 document in one update.
 
+### Resent and buffered uploads (phase 1)
+
+A robot may send a node or its parts again (buffered while offline, MQTT redelivery). The service
+is built for it; robots that send nothing new keep working.
+
+- **QoS.** `robot/node_update`, `image_upload`, `depth_upload` and `costmap_upload` are subscribed
+  at QoS 1 (the granted QoS is the lower of the robot's publish QoS and this): a robot must publish
+  at QoS 1 to get the broker's redelivery. This is not an acknowledgement of processing (the
+  PUBACK goes out when the message is handed to the service, before the node is stored).
+- **Persistent session (opt-in).** `GRAPH_BUILDER_MQTT_PERSISTENT_SESSION=true` makes graph-builder
+  connect with `GRAPH_BUILDER_MQTT_CLIENT_ID` (default `graph_builder`) and `clean_session=False`,
+  so the broker queues QoS 1 messages while it is down. Default off: the queue is bounded by the
+  broker (mosquitto `max_queued_messages` / `max_queued_bytes`, not configured in this repo) and
+  only one graph-builder may use the client id. Topics are subscribed again on every reconnect and
+  the reconnect watchdog is unchanged.
+- **Deterministic node ids.** The global node id is
+  `uuid5(ns, "{robot_name}:{session_id}:{session_node_id}")`, with the open cloud session's id (not
+  the payload's), and `:{run_id}` appended when the robot sends one. The same robot node always
+  has the same id, so uploads find it again after a restart.
+- **Duplicate nodes.** A node whose id is stored already (in memory, the node-id LRU
+  `NODE_EXISTS_CACHE_SIZE`, or ArangoDB) is a no-op: first write wins (a resend with another pose or
+  metadata does not change the node), no `add_node`, no new edges, no `node_count`, no WebSocket
+  `node_added`; counted in `nodes_duplicate`. Buffered images / depth / costmaps are still attached.
+  If the first attempt stored the node but failed on its edges or on counting, a resend does not
+  repair that.
+- **Parts after a restart.** An image is stored at once when its node exists in ArangoDB; a depth
+  or costmap record is set on the existing document. Only a node that does not exist yet makes an
+  upload wait in the buffer (30 s).
+- **`run_id` (optional, all four payloads).** Any string that is stable for one robot run /
+  topomap run and changes when the robot restarts and restarts its `session_node_id` counter.
+  A changed `run_id` resets the robot's state (as a smaller id used to); a lower `session_node_id`
+  with the same `run_id` is just a resend. Without `run_id` the old heuristic remains: a smaller
+  id than seen before is a reset (a resend of an older node looks the same). Robots that restart
+  their counter should send `run_id`: otherwise, after a graph-builder restart, the new run's
+  nodes would be taken for duplicates of the old run's.
+
 ## How It Works
 
 ### Node Processing Pipeline

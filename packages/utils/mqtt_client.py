@@ -32,7 +32,8 @@ class MQTTClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         transport: str = "tcp",
-        ws_path: Optional[str] = None
+        ws_path: Optional[str] = None,
+        clean_session: bool = True
     ):
         self.logger = logging.getLogger(f"MQTTClient_{client_id}")
         self.broker = broker
@@ -47,7 +48,12 @@ class MQTTClient:
         # once the registered topics are subscribed again.
         self._connect_listeners: List[Callable[[], None]] = []
 
-        self.client = mqtt_client.Client(client_id=client_id, transport=transport, protocol=mqtt_client.MQTTv311)
+        # clean_session=False (a persistent session) needs a stable client_id: the broker then
+        # keeps the subscriptions and queues QoS 1 messages while the client is away.
+        # Subscribing again in _on_connect stays harmless (and covers a broker that lost it).
+        self.clean_session = clean_session
+        self.client = mqtt_client.Client(client_id=client_id, clean_session=clean_session,
+                                         transport=transport, protocol=mqtt_client.MQTTv311)
         # Surface paho's own connection/reconnection logging, which is otherwise
         # silent and was the reason a stalled reconnect went unnoticed.
         self.client.enable_logger(self.logger)

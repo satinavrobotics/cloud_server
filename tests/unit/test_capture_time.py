@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from packages.services.graph_builder.server import GraphBuilderService
+from packages.services.graph_builder.upload_buffer import NodeIdCache
 from packages.utils import capture_time as ct
 
 pytestmark = pytest.mark.unit
@@ -75,6 +76,10 @@ class TestIngest:
         svc._upload_lock = threading.RLock()
         svc.session_to_global_map = {}
         svc._stored_nodes = {}
+        svc._node_cache = NodeIdCache(10)
+        svc._processing = set()
+        svc._robot_runs = {}
+        svc._legacy_epochs = {}
         svc.image_buffer = MagicMock()
         svc.image_buffer.take.return_value = []
         svc.image_buffer_timeout = 1
@@ -83,6 +88,7 @@ class TestIngest:
         svc._find_nearby_nodes = lambda *a, **k: []
         svc._create_edges = lambda *a, **k: []
         svc.graph_db = MagicMock()
+        svc.graph_db.node_exists.return_value = False
         svc.graph_db.add_node.return_value = False   # stop right after add_node
         svc._process_topology(payload, map_id="m", session_id="s")
         return svc.graph_db.add_node.call_args.kwargs["metadata"]

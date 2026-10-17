@@ -134,6 +134,16 @@ IMAGE_BUFFER_TIMEOUT = float(os.getenv("IMAGE_BUFFER_TIMEOUT", "30.0"))
 # is dropped and reported as MAP.INGEST_REJECTED (reason buffer_full).
 UPLOAD_BUFFER_MAX_BYTES = int(os.getenv("UPLOAD_BUFFER_MAX_BYTES", str(256 * 1024 * 1024)))
 UPLOAD_BUFFER_MAX_ENTRIES = int(os.getenv("UPLOAD_BUFFER_MAX_ENTRIES", "5000"))
+# Nodes known to exist in ArangoDB (graph-builder, an LRU of ids): a resent node and the
+# image / depth / costmap uploads of a node stored before a restart skip the database lookup.
+NODE_EXISTS_CACHE_SIZE = int(os.getenv("NODE_EXISTS_CACHE_SIZE", "20000"))
+# Opt-in MQTT persistent session for graph-builder: a stable client id and clean_session=False,
+# so the broker queues QoS 1 uploads (node_update / image / depth / costmap) while it is down.
+# Off by default: the queue is bounded by the broker's own limits (mosquitto max_queued_messages
+# / max_queued_bytes, not set in this repo), and only one graph-builder may use the client id.
+GRAPH_BUILDER_MQTT_PERSISTENT_SESSION = os.getenv(
+    "GRAPH_BUILDER_MQTT_PERSISTENT_SESSION", "false").lower() in ("true", "1", "yes")
+GRAPH_BUILDER_MQTT_CLIENT_ID = os.getenv("GRAPH_BUILDER_MQTT_CLIENT_ID", "graph_builder")
 
 # ==================== MQTT Configuration ====================
 MQTT_HOST      = os.getenv("MQTT_HOST", "localhost")

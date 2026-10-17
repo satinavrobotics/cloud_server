@@ -19,6 +19,7 @@ is logged once per OVERFLOW_LOG_INTERVAL_S, with the number dropped since.
 import datetime
 import logging
 import threading
+from collections import OrderedDict
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar
 
 NodeKey = Tuple[str, Any]
@@ -177,16 +178,29 @@ class NodeUploadBuffer:
             self.bytes -= self._bytes_of(subs)
             return len(subs)
 
-    def clear_robot(self, robot_name: str) -> int:
+    def clear_robot(self, robot_name: str,
+                    keep: Optional[Callable[[Any], bool]] = None) -> int:
         """Discard everything buffered for a robot (its topomap session restarted); how many
-        node keys were cleared."""
+        node keys were cleared. `keep(entry)` True: that entry belongs to the new run and
+        stays (a node key is cleared only when none stays)."""
         with self.lock:
             keys = [k for k in self.entries if k[0] == robot_name]
+            cleared = 0
             for key in keys:
-                subs = self.entries.pop(key)
-                self.stats[self.stat] -= len(subs)
-                self.bytes -= self._bytes_of(subs)
-            return len(keys)
+                subs = self.entries[key]
+                if keep is not None:
+                    kept = {s: v for s, v in subs.items() if keep(v[0])}
+                    gone = {s: v for s, v in subs.items() if s not in kept}
+                else:
+                    kept, gone = {}, subs
+                self.stats[self.stat] -= len(gone)
+                self.bytes -= self._bytes_of(gone)
+                if kept:
+                    self.entries[key] = kept
+                else:
+                    del self.entries[key]
+                    cleared += 1
+            return cleared
 
     def cleanup(self, max_age: float) -> int:
         """Discard entries older than `max_age` seconds (periodic); how many."""
@@ -205,3 +219,34 @@ class NodeUploadBuffer:
                     del self.entries[key]
             self.stats[self.stat] -= removed
         return removed
+
+
+class NodeIdCache:
+    """A thread-safe LRU set of node ids known to exist in ArangoDB, `(map, global id)`. Only
+    positives are kept: a node that does not exist yet may be stored a moment later."""
+
+    def __init__(self, max_size: int):
+        self._max_size = max_size
+        self._ids: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            if key in self._ids:
+                self._ids.move_to_end(key)  # type: ignore[arg-type]
+                return True
+            return False
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def add(self, key: Tuple[str, str]) -> None:
+        with self._lock:
+            self._ids[key] = None
+            self._ids.move_to_end(key)
+            while len(self._ids) > self._max_size:
+                self._ids.popitem(last=False)
+
+    def discard(self, key: Tuple[str, str]) -> None:
+        with self._lock:
+            self._ids.pop(key, None)

@@ -89,6 +89,8 @@ class FakeCursor:
             db.reconstructions_deleted.append(params[0])
         elif sql == map_delete.SEMANTICS_SQL:
             db.semantics_deleted.append(params[0])
+        elif sql == map_delete.VIEW_SETTINGS_SQL:
+            db.view_settings_deleted.append(params[0])
         elif sql == map_delete.EDGE_OBSERVATIONS_SQL:
             db.edge_observations_deleted.append(params[0])
         elif sql == map_delete.BLOCKED_NODES_SQL:
@@ -156,6 +158,7 @@ class FakeDb:
         self.sessions_deleted = []
         self.reconstructions_deleted = []
         self.semantics_deleted = []
+        self.view_settings_deleted = []
         self.edge_observations_deleted = []
         self.blocked_deleted = []
         self.robots = {}
@@ -234,6 +237,7 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     assert db.sessions_deleted == ["site_a"]  # its mapping sessions go with the row
     assert db.reconstructions_deleted == ["site_a"]  # and its reconstruction jobs (R3)
     assert db.semantics_deleted == ["site_a"]  # and its semantic jobs
+    assert db.view_settings_deleted == ["site_a"]  # and its view settings
     assert db.edge_observations_deleted == ["site_a"]  # and its edge statistics
     assert db.blocked_deleted == ["site_a"]  # and its blocked-node exclusions
     assert graph.calls == ["site_a"] and images.calls == ["site_a"]

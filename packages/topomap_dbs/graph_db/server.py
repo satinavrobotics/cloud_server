@@ -488,6 +488,24 @@ class GraphDatabaseService:
             self.logger.error(f"Failed to bulk insert edges: {e}")
             return 0
 
+    def node_exists(self, map_id: str, node_id: Union[int, str]) -> bool:
+        """
+        Whether a node document exists in a map (a key lookup: cheaper than get_node, which
+        builds the flattened record).
+
+        Returns:
+            True if the node exists; False if it does not, the map has no node collection, or
+            the lookup failed (logged)
+        """
+        try:
+            node_collection_name = f"nodes_{map_id}"
+            if not self.db.has_collection(node_collection_name):
+                return False
+            return bool(self.db.collection(node_collection_name).has(str(node_id)))
+        except Exception as e:
+            self.logger.error(f"Failed to check node {node_id} in map {map_id}: {e}")
+            return False
+
     def get_node(
         self,
         map_id: str,
