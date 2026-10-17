@@ -6,6 +6,7 @@ price changes (sparse, against the previous capture), the charts, and for each g
 checks. `sessions` gives each capture's session id (in capture order): the viewer breaks the trail where it changes. Only the changes are stored for price and clearance, so the file stays small.
 """
 import json
+import math
 import os
 import sys
 
@@ -53,6 +54,8 @@ def _capture_state(V, Fn, Bn, nav_l, hold=None):
         held = hold.astype(bool)
     elif Fn is not None and Bn is not None:
         held = (V < 100) & (Bn >= 0) & (Bn > Fn)
+    if Fn is not None and Bn is not None:
+        held = held | ((V >= 100) & (V != 255) & (Bn >= 0) & (Bn > Fn))   # close lethal, latest report also lethal
     nav5 = np.repeat(np.repeat(nav_l, 2, 0), 2, 1)[:V.shape[0], :V.shape[1]]
     state = np.zeros(V.shape, np.uint8)
     state[free] = 1
@@ -60,6 +63,17 @@ def _capture_state(V, Fn, Bn, nav_l, hold=None):
     state[held] = 4
     state[free & ~nav5 & ~held] = 2
     return state, nav5
+
+
+def _valid_at(g, a):
+    """whether the anchor at world point `a` (m) sits on a validated lattice cell (the engine's `_val_h`); None -> validated"""
+    val = getattr(g, "_val_h", None)
+    if val is None:
+        return True
+    r = int(math.floor(a[1] / S.RES_M - 0.5 + 1e-6)) - g._cy0
+    c = int(math.floor(a[0] / S.RES_M - 0.5 + 1e-6)) - g._cx0
+    r, c = r // 2, c // 2
+    return 0 <= r < val.shape[0] and 0 <= c < val.shape[1] and bool(val[r, c])
 
 
 def run(tree, map_dir, out_path, exponential):
@@ -85,7 +99,7 @@ def run(tree, map_dir, out_path, exponential):
     routes = [[None] * n for _ in goals]
     route_checks = [[None] * n for _ in goals]
     states, origins, shapes = [], [], []
-    clr_planes, nav_planes, charts = [], [], []
+    clr_planes, nav_planes, charts, frontier = [], [], [], []
     for i, lf in enumerate(leaves):
         g.fold_many([lf])
         poses.append([round(lf.x, 4), round(lf.y, 4), round(lf.yaw, 4)])
@@ -104,7 +118,9 @@ def run(tree, map_dir, out_path, exponential):
             c = g._clearance_cell(g._cx0 // 2 + x, g._cy0 // 2 + y)
             clr_l[y, x] = 0.0 if c is None else c
         clr_planes.append(clr_l)
-        charts.append([[round(c.anchor[0], 3), round(c.anchor[1], 3)] for c in g.query(big, raster=False).charts])
+        anchors = [c.anchor for c in g.query(big, raster=False).charts]
+        charts.append([[round(a[0], 3), round(a[1], 3)] for a in anchors])
+        frontier.append([not _valid_at(g, a) for a in anchors])
 
         def on_nav(x, y, nav5=nav5, origin=origin, shape=V.shape):
             # the engine's lattice convention: a 0.1 m node is the top-left 5 cm cell of its 2 x 2 block
@@ -155,7 +171,7 @@ def run(tree, map_dir, out_path, exponential):
         prev_c, prev_p = c_plane, p_plane
 
     with open(out_path, "w") as f:
-        json.dump(dict(poses=poses, sessions=sessions, goals=goals, routes=routes, checks=route_checks,
+        json.dump(dict(poses=poses, sessions=sessions, frontier=frontier, goals=goals, routes=routes, checks=route_checks,
                        crop=dict(H=int(r1 - r0), W=int(c1 - c0), ox=int(gx0 + c0), oy=int(gy0 + r0)),
                        states=state_rle, deltas=deltas, charts=charts, pmax=peak, clr_max=S.CLR_MAX_M,
                        kappa=kappa, exponential=bool(exponential)), f, separators=(",", ":"))
