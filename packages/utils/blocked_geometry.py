@@ -31,7 +31,7 @@ MIN_HALF_WIDTH_M = 0.05
 
 def half_width_for(length: Any, width: Any, default: float = HALF_WIDTH_M) -> float:
     """The overlay half width for a robot: half of the SMALLER footprint side (the r_d rule of
-    scene_adapter.half_side, integration.md "Decisions": to be rethought for a long robot).
+    cloud_common.objects.map.half_side, integration.md "Decisions": to be rethought for a long robot).
     Either side unknown (-1 until the factsheet arrives, missing, non-finite) gives `default`."""
     try:
         sides = [float(length), float(width)]

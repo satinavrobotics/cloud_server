@@ -7,7 +7,7 @@
   worker must not mistake an outage for a missing PNG: it backs off and does not skip the leaf.
 * `PgFootprint(connect)`: `robot_name -> (length, width)` from the robot's factsheet in Postgres
   (`status->'factsheet'`, -1 until the robot has sent it); the worker caches per robot and turns
-  it into `r_d` with `scene_adapter.half_side`. None, -1 and failures all give `(-1, -1)`, which
+  it into `r_d` with `half_side` (cloud_common.objects.map). None, -1 and failures all give `(-1, -1)`, which
   the worker counts as an unknown footprint and replaces by the params default.
 
 Synchronous like the worker; connections come from an injected factory (see scene_guard).
