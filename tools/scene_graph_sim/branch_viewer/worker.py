@@ -43,7 +43,7 @@ def _load_leaves(map_dir, adapter):
     return leaves
 
 
-def _capture_state(V, Fn, Bn, nav_l, hold=None):
+def _capture_state(V, Fn, Bn, nav_l, hold=None, post_block=None):
     """the 5 cm state of one capture: 0 unknown, 1 free and navigable, 2 free but not navigable, 3 lethal, 4 held lethal.
     `hold` is the engine's own held plane (after the away-from-walls filter) when the engine has one, so the viewer shows
     what the planner uses; without it the raw close-evidence rule is shown."""
@@ -54,7 +54,9 @@ def _capture_state(V, Fn, Bn, nav_l, hold=None):
         held = hold.astype(bool)
     elif Fn is not None and Bn is not None:
         held = (V < 100) & (Bn >= 0) & (Bn > Fn)
-    if Fn is not None and Bn is not None:
+    if post_block is not None:
+        held = held | ((V >= 100) & (V != 255) & post_block)                   # posterior says hazard, latest report also lethal
+    elif Fn is not None and Bn is not None:
         held = held | ((V >= 100) & (V != 255) & (Bn >= 0) & (Bn > Fn))   # close lethal, latest report also lethal
     nav5 = np.repeat(np.repeat(nav_l, 2, 0), 2, 1)[:V.shape[0], :V.shape[1]]
     state = np.zeros(V.shape, np.uint8)
@@ -106,7 +108,10 @@ def run(tree, map_dir, out_path, exponential):
         V = g._V
         s = g._solved
         nav_l = (s.plane >= 0) if s is not None else np.zeros((V.shape[0] // 2, V.shape[1] // 2), bool)
-        state, nav5 = _capture_state(V, g._Fn, g._Bn, nav_l, hold=g._hold)
+        post = getattr(g, "_Lp", None)
+        thr = getattr(sys.modules.get("packages.scene_graph.engine"), "POST_T_BLOCK", None)
+        post_block = None if post is None or thr is None else (post >= thr)
+        state, nav5 = _capture_state(V, g._Fn, g._Bn, nav_l, hold=g._hold, post_block=post_block)
         origin = (int(g._cx0), int(g._cy0))
         states.append(state)
         origins.append(origin)
