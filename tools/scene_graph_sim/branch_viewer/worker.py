@@ -108,9 +108,7 @@ def run(tree, map_dir, out_path, exponential):
         V = g._V
         s = g._solved
         nav_l = (s.plane >= 0) if s is not None else np.zeros((V.shape[0] // 2, V.shape[1] // 2), bool)
-        post = getattr(g, "_Lp", None)
-        thr = getattr(sys.modules.get("packages.scene_graph.engine"), "POST_T_BLOCK", None)
-        post_block = None if post is None or thr is None else (post >= thr)
+        post_block = getattr(g, "_hazard", None)
         state, nav5 = _capture_state(V, g._Fn, g._Bn, nav_l, hold=g._hold, post_block=post_block)
         origin = (int(g._cx0), int(g._cy0))
         states.append(state)
