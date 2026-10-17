@@ -404,3 +404,94 @@ class TestRoute:
         assert sa.call_args_list[0].kwargs["force"] is True
         assert sa.call_args_list[1].kwargs["force"] is False
         assert sa.call_args.kwargs["backlog_fetch"] is ib.fetch_backlog
+
+
+# --- start_session replace ----------------------------------------------------------------------
+
+async def rep(db, switch, fetch, clock=None, **kw):
+    clock = clock or Clock()
+    return await maps.start_session(None, "yard", {"robot": "r1", "replace": True}, m1.PUB, "op",
+                                    switch=switch, backlog_fetch=fetch,
+                                    backlog_opts=opts(clock), **kw)
+
+
+class TestReplace:
+    async def test_drained_backlog_replaces(self, db):
+        switch, sid = await mapping_session(db)
+        out = await rep(db, switch, feed([snap(2), snap(0)]))
+        assert out["replaced_session"]["session_id"] == sid
+        assert out["backlog"] == {"state": "drained", "waited_s": 2.0}
+
+    async def test_stalled_backlog_is_409_and_keeps_the_session(self, db):
+        switch, sid = await mapping_session(db)
+        code, detail = await status_of(rep(db, switch, feed([snap(4)])))
+        assert code == 409 and detail["error"] == "backlog_pending"
+        assert "replace with force=true" in detail["message"]
+        assert [s for s in db.sessions if s["ended_at"] is None]  # still open, nothing started
+
+    async def test_cap_is_409(self, db):
+        switch, sid = await mapping_session(db)
+        c = Clock()
+
+        async def fetch(robot):
+            return snap(1000 - int((c.t - 1000) // 30))
+        code, detail = await status_of(rep(db, switch, fetch, c))
+        assert code == 409 and detail["reason"] == "cap"
+
+    async def test_force_skips_the_wait_and_reports_the_backlog(self, db):
+        switch, sid = await mapping_session(db)
+        fetch = feed([snap(4)])
+        out = await rep(db, switch, fetch, force=True)
+        assert out["replaced_session"]["session_id"] == sid
+        assert out["backlog_skipped"]["depth"] == 4 and fetch.calls == 1
+
+    @pytest.mark.parametrize("first", [None, snap(3, known=False)])
+    async def test_unknown_backlog_replaces_without_waiting(self, db, first):
+        switch, sid = await mapping_session(db)
+        out = await rep(db, switch, feed([first]))
+        assert out["replaced_session"]["session_id"] == sid and out["backlog"] == "unknown"
+
+    async def test_paused_mapping_session_fails_fast(self, db):
+        switch, sid = await mapping_session(db)
+        await maps.session_action(None, "yard", sid, "pause", m1.PUB, switch=switch)
+        fetch = feed([snap(4)])
+        code, detail = await status_of(rep(db, switch, fetch))
+        assert code == 409 and detail["reason"] == "paused" and fetch.calls == 1
+
+    async def test_nothing_to_replace_does_not_wait(self, db):
+        _orch, switch = prepare(db)
+        fetch = feed([snap(4)])
+        out = await rep(db, switch, fetch)
+        assert out["replaced_session"] is None and fetch.calls == 0 and "backlog" not in out
+
+    async def test_replacing_an_operate_session_does_not_wait(self, db):
+        switch, sid = await mapping_session(db)
+        db.sessions[0]["node_count"] = 5  # the map holds data: `ready` after the finish
+        await maps.session_action(None, "yard", sid, "finish", m1.PUB, switch=switch)
+        await start(db, switch, purpose="operate")
+        fetch = feed([snap(4)])
+        out = await rep(db, switch, fetch)
+        assert out["replaced_session"] is not None and fetch.calls == 0
+
+    async def test_without_replace_or_a_fetch_there_is_no_wait(self, db):
+        switch, sid = await mapping_session(db)
+        fetch = feed([snap(4)])
+        with pytest.raises(HTTPException):  # an open session without `replace` is refused
+            await maps.start_session(None, "yard", {"robot": "r1"}, m1.PUB, "op", switch=switch,
+                                     backlog_fetch=fetch, backlog_opts=opts(Clock()))
+        assert fetch.calls == 0
+        out = await maps.start_session(None, "yard", {"robot": "r1", "replace": True}, m1.PUB,
+                                       "op", switch=switch)
+        assert out["replaced_session"]["session_id"] == sid and "backlog" not in out
+
+    async def test_the_start_route_passes_force_and_the_fetch(self):
+        from unittest.mock import AsyncMock
+        import packages.api.main as main
+        svc = SimpleNamespace(database=None, mapping_switch=None, reloc_jobs=None)
+        with patch.object(main, "service", svc), \
+                patch.object(main.maps, "start_session", AsyncMock(return_value={"ok": 1})) as ss:
+            await main.start_map_session("yard", {"robot": "r1"}, force=True)
+            await main.start_map_session("yard", {"robot": "r1"})
+        assert ss.call_args_list[0].kwargs["force"] is True
+        assert ss.call_args_list[1].kwargs["force"] is False
+        assert ss.call_args.kwargs["backlog_fetch"] is ib.fetch_backlog

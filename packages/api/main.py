@@ -964,7 +964,7 @@ async def _record_session_edges(session: Dict[str, Any]) -> None:
 
 
 @app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
-async def start_map_session(map_id: str, body: Dict[str, Any]):
+async def start_map_session(map_id: str, body: Dict[str, Any], force: bool = False):
     """Start a session `{robot, purpose?, services?, placement?, replace?}` on the map (maps
     redesign M1, §14). `purpose`: "mapping" (default: the robot adds data; the map goes to
     `mapping` and graph-builder stores the robot's nodes and images in it) or "operate" (the
@@ -973,7 +973,9 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     slam_map map; [] starts nothing; "slam" on a geo map: 400); `placement` {pose: {x, y, yaw},
     robot_pose: {x, y, theta}} puts the robot on a LOCAL map (422 on a geo map, which is placed
     by the robot's datum); `replace: true` finishes the robot's open session in the same
-    transaction. Errors: packages/api/maps.py (module docstring). 409 also while a
+    transaction; that finish waits for the robot's upload backlog like a finish (409
+    `{error: "backlog_pending"}`; `?force=true` replaces anyway). Errors: packages/api/maps.py
+    (module docstring). 409 also while a
     relocalization job runs for the robot (mapping sessions that record a SLAM map). While the
     robot's previous SLAM map is still being saved, the services start when the save ended
     (the actions say so). A mapping session's services
@@ -987,7 +989,8 @@ async def start_map_session(map_id: str, body: Dict[str, Any]):
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
         switch=service.mapping_switch, arango_node_count=_arango_node_count,
-        reloc_jobs=service.reloc_jobs, on_finished=_record_session_edges))
+        reloc_jobs=service.reloc_jobs, on_finished=_record_session_edges,
+        backlog_fetch=ingest_backlog.fetch_backlog, force=force))
 
 
 @app.get("/api/v1/maps/{map_id}/sessions")

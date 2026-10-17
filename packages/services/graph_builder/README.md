@@ -469,6 +469,8 @@ mapping session polls it (packages/api/ingest_backlog.py) and waits for `depth =
 `open_trackers` falls) or 10 min in all; `?force=true` finishes anyway. `highest_complete_id` is
 only a liveness signal there, never the gate (it is a maximum, not a prefix). A paused session
 refuses uploads (`session_paused`, retryable), so its backlog does not drain.
+`POST /api/v1/maps/{id}/sessions` with `replace: true` runs the same wait on the mapping session it
+replaces (same limits, 409 and `?force=true`); delete paths never wait.
 
 **Ack.** Topic `robot/<robot_name>/ingest_ack`, QoS 1, not retained:
 
