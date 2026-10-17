@@ -18,7 +18,8 @@ SPDX-License-Identifier: Apache-2.0
 """
 
 import datetime
-from typing import Any, Dict, Literal, Optional
+import math
+from typing import Any, Dict, Literal, Optional, Tuple
 import pydantic
 
 from cloud_common.objects import common, object
@@ -88,6 +89,20 @@ CHART_RADIUS_MAX_M = 5.0     # proposal
 CLOSE_EVIDENCE_RANGE_DEFAULT_M = 1.3
 CLOSE_EVIDENCE_RANGE_MAX_M = 3.0   # proposal
 ROBOT_HALF_SIDE_DEFAULT_M = 0.25
+
+
+def half_side(length: Any, width: Any, default: float = ROBOT_HALF_SIDE_DEFAULT_M) -> Tuple[float, bool]:
+    """`(r_d, known)`: half of the SMALLER footprint side. -1 / missing / non-finite on either
+    side (the factsheet has not arrived) gives `(default, False)`, so the worker can count it.
+    Decided by LACI 2026-10-12, to be rethought (integration.md, decisions).
+    Lives here (pure, no numpy) so both the API and the graph builder can use it."""
+    try:
+        sides = [float(length), float(width)]
+    except (TypeError, ValueError):
+        return default, False
+    if any((not math.isfinite(s)) or s <= 0.0 for s in sides):
+        return default, False
+    return min(sides) / 2.0, True
 
 
 class SceneGraphParamsV1(pydantic.BaseModel):

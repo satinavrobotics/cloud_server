@@ -17,6 +17,7 @@ import importlib.util
 import json
 import math
 import os
+import sys
 import uuid
 from pathlib import Path
 
@@ -632,6 +633,14 @@ class TestCreate:
         assert out["scene_graph_params"]["robot_half_side_m"] == 0.35
         assert fdb.maps["a"]["spec"]["scene_graph_params"]["robot_half_side_m"] == 0.35
         assert "robot_name" not in fdb.maps["a"]["spec"]
+
+    async def test_robot_name_works_without_graph_builder(self, fdb, monkeypatch):
+        # the API image does not ship packages/services/graph_builder: the rule must not need it
+        monkeypatch.setitem(sys.modules, "packages.services.graph_builder", None)
+        monkeypatch.setitem(sys.modules, "packages.services.graph_builder.scene_adapter", None)
+        self._robot(fdb, "r1", 1.2, 0.7)
+        out = await maps.create_map(None, {"name": "a", "type": "local", "robot_name": "r1"}, PUB)
+        assert out["scene_graph_params"]["robot_half_side_m"] == 0.35
 
     async def test_robot_name_keeps_the_other_params(self, fdb):
         self._robot(fdb, "r1", 1.2, 0.7)

@@ -18,12 +18,13 @@ from typing import Any, Mapping, Optional, Tuple
 
 import numpy as np
 
+from cloud_common.objects.map import ROBOT_HALF_SIDE_DEFAULT_M, half_side   # noqa: F401 (half_side re-exported)
 from packages.scene_graph.api import Leaf, View
 
 from . import scene_leaf
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-DEFAULT_HALF_SIDE = 0.25
+DEFAULT_HALF_SIDE = ROBOT_HALF_SIDE_DEFAULT_M
 
 SKIP_NO_LAYER = "no_occupancy_layer"
 SKIP_NO_POSE = "no_pose"
@@ -120,19 +121,6 @@ def decode_png_gray8(data: bytes) -> np.ndarray:
             raise PngError(f"unknown filter type {ft}")
         prev = out[y].tobytes()
     return out
-
-
-def half_side(length: Any, width: Any, default: float = DEFAULT_HALF_SIDE) -> Tuple[float, bool]:
-    """`(r_d, known)`: half of the SMALLER footprint side. -1 / missing / non-finite on either
-    side (the factsheet has not arrived) gives `(default, False)`, so the worker can count it.
-    Decided by LACI 2026-10-12, to be rethought (integration.md, decisions)."""
-    try:
-        sides = [float(length), float(width)]
-    except (TypeError, ValueError):
-        return default, False
-    if any((not math.isfinite(s)) or s <= 0.0 for s in sides):
-        return default, False
-    return min(sides) / 2.0, True
 
 
 def _num(value: Any) -> Optional[float]:

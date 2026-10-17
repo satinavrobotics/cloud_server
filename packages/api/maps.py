@@ -134,7 +134,7 @@ from fastapi import HTTPException
 
 from cloud_common.objects.map import (
     MAP_STATES, MAP_TYPES, MapObjectV1, MapSpecV1, MapStatusV1, SceneGraphParamsV1, effective_state,
-    effective_type, has_real_datum,
+    effective_type, has_real_datum, half_side,
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
@@ -795,11 +795,6 @@ async def _params_from_footprint(db: Any, req: CreateMapRequest, params: SceneGr
     """`params` with robot_half_side_m taken from `req.robot_name`'s factsheet, by the rule the
     builder uses (half of the smaller side). Never a silent default: a footprint that has not
     arrived is a 409, because the value is fixed for the life of the map."""
-    try:
-        from packages.services.graph_builder.scene_adapter import half_side   # lazy: needs numpy
-    except ImportError as exc:
-        raise HTTPException(503, "the footprint rule (scene_adapter.half_side) is unavailable; "
-                                 "create the map without robot_name") from exc
     robot = await _robot_or_404(db, req.robot_name)
     factsheet = getattr(getattr(robot, "status", None), "factsheet", None)
     half, known = half_side(getattr(factsheet, "length", None), getattr(factsheet, "width", None))
@@ -831,7 +826,7 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
     Postgres row: adopt it with POST /map/load, or delete it first).
 
     `robot_name` (optional) fixes scene_graph_params.robot_half_side_m from that robot's
-    factsheet footprint, by the builder's own rule (scene_adapter.half_side): 404 for an unknown
+    factsheet footprint, by the builder's own rule (cloud_common.objects.map.half_side): 404 for an unknown
     robot, 409 if its footprint has not arrived; 422 (in CreateMapRequest, before any DB access) if
     the request also sets robot_half_side_m. The robot lookup comes before the name-conflict checks."""
     req = parse_body(CreateMapRequest, data)
