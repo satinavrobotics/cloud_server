@@ -69,6 +69,15 @@ delete with close_sessions=true finishes them first, delete_map_closing_sessions
 decision Q-U2). Repeating pause/resume/finish/archive/restore on a map or session already in
 that state is a no-op (`changed: false`, no event). pause/resume are for mapping sessions only.
 
+Finish waits for the robot's upload backlog (packages/api/ingest_backlog.py): a node the robot
+spooled and uploads after the finish is refused (`no_session`) and lost. Mapping sessions only;
+the wait polls graph-builder for the robot's `spool_state.depth` of its current run and ends at 0,
+before the robot's lock and the transaction. 409 `{error: backlog_pending, reason, backlog}` after
+FINISH_BACKLOG_NO_PROGRESS_S (60) without progress or FINISH_BACKLOG_MAX_S (600) in all;
+`?force=true` finishes anyway (`backlog_skipped`: the snapshot). An unknown backlog (older robot,
+no spool_state, graph-builder unreachable) does not wait (`backlog: "unknown"`); a finished session
+never waits. A session finished, paused or resumed during the wait is a 409.
+
 Robot services (docs/satinav-maps-redesign.md §14.16, packages/api/mapping_switch.py): the
 mapping services of a session (`services`, today `topo` = the orchestrator's `topomap` /
 `sim_topomap`) run on the robot's orchestrator. Opening a mapping session STARTS them, resuming
@@ -138,6 +147,7 @@ from cloud_common.objects.map import (
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
+from packages.api import ingest_backlog
 from packages.api.mapping_switch import (
     SLAM_FAILED, SLAM_SAVED, SLAM_SERVICE, Snapshot, SlamResult, action_name, robot_action,
     service_action, slam_save_action, slam_start_action, START, STOP)
@@ -826,8 +836,8 @@ async def create_map(db: Any, data: Any, publisher_id: uuid.UUID, actor: Optiona
     Postgres row: adopt it with POST /map/load, or delete it first).
 
     `robot_name` (optional) fixes scene_graph_params.robot_half_side_m from that robot's
-    factsheet footprint, by the builder's own rule (cloud_common.objects.map.half_side): 404 for an unknown
-    robot, 409 if its footprint has not arrived; 422 (in CreateMapRequest, before any DB access) if
+    factsheet footprint, by the builder's own rule (cloud_common.objects.map.half_side):
+    404 for an unknown robot, 409 if its footprint has not arrived; 422 (in CreateMapRequest, before any DB access) if
     the request also sets robot_half_side_m. The robot lookup comes before the name-conflict checks."""
     req = parse_body(CreateMapRequest, data)
     sg_params = req.scene_graph_params or SceneGraphParamsV1()
@@ -2895,9 +2905,18 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
                          switch: Optional[Any] = None,
                          arango_node_count: Optional[Callable[[str], int]] = None,
                          reloc_jobs: Optional[Any] = None,
-                         on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None
+                         on_finished: Optional[Callable[[Dict[str, Any]], Awaitable[Any]]] = None,
+                         backlog_fetch: Optional[ingest_backlog.BacklogFetch] = None,
+                         force: bool = False,
+                         backlog_opts: Optional[Dict[str, Any]] = None
                          ) -> Dict[str, Any]:
-    """pause / resume / finish (see the module docstring). `on_finished(session)` is awaited
+    """pause / resume / finish (see the module docstring). Finish of a MAPPING session first waits
+    for the robot's upload backlog (`backlog_fetch(robot)`, packages/api/ingest_backlog.py; None
+    = no gate): before the robot's lock and the transaction, at most FINISH_BACKLOG_MAX_S and
+    FINISH_BACKLOG_NO_PROGRESS_S without progress, then 409 {error: backlog_pending, backlog}.
+    `force` skips the wait (`backlog_skipped` in the response); an unknown backlog (older robot,
+    graph-builder unreachable) does not wait (`backlog: "unknown"`); a finished session never
+    waits; one finished, or paused / resumed, during the wait is a 409. `on_finished(session)` is awaited
     once after a finish committed, after the robot actions and the robot's lock are done (the
     edge statistics of the session: it must only schedule work; its failure is logged). After the commit, resume starts the
     session's services on the robot's orchestrator (SLAM first when `slam` is in them) and
@@ -2913,6 +2932,10 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
         uuid.UUID(str(session_id))
     except ValueError:
         raise HTTPException(404, f"Did not find mapping session \"{session_id}\"") from None
+    backlog_info = None
+    if action == "finish" and backlog_fetch is not None:
+        backlog_info = await _wait_for_backlog(db, map_name, session_id, backlog_fetch, force,
+                                               backlog_opts or {})
     robot_name = None
     found = None
     if switch is not None or action == "resume":  # the robot's lock is taken before the tx
@@ -2944,9 +2967,56 @@ async def session_action(db: Any, map_name: str, session_id: str, action: str,
         out.update(await notify_robot(switch, db, out["session"]["robot_name"], actions=actions))
         if slam_warning:
             out["slam_warning"] = slam_warning
+    if backlog_info:
+        out.update(backlog_info)
     if action == "finish" and out["changed"]:
         await _session_finished(on_finished, session)
     return out
+
+
+async def _peek_session(db: Any, map_name: str, session_id: str) -> Optional[Dict[str, Any]]:
+    async with open_store(db, uuid.uuid4()) as store:
+        session = await store.lock_session(session_id)
+    return session if session is not None and session["map_name"] == map_name else None
+
+
+async def _wait_for_backlog(db: Any, map_name: str, session_id: str,
+                            fetch: ingest_backlog.BacklogFetch, force: bool,
+                            opts: Dict[str, Any]) -> Dict[str, Any]:
+    """The Finish gate (see session_action): extra response fields (`backlog` /
+    `backlog_skipped`), {} when there is nothing to wait for. Raises 409 backlog_pending."""
+    session = await _peek_session(db, map_name, session_id)
+    if (session is None or session["ended_at"] is not None
+            or ms.purpose_of(session) != ms.MAPPING):  # unknown / repeated / operate: no wait
+        return {}
+    robot_name = session["robot_name"]
+    if force:
+        snap = await fetch(robot_name)
+        return {"backlog_skipped": snap if snap else "unknown"}
+    paused = session["paused_at"] is not None
+    if paused:  # the cloud refuses a paused session's uploads: the depth cannot fall, no wait
+        opts = {**opts, "max_s": 0}
+    result = await ingest_backlog.wait_for_backlog(robot_name, fetch, **opts)
+    state, snap = result["state"], result["backlog"]
+    if state == ingest_backlog.UNKNOWN:
+        return {"backlog": "unknown"}
+    if state in (ingest_backlog.STALLED, ingest_backlog.CAP):
+        raise HTTPException(409, {
+            "error": "backlog_pending", "reason": "paused" if paused else state,
+            "waited_s": result["waited_s"],
+            "backlog": snap,
+            "message": (f"Robot '{robot_name}' still has {snap.get('depth')} spooled node(s) to "
+                        "upload; finishing now would lose them. "
+                        + ("The session is paused, so the cloud refuses them: resume it, or "
+                           if paused else "Retry later, or ")
+                        + "finish with force=true to discard them.")})
+    now = await _peek_session(db, map_name, session_id)
+    if now is not None and now["ended_at"] is not None:  # finished meanwhile: _session_action
+        return {}                                        # answers the usual repeat (changed: false)
+    if now is None or (now["paused_at"] is None) != (session["paused_at"] is None):
+        raise HTTPException(409, f"Session {session_id} changed while waiting for the robot's "
+                                 "upload backlog (paused or resumed): retry the finish")
+    return {"backlog": {"state": ingest_backlog.DRAINED, "waited_s": result["waited_s"]}}
 
 
 async def _session_action(db: Any, map_name: str, session_id: str, action: str,

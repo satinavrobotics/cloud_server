@@ -153,6 +153,12 @@ INGEST_STATE_SEED_SETTLE_S = float(os.getenv("INGEST_STATE_SEED_SETTLE_S", "5.0"
 # paho's outgoing queue (acks / ingest_state wait here while the broker is away); a publish that
 # does not fit is dropped and counted (`acks_dropped`). 0 = unlimited.
 INGEST_MQTT_MAX_QUEUED = max(0, int(os.getenv("INGEST_MQTT_MAX_QUEUED", "10000")))
+# Finish of a mapping session waits for the robot's upload backlog (spool_state.depth == 0 for
+# its current run, packages/api/ingest_backlog.py): polled every POLL_S; 409 backlog_pending after
+# NO_PROGRESS_S without progress or MAX_S in all; `force=true` skips the wait.
+FINISH_BACKLOG_POLL_S = max(0.05, float(os.getenv("FINISH_BACKLOG_POLL_S", "2")))
+FINISH_BACKLOG_NO_PROGRESS_S = max(0.0, float(os.getenv("FINISH_BACKLOG_NO_PROGRESS_S", "60")))
+FINISH_BACKLOG_MAX_S = max(0.0, float(os.getenv("FINISH_BACKLOG_MAX_S", "600")))
 # Opt-in MQTT persistent session for graph-builder: a stable client id and clean_session=False,
 # so the broker queues QoS 1 uploads (node_update / image / depth / costmap) while it is down.
 # Off by default: the queue is bounded by the broker's own limits (mosquitto max_queued_messages

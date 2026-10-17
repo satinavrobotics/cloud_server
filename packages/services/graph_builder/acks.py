@@ -349,6 +349,50 @@ class AckManager:
                 "ack_trackers": len(self._entries),
             }
 
+    def backlog(self, robot: Any, run_id: Optional[str] = None) -> Dict[str, Any]:
+        """What the robot still has to upload, for the API's Finish gate (read-only).
+
+        `depth` is the robot's own spool_state.depth (entries not yet complete or terminally
+        rejected). It counts only for the robot's current run: `run_id` when given, else the
+        latest run cloud-side (the latest accepted node's run, else the ingest_state's), else
+        the spool_state's own; a spool_state run no accepted node carries yet (a restarted
+        robot that already spooled) is the current run, one seen earlier but not the latest is
+        stale. A spool_state of another run, or without an integer depth,
+        is `known: false` (the gate cannot say; `pending` is false). `highest_complete_id` and
+        `open_trackers` (bundles of that run waiting for parts) are liveness signals for the
+        caller, not part of the gate."""
+        with self._lock:
+            runs = self._runs.get(robot) or []
+            state = self._states.get(robot)
+            spool = self._spool.get(robot)
+            if run_id is None:
+                spool_run = spool.get("run_id") if spool is not None else None
+                if spool_run is not None and spool_run not in runs:
+                    # a run no accepted node carries yet (the robot restarted and spooled): the
+                    # spool's own run is current. One seen but not the latest is stale.
+                    run_id = spool_run
+                else:
+                    run_id = runs[-1] if runs else (state.run_id if state is not None else None)
+                    if run_id is None:
+                        run_id = spool_run
+            depth = spool.get("depth") if spool is not None else None
+            known = (spool is not None and spool.get("run_id") == run_id
+                     and isinstance(depth, int) and not isinstance(depth, bool) and depth >= 0)
+            now_ms = self._wall_ms()
+            return {
+                "robot_name": robot,
+                "run_id": run_id,
+                "known": known,
+                "pending": bool(known and depth > 0),
+                "depth": depth if known else None,
+                "last_spooled_id": spool.get("last_spooled_id") if known else None,
+                "highest_complete_id": (state.highest if state is not None
+                                        and state.run_id == run_id else None),
+                "open_trackers": sum(1 for k in self._entries if k[0] == robot and k[1] == run_id),
+                "spool_age_s": (round(max(0, now_ms - spool["received_ms"]) / 1000.0, 1)
+                                if spool is not None else None),
+            }
+
     # --- internals (call under the lock) --------------------------------------------------
 
     def _evict(self) -> None:

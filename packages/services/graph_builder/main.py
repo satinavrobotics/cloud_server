@@ -233,6 +233,14 @@ async def get_stats():
     return StatsResponse(**stats)
 
 
+@app.get("/ingest/backlog/{robot_name}")
+async def get_ingest_backlog(robot_name: str, run_id: Optional[str] = None):
+    """What the robot still has to upload (its retained spool_state.depth for its current run),
+    read-only: the API gates a mapping session's Finish on `pending` false. `known: false` when
+    no spool_state of that run was seen (an older robot, or graph-builder just started)."""
+    return service.acks.backlog(robot_name, run_id)
+
+
 @app.post("/node")
 async def process_node(node: NodeUpdate):
     """

@@ -24,7 +24,7 @@ import uvicorn
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
 from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, sites
-from packages.api import map_series, series_axis
+from packages.api import map_series, series_axis, ingest_backlog
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -1235,7 +1235,7 @@ async def unplace_map_session(map_id: str, session_id: str):
 
 
 @app.post("/api/v1/maps/{map_id}/sessions/{session_id}/{action}")
-async def map_session_action(map_id: str, session_id: str, action: str):
+async def map_session_action(map_id: str, session_id: str, action: str, force: bool = False):
     """`pause`, `resume` or `finish` a session. Finishing the map's only open mapping session
     makes the map `ready` when it holds data (nodes or a saved SLAM map) and `draft` otherwise;
     finishing an operate session is "Stop using" (the map state does not change). pause/resume:
@@ -1245,13 +1245,19 @@ async def map_session_action(map_id: str, session_id: str, action: str):
     stop, a repeated resume the start). After the commit resume starts the session's mapping
     services on the robot's orchestrator, pause/finish stop them; a failure never fails or undoes
     the action. The response adds `robot_actions` (what was done on the robot), `robot_notified`
-    (false when one failed), `mapping_warning` and `mapping_state`."""
+    (false when one failed), `mapping_warning` and `mapping_state`.
+
+    `finish` of a mapping session waits for the robot's upload backlog (up to 10 minutes, 60 s
+    without progress): 409 `{error: "backlog_pending", backlog}`; `?force=true` finishes anyway
+    (the response's `backlog_skipped` says what was pending). `backlog` is "unknown" when the
+    robot's backlog could not be read (no wait)."""
     _require_service()
     return await _site_call(f"{action} map session", maps.session_action(
         service.database, map_id, session_id, action, uuid.uuid4(),
         recording.request_actor(), switch=service.mapping_switch,
         arango_node_count=_arango_node_count, reloc_jobs=service.reloc_jobs,
-        on_finished=_record_session_edges))
+        on_finished=_record_session_edges, backlog_fetch=ingest_backlog.fetch_backlog,
+        force=force))
 
 
 @app.post("/api/v1/maps/{map_id}/archive")

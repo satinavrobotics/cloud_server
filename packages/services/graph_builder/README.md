@@ -456,7 +456,19 @@ is its `camera_name`, of a depth image its `camera_name`, of a costmap its `laye
 (on all four message types or on none). Unknown extra fields, and manifest entries that do not
 match, are ignored. The robot also publishes `robot/<robot_name>/spool_state`, retained, QoS 1:
 `{"run_id", "last_spooled_id", "depth"}`; graph-builder keeps the latest per robot (bounded by
-robots) and shows it in `GET /stats` as `spool_state`. It has no other effect.
+robots) and shows it in `GET /stats` as `spool_state`. `depth` is the number of spool entries
+not yet complete or terminally rejected.
+
+**Finish gate.** `GET /ingest/backlog/{robot_name}[?run_id=]` (read-only) answers
+`{robot_name, run_id, known, pending, depth, last_spooled_id, highest_complete_id, open_trackers,
+spool_age_s}` for the robot's current run (`run_id` if given, else the latest accepted node's run,
+else the spool_state's). `pending` is `depth > 0`; `known` is false when there is no spool_state of
+that run with an integer depth (then `pending` is false and `depth` null). The API's Finish of a
+mapping session polls it (packages/api/ingest_backlog.py) and waits for `depth == 0`: 409
+`backlog_pending` after 60 s without progress (depth falls, `highest_complete_id` rises, or
+`open_trackers` falls) or 10 min in all; `?force=true` finishes anyway. `highest_complete_id` is
+only a liveness signal there, never the gate (it is a maximum, not a prefix). A paused session
+refuses uploads (`session_paused`, retryable), so its backlog does not drain.
 
 **Ack.** Topic `robot/<robot_name>/ingest_ack`, QoS 1, not retained:
 
