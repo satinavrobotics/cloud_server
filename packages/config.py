@@ -141,6 +141,18 @@ NODE_EXISTS_CACHE_SIZE = int(os.getenv("NODE_EXISTS_CACHE_SIZE", "20000"))
 # this many wait at once (the rest are dropped as duplicates at once: the robot resends); the
 # storing work runs on its own small pool, so waiters never starve it.
 NODE_CLAIM_WAIT_THREADS = max(1, int(os.getenv("NODE_CLAIM_WAIT_THREADS", "8")))
+# Robot ingest acks (graph-builder, acks.py): a node that declared its parts gets a final ack
+# when the last one is stored, or this long after the node was accepted with `resend: parts`.
+INGEST_ACK_PART_TIMEOUT_S = float(os.getenv("INGEST_ACK_PART_TIMEOUT_S", "120"))
+# Nodes with parts still pending are tracked in memory, at most this many (oldest evicted).
+INGEST_ACK_TRACKER_MAX = max(1, int(os.getenv("INGEST_ACK_TRACKER_MAX", "20000")))
+# Retained robot/<robot>/ingest_state: published at most this often per robot (the last value
+# is always flushed by a timer); retained values are read once at startup for this long.
+INGEST_STATE_MIN_INTERVAL_S = float(os.getenv("INGEST_STATE_MIN_INTERVAL_S", "1.0"))
+INGEST_STATE_SEED_SETTLE_S = float(os.getenv("INGEST_STATE_SEED_SETTLE_S", "5.0"))
+# paho's outgoing queue (acks / ingest_state wait here while the broker is away); a publish that
+# does not fit is dropped and counted (`acks_dropped`). 0 = unlimited.
+INGEST_MQTT_MAX_QUEUED = max(0, int(os.getenv("INGEST_MQTT_MAX_QUEUED", "10000")))
 # Opt-in MQTT persistent session for graph-builder: a stable client id and clean_session=False,
 # so the broker queues QoS 1 uploads (node_update / image / depth / costmap) while it is down.
 # Off by default: the queue is bounded by the broker's own limits (mosquitto max_queued_messages

@@ -35,6 +35,14 @@ def _service(**kw):
     return service
 
 
+def _unguarded(service):
+    """Without the run_id session guard (phase 2): these tests look at the layers below it
+    (the reset on a run_id change, the buffers' run filter), which a mixed-run session no
+    longer reaches."""
+    service._run_id_conflict = AsyncMock(return_value=False)
+    return service
+
+
 def _restarted(stored):
     """A graph-builder with empty memory whose ArangoDB holds the nodes in `stored`."""
     service = _service()
@@ -167,7 +175,7 @@ class TestRunId:
         assert s.stats["nodes_duplicate"] == 1 and s.graph_db.add_node.call_count == 3
 
     async def test_run_id_change_resets_and_ids_differ(self):
-        s = _service()
+        s = _unguarded(_service())
         await self._nodes(s, [1, 2, 3], run_id="a")
         old = s.session_to_global_map[("r1", 1)][0]
         await self._nodes(s, [1], run_id="b")
@@ -176,7 +184,7 @@ class TestRunId:
         assert s.graph_db.add_node.call_count == 4  # not a duplicate of run a's node 1
 
     async def test_buffered_upload_of_the_new_run_survives_the_reset(self):
-        s = _service()
+        s = _unguarded(_service())
         await self._nodes(s, [1, 2], run_id="a")
         await s._handle_image_upload({**IMAGE, "session_node_id": 1, "run_id": "b"})
         await s._handle_image_upload({**IMAGE, "session_node_id": 9, "run_id": "a"})
@@ -211,7 +219,8 @@ class TestSubscriptions:
         client = self._connect(False).return_value
         topics = {c.args[0]: c.kwargs["qos"] for c in client.register_callback.call_args_list}
         assert topics == {"robot/node_update": 1, "robot/image_upload": 1,
-                          "robot/depth_upload": 1, "robot/costmap_upload": 1}
+                          "robot/depth_upload": 1, "robot/costmap_upload": 1,
+                          "robot/+/ingest_state": 1, "robot/+/spool_state": 1}
 
     def test_clean_session_with_a_fresh_client_id_by_default(self):
         kw = self._connect(False).call_args.kwargs
@@ -545,7 +554,7 @@ class TestMixedRunId:
 
     async def test_upload_of_an_earlier_run_does_not_attach_to_this_runs_node(self):
         arango = _Arango()
-        s = arango.service()
+        s = _unguarded(arango.service())
         await s._handle_node_update({**NODE, "run_id": "B"})
         await s._handle_image_upload({**IMAGE, "run_id": "A"})
         s.image_db.store_image.assert_not_called()
@@ -603,7 +612,7 @@ class TestUnknownExistence:
 
 class TestStaleRunParts:
     async def test_buffered_part_of_another_run_is_discarded_not_attached(self):
-        s = _service()
+        s = _unguarded(_service())
         await s._handle_image_upload({**IMAGE, "run_id": "A"})  # no node yet: buffered
         assert ("r1", 7) in s.image_buffer
         await s._handle_node_update({**NODE, "run_id": "B"})

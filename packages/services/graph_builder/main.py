@@ -64,6 +64,15 @@ class StatsResponse(BaseModel):
     errors: int
     mqtt_connected: bool
     radius_threshold: float
+    # Robot ingest contract (acks.py): per robot, the retained high-water mark we publish and the
+    # robot's own spool_state; the count of bundles waiting for parts; the ack counters.
+    ingest_state: Dict[str, Any] = {}
+    spool_state: Dict[str, Any] = {}
+    ack_trackers: int = 0
+    acks_sent: int = 0
+    acks_failed: int = 0
+    acks_dropped: int = 0
+    run_id_mismatch: int = 0
 
 
 # HealthResponse is now imported from packages.utils.service_utils
@@ -125,8 +134,15 @@ async def lifespan(app: FastAPI):
             except Exception as e:  # noqa: BLE001
                 logging.warning(f"Rejection flush failed: {e}")
 
+    async def _periodic_ack_flush():
+        # Timeout acks and held-back ingest_state values (robot ingest contract).
+        while True:
+            await asyncio.sleep(1)
+            await service.flush_acks()
+
     asyncio.create_task(_periodic_cleanup())
     asyncio.create_task(_periodic_reject_flush())
+    asyncio.create_task(_periodic_ack_flush())
     global _scene_host
     scene_host = None
     if SCENE_GRAPH_WORKER_ENABLED:

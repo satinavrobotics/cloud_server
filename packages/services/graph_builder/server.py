@@ -50,6 +50,13 @@ has the same id:
   robots get the old reset behaviour (and, after a graph-builder restart, a restarted counter
   would look like duplicates): robots should send run_id. Once a robot is known to send it
   (also looked up in ArangoDB after a restart) a message without it never triggers that reset.
+
+Robot ingest contract (phase 2, acks.py, README): every node and part is answered to the robot
+on `robot/<robot>/ingest_ack` once its state is durable (or it is refused), `parts` in a
+node_update declares the parts to expect, a retained `ingest_state` carries the high-water mark
+of complete bundles, and the robot's `spool_state` is kept for the stats. A cloud session binds
+the first `run_id` it sees (`_run_id_conflict`): another one is refused as `run_id_mismatch`
+before any state is touched, in particular before the run_id-change reset.
 """
 
 import logging
@@ -64,7 +71,7 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 from typing import Callable, Dict, Any, Optional, List, Union, Set, Tuple
 from datetime import datetime, timezone as _dt_timezone
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 import math
 
@@ -81,9 +88,11 @@ from packages.config import (
     UPLOAD_BUFFER_MAX_BYTES, UPLOAD_BUFFER_MAX_ENTRIES, NODE_EXISTS_CACHE_SIZE,
     NODE_CLAIM_WAIT_THREADS,
     GRAPH_BUILDER_MQTT_PERSISTENT_SESSION, GRAPH_BUILDER_MQTT_CLIENT_ID,
+    INGEST_ACK_PART_TIMEOUT_S, INGEST_ACK_TRACKER_MAX, INGEST_STATE_MIN_INTERVAL_S,
+    INGEST_STATE_SEED_SETTLE_S, INGEST_MQTT_MAX_QUEUED,
 )
 from packages.events.emit import Event, emit
-from packages.services.graph_builder import ingest
+from packages.services.graph_builder import acks, ingest
 from packages.utils import capture_time
 from packages.services.graph_builder.upload_buffer import DROPPED, NodeIdCache, NodeUploadBuffer
 
@@ -96,6 +105,12 @@ UPLOAD_QOS = 1
 NODE_CLAIM_WAIT_S = 15.0
 # After a failed last-run lookup (an unindexed scan) the next one waits this long (seconds).
 RUN_PROBE_BACKOFF_S = 30.0
+# Cloud sessions whose bound run_id is remembered (LRU), and the pause after a failed lookup.
+RUN_BINDING_CACHE_SIZE = 1024
+RUN_GUARD_BACKOFF_S = 30.0
+# Robot topics of the ingest contract (the robot's spool_state, our retained ingest_state).
+INGEST_STATE_TOPIC = "robot/+/ingest_state"
+SPOOL_STATE_TOPIC = "robot/+/spool_state"
 
 
 def _run_id_of(payload: Dict[str, Any]) -> Optional[str]:
@@ -348,6 +363,13 @@ class GraphBuilderService:
         # failed count does not publish them a second time. In memory: after a restart a
         # repaired node is published (and logged) again.
         self._published = NodeIdCache(NODE_EXISTS_CACHE_SIZE)
+        # Cloud session id -> the run_id it is bound to (LRU), and session id -> time.monotonic()
+        # before which a failed binding lookup is not repeated. Under _upload_lock.
+        self._session_runs: "OrderedDict[str, str]" = OrderedDict()
+        self._run_guard_retry: Dict[str, float] = {}
+        # time.monotonic() until which retained ingest_state messages seed the acks' state
+        # (set at the first connect).
+        self._seed_until: Optional[float] = None
 
         # Robot registration cache
         # Set of robot names that are known to exist in Mission Dispatch
@@ -373,7 +395,14 @@ class GraphBuilderService:
             "costmap_saved": 0,
             "costmap_rejected": 0,
             "buffered_costmap": 0,
+            "run_id_mismatch": 0,
+            "acks_unackable": 0,
         }
+        # Acks / ingest_state to the robot, the spool_state read from it (acks.py).
+        self.acks = acks.AckManager(
+            self._mqtt_publish, self.stats, part_timeout_s=INGEST_ACK_PART_TIMEOUT_S,
+            max_trackers=INGEST_ACK_TRACKER_MAX, state_min_interval_s=INGEST_STATE_MIN_INTERVAL_S)
+        self.ingest_state_seed_settle_s = INGEST_STATE_SEED_SETTLE_S
 
         # Uploads that arrived before their node (module docstring). One lock for the three
         # buffers, the mapping writes and _stored_nodes.
@@ -441,6 +470,14 @@ class GraphBuilderService:
                 clean_session=not persistent,
             )
 
+            # Acks and ingest_state wait in paho's queue while the broker is away: bound it.
+            try:
+                if INGEST_MQTT_MAX_QUEUED:
+                    self.mqtt_client.client.max_queued_messages_set(INGEST_MQTT_MAX_QUEUED)
+            except Exception as e:  # noqa: BLE001 - an older paho: unbounded, as before
+                self.logger.warning(f"Could not cap the MQTT outgoing queue: {e}")
+            self.mqtt_client.add_connect_listener(self._on_first_connect)
+
             # Register callbacks. All uploads are subscribed at QoS 1: a robot publishing at
             # QoS 1 gets the broker's redelivery while this client is connected (the granted
             # QoS is the lower of the two); the handlers are idempotent for the duplicates.
@@ -455,6 +492,12 @@ class GraphBuilderService:
                 self.mqtt_client.register_callback(self.mqtt_costmap_topic,
                                                    self._on_costmap_upload_message,
                                                    qos=UPLOAD_QOS)
+            # The retained high-water mark (read once at startup to seed it) and the robot's
+            # spool state.
+            self.mqtt_client.register_callback(INGEST_STATE_TOPIC,
+                                               self._on_ingest_state_message, qos=UPLOAD_QOS)
+            self.mqtt_client.register_callback(SPOOL_STATE_TOPIC,
+                                               self._on_spool_state_message, qos=UPLOAD_QOS)
 
             # Connect and start background loop
             self.mqtt_client.connect()
@@ -470,6 +513,152 @@ class GraphBuilderService:
         if self.mqtt_client:
             self.mqtt_client.disconnect()
             self.logger.info("Disconnected from MQTT broker")
+
+    # ==================== Acks, ingest_state, spool_state ====================
+
+    def _mqtt_publish(self, topic: str, payload: str, qos: int, retain: bool) -> Optional[int]:
+        """AckManager's publisher: paho's rc (QoS 1 while disconnected is queued), None without
+        a client. paho's publish only queues the message: it does not wait for the broker."""
+        client = self.mqtt_client
+        if client is None:
+            return None
+        return client.publish(topic, payload, qos=qos, retain=retain).rc
+
+    def _ack(self, method: str, *args) -> None:
+        """Call an AckManager event; an ack never raises into ingest (logged, `acks_failed`)."""
+        try:
+            getattr(self.acks, method)(*args)
+        except Exception as e:  # noqa: BLE001
+            self.stats["acks_failed"] += 1
+            self.logger.warning(f"Ack ({method}) failed: {e}")
+
+    def _on_first_connect(self) -> None:
+        """Retained ingest_state messages arrive right after the first subscribe: seed from
+        them for a short settle window (later ones are mostly our own publishes echoing back)."""
+        if self._seed_until is None:
+            self._seed_until = time.monotonic() + self.ingest_state_seed_settle_s
+
+    def _robot_of_topic(self, msg) -> Optional[str]:
+        parts = str(msg.topic).split('/')
+        return parts[1] if len(parts) == 3 else None
+
+    def _on_ingest_state_message(self, client, userdata, msg):
+        """robot/+/ingest_state (paho thread): seed the high-water mark after a restart."""
+        until = self._seed_until
+        if until is None or time.monotonic() > until:
+            return
+        try:
+            self.acks.seed_state(self._robot_of_topic(msg), json.loads(msg.payload.decode('utf-8')))
+        except Exception as e:  # noqa: BLE001 - an empty (cleared) or foreign payload
+            self.logger.debug(f"Ignored ingest_state on {msg.topic}: {e}")
+
+    def _on_spool_state_message(self, client, userdata, msg):
+        """robot/+/spool_state (paho thread): keep the robot's latest, for the stats."""
+        try:
+            self.acks.note_spool(self._robot_of_topic(msg), json.loads(msg.payload.decode('utf-8')))
+        except Exception as e:  # noqa: BLE001
+            self.logger.debug(f"Ignored spool_state on {msg.topic}: {e}")
+
+    async def flush_acks(self) -> None:
+        """Timeout acks and held-back ingest_state values (periodic, main.py)."""
+        try:
+            self.acks.flush()
+        except Exception as e:  # noqa: BLE001
+            self.stats["acks_failed"] += 1
+            self.logger.warning(f"Ack flush failed: {e}")
+
+    async def _run_id_conflict(self, robot_name: str, session: "ingest.OpenSession",
+                               run_id: Optional[str]) -> bool:
+        """The payload's `run_id` differs from the one the open cloud session is bound to. A
+        session binds the first run_id it sees: found with `graph_db.last_run_id` (the newest
+        node that has one) or, when its nodes carry none, this payload's. No `run_id`: never a
+        conflict (older robot). A lookup that fails is not a conflict and binds nothing."""
+        if run_id is None:
+            return False
+        sid = session.session_id
+        with self._upload_lock:
+            bound = self._session_runs.get(sid)
+            if bound is not None:
+                self._session_runs.move_to_end(sid)
+            elif time.monotonic() < self._run_guard_retry.get(sid, 0.0):
+                return False
+        if bound is None:
+            try:
+                last = await asyncio.to_thread(self.graph_db.last_run_id, session.map_name,
+                                               robot_name, sid)
+            except Exception as e:  # noqa: BLE001 - unknown: let it through, ask again later
+                self.logger.warning(f"Could not look up the run of session {sid}: {e}")
+                with self._upload_lock:
+                    self._run_guard_retry[sid] = time.monotonic() + RUN_GUARD_BACKOFF_S
+                    while len(self._run_guard_retry) > RUN_BINDING_CACHE_SIZE:
+                        self._run_guard_retry.pop(next(iter(self._run_guard_retry)))
+                return False
+            with self._upload_lock:
+                bound = self._session_runs.setdefault(
+                    sid, last if isinstance(last, str) and last else run_id)
+                self._run_guard_retry.pop(sid, None)
+                while len(self._session_runs) > RUN_BINDING_CACHE_SIZE:
+                    self._session_runs.popitem(last=False)
+        return bound != run_id
+
+    async def _reject_run_id(self, resolution: "ingest.Resolution", kind: str) -> None:
+        """Count and report a node / part of another run than its session's as
+        `run_id_mismatch` (nothing else is touched)."""
+        self.stats["run_id_mismatch"] += 1
+        await self._reject(dataclasses.replace(resolution, reason=ingest.RUN_ID_MISMATCH), kind)
+
+    def _note_part_stored(self, entry: Dict[str, Any], kind: str, sub: str) -> None:
+        """A part is stored (MinIO and, for depth / costmap, the node's record): tell the ack
+        tracker. `entry` is the buffered upload; one without robot_name / session_node_id (the
+        manual POST /node path) is not a robot's."""
+        robot_name, sid = entry.get("robot_name"), entry.get("session_node_id")
+        if robot_name is None or sid is None:
+            return
+        self._ack("part_stored", robot_name, entry.get("run_id"), sid, kind, str(sub))
+
+    def _ack_part_rejected(self, payload: Dict[str, Any], kind: str, sub: Any, reason: str,
+                           resolution: Optional["ingest.Resolution"] = None) -> None:
+        """Tell the robot a part was not stored (the part's own run_id and node id)."""
+        session = resolution.session if resolution is not None else None
+        self._ack("part_rejected", payload.get("robot_name"), _run_id_of(payload),
+                  payload.get("session_node_id"), kind, "" if sub is None else str(sub), reason,
+                  session.session_id if session else None)
+
+    def _ack_part_invalid(self, payload: Dict[str, Any], kind: str, sub: Any) -> None:
+        """A part that cannot be stored (invalid_payload, terminal): acked when it names its
+        node, else only counted."""
+        if payload.get("robot_name") is None or payload.get("session_node_id") is None:
+            self.stats["acks_unackable"] += 1
+            return
+        self._ack_part_rejected(payload, kind, sub, ingest.INVALID_PAYLOAD)
+
+    def _parts_truth(self, map_id: str, global_id: str,
+                     manifest: List[Tuple[str, str]]) -> Set[Tuple[str, str]]:
+        """Which declared parts of a stored node exist in storage (a resent node: the robot
+        may have restarted, this process may have). Depth / costmap: the node document's
+        `depth.{sub}` / `costmap.{sub}` records (one read); images: the node's objects in MinIO
+        (one listing). A read that fails finds nothing: the part counts as missing and is
+        resent (idempotent)."""
+        found: Set[Tuple[str, str]] = set()
+        if any(kind in ("depth", "costmap") for kind, _ in manifest):
+            try:
+                node = self.graph_db.get_node(map_id, global_id) or {}
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning(f"Could not read node {global_id} for its parts: {e}")
+                node = {}
+            for kind in ("depth", "costmap"):
+                records = node.get(kind)
+                if isinstance(records, dict):
+                    found |= {(kind, sub) for kind_, sub in manifest
+                              if kind_ == kind and sub in records}
+        if any(kind == "image" for kind, _ in manifest):
+            try:
+                names = set(self.image_db.list_node_images(str(global_id), map_id) or [])
+            except Exception as e:  # noqa: BLE001
+                self.logger.warning(f"Could not list the images of node {global_id}: {e}")
+                names = set()
+            found |= {(kind, sub) for kind, sub in manifest if kind == "image" and sub in names}
+        return found
 
     def close(self):
         """Stop the node-topology pool (running calls finish; waiting resends time out)."""
@@ -798,13 +987,23 @@ class GraphBuilderService:
         session_node_id = payload.get('session_node_id')
         x, y = payload.get('x'), payload.get('y')
         yaw = payload.get('yaw', payload.get('theta', 0.0))
+        run_id = _run_id_of(payload)
+        manifest = acks.parse_parts(payload.get('parts'))
         if session_node_id is None or robot_name is None or x is None or y is None:
             self.logger.error("Missing required fields: session_node_id, robot_name, x, y")
             self.stats["errors"] += 1
+            if session_node_id is None or robot_name is None:
+                self.stats["acks_unackable"] += 1  # not even the node can be named
+            else:
+                self._ack("node_failed", robot_name, run_id, session_node_id,
+                          ingest.INVALID_PAYLOAD, manifest, None)
             return
 
         active_mission, register_map = await self._active_mission(robot_name)
         if not register_map:
+            # Dropped on purpose (the mission does not register the map): terminal for the robot.
+            self._ack("node_failed", robot_name, run_id, session_node_id, ingest.NO_SESSION,
+                      manifest, None)
             await self._log_mission_waypoint(
                 robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
                 _mission=active_mission,
@@ -818,6 +1017,8 @@ class GraphBuilderService:
             await self._reject(resolution, "image", self.image_buffer.pop(node_key))
             await self._reject(resolution, "depth", self.depth_buffer.pop(node_key))
             await self._reject(resolution, "costmap", self.costmap_buffer.pop(node_key))
+            self._ack("node_failed", robot_name, run_id, session_node_id, resolution.reason,
+                      manifest, resolution.session.session_id if resolution.session else None)
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
@@ -826,56 +1027,96 @@ class GraphBuilderService:
             return
 
         session = resolution.session
-        if not await self._ensure_robot_exists(robot_name):
-            self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
-        # `_process_topology` reports the claim it holds in `claims` (not the returned node's
-        # id: a repair may resolve to another candidate id than the claimed one). If this
-        # handler is cancelled meanwhile the worker thread still finishes: its claim is
-        # released when it does.
-        claims: List[Tuple[str, str]] = []
-        future = asyncio.get_running_loop().run_in_executor(
-            self._topology_executor,
-            functools.partial(
-                self._process_topology, payload, map_id=session.map_name,
-                transform=session.map_t_session, session_id=session.session_id,
-                hold_claim=True, claim_out=claims))
-        try:
-            result = await asyncio.shield(future)
-        except asyncio.CancelledError:
-            future.add_done_callback(lambda _f: self._release_claims(claims))
-            raise
-        if result is None:
+        if await self._run_id_conflict(robot_name, session, run_id):
+            # Before anything is touched: the run_id-change reset must not run for it.
+            await self._reject_run_id(resolution, "node")
+            self._ack("node_failed", robot_name, run_id, session_node_id,
+                      ingest.RUN_ID_MISMATCH, manifest, session.session_id)
             return
-        global_node_id, mx, my, myaw, map_id, edges, session_node_id, robot_name = result
-        published_key = (map_id, global_node_id)
+        self._ack("begin", robot_name, run_id, session_node_id, manifest, session.session_id)
         try:
-            # The claim is held until the node is counted and marked complete: a resend that
-            # waited for it then sees a finished node, not one to repair (and count again).
-            if await self._count_nodes(session.session_id) is not False:
-                await asyncio.to_thread(self._complete_node, map_id, global_node_id)
+            if not await self._ensure_robot_exists(robot_name):
+                self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
+            # `_process_topology` reports the claim it holds in `claims` (not the returned node's
+            # id: a repair may resolve to another candidate id than the claimed one). If this
+            # handler is cancelled meanwhile the worker thread still finishes: its claim is
+            # released when it does.
+            claims: List[Tuple[str, str]] = []
+            outcome: Dict[str, Any] = {"status": "failed", "reason": ingest.STORE_FAILED}
+            future = asyncio.get_running_loop().run_in_executor(
+                self._topology_executor,
+                functools.partial(
+                    self._process_topology, payload, map_id=session.map_name,
+                    transform=session.map_t_session, session_id=session.session_id,
+                    hold_claim=True, claim_out=claims, outcome=outcome))
+            try:
+                result = await asyncio.shield(future)
+            except asyncio.CancelledError:
+                future.add_done_callback(lambda _f: self._release_claims(claims))
+                raise
+            if result is None:
+                # Acked only now that the node is durable (or known not to be): a duplicate is
+                # answered from storage; a node another attempt is storing is acked by that attempt.
+                if outcome["status"] == "duplicate":
+                    truth = None
+                    if manifest:
+                        truth = await asyncio.to_thread(
+                            self._parts_truth, outcome["map_id"], outcome["global_id"], manifest)
+                    self._ack("node_ok", robot_name, run_id, session_node_id, acks.DUPLICATE,
+                              session.session_id, manifest, truth)
+                elif outcome["status"] == "failed":
+                    self._ack("node_failed", robot_name, run_id, session_node_id,
+                              outcome["reason"], manifest, session.session_id)
+                return
+            global_node_id, mx, my, myaw, map_id, edges, session_node_id, robot_name = result
+            published_key = (map_id, global_node_id)
+            counted = False
+            try:
+                # The claim is held until the node is counted and marked complete: a resend that
+                # waited for it then sees a finished node, not one to repair (and count again).
+                if await self._count_nodes(session.session_id) is not False:
+                    await asyncio.to_thread(self._complete_node, map_id, global_node_id)
+                    counted = True
+                else:
+                    self.logger.warning(f"Node {global_node_id} stays incomplete (not counted): "
+                                        "a resend repairs it")
+                # Published / logged once per node (in this process): a repair after a failed
+                # count must not do it again. Decided under the claim.
+                already_published = published_key in self._published
+                self._published.add(published_key)
+            finally:
+                self._release_claims(claims)
+            if counted:
+                truth = None
+                if outcome.get("repaired") and manifest:  # its earlier parts are in storage
+                    truth = await asyncio.to_thread(self._parts_truth, map_id, global_node_id,
+                                                    manifest)
+                self._ack("node_ok", robot_name, run_id, session_node_id, acks.ACCEPTED,
+                          session.session_id, manifest, truth)
             else:
-                self.logger.warning(f"Node {global_node_id} stays incomplete (not counted): "
-                                    "a resend repairs it")
-            # Published / logged once per node (in this process): a repair after a failed
-            # count must not do it again. Decided under the claim.
-            already_published = published_key in self._published
-            self._published.add(published_key)
-        finally:
-            self._release_claims(claims)
-        if already_published:
-            return
-        await self._publish_node_update(map_id, global_node_id, mx, my, myaw, edges, image_ids=None)
-        if active_mission is not None:
-            await self._log_mission_waypoint(
-                robot_name, global_node_id, session_node_id, mx, my, myaw, map_id,
-                _mission=active_mission,
-            )
+                self._ack("node_failed", robot_name, run_id, session_node_id, ingest.STORE_FAILED,
+                          manifest, session.session_id)
+            if already_published:
+                return
+            await self._publish_node_update(map_id, global_node_id, mx, my, myaw, edges, image_ids=None)
+            if active_mission is not None:
+                await self._log_mission_waypoint(
+                    robot_name, global_node_id, session_node_id, mx, my, myaw, map_id,
+                    _mission=active_mission,
+                )
+        except BaseException as exc:  # incl. CancelledError: the begun bundle must not linger
+            self._ack("node_abandoned", robot_name, run_id, session_node_id, manifest,
+                      session.session_id)
+            if not isinstance(exc, asyncio.CancelledError):
+                self.logger.debug("node_update aborted after begin", exc_info=True)
+            raise
 
     def _process_topology(self, payload: Dict[str, Any], map_id: Optional[str] = None,
                           transform: Optional[Dict[str, float]] = None,
                           session_id: Optional[str] = None,
                           hold_claim: bool = False,
-                          claim_out: Optional[List[Tuple[str, str]]] = None
+                          claim_out: Optional[List[Tuple[str, str]]] = None,
+                          outcome: Optional[Dict[str, Any]] = None
                           ) -> Optional[Tuple]:
         """
         Build topological graph from a node-update payload.
@@ -909,6 +1150,10 @@ class GraphBuilderService:
             claim_out: with `hold_claim`, the held claim is appended here (before the call
                     returns) -- the caller releases exactly it (`_release_claims`), whatever
                     candidate id the returned node resolved to.
+            outcome: filled for the caller when None is returned: `status` 'duplicate' (with
+                    `global_id`, `map_id`: stored and complete already), 'busy' (another attempt
+                    is storing the node; it acks) or 'failed' (`reason`: lookup_failed or
+                    store_failed); `repaired` True on a returned node that was repaired.
 
         Returns (global_node_id, x, y, yaw, map_id, edges, session_node_id, robot_name), with
         x, y, yaw in the map frame, or None on failure or for a duplicate.
@@ -956,7 +1201,7 @@ class GraphBuilderService:
                     self._processing.add(claim)
             if known is not None:
                 return self._attach_duplicate(session_key, known, map_id, transform, session_id,
-                                              run_id)
+                                              run_id, outcome)
             if busy is None:
                 break
             # The same node is being stored by another worker thread: wait for it (no lock
@@ -965,6 +1210,8 @@ class GraphBuilderService:
                 self.stats["nodes_duplicate"] += 1
                 self.logger.warning(f"Node {busy[1]} is being stored and too many resends "
                                     "wait; resend ignored")
+                if outcome is not None:
+                    outcome["status"] = "busy"
                 return None
             try:
                 waited = self._wait_claim(busy, deadline)
@@ -974,6 +1221,8 @@ class GraphBuilderService:
                 self.stats["nodes_duplicate"] += 1
                 self.logger.warning(f"Node {busy[1]} is still being stored after "
                                     f"{self.claim_wait_s:.0f}s; resend ignored")
+                if outcome is not None:
+                    outcome["status"] = "busy"
                 return None
 
         held = False
@@ -984,14 +1233,18 @@ class GraphBuilderService:
                 self.logger.error(f"Cannot tell whether node {global_node_id} {session_key} "
                                   "exists (ArangoDB lookup failed); nothing written, "
                                   "a resend settles it")
+                if outcome is not None:
+                    outcome["reason"] = ingest.LOOKUP_FAILED
                 return None
             if state == 'complete':
                 self._complete_cache.add((map_id, found))
                 return self._attach_duplicate(session_key, found, map_id, transform,
-                                              session_id, run_id)
+                                              session_id, run_id, outcome)
             if state == 'incomplete':
                 result = self._repair_node(payload, map_id, transform, session_id, x, y, yaw,
                                            found)
+                if result is not None and outcome is not None:
+                    outcome["repaired"] = True
             else:
                 result = self._store_node(payload, map_id, transform, session_id, x, y, yaw,
                                           global_node_id)
@@ -1038,16 +1291,20 @@ class GraphBuilderService:
 
     def _attach_duplicate(self, session_key: Tuple[str, Any], global_node_id: str, map_id: str,
                           transform: Dict[str, float], session_id: str,
-                          run_id: Optional[str] = None) -> None:
+                          run_id: Optional[str] = None,
+                          outcome: Optional[Dict[str, Any]] = None) -> None:
         """A resent node that is stored already: no write, no edges, no count, no WebSocket
         update. Only what a later upload needs is restored in memory (mapping, `_stored_nodes`:
-        e.g. after a restart) and anything buffered for the node is saved. Always None."""
+        e.g. after a restart) and anything buffered for the node is saved. Always None;
+        `outcome` (when given) says 'duplicate'."""
         transform, images, depth, costmap = self._restore_node(
             session_key, global_node_id, map_id, transform, session_id, run_id)
         self._node_cache.add((map_id, global_node_id))
         self.stats["nodes_duplicate"] += 1
         self.logger.debug(f"Node {global_node_id} {session_key} is stored already; resend "
                           "ignored (first write wins)")
+        if outcome is not None:
+            outcome.update(status="duplicate", global_id=global_node_id, map_id=map_id)
         self._save_buffered(global_node_id, map_id, transform, session_id, images, depth,
                             costmap)
         return None
@@ -1303,6 +1560,7 @@ class GraphBuilderService:
             if session_node_id is None or robot_name is None or camera_name is None or image_data_b64 is None:
                 self.logger.error("Missing required fields in image upload: session_node_id, robot_name, camera_name, image_data")
                 self.stats["errors"] += 1
+                self._ack_part_invalid(payload, "image", camera_name)
                 return
 
             self.logger.info(f"📸 Image upload: camera={camera_name}, yaw_offset={yaw_offset}, robot={robot_name}, session_node={session_node_id}")
@@ -1310,8 +1568,15 @@ class GraphBuilderService:
             resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
             if not resolution.accepted:
                 await self._reject(resolution, "image")
+                self._ack_part_rejected(payload, "image", camera_name, resolution.reason,
+                                        resolution)
                 return
             session = resolution.session
+            if await self._run_id_conflict(robot_name, session, run_id):
+                await self._reject_run_id(resolution, "image")
+                self._ack_part_rejected(payload, "image", camera_name, ingest.RUN_ID_MISMATCH,
+                                        resolution)
+                return
 
             image_dict = {
                 'image_id': camera_name,
@@ -1319,6 +1584,8 @@ class GraphBuilderService:
                 'content_type': content_type,
                 'session_id': session.session_id,  # NodeUploadBuffer.take checks it
                 'run_id': run_id,  # a reset keeps the new run's buffered uploads
+                'robot_name': robot_name,  # the ack of the stored part (_note_part_stored)
+                'session_node_id': session_node_id,
                 'metadata': {
                     'camera_name': camera_name,
                     'timestamp': timestamp,
@@ -1346,12 +1613,17 @@ class GraphBuilderService:
                 lambda: self._mapped_node(node_key, session.session_id, run_id) or known)
             if target is DROPPED:
                 await self._reject_buffer_full(resolution, "image")
+                self._ack_part_rejected(payload, "image", camera_name, ingest.BUFFER_FULL,
+                                        resolution)
             elif target is not None:
                 global_node_id, map_id = target
                 saved_image_ids = await asyncio.to_thread(
                     self._save_images, global_node_id, map_id, [image_dict])
                 if saved_image_ids:
                     await self._publish_image_update(map_id, global_node_id, saved_image_ids)
+                else:  # (a stored image was acked by _save_images)
+                    self._ack_part_rejected(payload, "image", camera_name, ingest.STORE_FAILED,
+                                            resolution)
             else:
                 self.logger.debug(f"Buffered image for ({robot_name}, {session_node_id}, {camera_name})")
 
@@ -1400,6 +1672,7 @@ class GraphBuilderService:
             except spec.error as e:
                 self.logger.error(f"Invalid {spec.kind} upload: {e}")
                 self.stats["errors"] += 1
+                self._ack_part_invalid(payload, spec.kind, payload.get(spec.sub_field))
                 return
             robot_name = payload['robot_name']
             session_node_id = payload['session_node_id']
@@ -1408,11 +1681,18 @@ class GraphBuilderService:
             resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
             if not resolution.accepted:
                 await self._reject(resolution, spec.kind)
+                self._ack_part_rejected(payload, spec.kind, sub, resolution.reason, resolution)
                 return
             session = resolution.session
             run_id = _run_id_of(payload)
+            if await self._run_id_conflict(robot_name, session, run_id):
+                await self._reject_run_id(resolution, spec.kind)
+                self._ack_part_rejected(payload, spec.kind, sub, ingest.RUN_ID_MISMATCH,
+                                        resolution)
+                return
             entry = {spec.sub_key: sub, "data": payload[spec.data_key], "parsed": parsed,
-                     "session_id": session.session_id, "run_id": run_id}
+                     "session_id": session.session_id, "run_id": run_id,
+                     "robot_name": robot_name, "session_node_id": session_node_id}
 
             # The record goes onto the node's document: a node stored before a restart is not
             # in memory, so its document is looked up (by the deterministic id) before buffering.
@@ -1429,10 +1709,14 @@ class GraphBuilderService:
                 lambda: self._stored_node(node_key, session.session_id, run_id) or known)
             if target is DROPPED:
                 await self._reject_buffer_full(resolution, spec.kind)
+                self._ack_part_rejected(payload, spec.kind, sub, ingest.BUFFER_FULL, resolution)
             elif target is not None:
                 global_node_id, map_id, transform = target
-                await asyncio.to_thread(self._save_layers, spec, global_node_id, map_id,
-                                        [entry], transform, session.session_id)
+                saved = await asyncio.to_thread(self._save_layers, spec, global_node_id, map_id,
+                                                [entry], transform, session.session_id)
+                if not saved:  # (a stored one was acked by _save_layers)
+                    self._ack_part_rejected(payload, spec.kind, sub, ingest.STORE_FAILED,
+                                            resolution)
         except Exception as e:
             self.logger.error(f"Error processing {spec.kind} upload message: {e}")
             self.stats["errors"] += 1
@@ -1493,6 +1777,9 @@ class GraphBuilderService:
             self.stats["errors"] += len(stored)
             return 0
         self.stats[f"{spec.kind}_saved"] += len(stored)
+        for entry in entries:
+            if entry[spec.sub_key] in stored:
+                self._note_part_stored(entry, spec.kind, entry[spec.sub_key])
         return len(stored)
 
     # ==================== Node Processing ====================
@@ -1740,6 +2027,7 @@ class GraphBuilderService:
                 if success:
                     saved_image_ids.append(image_id)
                     self.stats["images_saved"] += 1
+                    self._note_part_stored(img, "image", image_id)
                     self.logger.info(f"✅ Successfully saved image {image_id} for node {node_id_str} in map {map_id}")
                 else:
                     self.logger.warning(f"❌ Failed to save image {image_id} for node {node_id_str}")
@@ -2055,6 +2343,7 @@ class GraphBuilderService:
         """
         return {
             **self.stats,
+            **self.acks.snapshot(),  # ingest_state / spool_state per robot, tracked bundles
             "mqtt_connected": self.mqtt_connected,
             "radius_threshold": self.radius_threshold
         }

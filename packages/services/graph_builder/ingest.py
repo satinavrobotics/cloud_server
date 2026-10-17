@@ -29,6 +29,11 @@ restart from a resend. Otherwise it is dropped:
     buffer_full       a depth / costmap / image that would wait for its node found its upload
                       buffer at its size cap (UPLOAD_BUFFER_MAX_BYTES / _ENTRIES); not a
                       session decision, never set for nodes
+    run_id_mismatch   the payload's `run_id` is not the one the open cloud session is bound to
+                      (the first it saw; server.py `_run_id_conflict`); nothing is touched
+
+Two more reasons exist only in the acks to the robot (acks.py), not as MAP.INGEST_REJECTED:
+`invalid_payload` (a part that cannot be stored) and `store_failed` (the write failed).
 
 Realignment (a robot restart mid-session on a GEO map): the robot takes a new datum at every
 navstack start, and a geo map's frame is absolute (UTM grid metres from the map's `geo` origin),
@@ -102,6 +107,11 @@ MAP_MISSING = "map_missing"
 DATUM_CHANGED = "datum_changed"
 LOOKUP_FAILED = "lookup_failed"
 BUFFER_FULL = "buffer_full"
+# REASONS is documentation only (MAP.INGEST_REJECTED's `reason` is a free string).
+RUN_ID_MISMATCH = "run_id_mismatch"
+# Ack-only reasons (acks.py): never recorded as MAP.INGEST_REJECTED.
+INVALID_PAYLOAD = "invalid_payload"
+STORE_FAILED = "store_failed"
 REASONS = (NO_SESSION, MAP_DELETING, MAP_MISSING, SESSION_PAUSED,
            SESSION_UNPLACED, DATUM_CHANGED, LOOKUP_FAILED, BUFFER_FULL)
 

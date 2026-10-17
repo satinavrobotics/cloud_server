@@ -377,7 +377,8 @@ is built for it; robots that send nothing new keep working.
 - **QoS.** `robot/node_update`, `image_upload`, `depth_upload` and `costmap_upload` are subscribed
   at QoS 1 (the granted QoS is the lower of the robot's publish QoS and this): a robot must publish
   at QoS 1 to get the broker's redelivery. This is not an acknowledgement of processing (the
-  PUBACK goes out when the message is handed to the service, before the node is stored).
+  PUBACK goes out when the message is handed to the service, before the node is stored; see
+  "Robot ingest contract" below for the acks).
 - **Persistent session (opt-in).** `GRAPH_BUILDER_MQTT_PERSISTENT_SESSION=true` makes graph-builder
   connect with `GRAPH_BUILDER_MQTT_CLIENT_ID` (default `graph_builder`) and `clean_session=False`,
   so the broker queues QoS 1 messages while it is down. Default off: the queue is bounded by the
@@ -442,6 +443,148 @@ is built for it; robots that send nothing new keep working.
   of an older backlog is not deduplicated (it is taken for a restart and creates new nodes), and a
   resend that straddles a Finish / new cloud session creates a second node in the new session's
   map (the cloud session is part of the id). Robots should send `run_id`.
+
+### Robot ingest contract (acks, ingest_state, spool_state, run_id)
+
+Phase 2. QoS 1 PUBACK only means "handed to graph-builder"; the robot learns what happened to a
+node from these messages (`acks.py`). Robots that send none of the new fields keep working: they
+get one ack per node with `run_id: null`, `complete: null`.
+
+**Messages from the robot.** `robot/node_update` may carry `parts`: the parts it will send for the
+node, `[{"kind": "image"|"depth"|"costmap", "sub": "<camera or layer>"}]` (the `sub` of an image
+is its `camera_name`, of a depth image its `camera_name`, of a costmap its `layer`), and `run_id`
+(on all four message types or on none). Unknown extra fields, and manifest entries that do not
+match, are ignored. The robot also publishes `robot/<robot_name>/spool_state`, retained, QoS 1:
+`{"run_id", "last_spooled_id", "depth"}`; graph-builder keeps the latest per robot (bounded by
+robots) and shows it in `GET /stats` as `spool_state`. It has no other effect.
+
+**Ack.** Topic `robot/<robot_name>/ingest_ack`, QoS 1, not retained:
+
+```json
+{"v": 1, "robot_name": "r1", "run_id": "…"|null, "session_node_id": 7,
+ "status": "accepted"|"duplicate"|"rejected", "reason": null|"<reason>",
+ "resend": "none"|"parts"|"node",
+ "parts_stored": [{"kind": "image", "sub": "left"}], "parts_missing": [{"kind": "depth", "sub": "left"}],
+ "complete": true|false|null, "session_id": "<cloud session id>"|null, "ts": 1760000000000}
+```
+
+An ack is keyed by `(run_id, session_node_id)`: the robot ignores one whose `run_id` is not the one
+of the bundle it is sending. It is sent only when the state is durable: after the node is stored,
+counted and marked complete (not when the message arrives), after a part is in MinIO (and, for
+depth / costmap, on the node document), or when the message is refused.
+
+- `accepted`: the node was newly stored. `duplicate`: it was stored already (a success for the
+  robot). `rejected`: the node was **not** stored; the one exception is the final ack of a bundle
+  one of whose parts was refused for a terminal reason, which says `rejected` with that reason
+  although the node is stored (the robot drops the bundle either way).
+- `resend`: `node` = send the node_update again (only for a rejected node with a retryable reason);
+  `parts` = send exactly the parts in `parts_missing`, never the node_update; `none` = nothing
+  (bundle complete, or a terminal rejection).
+- `complete`: `true` when every declared part is stored (an empty manifest counts); `false` while
+  parts are missing or pending; `null` when the node has no manifest, so its parts cannot be
+  judged. A node without a manifest is acked once, when it is stored (`complete: null`, `resend:
+  none`), and does not advance `ingest_state`.
+- **With a manifest** the first ack comes when the node is accepted / duplicate / rejected
+  (`complete: false`, `parts_missing` = declared parts not stored yet, `resend: none` for a new
+  node because its parts are on the way, `parts` for a duplicate). A **final** ack with the same
+  key follows once, when the last declared part is stored (`complete: true`, `resend: none`), or as
+  soon as every declared part is either stored or was refused (`complete: false`, `resend: parts`
+  with the refused ones; a terminal refusal ends the bundle with `rejected`), or
+  `INGEST_ACK_PART_TIMEOUT_S` (120) after the node was accepted: `complete: false`, `resend: parts`,
+  `parts_missing` = what never arrived. The tracker survives a timeout ack, so the resent parts
+  still end in the final ack (at most 3 timeout acks per bundle, `MAX_TIMEOUT_ACKS`).
+- **Duplicate nodes** are answered from storage, not memory: `depth.{sub}` / `costmap.{sub}`
+  records of the node document (one read) and the node's images in MinIO (one listing, only for
+  declared images), on the duplicate path only. Complete: `duplicate`, `complete: true`, `resend:
+  none`; otherwise `resend: parts` with `parts_missing`. A read that fails counts the parts as
+  missing (a resent part is idempotent).
+- **A rejected part** of a node that has a pending tracker is recorded (see the final ack above).
+  A rejected part without one (the node is unknown, was rejected, or graph-builder restarted)
+  gets its own ack: `rejected`, the reason, `resend: parts` (retryable) or `none` (terminal),
+  `parts_missing` = that part, with the part's own `run_id` and `session_node_id`. Identical acks
+  of one key are sent at most once a second (`acks_coalesced`). A malformed part that names its
+  node gets `invalid_payload`; a message that cannot name its node (no `robot_name` or
+  `session_node_id`) is only counted (`acks_unackable`, `errors`).
+
+| reason | resend | when |
+|---|---|---|
+| `no_session` | none | no open session (also a RUNNING mission with `register_map = false`) |
+| `map_deleting`, `map_missing` | none | the session's map is being deleted / has no row |
+| `datum_changed` | none | the session's datum cannot be re-anchored: finish the session |
+| `run_id_mismatch` | none | see below |
+| `invalid_payload` | none | the node or part cannot be stored (missing / malformed fields) |
+| `session_paused`, `session_unplaced` | node (part: parts) | try again when the session takes data |
+| `lookup_failed` | node (part: parts) | Postgres or an ArangoDB existence check failed |
+| `buffer_full` | node (part: parts) | a part found the upload buffer at its cap |
+| `store_failed` | node (part: parts) | the write (node, edges, count, MinIO, record) failed |
+
+All except `invalid_payload` and `store_failed` are the `MAP.INGEST_REJECTED` reasons (the event
+keeps its rate limit and counts); `run_id_mismatch` is one of them too.
+
+**`ingest_state`.** Topic `robot/<robot_name>/ingest_state`, QoS 1, **retained**:
+`{"v": 1, "robot_name", "run_id", "highest_complete_id": <int>, "ts"}`: the highest
+`session_node_id` whose bundle is complete (the node stored and `complete: true`) for the current
+`run_id`. It only grows within a `run_id` (ids may have gaps), and restarts at the first complete
+id of a new `run_id`. It is published on change, at most every `INGEST_STATE_MIN_INTERVAL_S` (1 s)
+per robot; a periodic task (every second) publishes the last value that was held back. After a
+restart graph-builder subscribes to `robot/+/ingest_state` and, for `INGEST_STATE_SEED_SETTLE_S`
+(5 s) after its first connect, takes the retained values as the starting state of robots it has no
+state for (later messages are mostly its own publishes echoing back and are ignored). The broker's
+retained message is the only persistence: if the broker loses its retained store the value
+restarts from the next completed node. Nothing is written to Postgres. The seed is merged with a
+state this process already created (a completion before the retained message arrived): same
+`run_id`, the higher id; another `run_id`, the local one. **Latest run:** the run most recently
+seen on a node accepted by this process (run_ids are unique, a run seen before never becomes the
+latest again). A completion of any other run (a late part or node of a superseded run) is still
+acked but never changes `ingest_state`. A node whose handler fails or is cancelled after the
+bundle was announced and before its first ack is answered `rejected: store_failed, resend: node`;
+a tracker that never got an ack is dropped after 2 x `INGEST_ACK_PART_TIMEOUT_S`.
+
+**`run_id` guard.** A cloud session binds the first `run_id` it sees (found with the newest stored
+node of the session that has one, else the first message's; remembered per session id, at most
+1024 sessions). A node or part with another `run_id` is refused as `run_id_mismatch` before any
+state is touched: in particular before the run_id-change reset, so it cannot wipe the legitimate
+run's mappings or buffers. A message without `run_id` is never refused. If the lookup fails the
+message is let through and nothing is bound (retried after 30 s). A genuine counter restart of the
+robot therefore needs a new cloud session (finish and start one); `run_id` changes across
+sessions still reset the robot's in-memory state as before.
+
+**For the robot.**
+1. Send the `node_update` first (with `parts` and `run_id`), then its parts, in increasing id
+   order, one bundle in flight.
+2. Wait for an ack with the bundle's `(run_id, session_node_id)`; delete the bundle only on
+   `complete: true` or a terminal rejection (`resend: none` with `status: rejected`).
+3. Never send the `node_update` again unless `resend == "node"`; on `resend == "parts"` send only
+   `parts_missing`. After a restart or when no ack comes (see below) resend the node: a duplicate
+   is answered from storage and says what is missing.
+4. `ingest_state` (retained, so available when the robot reconnects) tells the highest complete id
+   without waiting for the acks it missed.
+
+**Guarantees and non-guarantees.**
+- Acks are QoS 1 but are lost if the robot is offline when they are published (not retained, and
+  the robot's session may be clean): use `ingest_state` and resending. The resend is always safe.
+- graph-builder's pending trackers (and the ack coalescing table) are in memory, bounded by
+  `INGEST_ACK_TRACKER_MAX` (20000 bundles, oldest evicted, `ack_trackers_evicted`) and lost on a
+  restart; the robot's resend then gets the truth from storage. A part stored with no tracker is
+  not acked.
+- Acks and `ingest_state` wait in paho's outgoing queue while the broker is away, capped at
+  `INGEST_MQTT_MAX_QUEUED` (10000; a publish that does not fit is `acks_dropped`). A failing
+  publish is logged and counted (`acks_failed`) and never reaches ingest. A robot name that is not
+  a single topic level (empty, `/`, `+`, `#`) is not acked (`acks_invalid_robot`).
+- The `node_count` residual of phase 1 remains: if the count succeeded but the completion marker
+  could not be written, a later repair of that node counts it again. The node is acked
+  `accepted` in that case (it is complete in this process).
+- A node being stored by another attempt (a concurrent resend) is not acked by the waiting
+  attempt; the storing attempt acks it.
+- Finish waiting in the API is not implemented here.
+
+**Config** (`packages/config.py`, environment): `INGEST_ACK_PART_TIMEOUT_S` (120),
+`INGEST_ACK_TRACKER_MAX` (20000), `INGEST_STATE_MIN_INTERVAL_S` (1.0),
+`INGEST_STATE_SEED_SETTLE_S` (5.0), `INGEST_MQTT_MAX_QUEUED` (10000, 0 = unlimited). Counters in
+`GET /stats`: `acks_sent`, `acks_failed`, `acks_dropped`, `acks_coalesced`, `acks_invalid_robot`,
+`acks_unackable`, `ack_trackers_evicted`, `ack_timeouts`, `ingest_state_published`,
+`run_id_mismatch`; plus `ingest_state`, `spool_state` and `ack_trackers` (bundles waiting for
+parts).
 
 ## How It Works
 
