@@ -1,0 +1,155 @@
+# Robot (Raspberry Pi 4, linux/arm64) override: the same stack as the cloud, smaller, pulled from the private registry.
+# No sync or share with the cloud. Layered over the main file, which stays the single definition of every service:
+#
+#   docker compose --env-file .env.robot \
+#     -f mission_dispatch_services.yaml -f mission_dispatch_services_robot.yaml up -d --no-build
+#
+# (scripts/deploy_robot.sh wraps this.) Needs Docker Compose >= 2.24 (`!override`, `!reset`).
+#
+# What differs from the cloud:
+#   - off (profile cloud-only, never started here): livekit-service (LiveKit Cloud tokens), livekit-sfu and
+#     livekit-sfu-tokens (self-hosted video), agent-orchestrator-service (needs an LLM API).
+#   - kept: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api.
+#     minio-tailnet stays: presigned URLs are signed for MINIO_HOST, which here is the Pi's tailnet IP.
+#   - images come from the registry (IMAGE_REGISTRY/IMAGE_TAG, written by scripts/build_push.sh), never built here.
+#   - Every container has a memory limit (defaults sum to ~3.4 GB: for a 4 GB Pi; see .env.robot.example for 8 GB) and a
+#     rotated log. Postgres, ArangoDB, the planner and graph-builder listen on loopback only; mosquitto on loopback + the
+#     tailnet IP; the API (8000) and MinIO's tailnet forwarder are the only other doors.
+#   - MinIO data lives under ${MINIO_DATA_DIR}; the cloud's hash-named pgdata14 volume does not exist here.
+x-logging: &logging
+  driver: json-file
+  options: {max-size: 10m, max-file: "3"}
+
+services:
+  mosquitto:
+    command:
+      - /bin/sh
+      - -c
+      - |
+        sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" "127.0.0.1 ${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}" "error warning notice"
+    mem_limit: ${MEM_MOSQUITTO:-128m}
+    logging: *logging
+
+  postgres:
+    # timescaledb-tune runs once, at initdb (an existing data volume keeps its settings).
+    environment:
+      - TS_TUNE_MEMORY=${PG_TUNE_MEMORY:-512MB}
+      - TS_TUNE_NUM_CPUS=${PG_TUNE_CPUS:-2}
+      - TS_TUNE_MAX_CONNS=${PG_MAX_CONNS:-60}
+    command: !override
+      - postgres
+      - -c
+      - timescaledb.telemetry_level=off
+      - -c
+      - timezone=UTC
+      - -c
+      - listen_addresses=127.0.0.1
+    mem_limit: ${MEM_POSTGRES:-768m}
+    logging: *logging
+    # First boot (initdb, timescaledb-tune, extensions) is slow on a Pi.
+    healthcheck:
+      start_period: 120s
+      retries: 30
+
+  arangodb:
+    # RocksDB caches and AQL memory capped to fit the Pi; the entrypoint passes option-style args to arangod.
+    command:
+      - --server.endpoint=tcp://127.0.0.1:${ARANGO_PORT:-8529}
+      - --rocksdb.block-cache-size=${ARANGO_BLOCK_CACHE_BYTES:-100000000}
+      - --rocksdb.total-write-buffer-size=${ARANGO_WRITE_BUFFER_BYTES:-100000000}
+      - --query.memory-limit=${ARANGO_QUERY_MEMORY_BYTES:-200000000}
+    mem_limit: ${MEM_ARANGO:-768m}
+    logging: *logging
+    healthcheck:
+      start_period: 90s
+
+  minio:
+    # Built from source by scripts/build_push.sh (docker/minio): the upstream image is no longer published.
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/minio:${IMAGE_TAG:-latest}
+    volumes: !override
+      - ${MINIO_DATA_DIR:?set MINIO_DATA_DIR}:/data
+    mem_limit: ${MEM_MINIO:-384m}
+    logging: *logging
+
+  minio-tailnet:
+    environment:
+      - MINIO_TAILNET_IP=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
+    mem_limit: 64m
+    logging: *logging
+
+  mission-dispatch:
+    build: !reset null
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/mission_dispatch:${IMAGE_TAG:-latest}
+    mem_limit: ${MEM_DISPATCH:-256m}
+    logging: *logging
+
+  graph-builder-service:
+    build: !reset null
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/graph_builder_service:${IMAGE_TAG:-latest}
+    command: !override
+      - python
+      - -m
+      - packages.services.graph_builder.main
+      - --port
+      - ${GRAPH_BUILDER_PORT:-8004}
+      - --host
+      - 127.0.0.1
+    environment:
+      # The default 256 MiB upload buffer would fill most of the container's limit.
+      - UPLOAD_BUFFER_MAX_BYTES=${UPLOAD_BUFFER_MAX_BYTES:-100000000}
+    mem_limit: ${MEM_GRAPH_BUILDER:-384m}
+    logging: *logging
+
+  mission-planner-service:
+    build: !reset null
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/mission_planner_service:${IMAGE_TAG:-latest}
+    command: !override
+      - python
+      - -m
+      - packages.services.mission_planner.main
+      - --port
+      - ${MISSION_PLANNER_PORT:-8005}
+      - --host
+      - 127.0.0.1
+    mem_limit: ${MEM_PLANNER:-256m}
+    logging: *logging
+
+  api-delegation-service:
+    build: !reset null
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/api_delegation_service:${IMAGE_TAG:-latest}
+    environment:
+      # Presigned URLs are signed for the Pi's tailnet address (served by minio-tailnet).
+      - MINIO_HOST=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
+      - RECONSTRUCTION_MINIO_ENDPOINT=${ROBOT_TAILNET_IP}:${MINIO_PORT:-9000}
+    mem_limit: ${MEM_API:-384m}
+    logging: *logging
+    # The entrypoint runs `alembic upgrade head` before serving; mission-dispatch waits for this to be healthy.
+    healthcheck:
+      start_period: 120s
+    # livekit-service is not started on the robot, so the API must not wait for it.
+    depends_on: !override
+      mosquitto:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      arangodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      mission-planner-service:
+        condition: service_started
+      graph-builder-service:
+        condition: service_started
+
+  # --- not on the robot
+  livekit-service:
+    profiles: [cloud-only]
+  livekit-sfu:
+    profiles: [cloud-only]
+  livekit-sfu-tokens:
+    profiles: [cloud-only]
+  agent-orchestrator-service:
+    profiles: [cloud-only]
+
+volumes:
+  pgdata14: !reset null

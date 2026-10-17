@@ -4,7 +4,7 @@
 # the compose file or the running stack: the cloud keeps building its own native images with restart_services.sh /
 # scripts/deploy.sh. This is the producer side of a robot (Raspberry Pi) deploy, which only pulls.
 #
-#   scripts/build_push.sh [options] [SERVICE...]     SERVICE = compose service names (default: all 7)
+#   scripts/build_push.sh [options] [SERVICE...]     SERVICE = compose service names (default: all 8)
 #
 # Options:
 #   --check          build only, push nothing (cache only): proves every platform builds, wheels included
@@ -42,6 +42,9 @@ SERVICES=(
     "livekit-sfu-tokens|livekit_sfu_tokens|packages/services/livekit_sfu_tokens/Dockerfile"
     "agent-orchestrator-service|agent_orchestrator_service|packages/services/agent_orchestrator/Dockerfile"
     "api-delegation-service|api_delegation_service|packages/api/Dockerfile"
+    # MinIO no longer publishes images: built from source at the pinned release (the robot pulls it from here).
+    # The optional 4th field is the build context (default: the repo root).
+    "minio|minio|docker/minio/Dockerfile|docker/minio"
 )
 
 usage() { sed -n '2,/^set -e/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'; }
@@ -82,12 +85,14 @@ fi
 # --- tag and tree state
 SHA="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
 DIRTY=0
-[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=no)" ] || DIRTY=1
+# untracked files count: the build context is the working tree, so a new file would ship in an image its sha does not have
+[ -z "$(git -C "$ROOT" status --porcelain --untracked-files=normal -- . ':!.claude' ':!.serena')" ] || DIRTY=1
 if [ "$CHECK" = 0 ] && [ "$DIRTY" = 1 ] && [ "$DIRTY_OK" = 0 ]; then
     die "the working tree has uncommitted changes; commit them, or pass --allow-dirty (tag ${SHA}-dirty, no :latest)"
 fi
 if [ "$DIRTY" = 1 ]; then LATEST=0; fi
-if [ -z "$TAG" ]; then TAG="$SHA"; [ "$DIRTY" = 0 ] || TAG="${SHA}-dirty"; fi
+if [ -z "$TAG" ]; then TAG="$SHA"; fi
+[ "$DIRTY" = 0 ] || case "$TAG" in *-dirty) ;; *) TAG="${TAG}-dirty" ;; esac
 
 # --- builder
 if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
@@ -102,7 +107,7 @@ fi
 echo "build_push: ${#SELECTED[@]} image(s), platforms $PLATFORMS, tag $TAG$([ "$CHECK" = 1 ] && echo ', check only (no push)')" >&2
 
 for entry in "${SELECTED[@]}"; do
-    IFS='|' read -r svc image dockerfile <<<"$entry"
+    IFS='|' read -r svc image dockerfile context <<<"$entry"
     ref="$REGISTRY/$REPO/$image"
     cache="$REGISTRY/$REPO/cache/$image"
     args=(docker buildx build --builder "$BUILDER" --platform "$PLATFORMS"
@@ -116,7 +121,7 @@ for entry in "${SELECTED[@]}"; do
         args+=(--cache-to "type=registry,ref=$cache,mode=max,ignore-error=true" --push -t "$ref:$TAG")
         [ "$LATEST" = 0 ] || args+=(-t "$ref:latest")
     fi
-    args+=("$ROOT")
+    args+=("$ROOT/${context:-.}")
     echo "== $svc -> $ref:$TAG" >&2
     run "${args[@]}"
 done

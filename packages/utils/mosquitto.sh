@@ -22,6 +22,10 @@
 # Get ports from arguments or use defaults
 MQTT_PORT_TCP=${1:-1883}
 MQTT_PORT_WEBSOCKET=${2:-9001}
+# Space-separated addresses to listen on (default: all interfaces, as before). A robot lists 127.0.0.1 and its tailnet IP.
+MQTT_BIND_ADDRS=${3:-0.0.0.0}
+# Log types (default: all, as before). A robot passes "error warning notice": "all" logs every publish, image traffic included.
+MQTT_LOG_TYPES=${4:-all}
 
 echo "Starting Mosquitto MQTT Broker..."
 echo "TCP Port: $MQTT_PORT_TCP"
@@ -32,19 +36,25 @@ cat > /tmp/mosquitto.conf <<EOF
 # Mosquitto Configuration for Testing
 # Allow anonymous connections (for testing only)
 allow_anonymous true
+EOF
+for addr in $MQTT_BIND_ADDRS; do
+cat >> /tmp/mosquitto.conf <<EOF
 
 # TCP Listener
-listener $MQTT_PORT_TCP 0.0.0.0
+listener $MQTT_PORT_TCP $addr
 protocol mqtt
 
 # WebSocket Listener
-listener $MQTT_PORT_WEBSOCKET 0.0.0.0
+listener $MQTT_PORT_WEBSOCKET $addr
 protocol websockets
+EOF
+done
+cat >> /tmp/mosquitto.conf <<EOF
 
 # Logging
 log_dest stdout
-log_type all
 EOF
+for t in $MQTT_LOG_TYPES; do echo "log_type $t" >> /tmp/mosquitto.conf; done
 
 echo "Configuration created at /tmp/mosquitto.conf"
 cat /tmp/mosquitto.conf

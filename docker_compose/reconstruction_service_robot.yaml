@@ -1,0 +1,23 @@
+# 3D reconstruction service, RAW backend, for a robot-side host (Raspberry Pi 4, linux/arm64, no GPU).
+# Same contract as reconstruction_service.yaml; image built from Dockerfile.raw in cloud_reconstruction.
+#
+#   docker compose -p recon --env-file .env.robot -f reconstruction_service_robot.yaml up -d
+# (--env-file is required: without it compose reads docker_compose/.env, the cloud's file.)
+services:
+  reconstruction-service:
+    image: ${RECON_IMAGE:-100.85.3.47:5050/sati/reconstruction_raw:latest}
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: 1g
+    memswap_limit: 1g
+    environment:
+      - RECON_SERVICE_KEY=${RECONSTRUCTION_SERVICE_KEY:?set RECONSTRUCTION_SERVICE_KEY in .env}
+      - RECON_HOST=127.0.0.1
+      - RECON_PORT=8009
+      - RECON_BACKEND=raw
+      - RECON_MAX_VOXELS=3000000
+    volumes:
+      - recon-spool:/var/lib/recon/spool
+
+volumes:
+  recon-spool:
