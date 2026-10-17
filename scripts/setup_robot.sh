@@ -38,6 +38,7 @@ confirm() { [ "$YES" = 1 ] && return 0; read -r -p "$1 [y/N] " a; [ "$a" = y ] |
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo"
 
 # --- prerequisites
+[ -w "$DC_DIR" ] || die "$DC_DIR is not writable by $(id -un) (it holds .env.robot and the deploy tag files); run: sudo chown -R $(id -un) \"$ROOT\""
 [ "$(uname -m)" = aarch64 ] || log "warning: this host is $(uname -m), not aarch64 (fine for a test, the Pi image set is arm64)"
 command -v docker >/dev/null || die "docker is not installed (https://docs.docker.com/engine/install/)"
 ver="$(docker compose version --short 2>/dev/null | sed 's/^v//')" || true
