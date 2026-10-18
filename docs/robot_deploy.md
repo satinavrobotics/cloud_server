@@ -13,7 +13,7 @@ on the cloud host for amd64 + arm64, pushed to the private registry, and the Pi 
 
 ## What runs on the robot
 
-On: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api.
+On: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api, nginx-gateway.
 `minio-tailnet` stays: presigned URLs are signed for `MINIO_HOST`, which is the Pi's tailnet IP.
 
 Off (profile `cloud-only`): livekit-service (LiveKit Cloud tokens), livekit-sfu and livekit-sfu-tokens (self-hosted video),
@@ -83,18 +83,15 @@ The routing is one file, `docker_compose/nginx/routes.conf`, shared by the cloud
 (`nginx-gateway.yaml`, which also fronts the Expo dev server) and the robot gateway, so the robot has exactly the
 cloud's public paths and no robot-specific code in the client.
 
-```bash
-docker compose --env-file .env.robot -f docker_compose/nginx_gateway_robot.yaml up -d   # on the Pi
-```
+It is the `nginx-gateway` service of `mission_dispatch_services_robot.yaml`, so `deploy_robot.sh` pulls, starts, health-checks
+and rolls it back with the rest of the stack.
 
 It listens on loopback and `ROBOT_TAILNET_IP` only (`ROBOT_GATEWAY_PORT`, default 80) and serves no UI (the desktop app
 brings its own). It sends **no CORS headers** (`nginx/cors-robot.conf`): the desktop app reaches the robot through its own
 same-origin relay, and a web page in an operator's browser must not be able to call the robot cross-origin (the cloud gateway's
-permissive CORS, `nginx/cors-cloud.conf`, would let any page the operator opens start and stop robot processes). It runs in its
-own compose project (`sati-robot-gateway`): `deploy_robot.sh` uses `--remove-orphans` for the robot stack and would otherwise
-delete it. Services that are off on the robot (agent,
+permissive CORS, `nginx/cors-cloud.conf`, would let any page the operator opens start and stop robot processes). Services that are off on the robot (agent,
 LiveKit tokens) answer 502 on their prefix; `GET /api/v1/server-info` is how the client learns they are absent.
-Not started by `deploy_robot.sh` yet, and not yet run on arm64 hardware (the config was tested on the cloud host:
+Not yet run on arm64 hardware (the config was tested on the cloud host:
 routes, CORS, preflight, WebSocket upgrade, binding only loopback + the tailnet IP).
 
 ## Raw reconstruction (optional)

@@ -9,7 +9,7 @@
 # What differs from the cloud:
 #   - off (profile cloud-only, never started here): livekit-service (LiveKit Cloud tokens), livekit-sfu and
 #     livekit-sfu-tokens (self-hosted video), agent-orchestrator-service (needs an LLM API).
-#   - kept: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api.
+#   - kept: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api, nginx-gateway.
 #     minio-tailnet stays: presigned URLs are signed for MINIO_HOST, which here is the Pi's tailnet IP.
 #   - images come from the registry (IMAGE_REGISTRY/IMAGE_TAG, written by scripts/build_push.sh), never built here.
 #   - Every container has a memory limit (defaults sum to ~3.4 GB: for a 4 GB Pi; see .env.robot.example for 8 GB) and a
@@ -141,6 +141,32 @@ services:
       graph-builder-service:
         condition: service_started
 
+  # The app's one door: forwards /api/ and /ws/ to the API by path (docs/robot_deploy.md, Gateway). Loopback + the tailnet
+  # IP only, no CORS headers. Stock image, nothing to build.
+  nginx-gateway:
+    image: nginx:alpine
+    container_name: sati_nginx_gateway
+    network_mode: host
+    environment:
+      - ROBOT_TAILNET_IP=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
+      - ROBOT_GATEWAY_PORT=${ROBOT_GATEWAY_PORT:-80}
+    volumes:
+      - ./nginx/nginx-robot.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx:/etc/nginx/sati:ro      # routes.conf and the CORS files are included from here
+      - nginx_logs:/var/log/nginx
+    mem_limit: 64m
+    restart: unless-stopped
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:${ROBOT_GATEWAY_PORT:-80}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      api-delegation-service:
+        condition: service_healthy
+
   # --- not on the robot
   livekit-service:
     profiles: [cloud-only]
@@ -153,3 +179,4 @@ services:
 
 volumes:
   pgdata14: !reset null
+  nginx_logs:
