@@ -64,6 +64,31 @@ Rolling back restores the old images but **not** the database schema (the API ru
 `deploy_robot.sh` records the running and the previous tag (`docker_compose/.robot_current_tag`, `.robot_previous_tag`).
 If a new tag is not healthy within the timeout, it redeploys the previous one.
 
+## Telling the app what this robot has
+
+The API answers `GET /api/v1/server-info` from its own configuration, so the app knows what is on this server and hides
+the rest. On the robot set `SERVER_KIND=robot` in `.env.robot` (see the example); the scene-graph, reconstruction and
+LiveKit entries are read from the settings that already switch those services on. "Reconstruction: available" means the
+URL is set, not that the service is running.
+
+## Gateway (nginx)
+
+The app talks to one address and the gateway forwards by path: `/api/` and `/ws/` to the API (:8000),
+`/api/agent/` and `/ws/agent/` to the agent (:8007), `/api/livekit-selfhost/` to the LiveKit token service (:8008).
+The routing is one file, `docker_compose/nginx/routes.conf`, shared by the cloud gateway
+(`nginx-gateway.yaml`, which also fronts the Expo dev server) and the robot gateway, so the robot has exactly the
+cloud's public paths and no robot-specific code in the client.
+
+```bash
+docker compose --env-file .env.robot -f docker_compose/nginx_gateway_robot.yaml up -d   # on the Pi
+```
+
+It listens on loopback and `ROBOT_TAILNET_IP` only (`ROBOT_GATEWAY_PORT`, default 80), serves no UI (the desktop app
+brings its own), and gives the REST routes the same CORS headers as the cloud. Services that are off on the robot (agent,
+LiveKit tokens) answer 502 on their prefix; `GET /api/v1/server-info` is how the client learns they are absent.
+Not started by `deploy_robot.sh` yet, and not yet run on arm64 hardware (the config was tested on the cloud host:
+routes, CORS, preflight, WebSocket upgrade, binding only loopback + the tailnet IP).
+
 ## Raw reconstruction (optional)
 
 Only the raw backend (sensor depth, no MapAnything/torch) is meant for the Pi. See `reconstruction_service_robot.yaml`

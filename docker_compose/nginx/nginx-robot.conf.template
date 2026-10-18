@@ -1,0 +1,39 @@
+# Robot (Raspberry Pi) gateway: the same public paths as the cloud gateway, in front of the robot's own services.
+# The nginx image renders this with envsubst (/etc/nginx/templates/default.conf.template -> conf.d/default.conf),
+# so only ${ROBOT_TAILNET_IP} and ${ROBOT_GATEWAY_PORT} are substituted; routing lives in routes.conf.
+#
+# Doors: loopback and the robot's tailnet IP only, never every interface (docs/robot_deploy.md).
+# No UI is served from the robot: the desktop app brings its own, so there are no Expo (web_server) blocks.
+
+gzip on;
+gzip_types application/json application/octet-stream;
+gzip_min_length 1024;
+gzip_vary on;
+
+upstream backend_api {
+    server localhost:8000;
+}
+
+# Not part of the robot stack (profile cloud-only): the matching prefixes answer 502 and
+# GET /api/v1/server-info reports agent / livekit as unavailable.
+upstream agent_api {
+    server localhost:8007;
+}
+
+upstream livekit_selfhost_api {
+    server localhost:8008;
+}
+
+server {
+    listen 127.0.0.1:${ROBOT_GATEWAY_PORT};
+    listen ${ROBOT_TAILNET_IP}:${ROBOT_GATEWAY_PORT};
+    server_name _;
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+
+    access_log /var/log/nginx/sati_access.log;
+    error_log /var/log/nginx/sati_error.log;
+
+    include /etc/nginx/sati/routes.conf;
+}

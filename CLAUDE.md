@@ -73,7 +73,7 @@ All services use `network_mode: host` and communicate over localhost. Port assig
 | mission-planner-service | 8005 | Path planning on the topological graph |
 | livekit-service | 8006 | Teleoperation video token service for **LiveKit Cloud** (caller-chosen grants; the pre-existing one) |
 | livekit-sfu-tokens | 8008 | Role-scoped tokens for the **self-hosted** Tailscale-only LiveKit SFU (`livekit-sfu`, below); shares only `packages/utils/livekit_tokens.py` with `livekit-service` |
-| agent-orchestrator-service | 8007 | LLM agent: watches fleet events, produces insights (`/api/agent/*`, `/ws/agent/*` via the client's nginx) |
+| agent-orchestrator-service | 8007 | LLM agent: watches fleet events, produces insights (`/api/agent/*`, `/ws/agent/*` via the gateway nginx, `docker_compose/nginx/`) |
 | mosquitto | 1883/9001 | MQTT broker (TCP/WebSocket) |
 | postgres | 5432 | Mission/robot/map/settings objects (mission-dispatch, mission-planner, api, graph-builder) |
 | arangodb | 8529 | Graph database backend |
