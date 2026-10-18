@@ -45,6 +45,8 @@ SERVICES=(
     # MinIO no longer publishes images: built from source at the pinned release (the robot pulls it from here).
     # The optional 4th field is the build context (default: the repo root).
     "minio|minio|docker/minio/Dockerfile|docker/minio"
+    # The LiveKit SFU, mirrored (FROM the pinned upstream image) so the offline robot pulls it from this registry too.
+    "livekit-sfu|livekit_sfu|docker/livekit/Dockerfile|docker/livekit"
 )
 
 usage() { sed -n '2,/^set -e/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'; }

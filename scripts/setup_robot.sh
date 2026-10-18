@@ -91,6 +91,7 @@ if [ -f "$ENV_FILE" ]; then
 else
     rand() { head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24; }
     PG="$(rand)"; ARANGO="$(rand)"; MINIO_USER="sati$(rand | head -c 8)"; MINIO_PASS="$(rand)"
+    SFU_KEY="API$(rand | head -c 12)"; SFU_SECRET="$(rand)$(rand)"
     sed -e "s/^ROBOT_TAILNET_IP=[^ ]*/ROBOT_TAILNET_IP=$TS_IP/" \
         -e "s#^MINIO_DATA_DIR=[^ ]*#MINIO_DATA_DIR=$MINIO_DIR#" \
         -e "s#^IMAGE_REGISTRY=[^ ]*#IMAGE_REGISTRY=$REGISTRY/sati#" \
@@ -99,6 +100,8 @@ else
         -e "s/^ARANGO_ROOT_PASSWORD=CHANGE_ME/ARANGO_ROOT_PASSWORD=$ARANGO/" \
         -e "s/^MINIO_ROOT_USER=CHANGE_ME/MINIO_ROOT_USER=$MINIO_USER/" \
         -e "s/^MINIO_ROOT_PASSWORD=CHANGE_ME/MINIO_ROOT_PASSWORD=$MINIO_PASS/" \
+        -e "s/^LIVEKIT_SFU_API_KEY=CHANGE_ME/LIVEKIT_SFU_API_KEY=$SFU_KEY/" \
+        -e "s/^LIVEKIT_SFU_API_SECRET=CHANGE_ME/LIVEKIT_SFU_API_SECRET=$SFU_SECRET/" \
         -e "s/[[:space:]]*#.*$//" \
         "$DC_DIR/.env.robot.example" > "$ENV_FILE.tmp"
     [ -z "$TAG" ] || sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$TAG/" "$ENV_FILE.tmp"

@@ -17,14 +17,15 @@ upstream backend_api {
     server localhost:8000;
 }
 
-# Not part of the robot stack (profile cloud-only): the matching prefixes answer 502 and
-# GET /api/v1/server-info reports agent / livekit as unavailable.
+# Not part of the robot stack (profile cloud-only): the prefix answers 502 and
+# GET /api/v1/server-info reports the agent as unavailable.
 upstream agent_api {
     server localhost:8007;
 }
 
+# The robot's own token service listens on the tailnet IP (robots call it there), not on loopback.
 upstream livekit_selfhost_api {
-    server localhost:8008;
+    server ${ROBOT_TAILNET_IP}:8008;
 }
 
 server {

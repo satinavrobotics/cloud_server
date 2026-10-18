@@ -7,9 +7,10 @@
 # (scripts/deploy_robot.sh wraps this.) Needs Docker Compose >= 2.24 (`!override`, `!reset`).
 #
 # What differs from the cloud:
-#   - off (profile cloud-only, never started here): livekit-service (LiveKit Cloud tokens), livekit-sfu and
-#     livekit-sfu-tokens (self-hosted video), agent-orchestrator-service (needs an LLM API).
-#   - kept: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api, nginx-gateway.
+#   - off (profile cloud-only, never started here): livekit-service (LiveKit Cloud tokens: needs the internet),
+#     agent-orchestrator-service (needs an LLM API).
+#   - kept: mosquitto, postgres, arangodb, minio, minio-tailnet, mission-dispatch, graph-builder, mission-planner, api,
+#     nginx-gateway, livekit-sfu + livekit-sfu-tokens (the robot's own video server, small config, no internet needed).
 #     minio-tailnet stays: presigned URLs are signed for MINIO_HOST, which here is the Pi's tailnet IP.
 #   - images come from the registry (IMAGE_REGISTRY/IMAGE_TAG, written by scripts/build_push.sh), never built here.
 #   - Every container has a memory limit (defaults sum to ~3.4 GB: for a 4 GB Pi; see .env.robot.example for 8 GB) and a
@@ -97,6 +98,9 @@ services:
     environment:
       # The default 256 MiB upload buffer would fill most of the container's limit.
       - UPLOAD_BUFFER_MAX_BYTES=${UPLOAD_BUFFER_MAX_BYTES:-100000000}
+      # Scene-graph worker: cap the resident engines and the step pool to fit the container (the cloud defaults assume a big host).
+      - SCENE_GRAPH_MAX_RESIDENT_BYTES=${SCENE_GRAPH_MAX_RESIDENT_BYTES:-120000000}
+      - SCENE_GRAPH_WORKER_THREADS=${SCENE_GRAPH_WORKER_THREADS:-2}
     mem_limit: ${MEM_GRAPH_BUILDER:-384m}
     logging: *logging
 
@@ -111,6 +115,10 @@ services:
       - ${MISSION_PLANNER_PORT:-8005}
       - --host
       - 127.0.0.1
+    environment:
+      # Scene-graph planner: fewer cached graphs, with a byte budget, to fit the container.
+      - SCENE_GRAPH_CACHE_VERSIONS=${SCENE_GRAPH_CACHE_VERSIONS:-2}
+      - SCENE_GRAPH_CACHE_MAX_BYTES=${SCENE_GRAPH_CACHE_MAX_BYTES:-80000000}
     mem_limit: ${MEM_PLANNER:-256m}
     logging: *logging
 
@@ -121,6 +129,9 @@ services:
       # Presigned URLs are signed for the Pi's tailnet address (served by minio-tailnet).
       - MINIO_HOST=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
       - RECONSTRUCTION_MINIO_ENDPOINT=${ROBOT_TAILNET_IP}:${MINIO_PORT:-9000}
+      # Removes a deleted robot's participant from the local SFU (loopback, LIVEKIT_SFU_ADMIN_URL's default).
+      - LIVEKIT_SFU_API_KEY=${LIVEKIT_SFU_API_KEY:?set LIVEKIT_SFU_API_KEY}
+      - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
     mem_limit: ${MEM_API:-384m}
     logging: *logging
     # The entrypoint runs `alembic upgrade head` before serving; mission-dispatch waits for this to be healthy.
@@ -167,12 +178,55 @@ services:
       api-delegation-service:
         condition: service_healthy
 
+  # Self-hosted video, offline: the Jetson robots publish to this SFU and clients subscribe (docs/robot_deploy.md, Video).
+  # Reached on the tailnet IP only (7880 signalling, 7881 TCP, 50000-50100 UDP media). Keys: LIVEKIT_SFU_API_KEY/SECRET.
+  livekit-sfu:
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/livekit_sfu:${IMAGE_TAG:-latest}
+    environment:
+      - LIVEKIT_SFU_API_KEY=${LIVEKIT_SFU_API_KEY:?set LIVEKIT_SFU_API_KEY}
+      - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
+      - ROBOT_TAILNET_IP=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
+    volumes: !override
+      - ./livekit/livekit-robot.yaml:/etc/livekit-robot.yaml:ro
+    entrypoint: !override
+      - sh
+      - -c
+      - |
+        sed "s/__NODE_IP__/$${ROBOT_TAILNET_IP}/g" /etc/livekit-robot.yaml > /tmp/livekit.yaml
+        LIVEKIT_KEYS="$${LIVEKIT_SFU_API_KEY}: $${LIVEKIT_SFU_API_SECRET}" exec /livekit-server --config /tmp/livekit.yaml
+    mem_limit: ${MEM_LIVEKIT:-192m}
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:7880/"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+
+  # Role-scoped tokens for the SFU. Robots call /api/createToken on the tailnet IP; the gateway forwards the operator route.
+  livekit-sfu-tokens:
+    build: !reset null
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/livekit_sfu_tokens:${IMAGE_TAG:-latest}
+    command: !override
+      - python
+      - -m
+      - packages.services.livekit_sfu_tokens.main
+      - --port
+      - ${LIVEKIT_SFU_TOKENS_PORT:-8008}
+      - --host
+      - ${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
+    environment:
+      - LIVEKIT_SFU_API_KEY=${LIVEKIT_SFU_API_KEY:?set LIVEKIT_SFU_API_KEY}
+      - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
+      # What robots and clients are told to connect to: this Pi's SFU.
+      - LIVEKIT_SFU_SERVER_URL=${LIVEKIT_SFU_SERVER_URL:-ws://${ROBOT_TAILNET_IP}:7880}
+    mem_limit: 64m
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://${ROBOT_TAILNET_IP}:${LIVEKIT_SFU_TOKENS_PORT:-8008}/health', timeout=4); sys.exit(0)"]
+
   # --- not on the robot
   livekit-service:
-    profiles: [cloud-only]
-  livekit-sfu:
-    profiles: [cloud-only]
-  livekit-sfu-tokens:
     profiles: [cloud-only]
   agent-orchestrator-service:
     profiles: [cloud-only]
