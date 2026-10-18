@@ -117,6 +117,42 @@ Health check endpoint.
 }
 ```
 
+#### `GET /api/v1/server-info`
+
+What this server is and which optional services it has. The same API runs in the cloud and on a robot's own computer;
+a client (the desktop app) asks this first and hides what the server lacks. Read-only, no authentication, no database
+access. Computed from configuration (`packages/api/server_info.py`, settings in `packages/config.py`).
+
+**Response:**
+```json
+{
+  "schema_version": 1,
+  "name": "Satina cloud",
+  "kind": "cloud",
+  "version": "3f2a9c1",
+  "server_id": null,
+  "capabilities": {
+    "robots": true, "missions": true, "maps": true, "orchestration": true,
+    "scene_graph": true, "reconstruction": true, "semantic": true, "agent": true, "fleet": true
+  },
+  "livekit": {
+    "available": true, "backend": "selfhost",
+    "token_path": "/api/livekit-selfhost/createToken", "room_policy": "client"
+  },
+  "min_client_version": null,
+  "recommended_client_version": null
+}
+```
+
+- `kind` is `"cloud"` or `"robot"` (`SERVER_KIND`; anything but `robot` means cloud). `version` is the build commit.
+- A capability is true when its service is **configured**, not when it is up: `scene_graph` = `SCENE_GRAPH_WORKER_ENABLED`,
+  `reconstruction` = `RECONSTRUCTION_SERVICE_URL`, `semantic` = `SEMANTIC_SERVICE_URL`, `agent` = `SERVER_AGENT_AVAILABLE`
+  (default on for a cloud, off for a robot), `livekit.available` = the SFU key pair is set.
+- `room_policy` says who names the LiveKit room: `"client"` (today) or `"server"` (the token decides): `LIVEKIT_ROOM_POLICY`.
+- `min_client_version` / `recommended_client_version` (`x.y.z`) tell the desktop app to refuse or to suggest an update.
+- Additive contract: keys are only added. A client that gets 404 is talking to a server older than this endpoint and
+  should assume everything is available. Design: `sati-client/docs/ROBOT_SERVER_PROFILE.md`.
+
 #### `GET /stats`
 
 Get service statistics including WebSocket connection counts.

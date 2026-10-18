@@ -536,6 +536,15 @@ services:
       - SEMANTIC_CALLBACK_SECRET=${SEMANTIC_CALLBACK_SECRET:-}
       - SEMANTIC_CALLBACK_BASE_URL=${SEMANTIC_CALLBACK_BASE_URL:-http://localhost:8000}
       - SEMANTIC_MINIO_ENDPOINT=${SEMANTIC_MINIO_ENDPOINT:-localhost:9000}
+      # GET /api/v1/server-info (packages/api/server_info.py): which server this is. SERVER_KIND=robot in .env.robot.
+      - BUILD_SHA=${GIT_SHA:-unknown}
+      - SERVER_KIND=${SERVER_KIND:-cloud}
+      - SERVER_NAME=${SERVER_NAME:-}
+      - SERVER_ID=${SERVER_ID:-}
+      - SERVER_AGENT_AVAILABLE=${SERVER_AGENT_AVAILABLE:-}
+      - MIN_CLIENT_VERSION=${MIN_CLIENT_VERSION:-}
+      - RECOMMENDED_CLIENT_VERSION=${RECOMMENDED_CLIENT_VERSION:-}
+      - LIVEKIT_ROOM_POLICY=${LIVEKIT_ROOM_POLICY:-client}
     # Optional: the SFU key pair lets DELETE /api/v1/robots/{name} remove the robot's LiveKit participant.
     env_file:
       - path: livekit_sfu.env

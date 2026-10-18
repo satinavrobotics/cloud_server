@@ -403,6 +403,10 @@ app.add_middleware(IdempotencyMiddleware, store=_idempotency_store,
 from packages.api.orchestrator_proxy import router as orchestrator_proxy_router
 app.include_router(orchestrator_proxy_router)
 
+# GET /api/v1/server-info: what this server is and which optional services it has (packages/api/server_info.py).
+from packages.api.server_info import router as server_info_router
+app.include_router(server_info_router)
+
 
 # ==================== Health & Stats ====================
 

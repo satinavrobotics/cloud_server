@@ -768,6 +768,24 @@ SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD = min(TURN_LAMBDA_FALLBACK_MAX_M_PER_RAD if _t
 SCENE_GRAPH_WAYPOINT_BUDGET_M = _opt_float("SCENE_GRAPH_WAYPOINT_BUDGET_M")
 # The commit the running image was built from (compose BUILD_SHA <- scripts/deploy.sh GIT_SHA); "unknown" otherwise.
 BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
+
+# ==================== Server identity (GET /api/v1/server-info, packages/api/server_info.py) ====================
+# The same API runs in the cloud and on a robot's own computer; these say which one this is. Only SERVER_KIND is
+# normally set (".env.robot": SERVER_KIND=robot): the capabilities the endpoint reports come from the settings
+# above (scene graph, reconstruction, semantic, LiveKit keys). Anything but "robot" means "cloud".
+SERVER_KIND = os.getenv("SERVER_KIND", "cloud").strip().lower()
+# Display name; empty = "Satina cloud" for a cloud server, the host name for a robot.
+SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
+# A stable identity of this server, for provenance when data is copied between servers (unset = not reported).
+SERVER_ID = _env_or_none("SERVER_ID")
+# The agent service (:8007) is a cloud singleton: on by default for a cloud server, off for a robot.
+_agent_env = _env_or_none("SERVER_AGENT_AVAILABLE")   # compose passes "" when unset: that means "the default"
+SERVER_AGENT_AVAILABLE = (SERVER_KIND != "robot") if _agent_env is None else _agent_env.lower() in ("true", "1", "yes")
+# Oldest / newest desktop-app version this server wants (x.y.z); unset = no requirement.
+MIN_CLIENT_VERSION = _env_or_none("MIN_CLIENT_VERSION")
+RECOMMENDED_CLIENT_VERSION = _env_or_none("RECOMMENDED_CLIENT_VERSION")
+# Who names the LiveKit room: "client" (today: the token request carries the room) or "server" (the token decides).
+LIVEKIT_ROOM_POLICY = os.getenv("LIVEKIT_ROOM_POLICY", "client").strip().lower()
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
 # that has a stored scene graph. CONCURRENCY loads at a time.
