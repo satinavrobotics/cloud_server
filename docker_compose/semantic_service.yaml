@@ -1,6 +1,6 @@
 # Semantic layer service (docs/semantic/design.md, contract cloud_semantic/CONTRACT.md).
 # Its own compose project; the code lives in web_stack/cloud_semantic (image built there:
-# docker build -t sem-service:1.0.0 cloud_semantic). Same host as the API: host networking, bound to
+# docker build -t sem-service:1.0.1 cloud_semantic). Same host as the API: host networking, bound to
 # 127.0.0.1:8010. The API's SEMANTIC_SERVICE_URL points here and it reads the same SEMANTIC_SERVICE_KEY from .env.
 #
 #   docker compose -p sem -f semantic_service.yaml up -d
@@ -10,7 +10,7 @@
 # a job runs, guarded by free VRAM (SEM_GPU_MIN_FREE_MIB), so it can share the card with the reconstruction service.
 services:
   semantic-service:
-    image: ${SEM_IMAGE:-sem-service:1.0.0}
+    image: ${SEM_IMAGE:-sem-service:1.0.1}
     network_mode: host
     restart: unless-stopped
     gpus: all
