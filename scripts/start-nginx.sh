@@ -13,13 +13,8 @@ if [ ! -f "$CLOUD_SERVER_DIR/$COMPOSE_FILE" ]; then
     exit 1
 fi
 
-# Check if Nginx is already running
-if docker ps | grep -q "sati_nginx_gateway"; then
-    echo "✅ Nginx gateway is already running"
-    echo "   (after editing docker_compose/nginx/: docker exec sati_nginx_gateway nginx -s reload;"
-    echo "    after changing the compose file or the mounted paths: docker compose -f $COMPOSE_FILE up -d)"
-    exit 0
-fi
+# `up -d` is idempotent: it leaves a running gateway alone and recreates it when its definition (mounts, image) changed.
+# After editing only the files under docker_compose/nginx/, a reload is enough:  docker exec sati_nginx_gateway nginx -s reload
 
 cd "$CLOUD_SERVER_DIR"
 docker compose -f "$COMPOSE_FILE" up -d

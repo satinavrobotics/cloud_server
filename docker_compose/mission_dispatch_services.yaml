@@ -545,6 +545,7 @@ services:
       - MIN_CLIENT_VERSION=${MIN_CLIENT_VERSION:-}
       - RECOMMENDED_CLIENT_VERSION=${RECOMMENDED_CLIENT_VERSION:-}
       - LIVEKIT_ROOM_POLICY=${LIVEKIT_ROOM_POLICY:-client}
+      - SERVER_LIVEKIT_AVAILABLE=${SERVER_LIVEKIT_AVAILABLE:-}
     # Optional: the SFU key pair lets DELETE /api/v1/robots/{name} remove the robot's LiveKit participant.
     env_file:
       - path: livekit_sfu.env

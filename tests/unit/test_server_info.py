@@ -1,6 +1,9 @@
 """GET /api/v1/server-info (packages/api/server_info.py): what a server reports about itself, from configuration."""
-import importlib
+import json
 import os
+import pathlib
+import subprocess
+import sys
 from types import SimpleNamespace
 
 for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_PASSWORD"):
@@ -21,7 +24,7 @@ def cfg(**over):
         SERVER_KIND="cloud", SERVER_NAME="", SERVER_ID=None, BUILD_SHA="3f2a9c1", SERVER_AGENT_AVAILABLE=True,
         SCENE_GRAPH_WORKER_ENABLED=True, RECONSTRUCTION_SERVICE_URL="http://127.0.0.1:8009",
         SEMANTIC_SERVICE_URL="http://127.0.0.1:8010", LIVEKIT_SFU_API_KEY="k", LIVEKIT_SFU_API_SECRET="s",
-        LIVEKIT_ROOM_POLICY="client", MIN_CLIENT_VERSION=None, RECOMMENDED_CLIENT_VERSION=None,
+        LIVEKIT_ROOM_POLICY="client", SERVER_LIVEKIT_AVAILABLE=None, MIN_CLIENT_VERSION=None, RECOMMENDED_CLIENT_VERSION=None,
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -58,15 +61,20 @@ class TestBuild:
         assert si.build_server_info(cfg(LIVEKIT_SFU_API_SECRET=None)).livekit.available is False
         assert si.build_server_info(cfg(LIVEKIT_SFU_API_KEY="")).livekit.available is False
 
-    def test_the_room_policy_is_client_unless_a_known_value_is_set(self):
-        assert si.build_server_info(cfg(LIVEKIT_ROOM_POLICY="server")).livekit.room_policy == "server"
-        assert si.build_server_info(cfg(LIVEKIT_ROOM_POLICY="bogus")).livekit.room_policy == "client"
+    def test_an_explicit_video_setting_beats_the_key_pair(self):
+        # the API holds the SFU keys on a robot too (to remove participants), where the token service is not deployed
+        assert si.build_server_info(cfg(SERVER_LIVEKIT_AVAILABLE=False)).livekit.available is False
+        assert si.build_server_info(cfg(SERVER_LIVEKIT_AVAILABLE=True, LIVEKIT_SFU_API_KEY=None)).livekit.available is True
 
-    def test_an_unknown_kind_is_a_cloud_server_and_a_robot_name_defaults_to_the_host(self):
-        assert si.build_server_info(cfg(SERVER_KIND="robo")).kind == "cloud"
-        assert si.build_server_info(cfg(SERVER_KIND=" ROBOT ")).kind == "robot"
-        robot = si.build_server_info(cfg(SERVER_KIND="robot"))
-        assert robot.name and robot.name != "Satina cloud"
+    def test_the_room_policy_and_kind_are_passed_through_as_configured(self):
+        assert si.build_server_info(cfg(LIVEKIT_ROOM_POLICY="server")).livekit.room_policy == "server"
+        assert si.build_server_info(cfg(SERVER_KIND="robot")).kind == "robot"
+
+    def test_names_default_by_kind(self):
+        assert si.build_server_info(cfg(SERVER_NAME="")).name == "Satina cloud"
+        robot = si.build_server_info(cfg(SERVER_KIND="robot", SERVER_NAME=""))
+        assert robot.name and robot.name != "Satina cloud"                # this host's name
+        assert si.build_server_info(cfg(SERVER_KIND="robot", SERVER_NAME="peacock")).name == "peacock"
 
     def test_server_id_is_passed_through_and_optional(self):
         assert si.build_server_info(cfg(SERVER_ID="srv-1")).server_id == "srv-1"
@@ -87,39 +95,59 @@ class TestBuild:
                                              "reconstruction", "semantic", "agent", "fleet"}
 
 
-class TestConfigDefaults:
-    """packages/config.py: the settings the endpoint reads, with what compose passes when they are unset."""
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+SETTINGS = ("SERVER_KIND", "SERVER_NAME", "SERVER_ID", "SERVER_AGENT_AVAILABLE", "SERVER_LIVEKIT_AVAILABLE",
+            "MIN_CLIENT_VERSION", "RECOMMENDED_CLIENT_VERSION", "LIVEKIT_ROOM_POLICY")
 
-    @pytest.fixture(autouse=True)
-    def _restore_config(self, monkeypatch):
-        """Reloading packages.config with test env must not leak into the tests that run after this class."""
-        yield
-        monkeypatch.undo()
-        import packages.config as config
-        importlib.reload(config)
 
-    @staticmethod
-    def load(monkeypatch, **env):
-        for key in ("SERVER_KIND", "SERVER_NAME", "SERVER_ID", "SERVER_AGENT_AVAILABLE", "MIN_CLIENT_VERSION",
-                    "RECOMMENDED_CLIENT_VERSION", "LIVEKIT_ROOM_POLICY"):
-            monkeypatch.delenv(key, raising=False)
-        for key, value in env.items():
-            monkeypatch.setenv(key, value)
-        import packages.config as config
-        return importlib.reload(config)
+def read_settings(**env):
+    """packages/config.py's server-identity settings for a given environment, read in a fresh interpreter (the config
+    module is read at import time, and reloading it in-process would leak into other tests)."""
+    base = {k: v for k, v in os.environ.items() if k not in SETTINGS}
+    base.update({"ARANGO_PASSWORD": "t", "MINIO_ACCESS_KEY": "t", "MINIO_SECRET_KEY": "t", "POSTGRES_PASSWORD": "t",
+                 "PYTHONPATH": str(ROOT)})
+    base.update(env)
+    code = ("import json, packages.config as c; print(json.dumps({k: getattr(c, k) for k in %r}))" % (SETTINGS,))
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=base, capture_output=True, text=True, check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
 
-    def test_defaults_describe_a_cloud_server_with_an_agent(self, monkeypatch):
-        c = self.load(monkeypatch)
-        assert (c.SERVER_KIND, c.SERVER_AGENT_AVAILABLE, c.SERVER_ID, c.LIVEKIT_ROOM_POLICY) == ("cloud", True, None, "client")
 
-    def test_empty_values_from_compose_mean_the_default(self, monkeypatch):
-        c = self.load(monkeypatch, SERVER_AGENT_AVAILABLE="", SERVER_ID="", SERVER_NAME="", MIN_CLIENT_VERSION="")
-        assert (c.SERVER_AGENT_AVAILABLE, c.SERVER_ID, c.SERVER_NAME, c.MIN_CLIENT_VERSION) == (True, None, "", None)
+class TestConfig:
+    """The settings the endpoint reads, with what compose passes when they are unset (an empty string)."""
 
-    def test_a_robot_has_no_agent_unless_asked(self, monkeypatch):
-        assert self.load(monkeypatch, SERVER_KIND="robot").SERVER_AGENT_AVAILABLE is False
-        assert self.load(monkeypatch, SERVER_KIND="robot", SERVER_AGENT_AVAILABLE="true").SERVER_AGENT_AVAILABLE is True
-        assert self.load(monkeypatch, SERVER_KIND="cloud", SERVER_AGENT_AVAILABLE="false").SERVER_AGENT_AVAILABLE is False
+    def test_defaults_describe_a_cloud_server_with_an_agent(self):
+        c = read_settings()
+        assert (c["SERVER_KIND"], c["SERVER_AGENT_AVAILABLE"], c["SERVER_ID"], c["LIVEKIT_ROOM_POLICY"]) == ("cloud", True, None, "client")
+        assert c["SERVER_LIVEKIT_AVAILABLE"] is None and c["SERVER_NAME"] == ""
+
+    def test_empty_and_blank_values_mean_the_default(self):
+        blanks = {k: "" for k in SETTINGS}
+        assert read_settings(**blanks) == read_settings()
+        spaces = {k: "   " for k in SETTINGS}                          # a stray space in a .env file
+        c = read_settings(**spaces)
+        assert c == read_settings()
+        assert c["SERVER_AGENT_AVAILABLE"] is True and c["SERVER_ID"] is None
+
+    @pytest.mark.parametrize("raw,kind", [("robot", "robot"), (" ROBOT ", "robot"), ("cloud", "cloud"), ("robo", "cloud"), ("", "cloud")])
+    def test_the_kind_is_robot_or_cloud(self, raw, kind):
+        assert read_settings(SERVER_KIND=raw)["SERVER_KIND"] == kind
+
+    def test_a_robot_has_no_agent_unless_asked(self):
+        assert read_settings(SERVER_KIND="robot")["SERVER_AGENT_AVAILABLE"] is False
+        assert read_settings(SERVER_KIND="robot", SERVER_AGENT_AVAILABLE="true")["SERVER_AGENT_AVAILABLE"] is True
+        assert read_settings(SERVER_KIND="cloud", SERVER_AGENT_AVAILABLE="false")["SERVER_AGENT_AVAILABLE"] is False
+
+    def test_the_room_policy_is_validated_once_here(self):
+        assert read_settings(LIVEKIT_ROOM_POLICY="Server")["LIVEKIT_ROOM_POLICY"] == "server"
+        assert read_settings(LIVEKIT_ROOM_POLICY="bogus")["LIVEKIT_ROOM_POLICY"] == "client"
+
+    @pytest.mark.parametrize("raw,expected", [("", None), ("true", True), ("1", True), ("yes", True), ("false", False), ("no", False)])
+    def test_the_video_switch_is_unset_true_or_false(self, raw, expected):
+        assert read_settings(SERVER_LIVEKIT_AVAILABLE=raw)["SERVER_LIVEKIT_AVAILABLE"] is expected
+
+    def test_strings_are_stripped(self):
+        c = read_settings(SERVER_ID=" srv-1 ", SERVER_NAME=" peacock ", MIN_CLIENT_VERSION=" 1.2.3 ")
+        assert (c["SERVER_ID"], c["SERVER_NAME"], c["MIN_CLIENT_VERSION"]) == ("srv-1", "peacock", "1.2.3")
 
 
 class TestHttp:

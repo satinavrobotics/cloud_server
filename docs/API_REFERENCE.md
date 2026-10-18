@@ -147,7 +147,8 @@ access. Computed from configuration (`packages/api/server_info.py`, settings in 
 - `kind` is `"cloud"` or `"robot"` (`SERVER_KIND`; anything but `robot` means cloud). `version` is the build commit.
 - A capability is true when its service is **configured**, not when it is up: `scene_graph` = `SCENE_GRAPH_WORKER_ENABLED`,
   `reconstruction` = `RECONSTRUCTION_SERVICE_URL`, `semantic` = `SEMANTIC_SERVICE_URL`, `agent` = `SERVER_AGENT_AVAILABLE`
-  (default on for a cloud, off for a robot), `livekit.available` = the SFU key pair is set.
+  (default on for a cloud, off for a robot), `livekit.available` = `SERVER_LIVEKIT_AVAILABLE` when set, else whether the SFU key
+  pair is set (the key pair alone does not prove a token service is deployed: set the variable to `false` on such a server).
 - `room_policy` says who names the LiveKit room: `"client"` (today) or `"server"` (the token decides): `LIVEKIT_ROOM_POLICY`.
 - `min_client_version` / `recommended_client_version` (`x.y.z`) tell the desktop app to refuse or to suggest an update.
 - Additive contract: keys are only added. A client that gets 404 is talking to a server older than this endpoint and

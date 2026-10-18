@@ -4,6 +4,7 @@ The same API runs in the cloud and on a robot's own computer, with different ser
 no agent, may have no video, ...). A client asks this first and hides what the server lacks. Read-only, no
 database access, no secrets, cheap enough to poll. Everything is computed from configuration the API already reads
 (packages/config.py), so a capability is true only when its service is configured and cannot drift from reality.
+A robot without the video token service sets SERVER_LIVEKIT_AVAILABLE=false (the SFU key pair alone proves nothing there).
 
     {"schema_version": 1, "name": "...", "kind": "cloud" | "robot", "version": "<build sha>", "server_id": null | "...",
      "capabilities": {"robots", "missions", "maps", "orchestration", "scene_graph", "reconstruction", "semantic",
@@ -30,7 +31,6 @@ SCHEMA_VERSION = 1
 # The token route the client uses for the self-hosted SFU (nginx maps it onto the token service, :8008).
 LIVEKIT_TOKEN_PATH = "/api/livekit-selfhost/createToken"
 CLOUD_DEFAULT_NAME = "Satina cloud"
-ROOM_POLICIES = ("client", "server")
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
 
 
@@ -78,9 +78,12 @@ def _semver_or_none(name: str, value: Optional[str]) -> Optional[str]:
 
 def build_server_info(cfg=config) -> ServerInfo:
     """The server's self-description from `cfg` (the config module; a stand-in object in tests)."""
-    kind = "robot" if str(cfg.SERVER_KIND).strip().lower() == "robot" else "cloud"
-    name = (cfg.SERVER_NAME or "").strip() or (CLOUD_DEFAULT_NAME if kind == "cloud" else socket.gethostname())
-    room_policy = cfg.LIVEKIT_ROOM_POLICY if cfg.LIVEKIT_ROOM_POLICY in ROOM_POLICIES else "client"
+    kind = cfg.SERVER_KIND                      # normalized once, in packages/config.py
+    name = cfg.SERVER_NAME or (CLOUD_DEFAULT_NAME if kind == "cloud" else socket.gethostname())
+    room_policy = cfg.LIVEKIT_ROOM_POLICY       # validated in packages/config.py
+    # An explicit setting wins; otherwise the SFU key pair stands in (see SERVER_LIVEKIT_AVAILABLE in config.py).
+    video = (bool(cfg.LIVEKIT_SFU_API_KEY and cfg.LIVEKIT_SFU_API_SECRET)
+             if cfg.SERVER_LIVEKIT_AVAILABLE is None else bool(cfg.SERVER_LIVEKIT_AVAILABLE))
     return ServerInfo(
         schema_version=SCHEMA_VERSION,
         name=name,
@@ -97,7 +100,7 @@ def build_server_info(cfg=config) -> ServerInfo:
             fleet=True,                         # a robot server may host several robots (decision D2)
         ),
         livekit=LiveKitInfo(
-            available=bool(cfg.LIVEKIT_SFU_API_KEY and cfg.LIVEKIT_SFU_API_SECRET),
+            available=video,
             backend="selfhost",
             token_path=LIVEKIT_TOKEN_PATH,
             room_policy=room_policy,

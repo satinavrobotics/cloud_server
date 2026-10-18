@@ -67,9 +67,13 @@ If a new tag is not healthy within the timeout, it redeploys the previous one.
 ## Telling the app what this robot has
 
 The API answers `GET /api/v1/server-info` from its own configuration, so the app knows what is on this server and hides
-the rest. On the robot set `SERVER_KIND=robot` in `.env.robot` (see the example); the scene-graph, reconstruction and
-LiveKit entries are read from the settings that already switch those services on. "Reconstruction: available" means the
-URL is set, not that the service is running.
+the rest. On the robot set `SERVER_KIND=robot` in `.env.robot` (see the example). The scene-graph, reconstruction and
+semantic entries come from the settings that already switch those services on; "available" means **configured**, not
+running (the URL is set, the service may still be down).
+
+Video is the exception: the API holds the SFU key pair on a robot too (it uses it to remove participants), so the keys alone
+do not prove the video server and its token service are deployed. `.env.robot.example` therefore sets
+`SERVER_LIVEKIT_AVAILABLE=false`; set it to `true` once the robot runs its own SFU and token service.
 
 ## Gateway (nginx)
 
@@ -83,8 +87,12 @@ cloud's public paths and no robot-specific code in the client.
 docker compose --env-file .env.robot -f docker_compose/nginx_gateway_robot.yaml up -d   # on the Pi
 ```
 
-It listens on loopback and `ROBOT_TAILNET_IP` only (`ROBOT_GATEWAY_PORT`, default 80), serves no UI (the desktop app
-brings its own), and gives the REST routes the same CORS headers as the cloud. Services that are off on the robot (agent,
+It listens on loopback and `ROBOT_TAILNET_IP` only (`ROBOT_GATEWAY_PORT`, default 80) and serves no UI (the desktop app
+brings its own). It sends **no CORS headers** (`nginx/cors-robot.conf`): the desktop app reaches the robot through its own
+same-origin relay, and a web page in an operator's browser must not be able to call the robot cross-origin (the cloud gateway's
+permissive CORS, `nginx/cors-cloud.conf`, would let any page the operator opens start and stop robot processes). It runs in its
+own compose project (`sati-robot-gateway`): `deploy_robot.sh` uses `--remove-orphans` for the robot stack and would otherwise
+delete it. Services that are off on the robot (agent,
 LiveKit tokens) answer 502 on their prefix; `GET /api/v1/server-info` is how the client learns they are absent.
 Not started by `deploy_robot.sh` yet, and not yet run on arm64 hardware (the config was tested on the cloud host:
 routes, CORS, preflight, WebSocket upgrade, binding only loopback + the tailnet IP).

@@ -5,6 +5,9 @@
 # Doors: loopback and the robot's tailnet IP only, never every interface (docs/robot_deploy.md).
 # No UI is served from the robot: the desktop app brings its own, so there are no Expo (web_server) blocks.
 
+# No CORS on a robot (cors-robot.conf): see the comment there.
+include /etc/nginx/sati/cors-robot.conf;
+
 gzip on;
 gzip_types application/json application/octet-stream;
 gzip_min_length 1024;

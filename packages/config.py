@@ -773,19 +773,31 @@ BUILD_SHA = os.getenv("BUILD_SHA", "unknown").strip() or "unknown"
 # The same API runs in the cloud and on a robot's own computer; these say which one this is. Only SERVER_KIND is
 # normally set (".env.robot": SERVER_KIND=robot): the capabilities the endpoint reports come from the settings
 # above (scene graph, reconstruction, semantic, LiveKit keys). Anything but "robot" means "cloud".
-SERVER_KIND = os.getenv("SERVER_KIND", "cloud").strip().lower()
+def _server_env(name: str):
+    """A setting of this block: stripped, and None when unset or blank (compose passes "" for an unset variable)."""
+    return (os.getenv(name) or "").strip() or None
+
+
+SERVER_KIND = "robot" if (_server_env("SERVER_KIND") or "").lower() == "robot" else "cloud"
 # Display name; empty = "Satina cloud" for a cloud server, the host name for a robot.
-SERVER_NAME = os.getenv("SERVER_NAME", "").strip()
+SERVER_NAME = _server_env("SERVER_NAME") or ""
 # A stable identity of this server, for provenance when data is copied between servers (unset = not reported).
-SERVER_ID = _env_or_none("SERVER_ID")
+SERVER_ID = _server_env("SERVER_ID")
 # The agent service (:8007) is a cloud singleton: on by default for a cloud server, off for a robot.
-_agent_env = _env_or_none("SERVER_AGENT_AVAILABLE")   # compose passes "" when unset: that means "the default"
+_agent_env = _server_env("SERVER_AGENT_AVAILABLE")
 SERVER_AGENT_AVAILABLE = (SERVER_KIND != "robot") if _agent_env is None else _agent_env.lower() in ("true", "1", "yes")
 # Oldest / newest desktop-app version this server wants (x.y.z); unset = no requirement.
-MIN_CLIENT_VERSION = _env_or_none("MIN_CLIENT_VERSION")
-RECOMMENDED_CLIENT_VERSION = _env_or_none("RECOMMENDED_CLIENT_VERSION")
+MIN_CLIENT_VERSION = _server_env("MIN_CLIENT_VERSION")
+RECOMMENDED_CLIENT_VERSION = _server_env("RECOMMENDED_CLIENT_VERSION")
 # Who names the LiveKit room: "client" (today: the token request carries the room) or "server" (the token decides).
-LIVEKIT_ROOM_POLICY = os.getenv("LIVEKIT_ROOM_POLICY", "client").strip().lower()
+LIVEKIT_ROOM_POLICY = (_server_env("LIVEKIT_ROOM_POLICY") or "client").lower()
+if LIVEKIT_ROOM_POLICY not in ("client", "server"):
+    LIVEKIT_ROOM_POLICY = "client"
+# Does this server have a LiveKit server and token service the app can use? Unset = derived from the SFU key pair; the
+# key pair alone is not proof (the API holds it to remove participants even where the token service is not deployed, as
+# on a robot), so a server without the token service sets this to false.
+_livekit_env = _server_env("SERVER_LIVEKIT_AVAILABLE")
+SERVER_LIVEKIT_AVAILABLE = None if _livekit_env is None else _livekit_env.lower() in ("true", "1", "yes")
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
 # that has a stored scene graph. CONCURRENCY loads at a time.
