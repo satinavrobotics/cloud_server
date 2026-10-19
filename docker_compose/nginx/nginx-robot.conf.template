@@ -14,13 +14,13 @@ gzip_min_length 1024;
 gzip_vary on;
 
 upstream backend_api {
-    server localhost:8000;
+    server 127.0.0.1:8000;
 }
 
 # Not part of the robot stack (profile cloud-only): the prefix answers 502 and
 # GET /api/v1/server-info reports the agent as unavailable.
 upstream agent_api {
-    server localhost:8007;
+    server 127.0.0.1:8007;
 }
 
 # The robot's own token service listens on the tailnet IP (robots call it there), not on loopback.
