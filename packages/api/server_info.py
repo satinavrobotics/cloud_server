@@ -95,8 +95,10 @@ def build_server_info(cfg=config) -> ServerInfo:
             robots=True, missions=True, maps=True,
             orchestration=True,                 # the API's /api/v1/orchestration proxy is always part of it
             scene_graph=bool(cfg.SCENE_GRAPH_WORKER_ENABLED),
-            reconstruction=bool(cfg.RECONSTRUCTION_SERVICE_URL),
-            semantic=bool(cfg.SEMANTIC_SERVICE_URL),
+            # the API refuses jobs (503 not_configured) unless URL, key AND callback secret are all set: advertising on the URL
+            # alone made the app offer a layer that could only fail
+            reconstruction=bool(cfg.RECONSTRUCTION_SERVICE_URL and cfg.RECONSTRUCTION_SERVICE_KEY and cfg.RECONSTRUCTION_CALLBACK_SECRET),
+            semantic=bool(cfg.SEMANTIC_SERVICE_URL and cfg.SEMANTIC_SERVICE_KEY and cfg.SEMANTIC_CALLBACK_SECRET),
             agent=bool(cfg.SERVER_AGENT_AVAILABLE),
             fleet=True,                         # a robot server may host several robots (decision D2)
             diagnostics=bool(cfg.SERVER_DIAGNOSTICS_AVAILABLE),
