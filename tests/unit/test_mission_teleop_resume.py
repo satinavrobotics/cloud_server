@@ -143,3 +143,82 @@ async def test_a_rejection_from_a_robot_that_runs_someone_elses_order_still_fail
 
     assert mission.status.state == mission_object.MissionStateV1.FAILED
     r._cancel_order.assert_not_awaited()
+
+
+# ---- adopting the order the robot is already running (instead of cancelling it and sending the same route again)
+from packages.controllers.mission.server import _route_digest  # noqa: E402
+import cloud_common.objects.mission as _mission_objects  # noqa: E402
+
+
+def _revisions_setup(r, route_changed=False, known=True):
+    """A run on revision 1 (the dispatcher has sent v1, which the robot refused) while the robot executes revision 0."""
+    mission = _armed(r)
+    mission.status.run_id = "abcd1234"
+    mission.status.order_rev = 1
+    old = f"{server_module.order_ids.run_prefix('m1', 'abcd1234', 0)}-n0"
+    new = f"{server_module.order_ids.run_prefix('m1', 'abcd1234', 1)}-n0"
+    node = mission.mission_tree[0]
+    r._current_order_id = MagicMock(side_effect=lambda: f"{r._order_prefix()}-n0")
+    r._current_leaf_node = MagicMock(return_value=node)
+    r._cancel_order = AsyncMock(return_value=True)
+    r._persist_current_mission_status = AsyncMock()
+    digest = _route_digest(node.route)
+    if known:
+        r._order_records[old] = _mission_objects.MissionSentOrderV1(
+            order_id=old, route_digest=("0" * len(digest)) if route_changed else digest, waypoint_offset=0)
+    state = _executing(_build_state(order_id=old))
+    state.errors = [_error(types.VDA5050ErrorLevel.WARNING, "An order is running", [("orderId", new)], etype="orderUpdateError")]
+    return mission, old, new, state
+
+
+async def test_the_robots_running_earlier_revision_is_adopted_when_its_route_is_still_the_wanted_one():
+    r, _ = _make_robot()
+    mission, old, new, state = _revisions_setup(r)
+
+    await r._on_client_message(state)
+
+    assert mission.status.state == mission_object.MissionStateV1.RUNNING
+    r._cancel_order.assert_not_awaited()                       # the robot is not stopped
+    r._send_order.assert_not_awaited()                         # and nothing is sent
+    assert r._current_order_id() == old                        # the dispatcher now follows the robot's order
+    assert mission.status.sent_order.order_id == old
+    assert r._pending_send is None and r._order_mismatch_count == 0
+    # the refused revision's leftover error is not a rejection of the order we now follow, so it cannot fail the mission later
+    assert r._order_rejection(state) == []
+
+
+async def test_a_reroute_since_means_no_adoption_the_old_route_is_cancelled_and_the_new_one_sent():
+    r, _ = _make_robot()
+    mission, old, new, state = _revisions_setup(r, route_changed=True)
+    await r._on_client_message(state)
+    assert mission.status.state == mission_object.MissionStateV1.RUNNING
+    r._cancel_order.assert_awaited_once()
+    assert r._current_order_id() == new
+
+
+async def test_an_order_whose_content_is_not_known_is_not_adopted_either():
+    r, _ = _make_robot()
+    mission, old, new, state = _revisions_setup(r, known=False)
+    await r._on_client_message(state)
+    r._cancel_order.assert_awaited_once()
+    assert r._current_order_id() == new
+
+
+async def test_a_new_revision_after_an_adoption_never_reuses_the_refused_revisions_id():
+    r, _ = _make_robot()
+    mission, old, new, state = _revisions_setup(r)
+    await r._on_client_message(state)
+    assert r._current_order_id() == old
+    assert await r._bump_order_rev() is True
+    assert mission.status.order_rev == 2                       # v1 was used (and refused): the next is v2, not v1 again
+    assert r._current_order_id().startswith(server_module.order_ids.run_prefix("m1", "abcd1234", 2))
+
+
+async def test_a_robot_executing_an_order_of_another_run_is_never_adopted():
+    r, _ = _make_robot()
+    mission, old, new, state = _revisions_setup(r)
+    state.orderId = "m1-rffffffff-n0"
+    await r._on_client_message(state)
+    assert mission.status.state == mission_object.MissionStateV1.FAILED       # as before: a rejection by a robot on a foreign order
+    r._cancel_order.assert_not_awaited()
+    assert r._adopted_prefix is None

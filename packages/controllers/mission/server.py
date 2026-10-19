@@ -688,6 +688,10 @@ class Robot:
         self._resume_pending = False
         # When stopTeleop was last acknowledged (monotonic): see _teleop_hold.
         self._teleop_ended_at: Optional[float] = None
+        # What every order sent in the current run was built from (status.sent_order keeps only the last), so that an earlier
+        # revision the robot is still executing can be adopted (see _try_adopt_running_order); and the prefix adopted, if any.
+        self._order_records: Dict[str, mission_object.MissionSentOrderV1] = {}
+        self._adopted_prefix: Optional[str] = None
         # The send the current node is owed, made once no cancelOrder of ours is in
         # flight (see _flush_pending_send): SEND_NODE, or NEW_REVISION after the robot
         # dropped the node's order to make way for new content.
@@ -844,6 +848,8 @@ class Robot:
             # made a held mission look dispatched (its state handling then sent orders).
             self._current_behavior_tree = None
             self._sent_order = None
+            self._order_records.clear()
+            self._adopted_prefix = None
             self._unknown_content_order_id = None
             self._order_revisions.clear()
             self._resume_pending = False
@@ -1372,6 +1378,8 @@ class Robot:
     def _order_prefix(self) -> str:
         """Prefix of every order/node id generated for the current mission's run and
         revision (see order_ids)."""
+        if self._adopted_prefix is not None:
+            return self._adopted_prefix
         status = self._current_mission.status
         return order_ids.run_prefix(str(self._current_mission.name),
                                     status.run_id, status.order_rev)
@@ -1566,6 +1574,7 @@ class Robot:
             await self._stop_our_order("churn")  # nothing to do unless it still runs one
             return False
         replaced = self._current_order_id()
+        self._adopted_prefix = None       # the revision counter only ever moves forward: an id used (and refused) is never reused
         legacy = status.run_id is None
         if legacy:
             status.run_id = uuid.uuid4().hex[:8]
@@ -1830,6 +1839,7 @@ class Robot:
             self.warning(f"[{self._current_mission.name}] Could not persist the order "
                          f"about to be sent ({err}); not sending it yet")
             return False
+        self._order_records[record.order_id] = record
         return True
 
     def _sent_order_record(self, order_id: Optional[str]) \
@@ -3110,6 +3120,8 @@ class Robot:
                 # rejects it while it still runs one, or the cancel takes it). The
                 # cancel's completion decides what comes next.
                 return
+            if await self._try_adopt_running_order(message):
+                return
             rejection = self._order_rejection(message)
             if rejection and (message.nodeStates or message.edgeStates) and \
                     self._is_order_of_run(message.orderId) and not self._current_mission.needs_canceled:
@@ -3261,6 +3273,43 @@ class Robot:
         self._resume_pending = False
         self._end_current_mission(mission_object.MissionStateV1.CANCELED)
         await self.post_mission_completion()
+        return True
+
+    async def _try_adopt_running_order(self, message: types.VDA5050State) -> bool:
+        """The robot executes an EARLIER revision of this very run (it resumed it after teleop, or never let go of it) while the
+        dispatcher moved on to a newer one the robot refuses. If that earlier order was built from the route the node still has,
+        it is the order we want: follow it (nothing is cancelled or resent, the robot keeps driving). A reroute since, an order
+        whose content is not known (a dispatcher restarted meanwhile), or anything else is not adopted: the caller cancels and
+        resends as before. The revision counter is not moved back: the next revision is numbered after the refused one."""
+        mission = self._current_mission
+        order_id = message.orderId
+        if mission.needs_canceled or self._has_outstanding_cancel() or not (message.nodeStates or message.edgeStates):
+            return False
+        current = self._current_order_id()
+        if current is None or order_id == current or order_id in self._dead_order_ids \
+                or not self._is_order_of_run(order_id):
+            return False
+        if order_ids.order_node_index(order_id) != order_ids.order_node_index(current):
+            return False
+        node = self._current_leaf_node()
+        record = self._order_records.get(order_id)
+        if node is None or node.route is None or record is None or record.route_digest is None \
+                or record.route_digest != _route_digest(node.route):
+            return False
+        self._adopted_prefix = order_ids.order_prefix(order_id)
+        mission.status.sent_order = record
+        self._pending_send = None
+        self._sent_order = None
+        self._order_mismatch_count = 0
+        self._order_resends = 0
+        self._dead_order_ids.discard(order_id)
+        self._released_order_ids.discard(order_id)
+        self.warning(f"[{mission.name}] The robot is executing {order_id}, an earlier revision of this run built from the "
+                     f"route the node still has: following it instead of resending")
+        try:
+            await self._persist_current_mission_status()
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not persist the adopted order ({err}); adopted in memory only")
         return True
 
     def _teleop_hold(self) -> bool:
