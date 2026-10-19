@@ -3,19 +3,29 @@
 #
 #   docker compose -p recon --env-file .env.robot -f reconstruction_service_robot.yaml up -d
 # (--env-file is required: without it compose reads docker_compose/.env, the cloud's file.)
+#
+# Memory: a job runs in a child process that gives its memory back when it ends; idle, the service is a small web process.
+# A job that outgrows the container limit is killed by the kernel and reported as `crashed` (the service and the rest of the
+# Pi keep running), and RECON_MAX_VOXELS bounds a job from inside: past it the grid is coarsened (x1.5) and the job restarts,
+# so a big map costs resolution, not memory. The defaults fit a 4 GB Pi next to the rest of the stack; raise them on an 8 GB
+# one (RECON_MEM_LIMIT=1536m RECON_MAX_VOXELS=6000000 in .env.robot). Each finished job reports its peak_rss_mb: tune from that,
+# and watch the memory bar in the app's server-health panel while a job runs.
 services:
   reconstruction-service:
     image: ${RECON_IMAGE:-100.85.3.47:5050/sati/reconstruction_raw:latest}
     network_mode: host
     restart: unless-stopped
-    mem_limit: 1g
-    memswap_limit: 1g
+    mem_limit: ${RECON_MEM_LIMIT:-768m}
+    memswap_limit: ${RECON_MEM_LIMIT:-768m}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
     environment:
       - RECON_SERVICE_KEY=${RECONSTRUCTION_SERVICE_KEY:?set RECONSTRUCTION_SERVICE_KEY in .env}
       - RECON_HOST=127.0.0.1
       - RECON_PORT=8009
       - RECON_BACKEND=raw
-      - RECON_MAX_VOXELS=3000000
+      - RECON_MAX_VOXELS=${RECON_MAX_VOXELS:-2000000}
     volumes:
       - recon-spool:/var/lib/recon/spool
 
