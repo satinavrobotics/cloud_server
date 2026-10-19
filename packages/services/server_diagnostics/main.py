@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
     global service
     service = DiagnosticsService(
         DockerReader(os.getenv("DIAGNOSTICS_DOCKER_SOCKET", DEFAULT_SOCKET)),
+        gateway_url=os.getenv("DIAGNOSTICS_GATEWAY_URL", "http://127.0.0.1:80"),
         include=os.getenv("DIAGNOSTICS_INCLUDE", ""),
         window_minutes=float(os.getenv("DIAGNOSTICS_WINDOW_MINUTES", "15")),
     )

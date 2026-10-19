@@ -91,6 +91,10 @@ wait_healthy() {
 # up -d itself fails when a dependency is unhealthy: that is a failed deploy too, not an abort.
 up_ok=1
 run dc up -d --no-build --remove-orphans || up_ok=0
+# Always recreate the gateway: its config files are bind-mounted, and `git pull` replaces a file (new inode) while a running
+# container keeps the old one, so an unchanged compose definition would leave nginx on stale config (a 502 for a route that was
+# fixed in git). Recreating takes a few seconds.
+[ "$up_ok" = 0 ] || run dc up -d --no-build --no-deps --force-recreate nginx-gateway || up_ok=0
 
 if [ "$DRY" = 1 ]; then log "dry run: would wait up to ${TIMEOUT_S}s for healthy"; exit 0; fi
 

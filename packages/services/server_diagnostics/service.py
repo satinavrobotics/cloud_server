@@ -7,9 +7,13 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .analyzer import Finding, analyze, worst
+from .analyzer import SEVERITY_RANK, Finding, analyze, worst
+from .checks import run_checks
 from .docker_api import DockerReader, DockerUnavailable
+from .host import host_findings, read_host
 from .redact import redact_line
+import urllib.error
+import urllib.request
 
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
 ANALYSIS_TAIL = 400            # lines read from each container to judge it
@@ -33,8 +37,12 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
 
 class DiagnosticsService:
     def __init__(self, docker: DockerReader, include: str = "", window_minutes: float = 15.0,
-                 cache_seconds: float = 5.0, clock: Callable[[], float] = time.time):
+                 cache_seconds: float = 5.0, clock: Callable[[], float] = time.time,
+                 gateway_url: str = "", fetch=None, host_reader: Callable[[], Dict] = read_host):
         self._docker = docker
+        self._gateway = gateway_url.rstrip("/")
+        self._fetch = fetch or _http_fetch
+        self._read_host = host_reader
         self._include = re.compile(include) if include else None
         self._window = max(1.0, window_minutes) * 60.0
         self._ttl = cache_seconds
@@ -81,7 +89,15 @@ class DiagnosticsService:
         status = "restarting" if st.get("Restarting") else (st.get("Status") or "unknown")
         if status not in ("running", "exited", "restarting", "paused", "dead", "created"):
             status = "unknown"
+        limit = (info.get("HostConfig") or {}).get("Memory") or None       # 0 = no limit
+        usage = None
+        if status == "running":
+            try:
+                usage = self._docker.stats(container_id).get("usage_bytes")
+            except (DockerUnavailable, ValueError):
+                usage = None
         return {
+            "mem_usage_bytes": usage, "mem_limit_bytes": limit,
             "state": status,
             "health": health if health in ("healthy", "unhealthy", "starting") else None,
             "restart_count": int(info.get("RestartCount") or 0),
@@ -105,7 +121,8 @@ class DiagnosticsService:
 
     # ---- the three answers
     def overview(self) -> Dict:
-        """Every service with its state and a count of findings; cached for a few seconds (the UI polls)."""
+        """Every service with its state, memory and a count of findings, the host, and the active checks; cached for a few
+        seconds (the UI polls)."""
         with self._lock:
             now = self._clock()
             if self._cached and now - self._cached[0] < self._ttl:
@@ -113,6 +130,7 @@ class DiagnosticsService:
             services = []
             for item in self._containers():
                 state, findings = self._judge(item)
+                usage, limit = state["mem_usage_bytes"], state["mem_limit_bytes"]
                 services.append({
                     "name": item["service"], "container": item["container"], "image": state["image"],
                     "state": state["state"], "health": state["health"],
@@ -120,14 +138,24 @@ class DiagnosticsService:
                     "restart_count": state["restart_count"],
                     "started_at": state["started_at"].isoformat() if state["started_at"] else None,
                     "exit_code": state["exit_code"], "oom_killed": state["oom_killed"],
+                    "memory": {"usage_bytes": usage, "limit_bytes": limit,
+                               "percent": round(usage / limit * 100, 1) if usage and limit else None},
                     "severity": worst(findings), "findings_count": len(findings),
                 })
+            host = self._read_host()
+            host_found = host_findings(host)
+            checks = [c.to_dict() for c in run_checks(self._fetch, self._gateway, services)] if self._gateway else []
+            failing = [c for c in checks if not c["ok"]]
+            severities = ([s["severity"] for s in services] + [c["severity"] for c in failing] + [f.severity for f in host_found])
             summary = {"total": len(services),
                        "up": sum(s["severity"] == "ok" for s in services),
                        "warn": sum(s["severity"] == "warn" for s in services),
-                       "down": sum(s["severity"] == "error" for s in services)}
+                       "down": sum(s["severity"] == "error" for s in services),
+                       "checks_failing": len(failing)}
             result = {"generated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
-                      "host": socket.gethostname(), "summary": summary, "services": services}
+                      "host": socket.gethostname(), "host_stats": host, "severity": max(severities, key=lambda s: SEVERITY_RANK[s], default="ok"),
+                      "summary": summary, "services": services, "checks": checks,
+                      "host_findings": [f.to_dict() for f in host_found]}
             self._cached = (now, result)
             return result
 
@@ -164,3 +192,15 @@ def _status_text(state: Dict) -> str:
     if state["state"] in ("exited", "dead") and state["exit_code"] is not None:
         text += f", exit code {state['exit_code']}"
     return text
+
+
+def _http_fetch(method: str, url: str, timeout: float = 2.5):
+    """(status or None, body text, error text) for one request; an HTTP error status is an answer, not an error."""
+    request = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read(200_000).decode("utf-8", errors="replace"), ""
+    except urllib.error.HTTPError as err:
+        return err.code, err.read(2000).decode("utf-8", errors="replace"), ""
+    except (OSError, ValueError) as err:
+        return None, "", str(err)

@@ -119,6 +119,29 @@ def recent_lines(lines: Iterable[str], now: datetime, window_seconds: float) -> 
     return out
 
 
+MEMORY_WARN, MEMORY_ERROR = 0.80, 0.92     # fraction of its memory limit a container uses
+
+
+def _mb(n) -> str:
+    return f"{n / 1048576:.0f} MB"
+
+
+def _memory_findings(state: Dict) -> List[Finding]:
+    usage, limit = state.get("mem_usage_bytes"), state.get("mem_limit_bytes")
+    if not usage or not limit or state.get("state") != "running":
+        return []
+    frac = usage / limit
+    if frac < MEMORY_WARN:
+        return []
+    hint = ("Raise this service's memory limit (mem_limit in the compose file, or its MEM_* setting in .env.robot) or reduce its "
+            "load. At the limit the kernel kills it (it then shows as 'Stopped for using too much memory').")
+    if frac >= MEMORY_ERROR:
+        return [Finding("memory-critical", "error", "About to run out of its memory limit",
+                        f"Uses {_mb(usage)} of {_mb(limit)} ({frac * 100:.0f}%).", hint)]
+    return [Finding("memory-high", "warn", "Using most of its memory limit",
+                    f"Uses {_mb(usage)} of {_mb(limit)} ({frac * 100:.0f}%).", hint)]
+
+
 def _state_findings(state: Dict, now: datetime, window_seconds: float) -> List[Finding]:
     findings: List[Finding] = []
     status = state.get("state")
@@ -147,6 +170,7 @@ def _state_findings(state: Dict, now: datetime, window_seconds: float) -> List[F
         findings.append(Finding("restarted-recently", "warn", "Restarted a moment ago",
                                 f"It was restarted {state.get('restart_count')} time(s) and has only been up since {started.isoformat()}.",
                                 "Read the lines before the restart for what made it stop."))
+    findings.extend(_memory_findings(state))
     return findings
 
 

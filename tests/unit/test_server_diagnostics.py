@@ -215,15 +215,24 @@ class FakeDocker:
 
     def inspect(self, cid):
         c = self.containers[cid]
-        return {"State": c["state"], "RestartCount": c.get("restarts", 0), "Config": {"Image": c.get("image", "img:1")}}
+        return {"State": c["state"], "RestartCount": c.get("restarts", 0), "Config": {"Image": c.get("image", "img:1")},
+                "HostConfig": {"Memory": c.get("limit", 0)}}
+
+    def stats(self, cid):
+        return {"usage_bytes": self.containers[cid].get("usage"), "engine_limit_bytes": 0}
 
     def logs(self, cid, tail, since=None):
         self.logged.append((cid, tail, since))
         return self.containers[cid].get("lines", [])[-tail:]
 
 
+HOST_OK = {"mem_total_bytes": 4 << 30, "mem_available_bytes": 2 << 30, "swap_total_bytes": 0, "swap_used_bytes": 0,
+           "disk_total_bytes": 100 << 30, "disk_free_bytes": 50 << 30, "load1": 0.5, "cpus": 4}
+
+
 def make(containers, **kw):
     clock = {"t": NOW.timestamp()}
+    kw.setdefault("host_reader", lambda: HOST_OK)
     svc = DiagnosticsService(FakeDocker(containers), clock=lambda: clock["t"], **kw)
     return svc, clock
 
@@ -250,7 +259,7 @@ class TestService:
         assert by["api"]["severity"] == "ok" and by["api"]["status_text"] == "running (healthy)"
         assert by["db"]["severity"] == "error" and by["db"]["status_text"] == "exited, exit code 1"
         assert by["sati_nginx_gateway"]["severity"] == "error" and by["sati_nginx_gateway"]["findings_count"] == 2
-        assert out["summary"] == {"total": 3, "up": 1, "warn": 0, "down": 2}
+        assert out["summary"] == {"total": 3, "up": 1, "warn": 0, "down": 2, "checks_failing": 0}
 
     def test_overview_is_cached_for_a_few_seconds(self):
         svc, clock = make(FLEET)
@@ -311,7 +320,7 @@ class TestService:
         class Flaky(FakeDocker):
             def logs(self, cid, tail, since=None):
                 raise DockerUnavailable("boom")
-        svc = DiagnosticsService(Flaky(FLEET), clock=lambda: NOW.timestamp())
+        svc = DiagnosticsService(Flaky(FLEET), clock=lambda: NOW.timestamp(), host_reader=lambda: HOST_OK)
         assert svc.overview()["summary"]["total"] == 3
 
 
@@ -334,7 +343,7 @@ class Client:
 class TestRoutes:
     @pytest.fixture
     def client(self):
-        diag_main.service = DiagnosticsService(FakeDocker(FLEET), clock=lambda: NOW.timestamp())
+        diag_main.service = DiagnosticsService(FakeDocker(FLEET), clock=lambda: NOW.timestamp(), host_reader=lambda: HOST_OK)
         yield Client()
         diag_main.service = None
 
@@ -347,8 +356,10 @@ class TestRoutes:
         body = client.get("/services").json()
         assert body["summary"]["total"] == 3 and {"generated_at", "host", "services"} <= set(body)
         assert set(body["services"][0]) == {"name", "container", "image", "state", "health", "status_text",
-                                            "restart_count", "started_at", "exit_code", "oom_killed", "severity",
+                                            "restart_count", "started_at", "exit_code", "oom_killed", "memory", "severity",
                                             "findings_count"}
+        assert set(body) >= {"host", "host_stats", "severity", "summary", "checks", "host_findings"}
+        assert isinstance(body["host"], str) and body["summary"]["checks_failing"] == 0
 
     def test_logs_and_analysis(self, client):
         logs = client.get("/services/api/logs?lines=5").json()
@@ -376,3 +387,183 @@ class TestRoutes:
     def test_health_and_root(self, client):
         assert client.get("/health").status_code == 200
         assert "services" in client.get("/").json()["endpoints"]
+
+
+# ---- memory, host and checks (added with the second round of diagnostics)
+from packages.services.server_diagnostics.checks import (  # noqa: E402
+    capability_check, gateway_checks, image_tag, run_checks, version_check)
+from packages.services.server_diagnostics.host import host_findings, read_host  # noqa: E402
+
+
+class TestMemory:
+    def test_stats_are_the_working_set_without_reclaimable_cache(self, tmp_path):
+        path = str(tmp_path / "docker.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(2)
+        payload = json.dumps({"memory_stats": {"usage": 300_000_000, "limit": 400_000_000,
+                                               "stats": {"inactive_file": 50_000_000}}}).encode()
+
+        def serve():
+            conn, _ = server.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(payload) + payload)
+            conn.close()
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            assert DockerReader(path, timeout=3).stats("abc") == {"usage_bytes": 250_000_000, "engine_limit_bytes": 400_000_000}
+        finally:
+            server.close()
+
+    @pytest.mark.parametrize("usage,limit,expect", [
+        (100, 1000, None), (790, 1000, None), (800, 1000, "memory-high"), (919, 1000, "memory-high"), (920, 1000, "memory-critical")])
+    def test_thresholds(self, usage, limit, expect):
+        state = running(mem_usage_bytes=usage * 1_000_000, mem_limit_bytes=limit * 1_000_000)
+        ids = {f.id for f in analyze(state, [], NOW, WINDOW)}
+        assert (ids & {"memory-high", "memory-critical"}) == ({expect} if expect else set())
+
+    def test_no_limit_or_not_running_means_no_memory_finding(self):
+        assert analyze(running(mem_usage_bytes=10**9, mem_limit_bytes=None), [], NOW, WINDOW) == []
+        assert analyze(running(state="exited", exit_code=0, mem_usage_bytes=10**9, mem_limit_bytes=10**9), [], NOW, WINDOW) == []
+
+    def test_the_overview_reports_usage_and_percent(self):
+        containers = {"a": {"name": "x", "labels": {"com.docker.compose.service": "api"}, "state": STATE_OK,
+                            "usage": 350 * 1048576, "limit": 384 * 1048576},
+                      "b": {"name": "y", "labels": {"com.docker.compose.service": "db"}, "state": STATE_OK, "usage": 5 * 1048576}}
+        svc, _ = make(containers)
+        by = {s["name"]: s for s in svc.overview()["services"]}
+        assert by["api"]["memory"]["percent"] == 91.1 and by["api"]["severity"] == "warn"
+        assert by["db"]["memory"] == {"usage_bytes": 5 * 1048576, "limit_bytes": None, "percent": None}
+
+
+class TestHost:
+    def test_read_host_from_proc(self, tmp_path):
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text("MemTotal: 4000000 kB\nMemAvailable: 1000000 kB\nSwapTotal: 2000 kB\nSwapFree: 500 kB\n")
+        load = tmp_path / "loadavg"
+        load.write_text("1.50 1.00 0.50 1/100 123\n")
+        h = read_host(str(meminfo), str(load), str(tmp_path))
+        assert (h["mem_total_bytes"], h["mem_available_bytes"]) == (4_000_000 * 1024, 1_000_000 * 1024)
+        assert (h["swap_total_bytes"], h["swap_used_bytes"]) == (2000 * 1024, 1500 * 1024) and h["load1"] == 1.5
+        assert h["disk_total_bytes"] > 0 and h["cpus"] >= 1
+
+    def test_unreadable_proc_gives_none(self, tmp_path):
+        h = read_host(str(tmp_path / "no"), str(tmp_path / "no"), str(tmp_path / "no"))
+        assert h["mem_total_bytes"] is None and h["load1"] is None and h["disk_total_bytes"] is None
+
+    def test_findings(self):
+        assert host_findings(HOST_OK) == []
+        low = dict(HOST_OK, mem_available_bytes=300 << 20)
+        assert [(f.id, f.severity) for f in host_findings(low)] == [("host-memory-low", "warn")]
+        assert host_findings(dict(HOST_OK, mem_available_bytes=100 << 20))[0].severity == "error"
+        assert host_findings(dict(HOST_OK, swap_total_bytes=1000, swap_used_bytes=800))[0].id == "host-swap-high"
+        assert host_findings(dict(HOST_OK, disk_free_bytes=5 << 30))[0].id == "host-disk-low"
+        assert host_findings(dict(HOST_OK, disk_free_bytes=2 << 30))[0].severity == "error"
+        assert host_findings(dict(HOST_OK, load1=9.0))[0].id == "host-load-high"
+        assert host_findings({}) == []
+
+
+INFO_ALL = {"capabilities": {"agent": True, "scene_graph": True, "reconstruction": False, "semantic": False, "diagnostics": True},
+            "livekit": {"available": True, "token_path": "/api/livekit-selfhost/createToken"}}
+
+
+def fake_fetch(table):
+    """table: url suffix -> status (or (status, body)); unknown paths answer 404; None = nothing answers."""
+    def fetch(method, url):
+        for suffix, answer in table.items():
+            if url.endswith(suffix):
+                if answer is None:
+                    return None, "", "connection refused"
+                status, body = answer if isinstance(answer, tuple) else (answer, "")
+                return status, body, ""
+        return 404, "", ""
+    return fetch
+
+
+GW = "http://gw"
+OK_TABLE = {"/health": 200, "/api/v1/server-info": (200, json.dumps(INFO_ALL)), "/createToken": 405, "/api/agent/health": 200}
+
+
+def svc(name, state="running", image="reg/sati/x:t1"):
+    return {"name": name, "state": state, "image": image}
+
+
+ALL_SERVICES = [svc("api-delegation-service"), svc("graph-builder-service"), svc("livekit-sfu-tokens"), svc("livekit-sfu", image="livekit/livekit:v1"),
+                svc("agent-orchestrator-service"), svc("server-diagnostics")]
+
+
+class TestChecks:
+    def test_everything_fine(self):
+        checks = run_checks(fake_fetch(OK_TABLE), GW, ALL_SERVICES)
+        assert all(c.ok for c in checks), [c.detail for c in checks if not c.ok]
+        assert {c.id for c in checks} >= {"gateway-answers", "gateway-reaches-api", "gateway-reaches-token-service",
+                                           "gateway-reaches-agent", "capabilities-match", "same-version"}
+
+    def test_the_token_route_502_is_the_raspberry_pi_bug(self):
+        checks = run_checks(fake_fetch(dict(OK_TABLE, **{"/createToken": 502})), GW, ALL_SERVICES)
+        bad = [c for c in checks if not c.ok]
+        assert [c.id for c in bad] == ["gateway-reaches-token-service"] and bad[0].severity == "error"
+        assert "tailnet address" in bad[0].hint and "502" in bad[0].detail
+
+    def test_a_dead_gateway_stops_the_route_checks(self):
+        checks = run_checks(fake_fetch({"/health": None}), GW, ALL_SERVICES)
+        ids = [c.id for c in checks]
+        assert ids[0] == "gateway-answers" and not checks[0].ok and "gateway-reaches-api" not in ids
+
+    def test_api_502_and_404(self):
+        for status in (502, 404):
+            checks, info = gateway_checks(fake_fetch({"/health": 200, "/api/v1/server-info": status}), GW)
+            assert info is None and [c.id for c in checks if not c.ok] == ["gateway-reaches-api"]
+
+    def test_server_info_that_is_not_json(self):
+        checks, info = gateway_checks(fake_fetch({"/health": 200, "/api/v1/server-info": (200, "<html>")}), GW)
+        assert info is None and not checks[-1].ok
+
+    def test_routes_are_only_probed_for_what_is_advertised(self):
+        info = {"capabilities": {"agent": False}, "livekit": {"available": False}}
+        checks, _ = gateway_checks(fake_fetch({"/health": 200, "/api/v1/server-info": (200, json.dumps(info))}), GW)
+        assert {c.id for c in checks} == {"gateway-answers", "gateway-reaches-api"}
+
+    def test_advertised_but_not_running(self):
+        services = [s for s in ALL_SERVICES if s["name"] != "graph-builder-service"]
+        c = capability_check(INFO_ALL, services)
+        assert not c.ok and c.severity == "error" and "scene_graph is advertised but graph-builder-service is not on this server" in c.detail
+        stopped = [dict(s, state="exited") if s["name"] == "livekit-sfu-tokens" else s for s in ALL_SERVICES]
+        assert "not running" in capability_check(INFO_ALL, stopped).detail
+
+    def test_running_but_not_advertised(self):
+        info = {"capabilities": {"scene_graph": True, "agent": False, "reconstruction": False}, "livekit": {"available": False}}
+        c = capability_check(info, [svc("graph-builder-service"), svc("reconstruction-service")])
+        assert not c.ok and c.severity == "warn" and "reconstruction" in c.detail
+        # graph-builder always runs, so scene_graph being off with it running is normal
+        assert capability_check({"capabilities": {"scene_graph": False}, "livekit": {}}, [svc("graph-builder-service")]).ok
+
+    def test_no_server_info_no_capability_check(self):
+        assert capability_check(None, ALL_SERVICES) is None
+
+    def test_version_skew(self):
+        services = [svc("api-delegation-service", image="r/sati/api:old1"), svc("mission-dispatch", image="r/sati/m:new2"),
+                    svc("server-diagnostics", image="r/sati/d:new2"), svc("postgres", image="postgres:17")]
+        c = version_check(services)
+        assert not c.ok and c.severity == "warn" and "old1: api-delegation-service" in c.detail and "new2: mission-dispatch" in c.detail
+        assert "robot_compose.sh" in c.hint
+        assert version_check([svc("api-delegation-service", image="a:latest"), svc("mission-dispatch", image="b:latest")]).ok
+        assert version_check([]).ok
+
+    @pytest.mark.parametrize("image,tag", [("a:1", "1"), ("host:5000/sati/x:abc", "abc"), ("host:5000/sati/x", "latest"),
+                                           ("x:t@sha256:deadbeef", "t")])
+    def test_image_tag(self, image, tag):
+        assert image_tag(image) == tag
+
+    def test_the_overview_includes_checks_and_the_worst_severity(self):
+        containers = {"a": {"name": "x", "labels": {"com.docker.compose.service": "api-delegation-service"}, "state": STATE_OK}}
+        svc_, _ = make(containers, gateway_url=GW, fetch=fake_fetch({"/health": None}))
+        out = svc_.overview()
+        assert out["summary"]["checks_failing"] >= 1 and out["severity"] == "error"
+        assert out["checks"][0]["id"] == "gateway-answers" and out["host_stats"]["cpus"] == 4
+
+    def test_host_findings_raise_the_overall_severity(self):
+        low = dict(HOST_OK, disk_free_bytes=1 << 30)
+        svc_, _ = make(FLEET, host_reader=lambda: low)
+        out = svc_.overview()
+        assert out["host_findings"][0]["id"] == "host-disk-low" and out["severity"] == "error"

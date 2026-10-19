@@ -71,6 +71,16 @@ class DockerReader:
     def inspect(self, container_id: str) -> Dict:
         return json.loads(self._get(f"/containers/{container_id}/json"))
 
+    def stats(self, container_id: str) -> Dict:
+        """One memory sample: {usage_bytes (working set: without reclaimable file cache), engine_limit_bytes}."""
+        data = json.loads(self._get(f"/containers/{container_id}/stats?stream=false&one-shot=true"))
+        mem = data.get("memory_stats") or {}
+        detail = mem.get("stats") or {}
+        cache = detail.get("inactive_file", detail.get("total_inactive_file", detail.get("cache", 0))) or 0
+        usage = mem.get("usage")
+        return {"usage_bytes": max(0, usage - cache) if isinstance(usage, int) else None,
+                "engine_limit_bytes": mem.get("limit")}
+
     def logs(self, container_id: str, tail: int, since: Optional[int] = None) -> List[str]:
         """The last `tail` lines (each starting with its timestamp), optionally only those after epoch `since`."""
         query = f"stdout=1&stderr=1&timestamps=1&tail={int(tail)}" + (f"&since={int(since)}" if since else "")

@@ -34,6 +34,20 @@ The nginx gateway also writes its error log to stderr now, so these rules can se
 robot test showed: a gateway sending the token route to `localhost:8008` while the service listened on the tailnet
 address answers 502, and the log says `connect() failed (111: Connection refused) while connecting to upstream`.
 
+## Memory, the host and the active checks
+
+- Every running service reports its **memory** (working set, without reclaimable file cache) against its limit; 80% of the
+  limit is a warning, 92% an error, before the kernel kills it. A service without a limit shows its usage only.
+- The **host** block gives total and available memory, swap, free disk and load; low memory (10%/5%), a swapping machine, a
+  nearly full disk and an overloaded CPU are host findings.
+- **Checks** ask the running server the questions whose wrong answer has hurt before (see `checks.py`): the gateway
+  answers and reaches the API, the video token service and the agent (a gateway pointing at a wrong address answers 502 for
+  that route and logs nothing until someone uses it); what `server-info` advertises is what runs (and the other way round);
+  the platform's own services run one image tag. `DIAGNOSTICS_GATEWAY_URL` (default `http://127.0.0.1:80`; the robot overlay
+  uses `ROBOT_GATEWAY_PORT`) says which gateway to ask.
+- `GET /services` carries all of it: `severity` (worst of everything), `summary.checks_failing`, `host_stats`,
+  `host_findings`, `checks` and `services[].memory`.
+
 ## Deploying
 
 Cloud: `docker compose -f docker_compose/mission_dispatch_services.yaml up -d --build server-diagnostics`, then recreate
