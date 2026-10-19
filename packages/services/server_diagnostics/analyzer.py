@@ -89,6 +89,10 @@ RULES: List[Rule] = [
           r"traceback \(most recent call last\)"),
 ]
 
+# Words like "timeout" or "permission" are everyday vocabulary in routine lines ("Image buffer timeout: 30s"): for these
+# rules an INFO or DEBUG line is never a symptom.
+_LEVEL_SENSITIVE = {"timeout", "permission-denied", "mqtt", "name-resolution"}
+_ROUTINE_LINE = re.compile(r"\b(INFO|DEBUG)\b|\[(info|debug|notice)\]")
 _ERROR_LINE = re.compile(r"\b(ERROR|CRITICAL|FATAL|PANIC)\b|\[(error|emerg|crit|alert)\]")
 _WARNING_LINE = re.compile(r"\b(WARNING|WARN)\b|\[warn\]")
 ERROR_LINES_FOR_ERROR = 20
@@ -156,6 +160,8 @@ def analyze(state: Dict, lines: List[str], now: datetime, window_seconds: float)
     matched: Dict[str, Finding] = {}
     for line in window:
         for rule in RULES:
+            if rule.id in _LEVEL_SENSITIVE and _ROUTINE_LINE.search(line):
+                continue
             if rule.pattern.search(line):
                 f = matched.get(rule.id)
                 if f is None:

@@ -97,6 +97,12 @@ class TestAnalyzer:
     def test_the_known_failures(self, text, rule):
         assert rule in {f.id for f in analyze(running(), [stamp(10, text)], NOW, WINDOW)}
 
+    def test_routine_info_lines_that_mention_a_timeout_are_not_symptoms(self):
+        lines = [stamp(5, "2026-10-19 17:18:35,060 - GraphBuilderService - INFO -    Image buffer timeout: 30.0s"),
+                 stamp(5, "[info] reconnect timeout set to 5s")]
+        assert analyze(running(), lines, NOW, WINDOW) == []
+        assert "timeout" in {f.id for f in analyze(running(), [stamp(5, "ERROR request timeout after 30s")], NOW, WINDOW)}
+
     def test_error_level_lines_warn_and_many_escalate(self):
         few = [stamp(10, "ERROR something odd")] * 3
         (f,) = analyze(running(), few, NOW, WINDOW)
