@@ -139,13 +139,43 @@ async def _mismatch_until_failed(r, m, order_id):
 
 @pytest.mark.unit
 async def test_b_mismatch_failure_while_robot_runs_our_stale_order_sends_cancel():
+    """An older revision the dispatcher cannot vouch for (content unknown: e.g. sent by a dispatcher process that was restarted)
+    is not adopted: the robot that never takes the new revision fails the mission, and its old order is cancelled."""
     r, _ = _make_robot()
     m = await _start(r, _mission())
     stale = _order_id(r)
     assert await r._bump_order_rev()                 # the robot holds an older revision
+    r._order_records.clear()                         # ... whose content this process does not know
     await _mismatch_until_failed(r, m, stale)
     assert m.status.state == State.FAILED
     assert len(_cancels(r)) == 1
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_b_a_changed_route_since_is_not_adopted_either():
+    r, _ = _make_robot()
+    m = await _start(r, _mission())
+    stale = _order_id(r)
+    assert await r._bump_order_rev()
+    for record in r._order_records.values():         # the node's route was replaced since the old order was built
+        record.route_digest = "0" * len(record.route_digest)
+    await _mismatch_until_failed(r, m, stale)
+    assert m.status.state == State.FAILED
+    assert len(_cancels(r)) == 1
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_b_a_stale_revision_built_from_the_current_route_is_adopted_not_failed():
+    r, _ = _make_robot()
+    m = await _start(r, _mission())
+    stale = _order_id(r)
+    assert await r._bump_order_rev()                 # the robot holds an older revision, built from the route the node still has
+    await _mismatch_until_failed(r, m, stale)
+    assert m.status.state == State.RUNNING           # the dispatcher follows the robot's order
+    assert _cancels(r) == []
+    assert _order_id(r) == stale
     r._cancel_mission_timeout()
 
 

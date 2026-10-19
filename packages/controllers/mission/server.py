@@ -564,6 +564,9 @@ class Robot:
     # needs this long since the order was last (re)sent -- longer than the largest resend
     # interval, so the schedule always completes first and the last send gets an answer.
     ORDER_GIVE_UP_MIN_S = 10.0
+    # After stopTeleop the robot resumes the order it paused for the operator: for this long the dispatcher draws no conclusion
+    # about that order (a "canceled" report belongs to the pause) and sends nothing, so it never races the resume.
+    TELEOP_RESUME_GRACE_S = 10.0
     # A "canceled" about the current order while the robot still lists nodes is read as
     # left over from the previous order while it drives, or this soon after the order
     # went out; otherwise as the robot dropping the order (see update_mission_state).
@@ -683,6 +686,12 @@ class Robot:
         # A mission resumed after a restart waits for the robot's first state message,
         # which decides how it goes on (see _resume_from_state).
         self._resume_pending = False
+        # When stopTeleop was last acknowledged (monotonic): see _teleop_hold.
+        self._teleop_ended_at: Optional[float] = None
+        # What every order sent in the current run was built from (status.sent_order keeps only the last), so that an earlier
+        # revision the robot is still executing can be adopted (see _try_adopt_running_order); and the prefix adopted, if any.
+        self._order_records: Dict[str, mission_object.MissionSentOrderV1] = {}
+        self._adopted_prefix: Optional[str] = None
         # The send the current node is owed, made once no cancelOrder of ours is in
         # flight (see _flush_pending_send): SEND_NODE, or NEW_REVISION after the robot
         # dropped the node's order to make way for new content.
@@ -839,6 +848,8 @@ class Robot:
             # made a held mission look dispatched (its state handling then sent orders).
             self._current_behavior_tree = None
             self._sent_order = None
+            self._order_records.clear()
+            self._adopted_prefix = None
             self._unknown_content_order_id = None
             self._order_revisions.clear()
             self._resume_pending = False
@@ -1367,6 +1378,8 @@ class Robot:
     def _order_prefix(self) -> str:
         """Prefix of every order/node id generated for the current mission's run and
         revision (see order_ids)."""
+        if self._adopted_prefix is not None:
+            return self._adopted_prefix
         status = self._current_mission.status
         return order_ids.run_prefix(str(self._current_mission.name),
                                     status.run_id, status.order_rev)
@@ -1561,6 +1574,7 @@ class Robot:
             await self._stop_our_order("churn")  # nothing to do unless it still runs one
             return False
         replaced = self._current_order_id()
+        self._adopted_prefix = None       # the revision counter only ever moves forward: an id used (and refused) is never reused
         legacy = status.run_id is None
         if legacy:
             status.run_id = uuid.uuid4().hex[:8]
@@ -1825,6 +1839,7 @@ class Robot:
             self.warning(f"[{self._current_mission.name}] Could not persist the order "
                          f"about to be sent ({err}); not sending it yet")
             return False
+        self._order_records[record.order_id] = record
         return True
 
     def _sent_order_record(self, order_id: Optional[str]) \
@@ -3086,6 +3101,8 @@ class Robot:
         # A send the current node is owed goes out once no cancelOrder of ours is in
         # flight; this state still describes the robot before it.
         if self._pending_send is not None and not self._has_outstanding_cancel():
+            if self._teleop_hold():
+                return                       # the robot resumes its paused order first; the send is made after the hold
             await self._flush_pending_send()
             return
 
@@ -3103,7 +3120,25 @@ class Robot:
                 # rejects it while it still runs one, or the cancel takes it). The
                 # cancel's completion decides what comes next.
                 return
+            if await self._try_adopt_running_order(message):
+                return
             rejection = self._order_rejection(message)
+            if rejection and (message.nodeStates or message.edgeStates) and \
+                    self._is_order_of_run(message.orderId) and not self._current_mission.needs_canceled:
+                # The robot refuses the new revision because it is carrying on an EARLIER revision of this very run (it resumed
+                # after teleop, or never let go of it): the mission is alive. Failing it left the robot driving a mission the
+                # dispatcher had closed. Cancel the old revision; the cancel's completion sends the node again as the new one.
+                reasons = "; ".join(e.errorDescription for e in rejection)
+                self.warning(f"[{self._current_mission.name}] Robot still runs {message.orderId} (an earlier "
+                             f"revision of this run) and refused the new one ({reasons}): cancelling it to realign")
+                self._order_mismatch_count = 0
+                if await self._cancel_order(
+                        CancelPurpose.REPLACE, "realign",
+                        f"Realign: the robot is executing {message.orderId}; cancelling it before sending",
+                        ours=OURS_DISPATCHER):
+                    return
+                self._pending_send = NEW_REVISION
+                return
             if rejection:
                 reasons = "; ".join(e.errorDescription for e in rejection)
                 self.warning(f"[{self._current_mission.name}] Robot rejected the dispatched "
@@ -3239,6 +3274,58 @@ class Robot:
         self._end_current_mission(mission_object.MissionStateV1.CANCELED)
         await self.post_mission_completion()
         return True
+
+    async def _try_adopt_running_order(self, message: types.VDA5050State) -> bool:
+        """The robot executes an EARLIER revision of this very run (it resumed it after teleop, or never let go of it) while the
+        dispatcher moved on to a newer one the robot refuses. If that earlier order was built from the route the node still has,
+        it is the order we want: follow it (nothing is cancelled or resent, the robot keeps driving). A reroute since, an order
+        whose content is not known (a dispatcher restarted meanwhile), or anything else is not adopted: the caller cancels and
+        resends as before. The revision counter is not moved back: the next revision is numbered after the refused one."""
+        mission = self._current_mission
+        order_id = message.orderId
+        if mission.needs_canceled or self._has_outstanding_cancel() or not (message.nodeStates or message.edgeStates):
+            return False
+        current = self._current_order_id()
+        if current is None or order_id == current or order_id in self._dead_order_ids \
+                or not self._is_order_of_run(order_id):
+            return False
+        if order_ids.order_node_index(order_id) != order_ids.order_node_index(current):
+            return False
+        node = self._current_leaf_node()
+        record = self._order_records.get(order_id)
+        if node is None or node.route is None or record is None or record.route_digest is None \
+                or record.route_digest != _route_digest(node.route):
+            return False
+        self._adopted_prefix = order_ids.order_prefix(order_id)
+        mission.status.sent_order = record
+        self._pending_send = None
+        self._sent_order = None
+        self._order_mismatch_count = 0
+        self._order_resends = 0
+        self._dead_order_ids.discard(order_id)
+        self._released_order_ids.discard(order_id)
+        self.warning(f"[{mission.name}] The robot is executing {order_id}, an earlier revision of this run built from the "
+                     f"route the node still has: following it instead of resending")
+        try:
+            await self._persist_current_mission_status()
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"[{mission.name}] Could not persist the adopted order ({err}); adopted in memory only")
+        return True
+
+    def _teleop_hold(self) -> bool:
+        """Whether the robot's order is paused for a teleoperator, or was handed back a moment ago. Starting teleop makes the robot
+        report its paused order as "canceled"; that is the pause, not a dropped order, and stopTeleop resumes the same order. So
+        while this holds the dispatcher neither declares the order dead nor sends a new revision of it (2026-10-19: it did, the
+        robot -- resuming the original -- rejected "An order is running", and the mission was failed while the robot drove on)."""
+        robot = self._robot_object
+        if robot is not None and (robot.status.state == robot_object.RobotStateV1.TELEOP
+                                  or getattr(robot, "switch_teleop", False)):
+            return True
+        if any(a.actionType == types.NVInstantActionType.START_TELEOP
+               for a in self._current_instant_actions.values()):
+            return True
+        return self._teleop_ended_at is not None and \
+            time.monotonic() - self._teleop_ended_at < self.TELEOP_RESUME_GRACE_S
 
     def _is_order_of_run(self, order_id: Optional[str]) -> bool:
         """Whether `order_id` is an order of the current run, of any revision."""
@@ -4453,6 +4540,7 @@ class Robot:
                 resume_robot_state = robot_object.RobotStateV1.ON_TASK \
                     if self._current_mission else robot_object.RobotStateV1.IDLE
                 self._set_robot_state(resume_robot_state)
+                self._teleop_ended_at = time.monotonic()
                 self.mission_info("Stop teleop")
 
     def update_mission_state(self, message: types.VDA5050State,
@@ -4492,6 +4580,10 @@ class Robot:
             self._set_mission_state(mission_object.MissionStateV1.FAILED)
             return
         if mission_status == "canceled":
+            if self._teleop_hold() and not self._current_mission.needs_canceled:
+                self.mission_info("The robot reports its order canceled while paused for teleop: "
+                                  "not a dropped order, nothing is resent")
+                return
             if self._current_mission.needs_canceled:
                 self._set_mission_state(mission_object.MissionStateV1.CANCELED)
             elif self._edge_blocked_error(message) is not None:
