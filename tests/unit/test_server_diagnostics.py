@@ -609,6 +609,11 @@ class TestAuditFixes:
         (f,) = analyze(running(), lines, NOW, WINDOW)
         assert (f.id, f.count) == ("errors-logged", 2)
 
+    def test_routine_registry_misses_are_not_errors(self):
+        lines = [stamp(5, 'time="x" level=error msg="response completed with error" err.code="manifest unknown"')] * 30
+        assert analyze(running(), lines, NOW, WINDOW) == []
+        assert [f.id for f in analyze(running(), [stamp(5, "level=error msg=db down")], NOW, WINDOW)] == ["errors-logged"]
+
     def test_a_line_matching_two_rules_does_not_hide_other_errors(self):
         both = stamp(5, "ERROR connect() failed (111: Connection refused) while connecting to upstream")
         others = [stamp(5, "ERROR something else")] * 3

@@ -93,6 +93,8 @@ RULES: List[Rule] = [
 # Words like "timeout" or "permission" are everyday vocabulary in routine lines ("Image buffer timeout: 30s"): for these
 # rules an INFO or DEBUG line is never a symptom.
 _LEVEL_SENSITIVE = {"timeout", "permission-denied", "mqtt", "name-resolution"}
+# Registry clients (docker buildx, pull) ask for tags and blobs that do not exist yet as part of normal work; the registry logs each as an error.
+_BENIGN_ERROR = re.compile(r"(manifest|blob|name) unknown", re.IGNORECASE)
 _ROUTINE_LINE = re.compile(r"\b(INFO|DEBUG)\b|\[(info|debug|notice)\]")
 # Level words: UPPERCASE as in Python/Go logs, or a level field/bracket in any case (`level=error`, "level":"error", [emerg]).
 # Plain lowercase prose ("no error", "0 errors") is not a level.
@@ -206,7 +208,7 @@ def analyze(state: Dict, lines: List[str], now: datetime, window_seconds: float)
         minutes = max(1, round(window_seconds / 60))
         f.detail = f"{f.count} matching line(s) in the last {minutes} minutes; the newest is the sample."
         findings.append(f)
-    errors = [ln for i, ln in enumerate(window) if i not in explained and _ERROR_LINE.search(ln)]
+    errors = [ln for i, ln in enumerate(window) if i not in explained and _ERROR_LINE.search(ln) and not _BENIGN_ERROR.search(ln)]
     if errors:
         severity = "error" if len(errors) >= ERROR_LINES_FOR_ERROR else "warn"
         findings.append(Finding("errors-logged", severity, "Errors in the log",
