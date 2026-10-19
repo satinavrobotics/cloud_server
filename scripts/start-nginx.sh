@@ -13,11 +13,12 @@ if [ ! -f "$CLOUD_SERVER_DIR/$COMPOSE_FILE" ]; then
     exit 1
 fi
 
-# `up -d` is idempotent: it leaves a running gateway alone and recreates it when its definition (mounts, image) changed.
-# After editing only the files under docker_compose/nginx/, a reload is enough:  docker exec sati_nginx_gateway nginx -s reload
+# Always recreated (a few seconds): the config files are bind-mounted, and when git (or an editor) replaces a file the running
+# container keeps the old one, so neither `up -d` (nothing changed in the compose file) nor `nginx -s reload` picks up the edit.
+# Server diagnostics (/api/diagnostics/) would show the symptom as a failing gateway check.
 
 cd "$CLOUD_SERVER_DIR"
-docker compose -f "$COMPOSE_FILE" up -d
+docker compose -f "$COMPOSE_FILE" up -d --force-recreate
 
 # Wait a moment for it to start
 sleep 2

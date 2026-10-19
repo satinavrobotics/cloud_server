@@ -113,6 +113,19 @@ answer 502 on their prefix; `GET /api/v1/server-info` is how the client learns t
 Not yet run on arm64 hardware (the config was tested on the cloud host:
 routes, CORS, preflight, WebSocket upgrade, binding only loopback + the tailnet IP).
 
+## Operating it: what has gone wrong, and how it shows
+
+The app's server-health panel (`/api/diagnostics/`, see `SERVER_DIAGNOSTICS.md`) runs these checks continuously. Each
+failure below happened once and now has a check and a guard.
+
+| What happened | How it shows | Guard |
+|---|---|---|
+| The gateway sent the token route to `localhost:8008` but the token service listens on the tailnet IP: 502, no video token | check "The gateway reaches the video token service" fails with the reason | the robot template uses `${ROBOT_TAILNET_IP}`; `deploy_robot.sh` always recreates the gateway |
+| The gateway ran on an old config after `git pull` (single-file bind mounts keep the old inode; `nginx -s reload` and an unchanged `up -d` do not help) | a gateway check fails | `deploy_robot.sh` and `start-nginx.sh` recreate the gateway; never rely on a reload after a pull |
+| One service recreated by hand on the tag in `.env.robot` while the rest ran the deployed tag (API without `server-info`) | check "All services run the same version"; "The gateway reaches the API" (404) | use `scripts/robot_compose.sh` (it applies `.robot_current_tag`), not bare `docker compose` |
+| `SERVER_KIND` or a capability flag missing from `.env.robot`: the Pi called itself the cloud and hid scene graph and reconstruction | check "What the server advertises is running" | `.env.robot.example` lists every flag; compare with it after editing |
+| A service near its memory limit | memory bar, finding "Using most of its memory limit" (80%) / "About to run out" (92%); the kernel's kill shows as "Stopped for using too much memory" | the `MEM_*` limits; the host panel shows total memory, swap and disk |
+
 ## Raw reconstruction (optional)
 
 Only the raw backend (sensor depth, no MapAnything/torch) is meant for the Pi. See `reconstruction_service_robot.yaml`

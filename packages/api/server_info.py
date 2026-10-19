@@ -44,6 +44,7 @@ class Capabilities(pydantic.BaseModel):
     semantic: bool
     agent: bool
     fleet: bool
+    diagnostics: bool = False      # additive (schema stays 1): a server that predates it simply lacks the key
 
 
 class LiveKitInfo(pydantic.BaseModel):
@@ -98,6 +99,7 @@ def build_server_info(cfg=config) -> ServerInfo:
             semantic=bool(cfg.SEMANTIC_SERVICE_URL),
             agent=bool(cfg.SERVER_AGENT_AVAILABLE),
             fleet=True,                         # a robot server may host several robots (decision D2)
+            diagnostics=bool(cfg.SERVER_DIAGNOSTICS_AVAILABLE),
         ),
         livekit=LiveKitInfo(
             available=video,

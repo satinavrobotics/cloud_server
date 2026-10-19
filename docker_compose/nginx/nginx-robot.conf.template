@@ -14,16 +14,21 @@ gzip_min_length 1024;
 gzip_vary on;
 
 upstream backend_api {
-    server localhost:8000;
+    server 127.0.0.1:8000;
 }
 
 # Not part of the robot stack (profile cloud-only): the prefix answers 502 and
 # GET /api/v1/server-info reports the agent as unavailable.
 upstream agent_api {
-    server localhost:8007;
+    server 127.0.0.1:8007;
 }
 
 # The robot's own token service listens on the tailnet IP (robots call it there), not on loopback.
+# Server diagnostics (container status and logs), loopback only.
+upstream diagnostics_api {
+    server 127.0.0.1:8011;
+}
+
 upstream livekit_selfhost_api {
     server ${ROBOT_TAILNET_IP}:8008;
 }
@@ -38,6 +43,7 @@ server {
 
     access_log /var/log/nginx/sati_access.log;
     error_log /var/log/nginx/sati_error.log;
+    error_log /dev/stderr warn;     # also in `docker logs`, so server diagnostics can read it
 
     include /etc/nginx/sati/routes.conf;
 }

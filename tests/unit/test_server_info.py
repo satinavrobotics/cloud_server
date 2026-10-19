@@ -24,13 +24,17 @@ def cfg(**over):
         SERVER_KIND="cloud", SERVER_NAME="", SERVER_ID=None, BUILD_SHA="3f2a9c1", SERVER_AGENT_AVAILABLE=True,
         SCENE_GRAPH_WORKER_ENABLED=True, RECONSTRUCTION_SERVICE_URL="http://127.0.0.1:8009",
         SEMANTIC_SERVICE_URL="http://127.0.0.1:8010", LIVEKIT_SFU_API_KEY="k", LIVEKIT_SFU_API_SECRET="s",
-        LIVEKIT_ROOM_POLICY="client", SERVER_LIVEKIT_AVAILABLE=None, MIN_CLIENT_VERSION=None, RECOMMENDED_CLIENT_VERSION=None,
+        LIVEKIT_ROOM_POLICY="client", SERVER_LIVEKIT_AVAILABLE=None, SERVER_DIAGNOSTICS_AVAILABLE=True, MIN_CLIENT_VERSION=None, RECOMMENDED_CLIENT_VERSION=None,
     )
     base.update(over)
     return SimpleNamespace(**base)
 
 
 class TestBuild:
+    def test_the_diagnostics_capability_follows_the_setting(self):
+        assert si.build_server_info(cfg(SERVER_DIAGNOSTICS_AVAILABLE=False)).capabilities.diagnostics is False
+        assert si.build_server_info(cfg(SERVER_DIAGNOSTICS_AVAILABLE=True)).capabilities.diagnostics is True
+
     def test_a_cloud_server_with_everything(self):
         info = si.build_server_info(cfg())
         assert (info.schema_version, info.kind, info.name, info.version) == (1, "cloud", "Satina cloud", "3f2a9c1")
@@ -92,11 +96,11 @@ class TestBuild:
         assert set(body) == {"schema_version", "name", "kind", "version", "server_id", "capabilities", "livekit",
                              "min_client_version", "recommended_client_version"}
         assert set(body["capabilities"]) == {"robots", "missions", "maps", "orchestration", "scene_graph",
-                                             "reconstruction", "semantic", "agent", "fleet"}
+                                             "reconstruction", "semantic", "agent", "fleet", "diagnostics"}
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SETTINGS = ("SERVER_KIND", "SERVER_NAME", "SERVER_ID", "SERVER_AGENT_AVAILABLE", "SERVER_LIVEKIT_AVAILABLE",
+SETTINGS = ("SERVER_KIND", "SERVER_NAME", "SERVER_ID", "SERVER_AGENT_AVAILABLE", "SERVER_LIVEKIT_AVAILABLE", "SERVER_DIAGNOSTICS_AVAILABLE",
             "MIN_CLIENT_VERSION", "RECOMMENDED_CLIENT_VERSION", "LIVEKIT_ROOM_POLICY")
 
 
@@ -136,6 +140,12 @@ class TestConfig:
         assert read_settings(SERVER_KIND="robot")["SERVER_AGENT_AVAILABLE"] is False
         assert read_settings(SERVER_KIND="robot", SERVER_AGENT_AVAILABLE="true")["SERVER_AGENT_AVAILABLE"] is True
         assert read_settings(SERVER_KIND="cloud", SERVER_AGENT_AVAILABLE="false")["SERVER_AGENT_AVAILABLE"] is False
+
+    def test_diagnostics_are_on_for_a_cloud_server_and_off_for_a_robot_until_deployed(self):
+        assert read_settings()["SERVER_DIAGNOSTICS_AVAILABLE"] is True
+        assert read_settings(SERVER_KIND="robot")["SERVER_DIAGNOSTICS_AVAILABLE"] is False
+        assert read_settings(SERVER_KIND="robot", SERVER_DIAGNOSTICS_AVAILABLE="true")["SERVER_DIAGNOSTICS_AVAILABLE"] is True
+        assert read_settings(SERVER_DIAGNOSTICS_AVAILABLE="false")["SERVER_DIAGNOSTICS_AVAILABLE"] is False
 
     def test_the_room_policy_is_validated_once_here(self):
         assert read_settings(LIVEKIT_ROOM_POLICY="Server")["LIVEKIT_ROOM_POLICY"] == "server"
