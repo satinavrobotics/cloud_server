@@ -53,7 +53,8 @@ RULES: List[Rule] = [
     _rule("timeout", "warn", "Requests are timing out",
           "Something answered too slowly or not at all. Check the CPU, memory and network of the machine and of the "
           "service named in the line.",
-          r"timed out|timeout|ETIMEDOUT|deadline exceeded"),
+          r"timed out|ETIMEDOUT|deadline exceeded|timeout (exceeded|reached|expired|error|while|after|waiting|connecting)|"
+          r"(request|read|connect|connection|gateway|upstream)[ _-]timeout(?!\s*[=:]\s*\d)"),
     _rule("auth-failed", "error", "A login or key was refused",
           "A password, key or token was rejected. Check the credentials in the .env of this service against the "
           "service it connects to.",
@@ -93,7 +94,9 @@ RULES: List[Rule] = [
 # rules an INFO or DEBUG line is never a symptom.
 _LEVEL_SENSITIVE = {"timeout", "permission-denied", "mqtt", "name-resolution"}
 _ROUTINE_LINE = re.compile(r"\b(INFO|DEBUG)\b|\[(info|debug|notice)\]")
-_ERROR_LINE = re.compile(r"\b(ERROR|CRITICAL|FATAL|PANIC)\b|\[(error|emerg|crit|alert)\]")
+# Level words: UPPERCASE as in Python/Go logs, or a level field/bracket in any case (`level=error`, "level":"error", [emerg]).
+# Plain lowercase prose ("no error", "0 errors") is not a level.
+_ERROR_LINE = re.compile(r"(?-i:\b(?:ERROR|CRITICAL|FATAL|PANIC)\b)|\blevel[\"']?\s*[=:]\s*[\"']?(error|fatal|critical|panic)\b|\[(error|emerg|crit|alert)\]", re.IGNORECASE)
 _WARNING_LINE = re.compile(r"\b(WARNING|WARN)\b|\[warn\]")
 ERROR_LINES_FOR_ERROR = 20
 
@@ -158,6 +161,10 @@ def _state_findings(state: Dict, now: datetime, window_seconds: float) -> List[F
         findings.append(Finding("stopped-with-error", "error", f"Stopped with exit code {exit_code}",
                                 "The container is not running and its last run ended with an error.",
                                 "Read the last lines below for the reason, fix it, then start the service again."))
+    elif status in ("exited", "created", "dead") and state.get("restart_policy") in ("always", "unless-stopped"):
+        findings.append(Finding("stopped", "warn", "Not running although it should be",
+                                f"The container is {status} but is set to restart automatically, so someone stopped it (or it never started).",
+                                "Start it again (docker start / compose up -d), or remove it if it is not wanted."))
     elif status == "paused":
         findings.append(Finding("paused", "warn", "Paused", "The container is paused and does nothing.",
                                 "Unpause it with docker unpause."))
@@ -182,7 +189,8 @@ def analyze(state: Dict, lines: List[str], now: datetime, window_seconds: float)
     findings = _state_findings(state, now, window_seconds)
     window = recent_lines(lines, now, window_seconds)
     matched: Dict[str, Finding] = {}
-    for line in window:
+    explained = set()                       # lines already named by an error-severity rule (never counted twice)
+    for index, line in enumerate(window):
         for rule in RULES:
             if rule.id in _LEVEL_SENSITIVE and _ROUTINE_LINE.search(line):
                 continue
@@ -192,13 +200,14 @@ def analyze(state: Dict, lines: List[str], now: datetime, window_seconds: float)
                     f = matched[rule.id] = Finding(rule.id, rule.severity, rule.title, "", rule.hint)
                 f.count += 1
                 f.sample = line[:SAMPLE_CHARS]
+                if rule.severity == "error":
+                    explained.add(index)
     for f in matched.values():
         minutes = max(1, round(window_seconds / 60))
         f.detail = f"{f.count} matching line(s) in the last {minutes} minutes; the newest is the sample."
         findings.append(f)
-    errors = [ln for ln in window if _ERROR_LINE.search(ln)]
-    already_explained = sum(f.count for f in matched.values() if f.severity == "error")
-    if errors and len(errors) > already_explained:
+    errors = [ln for i, ln in enumerate(window) if i not in explained and _ERROR_LINE.search(ln)]
+    if errors:
         severity = "error" if len(errors) >= ERROR_LINES_FOR_ERROR else "warn"
         findings.append(Finding("errors-logged", severity, "Errors in the log",
                                 f"{len(errors)} line(s) with an error level in the last {max(1, round(window_seconds / 60))} minutes.",

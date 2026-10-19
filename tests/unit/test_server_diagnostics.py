@@ -79,7 +79,7 @@ class TestAnalyzer:
         assert analyze(running(), [old], NOW, WINDOW) == []
 
     def test_counts_and_newest_sample(self):
-        lines = [stamp(120, "timeout talking to a"), stamp(60, "timeout talking to b")]
+        lines = [stamp(120, "request timed out talking to a"), stamp(60, "request timed out talking to b")]
         (f,) = analyze(running(), lines, NOW, WINDOW)
         assert (f.id, f.severity, f.count) == ("timeout", "warn", 2) and f.sample.endswith("to b")
 
@@ -133,7 +133,7 @@ class TestAnalyzer:
         assert analyze(running(restart_count=5), [], NOW, WINDOW) == []
 
     def test_errors_sort_before_warnings(self):
-        lines = [stamp(5, "timeout"), stamp(5, "Traceback (most recent call last):")]
+        lines = [stamp(5, "request timed out"), stamp(5, "Traceback (most recent call last):")]
         severities = [f.severity for f in analyze(running(), lines, NOW, WINDOW)]
         assert severities == sorted(severities, key=lambda s: -{"warn": 1, "error": 2}[s])
 
@@ -216,7 +216,7 @@ class FakeDocker:
     def inspect(self, cid):
         c = self.containers[cid]
         return {"State": c["state"], "RestartCount": c.get("restarts", 0), "Config": {"Image": c.get("image", "img:1")},
-                "HostConfig": {"Memory": c.get("limit", 0)}}
+                "HostConfig": {"Memory": c.get("limit", 0), "RestartPolicy": {"Name": c.get("policy", "")}}}
 
     def stats(self, cid):
         return {"usage_bytes": self.containers[cid].get("usage"), "engine_limit_bytes": 0}
@@ -567,3 +567,151 @@ class TestChecks:
         svc_, _ = make(FLEET, host_reader=lambda: low)
         out = svc_.overview()
         assert out["host_findings"][0]["id"] == "host-disk-low" and out["severity"] == "error"
+
+
+# ---- the audit round (2026-10-19)
+import time  # noqa: E402
+
+from packages.services.server_diagnostics.service import _http_fetch  # noqa: E402
+
+
+class TestRedactionHardening:
+    @pytest.mark.parametrize("line,secret", [
+        ("Cookie: session=abc123xyz", "abc123xyz"), ("Set-Cookie: sid=abcdef; Path=/", "abcdef"),
+        ("Authorization: Token abcdef123456", "abcdef123456"), ("redis://:pw0rd@host:6379/0", "pw0rd"),
+        ("curl -u admin:secret123 http://x", "secret123"), ("pass=hunter2", "hunter2"), ("passphrase=hunter2", "hunter2"),
+        ("auth=abc123456", "abc123456"), ("key=abc123456", "abc123456"), ("sk=abc123456", "abc123456"),
+        ("aws_secret_access_key wJalrXUtnFEMI/K7MDENG", "wJalrXUtnFEMI"), ("password is hunter2 ok", "hunter2"),
+        ('invalid password "hunter2"', "hunter2"), ("token ghp_abcdefghijklmnopqrstuvwxyz0123456789", "ghp_abc"),
+        ("key sk-ant-abcdefghijklmnopqrstuvwxyz0123", "sk-ant"), ("-----BEGIN RSA PRIVATE KEY-----MIIEvQ", "MIIEvQ"),
+        ("postgres://u:p@ss:word@h/db", "ss:word"), ("postgres://u:pass word@h", "pass word"),
+        ("password='it\\'s secret'", "s secret"), ('password: "abc\\"def ghi"', "def ghi"),
+        ("MINIO_ROOT_PASSWORD=abc", "=abc"), ("GET /x?token=abc123456 HTTP/1.1", "abc123456")])
+    def test_more_shapes(self, line, secret):
+        assert secret not in redact_line(line)
+
+    @pytest.mark.parametrize("line", ["basic configuration loaded", "passed 3 checks", "the key is in the lock", "keyboard layout set",
+                                      "INFO: GET /health 200 OK (3 tokens issued)"])
+    def test_prose_is_untouched(self, line):
+        assert redact_line(line) == line
+
+    @pytest.mark.parametrize("payload", ["a-" * 8000, "a." * 8000, "password=" + "a" * 16000, "key" * 6000, "://" * 5000,
+                                         "x-api-key-" * 3000, ("a" * 70 + "-") * 200])
+    def test_hostile_lines_do_not_make_the_scrub_slow(self, payload):
+        start = time.time()
+        redact_line(payload)
+        assert time.time() - start < 0.5
+
+
+class TestAuditFixes:
+    def test_level_fields_in_any_case_count_as_errors(self):
+        lines = [stamp(5, 'level=error msg="db down"'), stamp(5, '{"level":"ERROR","msg":"x"}'), stamp(5, "found 0 errors, no error here")]
+        (f,) = analyze(running(), lines, NOW, WINDOW)
+        assert (f.id, f.count) == ("errors-logged", 2)
+
+    def test_a_line_matching_two_rules_does_not_hide_other_errors(self):
+        both = stamp(5, "ERROR connect() failed (111: Connection refused) while connecting to upstream")
+        others = [stamp(5, "ERROR something else")] * 3
+        ids = {f.id: f.count for f in analyze(running(), [both] + others, NOW, WINDOW)}
+        assert ids["errors-logged"] == 3
+
+    @pytest.mark.parametrize("line", ["request_timeout=30", "read timeout: 30", "connect_timeout=5s", "set timeout 10"])
+    def test_timeout_settings_are_not_symptoms(self, line):
+        assert analyze(running(), [stamp(5, line)], NOW, WINDOW) == []
+
+    @pytest.mark.parametrize("line", ["request timed out", "upstream timeout while reading", "ETIMEDOUT", "context deadline exceeded"])
+    def test_real_timeouts_are_found(self, line):
+        assert "timeout" in {f.id for f in analyze(running(), [stamp(5, line)], NOW, WINDOW)}
+
+    def test_log_text_is_split_on_newlines_only(self, tmp_path):
+        path = str(tmp_path / "d.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+        payload = frame(1, "2026-10-19T16:00:00Z one\x85 stale\x0cpart\r\n2026-10-19T16:00:01Z two\n")
+
+        def serve():
+            conn, _ = server.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(payload) + payload)
+            conn.close()
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            lines = DockerReader(path, timeout=3).logs("abc", 10)
+        finally:
+            server.close()
+        assert lines == ["2026-10-19T16:00:00Z one\x85 stale\x0cpart", "2026-10-19T16:00:01Z two"]
+
+    def test_a_non_json_answer_is_unavailable_not_a_crash(self, tmp_path):
+        path = str(tmp_path / "d.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen(1)
+
+        def serve():
+            conn, _ = server.accept()
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nnope!")
+            conn.close()
+        threading.Thread(target=serve, daemon=True).start()
+        try:
+            with pytest.raises(DockerUnavailable, match="not JSON"):
+                DockerReader(path, timeout=3).inspect("abc")
+        finally:
+            server.close()
+
+    def test_a_container_that_vanishes_mid_refresh_is_one_unknown_row_not_a_503(self):
+        class Vanishing(FakeDocker):
+            def inspect(self, cid):
+                if cid == "b2":
+                    raise DockerUnavailable("Docker answered 404 for /containers/b2/json")
+                return super().inspect(cid)
+        svc_ = DiagnosticsService(Vanishing(FLEET), clock=lambda: NOW.timestamp(), host_reader=lambda: HOST_OK)
+        out = svc_.overview()
+        by = {s["name"]: s for s in out["services"]}
+        assert by["db"]["state"] == "unknown" and by["db"]["severity"] == "warn" and by["api"]["state"] == "running"
+        assert out["summary"]["total"] == 3
+
+    def test_a_service_stopped_by_hand_is_flagged(self):
+        containers = {"a": {"name": "x", "labels": {"com.docker.compose.service": "w"},
+                            "state": {"Status": "exited", "ExitCode": 0, "StartedAt": "2026-10-19T10:00:00Z"}, "policy": "unless-stopped"},
+                      "b": {"name": "y", "labels": {"com.docker.compose.service": "job"},
+                            "state": {"Status": "exited", "ExitCode": 0, "StartedAt": "2026-10-19T10:00:00Z"}, "policy": "no"}}
+        by = {s["name"]: s for s in make(containers)[0].overview()["services"]}
+        assert by["w"]["severity"] == "warn" and by["job"]["severity"] == "ok"
+
+    def test_the_probe_does_not_follow_redirects(self):
+        import http.server
+        hits = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(301)
+                self.send_header("Location", "http://127.0.0.1:1/elsewhere")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            status, _, err = _http_fetch("GET", f"http://127.0.0.1:{httpd.server_address[1]}/health", timeout=3)
+        finally:
+            httpd.shutdown()
+        assert status == 301 and hits == ["/health"]
+
+    @pytest.mark.parametrize("path", ["@evil.example/x", "//evil.example/x", "http://evil.example/x", ""])
+    def test_a_server_supplied_token_path_cannot_redirect_the_probe(self, path):
+        info = dict(INFO_ALL, livekit={"available": True, "token_path": path})
+        seen = []
+
+        def fetch(method, url):
+            seen.append(url)
+            return (200, json.dumps(info), "") if url.endswith("server-info") else (200 if url.endswith("/health") else 405, "", "")
+        gateway_checks(fetch, GW)
+        assert all(u.startswith(GW + "/") and "evil" not in u for u in seen)
+
+    def test_overview_reads_containers_in_parallel_and_caps_log_reads(self):
+        svc_, _ = make(FLEET)
+        assert svc_._slots._value == 4

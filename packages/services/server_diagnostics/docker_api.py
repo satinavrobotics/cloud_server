@@ -11,6 +11,7 @@ import struct
 from typing import Dict, List, Optional
 
 DEFAULT_SOCKET = "/var/run/docker.sock"
+MAX_BODY_BYTES = 8_000_000      # a log answer is cut here: a container that writes huge lines cannot exhaust this service's memory
 _HEADER = struct.Struct(">BxxxL")     # stream type, 3 padding bytes, payload size
 
 
@@ -56,7 +57,7 @@ class DockerReader:
         try:
             conn.request("GET", path)
             response = conn.getresponse()
-            body = response.read()
+            body = response.read(MAX_BODY_BYTES)
         except (OSError, http.client.HTTPException) as err:
             raise DockerUnavailable(f"cannot reach the Docker socket at {self.socket_path}: {err}") from err
         finally:
@@ -65,15 +66,21 @@ class DockerReader:
             raise DockerUnavailable(f"Docker answered {response.status} for {path.split('?')[0]}")
         return body
 
+    def _json(self, path: str):
+        try:
+            return json.loads(self._get(path))
+        except ValueError as err:
+            raise DockerUnavailable(f"Docker sent something that is not JSON for {path.split('?')[0]}") from err
+
     def list_containers(self) -> List[Dict]:
-        return json.loads(self._get("/containers/json?all=1"))
+        return self._json("/containers/json?all=1")
 
     def inspect(self, container_id: str) -> Dict:
-        return json.loads(self._get(f"/containers/{container_id}/json"))
+        return self._json(f"/containers/{container_id}/json")
 
     def stats(self, container_id: str) -> Dict:
         """One memory sample: {usage_bytes (working set: without reclaimable file cache), engine_limit_bytes}."""
-        data = json.loads(self._get(f"/containers/{container_id}/stats?stream=false&one-shot=true"))
+        data = self._json(f"/containers/{container_id}/stats?stream=false&one-shot=true")
         mem = data.get("memory_stats") or {}
         detail = mem.get("stats") or {}
         cache = detail.get("inactive_file", detail.get("total_inactive_file", detail.get("cache", 0))) or 0
@@ -85,4 +92,4 @@ class DockerReader:
         """The last `tail` lines (each starting with its timestamp), optionally only those after epoch `since`."""
         query = f"stdout=1&stderr=1&timestamps=1&tail={int(tail)}" + (f"&since={int(since)}" if since else "")
         text = demultiplex(self._get(f"/containers/{container_id}/logs?{query}"))
-        return [line for line in text.splitlines() if line.strip()]
+        return [line.rstrip("\r") for line in text.split("\n") if line.strip()]

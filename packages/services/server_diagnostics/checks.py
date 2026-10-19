@@ -81,13 +81,16 @@ def gateway_checks(fetch: Fetch, gateway: str) -> Tuple[List[Check], Optional[Di
     checks.append(_result(
         "gateway-reaches-api", "The gateway reaches the API", None if info is not None else f"GET /api/v1/server-info gave {api_status}", "error",
         "502 means the gateway cannot reach the API container (port 8000): check api-delegation-service is healthy, and that the "
-        "gateway's upstream address is one the API listens on. 404 means the API image is older than this check (version skew).",
+        "gateway's upstream address is one the API listens on. 404 means the API image is older than this check (version skew). "
+        "301/302 means this gateway redirects to https: set DIAGNOSTICS_GATEWAY_URL to its https address.",
         "server-info answers through the gateway"))
     if info is None:
         return checks, None
     video = ((info.get("livekit") or {}).get("available"))
     if video:
         path = (info.get("livekit") or {}).get("token_path") or "/api/livekit-selfhost/createToken"
+        if not isinstance(path, str) or not path.startswith("/") or path.startswith("//") or "@" in path:
+            path = "/api/livekit-selfhost/createToken"          # a server-supplied path may not point the probe at another host
         st, _, err = fetch("GET", gateway + path)
         bad = st is None or st in _BAD_GATEWAY or st == 404
         checks.append(_result(

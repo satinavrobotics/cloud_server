@@ -14,9 +14,11 @@ from .host import host_findings, read_host
 from .redact import redact_line
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
-ANALYSIS_TAIL = 400            # lines read from each container to judge it
+ANALYSIS_TAIL = 1000           # lines read from each container to judge it
+MAX_PARALLEL = 6               # containers read at the same time by one refresh
 MAX_LOG_LINES = 2000
 MAX_LOG_CHARS = 400_000
 
@@ -48,6 +50,7 @@ class DiagnosticsService:
         self._ttl = cache_seconds
         self._clock = clock
         self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(4)      # at most this many log reads at once, whoever asks
         self._cached: Optional[Tuple[float, Dict]] = None
 
     # ---- which containers belong to this server
@@ -97,6 +100,7 @@ class DiagnosticsService:
             except (DockerUnavailable, ValueError):
                 usage = None
         return {
+            "restart_policy": ((info.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name") or "",
             "mem_usage_bytes": usage, "mem_limit_bytes": limit,
             "state": status,
             "health": health if health in ("healthy", "unhealthy", "starting") else None,
@@ -108,7 +112,9 @@ class DiagnosticsService:
         }
 
     def _lines(self, container_id: str, tail: int, since: Optional[float] = None) -> List[str]:
-        return [redact_line(line) for line in self._docker.logs(container_id, tail, since=int(since) if since else None)]
+        with self._slots:
+            raw = self._docker.logs(container_id, tail, since=int(since) if since else None)
+        return [redact_line(line) for line in raw]
 
     def _judge(self, item: Dict) -> Tuple[Dict, List[Finding]]:
         state = self._state(item["id"])
@@ -119,6 +125,13 @@ class DiagnosticsService:
             lines = []
         return state, analyze(state, lines, now, self._window)
 
+    def _judge_or_unknown(self, item: Dict):
+        try:
+            state, findings = self._judge(item)
+            return item, state, findings
+        except DockerUnavailable:
+            return item, None, []
+
     # ---- the three answers
     def overview(self) -> Dict:
         """Every service with its state, memory and a count of findings, the host, and the active checks; cached for a few
@@ -127,9 +140,18 @@ class DiagnosticsService:
             now = self._clock()
             if self._cached and now - self._cached[0] < self._ttl:
                 return self._cached[1]
+            items = self._containers()
+            with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as pool:
+                judged = list(pool.map(self._judge_or_unknown, items))
             services = []
-            for item in self._containers():
-                state, findings = self._judge(item)
+            for item, state, findings in judged:
+                if state is None:                    # the container vanished or the engine failed on it (a recreate mid-refresh)
+                    services.append({
+                        "name": item["service"], "container": item["container"], "image": "", "state": "unknown", "health": None,
+                        "status_text": "could not be read (it may have just been recreated)", "restart_count": 0, "started_at": None,
+                        "exit_code": None, "oom_killed": False, "memory": {"usage_bytes": None, "limit_bytes": None, "percent": None},
+                        "severity": "warn", "findings_count": 1})
+                    continue
                 usage, limit = state["mem_usage_bytes"], state["mem_limit_bytes"]
                 services.append({
                     "name": item["service"], "container": item["container"], "image": state["image"],
@@ -194,11 +216,20 @@ def _status_text(state: Dict) -> str:
     return text
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an answer (301 to https), not something to follow to another host."""
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_NO_REDIRECT = urllib.request.build_opener(_NoRedirect)
+
+
 def _http_fetch(method: str, url: str, timeout: float = 2.5):
     """(status or None, body text, error text) for one request; an HTTP error status is an answer, not an error."""
     request = urllib.request.Request(url, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _NO_REDIRECT.open(request, timeout=timeout) as response:
             return response.status, response.read(200_000).decode("utf-8", errors="replace"), ""
     except urllib.error.HTTPError as err:
         return err.code, err.read(2000).decode("utf-8", errors="replace"), ""
