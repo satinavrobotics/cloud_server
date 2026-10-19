@@ -326,8 +326,9 @@ camera block's `width` x `height`. A dropped one counts as `dropped_depth` in
 
 `robot/costmap_upload` (`MQTT_COSTMAP_TOPIC`, default `robot/costmap_upload`, empty = not
 subscribed; subscribed at QoS 1): one message per node and layer with an occupancy PNG
-(u8: 0..100 = occupancy percent, 255 = unknown; the PNG's pixels are not decoded by graph-builder,
-only its header: signature, width x height equal to `width` x `height`, 8-bit grayscale).
+(u8: 0..100 = occupancy percent, 255 = unknown, 253 = person-labelled, 254 reserved; the PNG's pixels
+are not decoded when it is received, only its header: signature, width x height equal to `width` x
+`height`, 8-bit grayscale).
 
 ```json
 {
@@ -346,10 +347,16 @@ only its header: signature, width x height equal to `width` x `height`, 8-bit gr
 Required: `session_node_id`, `robot_name`, `layer` (1-32 characters of `A-Z a-z 0-9 _ -`,
 it names the MinIO object and the node attribute), `costmap_data`,
 `width`/`height` (positive integers), `resolution` (finite, > 0), `origin` (`x`, `y`, `yaw`,
-finite). `content_type` and `costmap_encoding` default to, and must be, `image/png` and
-`u8_occ100_unknown255`. `origin_pose3d` is optional (7 finite fields, non-zero quaternion).
+finite). `content_type` defaults to, and must be, `image/png`; `costmap_encoding` defaults to
+`u8_occ100_unknown255` and must be that or `u8_occ100_unknown255_person253` (the same grid where 253 =
+a person-class vote within the robot's last seconds, the belief under it erased; the encoding is
+informational and is not stored on the node). `origin_pose3d` is optional (7 finite fields, non-zero quaternion).
 The base64 is decoded strictly when saving. An invalid message is logged and counted in
 `errors` (no event).
+
+The scene adapter reads 253 (person-labelled) and 254 (reserved) as unknown (255) when it decodes the
+occupancy window, before any fold (`scene_adapter.occupancy_window`): such a cell is no free, occupied or
+unobserved-gap vote and never blocks or frees anything. 0..100 and 255 are unchanged.
 
 Resolved by session and buffered exactly like depth (per `(robot, node)` and layer, 30 s,
 overwritten per layer, dropped with a rejected node). The buffers (image, depth, costmap; each)

@@ -101,3 +101,28 @@ def test_channels_only_when_same_size():
     ("x", 1.0, (0.25, False)), (float("nan"), 1.0, (0.25, False))])
 def test_half_side_is_the_smaller_side(length, width, expect):
     assert sa.half_side(length, width) == expect
+
+
+def test_person_and_reserved_values_read_as_unknown():
+    arr = np.array([[0, 50, 100, 253, 254, 255, 99, 252]], np.uint8)
+    out = sa.occupancy_window(png(arr))
+    assert out.tolist() == [[0, 50, 100, 255, 255, 255, 99, 252]]
+    assert (sa.UNKNOWN, sa.PERSON, sa.RESERVED) == (255, 253, 254)
+    ok = np.arange(0, 101, dtype=np.uint8).reshape(1, 101)
+    assert np.array_equal(sa.occupancy_window(png(ok)), ok)
+
+
+def test_person_cells_give_no_vote_in_the_fold():
+    from packages.scene_graph.api import SceneParams
+    from packages.scene_graph.engine import ChartGraph
+    arr = np.zeros((6, 8), np.uint8)
+    arr[2:4, 2:4] = 253
+    leaf, why = sa.to_leaf(node(), png(arr))
+    assert why is None and (leaf.window_u8 == 253).sum() == 0 and (leaf.window_u8 == 255).sum() == 4
+    ref = np.zeros((6, 8), np.uint8)
+    ref[2:4, 2:4] = 255
+    ref_leaf, _ = sa.to_leaf(node(), png(ref))
+    g1, g2 = ChartGraph(SceneParams()), ChartGraph(SceneParams())
+    g1.fold_many([leaf]); g2.fold_many([ref_leaf])
+    assert np.array_equal(g1._V, g2._V)
+    assert (g1._V == 255).any() and not ((g1._V >= 100) & (g1._V != 255)).any()

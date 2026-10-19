@@ -5,8 +5,9 @@ Pure: no database, MinIO, Postgres or config. The ingest worker fetches the node
 go wrong with stored data (frames, stamps, size, units) is decided here, in one tested place.
 
 A node that cannot be turned into a leaf yields `(None, reason)`; the worker counts reasons.
-The window is passed through untouched: origin and yaw are the stored `origin_map`, the library
-resamples rotated windows, and values (0..100, 255 unknown) are not reinterpreted here.
+The window is passed through: origin and yaw are the stored `origin_map`, the library resamples
+rotated windows, and values 0..100 / 255 (unknown) are not reinterpreted. Only the person label
+(253) and the reserved value (254) are folded into unknown by `occupancy_window`.
 
 PNG decoding is local (zlib + numpy, 8-bit grayscale, not interlaced: what ingest accepts), so
 graph-builder needs no imaging dependency.
@@ -24,6 +25,9 @@ from packages.scene_graph.api import Leaf, View
 from . import scene_leaf
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+UNKNOWN = 255     # never observed, or the observation expired
+PERSON = 253      # person-labelled by the robot (`u8_occ100_unknown255_person253`): the belief under it is erased
+RESERVED = 254    # reserved by the robot, never sent today
 DEFAULT_HALF_SIDE = ROBOT_HALF_SIDE_DEFAULT_M
 
 SKIP_NO_LAYER = "no_occupancy_layer"
@@ -123,6 +127,19 @@ def decode_png_gray8(data: bytes) -> np.ndarray:
     return out
 
 
+def occupancy_window(data: bytes) -> np.ndarray:
+    """The occupancy window of a costmap PNG: `decode_png_gray8` with the person label (253) and
+    the reserved value (254) turned into unknown (255), before any fold.
+
+    A person-labelled cell carries no belief (the robot erased it; it was neither free nor occupied
+    as far as the cloud knows), so it must give no free, occupied or unobserved-gap vote. Unknown
+    is the one value every consumer already treats that way. 254 is reserved for a later use and is
+    not interpreted. Values 0..100 and 255 are returned unchanged."""
+    window = decode_png_gray8(data)
+    window[(window == PERSON) | (window == RESERVED)] = UNKNOWN
+    return window
+
+
 def _num(value: Any) -> Optional[float]:
     try:
         v = float(value)
@@ -215,7 +232,7 @@ def to_leaf(node: Mapping[str, Any], png: bytes, r_d: float = DEFAULT_HALF_SIDE,
         return None, SKIP_BAD_PNG
     if window is None:
         try:
-            window = decode_png_gray8(png)
+            window = occupancy_window(png)
         except PngError:
             return None, SKIP_BAD_PNG
     if window.shape != (record.get("height"), record.get("width")):

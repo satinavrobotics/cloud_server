@@ -413,7 +413,7 @@ class PngPrefetch:
         if png is None:
             return None, None, None
         try:
-            return png, scene_adapter.decode_png_gray8(png), None
+            return png, scene_adapter.occupancy_window(png), None
         except scene_adapter.PngError as exc:
             return png, None, exc
 

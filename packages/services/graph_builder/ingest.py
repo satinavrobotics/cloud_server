@@ -402,6 +402,9 @@ def depth_record(payload: Mapping[str, Any], session: "OpenSession",
 # --- costmap (`robot/costmap_upload`) ----------------------------------------------------------
 
 COSTMAP_ENCODING = "u8_occ100_unknown255"
+# The same grid with 253 = person-labelled (no belief; the scene adapter reads it as unknown).
+PERSON_ENCODING = "u8_occ100_unknown255_person253"
+COSTMAP_ENCODINGS = (COSTMAP_ENCODING, PERSON_ENCODING)
 COSTMAP_CONTENT_TYPE = "image/png"
 COSTMAP_DATA_KEY = "costmap_data"  # the PNG (MinIO), never stored on the node
 # A layer names a MinIO object (`{node}/costmap/{layer}.png`) and an ArangoDB attribute.
@@ -463,7 +466,7 @@ def check_costmap_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     if not COSTMAP_LAYER_RE.fullmatch(layer):  # fullmatch: `$` alone admits a trailing \n
         raise CostmapPayloadError(f"invalid layer {layer!r} (1-32 of A-Z a-z 0-9 _ -)")
     encoding = payload.get("costmap_encoding", COSTMAP_ENCODING)
-    if encoding != COSTMAP_ENCODING:
+    if encoding not in COSTMAP_ENCODINGS:
         raise CostmapPayloadError(f"unsupported costmap_encoding {encoding!r}")
     content_type = payload.get("content_type", COSTMAP_CONTENT_TYPE)
     if content_type != COSTMAP_CONTENT_TYPE:

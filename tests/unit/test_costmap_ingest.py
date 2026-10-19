@@ -68,6 +68,14 @@ async def _none():
 
 
 class TestPayload:
+    def test_encodings(self):
+        for enc in ("u8_occ100_unknown255", "u8_occ100_unknown255_person253"):
+            assert ingest.check_costmap_payload({**COSTMAP, "costmap_encoding": enc})
+        assert ingest.check_costmap_payload({k: v for k, v in COSTMAP.items() if k != "costmap_encoding"})
+        for bad in ("u8_occ100_unknown255_person254", "u8_occ100", ""):
+            with pytest.raises(ingest.CostmapPayloadError):
+                ingest.check_costmap_payload({**COSTMAP, "costmap_encoding": bad})
+
     @pytest.mark.parametrize("patch_", [
         {"costmap_data": None}, {"costmap_data": ""}, {"layer": ""}, {"layer": "a/b"},
         {"layer": "."}, {"layer": ".."}, {"layer": "a.b"}, {"layer": "a b"},
