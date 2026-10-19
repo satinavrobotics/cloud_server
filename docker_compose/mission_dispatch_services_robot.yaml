@@ -225,6 +225,14 @@ services:
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://${ROBOT_TAILNET_IP}:${LIVEKIT_SFU_TOKENS_PORT:-8008}/health', timeout=4); sys.exit(0)"]
 
+  # Container status and logs for the dashboard (docs: server diagnostics). Loopback only, behind the gateway.
+  # Needs its image pushed first (scripts/build_push.sh), then SERVER_DIAGNOSTICS_AVAILABLE=true in .env.robot.
+  server-diagnostics:
+    build: !reset null
+    image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/server_diagnostics:${IMAGE_TAG:-latest}
+    mem_limit: 48m
+    logging: *logging
+
   # --- not on the robot
   livekit-service:
     profiles: [cloud-only]

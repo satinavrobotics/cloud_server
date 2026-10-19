@@ -40,6 +40,7 @@ SERVICES=(
     "mission-planner-service|mission_planner_service|packages/services/mission_planner/Dockerfile"
     "livekit-service|livekit_service|packages/services/livekit/Dockerfile"
     "livekit-sfu-tokens|livekit_sfu_tokens|packages/services/livekit_sfu_tokens/Dockerfile"
+    "server-diagnostics|server_diagnostics|packages/services/server_diagnostics/Dockerfile"
     "agent-orchestrator-service|agent_orchestrator_service|packages/services/agent_orchestrator/Dockerfile"
     "api-delegation-service|api_delegation_service|packages/api/Dockerfile"
     # MinIO no longer publishes images: built from source at the pinned release (the robot pulls it from here).

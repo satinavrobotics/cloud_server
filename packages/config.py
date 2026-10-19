@@ -47,6 +47,7 @@ PORT_MISSION_PLANNER = 8005
 PORT_LIVEKIT = 8006
 PORT_AGENT_ORCHESTRATOR = 8007
 PORT_API_DELEGATION = 8000
+PORT_SERVER_DIAGNOSTICS = 8011
 
 # ==================== Infrastructure Ports ====================
 PORT_ARANGODB = 8529
@@ -786,6 +787,10 @@ SERVER_ID = _server_env("SERVER_ID")
 # The agent service (:8007) is a cloud singleton: on by default for a cloud server, off for a robot.
 _agent_env = _server_env("SERVER_AGENT_AVAILABLE")
 SERVER_AGENT_AVAILABLE = (SERVER_KIND != "robot") if _agent_env is None else _agent_env.lower() in ("true", "1", "yes")
+# The diagnostics service (:8011, container status and logs for the dashboard): on by default for a cloud server, off for a
+# robot until its image is deployed there (then set SERVER_DIAGNOSTICS_AVAILABLE=true in .env.robot).
+_diagnostics_env = _server_env("SERVER_DIAGNOSTICS_AVAILABLE")
+SERVER_DIAGNOSTICS_AVAILABLE = (SERVER_KIND != "robot") if _diagnostics_env is None else _diagnostics_env.lower() in ("true", "1", "yes")
 # Oldest / newest desktop-app version this server wants (x.y.z); unset = no requirement.
 MIN_CLIENT_VERSION = _server_env("MIN_CLIENT_VERSION")
 RECOMMENDED_CLIENT_VERSION = _server_env("RECOMMENDED_CLIENT_VERSION")

@@ -24,6 +24,11 @@ upstream agent_api {
 }
 
 # The robot's own token service listens on the tailnet IP (robots call it there), not on loopback.
+# Server diagnostics (container status and logs), loopback only.
+upstream diagnostics_api {
+    server 127.0.0.1:8011;
+}
+
 upstream livekit_selfhost_api {
     server ${ROBOT_TAILNET_IP}:8008;
 }
@@ -38,6 +43,7 @@ server {
 
     access_log /var/log/nginx/sati_access.log;
     error_log /var/log/nginx/sati_error.log;
+    error_log /dev/stderr warn;     # also in `docker logs`, so server diagnostics can read it
 
     include /etc/nginx/sati/routes.conf;
 }

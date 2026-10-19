@@ -455,6 +455,27 @@ services:
       retries: 3
       start_period: 20s
 
+  # Read-only container status and logs for the dashboard (the server's counterpart of the robot orchestrator's logs).
+  # Loopback only: the gateway exposes it as /api/diagnostics/. The Docker socket is mounted read-only and the service
+  # only sends GET requests to it; every log line is scrubbed of secrets before it is returned.
+  server-diagnostics:
+    build:
+      context: ..
+      dockerfile: packages/services/server_diagnostics/Dockerfile
+    image: ${SERVER_DIAGNOSTICS_IMAGE:-server_diagnostics:latest}
+    command: ["python", "-m", "packages.services.server_diagnostics.main",
+              "--port", "${PORT_SERVER_DIAGNOSTICS:-8011}", "--host", "127.0.0.1"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    network_mode: "host"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:${PORT_SERVER_DIAGNOSTICS:-8011}/health', timeout=4); sys.exit(0)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+
   # Create Agent Orchestrator Service (LLM triage of VDA5050 state)
   agent-orchestrator-service:
     build:
@@ -546,6 +567,7 @@ services:
       - RECOMMENDED_CLIENT_VERSION=${RECOMMENDED_CLIENT_VERSION:-}
       - LIVEKIT_ROOM_POLICY=${LIVEKIT_ROOM_POLICY:-client}
       - SERVER_LIVEKIT_AVAILABLE=${SERVER_LIVEKIT_AVAILABLE:-}
+      - SERVER_DIAGNOSTICS_AVAILABLE=${SERVER_DIAGNOSTICS_AVAILABLE:-}
     # Optional: the SFU key pair lets DELETE /api/v1/robots/{name} remove the robot's LiveKit participant.
     env_file:
       - path: livekit_sfu.env
