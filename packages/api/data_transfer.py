@@ -25,7 +25,6 @@ import asyncio
 import functools
 import logging
 import os
-import shutil
 import uuid
 from typing import Any, Dict, List, Optional
 

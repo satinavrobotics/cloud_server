@@ -15,9 +15,8 @@ Everything is idempotent, so an interrupted import is finished by running it aga
 and says so in the report. Nothing already on the target is overwritten or removed. The bundle is verified once,
 in full, before the first write.
 """
-import json
 import logging
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Protocol
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Protocol
 
 from packages.migration.bundle import BundleReader, map_dir, rosbag_dir, runs_dir
 
