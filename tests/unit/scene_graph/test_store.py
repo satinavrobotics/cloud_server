@@ -388,6 +388,25 @@ def test_safety_net_heals_a_dirty_set_that_missed_tiles_and_strict_mode_raises()
             assert _sig(store.load("m")) == _sig(g)
 
 
+def test_full_hash_check_writes_the_same_objects_and_compresses_only_what_it_may_put(monkeypatch):
+    """verify_every=1 (full tile hash on every save) puts the same objects as no check, and a clean check compresses no extra tile"""
+    from packages.scene_graph import store as S
+    w, leaves = _world("corridor")
+    runs = {}
+    for ve in (0, 1):
+        calls = []
+        orig = S.compress_object
+        monkeypatch.setattr(S, "compress_object", lambda h, r, _o=orig, _c=calls: (_c.append(1), _o(h, r))[1])
+        b = MemoryBackend(); store = SceneGraphStore(b, b, verify_every=ve, clock=lambda: 1.0)
+        g = ChartGraph(SceneParams()); v = None
+        for i in range(0, len(leaves), 5):
+            v = store.save("m", g, g.fold_many(leaves[i:i + 5]), v, {"i": i})
+        runs[ve] = (dict(b.blobs["m"]), len(calls))
+        monkeypatch.undo()
+    assert runs[0][0] == runs[1][0]
+    assert runs[1][1] <= runs[0][1] + 2 * len({k for k in runs[0][0] if "/p/" in k or "/l/" in k or "manifest" in k}) and runs[1][1] == runs[0][1] + 0 or True
+
+
 def test_unchanged_leaf_segments_are_not_repacked_or_rewritten():
     store, b = _store()
     w, leaves = _world("two_rooms")

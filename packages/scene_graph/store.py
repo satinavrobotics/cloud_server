@@ -283,11 +283,14 @@ class SceneGraphStore:
                 b, pad = dirty.bbox, 4 * RES
                 cand = {t for t in _tiles_in(b.x0 - pad, b.y0 - pad, b.x1 + pad, b.y1 + pad) if t in allc}
         new_blobs: Dict[str, bytes] = {}
-        self._pack_tiles(st, lut, cand, gen, tiles, new_blobs)
+        known = self._known_names(prev)
+        self._pack_tiles(st, lut, cand, gen, tiles, new_blobs, tiles, known)
         count = self._saves.get(map_id, 0) + 1
         if prev is not None and cand != allc and (full or (self.verify_every and count % self.verify_every == 0)):
             check, blobs_all = dict(), {}
-            self._pack_tiles(st, lut, allc, gen, check, blobs_all)
+            # hash every tile of the canvas, but compress only a tile whose hash differs from the one this save settled on: an
+            # equal one has its object already (in new_blobs, or in the base manifest = `known`), so it was never going to be put
+            self._pack_tiles(st, lut, allc, gen, check, blobs_all, tiles, known)
             if check != tiles:
                 missed = sorted(k for k in set(check) | set(tiles) if check.get(k) != tiles.get(k))
                 self.coverage_mismatches += 1
@@ -379,7 +382,6 @@ class SceneGraphStore:
         # known to exist (a committed manifest is never collected) and is not sent again (it is only here when a hash repeats
         # at another coordinate); everything else is put, also on a retry: a "known" object from an uncommitted attempt could
         # have been collected by another process in between, so only committed names count.
-        known = self._known_names(prev)
         for name, blob in new_blobs.items():
             if name not in known:
                 self.blobs.put(map_id, name, blob)
@@ -441,16 +443,20 @@ class SceneGraphStore:
                 | {"g%d/p/%s" % (g, h) for h in man["pages"].values()})
 
     @staticmethod
-    def _pack_tiles(st, lut, coords, gen, tiles, blobs) -> None:
-        """hash (and pack) the tiles `coords` into `tiles` {name: hash} / `blobs`; a tile that became empty is dropped"""
+    def _pack_tiles(st, lut, coords, gen, tiles, blobs, against, known=frozenset()) -> None:
+        """hash the tiles `coords` into `tiles` {name: hash} and pack those whose hash differs from `against`'s into `blobs`; a
+        tile that became empty is dropped. An object the base manifest names (`known`) or `blobs` already holds is not packed again:
+        `save` never puts the former and the latter would be the same bytes."""
         for (tx, ty) in sorted(coords):
             arrs = tile_arrays(st, tx, ty, lut)
             name = "%d,%d" % (tx, ty)
             if arrs is None:
                 tiles.pop(name, None); continue
             h, head, raw = hash_arrays(arrs)
-            if tiles.get(name) != h:                       # an unchanged tile is neither compressed nor written
-                blobs["g%d/t/%s" % (gen, h)] = compress_object(head, raw)
+            if against.get(name) != h:                     # an unchanged tile is neither compressed nor written
+                key = "g%d/t/%s" % (gen, h)
+                if key not in blobs and key not in known:
+                    blobs[key] = compress_object(head, raw)
             tiles[name] = h
 
     def _manifest_by_name(self, map_id, name, epoch=None):
@@ -660,6 +666,7 @@ class SceneGraphStore:
         lut = np.full(max(id_to_idx, default=0) + 1, -1, np.int32)
         for i, j in id_to_idx.items(): lut[i] = j
         plane = np.where(own > 0, lut[np.minimum(own, len(lut) - 1)], -1).astype(np.int32)
+        del own
         leaves: List[LeafRecord] = []
         for h in man["segments"]:
             arr, m = unpack(self.blobs.get(map_id, "g%d/l/%s" % (man["generation"], h)))
@@ -669,6 +676,7 @@ class SceneGraphStore:
                          leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
+        del V, T, B, Fn, Bn, Hold, Val, chan, plane      # the state alone holds the planes while the engine copies and re-solves
         g = ChartGraph(SceneParams(**p))
         g.import_state(st, verify=verify)
         if [_fmt(k) for k in g._keys] != [c["key"] for c in charts]:
