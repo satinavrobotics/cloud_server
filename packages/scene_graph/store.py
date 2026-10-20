@@ -246,7 +246,7 @@ class SceneGraphStore:
         else:
             raise ValueError("generation is neither current nor begun")
         prev = self._manifest_by_name(map_id, pending.get("manifest") if pend else (meta or {}).get("manifest"))
-        st = sg.export_state()
+        st = getattr(sg, "export_state_lazy", sg.export_state)()          # time planes as views: a tile is widened on its own
         if st.V is None:
             raise ValueError("nothing to save: the engine has no state")
         if pend and pending.get("params_hash") and pending["params_hash"] != params_hash(st.params, _pipeline(st.params)):
