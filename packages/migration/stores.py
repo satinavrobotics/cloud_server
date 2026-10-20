@@ -480,7 +480,7 @@ class ServiceTarget:
                       for r in rows]
             inserted = 0
             async with conn.cursor() as cur2:
-                await cur2.executemany(sql, values, returning=False)
+                await cur2.executemany(sql, values)
                 inserted = len(values) if kind != "events" else max(cur2.rowcount, 0)
             if inserted:
                 await conn.execute("INSERT INTO import_items (import_id, kind, key) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
