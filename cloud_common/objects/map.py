@@ -249,6 +249,10 @@ class MapStatusV1(pydantic.BaseModel):
     # When a SLAM map of this map was last saved on a robot (packages/api/maps.py
     # mark_slam_saved): the map holds data, so it is `ready` even without topomap nodes.
     slam_saved_at: Optional[datetime.datetime] = None
+    # Set on a map created by a data import (packages/migration): which server and map it was copied
+    # from and how far the import is (`phase`: importing | complete). While `importing` the map is
+    # kept `archived`, i.e. hidden and not operable, until the import commits.
+    imported_from: Optional[Dict[str, Any]] = None
 
 
 def effective_type(spec: Any) -> str:

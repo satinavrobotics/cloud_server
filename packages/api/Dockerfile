@@ -39,6 +39,9 @@ COPY packages/utils/ /app/packages/utils/
 
 # Phase 0 libraries (fleet events + telemetry ingest, used by packages/api/telemetry.py)
 COPY packages/events/ /app/packages/events/
+
+# Data transfer between servers (packages/api/data_transfer.py imports it).
+COPY packages/migration/ /app/packages/migration/
 COPY packages/telemetry_ingest/ /app/packages/telemetry_ingest/
 
 # Scene graph library (read API: packages/api/scene_graph_reads.py; needs numpy + scipy)

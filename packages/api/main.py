@@ -407,6 +407,10 @@ app.include_router(orchestrator_proxy_router)
 from packages.api.server_info import router as server_info_router
 app.include_router(server_info_router)
 
+# /api/v1/transfer/*: move maps between servers as a bundle (packages/api/data_transfer.py).
+from packages.api.data_transfer import router as data_transfer_router
+app.include_router(data_transfer_router)
+
 
 # ==================== Health & Stats ====================
 

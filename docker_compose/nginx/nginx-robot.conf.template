@@ -1,8 +1,10 @@
 # Robot (Raspberry Pi) gateway: the same public paths as the cloud gateway, in front of the robot's own services.
 # The nginx image renders this with envsubst (/etc/nginx/templates/default.conf.template -> conf.d/default.conf),
-# so only ${ROBOT_TAILNET_IP} and ${ROBOT_GATEWAY_PORT} are substituted; routing lives in routes.conf.
+# so only ${ROBOT_TAILNET_IP}, ${ROBOT_GATEWAY_PORT} and ${ROBOT_LAN_IP} are substituted; routing lives in routes.conf.
 #
-# Doors: loopback and the robot's tailnet IP only, never every interface (docs/robot_deploy.md).
+# Doors: loopback and the robot's tailnet IP, and nothing else unless ROBOT_LAN_IP is set (docs/robot_deploy.md). The
+# gateway has no login, so a LAN door is an explicit choice: ROBOT_LAN_IP=<the robot's LAN address> or 0.0.0.0 (every
+# interface). Unset, it is 127.0.0.2: a second loopback address nothing can reach from outside, which keeps this line valid.
 # No UI is served from the robot: the desktop app brings its own, so there are no Expo (web_server) blocks.
 
 # No CORS on a robot (cors-robot.conf): see the comment there.
@@ -36,6 +38,7 @@ upstream livekit_selfhost_api {
 server {
     listen 127.0.0.1:${ROBOT_GATEWAY_PORT};
     listen ${ROBOT_TAILNET_IP}:${ROBOT_GATEWAY_PORT};
+    listen ${ROBOT_LAN_IP}:${ROBOT_GATEWAY_PORT};
     server_name _;
 
     add_header X-Frame-Options "SAMEORIGIN" always;

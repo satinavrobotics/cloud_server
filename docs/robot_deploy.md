@@ -20,6 +20,11 @@ Off (profile `cloud-only`): livekit-service (LiveKit Cloud tokens: needs the int
 API). The scene-graph worker (in graph-builder) and planner are on in `.env.robot.example` (`SCENE_GRAPH_WORKER_ENABLED` /
 `SCENE_GRAPH_PLANNER_ENABLED`; both default to false in the code), with memory caps in the robot compose file; their real memory use on a Pi is not measured yet.
 
+LAN door (opt-in): the gateway listens on loopback and `ROBOT_TAILNET_IP` only. A client on the local network (the desktop app's Scan, or a typed
+`http://192.168.x.y`) gets "connection refused" until `ROBOT_LAN_IP=<this robot's LAN address>` (or `0.0.0.0` for every interface) is set in `.env.robot`
+and the gateway recreated (`scripts/robot_compose.sh up -d --force-recreate nginx-gateway`). The gateway has no login: whoever can reach it can drive the
+robot, which is why this is a choice and not the default.
+
 Network: Postgres, ArangoDB, the planner and graph-builder listen on `127.0.0.1` only; mosquitto on `127.0.0.1` and the tailnet IP
 (`ROBOT_TAILNET_IP`); the API (8000) and the MinIO forwarder are the doors. Mosquitto still allows anonymous clients, so
 Tailscale (ACLs) is the boundary: keep the ACL tight. Every container has a memory limit and a rotated log (10 MB x 3);
@@ -85,7 +90,7 @@ Both are in `mission_dispatch_services_robot.yaml` and deploy with the rest.
 - **Where it listens:** signalling (7880) on loopback + `ROBOT_TAILNET_IP`, TCP fallback 7881, media UDP 50000-50100. The token
   service listens on `ROBOT_TAILNET_IP:8008` (robots call `/api/createToken` there; the gateway forwards only the operator route).
   `node_ip` is the tailnet IP, so media goes over Tailscale. If the Pi must work with no Tailscale session at all (LAN only), this
-  needs a LAN-IP variant: not built.
+  needs a LAN-IP variant: not built (the gateway's LAN door below carries the REST and websocket traffic; video media still goes to the tailnet IP).
 - **Keys:** `LIVEKIT_SFU_API_KEY` / `LIVEKIT_SFU_API_SECRET` in `.env.robot` (`setup_robot.sh` generates a fresh pair). The robots
   and clients are told `ws://<ROBOT_TAILNET_IP>:7880` (`LIVEKIT_SFU_SERVER_URL` overrides it). The robots' video client must be
   pointed at this Pi's token service (`http://<ROBOT_TAILNET_IP>:8008`) instead of the cloud's.
