@@ -460,6 +460,29 @@ class TestHost:
         assert host_findings(dict(HOST_OK, disk_free_bytes=5 << 30))[0].id == "host-disk-low"
         assert host_findings(dict(HOST_OK, disk_free_bytes=2 << 30))[0].severity == "error"
         assert host_findings(dict(HOST_OK, load1=9.0))[0].id == "host-load-high"
+
+    def test_memory_limits_that_add_up_to_more_than_the_machine(self):
+        assert host_findings(dict(HOST_OK, container_limits_bytes=4 << 30)) == []                  # exactly the machine: fine
+        assert host_findings(dict(HOST_OK, container_limits_bytes=int(4.3 * (1 << 30)))) == []     # a little over: normal
+        f = host_findings(dict(HOST_OK, container_limits_bytes=int(4.8 * (1 << 30))))
+        assert [(x.id, x.severity) for x in f] == [("host-memory-overcommitted", "warn")]
+        assert host_findings(dict(HOST_OK, container_limits_bytes=None)) == []
+
+    def test_raspberry_pi_power_flags(self, tmp_path):
+        flag = tmp_path / "get_throttled"
+        no = str(tmp_path / "no")
+        flag.write_text("0x50005\n")
+        h = read_host(no, no, no, str(flag))
+        assert h["throttled"] == 0x50005
+        f = host_findings(dict(HOST_OK, throttled=0x50005))
+        assert [(x.id, x.severity) for x in f] == [("host-power-throttled", "error")]
+        assert "under-voltage" in f[0].detail and "throttled" in f[0].detail
+        assert [(x.id, x.severity) for x in host_findings(dict(HOST_OK, throttled=0x4))] == [("host-power-throttled", "warn")]
+        earlier = host_findings(dict(HOST_OK, throttled=0x50000))
+        assert [(x.id, x.severity) for x in earlier] == [("host-power-throttled-earlier", "warn")]
+        assert host_findings(dict(HOST_OK, throttled=0)) == []
+        assert read_host(no, no, no, no)["throttled"] is None          # not a Pi: no finding
+        assert host_findings(dict(HOST_OK, throttled=None)) == []
         assert host_findings({}) == []
 
 

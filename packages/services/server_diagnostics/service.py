@@ -165,6 +165,8 @@ class DiagnosticsService:
                     "severity": worst(findings), "findings_count": len(findings),
                 })
             host = self._read_host()
+            limits = [s["memory"]["limit_bytes"] for s in services if s["memory"]["limit_bytes"]]
+            host["container_limits_bytes"] = sum(limits) if limits else None
             host_found = host_findings(host)
             checks = [c.to_dict() for c in run_checks(self._fetch, self._gateway, services)] if self._gateway else []
             failing = [c for c in checks if not c["ok"]]

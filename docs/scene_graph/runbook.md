@@ -413,6 +413,9 @@ differ by up to about 1 m (the legacy planner returns a node and its own positio
     container's memory limit: the rest is for the fold's temporaries (a fold can need a multiple of the engine),
     decoded PNGs (`PREFETCH_QUEUE` x a costmap) and the process. A cap above the container limit means an OOM kill
     instead of an eviction. `MemoryError` inside a fold is handled (backoff, then bisect), an OOM kill is not.
+    On the 4 GB Pi the robot compose gives the graph builder 896 MiB (MEM_GRAPH_BUILDER; it was 384 MiB and the engine passed
+    its 120 MB budget, reached ~750 MB resident and was OOM-killed) and small steps: STEP_BUDGET_S=5, BATCH_MAX_LEAVES=8,
+    PREFETCH_QUEUE=16. The budget is still not enforced by the engine; that needs a code fix (evict or spill when over budget).
   * `WORKER_THREADS` vs cores: each fold is mostly CPU-bound numpy/scipy; more threads than physical cores only
     interleave them (and multiply peak memory, since every running fold has temporaries). The default is
     `min(8, cores)`.
