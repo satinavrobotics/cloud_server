@@ -40,6 +40,8 @@ class MinIOService:
         self.minio_port = minio_port
         self.bucket_prefix = bucket_prefix
         self.client: Optional[Minio] = None
+        # Buckets seen to exist (see _ensure_bucket_cached); dropped by _delete_bucket
+        self._known_buckets: set = set()
         self._connect(minio_access_key, minio_secret_key, minio_secure)
 
     def _connect(self, access_key: str, secret_key: str, secure: bool) -> None:
@@ -81,12 +83,43 @@ class MinIOService:
             self.logger.error(f"Failed to ensure bucket '{bucket_name}': {e}")
             return False
 
+    def _ensure_bucket_cached(self, bucket_name: str) -> bool:
+        """`_ensure_bucket`, but a bucket this process already saw (or made) is not asked about
+        again: one request less per stored object. Only for a caller that retries after a
+        NoSuchBucket error (`_put_with_bucket`): another process may delete the bucket."""
+        if bucket_name in self._known_buckets:
+            return True
+        if self._ensure_bucket(bucket_name):
+            self._known_buckets.add(bucket_name)
+            return True
+        return False
+
+    def _put_with_bucket(self, map_id: str, put):
+        """`put(bucket_name)` after making sure the map's bucket exists (cached, see
+        _ensure_bucket_cached). When the put says NoSuchBucket the cached knowledge was stale
+        (the bucket was deleted by another process): it is forgotten, the bucket is made again,
+        as the uncached check would have, and the put is repeated once. Returns False when the
+        bucket cannot be ensured, else what `put` returns; other errors propagate."""
+        bucket_name = self._bucket_name(map_id)
+        if not self._ensure_bucket_cached(bucket_name):
+            return False
+        try:
+            return put(bucket_name)
+        except S3Error as e:
+            if e.code != "NoSuchBucket":
+                raise
+            self._known_buckets.discard(bucket_name)
+            if not self._ensure_bucket_cached(bucket_name):
+                return False
+            return put(bucket_name)
+
     def _ensure_map_bucket(self, map_id: str) -> bool:
         """Ensure the per-map bucket exists. Returns False on error."""
         return self._ensure_bucket(self._bucket_name(map_id))
 
     def _delete_bucket(self, bucket_name: str) -> bool:
         """Empty and remove a bucket. Idempotent: returns True if already absent."""
+        self._known_buckets.discard(bucket_name)
         try:
             try:
                 exists = self.client.bucket_exists(bucket_name)
