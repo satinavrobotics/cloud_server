@@ -34,7 +34,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import ndimage
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import connected_components, dijkstra
 
 TAU0_FACTOR = 2.0 * math.sqrt(2.0)
@@ -73,11 +73,17 @@ class Space:
         idx[ys, xs] = np.arange(len(ys), dtype=np.int32)
         return Space(H, W, ys.astype(np.int32), xs.astype(np.int32), idx)
 
+    def padded(self) -> Tuple[np.ndarray, np.ndarray, int]:
+        """(the cell-index image with a ring of -1 around it, flattened; the flat place of every cell in it; its row length)"""
+        Wp = self.W + 2
+        P = np.full((self.H + 2) * Wp, -1, np.int32)
+        P.reshape(self.H + 2, Wp)[1:-1, 1:-1] = self.idx
+        return P, (self.ys.astype(np.int64) + 1) * Wp + self.xs + 1, Wp
+
     def neighbours(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """cell index of the N, E, S, W 4-neighbour of every cell (-1: not in F)"""
-        P = np.pad(self.idx, 1, constant_values=-1)
-        y, x = self.ys + 1, self.xs + 1
-        return P[y - 1, x], P[y, x + 1], P[y + 1, x], P[y, x - 1]
+        P, pos, Wp = self.padded()
+        return P[pos - Wp], P[pos + 1], P[pos + Wp], P[pos - 1]
 
 
 # ---------------------------------------------------------------------------------------------------------------- function
@@ -93,6 +99,14 @@ def distance(sp: Space, h: float) -> np.ndarray:
     return d[sp.ys - y0 + 1, sp.xs - x0 + 1] * h
 
 
+def group_order(lab: np.ndarray, K: int) -> np.ndarray:
+    """np.argsort(lab, kind="stable") for labels in [0, K): the same permutation (a stable sort has exactly one result), found by
+    numpy's radix sort when the labels fit 16 bits"""
+    if K <= 65535 and len(lab):
+        return np.argsort(lab.astype(np.uint16), kind="stable")
+    return np.argsort(lab, kind="stable")
+
+
 def ranks(f: np.ndarray) -> np.ndarray:
     """rank of every cell in the order (-f, row, col); cells are row-major, so a stable sort of -f is that order"""
     order = np.argsort(-f, kind="stable")
@@ -101,20 +115,31 @@ def ranks(f: np.ndarray) -> np.ndarray:
     return r
 
 
-def raw_basins(sp: Space, rank: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """(basin id per cell, root cell per basin). Basin ids follow the rank of the roots."""
+def raw_basins(sp: Space, rank: np.ndarray, nb: Optional[tuple] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """(basin id per cell, root cell per basin). Basin ids follow the rank of the roots. `nb`: sp.neighbours() when known."""
     N = sp.N
-    nb = np.stack(sp.neighbours())                                          # (4, N)
-    rn = np.where(nb >= 0, rank[np.maximum(nb, 0)], BIG)
-    arg = rn.argmin(0)
-    has = rn[arg, np.arange(N)] < rank
-    par = np.where(has, nb[arg, np.arange(N)], np.arange(N)).astype(np.int64)
+    if rank.dtype.kind in "iu" and len(rank) == N and N and int(rank.min()) >= 0 and int(rank.max()) < N and bool((np.bincount(rank, minlength=N) == 1).all()):
+        # ranks are a permutation of 0..N-1 (what `ranks` returns): the earliest neighbour is the cell holding the least
+        # neighbour rank, found on the padded rank image without the cell indices of the neighbours
+        P, pos, Wp = sp.padded()
+        RP = np.full(len(P), BIG, np.int64)
+        RP[pos] = rank
+        m = np.minimum(np.minimum(RP[pos - Wp], RP[pos + 1]), np.minimum(RP[pos + Wp], RP[pos - 1]))
+        has = m < rank
+        cell_of = np.empty(N, np.int64); cell_of[rank] = np.arange(N)
+        par = np.where(has, cell_of[np.minimum(m, N - 1)], np.arange(N)).astype(np.int64)
+    else:
+        nb = np.stack(sp.neighbours() if nb is None else nb)                # (4, N)
+        rn = np.where(nb >= 0, rank[np.maximum(nb, 0)], BIG)
+        arg = rn.argmin(0)
+        has = rn[arg, np.arange(N)] < rank
+        par = np.where(has, nb[arg, np.arange(N)], np.arange(N)).astype(np.int64)
     while True:                                                             # pointer doubling: ranks fall along every chain
         nxt = par[par]
         if np.array_equal(nxt, par):
             break
         par = nxt
-    roots = np.unique(par)
+    roots = np.nonzero(par == np.arange(N))[0]                              # the fixed points: the values of par, ascending
     roots = roots[np.argsort(rank[roots], kind="stable")]
     bid = np.empty(N, np.int64)
     pos = np.empty(N, np.int64)
@@ -123,9 +148,9 @@ def raw_basins(sp: Space, rank: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return bid, roots
 
 
-def crossings(sp: Space, lab: np.ndarray, f: np.ndarray):
+def crossings(sp: Space, lab: np.ndarray, f: np.ndarray, nb: Optional[tuple] = None):
     """4-adjacent cell pairs (i, j) in different regions: (i, j, value min(f_i, f_j)); each unordered pair once (E and S)"""
-    _, E, S, _ = sp.neighbours()
+    _, E, S, _ = sp.neighbours() if nb is None else nb
     out = []
     for nb in (E, S):
         i = np.nonzero(nb >= 0)[0]
@@ -157,29 +182,45 @@ def merge_tree(peakv, peakr, lo, hi, s, tau: float) -> List[Tuple[float, int, in
     """The merges of persistence below `tau`, smallest persistence first: [(p, keep, drop)] on the region ids given.
     peakv / peakr: peak value and peak rank per region (the elder of a pair is the higher peak, ties the smaller rank);
     (lo, hi, s): adjacent pairs and their saddle. Pure union-find on region ids, O((R + S) log S)."""
-    peakv = dict(enumerate(np.asarray(peakv, float).tolist())) if not isinstance(peakv, dict) else dict(peakv)
-    peakr = dict(enumerate(np.asarray(peakr).tolist())) if not isinstance(peakr, dict) else dict(peakr)
+    arrays = not isinstance(peakv, dict) and not isinstance(peakr, dict)
+    pv_arr = np.asarray(peakv, float) if not isinstance(peakv, dict) else None
+    pr_arr = np.asarray(peakr) if not isinstance(peakr, dict) else None
+    peakv = dict(enumerate(pv_arr.tolist())) if pv_arr is not None else dict(peakv)
+    peakr = dict(enumerate(pr_arr.tolist())) if pr_arr is not None else dict(peakr)
+    lo_a, hi_a, s_a = np.asarray(lo), np.asarray(hi), np.asarray(s, float)
+    lo_l, hi_l, s_l = lo_a.tolist(), hi_a.tolist(), s_a.tolist()
     sad: Dict[int, Dict[int, float]] = {}
-    for a, b, v in zip(np.asarray(lo).tolist(), np.asarray(hi).tolist(), np.asarray(s, float).tolist()):
+    for a, b, v in zip(lo_l, hi_l, s_l):
         sad.setdefault(a, {})[b] = v
         sad.setdefault(b, {})[a] = v
     ver = {r: 0 for r in peakv}
     heap: list = []
     limit = tau - TOL
-
-    def push(a, b):
-        p = min(peakv[a], peakv[b]) - sad[a][b]
-        if p < limit:
-            ka, kb = (a, b) if peakr[a] < peakr[b] else (b, a)
-            heapq.heappush(heap, (p, -sad[a][b], peakr[ka], peakr[kb], a, b, ver[a], ver[b]))
-    for a in sad:
-        for b in sad[a]:
-            if a < b:
-                push(a, b)
+    # The heap entries (p, -s, peak ranks, a, b, versions) are pairwise distinct (a pair is pushed once per version of its
+    # regions), so the order they pop in does not depend on how the heap was filled: the first fill is vectorised and heapified.
+    n_pairs = len(lo_l)
+    if (arrays and n_pairs and int(lo_a.min()) >= 0 and int(hi_a.max()) < len(pv_arr) and bool((lo_a < hi_a).all())
+            and (n_pairs == 1 or bool((np.diff(lo_a.astype(np.int64) * len(pv_arr) + hi_a) > 0).all()))):
+        # unique pairs lo < hi: the dict above holds exactly these (lo, hi, s)
+        p0 = np.minimum(pv_arr[lo_a], pv_arr[hi_a]) - s_a
+        k0 = np.nonzero(p0 < limit)[0]
+        ra, rb = pr_arr[lo_a[k0]], pr_arr[hi_a[k0]]
+        heap = list(zip(p0[k0].tolist(), (-s_a[k0]).tolist(), np.minimum(ra, rb).tolist(), np.maximum(ra, rb).tolist(),
+                        lo_a[k0].tolist(), hi_a[k0].tolist(), [0] * len(k0), [0] * len(k0)))
+        heapq.heapify(heap)
+    else:
+        for a in sad:
+            for b in sad[a]:
+                if a < b:
+                    p = min(peakv[a], peakv[b]) - sad[a][b]
+                    if p < limit:
+                        ka, kb = (a, b) if peakr[a] < peakr[b] else (b, a)
+                        heapq.heappush(heap, (p, -sad[a][b], peakr[ka], peakr[kb], a, b, ver[a], ver[b]))
     out: List[Tuple[float, int, int]] = []
+    heappush, heappop = heapq.heappush, heapq.heappop
     while heap:
-        p, _, _, _, a, b, va, vb = heapq.heappop(heap)
-        if a not in ver or b not in ver or ver[a] != va or ver[b] != vb or b not in sad.get(a, {}):
+        p, _, _, _, a, b, va, vb = heappop(heap)
+        if ver.get(a, -1) != va or ver.get(b, -1) != vb or b not in sad.get(a, ()):       # versions are >= 0: -1 = merged away
             continue
         keep, drop = (a, b) if (peakv[a], -peakr[a]) >= (peakv[b], -peakr[b]) else (b, a)
         out.append((p, keep, drop))
@@ -196,9 +237,20 @@ def merge_tree(peakv, peakr, lo, hi, s, tau: float) -> List[Tuple[float, int, in
             sx.pop(drop, None)
             sx[keep] = nv
         del sad[drop], ver[drop], peakv[drop], peakr[drop]
-        ver[keep] += 1
-        for x in sk:
-            push(keep, x) if keep < x else push(x, keep)
+        vk = ver[keep] = ver[keep] + 1
+        pk, rk = peakv[keep], peakr[keep]
+        for x, v in sk.items():                    # push(min(keep, x), max(keep, x)), inlined
+            px = peakv[x]
+            if keep < x:
+                p = (px if px < pk else pk) - v
+                if p < limit:
+                    rx = peakr[x]
+                    heappush(heap, (p, -v, rk, rx, keep, x, vk, ver[x]) if rk < rx else (p, -v, rx, rk, keep, x, vk, ver[x]))
+            else:
+                p = (pk if pk < px else px) - v
+                if p < limit:
+                    rx = peakr[x]
+                    heappush(heap, (p, -v, rk, rx, x, keep, ver[x], vk) if rk < rx else (p, -v, rx, rk, x, keep, ver[x], vk))
     return out
 
 
@@ -245,8 +297,19 @@ def centres(sp: Space, lab: np.ndarray, f: np.ndarray, K: int) -> np.ndarray:
     cy = np.bincount(lab, weights=sp.ys, minlength=K) / np.maximum(cnt, 1)
     cx = np.bincount(lab, weights=sp.xs, minlength=K) / np.maximum(cnt, 1)
     d2 = np.round((sp.ys - cy[lab]) ** 2 + (sp.xs - cx[lab]) ** 2, 9)
-    o = np.lexsort((np.arange(sp.N), -f, d2, lab))
-    first = np.concatenate([[True], lab[o][1:] != lab[o][:-1]])
+    if len(lab) == 0 or int(lab.max()) >= K or (cnt == 0).any():
+        o = np.lexsort((np.arange(sp.N), -f, d2, lab))
+        first = np.concatenate([[True], lab[o][1:] != lab[o][:-1]])
+        return o[first].astype(np.int64)
+    # the first cell of every chart in the order (chart, d2, -f, index): the cells of least d2 (cell indices ascending within a
+    # chart), then the first of those by (-f, index). The same cell as the full lexsort, which sorts the whole canvas.
+    go = group_order(lab, K)
+    cut = np.concatenate([[0], np.cumsum(cnt)])
+    d2o = d2[go]
+    cand = go[d2o == np.repeat(np.minimum.reduceat(d2o, cut[:-1]), cnt)]
+    o = cand[np.lexsort((cand, -f[cand], lab[cand]))]
+    lo = lab[o]
+    first = np.concatenate([[True], lo[1:] != lo[:-1]])
     return o[first].astype(np.int64)
 
 
@@ -263,6 +326,47 @@ class Partition:
     region: np.ndarray          # persistence region (index 0..R-1, rank order of the peaks) of each chart
     regions: int
     seed: np.ndarray            # cell index of the net point each chart was cut around (== anchor without a radius)
+    edges: Optional[tuple] = None   # (row cell, column cell, length) of the lattice edges inside F (`edges_full`), with a radius
+    edge_cuts: Optional[tuple] = None
+
+
+def edges_full(sp: Space, h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int, int, int]]:
+    """The 8-neighbour lattice edges inside F as (row cell, column cell, length m) and the offsets of the four direction blocks
+    (E, S, SE, SW; the last two are the diagonals): a diagonal needs both orthogonal cells in F, as the engine's route does.
+    One flat gather per direction on the padded cell-index image (a neighbour outside the canvas reads the pad, -1)."""
+    P, pos, Wp = sp.padded()
+    R, C, L, cuts = [], [], [], [0]
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        nbv = P[pos + (dy * Wp + dx)]
+        a = np.nonzero(nbv >= 0)[0]
+        b = nbv[a]
+        if dy and dx:
+            pa = pos[a]
+            keep = (P[pa + dx] >= 0) & (P[pa + dy * Wp] >= 0)
+            a, b = a[keep], b[keep]
+        R.append(a); C.append(b); L.append(np.full(len(a), math.hypot(dy, dx) * h))
+        cuts.append(cuts[-1] + len(a))
+    return np.concatenate(R), np.concatenate(C), np.concatenate(L), tuple(cuts)
+
+
+def edges_within(sp: Space, edges, cuts, region: np.ndarray, cells: Optional[np.ndarray] = None):
+    """`edges_full` restricted to one region: an edge joins cells of one region only, and a diagonal also needs both orthogonal
+    cells in that region (a cell of another region beside the step is across a pass: the step would be a way round it). With
+    `cells` (bool per cell) only the edges whose row cell is in `cells`. Order as in `edges_full`."""
+    R, C, L = edges
+    k = np.arange(len(R)) if cells is None else np.nonzero(cells[R])[0]
+    keep = region[R[k]] == region[C[k]]
+    k = k[keep]
+    a, b = R[k], C[k]
+    diag = k >= cuts[2]
+    if diag.any():
+        d = np.nonzero(diag)[0]
+        o1 = sp.idx[sp.ys[a[d]], sp.xs[b[d]]]
+        o2 = sp.idx[sp.ys[b[d]], sp.xs[a[d]]]
+        ok = np.ones(len(k), bool)
+        ok[d] = (region[o1] == region[a[d]]) & (region[o2] == region[a[d]])
+        k = k[ok]
+    return R[k], C[k], L[k]
 
 
 def edges8(sp: Space, h: float, region: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -270,29 +374,14 @@ def edges8(sp: Space, h: float, region: Optional[np.ndarray] = None) -> Tuple[np
     as the engine's route does, so geodesic distances here are the distances routes have. With `region`, an edge joins cells of
     one region only, and a diagonal also needs both orthogonal cells in that region (a cell of another region beside the
     step is across a pass: the step would be a way round it)."""
-    R, C, L = [], [], []
-    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
-        y2, x2 = sp.ys + dy, sp.xs + dx
-        ok = (y2 >= 0) & (y2 < sp.H) & (x2 >= 0) & (x2 < sp.W)
-        ok[ok] &= sp.nav[y2[ok], x2[ok]]
-        a = np.nonzero(ok)[0]
-        b = sp.idx[y2[a], x2[a]]
-        if dy and dx:
-            keep = sp.nav[sp.ys[a], x2[a]] & sp.nav[y2[a], sp.xs[a]]
-            a, b = a[keep], b[keep]
-            if region is not None:
-                o1, o2 = sp.idx[sp.ys[a], x2[a]], sp.idx[y2[a], sp.xs[a]]
-                keep = (region[o1] == region[a]) & (region[o2] == region[a])
-                a, b = a[keep], b[keep]
-        if region is not None:
-            keep = region[a] == region[b]
-            a, b = a[keep], b[keep]
-        R.append(a); C.append(b); L.append(np.full(len(a), math.hypot(dy, dx) * h))
-    return np.concatenate(R), np.concatenate(C), np.concatenate(L)
+    R, C, L, cuts = edges_full(sp, h)
+    if region is None:
+        return R, C, L
+    return edges_within(sp, (R, C, L), cuts, region)
 
 
 def subdivide(sp: Space, f: np.ndarray, region: np.ndarray, radius: float, h: float,
-              cache: Optional[dict] = None) -> Tuple[np.ndarray, np.ndarray]:
+              cache: Optional[dict] = None, edges=None, cuts=None) -> Tuple[np.ndarray, np.ndarray]:
     """(chart per cell, net point cell per chart): every persistence region cut into geodesic Voronoi cells of a greedy net.
     Cells are taken in the order of room (B quantised to the lattice step, ties in scan order: translation invariant, and
     stable when the canvas grows, which keeps the relative scan order); a
@@ -301,36 +390,49 @@ def subdivide(sp: Space, f: np.ndarray, region: np.ndarray, radius: float, h: fl
     point of a region is a cell of maximal room, and no chart crosses a pass. Charts are the Voronoi cells of the net points
     (geodesic in the region): connected, and every cell reaches its net point without leaving its chart. The anchor of a
     chart is its centre (`centres`), not the net point. `cache` (a dict the caller keeps
-    between calls) serves a region whose cells and room are unchanged from the last call; it holds the last call's regions only."""
+    between calls) serves a region whose cells and room are unchanged from the last call; it holds the last call's regions only.
+    `edges`, `cuts`: `edges_full(sp, h)` when the caller has it already."""
     N = sp.N
-    R, C, L = edges8(sp, h, region)
-    eo = np.argsort(region[R], kind="stable")
-    R, C, L = R[eo], C[eo], L[eo]
     nR = int(region.max()) + 1
-    ecut = np.searchsorted(region[R], np.arange(nR + 1))
-    co = np.argsort(region, kind="stable")
-    ccut = np.searchsorted(region[co], np.arange(nR + 1))
+    co = group_order(region, nR)                                 # cells of a region, ascending cell index = scan order
+    ccut = np.concatenate([[0], np.cumsum(np.bincount(region, minlength=nR))])
     q = np.rint(f / h).astype(np.int64)
     lab = np.empty(N, np.int32)
     seeds: List[int] = []
     used: dict = {}
-    for r in range(nR):                                          # a region at a time: distances never leave it
-        cells = np.sort(co[ccut[r]:ccut[r + 1]])                 # ascending cell index = scan order
-        n = len(cells)
-        ck = None
-        if cache is not None:
-            ys, xs = sp.ys[cells], sp.xs[cells]
+    keys: List[Optional[bytes]] = [None] * nR
+    hits: List[Optional[tuple]] = [None] * nR
+    if cache is not None:                                        # the content key of every region, in one pass
+        yo, xo = sp.ys[co], sp.xs[co]
+        starts = ccut[:-1]
+        Y = (yo - np.repeat(np.minimum.reduceat(yo, starts), np.diff(ccut))).astype(np.int32)
+        X = (xo - np.repeat(np.minimum.reduceat(xo, starts), np.diff(ccut))).astype(np.int32)
+        Q = q[co].astype(np.int32)
+        tail = np.array([radius, h], np.float64).tobytes()
+        for r in range(nR):
+            a0, a1 = int(ccut[r]), int(ccut[r + 1])
             hk = hashlib.blake2b(digest_size=16)
-            for a in ((ys - ys.min()).astype(np.int32), (xs - xs.min()).astype(np.int32), q[cells].astype(np.int32)):
-                hk.update(a.tobytes())
-            hk.update(np.array([radius, h], np.float64).tobytes())
-            ck = hk.digest()
-            hit = cache.get(ck)
-            if hit is not None:
-                used[ck] = hit
-                lab[cells] = hit[0] + len(seeds)
-                seeds.extend(int(cells[i]) for i in hit[1])
-                continue
+            hk.update(Y[a0:a1]); hk.update(X[a0:a1]); hk.update(Q[a0:a1])
+            hk.update(tail)
+            keys[r] = hk.digest()
+            hits[r] = cache.get(keys[r])
+    miss = np.array([hit is None for hit in hits], bool)
+    if miss.any():                                               # edges of the regions to cut, grouped by region
+        if edges is None:
+            *edges, cuts = edges_full(sp, h)
+        R, C, L = edges_within(sp, edges, cuts, region, miss[region])
+        eo = group_order(region[R], nR)
+        R, C, L = R[eo], C[eo], L[eo]
+        ecut = np.concatenate([[0], np.cumsum(np.bincount(region[R], minlength=nR))])
+    for r in range(nR):                                          # a region at a time: distances never leave it
+        cells = co[ccut[r]:ccut[r + 1]]
+        n = len(cells)
+        ck, hit = keys[r], hits[r]
+        if hit is not None:
+            used[ck] = hit
+            lab[cells] = hit[0] + len(seeds)
+            seeds.extend(int(cells[i]) for i in hit[1])
+            continue
         e0, e1 = ecut[r], ecut[r + 1]
         lr, lc = np.searchsorted(cells, R[e0:e1]), np.searchsorted(cells, C[e0:e1])
         G = coo_matrix((np.concatenate([L[e0:e1], L[e0:e1]]), (np.concatenate([lr, lc]), np.concatenate([lc, lr]))),
@@ -345,6 +447,8 @@ def subdivide(sp: Space, f: np.ndarray, region: np.ndarray, radius: float, h: fl
         img = -np.ones((int(ys.max()) - y0 + 1, int(xs.max()) - x0 + 1), np.int64)
         img[ys - y0, xs - x0] = np.arange(n)
         rad = int(math.ceil(radius / h)) + 1                     # a search never leaves the box of this half side
+        Gp, Gx, Gd = G.indptr, G.indices, G.data
+        place = np.full(n, -1, np.int64)                         # cell of the region -> its place in the box being searched
         pos = 0
         while True:
             while pos < n and covered[order[pos]]:
@@ -355,9 +459,19 @@ def subdivide(sp: Space, f: np.ndarray, region: np.ndarray, radius: float, h: fl
             sy, sx = int(ys[s]) - y0, int(xs[s]) - x0
             win = img[max(0, sy - rad):sy + rad + 1, max(0, sx - rad):sx + rad + 1]
             loc = win[win >= 0]                                  # cells of the box: the only ones within `radius`
-            sub = G[loc][:, loc]
-            d = dijkstra(sub, directed=False, indices=int(np.nonzero(loc == s)[0][0]),
-                         limit=radius + TOL)
+            # the subgraph of G on the box cells (loc is ascending, so the places keep the cell order): the rows of `loc`, the
+            # entries whose column is in the box. Its distances do not depend on the order of the entries within a row.
+            m = len(loc)
+            place[loc] = np.arange(m)
+            st, ln = Gp[loc], Gp[loc + 1] - Gp[loc]
+            row = np.repeat(np.arange(m), ln)
+            flat = np.arange(len(row)) - np.repeat(np.cumsum(ln) - ln, ln) + np.repeat(st, ln)
+            col = place[Gx[flat]]
+            kept = col >= 0
+            sub = csr_matrix((Gd[flat][kept], col[kept].astype(np.int32),
+                              np.concatenate([[0], np.cumsum(np.bincount(row[kept], minlength=m))]).astype(np.int32)), shape=(m, m))
+            d = dijkstra(sub, directed=False, indices=int(place[s]), limit=radius + TOL)
+            place[loc] = -1
             hit = np.isfinite(d)
             reach = loc[hit]
             covered[reach] = True
@@ -383,9 +497,10 @@ def partition(F: np.ndarray, h: float, tau: float, radius: Optional[float] = Non
         return Partition(sp, np.zeros(0), np.zeros(0, np.int32), 0, z, 0, 0, z, 0, z)
     f = distance(sp, h)
     rank = ranks(f)
-    bid, roots = raw_basins(sp, rank)
+    nb = sp.neighbours()
+    bid, roots = raw_basins(sp, rank, nb)
     R = len(roots)
-    i, j, val = crossings(sp, bid, f)
+    i, j, val = crossings(sp, bid, f, nb)
     lo, hi, s = saddles(bid, i, j, val)
     tree = merge_tree(f[roots], rank[roots], lo, hi, s, tau)
     surv = survivors(R, tree)
@@ -396,9 +511,10 @@ def partition(F: np.ndarray, h: float, tau: float, radius: Optional[float] = Non
     if radius is None:
         a = anchors(sp, reg, f, len(keep))
         return Partition(sp, f, reg, len(keep), a, R, len(tree), np.arange(len(keep)), len(keep), a)
-    full, seeds = subdivide(sp, f, reg, radius, h, cache)
+    *edges, cuts = edges_full(sp, h)
+    full, seeds = subdivide(sp, f, reg, radius, h, cache, edges, cuts)
     return Partition(sp, f, full, len(seeds), centres(sp, full, f, len(seeds)), R, len(tree), reg[seeds].astype(np.int64),
-                     len(keep), seeds)
+                     len(keep), seeds, tuple(edges), cuts)
 
 
 # ---------------------------------------------------------------------------------------------------------------- interface
@@ -433,11 +549,12 @@ def arcs(sp: Space, full: np.ndarray, f: np.ndarray, g: Optional[np.ndarray] = N
         return Arcs(z, z, z, z, np.zeros(0), np.zeros(0), z)
     nV = (sp.H + 1) * W1
     # boundary edges: a cell of F next to a cell that is not
-    bnd = np.zeros(nV, np.int64)
+    bv = []
     for nb, v0, v1 in ((Nn, y * W1 + x, y * W1 + x + 1), (E, y * W1 + x + 1, (y + 1) * W1 + x + 1),
                        (S, (y + 1) * W1 + x, (y + 1) * W1 + x + 1), (Wn, y * W1 + x, (y + 1) * W1 + x)):
         m = nb < 0
-        bnd += np.bincount(v0[m], minlength=nV) + np.bincount(v1[m], minlength=nV)
+        bv.append(v0[m]); bv.append(v1[m])
+    bnd = np.bincount(np.concatenate(bv), minlength=nV)
     ifc = np.bincount(np.concatenate([ev0, ev1]), minlength=nV)
     # an arc continues through a corner of map degree exactly 2 that is made of two interface edges
     joint = (ifc == 2) & (bnd == 0)

@@ -1556,7 +1556,7 @@ class SceneWorker:
                 elif self.engine is not None and hasattr(self.engine, "export_state"):
                     index = {r.key: (int(r.t), str(r.session), float(r.x), float(r.y), float(r.r_d),
                                      None if r.view is None else tuple(float(v) for v in r.view))
-                             for r in self.engine.export_state().leaves}
+                             for r in getattr(self.engine, "export_state_lazy", self.engine.export_state)().leaves}
             except Exception as exc:  # noqa: BLE001 - an optimisation only
                 log.warning("scene worker %s: stored leaves unreadable (%s: %s): the replay folds them "
                             "again", self.map_id, type(exc).__name__, exc)

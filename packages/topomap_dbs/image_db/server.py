@@ -71,9 +71,6 @@ class ImageDatabaseService(MinIOService):
         """Store an image in MinIO. Returns True if successful."""
         try:
             map_id = map_id or self.default_map_id
-            if not self._ensure_map_bucket(map_id):
-                return False
-
             bucket_name = self._bucket_name(map_id)
             object_name = f"{node_id}/images/{image_id}"
 
@@ -84,14 +81,15 @@ class ImageDatabaseService(MinIOService):
 
             self.logger.info(f"[DEBUG] Storing image {image_id} with metadata: {metadata}")
 
-            self.client.put_object(
-                bucket_name,
-                object_name,
-                io.BytesIO(image_data),
-                length=len(image_data),
-                content_type=content_type,
-                metadata=metadata,
-            )
+            if self._put_with_bucket(map_id, lambda bucket: self.client.put_object(
+                    bucket,
+                    object_name,
+                    io.BytesIO(image_data),
+                    length=len(image_data),
+                    content_type=content_type,
+                    metadata=metadata,
+            )) is False:
+                return False
             self.logger.debug(
                 f"Stored image {image_id} for node {node_id} in map {map_id} "
                 f"(bucket={bucket_name}, object={object_name})"
@@ -111,18 +109,17 @@ class ImageDatabaseService(MinIOService):
         """Put one PNG of a node at `key` in the map bucket (content type image/png, the
         non-None `metadata` values as strings plus `node_id`). Returns True if successful."""
         try:
-            if not self._ensure_map_bucket(map_id):
-                return False
             meta = {k: str(v) for k, v in (metadata or {}).items() if v is not None}
             meta["node_id"] = str(node_id)
-            self.client.put_object(
-                self._bucket_name(map_id),
-                key,
-                io.BytesIO(png_data),
-                length=len(png_data),
-                content_type="image/png",
-                metadata=meta,
-            )
+            if self._put_with_bucket(map_id, lambda bucket: self.client.put_object(
+                    bucket,
+                    key,
+                    io.BytesIO(png_data),
+                    length=len(png_data),
+                    content_type="image/png",
+                    metadata=meta,
+            )) is False:
+                return False
             return True
         except Exception as e:
             self.logger.error(f"Failed to store {what} for node {node_id}: {e}")

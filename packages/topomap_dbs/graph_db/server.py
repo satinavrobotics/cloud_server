@@ -7,6 +7,11 @@ Manages ArangoDB persistent graph storage with ArangoDB geo indexes for spatial 
 
 import logging
 import asyncio
+import math
+import random
+import threading
+import time
+from contextlib import contextmanager
 from typing import Dict, Any, List, Optional, Tuple, Union
 from datetime import datetime
 
@@ -24,6 +29,16 @@ except ImportError:
 
 # Per-map scene-graph index collections (`{prefix}{map_id}`), dropped with the map.
 SCENE_GRAPH_COLLECTION_PREFIXES = ("sg_anchors_", "sg_links_", "sg_meta_")
+
+
+def _forget_map_collections(service, map_id: str) -> None:
+    """Drop the collection caches of a map's collections (a service object without them, e.g. a
+    test stub, has nothing to drop)."""
+    forget = getattr(service, "_forget_collection", None)
+    if forget is not None:
+        for name in (f"nodes_{map_id}", f"edges_{map_id}",
+                     *(f"{prefix}{map_id}" for prefix in SCENE_GRAPH_COLLECTION_PREFIXES)):
+            forget(name)
 
 
 class GraphDatabaseService:
@@ -54,7 +69,6 @@ class GraphDatabaseService:
         self.spatial_index_manager: Optional[SpatialIndexManager] = None
         self._session_indexed: set = set()   # node collections with the session_id index
         self._costmap_indexed: set = set()   # ... with the costmap_stored_ms index
-
         self._connect_to_arango(arango_username, arango_password)
         self._initialize_graph()
         self._setup_spatial_indexes()
@@ -143,6 +157,58 @@ class GraphDatabaseService:
         except Exception as e:
             self.logger.warning(f"Failed to setup geo indexes: {e}")
     
+    # ==================== collection-exists cache ====================
+
+    # Per-instance state of the caches and locks below, created on first use (so an instance
+    # built without __init__, as the unit tests do, has them too).
+    # _known_collections: collections seen to exist (positive answers only, per process): the
+    #   ingest path asked `has_collection` 4-5 times per node. Dropped on delete_map and on any
+    #   "collection not found" (1203) error, which also covers a map another process deleted.
+    # _range_indexed: node collection -> monotonic time its pose range index was last ensured
+    #   (re-ensured after RANGE_INDEX_TTL_S, so a collection recreated elsewhere gets it again).
+    # _doc_locks: one lock per (collection, key) with writers waiting/running: the part updates
+    #   of one node document (depth, costmap, ingest_complete) are applied one after the other.
+    @property
+    def _known_collections(self) -> set:
+        return self.__dict__.setdefault("_known_collections_", set())
+
+    @property
+    def _range_indexed(self) -> Dict[str, float]:
+        return self.__dict__.setdefault("_range_indexed_", {})
+
+    @property
+    def _doc_locks(self) -> Dict[Tuple[str, str], List[Any]]:
+        return self.__dict__.setdefault("_doc_locks_", {})
+
+    @property
+    def _doc_locks_guard(self):
+        return self.__dict__.setdefault("_doc_locks_guard_", threading.Lock())
+
+
+    ERROR_COLLECTION_NOT_FOUND = 1203     # ERROR_ARANGO_DATA_SOURCE_NOT_FOUND
+    ERROR_CONFLICT = 1200                 # ERROR_ARANGO_CONFLICT (write-write conflict)
+
+    def _has_collection(self, name: str) -> bool:
+        """`db.has_collection(name)`, but a collection seen to exist is not asked about again
+        in this process (`_forget_collection` on a delete or a 1203 error)."""
+        if name in self._known_collections:
+            return True
+        if self.db.has_collection(name):
+            self._known_collections.add(name)
+            return True
+        return False
+
+    def _forget_collection(self, name: str) -> None:
+        self._known_collections.discard(name)
+        self._range_indexed.pop(name, None)
+        for cache in (getattr(self, "_costmap_indexed", None), getattr(self, "_session_indexed", None)):
+            if cache is not None:
+                cache.discard(name)
+
+    @classmethod
+    def _is_missing_collection(cls, exc: BaseException) -> bool:
+        return getattr(exc, "error_code", None) == cls.ERROR_COLLECTION_NOT_FOUND
+
     def _log_callback(self, level: str, message: str):
         """Logging callback for sub-components."""
         log_method = getattr(self.logger, level, self.logger.info)
@@ -280,7 +346,7 @@ class GraphDatabaseService:
                 node_collection_name = f"nodes_{map_id}"
 
                 # Ensure the collection exists
-                if not self.db.has_collection(node_collection_name):
+                if not self._has_collection(node_collection_name):
                     self.logger.warning(f"Collection {node_collection_name} doesn't exist. Creating it.")
                     # Create the map first
                     self.create_map(map_id)
@@ -307,7 +373,18 @@ class GraphDatabaseService:
                 if map_id:
                     # For map-specific collections, use direct collection access
                     collection = self.db.collection(node_collection_name)
-                    collection.insert(node_doc)
+                    try:
+                        collection.insert(node_doc)
+                    except Exception as missing:
+                        if not self._is_missing_collection(missing):
+                            raise
+                        # the cached "exists" is stale (the map was deleted by another process):
+                        # what the uncached check would have done
+                        self._forget_collection(node_collection_name)
+                        self._forget_collection(f"edges_{map_id}")
+                        self.logger.warning(f"Collection {node_collection_name} doesn't exist. Creating it.")
+                        self.create_map(map_id)
+                        collection.insert(node_doc)
                 else:
                     # For default collection, use graph vertex collection
                     vertex_collection = self.graph.vertex_collection(self.node_collection)
@@ -369,7 +446,7 @@ class GraphDatabaseService:
                 edge_collection_name = f"edges_{map_id}"
 
                 # Ensure the collections exist
-                if not self.db.has_collection(edge_collection_name):
+                if not self._has_collection(edge_collection_name):
                     self.logger.warning(f"Collection {edge_collection_name} doesn't exist. Creating map.")
                     self.create_map(map_id)
 
@@ -462,7 +539,7 @@ class GraphDatabaseService:
             if map_id:
                 node_collection_name = f"nodes_{map_id}"
                 edge_collection_name = f"edges_{map_id}"
-                if not self.db.has_collection(edge_collection_name):
+                if not self._has_collection(edge_collection_name):
                     self.create_map(map_id)
             else:
                 node_collection_name = self.node_collection
@@ -487,7 +564,16 @@ class GraphDatabaseService:
             options = {'overwrite_mode': 'ignore'} if deterministic_keys else {}
             if map_id:
                 collection = self.db.collection(edge_collection_name)
-                results = collection.insert_many(docs, silent=False, **options)
+                try:
+                    results = collection.insert_many(docs, silent=False, **options)
+                except Exception as missing:
+                    if not self._is_missing_collection(missing):
+                        raise
+                    # stale cache (map deleted elsewhere): recreate as the uncached check did
+                    self._forget_collection(edge_collection_name)
+                    self._forget_collection(node_collection_name)
+                    self.create_map(map_id)
+                    results = collection.insert_many(docs, silent=False, **options)
             else:
                 edge_collection = self.graph.edge_collection(self.edge_collection)
                 results = edge_collection.insert_many(docs, silent=False, **options)
@@ -525,9 +611,15 @@ class GraphDatabaseService:
         """
         try:
             node_collection_name = f"nodes_{map_id}"
-            if not self.db.has_collection(node_collection_name):
+            if not self._has_collection(node_collection_name):
                 return False
-            return bool(self.db.collection(node_collection_name).has(str(node_id)))
+            try:
+                return bool(self.db.collection(node_collection_name).has(str(node_id)))
+            except Exception as missing:
+                if not self._is_missing_collection(missing):
+                    raise
+                self._forget_collection(node_collection_name)   # deleted since it was cached
+                return False
         except Exception as e:
             self.logger.error(f"Failed to check node {node_id} in map {map_id}: {e}")
             raise
@@ -547,11 +639,17 @@ class GraphDatabaseService:
             Exception: the lookup failed (logged)
         """
         try:
-            if not self.db.has_collection(f"nodes_{map_id}"):
+            if not self._has_collection(f"nodes_{map_id}"):
                 return False
-            cursor = self.db.aql.execute(self.NODE_INGEST_INCOMPLETE_AQL, bind_vars={
-                "@col": f"nodes_{map_id}", "key": str(node_id)})
-            return any(r is True for r in cursor)
+            try:
+                cursor = self.db.aql.execute(self.NODE_INGEST_INCOMPLETE_AQL, bind_vars={
+                    "@col": f"nodes_{map_id}", "key": str(node_id)})
+                return any(r is True for r in cursor)
+            except Exception as missing:
+                if not self._is_missing_collection(missing):
+                    raise
+                self._forget_collection(f"nodes_{map_id}")      # deleted since it was cached
+                return False
         except Exception as e:
             self.logger.error(f"Failed to read the ingest marker of node {node_id} in {map_id}: {e}")
             raise
@@ -732,13 +830,51 @@ class GraphDatabaseService:
                                bind_vars: Dict[str, Any], what: str) -> bool:
         """Run one of the SET_NODE_* updates on a node. False (logged) when the map or node
         does not exist (ArangoDB errors on a missing collection) or on any other failure."""
+        name = f"nodes_{map_id}"
         try:
-            cursor = self.db.aql.execute(aql, bind_vars={
-                "@col": f"nodes_{map_id}", "key": str(node_id), **bind_vars})
-            return bool(list(cursor))
+            # The parts of one node (depth, costmap, the completion marker) come from separate
+            # handlers at the same time: applied one after the other here (this process), and a
+            # write-write conflict (1200: another process, or a plain ArangoDB lock timeout) is
+            # retried a bounded number of times. Every one of these updates is idempotent.
+            with self._doc_lock(name, str(node_id)):
+                for attempt in range(self.CONFLICT_RETRIES + 1):
+                    try:
+                        cursor = self.db.aql.execute(aql, bind_vars={
+                            "@col": name, "key": str(node_id), **bind_vars})
+                        return bool(list(cursor))
+                    except Exception as e:
+                        if (getattr(e, "error_code", None) != self.ERROR_CONFLICT
+                                or attempt >= self.CONFLICT_RETRIES):
+                            raise
+                        self.conflict_retries += 1
+                        time.sleep(random.uniform(0, self.CONFLICT_BACKOFF_S * (2 ** attempt)))
         except Exception as e:
             self.logger.error(f"Failed to set {what} on node {node_id} in {map_id}: {e}")
             return False
+
+    CONFLICT_RETRIES = 6
+    CONFLICT_BACKOFF_S = 0.02           # jittered: attempt n sleeps U(0, 0.02 * 2^n) s, <= 1.3 s in all
+    RANGE_INDEX_TTL_S = 600.0
+    conflict_retries = 0                # how many 1200 conflicts were retried (a counter, for tests)
+
+    @contextmanager
+    def _doc_lock(self, collection: str, key: str):
+        """Mutual exclusion on one document among this process's threads (keyed, reference
+        counted: the dict only holds documents somebody is working on)."""
+        k = (collection, key)
+        with self._doc_locks_guard:
+            entry = self._doc_locks.get(k)
+            if entry is None:
+                entry = self._doc_locks[k] = [threading.Lock(), 0]
+            entry[1] += 1
+        try:
+            with entry[0]:
+                yield
+        finally:
+            with self._doc_locks_guard:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    del self._doc_locks[k]
 
     def set_node_depth(self, map_id: str, node_id: Union[int, str], camera: str,
                        record: Dict[str, Any]) -> bool:
@@ -1074,6 +1210,53 @@ class GraphDatabaseService:
             self.logger.error(f"ArangoDB k-NN query failed: {e}")
             return [], []
 
+    # The range query is served by a persistent index on (pose.x, pose.y): the candidates are the
+    # nodes whose pose.x lies in [x - r', x + r'] (r' = r plus a margin far above float rounding,
+    # so the box is a superset of the disc), tested with the original distance expression. The
+    # documents whose pose.x is not a number are not in that interval (the original query coerces
+    # them: null counts as 0), so the two index ranges below and above all numbers collect them
+    # and they get the same distance test; likewise pose.y is only box-tested when it is a number.
+    # The result (documents, distances, order of distinct distances, the limit) is that of the full scan.
+    RANGE_COLLECT_AQL = """
+        LET cand = UNION(
+            (FOR node IN @@col
+                FILTER node.pose.x >= @xlo AND node.pose.x <= @xhi
+                FILTER (node.pose.y >= @ylo AND node.pose.y <= @yhi) OR !IS_NUMBER(node.pose.y)
+                LET distance = SQRT(POW(node.pose.x - @x, 2) + POW(node.pose.y - @y, 2))
+                FILTER distance <= @radius
+                RETURN {node: node, distance: distance}),
+            (FOR node IN @@col
+                FILTER node.pose.x < @numlo
+                LET distance = SQRT(POW(node.pose.x - @x, 2) + POW(node.pose.y - @y, 2))
+                FILTER distance <= @radius
+                RETURN {node: node, distance: distance}),
+            (FOR node IN @@col
+                FILTER node.pose.x > @numhi
+                LET distance = SQRT(POW(node.pose.x - @x, 2) + POW(node.pose.y - @y, 2))
+                FILTER distance <= @radius
+                RETURN {node: node, distance: distance})
+        )
+        FOR r IN cand
+            SORT r.distance ASC, r.node._key ASC
+            LIMIT @max_results
+            RETURN r
+    """
+    # Nodes at exactly the same distance: the original query's order among them is whatever its
+    # SORT happens to do with the scan order (not stable for large results; observed to differ
+    # from the scan order), so there is none to keep; here they are ordered by `_key`.
+    _FLOAT_MAX = 1.7976931348623157e308
+
+    def _ensure_range_index(self, name: str) -> None:
+        now = time.monotonic()
+        last = self._range_indexed.get(name)
+        if last is not None and now - last < self.RANGE_INDEX_TTL_S:
+            return
+        try:
+            self.db.collection(name).add_persistent_index(fields=["pose.x", "pose.y"])
+            self._range_indexed[name] = now
+        except Exception as e:  # the query is correct without it, only a full scan again
+            self.logger.warning(f"Could not ensure the pose index of {name}: {e}")
+
     def _range_arango(
         self,
         x: float,
@@ -1088,12 +1271,32 @@ class GraphDatabaseService:
             collection = f"nodes_{map_id}"
 
             # Check if collection exists (for map-specific queries)
-            if map_id and not self.db.has_collection(collection):
+            if map_id and not self._has_collection(collection):
                 self.logger.debug(f"Collection {collection} does not exist, returning empty results")
                 return [], []
 
             # Handle max_results properly - if None, use a large number
             limit = max_results if max_results is not None else 1000000
+
+            numeric = all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                          for v in (x, y, radius))
+            if numeric and isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 and map_id:
+                self._ensure_range_index(collection)
+                m = (abs(radius) * 1e-9 + (abs(x) + abs(y) + abs(radius)) * 1e-12 + 1e-12)
+                bind_vars = {
+                    '@col': collection, 'x': x, 'y': y, 'radius': radius, 'max_results': limit,
+                    'xlo': x - radius - m, 'xhi': x + radius + m,
+                    'ylo': y - radius - m, 'yhi': y + radius + m,
+                    'numlo': -self._FLOAT_MAX, 'numhi': self._FLOAT_MAX,
+                }
+                try:
+                    results = list(self.db.aql.execute(self.RANGE_COLLECT_AQL, bind_vars=bind_vars))
+                except Exception as missing:
+                    if not self._is_missing_collection(missing):
+                        raise
+                    self._forget_collection(collection)     # deleted since it was cached
+                    return [], []
+                return [r['node'] for r in results], [r['distance'] for r in results]
 
             aql = f"""
             FOR node IN {collection}
@@ -1272,6 +1475,7 @@ class GraphDatabaseService:
             graph_name = f"map_{map_id}"
             node_collection = f"nodes_{map_id}"
             edge_collection = f"edges_{map_id}"
+            _forget_map_collections(self, map_id)    # (again below: nothing may re-cache meanwhile)
 
             # Delete graph
             if self.db.has_graph(graph_name):
@@ -1290,6 +1494,8 @@ class GraphDatabaseService:
             for prefix in SCENE_GRAPH_COLLECTION_PREFIXES:
                 if self.db.has_collection(f"{prefix}{map_id}"):
                     self.db.delete_collection(f"{prefix}{map_id}")
+
+            _forget_map_collections(self, map_id)
 
             self.logger.info(f"✅ Deleted map: {map_id}")
             return True
