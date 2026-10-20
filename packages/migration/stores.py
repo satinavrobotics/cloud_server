@@ -22,6 +22,13 @@ from packages.migration.apply import ImportRefused
 logger = logging.getLogger(__name__)
 
 MAP_TABLE = "mapobjectv1"
+# HTTP headers MinIO lists next to the user metadata; sending one back as user metadata breaks the request signature.
+STANDARD_HEADERS = frozenset({"content-type", "content-encoding", "content-disposition", "content-language",
+                              "cache-control", "expires"})
+
+
+def user_metadata(meta: Dict[str, Any]) -> Dict[str, str]:
+    return {str(k): str(v) for k, v in (meta or {}).items() if str(k).lower() not in STANDARD_HEADERS}
 CHUNK = 1 << 20
 
 
@@ -100,8 +107,8 @@ class ServiceMapSource:
         for o in self.images.client.list_objects(bucket, recursive=True, include_user_meta=True):
             if o.is_dir:
                 continue
-            meta = {k[len("x-amz-meta-"):] if k.lower().startswith("x-amz-meta-") else k: v
-                    for k, v in (o.metadata or {}).items()}
+            meta = user_metadata({k[len("x-amz-meta-"):] if k.lower().startswith("x-amz-meta-") else k: v
+                                  for k, v in (o.metadata or {}).items()})
             out.append({"key": o.object_name, "size": int(o.size),
                         "content_type": o.content_type or mimetypes.guess_type(o.object_name)[0]
                         or "application/octet-stream", "metadata": meta})
@@ -163,21 +170,27 @@ class ServiceTarget:
         return created
 
     async def add_sessions(self, name: str, sessions: List[Dict[str, Any]]) -> int:
+        """Insert the sessions that are not there yet; the number inserted. A session id is the table's primary
+        key, so one that already belongs to another map on this server is skipped (and reported by the caller)."""
         if not sessions:
             return 0
+        inserted = 0
         async with self.db.connection() as conn:
-            cur = await conn.execute("SELECT column_name FROM information_schema.columns "
+            cur = await conn.execute("SELECT column_name, data_type FROM information_schema.columns "
                                      "WHERE table_name = 'map_sessions'")
-            known = {r[0] for r in await cur.fetchall()}
+            known = {r[0]: r[1] for r in await cur.fetchall()}
             for s in sessions:
                 row = {k: v for k, v in s.items() if k in known}
                 row["map_name"] = name
                 cols = list(row)
-                values = [Jsonb(v) if isinstance(v, (dict, list)) else v for v in row.values()]
-                await conn.execute(
+                # jsonb columns take Jsonb; a Postgres array (data_type ARRAY) takes the plain list
+                values = [Jsonb(v) if isinstance(v, (dict, list)) and known[k] in ("jsonb", "json") else v
+                          for k, v in row.items()]
+                cur = await conn.execute(
                     f"INSERT INTO map_sessions ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) "
                     "ON CONFLICT (session_id) DO NOTHING", values)
-        return len(sessions)
+                inserted += max(cur.rowcount, 0)
+        return inserted
 
     def _insert_many(self, collection: str, docs: List[Dict[str, Any]], edge: bool) -> int:
         if not self.graph.db.has_collection(collection):
@@ -208,14 +221,17 @@ class ServiceTarget:
         if not self.images._ensure_map_bucket(name):
             raise RuntimeError(f"cannot create the bucket of map {name!r}")
         self.images.client.put_object(bucket_of(self.images, name), key, stream, length=size,
-                                      content_type=content_type or "application/octet-stream", metadata=metadata)
+                                      content_type=content_type or "application/octet-stream", metadata=user_metadata(metadata))
         got = self._stat_size(name, key)
         if got != size:
             raise RuntimeError(f"{key}: stored {got} bytes, expected {size}")
 
     async def put_object(self, name: str, key: str, stream: Any, size: int, content_type: Optional[str],
                          metadata: Dict[str, str]) -> None:
-        await asyncio.to_thread(self._put, name, key, stream, size, content_type, metadata)
+        try:
+            await asyncio.to_thread(self._put, name, key, stream, size, content_type, metadata)
+        except Exception as exc:  # noqa: BLE001 - minio's errors are frozen dataclasses that cannot cross a thread
+            raise RuntimeError(f"{key}: {type(exc).__name__}: {exc}") from None
 
     async def put_view_settings(self, name: str, settings: Dict[str, Any]) -> bool:
         async with self.db.connection() as conn:

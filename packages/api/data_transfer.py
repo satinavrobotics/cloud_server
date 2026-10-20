@@ -17,6 +17,7 @@
 Design and guarantees: docs/DATA_TRANSFER.md (sati-client/docs/DATA_MIGRATION.md has the long form).
 """
 import asyncio
+import functools
 import logging
 import os
 import shutil
@@ -65,12 +66,12 @@ def manager(request: Request) -> TransferManager:
 
 
 def _guard(fn):
+    @functools.wraps(fn)
     async def inner(*a, **kw):
         try:
             return await fn(*a, **kw)
         except TransferError as exc:
             raise HTTPException(exc.status, str(exc))
-    inner.__name__, inner.__doc__ = fn.__name__, fn.__doc__
     return inner
 
 

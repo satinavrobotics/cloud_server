@@ -139,9 +139,17 @@ async def _apply_map(reader: BundleReader, plan: Dict[str, Any], store: TargetSt
             if not await store.begin_map(dst, spec, status):
                 raise ImportRefused(f"{dst!r} was created by someone else while the import started")
         row = await store.get_row(dst)
-        marker = (row.get("status") or {}).get("imported_from") or marker
+        marker = dict((row.get("status") or {}).get("imported_from") or marker)
+        ids = list(marker.get("import_ids") or [marker.get("import_id")])
+        if import_id not in ids:
+            ids.append(import_id)       # a rollback of any run that touched the map finds it
+        marker["import_ids"] = ids
         await tell(map=dst, phase="sessions")
-        out["sessions"] = await store.add_sessions(dst, meta.get("sessions") or [])
+        listed_sessions = meta.get("sessions") or []
+        out["sessions"] = await store.add_sessions(dst, listed_sessions)
+        if out["sessions"] < len(listed_sessions):
+            # Either a resume (already there) or a session id this server has under another map.
+            out["sessions_not_inserted"] = len(listed_sessions) - out["sessions"]
 
         await tell(map=dst, phase="nodes")
         nodes = 0

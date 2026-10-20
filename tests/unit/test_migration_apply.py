@@ -39,9 +39,10 @@ class FakeStore:
 
     async def add_sessions(self, name, sessions):
         d = self.sessions.setdefault(name, {})
-        for s in sessions:
-            d.setdefault(s["session_id"], s)
-        return len(sessions)
+        new = [s for s in sessions if s["session_id"] not in d]
+        for s in new:
+            d[s["session_id"]] = s
+        return len(new)
 
     async def put_nodes(self, name, docs):
         d = self.nodes.setdefault(name, {})
@@ -101,7 +102,7 @@ def test_fresh_import_with_rename(tmp_path):
     assert row["status"]["state"] == "ready"
     assert row["status"]["imported_from"] == {
         "source": "pi-1", "source_name": "Pi", "map": "Hall", "import_id": "imp-1", "phase": "complete",
-        "created_at": plan["created_at"], "source_state": "ready"}
+        "created_at": plan["created_at"], "source_state": "ready", "import_ids": ["imp-1"]}
     assert set(store.nodes["Hall-Pi"]) == {"n1", "n2"}
     assert all(d["map_id"] == "Hall-Pi" for d in store.nodes["Hall-Pi"].values())
     assert store.edges["Hall-Pi"][0]["_from"] == "nodes_Hall-Pi/n1"
@@ -122,6 +123,8 @@ def test_repeat_changes_nothing(tmp_path):
     assert report["ok"] and report["maps"][0]["objects_copied"] == 0 and report["maps"][0]["objects_skipped"] == 2
     assert (dict(store.nodes["Hall"]), list(store.edges["Hall"]), dict(store.objects["Hall"])) == snapshot
     assert store.rows["Hall"]["status"]["imported_from"]["import_id"] == "imp-1"      # who created it first
+    assert store.rows["Hall"]["status"]["imported_from"]["import_ids"] == ["imp-1", "imp-2"]   # rollback by either
+    assert report["maps"][0]["sessions"] == 0 and report["maps"][0]["sessions_not_inserted"] == 1
 
 
 def test_interrupted_import_is_hidden_and_resumes(tmp_path):
@@ -201,3 +204,8 @@ def test_progress_is_reported(tmp_path):
         seen.append(info["phase"])
     run(apply_import(reader, plan, FakeStore(), "i", progress))
     assert seen[0] == "sessions" and seen[-1] == "commit" and "nodes" in seen
+
+
+def test_standard_headers_are_not_user_metadata():
+    from packages.migration.stores import user_metadata
+    assert user_metadata({"Node_id": "n", "content-type": "image/png", "Cache-Control": "x"}) == {"Node_id": "n"}

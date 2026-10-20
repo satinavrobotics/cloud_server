@@ -222,8 +222,8 @@ class TransferManager:
             raise TransferError("the import is running", 409)
         async with self.database.connection() as conn:
             cur = await conn.execute(
-                "SELECT name FROM mapobjectv1 WHERE lifecycle = 'ALIVE' AND status->'imported_from'->>'import_id' = %s",
-                (job_id,))
+                "SELECT name FROM mapobjectv1 WHERE lifecycle = 'ALIVE' AND (status->'imported_from'->>'import_id' = %s "
+                "OR status->'imported_from'->'import_ids' ? %s)", (job_id, job_id))
             names = [r[0] for r in await cur.fetchall()]
         for name in names:
             await self.map_deleter.request(name, guard=self.refuse_open_session)
