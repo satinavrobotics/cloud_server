@@ -148,6 +148,32 @@ def raw_basins(sp: Space, rank: np.ndarray, nb: Optional[tuple] = None) -> Tuple
     return bid, roots
 
 
+def raw_basins_f(sp: Space, f: np.ndarray, pad: tuple) -> Tuple[np.ndarray, np.ndarray]:
+    """`raw_basins(sp, ranks(f))` without ranks: (basin id per cell, root cell per basin, roots in rank order). A neighbour precedes
+    a cell iff it has the larger f, or an equal f and a smaller (row, col): that is the N and W neighbour; among the preceding
+    ones the earliest is the one of largest f, then N, W, E, S. `pad`: `sp.padded()`."""
+    N = sp.N
+    P, pos, Wp = pad
+    FP = np.full(len(P), -np.inf)
+    FP[pos] = f
+    cand = np.stack([FP[pos - Wp], FP[pos - 1], FP[pos + 1], FP[pos + Wp]])          # N, W, E, S
+    arg = cand.argmax(0)                                                              # the first of equal values: N, W, E, S
+    ar = np.arange(N)
+    bf = cand[arg, ar]
+    has = (bf > f) | ((bf == f) & (arg < 2))
+    par = np.where(has, P[pos + np.array([-Wp, -1, 1, Wp])[arg]], ar).astype(np.int64)
+    while True:                                                                       # pointer doubling: ranks fall along every chain
+        nxt = par[par]
+        if np.array_equal(nxt, par):
+            break
+        par = nxt
+    roots = np.flatnonzero(par == ar)
+    roots = roots[np.argsort(-f[roots], kind="stable")]
+    pr = np.empty(N, np.int64)
+    pr[roots] = np.arange(len(roots))
+    return pr[par], roots
+
+
 def crossings(sp: Space, lab: np.ndarray, f: np.ndarray, nb: Optional[tuple] = None):
     """4-adjacent cell pairs (i, j) in different regions: (i, j, value min(f_i, f_j)); each unordered pair once (E and S)"""
     _, E, S, _ = sp.neighbours() if nb is None else nb
@@ -170,11 +196,11 @@ def saddles(lab: np.ndarray, i: np.ndarray, j: np.ndarray, val: np.ndarray):
     lo, hi = np.minimum(a, b).astype(np.int64), np.maximum(a, b).astype(np.int64)
     n = int(hi.max()) + 1
     code = lo * n + hi
-    o = np.lexsort((-val, code))
+    o = np.argsort(code, kind="stable")                      # per pair the largest value: the first of a (-val, code) sort
     code, v = code[o], val[o]
     first = np.concatenate([[True], code[1:] != code[:-1]])
     c = code[first]
-    return c // n, c % n, v[first]
+    return c // n, c % n, np.maximum.reduceat(v, np.flatnonzero(first))
 
 
 # ---------------------------------------------------------------------------------------------------------------- merge
@@ -330,23 +356,26 @@ class Partition:
     edge_cuts: Optional[tuple] = None
 
 
-def edges_full(sp: Space, h: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int, int, int]]:
+def edges_full(sp: Space, h: float, pad: Optional[tuple] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int, int, int, int]]:
     """The 8-neighbour lattice edges inside F as (row cell, column cell, length m) and the offsets of the four direction blocks
     (E, S, SE, SW; the last two are the diagonals): a diagonal needs both orthogonal cells in F, as the engine's route does.
-    One flat gather per direction on the padded cell-index image (a neighbour outside the canvas reads the pad, -1)."""
-    P, pos, Wp = sp.padded()
-    R, C, L, cuts = [], [], [], [0]
-    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+    One flat gather per direction on the padded cell-index image (a neighbour outside the canvas reads the pad, -1); `pad`:
+    `sp.padded()` when the caller has it already."""
+    P, pos, Wp = sp.padded() if pad is None else pad
+    R, C, cuts = [], [], [0]
+    dirs = ((0, 1), (1, 0), (1, 1), (1, -1))
+    for dy, dx in dirs:
         nbv = P[pos + (dy * Wp + dx)]
-        a = np.nonzero(nbv >= 0)[0]
-        b = nbv[a]
+        ok = nbv >= 0
         if dy and dx:
-            pa = pos[a]
-            keep = (P[pa + dx] >= 0) & (P[pa + dy * Wp] >= 0)
-            a, b = a[keep], b[keep]
-        R.append(a); C.append(b); L.append(np.full(len(a), math.hypot(dy, dx) * h))
+            ok &= (P[pos + dx] >= 0) & (P[pos + dy * Wp] >= 0)
+        a = np.flatnonzero(ok)
+        R.append(a); C.append(nbv[a])
         cuts.append(cuts[-1] + len(a))
-    return np.concatenate(R), np.concatenate(C), np.concatenate(L), tuple(cuts)
+    L = np.empty(cuts[-1])
+    for k, (dy, dx) in enumerate(dirs):
+        L[cuts[k]:cuts[k + 1]] = math.hypot(dy, dx) * h
+    return np.concatenate(R), np.concatenate(C), L, tuple(cuts)
 
 
 def edges_within(sp: Space, edges, cuts, region: np.ndarray, cells: Optional[np.ndarray] = None):
@@ -723,8 +752,8 @@ class PartitionSolver:
             inf = float(max(H, W) + 4)
             yy = np.arange(wy0, wy1 + 1)
             xx = np.arange(wx0, wx1 + 1)
-            rpd = np.minimum((yy - ey0 + 1) if ey0 > 0 else inf, (ey1 - yy + 1) if ey1 < H - 1 else inf)
-            cpd = np.minimum((xx - ex0 + 1) if ex0 > 0 else inf, (ex1 - xx + 1) if ex1 < W - 1 else inf)
+            rpd = np.minimum(np.full(len(yy), inf) if ey0 == 0 else yy - ey0 + 1, np.full(len(yy), inf) if ey1 == H - 1 else ey1 - yy + 1)
+            cpd = np.minimum(np.full(len(xx), inf) if ex0 == 0 else xx - ex0 + 1, np.full(len(xx), inf) if ex1 == W - 1 else ex1 - xx + 1)
             if bool((inner < np.minimum(rpd[:, None], cpd[None, :])).all()):
                 break
             pad *= 2
@@ -747,19 +776,21 @@ class PartitionSolver:
         else:
             oc = oi[sp.ys, sp.xs]
             f = self._distance(F, sp, st, oi, off, oc)
-        rank = ranks(f)
-        nb = sp.neighbours()
-        bid, roots = raw_basins(sp, rank, nb)
+        pad = sp.padded()
+        P, pos, Wp = pad
+        nb = (P[pos - Wp], P[pos + 1], P[pos + Wp], P[pos - 1])
+        bid, roots = raw_basins_f(sp, f, pad)
         R = len(roots)
         i, j, val = crossings(sp, bid, f, nb)
         lo, hi, s = saddles(bid, i, j, val)
-        tree = merge_tree(f[roots], rank[roots], lo, hi, s, tau)
+        # the ranks of the peaks are only ever compared: their position among the roots (rank order) orders them the same way
+        tree = merge_tree(f[roots], np.arange(R), lo, hi, s, tau)
         surv = survivors(R, tree)
         keep = np.unique(surv)
         new = np.empty(R, np.int64)
         new[keep] = np.arange(len(keep))
         reg = new[surv[bid]].astype(np.int32)
-        *edges, cuts = edges_full(sp, h)
+        *edges, cuts = edges_full(sp, h, pad)
         q = np.rint(f / h).astype(np.int64)
         full, seeds = self._subdivide(sp, q, reg, len(keep), st, oc, off)
         part = Partition(sp, f, full, len(seeds), centres(sp, full, f, len(seeds)), R, len(tree), reg[seeds].astype(np.int64),
