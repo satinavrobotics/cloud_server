@@ -19,7 +19,7 @@ from packages.migration.apply import ImportRefused, apply_import
 from packages.migration.bundle import BundleError, BundleReader, BundleWriter
 from packages.migration.export import ExportRefused, export_maps
 from packages.migration.plan import plan_import
-from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_postgres
+from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_postgres, read_instance_id
 
 logger = logging.getLogger(__name__)
 
@@ -60,11 +60,21 @@ class TransferManager:
         self.keep_s, self.max_bytes = keep_hours * 3600, max_bundle_bytes
         self.refuse_open_session = refuse_open_session
         self.poll_s = 2.0
+        self._instance_id: Optional[str] = None
+        self._instance_read = False
         self.http_transport: Optional[httpx.AsyncBaseTransport] = None      # tests
         self.exports: Dict[str, Dict[str, Any]] = {}
         self.imports: Dict[str, Dict[str, Any]] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         os.makedirs(spool_dir, exist_ok=True)
+
+    async def identity(self) -> Dict[str, Any]:
+        """Who this server is, for a bundle's manifest and the self-copy check: the configured description plus the unique id of
+        its own database (read once)."""
+        if not self._instance_read:
+            self._instance_id = await read_instance_id(self.database)
+            self._instance_read = True
+        return {**self.info, "instance_id": self._instance_id}
 
     # ---- housekeeping -------------------------------------------------------------------------
     def sweep(self) -> None:
@@ -103,7 +113,7 @@ class TransferManager:
         try:
             pg = await prefetch_postgres(self.database, list(job["picks"]))
             source = ServiceMapSource(self.topomap_db, pg)
-            job["summary"] = await asyncio.to_thread(self._build, source, job)
+            job["summary"] = await asyncio.to_thread(self._build, source, job, await self.identity())
             job["size"] = os.path.getsize(job["path"])
             job["state"] = "done"
         except ExportRefused as exc:
@@ -115,8 +125,8 @@ class TransferManager:
             self._drop_partial(job)
             job["touched"] = time.time()
 
-    def _build(self, source: ServiceMapSource, job: Dict[str, Any]) -> Dict[str, Any]:
-        with BundleWriter(source=self.info, tmp_dir=self.spool_dir) as writer:
+    def _build(self, source: ServiceMapSource, job: Dict[str, Any], identity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with BundleWriter(source=identity or self.info, tmp_dir=self.spool_dir) as writer:
             summary = export_maps(source, job["picks"], writer)
             tmp = job["path"] + ".part"
             with open(tmp, "wb") as f:
@@ -226,13 +236,12 @@ class TransferManager:
                     os.remove(path)
             job["touched"] = time.time()
 
-    @staticmethod
-    async def remote_maps(source_url: str, sizes: bool) -> Dict[str, Any]:
+    async def remote_maps(self, source_url: str, sizes: bool) -> Dict[str, Any]:
         base = source_url.rstrip("/")
         if not base.startswith(("http://", "https://")):
             raise TransferError("source_url must be an http(s) URL")
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=120.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=120.0), transport=self.http_transport) as client:
                 r = await client.get(f"{base}/api/v1/transfer/maps", params={"sizes": "true"} if sizes else None)
         except httpx.HTTPError as exc:
             raise TransferError(f"cannot reach {base}: {exc}", 502)
@@ -240,14 +249,19 @@ class TransferManager:
             raise TransferError("that server does not support data transfer yet (it needs the newer software)", 502)
         if r.status_code >= 400:
             raise TransferError(f"{base} answered {r.status_code}: {_detail(r)}", 502)
-        return r.json()
+        data = r.json()
+        theirs = ((data.get("server") or {}).get("instance_id"))
+        mine = (await self.identity()).get("instance_id")
+        data["is_self"] = bool(theirs and mine and theirs == mine)      # the app is connected to the very server it chose as the source
+        return data
 
     async def _plan(self, path: str) -> Dict[str, Any]:
         inventory = PgInventory(await self.target_maps())
+        mine = (await self.identity()).get("instance_id")
 
         def run() -> Dict[str, Any]:
             with BundleReader(path) as reader:
-                return plan_import(reader, inventory)
+                return plan_import(reader, inventory, self_instance=mine)
         return await asyncio.to_thread(run)
 
     async def target_maps(self) -> Dict[str, Dict[str, Any]]:

@@ -48,6 +48,13 @@ class PullRequest(BaseModel):
     maps: Dict[str, List[str]]
 
 
+def _server_description() -> Dict[str, Any]:
+    """The name this server shows in GET /api/v1/server-info (the host name on a robot that has no SERVER_NAME), its id and kind."""
+    from packages.api.server_info import build_server_info
+    si = build_server_info()
+    return {"name": si.name, "server_id": si.server_id, "kind": si.kind, "version": si.version}
+
+
 def manager(request: Request) -> TransferManager:
     service = getattr(request.app.state, "service", None)
     if service is None:
@@ -57,8 +64,7 @@ def manager(request: Request) -> TransferManager:
         from packages.api import maps
         mgr = TransferManager(
             service.database, service.topomap_db, service.map_deleter, config.TRANSFER_SPOOL_DIR,
-            info={"name": config.SERVER_NAME or None, "server_id": config.SERVER_ID, "kind": config.SERVER_KIND,
-                  "version": config.BUILD_SHA},
+            info=_server_description(),
             keep_hours=config.TRANSFER_KEEP_HOURS, max_bundle_bytes=config.TRANSFER_MAX_BUNDLE_BYTES,
             refuse_open_session=maps.refuse_open_session)
         request.app.state.transfer = mgr
@@ -99,7 +105,7 @@ async def exportable_maps(request: Request, sizes: bool = False):
             item["state"] = (row.get("status") or {}).get("state")
             item["open_session"] = any(not s.get("ended_at") for s in pg[item["name"]].get("sessions", []))
             item["parts"] = await asyncio.to_thread(measure, item["name"])
-    return {"maps": out, "parts": list(PARTS)}
+    return {"maps": out, "parts": list(PARTS), "server": await mgr.identity()}
 
 
 @router.post("/exports", status_code=202)
@@ -167,9 +173,9 @@ async def pull_import(body: PullRequest, request: Request):
 
 @router.get("/remote/maps")
 @_guard
-async def remote_maps(source_url: str, sizes: bool = False):
+async def remote_maps(source_url: str, request: Request, sizes: bool = False):
     """The maps another Sati server could send, asked by this server (no cross-origin call from the client)."""
-    return await TransferManager.remote_maps(source_url, sizes)
+    return await manager(request).remote_maps(source_url, sizes)
 
 
 @router.get("/imports/{import_id}")

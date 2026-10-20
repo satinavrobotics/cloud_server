@@ -48,6 +48,19 @@ def bucket_of(minio_service: Any, name: str) -> str:
     return minio_service._bucket_name(name)
 
 
+async def read_instance_id(database: Any) -> Optional[str]:
+    """A unique id of THIS server: its Postgres cluster's system identifier (set when the database was created, never shared
+    by two servers). None when the database user may not read it."""
+    try:
+        async with database.connection() as conn:
+            cur = await conn.execute("SELECT system_identifier::text FROM pg_control_system()")
+            row = await cur.fetchone()
+        return str(row[0]) if row else None
+    except Exception:  # noqa: BLE001 - optional: the naming and the self-copy check degrade without it
+        logger.warning("Could not read this server's Postgres system identifier; transfers cannot tell it from another server")
+        return None
+
+
 async def prefetch_postgres(database: Any, names: List[str]) -> Dict[str, Dict[str, Any]]:
     """The Postgres side of a map export: row, sessions, view settings (read-only)."""
     out: Dict[str, Dict[str, Any]] = {}

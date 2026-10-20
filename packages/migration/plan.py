@@ -25,9 +25,10 @@ def bucket_of(name: str) -> str:
 
 
 def source_key(manifest: Dict[str, Any]) -> str:
-    """Who the bundle came from, for recognising a repeated import: the server id, else its name."""
+    """Who the bundle came from, for recognising a repeated import: the server's own unique id (its database's system
+    identifier), else its configured id, else its name."""
     src = manifest.get("source") or {}
-    return str(src.get("server_id") or src.get("name") or "unknown-source")
+    return str(src.get("instance_id") or src.get("server_id") or src.get("name") or "unknown-source")
 
 
 def _slug(text: str) -> str:
@@ -55,10 +56,17 @@ def choose_name(name: str, existing: Set[str], source_label: str) -> str:
     return cand
 
 
-def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = True) -> Dict[str, Any]:
+SELF_COPY = ("This bundle comes from this server itself, and copying a server into itself does nothing useful. Connect the app to the "
+             "server that should receive the maps, and choose the other server as the source.")
+
+
+def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = True,
+                self_instance: Optional[str] = None) -> Dict[str, Any]:
     manifest = reader.manifest
     errors: List[str] = []
     warnings: List[str] = []
+    if self_instance and (manifest.get("source") or {}).get("instance_id") == self_instance:
+        errors.append(SELF_COPY)
     if verify:
         errors += [f"bundle damaged: {p}" for p in reader.verify()]
     existing = target.maps()

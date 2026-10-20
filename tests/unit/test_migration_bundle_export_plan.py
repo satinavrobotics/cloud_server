@@ -280,3 +280,24 @@ def test_damaged_bundle_fails_the_plan(tmp_path):
     with B.BundleReader(str(out)) as r:
         plan = plan_import(r, Target())
     assert not plan["ok"] and "damaged" in plan["errors"][0]
+
+
+def test_a_bundle_from_this_very_server_is_refused(tmp_path):
+    src = {"name": "raspberrypi", "server_id": None, "instance_id": "7001"}
+    with reader_for(tmp_path, src=src) as r:
+        same = plan_import(r, Target(), self_instance="7001")
+        other = plan_import(r, Target(), self_instance="7002")
+        unknown = plan_import(r, Target())
+    assert not same["ok"] and "from this server itself" in same["errors"][0]
+    assert other["ok"] and unknown["ok"]
+
+
+def test_source_identity_prefers_the_instance_id_and_names_come_from_the_server_name(tmp_path):
+    from packages.migration.plan import source_key
+    assert source_key({"source": {"instance_id": "7001", "server_id": "s", "name": "n"}}) == "7001"
+    assert source_key({"source": {"server_id": "s", "name": "n"}}) == "s"
+    assert source_key({"source": {"name": "raspberrypi"}}) == "raspberrypi"
+    assert source_key({"source": {}}) == "unknown-source"
+    with reader_for(tmp_path, src={"name": "raspberrypi", "instance_id": "7001"}) as r:
+        plan = plan_import(r, Target({"Hall": {"lifecycle": "ALIVE"}}))
+    assert plan["maps"][0]["target_name"] == "Hall-raspberrypi"

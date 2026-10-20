@@ -84,14 +84,22 @@ def test_pull_rejects_bad_input(tmp_path):
         with pytest.raises(TransferError):
             mgr.start_pull("http://x", {})
         with pytest.raises(TransferError, match="does not support"):
-            await mgr.remote_maps("http://x", False) if False else await _remote_404(mgr)
+            await _remote_404(mgr)
     asyncio.new_event_loop().run_until_complete(go())
 
 
 async def _remote_404(mgr):
-    orig = httpx.AsyncClient
-    try:
-        httpx.AsyncClient = lambda **kw: orig(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
-        return await TransferManager.remote_maps("http://x", False)
-    finally:
-        httpx.AsyncClient = orig
+    mgr.http_transport = httpx.MockTransport(lambda r: httpx.Response(404))
+    return await mgr.remote_maps("http://x", False)
+
+
+def test_remote_listing_says_when_the_source_is_this_very_server(tmp_path):
+    mgr = make_manager(tmp_path, lambda r: httpx.Response(200, json={"maps": [], "parts": [], "server": {"instance_id": "999"}}))
+
+    async def go(mine):
+        mgr._instance_id, mgr._instance_read = mine, True
+        return await mgr.remote_maps("http://robot", False)
+    loop = asyncio.new_event_loop()
+    assert loop.run_until_complete(go("999"))["is_self"] is True
+    assert loop.run_until_complete(go("111"))["is_self"] is False
+    assert loop.run_until_complete(go(None))["is_self"] is False         # without an own id nothing is claimed
