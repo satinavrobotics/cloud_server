@@ -8,6 +8,7 @@
     POST   /api/v1/transfer/imports                      the bundle as the request body -> the dry-run plan; nothing is written
     POST   /api/v1/transfer/imports/pull {"source_url": "http://robot", "maps": {...}}
                                                          this server fetches the bundle from the other one (D13), then plans
+    GET    /api/v1/transfer/remote/maps?source_url=...   the maps another server could send
     GET    /api/v1/transfer/imports/{id}                 plan, progress, report
     POST   /api/v1/transfer/imports/{id}/plan            plan again (names may have changed)
     POST   /api/v1/transfer/imports/{id}/apply           start writing (202); only a user action starts it
@@ -24,7 +25,6 @@ import shutil
 import uuid
 from typing import Any, Dict, List, Optional
 
-import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -157,44 +157,19 @@ async def upload_import(request: Request):
     return await mgr.new_import(path, origin="upload")
 
 
-@router.post("/imports/pull")
+@router.post("/imports/pull", status_code=202)
 @_guard
 async def pull_import(body: PullRequest, request: Request):
-    """Fetch a bundle from another Sati server: start its export, wait, download it here, plan."""
-    mgr = manager(request)
-    base = body.source_url.rstrip("/")
-    if not base.startswith(("http://", "https://")):
-        raise TransferError("source_url must be an http(s) URL")
-    path = os.path.join(mgr.spool_dir, f"pull-{uuid.uuid4().hex}.part")
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=600.0)) as client:
-            r = await client.post(f"{base}/api/v1/transfer/exports", json={"maps": body.maps})
-            if r.status_code >= 400:
-                raise TransferError(f"the source refused the export ({r.status_code}): {r.text[:300]}", 502)
-            job = r.json()
-            while job["state"] == "running":
-                await asyncio.sleep(2)
-                job = (await client.get(f"{base}/api/v1/transfer/exports/{job['id']}")).json()
-            if job["state"] != "done":
-                raise TransferError(f"the source could not export: {job.get('error')}", 502)
-            size = 0
-            async with client.stream("GET", f"{base}/api/v1/transfer/exports/{job['id']}/bundle") as resp:
-                if resp.status_code != 200:
-                    raise TransferError(f"the source bundle download failed ({resp.status_code})", 502)
-                with open(path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(1 << 20):
-                        size += len(chunk)
-                        if mgr.max_bytes and size > mgr.max_bytes:
-                            raise TransferError("the bundle is larger than the cap", 413)
-                        f.write(chunk)
-            await client.delete(f"{base}/api/v1/transfer/exports/{job['id']}")
-    except httpx.HTTPError as exc:
-        raise TransferError(f"cannot reach the source server: {exc}", 502)
-    except BaseException:
-        if os.path.exists(path):
-            os.remove(path)
-        raise
-    return await mgr.new_import(path, origin=base)
+    """Start fetching a bundle from another Sati server (its export, then the download here), then plan it.
+    Returns the import job at once (state `fetching`, with progress); poll GET /imports/{id}."""
+    return manager(request).start_pull(body.source_url, body.maps)
+
+
+@router.get("/remote/maps")
+@_guard
+async def remote_maps(source_url: str, sizes: bool = False):
+    """The maps another Sati server could send, asked by this server (no cross-origin call from the client)."""
+    return await TransferManager.remote_maps(source_url, sizes)
 
 
 @router.get("/imports/{import_id}")

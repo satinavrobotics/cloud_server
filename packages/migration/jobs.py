@@ -6,13 +6,14 @@ rollback finds exactly what an import created. A bundle that was never applied i
 deleted; so is a finished export.
 """
 import asyncio
-import json
 import logging
 import os
 import shutil
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence
+
+import httpx
 
 from packages.migration.apply import ImportRefused, apply_import
 from packages.migration.bundle import BundleError, BundleReader, BundleWriter
@@ -29,6 +30,13 @@ class TransferError(Exception):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
+
+
+def _detail(resp: Any) -> str:
+    try:
+        return str(resp.json().get("detail", resp.text))[:300]
+    except Exception:  # noqa: BLE001
+        return resp.text[:300]
 
 
 class PgInventory:
@@ -51,6 +59,8 @@ class TransferManager:
         self.spool_dir, self.info = spool_dir, info
         self.keep_s, self.max_bytes = keep_hours * 3600, max_bundle_bytes
         self.refuse_open_session = refuse_open_session
+        self.poll_s = 2.0
+        self.http_transport: Optional[httpx.AsyncBaseTransport] = None      # tests
         self.exports: Dict[str, Dict[str, Any]] = {}
         self.imports: Dict[str, Dict[str, Any]] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
@@ -62,7 +72,7 @@ class TransferManager:
         now = time.time()
         for table in (self.exports, self.imports):
             for job_id, job in list(table.items()):
-                busy = job["state"] in ("running", "applying")
+                busy = job["state"] in ("running", "applying", "fetching")
                 if not busy and now - job["touched"] > self.keep_s:
                     self._drop_file(job)
                     del table[job_id]
@@ -151,6 +161,86 @@ class TransferManager:
             raise TransferError(str(exc), 422)
         self.imports[job_id] = job
         return self.public(job)
+
+    # ---- pull: this server fetches the bundle from another one (D13) -------------------------------
+    def start_pull(self, source_url: str, picks: Dict[str, Sequence[str]]) -> Dict[str, Any]:
+        base = source_url.rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            raise TransferError("source_url must be an http(s) URL")
+        if not picks:
+            raise TransferError("pick at least one map")
+        self.sweep()
+        job_id = uuid.uuid4().hex[:12]
+        job = {"id": job_id, "state": "fetching", "path": self._new_path("import", job_id), "origin": base,
+               "plan": None, "report": None, "progress": {"phase": "exporting"}, "error": None,
+               "created": time.time(), "touched": time.time()}
+        self.imports[job_id] = job
+        self._tasks[job_id] = asyncio.get_running_loop().create_task(self._run_pull(job, base, picks))
+        return self.public(job)
+
+    async def _run_pull(self, job: Dict[str, Any], base: str, picks: Dict[str, Sequence[str]]) -> None:
+        part = job["path"] + ".part"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=600.0), transport=self.http_transport) as client:
+                r = await client.post(f"{base}/api/v1/transfer/exports", json={"maps": picks})
+                if r.status_code >= 400:
+                    raise TransferError(f"the source refused the export ({r.status_code}): {_detail(r)}", 502)
+                remote = r.json()
+                while remote["state"] == "running":
+                    await asyncio.sleep(self.poll_s)
+                    remote = (await client.get(f"{base}/api/v1/transfer/exports/{remote['id']}")).json()
+                if remote["state"] != "done":
+                    raise TransferError(f"the source could not export: {remote.get('error')}", 502)
+                total, size = remote.get("size"), 0
+                job["progress"] = {"phase": "downloading", "bytes": 0, "total": total}
+                async with client.stream("GET", f"{base}/api/v1/transfer/exports/{remote['id']}/bundle") as resp:
+                    if resp.status_code != 200:
+                        raise TransferError(f"the bundle download failed ({resp.status_code})", 502)
+                    with open(part, "wb") as f:
+                        async for chunk in resp.aiter_bytes(1 << 20):
+                            size += len(chunk)
+                            if self.max_bytes and size > self.max_bytes:
+                                raise TransferError("the bundle is larger than the cap", 413)
+                            f.write(chunk)
+                            job["progress"] = {"phase": "downloading", "bytes": size, "total": total}
+                try:
+                    await client.delete(f"{base}/api/v1/transfer/exports/{remote['id']}")
+                except httpx.HTTPError:
+                    pass                      # the source sweeps it later
+            os.replace(part, job["path"])
+            job["progress"] = {"phase": "planning"}
+            job["plan"] = await self._plan(job["path"])
+            job["state"], job["progress"] = "planned", None
+        except TransferError as exc:
+            job["state"], job["error"] = "failed", str(exc)
+        except httpx.HTTPError as exc:
+            job["state"], job["error"] = "failed", f"cannot reach the source server: {exc}"
+        except BundleError as exc:
+            job["state"], job["error"] = "failed", str(exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Pull %s failed", job["id"])
+            job["state"], job["error"] = "failed", f"{type(exc).__name__}: {exc}"
+        finally:
+            for path in (part,) + ((job["path"],) if job["state"] == "failed" else ()):
+                if os.path.exists(path):
+                    os.remove(path)
+            job["touched"] = time.time()
+
+    @staticmethod
+    async def remote_maps(source_url: str, sizes: bool) -> Dict[str, Any]:
+        base = source_url.rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            raise TransferError("source_url must be an http(s) URL")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=120.0)) as client:
+                r = await client.get(f"{base}/api/v1/transfer/maps", params={"sizes": "true"} if sizes else None)
+        except httpx.HTTPError as exc:
+            raise TransferError(f"cannot reach {base}: {exc}", 502)
+        if r.status_code == 404:
+            raise TransferError("that server does not support data transfer yet (it needs the newer software)", 502)
+        if r.status_code >= 400:
+            raise TransferError(f"{base} answered {r.status_code}: {_detail(r)}", 502)
+        return r.json()
 
     async def _plan(self, path: str) -> Dict[str, Any]:
         inventory = PgInventory(await self.target_maps())
