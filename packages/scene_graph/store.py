@@ -589,6 +589,17 @@ class SceneGraphStore:
                 _, old = self._tiles.popitem(last=False)
                 self._tile_bytes -= sum(a.nbytes for a in old.values())
 
+    def scale_tile_cache(self, scale: float) -> None:
+        """Run the tile cache at `scale` x its configured bytes (1.0 restores it); entries over the new budget are dropped
+        oldest first. Memory relief only: a dropped tile is read again from the store."""
+        with self._lock:
+            full = getattr(self, "_tile_cache_full", None)
+            if full is None: full = self._tile_cache_full = self.tile_cache_bytes
+            self.tile_cache_bytes = max(0, int(full * max(0.0, min(1.0, scale))))
+            while self._tile_bytes > self.tile_cache_bytes and self._tiles:
+                _, old = self._tiles.popitem(last=False)
+                self._tile_bytes -= sum(a.nbytes for a in old.values())
+
     def _evict(self, map_id, names=None) -> None:
         """drop cached pages / tiles of `map_id` (all, or the named objects): gc and drop delete them from the store"""
         with self._lock:

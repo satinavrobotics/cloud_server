@@ -80,6 +80,7 @@ class ImageDatabaseService(MinIOService):
             metadata["node_id"] = str(node_id)
 
             self.logger.info(f"[DEBUG] Storing image {image_id} with metadata: {metadata}")
+            existed = self._object_may_exist(bucket_name, object_name)
 
             if self._put_with_bucket(map_id, lambda bucket: self.client.put_object(
                     bucket,
@@ -95,7 +96,8 @@ class ImageDatabaseService(MinIOService):
                 f"(bucket={bucket_name}, object={object_name})"
             )
             # the same id may have been stored before: its cached thumbnails are stale now
-            self._remove_thumbs(bucket_name, node_id, image_id)
+            if existed:
+                self._remove_thumbs(bucket_name, node_id, image_id)
             return True
 
         except Exception as e:
@@ -361,6 +363,17 @@ class ImageDatabaseService(MinIOService):
     @staticmethod
     def thumb_key(node_id: str, image_id: str, size: str) -> str:
         return f"{node_id}/thumbs/{size}/{image_id}.jpg"
+
+    def _object_may_exist(self, bucket_name: str, object_name: str) -> bool:
+        """False only when MinIO says the key (or its bucket) is not there; any other answer counts as
+        'may exist' so the stale thumbnails are still removed."""
+        try:
+            self.client.stat_object(bucket_name, object_name)
+            return True
+        except S3Error as e:
+            return e.code not in ("NoSuchKey", "NoSuchBucket", "NoSuchObject")
+        except Exception:  # noqa: BLE001
+            return True
 
     def _remove_thumbs(self, bucket_name: str, node_id: str, image_id: str) -> None:
         """Remove the cached thumbnails of an image (every size). Best effort."""

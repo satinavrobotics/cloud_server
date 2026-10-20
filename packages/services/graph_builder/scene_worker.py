@@ -250,6 +250,8 @@ class WorkerConfig:
     lazy_load: bool = False
     nbytes_refresh_s: float = 10.0
     memory_retry_limit: int = 3
+    # store.gc (the store's default keep) after this many saves of the map and once when it goes idle (0: never)
+    gc_every_saves: int = 0
 
 
 @dataclass
@@ -275,6 +277,10 @@ class SceneWorkerStats:
     rebuilds: int = 0
     resident: bool = False                  # an engine is held in memory (gauge)
     resident_bytes: Optional[int] = None    # engine.nbytes (None: the engine cannot say); 0 when not resident
+    canvas: Optional[Tuple[int, int]] = None    # the engine's dense canvas (H, W) while resident
+    gc_runs: int = 0                        # store.gc calls
+    gc_deleted: int = 0                     # objects they removed
+    memory_paused_steps: int = 0            # steps that pulled nothing because the memory guard was paused
     loads: int = 0                          # engines loaded through the factory
     evictions: int = 0                      # engines dropped to free memory
     prefetch_hits: int = 0                  # leaves whose PNG was fetched + decoded by the prefetch pool
@@ -455,13 +461,18 @@ class SceneWorker:
                  mono_ms: Optional[Callable[[], int]] = None,
                  prefetch: Optional[PngPrefetch] = None,
                  stored_leaves: Optional[Callable[[int], Optional[Mapping[str, tuple]]]] = None,
-                 half_side: Optional[float] = None) -> None:
+                 half_side: Optional[float] = None,
+                 memory: Any = None, load_gate: Any = None) -> None:
         if engine is None and engine_factory is None:
             raise ValueError("SceneWorker needs an engine or an engine_factory")
         self.map_id, self.source, self.fetch_png, self.footprint = map_id, source, fetch_png, footprint
         self.engine, self.store, self.cursor_store, self.guard = engine, store, cursor_store, guard
         self.engine_factory, self._loaded_version = engine_factory, loaded_version
         self.prefetch = prefetch
+        self.memory = memory                 # MemoryGuard (scene_memory): `.paused` stops intake, None: never
+        self.load_gate = load_gate           # LoadGate: refuses an engine load (memory high / crash cooldown), keeps the marker
+        self._saves_since_gc = 0
+        self._load_refused = ""
         # the map's fixed robot half side (its spec's robot_half_side_m, set at creation): when given, every node is folded
         # with it and the live footprint is not read; None = the legacy per-robot footprint (a map from before the spec)
         self._half_side = half_side
@@ -646,7 +657,7 @@ class SceneWorker:
         st, eng = self.stats, self.engine
         st.resident = eng is not None
         if eng is None:
-            st.resident_bytes = 0
+            st.resident_bytes, st.canvas = 0, None
             return
         now = self._mono()
         if not force and not self._bytes_stale and st.resident_bytes is not None:
@@ -657,6 +668,8 @@ class SceneWorker:
         try:
             size = getattr(eng, "nbytes", None)
             st.resident_bytes = int(size) if size is not None else None
+            shape = getattr(getattr(eng, "_V", None), "shape", None)
+            st.canvas = (int(shape[0]), int(shape[1])) if shape is not None and len(shape) >= 2 else None
         except Exception:  # noqa: BLE001  a gauge: never the step's problem
             st.resident_bytes = None
         if st.resident_bytes is None and not self._bytes_warned:
@@ -711,9 +724,18 @@ class SceneWorker:
         # 2. pull (not while a full batch is already waiting: fold that first)
         more = False
         t_step = self._mono()
-        skipped, fetch_error = self._retry_pending()
+        # memory guard: pull and prefetch nothing while the container is near its limit; what is buffered is still
+        # folded and saved, and the durable cursor means nothing is lost (the next step after the resume re-reads)
+        paused = self.memory is not None and bool(self.memory.paused)
+        if paused:
+            skipped, fetch_error = 0, None
+            self.stats.memory_paused_steps += 1
+        else:
+            skipped, fetch_error = self._retry_pending()
         plan_mode = self._plan_mode()
-        if plan_mode:
+        if paused:
+            more = False
+        elif plan_mode:
             self._plan_cut_overdue()
             if fetch_error is None:
                 if self._leaf_count() >= self._batch_max():
@@ -763,7 +785,7 @@ class SceneWorker:
             self._buf_since_ms = self._mono()
         self._release_leading_skips()
         # a rebuild folds fixed batches; at the head of the nodes the remainder is flushed
-        self._head = (not more) and fetch_error is None
+        self._head = (not more) and fetch_error is None and not paused
         # 4. fold once per batch
         folded = 0
         self._quarantined = []
@@ -826,6 +848,8 @@ class SceneWorker:
             state, sleep = WORKED, 0.0
         else:
             state = IDLE
+            if self._saves_since_gc and cfg.gc_every_saves > 0 and self._dirty is None and not waiting:
+                self._gc()
             cap = max(cfg.idle_max_s, cfg.idle_sleep_s)
             sleep = min(cap, cfg.idle_sleep_s * (2 ** min(self._idle_streak, 16)))
             self._idle_streak += 1
@@ -1175,9 +1199,22 @@ class SceneWorker:
                         "engine_factory to reload it", self.map_id, self._loaded_version, version)
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s,
                               detail=f"engine at {self._loaded_version}, store at {version}")
+        gate = self.load_gate
+        if gate is not None:
+            refused = gate.refusal(self.map_id)
+            if refused is not None:
+                reason, retry_s = refused
+                if reason != self._load_refused:
+                    self._load_refused = reason
+                    log.warning("scene worker %s: engine load refused: %s", self.map_id, reason)
+                return StepResult(BACKOFF, sleep_s=max(retry_s, self.config.backoff_s), detail=f"load refused: {reason}")
+            self._load_refused = ""
+            gate.begin(self.map_id)
         try:
             self.engine = self.engine_factory(version)
         except Exception as exc:
+            if gate is not None:
+                gate.done(self.map_id, False)
             log.exception("scene worker %s: loading the engine (version %s) failed", self.map_id, version)
             self._failed("load", f"{type(exc).__name__}: {exc}")
             if self._deterministic(exc):
@@ -1187,6 +1224,8 @@ class SceneWorker:
             else:
                 self._load_failures = 0
             return StepResult(BACKOFF, sleep_s=self.config.backoff_s, detail=f"load: {exc}")
+        if gate is not None:
+            gate.done(self.map_id, True)
         self._loaded_version = version
         self._load_failures = 0
         self.stats.loads += 1
@@ -2131,8 +2170,31 @@ class SceneWorker:
                 self.publish(int(version), dirty)
             except Exception:
                 log.exception("scene worker %s: publish callback failed", self.map_id)
+        self._saves_since_gc += 1
+        every = self.config.gc_every_saves
+        if every > 0 and self._saves_since_gc >= every:
+            self._gc()
         self._refresh_gauges()
         return None
+
+    def _gc(self) -> None:
+        """store.gc with its default keep, on the worker's own slot (no save of this map runs meanwhile, and the map's
+        lock is held, so no other writer). Never for a version the store does not hold as live: the live version this
+        worker expects and the pending generation's manifest are always kept (the store keeps `leased` and `pending`)."""
+        self._saves_since_gc = 0
+        gc = getattr(self.store, "gc", None)
+        if gc is None or not self._started or self.state in TERMINAL:
+            return
+        try:
+            meta = self.store.meta(self.map_id) or {}
+            live = int(meta.get("version") or 0)
+            if live <= 0 or live != self._expected_version:
+                return                      # the store moved under us (fenced next step): collect nothing
+            res = gc(self.map_id, leased=[live]) or {}
+            self.stats.gc_runs += 1
+            self.stats.gc_deleted += int(res.get("deleted") or 0)
+        except Exception as exc:  # noqa: BLE001  housekeeping: never the step's problem
+            log.warning("scene worker %s: store gc failed: %s", self.map_id, exc)
 
     def _event_updated(self, version: int, charts: Optional[int]) -> None:
         """'updated' events are at most one per `updated_event_interval_s` per map (the websocket

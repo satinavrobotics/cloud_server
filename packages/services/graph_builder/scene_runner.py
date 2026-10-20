@@ -67,6 +67,7 @@ class RunnerConfig:
     max_resident_bytes: int = 0         # ... and their total engine.nbytes (0: no cap)
     evict_idle_s: float = 60.0          # an engine is evicted only after its map was quiet this long
     over_budget_log_s: float = 60.0     # how often "everything resident is active" is logged
+    mem_stats_log_s: float = 60.0       # one INFO line (RSS, cgroup, engines) this often while an engine is active (0: off)
 
 
 class SceneRunner:
@@ -77,8 +78,11 @@ class SceneRunner:
                  on_status: Optional[Callable[[str, str], None]] = None,
                  skip_reason: Optional[Callable[[str], Optional[str]]] = None,
                  on_event: Optional[Callable[[str, str, Dict[str, Any]], None]] = None,
-                 prefetch: Any = None) -> None:
+                 prefetch: Any = None, memory: Any = None, load_gate: Any = None) -> None:
         self.list_maps, self.make_worker = list_maps, make_worker
+        self.memory = memory                # scene_memory.MemoryGuard (or None): sampled every tick, reported in snapshot
+        self.load_gate = load_gate          # scene_memory.LoadGate (marker state is reported in snapshot)
+        self._mem_logged: Optional[float] = None
         self.prefetch = prefetch            # shared PNG prefetch pool: snapshotted, closed with the runner
         self.config = config or RunnerConfig()
         self.now, self.on_status = now, on_status
@@ -131,6 +135,7 @@ class SceneRunner:
             self._step_map(map_id, t)
             stepped += 1
         self._enforce_budget(self.now(), inline=True)
+        self._memory_tick(self.now())
         return stepped
 
     def run(self, sleep: Callable[[float], None], should_stop: Callable[[], bool],
@@ -169,6 +174,7 @@ class SceneRunner:
                              skipped=dict(getattr(stats, "skipped", {}) or {}),
                              resident=bool(getattr(stats, "resident", False)),
                              resident_bytes=getattr(stats, "resident_bytes", None),
+                             canvas=getattr(stats, "canvas", None),
                              loads=getattr(stats, "loads", 0), evictions=getattr(stats, "evictions", 0),
                              prefetch_hits=getattr(stats, "prefetch_hits", 0),
                              already_folded=getattr(stats, "already_folded", 0),
@@ -191,6 +197,7 @@ class SceneRunner:
                          "max_engines": self.config.max_resident,
                          "max_bytes": self.config.max_resident_bytes,
                          "evictions": self.evictions, "over_budget": self.over_budget}}
+        out["memory"] = self.memory_snapshot()
         if self.prefetch is not None:
             snap = getattr(self.prefetch, "snapshot", None)
             if snap is not None:
@@ -401,6 +408,7 @@ class SceneRunner:
             cold_now += cold
         self._queue_depth = waiting
         self._enforce_budget(t, inline=False)
+        self._memory_tick(t)
         return collected
 
     @staticmethod
@@ -495,6 +503,52 @@ class SceneRunner:
             self._over_logged = t
             log.warning("scene runner: %d engines / %d bytes resident, over budget (max %d / %d bytes) and "
                         "no idle engine to evict", n, b, cfg.max_resident, cfg.max_resident_bytes)
+
+    # ---- memory report
+
+    def memory_snapshot(self) -> Dict[str, Any]:
+        """RSS, cgroup memory.current / max, oom counters, the guard's verdict, the load marker, and per resident
+        engine its nbytes and canvas (H, W)."""
+        from . import scene_memory
+        out: Dict[str, Any] = (self.memory.snapshot() if self.memory is not None
+                               else scene_memory.process_stats())
+        engines: Dict[str, Any] = {}
+        for map_id, worker in list(self._workers.items()):
+            st = getattr(worker, "stats", None)
+            if st is not None and getattr(st, "resident", False):
+                engines[map_id] = {"nbytes": getattr(st, "resident_bytes", None),
+                                   "canvas": getattr(st, "canvas", None)}
+        out["engines"] = engines
+        marker = getattr(self.load_gate, "marker", None)
+        if marker is not None:
+            out["load_marker"] = marker.snapshot()
+        return out
+
+    def _memory_tick(self, t: float) -> None:
+        if self.memory is not None:
+            try:
+                self.memory.check()
+            except Exception:  # noqa: BLE001
+                log.exception("scene runner: memory guard check failed")
+        every = self.config.mem_stats_log_s
+        if not every or (self._mem_logged is not None and t - self._mem_logged < every):
+            return
+        snap = self.memory_snapshot()
+        if not snap["engines"]:
+            return
+        self._mem_logged = t
+
+        def mb(v: Any) -> str:
+            return "n/a" if v is None else f"{v / 1048576:.0f}MB"
+
+        def eng(e: Dict[str, Any]) -> str:
+            c = e.get("canvas")
+            return f"{mb(e['nbytes'])} {c[0]}x{c[1]}" if c else mb(e["nbytes"])
+
+        log.info("scene runner: memory rss=%s cgroup=%s/%s oom=%s oom_kill=%s paused=%s engines=%s",
+                 mb(snap.get("rss_bytes")), mb(snap.get("cgroup_current_bytes")), mb(snap.get("cgroup_max_bytes")),
+                 snap.get("oom"), snap.get("oom_kill"), snap.get("paused", False),
+                 {m: eng(e) for m, e in snap["engines"].items()})
 
     def _report(self, map_id: str, kind: str, payload: Dict[str, Any]) -> None:
         if self.on_event is None:

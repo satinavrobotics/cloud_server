@@ -69,6 +69,7 @@ class GraphDatabaseService:
         self.spatial_index_manager: Optional[SpatialIndexManager] = None
         self._session_indexed: set = set()   # node collections with the session_id index
         self._costmap_indexed: set = set()   # ... with the costmap_stored_ms index
+        self._run_indexed: set = set()       # ... with the (robot_name, session_id) index (last_run_id)
         self._connect_to_arango(arango_username, arango_password)
         self._initialize_graph()
         self._setup_spatial_indexes()
@@ -201,7 +202,8 @@ class GraphDatabaseService:
     def _forget_collection(self, name: str) -> None:
         self._known_collections.discard(name)
         self._range_indexed.pop(name, None)
-        for cache in (getattr(self, "_costmap_indexed", None), getattr(self, "_session_indexed", None)):
+        for cache in (getattr(self, "_costmap_indexed", None), getattr(self, "_session_indexed", None),
+                      getattr(self, "_run_indexed", None)):
             if cache is not None:
                 cache.discard(name)
 
@@ -674,6 +676,14 @@ class GraphDatabaseService:
         try:
             if not self.db.has_collection(f"nodes_{map_id}"):
                 return None
+            name = f"nodes_{map_id}"
+            run_indexed = self.__dict__.setdefault("_run_indexed", set())
+            if name not in run_indexed:
+                try:
+                    self.db.collection(name).add_persistent_index(fields=["robot_name", "session_id"])
+                    run_indexed.add(name)
+                except Exception as e:  # the query works without it, only slower
+                    self.logger.warning(f"Could not ensure the (robot_name, session_id) index of {name}: {e}")
             cursor = self.db.aql.execute(self.NODE_RUN_ID_AQL, bind_vars={
                 "@col": f"nodes_{map_id}", "robot": robot_name, "session": str(session_id)})
             return next(iter(cursor), None)

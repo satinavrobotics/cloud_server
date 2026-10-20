@@ -1682,7 +1682,11 @@ class ChartGraph(SceneGraph):
                 seen.add(id(o)); return sys.getsizeof(o) + sum(walk(v, depth + 1) for v in o.values())
             if isinstance(o, (list, tuple, set)):
                 seen.add(id(o)); n = sys.getsizeof(o)
-                if o and not isinstance(next(iter(o)), (int, float, str, bytes, bool, tuple)):
+                first = next(iter(o), None)
+                # a leading scalar / tuple no longer hides the rest of a tuple that holds arrays or dicts: the link memo is
+                # (names, {key: (length, integrals, ys, xs)})
+                if o and (not isinstance(first, (int, float, str, bytes, bool, tuple))
+                          or (isinstance(o, tuple) and any(isinstance(v, (np.ndarray, dict)) for v in o[:8]))):
                     n += sum(walk(v, depth + 1) for v in o)
                 return n
             if hasattr(o, "__dict__"):

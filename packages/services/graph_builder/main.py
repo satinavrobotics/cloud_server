@@ -73,6 +73,8 @@ class StatsResponse(BaseModel):
     acks_failed: int = 0
     acks_dropped: int = 0
     run_id_mismatch: int = 0
+    # process RSS, cgroup memory.current / max, oom counters, and (worker on) per engine nbytes + canvas
+    memory: Dict[str, Any] = {}
 
 
 # HealthResponse is now imported from packages.utils.service_utils
@@ -218,6 +220,17 @@ def _scene_graph_health() -> dict:
         return {"scene_graph_worker": {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}}
 
 
+def _memory_stats() -> dict:
+    try:
+        snap = getattr(getattr(_scene_host, "runner", None), "memory_snapshot", None)
+        if snap is not None:
+            return snap()
+        from .scene_memory import process_stats
+        return process_stats()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
@@ -240,6 +253,7 @@ async def health_check():
 async def get_stats():
     """Get service statistics."""
     stats = service.get_stats()
+    stats["memory"] = _memory_stats()
     return StatsResponse(**stats)
 
 

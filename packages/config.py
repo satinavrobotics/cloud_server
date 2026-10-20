@@ -902,6 +902,20 @@ SCENE_GRAPH_STEP_BUDGET_S = float(os.getenv("SCENE_GRAPH_STEP_BUDGET_S", "0.0"))
 SCENE_GRAPH_SLOW_STEP_S = float(os.getenv("SCENE_GRAPH_SLOW_STEP_S", "30.0"))
 SCENE_GRAPH_STATS_LOG_S = float(os.getenv("SCENE_GRAPH_STATS_LOG_S", "60.0"))
 
+# Graph-builder memory guard (cgroup-aware). Above HIGH_FRACTION of memory.max (cgroup v2 / v1; absent: off) the
+# scene runner pauses intake + prefetch (nothing is dropped: the cursor is durable), shrinks the store tile cache and
+# refuses to load another engine; it resumes below LOW_FRACTION. LOAD_MARKER_PATH: a file written while an engine
+# loads; a marker left by a dead process stops that map's auto-load for LOAD_COOLDOWN_S (restart-loop breaker).
+SCENE_GRAPH_MEM_HIGH_FRACTION = float(os.getenv("SCENE_GRAPH_MEM_HIGH_FRACTION", "0.80"))
+SCENE_GRAPH_MEM_LOW_FRACTION = float(os.getenv("SCENE_GRAPH_MEM_LOW_FRACTION", "0.70"))
+SCENE_GRAPH_LOAD_MARKER_PATH = os.getenv("SCENE_GRAPH_LOAD_MARKER_PATH", "/tmp/scene_graph_load_marker.json")
+SCENE_GRAPH_LOAD_COOLDOWN_S = float(os.getenv("SCENE_GRAPH_LOAD_COOLDOWN_S", "600.0"))
+SCENE_GRAPH_MEM_STATS_LOG_S = float(os.getenv("SCENE_GRAPH_MEM_STATS_LOG_S", "60.0"))
+# store.gc (keep the default last versions) every N saves of a map and once when it goes idle (0: never)
+SCENE_GRAPH_GC_EVERY_SAVES = int(os.getenv("SCENE_GRAPH_GC_EVERY_SAVES", "50"))
+# per-robot cache of "is a mission RUNNING" in graph-builder's node ingest (0: query per node)
+GB_ACTIVE_MISSION_TTL_S = float(os.getenv("GB_ACTIVE_MISSION_TTL_S", "1.0"))
+
 # Scale of the ingest worker (one process, up to MAX_MAPS maps, small and very large).
 # WORKER_THREADS: size of the dedicated step pool (one step per map at a time, earliest-due map first;
 # a cold engine load never takes the last thread). MAX_RESIDENT_ENGINES / MAX_RESIDENT_BYTES: at most
