@@ -721,7 +721,7 @@ class ChartGraph(SceneGraph):
         full = part.full.astype(np.int64)
         sp.clr = clr[sp.ys, sp.xs]
         sp.clr_price = self._clr_price_h[sp.ys, sp.xs]
-        edges = self._lattice_edges(sp, h)
+        edges = part.edges if part.edges is not None else self._lattice_edges(sp, h)    # the same edges (morse.edges_full)
         plane = -np.ones((H, W), np.int32); plane[sp.ys, sp.xs] = full
         # persistent keys
         cells = [(int(sp.xs[a]), int(sp.ys[a])) for a in A]
@@ -741,8 +741,17 @@ class ChartGraph(SceneGraph):
               "soft": np.where((v > 0) & (v < 100), v / 99.0, 0.0)}
         for name, (cv, _) in self._chan.items():
             w = cv[::LAT, ::LAT]; ch[name] = np.where((w > 0) & (w < 100), w / 99.0, 0.0)
-        chv = {k: f[sp.ys, sp.xs] for k, f in ch.items()}
-        links = self._links(sp, A, full, edges, chv, morse.arcs(sp, part.full, part.f, sp.clr))
+        if all(f.dtype == np.float64 for f in ch.values()):
+            fm = np.empty((len(ch), sp.N))                             # the channels at the cells of F, one row each
+            for i, f in enumerate(ch.values()):
+                fm[i] = f[sp.ys, sp.xs]
+            chv = dict(zip(ch, fm))
+        else:                                                          # (a channel of another dtype keeps its own arithmetic)
+            fm, chv = None, {k: f[sp.ys, sp.xs] for k, f in ch.items()}
+        K = len(A)
+        gorder = morse.group_order(full, K)                            # cells by chart, ascending within a chart
+        gcut = np.concatenate([[0], np.cumsum(np.bincount(full, minlength=K))])
+        links = self._links(sp, A, full, edges, chv, morse.arcs(sp, part.full, part.f, sp.clr), (gorder, gcut), fm)
         # chart records
         eb = ch["ever_blocked"]
         pose_cell = {}
@@ -752,17 +761,28 @@ class ChartGraph(SceneGraph):
                 pose_cell.setdefault(int(plane[y, x]), []).append((k, y, x))
         charts = []
         peaks = np.full(len(A), -1.0)
-        np.maximum.at(peaks, full, part.f)
-        order = np.argsort(full, kind="stable"); cut = np.searchsorted(full[order], np.arange(len(A) + 1))
+        order, cut = gorder, gcut
+        cnts = np.diff(cut)
+        if (cnts > 0).all():                                           # a chart's cells are the cells it labels: max, and the
+            peaks = np.maximum.reduceat(part.f[order], cut[:-1])       # means of 0/1 planes are count / n (exact integers)
+            n_driven = np.add.reduceat(S[sp.ys[order], sp.xs[order]].astype(np.int64), cut[:-1])
+            n_blocked = np.add.reduceat(eb[sp.ys[order], sp.xs[order]].astype(np.int64), cut[:-1])
+        else:
+            np.maximum.at(peaks, full, part.f)
+            n_driven = n_blocked = None
         for j, a in enumerate(A):
             cc = order[cut[j]:cut[j + 1]]
             ay, ax = int(sp.ys[a]), int(sp.xs[a])
             leaf = None
             if j in pose_cell:
                 leaf = min(pose_cell[j], key=lambda t: ((t[1] - ay) ** 2 + (t[2] - ax) ** 2, t[0]))[0]
+            if n_driven is not None:
+                n = int(cnts[j]); dfrac = float(n_driven[j] / n); efrac = float(n_blocked[j] / n)
+            else:
+                dfrac = float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0
+                efrac = float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0
             charts.append(Chart(key=keys[j], anchor=self._cell_xy(ay, ax), cells=int(len(cc)), area_m2=float(len(cc) * h ** 2),
-                                clearance=float(sp.clr[a]), driven_frac=float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0,
-                                ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf,
+                                clearance=float(sp.clr[a]), driven_frac=dfrac, ever_blocked_frac=efrac, leaf=leaf,
                                 peak=float(peaks[j]), region=int(part.region[j])))
         return _Solved(sp=sp, A=A, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
                        dep=np.zeros((H, W), bool), S=S, peak=peaks, region=part.region, val=self._val_h)
@@ -790,58 +810,104 @@ class ChartGraph(SceneGraph):
         return np.concatenate(R), np.concatenate(C), np.concatenate(Ln)
 
     # ------------------------------------------------------------------ links
-    def _links(self, sp, A, full, edges, chv, arcs: "morse.Arcs") -> List[dict]:
+    def _links(self, sp, A, full, edges, chv, arcs: "morse.Arcs", grp=None, fm=None) -> List[dict]:
         """One link per arc of the interface. Length: the shortest 8-neighbour route anchor -> portal -> anchor, each half inside
-        its own region (one Dijkstra per region, served from the last batch while the region and its anchor are unchanged)."""
+        its own region (one Dijkstra per region, served from the last batch while the region and its anchor are unchanged; so are
+        the routes read off its predecessors). `grp`: (cells by chart, ascending within a chart; offsets) when the caller has it.
+        `fm`: the channel values of `chv` as the rows of one matrix, in the order of `chv`, when the caller has it."""
         R, C, Ln = edges
         k = len(A)
-        ec = np.where(full[R] == full[C], full[R], -1)
-        order = np.argsort(ec, kind="stable"); ecs = ec[order]
-        cut = np.searchsorted(ecs, np.arange(-1, k + 1))
-        cells_of = np.split(np.argsort(full, kind="stable"), np.searchsorted(np.sort(full), np.arange(1, k)))
-        D, PRED, CJ = [], [], []
+        if grp is None:
+            gorder = morse.group_order(full, k)
+            gcut = np.concatenate([[0], np.cumsum(np.bincount(full, minlength=k))])
+        else:
+            gorder, gcut = grp
+        Aa = np.asarray(A, np.int64)
+        cnt = np.diff(gcut)
+        # the content key of every chart: its cells relative to its top left corner, and its anchor (as always, one blake2b of
+        # the same bytes), the arrays built once for all charts
+        ys_o, xs_o = sp.ys[gorder], sp.xs[gorder]
+        y0s, x0s = np.minimum.reduceat(ys_o, gcut[:-1]), np.minimum.reduceat(xs_o, gcut[:-1])
+        Yr = (ys_o - np.repeat(y0s, cnt)).astype(np.int32)
+        Xr = (xs_o - np.repeat(x0s, cnt)).astype(np.int32)
+        anc = np.stack([sp.ys[Aa] - y0s, sp.xs[Aa] - x0s], 1).astype(np.int32)
+        D, PRED, CJ, PC = [], [], [], []
+        keys, hits = [], []
+        for j in range(k):
+            g0, g1 = int(gcut[j]), int(gcut[j + 1])
+            hk = hashlib.blake2b(digest_size=16)
+            hk.update(Yr[g0:g1]); hk.update(Xr[g0:g1]); hk.update(anc[j])
+            keys.append(hk.digest())
+            hits.append(self._rcache.get(keys[-1]))
+        miss = np.array([hit is None for hit in hits], bool)
+        if miss.any():                                    # the edges inside the charts to solve, grouped by chart
+            fR = full[R]
+            em = np.nonzero(miss[fR] & (fR == full[C]))[0]
+            fR = fR[em]
+            eo = em[morse.group_order(fR, k)]
+            ecut = np.concatenate([[0], np.cumsum(np.bincount(fR, minlength=k))])
+            del fR, em
         rnew: dict = {}
         for j, a in enumerate(A):
-            cj = cells_of[j]                              # cells of the region, ascending
-            ys, xs = sp.ys[cj], sp.xs[cj]
-            y0, x0 = int(ys.min()), int(xs.min())
-            hk = hashlib.blake2b(digest_size=16)
-            hk.update((ys - y0).astype(np.int32).tobytes()); hk.update((xs - x0).astype(np.int32).tobytes())
-            hk.update(np.array([sp.ys[a] - y0, sp.xs[a] - x0], np.int32).tobytes())
-            key = hk.digest()
-            hit = self._rcache.get(key)
+            cj = gorder[int(gcut[j]):int(gcut[j + 1])]    # cells of the region, ascending
+            key, hit = keys[j], hits[j]
             if hit is None:
-                e = order[cut[j + 1]:cut[j + 2]]
+                e = eo[ecut[j]:ecut[j + 1]]
                 n = len(cj)
                 lr = np.searchsorted(cj, R[e]); lc = np.searchsorted(cj, C[e])
                 g = coo_matrix((np.concatenate([Ln[e], Ln[e]]), (np.concatenate([lr, lc]), np.concatenate([lc, lr]))), shape=(n, n)).tocsr()
-                hit = dijkstra(g, directed=False, indices=int(np.searchsorted(cj, a)), return_predecessors=True)
+                hit = dijkstra(g, directed=False, indices=int(np.searchsorted(cj, a)), return_predecessors=True) + ({},)
             rnew[key] = hit
-            D.append(hit[0]); PRED.append(hit[1]); CJ.append(cj)
+            D.append(hit[0]); PRED.append(hit[1]); CJ.append(cj); PC.append(hit[2])
         self._rcache = rnew
 
-        def route(j, cell):
-            """cells of the shortest route anchor -> cell inside chart j: followed in the chart's own index space (one
-            lookup in, one out) and mapped back to cell indices at the end"""
-            cj, pr = CJ[j], PRED[j]
-            goal = int(np.searchsorted(cj, A[j]))
-            q = int(np.searchsorted(cj, cell))
-            p = [q]
+        # chart-local index of every portal (a cell's place in its chart's ascending cell list), and of every anchor
+        inv = np.empty(len(gorder), np.int64); inv[gorder] = np.arange(len(gorder))
+
+        def local(cells, charts):
+            q = inv[cells] - gcut[charts]
+            bad = np.nonzero(full[cells] != charts)[0]
+            for i in bad.tolist():                        # a cell outside the chart it is said to be in: the lookup itself
+                q[i] = np.searchsorted(CJ[int(charts[i])], cells[i])
+            return q
+        goals = local(Aa, np.arange(k, dtype=np.int64)).tolist() if k else []
+        qu = local(arcs.p, arcs.a).tolist(); qv = local(arcs.q, arcs.b).tolist()
+
+        def route(j, q):
+            """local indices of the shortest route anchor -> local cell q inside chart j, read off the chart's predecessor
+            array; None when unreachable. Kept with the chart's Dijkstra for as long as the chart's content is unchanged."""
+            pc = PC[j]
+            if q in pc: return pc[q]
+            pr, goal = PRED[j], goals[j]
+            p = [q]; q0 = q
             while q != goal:
                 q = int(pr[q])
-                if q < 0: return None
+                if q < 0:
+                    pc[q0] = None; return None
                 p.append(q)
-            return cj[p[::-1]].tolist()
+            pc[q0] = r = np.array(p[::-1], np.int64)
+            return r
         h = self._h
+        names = list(chv)
+        Fm = fm
+        if Fm is None and all(v.dtype == np.float64 for v in chv.values()):
+            Fm = np.stack([chv[n] for n in names])
         out = []
-        for a, b, u, v, s, w in zip(arcs.a.tolist(), arcs.b.tolist(), arcs.p.tolist(), arcs.q.tolist(), arcs.s.tolist(),
-                                    arcs.g.tolist()):
-            du = D[a][int(np.searchsorted(CJ[a], u))]; dv = D[b][int(np.searchsorted(CJ[b], v))]
-            pa = route(a, u); pb = route(b, v)
+        for a, b, u, v, s, w, iu, iv in zip(arcs.a.tolist(), arcs.b.tolist(), arcs.p.tolist(), arcs.q.tolist(), arcs.s.tolist(),
+                                            arcs.g.tolist(), qu, qv):
+            du = D[a][iu]; dv = D[b][iv]
+            pa = route(a, iu); pb = route(b, iv)
             if pa is None or pb is None or not (np.isfinite(du) and np.isfinite(dv)): continue
-            cells = np.array(pa + pb[::-1], np.int64)
+            cells = np.concatenate([CJ[a][pa], CJ[b][pb][::-1]])
             seg = np.hypot(np.diff(sp.ys[cells]).astype(float), np.diff(sp.xs[cells]).astype(float)) * h * 0.5
-            integ = {name: float((seg * (f[cells[:-1]] + f[cells[1:]])).sum()) for name, f in chv.items()}
+            if Fm is None:                                # channels of other dtypes: each in its own arithmetic
+                integ = {name: float((seg * (f[cells[:-1]] + f[cells[1:]])).sum()) for name, f in chv.items()}
+                out.append(dict(a=a, b=b, length=float(du + dv + h), width=2.0 * float(w), saddle=float(s), u=u, v=v,
+                                route=cells.tolist(), integ=integ))
+                continue
+            gm = Fm.take(cells, axis=1)
+            # one row per channel, C-contiguous: each row is summed pairwise exactly as a 1-D array of its own
+            integ = dict(zip(names, np.ascontiguousarray(seg * (gm[:, :-1] + gm[:, 1:])).sum(axis=1).tolist()))
             out.append(dict(a=a, b=b, length=float(du + dv + h), width=2.0 * float(w), saddle=float(s), u=u, v=v,
                             route=cells.tolist(), integ=integ))
         return out
@@ -853,8 +919,7 @@ class ChartGraph(SceneGraph):
         sig, link_sig = {}, set()
         if s is not None:
             gy0, gx0 = self._cy0 // 2, self._cx0 // 2
-            ys, xs = np.nonzero(s.plane >= 0)
-            lab = s.plane[ys, xs]
+            ys, xs, lab = s.sp.ys, s.sp.xs, s.full                  # the cells of the plane (row-major) and their chart
             k = len(s.keys)
             cnt = np.bincount(lab, minlength=k)
             chk = np.bincount(lab, weights=((ys.astype(np.int64) + gy0) * 7919 + (xs.astype(np.int64) + gx0)).astype(np.float64), minlength=k)
@@ -875,8 +940,9 @@ class ChartGraph(SceneGraph):
                 if sy + op.shape[0] <= s.plane.shape[0] and sx + op.shape[1] <= s.plane.shape[1]:
                     big = -np.ones(s.plane.shape, op.dtype); big[sy:sy + op.shape[0], sx:sx + op.shape[1]] = op; op = big
             if op is not None and op.shape == s.plane.shape:
-                a = np.where(op >= 0, np.array([self._hash(k) for k in old.keys] + [0])[op], 0) if len(old.keys) else np.zeros(s.plane.shape)
-                b = np.where(s.plane >= 0, np.array([self._hash(k) for k in s.keys] + [0])[s.plane], 0) if len(s.keys) else np.zeros(s.plane.shape)
+                # a cell's hash is that of its chart key, 0 outside F: index -1 picks the trailing 0
+                a = np.array([self._hash(k) for k in old.keys] + [0])[op] if len(old.keys) else np.zeros(s.plane.shape)
+                b = np.array([self._hash(k) for k in s.keys] + [0])[s.plane] if len(s.keys) else np.zeros(s.plane.shape)
                 changed_cells = a != b
         self._sig, self._link_sig = sig, link_sig
         changed = sorted(k for k in sig if old_sig.get(k) != sig[k])
