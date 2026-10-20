@@ -13,7 +13,8 @@
 #     nginx-gateway, livekit-sfu + livekit-sfu-tokens (the robot's own video server, small config, no internet needed).
 #     minio-tailnet stays: presigned URLs are signed for MINIO_HOST, which here is the Pi's tailnet IP.
 #   - images come from the registry (IMAGE_REGISTRY/IMAGE_TAG, written by scripts/build_push.sh), never built here.
-#   - Every container has a memory limit (defaults sum to ~3.3 GiB, ~4.0 GiB with the reconstruction container, set from
+#   - Python services get MALLOC_ARENA_MAX=2 (glibc makes up to 8 arenas per core for many threads; fewer arenas, lower RSS).
+#   - Every container has a memory limit (defaults sum to 3456 MiB = ~3.4 GiB, ~4.1 GiB with the reconstruction container, set from
 #     what each one used on a 4 GB Pi: the graph builder alone peaked at ~750 MB; see .env.robot.example for 8 GB) and a
 #     rotated log. Postgres, ArangoDB, the planner and graph-builder listen on loopback only; mosquitto on loopback + the
 #     tailnet IP; the API (8000) and MinIO's tailnet forwarder are the only other doors.
@@ -82,6 +83,8 @@ services:
   mission-dispatch:
     build: !reset null
     image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/mission_dispatch:${IMAGE_TAG:-latest}
+    environment:
+      - MALLOC_ARENA_MAX=2
     mem_limit: ${MEM_DISPATCH:-160m}
     logging: *logging
 
@@ -107,6 +110,7 @@ services:
       - SCENE_GRAPH_STEP_BUDGET_S=${SCENE_GRAPH_STEP_BUDGET_S:-5}
       - SCENE_GRAPH_BATCH_MAX_LEAVES=${SCENE_GRAPH_BATCH_MAX_LEAVES:-8}
       - SCENE_GRAPH_PREFETCH_QUEUE=${SCENE_GRAPH_PREFETCH_QUEUE:-16}
+      - MALLOC_ARENA_MAX=2
     mem_limit: ${MEM_GRAPH_BUILDER:-896m}
     logging: *logging
 
@@ -125,7 +129,11 @@ services:
       # Scene-graph planner: fewer cached graphs, with a byte budget, to fit the container.
       - SCENE_GRAPH_CACHE_VERSIONS=${SCENE_GRAPH_CACHE_VERSIONS:-2}
       - SCENE_GRAPH_CACHE_MAX_BYTES=${SCENE_GRAPH_CACHE_MAX_BYTES:-80000000}
-    mem_limit: ${MEM_PLANNER:-128m}
+      # Byte caches of the planner (cloud defaults 64 MB store tiles; the lazy tile cache is a count of ~35 KB tiles).
+      - SCENE_GRAPH_STORE_TILE_CACHE_BYTES=${SCENE_GRAPH_STORE_TILE_CACHE_BYTES:-33554432}
+      - SCENE_GRAPH_LAZY_TILE_CACHE=${SCENE_GRAPH_LAZY_TILE_CACHE:-512}
+      - MALLOC_ARENA_MAX=2
+    mem_limit: ${MEM_PLANNER:-192m}
     logging: *logging
 
   api-delegation-service:
@@ -138,6 +146,12 @@ services:
       # Removes a deleted robot's participant from the local SFU (loopback, LIVEKIT_SFU_ADMIN_URL's default).
       - LIVEKIT_SFU_API_KEY=${LIVEKIT_SFU_API_KEY:?set LIVEKIT_SFU_API_KEY}
       - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
+      # Byte caches (cloud defaults: 96 MB results, 64 MB occupancy chunks, 64 MB occupancy index, 64 MB per store's tiles).
+      - SCENE_GRAPH_API_RESULT_CACHE_BYTES=${SCENE_GRAPH_API_RESULT_CACHE_BYTES:-25165824}
+      - OCCUPANCY_CHUNK_CACHE_BYTES=${OCCUPANCY_CHUNK_CACHE_BYTES:-16777216}
+      - OCCUPANCY_INDEX_CACHE_BYTES=${OCCUPANCY_INDEX_CACHE_BYTES:-8388608}
+      - SCENE_GRAPH_STORE_TILE_CACHE_BYTES=${SCENE_GRAPH_STORE_TILE_CACHE_BYTES:-16777216}
+      - MALLOC_ARENA_MAX=2
     mem_limit: ${MEM_API:-384m}
     logging: *logging
     # The entrypoint runs `alembic upgrade head` before serving; mission-dispatch waits for this to be healthy.

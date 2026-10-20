@@ -75,6 +75,7 @@ from collections import OrderedDict, defaultdict
 
 import math
 
+from packages import config as _gb_config
 from packages.utils.mqtt_client import MQTTClient
 from packages.database.postgres import PostgresDatabase
 from cloud_common.objects.robot import RobotObjectV1, RobotStatusV1
@@ -827,7 +828,16 @@ class GraphBuilderService:
         return row[1] or "ready"
 
     async def _active_mission(self, robot_name: str):
-        """(RUNNING mission or None, register_map). Unchanged rule: no mission -> ingest."""
+        """(RUNNING mission or None, register_map). Unchanged rule: no mission -> ingest.
+        The answer is cached per robot for `GB_ACTIVE_MISSION_TTL_S` (a node per second would
+        otherwise be one PostgreSQL query each); a failed lookup is never cached."""
+        ttl = float(getattr(_gb_config, "GB_ACTIVE_MISSION_TTL_S", 0.0) or 0.0)
+        cache = self.__dict__.setdefault("_mission_cache", {})
+        now = time.monotonic()
+        if ttl > 0:
+            hit = cache.get(robot_name)
+            if hit is not None and now - hit[0] < ttl:
+                return hit[1]
         try:
             missions = await self.database.list_objects(
                 MissionObjectV1,
@@ -839,8 +849,10 @@ class GraphBuilderService:
                     most_recent=None,
                 )
             )
-            if missions:
-                return missions[0], missions[0].register_map
+            answer = (missions[0], missions[0].register_map) if missions else (None, True)
+            if ttl > 0:
+                cache[robot_name] = (now, answer)
+            return answer
         except Exception as e:
             self.logger.error(f"Failed to look up active mission for '{robot_name}': {e}")
         return None, True

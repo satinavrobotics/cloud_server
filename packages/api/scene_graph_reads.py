@@ -8,6 +8,7 @@ The library and its store are injected (`SceneGraphReads(meta, load, lineage[, t
 dependency on the engine and is testable with fakes. Reads are pinned to one version: the response
 says which, and the same `version` can be passed back for a consistent follow-up (raster after JSON).
 """
+from packages import config
 import asyncio
 import hashlib
 import logging
@@ -28,7 +29,7 @@ MAX_CELLS = 4_000_000         # lattice cells per request, JSON or raster (the r
 MAX_CHARTS = 20_000
 MAX_OWNER_KEYS = 65_534       # the owner plane is u16: 0 = no chart, i = keys[i - 1]
 CACHE_RESULTS = 64            # count bound; the byte bound below is the one that matters for rasters
-CACHE_RESULT_BYTES = 96 * 1024 * 1024
+CACHE_RESULT_BYTES = config.SCENE_GRAPH_API_RESULT_CACHE_BYTES   # default 96 MB
 CACHE_GRAPHS = 2
 CACHE_VIEWS = 8               # (map, epoch, version, tile-set) views kept; tiles load lazily inside a view
 CACHE_LINEAGE = 32
@@ -536,4 +537,4 @@ def build(enabled: bool, client: Any = None) -> SceneGraphReads:
     if client is None:
         raise ValueError("scene graph reads need the topomap database client")
     from packages.scene_graph.store import SceneGraphStore   # lazy: the engine is optional
-    return from_store(SceneGraphStore.from_client(client))
+    return from_store(SceneGraphStore.from_client(client, tile_cache_bytes=config.SCENE_GRAPH_STORE_TILE_CACHE_BYTES))

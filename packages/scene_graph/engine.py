@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy import ndimage
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
@@ -36,10 +36,10 @@ from . import morse
 from .place import place_regions
 from . import turn as turn_search
 from . import weights
-from .chart_keys import assign_A, overlaps
+from .chart_keys import assign_A, overlaps, overlaps_cells
 from .leafcover import View as CamView
 from .leafcover import select_views
-from .state import EngineState, LeafRecord, StateMismatch
+from .state import EngineState, LeafRecord, StateMismatch, TimePlane, widen_time
 from .window import to_lattice
 
 RES = 0.05                      # costmap cell (m)
@@ -52,6 +52,76 @@ RESERVED = ("undriven", "ever_blocked", "soft")
 ROUTE_UNIT_M = weights.ROUTE_UNIT_M      # route cost unit (weights.py): path costs are exact integers
 MAX_WINDOW_M = 20.0         # input validation: a leaf window side above this is refused
 POSE_SLACK_M = 5.0          # input validation: a pose may lie this far outside its window's footprint
+
+
+# Time planes (T, B, Fn, Bn and the channels' T) are int64 capture times, -1 = never. While every stamp of the engine lies within
+# +-2**30 ms of the first batch's earliest, they are held as int32 OFFSETS from a per-engine epoch (offset = stamp - epoch >= 0, -1
+# stays -1): every use is a comparison (>, ==, >= 0, max-merge), which a common offset preserves, and everything that leaves the
+# engine (export_state, the store) is widened back to the original int64. A stamp outside the range (or a negative one) switches
+# the engine, before anything is mutated, to epoch None = the plain int64 planes.
+_T_HALF = 1 << 30
+_T_MAX = (1 << 31) - 2
+
+
+def _t_range(a: np.ndarray, rows: int = 512):
+    """(min, max) of the non-negative entries of an integer plane, None when it has none; row blocks, so no full-size temporary"""
+    lo = hi = None
+    for r0 in range(0, a.shape[0], rows):
+        blk = np.asarray(a[r0:r0 + rows])
+        v = blk[blk >= 0]
+        if v.size:
+            l, h = int(v.min()), int(v.max())
+            lo = l if lo is None else min(lo, l); hi = h if hi is None else max(hi, h)
+    return lo, hi
+
+
+def _epoch_for(lo: Optional[int], hi: Optional[int]) -> Optional[int]:
+    """the epoch that holds every stamp in [lo, hi] as an int32 offset with 2**30 ms of room either side, None when they do not fit"""
+    if lo is None: return None
+    if lo < 0 or hi - lo > _T_HALF - 2: return None
+    return lo - _T_HALF
+
+
+def _edt(free: np.ndarray) -> np.ndarray:
+    """`ndimage.distance_transform_edt(free)` the way scipy forms it (feature transform, offsets to the cell, squared, summed, square
+    root: every sum is an integer below 2**53, so its root is correctly rounded), but returned as the int32 SQUARED distances when
+    they fit, with scipy's own transient (about 40 B per cell: int32 offsets, widened float64 copies) avoided by forming them in row
+    blocks. `np.sqrt(result, dtype=np.float64)` equals scipy's float64 result bit for bit. A plane whose squares do not fit int32
+    gets scipy's float64 plane."""
+    ft = ndimage.distance_transform_edt(free, return_distances=False, return_indices=True)
+    H, W = free.shape
+    out = np.empty((H, W), np.int32)
+    cols = np.arange(W, dtype=np.int64)
+    for r0 in range(0, H, 256):
+        r1 = min(H, r0 + 256)
+        dy = ft[0, r0:r1].astype(np.int64) - np.arange(r0, r1, dtype=np.int64)[:, None]
+        dx = ft[1, r0:r1].astype(np.int64) - cols
+        sq = dy * dy + dx * dx
+        if int(sq.max()) >= (1 << 31):
+            del ft
+            return ndimage.distance_transform_edt(free)
+        out[r0:r1] = sq
+    return out
+
+
+def _dt_float(d: np.ndarray) -> np.ndarray:
+    """float64 distances (a new array) of a cache entry or `_edt` result: int32 squared distances -> their roots; float64 -> a copy"""
+    return np.sqrt(d, dtype=np.float64) if d.dtype != np.float64 else d.copy()
+
+
+def _time_prop(name: str):
+    """`g._T` etc. read as the original int64 plane (a widened copy while the engine holds offsets); assignment narrows"""
+    def get(self):
+        a = getattr(self, name)
+        return a if a is None or self._tep is None else widen_time(a, self._tep)
+
+    def set_(self, v):
+        if v is not None and self._tep is not None:
+            v = np.asarray(v, np.int64); off = v - self._tep
+            if ((v >= 0) & ((off < 0) | (off > _T_MAX))).any(): raise ValueError("stamp outside the engine's int32 time range")
+            v = np.where(v >= 0, off, -1).astype(np.int32)
+        setattr(self, name, v)
+    return property(get, set_)
 
 
 def block_min(a: np.ndarray) -> np.ndarray:
@@ -118,6 +188,69 @@ def _squares(r: float) -> List[np.ndarray]:
     return _SQ[key]
 
 
+_SQ_ROWS: Dict[float, list] = {}
+
+
+def _square_rows(r: float):
+    """the row intervals of `_squares(r)`: per structure (centre, [(dy, dx0, length)]) with the centre at shape // 2 (scipy's
+    origin 0), or None for the whole set when a structure row is not one interval (the caller then falls back to scipy)"""
+    key = round(r, 4)
+    if key not in _SQ_ROWS:
+        out = []
+        for st in _squares(r):
+            cy, cx = st.shape[0] // 2, st.shape[1] // 2
+            rows = []
+            for i, row in enumerate(st):
+                nz = np.nonzero(row)[0]
+                if len(nz) == 0: continue                         # an empty row constrains nothing
+                if not row[nz[0]:nz[-1] + 1].all(): out = None; break
+                rows.append((i - cy, int(nz[0]) - cx, int(len(nz))))
+            if out is None: break
+            out.append(rows)
+        _SQ_ROWS[key] = out
+    return _SQ_ROWS[key]
+
+
+def _erode_union(free: np.ndarray, sqs: List[np.ndarray], rows_tbl, band_cells: int = 1 << 20) -> np.ndarray:
+    """OR over the structures of `ndimage.binary_erosion(free, structure=st, border_value=0)`, bit for bit. A structure whose rows are
+    intervals fits at (y, x) iff, on every structure row dy with interval [a, a + L), the run of free cells starting at
+    (y + dy, x + a) is at least L long: one run-length plane (shared by all structures), one comparison per row. Outside the plane
+    the run is 0 (border_value 0), and a run is cut at the right edge, so an interval leaving the plane never fits."""
+    H, W = free.shape
+    if rows_tbl is None or H == 0 or W == 0:
+        sq = np.zeros_like(free)
+        for st in sqs: sq |= ndimage.binary_erosion(free, structure=st, border_value=0)
+        return sq
+    if H * W > 2 * band_cells:
+        # bands of rows with a halo of the structure height keep the transient run-length planes small; a row of the result reads
+        # only the rows within the structure's reach, so each band's interior is the result of the whole plane
+        pad = max(max(st.shape) for st in sqs); B = max(pad, band_cells // W)
+        sq = np.zeros_like(free)
+        for b0 in range(0, H, B):
+            b1 = min(H, b0 + B); lo, hi = max(0, b0 - pad), min(H, b1 + pad)
+            sq[b0:b1] = _erode_union(free[lo:hi], sqs, rows_tbl, band_cells=1 << 62)[b0 - lo:b1 - lo]
+        return sq
+    dt = np.uint16 if W < 65535 else np.int32                       # run lengths <= W
+    idx = np.arange(W, dtype=dt)
+    nb = np.where(free, dt(W), idx)                             # position of a blocked cell, W for a free one
+    nb = np.minimum.accumulate(nb[:, ::-1], axis=1)[:, ::-1]    # next blocked cell at or after x (W: none)
+    run = nb - idx                                              # free cells in a row from x on (0 on a blocked cell)
+    del nb
+    sq = np.zeros_like(free)
+    for rows in rows_tbl:
+        # fit[y, x] needs run[y + dy, x + a] >= L, and never fits when (y + dy, x + a) is outside for some row
+        Y0 = max(max(0, -dy) for dy, a, L in rows); Y1 = min(min(H, H - dy) for dy, a, L in rows)
+        X0 = max(max(0, -a) for dy, a, L in rows); X1 = min(min(W, W - a) for dy, a, L in rows)
+        if Y0 >= Y1 or X0 >= X1: continue
+        fit = None
+        for dy, a, L in rows:
+            ok = run[Y0 + dy:Y1 + dy, X0 + a:X1 + a] >= L
+            if fit is None: fit = ok
+            else: fit &= ok
+        if fit is not None: sq[Y0:Y1, X0:X1] |= fit
+    return sq
+
+
 def _line(y0: int, x0: int, y1: int, x1: int):
     """cells of the digital straight line, ties rounded up in exact integer arithmetic: the line of a translated pair is the
     translated line (np.rint rounds half to even, so the line depended on the canvas origin)"""
@@ -136,20 +269,49 @@ def _state_params(p: SceneParams) -> dict:
     return out
 
 
+def _csr_sym(lr: np.ndarray, lc: np.ndarray, w: np.ndarray, n: int):
+    """`coo_matrix((concat(w, w), (concat(lr, lc), concat(lc, lr))), shape=(n, n)).tocsr()` for edges (lr, lc) that are pairwise
+    distinct as unordered pairs: the symmetric graph as CSR with the column indices of every row ascending, which is what the
+    conversion produces (a stable bucket by row, then the indices sorted, no duplicate to sum). Built from the same three
+    arrays (indptr, indices, data), so a Dijkstra on it visits the same entries in the same order. With a repeated pair (never
+    produced by the lattice edges) it takes the conversion."""
+    rows = np.concatenate([lr, lc]); cols = np.concatenate([lc, lr]); dat = np.concatenate([w, w])
+    key = rows.astype(np.int64) * n + cols
+    o = np.argsort(key, kind="stable")
+    ks = key[o]
+    if len(ks) > 1 and bool((ks[1:] == ks[:-1]).any()):
+        return coo_matrix((dat, (rows, cols)), shape=(n, n)).tocsr()
+    indptr = np.concatenate([[0], np.cumsum(np.bincount(rows, minlength=n))]).astype(np.int32)
+    return csr_matrix((dat[o], cols[o].astype(np.int32), indptr), shape=(n, n))
+
+
 def _away_from_walls(held: np.ndarray, blocked: np.ndarray, min_clearance: float) -> np.ndarray:
     """The `held` cells (full-resolution bool plane) that survive the away-from-walls filter: the 8-connected components of `held`
     with at least one cell farther than `min_clearance` m (euclidean, cells x RES) from every `blocked` cell (V >= 100, unknown
     included). One distance transform of the whole canvas and one per-component maximum: O(canvas), no per-component crops. The
     decision is the one of the per-component crops this replaces: a crop's distance is never below the full one, and the two are
     equal for every cell within min_clearance of a blocked cell, so `max(d) > min_clearance` agrees on both."""
-    lab, n = ndimage.label(held, structure=np.ones((3, 3)))
-    if not n: return np.zeros(held.shape, bool)
-    if not blocked.any():
-        return held.copy()                                          # no wall anywhere: every component is away from walls
-    dist = ndimage.distance_transform_edt(~blocked) * RES
-    far = np.asarray(ndimage.maximum(dist, lab, index=np.arange(1, n + 1))) > min_clearance
-    keep = np.concatenate(([False], far))
-    return keep[lab] & held
+    H, W = held.shape
+    rows = np.nonzero(held.any(1))[0]
+    if not len(rows): return np.zeros(held.shape, bool)
+    cols = np.nonzero(held.any(0))[0]
+    # a component's decision reads the distance only of its own cells, and a cell within min_clearance of a blocked cell has that cell
+    # within g cells (Chebyshev) of it: crop to the box of `held` grown by g. The cropped transform is never below the full one and
+    # equal to it wherever the full one is <= min_clearance; with no blocked cell in the crop every held cell is farther than that.
+    g = int(math.ceil(min_clearance / RES)) + 2
+    y0, y1 = max(0, int(rows[0]) - g), min(H, int(rows[-1]) + 1 + g)
+    x0, x1 = max(0, int(cols[0]) - g), min(W, int(cols[-1]) + 1 + g)
+    hc, bc = held[y0:y1, x0:x1], blocked[y0:y1, x0:x1]
+    lab, n = ndimage.label(hc, structure=np.ones((3, 3)))
+    if not bc.any():
+        return held.copy()                                          # no wall near any held cell: every component is away from walls
+    dist = ndimage.distance_transform_edt(~bc) * RES
+    has = np.zeros(n + 1, bool)
+    has[lab[(dist > min_clearance) & hc]] = True                    # a component is kept iff one of its cells is farther than that
+    has[0] = False
+    out = np.zeros(held.shape, bool)
+    out[y0:y1, x0:x1] = has[lab] & hc
+    return out
 
 
 class ChartGraph(SceneGraph):
@@ -168,12 +330,15 @@ class ChartGraph(SceneGraph):
         self._leaf_order: List[Tuple[int, str]] = []      # (capture time, key), kept sorted: export_state never sorts
         self._leaf_recs: Dict[str, LeafRecord] = {}       # exported records, reused until the leaf changes
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
-        self._V = self._T = self._B = None
-        self._Fn = None                         # close-evidence plane (params.near_range_m set): latest FREE time from within range
-        self._Bn = None                         # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
+        self._tep: Optional[int] = None         # epoch of the time planes below (int32 offsets) or None (plain int64 stamps)
+        self._V = self._Tr = self._Br = None    # value, latest capture time of the winner, latest time reported blocked (raw: see _tep)
+        self._Fnr = None                        # close-evidence plane (params.near_range_m set): latest FREE time from within range
+        self._Bnr = None                        # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
         self._hold = None                       # cells the rule holds blocked, after the away-from-walls filter (only with that filter)
         self._hold_prev = (None, 0, 0)          # (_hold, cx0, cy0) before the batch being folded: the dirty box includes its changes
         self._val_h = None                      # validity per lattice cell (close-evidence rule only), set by `_build_F`
+        self._free_prev = None                  # the `free` plane of the last F build (the base of the next, windowed one)
+        self._hold_win = None                   # window outside which the last build's hold plane equals the previous one (None: unknown)
         self._chan: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         self._tau = morse.tau0(params.lattice) * morse.BASE_TAU
         self._ccache: dict = {}                    # morse.subdivide: the regions of the last solve
@@ -192,10 +357,24 @@ class ChartGraph(SceneGraph):
         self._pl_new: List[str] = []            # leaves added since then (appended to a session in capture order => incremental)
         self._pl_full = False                   # a leaf was removed or changed: rebuild the evidence
         self._rcache: dict = {}                 # routes from the anchor inside a chart, by chart content
+        self._lmemo = None                      # (channel names, {link content key: link values}) of the last solve (`_links`)
+
+    _T, _B = _time_prop("_Tr"), _time_prop("_Br")
+    _Fn, _Bn = _time_prop("_Fnr"), _time_prop("_Bnr")
 
     # ------------------------------------------------------------------ canvas and fold
-    def _plan_canvas(self, gx0: int, gy0: int, gx1: int, gy1: int):
-        """None when [gx0, gx1) x [gy0, gy1) fits; else the new canvas geometry. Raises LeafError above max_canvas_cells."""
+    def _time_epoch(self, stamps: Sequence[int]) -> Optional[int]:
+        """The epoch the time planes will have after folding leaves with these capture times: the current one while every stamp
+        fits it, the first batch's (fresh engine) when they fit that, else None (int64 planes; never goes back)."""
+        if self._V is None:
+            return _epoch_for(min(stamps), max(stamps))
+        ep = self._tep
+        if ep is None: return None
+        return ep if all(0 <= s - ep <= _T_MAX for s in stamps) else None
+
+    def _plan_canvas(self, gx0: int, gy0: int, gx1: int, gy1: int, tep=False):
+        """None when [gx0, gx1) x [gy0, gy1) fits (and the time planes keep their epoch, `tep`: see `_time_epoch`); else the new
+        canvas geometry. Raises LeafError above max_canvas_cells."""
         if self._V is None:
             cx0 = (gx0 - MARGIN) // 2 * 2; cy0 = (gy0 - MARGIN) // 2 * 2
             W = (gx1 + MARGIN - cx0 + 1) // 2 * 2; H = (gy1 + MARGIN - cy0 + 1) // 2 * 2
@@ -203,11 +382,13 @@ class ChartGraph(SceneGraph):
         else:
             h, w = self._V.shape
             if gx0 >= self._cx0 and gy0 >= self._cy0 and gx1 <= self._cx0 + w and gy1 <= self._cy0 + h:
-                return None
+                if tep is False or tep == self._tep: return None
+                return dict(fresh=False, cx0=self._cx0, cy0=self._cy0, H=h, W=w, oy=0, ox=0, h=h, w=w, tep=tep)   # time mode switch only
             nx0 = min(self._cx0, (gx0 - MARGIN) // 2 * 2); ny0 = min(self._cy0, (gy0 - MARGIN) // 2 * 2)
             nx1 = max(self._cx0 + w, gx1 + MARGIN); ny1 = max(self._cy0 + h, gy1 + MARGIN)
             plan = dict(fresh=False, cx0=nx0, cy0=ny0, H=(ny1 - ny0 + 1) // 2 * 2, W=(nx1 - nx0 + 1) // 2 * 2,
                         oy=self._cy0 - ny0, ox=self._cx0 - nx0, h=h, w=w)
+        plan["tep"] = self._tep if tep is False else tep
         if plan["H"] * plan["W"] > self.max_canvas_cells:
             raise LeafError(None, f"the batch needs a canvas of {plan['H']} x {plan['W']} cells, above the bound "
                                   f"{self.max_canvas_cells} (an absurd pose?)")
@@ -216,26 +397,38 @@ class ChartGraph(SceneGraph):
     def _grow_canvas(self, plan):
         """Allocate the grown planes WITHOUT touching the state (a MemoryError leaves the engine as it was)."""
         H, W, oy, ox, h, w = plan["H"], plan["W"], plan["oy"], plan["ox"], plan["h"], plan["w"]
+        tep = plan["tep"]
+        tdt = np.int64 if tep is None else np.int32
         if plan["fresh"]:
-            return dict(V=np.full((H, W), 255, np.uint8), T=-np.ones((H, W), np.int64), B=-np.ones((H, W), np.int64),
-                        Fn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
-                        Bn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
-                        chan={}, kp=None)
+            return dict(V=np.full((H, W), 255, np.uint8), Tr=-np.ones((H, W), tdt), Br=-np.ones((H, W), tdt),
+                        Fnr=None if self.params.near_range_m is None else -np.ones((H, W), tdt),
+                        Bnr=None if self.params.near_range_m is None else -np.ones((H, W), tdt),
+                        chan={}, kp=None, tep=tep)
 
         def grow(a, fill):
             b = np.full((H, W), fill, a.dtype); b[oy:oy + h, ox:ox + w] = a; return b
-        out = dict(V=grow(self._V, 255), T=grow(self._T, -1), B=grow(self._B, -1),
-                   Fn=None if self._Fn is None else grow(self._Fn, -1),
-                   Bn=None if self._Bn is None else grow(self._Bn, -1),
-                   chan={k: (grow(v, 255), grow(t, -1)) for k, (v, t) in self._chan.items()}, kp=None)
+
+        def grow_t(a):
+            """a time plane into the new canvas; an epoch change (int32 offsets -> int64 stamps only) widens it row block by row block"""
+            b = np.full((H, W), -1, tdt)
+            if tep == self._tep:
+                b[oy:oy + h, ox:ox + w] = a
+            else:
+                for r0 in range(0, h, 512):
+                    b[oy + r0:oy + min(h, r0 + 512), ox:ox + w] = widen_time(a[r0:r0 + 512], self._tep)
+            return b
+        out = dict(V=grow(self._V, 255), Tr=grow_t(self._Tr), Br=grow_t(self._Br),
+                   Fnr=None if self._Fnr is None else grow_t(self._Fnr),
+                   Bnr=None if self._Bnr is None else grow_t(self._Bnr),
+                   chan={k: (grow(v, 255), grow_t(t)) for k, (v, t) in self._chan.items()}, kp=None, tep=tep)
         if self._key_plane is not None:
             kp = np.full((H // 2, W // 2), -1, self._key_plane.dtype)
             kp[oy // 2:oy // 2 + h // 2, ox // 2:ox // 2 + w // 2] = self._key_plane; out["kp"] = kp
         return out
 
     def _commit_canvas(self, plan, arrays) -> Tuple[int, int]:
-        self._V, self._T, self._B, self._chan = arrays["V"], arrays["T"], arrays["B"], arrays["chan"]
-        self._Fn, self._Bn = arrays["Fn"], arrays["Bn"]
+        self._V, self._Tr, self._Br, self._chan = arrays["V"], arrays["Tr"], arrays["Br"], arrays["chan"]
+        self._Fnr, self._Bnr, self._tep = arrays["Fnr"], arrays["Bnr"], arrays["tep"]
         if arrays["kp"] is not None: self._key_plane = arrays["kp"]
         self._cx0, self._cy0 = plan["cx0"], plan["cy0"]
         return (0, 0) if plan["fresh"] else (plan["oy"] // 2, plan["ox"] // 2)
@@ -375,7 +568,7 @@ class ChartGraph(SceneGraph):
             return Dirty(None, [], {}, [], self._watermark)
         plan = grown = None
         if bounds is not None:
-            plan = self._plan_canvas(*bounds)                        # LeafError above the canvas bound
+            plan = self._plan_canvas(*bounds, self._time_epoch([int(lf.stamp_ms) for lf, *_ in prepared]))   # LeafError above the bound
             if plan is not None: grown = self._grow_canvas(plan)     # a MemoryError here changes nothing
         # ---- mutation: from here an escaping exception leaves the state undefined => the engine is FAULTED
         old = self._solved
@@ -396,14 +589,16 @@ class ChartGraph(SceneGraph):
                       if bbox.x0 <= r.x <= bbox.x1 and bbox.y0 <= r.y <= bbox.y1 and k not in keep]:
                 self._leaf_del(k); self._pl_full = True
         shift = (0, 0)
+        rbox = None
         if plan is not None:
             shift = self._commit_canvas(plan, grown)
         if region is not None and self._V is not None:
             x0, y0 = max(region[0] - self._cx0, 0), max(region[1] - self._cy0, 0)
             x1, y1 = min(region[2] - self._cx0, self._V.shape[1]), min(region[3] - self._cy0, self._V.shape[0])
             if x0 < x1 and y0 < y1:
-                self._V[y0:y1, x0:x1] = 255; self._T[y0:y1, x0:x1] = -1; self._B[y0:y1, x0:x1] = -1
-                if self._Fn is not None: self._Fn[y0:y1, x0:x1] = -1; self._Bn[y0:y1, x0:x1] = -1
+                rbox = (y0, y1, x0, x1)
+                self._V[y0:y1, x0:x1] = 255; self._Tr[y0:y1, x0:x1] = -1; self._Br[y0:y1, x0:x1] = -1
+                if self._Fnr is not None: self._Fnr[y0:y1, x0:x1] = -1; self._Bnr[y0:y1, x0:x1] = -1
                 for v, t in self._chan.values():
                     v[y0:y1, x0:x1] = 255; t[y0:y1, x0:x1] = -1
         touched = None                                   # global full-resolution cells whose value, time or blocked time changed
@@ -415,16 +610,18 @@ class ChartGraph(SceneGraph):
             touched = g if touched is None else (min(touched[0], g[0]), min(touched[1], g[1]), max(touched[2], g[2]), max(touched[3], g[3]))
         for lf, w, gx, gy, chans in prepared:
             pose = None
-            if self._Fn is not None:
+            if self._Fnr is not None:
                 p = self.params
                 pose = (lf.x, lf.y, p.near_range_m)
-            grow_touched(self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B,
-                                         self._Fn, pose, self._Bn))
+            ts = int(lf.stamp_ms) - (self._tep or 0)                     # the stamp as the time planes hold it
+            grow_touched(self._fold_into(self._V, self._Tr, w, gx, gy, self._cx0, self._cy0, ts, self._Br,
+                                         self._Fnr, pose, self._Bnr))
             for name, cw in chans.items():
                 if name not in self._chan:
-                    self._chan[name] = (np.full(self._V.shape, 255, np.uint8), -np.ones(self._V.shape, np.int64))
+                    self._chan[name] = (np.full(self._V.shape, 255, np.uint8),
+                                        -np.ones(self._V.shape, np.int64 if self._tep is None else np.int32))
                 v, t = self._chan[name]
-                grow_touched(self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, lf.stamp_ms))
+                grow_touched(self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, ts))
             rec = _Rec(lf.session, lf.stamp_ms, lf.x, lf.y, lf.r_d,
                        None if lf.view is None else CamView(lf.key, lf.view.x, lf.view.y, lf.view.yaw, lf.view.fov, lf.view.rng))
             old_rec = self._leaves.get(lf.key)
@@ -437,10 +634,18 @@ class ChartGraph(SceneGraph):
         moved = touched is not None or bool(self._pl_new) or self._pl_full or region is not None
         self._cache = {}
         self._shift = shift
-        self._solve(shift, birth)
+        # the canvas box (rows y0:y1, cols x0:x1) outside which V, Br, Fnr, Bnr are those of the previous solve: every write to them
+        # is a fold (`touched` bounds all of its changes) or the refold reset (`rbox`); (0, 0, 0, 0) when nothing was written
+        fbox = (0, 0, 0, 0)
+        for b in (None if touched is None else (touched[1] - self._cy0, touched[3] - self._cy0, touched[0] - self._cx0, touched[2] - self._cx0), rbox):
+            if b is not None:
+                fbox = b if fbox[0] >= fbox[1] else (min(fbox[0], b[0]), max(fbox[1], b[1]), min(fbox[2], b[2]), max(fbox[3], b[3]))
+        self._solve(shift, birth, fbox)
         if moved: self.version += 1
         # the dirty box is where cells actually changed (and the area of a refold), not where windows were laid down
-        return self._dirty(old, old_sig, old_link_sig, old_keys, touched, region)
+        dirty = self._dirty(old, old_sig, old_link_sig, old_keys, touched, region)
+        self._hold_prev = (None, 0, 0)                   # only the dirty box above reads it: do not keep the previous plane alive
+        return dirty
 
     # ------------------------------------------------------------------ F(r), evidence
     def _polylines(self) -> Dict[float, np.ndarray]:
@@ -464,7 +669,7 @@ class ChartGraph(SceneGraph):
                     rr, cc = _line(y, x, yy, xx); ok = (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W); m[rr[ok], cc[ok]] = True
         return out
 
-    def _erode(self, free: np.ndarray, shift: Tuple[int, int]) -> np.ndarray:
+    def _erode(self, free: np.ndarray, shift: Tuple[int, int], box=None) -> np.ndarray:
         """cells where the robot square fits at one of the headings.  An erosion reads `free` only inside the square's support, so a cell of
         the previous result stays exact unless `free` changed within that support: recompute the changed box widened by the support (plus
         the support again, so the inner part is exact) and splice it into the previous result.  New canvas area is unknown (not free), which
@@ -483,76 +688,131 @@ class ChartGraph(SceneGraph):
                     s2 = np.zeros_like(free); s2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = sp_
                     prev = (f2, s2)
         if prev is None:
-            sq = np.zeros_like(free)
-            for st in sqs:
-                sq |= ndimage.binary_erosion(free, structure=st, border_value=0)
+            sq = _erode_union(free, sqs, _square_rows(self.params.robot_half_side))
         else:
             fp, sp_ = prev
-            d = fp != free
+            # `box` (rows y0:y1, cols x0:x1) bounds the cells where `free` differs from the previous plane: compare only there
+            oy0, ox0 = 0, 0
+            if box is not None and c[0].shape == free.shape:
+                oy0, oy1, ox0, ox1 = box
+                d = fp[oy0:oy1, ox0:ox1] != free[oy0:oy1, ox0:ox1]
+            else:
+                d = fp != free
             if not d.any():
                 sq = sp_
             else:
                 H, W = free.shape
                 pad = max(max(st.shape) for st in sqs)
-                rows = np.nonzero(d.any(1))[0]; cols = np.nonzero(d.any(0))[0]
+                rows = np.nonzero(d.any(1))[0] + oy0; cols = np.nonzero(d.any(0))[0] + ox0
                 y0, y1 = max(0, rows[0] - pad), min(H, rows[-1] + 1 + pad)
                 x0, x1 = max(0, cols[0] - pad), min(W, cols[-1] + 1 + pad)
                 wy0, wy1, wx0, wx1 = max(0, y0 - pad), min(H, y1 + pad), max(0, x0 - pad), min(W, x1 + pad)
                 win = free[wy0:wy1, wx0:wx1]
-                e = np.zeros_like(win)
-                for st in sqs:
-                    e |= ndimage.binary_erosion(win, structure=st, border_value=0)
-                sq = sp_.copy()
+                e = _erode_union(win, sqs, _square_rows(self.params.robot_half_side))
+                sq = sp_                                           # the cache entry is ours: spliced in place
                 sq[y0:y1, x0:x1] = e[y0 - wy0:y1 - wy0, x0 - wx0:x1 - wx0]
         self._ecache = (free, sq)
         return sq
 
-    def _clearance_cells(self, free: np.ndarray, shift: Tuple[int, int]) -> np.ndarray:
+    def _clearance_cells(self, free: np.ndarray, shift: Tuple[int, int], scale: Optional[float] = None, box=None, lattice: bool = False):
         """`distance_transform_edt(free)`, recomputed only where it can have changed.  A cell outside the changed box grown by R (the largest
         distance of the previous map) keeps its value: its nearest blocked cell was within R and is untouched, and a newly blocked cell is
         farther than R.  Inside, the transform of a window is exact for every cell whose value does not exceed its distance to the window's
         edge (anything blocked outside the window is farther than that); the window widens until that holds for the whole box.  New canvas
-        area counts as changed (it was not part of the previous transform)."""
+        area counts as changed (it was not part of the previous transform).  `box` (rows y0:y1, cols x0:x1), when given, bounds the cells
+        where `free` differs from the plane of the previous call (same shape): the comparison is made only there.  `lattice` returns
+        (block minimum, top-left sample) of the scaled plane instead of the plane: min and a monotone map (sqrt, times a positive
+        scale) commute, so the root and the scale are applied to the quarter-size planes, with the same values."""
         c, self._dcache = self._dcache, None
+        dp = self._clearance_raw(c, free, shift, box)
+        packed = dp.dtype != np.float64
+        if lattice:
+            if scale is None: scale = 1.0
+            if packed:
+                return (np.sqrt(block_min(dp), dtype=np.float64) * scale, np.sqrt(dp[::LAT, ::LAT], dtype=np.float64) * scale)
+            return block_min(dp * scale), (dp * scale)[::LAT, ::LAT]
+        # what is returned is always the float64 plane scipy gives
+        scaled = lambda dt, owned: dt if scale is None else ((dt.__imul__(scale)) if owned else dt * scale)
+        return scaled(_dt_float(dp), True) if packed else scaled(dp, False)
+
+    def _clearance_raw(self, c, free: np.ndarray, shift: Tuple[int, int], box=None) -> np.ndarray:
+        """the cache entry (squared distances as int32 (4 B per cell; `_edt`), or scipy's float64 plane when they do not fit) after the
+        update; it is also stored in `self._dcache` with `free`"""
         if c is None:
-            dt = ndimage.distance_transform_edt(free)
-            self._dcache = (free, dt)
-            return dt
+            d = _edt(free); self._dcache = (free, d)
+            return d
         fp, dp = c
         H, W = free.shape
         newarea = None
         if fp.shape != free.shape:
             oy, ox = 2 * shift[0], 2 * shift[1]
             if oy + fp.shape[0] > H or ox + fp.shape[1] > W:
-                dt = ndimage.distance_transform_edt(free); self._dcache = (free, dt); return dt
+                d = _edt(free); self._dcache = (free, d)
+                return d
             f2 = np.zeros_like(free); f2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = fp
-            d2 = np.zeros(free.shape); d2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = dp
+            d2 = np.zeros(free.shape, dp.dtype); d2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = dp
             newarea = np.ones(free.shape, bool); newarea[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = False
             fp, dp = f2, d2
-        ch = fp != free
-        if newarea is not None: ch |= newarea
+        packed = dp.dtype != np.float64
+        oy0 = ox0 = 0
+        if box is not None and newarea is None:
+            oy0, oy1, ox0, ox1 = box
+            ch = fp[oy0:oy1, ox0:ox1] != free[oy0:oy1, ox0:ox1]
+        else:
+            ch = fp != free
+            if newarea is not None: ch |= newarea
         if not ch.any():
             self._dcache = (free, dp)
             return dp
-        rows = np.nonzero(ch.any(1))[0]; cols = np.nonzero(ch.any(0))[0]
-        R = int(math.ceil(float(dp.max()))) + 1
-        ey0, ey1 = max(0, rows[0] - R), min(H, rows[-1] + 1 + R)
-        ex0, ex1 = max(0, cols[0] - R), min(W, cols[-1] + 1 + R)
-        rw = R + 1
+        rows = np.nonzero(ch.any(1))[0] + oy0; cols = np.nonzero(ch.any(0))[0] + ox0
+        del ch, newarea
+        by0, by1, bx0, bx1 = int(rows[0]), int(rows[-1]) + 1, int(cols[0]), int(cols[-1]) + 1      # tight box of the changed cells
+        r = None
+        if not (fp.all() or free.all()):
+            # Reach of the change. A cell p can change only if a changed cell c has |p - c| <= d_old(p) (a newly blocked c is nearer than
+            # the old nearest blocked cell; a newly free c was p's nearest). d_old is a distance function, so it is 1-Lipschitz: for p
+            # outside the box grown by t, the segment c -> p leaves that box at a lattice cell q of its border ring with |c - q| >= t - 1/2
+            # and d_old(p) <= d_old(q) + |p - q|, so d_old(q) >= t - 1/2. When every ring cell has d_old < t - 1, no p outside the grown
+            # box changes. (A side of the grown box beyond the canvas has no ring: nothing lies beyond it.)
+            lim = lambda t: (t - 1) ** 2 if packed else float(t - 1)
+            for t in (4, 8, 16, 32, 64):
+                ry0, ry1, rx0, rx1 = by0 - t, by1 - 1 + t, bx0 - t, bx1 - 1 + t
+                cx_a, cx_b, cy_a, cy_b = max(0, rx0), min(W, rx1 + 1), max(0, ry0), min(H, ry1 + 1)
+                mx = 0
+                if ry0 >= 0: mx = max(mx, dp[ry0, cx_a:cx_b].max())
+                if ry1 < H: mx = max(mx, dp[ry1, cx_a:cx_b].max())
+                if rx0 >= 0: mx = max(mx, dp[cy_a:cy_b, rx0].max())
+                if rx1 < W: mx = max(mx, dp[cy_a:cy_b, rx1].max())
+                if mx < lim(t): r = t; break
+        if r is None:
+            r = int(math.ceil(math.sqrt(int(dp.max())) if packed else float(dp.max()))) + 1
+        ey0, ey1 = max(0, by0 - r), min(H, by1 + r)
+        ex0, ex1 = max(0, bx0 - r), min(W, bx1 + r)
+        # first window margin: the largest old distance in the box (a cell farther from the window edge than its distance is exact)
+        mE = dp[ey0:ey1, ex0:ex1].max()
+        rw = int(math.ceil(math.sqrt(int(mE)) if packed else float(mE))) + 2
         while True:
             wy0, wy1, wx0, wx1 = max(0, ey0 - rw), min(H, ey1 + rw), max(0, ex0 - rw), min(W, ex1 + rw)
-            dtw = ndimage.distance_transform_edt(free[wy0:wy1, wx0:wx1])
-            sub = dtw[ey0 - wy0:ey1 - wy0, ex0 - wx0:ex1 - wx0]
+            dw = _edt(free[wy0:wy1, wx0:wx1])
+            subd = dw[ey0 - wy0:ey1 - wy0, ex0 - wx0:ex1 - wx0]
+            sub = np.sqrt(subd, dtype=np.float64) if subd.dtype != np.float64 else subd
+            del dw
+            if wy0 == 0 and wy1 == H and wx0 == 0 and wx1 == W: break
+            # `sub <= bound` with bound the least of four per-side distances to the window edge (inf on a side that is the canvas
+            # edge): tested one side at a time, which is the same set of comparisons without a plane-sized `bound`
             yy = np.arange(ey0, ey1)[:, None]; xx = np.arange(ex0, ex1)[None, :]
             inf = np.inf
-            bound = np.minimum(np.minimum(np.where(wy0 > 0, yy - wy0 + 1.0, inf), np.where(wy1 < H, wy1 - yy, inf)),
-                               np.minimum(np.where(wx0 > 0, xx - wx0 + 1.0, inf), np.where(wx1 < W, wx1 - xx, inf)))
-            full_window = wy0 == 0 and wy1 == H and wx0 == 0 and wx1 == W
-            if full_window or bool((sub <= bound).all()): break
+            by = np.minimum(np.where(wy0 > 0, yy - wy0 + 1.0, inf), np.where(wy1 < H, wy1 - yy, inf))
+            bx = np.minimum(np.where(wx0 > 0, xx - wx0 + 1.0, inf), np.where(wx1 < W, wx1 - xx, inf))
+            if bool((sub <= by).all()) and bool((sub <= bx).all()): break
             rw *= 2
-        dt = dp.copy()
+        if packed and subd.dtype != np.float64:
+            dp[ey0:ey1, ex0:ex1] = subd                          # the cache entry is ours (taken above, or a fresh grown copy)
+            self._dcache = (free, dp)
+            return dp
+        dt = _dt_float(dp)
         dt[ey0:ey1, ex0:ex1] = sub
-        self._dcache = (free, dt)
+        self._dcache = (free, dt)                                # a box that does not fit int32 keeps the plane in float64 from here on
         return dt
 
     def _disc(self, thr: float) -> np.ndarray:
@@ -646,7 +906,40 @@ class ChartGraph(SceneGraph):
         self._pl = dict(shape=shape, G=G, W=Wm, S=S, P=Pm, last=last)
         return G, Wm, S, Pm
 
-    def _build_F(self, shift: Tuple[int, int] = (0, 0)):
+    def _hold_window(self, box):
+        """(new hold plane, window): the away-from-walls filter of the held cells, recomputed only around `box`, the cells where V, Bnr
+        or Fnr changed; the previous plane `self._hold` is kept elsewhere.  Exact: the filter keeps an 8-connected component of the held
+        cells iff one of its cells is farther than min_clearance from every blocked cell.  A component of the new held set with no cell
+        in the window W (W contains `box` grown by g + 2, g = the clearance in cells + 2) has all its cells and their neighbours outside
+        `box`, so it is also a component of the old held set; and no blocked cell within the clearance of it changed, so its decision is
+        the old one.  Inside W the components are recomputed whole: W is grown until no held cell lies on its inner border (no
+        component crosses it), and the decision is the one of `_away_from_walls` on W grown by g (blocked cells within the clearance of
+        a held cell of W are inside that crop; farther ones cannot change the comparison)."""
+        V, Bn, Fn = self._V, self._Bnr, self._Fnr
+        H, Wd = V.shape
+        mc = self.params.near_min_clearance_m
+        g = int(math.ceil(mc / RES)) + 2
+        y0, y1, x0, x1 = box
+        m = g + 2
+        while True:
+            wy0, wy1, wx0, wx1 = max(0, y0 - m), min(H, y1 + m), max(0, x0 - m), min(Wd, x1 + m)
+            held_w = (V[wy0:wy1, wx0:wx1] < 100) & (Bn[wy0:wy1, wx0:wx1] >= 0) & (Bn[wy0:wy1, wx0:wx1] > Fn[wy0:wy1, wx0:wx1])
+            if not ((wy0 > 0 and held_w[0].any()) or (wy1 < H and held_w[-1].any())
+                    or (wx0 > 0 and held_w[:, 0].any()) or (wx1 < Wd and held_w[:, -1].any())):
+                break
+            m *= 2
+        hold = self._hold.copy()
+        if held_w.any():
+            py0, py1, px0, px1 = max(0, wy0 - g), min(H, wy1 + g), max(0, wx0 - g), min(Wd, wx1 + g)
+            hc = np.zeros((py1 - py0, px1 - px0), bool)
+            hc[wy0 - py0:wy1 - py0, wx0 - px0:wx1 - px0] = held_w
+            out = _away_from_walls(hc, V[py0:py1, px0:px1] >= 100, mc)
+            hold[wy0:wy1, wx0:wx1] = out[wy0 - py0:wy1 - py0, wx0 - px0:wx1 - px0]
+        else:
+            hold[wy0:wy1, wx0:wx1] = False
+        return hold, (wy0, wy1, wx0, wx1)
+
+    def _build_F(self, shift: Tuple[int, int] = (0, 0), box=None):
         """(F, clr, S): the navigable lattice cells, the physical clearance of every lattice cell (distance to the nearest
         blocked or unknown cell, m) and the driven (body covered) image. With the close-evidence rule it also sets `_val_h`, the
         validity of each lattice cell: valid = (seen free from within range and not held) or driven (G | W | P of the evidence).
@@ -654,37 +947,74 @@ class ChartGraph(SceneGraph):
         driven cell is valid unobserved). The lattice sample is the top-left costmap cell, as for F's own free cells (the
         one-tree validity decision)."""
         V = self._V
-        free = (V != 255) & (V < 100)
-        hold_v = None
-        if self._Fn is not None:
-            # close evidence: reported lethal from within range more recently than seen free from within range (and, with
-            # near_min_clearance_m, away from walls). A lethal from beyond the range is not true evidence: a later free retracts it.
-            lethal = (self._Bn >= 0) & (self._Bn > self._Fn)
-            held = (V < 100) & lethal
-            if self.params.near_min_clearance_m is not None:
-                held = _away_from_walls(held, V >= 100, self.params.near_min_clearance_m) if held.any() else held
-                self._hold = held
-            free &= ~held
+        near = self._Fnr is not None
+        mc = self.params.near_min_clearance_m
+        prev, self._free_prev = self._free_prev, None
+        self._hold_win = None
+        # WINDOWED build. `box` bounds every cell where V, Br, Fnr, Bnr differ from the previous build (see `_mutate`); the previous
+        # free plane and hold plane are then exact outside the window below, so only the window is recomputed. Every cache must be the
+        # previous build's (same objects), the hold plane must exist when it is used, and the canvas must not have changed shape.
+        win = None
+        if (box is not None and prev is not None and prev.shape == V.shape
+                and self._ecache is not None and self._ecache[0] is prev and self._dcache is not None and self._dcache[0] is prev
+                and (not (near and mc is not None) or (self._hold is not None and self._hold.shape == V.shape))):
+            win = (0, 0, 0, 0) if box[0] >= box[1] or box[2] >= box[3] else tuple(int(v) for v in box)
+        hold_v_h = None
+        if win is not None:
+            if win[0] < win[1]:
+                if near and mc is not None:
+                    self._hold, win = self._hold_window(win)       # the new hold plane and the window it can differ from the old one in
+                    self._hold_win = win
+                wy0, wy1, wx0, wx1 = win
+                Vw = V[wy0:wy1, wx0:wx1]
+                fw = (Vw != 255) & (Vw < 100)
+                if near:
+                    if mc is not None: fw &= ~self._hold[wy0:wy1, wx0:wx1]
+                    else: fw &= ~((Vw < 100) & (self._Bnr[wy0:wy1, wx0:wx1] >= 0) & (self._Bnr[wy0:wy1, wx0:wx1] > self._Fnr[wy0:wy1, wx0:wx1]))
+                free = prev.copy()
+                free[wy0:wy1, wx0:wx1] = fw
+                win = (wy0, wy1, wx0, wx1)
+            else:
+                free = prev                                        # nothing changed: the same plane (the caches compare equal)
+                if near and mc is not None: self._hold_win = win
+        else:
+            free = (V != 255) & (V < 100)
+            if near:
+                # close evidence: reported lethal from within range more recently than seen free from within range (and, with
+                # near_min_clearance_m, away from walls). A lethal from beyond the range is not true evidence: a later free retracts it.
+                lethal = (self._Bnr >= 0) & (self._Bnr > self._Fnr)
+                held = (V < 100) & lethal
+                if mc is not None:
+                    held = _away_from_walls(held, V >= 100, mc) if held.any() else held
+                    self._hold = held
+                free &= ~held
+                del lethal, held
+        if near:
             # the validity test: a blocked cell is held by a close lethal newer than the close free whatever V says (V is that
-            # lethal, or a later far report); a free cell is held exactly as above
-            hold_v = np.where(V < 100, held, lethal)
-        sq = self._erode(free, shift)
-        clr = self._clearance_cells(free, shift) * RES
-        self._clr_price_h = block_min(clr)          # pricing only; `clr_h` (top-left) feeds the partition, charts and link widths
-        sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
+            # lethal, or a later far report); a free cell is held exactly as above. Only the lattice samples are read, so they are
+            # formed from the sampled planes (the same elementwise values as sampling the full-resolution result).
+            Vh, Bh, Fh = V[::LAT, ::LAT], self._Bnr[::LAT, ::LAT], self._Fnr[::LAT, ::LAT]
+            lethal_h = (Bh >= 0) & (Bh > Fh)
+            held_h = (Vh < 100) & lethal_h if mc is None else self._hold[::LAT, ::LAT]
+            hold_v_h = np.where(Vh < 100, held_h, lethal_h)
+        sq = self._erode(free, shift, win)
+        clr_price_h, clr_h = self._clearance_cells(free, shift, RES, win, lattice=True)   # distance in cells * RES
+        self._clr_price_h = clr_price_h             # pricing only; `clr_h` (top-left) feeds the partition, charts and link widths
+        sq_h, fr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT]
+        self._free_prev = free
         G, W, S, P = self._evidence(sq_h.shape, shift)
-        self._val_h = None if hold_v is None else ((self._Fn >= 0)[::LAT, ::LAT] & ~hold_v[::LAT, ::LAT]) | (G | W | P)
+        self._val_h = None if hold_v_h is None else ((self._Fnr[::LAT, ::LAT] >= 0) & ~hold_v_h) | (G | W | P)
         # the body stood at a leaf pose: the cells W proves there are free even where the window is unknown (a camera blind spot
         # under the robot); a REPORTED blocked cell stays blocked. Along the chord between two poses only known-free cells count.
-        cand = sq_h | (W & fr_h) | (P & (V == 255)[::LAT, ::LAT])
+        cand = sq_h | (W & fr_h) | (P & (V[::LAT, ::LAT] == 255))
         lab, _ = ndimage.label(cand, structure=np.ones((3, 3)))
         g = G & cand
         keep = np.isin(lab, np.unique(lab[g])) & cand if g.any() else np.zeros_like(cand)
         return keep, clr_h, S
 
     # ------------------------------------------------------------------ solve
-    def _solve(self, shift: Tuple[int, int], birth: str):
-        nav, clr, S = self._build_F(shift)
+    def _solve(self, shift: Tuple[int, int], birth: str, box=None):
+        nav, clr, S = self._build_F(shift, box)
         if self._key_plane is None:
             self._key_plane = -np.ones(nav.shape, np.int32)
         self._retired_map = {}
@@ -697,7 +1027,12 @@ class ChartGraph(SceneGraph):
     def _partition(self, nav: np.ndarray) -> "morse.Partition":
         if self.params.place_peak_m is not None:
             nav = self._place_filter(nav)
-        return morse.partition(nav, self._h, self._tau, radius=self._radius, cache=self._ccache)
+        # The solver keeps the previous solve and recomputes what changed (morse.PartitionSolver: the same Partition as
+        # morse.partition, exact for any previous state and any `shift`, which is only a hint of where the old canvas lies).
+        sv = getattr(self, "_psolver", None)
+        if sv is None:
+            sv = self._psolver = morse.PartitionSolver(self._h, self._tau, self._radius)
+        return sv.update(nav, self._shift)
 
     def _place_filter(self, nav: np.ndarray) -> np.ndarray:
         """The navigable set without the regions that are not places (scene_graph/place.py). Every path that cuts charts goes
@@ -715,36 +1050,70 @@ class ChartGraph(SceneGraph):
         out[sp.ys[~keep], sp.xs[~keep]] = False
         return out
 
+    def _channel_rows(self, sp, S):
+        """(chv, fm, src, eb): the channels at the cells of F: `fm` one row per channel (None when a channel is not float64),
+        `chv` the rows by name, `src` the bytes they are functions of ((N, nch) uint8, column 0 = driven, 1 = ever blocked, then
+        the plane values; None when a plane is not byte-sized), `eb` the ever-blocked plane (only when `src` is None). Formed by
+        gathering the planes at the cells BEFORE the elementwise channel expressions: an elementwise function commutes with a
+        gather, so every value is the one the full-plane expressions give at that cell."""
+        V = self._V
+        names = ["undriven", "ever_blocked", "soft"] + list(self._chan)
+        planes = [cv[::LAT, ::LAT] for cv, _ in self._chan.values()]
+        if V.dtype == np.uint8 and S.dtype == bool and all(p.dtype == np.uint8 for p in planes):
+            ys, xs = sp.ys, sp.xs
+            src = np.empty((sp.N, len(names)), np.uint8)
+            src[:, 0] = S[ys, xs]
+            src[:, 1] = self._Br[::LAT, ::LAT][ys, xs] >= 0
+            src[:, 2] = V[::LAT, ::LAT][ys, xs]
+            for i, p in enumerate(planes): src[:, 3 + i] = p[ys, xs]
+            fm = np.empty((len(names), sp.N))
+            fm[0] = src[:, 0] == 0                                     # (~S).astype(float)
+            fm[1] = src[:, 1]
+            u = np.arange(256, dtype=np.uint8)                         # soft and the plane channels: the same elementwise
+            lut = np.where((u > 0) & (u < 100), u / 99.0, 0.0)         # expression of a byte, tabulated once
+            for i in range(2, len(names)):
+                fm[i] = lut[src[:, i]]
+            return dict(zip(names, fm)), fm, src, None
+        v = V[::LAT, ::LAT]
+        ch = {"undriven": (~S).astype(float), "ever_blocked": (self._Br[::LAT, ::LAT] >= 0).astype(float),
+              "soft": np.where((v > 0) & (v < 100), v / 99.0, 0.0)}
+        for name, (cv, _) in self._chan.items():
+            w = cv[::LAT, ::LAT]; ch[name] = np.where((w > 0) & (w < 100), w / 99.0, 0.0)
+        if all(f.dtype == np.float64 for f in ch.values()):
+            fm = np.empty((len(ch), sp.N))                             # the channels at the cells of F, one row each
+            for i, f in enumerate(ch.values()):
+                fm[i] = f[sp.ys, sp.xs]
+            return dict(zip(ch, fm)), fm, None, ch["ever_blocked"]
+        return {k: f[sp.ys, sp.xs] for k, f in ch.items()}, None, None, ch["ever_blocked"]   # (a channel of another dtype keeps its own arithmetic)
+
     def _evaluate(self, part: "morse.Partition", clr, S, birth) -> _Solved:
         sp, A, h = part.sp, [int(a) for a in part.anchor], self._h
         H, W = sp.H, sp.W
         full = part.full.astype(np.int64)
         sp.clr = clr[sp.ys, sp.xs]
         sp.clr_price = self._clr_price_h[sp.ys, sp.xs]
-        edges = self._lattice_edges(sp, h)
+        edges = part.edges if part.edges is not None else self._lattice_edges(sp, h)    # the same edges (morse.edges_full)
         plane = -np.ones((H, W), np.int32); plane[sp.ys, sp.xs] = full
         # persistent keys
         cells = [(int(sp.xs[a]), int(sp.ys[a])) for a in A]
         prev_keys = list(self._keys)
-        keys_t, retired_t = assign_A(prev_keys, self._key_plane, plane, cells, birth, None)
-        ov = overlaps(self._key_plane, plane, len(prev_keys)) if prev_keys else {}
+        # the cell overlaps of the new charts with the previous keys, counted once (assign_A and the successors both read them)
+        ov_all = overlaps_cells(self._key_plane, sp.ys, sp.xs, full, len(prev_keys))
+        keys_t, retired_t = assign_A(prev_keys, self._key_plane, plane, cells, birth, None, ov=ov_all)
+        ov = ov_all if prev_keys else {}
         succ: Dict[tuple, List[tuple]] = {}
         for (j, k), n in sorted(ov.items(), key=lambda it: -it[1]):
             if prev_keys[k] in retired_t: succ.setdefault(prev_keys[k], []).append(keys_t[j])
         self._retired_map = {self._fmt(k): [self._fmt(s) for s in succ.get(k, [])] for k in retired_t}
         self._key_plane = plane.copy(); self._keys = list(keys_t)      # chart index per cell; keys in the same order
         keys = [self._fmt(k) for k in keys_t]
-        # channels on the lattice
-        V = self._V
-        v = V[::LAT, ::LAT]
-        ch = {"undriven": (~S).astype(float), "ever_blocked": (self._B[::LAT, ::LAT] >= 0).astype(float),
-              "soft": np.where((v > 0) & (v < 100), v / 99.0, 0.0)}
-        for name, (cv, _) in self._chan.items():
-            w = cv[::LAT, ::LAT]; ch[name] = np.where((w > 0) & (w < 100), w / 99.0, 0.0)
-        chv = {k: f[sp.ys, sp.xs] for k, f in ch.items()}
-        links = self._links(sp, A, full, edges, chv, morse.arcs(sp, part.full, part.f, sp.clr))
+        K = len(A)
+        gorder = morse.group_order(full, K)                            # cells by chart, ascending within a chart
+        gcut = np.concatenate([[0], np.cumsum(np.bincount(full, minlength=K))])
+        # channels on the lattice, at the cells of F
+        chv, fm, src, eb = self._channel_rows(sp, S)
+        links = self._links(sp, A, full, edges, chv, morse.arcs(sp, part.full, part.f, sp.clr), (gorder, gcut), fm, src)
         # chart records
-        eb = ch["ever_blocked"]
         pose_cell = {}
         for k, rec in self._leaves.items():
             y = int(math.floor(rec.y / RES) - self._cy0) // 2; x = int(math.floor(rec.x / RES) - self._cx0) // 2
@@ -752,17 +1121,34 @@ class ChartGraph(SceneGraph):
                 pose_cell.setdefault(int(plane[y, x]), []).append((k, y, x))
         charts = []
         peaks = np.full(len(A), -1.0)
-        np.maximum.at(peaks, full, part.f)
-        order = np.argsort(full, kind="stable"); cut = np.searchsorted(full[order], np.arange(len(A) + 1))
+        order, cut = gorder, gcut
+        cnts = np.diff(cut)
+        if (cnts > 0).all():                                           # a chart's cells are the cells it labels: max, and the
+            peaks = np.maximum.reduceat(part.f[order], cut[:-1])       # means of 0/1 planes are count / n (exact integers)
+            if src is not None:
+                n_driven = np.add.reduceat(src[order, 0].astype(np.int64), cut[:-1])
+                n_blocked = np.add.reduceat(src[order, 1].astype(np.int64), cut[:-1])
+            else:
+                n_driven = np.add.reduceat(S[sp.ys[order], sp.xs[order]].astype(np.int64), cut[:-1])
+                n_blocked = np.add.reduceat(eb[sp.ys[order], sp.xs[order]].astype(np.int64), cut[:-1])
+        else:
+            np.maximum.at(peaks, full, part.f)
+            n_driven = n_blocked = None
+            if eb is None:
+                eb = (self._Br[::LAT, ::LAT] >= 0).astype(float)
         for j, a in enumerate(A):
             cc = order[cut[j]:cut[j + 1]]
             ay, ax = int(sp.ys[a]), int(sp.xs[a])
             leaf = None
             if j in pose_cell:
                 leaf = min(pose_cell[j], key=lambda t: ((t[1] - ay) ** 2 + (t[2] - ax) ** 2, t[0]))[0]
+            if n_driven is not None:
+                n = int(cnts[j]); dfrac = float(n_driven[j] / n); efrac = float(n_blocked[j] / n)
+            else:
+                dfrac = float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0
+                efrac = float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0
             charts.append(Chart(key=keys[j], anchor=self._cell_xy(ay, ax), cells=int(len(cc)), area_m2=float(len(cc) * h ** 2),
-                                clearance=float(sp.clr[a]), driven_frac=float(S[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0,
-                                ever_blocked_frac=float(eb[sp.ys[cc], sp.xs[cc]].mean()) if len(cc) else 0.0, leaf=leaf,
+                                clearance=float(sp.clr[a]), driven_frac=dfrac, ever_blocked_frac=efrac, leaf=leaf,
                                 peak=float(peaks[j]), region=int(part.region[j])))
         return _Solved(sp=sp, A=A, full=full, keys=keys, charts=charts, links=links, edges=edges, plane=plane,
                        dep=np.zeros((H, W), bool), S=S, peak=peaks, region=part.region, val=self._val_h)
@@ -790,60 +1176,160 @@ class ChartGraph(SceneGraph):
         return np.concatenate(R), np.concatenate(C), np.concatenate(Ln)
 
     # ------------------------------------------------------------------ links
-    def _links(self, sp, A, full, edges, chv, arcs: "morse.Arcs") -> List[dict]:
+    def _links(self, sp, A, full, edges, chv, arcs: "morse.Arcs", grp=None, fm=None, src=None) -> List[dict]:
         """One link per arc of the interface. Length: the shortest 8-neighbour route anchor -> portal -> anchor, each half inside
-        its own region (one Dijkstra per region, served from the last batch while the region and its anchor are unchanged)."""
+        its own region (one Dijkstra per region, served from the last batch while the region and its anchor are unchanged; so are
+        the routes read off its predecessors). `grp`: (cells by chart, ascending within a chart; offsets) when the caller has it.
+        `fm`: the channel values of `chv` as the rows of one matrix, in the order of `chv`, when the caller has it. `src`: the
+        bytes of the planes the channel values are functions of, one row per cell of `sp` ((N, nch) uint8), when the caller has it.
+
+        Link memo (`_lmemo`, with `fm` and `src`): everything a link carries besides the fresh arc values (a, b, width, saddle, u, v)
+        is a function of (the two charts' cells and anchors, the portal cells, the channel bytes on the two charts' cells): the
+        lengths read the charts' Dijkstra (a function of the chart's cells and anchor, served from `_rcache` as before), the route
+        is a path of cells of the two charts, the integrals read the channel values at those cells and the segment lengths, which
+        are differences of cell coordinates. A link whose key (both charts' content keys, their channel digests, the offset
+        between their corners, the portals relative to their charts' corners) was seen in the last solve is rebuilt from the
+        memo: the route is stored as coordinates relative to the corner of chart a and mapped back to the cell indices of this
+        solve with `sp.idx`."""
         R, C, Ln = edges
         k = len(A)
-        ec = np.where(full[R] == full[C], full[R], -1)
-        order = np.argsort(ec, kind="stable"); ecs = ec[order]
-        cut = np.searchsorted(ecs, np.arange(-1, k + 1))
-        cells_of = np.split(np.argsort(full, kind="stable"), np.searchsorted(np.sort(full), np.arange(1, k)))
-        D, PRED, CJ = [], [], []
+        if grp is None:
+            gorder = morse.group_order(full, k)
+            gcut = np.concatenate([[0], np.cumsum(np.bincount(full, minlength=k))])
+        else:
+            gorder, gcut = grp
+        Aa = np.asarray(A, np.int64)
+        cnt = np.diff(gcut)
+        # the content key of every chart: its cells relative to its top left corner, and its anchor (as always, one blake2b of
+        # the same bytes), the arrays built once for all charts
+        ys_o, xs_o = sp.ys[gorder], sp.xs[gorder]
+        y0s, x0s = np.minimum.reduceat(ys_o, gcut[:-1]), np.minimum.reduceat(xs_o, gcut[:-1])
+        Yr = (ys_o - np.repeat(y0s, cnt)).astype(np.int32)
+        Xr = (xs_o - np.repeat(x0s, cnt)).astype(np.int32)
+        anc = np.stack([sp.ys[Aa] - y0s, sp.xs[Aa] - x0s], 1).astype(np.int32)
+        names = list(chv)
+        memo_on = src is not None and fm is not None
+        old_memo = {}
+        if memo_on:
+            lm = self._lmemo
+            if lm is not None and lm[0] == tuple(names): old_memo = lm[1]
+            src_o = src[gorder]                              # the channel bytes of the charts' cells, in the order of Yr / Xr
+        self._lmemo = None
+        keys, hits, kc = [], [], []
+        for j in range(k):
+            g0, g1 = int(gcut[j]), int(gcut[j + 1])
+            hk = hashlib.blake2b(digest_size=16)
+            hk.update(Yr[g0:g1]); hk.update(Xr[g0:g1]); hk.update(anc[j])
+            keys.append(hk.digest())
+            hits.append(self._rcache.get(keys[-1]))
+            if memo_on:                                   # (the digest of the stream so far is the chart key: the hash goes on)
+                hk.update(src_o[g0:g1]); kc.append(keys[-1] + hk.digest())
+        miss = np.array([hit is None for hit in hits], bool)
+        if miss.any():                                    # the edges inside the charts to solve, grouped by chart
+            em = np.nonzero(miss[full][R])[0]             # the edges of the charts to solve whose ends are in one chart
+            fR = full[R[em]]
+            kp = fR == full[C[em]]
+            em, fR = em[kp], fR[kp]
+            eo = em[morse.group_order(fR, k)]
+            ecut = np.concatenate([[0], np.cumsum(np.bincount(fR, minlength=k))])
+            del fR, em
         rnew: dict = {}
         for j, a in enumerate(A):
-            cj = cells_of[j]                              # cells of the region, ascending
-            ys, xs = sp.ys[cj], sp.xs[cj]
-            y0, x0 = int(ys.min()), int(xs.min())
-            hk = hashlib.blake2b(digest_size=16)
-            hk.update((ys - y0).astype(np.int32).tobytes()); hk.update((xs - x0).astype(np.int32).tobytes())
-            hk.update(np.array([sp.ys[a] - y0, sp.xs[a] - x0], np.int32).tobytes())
-            key = hk.digest()
-            hit = self._rcache.get(key)
+            key, hit = keys[j], hits[j]
             if hit is None:
-                e = order[cut[j + 1]:cut[j + 2]]
+                cj = gorder[int(gcut[j]):int(gcut[j + 1])]    # cells of the region, ascending
+                e = eo[ecut[j]:ecut[j + 1]]
                 n = len(cj)
                 lr = np.searchsorted(cj, R[e]); lc = np.searchsorted(cj, C[e])
-                g = coo_matrix((np.concatenate([Ln[e], Ln[e]]), (np.concatenate([lr, lc]), np.concatenate([lc, lr]))), shape=(n, n)).tocsr()
-                hit = dijkstra(g, directed=False, indices=int(np.searchsorted(cj, a)), return_predecessors=True)
+                g = _csr_sym(lr, lc, Ln[e], n)
+                hits[j] = hit = dijkstra(g, directed=False, indices=int(np.searchsorted(cj, a)), return_predecessors=True) + ({},)
             rnew[key] = hit
-            D.append(hit[0]); PRED.append(hit[1]); CJ.append(cj)
         self._rcache = rnew
 
-        def route(j, cell):
-            """cells of the shortest route anchor -> cell inside chart j: followed in the chart's own index space (one
-            lookup in, one out) and mapped back to cell indices at the end"""
-            cj, pr = CJ[j], PRED[j]
-            goal = int(np.searchsorted(cj, A[j]))
-            q = int(np.searchsorted(cj, cell))
-            p = [q]
+        # chart-local index of every portal (a cell's place in its chart's ascending cell list), and of every anchor
+        inv = np.empty(len(gorder), np.int64); inv[gorder] = np.arange(len(gorder))
+
+        def cells_of(j):
+            return gorder[int(gcut[j]):int(gcut[j + 1])]
+
+        def local(cells, charts):
+            q = inv[cells] - gcut[charts]
+            bad = np.nonzero(full[cells] != charts)[0]
+            for i in bad.tolist():                        # a cell outside the chart it is said to be in: the lookup itself
+                q[i] = np.searchsorted(cells_of(int(charts[i])), cells[i])
+            return q
+        goals = local(Aa, np.arange(k, dtype=np.int64)).tolist() if k else []
+        qu = local(arcs.p, arcs.a).tolist(); qv = local(arcs.q, arcs.b).tolist()
+
+        def route(j, q):
+            """local indices of the shortest route anchor -> local cell q inside chart j, read off the chart's predecessor
+            array; None when unreachable. Kept with the chart's Dijkstra for as long as the chart's content is unchanged."""
+            pc = hits[j][2]
+            if q in pc: return pc[q]
+            pr, goal = hits[j][1], goals[j]
+            p = [q]; q0 = q
             while q != goal:
                 q = int(pr[q])
-                if q < 0: return None
+                if q < 0:
+                    pc[q0] = None; return None
                 p.append(q)
-            return cj[p[::-1]].tolist()
+            pc[q0] = r = np.array(p[::-1], np.int64)
+            return r
         h = self._h
+        Fm = fm
+        if Fm is None and all(v.dtype == np.float64 for v in chv.values()):
+            Fm = np.stack([chv[n] for n in names])
+        aL, bL = arcs.a.tolist(), arcs.b.tolist()
+        lkeys = None
+        if memo_on:
+            pa_, qb_ = arcs.a, arcs.b
+            inch = ((full[arcs.p] == pa_) & (full[arcs.q] == qb_)).tolist()     # portals inside their charts (else: no memo)
+            ya, xa, yb, xb = y0s[pa_], x0s[pa_], y0s[qb_], x0s[qb_]
+            lkeys = [kk if ok else None for kk, ok in zip(zip(
+                [kc[a] for a in aL], [kc[b] for b in bL], (yb - ya).tolist(), (xb - xa).tolist(),
+                (sp.ys[arcs.p] - ya).tolist(), (sp.xs[arcs.p] - xa).tolist(),
+                (sp.ys[arcs.q] - yb).tolist(), (sp.xs[arcs.q] - xb).tolist()), inch)]
+        used: dict = {}
         out = []
-        for a, b, u, v, s, w in zip(arcs.a.tolist(), arcs.b.tolist(), arcs.p.tolist(), arcs.q.tolist(), arcs.s.tolist(),
-                                    arcs.g.tolist()):
-            du = D[a][int(np.searchsorted(CJ[a], u))]; dv = D[b][int(np.searchsorted(CJ[b], v))]
-            pa = route(a, u); pb = route(b, v)
+        hit_d, hit_v, hit_a = [], [], []
+        for i, (a, b, u, v, s, w, iu, iv) in enumerate(zip(aL, bL, arcs.p.tolist(), arcs.q.tolist(), arcs.s.tolist(),
+                                                            arcs.g.tolist(), qu, qv)):
+            lk = None if lkeys is None else lkeys[i]
+            if lk is not None:
+                val = old_memo.get(lk)
+                if val is not None:
+                    used[lk] = val
+                    d = dict(a=a, b=b, length=val[0], width=2.0 * float(w), saddle=float(s), u=u, v=v, route=None, integ=dict(val[1]))
+                    out.append(d); hit_d.append(d); hit_v.append(val); hit_a.append(a)
+                    continue
+            du = hits[a][0][iu]; dv = hits[b][0][iv]
+            pa = route(a, iu); pb = route(b, iv)
             if pa is None or pb is None or not (np.isfinite(du) and np.isfinite(dv)): continue
-            cells = np.array(pa + pb[::-1], np.int64)
+            cells = np.concatenate([cells_of(a)[pa], cells_of(b)[pb][::-1]])
             seg = np.hypot(np.diff(sp.ys[cells]).astype(float), np.diff(sp.xs[cells]).astype(float)) * h * 0.5
-            integ = {name: float((seg * (f[cells[:-1]] + f[cells[1:]])).sum()) for name, f in chv.items()}
-            out.append(dict(a=a, b=b, length=float(du + dv + h), width=2.0 * float(w), saddle=float(s), u=u, v=v,
+            if Fm is None:                                # channels of other dtypes: each in its own arithmetic
+                integ = {name: float((seg * (f[cells[:-1]] + f[cells[1:]])).sum()) for name, f in chv.items()}
+                out.append(dict(a=a, b=b, length=float(du + dv + h), width=2.0 * float(w), saddle=float(s), u=u, v=v,
+                                route=cells.tolist(), integ=integ))
+                continue
+            gm = Fm.take(cells, axis=1)
+            # one row per channel, C-contiguous: each row is summed pairwise exactly as a 1-D array of its own
+            integ = dict(zip(names, np.ascontiguousarray(seg * (gm[:, :-1] + gm[:, 1:])).sum(axis=1).tolist()))
+            length = float(du + dv + h)
+            out.append(dict(a=a, b=b, length=length, width=2.0 * float(w), saddle=float(s), u=u, v=v,
                             route=cells.tolist(), integ=integ))
+            if lk is not None:
+                used[lk] = (length, dict(integ), (sp.ys[cells] - y0s[a]).astype(np.int32), (sp.xs[cells] - x0s[a]).astype(np.int32))
+        if hit_d:                                         # the routes of the memo hits, as cell indices of this solve, in one gather
+            lens = [len(val[2]) for val in hit_v]
+            ha = np.asarray(hit_a, np.int64)
+            Y = np.concatenate([val[2] for val in hit_v]) + np.repeat(y0s[ha], lens)
+            X = np.concatenate([val[3] for val in hit_v]) + np.repeat(x0s[ha], lens)
+            flat = sp.idx[Y, X].tolist()
+            o = 0
+            for d, n in zip(hit_d, lens):
+                d["route"] = flat[o:o + n]; o += n
+        if memo_on: self._lmemo = (tuple(names), used)
         return out
 
     # ------------------------------------------------------------------ dirty
@@ -853,8 +1339,7 @@ class ChartGraph(SceneGraph):
         sig, link_sig = {}, set()
         if s is not None:
             gy0, gx0 = self._cy0 // 2, self._cx0 // 2
-            ys, xs = np.nonzero(s.plane >= 0)
-            lab = s.plane[ys, xs]
+            ys, xs, lab = s.sp.ys, s.sp.xs, s.full                  # the cells of the plane (row-major) and their chart
             k = len(s.keys)
             cnt = np.bincount(lab, minlength=k)
             chk = np.bincount(lab, weights=((ys.astype(np.int64) + gy0) * 7919 + (xs.astype(np.int64) + gx0)).astype(np.float64), minlength=k)
@@ -867,7 +1352,7 @@ class ChartGraph(SceneGraph):
     def _dirty(self, old: Optional[_Solved], old_sig, old_link_sig, old_keys, bounds, region) -> Dirty:
         s = self._solved
         sig, link_sig = self._signatures(s)
-        changed_cells = None
+        cc = None                                           # (ymin, ymax, xmin, xmax) of the cells whose chart changed
         if s is not None:
             op = None if old is None else old.plane
             if op is not None and op.shape != s.plane.shape:
@@ -875,9 +1360,27 @@ class ChartGraph(SceneGraph):
                 if sy + op.shape[0] <= s.plane.shape[0] and sx + op.shape[1] <= s.plane.shape[1]:
                     big = -np.ones(s.plane.shape, op.dtype); big[sy:sy + op.shape[0], sx:sx + op.shape[1]] = op; op = big
             if op is not None and op.shape == s.plane.shape:
-                a = np.where(op >= 0, np.array([self._hash(k) for k in old.keys] + [0])[op], 0) if len(old.keys) else np.zeros(s.plane.shape)
-                b = np.where(s.plane >= 0, np.array([self._hash(k) for k in s.keys] + [0])[s.plane], 0) if len(s.keys) else np.zeros(s.plane.shape)
-                changed_cells = a != b
+                # the key hash of each cell's owner (0 outside every chart: the trailing entry, index -1), compared row block by row
+                # block: the same booleans as comparing two full hash planes, without holding them
+                lut_a = np.array([self._hash(k) for k in old.keys] + [0]); lut_b = np.array([self._hash(k) for k in s.keys] + [0])
+                # only the bounding box of the changed cells is used.  A cell whose two owner indices differ is compared by hash (the
+                # tables differ); a cell with the same index i >= 0 changed iff the two tables hash their i-th key differently
+                # (i is below both lengths); an unowned cell (-1, hash 0) on both sides did not change
+                k = min(len(old.keys), len(s.keys))
+                bad = np.nonzero(lut_a[:k] != lut_b[:k])[0]
+                for r0 in range(0, s.plane.shape[0], 256):
+                    ob, nb = op[r0:r0 + 256], s.plane[r0:r0 + 256]
+                    ne = ob != nb
+                    iy, ix = np.nonzero(ne)
+                    if iy.size:
+                        sel = lut_a[ob[iy, ix]] != lut_b[nb[iy, ix]]
+                        iy, ix = iy[sel], ix[sel]
+                    if bad.size:
+                        ey, ex = np.nonzero(~ne & np.isin(nb, bad))
+                        iy, ix = np.concatenate([iy, ey]), np.concatenate([ix, ex])
+                    if iy.size:
+                        b = (int(iy.min()) + r0, int(iy.max()) + r0, int(ix.min()), int(ix.max()))
+                        cc = b if cc is None else (min(cc[0], b[0]), max(cc[1], b[1]), min(cc[2], b[2]), max(cc[3], b[3]))
         self._sig, self._link_sig = sig, link_sig
         changed = sorted(k for k in sig if old_sig.get(k) != sig[k])
         retired = {k: v for k, v in getattr(self, "_retired_map", {}).items()}
@@ -896,10 +1399,9 @@ class ChartGraph(SceneGraph):
         if hb is not None:
             x0 = hb[0] if x0 is None else min(x0, hb[0]); y0 = hb[1] if y0 is None else min(y0, hb[1])
             x1 = hb[2] if x1 is None else max(x1, hb[2]); y1 = hb[3] if y1 is None else max(y1, hb[3])
-        if changed_cells is not None and changed_cells.any():
-            ys, xs = np.nonzero(changed_cells)
-            cb = ((self._cx0 + 2 * xs.min()) * RES, (self._cy0 + 2 * ys.min()) * RES,
-                  (self._cx0 + 2 * xs.max() + 2) * RES, (self._cy0 + 2 * ys.max() + 2) * RES)
+        if cc is not None:
+            cb = ((self._cx0 + 2 * cc[2]) * RES, (self._cy0 + 2 * cc[0]) * RES,
+                  (self._cx0 + 2 * cc[3] + 2) * RES, (self._cy0 + 2 * cc[1] + 2) * RES)
             x0 = cb[0] if x0 is None else min(x0, cb[0]); y0 = cb[1] if y0 is None else min(y0, cb[1])
             x1 = cb[2] if x1 is None else max(x1, cb[2]); y1 = cb[3] if y1 is None else max(y1, cb[3])
         bb = None if x0 is None else BBox(x0, y0, x1, y1)
@@ -911,6 +1413,16 @@ class ChartGraph(SceneGraph):
         new = self._hold
         if new is None: return None
         old, ocx, ocy = self._hold_prev
+        win = self._hold_win
+        if win is not None and old is not None and old.shape == new.shape and (ocx, ocy) == (self._cx0, self._cy0):
+            # the window `_hold_window` recomputed: the plane equals the previous one outside it, so only it can differ
+            wy0, wy1, wx0, wx1 = win
+            if wy0 >= wy1: return None
+            d = new[wy0:wy1, wx0:wx1] != old[wy0:wy1, wx0:wx1]
+            if not d.any(): return None
+            ys, xs = np.nonzero(d)
+            return ((self._cx0 + wx0 + int(xs.min())) * RES, (self._cy0 + wy0 + int(ys.min())) * RES,
+                    (self._cx0 + wx0 + int(xs.max()) + 1) * RES, (self._cy0 + wy0 + int(ys.max()) + 1) * RES)
         diff = new
         if old is not None:
             oy, ox = ocy - self._cy0, ocx - self._cx0
@@ -1170,7 +1682,11 @@ class ChartGraph(SceneGraph):
                 seen.add(id(o)); return sys.getsizeof(o) + sum(walk(v, depth + 1) for v in o.values())
             if isinstance(o, (list, tuple, set)):
                 seen.add(id(o)); n = sys.getsizeof(o)
-                if o and not isinstance(next(iter(o)), (int, float, str, bytes, bool, tuple)):
+                first = next(iter(o), None)
+                # a leading scalar / tuple no longer hides the rest of a tuple that holds arrays or dicts: the link memo is
+                # (names, {key: (length, integrals, ys, xs)})
+                if o and (not isinstance(first, (int, float, str, bytes, bool, tuple))
+                          or (isinstance(o, tuple) and any(isinstance(v, (np.ndarray, dict)) for v in o[:8]))):
                     n += sum(walk(v, depth + 1) for v in o)
                 return n
             if hasattr(o, "__dict__"):
@@ -1202,13 +1718,20 @@ class ChartGraph(SceneGraph):
                                                   None if l.view is None else (l.view.x, l.view.y, l.view.yaw, l.view.fov, l.view.rng))
         return r
 
-    def export_state(self) -> EngineState:
-        """The resumable state, by reference (the arrays are not copied: the store slices them into tiles)."""
+    def export_state(self, lazy: bool = False) -> EngineState:
+        """The resumable state, by reference (the arrays are not copied: the store slices them into tiles). The time planes are
+        int64 arrays; while the engine holds them as int32 offsets they are widened copies, unless `lazy`: then they are
+        `TimePlane` views whose slices are the same int64 values (what a tile reader wants, without widening the whole canvas)."""
         self._check()
         p = self.params
+        ep = self._tep
+        if ep is None: wide = lambda a: a
+        elif lazy: wide = lambda a: None if a is None else TimePlane(a, ep)
+        else: wide = lambda a: None if a is None else widen_time(a, ep)
         st = EngineState(params=_state_params(p),
-                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Bn=self._Bn, Hold=self._hold,
-                         Val=self._val_h, chan=dict(self._chan),
+                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=wide(self._Tr), B=wide(self._Br), Fn=wide(self._Fnr),
+                         Bn=wide(self._Bnr), Hold=self._hold,
+                         Val=self._val_h, chan={k: (v, wide(t)) for k, (v, t) in self._chan.items()},
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
         s = self._solved
@@ -1217,11 +1740,16 @@ class ChartGraph(SceneGraph):
             st.plane = s.plane
         return st
 
-    def import_state(self, st: EngineState, verify: bool = True) -> None:
+    def export_state_lazy(self) -> EngineState:
+        """`export_state(lazy=True)`: for a reader that slices the planes (the store's save) or wants only the leaf records"""
+        return self.export_state(lazy=True)
+
+    def import_state(self, st: EngineState, verify: bool = True, release: bool = False) -> None:
         """Resume from `st` on a fresh engine: planes and evidence are taken as they are, then F and the partition are
         rebuilt (both are functions of the planes and the evidence) and must reproduce the stored owner plane cell for cell;
         the stored keys are then the keys of the rebuilt charts. The canvas is padded by MARGIN so that the distance to the
-        non-navigable cells near the stored edge sees unknown, as it did before."""
+        non-navigable cells near the stored edge sees unknown, as it did before. `release=True`: the caller will not use `st` again, so
+        its V / T / B / Fn / Bn / chan planes are dropped (set to None) as soon as their padded copies exist (lower peak)."""
         p = self.params
         if st.params != _state_params(p):
             raise ValueError("state was made with other parameters (%r, this engine %r): a store written with the close-evidence "
@@ -1230,17 +1758,58 @@ class ChartGraph(SceneGraph):
         if self._V is not None:
             raise ValueError("import_state needs a fresh engine")
         pad = MARGIN
-        padf = lambda a, fill: np.pad(a, pad, constant_values=fill)
-        padl = lambda a, fill: np.pad(a, pad // 2, constant_values=fill)
+
+        def padf(a, fill):                                   # np.pad(a, pad, constant_values=fill), one allocation
+            a = np.asarray(a); b = np.full((a.shape[0] + 2 * pad, a.shape[1] + 2 * pad), fill, a.dtype); b[pad:-pad, pad:-pad] = a
+            return b
+
+        def padl(a, fill, dt):                               # np.pad(a.astype(dt), pad // 2, constant_values=fill), one allocation
+            q = pad // 2; b = np.full((a.shape[0] + 2 * q, a.shape[1] + 2 * q), fill, dt); b[q:-q, q:-q] = a
+            return b
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
-        self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
+        self._V = padf(st.V, 255)
+        if release: st.V = None
         if p.near_range_m is not None and (st.Fn is None or st.Bn is None or st.Val is None):
             raise ValueError("state has no close-evidence planes (Fn, Bn, Val): it was made before the validity plane (pipeline "
                              "morse/2+valid carries it; the earlier rule-on tokens do not) and must be rebuilt, not resumed")
-        self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
-        self._Bn = None if p.near_range_m is None else padf(st.Bn, -1)
+        # time planes: int32 offsets from an epoch when every stamp of the state (planes and leaves) fits, else int64 as stored
+        tplanes = [np.asarray(a) for a in (st.T, st.B) + ((st.Fn, st.Bn) if p.near_range_m is not None else ())]
+        tplanes += [np.asarray(t) for _, t in st.chan.values()]
+        lo = hi = None
+        for a in tplanes:
+            l, h = _t_range(a)
+            if l is not None: lo = l if lo is None else min(lo, l); hi = h if hi is None else max(hi, h)
+        for l in st.leaves:
+            lo = int(l.t) if lo is None else min(lo, int(l.t)); hi = int(l.t) if hi is None else max(hi, int(l.t))
+        ep = _epoch_for(lo, hi)
+        tdt = np.int64 if ep is None else np.int32
+
+        def padt(a):
+            a = np.asarray(a); b = np.full((a.shape[0] + 2 * pad, a.shape[1] + 2 * pad), -1, tdt)
+            for r0 in range(0, a.shape[0], 512):
+                blk = a[r0:r0 + 512]
+                if ep is None: b[pad + r0:pad + r0 + len(blk), pad:-pad] = blk
+                else:
+                    o = blk.astype(np.int64) - ep; o[blk < 0] = -1; b[pad + r0:pad + r0 + len(blk), pad:-pad] = o
+            return b
+        self._tep = ep
+        del tplanes
+        a = None
+        self._Tr = padt(st.T)
+        if release: st.T = None
+        self._Br = padt(st.B)
+        if release: st.B = None
+        self._Fnr = None if p.near_range_m is None else padt(st.Fn)
+        self._Bnr = None if p.near_range_m is None else padt(st.Bn)
+        if release: st.Fn = st.Bn = None
         self._hold = None
-        self._chan = {k: (padf(v, 255), padf(t, -1)) for k, (v, t) in st.chan.items()}
+        self._free_prev = None
+        self._chan = {}
+        for k in list(st.chan):
+            v, t = st.chan[k]
+            self._chan[k] = (padf(v, 255), padt(t))
+            if release: del st.chan[k]
+            v = t = None
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,
                                     None if l.view is None else CamView(l.key, *l.view)) for l in st.leaves}
         self._leaf_order = sorted((l.t, l.key) for l in st.leaves)
@@ -1255,7 +1824,7 @@ class ChartGraph(SceneGraph):
             if p.near_range_m is not None:                      # the hold and validity planes of the planes (an export must carry them)
                 self._build_F(); self._verify_val(st, verify)
             return
-        self._key_plane = padl(st.plane.astype(np.int32), -1)
+        self._key_plane = padl(st.plane, -1, np.int32)
         nav, clr, S = self._build_F()
         if st.Hold is not None and verify and self._hold is not None:
             if not np.array_equal(padf(st.Hold, False), self._hold):

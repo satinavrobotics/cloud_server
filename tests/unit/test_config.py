@@ -186,3 +186,15 @@ def test_dispatch_and_api_tunable_defaults_and_overrides():
     assert config.DISPATCH_NOTIFY_RETRY_BACKOFF_S == (0.5, 1.0)
     config = _reload_config({**FULL_ENV, "BATTERY_LOW_PCT": "15", "AGENT_BATTERY_LOW_THRESHOLD": "30"})
     assert config.AGENT_BATTERY_LOW_THRESHOLD == 30.0
+
+
+@pytest.mark.unit
+def test_byte_cache_knobs_default_to_cloud_values_and_read_env():
+    names = ("SCENE_GRAPH_STORE_TILE_CACHE_BYTES", "SCENE_GRAPH_API_RESULT_CACHE_BYTES",
+             "OCCUPANCY_CHUNK_CACHE_BYTES", "OCCUPANCY_INDEX_CACHE_BYTES")
+    config = _reload_config({**FULL_ENV, **{k: None for k in names}})
+    assert config.SCENE_GRAPH_STORE_TILE_CACHE_BYTES == 64 << 20
+    assert config.SCENE_GRAPH_API_RESULT_CACHE_BYTES == 96 << 20
+    assert config.OCCUPANCY_CHUNK_CACHE_BYTES == 64 << 20 and config.OCCUPANCY_INDEX_CACHE_BYTES == 64 << 20
+    config = _reload_config({**FULL_ENV, "OCCUPANCY_INDEX_CACHE_BYTES": "8388608"})
+    assert config.OCCUPANCY_INDEX_CACHE_BYTES == 8 << 20
