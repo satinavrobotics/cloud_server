@@ -253,3 +253,58 @@ def test_next_uncovered():
         while want < n and cov[order[want]]:
             want += 1
         assert morse._next_uncovered(cov, order, pos, n) == want
+
+
+# ----------------------------------------------------------------------------------------------------------- the box search
+@pytest.mark.parametrize("seed", range(8))
+def test_the_box_search_of_big_regions_gives_the_same_cuts(seed, monkeypatch):
+    """regions of more than `_BOX_MIN` cells are searched in a box around each net point: the same cuts as the whole-region
+    graph (here the limit is lowered so that small fields take that path)"""
+    monkeypatch.setattr(morse, "_BOX_MIN", 25)
+    rng = np.random.default_rng(700 + seed)
+    tau = morse.tau0(H_STEP)
+    radius = [0.5, 1.0][seed % 2]
+    F = blob_field(rng, int(rng.integers(30, 70)), int(rng.integers(30, 70)))
+    solver = morse.PartitionSolver(H_STEP, tau, radius)
+    for step in range(12):
+        got = solver.update(F)
+        assert_same(got, morse.partition(F, H_STEP, tau, radius=radius), (seed, step))
+        F, _ = mutate(rng, F)
+
+
+def test_one_big_open_region_is_cut_like_subdivide():
+    tau = morse.tau0(H_STEP)
+    F = np.zeros((110, 120), bool)
+    F[3:107, 4:116] = True                                       # one region of ~11,000 cells: past the box limit
+    solver = morse.PartitionSolver(H_STEP, tau, 1.0)
+    assert_same(solver.update(F), morse.partition(F, H_STEP, tau, radius=1.0), "open")
+    G = F.copy(); G[50:53, 60:70] = False; G[3:5, 4:116] = False
+    assert_same(solver.update(G), morse.partition(G, H_STEP, tau, radius=1.0), "edited")
+
+
+def test_exploration_with_a_canvas_that_grows_on_every_side():
+    """a robot drives through a walled map, F gains the cells around it, and the canvas grows (the hint is right) toward every
+    side the drive reaches: the solver equals the full computation at every step"""
+    rng = np.random.default_rng(42)
+    Hw, Ww = 160, 200
+    world = np.ones((Hw, Ww), bool)
+    for _ in range(14):                                          # walls: pillars and bars
+        y, x = int(rng.integers(0, Hw - 12)), int(rng.integers(0, Ww - 12))
+        world[y:y + int(rng.integers(2, 12)), x:x + int(rng.integers(2, 12))] = False
+    tau = morse.tau0(H_STEP)
+    yy, xx = np.mgrid[-7:8, -7:8]
+    disc = (yy ** 2 + xx ** 2) <= 49
+    y, x = 80, 100
+    oy, ox = y - 8, x - 8                                        # world position of canvas cell (0, 0)
+    F = np.zeros((16, 16), bool)
+    solver = morse.PartitionSolver(H_STEP, tau, 1.0)
+    for step in range(70):
+        y = int(np.clip(y + rng.integers(-5, 6), 8, Hw - 9)); x = int(np.clip(x + rng.integers(-6, 7), 8, Ww - 9))
+        t, b, l, r = max(0, oy - (y - 8)), max(0, (y + 8) - (oy + F.shape[0])), max(0, ox - (x - 8)), max(0, (x + 8) - (ox + F.shape[1]))
+        if t or b or l or r:
+            F = np.pad(F, ((t, b), (l, r))); oy -= t; ox -= l
+        wy0, wx0 = y - 7 - oy, x - 7 - ox
+        F[wy0:wy0 + 15, wx0:wx0 + 15] |= disc & world[y - 7:y + 8, x - 7:x + 8]
+        got = solver.update(F, (t, l))
+        if step % 2 == 0 or step > 55:
+            assert_same(got, morse.partition(F, H_STEP, tau, radius=1.0), step)

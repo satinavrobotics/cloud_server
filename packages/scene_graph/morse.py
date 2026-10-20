@@ -25,6 +25,12 @@ The engine's radius is SceneParams.chart_radius; `levels` above the charts are `
 
 Counting identity (any tie order): chi(F) = #maxima - sum(saddle multiplicities) (B has no minima). Nothing here reads a chart
 index, a leaf or the canvas: the engine calls `partition` once per batch.
+
+`PartitionSolver` is `partition` with a memory: it keeps the previous solve and returns, for every F, exactly the Partition
+`partition` returns, at a cost that follows what changed. B is recomputed on the box of the changed cells grown by a bound on
+B (a cell farther from every changed cell than its old B keeps it); a region whose cell set and room are those of a region of
+the previous solve is served from it (the greedy net is a function of those); the other regions are cut again. The previous
+solve is compared with F cell by cell, so the canvas shift it is given is a hint that can only cost time.
 """
 import hashlib
 import heapq
@@ -758,6 +764,8 @@ class PartitionSolver:
 
     def update(self, F: np.ndarray, shift: Tuple[int, int] = (0, 0)) -> Partition:
         st, self._st = self._st, None                      # an exception leaves no state behind
+        if F.dtype != bool:
+            F = F != 0
         part, new = self._solve(F, shift, st)
         self._st = new
         return part
@@ -807,6 +815,7 @@ class PartitionSolver:
             g = int(math.ceil(float(fo.max()) / h + 1e-6))
         wy0, wy1, wx0, wx1 = max(0, y0 - g), min(H - 1, y1 + g), max(0, x0 - g), min(W - 1, x1 + g)
         pad = g + 2
+        tries = 0
         while True:
             ey0, ey1, ex0, ex1 = max(0, wy0 - pad), min(H - 1, wy1 + pad), max(0, wx0 - pad), min(W - 1, wx1 + pad)
             sub = np.zeros((ey1 - ey0 + 3, ex1 - ex0 + 3), bool)
@@ -822,7 +831,8 @@ class PartitionSolver:
             cpd = np.minimum(np.full(len(xx), inf) if ex0 == 0 else xx - ex0 + 1, np.full(len(xx), inf) if ex1 == W - 1 else ex1 - xx + 1)
             if bool((inner < np.minimum(rpd[:, None], cpd[None, :])).all()):
                 break
-            pad *= 2
+            pad = pad * 2 if tries == 0 else max(H, W)               # a second miss: the whole canvas
+            tries += 1
         i0, i1 = int(np.searchsorted(sp.ys, wy0)), int(np.searchsorted(sp.ys, wy1, side="right"))
         sel = i0 + np.flatnonzero((sp.xs[i0:i1] >= wx0) & (sp.xs[i0:i1] <= wx1))
         f[sel] = inner[sp.ys[sel] - wy0, sp.xs[sel] - wx0] * h
@@ -861,7 +871,7 @@ class PartitionSolver:
         full, seeds = self._subdivide(sp, q, reg, len(keep), st, oc, off, pad)
         part = Partition(sp, f, full, len(seeds), centres(sp, full, f, len(seeds)), R, len(tree), reg[seeds].astype(np.int64),
                          len(keep), seeds, tuple(edges), cuts)
-        return part, _State(sp, f, full, reg, q, seeds, len(keep))
+        return part, _State(sp, f, full, reg, q.astype(np.int32), seeds, len(keep))
 
     def _subdivide(self, sp: Space, q: np.ndarray, reg: np.ndarray, nR: int, st: Optional[_State], oc, off, pad=None):
         """`subdivide` with the regions that did not change served from the previous solve. A region is served when it is the
@@ -872,9 +882,9 @@ class PartitionSolver:
         h, radius = self.h, self.radius
         hit = np.zeros(nR, bool)
         if st is not None:
-            first = np.full(nR, -1, np.int64)
-            first[reg[::-1]] = np.arange(N - 1, -1, -1)
-            ocf = oc[first]
+            rep = np.empty(nR, np.int64)
+            rep[reg] = np.arange(N)                                # a cell of every region (any one: all are compared below)
+            ocf = oc[rep]
             ro = np.where(ocf >= 0, st.reg[np.maximum(ocf, 0)], -1).astype(np.int64)      # previous region of each region
             okc = (oc >= 0) & (st.reg[np.maximum(oc, 0)] == ro[reg]) & (st.q[np.maximum(oc, 0)] == q)
             nbad = np.bincount(reg[~okc], minlength=nR)
