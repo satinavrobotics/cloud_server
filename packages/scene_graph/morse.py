@@ -871,6 +871,9 @@ class PartitionSolver:
         full, seeds = self._subdivide(sp, q, reg, len(keep), st, oc, off, pad)
         part = Partition(sp, f, full, len(seeds), centres(sp, full, f, len(seeds)), R, len(tree), reg[seeds].astype(np.int64),
                          len(keep), seeds, tuple(edges), cuts)
+        # the next solve reads these arrays: the caller gets them read-only, so a write fails loudly instead of corrupting the state
+        for a in (f, full, seeds, sp.ys, sp.xs, sp.idx):
+            a.flags.writeable = False
         return part, _State(sp, f, full, reg, q.astype(np.int32), seeds, len(keep))
 
     def _subdivide(self, sp: Space, q: np.ndarray, reg: np.ndarray, nR: int, st: Optional[_State], oc, off, pad=None):
