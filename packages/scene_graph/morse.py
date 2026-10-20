@@ -204,6 +204,71 @@ def saddles(lab: np.ndarray, i: np.ndarray, j: np.ndarray, val: np.ndarray):
 
 
 # ---------------------------------------------------------------------------------------------------------------- merge
+def _merge_lists(pv_arr, pr_arr, lo_a, hi_a, s_a, limit: float) -> List[Tuple[float, int, int]]:
+    """`merge_tree` for region ids 0..R-1 and unique pairs lo < hi in ascending code order: the same pops, merges and output, with
+    lists indexed by region id instead of dicts (a merged-away region has version -1: its entries are stale)."""
+    R = len(pv_arr)
+    pv, pr = pv_arr.tolist(), pr_arr.tolist()
+    lo_l, hi_l, s_l = lo_a.tolist(), hi_a.tolist(), s_a.tolist()
+    sad: list = [None] * R
+    for a, b, v in zip(lo_l, hi_l, s_l):
+        da = sad[a]
+        if da is None:
+            da = sad[a] = {}
+        da[b] = v
+        db = sad[b]
+        if db is None:
+            db = sad[b] = {}
+        db[a] = v
+    ver = [0] * R
+    p0 = np.minimum(pv_arr[lo_a], pv_arr[hi_a]) - s_a
+    k0 = np.nonzero(p0 < limit)[0]
+    ra, rb = pr_arr[lo_a[k0]], pr_arr[hi_a[k0]]
+    heap = list(zip(p0[k0].tolist(), (-s_a[k0]).tolist(), np.minimum(ra, rb).tolist(), np.maximum(ra, rb).tolist(),
+                    lo_a[k0].tolist(), hi_a[k0].tolist(), [0] * len(k0), [0] * len(k0)))
+    heapq.heapify(heap)
+    out: List[Tuple[float, int, int]] = []
+    heappush, heappop = heapq.heappush, heapq.heappop
+    while heap:
+        p, _, _, _, a, b, va, vb = heappop(heap)
+        if ver[a] != va or ver[b] != vb or b not in sad[a]:
+            continue
+        pa, pb = pv[a], pv[b]
+        keep, drop = (a, b) if (pa, -pr[a]) >= (pb, -pr[b]) else (b, a)
+        out.append((p, keep, drop))
+        if pa == pb:
+            ra_, rb_ = pr[a], pr[b]
+            pr[keep] = ra_ if ra_ < rb_ else rb_
+        pk = pv[keep] = pa if pa > pb else pb
+        sk, sd = sad[keep], sad[drop]
+        del sk[drop]
+        del sd[keep]
+        for x, v in sd.items():
+            old = sk.get(x)
+            nv = v if old is None or v > old else old
+            sk[x] = nv
+            sx = sad[x]
+            del sx[drop]
+            sx[keep] = nv
+        sad[drop] = None
+        ver[drop] = -1
+        vk = ver[keep] = ver[keep] + 1
+        rk = pr[keep]
+        for x, v in sk.items():                    # push(min(keep, x), max(keep, x)), inlined
+            px = pv[x]
+            if keep < x:
+                p = (px if px < pk else pk) - v
+                if p < limit:
+                    rx = pr[x]
+                    heappush(heap, (p, -v, rk, rx, keep, x, vk, ver[x]) if rk < rx else (p, -v, rx, rk, keep, x, vk, ver[x]))
+            else:
+                p = (pk if pk < px else px) - v
+                if p < limit:
+                    rx = pr[x]
+                    heappush(heap, (p, -v, rk, rx, x, keep, ver[x], vk) if rk < rx else (p, -v, rx, rk, x, keep, ver[x], vk))
+    return out
+
+
 def merge_tree(peakv, peakr, lo, hi, s, tau: float) -> List[Tuple[float, int, int]]:
     """The merges of persistence below `tau`, smallest persistence first: [(p, keep, drop)] on the region ids given.
     peakv / peakr: peak value and peak rank per region (the elder of a pair is the higher peak, ties the smaller rank);
@@ -211,9 +276,12 @@ def merge_tree(peakv, peakr, lo, hi, s, tau: float) -> List[Tuple[float, int, in
     arrays = not isinstance(peakv, dict) and not isinstance(peakr, dict)
     pv_arr = np.asarray(peakv, float) if not isinstance(peakv, dict) else None
     pr_arr = np.asarray(peakr) if not isinstance(peakr, dict) else None
+    lo_a, hi_a, s_a = np.asarray(lo), np.asarray(hi), np.asarray(s, float)
+    if (arrays and len(lo_a) and int(lo_a.min()) >= 0 and int(hi_a.max()) < len(pv_arr) and bool((lo_a < hi_a).all())
+            and (len(lo_a) == 1 or bool((np.diff(lo_a.astype(np.int64) * len(pv_arr) + hi_a) > 0).all()))):
+        return _merge_lists(pv_arr, pr_arr, lo_a, hi_a, s_a, tau - TOL)
     peakv = dict(enumerate(pv_arr.tolist())) if pv_arr is not None else dict(peakv)
     peakr = dict(enumerate(pr_arr.tolist())) if pr_arr is not None else dict(peakr)
-    lo_a, hi_a, s_a = np.asarray(lo), np.asarray(hi), np.asarray(s, float)
     lo_l, hi_l, s_l = lo_a.tolist(), hi_a.tolist(), s_a.tolist()
     sad: Dict[int, Dict[int, float]] = {}
     for a, b, v in zip(lo_l, hi_l, s_l):
@@ -563,7 +631,7 @@ def _next_uncovered(covered: np.ndarray, order: np.ndarray, pos: int, n: int) ->
 _BOX_MIN = 6000        # a region of more cells than this is searched in a box around each net point (see `_cut_regions`)
 
 
-def _cut_regions(sp: Space, q: np.ndarray, region: np.ndarray, rids: np.ndarray, radius: float, h: float):
+def _cut_regions(sp: Space, q: np.ndarray, region: np.ndarray, rids: np.ndarray, radius: float, h: float, pad: Optional[tuple] = None):
     """The greedy net of `subdivide` for the regions `rids` only: (cells of those regions grouped by region and ascending within,
     chart (index of the net point within its region) per entry of those cells, net point cells per region in net order).
     The same algorithm as `subdivide` (room order, geodesic ball of the region graph, nearer net point wins, a tie keeps the
@@ -581,19 +649,17 @@ def _cut_regions(sp: Space, q: np.ndarray, region: np.ndarray, rids: np.ndarray,
     rcut = np.concatenate([[0], np.cumsum(np.bincount(rgs, minlength=nR)[rids])])
     loc = np.full(N, -1, np.int32); loc[mc] = np.arange(Nm, dtype=np.int32)
     ys, xs = sp.ys[mc], sp.xs[mc]
-    idx = sp.idx
+    P, pos, Wp = sp.padded() if pad is None else pad
+    pm = pos[mc]
     Ra, Ca, La = [], [], []
     for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):       # one half of the 8-neighbour edges inside the region (as `edges_within`)
-        y2, x2 = ys + dy, xs + dx
-        ok = (y2 < H) & (x2 >= 0) & (x2 < W)
-        a = np.flatnonzero(ok)
-        b = idx[y2[a], x2[a]]
-        k = b >= 0
-        a, b = a[k], b[k]
+        nbv = P[pm + (dy * Wp + dx)]
+        a = np.flatnonzero(nbv >= 0)
+        b = nbv[a]
         k = region[b] == rgs[a]
         a, b = a[k], b[k]
         if dy and dx:                                      # a diagonal also needs both orthogonal cells in the region
-            o1 = idx[ys[a], x2[a]]; o2 = idx[y2[a], xs[a]]
+            o1 = P[pm[a] + dx]; o2 = P[pm[a] + dy * Wp]
             k = (o1 >= 0) & (o2 >= 0)
             a, b, o1, o2 = a[k], b[k], o1[k], o2[k]
             k = (region[o1] == rgs[a]) & (region[o2] == rgs[a])
@@ -792,12 +858,12 @@ class PartitionSolver:
         reg = new[surv[bid]].astype(np.int32)
         *edges, cuts = edges_full(sp, h, pad)
         q = np.rint(f / h).astype(np.int64)
-        full, seeds = self._subdivide(sp, q, reg, len(keep), st, oc, off)
+        full, seeds = self._subdivide(sp, q, reg, len(keep), st, oc, off, pad)
         part = Partition(sp, f, full, len(seeds), centres(sp, full, f, len(seeds)), R, len(tree), reg[seeds].astype(np.int64),
                          len(keep), seeds, tuple(edges), cuts)
         return part, _State(sp, f, full, reg, q, seeds, len(keep))
 
-    def _subdivide(self, sp: Space, q: np.ndarray, reg: np.ndarray, nR: int, st: Optional[_State], oc, off):
+    def _subdivide(self, sp: Space, q: np.ndarray, reg: np.ndarray, nR: int, st: Optional[_State], oc, off, pad=None):
         """`subdivide` with the regions that did not change served from the previous solve. A region is served when it is the
         same set of cells as a region of the previous solve (every cell was a previous cell of one previous region, equally many)
         with the same room per cell: the greedy net of a region is a function of its cell set (graph, scan order) and its room,
@@ -822,7 +888,7 @@ class PartitionSolver:
             base_old = np.concatenate([[0], np.cumsum(nS_old)])
             nseed[hit] = nS_old[ro[hit]]
         if len(miss_ids):
-            mc, mlab, sc = _cut_regions(sp, q, reg, miss_ids, radius, h)
+            mc, mlab, sc = _cut_regions(sp, q, reg, miss_ids, radius, h, pad)
             nseed[miss_ids] = [len(a) for a in sc]
         base = np.concatenate([[0], np.cumsum(nseed)])
         lab = np.empty(N, np.int32)
