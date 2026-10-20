@@ -39,7 +39,7 @@ from . import weights
 from .chart_keys import assign_A, overlaps
 from .leafcover import View as CamView
 from .leafcover import select_views
-from .state import EngineState, LeafRecord, StateMismatch
+from .state import EngineState, LeafRecord, StateMismatch, TimePlane, widen_time
 from .window import to_lattice
 
 RES = 0.05                      # costmap cell (m)
@@ -52,6 +52,76 @@ RESERVED = ("undriven", "ever_blocked", "soft")
 ROUTE_UNIT_M = weights.ROUTE_UNIT_M      # route cost unit (weights.py): path costs are exact integers
 MAX_WINDOW_M = 20.0         # input validation: a leaf window side above this is refused
 POSE_SLACK_M = 5.0          # input validation: a pose may lie this far outside its window's footprint
+
+
+# Time planes (T, B, Fn, Bn and the channels' T) are int64 capture times, -1 = never. While every stamp of the engine lies within
+# +-2**30 ms of the first batch's earliest, they are held as int32 OFFSETS from a per-engine epoch (offset = stamp - epoch >= 0, -1
+# stays -1): every use is a comparison (>, ==, >= 0, max-merge), which a common offset preserves, and everything that leaves the
+# engine (export_state, the store) is widened back to the original int64. A stamp outside the range (or a negative one) switches
+# the engine, before anything is mutated, to epoch None = the plain int64 planes.
+_T_HALF = 1 << 30
+_T_MAX = (1 << 31) - 2
+
+
+def _t_range(a: np.ndarray, rows: int = 512):
+    """(min, max) of the non-negative entries of an integer plane, None when it has none; row blocks, so no full-size temporary"""
+    lo = hi = None
+    for r0 in range(0, a.shape[0], rows):
+        blk = np.asarray(a[r0:r0 + rows])
+        v = blk[blk >= 0]
+        if v.size:
+            l, h = int(v.min()), int(v.max())
+            lo = l if lo is None else min(lo, l); hi = h if hi is None else max(hi, h)
+    return lo, hi
+
+
+def _epoch_for(lo: Optional[int], hi: Optional[int]) -> Optional[int]:
+    """the epoch that holds every stamp in [lo, hi] as an int32 offset with 2**30 ms of room either side, None when they do not fit"""
+    if lo is None: return None
+    if lo < 0 or hi - lo > _T_HALF - 2: return None
+    return lo - _T_HALF
+
+
+def _edt(free: np.ndarray) -> np.ndarray:
+    """`ndimage.distance_transform_edt(free)` the way scipy forms it (feature transform, offsets to the cell, squared, summed, square
+    root: every sum is an integer below 2**53, so its root is correctly rounded), but returned as the int32 SQUARED distances when
+    they fit, with scipy's own transient (about 40 B per cell: int32 offsets, widened float64 copies) avoided by forming them in row
+    blocks. `np.sqrt(result, dtype=np.float64)` equals scipy's float64 result bit for bit. A plane whose squares do not fit int32
+    gets scipy's float64 plane."""
+    ft = ndimage.distance_transform_edt(free, return_distances=False, return_indices=True)
+    H, W = free.shape
+    out = np.empty((H, W), np.int32)
+    cols = np.arange(W, dtype=np.int64)
+    for r0 in range(0, H, 256):
+        r1 = min(H, r0 + 256)
+        dy = ft[0, r0:r1].astype(np.int64) - np.arange(r0, r1, dtype=np.int64)[:, None]
+        dx = ft[1, r0:r1].astype(np.int64) - cols
+        sq = dy * dy + dx * dx
+        if int(sq.max()) >= (1 << 31):
+            del ft
+            return ndimage.distance_transform_edt(free)
+        out[r0:r1] = sq
+    return out
+
+
+def _dt_float(d: np.ndarray) -> np.ndarray:
+    """float64 distances (a new array) of a cache entry or `_edt` result: int32 squared distances -> their roots; float64 -> a copy"""
+    return np.sqrt(d, dtype=np.float64) if d.dtype != np.float64 else d.copy()
+
+
+def _time_prop(name: str):
+    """`g._T` etc. read as the original int64 plane (a widened copy while the engine holds offsets); assignment narrows"""
+    def get(self):
+        a = getattr(self, name)
+        return a if a is None or self._tep is None else widen_time(a, self._tep)
+
+    def set_(self, v):
+        if v is not None and self._tep is not None:
+            v = np.asarray(v, np.int64); off = v - self._tep
+            if ((v >= 0) & ((off < 0) | (off > _T_MAX))).any(): raise ValueError("stamp outside the engine's int32 time range")
+            v = np.where(v >= 0, off, -1).astype(np.int32)
+        setattr(self, name, v)
+    return property(get, set_)
 
 
 def block_min(a: np.ndarray) -> np.ndarray:
@@ -244,9 +314,10 @@ class ChartGraph(SceneGraph):
         self._leaf_order: List[Tuple[int, str]] = []      # (capture time, key), kept sorted: export_state never sorts
         self._leaf_recs: Dict[str, LeafRecord] = {}       # exported records, reused until the leaf changes
         self._cx0 = self._cy0 = 0               # full-resolution global cell index of canvas cell (0, 0); even
-        self._V = self._T = self._B = None
-        self._Fn = None                         # close-evidence plane (params.near_range_m set): latest FREE time from within range
-        self._Bn = None                         # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
+        self._tep: Optional[int] = None         # epoch of the time planes below (int32 offsets) or None (plain int64 stamps)
+        self._V = self._Tr = self._Br = None    # value, latest capture time of the winner, latest time reported blocked (raw: see _tep)
+        self._Fnr = None                        # close-evidence plane (params.near_range_m set): latest FREE time from within range
+        self._Bnr = None                        # close-evidence plane: latest LETHAL time from within range (the held test uses it, not B)
         self._hold = None                       # cells the rule holds blocked, after the away-from-walls filter (only with that filter)
         self._hold_prev = (None, 0, 0)          # (_hold, cx0, cy0) before the batch being folded: the dirty box includes its changes
         self._val_h = None                      # validity per lattice cell (close-evidence rule only), set by `_build_F`
@@ -269,9 +340,22 @@ class ChartGraph(SceneGraph):
         self._pl_full = False                   # a leaf was removed or changed: rebuild the evidence
         self._rcache: dict = {}                 # routes from the anchor inside a chart, by chart content
 
+    _T, _B = _time_prop("_Tr"), _time_prop("_Br")
+    _Fn, _Bn = _time_prop("_Fnr"), _time_prop("_Bnr")
+
     # ------------------------------------------------------------------ canvas and fold
-    def _plan_canvas(self, gx0: int, gy0: int, gx1: int, gy1: int):
-        """None when [gx0, gx1) x [gy0, gy1) fits; else the new canvas geometry. Raises LeafError above max_canvas_cells."""
+    def _time_epoch(self, stamps: Sequence[int]) -> Optional[int]:
+        """The epoch the time planes will have after folding leaves with these capture times: the current one while every stamp
+        fits it, the first batch's (fresh engine) when they fit that, else None (int64 planes; never goes back)."""
+        if self._V is None:
+            return _epoch_for(min(stamps), max(stamps))
+        ep = self._tep
+        if ep is None: return None
+        return ep if all(0 <= s - ep <= _T_MAX for s in stamps) else None
+
+    def _plan_canvas(self, gx0: int, gy0: int, gx1: int, gy1: int, tep=False):
+        """None when [gx0, gx1) x [gy0, gy1) fits (and the time planes keep their epoch, `tep`: see `_time_epoch`); else the new
+        canvas geometry. Raises LeafError above max_canvas_cells."""
         if self._V is None:
             cx0 = (gx0 - MARGIN) // 2 * 2; cy0 = (gy0 - MARGIN) // 2 * 2
             W = (gx1 + MARGIN - cx0 + 1) // 2 * 2; H = (gy1 + MARGIN - cy0 + 1) // 2 * 2
@@ -279,11 +363,13 @@ class ChartGraph(SceneGraph):
         else:
             h, w = self._V.shape
             if gx0 >= self._cx0 and gy0 >= self._cy0 and gx1 <= self._cx0 + w and gy1 <= self._cy0 + h:
-                return None
+                if tep is False or tep == self._tep: return None
+                return dict(fresh=False, cx0=self._cx0, cy0=self._cy0, H=h, W=w, oy=0, ox=0, h=h, w=w, tep=tep)   # time mode switch only
             nx0 = min(self._cx0, (gx0 - MARGIN) // 2 * 2); ny0 = min(self._cy0, (gy0 - MARGIN) // 2 * 2)
             nx1 = max(self._cx0 + w, gx1 + MARGIN); ny1 = max(self._cy0 + h, gy1 + MARGIN)
             plan = dict(fresh=False, cx0=nx0, cy0=ny0, H=(ny1 - ny0 + 1) // 2 * 2, W=(nx1 - nx0 + 1) // 2 * 2,
                         oy=self._cy0 - ny0, ox=self._cx0 - nx0, h=h, w=w)
+        plan["tep"] = self._tep if tep is False else tep
         if plan["H"] * plan["W"] > self.max_canvas_cells:
             raise LeafError(None, f"the batch needs a canvas of {plan['H']} x {plan['W']} cells, above the bound "
                                   f"{self.max_canvas_cells} (an absurd pose?)")
@@ -292,26 +378,38 @@ class ChartGraph(SceneGraph):
     def _grow_canvas(self, plan):
         """Allocate the grown planes WITHOUT touching the state (a MemoryError leaves the engine as it was)."""
         H, W, oy, ox, h, w = plan["H"], plan["W"], plan["oy"], plan["ox"], plan["h"], plan["w"]
+        tep = plan["tep"]
+        tdt = np.int64 if tep is None else np.int32
         if plan["fresh"]:
-            return dict(V=np.full((H, W), 255, np.uint8), T=-np.ones((H, W), np.int64), B=-np.ones((H, W), np.int64),
-                        Fn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
-                        Bn=None if self.params.near_range_m is None else -np.ones((H, W), np.int64),
-                        chan={}, kp=None)
+            return dict(V=np.full((H, W), 255, np.uint8), Tr=-np.ones((H, W), tdt), Br=-np.ones((H, W), tdt),
+                        Fnr=None if self.params.near_range_m is None else -np.ones((H, W), tdt),
+                        Bnr=None if self.params.near_range_m is None else -np.ones((H, W), tdt),
+                        chan={}, kp=None, tep=tep)
 
         def grow(a, fill):
             b = np.full((H, W), fill, a.dtype); b[oy:oy + h, ox:ox + w] = a; return b
-        out = dict(V=grow(self._V, 255), T=grow(self._T, -1), B=grow(self._B, -1),
-                   Fn=None if self._Fn is None else grow(self._Fn, -1),
-                   Bn=None if self._Bn is None else grow(self._Bn, -1),
-                   chan={k: (grow(v, 255), grow(t, -1)) for k, (v, t) in self._chan.items()}, kp=None)
+
+        def grow_t(a):
+            """a time plane into the new canvas; an epoch change (int32 offsets -> int64 stamps only) widens it row block by row block"""
+            b = np.full((H, W), -1, tdt)
+            if tep == self._tep:
+                b[oy:oy + h, ox:ox + w] = a
+            else:
+                for r0 in range(0, h, 512):
+                    b[oy + r0:oy + min(h, r0 + 512), ox:ox + w] = widen_time(a[r0:r0 + 512], self._tep)
+            return b
+        out = dict(V=grow(self._V, 255), Tr=grow_t(self._Tr), Br=grow_t(self._Br),
+                   Fnr=None if self._Fnr is None else grow_t(self._Fnr),
+                   Bnr=None if self._Bnr is None else grow_t(self._Bnr),
+                   chan={k: (grow(v, 255), grow_t(t)) for k, (v, t) in self._chan.items()}, kp=None, tep=tep)
         if self._key_plane is not None:
             kp = np.full((H // 2, W // 2), -1, self._key_plane.dtype)
             kp[oy // 2:oy // 2 + h // 2, ox // 2:ox // 2 + w // 2] = self._key_plane; out["kp"] = kp
         return out
 
     def _commit_canvas(self, plan, arrays) -> Tuple[int, int]:
-        self._V, self._T, self._B, self._chan = arrays["V"], arrays["T"], arrays["B"], arrays["chan"]
-        self._Fn, self._Bn = arrays["Fn"], arrays["Bn"]
+        self._V, self._Tr, self._Br, self._chan = arrays["V"], arrays["Tr"], arrays["Br"], arrays["chan"]
+        self._Fnr, self._Bnr, self._tep = arrays["Fnr"], arrays["Bnr"], arrays["tep"]
         if arrays["kp"] is not None: self._key_plane = arrays["kp"]
         self._cx0, self._cy0 = plan["cx0"], plan["cy0"]
         return (0, 0) if plan["fresh"] else (plan["oy"] // 2, plan["ox"] // 2)
@@ -451,7 +549,7 @@ class ChartGraph(SceneGraph):
             return Dirty(None, [], {}, [], self._watermark)
         plan = grown = None
         if bounds is not None:
-            plan = self._plan_canvas(*bounds)                        # LeafError above the canvas bound
+            plan = self._plan_canvas(*bounds, self._time_epoch([int(lf.stamp_ms) for lf, *_ in prepared]))   # LeafError above the bound
             if plan is not None: grown = self._grow_canvas(plan)     # a MemoryError here changes nothing
         # ---- mutation: from here an escaping exception leaves the state undefined => the engine is FAULTED
         old = self._solved
@@ -478,8 +576,8 @@ class ChartGraph(SceneGraph):
             x0, y0 = max(region[0] - self._cx0, 0), max(region[1] - self._cy0, 0)
             x1, y1 = min(region[2] - self._cx0, self._V.shape[1]), min(region[3] - self._cy0, self._V.shape[0])
             if x0 < x1 and y0 < y1:
-                self._V[y0:y1, x0:x1] = 255; self._T[y0:y1, x0:x1] = -1; self._B[y0:y1, x0:x1] = -1
-                if self._Fn is not None: self._Fn[y0:y1, x0:x1] = -1; self._Bn[y0:y1, x0:x1] = -1
+                self._V[y0:y1, x0:x1] = 255; self._Tr[y0:y1, x0:x1] = -1; self._Br[y0:y1, x0:x1] = -1
+                if self._Fnr is not None: self._Fnr[y0:y1, x0:x1] = -1; self._Bnr[y0:y1, x0:x1] = -1
                 for v, t in self._chan.values():
                     v[y0:y1, x0:x1] = 255; t[y0:y1, x0:x1] = -1
         touched = None                                   # global full-resolution cells whose value, time or blocked time changed
@@ -491,16 +589,18 @@ class ChartGraph(SceneGraph):
             touched = g if touched is None else (min(touched[0], g[0]), min(touched[1], g[1]), max(touched[2], g[2]), max(touched[3], g[3]))
         for lf, w, gx, gy, chans in prepared:
             pose = None
-            if self._Fn is not None:
+            if self._Fnr is not None:
                 p = self.params
                 pose = (lf.x, lf.y, p.near_range_m)
-            grow_touched(self._fold_into(self._V, self._T, w, gx, gy, self._cx0, self._cy0, lf.stamp_ms, self._B,
-                                         self._Fn, pose, self._Bn))
+            ts = int(lf.stamp_ms) - (self._tep or 0)                     # the stamp as the time planes hold it
+            grow_touched(self._fold_into(self._V, self._Tr, w, gx, gy, self._cx0, self._cy0, ts, self._Br,
+                                         self._Fnr, pose, self._Bnr))
             for name, cw in chans.items():
                 if name not in self._chan:
-                    self._chan[name] = (np.full(self._V.shape, 255, np.uint8), -np.ones(self._V.shape, np.int64))
+                    self._chan[name] = (np.full(self._V.shape, 255, np.uint8),
+                                        -np.ones(self._V.shape, np.int64 if self._tep is None else np.int32))
                 v, t = self._chan[name]
-                grow_touched(self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, lf.stamp_ms))
+                grow_touched(self._fold_into(v, t, cw, gx, gy, self._cx0, self._cy0, ts))
             rec = _Rec(lf.session, lf.stamp_ms, lf.x, lf.y, lf.r_d,
                        None if lf.view is None else CamView(lf.key, lf.view.x, lf.view.y, lf.view.yaw, lf.view.fov, lf.view.rng))
             old_rec = self._leaves.get(lf.key)
@@ -516,7 +616,9 @@ class ChartGraph(SceneGraph):
         self._solve(shift, birth)
         if moved: self.version += 1
         # the dirty box is where cells actually changed (and the area of a refold), not where windows were laid down
-        return self._dirty(old, old_sig, old_link_sig, old_keys, touched, region)
+        dirty = self._dirty(old, old_sig, old_link_sig, old_keys, touched, region)
+        self._hold_prev = (None, 0, 0)                   # only the dirty box above reads it: do not keep the previous plane alive
+        return dirty
 
     # ------------------------------------------------------------------ F(r), evidence
     def _polylines(self) -> Dict[float, np.ndarray]:
@@ -579,53 +681,66 @@ class ChartGraph(SceneGraph):
         self._ecache = (free, sq)
         return sq
 
-    def _clearance_cells(self, free: np.ndarray, shift: Tuple[int, int]) -> np.ndarray:
+    def _clearance_cells(self, free: np.ndarray, shift: Tuple[int, int], scale: Optional[float] = None) -> np.ndarray:
         """`distance_transform_edt(free)`, recomputed only where it can have changed.  A cell outside the changed box grown by R (the largest
         distance of the previous map) keeps its value: its nearest blocked cell was within R and is untouched, and a newly blocked cell is
         farther than R.  Inside, the transform of a window is exact for every cell whose value does not exceed its distance to the window's
         edge (anything blocked outside the window is farther than that); the window widens until that holds for the whole box.  New canvas
         area counts as changed (it was not part of the previous transform)."""
         c, self._dcache = self._dcache, None
+        # the cache holds the squared distances as int32 (4 B per cell; `_edt`), or scipy's float64 plane when they do not fit; what
+        # is returned is always the float64 plane scipy gives
+        scaled = lambda dt, owned: dt if scale is None else ((dt.__imul__(scale)) if owned else dt * scale)
         if c is None:
-            dt = ndimage.distance_transform_edt(free)
-            self._dcache = (free, dt)
-            return dt
+            d = _edt(free); self._dcache = (free, d)
+            return scaled(_dt_float(d), True) if d.dtype != np.float64 else scaled(d, False)
         fp, dp = c
         H, W = free.shape
         newarea = None
         if fp.shape != free.shape:
             oy, ox = 2 * shift[0], 2 * shift[1]
             if oy + fp.shape[0] > H or ox + fp.shape[1] > W:
-                dt = ndimage.distance_transform_edt(free); self._dcache = (free, dt); return dt
+                d = _edt(free); self._dcache = (free, d)
+                return scaled(_dt_float(d), True) if d.dtype != np.float64 else scaled(d, False)
             f2 = np.zeros_like(free); f2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = fp
-            d2 = np.zeros(free.shape); d2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = dp
+            d2 = np.zeros(free.shape, dp.dtype); d2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = dp
             newarea = np.ones(free.shape, bool); newarea[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = False
             fp, dp = f2, d2
+        packed = dp.dtype != np.float64
         ch = fp != free
         if newarea is not None: ch |= newarea
         if not ch.any():
             self._dcache = (free, dp)
-            return dp
+            return scaled(_dt_float(dp), True) if packed else scaled(dp, False)
         rows = np.nonzero(ch.any(1))[0]; cols = np.nonzero(ch.any(0))[0]
-        R = int(math.ceil(float(dp.max()))) + 1
+        del ch, newarea
+        R = int(math.ceil(math.sqrt(int(dp.max())) if packed else float(dp.max()))) + 1
         ey0, ey1 = max(0, rows[0] - R), min(H, rows[-1] + 1 + R)
         ex0, ex1 = max(0, cols[0] - R), min(W, cols[-1] + 1 + R)
         rw = R + 1
         while True:
             wy0, wy1, wx0, wx1 = max(0, ey0 - rw), min(H, ey1 + rw), max(0, ex0 - rw), min(W, ex1 + rw)
-            dtw = ndimage.distance_transform_edt(free[wy0:wy1, wx0:wx1])
-            sub = dtw[ey0 - wy0:ey1 - wy0, ex0 - wx0:ex1 - wx0]
+            dw = _edt(free[wy0:wy1, wx0:wx1])
+            subd = dw[ey0 - wy0:ey1 - wy0, ex0 - wx0:ex1 - wx0]
+            sub = np.sqrt(subd, dtype=np.float64) if subd.dtype != np.float64 else subd
+            del dw
+            if wy0 == 0 and wy1 == H and wx0 == 0 and wx1 == W: break
+            # `sub <= bound` with bound the least of four per-side distances to the window edge (inf on a side that is the canvas
+            # edge): tested one side at a time, which is the same set of comparisons without a plane-sized `bound`
             yy = np.arange(ey0, ey1)[:, None]; xx = np.arange(ex0, ex1)[None, :]
             inf = np.inf
-            bound = np.minimum(np.minimum(np.where(wy0 > 0, yy - wy0 + 1.0, inf), np.where(wy1 < H, wy1 - yy, inf)),
-                               np.minimum(np.where(wx0 > 0, xx - wx0 + 1.0, inf), np.where(wx1 < W, wx1 - xx, inf)))
-            full_window = wy0 == 0 and wy1 == H and wx0 == 0 and wx1 == W
-            if full_window or bool((sub <= bound).all()): break
+            by = np.minimum(np.where(wy0 > 0, yy - wy0 + 1.0, inf), np.where(wy1 < H, wy1 - yy, inf))
+            bx = np.minimum(np.where(wx0 > 0, xx - wx0 + 1.0, inf), np.where(wx1 < W, wx1 - xx, inf))
+            if bool((sub <= by).all()) and bool((sub <= bx).all()): break
             rw *= 2
-        dt = dp.copy()
+        if packed and subd.dtype != np.float64:
+            dp[ey0:ey1, ex0:ex1] = subd                          # the cache entry is ours (taken above, or a fresh grown copy)
+            self._dcache = (free, dp)
+            return scaled(_dt_float(dp), True)
+        dt = _dt_float(dp)
         dt[ey0:ey1, ex0:ex1] = sub
-        self._dcache = (free, dt)
-        return dt
+        self._dcache = (free, dt)                                # a box that does not fit int32 keeps the plane in float64 from here on
+        return scaled(dt, False)
 
     def _disc(self, thr: float) -> np.ndarray:
         """offsets whose distance, computed exactly as the distance transform does (sqrt of the integer square, times the lattice step), is within thr"""
@@ -728,10 +843,10 @@ class ChartGraph(SceneGraph):
         V = self._V
         free = (V != 255) & (V < 100)
         hold_v = None
-        if self._Fn is not None:
+        if self._Fnr is not None:
             # close evidence: reported lethal from within range more recently than seen free from within range (and, with
             # near_min_clearance_m, away from walls). A lethal from beyond the range is not true evidence: a later free retracts it.
-            lethal = (self._Bn >= 0) & (self._Bn > self._Fn)
+            lethal = (self._Bnr >= 0) & (self._Bnr > self._Fnr)
             held = (V < 100) & lethal
             if self.params.near_min_clearance_m is not None:
                 held = _away_from_walls(held, V >= 100, self.params.near_min_clearance_m) if held.any() else held
@@ -741,11 +856,11 @@ class ChartGraph(SceneGraph):
             # lethal, or a later far report); a free cell is held exactly as above
             hold_v = np.where(V < 100, held, lethal)
         sq = self._erode(free, shift)
-        clr = self._clearance_cells(free, shift) * RES
+        clr = self._clearance_cells(free, shift, RES)         # distance in cells * RES (the cache keeps the unscaled plane)
         self._clr_price_h = block_min(clr)          # pricing only; `clr_h` (top-left) feeds the partition, charts and link widths
         sq_h, fr_h, clr_h = sq[::LAT, ::LAT], free[::LAT, ::LAT], clr[::LAT, ::LAT]
         G, W, S, P = self._evidence(sq_h.shape, shift)
-        self._val_h = None if hold_v is None else ((self._Fn >= 0)[::LAT, ::LAT] & ~hold_v[::LAT, ::LAT]) | (G | W | P)
+        self._val_h = None if hold_v is None else ((self._Fnr[::LAT, ::LAT] >= 0) & ~hold_v[::LAT, ::LAT]) | (G | W | P)
         # the body stood at a leaf pose: the cells W proves there are free even where the window is unknown (a camera blind spot
         # under the robot); a REPORTED blocked cell stays blocked. Along the chord between two poses only known-free cells count.
         cand = sq_h | (W & fr_h) | (P & (V == 255)[::LAT, ::LAT])
@@ -809,7 +924,7 @@ class ChartGraph(SceneGraph):
         # channels on the lattice
         V = self._V
         v = V[::LAT, ::LAT]
-        ch = {"undriven": (~S).astype(float), "ever_blocked": (self._B[::LAT, ::LAT] >= 0).astype(float),
+        ch = {"undriven": (~S).astype(float), "ever_blocked": (self._Br[::LAT, ::LAT] >= 0).astype(float),
               "soft": np.where((v > 0) & (v < 100), v / 99.0, 0.0)}
         for name, (cv, _) in self._chan.items():
             w = cv[::LAT, ::LAT]; ch[name] = np.where((w > 0) & (w < 100), w / 99.0, 0.0)
@@ -947,9 +1062,12 @@ class ChartGraph(SceneGraph):
                 if sy + op.shape[0] <= s.plane.shape[0] and sx + op.shape[1] <= s.plane.shape[1]:
                     big = -np.ones(s.plane.shape, op.dtype); big[sy:sy + op.shape[0], sx:sx + op.shape[1]] = op; op = big
             if op is not None and op.shape == s.plane.shape:
-                a = np.where(op >= 0, np.array([self._hash(k) for k in old.keys] + [0])[op], 0) if len(old.keys) else np.zeros(s.plane.shape)
-                b = np.where(s.plane >= 0, np.array([self._hash(k) for k in s.keys] + [0])[s.plane], 0) if len(s.keys) else np.zeros(s.plane.shape)
-                changed_cells = a != b
+                # the key hash of each cell's owner (0 outside every chart: the trailing entry, index -1), compared row block by row
+                # block: the same booleans as comparing two full hash planes, without holding them
+                lut_a = np.array([self._hash(k) for k in old.keys] + [0]); lut_b = np.array([self._hash(k) for k in s.keys] + [0])
+                changed_cells = np.empty(s.plane.shape, bool)
+                for r0 in range(0, s.plane.shape[0], 256):
+                    changed_cells[r0:r0 + 256] = lut_a[op[r0:r0 + 256]] != lut_b[s.plane[r0:r0 + 256]]
         self._sig, self._link_sig = sig, link_sig
         changed = sorted(k for k in sig if old_sig.get(k) != sig[k])
         retired = {k: v for k, v in getattr(self, "_retired_map", {}).items()}
@@ -1274,13 +1392,20 @@ class ChartGraph(SceneGraph):
                                                   None if l.view is None else (l.view.x, l.view.y, l.view.yaw, l.view.fov, l.view.rng))
         return r
 
-    def export_state(self) -> EngineState:
-        """The resumable state, by reference (the arrays are not copied: the store slices them into tiles)."""
+    def export_state(self, lazy: bool = False) -> EngineState:
+        """The resumable state, by reference (the arrays are not copied: the store slices them into tiles). The time planes are
+        int64 arrays; while the engine holds them as int32 offsets they are widened copies, unless `lazy`: then they are
+        `TimePlane` views whose slices are the same int64 values (what a tile reader wants, without widening the whole canvas)."""
         self._check()
         p = self.params
+        ep = self._tep
+        if ep is None: wide = lambda a: a
+        elif lazy: wide = lambda a: None if a is None else TimePlane(a, ep)
+        else: wide = lambda a: None if a is None else widen_time(a, ep)
         st = EngineState(params=_state_params(p),
-                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=self._T, B=self._B, Fn=self._Fn, Bn=self._Bn, Hold=self._hold,
-                         Val=self._val_h, chan=dict(self._chan),
+                         cx0=self._cx0, cy0=self._cy0, V=self._V, T=wide(self._Tr), B=wide(self._Br), Fn=wide(self._Fnr),
+                         Bn=wide(self._Bnr), Hold=self._hold,
+                         Val=self._val_h, chan={k: (v, wide(t)) for k, (v, t) in self._chan.items()},
                          leaves=[self._leaf_record(k) for _, k in self._leaf_order],
                          version=self.version, watermark=self._watermark)
         s = self._solved
@@ -1289,11 +1414,16 @@ class ChartGraph(SceneGraph):
             st.plane = s.plane
         return st
 
-    def import_state(self, st: EngineState, verify: bool = True) -> None:
+    def export_state_lazy(self) -> EngineState:
+        """`export_state(lazy=True)`: for a reader that slices the planes (the store's save) or wants only the leaf records"""
+        return self.export_state(lazy=True)
+
+    def import_state(self, st: EngineState, verify: bool = True, release: bool = False) -> None:
         """Resume from `st` on a fresh engine: planes and evidence are taken as they are, then F and the partition are
         rebuilt (both are functions of the planes and the evidence) and must reproduce the stored owner plane cell for cell;
         the stored keys are then the keys of the rebuilt charts. The canvas is padded by MARGIN so that the distance to the
-        non-navigable cells near the stored edge sees unknown, as it did before."""
+        non-navigable cells near the stored edge sees unknown, as it did before. `release=True`: the caller will not use `st` again, so
+        its V / T / B / Fn / Bn / chan planes are dropped (set to None) as soon as their padded copies exist (lower peak)."""
         p = self.params
         if st.params != _state_params(p):
             raise ValueError("state was made with other parameters (%r, this engine %r): a store written with the close-evidence "
@@ -1302,17 +1432,57 @@ class ChartGraph(SceneGraph):
         if self._V is not None:
             raise ValueError("import_state needs a fresh engine")
         pad = MARGIN
-        padf = lambda a, fill: np.pad(a, pad, constant_values=fill)
-        padl = lambda a, fill: np.pad(a, pad // 2, constant_values=fill)
+
+        def padf(a, fill):                                   # np.pad(a, pad, constant_values=fill), one allocation
+            a = np.asarray(a); b = np.full((a.shape[0] + 2 * pad, a.shape[1] + 2 * pad), fill, a.dtype); b[pad:-pad, pad:-pad] = a
+            return b
+
+        def padl(a, fill, dt):                               # np.pad(a.astype(dt), pad // 2, constant_values=fill), one allocation
+            q = pad // 2; b = np.full((a.shape[0] + 2 * q, a.shape[1] + 2 * q), fill, dt); b[q:-q, q:-q] = a
+            return b
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
-        self._V, self._T, self._B = padf(st.V, 255), padf(st.T, -1), padf(st.B, -1)
+        self._V = padf(st.V, 255)
+        if release: st.V = None
         if p.near_range_m is not None and (st.Fn is None or st.Bn is None or st.Val is None):
             raise ValueError("state has no close-evidence planes (Fn, Bn, Val): it was made before the validity plane (pipeline "
                              "morse/2+valid carries it; the earlier rule-on tokens do not) and must be rebuilt, not resumed")
-        self._Fn = None if p.near_range_m is None else padf(st.Fn, -1)
-        self._Bn = None if p.near_range_m is None else padf(st.Bn, -1)
+        # time planes: int32 offsets from an epoch when every stamp of the state (planes and leaves) fits, else int64 as stored
+        tplanes = [np.asarray(a) for a in (st.T, st.B) + ((st.Fn, st.Bn) if p.near_range_m is not None else ())]
+        tplanes += [np.asarray(t) for _, t in st.chan.values()]
+        lo = hi = None
+        for a in tplanes:
+            l, h = _t_range(a)
+            if l is not None: lo = l if lo is None else min(lo, l); hi = h if hi is None else max(hi, h)
+        for l in st.leaves:
+            lo = int(l.t) if lo is None else min(lo, int(l.t)); hi = int(l.t) if hi is None else max(hi, int(l.t))
+        ep = _epoch_for(lo, hi)
+        tdt = np.int64 if ep is None else np.int32
+
+        def padt(a):
+            a = np.asarray(a); b = np.full((a.shape[0] + 2 * pad, a.shape[1] + 2 * pad), -1, tdt)
+            for r0 in range(0, a.shape[0], 512):
+                blk = a[r0:r0 + 512]
+                if ep is None: b[pad + r0:pad + r0 + len(blk), pad:-pad] = blk
+                else:
+                    o = blk.astype(np.int64) - ep; o[blk < 0] = -1; b[pad + r0:pad + r0 + len(blk), pad:-pad] = o
+            return b
+        self._tep = ep
+        del tplanes
+        a = None
+        self._Tr = padt(st.T)
+        if release: st.T = None
+        self._Br = padt(st.B)
+        if release: st.B = None
+        self._Fnr = None if p.near_range_m is None else padt(st.Fn)
+        self._Bnr = None if p.near_range_m is None else padt(st.Bn)
+        if release: st.Fn = st.Bn = None
         self._hold = None
-        self._chan = {k: (padf(v, 255), padf(t, -1)) for k, (v, t) in st.chan.items()}
+        self._chan = {}
+        for k in list(st.chan):
+            v, t = st.chan[k]
+            self._chan[k] = (padf(v, 255), padt(t))
+            if release: del st.chan[k]
+            v = t = None
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,
                                     None if l.view is None else CamView(l.key, *l.view)) for l in st.leaves}
         self._leaf_order = sorted((l.t, l.key) for l in st.leaves)
@@ -1327,7 +1497,7 @@ class ChartGraph(SceneGraph):
             if p.near_range_m is not None:                      # the hold and validity planes of the planes (an export must carry them)
                 self._build_F(); self._verify_val(st, verify)
             return
-        self._key_plane = padl(st.plane.astype(np.int32), -1)
+        self._key_plane = padl(st.plane, -1, np.int32)
         nav, clr, S = self._build_F()
         if st.Hold is not None and verify and self._hold is not None:
             if not np.array_equal(padf(st.Hold, False), self._hold):

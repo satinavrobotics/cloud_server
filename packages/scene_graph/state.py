@@ -11,6 +11,50 @@ class StateMismatch(Exception):
     """a restored engine does not reproduce the stored state (key table or owner plane): the snapshot or the code that read it is wrong."""
 
 
+class TimePlane:
+    """Read-only int64 view of a time plane the engine keeps as int32 offsets from an epoch (-1 = never stays -1).
+    Slicing returns the original int64 values, so a tile reader (`store._slice`) sees exactly what a full int64 plane holds,
+    without the engine widening the whole canvas. `np.asarray(plane)` widens all of it."""
+    dtype = np.dtype(np.int64)
+    ndim = 2
+
+    def __init__(self, raw: np.ndarray, epoch: int):
+        self.raw, self.epoch = raw, int(epoch)
+
+    @property
+    def shape(self):
+        return self.raw.shape
+
+    @property
+    def size(self):
+        return self.raw.size
+
+    @property
+    def nbytes(self):
+        return self.raw.size * 8
+
+    def __len__(self):
+        return len(self.raw)
+
+    def __getitem__(self, key):
+        r = self.raw[key]
+        if np.ndim(r) == 0:
+            return int(r) + self.epoch if r >= 0 else -1
+        return widen_time(r, self.epoch)
+
+    def __array__(self, dtype=None, copy=None):
+        a = widen_time(self.raw, self.epoch)
+        return a if dtype is None else a.astype(dtype, copy=False)
+
+
+def widen_time(r: np.ndarray, epoch: int) -> np.ndarray:
+    """int32 offsets -> the int64 stamps they stand for (negative = never -> -1)"""
+    out = r.astype(np.int64)
+    out += epoch
+    out[r < 0] = -1
+    return out
+
+
 @dataclass
 class LeafRecord:
     key: str

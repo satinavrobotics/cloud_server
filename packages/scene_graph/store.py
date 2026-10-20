@@ -246,7 +246,7 @@ class SceneGraphStore:
         else:
             raise ValueError("generation is neither current nor begun")
         prev = self._manifest_by_name(map_id, pending.get("manifest") if pend else (meta or {}).get("manifest"))
-        st = sg.export_state()
+        st = getattr(sg, "export_state_lazy", sg.export_state)()          # time planes as views: a tile is widened on its own
         if st.V is None:
             raise ValueError("nothing to save: the engine has no state")
         if pend and pending.get("params_hash") and pending["params_hash"] != params_hash(st.params, _pipeline(st.params)):
@@ -669,8 +669,9 @@ class SceneGraphStore:
                          leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
+        del V, T, B, Fn, Bn, chan                                   # the state owns the planes; import_state frees them as it pads them
         g = ChartGraph(SceneParams(**p))
-        g.import_state(st, verify=verify)
+        g.import_state(st, verify=verify, release=True)
         if [_fmt(k) for k in g._keys] != [c["key"] for c in charts]:
             raise StateMismatch("restored keys differ from the stored key table")
         return g
