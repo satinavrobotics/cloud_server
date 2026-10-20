@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from packages import config
+from packages.migration.autosync import AutoSync, PgSyncStore
 from packages.migration.export import PARTS, object_part
 from packages.migration.jobs import TransferError, TransferManager
 from packages.migration.stores import ServiceMapSource
@@ -82,11 +83,11 @@ def _server_description() -> Dict[str, Any]:
     return {"name": si.name, "server_id": si.server_id, "kind": si.kind, "version": si.version}
 
 
-def manager(request: Request) -> TransferManager:
-    service = getattr(request.app.state, "service", None)
+def transfer_manager(app: Any) -> TransferManager:
+    service = getattr(app.state, "service", None)
     if service is None:
         raise HTTPException(503, "Service not initialized")
-    mgr = getattr(request.app.state, "transfer", None)
+    mgr = getattr(app.state, "transfer", None)
     if mgr is None:
         from packages.api import maps
         mgr = TransferManager(
@@ -94,8 +95,66 @@ def manager(request: Request) -> TransferManager:
             info=_server_description(),
             keep_hours=config.TRANSFER_KEEP_HOURS, max_bundle_bytes=config.TRANSFER_MAX_BUNDLE_BYTES,
             refuse_open_session=maps.refuse_open_session)
-        request.app.state.transfer = mgr
+        app.state.transfer = mgr
     return mgr
+
+
+def manager(request: Request) -> TransferManager:
+    return transfer_manager(request.app)
+
+
+class _Leader:
+    """Holds a Postgres advisory lock on its own connection for as long as this process runs the sync loop: one server process syncs at a time."""
+
+    def __init__(self, database: Any):
+        self.db, self.conn = database, None
+
+    async def __call__(self) -> bool:
+        if self.conn is not None and not self.conn.closed:
+            return True
+        from packages.api.entrypoint import advisory_lock_key
+        conn = await self.db.dedicated_connection()
+        cur = await conn.execute("SELECT pg_try_advisory_lock(%s)", (advisory_lock_key("transfer_autosync"),))
+        if (await cur.fetchone())[0]:
+            self.conn = conn
+            return True
+        await conn.close()
+        return False
+
+    async def release(self) -> None:
+        if self.conn is not None:
+            await self.conn.close()
+            self.conn = None
+
+
+def autosync_of(app: Any) -> AutoSync:
+    sync = getattr(app.state, "autosync", None)
+    if sync is None:
+        mgr = transfer_manager(app)
+        service = app.state.service
+
+        async def local_bags() -> List[Dict[str, Any]]:
+            return await asyncio.to_thread(_list_rosbags, mgr)
+
+        async def local_runs() -> List[Dict[str, Any]]:
+            from packages.migration.stores import list_runs
+            return await list_runs(mgr.database)
+        app.state.autosync_leader = _Leader(service.database)
+        sync = AutoSync(mgr, PgSyncStore(service.database), local_runs, local_bags, leader=app.state.autosync_leader)
+        app.state.autosync = sync
+    return sync
+
+
+def start_autosync(app: Any) -> None:
+    """Called once the service is up: the loop idles until sync is switched on in the settings."""
+    autosync_of(app).start()
+
+
+async def stop_autosync(app: Any) -> None:
+    sync = getattr(app.state, "autosync", None)
+    if sync is not None:
+        await sync.stop()
+        await app.state.autosync_leader.release()
 
 
 def _guard(fn):
@@ -117,6 +176,37 @@ def _list_rosbags(mgr: TransferManager) -> List[Dict[str, Any]]:
     except Exception:  # noqa: BLE001 - the listing must not fail because recordings cannot be listed
         logger.exception("Could not list rosbag recordings")
         return []
+
+
+class SyncSettings(BaseModel):
+    enabled: bool = False
+    destination_url: str = ""
+    interval_min: int = 15
+    history: bool = True
+    rosbags: bool = True
+
+
+@router.get("/sync")
+@_guard
+async def get_sync(request: Request):
+    """Automatic sync: `{settings, status}`. `status`: running, started_at / finished_at (epoch s), ok, error, note, sent, counts."""
+    return await autosync_of(request.app).get()
+
+
+@router.put("/sync")
+@_guard
+async def put_sync(body: SyncSettings, request: Request):
+    """Switch automatic sync on or off and say where to, how often (minutes) and what (history, recordings). Maps are not synced automatically."""
+    return await autosync_of(request.app).put(body.dict())
+
+
+@router.post("/sync/run", status_code=202)
+@_guard
+async def run_sync_now(request: Request):
+    """Run a sync cycle now instead of waiting for the interval (only if sync is switched on)."""
+    sync = autosync_of(request.app)
+    sync.run_now()
+    return await sync.get()
 
 
 @router.get("/maps")

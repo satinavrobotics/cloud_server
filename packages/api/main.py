@@ -352,11 +352,14 @@ async def lifespan(app: FastAPI):
     health_checker.add_dependency("database", lambda: service.database.is_running(), critical=True)
 
     app.state.service = service
+    from packages.api.data_transfer import start_autosync, stop_autosync
+    start_autosync(app)                 # idles until automatic sync is switched on (Servers page)
 
     logging.info("✅ API Delegation Service started")
 
     yield
 
+    await stop_autosync(app)
     if service:
         service.stop_watchers()
         await service.map_deleter.stop()
