@@ -16,7 +16,11 @@ what has to be done ON THE PI; none of it can be done from the server.
    use the official 5.1 V / 3 A supply and a short cable. Under-voltage throttles the CPU at random moments.
 4. **Reconstruction off** on the Pi (`RECON_MEM_LIMIT` 768m would push the limit sum to ~4.06 GiB > 3.7 GiB RAM).
    Without it the limits sum to ~3.3 GiB.
-5. **Free RAM / swap**: `free -m` before starting; stop anything not in the stack.
+5. **Route inflation** (planned routes keep away from objects; set on the server 2026-10-21): add to `.env.robot`
+   `SCENE_GRAPH_INFLATION_RADIUS_M=0.8`, `SCENE_GRAPH_INFLATION_SCALING=6`, `SCENE_GRAPH_SAFETY_KAPPA=1`, then deploy
+   (the planner reads them at start). Without them the Pi's planner uses the old hinge (no buffer beyond the robot's
+   circumscribed radius).
+6. **Free RAM / swap**: `free -m` before starting; stop anything not in the stack.
 
 ## Diagnose the last run (should, 5 minutes)
 
