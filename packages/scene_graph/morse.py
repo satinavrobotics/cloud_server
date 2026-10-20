@@ -537,11 +537,16 @@ def arcs(sp: Space, full: np.ndarray, f: np.ndarray, g: Optional[np.ndarray] = N
     Nn, E, S, Wn = sp.neighbours()
     y, x = sp.ys.astype(np.int64), sp.xs.astype(np.int64)
     ei, ej, ev0, ev1 = [], [], [], []
-    for nb, v0, v1 in ((E, y * W1 + x + 1, (y + 1) * W1 + x + 1), (S, (y + 1) * W1 + x, (y + 1) * W1 + x + 1)):
+    # The corner ids are formed for the selected cells only: corner (dy, dx) of cell (y, x) is (y + dy) * W1 + x + dx, the
+    # integer the full-length formula gives at that cell.
+    for nb, c0, c1 in ((E, (0, 1), (1, 1)), (S, (1, 0), (1, 1))):
         i = np.nonzero(nb >= 0)[0]
         j = nb[i].astype(np.int64)
         k = full[i] != full[j]
-        ei.append(i[k]); ej.append(j[k]); ev0.append(v0[i[k]]); ev1.append(v1[i[k]])
+        ik = i[k]
+        yk, xk = y[ik], x[ik]
+        ei.append(ik); ej.append(j[k])
+        ev0.append((yk + c0[0]) * W1 + xk + c0[1]); ev1.append((yk + c1[0]) * W1 + xk + c1[1])
     ei, ej, ev0, ev1 = (np.concatenate(v) for v in (ei, ej, ev0, ev1))
     nE = len(ei)
     if nE == 0:
@@ -550,10 +555,10 @@ def arcs(sp: Space, full: np.ndarray, f: np.ndarray, g: Optional[np.ndarray] = N
     nV = (sp.H + 1) * W1
     # boundary edges: a cell of F next to a cell that is not
     bv = []
-    for nb, v0, v1 in ((Nn, y * W1 + x, y * W1 + x + 1), (E, y * W1 + x + 1, (y + 1) * W1 + x + 1),
-                       (S, (y + 1) * W1 + x, (y + 1) * W1 + x + 1), (Wn, y * W1 + x, (y + 1) * W1 + x)):
+    for nb, c0, c1 in ((Nn, (0, 0), (0, 1)), (E, (0, 1), (1, 1)), (S, (1, 0), (1, 1)), (Wn, (0, 0), (1, 0))):
         m = nb < 0
-        bv.append(v0[m]); bv.append(v1[m])
+        ym, xm = y[m], x[m]
+        bv.append((ym + c0[0]) * W1 + xm + c0[1]); bv.append((ym + c1[0]) * W1 + xm + c1[1])
     bnd = np.bincount(np.concatenate(bv), minlength=nV)
     ifc = np.bincount(np.concatenate([ev0, ev1]), minlength=nV)
     # an arc continues through a corner of map degree exactly 2 that is made of two interface edges
