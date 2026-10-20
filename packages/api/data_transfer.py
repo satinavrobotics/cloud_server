@@ -52,10 +52,11 @@ class Selection(BaseModel):
     """What to move: maps (each with the parts to include), the finished runs of missions, and rosbag recordings."""
     maps: Dict[str, List[str]] = {}
     runs: List[str] = []
+    history: bool = False                          # the picked missions' events, tracks and state come along with their runs
     rosbags: List[RosbagPick] = []
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"maps": dict(self.maps), "runs": list(self.runs), "rosbags": [b.dict() for b in self.rosbags]}
+        return {"maps": dict(self.maps), "runs": list(self.runs), "history": self.history, "rosbags": [b.dict() for b in self.rosbags]}
 
 
 class ExportRequest(Selection):

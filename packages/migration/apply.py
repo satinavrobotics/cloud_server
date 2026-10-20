@@ -50,6 +50,7 @@ class TargetStore(Protocol):
     async def commit_map(self, name: str, state: str, imported_from: Dict[str, Any]) -> None: ...
     async def add_runs(self, import_id: str, runs: List[Dict[str, Any]], legs: List[Dict[str, Any]]) -> Dict[str, int]: ...   # {runs, legs} inserted, rest existed
     async def rosbag_size(self, robot: str, bag_id: str) -> Optional[int]: ...
+    async def add_history(self, import_id: str, kind: str, run_id: str, rows: List[Dict[str, Any]]) -> int: ...      # rows inserted
     async def put_rosbag(self, import_id: str, robot: str, bag_id: str, stream: Any, size: int, sidecar: Dict[str, Any]) -> None: ...
 
 
@@ -288,6 +289,37 @@ async def _apply_runs(reader: BundleReader, store: TargetStore, import_id: str, 
         out["legs_inserted"] += res.get("legs", 0)
         await tell(phase="runs", mission=mission, done=out["runs_inserted"], total=len(runs))
     out["runs_existing"] = len(runs) - out["runs_inserted"]
+    await _apply_history(reader, store, import_id, mission, base, renames, out, tell, should_stop)
+
+
+HISTORY_KINDS = ("events", "track", "state", "trajectory")
+
+
+async def _apply_history(reader: BundleReader, store: TargetStore, import_id: str, mission: str, base: str, renames: Dict[str, str],
+                         out: Dict[str, Any], tell: ProgressFn, should_stop: Optional[StopFn]) -> None:
+    """The recorded history of a mission's runs, one run and one kind at a time (each its own transaction: a stop or a failure leaves whole
+    runs, and a repeat inserts only what a run still lacks)."""
+    present = [k for k in HISTORY_KINDS if reader.has(f"{base}/{k}.ndjson")]
+    if not present:
+        return
+    hist = out.setdefault("history", {k: 0 for k in present})
+    for kind in present:
+        rows_in_run: List[Dict[str, Any]] = []
+        current: Optional[str] = None
+
+        async def flush() -> None:
+            if current is not None and rows_in_run:
+                hist[kind] += await store.add_history(import_id, kind, current, list(rows_in_run))
+        for row in reader.iter_ndjson(f"{base}/{kind}.ndjson"):
+            rid = str(row.get("run_id"))
+            if rid != current:
+                await flush()
+                if should_stop is not None and should_stop():
+                    raise ImportStopped()
+                current, rows_in_run = rid, []
+                await tell(phase="history", mission=mission, kind=kind)
+            rows_in_run.append(remap_run(row, renames))
+        await flush()
 
 
 async def _apply_rosbag(reader: BundleReader, store: TargetStore, import_id: str, entry: Dict[str, Any], renames: Dict[str, str],

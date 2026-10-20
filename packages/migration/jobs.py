@@ -21,7 +21,7 @@ from packages.migration.export import ExportRefused, export_selection
 from packages.migration.netinfo import is_own_address, own_urls
 from packages.migration.plan import plan_import, source_key
 from packages.migration.verify import verify_import
-from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_postgres, prefetch_runs, read_instance_id
+from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_history, prefetch_postgres, prefetch_runs, read_instance_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +48,14 @@ def clean_selection(selection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     maps = {str(k): [str(p) for p in v] for k, v in (sel.get("maps") or {}).items()}
     runs = [str(m) for m in (sel.get("runs") or [])]
+    history = bool(sel.get("history")) and bool(runs)
     bags = [{"robot": str(b.get("robot") or ""), "bag_id": str(b.get("bag_id") or "")} for b in (sel.get("rosbags") or [])]
     if maps:
         out["maps"] = maps
     if runs:
         out["runs"] = runs
+        if history:
+            out["history"] = True
     if bags:
         out["rosbags"] = bags
     if not out:
@@ -135,8 +138,13 @@ class TransferManager:
             sel = job["selection"]
             pg = await prefetch_postgres(self.database, list(sel.get("maps") or {}))
             runs = await prefetch_runs(self.database, list(sel.get("runs") or []))
-            source = ServiceMapSource(self.topomap_db, pg, runs)
-            job["summary"] = await asyncio.to_thread(self._build, source, job, await self.identity())
+            hist = await prefetch_history(self.database, list(sel.get("runs") or []), self.spool_dir) if sel.get("history") else None
+            try:
+                source = ServiceMapSource(self.topomap_db, pg, runs, hist)
+                job["summary"] = await asyncio.to_thread(self._build, source, job, await self.identity())
+            finally:
+                if hist is not None:
+                    hist.close()
             job["size"] = os.path.getsize(job["path"])
             job["state"] = "done"
         except ExportRefused as exc:

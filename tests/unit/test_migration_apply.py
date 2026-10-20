@@ -88,6 +88,15 @@ class FakeStore:
                 m += 1
         return {"runs": n, "legs": m}
 
+    async def add_history(self, import_id, kind, run_id, rows):
+        self.hist = getattr(self, "hist", {})
+        self.hist_calls = getattr(self, "hist_calls", [])
+        self.hist_calls.append((kind, run_id, len(rows)))
+        if (kind, run_id) in self.hist and kind != "events":
+            return 0
+        self.hist.setdefault((kind, run_id), []).extend(rows)
+        return len(rows)
+
     async def rosbag_size(self, robot, bag_id):
         v = (self.bags or {}).get((robot, bag_id))
         return None if v is None else len(v[0])

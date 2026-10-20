@@ -48,6 +48,11 @@ class FakeSource:
     def legs(self, mission):
         return list(self.runs_data.get(mission, {}).get("legs", []))
 
+    history_data = {}                                   # {(mission, kind): [rows ordered by run id]}
+
+    def history(self, mission, kind):
+        return list(self.history_data.get((mission, kind), []))
+
     def rosbag_meta(self, robot, bag_id):
         hit = self.bags_data.get((robot, bag_id))
         return None if hit is None else {**hit[0], "size": len(hit[1])}
@@ -223,7 +228,7 @@ def test_free_name_is_kept(tmp_path):
     with reader_for(tmp_path) as r:
         plan = plan_import(r, Target())
     assert plan["ok"] and plan["maps"][0]["action"] == "create" and plan["maps"][0]["target_name"] == "Hall"
-    assert plan["totals"] == {"maps": 1, "object_bytes": 15, "nodes": 2, "runs": 0, "legs": 0, "rosbag_bytes": 0, "present_bytes": 0}
+    assert plan["totals"] == {"maps": 1, "object_bytes": 15, "nodes": 2, "runs": 0, "legs": 0, "rosbag_bytes": 0, "present_bytes": 0, "history_rows": 0}
 
 
 def test_clash_renames_never_overwrites(tmp_path):

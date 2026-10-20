@@ -38,6 +38,7 @@ class MapSource(Protocol):
     # mission runs (finished ones only: a RUNNING run is live state)
     def runs(self, mission: str) -> List[Dict[str, Any]]: ...
     def legs(self, mission: str) -> List[Dict[str, Any]]: ...
+    def history(self, mission: str, kind: str) -> Iterable[Dict[str, Any]]: ...      # kind: events | track | state | trajectory, ordered by run id
     # rosbag recordings
     def rosbag_meta(self, robot: str, bag_id: str) -> Optional[Dict[str, Any]]: ...   # sidecar fields + size, None = not there
     def rosbag_fetch(self, robot: str, bag_id: str) -> Iterator[bytes]: ...
@@ -127,8 +128,12 @@ def export_maps(source: MapSource, picks: Dict[str, Sequence[str]], writer: Bund
     return summary
 
 
-def export_runs(source: MapSource, missions: Sequence[str], writer: BundleWriter) -> Dict[str, Any]:
-    """The finished runs (and their legs) of each picked mission. A mission without any is refused, not exported empty."""
+HISTORY_KINDS = ("events", "track", "state", "trajectory")
+
+
+def export_runs(source: MapSource, missions: Sequence[str], writer: BundleWriter, history: bool = False) -> Dict[str, Any]:
+    """The finished runs (and their legs) of each picked mission. A mission without any is refused, not exported empty. With `history`
+    each mission also brings what its runs recorded: events, the 1 Hz track, robot state and the node trajectory."""
     rows_by: Dict[str, List[Dict[str, Any]]] = {}
     for mission in missions:
         rows = source.runs(mission)
@@ -143,9 +148,15 @@ def export_runs(source: MapSource, missions: Sequence[str], writer: BundleWriter
         writer.add_ndjson(f"{base}/runs.ndjson", rows)
         writer.add_ndjson(f"{base}/legs.ndjson", legs)
         stamps = sorted(str(r["started_at"]) for r in rows if r.get("started_at"))
+        recorded: Dict[str, int] = {}
+        if history:
+            for kind in HISTORY_KINDS:
+                recorded[kind] = writer.add_ndjson(f"{base}/{kind}.ndjson", source.history(mission, kind))["count"]
         counts = {"runs": len(rows), "legs": len(legs), "first": stamps[0] if stamps else None, "last": stamps[-1] if stamps else None,
                   "robots": sorted({str(r["robot_name"]) for r in rows if r.get("robot_name")}),
                   "map_ids": sorted({str(r["map_id"]) for r in rows if r.get("map_id")})}
+        if history:
+            counts["history"] = recorded
         writer.items.append({"type": "runs", "name": mission, "counts": counts})
         summary[f"runs:{mission}"] = counts
     return summary
@@ -183,7 +194,8 @@ def export_rosbags(source: MapSource, bags: Sequence[Dict[str, str]], writer: Bu
 
 def export_selection(source: MapSource, selection: Dict[str, Any], writer: BundleWriter,
                      have: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Everything the user picked: `{"maps": {name: parts}, "runs": [mission], "rosbags": [{robot, bag_id}]}`. Raises ExportRefused
+    """Everything the user picked: `{"maps": {name: parts}, "runs": [mission], "history": bool, "rosbags": [{robot, bag_id}]}` (`history`: the
+    picked missions' events, tracks and state come along). Raises ExportRefused
     for an invalid pick; a refused pick writes nothing for the kinds after it. `have` = `{"maps": {map: {key: size}}, "rosbags":
     {"robot/bag": size}}`: what the receiving server holds already, so that only the rest is sent."""
     have = have or {}
@@ -196,7 +208,7 @@ def export_selection(source: MapSource, selection: Dict[str, Any], writer: Bundl
     if maps:
         summary.update(export_maps(source, maps, writer, have.get("maps")))
     if runs:
-        summary.update(export_runs(source, runs, writer))
+        summary.update(export_runs(source, runs, writer, bool(selection.get("history"))))
     if bags:
         summary.update(export_rosbags(source, bags, writer, have.get("rosbags")))
     return summary

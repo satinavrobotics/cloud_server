@@ -135,6 +135,7 @@ def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = Tr
                        "nodes": sum(int(m["counts"].get("nodes") or 0) for m in maps_out),
                        "runs": sum(int(r["counts"].get("runs") or 0) for r in runs_out),
                        "legs": sum(int(r["counts"].get("legs") or 0) for r in runs_out),
+                       "history_rows": sum(sum((r["counts"].get("history") or {}).values()) for r in runs_out),
                        "rosbag_bytes": sum(b["bytes"] for b in bags_out if b["action"] != "have"),
                        "present_bytes": sum(int(m["counts"].get("present_bytes") or 0) for m in maps_out)
                        + sum(b["bytes"] for b in bags_out if b["action"] == "have")}}
