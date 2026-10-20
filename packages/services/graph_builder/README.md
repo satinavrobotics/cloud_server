@@ -544,7 +544,8 @@ All except `invalid_payload` and `store_failed` are the `MAP.INGEST_REJECTED` re
 keeps its rate limit and counts); `run_id_mismatch` is one of them too.
 
 **Import (replay into a named session).** A bundle recorded earlier (a spool kept while no session
-was open) is replayed with `import_session_id` on the node and on every part: the target is that
+was open) is replayed with `import_session_id` (or the robot's spelling: `import: true` and `session_id` = the
+target) on the node and on every part: the target is that
 cloud session, finished or open, not the robot's open one. Optional `source_session_id` is the
 cloud session the bundle was recorded in; when present it must equal the target. Reasons, in
 addition to the table (`ingest.py` "Import"):
@@ -559,7 +560,7 @@ addition to the table (`ingest.py` "Import"):
 target's own `map_T_session` is used; the robot's datum is not compared and nothing is realigned.
 An import must carry `run_id` (else `invalid_payload`) and the target as a uuid (else
 `session_unknown`, terminal). Its acks carry `"import": true`, `import_session_id` (the target,
-canonical) and the target as `session_id` (null when rejected), are tracked per target
+canonical) and the target as `session_id` (also when rejected: the requested target), are tracked per target
 session (the same ids replayed to two sessions do not collide), and **never** advance
 `ingest_state` or count in `open_trackers`. No UI node or image update and no mission waypoint is made, and its rejections are counted
 apart (`import_rejected`), not as live drops. An import into the robot's open session is

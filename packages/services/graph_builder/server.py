@@ -118,6 +118,8 @@ INGEST_MODE_TOPIC = "robot/+/ingest_mode"
 def _import_of(payload: Dict[str, Any]) -> Optional[str]:
     """The target session of an import (explicit-session ingest, ingest.py), else None."""
     value = payload.get("import_session_id")
+    if value in (None, "") and payload.get("import") is True:  # the robot's spelling
+        value = payload.get("session_id")
     if value in (None, ""):
         return None
     return ingest.canonical_session_id(value) or str(value)
@@ -671,7 +673,7 @@ class GraphBuilderService:
         session = resolution.session if resolution is not None else None
         self._ack("part_rejected", payload.get("robot_name"), _run_id_of(payload),
                   payload.get("session_node_id"), kind, "" if sub is None else str(sub), reason,
-                  session.session_id if session else None, ns=_import_of(payload))
+                  session.session_id if session else _import_of(payload), ns=_import_of(payload))
 
     def _ack_part_invalid(self, payload: Dict[str, Any], kind: str, sub: Any) -> None:
         """A part that cannot be stored (invalid_payload, terminal): acked when it names its
@@ -1069,7 +1071,7 @@ class GraphBuilderService:
 
         if imp is not None and run_id is None:  # the legacy reset heuristic must not see it
             self._ack("node_failed", robot_name, None, session_node_id, ingest.INVALID_PAYLOAD,
-                      manifest, None, ns=imp)
+                      manifest, imp, ns=imp)
             return
         # An import is not a live message: no mission waypoint, no register_map gate.
         active_mission, register_map = ((None, True) if imp is not None
@@ -1093,7 +1095,7 @@ class GraphBuilderService:
                 await self._reject(resolution, "depth", self.depth_buffer.pop(node_key))
                 await self._reject(resolution, "costmap", self.costmap_buffer.pop(node_key))
             self._ack("node_failed", robot_name, run_id, session_node_id, resolution.reason,
-                      manifest, resolution.session.session_id if resolution.session else None, ns=imp)
+                      manifest, resolution.session.session_id if resolution.session else imp, ns=imp)
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, str(session_node_id), session_node_id, x, y, yaw, '',

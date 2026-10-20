@@ -10,7 +10,7 @@ for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_
 import pytest  # noqa: E402
 
 from packages.services.graph_builder import acks, ingest  # noqa: E402
-from tests.unit.test_graph_builder_ack import KEEP, last, svc  # noqa: E402
+from tests.unit.test_graph_builder_ack import IMG, KEEP, last, manifest, send_part, svc  # noqa: E402
 from tests.unit.test_maps_m2 import NODE, _row  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -35,6 +35,7 @@ def import_svc(target=KEEP, open_row=None):
         return open_row
     s.sessions = ingest.SessionResolver(fetch, ttl=0, fetch_by_id=by_id)
     s._publish_node_update = AsyncMock()
+    s._publish_image_update = AsyncMock()
     return s
 
 
@@ -181,3 +182,44 @@ class TestAckNamespace:
         a.flush()
         body = __import__("json").loads(sent[-1][1])
         assert body["import"] is True and body["resend"] == "parts"
+
+
+class TestRobotSpelling:
+    async def test_import_true_with_session_id_is_an_import(self):
+        s = import_svc()
+        await s._handle_node_update({**NODE, "run_id": "run1", "import": True,
+                                     "session_id": TARGET})
+        b = last(s)
+        assert b["status"] == "accepted" and b["session_id"] == TARGET and b["import"] is True
+
+    async def test_rejection_echoes_the_requested_session(self):
+        s = import_svc(target=target_row(owner="r2"))
+        await s._handle_node_update({**NODE, "run_id": "run1", "import": True,
+                                     "session_id": TARGET})
+        b = last(s)
+        assert b["reason"] == "session_unknown" and b["session_id"] == TARGET
+
+    async def test_live_node_with_a_session_id_is_not_an_import(self):
+        s = import_svc(open_row=_row())
+        await s._handle_node_update({**NODE, "run_id": "run1", "session_id": "whatever"})
+        assert "import" not in last(s)
+
+
+class TestImportParts:
+    async def test_parts_of_an_import_complete_the_bundle_apart_from_live(self):
+        s = import_svc()
+        extra = {"import": True, "session_id": TARGET, "run_id": "run1"}
+        await s._handle_node_update({**NODE, **extra, "parts": manifest(IMG)})
+        await send_part(s, IMG, **extra)
+        b = last(s)
+        assert b["complete"] is True and b["import"] is True and b["session_id"] == TARGET
+        assert s.mqtt_client.states() == []
+        s._publish_image_update.assert_not_called()
+
+    async def test_part_rejection_is_flagged_and_not_a_live_drop(self):
+        s = import_svc(open_row=_row())
+        extra = {"import": True, "session_id": TARGET, "run_id": "run1"}
+        await send_part(s, IMG, **extra)
+        b = last(s)
+        assert (b["reason"], b["import"]) == ("session_busy", True)
+        assert s.stats["images_rejected"] == 0 and s.stats["import_rejected"] == 1
