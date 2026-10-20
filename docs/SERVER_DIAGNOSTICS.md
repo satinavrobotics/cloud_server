@@ -39,7 +39,10 @@ address answers 502, and the log says `connect() failed (111: Connection refused
 - Every running service reports its **memory** (working set, without reclaimable file cache) against its limit; 80% of the
   limit is a warning, 92% an error, before the kernel kills it. A service without a limit shows its usage only.
 - The **host** block gives total and available memory, swap, free disk and load; low memory (10%/5%), a swapping machine, a
-  nearly full disk and an overloaded CPU are host findings.
+  nearly full disk and an overloaded CPU are host findings. Two more: **container memory limits that add up to more than 110% of
+  the machine's memory** (`host-memory-overcommitted`: when several peak together the kernel kills one at random) and, on a
+  Raspberry Pi, **power throttling** (`host-power-throttled`, read from the firmware flags in `/sys/devices/platform/soc/soc:firmware/get_throttled`,
+  the same as `vcgencmd get_throttled`; under-voltage is an error).
 - **Checks** ask the running server the questions whose wrong answer has hurt before (see `checks.py`): the gateway
   answers and reaches the API, the video token service and the agent (a gateway pointing at a wrong address answers 502 for
   that route and logs nothing until someone uses it); what `server-info` advertises is what runs (and the other way round);

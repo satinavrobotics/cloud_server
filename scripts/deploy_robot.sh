@@ -43,6 +43,15 @@ done
 [ -f "$ENV_FILE" ] || die "no $ENV_FILE (copy docker_compose/.env.robot.example and fill it in)"
 case "$TIMEOUT_S" in ''|*[!0-9]*) die "--timeout needs a number of seconds" ;; esac
 if grep -qE 'CHANGE_ME|100\.x\.y\.z' "$ENV_FILE" && [ "$DRY" = 0 ]; then die "$ENV_FILE still has placeholders (CHANGE_ME / 100.x.y.z)"; fi
+# Limits that an older .env.robot.example copied in as MEM_POSTGRES / MEM_ARANGO pin those two to the old defaults and would hide the
+# defaults of the compose file. Drop exactly those lines (an edited value stays: it is the operator's choice).
+if grep -qE '^(MEM_POSTGRES|MEM_ARANGO)=768m[[:space:]]*(#.*)?$' "$ENV_FILE"; then
+    if [ "$DRY" = 1 ]; then log "would drop the old default MEM_POSTGRES/MEM_ARANGO=768m lines from $ENV_FILE"
+    else
+        sed -i -E '/^(MEM_POSTGRES|MEM_ARANGO)=768m[[:space:]]*(#.*)?$/d' "$ENV_FILE"
+        log "dropped the old default MEM_POSTGRES/MEM_ARANGO=768m lines from $ENV_FILE: the compose defaults apply now"
+    fi
+fi
 if [ "$ROLLBACK" = 1 ]; then
     [ -s "$PREV" ] || die "no previous tag recorded ($PREV)"
     TAG="$(cat "$PREV")"

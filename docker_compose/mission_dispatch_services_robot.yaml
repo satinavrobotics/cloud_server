@@ -13,7 +13,8 @@
 #     nginx-gateway, livekit-sfu + livekit-sfu-tokens (the robot's own video server, small config, no internet needed).
 #     minio-tailnet stays: presigned URLs are signed for MINIO_HOST, which here is the Pi's tailnet IP.
 #   - images come from the registry (IMAGE_REGISTRY/IMAGE_TAG, written by scripts/build_push.sh), never built here.
-#   - Every container has a memory limit (defaults sum to ~3.4 GB: for a 4 GB Pi; see .env.robot.example for 8 GB) and a
+#   - Every container has a memory limit (defaults sum to ~3.3 GiB, ~4.0 GiB with the reconstruction container, set from
+#     what each one used on a 4 GB Pi: the graph builder alone peaked at ~750 MB; see .env.robot.example for 8 GB) and a
 #     rotated log. Postgres, ArangoDB, the planner and graph-builder listen on loopback only; mosquitto on loopback + the
 #     tailnet IP; the API (8000) and MinIO's tailnet forwarder are the only other doors.
 #   - MinIO data lives under ${MINIO_DATA_DIR}; the cloud's hash-named pgdata14 volume does not exist here.
@@ -28,7 +29,7 @@ services:
       - -c
       - |
         sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" "127.0.0.1 ${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}" "error warning notice"
-    mem_limit: ${MEM_MOSQUITTO:-128m}
+    mem_limit: ${MEM_MOSQUITTO:-64m}
     logging: *logging
 
   postgres:
@@ -45,7 +46,7 @@ services:
       - timezone=UTC
       - -c
       - listen_addresses=127.0.0.1
-    mem_limit: ${MEM_POSTGRES:-768m}
+    mem_limit: ${MEM_POSTGRES:-448m}
     logging: *logging
     # First boot (initdb, timescaledb-tune, extensions) is slow on a Pi.
     healthcheck:
@@ -59,7 +60,7 @@ services:
       - --rocksdb.block-cache-size=${ARANGO_BLOCK_CACHE_BYTES:-100000000}
       - --rocksdb.total-write-buffer-size=${ARANGO_WRITE_BUFFER_BYTES:-100000000}
       - --query.memory-limit=${ARANGO_QUERY_MEMORY_BYTES:-200000000}
-    mem_limit: ${MEM_ARANGO:-768m}
+    mem_limit: ${MEM_ARANGO:-512m}
     logging: *logging
     healthcheck:
       start_period: 90s
@@ -81,7 +82,7 @@ services:
   mission-dispatch:
     build: !reset null
     image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/mission_dispatch:${IMAGE_TAG:-latest}
-    mem_limit: ${MEM_DISPATCH:-256m}
+    mem_limit: ${MEM_DISPATCH:-160m}
     logging: *logging
 
   graph-builder-service:
@@ -101,7 +102,12 @@ services:
       # Scene-graph worker: cap the resident engines and the step pool to fit the container (the cloud defaults assume a big host).
       - SCENE_GRAPH_MAX_RESIDENT_BYTES=${SCENE_GRAPH_MAX_RESIDENT_BYTES:-120000000}
       - SCENE_GRAPH_WORKER_THREADS=${SCENE_GRAPH_WORKER_THREADS:-2}
-    mem_limit: ${MEM_GRAPH_BUILDER:-384m}
+      # Small steps: a fold used to run 60-85 s (budget off, 48 leaves), which stalled the worker and held many decoded PNGs
+      # in memory. Stop reading nodes after 5 s, fold 8 leaves at a time and prefetch at most 16 PNGs.
+      - SCENE_GRAPH_STEP_BUDGET_S=${SCENE_GRAPH_STEP_BUDGET_S:-5}
+      - SCENE_GRAPH_BATCH_MAX_LEAVES=${SCENE_GRAPH_BATCH_MAX_LEAVES:-8}
+      - SCENE_GRAPH_PREFETCH_QUEUE=${SCENE_GRAPH_PREFETCH_QUEUE:-16}
+    mem_limit: ${MEM_GRAPH_BUILDER:-896m}
     logging: *logging
 
   mission-planner-service:
@@ -119,7 +125,7 @@ services:
       # Scene-graph planner: fewer cached graphs, with a byte budget, to fit the container.
       - SCENE_GRAPH_CACHE_VERSIONS=${SCENE_GRAPH_CACHE_VERSIONS:-2}
       - SCENE_GRAPH_CACHE_MAX_BYTES=${SCENE_GRAPH_CACHE_MAX_BYTES:-80000000}
-    mem_limit: ${MEM_PLANNER:-256m}
+    mem_limit: ${MEM_PLANNER:-128m}
     logging: *logging
 
   api-delegation-service:
@@ -194,7 +200,7 @@ services:
       - |
         sed "s/__NODE_IP__/$${ROBOT_TAILNET_IP}/g" /etc/livekit-robot.yaml > /tmp/livekit.yaml
         LIVEKIT_KEYS="$${LIVEKIT_SFU_API_KEY}: $${LIVEKIT_SFU_API_SECRET}" exec /livekit-server --config /tmp/livekit.yaml
-    mem_limit: ${MEM_LIVEKIT:-192m}
+    mem_limit: ${MEM_LIVEKIT:-128m}
     logging: *logging
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:7880/"]
