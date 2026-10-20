@@ -17,9 +17,12 @@ mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 tag="r${RATE}_f${FACTOR}"
 
+MOUNTS=()
+[ -n "${BENCH_OFFICE8:-}" ] && MOUNTS=(-v "$BENCH_OFFICE8":/office8:ro)   # --world office8: dir with nodes.json + <key>.png
+
 run() {
   docker run --rm --user "$(id -u):$(id -g)" --cpus=1 --memory=896m --memory-swap=896m -e PYTHONDONTWRITEBYTECODE=1 \
-    -v "$REPO":/repo:ro -v "$HERE":/bench:ro -v "$OUT":/work "$IMAGE" python3 -I /bench/bench.py "$@" --repo /repo
+    -v "$REPO":/repo:ro -v "$HERE":/bench:ro -v "$OUT":/work "${MOUNTS[@]}" "$IMAGE" python3 -I /bench/bench.py "$@" --repo /repo
   rc=$?
   [ "$rc" = 137 ] && echo "OOM-KILLED (exit 137) in: $*" >&2
   return $rc

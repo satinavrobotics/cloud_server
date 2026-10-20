@@ -31,6 +31,10 @@ ap.add_argument("--max-real-s", type=float, default=2400.0)
 ap.add_argument("--profile", action="store_true", help="cProfile the fold_many calls (slows them)")
 ap.add_argument("--world-x", type=float, default=60.0)
 ap.add_argument("--world-y", type=float, default=40.0)
+ap.add_argument("--world", default="store", choices=["store", "aisles", "diag", "office8"],
+                help="store: the 60x40 m supermarket; aisles/diag: the engine harness worlds (aisles 40x30 m step 0.5, diag 90x90 m "
+                     "with pillars, a diagonal path); office8: the real export (--office8-dir)")
+ap.add_argument("--office8-dir", default="/office8")
 ap.add_argument("--clutter", type=float, default=0.0, help="0 = clean shelves; 1 = pallets/carts in the aisles and ragged shelf faces")
 a = ap.parse_args()
 REPO = os.path.abspath(a.repo)
@@ -189,7 +193,7 @@ class DirBackend:
 
 
 # ------------------------------------------------------------------------------------------------ synthetic supermarket
-def world(WX, WY, n_min):
+def world(WX, WY, n_min, fixed_step=None):
     """Perimeter walls, shelf rows every 3.6 m (aisles 2.4 m), a boustrophedon survey path through the aisles. The step is
     chosen so the path has at least n_min nodes (aldi scale: ~60x40 m, 800 nodes => ~0.7 m between nodes)."""
     T = np.zeros((int(WY / RES), int(WX / RES)), np.uint8)
@@ -216,7 +220,7 @@ def world(WX, WY, n_min):
                 if sg < 0:
                     by -= bh * RES
                 T[int(by / RES):int(by / RES) + bh, int(bx / RES):int(bx / RES) + bw] = 100
-    step = 1.0
+    step = fixed_step or 1.0
     while True:
         path = []
         for i, yc in enumerate(ycs):
@@ -227,7 +231,7 @@ def world(WX, WY, n_min):
             if i + 1 < len(ycs):
                 xe = xs[-1]
                 path += [(float(xe), float(yy)) for yy in np.arange(yc + step, ycs[i + 1], step)]
-        if len(path) >= n_min:
+        if len(path) >= n_min or fixed_step:
             return T, path, step
         step -= 0.01
 
@@ -235,8 +239,20 @@ def world(WX, WY, n_min):
 def make_nodes(n, n_min=None):
     """(node documents, {key: png bytes}). Transient 'people' blobs seen only on some captures, speckle noise, 10x10 m
     windows at 5 cm like the robot's occupancy layer, two sessions."""
+    if a.world == "office8":
+        return office8_nodes(n)
     rng = np.random.default_rng(12345)
-    T, path, step = world(a.world_x, a.world_y, a.nodes + a.extra)   # one step for ingest and restart
+    if a.world == "diag":
+        T = np.zeros((int(90 / RES), int(90 / RES)), np.uint8)
+        T[:8, :] = 100; T[-8:, :] = 100; T[:, :8] = 100; T[:, -8:] = 100
+        for _ in range(12):
+            cy, cx = rng.integers(200, 1600, 2)
+            T[cy:cy + 12, cx:cx + 12] = 100
+        path, step = [(3 + 0.53 * i, 3 + 0.53 * i) for i in range(n)], 0.53 * 2 ** 0.5
+    elif a.world == "aisles":
+        T, path, step = world(40.0, 30.0, 1, fixed_step=0.5)
+    else:
+        T, path, step = world(a.world_x, a.world_y, a.nodes + a.extra)   # one step for ingest and restart
     path = path[:n]
     yy, xx = np.mgrid[0:200, 0:200]
     far = np.hypot(yy - 100, xx - 100) * RES > 4.5
@@ -266,6 +282,23 @@ def make_nodes(n, n_min=None):
                      "costmap": {"occupancy": {"width": 200, "height": 200, "resolution": RES,
                                                "origin_map": {"x": gx * RES, "y": gy * RES, "yaw": 0.0}}}})
     return docs, pngs, step
+
+
+def office8_nodes(n):
+    """The real office8 export: node documents + their occupancy PNGs, ordered by session_node_id."""
+    d = a.office8_dir
+    rows = json.load(open(os.path.join(d, "nodes.json")))
+    rows = sorted([x for x in rows if "costmap" in x and "occupancy" in x["costmap"]], key=lambda x: x["session_node_id"])[:n]
+    docs, pngs = [], {}
+    for x in rows:
+        c = x["costmap"]["occupancy"]
+        key = x["_key"]
+        pngs[key] = open(os.path.join(d, key + ".png"), "rb").read()
+        docs.append({"_key": key, "session_id": x.get("session_id", "s"), "robot_name": x.get("robot_name", "r1"),
+                     "pose": x["pose"],
+                     "costmap": {"occupancy": {"width": c["width"], "height": c["height"], "resolution": c["resolution"],
+                                               "origin_map": c["origin_map"]}}})
+    return docs, pngs, 0.0
 
 
 class Clock:

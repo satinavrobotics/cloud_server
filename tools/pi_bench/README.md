@@ -76,3 +76,17 @@ the last node; no OOM). Where main's fold time goes (`--profile`, shares of fold
 (merge_tree 18%, subdivide 14%), `_evaluate` 34% (`_links` 21%), `_build_F` 11%; leaf folding itself ~3%. Outside the engine: save
 ~25% of worker-thread time, PNG decode + adapt + bookkeeping ~10%. Per-fold time grows with the map (first 10 folds 0.04 s,
 last 10 0.12 s at 800 nodes) because every fold is a full solve.
+
+## Harness worlds and the real office8 export
+
+`--world aisles|diag|office8` (run with `--nodes 552|160|89`; `BENCH_OFFICE8=<dir with nodes.json + PNGs> tools/pi_bench/run.sh ...`
+for office8). Results x86, rate 1.0, factor 1, old f05f4a3 -> main 9084b90:
+
+| world | fold sum s | mean s | first10 -> last10 s | ingest peak RSS | engine MB | restart load s / RSS |
+|---|---|---|---|---|---|---|
+| aisles 552 | 10.6 -> 5.4 | 0.116 -> 0.059 | 0.10 -> 0.14 ; 0.04 -> 0.08 | 192 -> 178 | 41 -> 26 | 0.51 -> 0.31 / 169 -> 146 |
+| diag 160 | 6.2 -> 4.3 | 0.23 -> 0.157 | 0.14 -> 0.33 ; 0.07 -> 0.25 | 604 -> 373 | 187 -> 116 | 1.1 -> 0.79 / 511 -> 348 |
+| office8 89 | 0.4 -> 0.3 | 0.029 -> 0.023 | 0.028 -> 0.030 ; 0.023 -> 0.021 | 99 -> 94 | 6.5 -> 4.0 | 0.05 -> 0.03 / 95 -> 92 |
+
+Diag is memory-bound (a 90 x 90 m open area): its engine exceeds the 120 MB resident budget (the runner logs "over budget", nothing
+is evictable while the map is active).
