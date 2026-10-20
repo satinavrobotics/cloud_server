@@ -118,6 +118,69 @@ def _squares(r: float) -> List[np.ndarray]:
     return _SQ[key]
 
 
+_SQ_ROWS: Dict[float, list] = {}
+
+
+def _square_rows(r: float):
+    """the row intervals of `_squares(r)`: per structure (centre, [(dy, dx0, length)]) with the centre at shape // 2 (scipy's
+    origin 0), or None for the whole set when a structure row is not one interval (the caller then falls back to scipy)"""
+    key = round(r, 4)
+    if key not in _SQ_ROWS:
+        out = []
+        for st in _squares(r):
+            cy, cx = st.shape[0] // 2, st.shape[1] // 2
+            rows = []
+            for i, row in enumerate(st):
+                nz = np.nonzero(row)[0]
+                if len(nz) == 0: continue                         # an empty row constrains nothing
+                if not row[nz[0]:nz[-1] + 1].all(): out = None; break
+                rows.append((i - cy, int(nz[0]) - cx, int(len(nz))))
+            if out is None: break
+            out.append(rows)
+        _SQ_ROWS[key] = out
+    return _SQ_ROWS[key]
+
+
+def _erode_union(free: np.ndarray, sqs: List[np.ndarray], rows_tbl, band_cells: int = 1 << 20) -> np.ndarray:
+    """OR over the structures of `ndimage.binary_erosion(free, structure=st, border_value=0)`, bit for bit. A structure whose rows are
+    intervals fits at (y, x) iff, on every structure row dy with interval [a, a + L), the run of free cells starting at
+    (y + dy, x + a) is at least L long: one run-length plane (shared by all structures), one comparison per row. Outside the plane
+    the run is 0 (border_value 0), and a run is cut at the right edge, so an interval leaving the plane never fits."""
+    H, W = free.shape
+    if rows_tbl is None or H == 0 or W == 0:
+        sq = np.zeros_like(free)
+        for st in sqs: sq |= ndimage.binary_erosion(free, structure=st, border_value=0)
+        return sq
+    if H * W > 2 * band_cells:
+        # bands of rows with a halo of the structure height keep the transient run-length planes small; a row of the result reads
+        # only the rows within the structure's reach, so each band's interior is the result of the whole plane
+        pad = max(max(st.shape) for st in sqs); B = max(pad, band_cells // W)
+        sq = np.zeros_like(free)
+        for b0 in range(0, H, B):
+            b1 = min(H, b0 + B); lo, hi = max(0, b0 - pad), min(H, b1 + pad)
+            sq[b0:b1] = _erode_union(free[lo:hi], sqs, rows_tbl, band_cells=1 << 62)[b0 - lo:b1 - lo]
+        return sq
+    dt = np.uint16 if W < 65535 else np.int32                       # run lengths <= W
+    idx = np.arange(W, dtype=dt)
+    nb = np.where(free, dt(W), idx)                             # position of a blocked cell, W for a free one
+    nb = np.minimum.accumulate(nb[:, ::-1], axis=1)[:, ::-1]    # next blocked cell at or after x (W: none)
+    run = nb - idx                                              # free cells in a row from x on (0 on a blocked cell)
+    del nb
+    sq = np.zeros_like(free)
+    for rows in rows_tbl:
+        # fit[y, x] needs run[y + dy, x + a] >= L, and never fits when (y + dy, x + a) is outside for some row
+        Y0 = max(max(0, -dy) for dy, a, L in rows); Y1 = min(min(H, H - dy) for dy, a, L in rows)
+        X0 = max(max(0, -a) for dy, a, L in rows); X1 = min(min(W, W - a) for dy, a, L in rows)
+        if Y0 >= Y1 or X0 >= X1: continue
+        fit = None
+        for dy, a, L in rows:
+            ok = run[Y0 + dy:Y1 + dy, X0 + a:X1 + a] >= L
+            if fit is None: fit = ok
+            else: fit &= ok
+        if fit is not None: sq[Y0:Y1, X0:X1] |= fit
+    return sq
+
+
 def _line(y0: int, x0: int, y1: int, x1: int):
     """cells of the digital straight line, ties rounded up in exact integer arithmetic: the line of a translated pair is the
     translated line (np.rint rounds half to even, so the line depended on the canvas origin)"""
@@ -142,14 +205,27 @@ def _away_from_walls(held: np.ndarray, blocked: np.ndarray, min_clearance: float
     included). One distance transform of the whole canvas and one per-component maximum: O(canvas), no per-component crops. The
     decision is the one of the per-component crops this replaces: a crop's distance is never below the full one, and the two are
     equal for every cell within min_clearance of a blocked cell, so `max(d) > min_clearance` agrees on both."""
-    lab, n = ndimage.label(held, structure=np.ones((3, 3)))
-    if not n: return np.zeros(held.shape, bool)
-    if not blocked.any():
-        return held.copy()                                          # no wall anywhere: every component is away from walls
-    dist = ndimage.distance_transform_edt(~blocked) * RES
-    far = np.asarray(ndimage.maximum(dist, lab, index=np.arange(1, n + 1))) > min_clearance
-    keep = np.concatenate(([False], far))
-    return keep[lab] & held
+    H, W = held.shape
+    rows = np.nonzero(held.any(1))[0]
+    if not len(rows): return np.zeros(held.shape, bool)
+    cols = np.nonzero(held.any(0))[0]
+    # a component's decision reads the distance only of its own cells, and a cell within min_clearance of a blocked cell has that cell
+    # within g cells (Chebyshev) of it: crop to the box of `held` grown by g. The cropped transform is never below the full one and
+    # equal to it wherever the full one is <= min_clearance; with no blocked cell in the crop every held cell is farther than that.
+    g = int(math.ceil(min_clearance / RES)) + 2
+    y0, y1 = max(0, int(rows[0]) - g), min(H, int(rows[-1]) + 1 + g)
+    x0, x1 = max(0, int(cols[0]) - g), min(W, int(cols[-1]) + 1 + g)
+    hc, bc = held[y0:y1, x0:x1], blocked[y0:y1, x0:x1]
+    lab, n = ndimage.label(hc, structure=np.ones((3, 3)))
+    if not bc.any():
+        return held.copy()                                          # no wall near any held cell: every component is away from walls
+    dist = ndimage.distance_transform_edt(~bc) * RES
+    has = np.zeros(n + 1, bool)
+    has[lab[(dist > min_clearance) & hc]] = True                    # a component is kept iff one of its cells is farther than that
+    has[0] = False
+    out = np.zeros(held.shape, bool)
+    out[y0:y1, x0:x1] = has[lab] & hc
+    return out
 
 
 class ChartGraph(SceneGraph):
@@ -483,9 +559,7 @@ class ChartGraph(SceneGraph):
                     s2 = np.zeros_like(free); s2[oy:oy + fp.shape[0], ox:ox + fp.shape[1]] = sp_
                     prev = (f2, s2)
         if prev is None:
-            sq = np.zeros_like(free)
-            for st in sqs:
-                sq |= ndimage.binary_erosion(free, structure=st, border_value=0)
+            sq = _erode_union(free, sqs, _square_rows(self.params.robot_half_side))
         else:
             fp, sp_ = prev
             d = fp != free
@@ -499,9 +573,7 @@ class ChartGraph(SceneGraph):
                 x0, x1 = max(0, cols[0] - pad), min(W, cols[-1] + 1 + pad)
                 wy0, wy1, wx0, wx1 = max(0, y0 - pad), min(H, y1 + pad), max(0, x0 - pad), min(W, x1 + pad)
                 win = free[wy0:wy1, wx0:wx1]
-                e = np.zeros_like(win)
-                for st in sqs:
-                    e |= ndimage.binary_erosion(win, structure=st, border_value=0)
+                e = _erode_union(win, sqs, _square_rows(self.params.robot_half_side))
                 sq = sp_.copy()
                 sq[y0:y1, x0:x1] = e[y0 - wy0:y1 - wy0, x0 - wx0:x1 - wx0]
         self._ecache = (free, sq)
