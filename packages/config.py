@@ -338,6 +338,13 @@ IDEMPOTENCY_LEASE_S = int(os.getenv("IDEMPOTENCY_LEASE_S", "120"))
 IDEMPOTENCY_LONG_LEASE_S = int(os.getenv("IDEMPOTENCY_LONG_LEASE_S", "3000"))
 IDEMPOTENCY_PURGE_INTERVAL_S = float(os.getenv("IDEMPOTENCY_PURGE_INTERVAL_S", "600"))
 
+# Data transfer between servers (packages/migration, packages/api/data_transfer.py): where export bundles and
+# uploaded import bundles are spooled (a bundle can be many GB: point this at a volume with room), how long a
+# finished export or an unapplied import is kept, and an optional cap on one bundle.
+TRANSFER_SPOOL_DIR = os.getenv("TRANSFER_SPOOL_DIR", "/tmp/sati-transfer")
+TRANSFER_KEEP_HOURS = float(os.getenv("TRANSFER_KEEP_HOURS", "24"))
+TRANSFER_MAX_BUNDLE_BYTES = int(os.getenv("TRANSFER_MAX_BUNDLE_BYTES", "0"))   # 0 = no cap
+
 # ==================== 3D reconstruction gateway (API, R3) ====================
 # docs/reconstruction/design.md §6.9 (packages/api/reconstruction.py). The reconstruction runs in
 # an external service (its own repo, any host); the API owns the job and talks to it over HTTP.
