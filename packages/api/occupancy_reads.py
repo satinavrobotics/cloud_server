@@ -20,7 +20,7 @@ PLANE_BYTES = TILE_CELLS * TILE_CELLS
 CELL_M = 0.05                         # F1
 CHUNK_M = 51.2                        # CHUNK_TILES * TILE_CELLS * CELL_M
 MAX_EXTENT_CHUNKS = 20000             # §4: 413 above this
-DEFAULT_BUDGET = 64 << 20             # §4: chunk LRU byte budget
+DEFAULT_BUDGET = 64 << 20             # (OCCUPANCY_CHUNK_CACHE_BYTES / _INDEX_CACHE_BYTES in config override it in the service)
 RETRY_AFTER_S = 2                     # 503 Retry-After; same value as scene_graph_reads.RETRY_AFTER_S
 PINNED_CACHE = "public, max-age=31536000, immutable"   # §4: a pinned version never changes
 UNPINNED_CACHE = "no-cache"
@@ -155,11 +155,15 @@ class OccupancyReads:
     requests for one key share one build (single flight). A failed build is not cached and is raised to every waiter.
     """
 
-    def __init__(self, store, budget_bytes=DEFAULT_BUDGET):
+    def __init__(self, store, budget_bytes=None, index_budget_bytes=None):
         self.store = store
         self._lock = threading.Lock()
+        from packages import config         # lazy: this module is importable on its own (R4)
+        if index_budget_bytes is None:      # an explicit chunk budget (tests) also bounds the indexes, as before
+            index_budget_bytes = config.OCCUPANCY_INDEX_CACHE_BYTES if budget_bytes is None else budget_bytes
+        if budget_bytes is None: budget_bytes = config.OCCUPANCY_CHUNK_CACHE_BYTES
         self._chunks = _ByteLRU(budget_bytes)
-        self._indexes = _ByteLRU(budget_bytes)
+        self._indexes = _ByteLRU(index_budget_bytes)
         self._flights = {}
 
     async def extent(self, map_id, version=None):
@@ -332,5 +336,6 @@ def parse_int(text, name):
 def build(client):
     """Occupancy reads for the API service over the store built on the topomap database client. The store is imported
     here, not at module level, so the module itself stays free of the scene-graph package (R4)."""
+    from packages import config
     from packages.scene_graph.store import SceneGraphStore
-    return OccupancyReads(SceneGraphStore.from_client(client))
+    return OccupancyReads(SceneGraphStore.from_client(client, tile_cache_bytes=config.SCENE_GRAPH_STORE_TILE_CACHE_BYTES))
