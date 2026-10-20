@@ -287,6 +287,23 @@ class ServiceTarget:
             return {}
         return {o.object_name: int(o.size) for o in self.images.client.list_objects(bucket, recursive=True) if not o.is_dir}
 
+    async def map_counts(self, name: str) -> Dict[str, int]:
+        def count() -> Dict[str, int]:
+            db = self.graph.db
+            return {kind: (db.collection(f"{kind}_{name}").count() if db.has_collection(f"{kind}_{name}") else 0) for kind in ("nodes", "edges")}
+        return await asyncio.to_thread(count)
+
+    async def existing_runs(self, run_ids: List[str]) -> Dict[str, int]:
+        """How many of these runs (and their legs) are in this server's tables."""
+        if not run_ids:
+            return {"runs": 0, "legs": 0}
+        async with self.db.connection() as conn:
+            cur = await conn.execute("SELECT count(*) FROM mission_runs WHERE run_id = ANY(%s::uuid[])", (run_ids,))
+            runs = (await cur.fetchone())[0]
+            cur = await conn.execute("SELECT count(*) FROM run_legs WHERE run_id = ANY(%s::uuid[])", (run_ids,))
+            legs = (await cur.fetchone())[0]
+        return {"runs": int(runs), "legs": int(legs)}
+
     async def object_sizes(self, name: str) -> Dict[str, int]:
         """Everything in the map's bucket as {key: size}: what a repeated transfer need not send again."""
         return await asyncio.to_thread(self._list_sizes, name)

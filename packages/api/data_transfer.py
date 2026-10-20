@@ -237,6 +237,14 @@ async def apply_import_route(import_id: str, request: Request):
     return manager(request).start_apply(import_id)
 
 
+@router.post("/imports/{import_id}/verify")
+@_guard
+async def verify_import_route(import_id: str, request: Request):
+    """Read-only check of a finished transfer against what this server really holds. Returns `{ok, problems, maps, runs, rosbags}`:
+    the lists name only the items that are complete here, which is what a Move may then delete from the source."""
+    return await manager(request).verify(import_id)
+
+
 @router.post("/imports/{import_id}/stop")
 @_guard
 async def stop_import_route(import_id: str, request: Request):

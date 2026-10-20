@@ -20,6 +20,7 @@ from packages.migration.bundle import BundleError, BundleReader, BundleWriter
 from packages.migration.export import ExportRefused, export_selection
 from packages.migration.netinfo import is_own_address, own_urls
 from packages.migration.plan import plan_import, source_key
+from packages.migration.verify import verify_import
 from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_postgres, prefetch_runs, read_instance_id
 
 logger = logging.getLogger(__name__)
@@ -222,7 +223,7 @@ class TransferManager:
     async def outbound_call(self, destination_url: str, method: str, import_id: str, action: str = "") -> Dict[str, Any]:
         """Relay one call about an import that lives on the destination: GET status, POST plan|apply|stop|rollback, DELETE."""
         dest = self._destination(destination_url)
-        if (method, action) not in {("GET", ""), ("DELETE", ""), ("POST", "plan"), ("POST", "apply"), ("POST", "stop"), ("POST", "rollback")}:
+        if (method, action) not in {("GET", ""), ("DELETE", ""), ("POST", "plan"), ("POST", "apply"), ("POST", "stop"), ("POST", "rollback"), ("POST", "verify")}:
             raise TransferError("that call cannot be relayed", 400)
         url = f"{dest}/api/v1/transfer/imports/{import_id}" + (f"/{action}" if action else "")
         try:
@@ -471,6 +472,21 @@ class TransferManager:
         finally:
             job["touched"] = time.time()
 
+    async def verify(self, job_id: str) -> Dict[str, Any]:
+        """Look at the destination's stores and say which items of a finished transfer are complete there (read-only). This is
+        what a Move waits for before it offers to delete anything on the source."""
+        job = self.import_job(job_id)
+        if job["state"] != "done" or not job.get("plan") or not os.path.exists(job["path"]):
+            raise TransferError("only a finished transfer can be checked (and the copy of its bundle must still be here)", 409)
+        probe = ServiceTarget(self.database, self.topomap_db)
+        reader = await asyncio.to_thread(BundleReader, job["path"])
+        try:
+            job["verification"] = await verify_import(reader, job["plan"], probe)
+        finally:
+            reader.close()
+        job["touched"] = time.time()
+        return job["verification"]
+
     def stop_import(self, job_id: str) -> Dict[str, Any]:
         """Stop a running transfer. A fetch is cancelled at once (nothing was written). A copy finishes the file it is on and then
         halts: what was copied stays, the map stays hidden, and `start_apply` carries on from there."""
@@ -514,7 +530,7 @@ class TransferManager:
 
     @staticmethod
     def public(job: Dict[str, Any]) -> Dict[str, Any]:
-        return {k: v for k, v in job.items() if k not in ("path", "touched", "have")}
+        return {k: v for k, v in job.items() if k not in ("path", "touched", "have", "verification")}
 
     async def close(self) -> None:
         for task in self._tasks.values():
