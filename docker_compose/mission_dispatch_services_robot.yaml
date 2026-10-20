@@ -159,7 +159,7 @@ services:
         condition: service_started
 
   # The app's one door: forwards /api/ and /ws/ to the API by path (docs/robot_deploy.md, Gateway). Loopback + the tailnet
-  # IP only, no CORS headers. Stock image, nothing to build.
+  # IP only (plus ROBOT_LAN_IP when set), no CORS headers. Stock image, nothing to build.
   nginx-gateway:
     image: nginx:alpine
     container_name: sati_nginx_gateway
@@ -167,6 +167,7 @@ services:
     environment:
       - ROBOT_TAILNET_IP=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
       - ROBOT_GATEWAY_PORT=${ROBOT_GATEWAY_PORT:-80}
+      - ROBOT_LAN_IP=${ROBOT_LAN_IP:-127.0.0.2}       # off unless set: a LAN door is an explicit choice (no login on the gateway)
     volumes:
       - ./nginx/nginx-robot.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ./nginx:/etc/nginx/sati:ro      # routes.conf and the CORS files are included from here
