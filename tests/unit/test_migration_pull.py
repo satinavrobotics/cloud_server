@@ -103,3 +103,35 @@ def test_remote_listing_says_when_the_source_is_this_very_server(tmp_path):
     assert loop.run_until_complete(go("999"))["is_self"] is True
     assert loop.run_until_complete(go("111"))["is_self"] is False
     assert loop.run_until_complete(go(None))["is_self"] is False         # without an own id nothing is claimed
+
+
+def test_stop_cancels_a_fetch_and_deletes_the_partial_file(tmp_path):
+    from packages.migration.jobs import TransferError
+    import pytest
+    bundle = build(tmp_path, FakeSource({"Hall": a_map()}), {"Hall": ["definition"]})
+
+    async def go():
+        mgr = make_manager(tmp_path, remote(bundle, export_state="running"))     # the remote export never finishes
+        job = mgr.start_pull("http://robot", {"Hall": ["definition"]})
+        await asyncio.sleep(0.1)
+        assert mgr.imports[job["id"]]["state"] == "fetching"
+        mgr.stop_import(job["id"])
+        for _ in range(50):
+            if mgr._tasks[job["id"]].done():
+                break
+            await asyncio.sleep(0.02)
+        assert mgr.imports[job["id"]]["state"] == "stopped" and mgr.imports[job["id"]]["error"] is None
+        with pytest.raises(TransferError, match="nothing is running"):
+            mgr.stop_import(job["id"])
+        with pytest.raises(TransferError, match="no bundle to apply"):
+            mgr.start_apply(job["id"])                                                # a fetch that was stopped has to be started again
+        return mgr
+    mgr = asyncio.new_event_loop().run_until_complete(go())
+    assert list((tmp_path / "spool").iterdir()) == []
+
+
+def test_stop_of_a_running_copy_only_raises_the_flag():
+    mgr = TransferManager(None, None, None, "/tmp/x-sati-spool-test", {})
+    mgr.imports["j"] = {"id": "j", "state": "applying", "progress": {"phase": "objects", "done": 3}, "touched": 0, "path": "p"}
+    out = mgr.stop_import("j")
+    assert mgr.imports["j"]["stop"] is True and out["progress"]["stopping"] is True and out["state"] == "applying"

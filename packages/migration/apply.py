@@ -31,6 +31,11 @@ class ImportRefused(Exception):
     """The import cannot start or continue (damaged bundle, lock busy, name taken by another map)."""
 
 
+class ImportStopped(Exception):
+    """The user asked to stop (cooperatively: checked between batches and files). What was copied stays; the map stays hidden
+    and a later apply of the same bundle carries on."""
+
+
 class TargetStore(Protocol):
     async def lock(self, name: str) -> Any: ...                            # async context manager; ImportRefused if busy
     async def get_row(self, name: str) -> Optional[Dict[str, Any]]: ...     # {lifecycle, spec, status}
@@ -46,6 +51,7 @@ class TargetStore(Protocol):
 
 
 ProgressFn = Callable[[Dict[str, Any]], Awaitable[None]]
+StopFn = Callable[[], bool]
 
 
 def rewrite_node(doc: Dict[str, Any], src: str, dst: str) -> Dict[str, Any]:
@@ -86,9 +92,11 @@ def final_state(source_state: Optional[str], node_count: int) -> str:
 
 
 async def apply_import(reader: BundleReader, plan: Dict[str, Any], store: TargetStore, import_id: str,
-                       progress: Optional[ProgressFn] = None) -> Dict[str, Any]:
-    """Run the plan; the report `{ok, maps: [{source, target, ...counts, error?}]}`. Never raises for a failed
-    map (the others still run); raises ImportRefused when nothing can start."""
+                       progress: Optional[ProgressFn] = None, should_stop: Optional[StopFn] = None) -> Dict[str, Any]:
+    """Run the plan; the report `{ok, stopped, maps: [{source, target, ...counts, error?}]}`. Never raises for a failed
+    map (the others still run); raises ImportRefused when nothing can start. `should_stop()` is asked between batches and
+    files: once it says yes the current map is left as it is (hidden, resumable), the later maps are not started
+    (`not_started`), and the report says `stopped`."""
     if not plan.get("ok"):
         raise ImportRefused("the plan has errors: " + "; ".join(plan.get("errors") or ["unknown"]))
     problems = reader.verify()
@@ -99,14 +107,22 @@ async def apply_import(reader: BundleReader, plan: Dict[str, Any], store: Target
         if progress is not None:
             await progress(kw)
 
-    report: Dict[str, Any] = {"import_id": import_id, "ok": True, "maps": []}
+    report: Dict[str, Any] = {"import_id": import_id, "ok": True, "stopped": False, "maps": []}
     for entry in plan["maps"]:
         src, dst = entry["source_name"], entry["target_name"]
         out: Dict[str, Any] = {"source": src, "target": dst, "action": entry["action"]}
         report["maps"].append(out)
+        if not report["stopped"] and should_stop is not None and should_stop():
+            report["ok"], report["stopped"] = False, True               # asked to stop between two maps
+        if report["stopped"]:
+            out["not_started"] = True
+            continue
         try:
-            await _apply_map(reader, plan, store, import_id, src, dst, out, tell)
+            await _apply_map(reader, plan, store, import_id, src, dst, out, tell, should_stop)
             out["ok"] = True
+        except ImportStopped:
+            out["ok"], out["stopped"] = False, True
+            report["ok"], report["stopped"] = False, True
         except Exception as exc:  # noqa: BLE001 - one map failing must not stop the others
             logger.exception("Import %s: map %s -> %s failed", import_id, src, dst)
             out["ok"], out["error"] = False, f"{type(exc).__name__}: {exc}"
@@ -115,7 +131,11 @@ async def apply_import(reader: BundleReader, plan: Dict[str, Any], store: Target
 
 
 async def _apply_map(reader: BundleReader, plan: Dict[str, Any], store: TargetStore, import_id: str,
-                     src: str, dst: str, out: Dict[str, Any], tell: ProgressFn) -> None:
+                     src: str, dst: str, out: Dict[str, Any], tell: ProgressFn,
+                     should_stop: Optional[StopFn] = None) -> None:
+    def check() -> None:
+        if should_stop is not None and should_stop():
+            raise ImportStopped()
     base = map_dir(src)
     meta = reader.read_json(f"{base}/map.json")
     marker = {"source": plan["source_key"], "source_name": (plan.get("source") or {}).get("name"),
@@ -154,18 +174,25 @@ async def _apply_map(reader: BundleReader, plan: Dict[str, Any], store: TargetSt
         await tell(map=dst, phase="nodes")
         nodes = 0
         for batch in _batches((rewrite_node(d, src, dst) for d in reader.iter_ndjson(f"{base}/nodes.ndjson")), BATCH):
+            check()
             nodes += await store.put_nodes(dst, batch)
+            out["nodes"] = nodes
             await tell(map=dst, phase="nodes", done=nodes)
         out["nodes"] = nodes
         await tell(map=dst, phase="edges")
         edges = 0
         for batch in _batches((rewrite_edge(d, src, dst) for d in reader.iter_ndjson(f"{base}/edges.ndjson")), BATCH):
+            check()
             edges += await store.put_edges(dst, batch)
+            out["edges"] = edges
         out["edges"] = edges
 
         copied = skipped = 0
         listed = list(reader.iter_ndjson(f"{base}/objects.ndjson")) if reader.has(f"{base}/objects.ndjson") else []
+        out["objects_total"] = len(listed)
         for i, obj in enumerate(listed, 1):
+            out["objects_copied"], out["objects_skipped"] = copied, skipped      # what a stop here leaves behind
+            check()
             have = await store.object_size(dst, obj["key"])
             if have == obj["size"]:
                 skipped += 1
@@ -177,6 +204,7 @@ async def _apply_map(reader: BundleReader, plan: Dict[str, Any], store: TargetSt
             if i % 50 == 0:
                 await tell(map=dst, phase="objects", done=i, total=len(listed))
         out["objects_copied"], out["objects_skipped"] = copied, skipped
+        check()
 
         if meta.get("view_settings"):
             out["view_settings"] = await store.put_view_settings(dst, meta["view_settings"])

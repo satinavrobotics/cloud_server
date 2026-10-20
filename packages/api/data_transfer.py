@@ -12,6 +12,7 @@
     GET    /api/v1/transfer/imports/{id}                 plan, progress, report
     POST   /api/v1/transfer/imports/{id}/plan            plan again (names may have changed)
     POST   /api/v1/transfer/imports/{id}/apply           start writing (202); only a user action starts it
+    POST   /api/v1/transfer/imports/{id}/stop            stop a running fetch or copy; apply again to continue where it stopped
     POST   /api/v1/transfer/imports/{id}/rollback        delete the maps this import created
     DELETE /api/v1/transfer/imports/{id}                 forget the plan and delete the spooled bundle
 
@@ -195,6 +196,12 @@ async def replan_import(import_id: str, request: Request):
 @_guard
 async def apply_import_route(import_id: str, request: Request):
     return manager(request).start_apply(import_id)
+
+
+@router.post("/imports/{import_id}/stop")
+@_guard
+async def stop_import_route(import_id: str, request: Request):
+    return manager(request).stop_import(import_id)
 
 
 @router.post("/imports/{import_id}/rollback")

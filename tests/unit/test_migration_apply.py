@@ -209,3 +209,50 @@ def test_progress_is_reported(tmp_path):
 def test_standard_headers_are_not_user_metadata():
     from packages.migration.stores import user_metadata
     assert user_metadata({"Node_id": "n", "content-type": "image/png", "Cache-Control": "x"}) == {"Node_id": "n"}
+
+
+def test_stop_leaves_the_map_hidden_and_continue_finishes_without_repeating_work(tmp_path):
+    reader, plan = planned(tmp_path)
+    store = FakeStore()
+    copied = []
+    original = store.put_object
+
+    async def counting(name, key, stream, size, content_type, metadata):
+        await original(name, key, stream, size, content_type, metadata)
+        copied.append(key)
+    store.put_object = counting
+    report = run(apply_import(reader, plan, store, "imp-1", should_stop=lambda: len(copied) >= 1))
+    assert report["stopped"] and not report["ok"]
+    m = report["maps"][0]
+    assert m["stopped"] and m["objects_copied"] == 1 and m["objects_total"] == 2
+    st = store.rows["Hall"]["status"]
+    assert st["state"] == "archived" and st["imported_from"]["phase"] == "importing"       # hidden until it is finished
+
+    plan2 = plan_import(reader, Target({"Hall": {"lifecycle": "ALIVE", "imported_from": st["imported_from"]}}))
+    assert plan2["maps"][0]["action"] == "resume"
+    report = run(apply_import(reader, plan2, store, "imp-2"))
+    assert report["ok"] and not report["stopped"]
+    m = report["maps"][0]
+    assert m["objects_copied"] == 1 and m["objects_skipped"] == 1                            # the first file was not copied again
+    assert len(copied) == 2 and store.rows["Hall"]["status"]["state"] == "ready"
+
+
+def test_stop_between_maps_does_not_start_the_next_one(tmp_path):
+    reader, plan = planned(tmp_path, maps={"A": a_map(), "B": a_map()})
+    store = FakeStore()
+    calls = {"n": 0}
+
+    def stop():
+        calls["n"] += 1
+        return store.rows.get("A", {}).get("status", {}).get("imported_from", {}).get("phase") == "complete"
+    report = run(apply_import(reader, plan, store, "i", should_stop=stop))
+    by = {m["source"]: m for m in report["maps"]}
+    assert by["A"]["ok"] and by["B"].get("not_started") and "B" not in store.rows
+    assert report["stopped"]
+
+
+def test_a_stop_asked_at_the_very_start_writes_nothing_but_the_hidden_marker(tmp_path):
+    reader, plan = planned(tmp_path)
+    store = FakeStore()
+    report = run(apply_import(reader, plan, store, "i", should_stop=lambda: True))
+    assert report["stopped"] and store.nodes.get("Hall") is None and store.objects.get("Hall") is None

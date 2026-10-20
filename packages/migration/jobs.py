@@ -182,6 +182,7 @@ class TransferManager:
         self.sweep()
         job_id = uuid.uuid4().hex[:12]
         job = {"id": job_id, "state": "fetching", "path": self._new_path("import", job_id), "origin": base,
+               "picks": {k: list(v) for k, v in picks.items()},
                "plan": None, "report": None, "progress": {"phase": "exporting"}, "error": None,
                "created": time.time(), "touched": time.time()}
         self.imports[job_id] = job
@@ -221,6 +222,8 @@ class TransferManager:
             job["progress"] = {"phase": "planning"}
             job["plan"] = await self._plan(job["path"])
             job["state"], job["progress"] = "planned", None
+        except asyncio.CancelledError:
+            job["state"], job["progress"] = "stopped", {"phase": "stopped"}      # the user pressed Stop: nothing was written yet
         except TransferError as exc:
             job["state"], job["error"] = "failed", str(exc)
         except httpx.HTTPError as exc:
@@ -231,7 +234,7 @@ class TransferManager:
             logger.exception("Pull %s failed", job["id"])
             job["state"], job["error"] = "failed", f"{type(exc).__name__}: {exc}"
         finally:
-            for path in (part,) + ((job["path"],) if job["state"] == "failed" else ()):
+            for path in (part,) + ((job["path"],) if job["state"] in ("failed", "stopped") else ()):
                 if os.path.exists(path):
                     os.remove(path)
             job["touched"] = time.time()
@@ -286,11 +289,13 @@ class TransferManager:
 
     def start_apply(self, job_id: str) -> Dict[str, Any]:
         job = self.import_job(job_id)
-        if job["state"] == "applying":
+        if job["state"] in ("applying", "fetching"):
             raise TransferError("the import is already running", 409)
+        if not job.get("plan") or not os.path.exists(job["path"]):
+            raise TransferError("there is no bundle to apply (the transfer was stopped before it was fetched): start it again", 409)
         if not job["plan"]["ok"]:
             raise TransferError("the plan has errors: " + "; ".join(job["plan"]["errors"]), 409)
-        job["state"], job["error"], job["progress"] = "applying", None, {"phase": "starting"}
+        job["state"], job["error"], job["progress"], job["stop"] = "applying", None, {"phase": "starting"}, False
         self._tasks[job_id] = asyncio.get_running_loop().create_task(self._run_apply(job))
         return self.public(job)
 
@@ -304,12 +309,13 @@ class TransferManager:
             job["plan"] = await self._plan(job["path"])
             reader = await asyncio.to_thread(BundleReader, job["path"])
             try:
-                job["report"] = await apply_import(reader, job["plan"], target, job["id"], progress)
+                job["report"] = await apply_import(reader, job["plan"], target, job["id"], progress,
+                                                   should_stop=lambda: bool(job.get("stop")))
             finally:
                 reader.close()
-            job["state"] = "done" if job["report"]["ok"] else "failed"
-            if job["state"] == "done":
-                job["progress"] = {"phase": "done"}
+            report = job["report"]
+            job["state"] = "stopped" if report.get("stopped") else ("done" if report["ok"] else "failed")
+            job["progress"] = {"phase": job["state"]} if job["state"] != "failed" else job["progress"]
         except (ImportRefused, BundleError) as exc:
             job["state"], job["error"] = "failed", str(exc)
         except Exception as exc:  # noqa: BLE001
@@ -317,6 +323,22 @@ class TransferManager:
             job["state"], job["error"] = "failed", f"{type(exc).__name__}: {exc}"
         finally:
             job["touched"] = time.time()
+
+    def stop_import(self, job_id: str) -> Dict[str, Any]:
+        """Stop a running transfer. A fetch is cancelled at once (nothing was written). A copy finishes the file it is on and then
+        halts: what was copied stays, the map stays hidden, and `start_apply` carries on from there."""
+        job = self.import_job(job_id)
+        if job["state"] == "fetching":
+            task = self._tasks.get(job_id)
+            if task is not None:
+                task.cancel()
+            job["state"], job["progress"] = "stopped", {"phase": "stopped"}
+        elif job["state"] == "applying":
+            job["stop"] = True
+            job["progress"] = dict(job.get("progress") or {}, stopping=True)
+        else:
+            raise TransferError("nothing is running to stop", 409)
+        return self.public(job)
 
     async def rollback(self, job_id: str) -> Dict[str, Any]:
         """Delete the maps this import created (the existing delete saga: idempotent, background). Maps that
