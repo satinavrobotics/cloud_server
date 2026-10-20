@@ -11,10 +11,27 @@ def overlaps(prev_key_plane, new_plane, nkeys_prev):
     u,c=np.unique(code,return_counts=True)
     return {(int(x//(nkeys_prev+1)),int(x%(nkeys_prev+1))):int(n) for x,n in zip(u,c)}
 
-def assign_A(prev_keys,prev_plane,new_plane,anchors,birth,order):
+def overlaps_cells(prev_key_plane,ys,xs,labels,nkeys_prev):
+    """`overlaps(prev_key_plane, new_plane, nkeys_prev)` for a new plane that is `labels[i]` at the cells (ys[i], xs[i]) and -1
+    elsewhere: the same dict, in the same order, without touching the cells outside the new plane. The mask, the codes and their
+    counts are those of `overlaps` restricted to the cells where new_plane >= 0 (the only ones its mask keeps); the counts of the
+    sorted distinct codes come from a bincount when the code range is small, else from np.unique, as there."""
+    pk=prev_key_plane[ys,xs]
+    m=pk>=0
+    if not m.any(): return {}
+    nl=np.asarray(labels)[m].astype(np.int64)
+    code=nl*(nkeys_prev+1)+pk[m]
+    if len(code) and int(code.min())>=0 and int(code.max())<(1<<22):
+        cnt=np.bincount(code)
+        u=np.nonzero(cnt)[0]; c=cnt[u]
+    else:
+        u,c=np.unique(code,return_counts=True)
+    return {(int(x//(nkeys_prev+1)),int(x%(nkeys_prev+1))):int(n) for x,n in zip(u,c)}
+
+def assign_A(prev_keys,prev_plane,new_plane,anchors,birth,order,ov=None):
     """prev_keys: list of keys (tuples (birth_leaf, n)); prev_plane: cell -> index into prev_keys (or -1);
     new_plane: cell -> new chart index; anchors: list of (x,y) per new chart; returns keys per new chart, retired keys."""
-    ov=overlaps(prev_plane,new_plane,len(prev_keys))
+    if ov is None: ov=overlaps(prev_plane,new_plane,len(prev_keys))
     nj=len(anchors); first=[None]*nj
     by_j={}
     for (j,k),n in ov.items(): by_j.setdefault(j,[]).append((-n,prev_keys[k],k))
