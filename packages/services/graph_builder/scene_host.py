@@ -163,7 +163,8 @@ def worker_config(params: Any) -> Any:
         lifecycle_check_s=config.SCENE_GRAPH_LIFECYCLE_CHECK_S,
         lazy_load=config.SCENE_GRAPH_LAZY_LOAD,
         memory_retry_limit=max(1, config.SCENE_GRAPH_MEMORY_RETRY_LIMIT),
-        expected_params_hash=expected_params_hash(params))
+        expected_params_hash=expected_params_hash(params),
+        gc_every_saves=max(0, int(getattr(config, "SCENE_GRAPH_GC_EVERY_SAVES", 0))))
 
 
 def runner_config(config: Any) -> Any:
@@ -174,7 +175,8 @@ def runner_config(config: Any) -> Any:
         threads=max(1, int(config.SCENE_GRAPH_WORKER_THREADS)),
         max_resident=max(0, int(config.SCENE_GRAPH_MAX_RESIDENT_ENGINES)),
         max_resident_bytes=max(0, int(config.SCENE_GRAPH_MAX_RESIDENT_BYTES)),
-        evict_idle_s=float(config.SCENE_GRAPH_EVICT_IDLE_S))
+        evict_idle_s=float(config.SCENE_GRAPH_EVICT_IDLE_S),
+        mem_stats_log_s=float(getattr(config, "SCENE_GRAPH_MEM_STATS_LOG_S", 60.0)))
 
 
 def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> SceneWorkerHost:
@@ -190,6 +192,17 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
     guard = scene_guard.PgGuard(scene_guard.connect_from_conninfo(conninfo or default_conninfo()))
     fetch_png = scene_sources.png_fetcher(service.image_db)
     footprint = scene_sources.PgFootprint(scene_guard.connect_from_conninfo(conninfo or default_conninfo()))
+    from . import scene_memory
+
+    def relieve() -> None:
+        store.scale_tile_cache(0.25)
+        scene_memory.trim_heap()
+
+    mem_guard = scene_memory.MemoryGuard(
+        high=_cfg.SCENE_GRAPH_MEM_HIGH_FRACTION, low=_cfg.SCENE_GRAPH_MEM_LOW_FRACTION,
+        on_high=relieve, on_low=lambda: store.scale_tile_cache(1.0))
+    load_gate = scene_memory.LoadGate(mem_guard, scene_memory.LoadMarker(
+        _cfg.SCENE_GRAPH_LOAD_MARKER_PATH, _cfg.SCENE_GRAPH_LOAD_COOLDOWN_S))
     cursors = scene_worker.MemoryCursorStore()
     cfg = worker_config(params)
     from packages import config as _config
@@ -240,7 +253,7 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
             stored_leaves=lambda version: stored_leaf_index(store, map_id, version),
             publish=scene_events.make_publish(service.update_publisher, loop, map_id),
             new_engine=lambda: ChartGraph(map_params), fence_errors=(StaleVersion,), prefetch=prefetch,
-            half_side=half_side,
+            half_side=half_side, memory=mem_guard, load_gate=load_gate,
             on_event=(lambda kind, payload: sink(map_id, kind, payload)) if sink else None)
 
     switched_off: set = set()
@@ -264,7 +277,7 @@ def build_host(service: Any, loop: Any, conninfo: Optional[str] = None) -> Scene
 
     runner = scene_runner.SceneRunner(
         list_maps, make_worker, on_event=sink, skip_reason=skip_reason, prefetch=prefetch,
-        config=runner_config(_config))
+        config=runner_config(_config), memory=mem_guard, load_gate=load_gate)
     return SceneWorkerHost(runner, guard)
 
 

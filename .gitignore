@@ -14,3 +14,6 @@ docker_compose/.env.staging
 docker_compose/.env.robot
 docker_compose/.robot_current_tag
 docker_compose/.robot_previous_tag
+
+# Backups of the robot env file (hold real credentials)
+docker_compose/.env.robot.bak-*

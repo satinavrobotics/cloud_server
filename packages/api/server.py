@@ -565,7 +565,8 @@ class ApiDelegationService:
         leaving its sg_* collections and objects behind."""
         try:
             from packages.scene_graph.store import SceneGraphStore  # lazy: the engine is optional
-            store = SceneGraphStore.from_client(self.topomap_db)
+            from packages import config as _cfg
+            store = SceneGraphStore.from_client(self.topomap_db, tile_cache_bytes=_cfg.SCENE_GRAPH_STORE_TILE_CACHE_BYTES)
         except Exception as err:  # noqa: BLE001
             return self._unbuildable_scene_hooks(err)
 
