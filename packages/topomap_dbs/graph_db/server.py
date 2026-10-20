@@ -933,6 +933,10 @@ class GraphDatabaseService:
         with a record). Filtered and sorted in ArangoDB; a persistent index on `session_id`
         is ensured once per collection. A map without a node collection has none ([]).
         RAISES on an ArangoDB error (the caller must not show a half trace)."""
+        return self._session_nodes(self.SESSION_TRACE_AQL, map_id, session_id)
+
+    def _session_nodes(self, aql: str, map_id: str, session_id: str) -> List[Dict[str, Any]]:
+        """`aql` (bind vars @col, sid) over the map's node collection, [] without one."""
         name = f"nodes_{map_id}"
         if not self.db.has_collection(name):
             return []
@@ -943,7 +947,20 @@ class GraphDatabaseService:
             except Exception as e:  # the query works without it, only slower
                 self.logger.warning(f"Could not ensure the session_id index of {name}: {e}")
         return list(self.db.aql.execute(
-            self.SESSION_TRACE_AQL, bind_vars={"@col": name, "sid": str(session_id)}))
+            aql, bind_vars={"@col": name, "sid": str(session_id)}))
+
+    # `session_trace_nodes` in the same order, with the stored depth / costmap records in full
+    # (the trajectory pack's manifest carries them).
+    SESSION_TRAJECTORY_AQL = SESSION_TRACE_AQL.replace(
+        "depth: ATTRIBUTES(IS_OBJECT(n.depth) ? n.depth : {}), "
+        "costmap: ATTRIBUTES(IS_OBJECT(n.costmap) ? n.costmap : {})}",
+        "depth: IS_OBJECT(n.depth) ? n.depth : {}, "
+        "costmap: IS_OBJECT(n.costmap) ? n.costmap : {}}")
+
+    def session_trajectory_nodes(self, map_id: str, session_id: str) -> List[Dict[str, Any]]:
+        """`session_trace_nodes` with `depth` / `costmap` as the stored {camera: record} /
+        {layer: record} dicts instead of their names. Same order, same RAISES on an ArangoDB error."""
+        return self._session_nodes(self.SESSION_TRAJECTORY_AQL, map_id, session_id)
 
     def remove_node(self, node_id: Union[int, str]) -> bool:
         """

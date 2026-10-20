@@ -23,7 +23,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, sites
+from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
@@ -1023,6 +1023,25 @@ async def map_session_trace(map_id: str, session_id: str, limit: Optional[int] =
     return await _site_call("map session trace", session_trace.session_trace(
         service.database, service.graph_db, service.image_db, map_id, session_id, limit,
         offset))
+
+
+@app.get("/api/v1/maps/{map_id}/sessions/{session_id}/trajectory")
+async def map_session_trajectory(map_id: str, session_id: str, from_index: Optional[int] = None,
+                                 to_index: Optional[int] = None):
+    """The session's nodes (as in `/trace`) with the bytes of their images, depth and costmap
+    PNGs, streamed as an uncompressed tar: `manifest.json` first, then `{index:06d}/image_{id}`,
+    `depth_{camera}.png`, `costmap_{layer}.png` per node, then `missing.json` (members that
+    could not be read; an archive without it was cut short). `from_index` (default 0) /
+    `to_index` (exclusive, default the end) take a window by `/trace` index; the manifest's
+    `next_index` continues it. 404 unknown map / session / session of another map; 422 bad
+    window (both before the first byte). Contract: packages/api/README.md."""
+    _require_service()
+    pack = await _site_call("map session trajectory", session_trajectory.trajectory_pack(
+        service.database, service.graph_db, service.image_db, map_id, session_id, from_index,
+        to_index))
+    return StreamingResponse(pack.stream(), media_type="application/x-tar", headers={
+        "Content-Disposition": f'attachment; filename="{pack.filename}"',
+        "X-Accel-Buffering": "no", "Cache-Control": "no-store"})
 
 
 @app.get("/api/v1/maps/{map_id}/edge-stats")

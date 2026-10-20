@@ -285,3 +285,54 @@ class TestArangoQuery:
         svc = self._service([{"id": "a"}])
         svc.db.collection.return_value.add_persistent_index.side_effect = RuntimeError("x")
         assert svc.session_trace_nodes("yard", "s") == [{"id": "a"}]
+
+
+class TestTrajectoryQuery:
+    def test_same_filter_and_order_as_the_trace_with_full_records(self):
+        trace_aql, traj_aql = GraphDatabaseService.SESSION_TRACE_AQL, GraphDatabaseService.SESSION_TRAJECTORY_AQL
+        assert traj_aql != trace_aql
+        assert traj_aql.split(" RETURN ")[0] == trace_aql.split(" RETURN ")[0]
+        assert "depth: IS_OBJECT(n.depth) ? n.depth : {}" in traj_aql
+        assert "costmap: IS_OBJECT(n.costmap) ? n.costmap : {}" in traj_aql
+        assert "ATTRIBUTES" not in traj_aql
+
+    def test_runs_the_trajectory_query(self):
+        svc = TestArangoQuery()._service([{"id": "a"}])
+        assert svc.session_trajectory_nodes("yard", "sid-1") == [{"id": "a"}]
+        args, kwargs = svc.db.aql.execute.call_args
+        assert args[0] == GraphDatabaseService.SESSION_TRAJECTORY_AQL
+        assert kwargs["bind_vars"] == {"@col": "nodes_yard", "sid": "sid-1"}
+        TestArangoQuery()._service([], has=False).session_trajectory_nodes("yard", "s") == []
+
+
+class TestImageDbPngReads:
+    def _db(self, get_object):
+        from packages.topomap_dbs.image_db.server import ImageDatabaseService
+        db = ImageDatabaseService.__new__(ImageDatabaseService)
+        db.logger = MagicMock()
+        db.default_map_id = "default"
+        db.client = MagicMock()
+        db.client.get_object = get_object
+        db._bucket_name = lambda map_id: f"map-{map_id}"
+        return db
+
+    def test_depth_and_costmap_read_their_keys_and_release_the_connection(self):
+        resp = MagicMock()
+        resp.read.return_value = b"png"
+        get = MagicMock(return_value=resp)
+        db = self._db(get)
+        assert db.get_depth("n1", "front", "yard") == b"png"
+        assert get.call_args.args[1] == "n1/depth/front.png"
+        assert db.get_costmap("n1", "occ", "yard") == b"png"
+        assert get.call_args.args[1] == "n1/costmap/occ.png"
+        assert resp.release_conn.call_count == 2
+
+    def test_missing_is_none_and_silent_other_errors_are_logged(self):
+        err = Exception("x")
+        err.code = "NoSuchKey"
+        db = self._db(MagicMock(side_effect=err))
+        assert db.get_depth("n1", "front", "yard") is None
+        db.logger.error.assert_not_called()
+        db = self._db(MagicMock(side_effect=RuntimeError("down")))
+        assert db.get_depth("n1", "front", "yard") is None
+        db.logger.error.assert_called_once()

@@ -166,13 +166,23 @@ class ImageDatabaseService(MinIOService):
     def get_costmap(self, node_id: str, layer: str, map_id: Optional[str] = None) -> Optional[bytes]:
         """A node's costmap PNG of one layer, or None when it is not stored (a layer whose
         record is on the node before the object is visible, or no such layer)."""
+        return self._get_png(self.costmap_key(str(node_id), layer), f"costmap {layer}", node_id,
+                             map_id)
+
+    def get_depth(self, node_id: str, camera: str, map_id: Optional[str] = None) -> Optional[bytes]:
+        """A node's u16-mm depth PNG of one camera, or None when it is not stored."""
+        return self._get_png(self.depth_key(str(node_id), camera), f"depth {camera}", node_id,
+                             map_id)
+
+    def _get_png(self, key: str, what: str, node_id: str, map_id: Optional[str]) -> Optional[bytes]:
+        """The object `key` of the map's bucket, or None when it is absent or unreadable
+        (only the latter is logged)."""
         try:
-            response = self.client.get_object(self._bucket_name(map_id or self.default_map_id),
-                                              self.costmap_key(str(node_id), layer))
+            response = self.client.get_object(self._bucket_name(map_id or self.default_map_id), key)
         except Exception as e:  # noqa: BLE001
             code = getattr(e, "code", "")
             if code not in ("NoSuchKey", "NoSuchBucket"):
-                self.logger.error(f"Failed to retrieve costmap {layer} of node {node_id}: {e}")
+                self.logger.error(f"Failed to retrieve {what} of node {node_id}: {e}")
             return None
         try:
             return response.read()

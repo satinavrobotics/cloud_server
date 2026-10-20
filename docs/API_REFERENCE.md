@@ -314,6 +314,36 @@ point per mapping session, newest 30). Each session now also has `new_cells`, `a
 
 ---
 
+### Map Session Trajectory
+
+#### `GET /api/v1/maps/{map_id}/sessions/{session_id}/trajectory`
+
+One mapping session as a stream of topology nodes with their data: the nodes of `.../trace` (same order and `index`)
+and the bytes of each node's images, depth PNGs and costmap PNGs, as an uncompressed tar (`application/x-tar`, chunked).
+Query (optional): `from_index` (default 0) and `to_index` (exclusive, default the end), a window by trace index; the
+manifest's `next_index` is where the next window starts (null on the last). Full contract: `packages/api/README.md`.
+
+```
+manifest.json                      plan: nodes, map-frame poses, depth/costmap records, member paths
+000000/image_<image_id>            original image bytes (any format)
+000000/depth_<camera>.png          16-bit mm depth (x record.depth_scale)
+000000/costmap_<layer>.png         8-bit: 0-100 occupancy, 255 unknown (253 = person, read as unknown)
+000001/...
+missing.json                       {"missing": [{"path", "reason"}]}: always last
+```
+
+```python
+import json, tarfile, requests
+r = requests.get(f"{API}/api/v1/maps/{map_id}/sessions/{sid}/trajectory", stream=True)
+with tarfile.open(fileobj=r.raw, mode="r|") as tar:          # stream mode: one pass, no seeking
+    for member in tar:
+        data = tar.extractfile(member).read()
+        ...  # the first member is manifest.json; map the others through its `path` fields
+```
+
+An archive without `missing.json` as its last member was cut short. 404 unknown map / session (before the first byte);
+422 bad window.
+
 ### Map Location and Relocalization
 
 Details: `docs/satinav-maps-redesign.md` §12 and §16.
