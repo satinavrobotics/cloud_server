@@ -115,6 +115,14 @@ SPOOL_STATE_TOPIC = "robot/+/spool_state"
 INGEST_MODE_TOPIC = "robot/+/ingest_mode"
 
 
+def _import_of(payload: Dict[str, Any]) -> Optional[str]:
+    """The target session of an import (explicit-session ingest, ingest.py), else None."""
+    value = payload.get("import_session_id")
+    if value in (None, ""):
+        return None
+    return ingest.canonical_session_id(value) or str(value)
+
+
 def _run_id_of(payload: Dict[str, Any]) -> Optional[str]:
     """The payload's optional `run_id` (one robot process run / topomap run) as a string, or
     None (absent or empty: an older robot)."""
@@ -298,6 +306,7 @@ class GraphBuilderService:
         )
         # Where a robot's data goes (its open mapping session), and the drop reports.
         self.sessions = ingest.SessionResolver(self._fetch_open_session, ttl=session_cache_ttl,
+                                               fetch_by_id=self._fetch_session_by_id,
                                                realign=self._realign_session)
         self.rejects = ingest.RejectLimiter(interval=reject_event_interval)
 
@@ -528,10 +537,11 @@ class GraphBuilderService:
             return None
         return client.publish(topic, payload, qos=qos, retain=retain).rc
 
-    def _ack(self, method: str, *args) -> None:
-        """Call an AckManager event; an ack never raises into ingest (logged, `acks_failed`)."""
+    def _ack(self, method: str, *args, ns: Optional[str] = None) -> None:
+        """Call an AckManager event; an ack never raises into ingest (logged, `acks_failed`).
+        `ns`: the target session of an import (its acks are keyed by it, acks.py)."""
         try:
-            getattr(self.acks, method)(*args)
+            getattr(self.acks, method)(*args, **({} if ns is None else {"ns": ns}))
         except Exception as e:  # noqa: BLE001
             self.stats["acks_failed"] += 1
             self.logger.warning(f"Ack ({method}) failed: {e}")
@@ -652,7 +662,8 @@ class GraphBuilderService:
         robot_name, sid = entry.get("robot_name"), entry.get("session_node_id")
         if robot_name is None or sid is None:
             return
-        self._ack("part_stored", robot_name, entry.get("run_id"), sid, kind, str(sub))
+        self._ack("part_stored", robot_name, entry.get("run_id"), sid, kind, str(sub),
+                  ns=entry.get("import"))
 
     def _ack_part_rejected(self, payload: Dict[str, Any], kind: str, sub: Any, reason: str,
                            resolution: Optional["ingest.Resolution"] = None) -> None:
@@ -660,7 +671,7 @@ class GraphBuilderService:
         session = resolution.session if resolution is not None else None
         self._ack("part_rejected", payload.get("robot_name"), _run_id_of(payload),
                   payload.get("session_node_id"), kind, "" if sub is None else str(sub), reason,
-                  session.session_id if session else None)
+                  session.session_id if session else None, ns=_import_of(payload))
 
     def _ack_part_invalid(self, payload: Dict[str, Any], kind: str, sub: Any) -> None:
         """A part that cannot be stored (invalid_payload, terminal): acked when it names its
@@ -719,6 +730,21 @@ class GraphBuilderService:
 
     # ==================== Sessions and rejections (M2) ====================
 
+    async def _fetch_session_by_id(self, session_id: str) -> Optional[Tuple]:
+        """ingest.SESSION_BY_ID_SQL (SessionResolver's fetch_by_id)."""
+        async with self.database.connection() as conn:
+            cursor = await conn.execute(ingest.SESSION_BY_ID_SQL, (uuid.UUID(session_id),))
+            return await cursor.fetchone()
+
+    async def _resolve(self, robot_name: str, payload: Dict[str, Any]) -> "ingest.Resolution":
+        """Where this message goes: the robot's open session, or for an import
+        (`import_session_id`) the named session."""
+        target = _import_of(payload)
+        if target is None:
+            return await self.sessions.resolve(robot_name, payload.get('session_id'))
+        return await self.sessions.resolve_import(robot_name, target,
+                                                  payload.get('source_session_id'))
+
     async def _fetch_open_session(self, robot_name: str) -> Optional[Tuple]:
         """ingest.OPEN_SESSION_SQL for one robot (SessionResolver's fetch)."""
         async with self.database.connection() as conn:
@@ -764,6 +790,9 @@ class GraphBuilderService:
         """Drop `count` nodes, images, depth images or costmaps ('node' | 'image' | 'depth' |
         'costmap'): count them and report when due. `log` False: the caller logs (the full
         buffers log once per window)."""
+        if resolution.imported:  # not live ingest: no counters of it, no MAP.INGEST_REJECTED
+            self.stats["import_rejected"] = self.stats.get("import_rejected", 0) + count
+            return
         stat = {"node": "nodes_rejected", "depth": "depth_rejected",
                 "costmap": "costmap_rejected"}.get(kind, "images_rejected")
         self.stats[stat] += count
@@ -1026,6 +1055,7 @@ class GraphBuilderService:
         x, y = payload.get('x'), payload.get('y')
         yaw = payload.get('yaw', payload.get('theta', 0.0))
         run_id = _run_id_of(payload)
+        imp = _import_of(payload)
         manifest = acks.parse_parts(payload.get('parts'))
         if session_node_id is None or robot_name is None or x is None or y is None:
             self.logger.error("Missing required fields: session_node_id, robot_name, x, y")
@@ -1034,29 +1064,36 @@ class GraphBuilderService:
                 self.stats["acks_unackable"] += 1  # not even the node can be named
             else:
                 self._ack("node_failed", robot_name, run_id, session_node_id,
-                          ingest.INVALID_PAYLOAD, manifest, None)
+                          ingest.INVALID_PAYLOAD, manifest, None, ns=imp)
             return
 
-        active_mission, register_map = await self._active_mission(robot_name)
+        if imp is not None and run_id is None:  # the legacy reset heuristic must not see it
+            self._ack("node_failed", robot_name, None, session_node_id, ingest.INVALID_PAYLOAD,
+                      manifest, None, ns=imp)
+            return
+        # An import is not a live message: no mission waypoint, no register_map gate.
+        active_mission, register_map = ((None, True) if imp is not None
+                                        else await self._active_mission(robot_name))
         if not register_map:
             # Dropped on purpose (the mission does not register the map): terminal for the robot.
             self._ack("node_failed", robot_name, run_id, session_node_id, ingest.NO_SESSION,
-                      manifest, None)
+                      manifest, None, ns=imp)
             await self._log_mission_waypoint(
                 robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
                 _mission=active_mission,
             )
             return
 
-        resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+        resolution = await self._resolve(robot_name, payload)
         if not resolution.accepted:
             await self._reject(resolution, "node")
-            node_key = (robot_name, session_node_id)
-            await self._reject(resolution, "image", self.image_buffer.pop(node_key))
-            await self._reject(resolution, "depth", self.depth_buffer.pop(node_key))
-            await self._reject(resolution, "costmap", self.costmap_buffer.pop(node_key))
+            if imp is None:  # (an import's key may be a live node's: leave its buffers)
+                node_key = (robot_name, session_node_id)
+                await self._reject(resolution, "image", self.image_buffer.pop(node_key))
+                await self._reject(resolution, "depth", self.depth_buffer.pop(node_key))
+                await self._reject(resolution, "costmap", self.costmap_buffer.pop(node_key))
             self._ack("node_failed", robot_name, run_id, session_node_id, resolution.reason,
-                      manifest, resolution.session.session_id if resolution.session else None)
+                      manifest, resolution.session.session_id if resolution.session else None, ns=imp)
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, str(session_node_id), session_node_id, x, y, yaw, '',
@@ -1069,9 +1106,9 @@ class GraphBuilderService:
             # Before anything is touched: the run_id-change reset must not run for it.
             await self._reject_run_id(resolution, "node")
             self._ack("node_failed", robot_name, run_id, session_node_id,
-                      ingest.RUN_ID_MISMATCH, manifest, session.session_id)
+                      ingest.RUN_ID_MISMATCH, manifest, session.session_id, ns=imp)
             return
-        self._ack("begin", robot_name, run_id, session_node_id, manifest, session.session_id)
+        self._ack("begin", robot_name, run_id, session_node_id, manifest, session.session_id, ns=imp)
         try:
             if not await self._ensure_robot_exists(robot_name):
                 self.logger.error(f"Failed to ensure robot '{robot_name}' exists in Mission Dispatch database")
@@ -1101,10 +1138,10 @@ class GraphBuilderService:
                         truth = await asyncio.to_thread(
                             self._parts_truth, outcome["map_id"], outcome["global_id"], manifest)
                     self._ack("node_ok", robot_name, run_id, session_node_id, acks.DUPLICATE,
-                              session.session_id, manifest, truth)
+                              session.session_id, manifest, truth, ns=imp)
                 elif outcome["status"] == "failed":
                     self._ack("node_failed", robot_name, run_id, session_node_id,
-                              outcome["reason"], manifest, session.session_id)
+                              outcome["reason"], manifest, session.session_id, ns=imp)
                 return
             global_node_id, mx, my, myaw, map_id, edges, session_node_id, robot_name = result
             published_key = (map_id, global_node_id)
@@ -1130,11 +1167,13 @@ class GraphBuilderService:
                     truth = await asyncio.to_thread(self._parts_truth, map_id, global_node_id,
                                                     manifest)
                 self._ack("node_ok", robot_name, run_id, session_node_id, acks.ACCEPTED,
-                          session.session_id, manifest, truth)
+                          session.session_id, manifest, truth, ns=imp)
             else:
                 self._ack("node_failed", robot_name, run_id, session_node_id, ingest.STORE_FAILED,
-                          manifest, session.session_id)
+                          manifest, session.session_id, ns=imp)
             if already_published:
+                return
+            if imp is not None:  # nothing live: no UI update, no waypoint
                 return
             await self._publish_node_update(map_id, global_node_id, mx, my, myaw, edges, image_ids=None)
             if active_mission is not None:
@@ -1144,7 +1183,7 @@ class GraphBuilderService:
                 )
         except BaseException as exc:  # incl. CancelledError: the begun bundle must not linger
             self._ack("node_abandoned", robot_name, run_id, session_node_id, manifest,
-                      session.session_id)
+                      session.session_id, ns=imp)
             if not isinstance(exc, asyncio.CancelledError):
                 self.logger.debug("node_update aborted after begin", exc_info=True)
             raise
@@ -1603,7 +1642,7 @@ class GraphBuilderService:
 
             self.logger.info(f"📸 Image upload: camera={camera_name}, yaw_offset={yaw_offset}, robot={robot_name}, session_node={session_node_id}")
 
-            resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+            resolution = await self._resolve(robot_name, payload)
             if not resolution.accepted:
                 await self._reject(resolution, "image")
                 self._ack_part_rejected(payload, "image", camera_name, resolution.reason,
@@ -1624,6 +1663,7 @@ class GraphBuilderService:
                 'run_id': run_id,  # a reset keeps the new run's buffered uploads
                 'robot_name': robot_name,  # the ack of the stored part (_note_part_stored)
                 'session_node_id': session_node_id,
+                'import': _import_of(payload),  # the ack key (acks.py `ns`)
                 'metadata': {
                     'camera_name': camera_name,
                     'timestamp': timestamp,
@@ -1658,7 +1698,8 @@ class GraphBuilderService:
                 saved_image_ids = await asyncio.to_thread(
                     self._save_images, global_node_id, map_id, [image_dict])
                 if saved_image_ids:
-                    await self._publish_image_update(map_id, global_node_id, saved_image_ids)
+                    if not image_dict.get("import"):
+                        await self._publish_image_update(map_id, global_node_id, saved_image_ids)
                 else:  # (a stored image was acked by _save_images)
                     self._ack_part_rejected(payload, "image", camera_name, ingest.STORE_FAILED,
                                             resolution)
@@ -1716,7 +1757,7 @@ class GraphBuilderService:
             session_node_id = payload['session_node_id']
             sub = str(payload[spec.sub_field])
 
-            resolution = await self.sessions.resolve(robot_name, payload.get('session_id'))
+            resolution = await self._resolve(robot_name, payload)
             if not resolution.accepted:
                 await self._reject(resolution, spec.kind)
                 self._ack_part_rejected(payload, spec.kind, sub, resolution.reason, resolution)
@@ -1730,7 +1771,8 @@ class GraphBuilderService:
                 return
             entry = {spec.sub_key: sub, "data": payload[spec.data_key], "parsed": parsed,
                      "session_id": session.session_id, "run_id": run_id,
-                     "robot_name": robot_name, "session_node_id": session_node_id}
+                     "robot_name": robot_name, "session_node_id": session_node_id,
+                     "import": _import_of(payload)}
 
             # The record goes onto the node's document: a node stored before a restart is not
             # in memory, so its document is looked up (by the deterministic id) before buffering.

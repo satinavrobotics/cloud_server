@@ -55,11 +55,12 @@ RESEND_NODE = "node"
 # The robot resends nothing after these (README reason table).
 TERMINAL_REASONS = frozenset({
     ingest.NO_SESSION, ingest.MAP_DELETING, ingest.MAP_MISSING, ingest.DATUM_CHANGED,
-    ingest.RUN_ID_MISMATCH, ingest.INVALID_PAYLOAD})
+    ingest.RUN_ID_MISMATCH, ingest.INVALID_PAYLOAD, ingest.SESSION_UNKNOWN,
+    ingest.SOURCE_MISMATCH})
 # It may resend: the node (rejected node) or the part (rejected part).
 RETRYABLE_REASONS = frozenset({
     ingest.SESSION_PAUSED, ingest.SESSION_UNPLACED, ingest.LOOKUP_FAILED, ingest.BUFFER_FULL,
-    ingest.STORE_FAILED})
+    ingest.STORE_FAILED, ingest.SESSION_BUSY})
 
 ACK_COALESCE_S = 1.0          # an identical ack of one (run, node) is sent at most this often
 UNACCEPTED_TTL_FACTOR = 2     # a begun node never made durable is dropped after this x part_timeout_s
@@ -103,6 +104,16 @@ def parse_parts(value: Any) -> Optional[List[Part]]:
         if kind in KINDS and isinstance(sub, str) and sub and (kind, sub) not in parts:
             parts.append((kind, sub))
     return parts
+
+
+def _key(robot: Any, run_id: Optional[str], sid: Any, ns: Optional[str]) -> Tuple:
+    """The tracker key. An import (`ns`: the target session) is tracked apart from the live
+    bundle of the same ids, and never advances `ingest_state`."""
+    return (robot, run_id, sid) if ns is None else (robot, run_id, sid, ns)
+
+
+def _ns_of(key: Tuple) -> Optional[str]:
+    return key[3] if len(key) > 3 else None
 
 
 def _part_dicts(parts) -> List[Dict[str, str]]:
@@ -161,13 +172,13 @@ class AckManager:
     # --- events ----------------------------------------------------------------------------
 
     def begin(self, robot: Any, run_id: Optional[str], sid: Any, manifest: Optional[List[Part]],
-              session_id: Optional[str]) -> None:
+              session_id: Optional[str], ns: Optional[str] = None) -> None:
         """A node with a non-empty manifest was received (not stored yet): parts stored from now
         on are recorded for it. A second receipt (a resend) keeps what is known."""
         if not manifest:
             return
         with self._lock:
-            key = (robot, run_id, sid)
+            key = _key(robot, run_id, sid, ns)
             entry = self._entries.get(key)
             if entry is None:
                 self._entries[key] = _Entry(list(manifest), session_id, since=self._clock())
@@ -179,22 +190,23 @@ class AckManager:
 
     def node_ok(self, robot: Any, run_id: Optional[str], sid: Any, status: str,
                 session_id: Optional[str], manifest: Optional[List[Part]],
-                truth: Optional[Set[Part]] = None) -> None:
+                truth: Optional[Set[Part]] = None, ns: Optional[str] = None) -> None:
         """The node is durable (stored and marked complete, or found stored): the first ack.
         `truth`: the parts found in storage (the duplicate path)."""
         out: List[Tuple[str, str, bool]] = []
         with self._lock:
-            key = (robot, run_id, sid)
-            self._note_run(robot, run_id)
+            key = _key(robot, run_id, sid, ns)
+            if ns is None:
+                self._note_run(robot, run_id)
             if manifest is None:  # no manifest: parts cannot be judged
                 self._entries.pop(key, None)
                 self._ack(out, robot, run_id, sid, status, None, RESEND_NONE, (), (), None,
-                          session_id)
+                          session_id, ns)
             elif not manifest:
                 self._entries.pop(key, None)
                 self._ack(out, robot, run_id, sid, status, None, RESEND_NONE, (), (), True,
-                          session_id)
-                self._complete(out, robot, run_id, sid)
+                          session_id, ns)
+                self._complete(out, robot, run_id, sid, ns)
             else:
                 entry = self._entries.get(key)
                 if entry is None:
@@ -215,37 +227,39 @@ class AckManager:
                     # A fresh node: its parts are on the way. A resent one: say what to resend.
                     self._ack(out, robot, run_id, sid, status, None,
                               RESEND_PARTS if status == DUPLICATE else RESEND_NONE,
-                              entry.stored, pending, False, session_id)
+                              entry.stored, pending, False, session_id, ns)
         self._send(out)
 
     def node_failed(self, robot: Any, run_id: Optional[str], sid: Any, reason: str,
-                    manifest: Optional[List[Part]], session_id: Optional[str]) -> None:
+                    manifest: Optional[List[Part]], session_id: Optional[str],
+                    ns: Optional[str] = None) -> None:
         """The node was not stored. Retryable reasons: resend the node."""
         out: List[Tuple[str, str, bool]] = []
         with self._lock:
-            self._entries.pop((robot, run_id, sid), None)
+            self._entries.pop(_key(robot, run_id, sid, ns), None)
             self._ack(out, robot, run_id, sid, REJECTED, reason,
                       RESEND_NODE if reason in RETRYABLE_REASONS else RESEND_NONE,
-                      (), manifest or (), False, session_id)
+                      (), manifest or (), False, session_id, ns)
         self._send(out)
 
     def node_abandoned(self, robot: Any, run_id: Optional[str], sid: Any,
-                       manifest: Optional[List[Part]], session_id: Optional[str]) -> None:
+                       manifest: Optional[List[Part]], session_id: Optional[str],
+                       ns: Optional[str] = None) -> None:
         """The handler of a begun node ended abnormally (exception, cancellation). If the node was
         not acked yet (its tracker has no status) it fails, retryable: resend the node. Otherwise
         (acked, or no tracker) nothing is sent."""
         with self._lock:
-            entry = self._entries.get((robot, run_id, sid))
+            entry = self._entries.get(_key(robot, run_id, sid, ns))
             pending = entry is not None and entry.status is None
         if pending:
-            self.node_failed(robot, run_id, sid, ingest.STORE_FAILED, manifest, session_id)
+            self.node_failed(robot, run_id, sid, ingest.STORE_FAILED, manifest, session_id, ns)
 
     def part_stored(self, robot: Any, run_id: Optional[str], sid: Any, kind: str,
-                    sub: str) -> None:
+                    sub: str, ns: Optional[str] = None) -> None:
         """A part is durable (MinIO and, for depth / costmap, the node's record)."""
         out: List[Tuple[str, str, bool]] = []
         with self._lock:
-            key = (robot, run_id, sid)
+            key = _key(robot, run_id, sid, ns)
             entry = self._entries.get(key)
             if entry is None:
                 return
@@ -256,13 +270,14 @@ class AckManager:
         self._send(out)
 
     def part_rejected(self, robot: Any, run_id: Optional[str], sid: Any, kind: str, sub: str,
-                      reason: str, session_id: Optional[str] = None) -> None:
+                      reason: str, session_id: Optional[str] = None,
+                      ns: Optional[str] = None) -> None:
         """A part was not stored. Of an accepted bundle it is recorded (the final or timeout ack
         lists it); otherwise it is acked on its own."""
         out: List[Tuple[str, str, bool]] = []
         part = (kind, sub)
         with self._lock:
-            key = (robot, run_id, sid)
+            key = _key(robot, run_id, sid, ns)
             entry = self._entries.get(key)
             if entry is not None and part in entry.stored:
                 return  # stored already (a resend that came too late)
@@ -272,7 +287,7 @@ class AckManager:
             else:
                 self._ack(out, robot, run_id, sid, REJECTED, reason,
                           RESEND_PARTS if reason in RETRYABLE_REASONS else RESEND_NONE,
-                          (), [part], False, session_id)
+                          (), [part], False, session_id, ns)
         self._send(out)
 
     def flush(self) -> None:
@@ -293,7 +308,7 @@ class AckManager:
                 self.stats["ack_timeouts"] += 1
                 if pending:
                     self._ack(out, key[0], key[1], key[2], entry.status, None, RESEND_PARTS,
-                              entry.stored, pending, False, entry.session_id)
+                              entry.stored, pending, False, entry.session_id, _ns_of(key))
                 entry.timeouts += 1
                 entry.since = now
                 entry.missing.clear()
@@ -449,7 +464,8 @@ class AckManager:
                 "last_spooled_id": spool.get("last_spooled_id") if known else None,
                 "highest_complete_id": (state.highest if state is not None
                                         and state.run_id == run_id else None),
-                "open_trackers": sum(1 for k in self._entries if k[0] == robot and k[1] == run_id),
+                "open_trackers": sum(1 for k in self._entries
+                                if len(k) == 3 and k[0] == robot and k[1] == run_id),
                 "spool_age_s": (round(max(0, now_ms - spool["received_ms"]) / 1000.0, 1)
                                 if spool is not None else None),
             }
@@ -492,27 +508,28 @@ class AckManager:
         self._final(out, key, entry)
 
     def _final(self, out, key, entry: _Entry) -> None:
-        robot, run_id, sid = key
+        robot, run_id, sid = key[:3]
+        ns = _ns_of(key)
         if not entry.missing:
             self._ack(out, robot, run_id, sid, entry.status, None, RESEND_NONE,
-                      entry.declared, (), True, entry.session_id)
+                      entry.declared, (), True, entry.session_id, ns)
             del self._entries[key]
-            self._complete(out, robot, run_id, sid)
+            self._complete(out, robot, run_id, sid, ns)
             return
         missing = list(entry.missing)
         terminal = [r for r in entry.missing.values() if r in TERMINAL_REASONS]
         if terminal:  # the bundle is refused for good
             self._ack(out, robot, run_id, sid, REJECTED, terminal[0], RESEND_NONE,
-                      entry.stored, missing, False, entry.session_id)
+                      entry.stored, missing, False, entry.session_id, ns)
             del self._entries[key]
             return
         self._ack(out, robot, run_id, sid, entry.status, next(iter(entry.missing.values())),
-                  RESEND_PARTS, entry.stored, missing, False, entry.session_id)
+                  RESEND_PARTS, entry.stored, missing, False, entry.session_id, ns)
         entry.missing.clear()  # the resent parts are pending again
         entry.since = self._clock()
 
     def _ack(self, out, robot, run_id, sid, status, reason, resend, stored, missing, complete,
-             session_id) -> None:
+             session_id, ns=None) -> None:
         if not valid_topic_level(robot):
             self.stats["acks_invalid_robot"] += 1
             logger.warning("Not acking a node of robot %r: not a topic level", robot)
@@ -521,13 +538,16 @@ class AckManager:
                 "status": status, "reason": reason, "resend": resend,
                 "parts_stored": _part_dicts(stored), "parts_missing": _part_dicts(missing),
                 "complete": complete, "session_id": session_id}
+        if ns is not None:
+            body["import"] = True
+            body["import_session_id"] = ns
         try:
             signature = json.dumps(body, sort_keys=True)
         except (TypeError, ValueError):
             self.stats["acks_failed"] += 1
             return
         now = self._clock()
-        key = (robot, run_id, sid)
+        key = _key(robot, run_id, sid, ns)
         last = self._last_ack.get(key)
         if last is not None and last[0] == signature and now - last[1] < ACK_COALESCE_S:
             self.stats["acks_coalesced"] += 1
@@ -539,8 +559,10 @@ class AckManager:
         body["ts"] = self._wall_ms()
         out.append((ack_topic(robot), json.dumps(body), False))
 
-    def _complete(self, out, robot, run_id, sid) -> None:
-        """A bundle is complete: advance the robot's high-water mark."""
+    def _complete(self, out, robot, run_id, sid, ns=None) -> None:
+        """A bundle is complete: advance the robot's high-water mark (not for an import)."""
+        if ns is not None:
+            return
         if isinstance(sid, bool) or not isinstance(sid, int) or not valid_topic_level(robot):
             return
         latest = self._runs.get(robot)

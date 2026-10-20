@@ -32,6 +32,23 @@ restart from a resend. Otherwise it is dropped:
     run_id_mismatch   the payload's `run_id` is not the one the open cloud session is bound to
                       (the first it saw; server.py `_run_id_conflict`); nothing is touched
 
+Import (explicit-session ingest): a payload with `import_session_id` is a bundle the robot
+recorded earlier and replays into a named session, which may be finished. It is resolved by that
+id, not as the robot's open session (`SessionResolver.resolve_import`, `decide_import`):
+
+    session_unknown   no such session, or it belongs to another robot (terminal)
+    source_mismatch   the payload's `source_session_id` (the cloud session the bundle was
+                      recorded in) is not the target (terminal: another frame)
+    session_busy      the robot has an open session (retryable: the replay waits; live and
+                      replayed ids of one robot must not meet in memory)
+    map_missing / map_deleting / session_unplaced  as above (the target's map and placement)
+
+A finished session is accepted (pause, the robot's datum and realignment do not apply: the
+session's own map_T_session is used). Nothing live happens for an import: no UI node update, no
+mission waypoint, and its acks are keyed by the target session and never touch `ingest_state`.
+An import has no authentication beyond the robot_name in the payload; the broker's topic ACLs
+decide who may publish it.
+
 Two more reasons exist only in the acks to the robot (acks.py), not as MAP.INGEST_REJECTED:
 `invalid_payload` (a part that cannot be stored) and `store_failed` (the write failed).
 
@@ -97,6 +114,8 @@ from packages.utils import map_geo, map_sessions
 logger = logging.getLogger("GraphBuilderService.ingest")
 
 SESSION_CACHE_TTL_S = 1.0
+BY_ID_TTL_FACTOR = 5  # an import's target is read once per 5 s, not per message
+BY_ID_CACHE_SIZE = 64
 REJECT_EVENT_INTERVAL_S = 60.0
 
 NO_SESSION = "no_session"
@@ -109,21 +128,27 @@ LOOKUP_FAILED = "lookup_failed"
 BUFFER_FULL = "buffer_full"
 # REASONS is documentation only (MAP.INGEST_REJECTED's `reason` is a free string).
 RUN_ID_MISMATCH = "run_id_mismatch"
+# Explicit-session (import) ingest only; see "Import" in the module docstring.
+SESSION_UNKNOWN = "session_unknown"
+SOURCE_MISMATCH = "source_mismatch"
+SESSION_BUSY = "session_busy"
 # Ack-only reasons (acks.py): never recorded as MAP.INGEST_REJECTED.
 INVALID_PAYLOAD = "invalid_payload"
 STORE_FAILED = "store_failed"
-REASONS = (NO_SESSION, MAP_DELETING, MAP_MISSING, SESSION_PAUSED,
+REASONS = (SESSION_UNKNOWN, SOURCE_MISMATCH, SESSION_BUSY, NO_SESSION, MAP_DELETING, MAP_MISSING, SESSION_PAUSED,
            SESSION_UNPLACED, DATUM_CHANGED, LOOKUP_FAILED, BUFFER_FULL)
 
 # One row per robot at most (partial unique index map_sessions_one_open_per_robot).
 OPEN_SESSION_SQL = (
     "SELECT s.session_id, s.map_name, s.paused_at IS NOT NULL, s.map_t_session, "
     "m.lifecycle, m.status->>'state', s.datum, r.spec->'datum', "
-    "m.spec->'geo', m.spec->>'type', s.purpose, s.aligned "
+    "m.spec->'geo', m.spec->>'type', s.purpose, s.aligned, s.robot_name "
     "FROM map_sessions s LEFT JOIN mapobjectv1 m "
     "ON m.name = s.map_name AND m.lifecycle <> 'DELETED' "
     "LEFT JOIN robotobjectv1 r ON r.name = s.robot_name AND r.lifecycle <> 'DELETED' "
     "WHERE s.robot_name = %s AND s.ended_at IS NULL")
+# The same row for a named session of any state (import).
+SESSION_BY_ID_SQL = OPEN_SESSION_SQL.rsplit(" WHERE ", 1)[0] + " WHERE s.session_id = %s"
 # Compare-and-set on the datum read: only the ingest that saw the old datum wins (rowcount 1).
 # Only a placed session (maps §14): an unplaced one waits for mission-dispatch's re-placement.
 REALIGN_SQL = ("UPDATE map_sessions SET datum = %s::jsonb, map_t_session = %s::jsonb "
@@ -146,17 +171,19 @@ class OpenSession:
     map_type: Optional[str] = None
     purpose: str = map_sessions.MAPPING
     aligned: bool = True  # placed (maps §14)
+    robot_name: Optional[str] = None  # the session's robot (import ownership check)
 
     @classmethod
     def from_row(cls, row: Tuple) -> "OpenSession":
         session_id, map_name, paused, transform, lifecycle, state, sdatum, rdatum = row[:8]
         mgeo, mtype = (row[8], row[9]) if len(row) >= 10 else (None, None)
         purpose, aligned = (row[10], row[11]) if len(row) >= 12 else (None, True)
+        owner = row[12] if len(row) >= 13 else None
         t = dict(map_geo.IDENTITY)
         t.update({k: float(v) for k, v in (transform or {}).items() if k in t})
         return cls(str(session_id), map_name, bool(paused), t, lifecycle, state or "ready",
                    sdatum or None, map_geo.robot_datum(rdatum or {}), mgeo or None, mtype,
-                   purpose or map_sessions.MAPPING, aligned is not False)
+                   purpose or map_sessions.MAPPING, aligned is not False, owner)
 
 
 same_datum = map_sessions.same_datum
@@ -169,6 +196,7 @@ class Resolution:
     session: Optional[OpenSession] = None
     reason: Optional[str] = None
     payload_session_id: Optional[str] = None
+    imported: bool = False  # an import's decision (its drops are not live ingest drops)
 
     @property
     def accepted(self) -> bool:
@@ -203,6 +231,39 @@ def decide(robot_name: str, session: Optional[OpenSession],
         logger.debug("Payload session_id %s of %s differs from its open session %s: accepted",
                      psid, robot_name, session.session_id)
     return Resolution(robot_name, session, reason, psid)
+
+
+def canonical_session_id(value: Any) -> Optional[str]:
+    """`value` as the canonical uuid string; None when absent or not a uuid."""
+    try:
+        return str(uuid_t.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def decide_import(robot_name: str, target: Optional[OpenSession],
+                  source_session_id: Any = None, robot_open: Optional[OpenSession] = None,
+                  target_session_id: Any = None) -> Resolution:
+    """The import rule (pure), module docstring "Import". `target` is the named session (any
+    state), `robot_open` the robot's open session, if any."""
+    tsid = str(target_session_id) if target_session_id not in (None, "") else None
+    if target is None or target.robot_name != robot_name:
+        return Resolution(robot_name, None, SESSION_UNKNOWN, tsid, True)
+    ssid = (canonical_session_id(source_session_id) or str(source_session_id)
+            if source_session_id not in (None, "") else None)
+    if ssid is not None and ssid != target.session_id:
+        reason = SOURCE_MISMATCH
+    elif robot_open is not None:
+        reason = SESSION_BUSY
+    elif target.map_lifecycle is None:
+        reason = MAP_MISSING
+    elif target.map_lifecycle == "DELETING":
+        reason = MAP_DELETING
+    elif not target.aligned:
+        reason = SESSION_UNPLACED
+    else:
+        reason = None
+    return Resolution(robot_name, target, reason, tsid, True)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -532,8 +593,11 @@ class SessionResolver:
 
     def __init__(self, fetch: Callable[[str], Any], ttl: float = SESSION_CACHE_TTL_S,
                  clock: Callable[[], float] = time.monotonic,
-                 realign: Optional[Callable[..., Any]] = None):
+                 realign: Optional[Callable[..., Any]] = None,
+                 fetch_by_id: Optional[Callable[[str], Any]] = None):
         self._fetch = fetch
+        self._fetch_by_id = fetch_by_id
+        self._by_id_cache: Dict[str, Tuple[float, Any]] = {}
         # async (robot_name, session, Realign) -> bool: the compare-and-set + event; True = won.
         self._realign = realign
         self.ttl = ttl
@@ -565,6 +629,39 @@ class SessionResolver:
                                                  resolution)
         return resolution
 
+    async def resolve_import(self, robot_name: str, target_session_id: Any,
+                             source_session_id: Any = None) -> Resolution:
+        """Resolve an import (`decide_import`). The named session is cached (`_by_id`); the robot's
+        open session is read fresh: its cached entry is dropped first, so a session opened
+        within the last `ttl` seconds still blocks the import. `fetch_by_id(session_id)` is the service's query
+        (SESSION_BY_ID_SQL)."""
+        tsid = canonical_session_id(target_session_id)
+        if tsid is None:  # not a session id: nothing to retry
+            return Resolution(robot_name, None, SESSION_UNKNOWN, str(target_session_id), True)
+        self._cache.pop(robot_name, None)
+        try:
+            row = await self._by_id(tsid)
+            robot_open = await self.open_session(robot_name)
+        except Exception as exc:  # noqa: BLE001 - e.g. Postgres down
+            logger.warning("Import session lookup for %s failed: %s", robot_name, exc)
+            return Resolution(robot_name, None, LOOKUP_FAILED, tsid, True)
+        target = OpenSession.from_row(row) if row is not None else None
+        return decide_import(robot_name, target, source_session_id, robot_open, tsid)
+
+    async def _by_id(self, session_id: str) -> Optional[Tuple]:
+        """The named session's row, cached for `ttl` x BY_ID_TTL_FACTOR (a replay sends many
+        messages to one session); a missing session is cached for `ttl` only."""
+        now = self._clock()
+        hit = self._by_id_cache.get(session_id)
+        if hit is not None and now < hit[0]:
+            return hit[1]
+        row = await self._fetch_by_id(session_id) if self._fetch_by_id else None
+        self._by_id_cache[session_id] = (
+            now + self.ttl * (BY_ID_TTL_FACTOR if row is not None else 1), row)
+        while len(self._by_id_cache) > BY_ID_CACHE_SIZE:
+            self._by_id_cache.pop(next(iter(self._by_id_cache)))
+        return row
+
     async def _try_realign(self, robot_name: str, session: OpenSession,
                            payload_session_id: Any, rejected: Resolution) -> Resolution:
         """Re-anchor a geo session after a datum change (module docstring), then decide again on
@@ -587,6 +684,7 @@ class SessionResolver:
         return decide(robot_name, fresh, payload_session_id)
 
     def invalidate(self, robot_name: Optional[str] = None) -> None:
+        self._by_id_cache.clear()
         if robot_name is None:
             self._cache.clear()
         else:
