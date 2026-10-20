@@ -684,6 +684,14 @@ if os.getenv("SCENE_GRAPH_PLANNER_MODE", "lazy").strip().lower() != "lazy":
         os.getenv("SCENE_GRAPH_PLANNER_MODE"))
 SCENE_GRAPH_LAZY_MAX_TILES = int(os.getenv("SCENE_GRAPH_LAZY_MAX_TILES", "400"))
 SCENE_GRAPH_LAZY_TILE_CACHE = int(os.getenv("SCENE_GRAPH_LAZY_TILE_CACHE", "512"))
+# Byte caches (a small host, e.g. the robot's Pi, lowers them; the defaults are the cloud's):
+#  - STORE_TILE_CACHE_BYTES: the decoded-tile cache of each SceneGraphStore (planner, and each of the API's stores);
+#  - API_RESULT_CACHE_BYTES: the API's scene-graph read result cache (scene_graph_reads);
+#  - OCCUPANCY_CHUNK_CACHE_BYTES / OCCUPANCY_INDEX_CACHE_BYTES: the API's occupancy chunk LRU and index LRU.
+SCENE_GRAPH_STORE_TILE_CACHE_BYTES = int(os.getenv("SCENE_GRAPH_STORE_TILE_CACHE_BYTES", str(64 << 20)))
+SCENE_GRAPH_API_RESULT_CACHE_BYTES = int(os.getenv("SCENE_GRAPH_API_RESULT_CACHE_BYTES", str(96 << 20)))
+OCCUPANCY_CHUNK_CACHE_BYTES = int(os.getenv("OCCUPANCY_CHUNK_CACHE_BYTES", str(64 << 20)))
+OCCUPANCY_INDEX_CACHE_BYTES = int(os.getenv("OCCUPANCY_INDEX_CACHE_BYTES", str(64 << 20)))
 # A store.meta answer is reused this long per map and shared by concurrent requests (one query).
 SCENE_GRAPH_META_TTL_S = float(os.getenv("SCENE_GRAPH_META_TTL_S", "0.75"))
 # A chart route needs a graph at least as new as the ingest: when the oldest costmap stored after the

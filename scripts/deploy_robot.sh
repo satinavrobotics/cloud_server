@@ -52,6 +52,14 @@ if grep -qE '^(MEM_POSTGRES|MEM_ARANGO)=768m[[:space:]]*(#.*)?$' "$ENV_FILE"; th
         log "dropped the old default MEM_POSTGRES/MEM_ARANGO=768m lines from $ENV_FILE: the compose defaults apply now"
     fi
 fi
+# Same for the old graph-builder default (384m), now 896m.
+if grep -qE '^MEM_GRAPH_BUILDER=384m[[:space:]]*(#.*)?$' "$ENV_FILE"; then
+    if [ "$DRY" = 1 ]; then log "would drop the old default MEM_GRAPH_BUILDER=384m line from $ENV_FILE"
+    else
+        sed -i -E '/^MEM_GRAPH_BUILDER=384m[[:space:]]*(#.*)?$/d' "$ENV_FILE"
+        log "dropped the old default MEM_GRAPH_BUILDER=384m line from $ENV_FILE: the compose default applies now"
+    fi
+fi
 if [ "$ROLLBACK" = 1 ]; then
     [ -s "$PREV" ] || die "no previous tag recorded ($PREV)"
     TAG="$(cat "$PREV")"

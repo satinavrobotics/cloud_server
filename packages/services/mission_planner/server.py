@@ -200,7 +200,7 @@ class MissionPlannerService:
         """The scene graph store over ArangoDB + MinIO (needs MINIO_* secrets in this service's env)."""
         from packages.scene_graph.store import SceneGraphStore
         from packages.topomap_dbs.client import TopomapDatabaseClient
-        return SceneGraphStore.from_client(TopomapDatabaseClient())
+        return SceneGraphStore.from_client(TopomapDatabaseClient(), tile_cache_bytes=config.SCENE_GRAPH_STORE_TILE_CACHE_BYTES)
 
     async def _try_chart_route(
         self, robot_name: str, map_id: str, target_x: float, target_y: float,
