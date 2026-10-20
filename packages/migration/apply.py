@@ -19,7 +19,7 @@ import json
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Protocol
 
-from packages.migration.bundle import BundleReader, map_dir
+from packages.migration.bundle import BundleReader, map_dir, rosbag_dir, runs_dir
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,9 @@ class TargetStore(Protocol):
                          metadata: Dict[str, str]) -> None: ...
     async def put_view_settings(self, name: str, settings: Dict[str, Any]) -> bool: ...
     async def commit_map(self, name: str, state: str, imported_from: Dict[str, Any]) -> None: ...
+    async def add_runs(self, import_id: str, runs: List[Dict[str, Any]], legs: List[Dict[str, Any]]) -> Dict[str, int]: ...   # {runs, legs} inserted, rest existed
+    async def rosbag_size(self, robot: str, bag_id: str) -> Optional[int]: ...
+    async def put_rosbag(self, import_id: str, robot: str, bag_id: str, stream: Any, size: int, sidecar: Dict[str, Any]) -> None: ...
 
 
 ProgressFn = Callable[[Dict[str, Any]], Awaitable[None]]
@@ -125,6 +128,45 @@ async def apply_import(reader: BundleReader, plan: Dict[str, Any], store: Target
             report["ok"], report["stopped"] = False, True
         except Exception as exc:  # noqa: BLE001 - one map failing must not stop the others
             logger.exception("Import %s: map %s -> %s failed", import_id, src, dst)
+            out["ok"], out["error"] = False, f"{type(exc).__name__}: {exc}"
+            report["ok"] = False
+
+
+    renames = plan.get("map_renames") or {}
+    report["runs"] = []
+    for entry in plan.get("runs") or []:
+        out = {"mission": entry["mission"]}
+        report["runs"].append(out)
+        if report["stopped"] or (should_stop is not None and should_stop()):
+            report["ok"], report["stopped"] = False, True
+            out["not_started"] = True
+            continue
+        try:
+            await _apply_runs(reader, store, import_id, entry["mission"], renames, out, tell, should_stop)
+            out["ok"] = True
+        except ImportStopped:
+            out["ok"], out["stopped"] = False, True
+            report["ok"], report["stopped"] = False, True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Import %s: runs of %s failed", import_id, entry["mission"])
+            out["ok"], out["error"] = False, f"{type(exc).__name__}: {exc}"
+            report["ok"] = False
+    report["rosbags"] = []
+    for entry in plan.get("rosbags") or []:
+        out = {"robot": entry["robot"], "bag_id": entry["bag_id"]}
+        report["rosbags"].append(out)
+        if report["stopped"] or (should_stop is not None and should_stop()):
+            report["ok"], report["stopped"] = False, True
+            out["not_started"] = True
+            continue
+        try:
+            await _apply_rosbag(reader, store, import_id, entry, renames, out, tell, should_stop)
+            out["ok"] = True
+        except ImportStopped:
+            out["ok"], out["stopped"] = False, True
+            report["ok"], report["stopped"] = False, True
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Import %s: recording %s/%s failed", import_id, entry["robot"], entry["bag_id"])
             out["ok"], out["error"] = False, f"{type(exc).__name__}: {exc}"
             report["ok"] = False
     return report
@@ -212,3 +254,58 @@ async def _apply_map(reader: BundleReader, plan: Dict[str, Any], store: TargetSt
         await tell(map=dst, phase="commit")
         marker = dict(marker, phase="complete")
         await store.commit_map(dst, final_state(marker.get("source_state"), out["nodes"]), marker)
+
+
+RUN_BATCH = 500
+
+
+def remap_run(row: Dict[str, Any], renames: Dict[str, str]) -> Dict[str, Any]:
+    """A run or leg row for the target: its map id follows the rename of that map (when it came with the same transfer)."""
+    out = dict(row)
+    mid = out.get("map_id")
+    if mid and mid in renames:
+        out["map_id"] = renames[mid]
+    return out
+
+
+async def _apply_runs(reader: BundleReader, store: TargetStore, import_id: str, mission: str, renames: Dict[str, str], out: Dict[str, Any],
+                      tell: ProgressFn, should_stop: Optional[StopFn]) -> None:
+    base = runs_dir(mission)
+    runs = [remap_run(r, renames) for r in reader.iter_ndjson(f"{base}/runs.ndjson")]
+    legs_by_run: Dict[str, List[Dict[str, Any]]] = {}
+    for leg in reader.iter_ndjson(f"{base}/legs.ndjson"):
+        legs_by_run.setdefault(str(leg["run_id"]), []).append(remap_run(leg, renames))
+    out.update({"runs": len(runs), "runs_inserted": 0, "legs_inserted": 0})
+    for batch in _batches(runs, RUN_BATCH):
+        if should_stop is not None and should_stop():
+            raise ImportStopped()
+        legs = [leg for r in batch for leg in legs_by_run.get(str(r["run_id"]), [])]
+        res = await store.add_runs(import_id, batch, legs)
+        out["runs_inserted"] += res.get("runs", 0)
+        out["legs_inserted"] += res.get("legs", 0)
+        await tell(phase="runs", mission=mission, done=out["runs_inserted"], total=len(runs))
+    out["runs_existing"] = len(runs) - out["runs_inserted"]
+
+
+async def _apply_rosbag(reader: BundleReader, store: TargetStore, import_id: str, entry: Dict[str, Any], renames: Dict[str, str],
+                        out: Dict[str, Any], tell: ProgressFn, should_stop: Optional[StopFn]) -> None:
+    robot, bag_id = entry["robot"], entry["bag_id"]
+    base = rosbag_dir(robot, bag_id)
+    meta = reader.read_json(f"{base}/meta.json")
+    size = int(meta["size"])
+    out["bytes"] = size
+    have = await store.rosbag_size(robot, bag_id)
+    if have == size:
+        out["skipped"] = True                                              # copied before (a repeat or a continue)
+        return
+    if have is not None:
+        raise ImportRefused(f"{robot}/{bag_id} already exists here with a different size ({have} bytes, not {size}); not overwritten")
+    if should_stop is not None and should_stop():
+        raise ImportStopped()
+    await tell(phase="rosbag", robot=robot, bag_id=bag_id, bytes=size)
+    sidecar = {k: v for k, v in meta.items() if k not in ("size", "last_modified", "download_url")}
+    if sidecar.get("map_id") in renames:
+        sidecar["map_id"] = renames[sidecar["map_id"]]
+    with reader.open(f"{base}/data") as stream:
+        await store.put_rosbag(import_id, robot, bag_id, stream, size, sidecar)
+    out["copied"] = True

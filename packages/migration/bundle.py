@@ -5,6 +5,9 @@
     maps/<q>/nodes.ndjson               one ArangoDB node document per line
     maps/<q>/edges.ndjson               one edge document per line
     maps/<q>/objects/<key>              MinIO objects of the map (images, depth, costmaps, ...), byte for byte
+    runs/<q>/runs.ndjson, legs.ndjson   the finished runs of one mission (mission_runs and run_legs rows), one per line
+    rosbags/<q robot>/<q bag>/meta.json the recording's sidecar (map, datum, description) and size
+    rosbags/<q robot>/<q bag>/data      the recording itself, byte for byte
 
 `<q>` is the map name URL-quoted, so any name is a safe path. Large things are files, never embedded in JSON.
 The reader refuses a bundle with a newer `schema_version` than it knows, and `verify()` re-hashes every file.
@@ -31,6 +34,14 @@ class BundleError(Exception):
 
 def map_dir(name: str) -> str:
     return "maps/" + quote(name, safe="")
+
+
+def runs_dir(mission: str) -> str:
+    return "runs/" + quote(mission, safe="")
+
+
+def rosbag_dir(robot: str, bag_id: str) -> str:
+    return f"rosbags/{quote(robot, safe='')}/{quote(bag_id, safe='')}"
 
 
 def _utcnow() -> str:

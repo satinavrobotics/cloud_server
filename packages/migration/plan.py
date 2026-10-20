@@ -74,10 +74,22 @@ def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = Tr
     src_key = source_key(manifest)
     label = (manifest.get("source") or {}).get("name") or src_key
     maps_out: List[Dict[str, Any]] = []
+    runs_out: List[Dict[str, Any]] = []
+    bags_out: List[Dict[str, Any]] = []
     total_bytes = 0
     for item in manifest.get("items", []):
-        if item.get("type") != "map":
-            warnings.append(f"item of type {item.get('type')!r} is not supported by this server and is skipped")
+        kind = item.get("type")
+        if kind == "runs":
+            runs_out.append({"mission": item["name"], "action": "add", "counts": item.get("counts") or {}})
+            continue
+        if kind == "rosbag":
+            counts = item.get("counts") or {}
+            total_bytes += int(counts.get("bytes") or 0)
+            bags_out.append({"robot": item.get("robot"), "bag_id": item.get("bag_id"), "action": "add", "bytes": int(counts.get("bytes") or 0),
+                             "map_id": counts.get("map_id"), "recorded_at": counts.get("recorded_at")})
+            continue
+        if kind != "map":
+            warnings.append(f"item of type {kind!r} is not supported by this server and is skipped")
             continue
         name = item["name"]
         counts = item.get("counts") or {}
@@ -99,12 +111,27 @@ def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = Tr
         total_bytes += int(counts.get("object_bytes") or 0)
         maps_out.append({"source_name": name, "target_name": target_name, "action": action, "reason": reason,
                          "parts": item.get("parts") or [], "counts": counts})
+    renames = {m["source_name"]: m["target_name"] for m in maps_out}
+    known = set(existing) | set(renames.values())
+    for run in runs_out:
+        missing = sorted({renames.get(mid, mid) for mid in (run["counts"].get("map_ids") or [])} - known)
+        if missing:
+            warnings.append(f"the runs of mission {run['mission']!r} refer to map(s) {', '.join(missing)} that this server does not have; "
+                            "they are copied as they are")
+    for bag in bags_out:
+        mid = bag.get("map_id")
+        if mid and renames.get(mid, mid) not in known:
+            warnings.append(f"recording {bag['robot']}/{bag['bag_id']} refers to map {mid!r}, which this server does not have")
     free = target.free_bytes()
     if free is not None and total_bytes > free * 0.9:
         errors.append(f"not enough disk: the bundle needs {total_bytes} bytes of objects, {free} are free")
-    if not maps_out and not errors:
+    if not (maps_out or runs_out or bags_out) and not errors:
         warnings.append("the bundle contains nothing this server can import")
     return {"ok": not errors, "errors": errors, "warnings": warnings, "source": manifest.get("source") or {},
             "source_key": src_key, "created_at": manifest.get("created_at"), "maps": maps_out,
+            "runs": runs_out, "rosbags": bags_out, "map_renames": renames,
             "totals": {"maps": len(maps_out), "object_bytes": total_bytes,
-                       "nodes": sum(int(m["counts"].get("nodes") or 0) for m in maps_out)}}
+                       "nodes": sum(int(m["counts"].get("nodes") or 0) for m in maps_out),
+                       "runs": sum(int(r["counts"].get("runs") or 0) for r in runs_out),
+                       "legs": sum(int(r["counts"].get("legs") or 0) for r in runs_out),
+                       "rosbag_bytes": sum(b["bytes"] for b in bags_out)}}

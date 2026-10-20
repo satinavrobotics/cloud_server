@@ -1,7 +1,8 @@
 """Data transfer between servers: pick maps, export them as a bundle, import a bundle on another server.
 
     GET    /api/v1/transfer/maps[?sizes=true]            what this server can export (sizes per part on request)
-    POST   /api/v1/transfer/exports   {"maps": {"Hall": ["definition", "images"], ...}}   -> 202, an export job
+    POST   /api/v1/transfer/exports   {"maps": {"Hall": ["definition", "images"]}, "runs": ["mission"], "rosbags": [{"robot", "bag_id"}]}
+                                                         -> 202, an export job (any of the three kinds, at least one)
     GET    /api/v1/transfer/exports/{id}                 its state and counts
     GET    /api/v1/transfer/exports/{id}/bundle          the bundle (a tar), streamed
     DELETE /api/v1/transfer/exports/{id}
@@ -42,20 +43,33 @@ logger = logging.getLogger("ApiDelegationService.data_transfer")
 router = APIRouter(prefix="/api/v1/transfer", tags=["data-transfer"])
 
 
-class ExportRequest(BaseModel):
-    maps: Dict[str, List[str]]
+class RosbagPick(BaseModel):
+    robot: str
+    bag_id: str
 
 
-class PullRequest(BaseModel):
+class Selection(BaseModel):
+    """What to move: maps (each with the parts to include), the finished runs of missions, and rosbag recordings."""
+    maps: Dict[str, List[str]] = {}
+    runs: List[str] = []
+    rosbags: List[RosbagPick] = []
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"maps": dict(self.maps), "runs": list(self.runs), "rosbags": [b.dict() for b in self.rosbags]}
+
+
+class ExportRequest(Selection):
+    pass
+
+
+class PullRequest(Selection):
     source_url: Optional[str] = None
     source_urls: Optional[List[str]] = None        # candidates, tried in order (a robot sending maps up lists its addresses)
     expect_instance_id: Optional[str] = None       # the source must answer with this instance id
-    maps: Dict[str, List[str]]
 
 
-class SendRequest(BaseModel):
+class SendRequest(Selection):
     destination_url: str
-    maps: Dict[str, List[str]]
 
 
 def _server_description() -> Dict[str, Any]:
@@ -91,6 +105,17 @@ def _guard(fn):
     return inner
 
 
+def _list_rosbags(mgr: TransferManager) -> List[Dict[str, Any]]:
+    """The recordings that can be picked: robot, bag id, size, map, when (the sidecar's `recorded_at`)."""
+    try:
+        return [{"robot": b["robot_name"], "bag_id": b["bag_id"], "size": b.get("size"), "map_id": b.get("map_id"),
+                 "recorded_at": b.get("recorded_at"), "description": b.get("description")}
+                for b in mgr.topomap_db.rosbag.list_bags()]
+    except Exception:  # noqa: BLE001 - the listing must not fail because recordings cannot be listed
+        logger.exception("Could not list rosbag recordings")
+        return []
+
+
 @router.get("/maps")
 async def exportable_maps(request: Request, sizes: bool = False):
     mgr = manager(request)
@@ -115,13 +140,15 @@ async def exportable_maps(request: Request, sizes: bool = False):
             item["state"] = (row.get("status") or {}).get("state")
             item["open_session"] = any(not s.get("ended_at") for s in pg[item["name"]].get("sessions", []))
             item["parts"] = await asyncio.to_thread(measure, item["name"])
-    return {"maps": out, "parts": list(PARTS), "server": await mgr.identity()}
+    from packages.migration.stores import list_runs
+    bags = await asyncio.to_thread(_list_rosbags, mgr)
+    return {"maps": out, "parts": list(PARTS), "server": await mgr.identity(), "runs": await list_runs(mgr.database), "rosbags": bags}
 
 
 @router.post("/exports", status_code=202)
 @_guard
 async def start_export(body: ExportRequest, request: Request):
-    return manager(request).start_export(body.maps)
+    return manager(request).start_export(body.as_dict())
 
 
 @router.get("/exports/{export_id}")
@@ -179,7 +206,7 @@ async def pull_import(body: PullRequest, request: Request):
     """Start fetching a bundle from another Sati server (its export, then the download here), then plan it.
     Returns the import job at once (state `fetching`, with progress); poll GET /imports/{id}."""
     sources = body.source_urls or ([body.source_url] if body.source_url else [])
-    return manager(request).start_pull(sources, body.maps, body.expect_instance_id)
+    return manager(request).start_pull(sources, body.as_dict(), body.expect_instance_id)
 
 
 @router.get("/remote/maps")
@@ -238,7 +265,7 @@ def _client_host(request: Request) -> Optional[str]:
 async def outbound_pull(body: SendRequest, request: Request):
     """Send maps to another server: it is asked to pull them from this one (it plans first; nothing is written there until
     apply). Returns the destination's import job plus `destination_url`; follow it with the calls below."""
-    return await manager(request).outbound_start(body.destination_url, body.maps, _client_host(request))
+    return await manager(request).outbound_start(body.destination_url, body.as_dict(), _client_host(request))
 
 
 @router.get("/outbound/imports/{import_id}")

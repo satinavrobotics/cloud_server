@@ -6,7 +6,7 @@ import tarfile
 import pytest
 
 from packages.migration import bundle as B
-from packages.migration.export import ExportRefused, export_maps, object_part
+from packages.migration.export import ExportRefused, export_maps, export_selection, object_part
 from packages.migration.plan import choose_name, plan_import
 
 
@@ -37,6 +37,25 @@ class FakeSource:
         data = self.m[name]["objects"][key]
         yield data[:2]
         yield data[2:]
+
+    # runs and recordings: {"runs": {mission: {"runs": [...], "legs": [...]}}, "bags": {(robot, bag): (meta, bytes)}}
+    runs_data = {}
+    bags_data = {}
+
+    def runs(self, mission):
+        return list(self.runs_data.get(mission, {}).get("runs", []))
+
+    def legs(self, mission):
+        return list(self.runs_data.get(mission, {}).get("legs", []))
+
+    def rosbag_meta(self, robot, bag_id):
+        hit = self.bags_data.get((robot, bag_id))
+        return None if hit is None else {**hit[0], "size": len(hit[1])}
+
+    def rosbag_fetch(self, robot, bag_id):
+        data = self.bags_data[(robot, bag_id)][1]
+        yield data[:3]
+        yield data[3:]
 
 
 def a_map(**over):
@@ -204,7 +223,7 @@ def test_free_name_is_kept(tmp_path):
     with reader_for(tmp_path) as r:
         plan = plan_import(r, Target())
     assert plan["ok"] and plan["maps"][0]["action"] == "create" and plan["maps"][0]["target_name"] == "Hall"
-    assert plan["totals"] == {"maps": 1, "object_bytes": 15, "nodes": 2}
+    assert plan["totals"] == {"maps": 1, "object_bytes": 15, "nodes": 2, "runs": 0, "legs": 0, "rosbag_bytes": 0}
 
 
 def test_clash_renames_never_overwrites(tmp_path):
@@ -301,3 +320,79 @@ def test_source_identity_prefers_the_instance_id_and_names_come_from_the_server_
     with reader_for(tmp_path, src={"name": "raspberrypi", "instance_id": "7001"}) as r:
         plan = plan_import(r, Target({"Hall": {"lifecycle": "ALIVE"}}))
     assert plan["maps"][0]["target_name"] == "Hall-raspberrypi"
+
+
+# ---- mission runs and recordings --------------------------------------------------------------------------------------------
+
+def run_row(i, mission="patrol", map_id="Hall", **over):
+    row = {"run_id": f"00000000-0000-0000-0000-00000000000{i}", "mission_name": mission, "robot_name": "peacock", "map_id": map_id,
+           "state": "COMPLETED", "started_at": f"2026-10-1{i}T10:00:00+00:00", "ended_at": f"2026-10-1{i}T10:05:00+00:00", "mission_tree": {"x": 1}}
+    row.update(over)
+    return row
+
+
+def leg_row(i, seq, map_id="Hall"):
+    return {"run_id": f"00000000-0000-0000-0000-00000000000{i}", "seq": seq, "mission_name": "patrol", "map_id": map_id, "duration_s": 3.5}
+
+
+def with_runs_and_bags(maps=None):
+    src = FakeSource(maps or {"Hall": a_map()})
+    src.runs_data = {"patrol": {"runs": [run_row(1), run_row(2)], "legs": [leg_row(1, 0), leg_row(1, 1), leg_row(2, 0)]}}
+    src.bags_data = {("peacock", "bag-1"): ({"description": "lap", "map_id": "Hall", "recorded_at": "2026-10-11T09:00:00Z"}, b"ROSBAGDATA")}
+    return src
+
+
+def build_sel(tmp_path, source, selection):
+    path = tmp_path / "sel.tar"
+    with B.BundleWriter(source={"name": "Pi", "server_id": "pi-1"}) as w:
+        export_selection(source, selection, w)
+        with open(path, "wb") as f:
+            w.pack(f)
+    return str(path)
+
+
+def test_runs_and_recordings_roundtrip_in_the_bundle(tmp_path):
+    src = with_runs_and_bags()
+    path = build_sel(tmp_path, src, {"maps": {}, "runs": ["patrol"], "rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    with B.BundleReader(path) as r:
+        assert r.verify() == []
+        kinds = [(i["type"], i["name"]) for i in r.manifest["items"]]
+        assert kinds == [("runs", "patrol"), ("rosbag", "peacock/bag-1")]
+        assert [x["run_id"][-1] for x in r.iter_ndjson("runs/patrol/runs.ndjson")] == ["1", "2"]
+        assert len(list(r.iter_ndjson("runs/patrol/legs.ndjson"))) == 3
+        assert r.open("rosbags/peacock/bag-1/data").read() == b"ROSBAGDATA"
+        assert r.read_json("rosbags/peacock/bag-1/meta.json")["map_id"] == "Hall"
+        runs_item = r.manifest["items"][0]["counts"]
+        assert runs_item["runs"] == 2 and runs_item["legs"] == 3 and runs_item["robots"] == ["peacock"] and runs_item["map_ids"] == ["Hall"]
+
+
+def test_export_selection_refusals(tmp_path):
+    src = with_runs_and_bags()
+    with B.BundleWriter() as w:
+        with pytest.raises(ExportRefused, match="at least one"):
+            export_selection(src, {}, w)
+        with pytest.raises(ExportRefused, match="no finished runs"):
+            export_selection(src, {"runs": ["nothing"]}, w)
+        with pytest.raises(ExportRefused, match="does not exist"):
+            export_selection(src, {"rosbags": [{"robot": "peacock", "bag_id": "nope"}]}, w)
+
+
+def test_plan_lists_runs_and_recordings_and_warns_about_maps_the_target_lacks(tmp_path):
+    src = with_runs_and_bags()
+    path = build_sel(tmp_path, src, {"runs": ["patrol"], "rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    with B.BundleReader(path) as r:
+        plan = plan_import(r, Target({"Elsewhere": {"lifecycle": "ALIVE"}}))
+    assert plan["ok"] and plan["maps"] == []
+    assert plan["runs"][0]["mission"] == "patrol" and plan["runs"][0]["counts"]["runs"] == 2
+    assert plan["rosbags"][0]["bytes"] == 10 and plan["totals"]["runs"] == 2 and plan["totals"]["legs"] == 3
+    assert any("refer to map(s) Hall" in w for w in plan["warnings"]) and any("refers to map 'Hall'" in w for w in plan["warnings"])
+    with B.BundleReader(path) as r:
+        quiet = plan_import(r, Target({"Hall": {"lifecycle": "ALIVE"}}))
+    assert quiet["warnings"] == []
+
+
+def test_plan_counts_recording_bytes_against_the_disk(tmp_path):
+    path = build_sel(tmp_path, with_runs_and_bags(), {"rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    with B.BundleReader(path) as r:
+        plan = plan_import(r, Target(free=5))
+    assert not plan["ok"] and "not enough disk" in plan["errors"][0]

@@ -51,7 +51,7 @@ def test_pull_fetches_plans_and_cleans_up(tmp_path):
 
     async def go():
         mgr = make_manager(tmp_path, remote(bundle, calls=calls))
-        job = mgr.start_pull("http://robot/", {"Hall": ["definition", "images"]})
+        job = mgr.start_pull("http://robot/", {"maps": {"Hall": ["definition", "images"]}})
         assert job["state"] == "fetching"
         done = await finish(mgr, job)
         return mgr, done
@@ -67,7 +67,7 @@ def test_pull_reports_a_failed_remote_export(tmp_path):
 
     async def go():
         mgr = make_manager(tmp_path, remote(bundle, export_state="failed"))
-        return await finish(mgr, mgr.start_pull("http://robot", {"Hall": []}))
+        return await finish(mgr, mgr.start_pull("http://robot", {"maps": {"Hall": []}}))
     done = asyncio.new_event_loop().run_until_complete(go())
     assert done["state"] == "failed" and "boom" in done["error"]
     assert list((tmp_path / "spool").iterdir()) == []
@@ -80,7 +80,7 @@ def test_pull_rejects_bad_input(tmp_path):
 
     async def go():
         with pytest.raises(TransferError):
-            mgr.start_pull("ftp://x", {"a": []})
+            mgr.start_pull("ftp://x", {"maps": {"a": []}})
         with pytest.raises(TransferError):
             mgr.start_pull("http://x", {})
         with pytest.raises(TransferError, match="does not support"):
@@ -112,7 +112,7 @@ def test_stop_cancels_a_fetch_and_deletes_the_partial_file(tmp_path):
 
     async def go():
         mgr = make_manager(tmp_path, remote(bundle, export_state="running"))     # the remote export never finishes
-        job = mgr.start_pull("http://robot", {"Hall": ["definition"]})
+        job = mgr.start_pull("http://robot", {"maps": {"Hall": ["definition"]}})
         await asyncio.sleep(0.1)
         assert mgr.imports[job["id"]]["state"] == "fetching"
         mgr.stop_import(job["id"])
@@ -159,7 +159,7 @@ def test_send_asks_the_destination_to_pull_and_tells_it_every_address_and_who_to
             return httpx.Response(202, json={"id": "r1", "state": "fetching", "origin": "x"})
         return httpx.Response(404)
     mgr = _sender(tmp_path, handler, monkeypatch)
-    job = asyncio.new_event_loop().run_until_complete(mgr.outbound_start("http://100.85.3.47/", {"office_pi": ["definition", "images"]}, "192.168.1.60"))
+    job = asyncio.new_event_loop().run_until_complete(mgr.outbound_start("http://100.85.3.47/", {"maps": {"office_pi": ["definition", "images"]}}, "192.168.1.60"))
     assert seen["body"] == {"source_urls": ["http://100.116.20.49", "http://192.168.1.60"], "expect_instance_id": "111",
                             "maps": {"office_pi": ["definition", "images"]}}
     assert job["id"] == "r1" and job["destination_url"] == "http://100.85.3.47"
@@ -172,15 +172,15 @@ def test_send_refuses_this_server_an_old_server_and_nothing_picked(tmp_path, mon
     old = _sender(tmp_path, lambda r: httpx.Response(404), monkeypatch)
     loop = asyncio.new_event_loop()
     with pytest.raises(TransferError, match="this server itself"):
-        loop.run_until_complete(same.outbound_start("http://100.85.3.47", {"a": []}))
+        loop.run_until_complete(same.outbound_start("http://100.85.3.47", {"maps": {"a": []}}))
     with pytest.raises(TransferError, match="this server itself"):
-        loop.run_until_complete(same.outbound_start("http://100.116.20.49", {"a": []}))        # its own address, caught before any call
+        loop.run_until_complete(same.outbound_start("http://100.116.20.49", {"maps": {"a": []}}))        # its own address, caught before any call
     with pytest.raises(TransferError, match="does not support"):
-        loop.run_until_complete(old.outbound_start("http://100.85.3.47", {"a": []}))
-    with pytest.raises(TransferError, match="at least one map"):
+        loop.run_until_complete(old.outbound_start("http://100.85.3.47", {"maps": {"a": []}}))
+    with pytest.raises(TransferError, match="at least one"):
         loop.run_until_complete(same.outbound_start("http://100.85.3.47", {}))
     with pytest.raises(TransferError, match="http"):
-        loop.run_until_complete(same.outbound_start("ftp://x", {"a": []}))
+        loop.run_until_complete(same.outbound_start("ftp://x", {"maps": {"a": []}}))
 
 
 def test_the_destination_picks_the_address_that_really_is_the_sender(tmp_path):

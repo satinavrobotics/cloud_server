@@ -8,11 +8,12 @@ thread. The importer is async; ArangoDB and MinIO calls run in threads.
 import asyncio
 import contextlib
 import datetime
+import io
 import json
 import logging
 import mimetypes
 import uuid
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from psycopg.types.json import Jsonb
 
@@ -82,11 +83,65 @@ async def prefetch_postgres(database: Any, names: List[str]) -> Dict[str, Dict[s
     return out
 
 
+async def prefetch_runs(database: Any, missions: List[str]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
+    """The finished runs and legs of each mission (read-only; a RUNNING run is live state and never exported)."""
+    out: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    async with database.connection() as conn:
+        for mission in missions:
+            cur = await conn.execute("SELECT * FROM mission_runs WHERE mission_name = %s AND state <> 'RUNNING' ORDER BY started_at, run_id",
+                                     (mission,))
+            cols = [d.name for d in cur.description]
+            runs = [jsonable(dict(zip(cols, r))) for r in await cur.fetchall()]
+            cur = await conn.execute("SELECT l.* FROM run_legs l JOIN mission_runs r USING (run_id) "
+                                     "WHERE r.mission_name = %s AND r.state <> 'RUNNING' ORDER BY l.run_id, l.seq", (mission,))
+            cols = [d.name for d in cur.description]
+            out[mission] = {"runs": runs, "legs": [jsonable(dict(zip(cols, r))) for r in await cur.fetchall()]}
+    return out
+
+
+async def list_runs(database: Any) -> List[Dict[str, Any]]:
+    """What can be picked: one row per mission that has finished runs."""
+    async with database.connection() as conn:
+        cur = await conn.execute(
+            "SELECT mission_name, count(*), min(started_at), max(started_at), array_agg(DISTINCT robot_name), "
+            "array_agg(DISTINCT map_id) FILTER (WHERE map_id IS NOT NULL) FROM mission_runs WHERE state <> 'RUNNING' "
+            "GROUP BY mission_name ORDER BY max(started_at) DESC")
+        return [{"mission": r[0], "runs": r[1], "first": jsonable(r[2]), "last": jsonable(r[3]), "robots": sorted(r[4] or []),
+                 "map_ids": sorted(r[5] or [])} for r in await cur.fetchall()]
+
+
+ROSBAG_BUCKET = "rosbags"
+
+
 class ServiceMapSource:
     """`export.MapSource` over the API's ArangoDB and MinIO clients plus the prefetched Postgres rows."""
 
-    def __init__(self, topomap_db: Any, pg: Dict[str, Dict[str, Any]]):
+    def __init__(self, topomap_db: Any, pg: Dict[str, Dict[str, Any]], runs: Optional[Dict[str, Dict[str, List[Dict[str, Any]]]]] = None):
         self.graph, self.images, self.pg = topomap_db.graph, topomap_db.image, pg
+        self.rosbags, self._runs = topomap_db.rosbag, runs or {}
+
+    def runs(self, mission: str) -> List[Dict[str, Any]]:
+        return list((self._runs.get(mission) or {}).get("runs", []))
+
+    def legs(self, mission: str) -> List[Dict[str, Any]]:
+        return list((self._runs.get(mission) or {}).get("legs", []))
+
+    def rosbag_meta(self, robot: str, bag_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            stat = self.rosbags.client.stat_object(ROSBAG_BUCKET, f"{robot}/{bag_id}")
+        except Exception:  # noqa: BLE001 - not there
+            return None
+        sidecar = self.rosbags._read_sidecar(robot, bag_id) or {}
+        return {**sidecar, "robot_name": robot, "bag_id": bag_id, "size": int(stat.size)}
+
+    def rosbag_fetch(self, robot: str, bag_id: str) -> Iterator[bytes]:
+        resp = self.rosbags.client.get_object(ROSBAG_BUCKET, f"{robot}/{bag_id}")
+        try:
+            for chunk in resp.stream(CHUNK):
+                yield chunk
+        finally:
+            resp.close()
+            resp.release_conn()
 
     def map_row(self, name: str) -> Optional[Dict[str, Any]]:
         return (self.pg.get(name) or {}).get("row")
@@ -141,7 +196,7 @@ class ServiceTarget:
     """`apply.TargetStore` over the API's Postgres pool, ArangoDB and MinIO clients."""
 
     def __init__(self, database: Any, topomap_db: Any, publisher_id: Optional[uuid.UUID] = None):
-        self.db, self.graph, self.images = database, topomap_db.graph, topomap_db.image
+        self.db, self.graph, self.images, self.rosbags = database, topomap_db.graph, topomap_db.image, topomap_db.rosbag
         self.publisher_id = publisher_id or uuid.uuid4()
 
     async def lock(self, name: str) -> Any:
@@ -258,3 +313,91 @@ class ServiceTarget:
             await conn.execute(f"UPDATE {MAP_TABLE} SET status = status || %s WHERE name = %s",
                                (Jsonb(patch), name))
             await self._notify(conn, name, "ALIVE")
+
+    # ---- mission runs and recordings -------------------------------------------------------------------------------------------
+    async def _columns(self, conn: Any, table: str) -> Dict[str, str]:
+        cur = await conn.execute("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = %s", (table,))
+        return {r[0]: r[1] for r in await cur.fetchall()}
+
+    @staticmethod
+    def _values(row: Dict[str, Any], known: Dict[str, str]) -> Tuple[List[str], List[Any]]:
+        cols = [k for k in row if k in known]
+        return cols, [Jsonb(row[k]) if isinstance(row[k], (dict, list)) and known[k] in ("jsonb", "json") else row[k] for k in cols]
+
+    async def add_runs(self, import_id: str, runs: List[Dict[str, Any]], legs: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Insert the runs and legs that are not there yet (finished rows are immutable, so an existing one is left as it is). A
+        cause code this server does not know becomes NULL (the detail stays in `abort_detail`)."""
+        inserted = {"runs": 0, "legs": 0}
+        async with self.db.connection() as conn:
+            run_cols = await self._columns(conn, "mission_runs")
+            leg_cols = await self._columns(conn, "run_legs")
+            cur = await conn.execute("SELECT code FROM cause_codes")
+            causes = {r[0] for r in await cur.fetchall()}
+            for r in runs:
+                row = dict(r)
+                if row.get("abort_cause") and row["abort_cause"] not in causes:
+                    row["abort_cause"] = None
+                cols, values = self._values(row, run_cols)
+                cur = await conn.execute(
+                    f"INSERT INTO mission_runs ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) ON CONFLICT (run_id) DO NOTHING", values)
+                if cur.rowcount > 0:
+                    inserted["runs"] += 1
+                    # remembered so that Undo removes exactly the runs this transfer inserted
+                    await conn.execute("INSERT INTO import_items (import_id, kind, key) VALUES (%s, 'run', %s) ON CONFLICT DO NOTHING",
+                                       (import_id, str(row["run_id"])))
+            for leg in legs:
+                cols, values = self._values(leg, leg_cols)
+                cur = await conn.execute(
+                    f"INSERT INTO run_legs ({', '.join(cols)}) VALUES ({', '.join(['%s'] * len(cols))}) ON CONFLICT (run_id, seq) DO NOTHING", values)
+                inserted["legs"] += max(cur.rowcount, 0)
+        return inserted
+
+    def _bag_size(self, robot: str, bag_id: str) -> Optional[int]:
+        try:
+            return int(self.rosbags.client.stat_object(ROSBAG_BUCKET, f"{robot}/{bag_id}").size)
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def rosbag_size(self, robot: str, bag_id: str) -> Optional[int]:
+        return await asyncio.to_thread(self._bag_size, robot, bag_id)
+
+    def _put_bag(self, robot: str, bag_id: str, stream: Any, size: int, sidecar: Dict[str, Any]) -> None:
+        client = self.rosbags.client
+        if not client.bucket_exists(ROSBAG_BUCKET):
+            client.make_bucket(ROSBAG_BUCKET)
+        client.put_object(ROSBAG_BUCKET, f"{robot}/{bag_id}", stream, length=size, content_type="application/octet-stream")
+        got = self._bag_size(robot, bag_id)
+        if got != size:
+            raise RuntimeError(f"{robot}/{bag_id}: stored {got} bytes, expected {size}")
+        # The sidecar goes last: a recording that was cut short has no sidecar, so nothing lists it as complete.
+        data = json.dumps({**sidecar, "robot_name": robot, "bag_id": bag_id}).encode()
+        client.put_object(ROSBAG_BUCKET, f"{robot}/{bag_id}.json", io.BytesIO(data), length=len(data), content_type="application/json")
+
+    async def put_rosbag(self, import_id: str, robot: str, bag_id: str, stream: Any, size: int, sidecar: Dict[str, Any]) -> None:
+        # recorded first: a copy that is cut short is still removed by Undo
+        async with self.db.connection() as conn:
+            await conn.execute("INSERT INTO import_items (import_id, kind, key) VALUES (%s, 'rosbag', %s) ON CONFLICT DO NOTHING",
+                               (import_id, f"{robot}/{bag_id}"))
+        try:
+            await asyncio.to_thread(self._put_bag, robot, bag_id, stream, size, sidecar)
+        except Exception as exc:  # noqa: BLE001 - minio's errors are frozen dataclasses that cannot cross a thread
+            raise RuntimeError(f"{robot}/{bag_id}: {type(exc).__name__}: {exc}") from None
+
+    async def remove_imported(self, import_id: str) -> Dict[str, int]:
+        """Undo for runs and recordings: delete exactly what `import_id` inserted (a run's legs go with it), then forget the rows."""
+        removed = {"runs": 0, "rosbags": 0}
+        async with self.db.connection() as conn:
+            cur = await conn.execute("SELECT kind, key FROM import_items WHERE import_id = %s", (import_id,))
+            items = await cur.fetchall()
+            run_ids = [k for kind, k in items if kind == "run"]
+            if run_ids:
+                cur = await conn.execute("DELETE FROM mission_runs WHERE run_id = ANY(%s::uuid[])", (run_ids,))
+                removed["runs"] = max(cur.rowcount, 0)
+        for kind, key in items:
+            if kind == "rosbag":
+                robot, bag_id = key.split("/", 1)
+                if await asyncio.to_thread(self.rosbags.delete_bag, robot, bag_id):
+                    removed["rosbags"] += 1
+        async with self.db.connection() as conn:
+            await conn.execute("DELETE FROM import_items WHERE import_id = %s", (import_id,))
+        return removed

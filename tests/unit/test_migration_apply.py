@@ -10,7 +10,7 @@ from packages.migration import bundle as B
 from packages.migration.apply import ImportRefused, apply_import, final_state, rewrite_edge, rewrite_node
 from packages.migration.export import export_maps
 from packages.migration.plan import plan_import
-from tests.unit.test_migration_bundle_export_plan import FakeSource, Target, a_map, build
+from tests.unit.test_migration_bundle_export_plan import FakeSource, Target, a_map, build, build_sel, with_runs_and_bags
 
 
 class FakeStore:
@@ -69,6 +69,32 @@ class FakeStore:
             return False
         self.views[name] = settings
         return True
+
+    runs_rows = None
+    bags = None
+
+    async def add_runs(self, import_id, runs, legs):
+        self.runs_rows = {} if self.runs_rows is None else self.runs_rows
+        self.legs_rows = getattr(self, "legs_rows", {})
+        n = m = 0
+        for r in runs:
+            if r["run_id"] not in self.runs_rows:
+                self.runs_rows[r["run_id"]] = r
+                n += 1
+        for leg in legs:
+            key = (leg["run_id"], leg["seq"])
+            if key not in self.legs_rows:
+                self.legs_rows[key] = leg
+                m += 1
+        return {"runs": n, "legs": m}
+
+    async def rosbag_size(self, robot, bag_id):
+        v = (self.bags or {}).get((robot, bag_id))
+        return None if v is None else len(v[0])
+
+    async def put_rosbag(self, import_id, robot, bag_id, stream, size, sidecar):
+        self.bags = {} if self.bags is None else self.bags
+        self.bags[(robot, bag_id)] = (stream.read(), sidecar)
 
     async def commit_map(self, name, state, imported_from):
         row = self.rows[name]
@@ -256,3 +282,50 @@ def test_a_stop_asked_at_the_very_start_writes_nothing_but_the_hidden_marker(tmp
     store = FakeStore()
     report = run(apply_import(reader, plan, store, "i", should_stop=lambda: True))
     assert report["stopped"] and store.nodes.get("Hall") is None and store.objects.get("Hall") is None
+
+
+def sel_plan(tmp_path, selection, target=None, src=None):
+    reader = B.BundleReader(build_sel(tmp_path, src or with_runs_and_bags(), selection))
+    return reader, plan_import(reader, target or Target({"Hall": {"lifecycle": "ALIVE"}}))
+
+
+def test_runs_and_recordings_are_applied_once_and_a_repeat_changes_nothing(tmp_path):
+    reader, plan = sel_plan(tmp_path, {"runs": ["patrol"], "rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    store = FakeStore()
+    report = run(apply_import(reader, plan, store, "i"))
+    assert report["ok"] and report["runs"][0]["runs_inserted"] == 2 and report["runs"][0]["legs_inserted"] == 3
+    assert report["rosbags"][0]["copied"] and store.bags[("peacock", "bag-1")][0] == b"ROSBAGDATA"
+    again = run(apply_import(reader, plan, store, "i2"))
+    assert again["runs"][0]["runs_inserted"] == 0 and again["runs"][0]["runs_existing"] == 2 and again["runs"][0]["legs_inserted"] == 0
+    assert again["rosbags"][0]["skipped"] and "copied" not in again["rosbags"][0]
+    assert len(store.runs_rows) == 2 and len(store.legs_rows) == 3
+
+
+def test_runs_and_the_recording_follow_a_map_that_was_renamed_in_the_same_transfer(tmp_path):
+    src = with_runs_and_bags()
+    path = build_sel(tmp_path, src, {"maps": {"Hall": ["definition"]}, "runs": ["patrol"], "rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    reader = B.BundleReader(path)
+    plan = plan_import(reader, Target({"Hall": {"lifecycle": "ALIVE"}}))
+    assert plan["map_renames"] == {"Hall": "Hall-Pi"}
+    store = FakeStore({"Hall": {"lifecycle": "ALIVE", "spec": {}, "status": {}}})
+    report = run(apply_import(reader, plan, store, "i"))
+    assert report["ok"]
+    assert {r["map_id"] for r in store.runs_rows.values()} == {"Hall-Pi"} and {leg["map_id"] for leg in store.legs_rows.values()} == {"Hall-Pi"}
+    assert store.bags[("peacock", "bag-1")][1]["map_id"] == "Hall-Pi"
+
+
+def test_a_recording_that_exists_with_another_size_is_never_overwritten(tmp_path):
+    reader, plan = sel_plan(tmp_path, {"rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    store = FakeStore()
+    store.bags = {("peacock", "bag-1"): (b"DIFFERENT-LENGTH-DATA", {})}
+    report = run(apply_import(reader, plan, store, "i"))
+    assert not report["ok"] and "different size" in report["rosbags"][0]["error"]
+    assert store.bags[("peacock", "bag-1")][0] == b"DIFFERENT-LENGTH-DATA"
+
+
+def test_stop_before_runs_and_recordings_leaves_them_not_started(tmp_path):
+    reader, plan = sel_plan(tmp_path, {"runs": ["patrol"], "rosbags": [{"robot": "peacock", "bag_id": "bag-1"}]})
+    store = FakeStore()
+    report = run(apply_import(reader, plan, store, "i", should_stop=lambda: True))
+    assert report["stopped"] and report["runs"][0]["not_started"] and report["rosbags"][0]["not_started"]
+    assert store.runs_rows is None and store.bags is None
