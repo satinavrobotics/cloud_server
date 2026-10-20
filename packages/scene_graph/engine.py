@@ -884,7 +884,12 @@ class ChartGraph(SceneGraph):
     def _partition(self, nav: np.ndarray) -> "morse.Partition":
         if self.params.place_peak_m is not None:
             nav = self._place_filter(nav)
-        return morse.partition(nav, self._h, self._tau, radius=self._radius, cache=self._ccache)
+        # The solver keeps the previous solve and recomputes what changed (morse.PartitionSolver: the same Partition as
+        # morse.partition, exact for any previous state and any `shift`, which is only a hint of where the old canvas lies).
+        sv = getattr(self, "_psolver", None)
+        if sv is None:
+            sv = self._psolver = morse.PartitionSolver(self._h, self._tau, self._radius)
+        return sv.update(nav, self._shift)
 
     def _place_filter(self, nav: np.ndarray) -> np.ndarray:
         """The navigable set without the regions that are not places (scene_graph/place.py). Every path that cuts charts goes
