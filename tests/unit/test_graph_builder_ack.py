@@ -361,7 +361,8 @@ TABLE = {  # reason -> the resend a rejected NODE gets
     "no_session": "none", "map_deleting": "none", "map_missing": "none",
     "datum_changed": "none", "run_id_mismatch": "none", "invalid_payload": "none",
     "session_paused": "node", "session_unplaced": "node", "lookup_failed": "node",
-    "buffer_full": "node", "store_failed": "node"}
+    "buffer_full": "node", "store_failed": "node",
+    "session_unknown": "none", "source_mismatch": "none", "session_busy": "node"}  # import only
 
 
 def _failing_lookup(s):
