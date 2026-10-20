@@ -160,7 +160,7 @@ def test_send_asks_the_destination_to_pull_and_tells_it_every_address_and_who_to
         return httpx.Response(404)
     mgr = _sender(tmp_path, handler, monkeypatch)
     job = asyncio.new_event_loop().run_until_complete(mgr.outbound_start("http://100.85.3.47/", {"maps": {"office_pi": ["definition", "images"]}}, "192.168.1.60"))
-    assert seen["body"] == {"source_urls": ["http://100.116.20.49", "http://192.168.1.60"], "expect_instance_id": "111",
+    assert seen["body"] == {"source_urls": ["http://100.116.20.49", "http://192.168.1.60"], "expect_instance_id": "111", "delta": True,
                             "maps": {"office_pi": ["definition", "images"]}}
     assert job["id"] == "r1" and job["destination_url"] == "http://100.85.3.47"
 

@@ -281,6 +281,16 @@ class ServiceTarget:
         except Exception:  # noqa: BLE001 - not there (or the bucket is not yet)
             return None
 
+    def _list_sizes(self, name: str) -> Dict[str, int]:
+        bucket = bucket_of(self.images, name)
+        if not self.images.client.bucket_exists(bucket):
+            return {}
+        return {o.object_name: int(o.size) for o in self.images.client.list_objects(bucket, recursive=True) if not o.is_dir}
+
+    async def object_sizes(self, name: str) -> Dict[str, int]:
+        """Everything in the map's bucket as {key: size}: what a repeated transfer need not send again."""
+        return await asyncio.to_thread(self._list_sizes, name)
+
     async def object_size(self, name: str, key: str) -> Optional[int]:
         return await asyncio.to_thread(self._stat_size, name, key)
 

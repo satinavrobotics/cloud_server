@@ -67,9 +67,11 @@ def check_parts(parts: Sequence[str]) -> List[str]:
     return ["definition"] + [p for p in PARTS if p in parts and p != "definition"]
 
 
-def export_maps(source: MapSource, picks: Dict[str, Sequence[str]], writer: BundleWriter) -> Dict[str, Any]:
+def export_maps(source: MapSource, picks: Dict[str, Sequence[str]], writer: BundleWriter,
+                have: Optional[Dict[str, Dict[str, int]]] = None) -> Dict[str, Any]:
     """Add each picked map (`{name: parts}`) to `writer`; the summary per map. Raises ExportRefused
-    before writing anything when a pick is invalid."""
+    before writing anything when a pick is invalid. `have` (`{map: {key: size}}`) is what the receiving server already holds:
+    an object listed there with the same size is named in the bundle (`present`) but its bytes are not sent."""
     plan: Dict[str, List[str]] = {}
     rows: Dict[str, Dict[str, Any]] = {}
     sessions: Dict[str, List[Dict[str, Any]]] = {}
@@ -92,9 +94,17 @@ def export_maps(source: MapSource, picks: Dict[str, Sequence[str]], writer: Bund
         node_entry = writer.add_ndjson(f"{base}/nodes.ndjson", source.nodes(name))
         edge_entry = writer.add_ndjson(f"{base}/edges.ndjson", source.edges(name))
         objects: List[Dict[str, Any]] = []
+        held = (have or {}).get(name) or {}
+        present = present_bytes = 0
         for obj in source.objects(name):
             part = object_part(obj["key"])
             if part is None or part not in parts:
+                continue
+            if held.get(obj["key"]) == obj["size"]:
+                objects.append({"key": obj["key"], "part": part, "size": obj["size"], "present": True,
+                                "content_type": obj.get("content_type"), "metadata": obj.get("metadata") or {}})
+                present += 1
+                present_bytes += obj["size"]
                 continue
             entry = writer.add_stream(f"{base}/objects/{obj['key']}", source.fetch(name, obj["key"]))
             if entry["size"] != obj["size"]:
@@ -109,7 +119,8 @@ def export_maps(source: MapSource, picks: Dict[str, Sequence[str]], writer: Bund
             "view_settings": source.view_settings(name), "sessions": sessions[name]})
         counts = {"nodes": node_entry["count"], "edges": edge_entry["count"],
                   "sessions": len(sessions[name]), "objects": len(objects),
-                  "object_bytes": sum(o["size"] for o in objects)}
+                  "object_bytes": sum(o["size"] for o in objects if not o.get("present")),
+                  "objects_present": present, "present_bytes": present_bytes}
         writer.items.append({"type": "map", "name": name, "parts": parts, "counts": counts})
         summary[name] = counts
         logger.info("Exported map %s: %s", name, counts)
@@ -140,8 +151,10 @@ def export_runs(source: MapSource, missions: Sequence[str], writer: BundleWriter
     return summary
 
 
-def export_rosbags(source: MapSource, bags: Sequence[Dict[str, str]], writer: BundleWriter) -> Dict[str, Any]:
-    """Each picked recording ({robot, bag_id}): its sidecar and its bytes, hashed as they are written."""
+def export_rosbags(source: MapSource, bags: Sequence[Dict[str, str]], writer: BundleWriter,
+                   have: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+    """Each picked recording ({robot, bag_id}): its sidecar and its bytes, hashed as they are written. A recording the receiving
+    server already holds (`have`: `{"robot/bag_id": size}`, same size) is named but its bytes are not sent."""
     metas: List[Dict[str, Any]] = []
     for pick in bags:
         robot, bag_id = str(pick.get("robot") or ""), str(pick.get("bag_id") or "")
@@ -154,19 +167,26 @@ def export_rosbags(source: MapSource, bags: Sequence[Dict[str, str]], writer: Bu
     for meta in metas:
         robot, bag_id = meta["robot_name"], meta["bag_id"]
         base = rosbag_dir(robot, bag_id)
-        entry = writer.add_stream(f"{base}/data", source.rosbag_fetch(robot, bag_id))
-        if entry["size"] != meta["size"]:
-            raise ExportRefused(f"{robot}/{bag_id}: read {entry['size']} bytes, expected {meta['size']}")
+        present = (have or {}).get(f"{robot}/{bag_id}") == meta["size"]
+        if not present:
+            entry = writer.add_stream(f"{base}/data", source.rosbag_fetch(robot, bag_id))
+            if entry["size"] != meta["size"]:
+                raise ExportRefused(f"{robot}/{bag_id}: read {entry['size']} bytes, expected {meta['size']}")
         writer.add_json(f"{base}/meta.json", meta)
-        counts = {"bytes": entry["size"], "map_id": meta.get("map_id"), "recorded_at": meta.get("recorded_at")}
+        counts = {"bytes": int(meta["size"]), "map_id": meta.get("map_id"), "recorded_at": meta.get("recorded_at")}
+        if present:
+            counts["present"] = True
         writer.items.append({"type": "rosbag", "name": f"{robot}/{bag_id}", "robot": robot, "bag_id": bag_id, "counts": counts})
         summary[f"rosbag:{robot}/{bag_id}"] = counts
     return summary
 
 
-def export_selection(source: MapSource, selection: Dict[str, Any], writer: BundleWriter) -> Dict[str, Any]:
+def export_selection(source: MapSource, selection: Dict[str, Any], writer: BundleWriter,
+                     have: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Everything the user picked: `{"maps": {name: parts}, "runs": [mission], "rosbags": [{robot, bag_id}]}`. Raises ExportRefused
-    for an invalid pick; a refused pick writes nothing for the kinds after it."""
+    for an invalid pick; a refused pick writes nothing for the kinds after it. `have` = `{"maps": {map: {key: size}}, "rosbags":
+    {"robot/bag": size}}`: what the receiving server holds already, so that only the rest is sent."""
+    have = have or {}
     maps = selection.get("maps") or {}
     runs = list(selection.get("runs") or [])
     bags = list(selection.get("rosbags") or [])
@@ -174,9 +194,9 @@ def export_selection(source: MapSource, selection: Dict[str, Any], writer: Bundl
         raise ExportRefused("pick at least one map, mission or recording")
     summary: Dict[str, Any] = {}
     if maps:
-        summary.update(export_maps(source, maps, writer))
+        summary.update(export_maps(source, maps, writer, have.get("maps")))
     if runs:
         summary.update(export_runs(source, runs, writer))
     if bags:
-        summary.update(export_rosbags(source, bags, writer))
+        summary.update(export_rosbags(source, bags, writer, have.get("rosbags")))
     return summary

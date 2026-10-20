@@ -101,7 +101,7 @@ def test_roundtrip_and_hashes(tmp_path):
         assert r.read_json("maps/Hall/map.json")["view_settings"] == {"z_floor": 0.4}
         assert r.open("maps/Hall/objects/n1/images/a").read() == b"jpegdata"
         item = r.manifest["items"][0]
-        assert item["counts"] == {"nodes": 2, "edges": 1, "sessions": 1, "objects": 2, "object_bytes": 15}
+        assert item["counts"] == {"nodes": 2, "edges": 1, "sessions": 1, "objects": 2, "object_bytes": 15, "objects_present": 0, "present_bytes": 0}
 
 
 def test_manifest_is_first_member(tmp_path):
@@ -223,7 +223,7 @@ def test_free_name_is_kept(tmp_path):
     with reader_for(tmp_path) as r:
         plan = plan_import(r, Target())
     assert plan["ok"] and plan["maps"][0]["action"] == "create" and plan["maps"][0]["target_name"] == "Hall"
-    assert plan["totals"] == {"maps": 1, "object_bytes": 15, "nodes": 2, "runs": 0, "legs": 0, "rosbag_bytes": 0}
+    assert plan["totals"] == {"maps": 1, "object_bytes": 15, "nodes": 2, "runs": 0, "legs": 0, "rosbag_bytes": 0, "present_bytes": 0}
 
 
 def test_clash_renames_never_overwrites(tmp_path):
@@ -342,10 +342,10 @@ def with_runs_and_bags(maps=None):
     return src
 
 
-def build_sel(tmp_path, source, selection):
+def build_sel(tmp_path, source, selection, have=None):
     path = tmp_path / "sel.tar"
     with B.BundleWriter(source={"name": "Pi", "server_id": "pi-1"}) as w:
-        export_selection(source, selection, w)
+        export_selection(source, selection, w, have)
         with open(path, "wb") as f:
             w.pack(f)
     return str(path)

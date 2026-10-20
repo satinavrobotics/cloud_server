@@ -19,7 +19,7 @@ from packages.migration.apply import ImportRefused, apply_import
 from packages.migration.bundle import BundleError, BundleReader, BundleWriter
 from packages.migration.export import ExportRefused, export_selection
 from packages.migration.netinfo import is_own_address, own_urls
-from packages.migration.plan import plan_import
+from packages.migration.plan import plan_import, source_key
 from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_postgres, prefetch_runs, read_instance_id
 
 logger = logging.getLogger(__name__)
@@ -117,11 +117,12 @@ class TransferManager:
         return os.path.join(self.spool_dir, f"{kind}-{job_id}{SUFFIX}")
 
     # ---- export -------------------------------------------------------------------------------
-    def start_export(self, selection: Dict[str, Any]) -> Dict[str, Any]:
+    def start_export(self, selection: Dict[str, Any], have: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """`have`: what the server that asked already holds (see `export_selection`); only the rest is put in the bundle."""
         selection = clean_selection(selection)
         self.sweep()
         job_id = uuid.uuid4().hex[:12]
-        job = {"id": job_id, "state": "running", "selection": selection,
+        job = {"id": job_id, "state": "running", "selection": selection, "have": have or {},
                "path": self._new_path("export", job_id), "summary": None, "size": None, "error": None,
                "created": time.time(), "touched": time.time()}
         self.exports[job_id] = job
@@ -148,7 +149,7 @@ class TransferManager:
 
     def _build(self, source: ServiceMapSource, job: Dict[str, Any], identity: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         with BundleWriter(source=identity or self.info, tmp_dir=self.spool_dir) as writer:
-            summary = export_selection(source, job["selection"], writer)
+            summary = export_selection(source, job["selection"], writer, job.get("have"))
             tmp = job["path"] + ".part"
             with open(tmp, "wb") as f:
                 writer.pack(f)
@@ -188,8 +189,8 @@ class TransferManager:
             raise TransferError("that is this server itself: choose another server to send to")
         return base
 
-    async def outbound_start(self, destination_url: str, selection: Dict[str, Any], client_host: Optional[str] = None
-                             ) -> Dict[str, Any]:
+    async def outbound_start(self, destination_url: str, selection: Dict[str, Any], client_host: Optional[str] = None,
+                             delta: bool = True) -> Dict[str, Any]:
         """Ask `destination_url` to pull `selection` (maps, mission runs, recordings) from this server. The destination is told every address this server can be
         reached on and this server's instance id, so it picks one that really is this server. Returns the destination's import
         job (it plans, then waits for apply)."""
@@ -209,7 +210,7 @@ class TransferManager:
                 from packages import config
                 urls = own_urls(config.TRANSFER_PUBLIC_PORT, client_host)
                 r = await client.post(f"{dest}/api/v1/transfer/imports/pull",
-                                      json={"source_urls": urls, "expect_instance_id": mine, **selection})
+                                      json={"source_urls": urls, "expect_instance_id": mine, "delta": delta, **selection})
         except httpx.HTTPError as exc:
             raise TransferError(f"cannot reach {dest}: {exc}", 502)
         if r.status_code >= 400:
@@ -255,7 +256,7 @@ class TransferManager:
 
     # ---- pull: this server fetches the bundle from another one (D13) -------------------------------
     def start_pull(self, source_url: Union[str, Sequence[str]], selection: Dict[str, Any],
-                   expect_instance_id: Optional[str] = None) -> Dict[str, Any]:
+                   expect_instance_id: Optional[str] = None, delta: bool = True) -> Dict[str, Any]:
         """`source_url`: one address, or several candidates (a robot sending maps up lists every address it can be reached on); with
         several, or with `expect_instance_id`, the first one that answers as that very server is used."""
         bases = [u.rstrip("/") for u in ([source_url] if isinstance(source_url, str) else list(source_url))]
@@ -269,7 +270,7 @@ class TransferManager:
                "plan": None, "report": None, "progress": {"phase": "exporting"}, "error": None,
                "created": time.time(), "touched": time.time()}
         self.imports[job_id] = job
-        self._tasks[job_id] = asyncio.get_running_loop().create_task(self._run_pull(job, bases, selection, expect_instance_id))
+        self._tasks[job_id] = asyncio.get_running_loop().create_task(self._run_pull(job, bases, selection, expect_instance_id, delta))
         return self.public(job)
 
     async def _choose_source(self, client: httpx.AsyncClient, bases: List[str], expect: Optional[str]) -> str:
@@ -293,14 +294,53 @@ class TransferManager:
             return base
         raise TransferError("none of the source's addresses could be reached from this server: " + ", ".join(tried), 502)
 
+    async def _have(self, client: httpx.AsyncClient, base: str, selection: Dict[str, Any]) -> Dict[str, Any]:
+        """What this server already holds of `selection`, so the source need not send it again: for each picked map that was imported
+        here from that very source before (the plan would resume it), its objects and sizes; for each picked recording, its size.
+        Best effort: anything that cannot be worked out is simply sent again."""
+        have: Dict[str, Any] = {}
+        try:
+            r = await client.get(f"{base}/api/v1/transfer/maps", timeout=10.0)
+            identity = (r.json().get("server") or {}) if r.status_code == 200 else {}
+            key = source_key({"source": identity}) if identity else None
+            target = ServiceTarget(self.database, self.topomap_db)
+            if key:
+                existing = await self.target_maps()
+                maps: Dict[str, Dict[str, int]] = {}
+                for name in selection.get("maps") or {}:
+                    same = [n for n, m in existing.items() if (m.get("imported_from") or {}).get("source") == key
+                            and (m.get("imported_from") or {}).get("map") == name and m.get("lifecycle") not in ("DELETING", "DELETED")]
+                    if same:
+                        sizes = await target.object_sizes(same[0])
+                        if sizes:
+                            maps[name] = sizes
+                if maps:
+                    have["maps"] = maps
+            bags = {}
+            for pick in selection.get("rosbags") or []:
+                size = await target.rosbag_size(pick["robot"], pick["bag_id"])
+                if size is not None:
+                    bags[f"{pick['robot']}/{pick['bag_id']}"] = size
+            if bags:
+                have["rosbags"] = bags
+        except Exception:  # noqa: BLE001
+            logger.warning("Could not work out what this server already holds; the whole selection is requested", exc_info=True)
+            return {}
+        return have
+
     async def _run_pull(self, job: Dict[str, Any], bases: List[str], selection: Dict[str, Any],
-                        expect_instance_id: Optional[str] = None) -> None:
+                        expect_instance_id: Optional[str] = None, delta: bool = True) -> None:
         part = job["path"] + ".part"
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=600.0), transport=self.http_transport) as client:
                 base = await self._choose_source(client, bases, expect_instance_id)
                 job["origin"] = base
-                r = await client.post(f"{base}/api/v1/transfer/exports", json=selection)
+                have: Dict[str, Any] = {}
+                if delta:
+                    job["progress"] = {"phase": "comparing"}
+                    have = await self._have(client, base, selection)
+                job["delta"] = bool(have)
+                r = await client.post(f"{base}/api/v1/transfer/exports", json={**selection, **({"have": have} if have else {})})
                 if r.status_code >= 400:
                     raise TransferError(f"the source refused the export ({r.status_code}): {_detail(r)}", 502)
                 remote = r.json()
@@ -474,7 +514,7 @@ class TransferManager:
 
     @staticmethod
     def public(job: Dict[str, Any]) -> Dict[str, Any]:
-        return {k: v for k, v in job.items() if k not in ("path", "touched")}
+        return {k: v for k, v in job.items() if k not in ("path", "touched", "have")}
 
     async def close(self) -> None:
         for task in self._tasks.values():

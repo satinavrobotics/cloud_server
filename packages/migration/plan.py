@@ -84,8 +84,9 @@ def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = Tr
             continue
         if kind == "rosbag":
             counts = item.get("counts") or {}
-            total_bytes += int(counts.get("bytes") or 0)
-            bags_out.append({"robot": item.get("robot"), "bag_id": item.get("bag_id"), "action": "add", "bytes": int(counts.get("bytes") or 0),
+            have = bool(counts.get("present"))
+            total_bytes += 0 if have else int(counts.get("bytes") or 0)
+            bags_out.append({"robot": item.get("robot"), "bag_id": item.get("bag_id"), "action": "have" if have else "add", "bytes": int(counts.get("bytes") or 0),
                              "map_id": counts.get("map_id"), "recorded_at": counts.get("recorded_at")})
             continue
         if kind != "map":
@@ -134,4 +135,6 @@ def plan_import(reader: BundleReader, target: TargetInventory, verify: bool = Tr
                        "nodes": sum(int(m["counts"].get("nodes") or 0) for m in maps_out),
                        "runs": sum(int(r["counts"].get("runs") or 0) for r in runs_out),
                        "legs": sum(int(r["counts"].get("legs") or 0) for r in runs_out),
-                       "rosbag_bytes": sum(b["bytes"] for b in bags_out)}}
+                       "rosbag_bytes": sum(b["bytes"] for b in bags_out if b["action"] != "have"),
+                       "present_bytes": sum(int(m["counts"].get("present_bytes") or 0) for m in maps_out)
+                       + sum(b["bytes"] for b in bags_out if b["action"] == "have")}}

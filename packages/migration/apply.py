@@ -239,6 +239,9 @@ async def _apply_map(reader: BundleReader, plan: Dict[str, Any], store: TargetSt
             if have == obj["size"]:
                 skipped += 1
                 continue
+            if obj.get("present"):
+                raise ImportRefused(f"{obj['key']} was left out of the bundle because this server had it, but it is gone now; "
+                                    "start the transfer again")
             with reader.open(f"{base}/objects/{obj['key']}") as stream:
                 await store.put_object(dst, obj["key"], stream, obj["size"], obj.get("content_type"),
                                        {str(k): str(v) for k, v in (obj.get("metadata") or {}).items()})
@@ -298,6 +301,9 @@ async def _apply_rosbag(reader: BundleReader, store: TargetStore, import_id: str
     if have == size:
         out["skipped"] = True                                              # copied before (a repeat or a continue)
         return
+    if entry.get("action") == "have":
+        raise ImportRefused(f"{robot}/{bag_id} was left out of the bundle because this server had it, but it is gone now; "
+                            "start the transfer again")
     if have is not None:
         raise ImportRefused(f"{robot}/{bag_id} already exists here with a different size ({have} bytes, not {size}); not overwritten")
     if should_stop is not None and should_stop():

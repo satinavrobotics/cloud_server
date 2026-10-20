@@ -59,17 +59,19 @@ class Selection(BaseModel):
 
 
 class ExportRequest(Selection):
-    pass
+    have: Optional[Dict[str, Any]] = None          # what the asking server holds already: {"maps": {map: {key: size}}, "rosbags": {"robot/bag": size}}
 
 
 class PullRequest(Selection):
     source_url: Optional[str] = None
     source_urls: Optional[List[str]] = None        # candidates, tried in order (a robot sending maps up lists its addresses)
     expect_instance_id: Optional[str] = None       # the source must answer with this instance id
+    delta: bool = True                             # tell the source what is already here, so only the rest is sent
 
 
 class SendRequest(Selection):
     destination_url: str
+    delta: bool = True
 
 
 def _server_description() -> Dict[str, Any]:
@@ -148,7 +150,7 @@ async def exportable_maps(request: Request, sizes: bool = False):
 @router.post("/exports", status_code=202)
 @_guard
 async def start_export(body: ExportRequest, request: Request):
-    return manager(request).start_export(body.as_dict())
+    return manager(request).start_export(body.as_dict(), body.have)
 
 
 @router.get("/exports/{export_id}")
@@ -206,7 +208,7 @@ async def pull_import(body: PullRequest, request: Request):
     """Start fetching a bundle from another Sati server (its export, then the download here), then plan it.
     Returns the import job at once (state `fetching`, with progress); poll GET /imports/{id}."""
     sources = body.source_urls or ([body.source_url] if body.source_url else [])
-    return manager(request).start_pull(sources, body.as_dict(), body.expect_instance_id)
+    return manager(request).start_pull(sources, body.as_dict(), body.expect_instance_id, body.delta)
 
 
 @router.get("/remote/maps")
@@ -265,7 +267,7 @@ def _client_host(request: Request) -> Optional[str]:
 async def outbound_pull(body: SendRequest, request: Request):
     """Send maps to another server: it is asked to pull them from this one (it plans first; nothing is written there until
     apply). Returns the destination's import job plus `destination_url`; follow it with the calls below."""
-    return await manager(request).outbound_start(body.destination_url, body.as_dict(), _client_host(request))
+    return await manager(request).outbound_start(body.destination_url, body.as_dict(), _client_host(request), body.delta)
 
 
 @router.get("/outbound/imports/{import_id}")
