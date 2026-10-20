@@ -12,6 +12,8 @@
     GET    /api/v1/transfer/imports/{id}                 plan, progress, report
     POST   /api/v1/transfer/imports/{id}/plan            plan again (names may have changed)
     POST   /api/v1/transfer/imports/{id}/apply           start writing (202); only a user action starts it
+    POST   /api/v1/transfer/outbound/pull {destination_url, maps}   SEND: ask another server to pull from this one; then
+    GET|POST|DELETE /api/v1/transfer/outbound/imports/{id}[/plan|apply|stop|rollback]?destination_url=   relayed to that import
     POST   /api/v1/transfer/imports/{id}/stop            stop a running fetch or copy; apply again to continue where it stopped
     POST   /api/v1/transfer/imports/{id}/rollback        delete the maps this import created
     DELETE /api/v1/transfer/imports/{id}                 forget the plan and delete the spooled bundle
@@ -45,7 +47,14 @@ class ExportRequest(BaseModel):
 
 
 class PullRequest(BaseModel):
-    source_url: str
+    source_url: Optional[str] = None
+    source_urls: Optional[List[str]] = None        # candidates, tried in order (a robot sending maps up lists its addresses)
+    expect_instance_id: Optional[str] = None       # the source must answer with this instance id
+    maps: Dict[str, List[str]]
+
+
+class SendRequest(BaseModel):
+    destination_url: str
     maps: Dict[str, List[str]]
 
 
@@ -169,7 +178,8 @@ async def upload_import(request: Request):
 async def pull_import(body: PullRequest, request: Request):
     """Start fetching a bundle from another Sati server (its export, then the download here), then plan it.
     Returns the import job at once (state `fetching`, with progress); poll GET /imports/{id}."""
-    return manager(request).start_pull(body.source_url, body.maps)
+    sources = body.source_urls or ([body.source_url] if body.source_url else [])
+    return manager(request).start_pull(sources, body.maps, body.expect_instance_id)
 
 
 @router.get("/remote/maps")
@@ -215,3 +225,36 @@ async def rollback_import(import_id: str, request: Request):
 async def delete_import(import_id: str, request: Request):
     manager(request).delete_import(import_id)
     return {"success": True}
+
+
+# ---- send: this (connected) server asks another one to pull from it; the app only ever talks to this server -----------------------
+
+def _client_host(request: Request) -> Optional[str]:
+    return request.headers.get("host")
+
+
+@router.post("/outbound/pull", status_code=202)
+@_guard
+async def outbound_pull(body: SendRequest, request: Request):
+    """Send maps to another server: it is asked to pull them from this one (it plans first; nothing is written there until
+    apply). Returns the destination's import job plus `destination_url`; follow it with the calls below."""
+    return await manager(request).outbound_start(body.destination_url, body.maps, _client_host(request))
+
+
+@router.get("/outbound/imports/{import_id}")
+@_guard
+async def outbound_get(import_id: str, destination_url: str, request: Request):
+    return await manager(request).outbound_call(destination_url, "GET", import_id)
+
+
+@router.post("/outbound/imports/{import_id}/{action}")
+@_guard
+async def outbound_action(import_id: str, action: str, destination_url: str, request: Request):
+    """plan | apply | stop | rollback on an import that lives on the destination."""
+    return await manager(request).outbound_call(destination_url, "POST", import_id, action)
+
+
+@router.delete("/outbound/imports/{import_id}")
+@_guard
+async def outbound_delete(import_id: str, destination_url: str, request: Request):
+    return await manager(request).outbound_call(destination_url, "DELETE", import_id)

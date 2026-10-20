@@ -11,13 +11,14 @@ import os
 import shutil
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import httpx
 
 from packages.migration.apply import ImportRefused, apply_import
 from packages.migration.bundle import BundleError, BundleReader, BundleWriter
 from packages.migration.export import ExportRefused, export_maps
+from packages.migration.netinfo import is_own_address, own_urls
 from packages.migration.plan import plan_import
 from packages.migration.stores import ServiceMapSource, ServiceTarget, prefetch_postgres, read_instance_id
 
@@ -155,6 +156,67 @@ class TransferManager:
         self._drop_file(job)
         del self.exports[job_id]
 
+    # ---- send: this server asks ANOTHER server to pull from it, and relays that import's calls ---------------------------
+    @staticmethod
+    def _destination(url: str) -> str:
+        base = (url or "").rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            raise TransferError("destination_url must be an http(s) URL")
+        host = base.split("://", 1)[1].split("/", 1)[0].rsplit("@", 1)[-1]
+        host = host[1:host.index("]")] if host.startswith("[") else host.split(":")[0]
+        if is_own_address(host):
+            raise TransferError("that is this server itself: choose another server to send to")
+        return base
+
+    async def outbound_start(self, destination_url: str, picks: Dict[str, Sequence[str]], client_host: Optional[str] = None
+                             ) -> Dict[str, Any]:
+        """Ask `destination_url` to pull `picks` from this server. The destination is told every address this server can be
+        reached on and this server's instance id, so it picks one that really is this server. Returns the destination's import
+        job (it plans, then waits for apply)."""
+        dest = self._destination(destination_url)
+        if not picks:
+            raise TransferError("pick at least one map")
+        mine = (await self.identity()).get("instance_id")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0), transport=self.http_transport) as client:
+                probe = await client.get(f"{dest}/api/v1/transfer/maps")
+                if probe.status_code == 404:
+                    raise TransferError("that server does not support data transfer yet (it needs the newer software)", 502)
+                if probe.status_code >= 400:
+                    raise TransferError(f"{dest} answered {probe.status_code}: {_detail(probe)}", 502)
+                theirs = ((probe.json().get("server") or {}).get("instance_id"))
+                if mine and theirs and mine == theirs:
+                    raise TransferError("that is this server itself: choose another server to send to")
+                from packages import config
+                urls = own_urls(config.TRANSFER_PUBLIC_PORT, client_host)
+                r = await client.post(f"{dest}/api/v1/transfer/imports/pull",
+                                      json={"source_urls": urls, "expect_instance_id": mine, "maps": picks})
+        except httpx.HTTPError as exc:
+            raise TransferError(f"cannot reach {dest}: {exc}", 502)
+        if r.status_code >= 400:
+            raise TransferError(f"{dest} refused: {_detail(r)}", 502)
+        job = r.json()
+        job["destination_url"] = dest
+        return job
+
+    async def outbound_call(self, destination_url: str, method: str, import_id: str, action: str = "") -> Dict[str, Any]:
+        """Relay one call about an import that lives on the destination: GET status, POST plan|apply|stop|rollback, DELETE."""
+        dest = self._destination(destination_url)
+        if (method, action) not in {("GET", ""), ("DELETE", ""), ("POST", "plan"), ("POST", "apply"), ("POST", "stop"), ("POST", "rollback")}:
+            raise TransferError("that call cannot be relayed", 400)
+        url = f"{dest}/api/v1/transfer/imports/{import_id}" + (f"/{action}" if action else "")
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0), transport=self.http_transport) as client:
+                r = await client.request(method, url)
+        except httpx.HTTPError as exc:
+            raise TransferError(f"cannot reach {dest}: {exc}", 502)
+        if r.status_code >= 400:
+            raise TransferError(_detail(r), r.status_code if r.status_code in (404, 409, 422) else 502)
+        out = r.json()
+        if isinstance(out, dict):
+            out["destination_url"] = dest
+        return out
+
     # ---- import -------------------------------------------------------------------------------
     async def new_import(self, path: str, origin: str) -> Dict[str, Any]:
         """Register a spooled bundle: verify and plan it. The file moves under the manager's care."""
@@ -173,26 +235,53 @@ class TransferManager:
         return self.public(job)
 
     # ---- pull: this server fetches the bundle from another one (D13) -------------------------------
-    def start_pull(self, source_url: str, picks: Dict[str, Sequence[str]]) -> Dict[str, Any]:
-        base = source_url.rstrip("/")
-        if not base.startswith(("http://", "https://")):
+    def start_pull(self, source_url: Union[str, Sequence[str]], picks: Dict[str, Sequence[str]],
+                   expect_instance_id: Optional[str] = None) -> Dict[str, Any]:
+        """`source_url`: one address, or several candidates (a robot sending maps up lists every address it can be reached on); with
+        several, or with `expect_instance_id`, the first one that answers as that very server is used."""
+        bases = [u.rstrip("/") for u in ([source_url] if isinstance(source_url, str) else list(source_url))]
+        if not bases or any(not b.startswith(("http://", "https://")) for b in bases):
             raise TransferError("source_url must be an http(s) URL")
         if not picks:
             raise TransferError("pick at least one map")
         self.sweep()
         job_id = uuid.uuid4().hex[:12]
-        job = {"id": job_id, "state": "fetching", "path": self._new_path("import", job_id), "origin": base,
+        job = {"id": job_id, "state": "fetching", "path": self._new_path("import", job_id), "origin": bases[0],
                "picks": {k: list(v) for k, v in picks.items()},
                "plan": None, "report": None, "progress": {"phase": "exporting"}, "error": None,
                "created": time.time(), "touched": time.time()}
         self.imports[job_id] = job
-        self._tasks[job_id] = asyncio.get_running_loop().create_task(self._run_pull(job, base, picks))
+        self._tasks[job_id] = asyncio.get_running_loop().create_task(self._run_pull(job, bases, picks, expect_instance_id))
         return self.public(job)
 
-    async def _run_pull(self, job: Dict[str, Any], base: str, picks: Dict[str, Sequence[str]]) -> None:
+    async def _choose_source(self, client: httpx.AsyncClient, bases: List[str], expect: Optional[str]) -> str:
+        """The first address that answers as the expected server. With one address and nothing to check it is simply used."""
+        if len(bases) == 1 and not expect:
+            return bases[0]
+        tried: List[str] = []
+        for base in bases:
+            try:
+                r = await client.get(f"{base}/api/v1/transfer/maps", timeout=5.0)
+            except httpx.HTTPError as exc:
+                tried.append(f"{base} ({type(exc).__name__})")
+                continue
+            if r.status_code != 200:
+                tried.append(f"{base} (HTTP {r.status_code})")
+                continue
+            theirs = ((r.json().get("server") or {}).get("instance_id"))
+            if expect and theirs != expect:
+                tried.append(f"{base} (another server answered)")
+                continue
+            return base
+        raise TransferError("none of the source's addresses could be reached from this server: " + ", ".join(tried), 502)
+
+    async def _run_pull(self, job: Dict[str, Any], bases: List[str], picks: Dict[str, Sequence[str]],
+                        expect_instance_id: Optional[str] = None) -> None:
         part = job["path"] + ".part"
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=600.0), transport=self.http_transport) as client:
+                base = await self._choose_source(client, bases, expect_instance_id)
+                job["origin"] = base
                 r = await client.post(f"{base}/api/v1/transfer/exports", json={"maps": picks})
                 if r.status_code >= 400:
                     raise TransferError(f"the source refused the export ({r.status_code}): {_detail(r)}", 502)

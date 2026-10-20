@@ -344,6 +344,8 @@ IDEMPOTENCY_PURGE_INTERVAL_S = float(os.getenv("IDEMPOTENCY_PURGE_INTERVAL_S", "
 TRANSFER_SPOOL_DIR = os.getenv("TRANSFER_SPOOL_DIR", "/tmp/sati-transfer")
 TRANSFER_KEEP_HOURS = float(os.getenv("TRANSFER_KEEP_HOURS", "24"))
 TRANSFER_MAX_BUNDLE_BYTES = int(os.getenv("TRANSFER_MAX_BUNDLE_BYTES", "0"))   # 0 = no cap
+# The port a destination uses to pull from this server when this server sends maps up (its gateway: ROBOT_GATEWAY_PORT on a robot).
+TRANSFER_PUBLIC_PORT = int(os.getenv("TRANSFER_PUBLIC_PORT", os.getenv("ROBOT_GATEWAY_PORT", "80")))
 
 # ==================== 3D reconstruction gateway (API, R3) ====================
 # docs/reconstruction/design.md §6.9 (packages/api/reconstruction.py). The reconstruction runs in

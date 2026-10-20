@@ -135,3 +135,90 @@ def test_stop_of_a_running_copy_only_raises_the_flag():
     mgr.imports["j"] = {"id": "j", "state": "applying", "progress": {"phase": "objects", "done": 3}, "touched": 0, "path": "p"}
     out = mgr.stop_import("j")
     assert mgr.imports["j"]["stop"] is True and out["progress"]["stopping"] is True and out["state"] == "applying"
+
+
+# ---- send: this server asks another one to pull from it -----------------------------------------------------------------
+
+def _sender(tmp_path, handler, monkeypatch, mine="111", urls=("http://100.116.20.49", "http://192.168.1.60")):
+    import packages.migration.jobs as jobs
+    mgr = make_manager(tmp_path, handler)
+    mgr._instance_id, mgr._instance_read = mine, True
+    monkeypatch.setattr(jobs, "own_urls", lambda port, client_host=None: list(urls))
+    monkeypatch.setattr(jobs, "is_own_address", lambda host: host in ("127.0.0.1", "localhost", "100.116.20.49"))
+    return mgr
+
+
+def test_send_asks_the_destination_to_pull_and_tells_it_every_address_and_who_to_expect(tmp_path, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        if request.method == "GET" and request.url.path == "/api/v1/transfer/maps":
+            return httpx.Response(200, json={"maps": [], "server": {"instance_id": "999", "name": "cloud"}})
+        if request.method == "POST" and request.url.path == "/api/v1/transfer/imports/pull":
+            seen["body"] = __import__("json").loads(request.content)
+            return httpx.Response(202, json={"id": "r1", "state": "fetching", "origin": "x"})
+        return httpx.Response(404)
+    mgr = _sender(tmp_path, handler, monkeypatch)
+    job = asyncio.new_event_loop().run_until_complete(mgr.outbound_start("http://100.85.3.47/", {"office_pi": ["definition", "images"]}, "192.168.1.60"))
+    assert seen["body"] == {"source_urls": ["http://100.116.20.49", "http://192.168.1.60"], "expect_instance_id": "111",
+                            "maps": {"office_pi": ["definition", "images"]}}
+    assert job["id"] == "r1" and job["destination_url"] == "http://100.85.3.47"
+
+
+def test_send_refuses_this_server_an_old_server_and_nothing_picked(tmp_path, monkeypatch):
+    import pytest
+    from packages.migration.jobs import TransferError
+    same = _sender(tmp_path, lambda r: httpx.Response(200, json={"maps": [], "server": {"instance_id": "111"}}), monkeypatch)
+    old = _sender(tmp_path, lambda r: httpx.Response(404), monkeypatch)
+    loop = asyncio.new_event_loop()
+    with pytest.raises(TransferError, match="this server itself"):
+        loop.run_until_complete(same.outbound_start("http://100.85.3.47", {"a": []}))
+    with pytest.raises(TransferError, match="this server itself"):
+        loop.run_until_complete(same.outbound_start("http://100.116.20.49", {"a": []}))        # its own address, caught before any call
+    with pytest.raises(TransferError, match="does not support"):
+        loop.run_until_complete(old.outbound_start("http://100.85.3.47", {"a": []}))
+    with pytest.raises(TransferError, match="at least one map"):
+        loop.run_until_complete(same.outbound_start("http://100.85.3.47", {}))
+    with pytest.raises(TransferError, match="http"):
+        loop.run_until_complete(same.outbound_start("ftp://x", {"a": []}))
+
+
+def test_the_destination_picks_the_address_that_really_is_the_sender(tmp_path):
+    import pytest
+    from packages.migration.jobs import TransferError
+
+    def handler(request):
+        host = request.url.host
+        if host == "10.0.0.9":                      # reachable, but another robot with the same kind of address
+            return httpx.Response(200, json={"server": {"instance_id": "other"}})
+        if host == "100.116.20.49":
+            return httpx.Response(200, json={"server": {"instance_id": "111"}})
+        raise httpx.ConnectTimeout("no route")
+    mgr = make_manager(tmp_path, handler)
+
+    async def go(bases):
+        async with httpx.AsyncClient(transport=mgr.http_transport) as c:
+            return await mgr._choose_source(c, bases, "111")
+    loop = asyncio.new_event_loop()
+    assert loop.run_until_complete(go(["http://192.168.9.9", "http://10.0.0.9", "http://100.116.20.49"])) == "http://100.116.20.49"
+    with pytest.raises(TransferError, match="none of the source's addresses"):
+        loop.run_until_complete(go(["http://192.168.9.9", "http://10.0.0.9"]))
+
+
+def test_only_the_expected_import_calls_are_relayed(tmp_path, monkeypatch):
+    import pytest
+    from packages.migration.jobs import TransferError
+    calls = []
+
+    def handler(request):
+        calls.append((request.method, request.url.path))
+        return httpx.Response(200, json={"id": "r1", "state": "planned"})
+    mgr = _sender(tmp_path, handler, monkeypatch)
+    loop = asyncio.new_event_loop()
+    out = loop.run_until_complete(mgr.outbound_call("http://100.85.3.47", "POST", "r1", "apply"))
+    assert out["destination_url"] == "http://100.85.3.47" and calls == [("POST", "/api/v1/transfer/imports/r1/apply")]
+    loop.run_until_complete(mgr.outbound_call("http://100.85.3.47", "GET", "r1"))
+    loop.run_until_complete(mgr.outbound_call("http://100.85.3.47", "DELETE", "r1"))
+    for method, action in [("POST", "exports"), ("GET", "apply"), ("DELETE", "stop"), ("POST", "../../maps")]:
+        with pytest.raises(TransferError, match="cannot be relayed"):
+            loop.run_until_complete(mgr.outbound_call("http://100.85.3.47", method, "r1", action))
