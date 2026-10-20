@@ -190,3 +190,13 @@ def test_edt_falls_back_to_scipy_when_squares_overflow_int32():
     f = np.ones((1, 70000), bool); f[0, 0] = False                # squared distance up to 4.9e9
     got = E._edt(f)
     assert got.dtype == np.float64 and np.array_equal(got, ndimage.distance_transform_edt(f))
+
+
+def test_import_state_release_drops_the_planes_and_changes_nothing(leaves):
+    g, _ = _fold(_shift(leaves, 1_760_000_000_000))
+    a, b = ChartGraph(g.params), ChartGraph(g.params)
+    a.import_state(g.export_state())
+    st = g.export_state()
+    b.import_state(st, release=True)
+    assert st.V is None and st.T is None and st.B is None and st.Fn is None and st.Bn is None and st.chan == {}
+    assert _digest(a) == _digest(b)

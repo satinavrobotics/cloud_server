@@ -1346,11 +1346,12 @@ class ChartGraph(SceneGraph):
         """`export_state(lazy=True)`: for a reader that slices the planes (the store's save) or wants only the leaf records"""
         return self.export_state(lazy=True)
 
-    def import_state(self, st: EngineState, verify: bool = True) -> None:
+    def import_state(self, st: EngineState, verify: bool = True, release: bool = False) -> None:
         """Resume from `st` on a fresh engine: planes and evidence are taken as they are, then F and the partition are
         rebuilt (both are functions of the planes and the evidence) and must reproduce the stored owner plane cell for cell;
         the stored keys are then the keys of the rebuilt charts. The canvas is padded by MARGIN so that the distance to the
-        non-navigable cells near the stored edge sees unknown, as it did before."""
+        non-navigable cells near the stored edge sees unknown, as it did before. `release=True`: the caller will not use `st` again, so
+        its V / T / B / Fn / Bn / chan planes are dropped (set to None) as soon as their padded copies exist (lower peak)."""
         p = self.params
         if st.params != _state_params(p):
             raise ValueError("state was made with other parameters (%r, this engine %r): a store written with the close-evidence "
@@ -1369,6 +1370,7 @@ class ChartGraph(SceneGraph):
             return b
         self._cx0, self._cy0 = st.cx0 - pad, st.cy0 - pad
         self._V = padf(st.V, 255)
+        if release: st.V = None
         if p.near_range_m is not None and (st.Fn is None or st.Bn is None or st.Val is None):
             raise ValueError("state has no close-evidence planes (Fn, Bn, Val): it was made before the validity plane (pipeline "
                              "morse/2+valid carries it; the earlier rule-on tokens do not) and must be rebuilt, not resumed")
@@ -1393,11 +1395,22 @@ class ChartGraph(SceneGraph):
                     o = blk.astype(np.int64) - ep; o[blk < 0] = -1; b[pad + r0:pad + r0 + len(blk), pad:-pad] = o
             return b
         self._tep = ep
-        self._Tr, self._Br = padt(st.T), padt(st.B)
+        del tplanes
+        a = None
+        self._Tr = padt(st.T)
+        if release: st.T = None
+        self._Br = padt(st.B)
+        if release: st.B = None
         self._Fnr = None if p.near_range_m is None else padt(st.Fn)
         self._Bnr = None if p.near_range_m is None else padt(st.Bn)
+        if release: st.Fn = st.Bn = None
         self._hold = None
-        self._chan = {k: (padf(v, 255), padt(t)) for k, (v, t) in st.chan.items()}
+        self._chan = {}
+        for k in list(st.chan):
+            v, t = st.chan[k]
+            self._chan[k] = (padf(v, 255), padt(t))
+            if release: del st.chan[k]
+            v = t = None
         self._leaves = {l.key: _Rec(l.session, l.t, l.x, l.y, l.r_d,
                                     None if l.view is None else CamView(l.key, *l.view)) for l in st.leaves}
         self._leaf_order = sorted((l.t, l.key) for l in st.leaves)

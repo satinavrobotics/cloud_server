@@ -669,8 +669,9 @@ class SceneGraphStore:
                          leaves=leaves,
                          keys=[_parse(c["key"]) for c in charts], plane=plane,
                          version=man["engine_version"], watermark=tuple(man["watermark"]))
+        del V, T, B, Fn, Bn, chan                                   # the state owns the planes; import_state frees them as it pads them
         g = ChartGraph(SceneParams(**p))
-        g.import_state(st, verify=verify)
+        g.import_state(st, verify=verify, release=True)
         if [_fmt(k) for k in g._keys] != [c["key"] for c in charts]:
             raise StateMismatch("restored keys differ from the stored key table")
         return g
