@@ -26,7 +26,7 @@ and the gateway recreated (`scripts/robot_compose.sh up -d --force-recreate ngin
 robot, which is why this is a choice and not the default.
 
 Network: Postgres, ArangoDB, the planner and graph-builder listen on `127.0.0.1` only; mosquitto on `127.0.0.1` and the tailnet IP
-(`ROBOT_TAILNET_IP`); the API (8000) and the MinIO forwarder are the doors. Mosquitto still allows anonymous clients, so
+(`ROBOT_TAILNET_IP`), plus `ROBOT_LAN_IP` when it is set (a robot on the local network connects its VDA5050 client to `<ROBOT_LAN_IP>:1883`); the API (8000) and the MinIO forwarder are the doors. Mosquitto still allows anonymous clients, so
 Tailscale (ACLs) is the boundary: keep the ACL tight. Every container has a memory limit and a rotated log (10 MB x 3);
 mosquitto logs errors/warnings only.
 
