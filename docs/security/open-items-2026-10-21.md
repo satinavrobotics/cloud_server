@@ -33,6 +33,10 @@ the app, or OIDC), then per-role limits for the dangerous routes (operations, or
 still guards callers that are not on the tailnet. To require the token everywhere: set `OPERATIONS_TRUST_TAILNET=false` in the profiles
 and render; the app then asks for the token once per server.
 
+## 5b. Settings can be changed from the tailnet too
+The same rule as item 5 covers `PUT /operations/config`: a tailnet peer can change a robot's memory limits and caches (an allowlisted set, bounded,
+never secrets, addresses or identity) and apply them by redeploying. A bad choice can starve a service, not open anything up. Same fix as item 5.
+
 ## 6. Old passwords remain in git history
 The Postgres, ArangoDB and MinIO passwords and user names that were in the tracked `docker_compose/.env` and the `.env.robot.bak-*`
 files were rotated on the cloud server on 2026-10-21, so the history copies open nothing. They are still readable. A history rewrite

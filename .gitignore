@@ -23,3 +23,6 @@ docker_compose/secrets.env
 docker_compose/.env.robot.bak*
 docker_compose/*.bak
 docker_compose/secrets.*.env
+
+# Local settings overrides written by the app on each machine
+docker_compose/local/overrides.env

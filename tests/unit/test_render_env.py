@@ -132,6 +132,30 @@ class TestRobotLan:
         assert s["LAN_WLAN_OFF"] == "true" and s["LAN_GATEWAY"]          # the internet comes through eth0 then
 
 
+class TestLocalOverrides:
+    def test_overrides_win_over_the_profile_and_get_their_own_hash(self, dc, tmp_path):
+        (dc / "local").mkdir()
+        (dc / "local" / "overrides.env").write_text("MEM_MINIO=512m\nPG_TUNE_MEMORY=1GB\n")
+        got = re_mod.parse_text(render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc))
+        assert got["MEM_MINIO"] == "512m" and got["PG_TUNE_MEMORY"] == "1GB"
+        assert got["CONFIG_OVERRIDES"] == re_mod.overrides_hash({"MEM_MINIO": "512m", "PG_TUNE_MEMORY": "1GB"})
+
+    def test_the_profile_hash_ignores_them_so_drift_from_the_repo_stays_visible(self, dc, tmp_path):
+        before = re_mod.parse_text(render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc))["CONFIG_HASH"]
+        (dc / "local").mkdir()
+        (dc / "local" / "overrides.env").write_text("MEM_MINIO=512m\n")
+        assert re_mod.parse_text(render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc))["CONFIG_HASH"] == before
+
+    def test_no_overrides_means_an_empty_hash(self, dc, tmp_path):
+        assert re_mod.parse_text(render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc))["CONFIG_OVERRIDES"] == ""
+
+    def test_a_secret_in_the_overrides_is_refused(self, dc, tmp_path):
+        (dc / "local").mkdir()
+        (dc / "local" / "overrides.env").write_text("MINIO_ROOT_PASSWORD=oops\n")
+        with pytest.raises(re_mod.RenderError, match="MINIO_ROOT_PASSWORD"):
+            render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc)
+
+
 class TestSecrets:
     def test_a_missing_required_secret_stops_the_render(self, dc, tmp_path):
         path = tmp_path / "s.env"

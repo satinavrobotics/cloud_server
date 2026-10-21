@@ -16,7 +16,7 @@ import logging
 import os
 import socket
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -60,6 +60,9 @@ async def lifespan(app: FastAPI):
         deploy_root=os.getenv("DEPLOY_ROOT", "/cloud_server"),
         trust_tailnet=os.getenv("OPERATIONS_TRUST_TAILNET", "").lower() in ("true", "1", "yes"),
         gateway_url=gateway,
+        config_profile=os.getenv("CONFIG_PROFILE", ""),
+        config_hash=os.getenv("CONFIG_HASH", ""),
+        running_overrides=os.getenv("CONFIG_OVERRIDES", ""),
     )
     logging.info("Server Diagnostics Service started")
     yield
@@ -131,6 +134,11 @@ class DeployRequest(BaseModel):
     tag: Optional[str] = None
     rollback: bool = False
     force: bool = False
+    apply_config: bool = False       # re-render the config (profile + local overrides) first; no tag = the tag that runs now
+
+
+class ConfigRequest(BaseModel):
+    changes: Dict[str, Optional[str]]
 
 
 def _caller_ip(request: Request) -> Optional[str]:
@@ -176,7 +184,24 @@ def operations_restart_all(request: Request, body: RestartAllRequest, x_operatio
 
 @app.post("/operations/deploy", status_code=202)
 def operations_deploy(request: Request, body: DeployRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
-    return _operate(request, lambda ops, who: ops.deploy(body.tag, rollback=body.rollback, force=body.force, operator=who), x_operations_token, x_operator)
+    return _operate(request, lambda ops, who: ops.deploy(body.tag, rollback=body.rollback, force=body.force, operator=who, apply_config=body.apply_config), x_operations_token, x_operator)
+
+
+@app.get("/operations/config")
+def operations_config_get():
+    """The robot server's tunable settings with their effective values and which are changed locally (no token: it only reads)."""
+    if operations is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        return operations.config_get()
+    except OperationError as err:
+        raise HTTPException(status_code=err.status, detail={"code": err.code, "message": err.message})
+
+
+@app.put("/operations/config")
+def operations_config_put(request: Request, body: ConfigRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    """Save changed settings as local overrides (null = back to the profile). Saves only: applying is a deploy with apply_config."""
+    return _operate(request, lambda ops, who: ops.config_put(body.changes, who), x_operations_token, x_operator)
 
 
 @app.get("/operations/{op_id}")

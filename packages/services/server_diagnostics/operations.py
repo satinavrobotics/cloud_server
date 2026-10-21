@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
+from . import robot_config
 from .docker_api import DockerActor, DockerUnavailable
 from .redact import redact_line
 from .service import COMPOSE_SERVICE_LABEL, DiagnosticsService, UnknownService
@@ -72,6 +73,7 @@ def _fetch_missions(url: str, timeout: float = 6.0):
 class Operations:
     def __init__(self, docker: DockerActor, diagnostics: DiagnosticsService, *, enabled: bool, token: str, kind: str,
                  deploy_root: str, trust_tailnet: bool = False, gateway_url: str = "", fetch_missions: Optional[Callable] = None,
+                 config_profile: str = "", config_hash: str = "", running_overrides: str = "",
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
         self._docker, self._diag = docker, diagnostics
         self._token = token or ""
@@ -81,6 +83,7 @@ class Operations:
             log.warning("OPERATIONS_ENABLED is set without OPERATIONS_TOKEN or OPERATIONS_TRUST_TAILNET: operations stay off")
         self._kind, self._root = kind, deploy_root.rstrip("/")
         self._gateway = gateway_url.rstrip("/")
+        self._profile, self._hash, self._running_overrides = config_profile, config_hash, running_overrides
         self._fetch_missions = fetch_missions or _fetch_missions
         self._sleep, self._clock = sleep, clock
         self._lock = threading.Lock()
@@ -214,13 +217,18 @@ class Operations:
         found = [c for c in self._docker.list_containers() if (c.get("Labels") or {}).get(DEPLOY_LABEL) == "deploy"]
         return sorted(found, key=lambda c: c.get("Created", 0))
 
-    def deploy(self, tag: Optional[str] = None, *, rollback: bool = False, force: bool = False, operator: str = "") -> Dict:
+    def deploy(self, tag: Optional[str] = None, *, rollback: bool = False, force: bool = False, operator: str = "",
+               apply_config: bool = False) -> Dict:
         if self._kind != "robot":
             raise OperationError(409, "not_a_robot", "deploys from the app are for robot servers")
-        if rollback == bool(tag):
+        if rollback and apply_config:
+            raise OperationError(400, "bad_request", "a rollback does not re-render the config")
+        if rollback == bool(tag) and not (apply_config and not rollback):
             raise OperationError(400, "bad_request", "give a tag or ask for a rollback, not both and not neither")
         if tag and not TAG.match(tag):
             raise OperationError(400, "bad_tag", "the tag must be a git sha (7 to 40 hex characters)")
+        if apply_config and not self._profile:
+            raise OperationError(409, "no_profile", "this machine's config was not rendered from a profile, so there is nothing to re-render")
         if not self._lock.acquire(blocking=False):
             raise OperationError(409, "busy", "another operator action is still running")
         try:
@@ -232,17 +240,21 @@ class Operations:
             active = self._guard(force)
             image = self._own_image()
             name = f"sati-deploy-{int(time.time())}"
-            spec = {"Image": image, "Cmd": ["bash", "scripts/deploy_robot.sh"] + (["--rollback"] if rollback else [tag]),
-                    "WorkingDir": self._root, "Labels": {DEPLOY_LABEL: "deploy", "sati.operation.target": "rollback" if rollback else tag,
-                                                         "sati.operation.operator": operator[:60]},
+            target = "rollback" if rollback else (tag or "current")
+            cmd = ["bash", "scripts/apply_robot.sh"] + ([tag] if tag else []) if apply_config else \
+                ["bash", "scripts/deploy_robot.sh"] + (["--rollback"] if rollback else [tag])
+            spec = {"Image": image, "Cmd": cmd, "WorkingDir": self._root,
+                    "Env": [f"CONFIG_PROFILE={self._profile}"] if apply_config else [],
+                    "Labels": {DEPLOY_LABEL: "deploy", "sati.operation.target": target + (" +config" if apply_config else ""),
+                               "sati.operation.operator": operator[:60]},
                     "HostConfig": {"NetworkMode": "host", "Binds": [f"{self._root}:{self._root}", "/var/run/docker.sock:/var/run/docker.sock"]}}
             try:
                 cid = self._docker.create(name, spec)
                 self._docker.start(cid)
             except DockerUnavailable as err:
                 raise OperationError(502, "deploy_not_started", str(err))
-            log.info("deploy %s started (%s) by %s%s", name, "rollback" if rollback else tag, operator[:60] or "unknown",
-                     f", forced over {active} active mission(s)" if active else "")
+            log.info("deploy %s started (%s%s) by %s%s", name, target, ", with the config re-rendered" if apply_config else "",
+                     operator[:60] or "unknown", f", forced over {active} active mission(s)" if active else "")
             self._prune_helpers()
         finally:
             self._lock.release()          # the deploy runs on in its own container; the lock only covers starting it
@@ -269,6 +281,24 @@ class Operations:
         return {"id": name, "kind": "deploy", "target": labels.get("sati.operation.target", ""), "status": status,
                 "operator": labels.get("sati.operation.operator", ""), "started": (st.get("StartedAt") or "")[:19] + "Z",
                 "finished": None if running else (st.get("FinishedAt") or "")[:19] + "Z", "lines": lines}
+
+    # ---- settings (docs/SERVER_OPERATIONS.md): list, and save as local overrides; applying is deploy(apply_config=True)
+    def config_get(self) -> Dict:
+        try:
+            return robot_config.describe(self._profile, self._kind, self._enabled and self._kind == "robot",
+                                         self._running_overrides, self._hash)
+        except robot_config.ConfigError as err:
+            raise OperationError(err.status, err.code, err.message)
+
+    def config_put(self, changes: Dict, operator: str = "") -> Dict:
+        if self._kind != "robot":
+            raise OperationError(400, "not_a_robot", "settings can be changed on a robot server only")
+        try:
+            robot_config.save(changes, self._profile)
+            log.info("settings saved by %s: %s", operator[:60] or "unknown", ", ".join(f"{k}={'(reset)' if v is None else v}" for k, v in changes.items()))
+        except robot_config.ConfigError as err:
+            raise OperationError(err.status, err.code, err.message + (f" [{err.key}]" if err.key and err.code == "unknown_key" else ""))
+        return self.config_get()
 
     # ---- reading
     def get(self, op_id: str) -> Dict:

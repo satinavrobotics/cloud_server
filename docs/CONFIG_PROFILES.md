@@ -41,6 +41,11 @@ on the commit it should be on. Both are null on a machine set up by hand.
 file, or the pull stops because of your local edits. Do step 1 and 2 first, then pull, then step 4. Passwords that were ever committed
 stay in git history: rotate them (`.env`, and the four `.env.robot.bak-*` files that were committed by mistake).
 
+## Local overrides (from the app)
+
+`docker_compose/local/overrides.env` (untracked, per machine) holds settings changed from the app (see [SERVER_OPERATIONS.md](SERVER_OPERATIONS.md)). `render_env.sh`
+merges it over the profile and writes `CONFIG_OVERRIDES` (its hash). It is never a secret and never in git.
+
 ## Other files
 
 - `staging` (`profiles/staging.env`, `secrets/staging.env.example`) renders `.env.staging` for the staging rehearsal override.

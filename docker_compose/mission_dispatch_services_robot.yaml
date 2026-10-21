@@ -81,7 +81,7 @@ services:
   minio-tailnet:
     environment:
       - MINIO_TAILNET_IP=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
-    mem_limit: 64m
+    mem_limit: ${MEM_MINIO_PROXY:-64m}
     logging: *logging
 
   mission-dispatch:
@@ -190,7 +190,7 @@ services:
       - ./nginx/nginx-robot.conf.template:/etc/nginx/templates/default.conf.template:ro
       - ./nginx:/etc/nginx/sati:ro      # routes.conf and the CORS files are included from here
       - nginx_logs:/var/log/nginx
-    mem_limit: 64m
+    mem_limit: ${MEM_GATEWAY:-64m}
     restart: unless-stopped
     logging: *logging
     healthcheck:
@@ -245,7 +245,7 @@ services:
       - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
       # What robots and clients are told to connect to: this Pi's SFU.
       - LIVEKIT_SFU_SERVER_URL=${LIVEKIT_SFU_SERVER_URL:-ws://${ROBOT_TAILNET_IP}:7880}
-    mem_limit: 64m
+    mem_limit: ${MEM_LIVEKIT_TOKENS:-64m}
     logging: *logging
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://${ROBOT_TAILNET_IP}:${LIVEKIT_SFU_TOKENS_PORT:-8008}/health', timeout=4); sys.exit(0)"]
@@ -259,7 +259,12 @@ services:
     environment:
       - DIAGNOSTICS_GATEWAY_URL=http://127.0.0.1:${ROBOT_GATEWAY_PORT:-80}     # the checks ask the robot's own gateway
       - DEPLOY_ROOT=${DEPLOY_ROOT:-/cloud_server}                               # where deploy_robot.sh runs (same path on the host and in the deploy container)
-    mem_limit: 96m
+      - ROBOT_PROFILES_DIR=/deploy/profiles                                     # settings the app shows (profiles read-only) and edits (local/overrides.env)
+      - ROBOT_LOCAL_DIR=/deploy/local
+    volumes:
+      - ./profiles:/deploy/profiles:ro
+      - ./local:/deploy/local
+    mem_limit: ${MEM_DIAGNOSTICS:-96m}
     logging: *logging
 
   # --- not on the robot

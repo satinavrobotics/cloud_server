@@ -28,6 +28,24 @@ Rules the server enforces, whatever the client sends:
 - one action at a time (409 `busy`); the diagnostics service is restarted only by a deploy;
 - a cloud server answers deploy with 409 `not_a_robot`.
 
+## Changing a robot's settings from the app
+
+A robot server's tunable settings (memory limits of every service, the database caches, three scene-graph knobs) can be edited in the app's
+Server health panel and applied without git or ssh.
+
+| Call | What it does |
+|---|---|
+| `GET /operations/config` | the settings with their effective value, the profile's value, the default, which are changed locally, the services a change restarts, and `pending_apply` (saved but not running yet). No token. |
+| `PUT /operations/config` `{changes: {KEY: "512m" \| null}}` | validates and saves to `docker_compose/local/overrides.env` on the machine (`null` removes the override). Saves only. Same auth as the other actions. |
+| `POST /operations/deploy` `{apply_config: true}` | runs `scripts/apply_robot.sh`: render the env file again (profile + overrides + secrets), then `deploy_robot.sh` on the tag that runs now (or `{tag, apply_config}`). Refused while missions are active, like any deploy. |
+
+Rules: only the settings listed in `robot_config.SETTINGS` can be changed, each with a type and bounds (a value is checked before it is written);
+the memory limits together must not exceed 95% of the machine's RAM; secrets and identity (`SERVER_KIND`, addresses, passwords) cannot be reached.
+`local/overrides.env` is per machine and not in git: the profile (`profiles/<name>.env`) stays the record of what the repo says, and
+`CONFIG_HASH` covers only the profile, so a machine with local overrides still shows whether it is behind the repo; `CONFIG_OVERRIDES` is the
+hash of the overrides (empty when there are none). To make a local change permanent for the machine, copy it into the profile and delete the
+override. `PG_TUNE_*` is not offered: it is read once, when the database volume is first created.
+
 ## How a deploy runs
 
 The deploy recreates the diagnostics service, so it cannot run inside it. The service starts a one-shot container from its own

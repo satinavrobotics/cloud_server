@@ -5,7 +5,8 @@
 
     profile   server | staging | pi4 | pi5 | any robot profile   (docker_compose/profiles/<profile>.env)
 
-The file is base.env, then the profile, then secrets.env, then CONFIG_PROFILE / CONFIG_HASH. server renders to docker_compose/.env
+The file is base.env, then the profile, then the machine's local overrides (docker_compose/local/overrides.env, written by the app,
+never committed), then secrets.env, then CONFIG_PROFILE / CONFIG_HASH / CONFIG_OVERRIDES. server renders to docker_compose/.env
 (compose reads it by default) and also livekit_sfu.env (the LIVEKIT_SFU_* keys, which the LiveKit services read as an env_file);
 staging renders .env.staging; a robot (a profile with SERVER_KIND=robot) renders .env.robot. It stops, writing nothing, if a
 required secret is missing, empty or still CHANGE_ME (the keys of secrets/<kind>.env.example; an empty value there means optional)
@@ -18,7 +19,7 @@ or if secrets.env sets a key that belongs in a profile, or a profile holds a sec
     --hash    print the config hash of the profile and stop (what a machine reports at /api/v1/server-info as config_hash)
     --out F   render the primary file to F instead of the default (extra files are then written next to it)
 
-CONFIG_HASH covers the non-secret keys only (not IMAGE_TAG, which a deploy changes), so two machines on one profile agree and a
+CONFIG_HASH covers the profile's non-secret keys only (not the local overrides: CONFIG_OVERRIDES is their own hash, empty when there are none) (not IMAGE_TAG, which a deploy changes), so two machines on one profile agree and a
 machine whose profile moved on shows a different hash. IMAGE_TAG already in the output file is kept: a render must not undo a deploy.
 """
 import argparse
@@ -38,7 +39,7 @@ ROBOT = ("robot", ".env.robot")
 SPLIT = {"server": [("livekit_sfu.env", "LIVEKIT_SFU_")]}
 NO_BASE = {"staging"}       # profiles that do not inherit base.env (the rehearsal is its own small world)
 KEEP = ("IMAGE_TAG",)        # machine state, not config
-NOT_HASHED = set(KEEP) | {"CONFIG_PROFILE", "CONFIG_HASH"}
+NOT_HASHED = set(KEEP) | {"CONFIG_PROFILE", "CONFIG_HASH", "CONFIG_OVERRIDES"}
 SECRET_NAME = re.compile(r"(PASSWORD|_SECRET|_KEY|_TOKEN|ROOT_USER)$")
 PLACEHOLDER = "CHANGE_ME"
 _LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
@@ -69,6 +70,25 @@ def is_secret(key: str) -> bool:
 def config_hash(settings: dict) -> str:
     body = "\n".join(f"{k}={v}" for k, v in sorted(settings.items()) if k not in NOT_HASHED and not is_secret(k))
     return hashlib.sha256(body.encode()).hexdigest()[:12]
+
+
+def overrides_hash(overrides: dict) -> str:
+    """12 hex characters over the override lines, or "" when there are none (the app's service computes the same)."""
+    if not overrides:
+        return ""
+    return hashlib.sha256("\n".join(f"{k}={v}" for k, v in sorted(overrides.items())).encode()).hexdigest()[:12]
+
+
+def local_overrides(dc: Path = DC) -> dict:
+    """docker_compose/local/overrides.env: settings changed on this machine from the app. Never a secret."""
+    path = dc / "local" / "overrides.env"
+    if not path.is_file():
+        return {}
+    found = parse(path)
+    held = sorted(k for k in found if is_secret(k))
+    if held:
+        raise RenderError(f"local/overrides.env holds secrets, which belong in secrets.env: {', '.join(held)}")
+    return found
 
 
 def available(dc: Path = DC) -> List[str]:
@@ -122,8 +142,10 @@ def render(profile: str, secrets_file: Path, previous: dict, dc: Path = DC) -> D
     stray = sorted(k for k in secrets if k not in required and k not in optional)
     if stray:
         raise RenderError(f"{secrets_file.name} has keys that are not secrets for {profile} (put settings in profiles/{profile}.env): {', '.join(stray)}")
-    config = {**settings, "CONFIG_PROFILE": profile}
+    overrides = local_overrides(dc)
+    config = {**settings, **overrides, "CONFIG_PROFILE": profile}
     config["CONFIG_HASH"] = config_hash(settings)
+    config["CONFIG_OVERRIDES"] = overrides_hash(overrides)
     kept = {k: previous[k] for k in KEEP if k in previous}
     everything = {**config, **kept, **{k: secrets[k] for k in [*required, *optional] if k in secrets}}
     header = f"# Rendered by scripts/render_env.sh {profile}: do not edit; change profiles/{profile}.env or secrets.env and render again."
