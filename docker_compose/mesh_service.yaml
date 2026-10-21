@@ -1,6 +1,6 @@
 # Mesh service (docs/mesh/design.md, contract cloud_mesh/CONTRACT.md): the photo-textured GLB mesh of a map.
 # Its own compose project; the code lives in web_stack/cloud_mesh (image built there:
-# docker build -t mesh-service:1.1.1 cloud_mesh). Same host as the API: host networking, bound to
+# docker build -t mesh-service:1.2.0 cloud_mesh). Same host as the API: host networking, bound to
 # 127.0.0.1:8012. The API's MESH_SERVICE_URL points here and it reads the same MESH_SERVICE_KEY from .env.
 #
 #   docker compose -p mesh -f mesh_service.yaml up -d
@@ -10,7 +10,7 @@
 # under 12 GB and the spool (frames, splat and mesh work files) lives in the mesh-spool volume.
 services:
   mesh-service:
-    image: ${MESH_IMAGE:-mesh-service:1.1.1}
+    image: ${MESH_IMAGE:-mesh-service:1.2.0}
     network_mode: host
     restart: unless-stopped
     gpus: all
