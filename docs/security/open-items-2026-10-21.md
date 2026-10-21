@@ -44,6 +44,12 @@ outside the team.
 secrets. Delete it once the profile setup has proven itself. `docker_compose/secrets.env` on each machine is the real store: keep it
 out of backups that leave the machine, and never `git add -A` there (it is in `.gitignore`).
 
+## 9. An assistant-created SSH key can log in to the Pi 4
+A key pair made for the assistant's sessions is installed in `/home/admin/.ssh/authorized_keys` on the Pi 4 (the only line in that file),
+and its private half sits in a session scratchpad on the dev box (`/tmp/claude-1000/.../scratchpad/pi_key`, mode 600). Anyone who can read
+that file on the dev box can log in to the Pi as `admin`. Remove the line from the Pi and delete the private key when no assistant
+session needs the access any more; re-install one per task if it is needed again. (The Pi 5 has no such key: ssh there is by password.)
+
 ## 8. Reconstruction, semantic and mesh service keys
 `RECONSTRUCTION_*`, `SEMANTIC_*` and `MESH_*` keys and callback secrets are in `secrets.env` and were never committed. No action; listed
 so a later rotation includes them.
