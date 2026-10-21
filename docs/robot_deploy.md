@@ -37,6 +37,20 @@ reach them can drive the robot (on 2026-10-21 a Pi with `0.0.0.0` had both open 
 Pi's `eth0` address from the profile (`ROBOT_LAN_IP`, `LAN_JETSON_IP`, `LAN_IFACE`, `LAN_WLAN_OFF`, `LAN_GATEWAY`); `check` is read-only, `apply`
 undoes itself if its checks fail. After a change to `ROBOT_LAN_IP`, `render_env.sh <profile>` and a deploy recreate the gateway and the broker.
 
+Which network for what: Tailscale for everything that involves a person, the app or the cloud; the robot LAN only for the robot's own link to its Pi.
+
+| Use | Network | Why |
+|---|---|---|
+| The app to the cloud and to the Pis | Tailscale | Works from anywhere, and it is the one place that checks who is connecting. |
+| Cloud to Pi (data transfer, deploys, image pulls, diagnostics) | Tailscale | Same. |
+| Restart and deploy buttons (operator actions) | Tailscale | Those endpoints trust the tailnet. |
+| The Jetson to its Pi (MQTT orders and state, the Pi's API) | LAN if wanted, else Tailscale | Fast, and it keeps working when the Wi-Fi or internet is down. |
+| Video and recording uploads | Tailscale | The Pi's video server and its upload address are bound to the tailnet address only. |
+
+Tailscale authenticates, the LAN does not: the gateway and the broker have no login, which is why the robot LAN holds only the robot's own devices.
+The Jetson's orchestrator derives its MQTT, registration and video addresses from one setting (`server.host`); pointing that at a LAN address would
+break video and uploads (tailnet-only), so move only the MQTT link to the LAN, and only with a separate MQTT address setting.
+
 No upgrades on a robot: the machines are never upgraded in place (no `apt upgrade`, no `rpi-update`, no unattended upgrades, no kernel or
 firmware change). Updates are made and tested on the server and then deployed to the robots with `scripts/build_push.sh` and
 `scripts/deploy_robot.sh` (or the app's Deploy button). The Pi 5 in particular runs a pinned 4 KB-page kernel: a firmware or kernel change
