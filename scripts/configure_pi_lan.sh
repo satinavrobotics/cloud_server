@@ -4,7 +4,11 @@
 #
 #   scp scripts/configure_pi_lan.sh satipi@rasp:/tmp/ && ssh -t satipi@rasp 'sudo bash /tmp/configure_pi_lan.sh apply'
 #
-#   configure_pi_lan.sh [--ip A.B.C.D] [--jetson A.B.C.D] [--iface IF] [--wlan-off [--gateway A.B.C.D]] check|apply|rollback
+#   configure_pi_lan.sh [--profile pi4|pi5] [--ip A.B.C.D] [--jetson A.B.C.D] [--iface IF] [--wlan-off [--gateway A.B.C.D]] check|apply|rollback
+#
+# --profile NAME reads the robot LAN settings from docker_compose/profiles/NAME.env, the one place they are written down for both Pis:
+#   ROBOT_LAN_IP (this Pi's address; the gateway and broker listen on it too), LAN_JETSON_IP, LAN_IFACE, LAN_WLAN_OFF=true|false,
+#   LAN_GATEWAY. Explicit options win over the profile. Never installs or upgrades a package.
 #
 #   check      read-only report: managers, addresses, routes, the Jetson, whether the address is free
 #   apply      back up the config, set eth0 to a static <ip>/24, verify, and undo by itself if the check fails
@@ -33,8 +37,23 @@ die() { printf "configure_pi_lan: %b\n" "$*" >&2; exit 1; }
 log() { printf "configure_pi_lan: %b\n" "$*" >&2; }
 usage() { sed -n '2,/^set -e/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 
+# --profile first: its values are the defaults that explicit options then override
+PROFILE=""
+for ((i = 1; i < $#; i++)); do [ "${!i}" = "--profile" ] && { j=$((i + 1)); PROFILE="${!j}"; }; done
+if [ -n "$PROFILE" ]; then
+    PF="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker_compose/profiles/$PROFILE.env"
+    [ -f "$PF" ] || die "no profile $PF"
+    pv() { sed -n "s/^$1=\(.*\)$/\1/p" "$PF" | tail -1; }
+    v="$(pv ROBOT_LAN_IP)"; [ -z "$v" ] || IP="$v"
+    v="$(pv LAN_JETSON_IP)"; [ -z "$v" ] || JETSON="$v"
+    v="$(pv LAN_IFACE)"; [ -z "$v" ] || IFACE="$v"
+    v="$(pv LAN_GATEWAY)"; [ -z "$v" ] || GATEWAY="$v"
+    [ "$(pv LAN_WLAN_OFF)" != true ] || WLAN_OFF=1
+fi
+
 while [ $# -gt 0 ]; do
     case "$1" in
+        --profile) [ $# -ge 2 ] || die "--profile needs a value"; shift ;;
         --ip) [ $# -ge 2 ] || die "--ip needs a value"; IP="$2"; shift ;;
         --jetson) [ $# -ge 2 ] || die "--jetson needs a value"; JETSON="$2"; shift ;;
         --iface) [ $# -ge 2 ] || die "--iface needs a value"; IFACE="$2"; shift ;;

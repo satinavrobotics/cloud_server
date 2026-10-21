@@ -20,11 +20,27 @@ Off (profile `cloud-only`): livekit-service (LiveKit Cloud tokens: needs the int
 API). The scene-graph worker (in graph-builder) and planner are on in `.env.robot.example` (`SCENE_GRAPH_WORKER_ENABLED` /
 `SCENE_GRAPH_PLANNER_ENABLED`; both default to false in the code), with memory caps in the robot compose file; their real memory use on a Pi is not measured yet.
 
-LAN door (opt-in): the gateway listens on loopback and `ROBOT_TAILNET_IP` only. A client on the local network (the desktop app's Scan, or a typed
-`http://192.168.x.y`) gets "connection refused" until `ROBOT_LAN_IP=<this robot's LAN address>` is set (in the robot's profile, then `render_env.sh` and a
-deploy). Use one address, **never `0.0.0.0`**: the gateway has no login and the broker allows anonymous clients, so whoever can reach them can drive the
-robot (on 2026-10-21 a Pi with `0.0.0.0` had both open on its wifi and ethernet; see [security/open-items-2026-10-21.md](security/open-items-2026-10-21.md)).
-It is a choice and not the default.
+Robot LAN (the Jetson and the Pis talk over it): each Pi's address is written in its profile and used by compose and by the LAN script.
+
+| Machine | LAN address | Interface | Wi-Fi | Notes |
+|---|---|---|---|---|
+| Jetson | `192.168.1.50` | | | the robot |
+| Pi 4 (`raspberrypi`) | `192.168.1.60` (`pi4.env`) | `eth0`, no gateway | on: the internet and Tailscale come through wlan0 | |
+| Pi 5 (`rasp`) | `192.168.1.70` (`pi5.env`) | `eth0`, router `192.168.1.1` | off: the internet and Tailscale come through eth0 | 4 KB-page kernel (`kernel=kernel8.img`) |
+
+`ROBOT_LAN_IP` (profile) makes the gateway (80) and the MQTT broker (1883, 9001) listen on that ONE address as well as loopback and the tailnet,
+so the Jetson can use `<ROBOT_LAN_IP>:1883`. Never `0.0.0.0`: the gateway has no login and the broker allows anonymous clients, so whoever can
+reach them can drive the robot (on 2026-10-21 a Pi with `0.0.0.0` had both open on its wifi and ethernet; see
+[security/open-items-2026-10-21.md](security/open-items-2026-10-21.md)). The robot LAN must hold only the robot's own devices.
+
+`scripts/configure_pi_lan.sh --profile pi4|pi5 check|apply|rollback` (run on the Pi, as root, through Tailscale, never over `eth0`) sets the
+Pi's `eth0` address from the profile (`ROBOT_LAN_IP`, `LAN_JETSON_IP`, `LAN_IFACE`, `LAN_WLAN_OFF`, `LAN_GATEWAY`); `check` is read-only, `apply`
+undoes itself if its checks fail. After a change to `ROBOT_LAN_IP`, `render_env.sh <profile>` and a deploy recreate the gateway and the broker.
+
+No upgrades on a robot: the machines are never upgraded in place (no `apt upgrade`, no `rpi-update`, no unattended upgrades, no kernel or
+firmware change). Updates are made and tested on the server and then deployed to the robots with `scripts/build_push.sh` and
+`scripts/deploy_robot.sh` (or the app's Deploy button). The Pi 5 in particular runs a pinned 4 KB-page kernel: a firmware or kernel change
+can break it. `apt-daily`, `apt-daily-upgrade` and `unattended-upgrades` are disabled on the Pis.
 
 Network: Postgres, ArangoDB, the planner and graph-builder listen on `127.0.0.1` only; mosquitto on `127.0.0.1` and the tailnet IP
 (`ROBOT_TAILNET_IP`), plus the single `ROBOT_LAN_IP` address when it is set (a robot on the local network connects its VDA5050 client to `<ROBOT_LAN_IP>:1883`); the API (8000) and the MinIO forwarder are the doors. Mosquitto still allows anonymous clients, so

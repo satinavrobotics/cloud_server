@@ -111,6 +111,27 @@ class TestOutputs:
         assert re_mod.parse(target) == {"POSTGRES_PASSWORD": "p", "LIVEKIT_SFU_API_KEY": "k"}
 
 
+class TestRobotLan:
+    """The robot LAN is written down once per Pi (profile) and read by compose (ROBOT_LAN_IP) and by configure_pi_lan.sh."""
+
+    @pytest.mark.parametrize("profile", ["pi4", "pi5"])
+    def test_one_valid_address_never_every_interface(self, profile):
+        import ipaddress
+        s = re_mod.merged_profile(profile)
+        ip, jetson = ipaddress.ip_address(s["ROBOT_LAN_IP"]), ipaddress.ip_address(s["LAN_JETSON_IP"])
+        assert not ip.is_unspecified and not ip.is_loopback
+        assert ip != jetson and ip in ipaddress.ip_network(f"{s['LAN_JETSON_IP']}/24", strict=False)
+        assert str(ip).split(".")[-1] not in ("0", "1", "255")
+        assert s["LAN_IFACE"] and s["LAN_WLAN_OFF"] in ("true", "false")
+
+    def test_the_two_pis_have_different_lan_addresses(self):
+        assert re_mod.merged_profile("pi4")["ROBOT_LAN_IP"] != re_mod.merged_profile("pi5")["ROBOT_LAN_IP"]
+
+    def test_a_wlan_off_pi_names_its_router(self):
+        s = re_mod.merged_profile("pi5")
+        assert s["LAN_WLAN_OFF"] == "true" and s["LAN_GATEWAY"]          # the internet comes through eth0 then
+
+
 class TestSecrets:
     def test_a_missing_required_secret_stops_the_render(self, dc, tmp_path):
         path = tmp_path / "s.env"
