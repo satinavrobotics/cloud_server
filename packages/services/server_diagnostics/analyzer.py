@@ -147,7 +147,7 @@ def _memory_findings(state: Dict) -> List[Finding]:
                     f"Uses {_mb(usage)} of {_mb(limit)} ({frac * 100:.0f}%).", hint)]
 
 
-def _state_findings(state: Dict, now: datetime, window_seconds: float) -> List[Finding]:
+def state_findings(state: Dict, now: datetime, window_seconds: float) -> List[Finding]:
     findings: List[Finding] = []
     status = state.get("state")
     exit_code = state.get("exit_code")
@@ -188,7 +188,7 @@ def analyze(state: Dict, lines: List[str], now: datetime, window_seconds: float)
 
     `state`: state, health, restart_count, exit_code, oom_killed, started_at (datetime or None).
     """
-    findings = _state_findings(state, now, window_seconds)
+    findings = state_findings(state, now, window_seconds)
     window = recent_lines(lines, now, window_seconds)
     matched: Dict[str, Finding] = {}
     explained = set()                       # lines already named by an error-severity rule (never counted twice)

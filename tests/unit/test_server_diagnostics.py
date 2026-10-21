@@ -258,17 +258,18 @@ class TestService:
         by = {s["name"]: s for s in out["services"]}
         assert by["api"]["severity"] == "ok" and by["api"]["status_text"] == "running (healthy)"
         assert by["db"]["severity"] == "error" and by["db"]["status_text"] == "exited, exit code 1"
-        assert by["sati_nginx_gateway"]["severity"] == "error" and by["sati_nginx_gateway"]["findings_count"] == 2
-        assert out["summary"] == {"total": 3, "up": 1, "warn": 0, "down": 2, "checks_failing": 0}
+        assert by["db"]["findings_count"] == 1
+        # healthy and running: its old error lines do not count here, only when it is opened (analysis)
+        assert by["sati_nginx_gateway"]["severity"] == "ok" and by["sati_nginx_gateway"]["findings_count"] == 0
+        assert out["summary"] == {"total": 3, "up": 2, "warn": 0, "down": 1, "checks_failing": 0}
+        assert svc._docker.logged == []              # the list never reads logs
 
     def test_overview_is_cached_for_a_few_seconds(self):
         svc, clock = make(FLEET)
         first = svc.overview()
-        svc._docker.logged.clear()
-        assert svc.overview() is first and svc._docker.logged == []
+        assert svc.overview() is first
         clock["t"] += 6
-        svc.overview()
-        assert svc._docker.logged
+        assert svc.overview() is not first
 
     def test_logs_are_redacted_and_bounded(self):
         containers = {"a1": {"name": "x", "labels": {"com.docker.compose.service": "api"}, "state": STATE_OK,

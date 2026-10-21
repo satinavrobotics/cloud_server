@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
-from .analyzer import SEVERITY_RANK, Finding, analyze, worst
+from .analyzer import SEVERITY_RANK, Finding, analyze, state_findings, worst
 from .checks import run_checks
 from .docker_api import DockerReader, DockerUnavailable
 from .host import host_findings, read_host
@@ -117,13 +117,12 @@ class DiagnosticsService:
         return [redact_line(line) for line in raw]
 
     def _judge(self, item: Dict) -> Tuple[Dict, List[Finding]]:
+        """The list judges the container itself (state, health, restarts, memory), never its logs: a service that runs
+        and is healthy is "up" however much its old log lines complain. The log findings are read when one service is
+        opened (analysis())."""
         state = self._state(item["id"])
         now = datetime.fromtimestamp(self._clock(), tz=timezone.utc)
-        try:
-            lines = self._lines(item["id"], ANALYSIS_TAIL, since=self._clock() - self._window)
-        except DockerUnavailable:
-            lines = []
-        return state, analyze(state, lines, now, self._window)
+        return state, state_findings(state, now, self._window)
 
     def _judge_or_unknown(self, item: Dict):
         try:

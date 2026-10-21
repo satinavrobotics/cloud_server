@@ -5,7 +5,7 @@ their logs say and what looks wrong. It is the server's counterpart of the robot
 
 - Code: `packages/services/server_diagnostics/` (own image, `scripts/build_push.sh` builds it). Port **8011**, bound to
   `127.0.0.1`; the gateway exposes it as `/api/diagnostics/`. Nothing but the gateway can reach it.
-- `GET /services` (state, health, restarts, a severity and the number of findings per service),
+- `GET /services` (state, health, restarts, memory, a severity and the number of findings per service; judged from the container itself, never from its logs, so a running, healthy service is "up" whatever its old log lines say; the log findings come from `/services/{name}/analysis` when one service is opened),
   `GET /services/{name}/logs?lines=200` (max 2000), `GET /services/{name}/analysis?lines=500`, `GET /health`.
 - Advertised as `capabilities.diagnostics` in `GET /api/v1/server-info` (`SERVER_DIAGNOSTICS_AVAILABLE`: on for a cloud
   server, off for a robot until the image is deployed there and the setting is `true` in `.env.robot`).
