@@ -22,3 +22,4 @@ docker_compose/.env.robot.bak-*
 docker_compose/secrets.env
 docker_compose/.env.robot.bak*
 docker_compose/*.bak
+docker_compose/secrets.*.env
