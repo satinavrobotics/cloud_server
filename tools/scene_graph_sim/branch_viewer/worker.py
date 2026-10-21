@@ -87,7 +87,11 @@ def run(tree, map_dir, out_path, exponential):
     from packages.services.mission_planner import scene_route as route_mod
 
     leaves = _load_leaves(map_dir, adapter)
-    g = ChartGraph(SceneParams(chart_radius=S.CHART_RADIUS_M, near_range_m=S.NEAR_RANGE_M, near_min_clearance_m=S.NEAR_MIN_CLEARANCE_M))
+    place = {}
+    if os.environ.get("SG_PLACE_RULE") == "1":
+        from packages.scene_graph.place import place_params_from_half_side
+        place["place_peak_m"], place["place_path_m"] = place_params_from_half_side(S.ROBOT_HALF_SIDE_M)
+    g = ChartGraph(SceneParams(chart_radius=S.CHART_RADIUS_M, near_range_m=S.NEAR_RANGE_M, near_min_clearance_m=S.NEAR_MIN_CLEARANCE_M, **place))
     kappa = S.KAPPA_EXPONENTIAL if exponential else S.KAPPA_LINEAR
     turn = route_mod.turn_lambda(None, True, S.TURN_LAMBDA_M_PER_RAD)[0]
     safety = route_mod.safety_for(g, 2 * S.ROBOT_HALF_SIDE_M, 2 * S.ROBOT_HALF_SIDE_M, kappa, turn=turn)
