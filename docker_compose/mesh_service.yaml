@@ -1,0 +1,31 @@
+# Mesh service (docs/mesh/design.md, contract cloud_mesh/CONTRACT.md): the photo-textured GLB mesh of a map.
+# Its own compose project; the code lives in web_stack/cloud_mesh (image built there:
+# docker build -t mesh-service:1.0.0 cloud_mesh). Same host as the API: host networking, bound to
+# 127.0.0.1:8012. The API's MESH_SERVICE_URL points here and it reads the same MESH_SERVICE_KEY from .env.
+#
+#   docker compose -p mesh -f mesh_service.yaml up -d
+#
+# Models (the MapAnything weights, Apache-2.0) are NOT baked in: the same directory as the reconstruction service
+# (RECON_MODELS_DIR, containing map-anything-apache/ and torch_home/) is mounted read-only at /models; offline, no download. The GPU is shared with the other services: a job keeps its VRAM
+# under 12 GB and the spool (frames, splat and mesh work files) lives in the mesh-spool volume.
+services:
+  mesh-service:
+    image: ${MESH_IMAGE:-mesh-service:1.0.0}
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    mem_limit: 16g
+    memswap_limit: 16g
+    environment:
+      - MESH_SERVICE_KEY=${MESH_SERVICE_KEY:?set MESH_SERVICE_KEY in .env}
+      - MESH_HOST=127.0.0.1
+      - MESH_PORT=8012
+      - MESH_MODEL_DIR=/models/map-anything-apache
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      - mesh-spool:/var/lib/mesh/spool
+      - ${RECON_MODELS_DIR:-/home/satiadmin/satinavrobotics/cloud_reconstruction/models}:/models:ro
+
+volumes:
+  mesh-spool:

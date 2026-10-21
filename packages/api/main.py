@@ -344,6 +344,7 @@ async def lifespan(app: FastAPI):
     # cluster (advisory lock).
     service.reconstruction.start_dispatcher()
     service.semantic.start_dispatcher()
+    service.mesh.start_dispatcher()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -365,6 +366,7 @@ async def lifespan(app: FastAPI):
         await service.map_deleter.stop()
         await service.reconstruction.stop()
         await service.semantic.stop()
+        await service.mesh.stop()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
@@ -1616,6 +1618,74 @@ async def put_map_view_settings(map_id: str, body: Dict[str, Any]):
 
 # ==================== Fleet Settings ====================
 # A single operator-editable settings object, always stored under
+# ==================== Mesh ====================
+# docs/mesh/design.md, contract cloud_mesh/CONTRACT.md; the logic is packages/api/mesh.py. The same
+# routes and error codes as the semantic layer (no_mesh in place of no_semantic). The GLB is
+# served through the API's default nginx location (buffered to a temp file, fine for tens of MB).
+
+@app.post("/api/v1/maps/{map_id}/mesh", status_code=202)
+async def start_map_mesh(map_id: str, body: Optional[Dict[str, Any]] = None):
+    """Start the map's textured mesh. Body optional: {session?, quality?, max_frames?, triangles?,
+    atlas?, splat_steps?, texture_opt?}. 202 + the job (queued); never automatic."""
+    _require_service()
+    return await _site_call("start mesh", service.mesh.start(
+        map_id, body, recording.request_actor()))
+
+
+@app.get("/api/v1/maps/{map_id}/mesh")
+async def get_map_mesh(map_id: str):
+    """{map_name, configured, mesh, job}: the current result (with `stale`, file URLs) and the
+    active job, or the newest job if it failed or was cancelled after the result."""
+    _require_service()
+    return await _site_call("read mesh", service.mesh.status(map_id))
+
+
+@app.post("/api/v1/maps/{map_id}/mesh/cancel")
+async def cancel_map_mesh(map_id: str):
+    _require_service()
+    return await _site_call("cancel mesh", service.mesh.cancel(map_id))
+
+
+@app.delete("/api/v1/maps/{map_id}/mesh", status_code=204)
+async def delete_map_mesh(map_id: str):
+    """Delete the current result (its files go) and cancel an active job."""
+    _require_service()
+    await _site_call("delete mesh", service.mesh.delete(map_id))
+    return Response(status_code=204)
+
+
+@app.get("/api/v1/maps/{map_id}/mesh/files/{name}")
+async def get_map_mesh_file(map_id: str, name: str, v: Optional[str] = None,
+                            if_none_match: Optional[str] = Header(None)):
+    """model.glb | meta.json of the current result. ETag = the job id; with `?v=<job id>` the
+    response is cached forever."""
+    _require_service()
+    info = await _site_call("read mesh file", service.mesh.open_file(map_id, name))
+    etag = f'"{info["job_id"]}"'
+    cache = ("public, max-age=31536000, immutable" if v == info["job_id"] else "no-cache")
+    headers = {"ETag": etag, "Cache-Control": cache}
+    if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
+        return Response(status_code=304, headers=headers)
+    if info.get("bytes") is not None:
+        headers["Content-Length"] = str(info["bytes"])
+    stream = service.mesh.objects.stream(info["bucket"], info["key"])
+    return StreamingResponse(stream, media_type=info["content_type"], headers=headers)
+
+
+@app.post("/internal/mesh/jobs/{job_id}/{kind}")
+async def mesh_callback(job_id: str, kind: str, body: Dict[str, Any],
+                        authorization: Optional[str] = Header(None)):
+    _require_service()
+    handlers = {"progress": service.mesh.on_progress,
+                "finish": service.mesh.on_finish,
+                "fail": service.mesh.on_fail}
+    if kind not in handlers:
+        raise HTTPException(status_code=404, detail="unknown callback")
+    service.mesh.authorize(job_id, authorization)
+    status, answer = await _site_call(f"mesh {kind}", handlers[kind](job_id, body))
+    return JSONResponse(status_code=status, content=answer)
+
+
 # GLOBAL_SETTINGS_NAME — see cloud_common/objects/settings.py for why this is
 # a singleton simulated by convention rather than a distinct storage mode.
 

@@ -21,6 +21,7 @@ CAPABILITY_SERVICES: Dict[str, Tuple[List[str], bool]] = {
     "scene_graph": (["graph-builder-service"], False),
     "reconstruction": (["reconstruction-service"], True),
     "semantic": (["semantic-service"], True),
+    "mesh": (["mesh-service"], True),
     "agent": (["agent-orchestrator-service"], True),
     "diagnostics": (["server-diagnostics"], True),
     "video": (["livekit-sfu-tokens", "livekit-sfu"], False),

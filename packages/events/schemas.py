@@ -533,6 +533,38 @@ class SemanticFailed(Payload):
     message: Optional[str] = None
 
 
+class MeshStarted(Payload):
+    """MAP.MESH_STARTED (packages/api/mesh.py): the service's first progress callback."""
+    map_name: str
+    job_id: str
+    params: Dict[str, Any] = {}
+    nodes_with_depth: Optional[int] = None
+    attempt: Optional[int] = None
+
+
+class MeshFinished(Payload):
+    """MAP.MESH_FINISHED: the job's outputs were verified and committed; it is the map's
+    current mesh."""
+    map_name: str
+    job_id: str
+    session: Optional[str] = None
+    triangles: Optional[int] = None
+    frames_used: Optional[int] = None
+    poses_source: Optional[str] = None
+    duration_s: Optional[float] = None
+
+
+class MeshFailed(Payload):
+    """MAP.MESH_FAILED: the job ended without a result (same `reason`s as ReconstructionFailed,
+    plus the service's no_usable_session, too_few_frames, registration_failed, gpu_oom). The
+    previous result is untouched."""
+    map_name: str
+    job_id: str
+    reason: str
+    stage: Optional[str] = None
+    message: Optional[str] = None
+
+
 class RecordingChanged(Payload):
     old_level: Optional[RecordingLevel] = None
     new_level: RecordingLevel

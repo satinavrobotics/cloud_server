@@ -87,6 +87,8 @@ SESSIONS_SQL = "DELETE FROM map_sessions WHERE map_name = %s"
 RECONSTRUCTIONS_SQL = "DELETE FROM map_reconstructions WHERE map_name = %s"
 # Its semantic-layer jobs (docs/semantic/design.md) the same way.
 SEMANTICS_SQL = "DELETE FROM map_semantics WHERE map_name = %s"
+# Its mesh jobs (docs/mesh/design.md) too.
+MESH_SQL = "DELETE FROM map_meshes WHERE map_name = %s"
 # Its view settings (migration 20261017_01_map_view_settings) too.
 VIEW_SETTINGS_SQL = "DELETE FROM map_view_settings WHERE map_name = %s"
 # Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
@@ -443,6 +445,7 @@ class MapDeleter:
                     await cursor.execute(SESSIONS_SQL, (map_id,))
                     await cursor.execute(RECONSTRUCTIONS_SQL, (map_id,))
                     await cursor.execute(SEMANTICS_SQL, (map_id,))
+                    await cursor.execute(MESH_SQL, (map_id,))
                     await cursor.execute(VIEW_SETTINGS_SQL, (map_id,))
                     await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
                     await cursor.execute(BLOCKED_NODES_SQL, (map_id,))

@@ -133,7 +133,7 @@ access. Computed from configuration (`packages/api/server_info.py`, settings in 
   "server_id": null,
   "capabilities": {
     "robots": true, "missions": true, "maps": true, "orchestration": true,
-    "scene_graph": true, "reconstruction": true, "semantic": true, "agent": true, "fleet": true
+    "scene_graph": true, "reconstruction": true, "semantic": true, "mesh": true, "agent": true, "fleet": true
   },
   "livekit": {
     "available": true, "backend": "selfhost",
@@ -146,7 +146,7 @@ access. Computed from configuration (`packages/api/server_info.py`, settings in 
 
 - `kind` is `"cloud"` or `"robot"` (`SERVER_KIND`; anything but `robot` means cloud). `version` is the build commit.
 - A capability is true when its service is **configured**, not when it is up: `scene_graph` = `SCENE_GRAPH_WORKER_ENABLED`,
-  `reconstruction` = `RECONSTRUCTION_SERVICE_URL`, `semantic` = `SEMANTIC_SERVICE_URL`, `agent` = `SERVER_AGENT_AVAILABLE`
+  `reconstruction` = `RECONSTRUCTION_SERVICE_URL`, `semantic` = `SEMANTIC_SERVICE_URL`, `mesh` = `MESH_SERVICE_URL` (each of these three also needs its `_SERVICE_KEY` and `_CALLBACK_SECRET`), `agent` = `SERVER_AGENT_AVAILABLE`
   (default on for a cloud, off for a robot), `livekit.available` = `SERVER_LIVEKIT_AVAILABLE` when set, else whether the SFU key
   pair is set (the key pair alone does not prove a token service is deployed: set the variable to `false` on such a server).
 - `room_policy` says who names the LiveKit room: `"client"` (today) or `"server"` (the token decides): `LIVEKIT_ROOM_POLICY`.
@@ -215,6 +215,15 @@ Load a topological map from the graph database.
 **Backend Service:** Graph Database Service
 
 ---
+
+### Map Mesh
+
+A photo-textured GLB mesh of a map, built on demand by the external mesh service (`docs/mesh/design.md`). Advertised as capability `mesh`; every route answers `503 not_configured` (POST) while `MESH_SERVICE_URL`, `MESH_SERVICE_KEY` and `MESH_CALLBACK_SECRET` are not all set. The same shape as the semantic layer.
+
+- `POST /api/v1/maps/{map_id}/mesh` starts a job. Body optional: `{session?, quality?, max_frames?, triangles?, atlas?, splat_steps?, texture_opt?}` (`session` is `"auto"` or a session id; `quality` is `fast` or `standard`; `atlas` is 1024, 2048, 4096 or 8192). `202` with the job (`state: queued`). `404 map_not_found`, `409 map_deleting | job_active | no_depth`, `422` for a bad body, `too_many_nodes` or `unknown_session` (with `sessions`: node counts per session), `503 not_configured`.
+- `GET /api/v1/maps/{map_id}/mesh` returns `{map_name, configured, mesh, job}`: `mesh` is the current result (`job_id`, `finished_at`, `params`, `session`, `triangles`, `bounds`, `poses_source`, `warnings`, `frames_used`, `duration_s`, `stale`, `stale_reason`, `files: {mesh, meta}` each `{name, bytes, url}`) or `null`; `job` is the active job, or the newest one when it failed or was cancelled after the result.
+- `POST /api/v1/maps/{map_id}/mesh/cancel` cancels the active job (`404 no_active_job`). `DELETE /api/v1/maps/{map_id}/mesh` deletes the current result and cancels an active job (`204`).
+- `GET /api/v1/maps/{map_id}/mesh/files/model.glb` (`model/gltf-binary`) and `.../meta.json`: the current result's files, streamed. `ETag` is the job id (`304` on `If-None-Match`); with `?v=<job_id>` the response is `immutable` for a year (the URLs in `files` carry it). `404 no_mesh | file_not_found`.
 
 ### Map Drive Statistics
 

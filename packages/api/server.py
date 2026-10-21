@@ -41,7 +41,7 @@ from packages.config import (
     SCENE_GRAPH_WORKER_ENABLED,
 )
 from packages.api.map_delete import MapDeleter
-from packages.api import localization_view, map_view_settings, maps, reconstruction, semantic
+from packages.api import localization_view, map_view_settings, maps, mesh, reconstruction, semantic
 from packages.api.mapping_switch import MappingSwitch
 from packages.api.slam_save_state import PgSlamStateStore
 from packages.api.orchestrator_maps import OrchestratorMaps
@@ -713,19 +713,27 @@ class ApiDelegationService:
             minio_access_key or require_secret("MINIO_ACCESS_KEY"),
             minio_secret_key or require_secret("MINIO_SECRET_KEY"))
 
+        # Mesh gateway (docs/mesh/design.md): same shape, own table and service.
+        self.mesh = mesh.create_gateway(
+            self.database, self.graph_db, self.image_db,
+            minio_access_key or require_secret("MINIO_ACCESS_KEY"),
+            minio_secret_key or require_secret("MINIO_SECRET_KEY"))
+
         # Per-map view settings of the map window (docs/semantic/design.md §10.4): a small table of its own.
         self.view_settings = map_view_settings.ViewSettingsStore(self.database)
 
         async def mark_jobs_deleting(cursor, map_id):
             return {"reconstruction": await reconstruction.mark_map_deleting(cursor, map_id),
-                    "semantic": await semantic.mark_map_deleting(cursor, map_id)}
+                    "semantic": await semantic.mark_map_deleting(cursor, map_id),
+                    "mesh": await mesh.mark_map_deleting(cursor, map_id)}
 
         async def after_jobs_marked(map_id, marked):
             await self.reconstruction.after_map_delete_marked(map_id, marked["reconstruction"])
             await self.semantic.after_map_delete_marked(map_id, marked["semantic"])
+            await self.mesh.after_map_delete_marked(map_id, marked["mesh"])
 
         # WP11 F1: DELETE /maps/{id} marks the map DELETING; this cleans up in the background.
-        # The mark also cancels the map's active reconstruction and semantic jobs (same transaction).
+        # The mark also cancels the map's active reconstruction, semantic and mesh jobs (same transaction).
         scene_drop, scene_active = self._scene_graph_delete_hooks()
         self.map_deleter = MapDeleter(
             self.database,

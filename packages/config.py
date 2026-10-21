@@ -408,6 +408,27 @@ SEMANTIC_MAX_DEPTH_M = float(os.getenv("SEMANTIC_MAX_DEPTH_M", "10.0"))
 # Camera frames one job may use; `every` is chosen so a map stays below it unless the request sets it.
 SEMANTIC_MAX_FRAMES = int(os.getenv("SEMANTIC_MAX_FRAMES", "400"))
 
+# ==================== Mesh gateway (API) ====================
+# docs/mesh/design.md (packages/api/mesh.py). Same shape as the semantic gateway above: the textured GLB mesh of a
+# map is built by an external GPU service (cloud_mesh, port 8012), the API owns the job. Unset service URL, key or
+# callback secret = feature off (POST .../mesh answers 503 not_configured).
+MESH_SERVICE_URL = _env_or_none("MESH_SERVICE_URL")
+MESH_SERVICE_KEY = _env_or_none("MESH_SERVICE_KEY")
+MESH_CALLBACK_SECRET = _env_or_none("MESH_CALLBACK_SECRET")
+# How the service reaches the API's /internal/mesh/... callbacks.
+MESH_CALLBACK_BASE_URL = os.getenv("MESH_CALLBACK_BASE_URL", "http://localhost:8000")
+# MinIO as the service sees it (host:port in the presigned URLs).
+MESH_MINIO_ENDPOINT = os.getenv("MESH_MINIO_ENDPOINT", "localhost:9000")
+MESH_MINIO_SECURE = os.getenv("MESH_MINIO_SECURE", "false").lower() in ("true", "1", "yes")
+MESH_STAGING_BUCKET = os.getenv("MESH_STAGING_BUCKET", "mesh-staging")
+MESH_URL_EXPIRY_S = int(os.getenv("MESH_URL_EXPIRY_S", "14400"))
+MESH_JOB_TIMEOUT_S = int(os.getenv("MESH_JOB_TIMEOUT_S", "3600"))
+MESH_QUEUE_TIMEOUT_S = int(os.getenv("MESH_QUEUE_TIMEOUT_S", "1800"))
+MESH_MAX_INFLIGHT = int(os.getenv("MESH_MAX_INFLIGHT", "1"))
+MESH_MAX_DEPTH_M = float(os.getenv("MESH_MAX_DEPTH_M", "6.0"))
+# Camera frames one job may use (the `max_frames` param is capped by it and defaults to it).
+MESH_MAX_FRAMES = int(os.getenv("MESH_MAX_FRAMES", "400"))
+
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"
 

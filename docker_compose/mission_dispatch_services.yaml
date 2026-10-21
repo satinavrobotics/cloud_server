@@ -557,6 +557,12 @@ services:
       - SEMANTIC_CALLBACK_SECRET=${SEMANTIC_CALLBACK_SECRET:-}
       - SEMANTIC_CALLBACK_BASE_URL=${SEMANTIC_CALLBACK_BASE_URL:-http://localhost:8000}
       - SEMANTIC_MINIO_ENDPOINT=${SEMANTIC_MINIO_ENDPOINT:-localhost:9000}
+      # Mesh gateway (docs/mesh/design.md); the service is deployed from mesh_service.yaml.
+      - MESH_SERVICE_URL=${MESH_SERVICE_URL:-}
+      - MESH_SERVICE_KEY=${MESH_SERVICE_KEY:-}
+      - MESH_CALLBACK_SECRET=${MESH_CALLBACK_SECRET:-}
+      - MESH_CALLBACK_BASE_URL=${MESH_CALLBACK_BASE_URL:-http://localhost:8000}
+      - MESH_MINIO_ENDPOINT=${MESH_MINIO_ENDPOINT:-localhost:9000}
       # GET /api/v1/server-info (packages/api/server_info.py): which server this is. SERVER_KIND=robot in .env.robot.
       - BUILD_SHA=${GIT_SHA:-unknown}
       - SERVER_KIND=${SERVER_KIND:-cloud}

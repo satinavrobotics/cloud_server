@@ -67,6 +67,9 @@ class EventCode(str, enum.Enum):
     MAP_SEMANTIC_STARTED = "MAP.SEMANTIC_STARTED"
     MAP_SEMANTIC_FINISHED = "MAP.SEMANTIC_FINISHED"
     MAP_SEMANTIC_FAILED = "MAP.SEMANTIC_FAILED"
+    MAP_MESH_STARTED = "MAP.MESH_STARTED"
+    MAP_MESH_FINISHED = "MAP.MESH_FINISHED"
+    MAP_MESH_FAILED = "MAP.MESH_FAILED"
     MAP_NODES_DELETED = "MAP.NODES_DELETED"
     MAP_SCENE_GRAPH_UPDATED = "MAP.SCENE_GRAPH_UPDATED"
     MAP_SCENE_GRAPH_FOLD_FAILED = "MAP.SCENE_GRAPH_FOLD_FAILED"
@@ -99,6 +102,9 @@ class Source(str, enum.Enum):
     # Semantic layer: MAP.SEMANTIC_* (packages/api/semantic.py). Allowed from migration
     # 20261015_01_map_semantics on.
     SEMANTIC = "semantic"
+    # Mesh service: MAP.MESH_* (packages/api/mesh.py). Allowed from migration
+    # 20261021_01_map_meshes on.
+    MESH = "mesh"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,6 +122,7 @@ _A = Source.API
 _G = Source.GRAPH_BUILDER
 _R = Source.RECONSTRUCTION
 _SEM = Source.SEMANTIC
+_MESH = Source.MESH
 
 # The discriminator is required wherever two events with the same code, robot and
 # timestamp can legitimately differ (several errors or nodes in one message), and
@@ -207,6 +214,11 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MAP_SEMANTIC_STARTED: CodeMeta(_S.INFO, True, schemas.SemanticStarted, _SEM),
     _C.MAP_SEMANTIC_FINISHED: CodeMeta(_S.INFO, True, schemas.SemanticFinished, _SEM),
     _C.MAP_SEMANTIC_FAILED: CodeMeta(_S.WARNING, True, schemas.SemanticFailed, _SEM),
+    # Mesh service (docs/mesh/design.md): same shape, discriminator
+    # `map:<name>:mesh:<job_id>:<state>`.
+    _C.MAP_MESH_STARTED: CodeMeta(_S.INFO, True, schemas.MeshStarted, _MESH),
+    _C.MAP_MESH_FINISHED: CodeMeta(_S.INFO, True, schemas.MeshFinished, _MESH),
+    _C.MAP_MESH_FAILED: CodeMeta(_S.WARNING, True, schemas.MeshFailed, _MESH),
     _C.MAP_NODES_DELETED: CodeMeta(_S.INFO, True, schemas.MapNodesDeleted, _A),
     _C.MAP_RECONSTRUCTION_FAILED: CodeMeta(_S.WARNING, True, schemas.ReconstructionFailed, _R),
     # Scene graph (docs/scene_graph/integration.md, ops/events). Source graph_builder, no robot;

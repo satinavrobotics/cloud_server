@@ -1,6 +1,6 @@
 # 3D map spike: splat and mesh results (office7, 2026-10-16/17)
 
-Status: parked. Nothing here is wired into the cloud server or the client. The scripts live in a scratchpad, not in this repo.
+Status: superseded (2026-10-21) by the mesh service: gateway `packages/api/mesh.py`, design `docs/mesh/design.md`, service spec and recipe in `cloud_reconstruction/docs/mesh_service_spec_2026-10-21.md` and `mesh_quality_handover_2026-10-20.md`. This spike (licence-clean TSDF mesh judged to have holes, AGS-Mesh non-commercial) is kept as the record of the earlier decision. The scripts live in a scratchpad, not in this repo.
 
 ## Setup
 

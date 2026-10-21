@@ -142,6 +142,14 @@ VALID_PAYLOADS = {
                                       "duration_s": 61.0},
     EventCode.MAP_SEMANTIC_FAILED: {"map_name": "lab", "job_id": "j1", "reason": "error",
                                     "stage": "segmenting", "message": "boom"},
+    EventCode.MAP_MESH_STARTED: {"map_name": "lab", "job_id": "j1",
+                                 "params": {"session": "auto", "quality": "standard"},
+                                 "nodes_with_depth": 412, "attempt": 1},
+    EventCode.MAP_MESH_FINISHED: {"map_name": "lab", "job_id": "j1", "session": "e9727ca2",
+                                  "triangles": 298114, "frames_used": 93,
+                                  "poses_source": "colmap", "duration_s": 540.0},
+    EventCode.MAP_MESH_FAILED: {"map_name": "lab", "job_id": "j1", "reason": "no_usable_session",
+                                "stage": "poses", "message": "no session registers 85%"},
 }
 
 
@@ -158,9 +166,9 @@ def test_codes_are_str_enums_with_spec_values():
 def test_severity_and_source_values_match_schema():
     assert [s.value for s in Severity] == ["info", "warning", "error", "critical"]
     # graph_builder: migration 20260929_01_maps_m2 widens fleet_events_source_check;
-    # reconstruction: 20261003_01_map_reconstructions; semantic: 20261015_01_map_semantics.
+    # reconstruction: 20261003_01_map_reconstructions; semantic: 20261015_01_map_semantics; mesh: 20261021_01_map_meshes.
     assert [s.value for s in Source] == ["dispatch", "api", "graph_builder", "reconstruction",
-                                         "semantic"]
+                                         "semantic", "mesh"]
 
 
 def test_meta_for_accepts_plain_string():

@@ -286,6 +286,7 @@ class Frame:
     yaw: float
     created_at: str
     cameras: Dict[str, Dict[str, Any]]  # camera -> the node's depth.{camera} record
+    session_id: Optional[str] = None    # the mapping session that recorded the node (mesh manifest)
 
 
 def frames_from_nodes(docs: Iterable[Mapping[str, Any]]) -> List[Frame]:
@@ -302,9 +303,11 @@ def frames_from_nodes(docs: Iterable[Mapping[str, Any]]) -> List[Frame]:
         if not cams:
             continue
         node_id = str(doc.get("node_id") or doc.get("_key"))
+        session = doc.get("session_id") or next(
+            (rec.get("session_id") for rec in cams.values() if rec.get("session_id")), None)
         frames.append(Frame(node_id, float(pose["x"]), float(pose["y"]),
                             float(pose.get("yaw") or 0.0), str(doc.get("created_at") or ""),
-                            cams))
+                            cams, str(session) if session else None))
     frames.sort(key=lambda f: (f.created_at, f.node_id))
     return frames
 
@@ -894,13 +897,14 @@ class ObjectStore:
                 raise RuntimeError(f"removing {bucket}/{prefix}: {errors[:3]}")
         return len(names)
 
-    def result_jobs(self) -> List[Tuple[str, str]]:
-        """(map bucket, job id) of every `reconstruction/{job}/` prefix in the map buckets."""
+    def result_jobs(self, prefix: str = RESULT_PREFIX) -> List[Tuple[str, str]]:
+        """(map bucket, job id) of every `{prefix}{job}/` prefix in the map buckets (default:
+        `reconstruction/`)."""
         out = []
         for b in self.client.list_buckets():
             if not b.name.startswith("map-"):
                 continue
-            for obj in self.client.list_objects(b.name, prefix=RESULT_PREFIX):
+            for obj in self.client.list_objects(b.name, prefix=prefix):
                 parts = obj.object_name.split("/")
                 if len(parts) >= 2 and parts[1]:
                     out.append((b.name, parts[1]))

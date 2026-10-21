@@ -979,7 +979,7 @@ class GraphDatabaseService:
     DEPTH_NODES_AQL = (
         "FOR d IN @@col FILTER d.depth != null "
         "RETURN {_key: d._key, node_id: d.node_id, pose: d.pose, depth: d.depth, "
-        "created_at: d.created_at}")
+        "created_at: d.created_at, session_id: d.session_id}")
 
     def depth_nodes(self, map_id: str) -> Tuple[int, List[Dict[str, Any]]]:
         """(node count, the nodes that carry `depth`) of a map, for the 3D reconstruction

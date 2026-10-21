@@ -7,7 +7,7 @@ database access, no secrets, cheap enough to poll. Everything is computed from c
 A robot without the video token service sets SERVER_LIVEKIT_AVAILABLE=false (the SFU key pair alone proves nothing there).
 
     {"schema_version": 1, "name": "...", "kind": "cloud" | "robot", "version": "<build sha>", "server_id": null | "...",
-     "capabilities": {"robots", "missions", "maps", "orchestration", "scene_graph", "reconstruction", "semantic",
+     "capabilities": {"robots", "missions", "maps", "orchestration", "scene_graph", "reconstruction", "semantic", "mesh",
                       "agent", "fleet": bool},
      "livekit": {"available", "backend", "token_path", "room_policy"},
      "min_client_version": null | "x.y.z", "recommended_client_version": null | "x.y.z"}
@@ -42,6 +42,7 @@ class Capabilities(pydantic.BaseModel):
     scene_graph: bool
     reconstruction: bool
     semantic: bool
+    mesh: bool = False             # additive (schema stays 1): a server that predates it simply lacks the key
     agent: bool
     fleet: bool
     diagnostics: bool = False      # additive (schema stays 1): a server that predates it simply lacks the key
@@ -99,6 +100,7 @@ def build_server_info(cfg=config) -> ServerInfo:
             # alone made the app offer a layer that could only fail
             reconstruction=bool(cfg.RECONSTRUCTION_SERVICE_URL and cfg.RECONSTRUCTION_SERVICE_KEY and cfg.RECONSTRUCTION_CALLBACK_SECRET),
             semantic=bool(cfg.SEMANTIC_SERVICE_URL and cfg.SEMANTIC_SERVICE_KEY and cfg.SEMANTIC_CALLBACK_SECRET),
+            mesh=bool(cfg.MESH_SERVICE_URL and cfg.MESH_SERVICE_KEY and cfg.MESH_CALLBACK_SECRET),
             agent=bool(cfg.SERVER_AGENT_AVAILABLE),
             fleet=True,                         # a robot server may host several robots (decision D2)
             diagnostics=bool(cfg.SERVER_DIAGNOSTICS_AVAILABLE),

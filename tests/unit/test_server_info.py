@@ -23,8 +23,8 @@ def cfg(**over):
     base = dict(
         SERVER_KIND="cloud", SERVER_NAME="", SERVER_ID=None, BUILD_SHA="3f2a9c1", SERVER_AGENT_AVAILABLE=True,
         SCENE_GRAPH_WORKER_ENABLED=True, RECONSTRUCTION_SERVICE_URL="http://127.0.0.1:8009",
-        SEMANTIC_SERVICE_URL="http://127.0.0.1:8010",
-        RECONSTRUCTION_SERVICE_KEY="k", RECONSTRUCTION_CALLBACK_SECRET="s", SEMANTIC_SERVICE_KEY="k", SEMANTIC_CALLBACK_SECRET="s", LIVEKIT_SFU_API_KEY="k", LIVEKIT_SFU_API_SECRET="s",
+        SEMANTIC_SERVICE_URL="http://127.0.0.1:8010", MESH_SERVICE_URL="http://127.0.0.1:8011",
+        RECONSTRUCTION_SERVICE_KEY="k", RECONSTRUCTION_CALLBACK_SECRET="s", SEMANTIC_SERVICE_KEY="k", SEMANTIC_CALLBACK_SECRET="s", MESH_SERVICE_KEY="k", MESH_CALLBACK_SECRET="s", LIVEKIT_SFU_API_KEY="k", LIVEKIT_SFU_API_SECRET="s",
         LIVEKIT_ROOM_POLICY="client", SERVER_LIVEKIT_AVAILABLE=None, SERVER_DIAGNOSTICS_AVAILABLE=True, MIN_CLIENT_VERSION=None, RECOMMENDED_CLIENT_VERSION=None,
     )
     base.update(over)
@@ -44,7 +44,7 @@ class TestBuild:
                                        "token_path": "/api/livekit-selfhost/createToken", "room_policy": "client"}
 
     @pytest.mark.parametrize("missing", ["SERVICE_KEY", "CALLBACK_SECRET", "SERVICE_URL"])
-    @pytest.mark.parametrize("feature,cap", [("RECONSTRUCTION", "reconstruction"), ("SEMANTIC", "semantic")])
+    @pytest.mark.parametrize("feature,cap", [("RECONSTRUCTION", "reconstruction"), ("SEMANTIC", "semantic"), ("MESH", "mesh")])
     def test_a_layer_is_advertised_only_when_the_api_can_actually_run_it(self, feature, cap, missing):
         """URL, key and callback secret must all be set (the API answers 503 not_configured otherwise)."""
         assert getattr(si.build_server_info(cfg()).capabilities, cap) is True
@@ -64,7 +64,7 @@ class TestBuild:
 
     @pytest.mark.parametrize("field,flag", [
         ("SCENE_GRAPH_WORKER_ENABLED", "scene_graph"), ("RECONSTRUCTION_SERVICE_URL", "reconstruction"),
-        ("SEMANTIC_SERVICE_URL", "semantic"), ("SERVER_AGENT_AVAILABLE", "agent")])
+        ("SEMANTIC_SERVICE_URL", "semantic"), ("MESH_SERVICE_URL", "mesh"), ("SERVER_AGENT_AVAILABLE", "agent")])
     def test_each_capability_follows_its_own_setting(self, field, flag):
         off = {"SCENE_GRAPH_WORKER_ENABLED": False, "SERVER_AGENT_AVAILABLE": False}.get(field)
         caps = si.build_server_info(cfg(**{field: off})).capabilities.dict()
@@ -106,7 +106,7 @@ class TestBuild:
         assert set(body) == {"schema_version", "name", "kind", "version", "server_id", "capabilities", "livekit",
                              "min_client_version", "recommended_client_version"}
         assert set(body["capabilities"]) == {"robots", "missions", "maps", "orchestration", "scene_graph",
-                                             "reconstruction", "semantic", "agent", "fleet", "diagnostics"}
+                                             "reconstruction", "semantic", "mesh", "agent", "fleet", "diagnostics"}
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
