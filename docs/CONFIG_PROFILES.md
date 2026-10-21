@@ -41,7 +41,12 @@ on the commit it should be on. Both are null on a machine set up by hand.
 file, or the pull stops because of your local edits. Do step 1 and 2 first, then pull, then step 4. Passwords that were ever committed
 stay in git history: rotate them (`.env`, and the four `.env.robot.bak-*` files that were committed by mistake).
 
-## Not covered yet
+## Other files
 
-`.env.staging` and `livekit_sfu.env` (both untracked already), and `scripts/setup_robot.sh`, which still writes `.env.robot` from
-`.env.robot.example` for a new robot.
+- `staging` (`profiles/staging.env`, `secrets/staging.env.example`) renders `.env.staging` for the staging rehearsal override.
+- On the server profile the self-hosted LiveKit keys (`LIVEKIT_SFU_*`) are not written to `.env` but to `livekit_sfu.env`, which
+  the two LiveKit services read as an `env_file`. `--init-secrets` takes them from that file too.
+- Any profile that says `SERVER_KIND=robot` is a robot (renders `.env.robot`, secrets from `secrets/robot.env.example`): a new robot
+  needs only its own profile file. `scripts/setup_robot.sh [--profile NAME]` creates the profile from the host (tailnet IP, name),
+  writes `secrets.env` with fresh random passwords and renders `.env.robot`; it still does the Docker, registry and volume setup.
+- `.env.robot.example` stays as a reference of the keys; nothing reads it any more.

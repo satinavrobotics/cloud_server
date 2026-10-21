@@ -14,18 +14,25 @@ spec = importlib.util.spec_from_file_location("render_env", ROOT / "scripts" / "
 re_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(re_mod)
 
+def render_primary(profile, secrets_file, previous, dc=None):
+    """The text of the profile's primary output file."""
+    kw = {} if dc is None else {"dc": dc}
+    return re_mod.render(profile, secrets_file, previous, **kw)[re_mod.profile_info(profile, *([dc] if dc else []))[1]]
+
+
 # What each profile must say itself: the compose files fall back to a default (the cloud's, usually) when one is missing
 REQUIRED = {
     "server": ["MINIO_HOST", "MINIO_TAILNET_IP", "MINIO_PORT", "API_DELEGATION_PORT", "LIVEKIT_SERVER_URL", "POSTGRES_DATABASE_HOST",
                "MQTT_BROKER", "GRAPH_DB_PORT", "IMAGE_DB_PORT", "MISSION_PLANNER_PORT", "GRAPH_BUILDER_PORT"],
     "pi4": ["ROBOT_TAILNET_IP", "MINIO_DATA_DIR", "IMAGE_REGISTRY", "SERVER_KIND", "SERVER_NAME", "COMPOSE_PROFILES"],
     "pi5": ["ROBOT_TAILNET_IP", "MINIO_DATA_DIR", "IMAGE_REGISTRY", "SERVER_KIND", "SERVER_NAME", "COMPOSE_PROFILES"],
+    "staging": ["POSTGRES_DATABASE_USERNAME", "API_DELEGATION_PORT", "MISSION_DISPATCH_IMAGE"],
 }
 PROFILES = sorted(REQUIRED)
 
 
 def fake_secrets(dc, profile, path):
-    example = re_mod.parse(dc / "secrets" / f"{re_mod.PROFILES[profile][0]}.env.example")
+    example = re_mod.parse(dc / "secrets" / f"{re_mod.profile_info(profile, dc)[0]}.env.example")
     path.write_text("".join(f"{k}={'x-' + k.lower() if v == 'CHANGE_ME' else ''}\n" for k, v in example.items()))
     return path
 
@@ -49,16 +56,59 @@ class TestProfiles:
         assert [k for k in re_mod.merged_profile(profile) if re_mod.is_secret(k)] == []
 
     def test_renders_with_its_secrets_and_says_which_profile(self, profile, dc, tmp_path):
-        text = re_mod.render(profile, fake_secrets(dc, profile, tmp_path / "s.env"), {}, dc)
+        text = render_primary(profile, fake_secrets(dc, profile, tmp_path / "s.env"), {}, dc)
         got = re_mod.parse_text(text)
         assert got["CONFIG_PROFILE"] == profile
         assert got["CONFIG_HASH"] == re_mod.config_hash(re_mod.merged_profile(profile, dc))
         required, _ = re_mod.required_secrets(profile, dc)
-        assert [k for k in required if not got.get(k)] == []
+        moved = [k for k in required if profile == "server" and k.startswith("LIVEKIT_SFU_")]      # those are in livekit_sfu.env
+        assert [k for k in required if k not in moved and not got.get(k)] == []
 
     def test_is_a_robot_only_where_the_profile_says_so(self, profile):
         kind = re_mod.merged_profile(profile).get("SERVER_KIND")
-        assert kind == (None if profile == "server" else "robot")
+        assert kind == ("robot" if profile.startswith("pi") else None)
+
+
+class TestOutputs:
+    def test_each_profile_names_its_output_file(self):
+        assert re_mod.profile_info("server") == ("server", ".env")
+        assert re_mod.profile_info("staging") == ("staging", ".env.staging")
+        assert re_mod.profile_info("pi4") == ("robot", ".env.robot")
+
+    def test_any_profile_that_says_robot_is_a_robot(self, dc):
+        (dc / "profiles" / "newbot.env").write_text("SERVER_KIND=robot\nROBOT_TAILNET_IP=100.1.2.3\nSERVER_NAME=newbot\n")
+        assert re_mod.profile_info("newbot", dc) == ("robot", ".env.robot")
+        text = render_primary("newbot", fake_secrets(dc, "newbot", dc / "s.env"), {}, dc)
+        assert re_mod.parse_text(text)["CONFIG_PROFILE"] == "newbot"
+
+    def test_a_profile_that_is_not_a_robot_and_not_known_is_refused(self, dc):
+        (dc / "profiles" / "odd.env").write_text("A=1\n")
+        with pytest.raises(re_mod.RenderError, match="unknown profile 'odd'.*pi4"):
+            re_mod.profile_info("odd", dc)
+
+    def test_the_server_splits_the_self_hosted_livekit_pair_into_its_own_file(self, dc, tmp_path):
+        out = re_mod.render("server", fake_secrets(dc, "server", tmp_path / "s.env"), {}, dc)
+        assert set(out) == {".env", "livekit_sfu.env"}
+        main, sfu = re_mod.parse_text(out[".env"]), re_mod.parse_text(out["livekit_sfu.env"])
+        assert set(sfu) == {"LIVEKIT_SFU_SERVER_URL", "LIVEKIT_SFU_OPERATOR_URL", "LIVEKIT_SFU_TTL", "LIVEKIT_SFU_API_KEY", "LIVEKIT_SFU_API_SECRET"}
+        assert not [k for k in main if k.startswith("LIVEKIT_SFU_")]
+        assert main["LIVEKIT_API_KEY"] and "LIVEKIT_SFU_API_KEY" not in main      # the Cloud pair stays in .env
+
+    def test_a_robot_keeps_its_livekit_pair_in_its_one_file(self, dc, tmp_path):
+        out = re_mod.render("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc)
+        assert set(out) == {".env.robot"} and "LIVEKIT_SFU_API_KEY" in re_mod.parse_text(out[".env.robot"])
+
+    def test_the_staging_rehearsal_renders_with_its_own_secrets(self, dc, tmp_path):
+        out = re_mod.render("staging", fake_secrets(dc, "staging", tmp_path / "s.env"), {}, dc)
+        assert set(out) == {".env.staging"} and re_mod.parse_text(out[".env.staging"])["POSTGRES_DATABASE_USERNAME"] == "satinav_staging"
+
+    def test_init_secrets_reads_the_split_file_too(self, dc, tmp_path):
+        env, sfu = tmp_path / ".env", tmp_path / "livekit_sfu.env"
+        env.write_text("POSTGRES_PASSWORD=p\n")
+        sfu.write_text("LIVEKIT_SFU_API_KEY=k\nLIVEKIT_SFU_TTL=1\n")
+        target = tmp_path / "secrets.env"
+        re_mod.init_secrets("server", [env, sfu], target)
+        assert re_mod.parse(target) == {"POSTGRES_PASSWORD": "p", "LIVEKIT_SFU_API_KEY": "k"}
 
 
 class TestSecrets:
@@ -66,27 +116,27 @@ class TestSecrets:
         path = tmp_path / "s.env"
         path.write_text("POSTGRES_PASSWORD=p\n")
         with pytest.raises(re_mod.RenderError, match="is missing: .*ARANGO_ROOT_PASSWORD"):
-            re_mod.render("server", path, {}, dc)
+            render_primary("server", path, {}, dc)
 
     def test_a_placeholder_counts_as_missing(self, dc, tmp_path):
         path = fake_secrets(dc, "server", tmp_path / "s.env")
         path.write_text(path.read_text().replace("x-minio_root_password", "CHANGE_ME"))
         with pytest.raises(re_mod.RenderError, match="MINIO_ROOT_PASSWORD"):
-            re_mod.render("server", path, {}, dc)
+            render_primary("server", path, {}, dc)
 
     def test_an_optional_secret_may_stay_empty(self, dc, tmp_path):
-        text = re_mod.render("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc)
+        text = render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {}, dc)
         assert re_mod.parse_text(text)["RECONSTRUCTION_SERVICE_KEY"] == ""
 
     def test_no_secrets_file_says_what_to_copy(self, dc, tmp_path):
         with pytest.raises(re_mod.RenderError, match="robot.env.example"):
-            re_mod.render("pi4", tmp_path / "none.env", {}, dc)
+            render_primary("pi4", tmp_path / "none.env", {}, dc)
 
     def test_a_setting_in_the_secrets_file_is_refused(self, dc, tmp_path):
         path = fake_secrets(dc, "pi4", tmp_path / "s.env")
         path.write_text(path.read_text() + "SERVER_NAME=oops\n")
         with pytest.raises(re_mod.RenderError, match="SERVER_NAME"):
-            re_mod.render("pi4", path, {}, dc)
+            render_primary("pi4", path, {}, dc)
 
     def test_a_secret_in_a_profile_is_refused(self, dc):
         with open(dc / "profiles" / "pi4.env", "a") as f:
@@ -101,7 +151,7 @@ class TestSecrets:
 
 class TestOutput:
     def test_the_deployed_image_tag_survives_a_render(self, dc, tmp_path):
-        text = re_mod.render("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {"IMAGE_TAG": "b62ed9aca081", "STALE": "1"}, dc)
+        text = render_primary("pi4", fake_secrets(dc, "pi4", tmp_path / "s.env"), {"IMAGE_TAG": "b62ed9aca081", "STALE": "1"}, dc)
         got = re_mod.parse_text(text)
         assert got["IMAGE_TAG"] == "b62ed9aca081" and "STALE" not in got
 
@@ -123,12 +173,12 @@ class TestOutput:
         old = tmp_path / ".env.robot"
         old.write_text("SERVER_NAME=x\nPOSTGRES_PASSWORD=p1\nARANGO_ROOT_PASSWORD=a1\nUNKNOWN_KEY=1\n")
         target = tmp_path / "secrets.env"
-        re_mod.init_secrets("pi4", old, target)
+        re_mod.init_secrets("pi4", [old], target)
         assert re_mod.parse(target) == {"POSTGRES_PASSWORD": "p1", "ARANGO_ROOT_PASSWORD": "a1"}
         assert (target.stat().st_mode & 0o777) == 0o600
         assert "still to add by hand" in capsys.readouterr().out
         with pytest.raises(re_mod.RenderError, match="not overwriting"):
-            re_mod.init_secrets("pi4", old, target)
+            re_mod.init_secrets("pi4", [old], target)
 
 
 def _tracked():
