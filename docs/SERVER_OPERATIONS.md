@@ -1,0 +1,44 @@
+# Operator actions from the app (restart, deploy)
+
+The server's diagnostics service (`packages/services/server_diagnostics`, behind the gateway at `/api/diagnostics/`) can restart this
+server's containers, and on a robot deploy a tag, for the desktop app's Server health panel.
+
+## Switching it on
+
+`OPERATIONS_ENABLED=true` is in every profile (`docker_compose/profiles/*.env`). It does nothing until `OPERATIONS_TOKEN` is set in the
+machine's `docker_compose/secrets.env` (random, 24+ characters; the example files list it) and `scripts/render_env.sh <profile>` is run.
+Without a token the actions answer 403. The app asks for the token once per server and keeps it in its own storage.
+
+## What it can do
+
+| Call | What it does |
+|---|---|
+| `GET /operations` | enabled, kind (cloud / robot), can_deploy, recent actions. No token. |
+| `POST /operations/restart` `{service, force}` | restart one service and wait until it is up (and healthy where it has a check) |
+| `POST /operations/restart-all` `{force}` | every service, databases first, the gateway last; not the diagnostics service itself |
+| `POST /operations/deploy` `{tag}` or `{rollback: true}` | robot only: `scripts/deploy_robot.sh <git sha>` or `--rollback` |
+| `GET /operations/{id}` | state and log lines (secrets removed). No token. |
+
+Posts need `X-Operations-Token`; `X-Operator` (free text) is logged. Each action returns 202 with an id at once; the app follows it.
+
+Rules the server enforces, whatever the client sends:
+- a service is named from the engine's own list; a tag must be 7-40 hex characters; nothing is ever run as a shell string;
+- refused with 409 `missions_active` while any mission is RUNNING or PENDING, unless `force` (if the API cannot be asked, it goes ahead:
+  it is often what is being fixed);
+- one action at a time (409 `busy`); the diagnostics service is restarted only by a deploy;
+- a cloud server answers deploy with 409 `not_a_robot`.
+
+## How a deploy runs
+
+The deploy recreates the diagnostics service, so it cannot run inside it. The service starts a one-shot container from its own
+image (which now carries the docker CLI and the compose plugin), with `DEPLOY_ROOT` (default `/cloud_server`) mounted at the same
+path and the Docker socket, running `bash scripts/deploy_robot.sh <tag>`. That container is kept, with its log, for the last five
+deploys (label `sati.operation=deploy`); the app reads its progress through `GET /operations/sati-deploy-<time>`. During the deploy
+the service restarts and does not answer for a while; the app shows "waiting" and carries on. `deploy_robot.sh` still rolls back on
+its own if the new tag is not healthy, and now writes the tag into `.env.robot`.
+
+## Trust
+
+The Docker socket is mounted `:ro`, which does not stop writes to it: whoever holds the token can restart anything on the server and
+start a container with the repo mounted. The token and the tailnet are the whole barrier; the endpoints are not reachable outside the
+tailnet. Keep the token in `secrets.env` only.
