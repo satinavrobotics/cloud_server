@@ -7,6 +7,7 @@ service's own image (which carries the docker CLI and compose): the deploy recre
 outlive it. That container is kept (with its log) for the last few deploys and is how the app follows a deploy's progress.
 """
 import hmac
+import ipaddress
 import json
 import logging
 import re
@@ -34,6 +35,20 @@ GATEWAY = ("nginx-gateway", "sati_nginx_gateway")
 ACTIVE_STATES = ("RUNNING", "PENDING")
 
 
+# Tailscale's own address space: callers from here need no token when the server trusts the tailnet (the tailnet already
+# authenticates who is on it). The LAN, the internet and everything else still need the token.
+TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+
+
+def trusted_caller(ip: Optional[str]) -> bool:
+    """A tailnet peer, or the machine itself. `ip` is the caller's address as the gateway saw it (X-Real-IP), never a client claim."""
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return False
+    return addr.is_loopback or any(addr in net for net in TAILNET)
+
+
 class OperationError(Exception):
     """status is the HTTP status to answer with; code a short machine-readable reason."""
     def __init__(self, status: int, code: str, message: str):
@@ -56,13 +71,14 @@ def _fetch_missions(url: str, timeout: float = 6.0):
 
 class Operations:
     def __init__(self, docker: DockerActor, diagnostics: DiagnosticsService, *, enabled: bool, token: str, kind: str,
-                 deploy_root: str, gateway_url: str = "", fetch_missions: Optional[Callable] = None,
+                 deploy_root: str, trust_tailnet: bool = False, gateway_url: str = "", fetch_missions: Optional[Callable] = None,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
         self._docker, self._diag = docker, diagnostics
         self._token = token or ""
-        self._enabled = bool(enabled and self._token)
-        if enabled and not self._token:
-            log.warning("OPERATIONS_ENABLED is set without OPERATIONS_TOKEN: operations stay off")
+        self._trust_tailnet = bool(trust_tailnet)
+        self._enabled = bool(enabled and (self._token or self._trust_tailnet))
+        if enabled and not self._enabled:
+            log.warning("OPERATIONS_ENABLED is set without OPERATIONS_TOKEN or OPERATIONS_TRUST_TAILNET: operations stay off")
         self._kind, self._root = kind, deploy_root.rstrip("/")
         self._gateway = gateway_url.rstrip("/")
         self._fetch_missions = fetch_missions or _fetch_missions
@@ -71,15 +87,20 @@ class Operations:
         self._records: Dict[str, Dict] = {}
 
     # ---- who may
-    def authorize(self, token: Optional[str]) -> None:
+    def token_required(self, caller_ip: Optional[str]) -> bool:
+        return not (self._trust_tailnet and trusted_caller(caller_ip))
+
+    def authorize(self, token: Optional[str], caller_ip: Optional[str] = None) -> None:
         if not self._enabled:
             raise OperationError(403, "operations_disabled", "operator actions are not enabled on this server")
-        if not token or not hmac.compare_digest(token.encode(), self._token.encode()):
+        if not self.token_required(caller_ip):
+            return
+        if not self._token or not token or not hmac.compare_digest(token.encode(), self._token.encode()):
             raise OperationError(401, "bad_token", "the operations token is missing or wrong")
 
-    def info(self) -> Dict:
+    def info(self, caller_ip: Optional[str] = None) -> Dict:
         return {"enabled": self._enabled, "kind": self._kind, "can_deploy": self._enabled and self._kind == "robot",
-                "recent": self.recent()}
+                "token_required": self.token_required(caller_ip), "recent": self.recent()}
 
     # ---- guards
     def _active_missions(self) -> Optional[int]:

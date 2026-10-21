@@ -470,6 +470,7 @@ services:
     environment:
       - OPERATIONS_ENABLED=${OPERATIONS_ENABLED:-}
       - OPERATIONS_TOKEN=${OPERATIONS_TOKEN:-}
+      - OPERATIONS_TRUST_TAILNET=${OPERATIONS_TRUST_TAILNET:-}
       - SERVER_KIND=${SERVER_KIND:-cloud}
       - DEPLOY_ROOT=${DEPLOY_ROOT:-/cloud_server}
     volumes:

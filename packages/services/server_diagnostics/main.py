@@ -11,6 +11,7 @@ Deliberately does not import packages.config (it needs the database secrets, whi
 """
 
 import argparse
+import ipaddress
 import logging
 import os
 import socket
@@ -18,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from packages.utils.fastapi_helpers import add_error_handlers
@@ -57,6 +58,7 @@ async def lifespan(app: FastAPI):
         token=os.getenv("OPERATIONS_TOKEN", ""),
         kind="robot" if os.getenv("SERVER_KIND", "").lower() == "robot" else "cloud",
         deploy_root=os.getenv("DEPLOY_ROOT", "/cloud_server"),
+        trust_tailnet=os.getenv("OPERATIONS_TRUST_TAILNET", "").lower() in ("true", "1", "yes"),
         gateway_url=gateway,
     )
     logging.info("Server Diagnostics Service started")
@@ -131,38 +133,50 @@ class DeployRequest(BaseModel):
     force: bool = False
 
 
-def _operate(call, token: Optional[str], operator: Optional[str]):
-    """Run one operator action: the token first, and an OperationError becomes its HTTP answer."""
+def _caller_ip(request: Request) -> Optional[str]:
+    """The caller's address: X-Real-IP when the request came through the gateway on this machine (which sets it from the
+    connection and overwrites anything the client sent), else the connection's own."""
+    peer = request.client.host if request.client else None
+    try:
+        via_gateway = peer is not None and ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        via_gateway = False
+    return (request.headers.get("x-real-ip") or peer) if via_gateway else peer
+
+
+def _operate(request: Request, call, token: Optional[str], operator: Optional[str]):
+    """Run one operator action: the caller's right first, and an OperationError becomes its HTTP answer."""
     if operations is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
-        operations.authorize(token)
+        operations.authorize(token, _caller_ip(request))
         return call(operations, (operator or "").strip())
     except OperationError as err:
         raise HTTPException(status_code=err.status, detail={"code": err.code, "message": err.message})
 
 
 @app.get("/operations")
-def operations_info():
-    """Whether operator actions are on here, whether this server can deploy, and the recent actions (no token needed)."""
+def operations_info(request: Request):
+    """Whether operator actions are on here, whether this server can deploy, whether THIS caller needs a token, and the recent
+    actions (no token needed to read)."""
     if operations is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    return operations.info()
+    return operations.info(_caller_ip(request))
 
 
 @app.post("/operations/restart", status_code=202)
-def operations_restart(body: RestartRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
-    return _operate(lambda ops, who: ops.restart(body.service, force=body.force, operator=who), x_operations_token, x_operator)
+def operations_restart(request: Request, body: RestartRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    return _operate(request, lambda ops, who: ops.restart(body.service, force=body.force, operator=who), x_operations_token, x_operator)
 
 
 @app.post("/operations/restart-all", status_code=202)
-def operations_restart_all(body: RestartAllRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
-    return _operate(lambda ops, who: ops.restart_all(force=body.force, operator=who), x_operations_token, x_operator)
+def operations_restart_all(request: Request, body: RestartAllRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    return _operate(request, lambda ops, who: ops.restart_all(force=body.force, operator=who), x_operations_token, x_operator)
 
 
 @app.post("/operations/deploy", status_code=202)
-def operations_deploy(body: DeployRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
-    return _operate(lambda ops, who: ops.deploy(body.tag, rollback=body.rollback, force=body.force, operator=who), x_operations_token, x_operator)
+def operations_deploy(request: Request, body: DeployRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    return _operate(request, lambda ops, who: ops.deploy(body.tag, rollback=body.rollback, force=body.force, operator=who), x_operations_token, x_operator)
 
 
 @app.get("/operations/{op_id}")

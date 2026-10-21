@@ -9,7 +9,7 @@ import pytest
 
 from packages.services.server_diagnostics import main as diag_main
 from packages.services.server_diagnostics.docker_api import DockerUnavailable
-from packages.services.server_diagnostics.operations import KEEP_DEPLOYS, Operations, OperationError
+from packages.services.server_diagnostics.operations import KEEP_DEPLOYS, Operations, OperationError, trusted_caller
 from packages.services.server_diagnostics.service import DiagnosticsService
 
 pytestmark = pytest.mark.unit
@@ -66,11 +66,11 @@ class FakeEngine:
         self.containers.pop(cid, None)
 
 
-def make(kind="robot", missions=(), enabled=True, token="tok", containers=None):
+def make(kind="robot", missions=(), enabled=True, token="tok", containers=None, trust_tailnet=False):
     engine = FakeEngine(containers if containers is not None else fleet())
     diag = DiagnosticsService(engine, host_reader=lambda: {})
     data = None if missions is None else [{"status": {"state": s}} for s in missions]
-    ops = Operations(engine, diag, enabled=enabled, token=token, kind=kind, deploy_root="/cloud_server/",
+    ops = Operations(engine, diag, enabled=enabled, token=token, kind=kind, deploy_root="/cloud_server/", trust_tailnet=trust_tailnet,
                      gateway_url="http://gw", fetch_missions=lambda url: data, sleep=lambda s: None)
     return ops, engine
 
@@ -112,6 +112,48 @@ class TestWhoMay:
     def test_info_says_whether_this_server_can_deploy(self):
         assert make(kind="robot")[0].info()["can_deploy"] is True
         assert make(kind="cloud")[0].info()["can_deploy"] is False
+
+
+class TestTailnetTrust:
+    @pytest.mark.parametrize("ip", ["100.64.0.1", "100.116.20.49", "100.127.255.254", "fd7a:115c:a1e0::1", "127.0.0.1", "::1"])
+    def test_these_callers_are_trusted(self, ip):
+        assert trusted_caller(ip)
+
+    @pytest.mark.parametrize("ip", ["100.128.0.1", "100.63.255.255", "192.168.1.60", "8.8.8.8", "10.0.0.5", "", None, "garbage", "100.116.20.49.evil", "100.116.20.49, 8.8.8.8"])
+    def test_these_are_not(self, ip):
+        assert not trusted_caller(ip)
+
+    def test_a_tailnet_caller_needs_no_token_when_trusted(self):
+        ops, _ = make(trust_tailnet=True)
+        ops.authorize(None, "100.116.20.49")
+        ops.authorize("", "100.64.1.2")
+
+    def test_anyone_else_still_needs_the_token(self):
+        ops, _ = make(trust_tailnet=True)
+        for ip in ("192.168.1.60", "8.8.8.8", None, "garbage"):
+            with pytest.raises(OperationError) as e:
+                ops.authorize(None, ip)
+            assert (e.value.status, e.value.code) == (401, "bad_token")
+        ops.authorize("tok", "192.168.1.60")
+
+    def test_without_the_setting_the_tailnet_needs_the_token_too(self):
+        ops, _ = make(trust_tailnet=False)
+        with pytest.raises(OperationError):
+            ops.authorize(None, "100.116.20.49")
+
+    def test_trust_alone_switches_the_feature_on_and_leaves_others_locked_out(self):
+        ops, _ = make(token="", trust_tailnet=True)
+        assert ops.info("100.116.20.49")["enabled"] is True
+        ops.authorize(None, "100.116.20.49")
+        with pytest.raises(OperationError) as e:
+            ops.authorize("anything", "192.168.1.60")
+        assert e.value.status == 401          # there is no token to match: a LAN caller can never act
+
+    def test_info_tells_each_caller_whether_it_needs_a_token(self):
+        ops, _ = make(trust_tailnet=True)
+        assert ops.info("100.116.20.49")["token_required"] is False
+        assert ops.info("192.168.1.60")["token_required"] is True
+        assert make(trust_tailnet=False)[0].info("100.116.20.49")["token_required"] is True
 
 
 class TestRestart:
@@ -297,6 +339,22 @@ class TestRoutes:
     def test_reading_needs_no_token(self, app):
         r = self.call("GET", "/operations")
         assert r.status_code == 200 and r.json()["enabled"] is True and r.json()["can_deploy"] is True
+
+    def test_the_gateway_vouches_for_the_caller_address(self):
+        ops, engine = make(trust_tailnet=True)
+        diag_main.operations = ops
+        try:
+            body = {"service": "postgres"}
+            lan = self.call("POST", "/operations/restart", json=body, headers={"X-Real-IP": "192.168.1.60"})
+            assert lan.status_code == 401 and engine.restarted == []
+            tailnet = self.call("POST", "/operations/restart", json=body, headers={"X-Real-IP": "100.116.20.49", "X-Operator": "me"})
+            assert tailnet.status_code == 202
+            wait_done(ops, tailnet.json())
+            assert engine.restarted == ["postgres"]
+            assert self.call("GET", "/operations", headers={"X-Real-IP": "100.116.20.49"}).json()["token_required"] is False
+            assert self.call("GET", "/operations", headers={"X-Real-IP": "192.168.1.60"}).json()["token_required"] is True
+        finally:
+            diag_main.operations = None
 
     def test_an_error_carries_its_code(self, app):
         r = self.call("POST", "/operations/deploy", json={"tag": "nope"}, headers={"X-Operations-Token": "tok"})
