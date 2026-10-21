@@ -48,7 +48,18 @@ out of backups that leave the machine, and never `git add -A` there (it is in `.
 A key pair made for the assistant's sessions is installed in `/home/admin/.ssh/authorized_keys` on the Pi 4 (the only line in that file),
 and its private half sits in a session scratchpad on the dev box (`/tmp/claude-1000/.../scratchpad/pi_key`, mode 600). Anyone who can read
 that file on the dev box can log in to the Pi as `admin`. Remove the line from the Pi and delete the private key when no assistant
-session needs the access any more; re-install one per task if it is needed again. (The Pi 5 has no such key: ssh there is by password.)
+session needs the access any more; re-install one per task if it is needed again. (The Pi 5 has no such key: it is reached with the user's own key `~/.ssh/rasp_satipi` on the dev box.)
+
+## 10. The Pi 5's robot-LAN door (by design, to be kept in view)
+The Pi 5 (`rasp`) has `ROBOT_LAN_IP=192.168.1.70`, its `eth0` address on the robot LAN (`scripts/configure_pi_lan.sh`). Its gateway (80, no
+login) and its MQTT broker (1883 and 9001, anonymous) therefore listen on that one address as well as loopback and the tailnet, so the
+Jetson on that LAN can reach them. It is a single address, not `0.0.0.0`, and the LAN is meant to hold only the robot's own devices.
+The risk is whatever else can join that LAN (a laptop plugged into the switch can drive the robot). Fix: authentication on the broker (item
+3) and a login on the gateway (item 4), then this door is safe to keep. Its wlan is off, so no wifi side exists.
+
+## 11. Pi 5 backup env files were world-readable
+`/cloud_server/docker_compose/.env.robot.bak-*` on the Pi 5 (copies of its `.env.robot` with secrets) were mode 644. Set to 600 on
+2026-10-21; they are still there, still with live secrets. Delete them once the profile setup has proven itself.
 
 ## 8. Reconstruction, semantic and mesh service keys
 `RECONSTRUCTION_*`, `SEMANTIC_*` and `MESH_*` keys and callback secrets are in `secrets.env` and were never committed. No action; listed
