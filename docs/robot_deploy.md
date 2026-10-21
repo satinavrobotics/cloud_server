@@ -7,7 +7,7 @@ on the cloud host for amd64 + arm64, pushed to the private registry, and the Pi 
 |---|---|
 | `scripts/build_push.sh` | builds the 9 images (7 services + MinIO + the LiveKit SFU mirror) multi-arch and pushes them to `100.85.3.47:5050/sati/…` |
 | `docker_compose/mission_dispatch_services_robot.yaml` | override over the main compose file: services off, sizes, registry images |
-| `docker_compose/.env.robot.example` | the robot's environment (copy to `.env.robot`, fresh secrets) |
+| `docker_compose/profiles/<robot>.env` + `secrets.env` | the robot's settings (tracked profile) and secrets (untracked); `scripts/render_env.sh <robot>` writes `.env.robot` from them: [CONFIG_PROFILES.md](CONFIG_PROFILES.md). `.env.robot.example` is only a reference of the keys |
 | `scripts/deploy_robot.sh` | pull, `up -d --no-build`, wait healthy, roll back to the previous tag |
 | `docker_compose/reconstruction_service_robot.yaml` | optional raw reconstruction (no MapAnything), see below |
 
@@ -21,16 +21,17 @@ API). The scene-graph worker (in graph-builder) and planner are on in `.env.robo
 `SCENE_GRAPH_PLANNER_ENABLED`; both default to false in the code), with memory caps in the robot compose file; their real memory use on a Pi is not measured yet.
 
 LAN door (opt-in): the gateway listens on loopback and `ROBOT_TAILNET_IP` only. A client on the local network (the desktop app's Scan, or a typed
-`http://192.168.x.y`) gets "connection refused" until `ROBOT_LAN_IP=<this robot's LAN address>` (or `0.0.0.0` for every interface) is set in `.env.robot`
-and the gateway recreated (`scripts/robot_compose.sh up -d --force-recreate nginx-gateway`). The gateway has no login: whoever can reach it can drive the
-robot, which is why this is a choice and not the default.
+`http://192.168.x.y`) gets "connection refused" until `ROBOT_LAN_IP=<this robot's LAN address>` is set (in the robot's profile, then `render_env.sh` and a
+deploy). Use one address, **never `0.0.0.0`**: the gateway has no login and the broker allows anonymous clients, so whoever can reach them can drive the
+robot (on 2026-10-21 a Pi with `0.0.0.0` had both open on its wifi and ethernet; see [security/open-items-2026-10-21.md](security/open-items-2026-10-21.md)).
+It is a choice and not the default.
 
 Network: Postgres, ArangoDB, the planner and graph-builder listen on `127.0.0.1` only; mosquitto on `127.0.0.1` and the tailnet IP
-(`ROBOT_TAILNET_IP`), plus `ROBOT_LAN_IP` when it is set (a robot on the local network connects its VDA5050 client to `<ROBOT_LAN_IP>:1883`); the API (8000) and the MinIO forwarder are the doors. Mosquitto still allows anonymous clients, so
+(`ROBOT_TAILNET_IP`), plus the single `ROBOT_LAN_IP` address when it is set (a robot on the local network connects its VDA5050 client to `<ROBOT_LAN_IP>:1883`); the API (8000) and the MinIO forwarder are the doors. Mosquitto still allows anonymous clients, so
 Tailscale (ACLs) is the boundary: keep the ACL tight. Every container has a memory limit and a rotated log (10 MB x 3);
 mosquitto logs errors/warnings only.
 
-Memory: the defaults are for a **4 GB** Pi (limits sum to ~3.7 GB with the gateway and video, so it is tight: watch it; 8 GB values are in `.env.robot.example`). `PG_TUNE_*` apply
+Memory: the defaults are for a **4 GB** Pi (limits sum to ~3.7 GB with the gateway and video, so it is tight: watch it; 8 GB values are in `profiles/pi5.env`). `PG_TUNE_*` apply
 only at the first initdb of the Postgres volume.
 
 ## One-time setup of the Pi
@@ -47,9 +48,10 @@ scripts/setup_robot.sh --deploy --tag <sha>     # setup, then the first deploy
 ```
 
 `scripts/setup_robot.sh` allows the plain-HTTP registry in `/etc/docker/daemon.json` (asks first, restarts docker), creates
-the `sati_pgdata17` volume and the MinIO directory, and writes `docker_compose/.env.robot` with fresh random passwords and
-this host's tailnet IP. It never overwrites an existing `.env.robot` and is safe to run again. Never copy the cloud's
-`docker_compose/.env`.
+the `sati_pgdata17` volume and the MinIO directory, creates the robot's profile `docker_compose/profiles/<name>.env` (`--profile NAME`,
+default this host's name; from this host's tailnet IP: review and commit it) and `docker_compose/secrets.env` with fresh random passwords, and
+renders `docker_compose/.env.robot` from them. It never overwrites an existing profile or `secrets.env` and is safe to run again. Never copy the
+cloud's `secrets.env`.
 
 ## Release (on the cloud host)
 
