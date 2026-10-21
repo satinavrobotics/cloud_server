@@ -36,6 +36,7 @@ BUILT_IN = {"server": ("server", ".env"), "staging": ("staging", ".env.staging")
 ROBOT = ("robot", ".env.robot")
 # profile -> [(extra output file, key prefix)]: those keys go to the extra file only (a service reads it as its own env_file)
 SPLIT = {"server": [("livekit_sfu.env", "LIVEKIT_SFU_")]}
+NO_BASE = {"staging"}       # profiles that do not inherit base.env (the rehearsal is its own small world)
 KEEP = ("IMAGE_TAG",)        # machine state, not config
 NOT_HASHED = set(KEEP) | {"CONFIG_PROFILE", "CONFIG_HASH"}
 SECRET_NAME = re.compile(r"(PASSWORD|_SECRET|_KEY|_TOKEN|ROOT_USER)$")
@@ -86,7 +87,8 @@ def profile_info(profile: str, dc: Path = DC) -> Tuple[str, str]:
 
 def merged_profile(profile: str, dc: Path = DC) -> dict:
     profile_info(profile, dc)
-    settings = {**parse(dc / "profiles" / "base.env"), **parse(dc / "profiles" / f"{profile}.env")}
+    base = {} if profile in NO_BASE else parse(dc / "profiles" / "base.env")
+    settings = {**base, **parse(dc / "profiles" / f"{profile}.env")}
     held = sorted(k for k in settings if is_secret(k))
     if held:
         raise RenderError(f"profile {profile} holds secrets, which belong in secrets.env: {', '.join(held)}")
