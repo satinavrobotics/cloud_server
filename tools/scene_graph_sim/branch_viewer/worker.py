@@ -6,6 +6,7 @@ price changes (sparse, against the previous capture), the charts, and for each g
 checks. `sessions` gives each capture's session id (in capture order): the viewer breaks the trail where it changes. Only the changes are stored for price and clearance, so the file stays small.
 """
 import json
+import math
 import os
 import sys
 
@@ -42,13 +43,21 @@ def _load_leaves(map_dir, adapter):
     return leaves
 
 
-def _capture_state(V, Fn, Bn, nav_l):
-    """the 5 cm state of one capture: 0 unknown, 1 free and navigable, 2 free but not navigable, 3 lethal, 4 held lethal"""
+def _capture_state(V, Fn, Bn, nav_l, hold=None, post_block=None):
+    """the 5 cm state of one capture: 0 unknown, 1 free and navigable, 2 free but not navigable, 3 lethal, 4 held lethal.
+    `hold` is the engine's own held plane (after the away-from-walls filter) when the engine has one, so the viewer shows
+    what the planner uses; without it the raw close-evidence rule is shown."""
     free = (V != 255) & (V < 100)
     lethal = (V >= 100) & (V != 255)
     held = np.zeros_like(free)
-    if Fn is not None and Bn is not None:
+    if hold is not None and hold.shape == V.shape:
+        held = hold.astype(bool)
+    elif Fn is not None and Bn is not None:
         held = (V < 100) & (Bn >= 0) & (Bn > Fn)
+    if post_block is not None:
+        held = held | ((V >= 100) & (V != 255) & post_block)                   # posterior says hazard, latest report also lethal
+    elif Fn is not None and Bn is not None:
+        held = held | ((V >= 100) & (V != 255) & (Bn >= 0) & (Bn > Fn))   # close lethal, latest report also lethal
     nav5 = np.repeat(np.repeat(nav_l, 2, 0), 2, 1)[:V.shape[0], :V.shape[1]]
     state = np.zeros(V.shape, np.uint8)
     state[free] = 1
@@ -56,6 +65,17 @@ def _capture_state(V, Fn, Bn, nav_l):
     state[held] = 4
     state[free & ~nav5 & ~held] = 2
     return state, nav5
+
+
+def _valid_at(g, a):
+    """whether the anchor at world point `a` (m) sits on a validated lattice cell (the engine's `_val_h`); None -> validated"""
+    val = getattr(g, "_val_h", None)
+    if val is None:
+        return True
+    r = int(math.floor(a[1] / S.RES_M - 0.5 + 1e-6)) - g._cy0
+    c = int(math.floor(a[0] / S.RES_M - 0.5 + 1e-6)) - g._cx0
+    r, c = r // 2, c // 2
+    return 0 <= r < val.shape[0] and 0 <= c < val.shape[1] and bool(val[r, c])
 
 
 def run(tree, map_dir, out_path, exponential):
@@ -67,7 +87,11 @@ def run(tree, map_dir, out_path, exponential):
     from packages.services.mission_planner import scene_route as route_mod
 
     leaves = _load_leaves(map_dir, adapter)
-    g = ChartGraph(SceneParams(chart_radius=S.CHART_RADIUS_M, near_range_m=S.NEAR_RANGE_M, near_min_clearance_m=S.NEAR_MIN_CLEARANCE_M))
+    place = {}
+    if os.environ.get("SG_PLACE_RULE") == "1":
+        from packages.scene_graph.place import place_params_from_half_side
+        place["place_peak_m"], place["place_path_m"] = place_params_from_half_side(S.ROBOT_HALF_SIDE_M)
+    g = ChartGraph(SceneParams(chart_radius=S.CHART_RADIUS_M, near_range_m=S.NEAR_RANGE_M, near_min_clearance_m=S.NEAR_MIN_CLEARANCE_M, **place))
     kappa = S.KAPPA_EXPONENTIAL if exponential else S.KAPPA_LINEAR
     turn = route_mod.turn_lambda(None, True, S.TURN_LAMBDA_M_PER_RAD)[0]
     safety = route_mod.safety_for(g, 2 * S.ROBOT_HALF_SIDE_M, 2 * S.ROBOT_HALF_SIDE_M, kappa, turn=turn)
@@ -81,14 +105,15 @@ def run(tree, map_dir, out_path, exponential):
     routes = [[None] * n for _ in goals]
     route_checks = [[None] * n for _ in goals]
     states, origins, shapes = [], [], []
-    clr_planes, nav_planes, charts = [], [], []
+    clr_planes, nav_planes, charts, frontier = [], [], [], []
     for i, lf in enumerate(leaves):
         g.fold_many([lf])
         poses.append([round(lf.x, 4), round(lf.y, 4), round(lf.yaw, 4)])
         V = g._V
         s = g._solved
         nav_l = (s.plane >= 0) if s is not None else np.zeros((V.shape[0] // 2, V.shape[1] // 2), bool)
-        state, nav5 = _capture_state(V, g._Fn, g._Bn, nav_l)
+        post_block = getattr(g, "_hazard", None)
+        state, nav5 = _capture_state(V, g._Fn, g._Bn, nav_l, hold=g._hold, post_block=post_block)
         origin = (int(g._cx0), int(g._cy0))
         states.append(state)
         origins.append(origin)
@@ -100,7 +125,9 @@ def run(tree, map_dir, out_path, exponential):
             c = g._clearance_cell(g._cx0 // 2 + x, g._cy0 // 2 + y)
             clr_l[y, x] = 0.0 if c is None else c
         clr_planes.append(clr_l)
-        charts.append([[round(c.anchor[0], 3), round(c.anchor[1], 3)] for c in g.query(big, raster=False).charts])
+        anchors = [c.anchor for c in g.query(big, raster=False).charts]
+        charts.append([[round(a[0], 3), round(a[1], 3)] for a in anchors])
+        frontier.append([not _valid_at(g, a) for a in anchors])
 
         def on_nav(x, y, nav5=nav5, origin=origin, shape=V.shape):
             # the engine's lattice convention: a 0.1 m node is the top-left 5 cm cell of its 2 x 2 block
@@ -151,7 +178,7 @@ def run(tree, map_dir, out_path, exponential):
         prev_c, prev_p = c_plane, p_plane
 
     with open(out_path, "w") as f:
-        json.dump(dict(poses=poses, sessions=sessions, goals=goals, routes=routes, checks=route_checks,
+        json.dump(dict(poses=poses, sessions=sessions, frontier=frontier, goals=goals, routes=routes, checks=route_checks,
                        crop=dict(H=int(r1 - r0), W=int(c1 - c0), ox=int(gx0 + c0), oy=int(gy0 + r0)),
                        states=state_rle, deltas=deltas, charts=charts, pmax=peak, clr_max=S.CLR_MAX_M,
                        kappa=kappa, exponential=bool(exponential)), f, separators=(",", ":"))

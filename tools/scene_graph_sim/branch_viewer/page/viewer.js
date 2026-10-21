@@ -80,9 +80,9 @@
       M.charts[i].forEach(function (c, k) {
         var p = toPx(c[0], c[1]);
         if (M.frontier && M.frontier[i] && M.frontier[i][k]) {
-          // frontier anchor: not plannable yet (outside the validated set). A light shaded halo and a hollow ring, not a solid dot.
-          ctx.fillStyle = "rgba(30,111,200,0.16)"; ctx.beginPath(); ctx.arc(p[0], p[1], 7, 0, 6.3); ctx.fill();
-          ctx.strokeStyle = "#1e6fc8"; ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(p[0], p[1], 4.5, 0, 6.3); ctx.stroke();
+          // frontier anchor (uncleared: not validated yet): a blue circle, larger than a plannable dot, so it reads as open
+          ctx.fillStyle = "rgba(30,111,200,0.25)"; ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, 6.3); ctx.fill();
+          ctx.strokeStyle = "#1e6fc8"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(p[0], p[1], 6, 0, 6.3); ctx.stroke();
           return;
         }
         ctx.fillStyle = "#1e6fc8"; ctx.beginPath(); ctx.arc(p[0], p[1], 2.5, 0, 6.3); ctx.fill();
