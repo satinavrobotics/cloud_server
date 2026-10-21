@@ -65,6 +65,10 @@ class ServerInfo(pydantic.BaseModel):
     livekit: LiveKitInfo
     min_client_version: Optional[str]
     recommended_client_version: Optional[str]
+    # additive (schema stays 1): which profile rendered this server's settings, and a hash of their non-secret part
+    # (scripts/render_env.sh <profile> --hash prints the one the repo expects). None on a server not set up from a profile.
+    config_profile: Optional[str] = None
+    config_hash: Optional[str] = None
 
 
 def _semver_or_none(name: str, value: Optional[str]) -> Optional[str]:
@@ -113,6 +117,8 @@ def build_server_info(cfg=config) -> ServerInfo:
         ),
         min_client_version=_semver_or_none("MIN_CLIENT_VERSION", cfg.MIN_CLIENT_VERSION),
         recommended_client_version=_semver_or_none("RECOMMENDED_CLIENT_VERSION", cfg.RECOMMENDED_CLIENT_VERSION),
+        config_profile=getattr(cfg, "CONFIG_PROFILE", "") or None,
+        config_hash=getattr(cfg, "CONFIG_HASH", "") or None,
     )
 
 
