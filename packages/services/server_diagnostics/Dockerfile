@@ -1,5 +1,11 @@
 # Server Diagnostics Service Dockerfile
+# The docker CLI and compose plugin come along for operator deploys: the service starts a one-shot container from this same image
+# that runs scripts/deploy_robot.sh (see operations.py). The service itself only talks to the engine's socket.
+FROM docker:27-cli AS dockercli
+
 FROM python:3.10-slim
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 WORKDIR /app
 

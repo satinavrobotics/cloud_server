@@ -465,6 +465,13 @@ services:
     image: ${SERVER_DIAGNOSTICS_IMAGE:-server_diagnostics:latest}
     command: ["python", "-m", "packages.services.server_diagnostics.main",
               "--port", "${PORT_SERVER_DIAGNOSTICS:-8011}", "--host", "127.0.0.1"]
+    # Operator actions (restart a service, restart all; a robot also deploys a tag): off unless OPERATIONS_ENABLED and a token are set.
+    # The socket is mounted ro, which does not stop writes; the service only sends the few it needs (docker_api.DockerActor).
+    environment:
+      - OPERATIONS_ENABLED=${OPERATIONS_ENABLED:-}
+      - OPERATIONS_TOKEN=${OPERATIONS_TOKEN:-}
+      - SERVER_KIND=${SERVER_KIND:-cloud}
+      - DEPLOY_ROOT=${DEPLOY_ROOT:-/cloud_server}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     network_mode: "host"

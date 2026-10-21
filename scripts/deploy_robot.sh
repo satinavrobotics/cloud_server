@@ -118,6 +118,8 @@ if [ "$DRY" = 1 ]; then log "dry run: would wait up to ${TIMEOUT_S}s for healthy
 if [ "$up_ok" = 1 ] && wait_healthy; then
     [ "$old" = "$TAG" ] || { [ -z "$old" ] || printf '%s\n' "$old" > "$PREV"; }
     printf '%s\n' "$TAG" > "$CUR"
+    # keep the env file in step: a later plain `docker compose up` (or render_env.sh) must not go back to an older tag
+    if grep -q '^IMAGE_TAG=' "$ENV_FILE"; then sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$TAG/" "$ENV_FILE"; else printf 'IMAGE_TAG=%s\n' "$TAG" >> "$ENV_FILE"; fi
     log "up, healthy, tag $TAG"
     exit 0
 fi

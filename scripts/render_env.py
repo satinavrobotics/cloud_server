@@ -32,7 +32,7 @@ DC = Path(__file__).resolve().parent.parent / "docker_compose"
 PROFILES = {"server": ("server", ".env"), "pi4": ("robot", ".env.robot"), "pi5": ("robot", ".env.robot")}
 KEEP = ("IMAGE_TAG",)        # machine state, not config
 NOT_HASHED = set(KEEP) | {"CONFIG_PROFILE", "CONFIG_HASH"}
-SECRET_NAME = re.compile(r"(PASSWORD|_SECRET|_KEY|ROOT_USER)$")
+SECRET_NAME = re.compile(r"(PASSWORD|_SECRET|_KEY|_TOKEN|ROOT_USER)$")
 PLACEHOLDER = "CHANGE_ME"
 _LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 

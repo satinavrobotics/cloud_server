@@ -258,6 +258,7 @@ services:
     image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/server_diagnostics:${IMAGE_TAG:-latest}
     environment:
       - DIAGNOSTICS_GATEWAY_URL=http://127.0.0.1:${ROBOT_GATEWAY_PORT:-80}     # the checks ask the robot's own gateway
+      - DEPLOY_ROOT=${DEPLOY_ROOT:-/cloud_server}                               # where deploy_robot.sh runs (same path on the host and in the deploy container)
     mem_limit: 96m
     logging: *logging
 

@@ -18,19 +18,22 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
 
 from packages.utils.fastapi_helpers import add_error_handlers
 from packages.utils.service_utils import (
     HealthResponse, configure_service_logging, create_health_response, create_root_response,
 )
 
-from .docker_api import DEFAULT_SOCKET, DockerReader, DockerUnavailable
+from .docker_api import DEFAULT_SOCKET, DockerActor, DockerReader, DockerUnavailable
+from .operations import Operations, OperationError
 from .service import MAX_LOG_LINES, DiagnosticsService, UnknownService
 
 DEFAULT_PORT = 8011
 
 service: Optional[DiagnosticsService] = None
+operations: Optional[Operations] = None
 
 
 def _unavailable(err: Exception) -> HTTPException:
@@ -39,21 +42,31 @@ def _unavailable(err: Exception) -> HTTPException:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global service
+    global service, operations
+    socket_path = os.getenv("DIAGNOSTICS_DOCKER_SOCKET", DEFAULT_SOCKET)
+    gateway = os.getenv("DIAGNOSTICS_GATEWAY_URL", "http://127.0.0.1:80")
     service = DiagnosticsService(
-        DockerReader(os.getenv("DIAGNOSTICS_DOCKER_SOCKET", DEFAULT_SOCKET)),
-        gateway_url=os.getenv("DIAGNOSTICS_GATEWAY_URL", "http://127.0.0.1:80"),
+        DockerReader(socket_path),
+        gateway_url=gateway,
         include=os.getenv("DIAGNOSTICS_INCLUDE", ""),
         window_minutes=float(os.getenv("DIAGNOSTICS_WINDOW_MINUTES", "15")),
     )
+    operations = Operations(
+        DockerActor(socket_path), service,
+        enabled=os.getenv("OPERATIONS_ENABLED", "").lower() in ("true", "1", "yes"),
+        token=os.getenv("OPERATIONS_TOKEN", ""),
+        kind="robot" if os.getenv("SERVER_KIND", "").lower() == "robot" else "cloud",
+        deploy_root=os.getenv("DEPLOY_ROOT", "/cloud_server"),
+        gateway_url=gateway,
+    )
     logging.info("Server Diagnostics Service started")
     yield
-    service = None
+    service = operations = None
 
 
 app = FastAPI(
     title="Server Diagnostics Service",
-    description="Read-only container status, logs and log analysis for this server",
+    description="Container status, logs and log analysis for this server, and token-guarded operator actions",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -103,6 +116,66 @@ def service_analysis(name: str, lines: int = Query(500, ge=1, le=MAX_LOG_LINES))
         raise _unavailable(err)
 
 
+class RestartRequest(BaseModel):
+    service: str
+    force: bool = False
+
+
+class RestartAllRequest(BaseModel):
+    force: bool = False
+
+
+class DeployRequest(BaseModel):
+    tag: Optional[str] = None
+    rollback: bool = False
+    force: bool = False
+
+
+def _operate(call, token: Optional[str], operator: Optional[str]):
+    """Run one operator action: the token first, and an OperationError becomes its HTTP answer."""
+    if operations is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        operations.authorize(token)
+        return call(operations, (operator or "").strip())
+    except OperationError as err:
+        raise HTTPException(status_code=err.status, detail={"code": err.code, "message": err.message})
+
+
+@app.get("/operations")
+def operations_info():
+    """Whether operator actions are on here, whether this server can deploy, and the recent actions (no token needed)."""
+    if operations is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    return operations.info()
+
+
+@app.post("/operations/restart", status_code=202)
+def operations_restart(body: RestartRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    return _operate(lambda ops, who: ops.restart(body.service, force=body.force, operator=who), x_operations_token, x_operator)
+
+
+@app.post("/operations/restart-all", status_code=202)
+def operations_restart_all(body: RestartAllRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    return _operate(lambda ops, who: ops.restart_all(force=body.force, operator=who), x_operations_token, x_operator)
+
+
+@app.post("/operations/deploy", status_code=202)
+def operations_deploy(body: DeployRequest, x_operations_token: Optional[str] = Header(None), x_operator: Optional[str] = Header(None)):
+    return _operate(lambda ops, who: ops.deploy(body.tag, rollback=body.rollback, force=body.force, operator=who), x_operations_token, x_operator)
+
+
+@app.get("/operations/{op_id}")
+def operations_get(op_id: str):
+    """One action: its state and log lines (secrets removed). No token: it only reads."""
+    if operations is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    try:
+        return operations.get(op_id)
+    except OperationError as err:
+        raise HTTPException(status_code=err.status, detail={"code": err.code, "message": err.message})
+
+
 @app.get("/")
 async def root():
     return create_root_response(
@@ -113,6 +186,7 @@ async def root():
             "services": "GET /services",
             "logs": "GET /services/{name}/logs?lines=200",
             "analysis": "GET /services/{name}/analysis?lines=500",
+            "operations": "GET /operations; POST /operations/restart | restart-all | deploy (X-Operations-Token)",
             "health": "GET /health",
         },
     )

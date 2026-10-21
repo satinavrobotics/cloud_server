@@ -1,7 +1,9 @@
-"""A read-only view of the Docker engine over its unix socket (standard library only).
+"""The Docker engine over its unix socket (standard library only).
 
-Only GET requests exist here: the service can list containers, inspect them and read their logs, never start, stop or
-change anything, and nothing a caller sends is put into a path except a container id taken from the engine's own list.
+DockerReader sends GET requests only: it can list containers, inspect them and read their logs, never change anything.
+DockerActor (below, used only by operations.py) adds the few writes the operator actions need: restart a container, and
+create, start and remove the one-shot container that runs a robot deploy. In both, nothing a caller sends is put into a
+path except a container id taken from the engine's own list.
 """
 
 import http.client
@@ -93,3 +95,37 @@ class DockerReader:
         query = f"stdout=1&stderr=1&timestamps=1&tail={int(tail)}" + (f"&since={int(since)}" if since else "")
         text = demultiplex(self._get(f"/containers/{container_id}/logs?{query}"))
         return [line.rstrip("\r") for line in text.split("\n") if line.strip()]
+
+
+class DockerActor(DockerReader):
+    """DockerReader plus restart / create / start / remove, and nothing else."""
+
+    def _send(self, method: str, path: str, body: Optional[Dict] = None, ok=(200, 201, 204)) -> bytes:
+        conn = _UnixConnection(self.socket_path, max(self.timeout, 30.0))      # a restart waits for the container to stop
+        try:
+            payload = json.dumps(body).encode() if body is not None else None
+            conn.request(method, path, body=payload, headers={"Content-Type": "application/json"} if payload else {})
+            response = conn.getresponse()
+            data = response.read(MAX_BODY_BYTES)
+        except (OSError, http.client.HTTPException) as err:
+            raise DockerUnavailable(f"cannot reach the Docker socket at {self.socket_path}: {err}") from err
+        finally:
+            conn.close()
+        if response.status not in ok:
+            detail = data[:300].decode("utf-8", errors="replace")
+            raise DockerUnavailable(f"Docker answered {response.status} for {method} {path.split('?')[0]}: {detail}")
+        return data
+
+    def restart(self, container_id: str, grace_seconds: int = 10) -> None:
+        self._send("POST", f"/containers/{container_id}/restart?t={int(grace_seconds)}")
+
+    def create(self, name: str, spec: Dict) -> str:
+        """Create a container (not started); returns its id."""
+        data = self._send("POST", f"/containers/create?name={name}", spec)
+        return json.loads(data)["Id"]
+
+    def start(self, container_id: str) -> None:
+        self._send("POST", f"/containers/{container_id}/start")
+
+    def remove(self, container_id: str) -> None:
+        self._send("DELETE", f"/containers/{container_id}?force=1")
