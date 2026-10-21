@@ -17,3 +17,8 @@ docker_compose/.robot_previous_tag
 
 # Backups of the robot env file (hold real credentials)
 docker_compose/.env.robot.bak-*
+
+# Per-machine secrets and the env files rendered from them (scripts/render_env.sh); the profiles themselves are tracked
+docker_compose/secrets.env
+docker_compose/.env.robot.bak*
+docker_compose/*.bak

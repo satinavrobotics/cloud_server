@@ -104,7 +104,7 @@ class TestBuild:
     def test_it_serializes_with_the_documented_keys(self):
         body = si.build_server_info(cfg()).dict()
         assert set(body) == {"schema_version", "name", "kind", "version", "server_id", "capabilities", "livekit",
-                             "min_client_version", "recommended_client_version"}
+                             "min_client_version", "recommended_client_version", "config_profile", "config_hash"}
         assert set(body["capabilities"]) == {"robots", "missions", "maps", "orchestration", "scene_graph",
                                              "reconstruction", "semantic", "agent", "fleet", "diagnostics"}
 
@@ -188,3 +188,14 @@ class TestHttp:
         import packages.api.main as main
         r = await self.get(main.app)
         assert r.status_code == 200 and r.json()["schema_version"] == 1
+
+
+class TestConfigProfile:
+    def test_reports_the_profile_and_hash_it_was_rendered_from(self):
+        info = si.build_server_info(cfg(CONFIG_PROFILE="pi4", CONFIG_HASH="c18a183b6c16"))
+        assert (info.config_profile, info.config_hash) == ("pi4", "c18a183b6c16")
+
+    def test_a_server_not_set_up_from_a_profile_reports_none(self):
+        assert si.build_server_info(cfg()).config_profile is None
+        info = si.build_server_info(cfg(CONFIG_PROFILE="", CONFIG_HASH=""))
+        assert (info.config_profile, info.config_hash) == (None, None)

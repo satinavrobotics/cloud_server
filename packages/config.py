@@ -820,6 +820,11 @@ if LIVEKIT_ROOM_POLICY not in ("client", "server"):
 # on a robot), so a server without the token service sets this to false.
 _livekit_env = _server_env("SERVER_LIVEKIT_AVAILABLE")
 SERVER_LIVEKIT_AVAILABLE = None if _livekit_env is None else _livekit_env.lower() in ("true", "1", "yes")
+
+# Which config profile rendered this machine's env file and a hash of its non-secret settings (scripts/render_env.py);
+# GET /api/v1/server-info reports both so a machine that is behind its profile shows. Empty when the file was written by hand.
+CONFIG_PROFILE = _server_env("CONFIG_PROFILE") or ""
+CONFIG_HASH = _server_env("CONFIG_HASH") or ""
 # Pre-warm at planner startup (only with SCENE_GRAPH_PLANNER_ENABLED): load the graph of these maps
 # (comma-separated) into the cache in the background; empty = every map the graph database lists
 # that has a stored scene graph. CONCURRENCY loads at a time.
