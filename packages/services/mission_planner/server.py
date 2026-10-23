@@ -351,11 +351,16 @@ class MissionPlannerService:
         # Note: end_node_id is the LEAF nearest the goal waypoint (within LEAF_SNAP_M, up to 1 m
         # off), target_node_position the snapped goal cell centre (within GOAL_SNAP_M of the tap):
         # the two need not coincide; the legacy planner's pair is node and node position.
+        if ids is None:
+            self._chart_outcomes["served_without_leaf_ids"] = \
+                self._chart_outcomes.get("served_without_leaf_ids", 0) + 1
+            self.logger.warning("Plan on map=%s served without leaf ids (an end has no topomap node "
+                                "within reach): waypoints=%d", map_id, len(plan.waypoints))
         return {
             "robot_position": {"x": float(start_xy[0]), "y": float(start_xy[1])},
-            "start_node_id": ids[0], "end_node_id": ids[-1],
+            "start_node_id": plan.waypoints[0].node_id, "end_node_id": plan.waypoints[-1].node_id,
             "target_node_position": {"x": plan.goal_xy[0], "y": plan.goal_xy[1]},
-            "path": ids, "path_length": len(ids),
+            "path": ids, "path_length": len(ids) if ids is not None else None,
             "waypoints": plan.waypoints, "waypoints_count": len(plan.waypoints),
             "planner": scene_route.PLANNER_SCENE_GRAPH,
             "min_width": plan.min_width, "chart_keys": plan.charts,

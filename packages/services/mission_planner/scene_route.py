@@ -189,7 +189,7 @@ class ChartFallback(Exception):
 @dataclass
 class ChartPlan:
     waypoints: List[common.Pose2D]
-    planned_path: List[str]            # one distinct leaf id per waypoint
+    planned_path: Optional[List[str]]  # one leaf id per waypoint; None when an end has no leaf in reach
     charts: List[str]
     min_width: float
     goal_xy: Pt                        # snapped goal cell centre
@@ -1075,8 +1075,9 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     pts, ids = collapse_repeated_leaf_ids(pts, ids, visible, max_gap_m)
     by_pt = dict(zip(pts, ids))
     poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)], allow_repeats=True)
-    if planned is None:
-        raise ChartFallback("waypoints_without_distinct_leaf_ids")
+    # An END without a leaf within reach is not a reason to give the plan up either (and lose its
+    # corridors to the legacy planner): it is served with planned_path None, a route of legs known
+    # by their VDA ids only (docs/node_policies_v2_plan.md, step 2.1).
     legs = None
     if trajectory_max_points > 0:
         try:
@@ -1109,5 +1110,5 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         goal_far["unverified_length_m"] = unverified_length_m(graph, route.nodes)
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
-                     repeated_leaf_ids=len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
+                     repeated_leaf_ids=planned is not None and len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
                      trajectory=legs, waypoint_budget=budget_record, goal_far=goal_far)

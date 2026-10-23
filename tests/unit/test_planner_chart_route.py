@@ -256,12 +256,17 @@ async def test_a_route_on_one_leaf_is_served_as_two_waypoints(on):
 
 
 @pytest.mark.unit
-async def test_a_waypoint_without_a_leaf_still_falls_back(on):
+async def test_a_route_without_any_leaf_is_served_without_ids_and_keeps_its_corridors(on):
     svc = _service(FakeStore(FakeGraph()))
     svc.graph_db.k_nearest_neighbors.side_effect = lambda x, y, k, map_id: ([], [])
+    robot = await svc.get_robot_status("r1")
+    robot.status.factsheet.width = 0.4
     out = await _plan(svc)
-    assert out["planner"] == "legacy"
-    assert out["planner_fallback"] == "waypoints_without_distinct_leaf_ids"
+    assert out["planner"] == "scene_graph" and not out.get("planner_fallback")
+    assert out["path"] is None and out["path_length"] is None
+    assert out["start_node_id"] is None and out["end_node_id"] is None
+    assert all(w.corridor_width_m for w in out["waypoints"][:-1])
+    assert svc._chart_outcomes["served_without_leaf_ids"] == 1
 
 
 @pytest.mark.unit
