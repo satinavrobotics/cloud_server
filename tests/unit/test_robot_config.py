@@ -32,7 +32,8 @@ def dirs(tmp_path):
 
 class TestSpecMatchesTheCompose:
     def test_every_default_is_the_compose_default(self):
-        text = (ROOT / "docker_compose" / "mission_dispatch_services_robot.yaml").read_text()
+        text = (ROOT / "docker_compose" / "mission_dispatch_services_robot.yaml").read_text() \
+            + (ROOT / "docker_compose" / "reconstruction_service_robot.yaml").read_text()
         wrong = []
         for s in rc.SETTINGS:
             found = re.findall(r"\$\{" + s["key"] + r":-([^}]*)\}", text)
@@ -252,3 +253,22 @@ class TestRoutes:
             assert r.status_code == 400 and r.json()["detail"]["code"] == "not_a_robot"
         finally:
             diag_main.operations = None
+
+
+class TestReconstructionBudget:
+    def test_reconstruction_counts_where_the_profile_sets_it(self, tmp_path):
+        prof = tmp_path / "profiles"; prof.mkdir()
+        (prof / "base.env").write_text("")
+        (prof / "p.env").write_text("RECON_MEM_LIMIT=1536m\n")
+        local = tmp_path / "local"
+        import pytest as _pt
+        with _pt.raises(rc.ConfigError) as e:
+            rc.save({"MEM_POSTGRES": "5g"}, "p", prof, local, total_memory=8 << 30)
+        assert e.value.code == "over_budget"
+
+    def test_a_machine_without_reconstruction_does_not_count_it(self, tmp_path):
+        prof = tmp_path / "profiles"; prof.mkdir()
+        (prof / "base.env").write_text("")
+        (prof / "q.env").write_text("")
+        local = tmp_path / "local"
+        rc.save({"MEM_POSTGRES": "1g"}, "q", prof, local, total_memory=5000 << 20)

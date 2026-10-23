@@ -26,6 +26,9 @@ MQTT_PORT_WEBSOCKET=${2:-9001}
 MQTT_BIND_ADDRS=${3:-0.0.0.0}
 # Log types (default: all, as before). A robot passes "error warning notice": "all" logs every publish, image traffic included.
 MQTT_LOG_TYPES=${4:-all}
+# Directory to keep the broker's state in (retained messages, subscriptions of persistent sessions) across a restart. Default: none,
+# as before. A robot mounts a volume there; without it every restart drops all retained messages.
+MQTT_PERSIST_DIR=${5:-}
 
 echo "Starting Mosquitto MQTT Broker..."
 echo "TCP Port: $MQTT_PORT_TCP"
@@ -55,6 +58,15 @@ cat >> /tmp/mosquitto.conf <<EOF
 log_dest stdout
 EOF
 for t in $MQTT_LOG_TYPES; do echo "log_type $t" >> /tmp/mosquitto.conf; done
+if [ -n "$MQTT_PERSIST_DIR" ]; then
+cat >> /tmp/mosquitto.conf <<EOF
+
+# Persistence
+persistence true
+persistence_location ${MQTT_PERSIST_DIR%/}/
+autosave_interval 60
+EOF
+fi
 
 echo "Configuration created at /tmp/mosquitto.conf"
 cat /tmp/mosquitto.conf

@@ -9,7 +9,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 PROFILES_DIR = Path(os.getenv("ROBOT_PROFILES_DIR", "/deploy/profiles"))
 LOCAL_DIR = Path(os.getenv("ROBOT_LOCAL_DIR", "/deploy/local"))
@@ -42,7 +42,9 @@ SETTINGS: List[Dict] = [
     _s("MEM_POSTGRES", MEM, "Postgres", _MEM_HELP, "memory", "448m", ["postgres"], min="128m", max="6g"),
     _s("MEM_ARANGO", MEM, "ArangoDB", _MEM_HELP, "memory", "512m", ["arangodb"], min="128m", max="6g"),
     _s("MEM_MINIO", MEM, "MinIO (maps, recordings)", _MEM_HELP, "memory", "384m", ["minio"], min="64m", max="4g"),
-    _s("MEM_MOSQUITTO", MEM, "MQTT broker", _MEM_HELP, "memory", "64m", ["mosquitto"], min="32m", max="1g"),
+    _s("MEM_MOSQUITTO", MEM, "MQTT broker", _MEM_HELP, "memory", "256m", ["mosquitto"], min="32m", max="1g"),
+    _s("RECON_MEM_LIMIT", MEM, "Reconstruction", _MEM_HELP + " Counted in the budget only where the profile sets it (the machine runs reconstruction).", "memory", "768m",
+       ["reconstruction-service"], min="256m", max="6g"),
     _s("MEM_LIVEKIT", MEM, "Video server (LiveKit SFU)", _MEM_HELP, "memory", "512m", ["livekit-sfu"], min="64m", max="2g"),
     _s("MEM_LIVEKIT_TOKENS", MEM, "Video token service", _MEM_HELP, "memory", "128m", ["livekit-sfu-tokens"], min="32m", max="1g"),
     _s("MEM_GATEWAY", MEM, "Gateway (nginx)", _MEM_HELP, "memory", "64m", ["nginx-gateway"], min="32m", max="1g"),
@@ -151,11 +153,11 @@ def memory_total_bytes(meminfo: str = "/proc/meminfo") -> int:
     return 0
 
 
-def check_budget(values: Dict[str, str], total: int) -> None:
-    """The memory limits together must fit the machine: refuse a set that cannot, whoever asks."""
+def check_budget(values: Dict[str, str], total: int, skip: Tuple[str, ...] = ()) -> None:
+    """The memory limits together must fit the machine: refuse a set that cannot, whoever asks. `skip` names limits of services this machine does not run."""
     if total <= 0:
         return
-    limits = sum(to_bytes(v) for k, v in values.items() if BY_KEY[k]["type"] == "memory")
+    limits = sum(to_bytes(v) for k, v in values.items() if BY_KEY[k]["type"] == "memory" and k not in skip)
     if limits > total * 0.95:
         raise ConfigError(400, "over_budget", f"the memory limits add up to {limits >> 20} MB but the machine has {total >> 20} MB: lower some limits", None)
 
@@ -190,7 +192,8 @@ def save(changes: Dict[str, Optional[str]], profile_name: str, profiles_dir: Pat
             merged.pop(key, None)
         else:
             merged[key] = value
-    check_budget(effective(profile, merged), memory_total_bytes() if total_memory is None else total_memory)
+    skip = () if "RECON_MEM_LIMIT" in profile or "RECON_MEM_LIMIT" in merged else ("RECON_MEM_LIMIT",)     # reconstruction runs only where the profile says so
+    check_budget(effective(profile, merged), memory_total_bytes() if total_memory is None else total_memory, skip)
     others = {k: v for k, v in current.items() if k not in BY_KEY}          # lines this service did not write stay as they are
     final = {**others, **merged}
     local_dir.mkdir(parents=True, exist_ok=True)

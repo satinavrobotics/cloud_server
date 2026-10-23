@@ -33,8 +33,10 @@ services:
         # ROBOT_LAN_IP (the gateway's LAN door) opens the broker on the LAN too, so a robot on the local network can use it: one
         # address, or 0.0.0.0 for every interface (that replaces the list: it already covers loopback and the tailnet IP)
         case "${ROBOT_LAN_IP:-}" in "" | 127.*) ;; 0.0.0.0) ADDRS="0.0.0.0" ;; *) ADDRS="$$ADDRS ${ROBOT_LAN_IP}" ;; esac
-        sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" "$$ADDRS" "error warning notice"
-    mem_limit: ${MEM_MOSQUITTO:-64m}
+        sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" "$$ADDRS" "error warning notice" /mosquitto/data
+    volumes:
+      - mosquitto_data:/mosquitto/data      # retained messages survive a restart
+    mem_limit: ${MEM_MOSQUITTO:-256m}
     logging: *logging
 
   postgres:
@@ -279,3 +281,4 @@ services:
 volumes:
   pgdata14: !reset null
   nginx_logs:
+  mosquitto_data:
