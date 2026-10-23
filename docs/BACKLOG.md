@@ -3,6 +3,33 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Done after the 2026-10-22 demo, with what is still open (2026-10-23)
+
+Pi 5 (`rasp`) runs tag `7dd955e869b5`; desktop 0.3.15 is packaged (not published).
+
+**Done**
+- **LiveKit on the LAN and the tailnet with one config** (`ec87188`): the Pi's hand-edits are in the repo (`rtc.ips`, signalling also on `ROBOT_LAN_IP`, `LIVEKIT_SFU_LAN_URL`, real image tags instead of the hand-built `lanvideo`). Checked from the Pi itself on 192.168.1.70, not from a real LAN-only client or with the Jetson on the LAN.
+- **Restart and settings from the robot's LAN without the token** (`b44e76f`, `OPERATIONS_TRUST_LAN`, pi4 and pi5 profiles). Anyone on that network can restart services and change settings (`docs/security/open-items-2026-10-21.md` 5a).
+- **Mosquitto keeps its state and has room** (`7dd955e`): 256m and a `mosquitto_data` volume; a retained message survived a restart in a local test.
+- **Memory limits fit the Pi 5** (`7dd955e`): 7296 MB (91.7% of 7955 MB), planner 512m, Postgres 1g, MinIO 512m (local override). The app's 95% guard counts `RECON_MEM_LIMIT` where the profile sets it. Not measured under a real reconstruction job.
+- **Diagnostics list judges the container, not its logs** (`38d6984`).
+- **Scene graph and occupancy grid from depth only** (`0054236`, `POST /api/v1/maps/{map}/scene-graph/rebuild-from-depth`, client row "Build from depth"). Never run on real Arango/MinIO data; nodes without `pose3d_map` cannot be built; needs `SCENE_GRAPH_WORKER_ENABLED` and an ended or paused session.
+- **Finish gate says why the upload does not drain** (`fix/look-for`): graph-builder keeps the robot's spool_state fields (`robot_report` on `GET /ingest/backlog`), the 409 and the client text name the cause and point to ORCHESTRATION > Spool. The robot-side latch (`leftovers_held`, `sent=0`) is not in these repos: root cause open.
+- **Comments and one default**: robot compose/profile comments match the config; the MinIO console default is 9002 (9001 is mosquitto's websocket port).
+- **Client 0.3.15** (`sati-client` branch `release/0.3.15`, local): frozen-video recovery and Reload button, diagnostics tabs, logs follow the newest line, teleop velocity client. Not run in a real app; the 8 s freeze threshold and the stats fields are guesses.
+- **Teleop velocity v2, client side** follows the robot team's plan (`cmd_vel2/<identity>`, int16 mm/s and mrad/s, advertised by `teleop.velocity_v2` in participant metadata). Open on their side: the bridge, per-robot limits, the firmware maximum, and that the legacy topic uses the participant *name* while v2 uses the *identity*.
+- **Robot picks its server from a candidate list** (`satibot_orchestrator` branch `feat/server-candidates`, `ea2447f`, not merged, not on the Jetson): LAN, then Pi tailnet, then dev box; `GET /server/active`. Rollout: merge, pull on the Jetson, compare its live `config.yaml`, restart the orchestrator, check `/server/active`, restart `base_services` and `livekit`.
+
+**Open (found by the look-for pass, ranked by offline-run impact)**
+1. Video token service and MinIO links are tied to the Pi's tailnet address (`robot.yaml` token `--host ${ROBOT_TAILNET_IP}`, `MINIO_HOST`). A LAN-only Jetson cannot fetch a video token unless the cached Tailscale netmap works. Needs a security decision (bind on the LAN too, or a gateway route).
+2. `100.85.3.47` is a default in `electron/main.js` (`DEFAULT_SERVER_URL`, update feed), `IMAGE_REGISTRY` in the robot compose files, `scripts/setup_robot.sh`, `scripts/livekit/robot_client.py`.
+3. Pi 4 memory: defaults sum to 4096 MiB on a 4 GB machine, plus 768m reconstruction, plus `MEM_GRAPH_BUILDER=1g`. Drop the 1g or turn something off.
+4. The robot SFU relies only on `rtc.ips.includes`, which the cloud config calls unreliable (`livekit.yaml:7-9`). Check with `verify_candidates.sh` on the Pi.
+5. Settings duplicated or contradictory between code, compose and profiles: `SCENE_GRAPH_WORKER_THREADS`, `SCENE_GRAPH_CACHE_VERSIONS`, `UPLOAD_BUFFER_MAX_BYTES` (256 MiB vs 100 MB), `VDA5050_NODE_POLICY_MODE`, missing path-cost settings on the Pi profiles, the LiveKit UDP range in docs (50000-60000) vs the robot (50000-50100), `SERVER_DIAGNOSTICS_AVAILABLE`.
+6. Cheap Pi savings, not measured: graph-builder logs about 10 INFO lines per node, uvicorn access logs on everywhere, Postgres healthcheck every 5 s. Measure CPU first.
+7. No cloud-side control to resume or discard a robot's spool latch (only via ORCHESTRATION > Spool on the robot).
+8. Client connection-loss and offline UX was not reviewed.
+
 ## LiveKit: the client was on LiveKit Cloud, the robots on the self-hosted SFU (2026-10-03)
 
 **Symptom:** The LiveKit room showed only client laptops; formidable-peacock (and
