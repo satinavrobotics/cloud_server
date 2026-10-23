@@ -177,3 +177,44 @@ async def test_a_route_edited_during_the_planner_call_is_not_overwritten():
     await r._enrich_routes()
     assert m.mission_tree[0].route is edited and m.route_rev == 0
     db.update_spec_fields.assert_not_awaited()
+
+
+def _goto(waypoints):
+    m = _mission(waypoints)
+    m.kind = "goto"
+    return m
+
+
+@pytest.mark.unit
+async def test_a_goto_without_annotation_is_logged_never_sent_to_the_planner(caplog):
+    planner = SimpleNamespace(enrich_route=AsyncMock())
+    r, _ = _make_robot(planner)
+    r._current_mission = _goto([_wp(0.0), _wp(5.0), _wp(10.0)])
+    with caplog.at_level("WARNING"):
+        await r._enrich_routes()
+    planner.enrich_route.assert_not_awaited()
+    assert "node_policy_unannotated" in caplog.text
+    assert "without an origin" in caplog.text and "no corridor" in caplog.text
+
+
+@pytest.mark.unit
+async def test_an_annotated_goto_is_not_reported(caplog):
+    planner = SimpleNamespace(enrich_route=AsyncMock())
+    r, _ = _make_robot(planner)
+    r._current_mission = _goto([_wp(0.0, origin="planned", corridor_width_m=0.4),
+                                _wp(5.0, origin="planned", corridor_width_m=0.0),
+                                _wp(10.0, origin="user")])
+    with caplog.at_level("WARNING"):
+        await r._enrich_routes()
+    assert "node_policy_unannotated" not in caplog.text
+
+
+@pytest.mark.unit
+async def test_a_route_without_corridors_is_enriched_even_when_nothing_asks_for_skipping():
+    planner = SimpleNamespace(enrich_route=AsyncMock(return_value=_enriched(
+        _wp(0.0, corridor_width_m=0.4), _wp(10.0), changed=True, inserted=0)))
+    r, _ = _make_robot(planner)
+    m = _mission([_wp(0.0), _wp(10.0)], planned_path=["a", "b"])   # no gap fill, no skippable
+    await _start_mission(r, m)
+    planner.enrich_route.assert_awaited_once()
+    r._cancel_mission_timeout()

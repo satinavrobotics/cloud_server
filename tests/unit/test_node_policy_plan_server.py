@@ -18,6 +18,8 @@ async def test_plan_carries_the_node_policy_report_and_marks_every_waypoint_but_
     assert wps[-1].skippable is None and wps[-1].corridor_width_m is None
     assert out["node_policy"]["unavailable"] is None
     assert out["node_policy"]["skippable"] == len(wps) - 1
+    # step 2.2 invariant: every go-to waypoint has an origin (planner points planned, the goal user)
+    assert [w.origin for w in wps] == ["planned"] * (len(wps) - 1) + ["user"]
 
 
 def _wps(*xs, **kw):

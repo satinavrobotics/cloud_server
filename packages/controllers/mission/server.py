@@ -1034,14 +1034,17 @@ class Robot:
         into the stored mission_tree before the first order, so order ids, waypoint offsets,
         resume and skipped-node reports all see one route. Only before the first start (never
         on a resume: waypoint indexes must not shift under a running mission), never for a
-        go-to (the planner marked its waypoints itself). Never blocks the mission: the planner
+        go-to (the planner marked its waypoints itself; `_check_goto_annotated` checks). Never blocks the mission: the planner
         being down or without a scene graph only logs, and the route is used as it is."""
         mission = self._current_mission
         # `_order_may_be_on_robot`, not only start_timestamp: that one is persisted lazily, the
         # run id before the first send, and a restart in between must not reshape a route an
         # order was already built from.
-        if mission.kind == "goto" or mission.status.start_timestamp is not None or \
+        if mission.status.start_timestamp is not None or \
                 self._order_may_be_on_robot() or self._robot_object is None:
+            return
+        if mission.kind == "goto":
+            self._check_goto_annotated(mission)
             return
         planner = getattr(self._robot_server, "mission_planner", None)
         if planner is None:
@@ -1059,7 +1062,8 @@ class Robot:
             if len(maps) != 1 or "" in maps:
                 continue            # mapless (robot frame) or mixed: no scene graph to ask
             if not (config.NODE_POLICY_GAP_FILL_ENABLED and insert and len(waypoints) >= 2) and \
-                    not any(w.skippable or w.origin == "planned" for w in waypoints):
+                    not any(w.skippable or w.origin == "planned" for w in waypoints) and \
+                    all(w.corridor_width_m is not None for w in waypoints[:-1]):
                 continue
             try:
                 result = await planner.enrich_route(
@@ -1102,6 +1106,26 @@ class Robot:
                 self._mission_writer_id())
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not store the enriched route ({err})")
+
+    def _check_goto_annotated(self, mission: mission_object.MissionObjectV1) -> None:
+        """A go-to's waypoints are marked by the planner itself (`_finalize_goto`), so it is not
+        enriched here. This is the safety net (docs/node_policies_v2_plan.md, step 2.3): a go-to
+        stored without origins, or without a single corridor, was not annotated, and the robot
+        will hold at its nodes by default instead of passing a gate. Logged, never refused."""
+        for node in mission.mission_tree:
+            if node.type != mission_object.MissionNodeType.ROUTE or node.route is None:
+                continue
+            inner = node.route.waypoints[:-1]
+            if not inner:
+                continue
+            problems = []
+            if any(w.origin is None for w in node.route.waypoints):
+                problems.append("waypoints without an origin")
+            if all(w.corridor_width_m is None for w in inner):
+                problems.append("no corridor on any pass-through waypoint")
+            if problems:
+                self.warning(f"[{mission.name}] node_policy_unannotated: go-to route "
+                             f"{node.name} has {' and '.join(problems)}")
 
     async def _settle_route_rev(self):
         """The tree this mission is about to be sent from is the stored one, so every reroute
