@@ -468,7 +468,9 @@ not yet complete or terminally rejected.
 
 **Finish gate.** `GET /ingest/backlog/{robot_name}[?run_id=]` (read-only) answers
 `{robot_name, run_id, known, pending, depth, last_spooled_id, highest_complete_id, open_trackers,
-spool_age_s}` for the robot's current run (`run_id` if given, else the latest accepted node's run,
+spool_age_s, robot_report}` (`robot_report`: the spool_state's other scalar fields, e.g. the robot's
+sender state and counters, at most 12, strings cut to 120 chars; the 409 message names them, and
+says when no node of the run has reached the server) for the robot's current run (`run_id` if given, else the latest accepted node's run,
 else the spool_state's). `pending` is `depth > 0`; `known` is false when there is no spool_state of
 that run with an integer depth (then `pending` is false and `depth` null). The API's Finish of a
 mapping session polls it (packages/api/ingest_backlog.py) and waits for `depth == 0`: 409

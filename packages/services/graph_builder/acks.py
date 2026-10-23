@@ -68,8 +68,30 @@ _RUNS_SEEN_CAP = 8            # runs remembered per robot (for "latest run")
 MAX_TIMEOUT_ACKS = 3          # timeout acks per bundle, then the entry is dropped
 _LAST_ACK_CAP = 5000
 _ROBOT_CAP = 10000            # ingest_state / spool_state entries kept (one per robot)
+# Extra scalar fields of a spool_state beyond the contract (e.g. the robot's sender state / counters)
+# are kept verbatim for diagnosis (`robot_report` of the backlog), bounded:
+_SPOOL_REPORT_MAX_FIELDS = 12
+_SPOOL_REPORT_MAX_STR = 120
+_SPOOL_CONTRACT_FIELDS = frozenset({"run_id", "last_spooled_id", "depth"})
 _MQTT_ERR_NO_CONN = 4         # paho: QoS 1 is queued for the reconnect, not lost
 _MQTT_ERR_QUEUE_SIZE = 15     # paho: the outgoing queue is at max_queued_messages
+
+
+def _spool_report(payload: Mapping) -> Dict[str, Any]:
+    """The spool_state's extra scalar fields (not run_id / last_spooled_id / depth), bounded: at
+    most _SPOOL_REPORT_MAX_FIELDS short string keys, strings cut to _SPOOL_REPORT_MAX_STR."""
+    out: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if len(out) >= _SPOOL_REPORT_MAX_FIELDS:
+            break
+        if (not isinstance(key, str) or key in _SPOOL_CONTRACT_FIELDS or not key
+                or len(key) > 40):
+            continue
+        if isinstance(value, str):
+            out[key] = value[:_SPOOL_REPORT_MAX_STR]
+        elif value is None or isinstance(value, (bool, int, float)):
+            out[key] = value
+    return out
 
 
 def valid_topic_level(name: Any) -> bool:
@@ -410,6 +432,7 @@ class AckManager:
             self._spool[robot] = {"run_id": payload.get("run_id"),
                                   "last_spooled_id": payload.get("last_spooled_id"),
                                   "depth": payload.get("depth"),
+                                  "report": _spool_report(payload),
                                   "received_ms": self._wall_ms()}
             self._spool.move_to_end(robot)
             self._cap(self._spool)
@@ -468,6 +491,8 @@ class AckManager:
                                 if len(k) == 3 and k[0] == robot and k[1] == run_id),
                 "spool_age_s": (round(max(0, now_ms - spool["received_ms"]) / 1000.0, 1)
                                 if spool is not None else None),
+                # what else the robot's spool_state said (sender state, counters), any run
+                "robot_report": dict(spool.get("report") or {}) if spool is not None else {},
             }
 
     # --- internals (call under the lock) --------------------------------------------------
