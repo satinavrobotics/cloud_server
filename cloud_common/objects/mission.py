@@ -441,6 +441,24 @@ class MissionSentOrderV1(pydantic.BaseModel):
                            session_id, map_t_session, applied ('inverse' | 'identity' | \
                            'none'), map_id_sent}. Lets node offsets the robot reports be read \
                            in the map frame, and a frame error be told from node placement.")
+    node_policy: Optional[Dict[str, Any]] = pydantic.Field(
+        None, description="What the order's nodePolicy actions said: {sent, withheld_reason, \
+                           nodes: [{seq, waypoint_index, skippable, corridor, max_wait_s, \
+                           reason}]}. Null for orders that are not route orders.")
+
+    def node_policy_summary(self) -> Optional[Dict[str, Any]]:
+        """{sent, withheld_reason, nodes, skippable, reasons: {reason: count}} of the order's
+        nodePolicy record, None when there is none."""
+        record = self.node_policy
+        if record is None:
+            return None
+        nodes = record.get("nodes") or []
+        reasons: Dict[str, int] = {}
+        for node in nodes:
+            reasons[node["reason"]] = reasons.get(node["reason"], 0) + 1
+        return {"sent": record.get("sent"), "withheld_reason": record.get("withheld_reason"),
+                "nodes": len(nodes), "skippable": sum(1 for n in nodes if n["skippable"]),
+                "reasons": reasons}
 
 
 class MissionSkippedNodeV1(pydantic.BaseModel):

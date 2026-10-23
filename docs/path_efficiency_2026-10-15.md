@@ -77,3 +77,16 @@ ratio 0.758. 291 legs have no track (time only). office8, Hospital, office6: leg
   the local planner smoothing corners shortens it (the median above 1 shows both are small).
 * Trajectories exist only from 2026-10-14; the sample is small until more runs accumulate.
 * The stale test needs `straight_m` (null on the first leg of an order, which has no plan anyway).
+
+## Note (2026-10-23): gates move the per-leg boundaries
+
+With nodePolicy v2 the robot counts a pass-through node as traversed when it is within
+`allowedDeviationXY` (0.35 m) **or** crosses the node's gate inside its corridor. A robot can
+therefore pass a node with a sideways offset of up to the corridor width (per side, capped at
+1.5 m) and still count it as reached. Per-leg times and distances, which cut the run at the
+moment each node was reported reached, carry a boundary error of up to that width. Whole-route
+numbers are not affected.
+
+What to check on the first gate run: the `EFFICIENCY_MIN_COVERAGE` rejection rate. Change
+nothing before that is seen. What each order sent per node is in the sent-order record
+(`status.sent_order.node_policy`, summary as `node_policy_summary` on the mission GET).

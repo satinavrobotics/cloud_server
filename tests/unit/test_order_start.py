@@ -92,3 +92,20 @@ async def test_a_stale_or_uninitialized_pose_drops_nothing(fresh, initialized):
     r, m = await _robot_with_pose(pose=(1.1, 1.0), fresh=fresh, initialized=initialized)
     _, record = await r._build_order(m.mission_tree[1], 1, 0)
     assert record.waypoint_offset == 0
+
+
+@pytest.mark.unit
+async def test_the_built_order_records_what_nodepolicy_said(monkeypatch):
+    r, m = await _robot_with_pose(pose=(0.0, 1.0))
+    monkeypatch.setattr(r, "_node_policy_decision", lambda: (True, "mode_on"))
+    _, record = await r._build_order(m.mission_tree[1], 1, 0)
+    assert record.node_policy["sent"] is True
+    assert record.node_policy["nodes"][-1]["reason"] == "structural_last"
+
+
+@pytest.mark.unit
+async def test_a_withheld_nodepolicy_is_recorded_with_its_reason(monkeypatch):
+    r, m = await _robot_with_pose(pose=(0.0, 1.0))
+    monkeypatch.setattr(r, "_node_policy_decision", lambda: (False, "mode_off"))
+    _, record = await r._build_order(m.mission_tree[1], 1, 0)
+    assert record.node_policy == {"sent": False, "withheld_reason": "mode_off", "nodes": []}

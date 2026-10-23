@@ -3115,7 +3115,10 @@ async def get_mission(mission_name: str):
     _require_service()
 
     mission = await service.database.get_object(MissionObjectV1, mission_name)
-    return mission.dict()
+    result = mission.dict()
+    sent = mission.status.sent_order
+    result["node_policy_summary"] = sent.node_policy_summary() if sent else None
+    return result
 
 
 @app.get("/api/v1/missions/{mission_name}/status")
@@ -3124,7 +3127,10 @@ async def get_mission_status(mission_name: str):
     _require_service()
 
     mission = await service.database.get_object(MissionObjectV1, mission_name)
-    return mission.status.dict()
+    result = mission.status.dict()
+    sent = mission.status.sent_order
+    result["node_policy_summary"] = sent.node_policy_summary() if sent else None
+    return result
 
 
 @app.post("/api/v1/missions", response_model=dict)

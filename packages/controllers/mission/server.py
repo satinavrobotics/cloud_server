@@ -1876,10 +1876,16 @@ class Robot:
             else:
                 self.warning(f"[{self._current_mission.name}] Route {mission_node.name}: no "
                              f"nodePolicy in this order ({why}); the robot holds no node")
-            return types.VDA5050Order.from_route(route, self._robot_object,
-                                                 self._order_prefix(), idx,
-                                                 node_policy=sends_policy), \
-                record
+            order = types.VDA5050Order.from_route(route, self._robot_object,
+                                                  self._order_prefix(), idx,
+                                                  node_policy=sends_policy)
+            record.node_policy = {
+                "sent": sends_policy,
+                "withheld_reason": None if sends_policy else why,
+                "nodes": types.describe_node_policies(
+                    order, route.waypoints, order_policy.current(), offset)
+                if sends_policy else []}
+            return order, record
         record = mission_object.MissionSentOrderV1(order_id=order_id)
         if mission_node.type == mission_object.MissionNodeType.MOVE and \
                 mission_node.move is not None:

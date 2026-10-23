@@ -93,6 +93,7 @@ Facts from reading the code on `main` @ 38aa447. Each one points at the step tha
 - **2.3 The dispatcher checks instead of assuming.** In `_enrich_routes`, a go-to is no longer exempt from the check. Before the first order, when any pass-through waypoint of a go-to has neither a corridor nor a recorded reason, log a warning and set a mission event (`node_policy_unannotated`). Re-annotating is not needed once 2.2 is in place; the check is the safety net. Plus a unit test of the invariant: every stored go-to waypoint has an `origin`.
 
 ### Phase 3: what was sent is visible
+_Status: 3.1 and 3.2 done on `feature/node-policies-v2` (reasons also include `gate_only`: guide node with room, not skippable). 3.3 open._
 - **3.1 Decision record.**
   - `MissionSentOrderV1` gains `node_policy: {sent: bool, withheld_reason?, nodes: [{seq, waypoint_index, skippable, corridor, max_wait_s, reason}]}`.
   - Reasons: `structural_last`, `operator`, `narrow`, `unknown:<why>`, `skip_disabled`, `ok`.

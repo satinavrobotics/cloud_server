@@ -183,6 +183,43 @@ def waypoint_node_policy(node_id: str, pose2d, policy: OrderPolicy,
         skippable=skippable, corridor_width_m=corridor, last=last)
 
 
+def describe_node_policies(order: "VDA5050Order", waypoints, policy: OrderPolicy,
+                           offset: int = 0) -> list:
+    """What the order's nodePolicy actions say, node by node, and why: read from the built
+    actions themselves, so the record cannot drift from the wire. `waypoints` are the
+    route's waypoints the order was built from, `offset` the index of the first in the
+    stored route. Reasons: structural_last, ok (skippable), narrow (measured, no room),
+    unknown:no_corridor (nothing known, the robot default applies), operator, skip_disabled,
+    gate_only (guide node with room, not skippable)."""
+    out = []
+    for j, (node, pose2d) in enumerate(zip(order.nodes[1:], waypoints)):
+        action = next((a for a in node.actions
+                       if a.actionType == NODE_POLICY_ACTION_TYPE), None)
+        if action is None:
+            continue
+        params = action.param_dict
+        corridor = params.get("corridorWidth")
+        skippable = bool(params.get("skippable"))
+        if j == len(waypoints) - 1:
+            reason = "structural_last"
+        elif skippable:
+            reason = "ok"
+        elif corridor == 0:
+            reason = "narrow"
+        elif corridor is None:
+            reason = "unknown:no_corridor"
+        elif getattr(pose2d, "origin", None) != "planned":
+            reason = "operator"
+        elif getattr(pose2d, "skippable", None) and not policy.node_policy_skip_enabled:
+            reason = "skip_disabled"
+        else:
+            reason = "gate_only"
+        out.append({"seq": node.sequenceId, "waypoint_index": offset + j,
+                    "skippable": skippable, "corridor": corridor,
+                    "max_wait_s": params.get("maxWaitS"), "reason": reason})
+    return out
+
+
 class VDA5050ActionState(pydantic.BaseModel):
     """VDA5050 Action State, sent from the client to the server"""
     actionId: str
