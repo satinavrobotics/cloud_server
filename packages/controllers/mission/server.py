@@ -46,6 +46,7 @@ from packages.controllers.mission import battery
 from packages.controllers.mission import behavior_tree
 from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import lifecycle
+from packages.controllers.mission import factsheet_actions
 from packages.controllers.mission import order_ids
 from packages.controllers.mission import order_policy
 from packages.controllers.mission import order_start
@@ -3518,22 +3519,20 @@ class Robot:
                 if value is not None and value >= minimum:
                     setattr(self._robot_object.status.factsheet, field, value)
 
-            # Store custom actions from factsheet (an empty list clears what was stored)
-            if message.actions is not None:
-                self._robot_object.status.factsheet.custom_actions = [
-                    robot_object.CustomActionV1(
-                        action_type=action.actionType,
-                        action_description=action.actionDescription,
-                        action_parameters=[
-                            robot_object.CustomActionParameterV1(key=param.key, value="" if param.value is None else str(param.value))
-                            for param in action.actionParameters
-                        ],
-                        blocking_type=action.blockingType.value,
-                        icon_hint=action.iconHint
-                    )
-                    for action in message.actions
-                ]
-                self.info(f"Stored {len(message.actions)} custom actions from factsheet")
+            # Custom actions from either place of the factsheet (an empty list clears what
+            # was stored; a factsheet listing neither keeps it).
+            actions, n_top, n_agv = factsheet_actions.listed_actions(message)
+            if actions is not None:
+                self._robot_object.status.factsheet.custom_actions = actions
+                self.info(f"Stored {len(actions)} custom actions from factsheet "
+                          f"(actions: {n_top}, protocolFeatures.agvActions: {n_agv}): "
+                          f"{[a.action_type for a in actions]}")
+            self._robot_object.status.factsheet.source = robot_object.FactsheetSourceV1(
+                received_at=datetime.datetime.now(datetime.timezone.utc),
+                topic=message.received_topic or "", retained=message.received_retained,
+                header_id=message.headerId, timestamp=message.timestamp,
+                manufacturer=message.manufacturer, serial_number=message.serialNumber,
+                actions_top_level=n_top, actions_agv_actions=n_agv)
 
             await self._write_status(api_objects.RobotObjectV1, self._robot_object.name, self._robot_object.status, self._writer_id())
 
@@ -5440,8 +5439,10 @@ class RobotServer:
             elif factsheet_match:
                 robot = factsheet_match.groups()[0]
                 pl = msg.payload
-                self._enqueue(self._mqtt_messages, ClientFactsheetMessage(name=robot,
-                                                                          payload=json.loads(pl)))
+                sheet = ClientFactsheetMessage(name=robot, payload=json.loads(pl))
+                sheet.payload.received_topic = msg.topic
+                sheet.payload.received_retained = bool(getattr(msg, "retain", False))
+                self._enqueue(self._mqtt_messages, sheet)
             elif datum_match:
                 robot = datum_match.groups()[0]
                 pl = msg.payload

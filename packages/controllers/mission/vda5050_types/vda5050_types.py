@@ -678,6 +678,9 @@ class VDA5050Factsheet(pydantic.BaseModel):
     localizationParameters: Optional[VDA5050LocalizationParameters]
     actions: Optional[List[VDA5050ActionDefinition]] = pydantic.Field(
         None, description="List of custom actions available on this robot")
+    # Set by the dispatcher on arrival (never part of the robot's message).
+    received_topic: Optional[str] = None
+    received_retained: Optional[bool] = None
 
 
 class VDA5050Visualization(pydantic.BaseModel):

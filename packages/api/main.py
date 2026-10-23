@@ -2527,9 +2527,14 @@ def _apply_factsheet_limits(factsheet, data: dict) -> None:
             setattr(factsheet, field, float(value))
 
 
-def _custom_actions(factsheet_data: dict) -> list:
+def _custom_actions(factsheet_data: dict) -> Optional[list]:
+    """The actions a registration lists, or None when it lists none: a registration without
+    an `actions` key, or with an empty one, says nothing, so it must not wipe the list the
+    robot's factsheet message stored (an empty list from the factsheet topic still clears it)."""
+    if not factsheet_data.get("actions"):
+        return None
     try:
-        return [CustomActionV1(**a) for a in factsheet_data.get("actions", [])]
+        return [CustomActionV1(**a) for a in factsheet_data["actions"]]
     except (ValidationError, TypeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid factsheet actions: {e}")
 
@@ -2589,7 +2594,9 @@ async def create_robot(robot_data: dict):
         if factsheet_data:
             robot.status.factsheet.agv_class = factsheet_data.get("agv_class", robot.status.factsheet.agv_class)
             _apply_factsheet_limits(robot.status.factsheet, factsheet_data)
-            robot.status.factsheet.custom_actions = _custom_actions(factsheet_data)
+            listed = _custom_actions(factsheet_data)
+            if listed is not None:
+                robot.status.factsheet.custom_actions = listed
             await service.database.update_status_fields(
                 RobotObjectV1, robot.name,
                 {"factsheet": json.loads(robot.status.factsheet.json())}, publisher_id)
@@ -2601,7 +2608,7 @@ async def create_robot(robot_data: dict):
         if factsheet_data:
             status.factsheet.agv_class = factsheet_data.get("agv_class", "")
             _apply_factsheet_limits(status.factsheet, factsheet_data)
-            status.factsheet.custom_actions = _custom_actions(factsheet_data)
+            status.factsheet.custom_actions = _custom_actions(factsheet_data) or []
         # status, lifecycle and the dispatcher-owned spec fields are server-owned: they
         # come after **robot_data so a caller cannot set them
         for owned in ROBOT_SERVER_OWNED_SPEC_FIELDS:

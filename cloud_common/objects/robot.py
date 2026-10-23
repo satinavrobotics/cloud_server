@@ -83,6 +83,21 @@ class CustomActionV1(pydantic.BaseModel):
     icon_hint: Optional[str] = None
 
 
+class FactsheetSourceV1(pydantic.BaseModel):
+    """Where the stored factsheet came from: the last factsheet message the dispatcher read
+    (docs/node_policies_v2_plan.md, step 1.2)."""
+    received_at: Optional[datetime.datetime] = None
+    topic: str = ""
+    retained: Optional[bool] = None
+    header_id: Optional[int] = None
+    timestamp: str = ""
+    manufacturer: str = ""
+    serial_number: str = ""
+    # Where the listed actions were found: top-level `actions`, protocolFeatures.agvActions.
+    actions_top_level: Optional[int] = None
+    actions_agv_actions: Optional[int] = None
+
+
 class RobotTypeIdentifierV1(pydantic.BaseModel):
     agv_class: str = ""
     speed_max: float = -1
@@ -115,6 +130,10 @@ class RobotTypeIdentifierV1(pydantic.BaseModel):
         "-1 until the robot has sent it.")
     custom_actions: List[CustomActionV1] = pydantic.Field(
         [], description="List of custom VDA5050 actions available on this robot")
+    source: Optional[FactsheetSourceV1] = pydantic.Field(
+        None, description="The last factsheet message this was read from (topic, receive time, "
+                          "headerId, timestamp, manufacturer, serialNumber); None for a robot "
+                          "known only from registration.")
 
 
 # Factsheet limits kept as reported: (RobotTypeIdentifierV1 field, VDA5050 physicalParameters
