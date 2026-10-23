@@ -21,8 +21,12 @@ _log = logging.getLogger(__name__)
 # the dispatcher never sends more.
 NODE_POLICY_MAX_WAIT_CAP_S = 120.0
 NODE_POLICY_MAX_WAIT_DEFAULT_S = 10.0
-# The widest corridorWidth (per side, m) we send: the robot team's contract (2026-10-23).
+# The robot team's contract (2026-10-23), numbers the robot owns: the widest corridorWidth (per
+# side, m) we send; the corridor the robot assumes when an order gives none; what it subtracts
+# from a corridor for its own pose error.
 NODE_POLICY_CORRIDOR_CAP_M = 1.5
+NODE_POLICY_CORRIDOR_DEFAULT_M = 0.75
+NODE_POLICY_LOCALISATION_MARGIN_M = 0.10
 
 
 def _float(name: str, default: float) -> float:

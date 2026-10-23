@@ -83,18 +83,6 @@ async def test_unknown_robot_width_means_not_skippable_and_says_so(on):
 
 
 @pytest.mark.unit
-async def test_skip_switch_off_still_plans_the_corridors(on, monkeypatch):
-    """The corridor is the robot's gate: only the dispatcher's wire forces skippable false."""
-    monkeypatch.setattr(config, "NODE_POLICY_SKIP_ENABLED", False)
-    svc = _service(FakeStore(FakeGraph()))
-    robot = await svc.get_robot_status("r1")
-    robot.status.factsheet.width = 0.4
-    out = await _plan(svc)
-    assert out["node_policy"]["corridor"]["measured"] == len(out["waypoints"]) - 1
-    assert all(w.corridor_width_m == 0.17 for w in out["waypoints"][:-1])
-
-
-@pytest.mark.unit
 async def test_legacy_fallback_reports_the_real_reason_nothing_is_skippable(on):
     store = FakeStore(FakeGraph())
     store.version = None                      # no graph

@@ -3105,6 +3105,13 @@ async def list_missions():
     return [mission.dict() for mission in missions]
 
 
+def _with_node_policy_summary(mission, body: dict) -> dict:
+    """`body` plus what the mission's last sent order said in its nodePolicy actions."""
+    sent = mission.status.sent_order
+    body["node_policy_summary"] = sent.node_policy_summary() if sent else None
+    return body
+
+
 @app.get("/api/v1/missions/{mission_name}")
 async def get_mission(mission_name: str):
     """
@@ -3115,10 +3122,7 @@ async def get_mission(mission_name: str):
     _require_service()
 
     mission = await service.database.get_object(MissionObjectV1, mission_name)
-    result = mission.dict()
-    sent = mission.status.sent_order
-    result["node_policy_summary"] = sent.node_policy_summary() if sent else None
-    return result
+    return _with_node_policy_summary(mission, mission.dict())
 
 
 @app.get("/api/v1/missions/{mission_name}/status")
@@ -3127,10 +3131,7 @@ async def get_mission_status(mission_name: str):
     _require_service()
 
     mission = await service.database.get_object(MissionObjectV1, mission_name)
-    result = mission.status.dict()
-    sent = mission.status.sent_order
-    result["node_policy_summary"] = sent.node_policy_summary() if sent else None
-    return result
+    return _with_node_policy_summary(mission, mission.status.dict())
 
 
 @app.post("/api/v1/missions", response_model=dict)

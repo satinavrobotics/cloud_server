@@ -557,12 +557,12 @@ class Robot:
     # An order the robot has not adopted yet is sent again with exponential back-off
     # (base * 2^resends, capped), not on every state message. See _resend_due().
     ORDER_RESEND_BASE_S = 1.0
-    # A pose older than this is not trusted to decide which waypoints are already behind the robot.
-    ORDER_START_POSE_MAX_AGE_S = 5.0
     ORDER_RESEND_MAX_S = 8.0
     # At most this many identical resends of one order the robot has not adopted; the
     # mission then fails after MAX_ORDER_MISMATCHES state messages as before.
     ORDER_MAX_RESENDS = 3
+    # A pose older than this is not trusted to decide which waypoints are already behind the robot.
+    ORDER_START_POSE_MAX_AGE_S = 5.0
     # The mismatch count alone is per state message, so a robot streaming state fast would
     # reach MAX_ORDER_MISMATCHES before the resends above are through. The give-up also
     # needs this long since the order was last (re)sent -- longer than the largest resend
@@ -1805,9 +1805,6 @@ class Robot:
         listed = any(a.action_type == types.NODE_POLICY_ACTION_TYPE
                      for a in self._robot_object.status.factsheet.custom_actions or [])
         return listed, "factsheet_lists_it" if listed else "factsheet_does_not_list_nodepolicy"
-
-    def _sends_node_policy(self) -> bool:
-        return self._node_policy_decision()[0]
 
     def _note_unusable_skips(self, mission_node: mission_object.MissionNodeV1,
                              route: mission_object.MissionRouteNodeV1) -> None:

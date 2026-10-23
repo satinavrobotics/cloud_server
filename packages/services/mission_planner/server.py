@@ -403,7 +403,6 @@ class MissionPlannerService:
         user = [w.copy() for w in waypoints if w.origin != common.WAYPOINT_ORIGIN_PLANNED]
         gap_fill = insert_planned and config.NODE_POLICY_GAP_FILL_ENABLED and len(user) >= 2
         base = user if gap_fill else [w.copy() for w in waypoints]
-        wants_corridor = True
         report: Dict[str, Any] = {"total": 0, "skippable": 0, "unavailable": None}
 
         def unchanged(reason: str) -> Dict[str, Any]:
@@ -413,8 +412,6 @@ class MissionPlannerService:
 
         if not config.SCENE_GRAPH_PLANNER_ENABLED:
             return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
-        if not gap_fill and not wants_corridor:
-            return unchanged(node_policy_plan.UNAVAILABLE_DISABLED)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(config.SCENE_GRAPH_TOTAL_BUDGET_S)
         try:
@@ -445,13 +442,9 @@ class MissionPlannerService:
                     pull, safety, routes)
             wanted = [i for i, w in enumerate(poses[:-1])
                       if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
-            if wants_corridor:
-                rep = node_policy_plan.annotate_corridors(
-                    graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
-                    config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes)
-            else:
-                rep = {"total": len(wanted), "skippable": 0,
-                       "unavailable": node_policy_plan.UNAVAILABLE_DISABLED}
+            rep = node_policy_plan.annotate_corridors(
+                graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
+                config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes)
             return poses, inserted, rep
 
         try:

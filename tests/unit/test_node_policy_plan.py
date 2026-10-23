@@ -1,6 +1,7 @@
 """Planner side of the nodePolicy skip data: corridor width from the scene graph, go-here
 marking, planned waypoints between operator waypoints (docs/node_policies_2026-10-13.md)."""
 import math
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -233,3 +234,32 @@ def test_go_here_plan_without_the_cfg_is_unchanged():
                                      lambda x, y: f"n{next(ids)}", 0.5, 1.5, 3.0)
     assert plan.node_policy is None
     assert all(w.skippable is None and w.corridor_width_m is None for w in plan.waypoints)
+
+
+@pytest.mark.unit
+def test_a_failed_remeasure_keeps_a_measured_no_room_corridor():
+    poses = _poses(0.05, 3.0, 8.0)
+    poses[1].corridor_width_m = 0.0
+    report = npp.annotate_corridors(StripGraph(fail_routes=True), poses, [1], 0.6, 0.05, 0.5)
+    assert poses[1].corridor_width_m == 0.0 and poses[1].skippable is False
+    assert report["corridor"] == {"measured": 0, "narrow": 1, "unknown": 1}   # waypoint 0 was never measured
+
+
+@pytest.mark.unit
+def test_a_new_measurement_replaces_an_old_no_room_corridor():
+    poses = _poses(0.05, 3.0, 8.0)
+    poses[1].corridor_width_m = 0.0
+    npp.annotate_corridors(StripGraph(), poses, [1], 0.6, 0.05, 0.5)
+    assert poses[1].corridor_width_m == 0.47 and poses[1].skippable is True
+
+
+@pytest.mark.unit
+def test_legs_cut_by_the_time_budget_are_reported_as_budget_not_unmeasurable():
+    class Slow(StripGraph):
+        def route(self, *a, **kw):
+            time.sleep(0.03)
+            return super().route(*a, **kw)
+    poses = _poses(0.05, 3.0, 5.0, 8.0, 12.0)
+    report = npp.annotate_corridors(Slow(), poses, [1, 2, 3], 0.6, 0.05, 0.5, budget_s=0.01)
+    assert report["unavailable"] == npp.UNAVAILABLE_BUDGET
+    assert report["corridor"]["unknown"] > 0

@@ -8,11 +8,8 @@ import math
 from typing import Optional, Sequence, Tuple
 
 from cloud_common.objects import common
-
-# The robot's corridor when the order gives none (the contract's "missing = unknown").
-DEFAULT_CORRIDOR_M = 0.75
-# The robot subtracts this from a corridor for its own pose error.
-LOCALISATION_MARGIN_M = 0.10
+from packages.controllers.mission.order_policy import NODE_POLICY_CORRIDOR_DEFAULT_M, \
+    NODE_POLICY_LOCALISATION_MARGIN_M
 
 
 def _unit(dx: float, dy: float) -> Optional[Tuple[float, float]]:
@@ -43,8 +40,8 @@ def is_passed(waypoints: Sequence[common.Pose2D], j: int, x: float, y: float,
     if math.hypot(x - here.x, y - here.y) <= deviation_xy_m:
         return True
     corridor = here.corridor_width_m
-    corridor = DEFAULT_CORRIDOR_M if corridor is None else corridor
-    room = corridor - LOCALISATION_MARGIN_M
+    corridor = NODE_POLICY_CORRIDOR_DEFAULT_M if corridor is None else corridor
+    room = corridor - NODE_POLICY_LOCALISATION_MARGIN_M
     if not math.isfinite(room) or room <= 0:
         return False                      # measured, no room: the distance rule only
     normal = _gate_normal(waypoints, j)
