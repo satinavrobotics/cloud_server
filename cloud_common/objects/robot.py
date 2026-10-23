@@ -250,6 +250,11 @@ class RobotSpecV1(pydantic.BaseModel):
                            "for that state, previously only reachable by hand-publishing "
                            "MQTT."
     )
+    node_policy: Optional[Literal['on', 'off']] = pydantic.Field(
+        None, description="Per-robot override of VDA5050_NODE_POLICY_MODE: 'on' sends this robot "
+                          "nodePolicy actions (gates, corridors, maxWaitS) whatever its factsheet "
+                          "lists, 'off' never does; unset follows the server's mode "
+                          "(docs/node_policies_v2_plan.md, step 1.1).")
     current_model: Optional[str] = pydantic.Field(
         None, description="The model the robot currently has loaded/active. "
                           "Reported by the orchestrator at registration and on change."
@@ -281,7 +286,7 @@ class RobotSpecV1(pydantic.BaseModel):
 
 # Spec fields a client may set with PUT /api/v1/robots/{name}; any other key is a 400.
 EDITABLE_ROBOT_SPEC_FIELDS = ("labels", "battery", "heartbeat_timeout", "switch_teleop",
-                              "current_model", "position_mode", "ip_address",
+                              "current_model", "position_mode", "node_policy", "ip_address",
                               "entrypoint_port", "telemetry_recording")
 # Spec fields written by the server only (needs_order_cancel by POST .../cancel-order, the
 # datum fields by mission-dispatch): a registration body cannot set them either.

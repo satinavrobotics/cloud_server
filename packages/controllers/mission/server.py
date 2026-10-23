@@ -1760,17 +1760,29 @@ class Robot:
                 f"{order_id} waits: send cancel order action", ours=OURS_DISPATCHER):
             self._order_gate_since = now
 
-    def _sends_node_policy(self) -> bool:
-        """Whether route orders to this robot carry nodePolicy actions: per
-        VDA5050_NODE_POLICY_MODE, by default only to a robot whose factsheet lists the
-        action (one that does not know it may reject the order)."""
+    def _node_policy_decision(self) -> Tuple[bool, str]:
+        """Whether route orders to this robot carry nodePolicy actions, and why: the robot's
+        own `node_policy` setting first, else VDA5050_NODE_POLICY_MODE (by default only to a
+        robot whose factsheet lists the action; one that does not know it may reject the
+        order)."""
+        spec = getattr(self._robot_object, "node_policy", None)
+        if spec == "on":
+            return True, "robot_spec_on"
+        if spec == "off":
+            return False, "robot_spec_off"
         mode = order_policy.current().node_policy_mode
         if mode == order_policy.NodePolicyMode.ON:
-            return True
-        if mode != order_policy.NodePolicyMode.FACTSHEET or self._robot_object is None:
-            return False
-        return any(a.action_type == types.NODE_POLICY_ACTION_TYPE
-                   for a in self._robot_object.status.factsheet.custom_actions or [])
+            return True, "mode_on"
+        if mode == order_policy.NodePolicyMode.OFF:
+            return False, "mode_off"
+        if self._robot_object is None:
+            return False, "no_robot"
+        listed = any(a.action_type == types.NODE_POLICY_ACTION_TYPE
+                     for a in self._robot_object.status.factsheet.custom_actions or [])
+        return listed, "factsheet_lists_it" if listed else "factsheet_does_not_list_nodepolicy"
+
+    def _sends_node_policy(self) -> bool:
+        return self._node_policy_decision()[0]
 
     def _note_unusable_skips(self, mission_node: mission_object.MissionNodeV1,
                              route: mission_object.MissionRouteNodeV1) -> None:
@@ -1833,9 +1845,12 @@ class Robot:
                                   f"({skipped} already passed by the robot at order start)")
             self.mission_info(f"Sending mission route node {mission_node.name}"
                               f"{f' from waypoint {offset}' if offset else ''}")
-            sends_policy = self._sends_node_policy()
+            sends_policy, why = self._node_policy_decision()
             if sends_policy:
                 self._note_unusable_skips(mission_node, route)
+            else:
+                self.warning(f"[{self._current_mission.name}] Route {mission_node.name}: no "
+                             f"nodePolicy in this order ({why}); the robot holds no node")
             return types.VDA5050Order.from_route(route, self._robot_object,
                                                  self._order_prefix(), idx,
                                                  node_policy=sends_policy), \

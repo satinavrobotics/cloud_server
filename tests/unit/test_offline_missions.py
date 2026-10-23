@@ -393,6 +393,37 @@ async def test_node_policy_is_sent_per_mode_and_factsheet(monkeypatch, mode, adv
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("spec, mode, advertised, expected, why", [
+    ("on", "off", [], True, "robot_spec_on"),
+    ("on", "factsheet", [], True, "robot_spec_on"),
+    ("off", "on", ["nodePolicy"], False, "robot_spec_off"),
+    (None, "on", [], True, "mode_on"),
+    (None, "off", ["nodePolicy"], False, "mode_off"),
+    (None, "factsheet", ["nodePolicy"], True, "factsheet_lists_it"),
+    (None, "factsheet", [], False, "factsheet_does_not_list_nodepolicy"),
+])
+async def test_the_robots_own_node_policy_setting_comes_first(
+        monkeypatch, spec, mode, advertised, expected, why):
+    monkeypatch.setattr(order_policy, "_current",
+                        order_policy.OrderPolicy(node_policy_mode=mode))
+    r, _ = _make_robot()
+    r._robot_object.node_policy = spec
+    _factsheet_robot(r, advertised)
+    assert r._node_policy_decision() == (expected, why)
+
+
+@pytest.mark.unit
+async def test_a_withheld_node_policy_says_why_in_the_mission_log(monkeypatch, caplog):
+    monkeypatch.setattr(order_policy, "_current",
+                        order_policy.OrderPolicy(node_policy_mode="factsheet"))
+    r, _ = _make_robot()
+    with caplog.at_level("WARNING"):
+        await _start(r, _mission(tree=_tree(_route("a", n=3))))
+    assert "factsheet_does_not_list_nodepolicy" in caplog.text
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
 async def test_a_resend_carries_the_same_node_policy_ids(monkeypatch):
     monkeypatch.setattr(order_policy, "_current",
                         order_policy.OrderPolicy(node_policy_mode="on"))
