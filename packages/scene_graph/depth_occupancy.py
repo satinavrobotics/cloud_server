@@ -21,6 +21,7 @@ import numpy as np
 UNKNOWN = 255
 OCCUPIED = 100
 FREE = 0
+RAY_CELLS = 2_000_000       # ray samples per chunk of the free-space march (~50 MB of float64 temporaries)
 
 
 def quat_matrix(x, y, z, w):
@@ -55,8 +56,11 @@ def floor_level(heights, search=0.4, bin_m=0.02, refine=0.04):
 
 
 def occupancy_from_depth(depth_u16, depth_scale, camera, t_base_cam, pose3d_map, origin, shape=(200, 200), res=0.05,
-                         robot_height=0.5, floor_tolerance=0.08, min_points=1):
-    """Window u8 [rows, cols] with cell (0, 0) at `origin` (map frame, metres)."""
+                         robot_height=0.5, floor_tolerance=0.08, min_points=1, ray_cells=None):
+    """Window u8 [rows, cols] with cell (0, 0) at `origin` (map frame, metres). `ray_cells` (default RAY_CELLS)
+    bounds the memory of the free-ray march (samples per chunk); it does not change the result."""
+    if ray_cells is None:
+        ray_cells = RAY_CELLS
     rows, cols = shape
     pts, cam = points_in_map(depth_u16, depth_scale, camera, t_base_cam, pose3d_map)
     out = np.full(shape, UNKNOWN, np.uint8)
@@ -79,9 +83,13 @@ def occupancy_from_depth(depth_u16, depth_scale, camera, t_base_cam, pose3d_map,
         n = int(L.max() / step) + 1
         t = (np.arange(n) * step)[None, :]
         unit = d / np.maximum(L[:, None], 1e-9)
-        keep = t < (L[:, None] - res / 2)
-        X = cam[0] + unit[:, 0:1] * t; Y = cam[1] + unit[:, 1:2] * t
-        a, b = ix(X[keep]), iy(Y[keep]); k = inb(a, b); free[b[k], a[k]] = True
+        # rays in chunks of at most `ray_cells` samples: one image can hold 1e5 hits x 400 steps, gigabytes at once
+        rows_per = max(1, int(ray_cells) // n)
+        for s in range(0, len(hit), rows_per):
+            u_, l_ = unit[s:s + rows_per], L[s:s + rows_per, None]
+            keep = t < (l_ - res / 2)
+            X = cam[0] + u_[:, 0:1] * t; Y = cam[1] + u_[:, 1:2] * t
+            a, b = ix(X[keep]), iy(Y[keep]); k = inb(a, b); free[b[k], a[k]] = True
     out[free | (fl > 0)] = FREE
     out[occ >= min_points] = OCCUPIED
     return out
