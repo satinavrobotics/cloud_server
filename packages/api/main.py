@@ -868,6 +868,55 @@ async def get_map_occupancy_chunk(map_id: str, cx: str, cy: str, version: Option
     return Response(content=body, media_type="application/octet-stream", headers=headers)
 
 
+# ==================== Scene graph + occupancy grid from depth only ====================
+# packages/api/depth_rebuild.py: writes the `occupancy_depth` layer on the nodes that have depth and no
+# costmap; the scene-graph worker folds it. Errors carry {code, message}: 404 map_not_found /
+# session_not_found / no_active_job, 409 map_deleting / session_active / no_depth / job_active (with the job).
+
+_depth_rebuild_jobs: Optional[Any] = None
+
+
+def _depth_rebuild():
+    global _depth_rebuild_jobs
+    _require_service()
+    if _depth_rebuild_jobs is None:
+        from packages.api import depth_rebuild
+        from packages.config import SCENE_GRAPH_WORKER_ENABLED
+        if getattr(service, "graph_db", None) is None or getattr(service, "database", None) is None:
+            raise HTTPException(status_code=503, detail={"code": "unavailable",
+                                                         "message": "The map databases are not up yet"})
+        _depth_rebuild_jobs = depth_rebuild.create(service.database, service.graph_db, service.image_db,
+                                                   SCENE_GRAPH_WORKER_ENABLED)
+    return _depth_rebuild_jobs
+
+
+class RebuildFromDepthRequest(BaseModel):
+    session_id: Optional[str] = Field(None, description="Only this session's nodes; default the whole map")
+
+
+@app.post("/api/v1/maps/{map_id}/scene-graph/rebuild-from-depth", status_code=202)
+async def start_rebuild_from_depth(map_id: str, body: Optional[RebuildFromDepthRequest] = None,
+                                   response: Response = None):
+    """(Re)create the map's scene graph and occupancy grid from depth only, for nodes without a costmap.
+    202 + the job; 200 + the job when one with the same scope already runs (idempotent)."""
+    status, job = await _site_call("start rebuild from depth", _depth_rebuild().start(
+        map_id, body.session_id if body else None, recording.request_actor()))
+    response.status_code = status
+    return job
+
+
+@app.get("/api/v1/maps/{map_id}/scene-graph/rebuild-from-depth")
+async def get_rebuild_from_depth(map_id: str):
+    """{map_name, worker_enabled, job}: the map's latest rebuild-from-depth job in this API process (null: none)."""
+    return _depth_rebuild().status(map_id)
+
+
+@app.post("/api/v1/maps/{map_id}/scene-graph/rebuild-from-depth/cancel")
+async def cancel_rebuild_from_depth(map_id: str):
+    """Ask the running job to stop after its current node (written layers stay). 404 no_active_job."""
+    return _depth_rebuild().cancel(map_id)
+
+
 @app.get("/api/v1/maps/{map_id}/blocked-nodes")
 async def list_blocked_nodes(map_id: str, with_chart_keys: bool = False):
     """The map's graph nodes a robot reported blocked whose exclusion has not expired: the

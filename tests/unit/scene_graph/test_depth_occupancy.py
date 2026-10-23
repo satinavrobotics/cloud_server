@@ -74,3 +74,10 @@ def test_floor_level_is_the_dominant_plane():
 def test_empty_depth_is_all_unknown():
     w = _run(np.zeros((336, 448), np.uint16))
     assert (w == UNKNOWN).all()
+
+
+def test_chunked_ray_march_gives_the_same_window():
+    depth = _scene(wall_x=3.0, box=(1.5, 1.8, -0.3, 0.3, 0.0, 0.3))
+    whole = _run(depth, ray_cells=10 ** 12)
+    for cells in (1, 997, 50_000):
+        assert np.array_equal(_run(depth, ray_cells=cells), whole)

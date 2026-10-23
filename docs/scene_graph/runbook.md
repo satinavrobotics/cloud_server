@@ -253,6 +253,22 @@ Both live in `mapobjectv1.status` (jsonb). There is no API for either yet; use S
   `python -m tools.scene_graph_clear_stale_pending --apply` is run in the graph-builder container (dry run without `--apply`).
 * There is no supported standalone "drop the graph" tool; the graph is removed by the map delete saga only.
 
+### 3a. Scene graph and occupancy grid from depth only (no costmap uploaded)
+
+A map recorded without costmaps has no occupancy-role layer on its nodes, so the worker folds nothing and there is no
+scene graph or occupancy grid. `POST /api/v1/maps/{map}/scene-graph/rebuild-from-depth` (body `{session_id?}`;
+`packages/api/depth_rebuild.py`; the client's map Details row "Scene graph") writes the `occupancy_depth` layer
+(`packages/scene_graph/depth_occupancy.py`, the rule of the offline `depth_occupancy_backfill.py`) on every node in scope
+with a depth record and no `occupancy` / `occupancy_depth` layer: PNG first, then the record through `set_node_costmaps`,
+which stamps `costmap_stored_ms`, so the worker picks the nodes up by itself (no rebuild request needed). The robot's
+`occupancy` layer is never touched and wins where both exist. Running it again writes nothing new. The job then waits
+(at most 10 min) until `sg_meta.cursor` reaches the newest occupancy record in scope (`fold.state`: caught_up | timeout |
+worker_off | map_disabled | not_needed). `GET` the same path for the job (`progress`, `generated`, `skipped`,
+`failed_by_reason`, `failures`, `fold`, `warnings`, `error`); `POST .../cancel` stops it after the current node.
+Refused while a mapping session of the map (or the given session) is recording (409 `session_active`), and with no
+depth in scope (409 `no_depth`). The job registry is in memory: an API restart forgets it (run it again).
+Nodes whose depth record lacks `pose3d_map` (the robot sent no `robot_pose3d`) cannot be generated (`no_pose3d`).
+
 ## 4. Rollout and rollback
 
 **Roll out** per map: backfill -> enable -> verify -> (later, globally) planner flag. Keep the planner off until the
