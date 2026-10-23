@@ -59,6 +59,7 @@ async def lifespan(app: FastAPI):
         kind="robot" if os.getenv("SERVER_KIND", "").lower() == "robot" else "cloud",
         deploy_root=os.getenv("DEPLOY_ROOT", "/cloud_server"),
         trust_tailnet=os.getenv("OPERATIONS_TRUST_TAILNET", "").lower() in ("true", "1", "yes"),
+        trust_lan=os.getenv("OPERATIONS_TRUST_LAN", "").lower() in ("true", "1", "yes"),
         gateway_url=gateway,
         config_profile=os.getenv("CONFIG_PROFILE", ""),
         config_hash=os.getenv("CONFIG_HASH", ""),

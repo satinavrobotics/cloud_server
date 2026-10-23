@@ -41,13 +41,16 @@ ACTIVE_STATES = ("RUNNING", "PENDING")
 TAILNET = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
 
 
-def trusted_caller(ip: Optional[str]) -> bool:
-    """A tailnet peer, or the machine itself. `ip` is the caller's address as the gateway saw it (X-Real-IP), never a client claim."""
+LAN = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fe80::/10"))
+
+
+def trusted_caller(ip: Optional[str], lan: bool = False) -> bool:
+    """A tailnet peer, the machine itself, and (lan=True) a private-range LAN address. `ip` is the caller's address as the gateway saw it (X-Real-IP), never a client claim."""
     try:
         addr = ipaddress.ip_address((ip or "").strip())
     except ValueError:
         return False
-    return addr.is_loopback or any(addr in net for net in TAILNET)
+    return addr.is_loopback or any(addr in net for net in TAILNET) or (lan and any(addr in net for net in LAN))
 
 
 class OperationError(Exception):
@@ -72,13 +75,14 @@ def _fetch_missions(url: str, timeout: float = 6.0):
 
 class Operations:
     def __init__(self, docker: DockerActor, diagnostics: DiagnosticsService, *, enabled: bool, token: str, kind: str,
-                 deploy_root: str, trust_tailnet: bool = False, gateway_url: str = "", fetch_missions: Optional[Callable] = None,
+                 deploy_root: str, trust_tailnet: bool = False, trust_lan: bool = False, gateway_url: str = "", fetch_missions: Optional[Callable] = None,
                  config_profile: str = "", config_hash: str = "", running_overrides: str = "",
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic):
         self._docker, self._diag = docker, diagnostics
         self._token = token or ""
         self._trust_tailnet = bool(trust_tailnet)
-        self._enabled = bool(enabled and (self._token or self._trust_tailnet))
+        self._trust_lan = bool(trust_lan)
+        self._enabled = bool(enabled and (self._token or self._trust_tailnet or self._trust_lan))
         if enabled and not self._enabled:
             log.warning("OPERATIONS_ENABLED is set without OPERATIONS_TOKEN or OPERATIONS_TRUST_TAILNET: operations stay off")
         self._kind, self._root = kind, deploy_root.rstrip("/")
@@ -91,7 +95,7 @@ class Operations:
 
     # ---- who may
     def token_required(self, caller_ip: Optional[str]) -> bool:
-        return not (self._trust_tailnet and trusted_caller(caller_ip))
+        return not ((self._trust_tailnet or self._trust_lan) and trusted_caller(caller_ip, lan=self._trust_lan))
 
     def authorize(self, token: Optional[str], caller_ip: Optional[str] = None) -> None:
         if not self._enabled:

@@ -33,6 +33,11 @@ the app, or OIDC), then per-role limits for the dangerous routes (operations, or
 still guards callers that are not on the tailnet. To require the token everywhere: set `OPERATIONS_TRUST_TAILNET=false` in the profiles
 and render; the app then asks for the token once per server.
 
+### 5a. ...and from the robot's LAN (2026-10-23)
+`OPERATIONS_TRUST_LAN=true` (pi4/pi5 profiles, decided 2026-10-23): a caller with a private LAN address (10/8, 172.16/12, 192.168/16, link-local)
+also needs no token, so the app can restart and change settings over the robot's LAN. Anyone plugged into that network can do it. Not set on the
+cloud server. To undo: set `OPERATIONS_TRUST_LAN=false` and render.
+
 ## 5b. Settings can be changed from the tailnet too
 The same rule as item 5 covers `PUT /operations/config`: a tailnet peer can change a robot's memory limits and caches (an allowlisted set, bounded,
 never secrets, addresses or identity) and apply them by redeploying. A bad choice can starve a service, not open anything up. Same fix as item 5.

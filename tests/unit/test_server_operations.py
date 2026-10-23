@@ -66,11 +66,11 @@ class FakeEngine:
         self.containers.pop(cid, None)
 
 
-def make(kind="robot", missions=(), enabled=True, token="tok", containers=None, trust_tailnet=False):
+def make(kind="robot", missions=(), enabled=True, token="tok", containers=None, trust_tailnet=False, trust_lan=False):
     engine = FakeEngine(containers if containers is not None else fleet())
     diag = DiagnosticsService(engine, host_reader=lambda: {})
     data = None if missions is None else [{"status": {"state": s}} for s in missions]
-    ops = Operations(engine, diag, enabled=enabled, token=token, kind=kind, deploy_root="/cloud_server/", trust_tailnet=trust_tailnet,
+    ops = Operations(engine, diag, enabled=enabled, token=token, kind=kind, deploy_root="/cloud_server/", trust_tailnet=trust_tailnet, trust_lan=trust_lan,
                      gateway_url="http://gw", fetch_missions=lambda url: data, sleep=lambda s: None)
     return ops, engine
 
@@ -140,6 +140,24 @@ class TestTailnetTrust:
         ops, _ = make(trust_tailnet=False)
         with pytest.raises(OperationError):
             ops.authorize(None, "100.116.20.49")
+
+    @pytest.mark.parametrize("ip", ["192.168.1.60", "10.1.2.3", "172.16.5.5", "172.31.255.1", "169.254.1.1", "fe80::1"])
+    def test_a_lan_caller_needs_no_token_when_the_lan_is_trusted(self, ip):
+        ops, _ = make(trust_tailnet=True, trust_lan=True)
+        ops.authorize(None, ip)
+        assert ops.info(ip)["token_required"] is False
+
+    @pytest.mark.parametrize("ip", ["8.8.8.8", "172.32.0.1", "11.0.0.1", "", None, "garbage", "192.168.1.60, 8.8.8.8"])
+    def test_a_trusted_lan_does_not_open_it_to_anyone_else(self, ip):
+        ops, _ = make(trust_tailnet=True, trust_lan=True)
+        with pytest.raises(OperationError) as e:
+            ops.authorize(None, ip)
+        assert (e.value.status, e.value.code) == (401, "bad_token")
+
+    def test_the_lan_is_not_trusted_unless_asked(self):
+        ops, _ = make(trust_tailnet=True)
+        with pytest.raises(OperationError):
+            ops.authorize(None, "192.168.1.60")
 
     def test_trust_alone_switches_the_feature_on_and_leaves_others_locked_out(self):
         ops, _ = make(token="", trust_tailnet=True)
