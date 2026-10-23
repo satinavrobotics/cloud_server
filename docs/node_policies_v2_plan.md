@@ -102,7 +102,8 @@ _Status: 3.1 and 3.2 done on `feature/node-policies-v2` (reasons also include `g
 - **3.2 API summary.** The mission GET carries `node_policy_summary` (counts by reason for the current order). The client display follows in sati-client, as a separate task.
 - **3.3 Analytics note.** Document in `path_efficiency_2026-10-15.md` that per-leg values have a boundary error of up to the corridor width under gates. Check the `EFFICIENCY_MIN_COVERAGE` rejection rate on the first gate run before changing anything.
 
-### Phase 4: W9 waypoint placement (investigation first; needs the Pi online)
+### Phase 4: W9 waypoint placement
+_Status: investigated 2026-10-23, see `waypoint_placement_findings_2026-10-23.md`. Outcome: stale stored routes, handled on the robot side; no cloud-side nudging; spur tips kept open. The text below is the original plan._
 - **4.1** For each robot-team case (run 140048: 18 lethal goal cells and 3 spur tips; run 123410: 4 cases), find the waypoint in the stored mission. Then classify:
   - its origin: operator, gap fill, go-to chart, or legacy;
   - its static clearance in the map: does the occupancy say lethal, or was it a person?
