@@ -48,6 +48,7 @@ from packages.controllers.mission import fleet_recorder
 from packages.controllers.mission import lifecycle
 from packages.controllers.mission import order_ids
 from packages.controllers.mission import order_policy
+from packages.controllers.mission import order_start
 from packages.controllers.mission import planner_client
 from packages.controllers.mission import run_change
 from packages.events.codes import EventCode, Source
@@ -555,6 +556,8 @@ class Robot:
     # An order the robot has not adopted yet is sent again with exponential back-off
     # (base * 2^resends, capped), not on every state message. See _resend_due().
     ORDER_RESEND_BASE_S = 1.0
+    # A pose older than this is not trusted to decide which waypoints are already behind the robot.
+    ORDER_START_POSE_MAX_AGE_S = 5.0
     ORDER_RESEND_MAX_S = 8.0
     # At most this many identical resends of one order the robot has not adopted; the
     # mission then fails after MAX_ORDER_MISMATCHES state messages as before.
@@ -665,6 +668,8 @@ class Robot:
         self._start_retry_at = 0.0  # monotonic
         # The frame the last route was converted into (see _route_in_robot_frame).
         self._last_route_frame: Optional[Dict[str, Any]] = None
+        # When the robot's pose was last taken from a state message (monotonic).
+        self._pose_at: Optional[float] = None
         self._robot_server = server
         self._alive = True
         # VDA5050 headerIds count per topic; see _next_header_id().
@@ -1698,6 +1703,7 @@ class Robot:
                 if built is None:
                     return
                 order, record = built
+                self._mark_skipped_waypoints_reached(mission_node, waypoint_offset, record)
                 # Stored before it goes out, so the robot's reports on it are read right,
                 # also by a dispatcher restarted meanwhile. Not stored: owed, not sent.
                 if not await self._persist_sent_order(record):
@@ -1785,6 +1791,19 @@ class Robot:
                          f"width (no scene graph or width unknown); sent not skippable: "
                          f"{bare[:10]}")
 
+    def _passed_at_start(self, route: mission_object.MissionRouteNodeV1) -> int:
+        """How many leading waypoints of `route` (in the robot's frame) the robot has already
+        passed, so the order leaves them out (order_start). 0 without a fresh, initialized
+        pose, so a stale pose never drops a waypoint."""
+        robot_obj = self._robot_object
+        if robot_obj is None or not robot_obj.status.position_initialized or \
+                self._state_is_after_offline or self._pose_at is None or \
+                time.monotonic() - self._pose_at > self.ORDER_START_POSE_MAX_AGE_S:
+            return 0
+        pose = robot_obj.status.pose
+        return order_start.passed_prefix(route.waypoints, pose.x, pose.y,
+                                         order_policy.current().deviation_xy_pass_m)
+
     async def _build_order(self, mission_node: mission_object.MissionNodeV1, idx: int,
                            waypoint_offset: int) \
             -> Optional[Tuple[types.VDA5050Order, mission_object.MissionSentOrderV1]]:
@@ -1805,6 +1824,13 @@ class Robot:
                 self._refuse_route_node(mission_node, str(err))
                 return None
             record.frame = self._last_route_frame
+            skipped = self._passed_at_start(route)
+            if skipped:
+                route = route.copy(update={"waypoints": route.waypoints[skipped:]})
+                offset += skipped
+                record.waypoint_offset = offset
+                self.mission_info(f"Route {mission_node.name}: starting at waypoint {offset} "
+                                  f"({skipped} already passed by the robot at order start)")
             self.mission_info(f"Sending mission route node {mission_node.name}"
                               f"{f' from waypoint {offset}' if offset else ''}")
             sends_policy = self._sends_node_policy()
@@ -1826,6 +1852,17 @@ class Robot:
             return types.VDA5050Order.from_action(mission_node.action, self._robot_object,
                                                   self._order_prefix(), idx), record
         return None
+
+    def _mark_skipped_waypoints_reached(self, mission_node: mission_object.MissionNodeV1,
+                                        requested_offset: int,
+                                        record: mission_object.MissionSentOrderV1) -> None:
+        """Waypoints the order left out because the robot was already past them count as
+        reached, the same as after a resume, so the client shows them done."""
+        if record.waypoint_offset <= max(requested_offset, 0):
+            return
+        task_status = self._current_mission.status.task_status
+        name = str(mission_node.name)
+        task_status[name] = max(task_status.get(name, -1), record.waypoint_offset - 1)
 
     async def _persist_sent_order(self, record: mission_object.MissionSentOrderV1) -> bool:
         """Store what the order about to be sent is built from. Returns False if it could
@@ -2891,6 +2928,7 @@ class Robot:
         if self._robot_object is not None:
             self._arm_online_watchdog()
             if message.agvPosition:
+                self._pose_at = time.monotonic()
                 self._robot_object.status.pose.x = message.agvPosition.x
                 self._robot_object.status.pose.y = message.agvPosition.y
                 self._robot_object.status.pose.theta = message.agvPosition.theta
