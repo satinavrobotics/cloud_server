@@ -99,6 +99,15 @@ def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None,
         return None
 
 
+def _operator_corridor(pose: common.Pose2D) -> bool:
+    """Whether the waypoint's corridor is the operator's, to be used as it is. A measured one
+    describes the place the waypoint had when it was measured, so it is measured again; a
+    corridor with no source (an operator's typed value, or a route stored before sources
+    existed) counts as the operator's."""
+    return pose.corridor_width_m is not None and \
+        pose.corridor_source != common.CORRIDOR_SOURCE_MEASURED
+
+
 def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Iterable[int],
                        robot_width: Optional[float], margin: float, snap_m: float,
                        budget_s: float = 0.0, keep_intent: bool = False, safety: Any = None,
@@ -110,9 +119,10 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
 
     The corridor of waypoint i is the narrower of the legs i-1 -> i and i -> i+1; waypoint 0 has
     only the leg 0 -> 1 (the edge before it starts at the robot, which the route does not know).
-    A waypoint that already carries its own `corridor_width_m` > 0 keeps it. A leg that
-    cannot be measured leaves the corridor None (unknown), except that a corridor already at 0.0
-    (measured, no room) is never lost to a failed re-measure; a passage with no room for the robot
+    A waypoint with the operator's `corridor_width_m` (any value, 0 included: see
+    `_operator_corridor`) keeps it; one measured earlier is measured again. A leg that cannot be
+    measured leaves the corridor None (unknown), except that a measured 0.0 (no room) is never
+    lost to a failed re-measure; a passage with no room for the robot
     gives 0.0 (measured, never skippable). A candidate without a corridor > 0 becomes
     `skippable=False`, except an operator's waypoint with `keep_intent`: it keeps its
     `skippable=True` (the editor shows what the operator asked; the dispatcher sends it not
@@ -126,7 +136,7 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
     # Only the legs next to a waypoint that has no corridor of its own are routed.
     need: Set[int] = set()
     for i in interior:
-        if not (poses[i].corridor_width_m or 0) > 0:
+        if not _operator_corridor(poses[i]):
             need.update(leg for leg in (i - 1, i) if 0 <= leg < last)
     widths: Dict[int, Optional[float]] = {}
     cut: Set[int] = set()                  # legs not measured because the time budget ran out
@@ -144,8 +154,9 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
     counts = {"measured": 0, "narrow": 0, "unknown": 0}
     for i in interior:
         pose = poses[i]
-        corridor: Optional[float] = pose.corridor_width_m if (pose.corridor_width_m or 0) > 0 else None
-        if corridor is None:
+        operator = _operator_corridor(pose)
+        corridor: Optional[float] = pose.corridor_width_m if operator else None
+        if not operator:
             if robot_width is None or not robot_width > 0:
                 reason = UNAVAILABLE_ROBOT_WIDTH if i in wanted or reason is None else reason
             else:
@@ -155,8 +166,10 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                 if corridor is None:
                     cut_here = any(leg in cut for leg in (i - 1, i))
                     reason = reason or (UNAVAILABLE_BUDGET if cut_here else UNAVAILABLE_WIDTH)
-        # A failed measurement never overwrites a known value: "measured, no room" (0.0) stays.
-        if corridor is None and pose.corridor_width_m == 0:
+        # A failed measurement never overwrites a known "measured, no room" (0.0): wherever the
+        # waypoint now is, no gate is the safe side. A positive one is not kept: it may be for
+        # a place the waypoint has left.
+        if corridor is None and pose.corridor_width_m == 0 and not operator:
             corridor = 0.0
         counts["unknown" if corridor is None else "measured" if corridor > 0 else "narrow"] += 1
         if i in wanted:
@@ -165,6 +178,8 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                 pose.skippable = usable
             done += usable
         pose.corridor_width_m = corridor
+        pose.corridor_source = common.CORRIDOR_SOURCE_OPERATOR if operator else \
+            common.CORRIDOR_SOURCE_MEASURED if corridor is not None else None
     return {"total": len(wanted), "skippable": done, "unavailable": reason, "corridor": counts}
 
 

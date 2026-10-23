@@ -84,3 +84,30 @@ async def preview(planner: Any, map_id: str, raw: List[Dict[str, Any]], return_l
     return {"waypoints": returned, "trajectory": list(result.get("trajectory") or []),
             "issues": list(result.get("issues") or []), "node_policy": policy,
             "planner": PLANNER_SCENE_GRAPH, "reason": None, "graph_version": result.get("graph_version")}
+
+
+async def measure_reroute(planner: Any, robot_name: str, reroute: Dict[str, Any]) -> Dict[str, Any]:
+    """A reroute's routes with their corridors measured again for the waypoints where they are now
+    (`update_nodes` of PUT /missions/{name}): the editor seeds a reroute with the stored route, so
+    a waypoint the operator moved still carries the corridor measured for its old place. The
+    waypoints are not re-planned or moved (`insert_planned` off); an operator's own corridor is
+    kept. A planner that is down, slow or without a scene graph leaves the route as it was given,
+    like a route with nothing to measure. Returns the routes as dicts."""
+    out: Dict[str, Any] = {}
+    for name, route in reroute.items():
+        route = route.dict() if hasattr(route, "dict") else dict(route or {})
+        waypoints = [w if isinstance(w, dict) else w.dict() for w in route.get("waypoints") or []]
+        maps = {w.get("map_id") or "" for w in waypoints}
+        if planner is not None and len(waypoints) >= 2 and len(maps) == 1 and "" not in maps:
+            try:
+                result = await planner.enrich_route(
+                    robot_name, next(iter(maps)), waypoints, insert_planned=False,
+                    timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
+                measured = [w if isinstance(w, dict) else w.dict() for w in result["waypoints"]]
+                if len(measured) == len(waypoints):
+                    waypoints = measured
+            except Exception as err:  # pylint: disable=broad-except
+                _log.warning("Reroute of %s: corridors not measured (%r); route stored as given",
+                             name, err)
+        out[name] = {**route, "waypoints": waypoints}
+    return out

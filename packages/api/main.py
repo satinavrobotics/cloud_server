@@ -3268,6 +3268,8 @@ async def update_mission(mission_name: str, mission_data: dict):
                                ". Send force: true to reroute anyway.",
                     "blocked_nodes": through})
         if reroute:
+            reroute = await route_preview_module.measure_reroute(
+                getattr(service, "mission_planner", None), getattr(mission, "robot", None) or "", reroute)
             # Fold the new routes into mission_tree (validated, planned_path cleared,
             # route_rev bumped) instead of storing the request: the row is what the
             # dispatcher resumes from, and a stored request would be re-applied on

@@ -141,3 +141,19 @@ Each step comes with unit tests (`./scripts/run_unit_tests.sh`). End-to-end chec
 - confirm the first order no longer contains a waypoint behind the robot.
 
 Then compare with the robot team's per-node traversal offsets once their gate is live.
+
+## Corridor provenance (2026-10-23, review follow-up)
+
+A measured corridor describes the place a waypoint had when it was measured. The mission editor
+seeds a reroute with the stored route and a dragged waypoint kept its corridor, which the planner
+then took for the operator's ("a value given here is used as it is") and a reroute is never
+enriched. Fix: `Pose2D.corridor_source` (`measured` | `operator`; unset with a value = the operator's,
+which also covers routes stored before this existed).
+
+- `annotate_corridors` keeps only an operator's corridor (any value, 0 included) and measures the rest
+  again; a failed re-measure keeps a measured 0.0 (no gate is the safe side) but never a positive one.
+- `PUT /missions/{name}` with `update_nodes` measures the new routes' corridors before storing them
+  (`route_preview.measure_reroute`: no re-planning, no moving; planner down or no graph: stored as given).
+- sati-client (`feature/corridor-source`): the editor round-trips `corridor_source`; typing a corridor
+  makes it the operator's, clearing it hands it back to the server.
+- Not covered: a robot-frame (mapless) or mixed-map reroute is not measured (no scene graph to ask).

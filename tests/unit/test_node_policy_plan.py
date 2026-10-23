@@ -239,7 +239,7 @@ def test_go_here_plan_without_the_cfg_is_unchanged():
 @pytest.mark.unit
 def test_a_failed_remeasure_keeps_a_measured_no_room_corridor():
     poses = _poses(0.05, 3.0, 8.0)
-    poses[1].corridor_width_m = 0.0
+    poses[1].corridor_width_m, poses[1].corridor_source = 0.0, "measured"
     report = npp.annotate_corridors(StripGraph(fail_routes=True), poses, [1], 0.6, 0.05, 0.5)
     assert poses[1].corridor_width_m == 0.0 and poses[1].skippable is False
     assert report["corridor"] == {"measured": 0, "narrow": 1, "unknown": 1}   # waypoint 0 was never measured
@@ -248,7 +248,7 @@ def test_a_failed_remeasure_keeps_a_measured_no_room_corridor():
 @pytest.mark.unit
 def test_a_new_measurement_replaces_an_old_no_room_corridor():
     poses = _poses(0.05, 3.0, 8.0)
-    poses[1].corridor_width_m = 0.0
+    poses[1].corridor_width_m, poses[1].corridor_source = 0.0, "measured"
     npp.annotate_corridors(StripGraph(), poses, [1], 0.6, 0.05, 0.5)
     assert poses[1].corridor_width_m == 0.47 and poses[1].skippable is True
 
@@ -263,3 +263,43 @@ def test_legs_cut_by_the_time_budget_are_reported_as_budget_not_unmeasurable():
     report = npp.annotate_corridors(Slow(), poses, [1, 2, 3], 0.6, 0.05, 0.5, budget_s=0.01)
     assert report["unavailable"] == npp.UNAVAILABLE_BUDGET
     assert report["corridor"]["unknown"] > 0
+
+
+@pytest.mark.unit
+def test_the_corridor_source_says_who_set_it():
+    poses = _poses(0.05, 3.0, 8.0)
+    npp.annotate_corridors(StripGraph(), poses, [1], 0.6, 0.05, 0.5)
+    assert [p.corridor_source for p in poses] == ["measured", "measured", None]
+
+
+@pytest.mark.unit
+def test_a_measured_corridor_is_measured_again_where_the_waypoint_is_now():
+    poses = _poses(0.05, 3.0, 8.0)
+    npp.annotate_corridors(StripGraph(), poses, [1], 0.6, 0.05, 0.5)
+    assert poses[1].corridor_width_m == 0.47
+    poses[1].x = 10.0                                  # moved by the operator, corridor left on it
+    npp.annotate_corridors(StripGraph(width_at=lambda x: 0.8 if x > 9 else 1.6), poses, [1],
+                           0.6, 0.05, 0.5)
+    assert poses[1].corridor_width_m == 0.07           # the narrower of the legs at its new place
+
+
+@pytest.mark.unit
+def test_a_stale_measured_corridor_is_not_kept_when_it_cannot_be_measured_again():
+    poses = _poses(0.05, 3.0, 8.0)
+    poses[1].corridor_width_m, poses[1].corridor_source = 0.47, "measured"
+    report = npp.annotate_corridors(StripGraph(fail_routes=True), poses, [1], 0.6, 0.05, 0.5)
+    assert poses[1].corridor_width_m is None and poses[1].corridor_source is None
+    assert poses[1].skippable is False and report["corridor"]["unknown"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("source", ["operator", None])
+@pytest.mark.parametrize("value", [0.3, 0.0])
+def test_an_operators_corridor_is_kept_whatever_the_graph_says(source, value):
+    """Typed in the editor (or stored before sources existed): used as it is, 0 included."""
+    poses = _poses(0.05, 3.0, 8.0)
+    poses[1].corridor_width_m, poses[1].corridor_source = value, source
+    g = StripGraph()
+    npp.annotate_corridors(g, poses, [1], 0.6, 0.05, 0.5)
+    assert poses[1].corridor_width_m == value and poses[1].corridor_source == "operator"
+    assert poses[1].skippable is (value > 0)

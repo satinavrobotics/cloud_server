@@ -163,8 +163,15 @@ class Pose2D(pydantic.BaseModel):
     corridor_width_m: Optional[float] = pydantic.Field(
         description="Metres of free ground on each side of the edges before and after this "
                     "waypoint that a skip may use (nodePolicy corridorWidth). Set by the "
-                    "planner from the scene graph; a value given here is used as it is. "
-                    "Without it the waypoint is not skippable.",
+                    "planner from the scene graph (corridor_source \"measured\"), or by the "
+                    "operator (\"operator\", or unset): an operator's value is used as it is, "
+                    "a measured one is measured again whenever the route is enriched or "
+                    "rerouted. Without it the waypoint is not skippable.",
+        default=None)
+    corridor_source: Optional[str] = pydantic.Field(
+        description="Who set corridor_width_m: \"measured\" (the planner, from the scene graph, "
+                    "for this waypoint's place in the route) or \"operator\". Unset with a "
+                    "corridor_width_m: the operator's.",
         default=None)
     origin: Optional[str] = pydantic.Field(
         description="Who put this waypoint in the route: unset/\"user\" (the operator) or "
@@ -180,6 +187,13 @@ class Pose2D(pydantic.BaseModel):
     def _corridor_ok(cls, value):
         return _finite_non_negative("corridor_width_m", value)
 
+    @pydantic.validator("corridor_source")
+    def _known_corridor_source(cls, value):
+        if value is not None and value not in CORRIDOR_SOURCES:
+            raise ICSUsageError(
+                f"corridor_source must be one of {', '.join(CORRIDOR_SOURCES)}, got {value!r}")
+        return value
+
     @pydantic.validator("origin")
     def _known_origin(cls, value):
         if value is not None and value not in WAYPOINT_ORIGINS:
@@ -191,6 +205,9 @@ class Pose2D(pydantic.BaseModel):
 WAYPOINT_ORIGIN_USER = "user"
 WAYPOINT_ORIGIN_PLANNED = "planned"
 WAYPOINT_ORIGINS = (WAYPOINT_ORIGIN_USER, WAYPOINT_ORIGIN_PLANNED)
+CORRIDOR_SOURCE_OPERATOR = "operator"
+CORRIDOR_SOURCE_MEASURED = "measured"
+CORRIDOR_SOURCES = (CORRIDOR_SOURCE_OPERATOR, CORRIDOR_SOURCE_MEASURED)
 
 
 def handle_response(response):
