@@ -367,6 +367,8 @@ async def lifespan(app: FastAPI):
         await service.reconstruction.stop()
         await service.semantic.stop()
         await service.mesh.stop()
+        if getattr(service, "person_removal", None) is not None:
+            await service.person_removal.stop()
         await service.stop_telemetry()
         logging.info("✅ API Delegation Service stopped")
 
@@ -915,6 +917,52 @@ async def get_rebuild_from_depth(map_id: str):
 async def cancel_rebuild_from_depth(map_id: str):
     """Ask the running job to stop after its current node (written layers stay). 404 no_active_job."""
     return _depth_rebuild().cancel(map_id)
+
+
+# ==================== Person removal (dynamic objects) ====================
+# packages/api/person_removal.py (docs/reconstruction/person_removal.md): person masks per keyframe camera, stored
+# next to the raw depth; the reconstruction and mesh manifests use them when person removal is on for the job.
+# Errors carry {code, message}: 404 map_not_found / session_not_found / no_active_job, 409 map_deleting /
+# session_active / no_depth / job_active (with the job), 503 not_configured / unavailable, 422 a bad body.
+
+def _person_removal():
+    _require_service()
+    ctl = getattr(service, "person_removal", None)
+    if ctl is None:
+        raise HTTPException(status_code=503, detail={"code": "unavailable",
+                                                     "message": "Person removal is not up yet"})
+    return ctl
+
+
+@app.get("/api/v1/maps/{map_id}/person-removal")
+async def get_person_removal(map_id: str):
+    """{map_name, available, settings (effective: enabled, source map|server, model, dilate_px), stored_settings,
+    coverage {frames, checked, masked} (null while a job runs), job (this API process's latest; null: none)}."""
+    return await _site_call("read person removal", _person_removal().status(map_id))
+
+
+@app.post("/api/v1/maps/{map_id}/person-removal", status_code=202)
+async def start_person_removal(map_id: str, body: Optional[Dict[str, Any]] = None, response: Response = None):
+    """(Re)compute the person masks of the map (body {session_id?, model?, dilate_px?, force?}). Frames already
+    checked with the same model and dilation are skipped unless `force`. 202 + the job; 200 + the job when one with
+    the same scope already runs."""
+    status, job = await _site_call("start person removal", _person_removal().start(
+        map_id, body, recording.request_actor()))
+    response.status_code = status
+    return job
+
+
+@app.post("/api/v1/maps/{map_id}/person-removal/cancel")
+async def cancel_person_removal(map_id: str):
+    """Stop the running job after its current frame (what was written stays). 404 no_active_job."""
+    return _person_removal().cancel(map_id)
+
+
+@app.put("/api/v1/maps/{map_id}/person-removal/settings")
+async def put_person_removal_settings(map_id: str, body: Optional[Dict[str, Any]] = None):
+    """The map's own choice {enabled: bool|null, model: str|null, dilate_px: int|null} (null: the server's;
+    all null removes the map's row). Used by the next reconstruction / mesh job of the map."""
+    return await _site_call("save person removal settings", _person_removal().put_settings(map_id, body))
 
 
 @app.get("/api/v1/maps/{map_id}/blocked-nodes")

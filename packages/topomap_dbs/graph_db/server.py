@@ -916,6 +916,21 @@ class GraphDatabaseService:
             self.SET_NODE_COSTMAPS_AQL, map_id, node_id, {"records": records},
             f"costmap {', '.join(records)}")
 
+    # Person removal (packages/api/person_removal.py): `person_mask.{camera}` records, merged per camera. Never
+    # touches costmap_stored_ms (the scene worker's cursor) nor the raw depth record.
+    SET_NODE_PERSON_MASKS_AQL = (
+        "FOR d IN @@col FILTER d._key == @key "
+        "UPDATE d WITH {person_mask: MERGE(IS_OBJECT(d.person_mask) ? d.person_mask : {}, @records)} IN @@col "
+        "OPTIONS {mergeObjects: false} RETURN NEW._key")
+
+    def set_node_person_masks(self, map_id: str, node_id: Union[int, str],
+                              records: Dict[str, Dict[str, Any]]) -> bool:
+        """Set `person_mask.{camera}` for the given cameras, keeping the others. False when the map or node does
+        not exist."""
+        return self._update_node_attribute(
+            self.SET_NODE_PERSON_MASKS_AQL, map_id, node_id, {"records": records},
+            f"person_mask {', '.join(records)}")
+
     # The scene-graph worker's ingest cursor (integration.md, "Review findings" 3): the database
     # clock at the moment a node's costmap record was written (`costmap_stored_ms`, set by the
     # two SET_NODE_COSTMAP* updates above), never the robot's capture time, which a late or
@@ -979,7 +994,7 @@ class GraphDatabaseService:
     DEPTH_NODES_AQL = (
         "FOR d IN @@col FILTER d.depth != null "
         "RETURN {_key: d._key, node_id: d.node_id, pose: d.pose, depth: d.depth, "
-        "created_at: d.created_at, session_id: d.session_id}")
+        "created_at: d.created_at, session_id: d.session_id, person_mask: d.person_mask}")
 
     def depth_nodes(self, map_id: str) -> Tuple[int, List[Dict[str, Any]]]:
         """(node count, the nodes that carry `depth`) of a map, for the 3D reconstruction

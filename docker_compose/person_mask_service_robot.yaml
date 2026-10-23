@@ -1,0 +1,31 @@
+# Person-mask service on a robot server (Raspberry Pi 5, linux/arm64, no GPU): docs/reconstruction/person_removal.md.
+# Optional and off unless deployed: the CPU image (onnxruntime only, no torch), one small YOLO-seg ONNX model.
+#
+#   docker compose -p person-mask --env-file .env.robot -f person_mask_service_robot.yaml up -d
+# (--env-file is required: without it compose reads docker_compose/.env, the cloud's file.)
+# Then set PERSON_MASK_SERVICE_URL=http://127.0.0.1:8013 in the profile (pi5.env) and redeploy the API.
+#
+# Memory: MEM_PERSON_MASK (robot setting, default 768m; counted in the memory budget only when PERSON_MASK_SERVICE_URL is
+# set). Idle, the process holds no model; a run loads it, the API unloads it at the end, and PERSON_MASK_IDLE_UNLOAD_S
+# unloads it if the API does not. PERSON_MASK_THREADS caps the cores one frame uses (default 2 of the Pi's 4).
+# The weights are not in the image: put the .onnx in PERSON_MASK_MODELS_DIR on the Pi (docs: 'Weights').
+services:
+  person-mask:
+    image: ${PERSON_MASK_IMAGE:-${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/person_mask:${IMAGE_TAG:-latest}}
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: ${MEM_PERSON_MASK:-768m}
+    memswap_limit: ${MEM_PERSON_MASK:-768m}
+    cpus: ${PERSON_MASK_CPUS:-2}
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+    environment:
+      - PERSON_MASK_SERVICE_KEY=${PERSON_MASK_SERVICE_KEY:-}
+      - PERSON_MASK_DEVICE=cpu
+      - PERSON_MASK_MODELS=${PERSON_MASK_MODELS:-nano=onnx:/models/yolo11n-seg.onnx}
+      - PERSON_MASK_DEFAULT_MODEL=${PERSON_MASK_DEFAULT_MODEL:-nano}
+      - PERSON_MASK_THREADS=${PERSON_MASK_THREADS:-2}
+      - PERSON_MASK_IDLE_UNLOAD_S=${PERSON_MASK_IDLE_UNLOAD_S:-60}
+    volumes:
+      - ${PERSON_MASK_MODELS_DIR:-/srv/sati/person_mask_models}:/models:ro
