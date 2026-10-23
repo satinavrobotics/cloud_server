@@ -2,12 +2,15 @@
 # Template: the entrypoint in mission_dispatch_services_robot.yaml replaces __NODE_IP__ with ROBOT_TAILNET_IP.
 # Small on purpose: one node, no Redis, no TURN, no metrics endpoint, a narrow media port range.
 port: 7880
-bind_addresses: ["127.0.0.1", "__NODE_IP__"]   # the signalling port: loopback (token service, API) + the tailnet IP, nothing else
+bind_addresses: ["127.0.0.1", "__NODE_IP__", "__LAN_IP__"]   # the signalling port: loopback (token service, API) + the tailnet IP + the LAN IP (ROBOT_LAN_IP; 127.0.0.2 = off), nothing else
 rtc:
   tcp_port: 7881
   port_range_start: 50000     # one UDP port per connected peer: 100 is far more than one robot and its viewers need
   port_range_end: 50100
-  node_ip: "__NODE_IP__"
+  # No node_ip: it would advertise the tailnet address only. Candidates are gathered from the addresses
+  # below instead (tailnet + LAN), and only those, so no public IPv6 or Wi-Fi address is offered.
+  ips:
+    includes: ["__NODE_IP__/32", "__LAN_IP__/32"]
   use_external_ip: false      # no STUN, no internet
   enable_loopback_candidate: false
 logging:

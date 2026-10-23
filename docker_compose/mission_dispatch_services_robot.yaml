@@ -211,15 +211,16 @@ services:
       - LIVEKIT_SFU_API_KEY=${LIVEKIT_SFU_API_KEY:?set LIVEKIT_SFU_API_KEY}
       - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
       - ROBOT_TAILNET_IP=${ROBOT_TAILNET_IP:?set ROBOT_TAILNET_IP}
+      - ROBOT_LAN_IP=${ROBOT_LAN_IP:-127.0.0.2}       # off unless set, like the gateway's LAN door
     volumes: !override
       - ./livekit/livekit-robot.yaml:/etc/livekit-robot.yaml:ro
     entrypoint: !override
       - sh
       - -c
       - |
-        sed "s/__NODE_IP__/$${ROBOT_TAILNET_IP}/g" /etc/livekit-robot.yaml > /tmp/livekit.yaml
+        sed -e "s/__NODE_IP__/$${ROBOT_TAILNET_IP}/g" -e "s/__LAN_IP__/$${ROBOT_LAN_IP}/g" /etc/livekit-robot.yaml > /tmp/livekit.yaml
         LIVEKIT_KEYS="$${LIVEKIT_SFU_API_KEY}: $${LIVEKIT_SFU_API_SECRET}" exec /livekit-server --config /tmp/livekit.yaml
-    mem_limit: ${MEM_LIVEKIT:-128m}
+    mem_limit: ${MEM_LIVEKIT:-512m}
     logging: *logging
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:7880/"]
@@ -245,7 +246,9 @@ services:
       - LIVEKIT_SFU_API_SECRET=${LIVEKIT_SFU_API_SECRET:?set LIVEKIT_SFU_API_SECRET}
       # What robots and clients are told to connect to: this Pi's SFU.
       - LIVEKIT_SFU_SERVER_URL=${LIVEKIT_SFU_SERVER_URL:-ws://${ROBOT_TAILNET_IP}:7880}
-    mem_limit: ${MEM_LIVEKIT_TOKENS:-64m}
+      # Operators that reached the gateway on the LAN address are told the LAN SFU address (empty = off).
+      - LIVEKIT_SFU_LAN_URL=${ROBOT_LAN_IP:+ws://${ROBOT_LAN_IP}:7880}
+    mem_limit: ${MEM_LIVEKIT_TOKENS:-128m}
     logging: *logging
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://${ROBOT_TAILNET_IP}:${LIVEKIT_SFU_TOKENS_PORT:-8008}/health', timeout=4); sys.exit(0)"]

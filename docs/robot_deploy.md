@@ -116,13 +116,16 @@ clients (the desktop app) subscribe, exactly as with the cloud's SFU. `livekit-s
 Both are in `mission_dispatch_services_robot.yaml` and deploy with the rest.
 
 - **Small config** (`docker_compose/livekit/livekit-robot.yaml`): one node, no Redis, no TURN, no STUN, no metrics port, log
-  level `warn`, 100 UDP media ports (50000-50100, one per connected peer), memory limit 192 MB (`MEM_LIVEKIT`). Measured idle:
+  level `warn`, 100 UDP media ports (50000-50100, one per connected peer), memory limit 512 MB (`MEM_LIVEKIT`; the token service 128 MB, `MEM_LIVEKIT_TOKENS`). Measured idle:
   about 11 MiB (on the cloud host, not on a Pi). LiveKit has no peer-to-peer mode; it always relays, which is what keeps the
   load on the Pi low (it forwards, never transcodes).
-- **Where it listens:** signalling (7880) on loopback + `ROBOT_TAILNET_IP`, TCP fallback 7881, media UDP 50000-50100. The token
-  service listens on `ROBOT_TAILNET_IP:8008` (robots call `/api/createToken` there; the gateway forwards only the operator route).
-  `node_ip` is the tailnet IP, so media goes over Tailscale. If the Pi must work with no Tailscale session at all (LAN only), this
-  needs a LAN-IP variant: not built (the gateway's LAN door below carries the REST and websocket traffic; video media still goes to the tailnet IP).
+- **Where it listens:** signalling (7880) on loopback + `ROBOT_TAILNET_IP` + `ROBOT_LAN_IP` (when set), TCP fallback 7881, media UDP
+  50000-50100. The token service listens on `ROBOT_TAILNET_IP:8008` (robots call `/api/createToken` there; the gateway forwards
+  only the operator route). There is no `node_ip`: ICE candidates come from `rtc.ips.includes` (the tailnet IP and `ROBOT_LAN_IP`
+  only), so media works over Tailscale and over the LAN. An operator that reached the gateway on `ROBOT_LAN_IP` is told
+  `ws://<ROBOT_LAN_IP>:7880` (`LIVEKIT_SFU_LAN_URL`, derived from `ROBOT_LAN_IP`); everyone else gets the tailnet URL. Robots
+  (the Jetson) still use the tailnet URL: a LAN-only Jetson would need the token service on the LAN address too (not done).
+  The SFU has no login: `ROBOT_LAN_IP` must be an address of the robot's own network (see the LAN door above).
 - **Keys:** `LIVEKIT_SFU_API_KEY` / `LIVEKIT_SFU_API_SECRET` in `.env.robot` (`setup_robot.sh` generates a fresh pair). The robots
   and clients are told `ws://<ROBOT_TAILNET_IP>:7880` (`LIVEKIT_SFU_SERVER_URL` overrides it). The robots' video client must be
   pointed at this Pi's token service (`http://<ROBOT_TAILNET_IP>:8008`) instead of the cloud's.

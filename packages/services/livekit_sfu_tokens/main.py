@@ -20,12 +20,12 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .server import (
     DASHBOARD_IDENTITY_PREFIX, DEFAULT_OPERATOR_TTL, InvalidIdentityError, LiveKitSfuTokenService,
-    MAX_NAME_LENGTH, ROLE_GRANTS, UnknownRoleError, notify_token_issued,
+    MAX_NAME_LENGTH, ROLE_GRANTS, UnknownRoleError, is_lan_request, notify_token_issued,
 )
 from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response, configure_service_logging
@@ -79,6 +79,7 @@ async def lifespan(app: FastAPI):
         api_secret=os.environ["LIVEKIT_SFU_API_SECRET"],
         server_url=os.environ["LIVEKIT_SFU_SERVER_URL"],
         operator_server_url=os.getenv("LIVEKIT_SFU_OPERATOR_URL") or None,
+        lan_server_url=os.getenv("LIVEKIT_SFU_LAN_URL") or None,
         ttl=int(os.getenv("LIVEKIT_SFU_TTL", str(DEFAULT_TTL))),
         operator_ttl=int(os.getenv("LIVEKIT_SFU_OPERATOR_TTL", str(DEFAULT_OPERATOR_TTL))),
     )
@@ -120,7 +121,7 @@ async def create_token(request: CreateTokenRequest, background: BackgroundTasks)
 
 
 @app.post("/api/operator/createToken", response_model=CreateTokenResponse)
-async def create_operator_token(request: CreateOperatorTokenRequest):
+async def create_operator_token(request: CreateOperatorTokenRequest, http_request: Request):
     """Operator-only token route: the role is fixed, so it is safe to expose
     through the dashboard's public gateway (it can never mint a robot token, and
     it can't take over a robot's identity: names must carry the dashboard prefix)."""
@@ -132,7 +133,9 @@ async def create_operator_token(request: CreateOperatorTokenRequest):
             detail=f"participantName must start with '{DASHBOARD_IDENTITY_PREFIX}'",
         )
     try:
-        return service.create_token(request.participantName, request.roomName, "operator")
+        via_lan = is_lan_request(http_request.headers.get("host"), service.lan_host)
+        return service.create_token(request.participantName, request.roomName, "operator",
+                                    via_lan=via_lan)
     except InvalidIdentityError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

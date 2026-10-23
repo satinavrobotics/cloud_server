@@ -79,7 +79,7 @@ class TestDescribeAndSave:
         d = rc.describe("pi5", "robot", True, "", "abc", profiles, local)
         by = {s["key"]: s for s in d["settings"]}
         assert by["MEM_MINIO"]["value"] == "512m" and by["MEM_MINIO"]["overridden"] and by["MEM_MINIO"]["profile_value"] is None
-        assert by["MEM_MINIO"]["default"] == "384m" and not by["MEM_ARANGO"]["overridden"] and by["MEM_ARANGO"]["value"] == "512m"
+        assert by["MEM_MINIO"]["default"] == "384m" and not by["MEM_ARANGO"]["overridden"] and by["MEM_ARANGO"]["value"] == "1g"
         assert d["pending_apply"] is True and d["profile"] == "pi5" and d["can_edit"] is True
 
     def test_nothing_is_pending_when_the_running_hash_matches(self, dirs):
@@ -107,9 +107,9 @@ class TestDescribeAndSave:
     def test_the_limits_together_must_fit_the_machine(self, dirs):
         profiles, local = dirs
         with pytest.raises(rc.ConfigError) as e:
-            rc.save({"MEM_GRAPH_BUILDER": "6g"}, "pi5", profiles, local, total_memory=4 * GiB)
+            rc.save({"MEM_GRAPH_BUILDER": "6g"}, "pi5", profiles, local, total_memory=8 * GiB)
         assert e.value.code == "over_budget" and not (local / "overrides.env").exists()
-        rc.save({"MEM_GRAPH_BUILDER": "1g"}, "pi5", profiles, local, total_memory=4 * GiB)
+        rc.save({"MEM_GRAPH_BUILDER": "1g"}, "pi5", profiles, local, total_memory=8 * GiB)
 
     def test_lines_this_service_did_not_write_are_kept(self, dirs):
         profiles, local = dirs

@@ -13,6 +13,7 @@ docs/livekit_sfu/README.md.
 import logging
 import os
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from packages.utils.livekit_tokens import mint_room_token
 
@@ -65,6 +66,13 @@ def notify_token_issued(role: str, participant_name: str, room_name: str,
         return False
 
 
+def is_lan_request(host_header: Optional[str], lan_host: Optional[str]) -> bool:
+    """True when the Host header (the gateway forwards the client's) names the LAN address."""
+    if not host_header or not lan_host:
+        return False
+    return urlparse("//" + host_header).hostname == lan_host
+
+
 class UnknownRoleError(ValueError):
     """Raised when a token is requested for a role not in ROLE_GRANTS."""
 
@@ -77,7 +85,8 @@ class LiveKitSfuTokenService:
     """Creates role-scoped JWTs for the self-hosted LiveKit server."""
 
     def __init__(self, api_key: str, api_secret: str, server_url: str, ttl: int = 36000,
-                 operator_server_url: Optional[str] = None, operator_ttl: Optional[int] = None):
+                 operator_server_url: Optional[str] = None, operator_ttl: Optional[int] = None,
+                 lan_server_url: Optional[str] = None):
         """
         Args:
             api_key: API key of the self-hosted LiveKit server
@@ -93,12 +102,17 @@ class LiveKitSfuTokenService:
                 Operator tokens are minted on the public dashboard route and
                 carry data-publish (teleop) rights, so they can be shorter-lived;
                 the client refetches on expiry.
+            lan_server_url: URL handed to operators that reached the gateway on the robot's
+                LAN address (e.g. ws://192.168.1.70:7880), so video works without Tailscale.
+                Unset = everyone gets the URL above.
         """
         self.logger = logging.getLogger("LiveKitSfuTokenService")
         self.api_key = api_key
         self.api_secret = api_secret
         self.server_url = server_url
         self.operator_server_url = operator_server_url or server_url
+        self.lan_server_url = lan_server_url or None
+        self.lan_host = urlparse(lan_server_url).hostname if lan_server_url else None
         self.ttl = ttl
         self.operator_ttl = operator_ttl or ttl
         self.logger.info(
@@ -106,12 +120,14 @@ class LiveKitSfuTokenService:
             f"operators -> {self.operator_server_url} (ttl {self.operator_ttl}s)"
         )
 
-    def create_token(self, participant_name: str, room_name: str, role: str) -> Dict[str, Any]:
+    def create_token(self, participant_name: str, room_name: str, role: str,
+                     via_lan: bool = False) -> Dict[str, Any]:
         """
         Create a token for one participant in one room.
 
         Returns:
-            Dictionary with token, ttl and server_url
+            Dictionary with token, ttl and server_url (the LAN URL for an operator with
+            via_lan when one is configured)
 
         Raises:
             UnknownRoleError: If role is not a key of ROLE_GRANTS
@@ -141,4 +157,6 @@ class LiveKitSfuTokenService:
             **grants,
         )
         server_url = self.operator_server_url if role == "operator" else self.server_url
+        if role == "operator" and via_lan and self.lan_server_url:
+            server_url = self.lan_server_url
         return {"token": token, "ttl": ttl, "server_url": server_url}
