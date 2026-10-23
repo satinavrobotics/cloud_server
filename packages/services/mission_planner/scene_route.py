@@ -1087,7 +1087,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     report = None
     if node_policy_cfg is not None:
         report = node_policy_plan.annotate_corridors(
-            graph, poses, range(1, len(poses) - 1), node_policy_cfg.get("robot_width"),
+            graph, poses, range(0, len(poses) - 1), node_policy_cfg.get("robot_width"),
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
             node_policy_cfg.get("budget_s", 0.0), safety=safety)
     pricing = None

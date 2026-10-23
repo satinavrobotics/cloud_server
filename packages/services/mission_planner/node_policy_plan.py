@@ -39,16 +39,16 @@ def corridor_per_side(width: Optional[float], robot_width: Optional[float],
                       margin: float = 0.0) -> Optional[float]:
     """The `corridorWidth` (per side of the edge) for a passage of full physical width `width`:
     the room the robot's centre line has on each side, (width - robot_width - margin) / 2,
-    floored to 1 cm. None when either width is unknown or no room is left."""
+    floored to 1 cm. 0.0 when the passage was measured and leaves no room (the robot then holds
+    to the distance rule only); None when either width is unknown."""
     if width is None or robot_width is None:
         return None
     if not (math.isfinite(width) and math.isfinite(robot_width)):
         return None
     room = (width - robot_width - max(0.0, margin)) / 2.0
     if not math.isfinite(room) or room <= 0:
-        return None
-    floored = math.floor(room * 100.0 + 1e-9) / 100.0
-    return floored if floored > 0 else None
+        return 0.0
+    return max(0.0, math.floor(room * 100.0 + 1e-9) / 100.0)
 
 
 def leg_widths(graph: Any, pts: Sequence[Pt], snap_m: float, budget_s: float = 0.0,
@@ -103,23 +103,30 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                        robot_width: Optional[float], margin: float, snap_m: float,
                        budget_s: float = 0.0, keep_intent: bool = False, safety: Any = None,
                        routes: Optional[LegRoutes] = None) -> Dict[str, Any]:
-    """Make the `candidates` (waypoint indexes that should be skippable) skippable where the scene
-    graph says how much room there is: sets `skippable` and `corridor_width_m` on those poses. A
-    waypoint that already carries its own `corridor_width_m` keeps it. The last waypoint, and a
-    waypoint without both adjacent legs (the first one: the edge before it starts at the robot,
-    which the route does not know), cannot get a computed corridor. A candidate without a corridor
-    becomes `skippable=False`, except an operator's waypoint with `keep_intent`: it keeps its
+    """Give every waypoint the robot drives through (all but the last) its `corridor_width_m`
+    from the scene graph, and make the `candidates` (waypoint indexes that should be skippable)
+    skippable where there is room. The corridor is the gate the robot may cross, so operator
+    waypoints get one too; only `skippable` is limited to the candidates.
+
+    The corridor of waypoint i is the narrower of the legs i-1 -> i and i -> i+1; waypoint 0 has
+    only the leg 0 -> 1 (the edge before it starts at the robot, which the route does not know).
+    A waypoint that already carries its own `corridor_width_m` > 0 keeps it. A leg that
+    cannot be measured leaves the corridor None (unknown); a passage with no room for the robot
+    gives 0.0 (measured, never skippable). A candidate without a corridor > 0 becomes
+    `skippable=False`, except an operator's waypoint with `keep_intent`: it keeps its
     `skippable=True` (the editor shows what the operator asked; the dispatcher sends it not
-    skippable and logs it). Returns
-    {"total": candidates, "skippable": how many are, "unavailable": reason or None}. With `routes`, a leg
+    skippable and logs it). Returns {"total": candidates, "skippable": how many are,
+    "unavailable": reason a width could not be known or None, "corridor": {"measured": n > 0,
+    "narrow": n at 0, "unknown": n None} over all annotated waypoints}. With `routes`, a leg
     already routed is not routed again, and the legs routed here are added to it."""
     last = len(poses) - 1
-    wanted = sorted({i for i in candidates if 0 <= i < last})
-    # Only the legs next to a candidate that has no corridor of its own are routed.
+    wanted = {i for i in candidates if 0 <= i < last}
+    interior = list(range(0, last))
+    # Only the legs next to a waypoint that has no corridor of its own are routed.
     need: Set[int] = set()
-    for i in wanted:
-        if not (poses[i].corridor_width_m or 0) > 0 and i > 0:
-            need.update((i - 1, i))
+    for i in interior:
+        if not (poses[i].corridor_width_m or 0) > 0:
+            need.update(leg for leg in (i - 1, i) if 0 <= leg < last)
     widths: Dict[int, Optional[float]] = {}
     if need and robot_width is not None and robot_width > 0:
         end = time.monotonic() + budget_s if budget_s > 0 else None
@@ -131,23 +138,27 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                                      (poses[leg + 1].x, poses[leg + 1].y), snap_m, safety, routes)
     reason: Optional[str] = None
     done = 0
-    for i in wanted:
+    counts = {"measured": 0, "narrow": 0, "unknown": 0}
+    for i in interior:
         pose = poses[i]
-        corridor = pose.corridor_width_m if (pose.corridor_width_m or 0) > 0 else None
+        corridor: Optional[float] = pose.corridor_width_m if (pose.corridor_width_m or 0) > 0 else None
         if corridor is None:
             if robot_width is None or not robot_width > 0:
-                reason = UNAVAILABLE_ROBOT_WIDTH
+                reason = UNAVAILABLE_ROBOT_WIDTH if i in wanted or reason is None else reason
             else:
-                before, after = widths.get(i - 1), widths.get(i)
-                if i > 0 and before is not None and after is not None:
-                    corridor = corridor_per_side(min(before, after), robot_width, margin)
+                legs = [widths.get(leg) for leg in (i - 1, i) if 0 <= leg < last]
+                if legs and all(w is not None for w in legs):
+                    corridor = corridor_per_side(min(legs), robot_width, margin)
                 if corridor is None:
                     reason = reason or UNAVAILABLE_WIDTH
-        if corridor is not None or not keep_intent or pose.origin == common.WAYPOINT_ORIGIN_PLANNED:
-            pose.skippable = corridor is not None
+        counts["unknown" if corridor is None else "measured" if corridor > 0 else "narrow"] += 1
+        if i in wanted:
+            usable = corridor is not None and corridor > 0
+            if usable or not keep_intent or pose.origin == common.WAYPOINT_ORIGIN_PLANNED:
+                pose.skippable = usable
+            done += usable
         pose.corridor_width_m = corridor
-        done += corridor is not None
-    return {"total": len(wanted), "skippable": done, "unavailable": reason}
+    return {"total": len(wanted), "skippable": done, "unavailable": reason, "corridor": counts}
 
 
 def _bearing(a: Pt, b: Pt) -> float:

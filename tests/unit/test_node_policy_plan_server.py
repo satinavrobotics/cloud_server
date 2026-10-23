@@ -6,7 +6,7 @@ from tests.unit.test_planner_chart_route import FakeGraph, FakeStore, _plan, _se
 
 
 @pytest.mark.unit
-async def test_plan_carries_the_node_policy_report_and_marks_interior_waypoints(on):
+async def test_plan_carries_the_node_policy_report_and_marks_every_waypoint_but_the_goal(on):
     svc = _service(FakeStore(FakeGraph()))
     robot = await svc.get_robot_status("r1")
     robot.status.factsheet.width = 0.4
@@ -14,10 +14,10 @@ async def test_plan_carries_the_node_policy_report_and_marks_interior_waypoints(
     wps = out["waypoints"]
     assert len(wps) > 2
     # FakeGraph: every leg is 0.8 wide -> (0.8 - 0.4 - 0.05) / 2 = 0.175 -> 0.17 per side
-    assert all(w.skippable is True and w.corridor_width_m == 0.17 for w in wps[1:-1])
-    assert wps[0].skippable is None and wps[-1].skippable is None
+    assert all(w.skippable is True and w.corridor_width_m == 0.17 for w in wps[:-1])
+    assert wps[-1].skippable is None and wps[-1].corridor_width_m is None
     assert out["node_policy"]["unavailable"] is None
-    assert out["node_policy"]["skippable"] == len(wps) - 2
+    assert out["node_policy"]["skippable"] == len(wps) - 1
 
 
 def _wps(*xs, **kw):
