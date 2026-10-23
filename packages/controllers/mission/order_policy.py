@@ -21,6 +21,8 @@ _log = logging.getLogger(__name__)
 # the dispatcher never sends more.
 NODE_POLICY_MAX_WAIT_CAP_S = 120.0
 NODE_POLICY_MAX_WAIT_DEFAULT_S = 10.0
+# The widest corridorWidth (per side, m) we send: the robot team's contract (2026-10-23).
+NODE_POLICY_CORRIDOR_CAP_M = 1.5
 
 
 def _float(name: str, default: float) -> float:
@@ -81,6 +83,18 @@ def clamp_max_wait_s(value: float) -> float:
     return min(value, NODE_POLICY_MAX_WAIT_CAP_S)
 
 
+def clamp_corridor_m(value) -> Optional[float]:
+    """A corridorWidth to send: None (unknown, or not finite) stays None, anything else
+    is limited to [0, cap]. 0 is a real value: measured, no room."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return min(max(value, 0.0), NODE_POLICY_CORRIDOR_CAP_M)
+
+
 class NodePolicyMode:
     OFF = "off"              # never send nodePolicy
     FACTSHEET = "factsheet"  # only to a robot whose factsheet lists the nodePolicy action
@@ -108,8 +122,8 @@ class OrderPolicy(pydantic.BaseModel):
 
     node_policy_mode: str = NodePolicyMode.FACTSHEET
     node_policy_max_wait_s: float = NODE_POLICY_MAX_WAIT_DEFAULT_S
-    # Kill switch for skippable=true: off, every nodePolicy goes out skippable=false and
-    # without a corridor, whatever the waypoints ask for.
+    # Kill switch for skippable=true: off, every nodePolicy goes out skippable=false,
+    # whatever the waypoints ask for. The corridor (the gate) is still sent.
     node_policy_skip_enabled: bool = True
 
     # A mission's timeout does not run while its robot is offline: a route the robot

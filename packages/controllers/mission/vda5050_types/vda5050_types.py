@@ -29,7 +29,7 @@ import pydantic
 from cloud_common.objects import mission, robot, common
 from packages.controllers.mission import order_ids
 from packages.controllers.mission.order_policy import OrderPolicy, \
-    clamp_max_wait_s, current as current_order_policy
+    clamp_corridor_m, clamp_max_wait_s, current as current_order_policy
 
 
 # Tell pylint to ignore the invalid names. We must use camelCase names because they are specified
@@ -141,21 +141,24 @@ class VDA5050Action(pydantic.BaseModel):
 
     @classmethod
     def node_policy(cls, node_id: str, max_wait_s: float, skippable: bool = False,
-                    corridor_width_m: Optional[float] = None) -> "VDA5050Action":
+                    corridor_width_m: Optional[float] = None,
+                    last: bool = False) -> "VDA5050Action":
         """The nodePolicy action of node `node_id`: non-blocking, so the robot drives
-        through it. corridorWidth is sent only when known. maxWaitS is clamped to what the
-        robot accepts."""
-        # Robot team: a missing corridorWidth means no skip, so never claim skippable
-        # without a usable one.
-        has_corridor = corridor_width_m is not None and math.isfinite(corridor_width_m) \
-            and corridor_width_m > 0
-        params = [VDA5050ActionParameter(key="skippable",
-                                         value=bool(skippable) and has_corridor),
-                  VDA5050ActionParameter(key="maxWaitS",
-                                         value=clamp_max_wait_s(max_wait_s))]
-        if has_corridor:
-            params.append(VDA5050ActionParameter(key="corridorWidth",
-                                                 value=float(corridor_width_m)))
+        through it. corridorWidth (per side, the robot's gate) is sent whenever it is known,
+        also with skippable=false; 0 means measured, no room, and a missing key means
+        unknown (the robot default applies). It is clamped to the contract's cap.
+        skippable is true only with a corridor > 0. The last node carries maxWaitS only
+        (skippable false, no corridor). maxWaitS is clamped to what the robot accepts."""
+        params = []
+        corridor = None if last else clamp_corridor_m(corridor_width_m)
+        # Robot team: skippable needs a usable corridorWidth, so never claim it without.
+        params.append(VDA5050ActionParameter(
+            key="skippable",
+            value=bool(skippable) and corridor is not None and corridor > 0))
+        params.append(VDA5050ActionParameter(key="maxWaitS",
+                                             value=clamp_max_wait_s(max_wait_s)))
+        if corridor is not None:
+            params.append(VDA5050ActionParameter(key="corridorWidth", value=corridor))
         return VDA5050Action(
             actionType=NODE_POLICY_ACTION_TYPE,
             actionId=order_ids.node_policy_action_id(node_id),
@@ -167,14 +170,17 @@ class VDA5050Action(pydantic.BaseModel):
         return {param.key: param.value for param in self.actionParameters}
 
 
-def waypoint_node_policy(node_id: str, pose2d, policy: OrderPolicy) -> VDA5050Action:
-    """The nodePolicy action of a route waypoint (see VDA5050Order.from_route)."""
+def waypoint_node_policy(node_id: str, pose2d, policy: OrderPolicy,
+                         last: bool = False) -> VDA5050Action:
+    """The nodePolicy action of a route waypoint (see VDA5050Order.from_route). The
+    corridor goes out whenever the waypoint has one; the skip kill switch only forces
+    skippable false."""
     max_wait = getattr(pose2d, "max_wait_s", None)
     corridor = getattr(pose2d, "corridor_width_m", None)
     skippable = bool(policy.node_policy_skip_enabled and getattr(pose2d, "skippable", None))
     return VDA5050Action.node_policy(
         node_id, max_wait_s=policy.node_policy_max_wait_s if max_wait is None else max_wait,
-        skippable=skippable, corridor_width_m=corridor if skippable else None)
+        skippable=skippable, corridor_width_m=corridor, last=last)
 
 
 class VDA5050ActionState(pydantic.BaseModel):
@@ -421,11 +427,11 @@ class VDA5050Order(pydantic.BaseModel):
                    node_policy: bool = False,
                    policy: Optional[OrderPolicy] = None) -> "VDA5050Order":
         """The order of a route node. With `node_policy`, every node the robot drives
-        through (not the start node, not the last one) carries a nodePolicy action: how
-        long to hold at it when it is blocked. A waypoint is skippable only when it says so
-        (`skippable`) AND carries a usable `corridor_width_m` (the planner sets it from the
-        scene graph) and the policy allows skipping; otherwise it is sent skippable=false
-        with no corridor. `max_wait_s` of a waypoint overrides the policy's default."""
+        through, and the last one (not the start node), carries a nodePolicy action: how
+        long to hold at it when it is blocked. A pass-through waypoint also carries its
+        `corridor_width_m` (the gate) when known, and is skippable only when it says so
+        (`skippable`) AND the corridor is > 0 AND the policy allows skipping. The last node
+        gets `maxWaitS` only. `max_wait_s` of a waypoint overrides the policy's default."""
         policy = policy or current_order_policy()
         # Create an initial node from the robots current position
         # The route's waypoints on a map carry the robot's name of it (the dispatcher relabels
@@ -442,8 +448,9 @@ class VDA5050Order(pydantic.BaseModel):
                 node = VDA5050Node.from_pose2d(pose2d, mission_id, j * 2 + 2,
                                                mission_node_id, final=j == last,
                                                policy=policy)
-                if node_policy and j != last:
-                    node.actions.append(waypoint_node_policy(node.nodeId, pose2d, policy))
+                if node_policy:
+                    node.actions.append(waypoint_node_policy(
+                        node.nodeId, pose2d, policy, last=j == last))
                 nodes.append(node)
             edges += [VDA5050Edge.from_mission_order(mission_id,
                                                      e * 2 + 1, mission_node_id)

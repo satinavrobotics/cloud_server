@@ -99,10 +99,11 @@ def _route_order(n_waypoints, policy=None):
                                      policy=policy)
 
 
-def test_node_policy_never_on_start_or_last_and_not_skippable():
+def test_node_policy_never_on_start_and_not_skippable():
     order = _route_order(4)
     assert order.nodes[0].actions == []
-    assert order.nodes[-1].actions == []
+    (last,) = order.nodes[-1].actions
+    assert _params(last) == {"skippable": False, "maxWaitS": 10.0}
     middle = order.nodes[1:-1]
     assert len(middle) == 3
     for node in middle:
@@ -129,7 +130,8 @@ def test_skippable_without_usable_corridor_is_not_skippable(corridor):
     params = vt.VDA5050Action.node_policy(
         "n", 10, skippable=True, corridor_width_m=corridor).param_dict
     assert params["skippable"] is False
-    assert "corridorWidth" not in params
+    # None / nan: unknown, key missing. 0 and negative: measured no room, sent as 0.
+    assert params.get("corridorWidth") == (0.0 if corridor in (0.0, -1.0) else None)
 
 
 def test_skippable_with_corridor():

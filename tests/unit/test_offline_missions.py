@@ -333,8 +333,8 @@ def _policy_order(n=3):
 def test_node_policy_goes_on_pass_through_nodes_only():
     order = _policy_order(3)
     carrying = [n.sequenceId for n in order.nodes if n.actions]
-    assert carrying == [2, 4]                         # not the start (0), not the last (6)
-    for node in order.nodes[1:3]:
+    assert carrying == [2, 4, 6]                      # not the start (0); the last has maxWaitS only
+    for node in order.nodes[1:]:
         (action,) = node.actions
         assert action.actionType == "nodePolicy"
         assert action.blockingType == types.VDA5050ActionBlockingType.NONE

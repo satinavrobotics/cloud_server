@@ -1,5 +1,6 @@
-"""Per-waypoint nodePolicy fields reach the order: skippable only with a corridor, maxWaitS override,
-the kill switch, the last node never has a policy (docs/node_policies_2026-10-13.md)."""
+"""Per-waypoint nodePolicy fields reach the order: skippable only with a corridor > 0, the corridor
+whenever known (0 = measured no room), maxWaitS override, the kill switch (skippable only), the last
+node maxWaitS only (docs/node_policies_v2_plan.md, step 1.3)."""
 import pytest
 
 from cloud_common.objects import common, mission, robot
@@ -29,7 +30,7 @@ def test_default_waypoints_are_not_skippable_and_carry_no_corridor():
     order = _order([_wp(i) for i in range(4)])
     for j in range(3):
         assert _params(order, j) == {"skippable": False, "maxWaitS": 10.0}
-    assert _params(order, 3) is None            # the last node has no policy
+    assert _params(order, 3) == {"skippable": False, "maxWaitS": 10.0}   # last: maxWaitS only
 
 
 @pytest.mark.unit
@@ -40,22 +41,34 @@ def test_skippable_with_corridor_is_sent_together():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("corridor", [None, 0.0])
-def test_skippable_without_a_usable_corridor_is_not_skippable(corridor):
+@pytest.mark.parametrize("corridor, wire", [(None, {}), (0.0, {"corridorWidth": 0.0})])
+def test_skippable_without_a_usable_corridor_is_not_skippable(corridor, wire):
     order = _order([_wp(0, skippable=True, corridor_width_m=corridor), _wp(1), _wp(2)])
-    assert _params(order, 0) == {"skippable": False, "maxWaitS": 10.0}
+    assert _params(order, 0) == {"skippable": False, "maxWaitS": 10.0, **wire}
 
 
 @pytest.mark.unit
-def test_corridor_without_skippable_is_not_sent():
+def test_corridor_without_skippable_is_sent():
+    """The gate is independent of skippable (operator waypoints, narrow guide nodes)."""
     order = _order([_wp(0, corridor_width_m=0.8), _wp(1)])
-    assert _params(order, 0) == {"skippable": False, "maxWaitS": 10.0}
+    assert _params(order, 0) == {"skippable": False, "maxWaitS": 10.0, "corridorWidth": 0.8}
 
 
 @pytest.mark.unit
-def test_last_waypoint_is_never_skippable_even_if_it_asks():
-    order = _order([_wp(0), _wp(1, skippable=True, corridor_width_m=1.0)])
-    assert _params(order, 1) is None
+def test_corridor_is_capped_and_a_non_finite_one_is_unknown():
+    order = _order([_wp(0, corridor_width_m=4.0), _wp(1), _wp(2)])
+    assert _params(order, 0)["corridorWidth"] == order_policy.NODE_POLICY_CORRIDOR_CAP_M == 1.5
+    for bad in (float("nan"), float("inf")):
+        assert "corridorWidth" not in v.VDA5050Action.node_policy(
+            "n", 10, corridor_width_m=bad).param_dict
+    assert v.VDA5050Action.node_policy("n", 10, corridor_width_m=-1).param_dict[
+        "corridorWidth"] == 0.0
+
+
+@pytest.mark.unit
+def test_last_waypoint_gets_max_wait_only_even_if_it_asks_for_more():
+    order = _order([_wp(0), _wp(1, skippable=True, corridor_width_m=1.0, max_wait_s=30.0)])
+    assert _params(order, 1) == {"skippable": False, "maxWaitS": 30.0}
 
 
 @pytest.mark.unit
@@ -68,10 +81,10 @@ def test_max_wait_override_is_clamped_by_the_helper():
 
 
 @pytest.mark.unit
-def test_kill_switch_sends_nothing_skippable():
+def test_kill_switch_forces_skippable_false_but_keeps_the_corridor():
     policy = order_policy.OrderPolicy(node_policy_skip_enabled=False)
     order = _order([_wp(0, skippable=True, corridor_width_m=0.8), _wp(1)], policy)
-    assert _params(order, 0) == {"skippable": False, "maxWaitS": 10.0}
+    assert _params(order, 0) == {"skippable": False, "maxWaitS": 10.0, "corridorWidth": 0.8}
 
 
 @pytest.mark.unit
