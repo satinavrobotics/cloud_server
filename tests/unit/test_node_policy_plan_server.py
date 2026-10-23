@@ -81,22 +81,27 @@ async def test_unknown_robot_width_means_not_skippable_and_says_so(on):
 
 
 @pytest.mark.unit
-async def test_skip_switch_off_leaves_the_plan_without_policy(on, monkeypatch):
+async def test_skip_switch_off_still_plans_the_corridors(on, monkeypatch):
+    """The corridor is the robot's gate: only the dispatcher's wire forces skippable false."""
     monkeypatch.setattr(config, "NODE_POLICY_SKIP_ENABLED", False)
     svc = _service(FakeStore(FakeGraph()))
+    robot = await svc.get_robot_status("r1")
+    robot.status.factsheet.width = 0.4
     out = await _plan(svc)
-    assert "node_policy" not in out
-    assert all(w.skippable is None for w in out["waypoints"])
+    assert out["node_policy"]["corridor"]["measured"] == len(out["waypoints"]) - 1
+    assert all(w.corridor_width_m == 0.17 for w in out["waypoints"][:-1])
 
 
 @pytest.mark.unit
-async def test_legacy_fallback_reports_why_nothing_is_skippable(on):
+async def test_legacy_fallback_reports_the_real_reason_nothing_is_skippable(on):
     store = FakeStore(FakeGraph())
     store.version = None                      # no graph
     svc = _service(store)
     out = await _plan(svc)
     assert out["planner"] == "legacy"
-    assert out["node_policy"] == {"total": 0, "skippable": 0, "unavailable": "legacy_planner"}
+    assert out["node_policy"]["unavailable"] == "no_scene_graph"
+    assert out["waypoints"][-1].origin == "user"
+    assert all(w.origin == "planned" for w in out["waypoints"][:-1])
 
 
 @pytest.mark.unit
@@ -107,3 +112,19 @@ async def test_enrich_keeps_planned_waypoints_when_it_may_not_replan_them(on):
     kept = common.Pose2D(x=3.0, y=0.0, map_id="m", origin="planned", skippable=True)
     out = await svc.enrich_route("r1", "m", [wps[0], kept, wps[1]], insert_planned=False)
     assert [w.x for w in out["waypoints"]] == [1.0, 3.0, 6.0]
+
+
+@pytest.mark.unit
+async def test_finalize_goto_gives_a_legacy_route_origins_and_corridors(on):
+    """Step 2.2: a route the legacy planner made gets the same data as a chart one when a graph exists."""
+    svc = _service(FakeStore(FakeGraph()))
+    robot = await svc.get_robot_status("r1")
+    robot.status.factsheet.width = 0.4
+    result = {"success": True, "planner": "legacy", "map_id": "m",
+              "waypoints": _wps(0.05, 3.0, 6.0, 9.0)}
+    await svc._finalize_goto(result, "r1", robot)
+    wps = result["waypoints"]
+    assert [w.origin for w in wps] == ["planned", "planned", "planned", "user"]
+    assert all(w.corridor_width_m == 0.17 for w in wps[:-1])
+    assert result["node_policy"]["unavailable"] is None
+    assert result["node_policy"]["corridor"]["measured"] == 3

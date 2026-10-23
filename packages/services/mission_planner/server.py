@@ -383,6 +383,7 @@ class MissionPlannerService:
     async def enrich_route(
         self, robot_name: str, map_id: str, waypoints: List[common.Pose2D],
         insert_planned: bool = True,
+        robot: Optional[robot_object.RobotObjectV1] = None,
     ) -> Dict[str, Any]:
         """The operator's route with its nodePolicy data completed (docs/node_policies_2026-10-13.md):
         planned waypoints inserted between two waypoints that are not in the same or a
@@ -402,7 +403,7 @@ class MissionPlannerService:
         user = [w.copy() for w in waypoints if w.origin != common.WAYPOINT_ORIGIN_PLANNED]
         gap_fill = insert_planned and config.NODE_POLICY_GAP_FILL_ENABLED and len(user) >= 2
         base = user if gap_fill else [w.copy() for w in waypoints]
-        wants_corridor = config.NODE_POLICY_SKIP_ENABLED
+        wants_corridor = True
         report: Dict[str, Any] = {"total": 0, "skippable": 0, "unavailable": None}
 
         def unchanged(reason: str) -> Dict[str, Any]:
@@ -424,7 +425,7 @@ class MissionPlannerService:
         except Exception as err:  # pylint: disable=broad-except
             self.logger.warning(f"Route enrich: scene graph of {map_id} unavailable ({err!r})")
             return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
-        robot = await self.get_robot_status(robot_name)
+        robot = robot or await self.get_robot_status(robot_name)
         robot_width = self._robot_width(robot)
         snap_m = config.SCENE_GRAPH_START_SNAP_M
         safety = scene_route.safety_for(graph, robot_width, self._robot_length(robot), config.SCENE_GRAPH_SAFETY_KAPPA,
@@ -483,9 +484,9 @@ class MissionPlannerService:
 
     def _node_policy_cfg(self, robot: Optional[robot_object.RobotObjectV1]
                          ) -> Optional[Dict[str, Any]]:
-        """Settings of the skip-data pass (scene_route.plan_on_graph), None when switched off."""
-        if not config.NODE_POLICY_SKIP_ENABLED:
-            return None
+        """Settings of the skip-data pass (scene_route.plan_on_graph). Always on: the corridor is the
+        robot's gate, which NODE_POLICY_SKIP_ENABLED does not switch off (it only stops the dispatcher
+        sending skippable=true)."""
         return {"robot_width": self._robot_width(robot),
                 "margin": config.SCENE_GRAPH_WIDTH_MARGIN_M,
                 "snap_m": config.SCENE_GRAPH_START_SNAP_M,
@@ -1164,7 +1165,41 @@ class MissionPlannerService:
                           "plan with ignore_exclusions"), on_path
         return path, None, []
 
-    async def plan_route(
+    async def plan_route(self, robot_name: str, **kwargs: Any) -> Dict[str, Any]:
+        """A go-to route (see `_plan_route`), finished the same way whichever planner made it
+        (`_finalize_goto`)."""
+        result = await self._plan_route(robot_name, **kwargs)
+        robot = result.pop("_robot", None)
+        if result.get("success") and result.get("waypoints"):
+            await self._finalize_goto(result, robot_name, robot)
+        return result
+
+    async def _finalize_goto(self, result: Dict[str, Any], robot_name: str,
+                             robot: Optional[robot_object.RobotObjectV1] = None) -> None:
+        """The one finishing step of a go-to plan (docs/node_policies_v2_plan.md, step 2.2): every
+        waypoint carries its `origin` (the planner's points `planned`, the goal the operator tapped
+        `user`), and the nodePolicy corridors are there: the chart planner annotates them while it
+        plans; a route the legacy planner made gets them from the scene graph here, or says why not
+        (`node_policy.unavailable`)."""
+        waypoints: List[common.Pose2D] = result["waypoints"]
+        for i, w in enumerate(waypoints):
+            if w.origin is None:
+                w.origin = common.WAYPOINT_ORIGIN_USER if i == len(waypoints) - 1 \
+                    else common.WAYPOINT_ORIGIN_PLANNED
+        if result.get("planner") == scene_route.PLANNER_SCENE_GRAPH and \
+                result.get("node_policy") is not None:
+            return
+        try:
+            out = await self.enrich_route(robot_name, result.get("map_id") or waypoints[0].map_id,
+                                          waypoints, insert_planned=False, robot=robot)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Go-to node policy annotation failed ({err!r})")
+            result["node_policy"] = {"total": 0, "skippable": 0, "unavailable": "error"}
+            return
+        result["waypoints"] = out["waypoints"]
+        result["node_policy"] = out["node_policy"]
+
+    async def _plan_route(
         self,
         robot_name: str,
         target_x: Optional[float] = None,
@@ -1237,11 +1272,13 @@ class MissionPlannerService:
         # Chart-graph planner (flag, off by default): any reason it cannot serve this request
         # falls through to the legacy steps below, unchanged, and is reported.
         known_robot: Optional[robot_object.RobotObjectV1] = None
+        result["_robot"] = None
         if config.SCENE_GRAPH_PLANNER_ENABLED:
             ctx: Dict[str, Any] = {}
             chart, reason = await self._try_chart_route(
                 robot_name, map_id, target_x, target_y, robot_pose, ignore_exclusions, ctx)
             known_robot = ctx.get("robot")
+            result["_robot"] = known_robot
             if reason == REASON_FOOTPRINT:
                 result["footprint"] = ctx["footprint"]
                 result["error"] = ctx["footprint"]["message"]
@@ -1261,8 +1298,6 @@ class MissionPlannerService:
             self.logger.info(f"Chart planner not used ({reason}); legacy planner")
             result["planner"] = scene_route.PLANNER_LEGACY
             result["planner_fallback"] = reason
-            result["node_policy"] = {"total": 0, "skippable": 0,
-                                     "unavailable": node_policy_plan.UNAVAILABLE_LEGACY}
 
         # Step 1: Find closest node to robot
         self.logger.info(f"Step 1: Finding closest node to robot '{robot_name}'")
