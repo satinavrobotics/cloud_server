@@ -1,0 +1,33 @@
+# Person-mask service, cloud / dev box (GPU): docs/reconstruction/person_removal.md. Optional; its own compose project.
+# Image: packages/services/person_mask/Dockerfile built with the GPU base (see its header), e.g. person-mask:gpu.
+# Same host as the API: host networking, bound to 127.0.0.1:8013. The API's PERSON_MASK_SERVICE_URL points here and it
+# sends the same PERSON_MASK_SERVICE_KEY (optional; both unset = no auth on loopback).
+#
+#   docker compose -p person-mask -f person_mask_service.yaml up -d
+#
+# Models (NOT baked in, never in git) are mounted read-only at /models from PERSON_MASK_MODELS_DIR. PERSON_MASK_MODELS
+# lists name=<kind>:<path>; the API picks one by name (PERSON_REMOVAL_MODEL, the map's setting or the run), else the
+# default here. Only one model is resident at a time; it is unloaded after PERSON_MASK_IDLE_UNLOAD_S without frames
+# and after each API run. Grounded-SAM-2 also needs its checkout (PERSON_MASK_GSAM2_ROOT, mounted at /gsam2).
+services:
+  person-mask:
+    image: ${PERSON_MASK_IMAGE:-person-mask:gpu}
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    mem_limit: ${MEM_PERSON_MASK:-8g}
+    memswap_limit: ${MEM_PERSON_MASK:-8g}
+    command: ["python", "-m", "packages.services.person_mask.main", "--host", "127.0.0.1", "--port", "8013"]
+    environment:
+      - PERSON_MASK_SERVICE_KEY=${PERSON_MASK_SERVICE_KEY:-}
+      - PERSON_MASK_DEVICE=${PERSON_MASK_DEVICE:-cuda}
+      - PERSON_MASK_MODELS=${PERSON_MASK_MODELS:-nano=onnx:/models/yolo11n-seg.onnx;large=ultralytics:/models/yolo11x-seg.pt;gsam2=grounded-sam2:/models/grounded_sam2}
+      - PERSON_MASK_DEFAULT_MODEL=${PERSON_MASK_DEFAULT_MODEL:-large}
+      - PERSON_MASK_IDLE_UNLOAD_S=${PERSON_MASK_IDLE_UNLOAD_S:-120}
+      - PERSON_MASK_GSAM2_ROOT=/gsam2
+      - YOLO_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    volumes:
+      - ${PERSON_MASK_MODELS_DIR:-/home/satiadmin/satinavrobotics/person_mask_models}:/models:ro
+      - ${PERSON_MASK_GSAM2_DIR:-/home/satiadmin/satinavrobotics/Grounded-SAM-2}:/gsam2:ro

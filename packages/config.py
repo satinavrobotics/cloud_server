@@ -48,6 +48,7 @@ PORT_LIVEKIT = 8006
 PORT_AGENT_ORCHESTRATOR = 8007
 PORT_API_DELEGATION = 8000
 PORT_SERVER_DIAGNOSTICS = 8011
+PORT_PERSON_MASK = 8013          # optional person-mask service (packages/services/person_mask)
 
 # ==================== Infrastructure Ports ====================
 PORT_ARANGODB = 8529
@@ -428,6 +429,21 @@ MESH_MAX_INFLIGHT = int(os.getenv("MESH_MAX_INFLIGHT", "1"))
 MESH_MAX_DEPTH_M = float(os.getenv("MESH_MAX_DEPTH_M", "6.0"))
 # Camera frames one job may use (the `max_frames` param is capped by it and defaults to it).
 MESH_MAX_FRAMES = int(os.getenv("MESH_MAX_FRAMES", "400"))
+
+# ==================== Person removal (API) ====================
+# docs/reconstruction/person_removal.md (packages/api/person_removal.py). The optional person-mask service
+# (packages/services/person_mask, port 8013) segments people in each keyframe's RGB; the API stores a mask and a
+# masked depth PNG next to the raw ones (never replacing them), and the reconstruction / mesh manifests use them
+# when person removal is on for the job. Unset URL = feature off (capability `person_removal` false, POST 503).
+PERSON_MASK_SERVICE_URL = _env_or_none("PERSON_MASK_SERVICE_URL")
+PERSON_MASK_SERVICE_KEY = _env_or_none("PERSON_MASK_SERVICE_KEY")
+# Default for jobs on maps that have no per-map choice: off. A profile / robot setting (robot_config.py).
+PERSON_REMOVAL_DEFAULT = _env_bool("PERSON_REMOVAL_DEFAULT", "false")
+# The service's model to use when neither the run nor the map names one (empty: the service's own default).
+PERSON_REMOVAL_MODEL = os.getenv("PERSON_REMOVAL_MODEL", "").strip()
+# Pixels the mask is grown by (people's outlines, depth flying pixels at their edges), in depth-image pixels.
+PERSON_REMOVAL_DILATE_PX = int(os.getenv("PERSON_REMOVAL_DILATE_PX", "6"))
+PERSON_MASK_TIMEOUT_S = float(os.getenv("PERSON_MASK_TIMEOUT_S", "120"))
 
 # ==================== Map Configuration ====================
 DEFAULT_MAP_ID = "default"

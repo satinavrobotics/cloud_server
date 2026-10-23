@@ -32,10 +32,13 @@ def dirs(tmp_path):
 
 class TestSpecMatchesTheCompose:
     def test_every_default_is_the_compose_default(self):
-        text = (ROOT / "docker_compose" / "mission_dispatch_services_robot.yaml").read_text()
+        # the robot override decides; a setting it does not mention is read from the robot's optional service file
+        # (person_mask_service_robot.yaml) or from the main file the override is layered over
+        texts = [(ROOT / "docker_compose" / f).read_text() for f in (
+            "mission_dispatch_services_robot.yaml", "person_mask_service_robot.yaml", "mission_dispatch_services.yaml")]
         wrong = []
         for s in rc.SETTINGS:
-            found = re.findall(r"\$\{" + s["key"] + r":-([^}]*)\}", text)
+            found = next((f for f in (re.findall(r"\$\{" + s["key"] + r":-([^}]*)\}", t) for t in texts) if f), [])
             if not found:
                 wrong.append(f"{s['key']}: not in the robot compose")
             elif any(f != s["default"] for f in found):
@@ -110,6 +113,29 @@ class TestDescribeAndSave:
             rc.save({"MEM_GRAPH_BUILDER": "6g"}, "pi5", profiles, local, total_memory=8 * GiB)
         assert e.value.code == "over_budget" and not (local / "overrides.env").exists()
         rc.save({"MEM_GRAPH_BUILDER": "1g"}, "pi5", profiles, local, total_memory=8 * GiB)
+
+    def test_an_optional_service_counts_only_where_it_is_used(self, dirs):
+        profiles, local = dirs
+        spec = rc.BY_KEY["MEM_PERSON_MASK"]
+        assert rc.counts_in_budget(spec, {}) is False and rc.counts_in_budget(spec, None) is True
+        assert rc.counts_in_budget(spec, {"PERSON_MASK_SERVICE_URL": "http://127.0.0.1:8013"}) is True
+        assert rc.counts_in_budget(rc.BY_KEY["MEM_API"], {}) is True
+        # 3.5g for the person-mask service fits on pi5 while it is not used there (no URL in the profile) ...
+        rc.save({"MEM_PERSON_MASK": "3584m"}, "pi5", profiles, local, total_memory=8 * GiB)
+        # ... and not once the profile points the API at it
+        with (profiles / "pi5.env").open("a") as f:
+            f.write("PERSON_MASK_SERVICE_URL=http://127.0.0.1:8013\n")
+        with pytest.raises(rc.ConfigError) as e:
+            rc.save({"MEM_PERSON_MASK": "3584m"}, "pi5", profiles, local, total_memory=8 * GiB)
+        assert e.value.code == "over_budget"
+        rc.save({"MEM_PERSON_MASK": "768m"}, "pi5", profiles, local, total_memory=8 * GiB)
+
+    def test_person_removal_switches_validate(self):
+        assert rc.validate("PERSON_REMOVAL_DEFAULT", "true") == "true"
+        with pytest.raises(rc.ConfigError):
+            rc.validate("PERSON_REMOVAL_DEFAULT", "yes")
+        with pytest.raises(rc.ConfigError):
+            rc.validate("PERSON_REMOVAL_DILATE_PX", "65")
 
     def test_lines_this_service_did_not_write_are_kept(self, dirs):
         profiles, local = dirs

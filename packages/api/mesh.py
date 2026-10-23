@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import pydantic
 from fastapi import HTTPException
 
+from packages.api import person_removal as pr
 from packages.api import reconstruction as rc
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.mesh_client import MeshClient
@@ -121,6 +122,8 @@ class StartBody(pydantic.BaseModel):
     atlas: Optional[int] = None
     splat_steps: Optional[int] = None
     texture_opt: Optional[bool] = None
+    # person removal for this run (docs/reconstruction/person_removal.md); null: the map's / server's setting
+    person_removal: Optional[bool] = None
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -212,9 +215,11 @@ def build_manifest(*, job_id: str, attempt: int, map_name: str, map_type: Option
                    frames: Sequence[Frame], map_bucket: str, staging_bucket: str,
                    presign_get: Callable[[str, str], str],
                    presign_put: Callable[[str, str], str], callback_base_url: str,
-                   token: str, now: datetime.datetime, expiry_s: int) -> Dict[str, Any]:
+                   token: str, now: datetime.datetime, expiry_s: int,
+                   person_removal: bool = False) -> Dict[str, Any]:
     """The POST /jobs body (CONTRACT.md). `frames` are already thinned. Like the semantic
-    manifest, with `session_id` on every node."""
+    manifest, with `session_id` on every node. With `person_removal`, a frame with people gets
+    the masked depth and a `mask_url` (person_removal.manifest_camera)."""
     nodes = []
     for f in frames:
         cameras = []
@@ -224,6 +229,8 @@ def build_manifest(*, job_id: str, attempt: int, map_name: str, map_type: Option
                    "depth_scale": float(rec.get("depth_scale") or 0.001),
                    "rgb_url": presign_get(map_bucket, rgb_key(f.node_id, name)),
                    "depth_url": presign_get(map_bucket, depth_key(f.node_id, name))}
+            pr.manifest_camera(cam, f.node_id, name, f.person_masks.get(name), person_removal,
+                               presign_get, map_bucket)
             if isinstance(rec.get("pose3d_map"), Mapping):
                 cam["pose3d"] = dict(rec["pose3d_map"])
             cameras.append(cam)
@@ -277,7 +284,8 @@ def mesh_view(job: Job, stale: Optional[bool], reason: Optional[Dict[str, int]]
             "nodes_used": inputs.get("nodes_used"), "sessions": inputs.get("sessions"),
             "frames_total": result.get("frames_total", inputs.get("frames")),
             "frames_used": result.get("frames_used"), "duration_s": result.get("duration_s"),
-            "stale": stale, "stale_reason": reason if stale else None, "files": files}
+            "stale": stale, "stale_reason": reason if stale else None, "files": files,
+            "person_removal": inputs.get("person_removal")}
 
 
 def glb_problem(head: bytes, size: int) -> Optional[str]:
@@ -521,6 +529,7 @@ class MeshGateway(rc.ReconstructionGateway):
         self._require_configured()
         params = job_params(self.config, body)
         await self._map(map_name)
+        await self._resolve_person_removal(map_name, params)
         existing = await self.repo.active(map_name)
         if existing is not None:
             raise _err(409, "job_active", "A mesh job of this map is already active",
@@ -753,7 +762,8 @@ class MeshGateway(rc.ReconstructionGateway):
             n_frames = sum(len(f.cameras) for f in used)
             inputs = {"nodes_total": total, "nodes_with_depth": len(frames),
                       "nodes_used": len(used), "sessions": per_session, "frames": n_frames,
-                      "digest": input_digest(frames), "nodes": digest_nodes(frames)}
+                      "digest": input_digest(frames), "nodes": digest_nodes(frames),
+                      "person_removal": pr.summarize(used, bool(job.params.get("person_removal")))}
             changed = await self.repo.update(job.job_id, {
                 "state": RUNNING, "attempts": attempt, "dispatched_at": now,
                 "last_contact_at": now, "next_try_at": None, "stage": QUEUED, "progress": 0.0,
@@ -792,7 +802,7 @@ class MeshGateway(rc.ReconstructionGateway):
             presign_put=lambda b, k: self.presigner.put(b, k, cfg.url_expiry_s),
             callback_base_url=cfg.callback_base_url,
             token=callback_token(cfg.callback_secret, job.job_id), now=now,
-            expiry_s=cfg.url_expiry_s)
+            expiry_s=cfg.url_expiry_s, person_removal=bool(job.params.get("person_removal")))
 
     # --- lifecycle ------------------------------------------------------------------------------
     async def prepare(self) -> None:

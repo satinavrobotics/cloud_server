@@ -84,6 +84,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import pydantic
 from fastapi import HTTPException
 
+from packages.api import person_removal as pr
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.reconstruction_client import ReconstructionClient, ServiceUnreachable
 from packages.api.reconstruction_topview import (MAX_HEADER, PlyError, TopViewError,
@@ -244,6 +245,8 @@ class StartBody(pydantic.BaseModel):
     voxel_m: Optional[float] = None
     max_depth_m: Optional[float] = None
     clip_z: Optional[float] = None
+    # person removal for this run (docs/reconstruction/person_removal.md); null: the map's / server's setting
+    person_removal: Optional[bool] = None
 
     class Config:
         extra = pydantic.Extra.forbid
@@ -287,6 +290,8 @@ class Frame:
     created_at: str
     cameras: Dict[str, Dict[str, Any]]  # camera -> the node's depth.{camera} record
     session_id: Optional[str] = None    # the mapping session that recorded the node (mesh manifest)
+    # camera -> the node's `person_mask.{camera}` record (person_removal.py); not part of the stale digest
+    person_masks: Dict[str, Dict[str, Any]] = dataclasses.field(default_factory=dict, compare=False)
 
 
 def frames_from_nodes(docs: Iterable[Mapping[str, Any]]) -> List[Frame]:
@@ -305,9 +310,11 @@ def frames_from_nodes(docs: Iterable[Mapping[str, Any]]) -> List[Frame]:
         node_id = str(doc.get("node_id") or doc.get("_key"))
         session = doc.get("session_id") or next(
             (rec.get("session_id") for rec in cams.values() if rec.get("session_id")), None)
+        masks = doc.get("person_mask") if isinstance(doc.get("person_mask"), Mapping) else {}
         frames.append(Frame(node_id, float(pose["x"]), float(pose["y"]),
                             float(pose.get("yaw") or 0.0), str(doc.get("created_at") or ""),
-                            cams, str(session) if session else None))
+                            cams, str(session) if session else None,
+                            {c: dict(masks[c]) for c in cams if isinstance(masks.get(c), Mapping)}))
     frames.sort(key=lambda f: (f.created_at, f.node_id))
     return frames
 
@@ -394,9 +401,11 @@ def build_manifest(*, job_id: str, attempt: int, map_name: str, map_type: Option
                    frames: Sequence[Frame], map_bucket: str, staging_bucket: str,
                    presign_get: Callable[[str, str], str],
                    presign_put: Callable[[str, str], str], callback_base_url: str,
-                   token: str, now: datetime.datetime, expiry_s: int) -> Dict[str, Any]:
+                   token: str, now: datetime.datetime, expiry_s: int,
+                   person_removal: bool = False) -> Dict[str, Any]:
     """The POST /jobs body (handover §2.1). `presign_get(bucket, key)` / `presign_put(...)`
-    return the URLs; everything else is pure."""
+    return the URLs; everything else is pure. With `person_removal`, a frame with people gets the
+    masked depth and a `mask_url` (person_removal.manifest_camera); the raw depth otherwise."""
     nodes = []
     for f in frames:
         cameras = []
@@ -406,6 +415,8 @@ def build_manifest(*, job_id: str, attempt: int, map_name: str, map_type: Option
                    "depth_scale": float(rec.get("depth_scale") or 0.001),
                    "rgb_url": presign_get(map_bucket, rgb_key(f.node_id, name)),
                    "depth_url": presign_get(map_bucket, depth_key(f.node_id, name))}
+            pr.manifest_camera(cam, f.node_id, name, f.person_masks.get(name), person_removal,
+                               presign_get, map_bucket)
             if isinstance(rec.get("pose3d_map"), Mapping):
                 cam["pose3d"] = dict(rec["pose3d_map"])
             cameras.append(cam)
@@ -420,7 +431,7 @@ def build_manifest(*, job_id: str, attempt: int, map_name: str, map_type: Option
         "created_at": _iso(now),
         "expires_at": _iso(now + datetime.timedelta(seconds=expiry_s)),
         "map": {"name": map_name, "type": map_type or "local", "crs": crs},
-        "params": dict(params),
+        "params": pr.strip_params(params),
         "nodes": nodes,
         "outputs": outputs,
         "callback": {"base_url": callback_url(callback_base_url, job_id), "token": token},
@@ -519,7 +530,8 @@ def reconstruction_view(job: Job, stale: Optional[bool],
             "bounds3d": result.get("bounds3d"),
             "duration_s": result.get("duration_s"),
             "stale": stale, "stale_reason": reason if stale else None,
-            "files": files}
+            "files": files,
+            "person_removal": inputs.get("person_removal")}
 
 
 def _discriminator(map_name: str, job_id: str, state: str) -> str:
@@ -951,6 +963,9 @@ class ReconstructionGateway:
         self._task: Optional[asyncio.Task] = None
         self._wake: Optional[asyncio.Event] = None
         self._staging_ready = False
+        # async (map) -> bool: person removal for a job whose request did not say (person_removal.SettingsStore.
+        # enabled_for, set by server.py); None = off
+        self.person_removal_policy: Optional[Callable[[str], Any]] = None
 
     # --- helpers --------------------------------------------------------------------------------
     async def _frames(self, map_name: str) -> Tuple[int, List[Frame]]:
@@ -972,6 +987,20 @@ class ReconstructionGateway:
         if row[0] == "DELETING":
             raise _err(409, "map_deleting", f"Map '{map_name}' is being deleted")
         return row[1] or {}
+
+    async def _resolve_person_removal(self, map_name: str, params: Dict[str, Any]) -> None:
+        """Fix the job's `person_removal` at POST (the run's value, else the map's / server's setting), so the job
+        records what it used. A policy that fails means off (logged): it never blocks a job."""
+        if params.get("person_removal") is not None:
+            params["person_removal"] = bool(params["person_removal"])
+            return
+        enabled = False
+        if self.person_removal_policy is not None:
+            try:
+                enabled = bool(await self.person_removal_policy(map_name))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Map %s: person removal setting unreadable, off for this job: %s", map_name, exc)
+        params["person_removal"] = enabled
 
     def _require_configured(self) -> None:
         if not self.config.configured or self.client is None:
@@ -1027,6 +1056,7 @@ class ReconstructionGateway:
         self._require_configured()
         params = job_params(self.config, body)
         await self._map(map_name)
+        await self._resolve_person_removal(map_name, params)
         existing = await self.repo.active(map_name)
         if existing is not None:
             raise _err(409, "job_active", "A reconstruction of this map is already active",
@@ -1538,7 +1568,8 @@ class ReconstructionGateway:
             inputs = {"nodes_total": total, "nodes_with_depth": len(frames),
                       "frames": sum(len(f.cameras) for f in frames),
                       "digest": input_digest(frames), "nodes": digest_nodes(frames),
-                      "z_floor": floor_z(frames)}
+                      "z_floor": floor_z(frames),
+                      "person_removal": pr.summarize(frames, bool(job.params.get("person_removal")))}
             changed = await self.repo.update(job.job_id, {
                 "state": RUNNING, "attempts": attempt, "dispatched_at": now,
                 "last_contact_at": now, "next_try_at": None, "stage": QUEUED, "progress": 0.0,
@@ -1574,7 +1605,7 @@ class ReconstructionGateway:
             presign_put=lambda b, k: self.presigner.put(b, k, cfg.url_expiry_s),
             callback_base_url=cfg.callback_base_url,
             token=callback_token(cfg.callback_secret, job.job_id), now=now,
-            expiry_s=cfg.url_expiry_s)
+            expiry_s=cfg.url_expiry_s, person_removal=bool(job.params.get("person_removal")))
 
     async def _backoff(self, job: Job, message: str) -> None:
         tries = int((job.error or {}).get("tries") or 0) + 1

@@ -8,7 +8,7 @@ A robot without the video token service sets SERVER_LIVEKIT_AVAILABLE=false (the
 
     {"schema_version": 1, "name": "...", "kind": "cloud" | "robot", "version": "<build sha>", "server_id": null | "...",
      "capabilities": {"robots", "missions", "maps", "orchestration", "scene_graph", "reconstruction", "semantic", "mesh",
-                      "agent", "fleet": bool},
+                      "agent", "fleet", "diagnostics", "person_removal": bool},
      "livekit": {"available", "backend", "token_path", "room_policy"},
      "min_client_version": null | "x.y.z", "recommended_client_version": null | "x.y.z"}
 
@@ -46,6 +46,7 @@ class Capabilities(pydantic.BaseModel):
     agent: bool
     fleet: bool
     diagnostics: bool = False      # additive (schema stays 1): a server that predates it simply lacks the key
+    person_removal: bool = False   # additive: the person-mask service is configured (PERSON_MASK_SERVICE_URL)
 
 
 class LiveKitInfo(pydantic.BaseModel):
@@ -108,6 +109,7 @@ def build_server_info(cfg=config) -> ServerInfo:
             agent=bool(cfg.SERVER_AGENT_AVAILABLE),
             fleet=True,                         # a robot server may host several robots (decision D2)
             diagnostics=bool(cfg.SERVER_DIAGNOSTICS_AVAILABLE),
+            person_removal=bool(getattr(cfg, "PERSON_MASK_SERVICE_URL", None)),
         ),
         livekit=LiveKitInfo(
             available=video,

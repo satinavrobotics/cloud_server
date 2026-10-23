@@ -145,6 +145,16 @@ class ImageDatabaseService(MinIOService):
         return self._store_png(png_data, self.depth_key(str(node_id), camera), node_id, map_id,
                                metadata, f"depth {camera}")
 
+    def store_node_png(self, png_data: bytes, key: str, node_id: str, map_id: str,
+                       metadata: Optional[Dict[str, str]] = None) -> bool:
+        """Store a derived PNG of a node at `key` (person removal: `{node}/person_mask/{camera}.png`,
+        `{node}/depth_masked/{camera}.png`; packages/api/person_removal.py). Only under the node's own prefix and
+        never over the raw depth, image or costmap objects. Returns True if successful."""
+        node = str(node_id)
+        if not key.startswith(node + "/") or "/depth/" in key or "/images/" in key or "/costmap/" in key:
+            raise ValueError(f"not a derived key of node {node}: {key}")
+        return self._store_png(png_data, key, node, map_id, metadata, key.split("/")[1])
+
     @staticmethod
     def costmap_key(node_id: str, layer: str) -> str:
         """Object key of a node's costmap PNG: `{node_id}/costmap/{layer}.png`."""
@@ -458,7 +468,7 @@ class ImageDatabaseService(MinIOService):
 
     def delete_node_images(self, node_id: str, map_id: Optional[str] = None) -> bool:
         """Delete every stored object of a node: its images and their thumbnails, depth images
-        and costmap layers. Returns True if successful."""
+        and costmap layers, and the person-removal masks and masked depth. Returns True if successful."""
         try:
             map_id = map_id or self.default_map_id
             bucket_name = self._bucket_name(map_id)
@@ -468,7 +478,7 @@ class ImageDatabaseService(MinIOService):
 
             objects = [
                 obj
-                for sub in ("images", "thumbs", "depth", "costmap")
+                for sub in ("images", "thumbs", "depth", "costmap", "person_mask", "depth_masked")
                 for obj in self.client.list_objects(bucket_name, prefix=f"{node_id}/{sub}/", recursive=True)
             ]
             for obj in objects:

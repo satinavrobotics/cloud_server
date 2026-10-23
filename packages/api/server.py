@@ -719,6 +719,16 @@ class ApiDelegationService:
             minio_access_key or require_secret("MINIO_ACCESS_KEY"),
             minio_secret_key or require_secret("MINIO_SECRET_KEY"))
 
+        # Person removal (docs/reconstruction/person_removal.md): masks from the optional person-mask service, a
+        # per-map setting (table map_person_removal) and the policy the reconstruction and mesh gateways ask when a
+        # job's request does not say. Off by default; the job routes answer 503 without PERSON_MASK_SERVICE_URL.
+        from packages import config as _config
+        from packages.api import person_removal as _person_removal
+        self.person_removal, self.person_removal_settings = _person_removal.create(
+            self.database, self.graph_db, self.image_db, _config)
+        self.reconstruction.person_removal_policy = self.person_removal_settings.enabled_for
+        self.mesh.person_removal_policy = self.person_removal_settings.enabled_for
+
         # Per-map view settings of the map window (docs/semantic/design.md §10.4): a small table of its own.
         self.view_settings = map_view_settings.ViewSettingsStore(self.database)
 
