@@ -130,6 +130,18 @@ class TestBacklog:
         m.note_spool("r1", {"run_id": "A", "depth": 1})
         assert m.backlog("r1", "A")["open_trackers"] == 2
 
+    def test_extra_spool_fields_are_the_robot_report(self):
+        m = self._mgr()
+        m.note_spool("r1", {"run_id": "A", "depth": 144, "sent": 0, "latch": "leftovers_held",
+                            "nested": {"x": 1}, "long": "y" * 500, 7: "bad key"})
+        report = m.backlog("r1")["robot_report"]
+        assert report["sent"] == 0 and report["latch"] == "leftovers_held"
+        assert "nested" not in report and len(report["long"]) == 120 and 7 not in report
+        assert "depth" not in report and "run_id" not in report
+        m.note_spool("r1", {"run_id": "A", "depth": 1, **{f"k{i}": i for i in range(50)}})
+        assert len(m.backlog("r1")["robot_report"]) == 12
+        assert self._mgr().backlog("r1")["robot_report"] == {}
+
     def test_age_and_the_endpoint(self):
         t = {"ms": 5000}
         m = acks.AckManager(lambda *a: 0, {}, wall_ms=lambda: t["ms"])
@@ -293,6 +305,22 @@ class TestFinish:
         assert detail["backlog"]["depth"] == 4 and "force=true" in detail["message"]
         out = await maps.session_action(None, "yard", sid, "pause", m1.PUB, switch=switch)
         assert out["changed"] is True  # still an open, running session
+
+    async def test_stalled_message_names_the_cause(self, db):
+        switch, sid = await mapping_session(db)
+        s = {**snap(144), "spool_age_s": 600.0,
+             "robot_report": {"sent": 0, "latch": "leftovers_held"}}
+        code, detail = await status_of(fin(switch, sid, feed([s])))
+        assert code == 409
+        msg = detail["message"]
+        assert "No node of this run has reached the server" in msg
+        assert "10 min ago" in msg and "sent=0, latch=leftovers_held" in msg
+
+    async def test_stalled_message_without_cause_signals(self, db):
+        switch, sid = await mapping_session(db)
+        code, detail = await status_of(fin(switch, sid, feed([snap(4, done=3)])))
+        assert code == 409 and "reached the server" not in detail["message"]
+        assert "reports" not in detail["message"]
 
     async def test_cap_is_409(self, db):
         switch, sid = await mapping_session(db)

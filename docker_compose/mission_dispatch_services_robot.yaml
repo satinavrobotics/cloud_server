@@ -14,7 +14,7 @@
 #     minio-tailnet stays: presigned URLs are signed for MINIO_HOST, which here is the Pi's tailnet IP.
 #   - images come from the registry (IMAGE_REGISTRY/IMAGE_TAG, written by scripts/build_push.sh), never built here.
 #   - Python services get MALLOC_ARENA_MAX=2 (glibc makes up to 8 arenas per core for many threads; fewer arenas, lower RSS).
-#   - Every container has a memory limit (defaults sum to 3456 MiB = ~3.4 GiB, ~4.1 GiB with the reconstruction container, set from
+#   - Every container has a memory limit (defaults sum to 4096 MiB = 4 GiB with livekit-sfu, its tokens and diagnostics, ~4.8 GiB with the reconstruction container, set from
 #     what each one used on a 4 GB Pi: the graph builder alone peaked at ~750 MB; see .env.robot.example for 8 GB) and a
 #     rotated log. Postgres, ArangoDB, the planner and graph-builder listen on loopback only; mosquitto on loopback + the
 #     tailnet IP; the API (8000) and MinIO's tailnet forwarder are the only other doors.
@@ -206,7 +206,7 @@ services:
         condition: service_healthy
 
   # Self-hosted video, offline: the Jetson robots publish to this SFU and clients subscribe (docs/robot_deploy.md, Video).
-  # Reached on the tailnet IP only (7880 signalling, 7881 TCP, 50000-50100 UDP media). Keys: LIVEKIT_SFU_API_KEY/SECRET.
+  # Reached on the tailnet IP and ROBOT_LAN_IP when set (7880 signalling, 7881 TCP, 50000-50100 UDP media). Keys: LIVEKIT_SFU_API_KEY/SECRET.
   livekit-sfu:
     image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/livekit_sfu:${IMAGE_TAG:-latest}
     environment:

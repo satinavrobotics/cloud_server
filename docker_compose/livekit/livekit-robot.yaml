@@ -1,5 +1,5 @@
 # Self-hosted LiveKit SFU on the robot (Raspberry Pi): the Jetson robots publish to it and clients subscribe, offline.
-# Template: the entrypoint in mission_dispatch_services_robot.yaml replaces __NODE_IP__ with ROBOT_TAILNET_IP.
+# Template: the entrypoint in mission_dispatch_services_robot.yaml replaces __NODE_IP__ with ROBOT_TAILNET_IP and __LAN_IP__ with ROBOT_LAN_IP.
 # Small on purpose: one node, no Redis, no TURN, no metrics endpoint, a narrow media port range.
 port: 7880
 bind_addresses: ["127.0.0.1", "__NODE_IP__", "__LAN_IP__"]   # the signalling port: loopback (token service, API) + the tailnet IP + the LAN IP (ROBOT_LAN_IP; 127.0.0.2 = off), nothing else

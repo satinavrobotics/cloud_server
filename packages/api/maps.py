@@ -3011,6 +3011,26 @@ async def _peek_session(db: Any, map_name: str, session_id: str) -> Optional[Dic
     return session if session is not None and session["map_name"] == map_name else None
 
 
+def _backlog_cause(snap: Optional[Dict[str, Any]]) -> str:
+    """What the backlog snapshot says about why it is not draining, as a sentence ('' when it
+    says nothing): no node of the run reached the server, the robot's spool_state is old, and the
+    extra fields the robot put in its spool_state (`robot_report`, e.g. its sender state)."""
+    if not isinstance(snap, dict):
+        return ""
+    parts = []
+    if snap.get("highest_complete_id") is None and not snap.get("open_trackers"):
+        parts.append("No node of this run has reached the server yet: the robot is not sending "
+                     "(see the Spool tab of its orchestrator).")
+    age = snap.get("spool_age_s")
+    if isinstance(age, (int, float)) and age >= 120:
+        parts.append(f"The robot last reported its upload queue {round(age / 60)} min ago.")
+    report = snap.get("robot_report")
+    if isinstance(report, dict) and report:
+        parts.append("The robot reports: "
+                     + ", ".join(f"{k}={v}" for k, v in list(report.items())[:12]) + ".")
+    return (" " + " ".join(parts)) if parts else ""
+
+
 async def _wait_for_backlog(db: Any, map_name: str, session_id: str,
                             fetch: ingest_backlog.BacklogFetch, force: bool,
                             opts: Dict[str, Any], verb: str = "finish") -> Dict[str, Any]:
@@ -3042,7 +3062,8 @@ async def _wait_for_backlog(db: Any, map_name: str, session_id: str,
                         + ("The session is paused, so the cloud refuses them: resume it, or "
                            if paused else (f"The drain is progressing but hit the {round(result['waited_s'])} s ceiling: retry to keep waiting, or "
                               if state == ingest_backlog.CAP else "Retry later, or "))
-                        + f"{verb} with force=true to discard them.")})
+                        + f"{verb} with force=true to discard them."
+                        + _backlog_cause(snap))})
     now = await _peek_session(db, map_name, session_id)
     if now is not None and now["ended_at"] is not None:  # finished meanwhile: _session_action
         return {}                                        # answers the usual repeat (changed: false)

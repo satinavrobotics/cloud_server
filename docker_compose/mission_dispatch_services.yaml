@@ -154,7 +154,7 @@ services:
   minio:
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
     # Loopback only; minio-tailnet (below) adds the Tailscale address. Never the LAN/internet.
-    command: server /data --address "127.0.0.1:9000" --console-address "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}"
+    command: server /data --address "127.0.0.1:9000" --console-address "127.0.0.1:${MINIO_CONSOLE_PORT:-9002}"
     environment:
       - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
       - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -176,7 +176,7 @@ services:
     image: nginx:1.29.3-alpine@sha256:b3c656d55d7ad751196f21b7fd2e8d4da9cb430e32f646adcf92441b72f82b14   # nginx 1.29.3 as running
     environment:
       - MINIO_TAILNET_IP=${MINIO_TAILNET_IP:-}
-      - MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-9001}
+      - MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-9002}
     command: ["sh", "-c", ": \"$${MINIO_TAILNET_IP:?set MINIO_TAILNET_IP}\" && envsubst '$${MINIO_TAILNET_IP} $${MINIO_CONSOLE_PORT}' < /minio_tailnet.conf.template > /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
     network_mode: "host"
     restart: unless-stopped
