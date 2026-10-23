@@ -4,6 +4,12 @@ Plan for the cloud_server side of the nodePolicy / corridor contract agreed with
 after the 22 Oct konferencia runs in which no order carried a nodePolicy. Supersedes the open parts of
 `node_policies_2026-10-13.md`. `satibot_orchestrator` is out of scope: it belongs to the robot side.
 
+**Status (branch `feature/node-policies-v2`):** Phase 0 and steps 1.1–1.5 are implemented with unit tests; Phases 2–4 are open.
+Call-outs from the implementation: D1–D3 were taken as recommended (the editor's explicit skippable on an operator waypoint is still
+sent not skippable, see `annotate_corridors` `keep_intent`; the go-to `origin` work is Phase 2). Step 1.1 still needs the data action
+`PUT /api/v1/robots/formidable-peacock {"node_policy": "on"}` after deploy. A registration with an empty `actions` list no longer
+clears the stored list (only a factsheet message does).
+
 ## 1. The agreed contract (summary)
 
 | Topic | Agreement |
