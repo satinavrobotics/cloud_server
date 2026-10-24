@@ -142,6 +142,26 @@ class TestBacklog:
         assert len(m.backlog("r1")["robot_report"]) == 12
         assert self._mgr().backlog("r1")["robot_report"] == {}
 
+    def test_leftover_hold_is_kept_apart_and_progress_age_advances(self):
+        m = self._mgr()
+        m.note_spool("r1", {"run_id": "A", "depth": 144, "hold": True, "leftovers": 144,
+                            "latched": True, "latch_reason": "leftovers_held",
+                            "last_progress_age_s": 30, "node_counters": {"x": 1}})
+        b = m.backlog("r1", "A")
+        assert b["hold"] and b["latched"] and b["leftovers"] == 144
+        assert b["latch_reason"] == "leftovers_held" and b["progress_age_s"] >= 30
+        assert "hold" not in b["robot_report"] and "latch_reason" not in b["robot_report"]
+        none = self._mgr()
+        none.note_spool("r1", {"run_id": "A", "depth": 1})
+        assert none.backlog("r1", "A")["hold"] is False
+        assert none.backlog("r1", "A")["progress_age_s"] is None
+
+    def test_cause_names_the_hold(self):
+        from packages.api.maps import _backlog_cause
+        text = _backlog_cause({"hold": True, "leftovers": 144, "latch_reason": "leftovers_held",
+                               "latched": True, "progress_age_s": 600})
+        assert "holding 144 bundle(s)" in text and "leftovers_held" in text and "10 min" in text
+
     def test_age_and_the_endpoint(self):
         t = {"ms": 5000}
         m = acks.AckManager(lambda *a: 0, {}, wall_ms=lambda: t["ms"])

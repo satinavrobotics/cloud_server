@@ -3015,9 +3015,17 @@ def _backlog_cause(snap: Optional[Dict[str, Any]]) -> str:
     if not isinstance(snap, dict):
         return ""
     parts = []
-    if snap.get("highest_complete_id") is None and not snap.get("open_trackers"):
+    if snap.get("hold") or snap.get("latched"):
+        n, why = snap.get("leftovers"), snap.get("latch_reason")
+        parts.append(f"The robot is holding {n if isinstance(n, int) else 'some'} bundle(s) from an "
+                     "earlier run" + (f" ({why})" if why else "")
+                     + " and waits for an operator decision (resume or discard).")
+    elif snap.get("highest_complete_id") is None and not snap.get("open_trackers"):
         parts.append("No node of this run has reached the server yet: the robot is not sending "
                      "(see the Spool tab of its orchestrator).")
+    prog = snap.get("progress_age_s")
+    if isinstance(prog, (int, float)) and prog >= 120:
+        parts.append(f"The robot made no upload progress for {round(prog / 60)} min.")
     age = snap.get("spool_age_s")
     if isinstance(age, (int, float)) and age >= 120:
         parts.append(f"The robot last reported its upload queue {round(age / 60)} min ago.")

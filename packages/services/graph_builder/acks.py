@@ -72,7 +72,10 @@ _ROBOT_CAP = 10000            # ingest_state / spool_state entries kept (one per
 # are kept verbatim for diagnosis (`robot_report` of the backlog), bounded:
 _SPOOL_REPORT_MAX_FIELDS = 12
 _SPOOL_REPORT_MAX_STR = 120
-_SPOOL_CONTRACT_FIELDS = frozenset({"run_id", "last_spooled_id", "depth"})
+# The leftover-hold fields are kept apart (the cause shown to the operator), not in the capped report.
+_SPOOL_HOLD_FIELDS = frozenset({"hold", "leftovers", "latched", "latch_reason",
+                                "last_progress_age_s"})
+_SPOOL_CONTRACT_FIELDS = frozenset({"run_id", "last_spooled_id", "depth"}) | _SPOOL_HOLD_FIELDS
 _MQTT_ERR_NO_CONN = 4         # paho: QoS 1 is queued for the reconnect, not lost
 _MQTT_ERR_QUEUE_SIZE = 15     # paho: the outgoing queue is at max_queued_messages
 
@@ -432,6 +435,8 @@ class AckManager:
             self._spool[robot] = {"run_id": payload.get("run_id"),
                                   "last_spooled_id": payload.get("last_spooled_id"),
                                   "depth": payload.get("depth"),
+                                  "hold": {k: payload[k] for k in _SPOOL_HOLD_FIELDS
+                                           if isinstance(payload.get(k), (str, int, float, bool))},
                                   "report": _spool_report(payload),
                                   "received_ms": self._wall_ms()}
             self._spool.move_to_end(robot)
@@ -493,7 +498,26 @@ class AckManager:
                                 if spool is not None else None),
                 # what else the robot's spool_state said (sender state, counters), any run
                 "robot_report": dict(spool.get("report") or {}) if spool is not None else {},
+                **self._hold_view(spool, now_ms),
             }
+
+    @staticmethod
+    def _hold_view(spool: Optional[Mapping], now_ms: float) -> Dict[str, Any]:
+        """The robot's leftover hold / latch, and its seconds since the last upload progress NOW:
+        the retained message's last_progress_age_s (robot seconds when composed) plus the time since
+        this side received it (only our clock; the robot sends no wall time)."""
+        hold = dict(spool.get("hold") or {}) if spool is not None else {}
+        age = hold.get("last_progress_age_s")
+        if isinstance(age, bool) or not isinstance(age, (int, float)):
+            age = None
+        else:
+            age = round(max(0, age) + max(0, now_ms - spool["received_ms"]) / 1000.0, 1)
+        return {"hold": hold.get("hold") is True,
+                "leftovers": (hold["leftovers"] if isinstance(hold.get("leftovers"), int)
+                              and not isinstance(hold["leftovers"], bool) else None),
+                "latched": hold.get("latched") is True,
+                "latch_reason": hold.get("latch_reason") if isinstance(hold.get("latch_reason"), str) else None,
+                "progress_age_s": age}
 
     # --- internals (call under the lock) --------------------------------------------------
 
