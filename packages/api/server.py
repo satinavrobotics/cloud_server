@@ -543,6 +543,44 @@ def _get_resize_semaphore() -> asyncio.Semaphore:
     return _resize_semaphore
 
 
+def build_mission_update(mission) -> Dict[str, Any]:
+    """The `mission_update` WebSocket message of a mission: the one builder for the live
+    broadcast and the snapshot sent when a client connects (/ws/mission/{name})."""
+    st = mission.status
+    return {
+        "type": "mission_update",
+        "mission_name": mission.name,
+        "robot_name": mission.robot,
+        "needs_canceled": mission.needs_canceled,
+        "timestamp": datetime.now().isoformat(),
+        "status": {
+            "state": st.state.value,
+            "current_node": st.current_node,
+            "failure_reason": st.failure_reason,
+            "failure_category": st.failure_category.value if st.failure_category is not None else None,
+            "start_timestamp": st.start_timestamp.isoformat() if st.start_timestamp is not None else None,
+            "end_timestamp": st.end_timestamp.isoformat() if st.end_timestamp is not None else None,
+            "blocked": st.blocked,
+            "blocked_node": st.blocked_node,
+            "blocked_edge": st.blocked_edge,
+            "blocked_waypoint_index": st.blocked_waypoint_index,
+            "block_reason": st.block_reason,
+            "block_reason_code": st.block_reason_code,
+            "blocked_held_s": st.blocked_held_s,
+            "blocked_sequence_id": st.blocked_sequence_id,
+            "blocked_skip_refused": st.blocked_skip_refused,
+            # Progress and the dispatch hold, so the client need not wait for its REST poll
+            "node_status": {
+                name: {"state": ns.state.value, "error_msg": ns.error_msg}
+                for name, ns in st.node_status.items()
+            },
+            "task_status": dict(st.task_status),
+            "held": st.held,
+            "held_reason": st.held_reason,
+        },
+    }
+
+
 class ApiDelegationService:
     """
     API Delegation Service - Central gateway for client requests.
@@ -2474,40 +2512,9 @@ class ApiDelegationService:
                 if mission.lifecycle == ObjectLifecycleV1.DELETED:
                     continue
 
-                # Build WebSocket message — include full status plus needs_canceled so
-                # clients can show the "(Canceling...)" indicator without a round-trip.
-                st = mission.status
-                message = {
-                    "type": "mission_update",
-                    "mission_name": mission.name,
-                    "robot_name": mission.robot,
-                    "needs_canceled": mission.needs_canceled,
-                    "timestamp": datetime.now().isoformat(),
-                    "status": {
-                        "state": st.state.value if hasattr(st, 'state') else "PENDING",
-                        "current_node": st.current_node if hasattr(st, 'current_node') else 0,
-                        "failure_reason": st.failure_reason if hasattr(st, 'failure_reason') else None,
-                        "failure_category": st.failure_category.value if (
-                            hasattr(st, 'failure_category') and st.failure_category is not None
-                        ) else None,
-                        "start_timestamp": st.start_timestamp.isoformat() if (
-                            hasattr(st, 'start_timestamp') and st.start_timestamp is not None
-                        ) else None,
-                        "end_timestamp": st.end_timestamp.isoformat() if (
-                            hasattr(st, 'end_timestamp') and st.end_timestamp is not None
-                        ) else None,
-                        "blocked": st.blocked if hasattr(st, 'blocked') else False,
-                        "blocked_node": st.blocked_node if hasattr(st, 'blocked_node') else None,
-                        "blocked_edge": st.blocked_edge if hasattr(st, 'blocked_edge') else None,
-                        "blocked_waypoint_index": st.blocked_waypoint_index if hasattr(
-                            st, 'blocked_waypoint_index') else None,
-                        "block_reason": st.block_reason if hasattr(st, 'block_reason') else None,
-                        "block_reason_code": getattr(st, "block_reason_code", None),
-                        "blocked_held_s": getattr(st, "blocked_held_s", None),
-                        "blocked_sequence_id": getattr(st, "blocked_sequence_id", None),
-                        "blocked_skip_refused": getattr(st, "blocked_skip_refused", None),
-                    }
-                }
+                # Build WebSocket message — full status plus needs_canceled so clients can
+                # show the "(Canceling...)" indicator without a round-trip.
+                message = build_mission_update(mission)
 
                 # Broadcast to all WebSocket clients subscribed to this mission
                 await self.ws_manager.broadcast("mission_status", mission.name, message)
