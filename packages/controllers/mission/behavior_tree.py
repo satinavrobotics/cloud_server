@@ -16,9 +16,13 @@ limitations under the License.
 
 SPDX-License-Identifier: Apache-2.0
 """
+import logging
+
 import py_trees
 from typing import Any
 import cloud_common.objects.mission as mission_object
+
+logger = logging.getLogger("Isaac Mission Dispatch.behavior_tree")
 
 def tree2mission_state(type: py_trees.common.Status) -> mission_object.MissionStateV1:
     if type == py_trees.common.Status.SUCCESS:
@@ -47,8 +51,7 @@ class ConstantBehaviorNode(py_trees.behaviour.Behaviour):
     """
 
     def __init__(self, name: str, idx: int, const_status=py_trees.common.Status.SUCCESS):
-        print(
-            f"Create a constant node for mission node {idx} with status {const_status}", flush=True)
+        logger.info("Create a constant node for mission node %s with status %s", idx, const_status)
         self.idx = idx
         self.name = name
         self.const_status = const_status
@@ -212,5 +215,4 @@ class MissionBehaviorTree():
                     tree2mission_state(node.status)
 
     def info(self, message: str):
-        print(f"[Isaac Mission Dispatch (Behavior Tree)] | : "
-              f"[{self.mission.name}] {message}", flush=True)
+        logger.info("[%s] %s", self.mission.name, message)
