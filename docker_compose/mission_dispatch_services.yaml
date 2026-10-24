@@ -23,13 +23,14 @@ services:
       - /bin/sh
       - -c 
       - | 
-        sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" 
+        sh mosquitto.sh "${MQTT_PORT_TCP}" "${MQTT_PORT_WEBSOCKET}" "0.0.0.0" "all" /mosquitto/data 
     network_mode: "host"
     restart: unless-stopped
     volumes:
     - type: bind
       source: ../packages/utils/mosquitto.sh
       target: /mosquitto.sh
+    - mosquitto_data:/mosquitto/data      # retained messages survive a restart
 
   # Create Postgres database
   postgres:
@@ -628,6 +629,7 @@ services:
 volumes:
   arango_data:
   mission_dispatch_spill:
+  mosquitto_data:
   pgdata14:
     # Production PG14 data. This was the container's anonymous volume, pinned by name so that
     # `down`/`up` reattaches it instead of creating a fresh, empty one. external: compose never
