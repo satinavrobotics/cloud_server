@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import HTTPException
 
+from packages.utils.timeutil import utcnow as _utcnow
 from packages import config
 from packages.events.codes import EventCode
 from packages.events.emit import INSERT_SQL, Event, build_row, row_params
@@ -82,10 +83,6 @@ PROCESSES = (health.PROCESS_DISPATCH, health.PROCESS_API)
 ROLE_WRITER = "writer"
 ROLE_STANDBY = "standby"
 MAX_PENDING_EVENTS = 200
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(UTC)
 
 
 def _iso(ts: Optional[datetime.datetime]) -> Optional[str]:

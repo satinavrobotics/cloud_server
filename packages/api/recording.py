@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 from fastapi import HTTPException
 
 from cloud_common.objects.common import TELEMETRY_RECORDING_LEVELS
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.events.schemas import RecordingLevel, RecordingScope
@@ -39,10 +40,6 @@ logger = logging.getLogger("ApiDelegationService.recording")
 # Counters for health/debugging: events written, and event writes that failed (the object
 # change was committed without its event).
 stats: Dict[str, int] = {"written": 0, "failed": 0}
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 # --- event discriminators -----------------------------------------------------------------
