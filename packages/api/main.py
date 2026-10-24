@@ -18,7 +18,7 @@ from datetime import datetime
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, validator
 import uvicorn
 
 from packages.api.server import ApiDelegationService, build_mission_update
@@ -196,6 +196,14 @@ class CreateBagEntryRequest(BaseModel):
     robot_name: str = Field(..., description="Name of the robot that produced the bag")
     description: Optional[str] = Field(None, description="Human-readable description of the recording")
     recorded_at: Optional[str] = Field(None, description="ISO-8601 timestamp when recording started")
+
+    @validator("robot_name")
+    def _robot_name_is_one_key_segment(cls, v):
+        # The name is the first segment of the bag's object key ({robot}/{bag_id}): a "/" would
+        # file the bag under another robot's prefix, where that robot's list and delete see it.
+        if not v or "/" in v or v in (".", ".."):
+            raise ValueError("robot_name must be a single name without '/'")
+        return v
 
 
 class CreateBagEntryResponse(BaseModel):

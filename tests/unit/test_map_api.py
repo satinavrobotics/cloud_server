@@ -1,6 +1,7 @@
 """Unit tests for map CRUD API endpoints and GPS navigation."""
 
 import pytest
+from fastapi import HTTPException
 
 from packages.api import maps
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
@@ -75,7 +76,7 @@ class TestApiDelegationGetMap:
         from packages.api.server import ApiDelegationService
 
         mock_db_inst = AsyncMock()
-        mock_db_inst.get_object = AsyncMock(side_effect=Exception("not found"))
+        mock_db_inst.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         mock_db.return_value = mock_db_inst
         mock_graph.return_value = Mock()
 
@@ -109,7 +110,7 @@ class TestApiDelegationUpdateDatum:
         map_obj = _make_map_obj()
         mock_db_inst = AsyncMock()
         mock_db_inst.get_object = AsyncMock(return_value=map_obj)
-        mock_db_inst.update_spec = AsyncMock()
+        mock_db_inst.update_spec_fields = AsyncMock()
         mock_db.return_value = mock_db_inst
         mock_graph.return_value = Mock()
 
@@ -121,7 +122,7 @@ class TestApiDelegationUpdateDatum:
         assert result["datum_latitude"] == 47.999
         assert result["datum_longitude"] == 8.888
         assert result["datum_bearing_deg"] == 45.0
-        mock_db_inst.update_spec.assert_called_once()
+        mock_db_inst.update_spec_fields.assert_called_once()
 
     @pytest.mark.asyncio
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
@@ -137,7 +138,7 @@ class TestApiDelegationUpdateDatum:
         from packages.api.server import ApiDelegationService
 
         mock_db_inst = AsyncMock()
-        mock_db_inst.get_object = AsyncMock(side_effect=Exception("not found"))
+        mock_db_inst.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         mock_db.return_value = mock_db_inst
         mock_graph.return_value = Mock()
 
@@ -163,7 +164,7 @@ class TestApiDelegationUpdateDatum:
         map_obj = _make_map_obj()
         mock_db_inst = AsyncMock()
         mock_db_inst.get_object = AsyncMock(return_value=map_obj)
-        mock_db_inst.update_spec = AsyncMock()
+        mock_db_inst.update_spec_fields = AsyncMock()
         mock_db.return_value = mock_db_inst
         mock_graph.return_value = Mock()
 
@@ -175,7 +176,7 @@ class TestApiDelegationUpdateDatum:
 
         assert result["datum_frame"] == "utm"
         assert result["datum_utm_zone"] == 34
-        spec = mock_db_inst.update_spec.call_args[0][2]
+        spec = MapSpecV1(**{**map_obj.spec.dict(), **mock_db_inst.update_spec_fields.call_args[0][2]})
         assert spec.datum_frame == "utm"
         assert spec.datum_utm_zone == 34 and spec.datum_utm_north is True
         assert spec.datum_utm_easting is None
@@ -201,7 +202,7 @@ class TestApiDelegationUpdateDatum:
         map_obj.description = "yard"
         mock_db_inst = AsyncMock()
         mock_db_inst.get_object = AsyncMock(return_value=map_obj)
-        mock_db_inst.update_spec = AsyncMock()
+        mock_db_inst.update_spec_fields = AsyncMock()
         mock_db.return_value = mock_db_inst
         mock_graph.return_value = Mock()
 
@@ -210,7 +211,7 @@ class TestApiDelegationUpdateDatum:
         result = await service.update_map_datum("site_a", 47.0, 8.0)
 
         assert result["datum_frame"] == "enu"
-        spec = mock_db_inst.update_spec.call_args[0][2]
+        spec = MapSpecV1(**{**map_obj.spec.dict(), **mock_db_inst.update_spec_fields.call_args[0][2]})
         assert spec.datum_frame == "enu"
         assert spec.datum_utm_zone is None and spec.datum_utm_easting is None
         assert spec.description == "yard"
@@ -280,8 +281,8 @@ class TestApiDelegationLoadMapPostgres:
         from packages.api.server import ApiDelegationService
 
         mock_db_inst = AsyncMock()
-        mock_db_inst.create_object = AsyncMock(side_effect=Exception("duplicate"))
-        mock_db_inst.update_spec = AsyncMock()
+        mock_db_inst.create_object = AsyncMock(side_effect=HTTPException(400, "duplicate"))
+        mock_db_inst.update_spec_fields = AsyncMock()
         mock_db.return_value = mock_db_inst
 
         mock_graph_inst = Mock()
@@ -295,14 +296,14 @@ class TestApiDelegationLoadMapPostgres:
         result = await service.load_map(map_id="existing")
 
         assert result["success"] is True
-        mock_db_inst.update_spec.assert_not_called()
+        mock_db_inst.update_spec_fields.assert_not_called()
 
         # ...whereas a load that does supply a datum updates the existing record.
         result = await service.load_map(
             map_id="existing", datum_latitude=47.37, datum_longitude=8.54)
 
         assert result["success"] is True
-        mock_db_inst.update_spec.assert_called_once()
+        mock_db_inst.update_spec_fields.assert_called_once()
 
     @pytest.mark.asyncio
     @patch('packages.topomap_dbs.client.ImageDatabaseService')
@@ -324,7 +325,7 @@ class TestApiDelegationLoadMapPostgres:
             datum_frame="utm", datum_utm_zone=34, datum_utm_north=True,
             datum_utm_easting=351756.484938, datum_utm_northing=5260323.440888)
         mock_db_inst = AsyncMock()
-        mock_db_inst.create_object = AsyncMock(side_effect=Exception("duplicate"))
+        mock_db_inst.create_object = AsyncMock(side_effect=HTTPException(400, "duplicate"))
         mock_db_inst.get_object = AsyncMock(return_value=stored)
         mock_db.return_value = mock_db_inst
 
@@ -575,7 +576,7 @@ class TestMissionPlannerGetMapDatum:
         from packages.services.mission_planner.server import MissionPlannerService
 
         mock_db_inst = AsyncMock()
-        mock_db_inst.get_object = AsyncMock(side_effect=Exception("not found"))
+        mock_db_inst.get_object = AsyncMock(side_effect=HTTPException(404, "not found"))
         mock_db.return_value = mock_db_inst
         mock_graph.return_value = Mock()
 

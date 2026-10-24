@@ -1036,7 +1036,9 @@ class ApiDelegationService:
             try:
                 await self.database.create_object(map_obj, _uuid.uuid4())
                 self.logger.info(f"Registered map '{actual_map_id}' in Postgres")
-            except Exception:
+            except HTTPException as exists:
+                if exists.status_code != 400:   # 400 = the DB layer's "already exists"
+                    raise
                 if datum_latitude is not None and datum_longitude is not None:
                     # Explicit datum provided — update the full spec including datum, but keep
                     # the stored map's type and geo origin (maps redesign M1): a legacy load
@@ -1208,7 +1210,9 @@ class ApiDelegationService:
         import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
-        except Exception:
+        except HTTPException as missing:   # the DB layer's 404; a DB error is not "not found"
+            if missing.status_code != 404:
+                raise
             return {"success": False, "error": f"Map '{map_id}' not found"}
         stats = self.graph_db.get_map_stats(map_id)
         result = {
@@ -1265,7 +1269,9 @@ class ApiDelegationService:
         import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
-        except Exception:
+        except HTTPException as missing:   # the DB layer's 404; a DB error is not "not found"
+            if missing.status_code != 404:
+                raise
             return {"success": False, "error": f"Map '{map_id}' not found"}
         is_geo = effective_type(map_obj.spec) == "geo"
         if is_geo:
@@ -1879,8 +1885,10 @@ class ApiDelegationService:
 
         try:
             await self.database.get_object(RobotObjectV1, robot_name)
-        except Exception as e:
-            self.logger.error(f"Robot '{robot_name}' not found: {e}")
+        except HTTPException as e:   # the DB layer's 404; a DB error is not "not found"
+            if e.status_code != 404:
+                raise
+            self.logger.error(f"Robot '{robot_name}' not found: {e.detail}")
             raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
         try:
@@ -1934,8 +1942,10 @@ class ApiDelegationService:
 
         try:
             await self.database.get_object(RobotObjectV1, robot_name)
-        except Exception as e:
-            self.logger.error(f"Robot '{robot_name}' not found: {e}")
+        except HTTPException as e:   # the DB layer's 404; a DB error is not "not found"
+            if e.status_code != 404:
+                raise
+            self.logger.error(f"Robot '{robot_name}' not found: {e.detail}")
             raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
         if not mission_name:
@@ -2036,8 +2046,10 @@ class ApiDelegationService:
             # Validate robot exists
             try:
                 robot = await self.database.get_object(RobotObjectV1, robot_name)
-            except Exception as e:
-                self.logger.error(f"Robot '{robot_name}' not found: {e}")
+            except HTTPException as e:   # the DB layer's 404; a DB error is not "not found"
+                if e.status_code != 404:
+                    raise
+                self.logger.error(f"Robot '{robot_name}' not found: {e.detail}")
                 raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
             # Validate action is available on this robot
