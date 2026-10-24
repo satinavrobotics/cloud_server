@@ -155,7 +155,9 @@ class FleetAgent:
                 import anthropic  # imported lazily so tests/dev don't require it
                 # base_url lets us target an Anthropic-compatible proxy (e.g. a
                 # local LiteLLM proxy fronting a free model). Unset == real API.
-                kwargs = {"api_key": api_key}
+                from packages import config
+                kwargs = {"api_key": api_key, "timeout": config.AGENT_LLM_TIMEOUT_S,
+                          "max_retries": config.AGENT_LLM_MAX_RETRIES}
                 if base_url:
                     kwargs["base_url"] = base_url
                 self._client = anthropic.Anthropic(**kwargs)

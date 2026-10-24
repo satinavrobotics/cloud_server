@@ -206,21 +206,21 @@ class TestSettingsRoutes:
             with pytest.raises(HTTPException) as exc:
                 await main.update_settings({"telemetry_recording": "verbose"})
         assert exc.value.status_code == 422
-        svc.database.update_spec.assert_not_awaited()
+        svc.database.update_spec_fields.assert_not_awaited()
 
     async def test_put_level_passes_the_hook(self):
         svc = _svc(settings=SettingsObjectV1(name=GLOBAL_SETTINGS_NAME))
         with patch.object(main, "service", svc):
             result = await main.update_settings({"telemetry_recording": "full"})
         assert result["telemetry_recording"] == "full"
-        assert "before_commit" in svc.database.update_spec.call_args.kwargs
+        assert "before_commit" in svc.database.update_spec_fields.call_args.kwargs
 
     async def test_put_without_the_field_is_unchanged(self):
         svc = _svc(settings=SettingsObjectV1(name=GLOBAL_SETTINGS_NAME,
                                              telemetry_recording="off"))
         with patch.object(main, "service", svc):
             result = await main.update_settings({"fault_error_types": ["e"]})
-        assert svc.database.update_spec.call_args.kwargs == {}
+        assert svc.database.update_spec_fields.call_args.kwargs == {}
         assert result["fault_error_types"] == ["e"] and result["telemetry_recording"] == "off"
 
     async def test_get_shows_the_field(self):

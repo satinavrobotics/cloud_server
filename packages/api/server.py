@@ -543,6 +543,44 @@ def _get_resize_semaphore() -> asyncio.Semaphore:
     return _resize_semaphore
 
 
+def build_mission_update(mission) -> Dict[str, Any]:
+    """The `mission_update` WebSocket message of a mission: the one builder for the live
+    broadcast and the snapshot sent when a client connects (/ws/mission/{name})."""
+    st = mission.status
+    return {
+        "type": "mission_update",
+        "mission_name": mission.name,
+        "robot_name": mission.robot,
+        "needs_canceled": mission.needs_canceled,
+        "timestamp": datetime.now().isoformat(),
+        "status": {
+            "state": st.state.value,
+            "current_node": st.current_node,
+            "failure_reason": st.failure_reason,
+            "failure_category": st.failure_category.value if st.failure_category is not None else None,
+            "start_timestamp": st.start_timestamp.isoformat() if st.start_timestamp is not None else None,
+            "end_timestamp": st.end_timestamp.isoformat() if st.end_timestamp is not None else None,
+            "blocked": st.blocked,
+            "blocked_node": st.blocked_node,
+            "blocked_edge": st.blocked_edge,
+            "blocked_waypoint_index": st.blocked_waypoint_index,
+            "block_reason": st.block_reason,
+            "block_reason_code": st.block_reason_code,
+            "blocked_held_s": st.blocked_held_s,
+            "blocked_sequence_id": st.blocked_sequence_id,
+            "blocked_skip_refused": st.blocked_skip_refused,
+            # Progress and the dispatch hold, so the client need not wait for its REST poll
+            "node_status": {
+                name: {"state": ns.state.value, "error_msg": ns.error_msg}
+                for name, ns in st.node_status.items()
+            },
+            "task_status": dict(st.task_status),
+            "held": st.held,
+            "held_reason": st.held_reason,
+        },
+    }
+
+
 class ApiDelegationService:
     """
     API Delegation Service - Central gateway for client requests.
@@ -998,7 +1036,9 @@ class ApiDelegationService:
             try:
                 await self.database.create_object(map_obj, _uuid.uuid4())
                 self.logger.info(f"Registered map '{actual_map_id}' in Postgres")
-            except Exception:
+            except HTTPException as exists:
+                if exists.status_code != 400:   # 400 = the DB layer's "already exists"
+                    raise
                 if datum_latitude is not None and datum_longitude is not None:
                     # Explicit datum provided — update the full spec including datum, but keep
                     # the stored map's type and geo origin (maps redesign M1): a legacy load
@@ -1012,8 +1052,14 @@ class ApiDelegationService:
                         new_spec = MapSpecV1(**{**map_obj.spec.dict(), "type": existing.type,
                                                 "geo": existing.geo,
                                                 "slam_map": existing.slam_map})
-                    await self.database.update_spec(
-                        MapObjectV1, actual_map_id, new_spec, _uuid.uuid4()
+                    # Only the legacy-load fields are written (type/geo too when the stored
+                    # map has no type yet), so other spec fields are not reverted (C6).
+                    written = json.loads(new_spec.json())
+                    keys = list(legacy_spec)
+                    if not (isinstance(existing, MapObjectV1) and existing.type is not None):
+                        keys += ["type", "geo"]
+                    await self.database.update_spec_fields(
+                        MapObjectV1, actual_map_id, {k: written[k] for k in keys}, _uuid.uuid4()
                     )
                     self.logger.info(f"Updated existing map '{actual_map_id}' in Postgres")
                 else:
@@ -1164,7 +1210,9 @@ class ApiDelegationService:
         import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
-        except Exception:
+        except HTTPException as missing:   # the DB layer's 404; a DB error is not "not found"
+            if missing.status_code != 404:
+                raise
             return {"success": False, "error": f"Map '{map_id}' not found"}
         stats = self.graph_db.get_map_stats(map_id)
         result = {
@@ -1221,7 +1269,9 @@ class ApiDelegationService:
         import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
-        except Exception:
+        except HTTPException as missing:   # the DB layer's 404; a DB error is not "not found"
+            if missing.status_code != 404:
+                raise
             return {"success": False, "error": f"Map '{map_id}' not found"}
         is_geo = effective_type(map_obj.spec) == "geo"
         if is_geo:
@@ -1251,7 +1301,12 @@ class ApiDelegationService:
                 # convergence for an 'enu' datum), so geo and the display transform agree.
                 block = map_geo.geo_of_datum_frame(new_datum)
                 new_spec = new_spec.copy(update={"geo": MapGeoV1(**block)})
-        await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
+        # Only the datum fields (and the geo block that follows them) are written: a whole-spec
+        # write would revert what another writer changed since the read above (backlog C6).
+        written = json.loads(new_spec.json())
+        keys = [k for k in spec if k.startswith("datum_")] + ["geo"]
+        await self.database.update_spec_fields(
+            MapObjectV1, map_id, {k: written[k] for k in keys}, _uuid.uuid4())
         self.logger.info(
             f"Updated datum for map '{map_id}': "
             f"({datum_latitude}, {datum_longitude}, bearing={datum_bearing_deg}°, "
@@ -1770,8 +1825,10 @@ class ApiDelegationService:
 
         try:
             await self.database.get_object(RobotObjectV1, robot_name)
-        except Exception as e:
-            self.logger.error(f"Robot '{robot_name}' not found: {e}")
+        except HTTPException as e:   # the DB layer's 404; a DB error is not "not found"
+            if e.status_code != 404:
+                raise
+            self.logger.error(f"Robot '{robot_name}' not found: {e.detail}")
             raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
         try:
@@ -1825,8 +1882,10 @@ class ApiDelegationService:
 
         try:
             await self.database.get_object(RobotObjectV1, robot_name)
-        except Exception as e:
-            self.logger.error(f"Robot '{robot_name}' not found: {e}")
+        except HTTPException as e:   # the DB layer's 404; a DB error is not "not found"
+            if e.status_code != 404:
+                raise
+            self.logger.error(f"Robot '{robot_name}' not found: {e.detail}")
             raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
         if not mission_name:
@@ -1927,8 +1986,10 @@ class ApiDelegationService:
             # Validate robot exists
             try:
                 robot = await self.database.get_object(RobotObjectV1, robot_name)
-            except Exception as e:
-                self.logger.error(f"Robot '{robot_name}' not found: {e}")
+            except HTTPException as e:   # the DB layer's 404; a DB error is not "not found"
+                if e.status_code != 404:
+                    raise
+                self.logger.error(f"Robot '{robot_name}' not found: {e.detail}")
                 raise HTTPException(status_code=404, detail=f"Robot '{robot_name}' not found")
 
             # Validate action is available on this robot
@@ -2414,40 +2475,9 @@ class ApiDelegationService:
                 if mission.lifecycle == ObjectLifecycleV1.DELETED:
                     continue
 
-                # Build WebSocket message — include full status plus needs_canceled so
-                # clients can show the "(Canceling...)" indicator without a round-trip.
-                st = mission.status
-                message = {
-                    "type": "mission_update",
-                    "mission_name": mission.name,
-                    "robot_name": mission.robot,
-                    "needs_canceled": mission.needs_canceled,
-                    "timestamp": datetime.now().isoformat(),
-                    "status": {
-                        "state": st.state.value if hasattr(st, 'state') else "PENDING",
-                        "current_node": st.current_node if hasattr(st, 'current_node') else 0,
-                        "failure_reason": st.failure_reason if hasattr(st, 'failure_reason') else None,
-                        "failure_category": st.failure_category.value if (
-                            hasattr(st, 'failure_category') and st.failure_category is not None
-                        ) else None,
-                        "start_timestamp": st.start_timestamp.isoformat() if (
-                            hasattr(st, 'start_timestamp') and st.start_timestamp is not None
-                        ) else None,
-                        "end_timestamp": st.end_timestamp.isoformat() if (
-                            hasattr(st, 'end_timestamp') and st.end_timestamp is not None
-                        ) else None,
-                        "blocked": st.blocked if hasattr(st, 'blocked') else False,
-                        "blocked_node": st.blocked_node if hasattr(st, 'blocked_node') else None,
-                        "blocked_edge": st.blocked_edge if hasattr(st, 'blocked_edge') else None,
-                        "blocked_waypoint_index": st.blocked_waypoint_index if hasattr(
-                            st, 'blocked_waypoint_index') else None,
-                        "block_reason": st.block_reason if hasattr(st, 'block_reason') else None,
-                        "block_reason_code": getattr(st, "block_reason_code", None),
-                        "blocked_held_s": getattr(st, "blocked_held_s", None),
-                        "blocked_sequence_id": getattr(st, "blocked_sequence_id", None),
-                        "blocked_skip_refused": getattr(st, "blocked_skip_refused", None),
-                    }
-                }
+                # Build WebSocket message — full status plus needs_canceled so clients can
+                # show the "(Canceling...)" indicator without a round-trip.
+                message = build_mission_update(mission)
 
                 # Broadcast to all WebSocket clients subscribed to this mission
                 await self.ws_manager.broadcast("mission_status", mission.name, message)

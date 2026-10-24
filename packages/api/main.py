@@ -18,10 +18,10 @@ from datetime import datetime
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, validator
 import uvicorn
 
-from packages.api.server import ApiDelegationService
+from packages.api.server import ApiDelegationService, build_mission_update
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
 from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
@@ -196,6 +196,14 @@ class CreateBagEntryRequest(BaseModel):
     robot_name: str = Field(..., description="Name of the robot that produced the bag")
     description: Optional[str] = Field(None, description="Human-readable description of the recording")
     recorded_at: Optional[str] = Field(None, description="ISO-8601 timestamp when recording started")
+
+    @validator("robot_name")
+    def _robot_name_is_one_key_segment(cls, v):
+        # The name is the first segment of the bag's object key ({robot}/{bag_id}): a "/" would
+        # file the bag under another robot's prefix, where that robot's list and delete see it.
+        if not v or "/" in v or v in (".", ".."):
+            raise ValueError("robot_name must be a single name without '/'")
+        return v
 
 
 class CreateBagEntryResponse(BaseModel):
@@ -424,7 +432,8 @@ async def health_check():
     """Health check endpoint."""
     _require_service()
 
-    dependencies = health_checker.check_all() if health_checker else {}
+    # The checks block (up to timeout x attempts per dependency): not on the event loop
+    dependencies = await asyncio.to_thread(health_checker.check_all) if health_checker else {}
     return create_health_response(
         service_name="api_delegation",
         dependencies=dependencies
@@ -1812,8 +1821,12 @@ async def update_settings(settings_data: dict):
         # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
         hook = recording.change_hook(recording.RecordingScope.GLOBAL, None,
                                      recording.request_actor())
-    await service.database.update_spec(SettingsObjectV1, settings.name, spec,
-                                       publisher_id, **_hook_kwargs(hook))
+    # Only the keys sent are written (validated values), so a concurrent writer of another
+    # settings key is not reverted by this read-modify-write (backlog C6).
+    validated = json.loads(spec.json())
+    await service.database.update_spec_fields(
+        SettingsObjectV1, settings.name, {k: validated[k] for k in changes},
+        publisher_id, **_hook_kwargs(hook))
 
     updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
     return updated_settings.dict()
@@ -3455,38 +3468,7 @@ async def websocket_mission_status(websocket: WebSocket, mission_name: str):
     # (e.g. fast-completing missions) don't get stuck on stale PENDING state.
     try:
         mission = await service.database.get_object(MissionObjectV1, mission_name)
-        st = mission.status
-        snapshot = {
-            "type": "mission_update",
-            "mission_name": mission.name,
-            "robot_name": mission.robot,
-            "needs_canceled": mission.needs_canceled,
-            "timestamp": datetime.now().isoformat(),
-            "status": {
-                "state": st.state.value if hasattr(st, "state") else "PENDING",
-                "current_node": st.current_node if hasattr(st, "current_node") else 0,
-                "failure_reason": st.failure_reason if hasattr(st, "failure_reason") else None,
-                "failure_category": st.failure_category.value if (
-                    hasattr(st, "failure_category") and st.failure_category is not None
-                ) else None,
-                "start_timestamp": st.start_timestamp.isoformat() if (
-                    hasattr(st, "start_timestamp") and st.start_timestamp is not None
-                ) else None,
-                "end_timestamp": st.end_timestamp.isoformat() if (
-                    hasattr(st, "end_timestamp") and st.end_timestamp is not None
-                ) else None,
-                "blocked": st.blocked if hasattr(st, "blocked") else False,
-                "blocked_node": st.blocked_node if hasattr(st, "blocked_node") else None,
-                "blocked_edge": st.blocked_edge if hasattr(st, "blocked_edge") else None,
-                "blocked_waypoint_index": st.blocked_waypoint_index if hasattr(
-                    st, "blocked_waypoint_index") else None,
-                "block_reason": st.block_reason if hasattr(st, "block_reason") else None,
-                "block_reason_code": getattr(st, "block_reason_code", None),
-                "blocked_held_s": getattr(st, "blocked_held_s", None),
-                "blocked_sequence_id": getattr(st, "blocked_sequence_id", None),
-                "blocked_skip_refused": getattr(st, "blocked_skip_refused", None),
-            },
-        }
+        snapshot = build_mission_update(mission)
         await websocket.send_json(snapshot)
     except Exception:
         pass  # Mission may not exist yet; client will receive updates via watcher
