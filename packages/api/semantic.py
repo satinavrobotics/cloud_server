@@ -30,7 +30,6 @@ Differences from reconstruction:
 import asyncio
 import dataclasses
 import datetime
-import hashlib
 import json
 import logging
 import math
@@ -47,7 +46,7 @@ from packages.api.entrypoint import advisory_lock_key
 from packages.api.reconstruction import (ACTIVE, CANCELLED, FAILED, FINALIZING, QUEUED, RUNNING,
                                          SUCCEEDED, Frame, Job, JobActive, ObjectStore,
                                          Presigner, _err, _error, _float, _int, _iso, _param,
-                                         _ts, _utcnow, callback_token, digest_nodes,
+                                         _ts, callback_token, digest_nodes,
                                          input_digest, map_crs, rgb_key, depth_key,
                                          staging_key, stale_reason)
 from packages.api.semantic_client import SemanticClient

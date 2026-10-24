@@ -6,7 +6,6 @@ Manages ArangoDB persistent graph storage with ArangoDB geo indexes for spatial 
 """
 
 import logging
-import asyncio
 import math
 import random
 import threading

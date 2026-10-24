@@ -25,6 +25,7 @@ import json
 import logging
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.events.codes import EventCode
 from packages.events.schemas import RecordingLevel  # the one definition of the levels
 from packages.telemetry_ingest import tables
@@ -105,10 +106,6 @@ class PolicySources:
 
 
 Loader = Callable[[Any, datetime.datetime], Awaitable[PolicySources]]
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class RecordingPolicy:

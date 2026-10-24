@@ -4817,7 +4817,6 @@ class Robot:
     def _start_wait(self, mission_node: mission_object.MissionNodeV1):
         """Start the timer of a "wait" action node. No order goes to the robot."""
         assert self._current_mission is not None and mission_node.action is not None
-        status = self._current_mission.status
         seconds = float(mission_node.action.action_parameters["seconds"])
         key = self._node_key(mission_node)
         # _send_order() runs again for a node whenever the robot's state does not match

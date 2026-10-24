@@ -28,7 +28,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from packages.events.emit import INSERT_SQL, row_params
 from packages.telemetry_ingest import tables

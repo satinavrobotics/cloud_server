@@ -32,6 +32,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.recorder_health import ROLE_STANDBY, ROLE_WRITER, RecorderHealthMonitor
 from packages.api.telemetry_detectors import (
@@ -68,10 +69,6 @@ SPILL_PREFIX = "api-"
 SPILL_SUFFIX = ".jsonl"
 
 Connect = Callable[[], Awaitable[Any]]
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class _Throttled:

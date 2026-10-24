@@ -58,6 +58,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from cloud_common.objects.map import MapObjectV1, MapSpecV1, MapStatusV1
 from cloud_common.objects.object import ObjectLifecycleV1
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.api.entrypoint import advisory_lock_key
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
@@ -115,10 +116,6 @@ def failed_discriminator(map_id: str, attempts: int) -> str:
 def deleted_discriminator(map_id: str, requested_at: Optional[str]) -> str:
     """Part of MAP.DELETED's event_id (stored data: never change the format)."""
     return f"map:{map_id}:deleted:{requested_at or '-'}"
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def _parse_ts(value: Any) -> Optional[datetime.datetime]:

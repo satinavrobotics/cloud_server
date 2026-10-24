@@ -46,8 +46,9 @@ import logging
 import math
 import re
 import uuid
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+from packages.utils.timeutil import utcnow
 from packages import config
 from packages.controllers.mission import battery, leg_tracker
 from packages.events import causes, detectors
@@ -219,10 +220,6 @@ TRAJECTORY_SQL = (
 
 
 # --- small helpers -------------------------------------------------------------------------
-
-def utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
 
 def to_utc(ts: Optional[datetime.datetime]) -> Optional[datetime.datetime]:
     """Aware UTC; naive datetimes (the dispatcher's own timestamps) are taken to be UTC."""

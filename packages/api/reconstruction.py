@@ -84,6 +84,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import pydantic
 from fastapi import HTTPException
 
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.reconstruction_client import ReconstructionClient, ServiceUnreachable
 from packages.api.reconstruction_topview import (MAX_HEADER, PlyError, TopViewError,
@@ -135,10 +136,6 @@ RESULT_PREFIX = "reconstruction/"
 PARAM_RANGES = {"voxel_m": (0.02, 0.5), "max_depth_m": (0.5, 65.0), "clip_z": (-5.0, 20.0)}
 FIXED_PARAMS = {"edge_rel": 0.05, "min_neighbours": 2, "max_voxels": 10_000_000,
                 "raster_max_px": 4096}
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def _iso(ts: Optional[datetime.datetime]) -> Optional[str]:
@@ -1500,7 +1497,6 @@ class ReconstructionGateway:
 
     async def _dispatch(self, job: Job) -> bool:
         """Build a fresh manifest for `job` and POST it. True when the service took it."""
-        cfg = self.config
         row = await self.repo.map_row(job.map_name)
         if row is None or row[0] == "DELETING":
             await self._end(job, CANCELLED, _error("map_deleting", "the map is being deleted"),
