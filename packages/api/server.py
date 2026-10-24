@@ -1742,66 +1742,6 @@ class ApiDelegationService:
 
     # ==================== Navigation Operations ====================
 
-    async def _call_mission_planner(
-        self,
-        robot_id: str,
-        goal_x: float,
-        goal_y: float,
-        map_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Internal method to call mission planner service.
-
-        Args:
-            robot_id: Robot ID
-            goal_x: Goal x coordinate
-            goal_y: Goal y coordinate
-            map_id: Map ID
-
-        Returns:
-            Mission planner response
-        """
-        try:
-            # Call mission planner via client
-            result = await self.mission_planner.navigate(
-                robot_name=robot_id,
-                target_x=goal_x,
-                target_y=goal_y,
-                map_id=map_id,
-            )
-            return result
-        except Exception as e:
-            self.logger.error(f"Mission planner call failed: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    async def plan_mission(
-        self,
-        robot_id: str,
-        goal_x: float,
-        goal_y: float,
-        map_id: Optional[str] = None,
-        mission_name: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Plan a mission for a robot.
-
-        Args:
-            robot_id: Robot ID
-            goal_x: Goal x coordinate
-            goal_y: Goal y coordinate
-            map_id: Map ID
-            mission_name: Optional mission name
-
-        Returns:
-            Mission planning result
-        """
-        self.logger.info(f"Planning mission for robot '{robot_id}' to ({goal_x}, {goal_y})")
-
-        return await self._call_mission_planner(robot_id, goal_x, goal_y, map_id)
-
     async def navigate(
         self,
         robot_name: str,
