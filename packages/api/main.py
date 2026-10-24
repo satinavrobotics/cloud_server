@@ -1812,8 +1812,12 @@ async def update_settings(settings_data: dict):
         # TELEMETRY.RECORDING_CHANGED in the same transaction (packages/api/recording.py)
         hook = recording.change_hook(recording.RecordingScope.GLOBAL, None,
                                      recording.request_actor())
-    await service.database.update_spec(SettingsObjectV1, settings.name, spec,
-                                       publisher_id, **_hook_kwargs(hook))
+    # Only the keys sent are written (validated values), so a concurrent writer of another
+    # settings key is not reverted by this read-modify-write (backlog C6).
+    validated = json.loads(spec.json())
+    await service.database.update_spec_fields(
+        SettingsObjectV1, settings.name, {k: validated[k] for k in changes},
+        publisher_id, **_hook_kwargs(hook))
 
     updated_settings = await service.database.get_object(SettingsObjectV1, GLOBAL_SETTINGS_NAME)
     return updated_settings.dict()

@@ -1050,8 +1050,14 @@ class ApiDelegationService:
                         new_spec = MapSpecV1(**{**map_obj.spec.dict(), "type": existing.type,
                                                 "geo": existing.geo,
                                                 "slam_map": existing.slam_map})
-                    await self.database.update_spec(
-                        MapObjectV1, actual_map_id, new_spec, _uuid.uuid4()
+                    # Only the legacy-load fields are written (type/geo too when the stored
+                    # map has no type yet), so other spec fields are not reverted (C6).
+                    written = json.loads(new_spec.json())
+                    keys = list(legacy_spec)
+                    if not (isinstance(existing, MapObjectV1) and existing.type is not None):
+                        keys += ["type", "geo"]
+                    await self.database.update_spec_fields(
+                        MapObjectV1, actual_map_id, {k: written[k] for k in keys}, _uuid.uuid4()
                     )
                     self.logger.info(f"Updated existing map '{actual_map_id}' in Postgres")
                 else:
@@ -1289,7 +1295,12 @@ class ApiDelegationService:
                 # convergence for an 'enu' datum), so geo and the display transform agree.
                 block = map_geo.geo_of_datum_frame(new_datum)
                 new_spec = new_spec.copy(update={"geo": MapGeoV1(**block)})
-        await self.database.update_spec(MapObjectV1, map_id, new_spec, _uuid.uuid4())
+        # Only the datum fields (and the geo block that follows them) are written: a whole-spec
+        # write would revert what another writer changed since the read above (backlog C6).
+        written = json.loads(new_spec.json())
+        keys = [k for k in spec if k.startswith("datum_")] + ["geo"]
+        await self.database.update_spec_fields(
+            MapObjectV1, map_id, {k: written[k] for k in keys}, _uuid.uuid4())
         self.logger.info(
             f"Updated datum for map '{map_id}': "
             f"({datum_latitude}, {datum_longitude}, bearing={datum_bearing_deg}°, "
