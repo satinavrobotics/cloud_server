@@ -56,7 +56,7 @@ TS_IP="$(tailscale ip -4 2>/dev/null | head -1)"
 [ -n "$TS_IP" ] || die "tailscale is not up (no tailnet IPv4); run 'sudo tailscale up'"
 log "tailnet IP $TS_IP, docker compose $ver"
 if ! (timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes); then
-    log "warning: the clock is not NTP-synchronised; presigned URLs fail on clock skew (install chrony or enable systemd-timesyncd)"
+    log "warning: the clock is not NTP-synchronised; presigned URLs fail on clock skew (scripts/configure_pi_network.sh apply installs chrony)"
 fi
 
 # --- registry: plain HTTP on the tailnet

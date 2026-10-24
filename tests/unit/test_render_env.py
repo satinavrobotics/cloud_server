@@ -112,7 +112,7 @@ class TestOutputs:
 
 
 class TestRobotLan:
-    """The robot LAN is written down once per Pi (profile) and read by compose (ROBOT_LAN_IP) and by configure_pi_lan.sh."""
+    """The robot LAN is written down once per Pi (profile) and read by compose (ROBOT_LAN_IP) and by configure_pi_network.sh."""
 
     @pytest.mark.parametrize("profile", ["pi4", "pi5"])
     def test_one_valid_address_never_every_interface(self, profile):

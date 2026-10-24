@@ -1,5 +1,7 @@
 # Robot (Raspberry Pi) deploy
 
+Setting up a Pi from scratch (Pi 4 or Pi 5), in order: [pi_setup.md](pi_setup.md).
+
 The same stack as the cloud, smaller, on a Raspberry Pi 4 (linux/arm64). No sync or share with the cloud. Images are built
 on the cloud host for amd64 + arm64, pushed to the private registry, and the Pi only pulls and runs them.
 
@@ -33,7 +35,7 @@ so the Jetson can use `<ROBOT_LAN_IP>:1883`. Never `0.0.0.0`: the gateway has no
 reach them can drive the robot (on 2026-10-21 a Pi with `0.0.0.0` had both open on its wifi and ethernet; see
 [security/open-items-2026-10-21.md](security/open-items-2026-10-21.md)). The robot LAN must hold only the robot's own devices.
 
-`scripts/configure_pi_lan.sh --profile pi4|pi5 check|apply|rollback` (run on the Pi, as root, through Tailscale, never over `eth0`) sets the
+`scripts/configure_pi_network.sh --profile pi4|pi5 check|apply|rollback` (the one network script, see [pi_setup.md](pi_setup.md); run on the Pi, as root, through Tailscale, never over `eth0`) sets the
 Pi's `eth0` address from the profile (`ROBOT_LAN_IP`, `LAN_JETSON_IP`, `LAN_IFACE`, `LAN_WLAN_OFF`, `LAN_GATEWAY`); `check` is read-only, `apply`
 undoes itself if its checks fail. After a change to `ROBOT_LAN_IP`, `render_env.sh <profile>` and a deploy recreate the gateway and the broker.
 

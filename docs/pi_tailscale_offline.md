@@ -3,7 +3,7 @@
 Handoff written 2026-10-19 from `jetson-boss` (100.125.64.82, tag:robot) and adapted for the Pi deployment.
 Items marked (measured) were read from the live Jetson. Items marked (doc) come from the Tailscale docs or the repo docs. Items marked (unproven) have not been tested.
 
-Automation: `scripts/configure_pi_network.sh` (`check`, `apply`, `offline-test`). Read section 5 for what it cannot do.
+Automation: `scripts/configure_pi_network.sh` (`check`, `apply`, `rollback`, `offline-test`; setup order in [pi_setup.md](pi_setup.md)). Read section 5 for what it cannot do.
 
 ## 1. Goal
 
@@ -33,7 +33,7 @@ That includes after a restart of tailscaled or a reboot.
 | `tailscale set --auto-update=false` | script `apply` | None. Stops self-updates restarting tailscaled at a random time. |
 | Second DNS server (default 1.1.1.1) | script `apply`: NetworkManager default-route profile if it runs, else a systemd-resolved `FallbackDNS` drop-in | Indirect. Name resolution survives a router DNS failure. |
 | systemd-timesyncd drop-in, `PollIntervalMaxSec` 600 | script `apply`, `/etc/systemd/timesyncd.conf.d/50-satinav-poll.conf` | Indirect. After an offline boot the clock syncs soon after the link returns. Wrong clocks hurt key and TLS checks. A Pi has no RTC, so this matters more here. |
-| chrony NTP server for the LAN (`NTP_ALLOW`, default 192.168.1.0/24, `local stratum 10`); replaces timesyncd | script `apply`, `/etc/chrony/conf.d/50-satinav-server.conf` | Indirect. The robot's Jetson takes its time from this Pi, so check the Pi's clock and RTC battery first. |
+| chrony NTP server for the LAN (`NTP_ALLOW`, default 192.168.1.0/24, `local stratum 10`); replaces timesyncd | script `apply --ntp-server` only (opt-in, floor at the build date), `/etc/chrony/conf.d/50-satinav-server.conf` | Indirect. The robot's Jetson takes its time from this Pi, so check the Pi's clock and RTC battery first. |
 | Docker starts after tailscaled | script `apply`, `/etc/systemd/system/docker.service.d/10-after-tailscaled.conf` | Mosquitto and the other containers come up with the tailnet address present (see `docs/robot_deploy.md`). |
 
 Only the version, the node attribute and the key expiry decide offline operation. The rest is hygiene.
@@ -55,8 +55,8 @@ Check these in order (`configure_pi_network.sh check` covers 1, 2, 5 and the cac
 Run on the Pi:
 
 ```bash
-sudo scripts/configure_pi_network.sh check     # read-only report
-sudo scripts/configure_pi_network.sh apply     # installs/pins the client, sets prefs, DNS, NTP, docker ordering
+sudo scripts/configure_pi_network.sh --profile pi5 check     # read-only report
+sudo scripts/configure_pi_network.sh --profile pi5 apply     # installs/pins the client, sets prefs, DNS, NTP, docker ordering
 ```
 
 `apply` is idempotent. If the client is below 1.104 it installs `tailscale=1.104.1`, which restarts tailscaled; run it when nothing depends on the tailnet. On macOS or Windows install a 1.104+ build from tailscale.com instead.

@@ -63,7 +63,7 @@ session needs the access any more; re-install one per task if it is needed again
 Decision 2026-10-21: the Jetson uses Tailscale by default; the LAN is an optional second path, so both Pis keep their LAN door open (Pi 4 on
 `192.168.1.60`, from `pi4.env`; Pi 5 as below). To close one: remove `ROBOT_LAN_IP` from its profile, `render_env.sh`, deploy.
 
-The Pi 5 (`rasp`) has `ROBOT_LAN_IP=192.168.1.70`, its `eth0` address on the robot LAN (`scripts/configure_pi_lan.sh`). Its gateway (80, no
+The Pi 5 (`rasp`) has `ROBOT_LAN_IP=192.168.1.70`, its `eth0` address on the robot LAN (`scripts/configure_pi_network.sh`). Its gateway (80, no
 login) and its MQTT broker (1883 and 9001, anonymous) therefore listen on that one address as well as loopback and the tailnet, so the
 Jetson on that LAN can reach them. It is a single address, not `0.0.0.0`, and the LAN is meant to hold only the robot's own devices.
 The risk is whatever else can join that LAN (a laptop plugged into the switch can drive the robot). Fix: authentication on the broker (item
