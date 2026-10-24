@@ -622,7 +622,9 @@ class TestImageDatabaseServiceDeleteNodeImages:
         mock_costmap = Mock()
         mock_costmap.object_name = "node_1/costmap/occupancy.png"
         by_prefix = {"node_1/images/": [mock_obj1, mock_obj2], "node_1/thumbs/": [mock_thumb],
-                     "node_1/depth/": [mock_depth], "node_1/costmap/": [mock_costmap]}
+                     "node_1/depth/": [mock_depth], "node_1/costmap/": [mock_costmap],
+                     "node_1/person_mask/": [Mock(object_name="node_1/person_mask/left.png")],
+                     "node_1/depth_masked/": [Mock(object_name="node_1/depth_masked/left.png")]}
         mock_client.list_objects.side_effect = lambda bucket, prefix, recursive: by_prefix[prefix]
         mock_client.remove_object.return_value = None
         mock_minio.return_value = mock_client
@@ -631,11 +633,12 @@ class TestImageDatabaseServiceDeleteNodeImages:
         result = service.delete_node_images(node_id="node_1", map_id="test_map")
 
         assert result is True
-        # The cached downscaled variants, depth images and costmap layers go with the images.
+        # The cached downscaled variants, depth images, costmap layers and person-removal products go with the images.
         removed = {c.args[1] for c in mock_client.remove_object.call_args_list}
         assert removed == {"node_1/images/img_001.jpg", "node_1/images/img_002.jpg",
                            "node_1/thumbs/thumb/img_001.jpg.jpg", "node_1/depth/left.png",
-                           "node_1/costmap/occupancy.png"}
+                           "node_1/costmap/occupancy.png", "node_1/person_mask/left.png",
+                           "node_1/depth_masked/left.png"}
 
     @patch('packages.topomap_dbs.minio_base.Minio')
     def test_delete_node_images_bucket_not_exists(self, mock_minio):

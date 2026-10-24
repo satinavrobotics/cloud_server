@@ -26,6 +26,7 @@ def cfg(**over):
         SEMANTIC_SERVICE_URL="http://127.0.0.1:8010", MESH_SERVICE_URL="http://127.0.0.1:8011",
         RECONSTRUCTION_SERVICE_KEY="k", RECONSTRUCTION_CALLBACK_SECRET="s", SEMANTIC_SERVICE_KEY="k", SEMANTIC_CALLBACK_SECRET="s", MESH_SERVICE_KEY="k", MESH_CALLBACK_SECRET="s", LIVEKIT_SFU_API_KEY="k", LIVEKIT_SFU_API_SECRET="s",
         LIVEKIT_ROOM_POLICY="client", SERVER_LIVEKIT_AVAILABLE=None, SERVER_DIAGNOSTICS_AVAILABLE=True, MIN_CLIENT_VERSION=None, RECOMMENDED_CLIENT_VERSION=None,
+        PERSON_MASK_SERVICE_URL="http://127.0.0.1:8013",
     )
     base.update(over)
     return SimpleNamespace(**base)
@@ -64,12 +65,18 @@ class TestBuild:
 
     @pytest.mark.parametrize("field,flag", [
         ("SCENE_GRAPH_WORKER_ENABLED", "scene_graph"), ("RECONSTRUCTION_SERVICE_URL", "reconstruction"),
-        ("SEMANTIC_SERVICE_URL", "semantic"), ("MESH_SERVICE_URL", "mesh"), ("SERVER_AGENT_AVAILABLE", "agent")])
+        ("SEMANTIC_SERVICE_URL", "semantic"), ("MESH_SERVICE_URL", "mesh"), ("SERVER_AGENT_AVAILABLE", "agent"),
+        ("PERSON_MASK_SERVICE_URL", "person_removal")])
     def test_each_capability_follows_its_own_setting(self, field, flag):
         off = {"SCENE_GRAPH_WORKER_ENABLED": False, "SERVER_AGENT_AVAILABLE": False}.get(field)
         caps = si.build_server_info(cfg(**{field: off})).capabilities.dict()
         assert caps[flag] is False
         assert [k for k, v in caps.items() if not v] == [flag]      # nothing else moved
+
+    def test_person_removal_is_off_on_a_config_that_predates_it(self):
+        stand_in = cfg()
+        del stand_in.PERSON_MASK_SERVICE_URL
+        assert si.build_server_info(stand_in).capabilities.person_removal is False
 
     def test_livekit_needs_both_halves_of_the_key_pair(self):
         assert si.build_server_info(cfg(LIVEKIT_SFU_API_SECRET=None)).livekit.available is False
@@ -106,7 +113,8 @@ class TestBuild:
         assert set(body) == {"schema_version", "name", "kind", "version", "server_id", "capabilities", "livekit",
                              "min_client_version", "recommended_client_version", "config_profile", "config_hash"}
         assert set(body["capabilities"]) == {"robots", "missions", "maps", "orchestration", "scene_graph",
-                                             "reconstruction", "semantic", "mesh", "agent", "fleet", "diagnostics"}
+                                             "reconstruction", "semantic", "mesh", "agent", "fleet", "diagnostics",
+                                             "person_removal"}
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]

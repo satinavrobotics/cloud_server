@@ -121,6 +121,10 @@ Fields:
 - `pose`: node pose in the map frame (x, y metres; yaw radians). Always present.
 - `pose3d`: optional, per camera: the full base pose in the map frame at that depth image's
   stamp. When present it **replaces** `pose` for that camera (§5).
+- `mask_url`: optional, per camera (person removal, [`person_removal.md`](person_removal.md)): a presigned GET of
+  a u8 PNG at the depth size, 255 = a person to leave out. When present, `depth_url` already points at the depth
+  with those pixels set to 0, so a service that ignores the key still drops them from the sensor depth; one that
+  predicts its own depth should also zero them there.
 - `nodes` is sorted by capture time. Only frames with depth are included.
 - `map.crs` is `null` for a local map. It is copied into the outputs and not used for math.
   A map converted from local to geo (maps §17) is rotated against the UTM grid: its `crs` then

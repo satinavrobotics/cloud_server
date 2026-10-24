@@ -577,6 +577,13 @@ services:
       - MESH_CALLBACK_SECRET=${MESH_CALLBACK_SECRET:-}
       - MESH_CALLBACK_BASE_URL=${MESH_CALLBACK_BASE_URL:-http://localhost:8000}
       - MESH_MINIO_ENDPOINT=${MESH_MINIO_ENDPOINT:-localhost:9000}
+      # Person removal (docs/reconstruction/person_removal.md); the optional service is deployed from
+      # person_mask_service.yaml (cloud, GPU) or person_mask_service_robot.yaml (Pi, CPU). Unset URL = off.
+      - PERSON_MASK_SERVICE_URL=${PERSON_MASK_SERVICE_URL:-}
+      - PERSON_MASK_SERVICE_KEY=${PERSON_MASK_SERVICE_KEY:-}
+      - PERSON_REMOVAL_DEFAULT=${PERSON_REMOVAL_DEFAULT:-false}
+      - PERSON_REMOVAL_MODEL=${PERSON_REMOVAL_MODEL:-}
+      - PERSON_REMOVAL_DILATE_PX=${PERSON_REMOVAL_DILATE_PX:-6}
       # GET /api/v1/server-info (packages/api/server_info.py): which server this is. SERVER_KIND=robot in .env.robot.
       - BUILD_SHA=${GIT_SHA:-unknown}
       - SERVER_KIND=${SERVER_KIND:-cloud}

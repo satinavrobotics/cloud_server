@@ -1,0 +1,8 @@
+# Person-mask service, CPU image (robot: linux/arm64, cloud: linux/amd64). The ONNX path only: no torch.
+fastapi==0.109.1
+uvicorn[standard]==0.17.6
+pydantic==1.9.0
+numpy==1.26.4
+Pillow==10.2.0
+# manylinux wheels for cp310 on aarch64 and x86_64
+onnxruntime==1.20.1

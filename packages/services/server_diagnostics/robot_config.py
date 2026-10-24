@@ -32,6 +32,7 @@ def _s(key, group, label, help, typ, default, restarts, **kw) -> Dict:
 
 
 MEM = "Memory limits"
+PERSON = "Person removal"
 _MEM_HELP = "The container is killed and restarted by Docker if it needs more than this."
 SETTINGS: List[Dict] = [
     _s("MEM_API", MEM, "API", _MEM_HELP, "memory", "384m", ["api-delegation-service"], min="64m", max="4g"),
@@ -65,6 +66,15 @@ SETTINGS: List[Dict] = [
        "int", "8", ["graph-builder-service"], min="1", max="64"),
     _s("SCENE_GRAPH_PREFETCH_QUEUE", "Scene graph", "Prefetch queue", "Smaller uses less memory.",
        "int", "16", ["graph-builder-service"], min="1", max="128"),
+    # Person removal (docs/reconstruction/person_removal.md). The service is optional (person_mask_service_robot.yaml);
+    # its memory limit counts against the budget only on a machine that uses it (PERSON_MASK_SERVICE_URL set).
+    _s("PERSON_REMOVAL_DEFAULT", PERSON, "Remove people by default",
+       "Reconstruction and mesh jobs use the person masks unless the map or the run says otherwise. The masks are made "
+       "by the map's 'Remove people' run.", "bool", "false", ["api-delegation-service"]),
+    _s("PERSON_REMOVAL_DILATE_PX", PERSON, "Mask margin (px)", "How far each person mask is grown, in depth pixels.",
+       "int", "6", ["api-delegation-service"], min="0", max="64"),
+    _s("MEM_PERSON_MASK", MEM, "Person removal (segmentation)", _MEM_HELP + " The model is loaded only while a run goes "
+       "on.", "memory", "768m", ["person-mask"], min="256m", max="4g", budget_if="PERSON_MASK_SERVICE_URL"),
 ]
 BY_KEY = {s["key"]: s for s in SETTINGS}
 
@@ -153,11 +163,24 @@ def memory_total_bytes(meminfo: str = "/proc/meminfo") -> int:
     return 0
 
 
-def check_budget(values: Dict[str, str], total: int, skip: Tuple[str, ...] = ()) -> None:
-    """The memory limits together must fit the machine: refuse a set that cannot, whoever asks. `skip` names limits of services this machine does not run."""
+def counts_in_budget(spec: Dict, context: Optional[Dict[str, str]]) -> bool:
+    """A memory limit counts unless it belongs to an optional service this machine does not run (`budget_if` names
+    the setting that says it does; unknown context = it counts)."""
+    flag = spec.get("budget_if")
+    if not flag or context is None:
+        return True
+    return str(context.get(flag, "")).strip().lower() not in ("", "false", "0", "no")
+
+
+def check_budget(values: Dict[str, str], total: int, context: Optional[Dict[str, str]] = None,
+                 skip: Tuple[str, ...] = ()) -> None:
+    """The memory limits together must fit the machine: refuse a set that cannot, whoever asks. `context` (the
+    profile with the overrides) decides whether an optional service's limit counts; `skip` names limits of services
+    this machine does not run."""
     if total <= 0:
         return
-    limits = sum(to_bytes(v) for k, v in values.items() if BY_KEY[k]["type"] == "memory" and k not in skip)
+    limits = sum(to_bytes(v) for k, v in values.items()
+                 if BY_KEY[k]["type"] == "memory" and k not in skip and counts_in_budget(BY_KEY[k], context))
     if limits > total * 0.95:
         raise ConfigError(400, "over_budget", f"the memory limits add up to {limits >> 20} MB but the machine has {total >> 20} MB: lower some limits", None)
 
@@ -193,7 +216,8 @@ def save(changes: Dict[str, Optional[str]], profile_name: str, profiles_dir: Pat
         else:
             merged[key] = value
     skip = () if "RECON_MEM_LIMIT" in profile or "RECON_MEM_LIMIT" in merged else ("RECON_MEM_LIMIT",)     # reconstruction runs only where the profile says so
-    check_budget(effective(profile, merged), memory_total_bytes() if total_memory is None else total_memory, skip)
+    check_budget(effective(profile, merged), memory_total_bytes() if total_memory is None else total_memory,
+                 {**profile, **merged}, skip)
     others = {k: v for k, v in current.items() if k not in BY_KEY}          # lines this service did not write stay as they are
     final = {**others, **merged}
     local_dir.mkdir(parents=True, exist_ok=True)
