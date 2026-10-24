@@ -1,8 +1,6 @@
 import logging
-import asyncio
 import threading
 import time
-import json
 from typing import Callable, Dict, Any, List, Optional
 import paho.mqtt.client as mqtt_client
 

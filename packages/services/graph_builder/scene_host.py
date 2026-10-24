@@ -25,9 +25,10 @@ JOIN_TIMEOUT_S = 30.0
 def default_conninfo() -> str:
     from packages.config import (POSTGRES_DATABASE_HOST, POSTGRES_DATABASE_NAME, POSTGRES_DATABASE_PORT,
                                  POSTGRES_DATABASE_USERNAME, postgres_database_password)
-    return (f"dbname={POSTGRES_DATABASE_NAME} user={POSTGRES_DATABASE_USERNAME} "
-            f"host={POSTGRES_DATABASE_HOST} password={postgres_database_password()} "
-            f"port={POSTGRES_DATABASE_PORT}")
+    from psycopg.conninfo import make_conninfo
+    return make_conninfo(dbname=POSTGRES_DATABASE_NAME, user=POSTGRES_DATABASE_USERNAME,
+                         host=POSTGRES_DATABASE_HOST, password=postgres_database_password(),
+                         port=POSTGRES_DATABASE_PORT)
 
 
 class SceneWorkerHost:

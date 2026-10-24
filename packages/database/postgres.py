@@ -16,11 +16,9 @@ limitations under the License.
 
 SPDX-License-Identifier: Apache-2.0
 """
-import argparse
 import datetime
 import json
 import logging
-import time
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Optional, Sequence
 import uuid
 import enum
@@ -30,9 +28,9 @@ import fastapi
 import pydantic
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from psycopg_pool import AsyncConnectionPool
 
-import traceback
 
 from packages import config
 from cloud_common import objects
@@ -367,7 +365,9 @@ class PostgresDatabase:
         """required_tables: tables this service needs but does not create itself (they come
         from the API's Alembic migrations). async_init() waits until they all exist."""
         self._logger = logging.getLogger("Isaac Mission Database")
-        self._auth = f"dbname={dbname} user={user} host={host} password={password} port={port}"
+        # make_conninfo quotes values: a password with a space or a quote breaks a hand-built string
+        self._auth = make_conninfo(dbname=dbname, user=user, host=host, password=password,
+                                   port=port)
         self._host = host
         self._pool: Optional[AsyncConnectionPool] = None
         self._max_retries = max_retries
@@ -510,8 +510,7 @@ class PostgresDatabase:
                                          status=status, **spec)
                             for name, lifecycle, spec, status in values]
         except Exception as err:
-            self._logger.error("Error in list_objects: %s", err)
-            traceback.print_exc()
+            self._logger.error("Error in list_objects: %s", err, exc_info=True)
             raise
 
     async def get_object(self, object_class: objects.ApiObjectType, name: str):
@@ -532,8 +531,7 @@ class PostgresDatabase:
         except fastapi.HTTPException:
             raise
         except Exception as err:
-            self._logger.error("Error in get_object: %s", err)
-            traceback.print_exc()
+            self._logger.error("Error in get_object: %s", err, exc_info=True)
             raise
 
     async def create_object(self, obj: objects.ApiObject, publisher_id: uuid.UUID,
@@ -547,8 +545,8 @@ class PostgresDatabase:
                     self._logger.info("Create object: %s:%s",
                                       obj.table_name(), obj.name)
                     spec_json = obj.spec.json()
-                    self._logger.info("   %s:%s:%s", obj.lifecycle.name,
-                                      spec_json, obj.status.json())
+                    self._logger.debug("   %s:%s:%s", obj.lifecycle.name,
+                                       spec_json, obj.status.json())
                     query = f"INSERT INTO {obj.table_name()} (name, lifecycle, spec, status) " \
                             f"VALUES (%s, %s, %s, %s);"
                     await cursor.execute(query, [obj.name, obj.lifecycle.name,
@@ -565,8 +563,7 @@ class PostgresDatabase:
         except fastapi.HTTPException:
             raise
         except Exception as err:  # pylint: disable=broad-except
-            self._logger.error("Error in create_object: %s", err)
-            traceback.print_exc()
+            self._logger.error("Error in create_object: %s", err, exc_info=True)
             raise
 
     async def update_spec(self, object_class: objects.ApiObjectType, name: str, spec: Any,
@@ -590,8 +587,7 @@ class PostgresDatabase:
                 if before_commit is not None:
                     await self._run_hook(before_commit, conn, old_spec, spec_json)
         except Exception as err:
-            self._logger.error("Database error: %s", err)
-            traceback.print_exc()
+            self._logger.error("Database error: %s", err, exc_info=True)
             raise
 
     async def update_spec_fields(self, object_class: objects.ApiObjectType, name: str,
@@ -629,8 +625,7 @@ class PostgresDatabase:
                     await self._run_hook(before_commit, conn, old_spec,
                                          json.dumps({**(old_spec or {}), **fields}))
         except Exception as err:
-            self._logger.error("Database error: %s", err)
-            traceback.print_exc()
+            self._logger.error("Database error: %s", err, exc_info=True)
             raise
 
     async def _run_hook(self, hook: SpecHook, conn: Any, old_spec: Optional[Dict[str, Any]],
@@ -652,8 +647,7 @@ class PostgresDatabase:
                     await cursor.execute(query, [status.json(), name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
         except Exception as err:
-            self._logger.error("Database error: %s", err)
-            traceback.print_exc()
+            self._logger.error("Database error: %s", err, exc_info=True)
             raise
 
     async def update_status_fields(self, object_class: objects.ApiObjectType, name: str,
@@ -678,8 +672,7 @@ class PostgresDatabase:
                     await cursor.execute(query, [json.dumps(fields), name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
         except Exception as err:
-            self._logger.error("Database error: %s", err)
-            traceback.print_exc()
+            self._logger.error("Database error: %s", err, exc_info=True)
             raise
 
     async def set_lifecycle(self, object_class: objects.ApiObjectType, name: str,
@@ -701,8 +694,7 @@ class PostgresDatabase:
                         await cursor.execute(query, [name])
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
         except Exception as err:
-            self._logger.error("Database error: %s", err)
-            traceback.print_exc()
+            self._logger.error("Database error: %s", err, exc_info=True)
             raise
 
     async def log_mission_waypoint(

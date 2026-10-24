@@ -150,11 +150,13 @@ async def lifespan(app: FastAPI):
 
     # Off by default: the robot team does not subscribe to ingest_mode (they asked for per-node
     # rejection instead), so a retained value nobody reads could only go stale.
+    # Kept: the loop holds only weak references to tasks, and shutdown cancels them.
+    background_tasks = []
     if os.getenv("INGEST_MODE_PUBLISH", "false").lower() in ("1", "true", "yes"):
-        asyncio.create_task(_periodic_ingest_mode())
-    asyncio.create_task(_periodic_cleanup())
-    asyncio.create_task(_periodic_reject_flush())
-    asyncio.create_task(_periodic_ack_flush())
+        background_tasks.append(asyncio.create_task(_periodic_ingest_mode()))
+    background_tasks.append(asyncio.create_task(_periodic_cleanup()))
+    background_tasks.append(asyncio.create_task(_periodic_reject_flush()))
+    background_tasks.append(asyncio.create_task(_periodic_ack_flush()))
     global _scene_host
     scene_host = None
     if SCENE_GRAPH_WORKER_ENABLED:
@@ -167,6 +169,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    for task in background_tasks:
+        task.cancel()
+    await asyncio.gather(*background_tasks, return_exceptions=True)
     if scene_host is not None:
         _scene_host = None
         try:

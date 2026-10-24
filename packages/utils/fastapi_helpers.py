@@ -7,11 +7,9 @@ Utilities for FastAPI applications including standardized error handling.
 
 import logging
 import uuid
-from typing import Union
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import ValidationError
 import requests
 
 

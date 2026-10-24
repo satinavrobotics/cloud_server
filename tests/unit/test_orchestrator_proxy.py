@@ -91,7 +91,7 @@ async def test_hop_by_hop_headers_are_not_forwarded():
                                    "Transfer-Encoding": "chunked", "Upgrade": "h2c",
                                    "Authorization": "Bearer t", "X-Other": "1"})
     await proxy.proxy_to_orchestrator("r1", "maps/list", req)
-    assert FakeClient.seen["headers"] == {"Authorization": "Bearer t", "X-Other": "1"}
+    assert FakeClient.seen["headers"] == {"X-Other": "1"}
 
 
 async def test_other_http_errors_are_502():

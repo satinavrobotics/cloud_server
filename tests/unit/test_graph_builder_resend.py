@@ -64,6 +64,19 @@ class TestDeterministicId:
         s = _service()
         assert s._node_global_id("r1", None, 7) != s._node_global_id("r1", None, 7)
 
+    async def test_live_node_added_message_carries_session_and_timestamp(self):
+        s = _service(sid="s1")
+        await s._handle_node_update(dict(NODE))
+        assert s._publish_node_update.await_args.kwargs["session_id"] == "s1"
+        # the message itself (the publisher is a mock in _service)
+        real = GraphBuilderService._publish_node_update
+        s.update_publisher = MagicMock(publish=AsyncMock())
+        await real(s, "yard", "n1", 1.0, 2.0, 0.5, [], session_id="s1")
+        msg = s.update_publisher.publish.await_args.args[1]
+        assert msg["node"]["session_id"] == "s1" and msg["node"]["timestamp"]
+        await real(s, "yard", "n2", 1.0, 2.0, 0.5, [])   # legacy path: no session known
+        assert "session_id" not in s.update_publisher.publish.await_args.args[1]["node"]
+
     async def test_uses_the_open_session_not_the_payloads(self):
         s = _service(sid="s1")
         await s._handle_node_update({**NODE, "session_id": "payload-session"})

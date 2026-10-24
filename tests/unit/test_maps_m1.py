@@ -1197,12 +1197,13 @@ class TestRoutes:
         assert created.status.state == "ready"
 
         # Existing local map + a datum in the request: datum updated, still local.
-        svc.database.create_object = AsyncMock(side_effect=Exception("duplicate"))
+        svc.database.create_object = AsyncMock(side_effect=HTTPException(400, "duplicate"))
         svc.database.get_object = AsyncMock(return_value=_obj("n", type="local"))
-        svc.database.update_spec = AsyncMock()
+        svc.database.update_spec_fields = AsyncMock()
         await ApiDelegationService.load_map(svc, map_id="n", datum_latitude=47.0,
                                             datum_longitude=19.0)
-        spec = svc.database.update_spec.call_args[0][2]
+        spec = MapSpecV1(**{**_obj("n", type="local").spec.dict(),
+                            **svc.database.update_spec_fields.call_args[0][2]})
         assert spec.type == "local" and spec.geo is None and spec.datum_latitude == 47.0
 
 

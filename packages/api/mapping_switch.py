@@ -80,6 +80,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence
 
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.api import orchestrator_client as oc
 from packages.api.orchestrator_services import pick_service
 from packages.config import (
@@ -118,10 +119,6 @@ RESTART_DETAIL = ("the API restarted while the SLAM map was being saved, so its 
 START, STOP, SAVE = "start", "stop", "save"
 SLAM_SERVICE = "SLAM recording"   # `service` of a SLAM action
 TOPOMAP_SERVICE = "topomap"       # `service` of a topomap switched through the mapping API
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def candidates_of(service: str) -> List[str]:

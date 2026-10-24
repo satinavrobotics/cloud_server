@@ -644,7 +644,7 @@ def _cut_regions(sp: Space, q: np.ndarray, region: np.ndarray, rids: np.ndarray,
     earlier one); the graph of all the regions is built in one pass from the cell-index image instead of from `edges_full`, and
     a region of at most `_BOX_MIN` cells is searched on its own graph without cutting a box out of it (the distances inside
     the radius are the same: the box holds every cell within the radius)."""
-    N, H, W = sp.N, sp.H, sp.W
+    N = sp.N
     nR = int(region.max()) + 1
     flag = np.zeros(nR, bool); flag[rids] = True
     mcells = np.flatnonzero(flag[region])
@@ -839,7 +839,7 @@ class PartitionSolver:
         return f
 
     def _solve(self, F: np.ndarray, shift, st: Optional[_State]):
-        h, tau, radius = self.h, self.tau, self.radius
+        h, tau = self.h, self.tau
         sp = Space.of(F)
         if sp.N == 0:
             z = np.zeros(0, np.int64)

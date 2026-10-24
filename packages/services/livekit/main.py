@@ -9,12 +9,11 @@ SFU has its own role-scoped counterpart, packages/services/livekit_sfu_tokens.
 import argparse
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .server import LiveKitService
@@ -22,7 +21,7 @@ from packages.utils.service_utils import (
     HealthResponse, create_health_response, create_root_response, configure_service_logging
 )
 from packages.utils.fastapi_helpers import add_error_handlers
-from packages.config import DEFAULT_HOST, LOG_LEVEL_DEFAULT
+from packages.config import DEFAULT_HOST, LOG_LEVEL_DEFAULT, require_secret
 
 # ==================== Request/Response Models ====================
 
@@ -66,10 +65,10 @@ async def lifespan(app: FastAPI):
     """Initialize and clean up service resources."""
     global service
 
-    # Load config from environment variables (see A3 in BACKLOG.md for credential rotation)
-    api_key = os.getenv("LIVEKIT_API_KEY", "APItMSWMP3TVdfZ")
-    api_secret = os.getenv("LIVEKIT_API_SECRET", "5aTOwvNSIY8Jvi5lEeBrffpb7P8n6MchhdysejZ8gcwD")
-    server_url = os.getenv("LIVEKIT_SERVER_URL", "wss://satinav-b22o2lgk.livekit.cloud")
+    # Credentials come from the environment only (compose passes LIVEKIT_* through; no literal defaults).
+    api_key = require_secret("LIVEKIT_API_KEY")
+    api_secret = require_secret("LIVEKIT_API_SECRET")
+    server_url = require_secret("LIVEKIT_SERVER_URL")
     default_ttl = int(os.getenv("LIVEKIT_TTL", "36000"))
 
     service = LiveKitService(

@@ -38,6 +38,7 @@ from collections import OrderedDict, deque
 import fastapi
 import psycopg
 import psycopg_pool
+from psycopg.conninfo import make_conninfo
 import pydantic
 
 from packages import config
@@ -2441,6 +2442,8 @@ class Robot:
         datum_* fields) comes from its first mapping session (doc Q1, packages/api/maps.py);
         seeding from the robot's assigned map gave local maps a datum, and wrote a mapless
         sentinel's row with whichever robot sent a datum first."""
+        if self._robot_object is None:
+            return   # the robot object is not loaded (yet) or is gone: nothing to persist to
         old = self._robot_object.datum
         new = robot_object.RobotDatumV1(**msg.dict())
         # Robots republish the same datum every few seconds: nothing to write when it and its
@@ -4814,7 +4817,6 @@ class Robot:
     def _start_wait(self, mission_node: mission_object.MissionNodeV1):
         """Start the timer of a "wait" action node. No order goes to the robot."""
         assert self._current_mission is not None and mission_node.action is not None
-        status = self._current_mission.status
         seconds = float(mission_node.action.action_parameters["seconds"])
         key = self._node_key(mission_node)
         # _send_order() runs again for a node whenever the robot's state does not match
@@ -5379,8 +5381,9 @@ class RobotServer:
         if not disable_fleet_recording:
             try:
                 self.fleet_recorder = fleet_recorder.FleetRecorder(
-                    conninfo=f"dbname={postgres_db} user={postgres_user} host={postgres_host} "
-                             f"password={postgres_password} port={postgres_port}",
+                    conninfo=make_conninfo(dbname=postgres_db, user=postgres_user,
+                                           host=postgres_host, password=postgres_password,
+                                           port=postgres_port),
                     spill_path=fleet_spill_path)
             except Exception as err:  # pylint: disable=broad-except
                 self.warning(f"Fleet recording disabled: {err}")

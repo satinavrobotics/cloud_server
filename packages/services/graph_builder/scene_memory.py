@@ -18,7 +18,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 log = logging.getLogger("GraphBuilderService.scene_memory")
 

@@ -71,7 +71,7 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 from typing import Callable, Dict, Any, Optional, List, Union, Set, Tuple
 from datetime import datetime, timezone as _dt_timezone
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 
 import math
 
@@ -1189,7 +1189,8 @@ class GraphBuilderService:
                 return
             if imp is not None:  # nothing live: no UI update, no waypoint
                 return
-            await self._publish_node_update(map_id, global_node_id, mx, my, myaw, edges, image_ids=None)
+            await self._publish_node_update(map_id, global_node_id, mx, my, myaw, edges, image_ids=None,
+                                            session_id=session.session_id)
             if active_mission is not None:
                 await self._log_mission_waypoint(
                     robot_name, global_node_id, session_node_id, mx, my, myaw, map_id,
@@ -1998,7 +1999,8 @@ class GraphBuilderService:
         y: float,
         yaw: float,
         edges: List[Dict[str, Any]],
-        image_ids: Optional[List[str]] = None
+        image_ids: Optional[List[str]] = None,
+        session_id: Optional[str] = None
     ):
         """
         Publish node update to WebSocket subscribers.
@@ -2009,6 +2011,8 @@ class GraphBuilderService:
             x, y, yaw: Node pose
             edges: List of created edges
             image_ids: Optional list of image IDs associated with this node
+            session_id: The mapping session the node belongs to (the node document's
+                `session_id`), so the client can place a live node in its session
         """
         try:
             # Ensure node_id is a string (UUIDs are strings)
@@ -2022,17 +2026,22 @@ class GraphBuilderService:
                     "to_node_id": str(edge["to_node_id"])
                 })
 
+            now = datetime.now().isoformat()
+            node_msg = {
+                "node_id": node_id_str,
+                "x": x,
+                "y": y,
+                "yaw": yaw,
+                "timestamp": now,
+            }
+            if session_id is not None:
+                node_msg["session_id"] = session_id
             update_message = {
                 "type": "node_added",
                 "map_id": map_id,
-                "node": {
-                    "node_id": node_id_str,
-                    "x": x,
-                    "y": y,
-                    "yaw": yaw
-                },
+                "node": node_msg,
                 "edges": edges_converted,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": now
             }
 
             self.logger.info(f"📡 Publishing WebSocket node metadata for GLOBAL node_id={node_id_str}, map_id={map_id}")

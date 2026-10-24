@@ -2,7 +2,7 @@
 """Shared MinIO connection and bucket management base class."""
 
 import logging
-from typing import List
+from typing import List, Optional
 
 try:
     from minio import Minio

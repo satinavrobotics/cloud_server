@@ -152,6 +152,7 @@ from cloud_common.objects.map import (
 )
 from cloud_common.objects.object import ObjectLifecycleV1
 from cloud_common.objects.robot import RobotObjectV1
+from packages.utils.timeutil import utcnow as _utcnow
 from packages.api import ingest_backlog
 from packages.api.mapping_switch import (
     SLAM_FAILED, SLAM_SAVED, SLAM_SERVICE, Snapshot, SlamResult, action_name, robot_action,
@@ -194,10 +195,6 @@ JSONB_SESSION_COLUMNS = frozenset({"datum", "map_t_session", "placement"})
 
 # Event counters for health/debugging (as packages/api/recording.py).
 stats: Dict[str, int] = {"written": 0, "failed": 0}
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def bucket_key(name: str) -> str:

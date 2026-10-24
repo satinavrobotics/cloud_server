@@ -21,8 +21,9 @@ SPDX-License-Identifier: Apache-2.0
 # specified here https://github.com/VDA5050/VDA5050/blob/main/VDA5050_EN.md
 import datetime
 import enum
+import logging
 import math
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Set, Union
 
 import pydantic
 
@@ -576,6 +577,10 @@ class VDA5050OperatingMode(str, enum.Enum):
     TEACHIN = "TEACHIN"
 
 
+_OPERATING_MODES = frozenset(m.value for m in VDA5050OperatingMode)
+_UNKNOWN_MODES_LOGGED: Set[str] = set()  # each unknown value is logged once
+
+
 class VDA5050EStop(str, enum.Enum):
     AUTOACK = "AUTOACK"
     MANUAL = "MANUAL"
@@ -616,7 +621,9 @@ class VDA5050State(pydantic.BaseModel):
     distanceSinceLastNode: Optional[float] = 0.0
     loads: Optional[List[VDA5050Load]] = []
     newBaseRequest: Optional[bool] = False
-    operatingMode: VDA5050OperatingMode = VDA5050OperatingMode.AUTOMATIC
+    # An unknown mode (e.g. a robot reporting TELEOPERATION) is kept as the string it sent: the
+    # state message, its heartbeat included, must not be dropped for it.
+    operatingMode: Union[VDA5050OperatingMode, str] = VDA5050OperatingMode.AUTOMATIC
     paused: Optional[bool] = False
     safetyState: Optional[VDA5050SafetyStatus] = None
     velocity: Optional[VDA5050Velocity]
@@ -630,6 +637,10 @@ class VDA5050State(pydantic.BaseModel):
     def default_operating_mode(cls, v):
         if v == "":
             return VDA5050OperatingMode.AUTOMATIC
+        if isinstance(v, str) and v not in _OPERATING_MODES and v not in _UNKNOWN_MODES_LOGGED:
+            _UNKNOWN_MODES_LOGGED.add(v)
+            logging.getLogger(__name__).warning(
+                "Unknown operatingMode %r in a state message: kept as reported", v)
         return v
 
 

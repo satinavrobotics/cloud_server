@@ -84,6 +84,9 @@ services:
     # What the dispatcher decides in advance for each node of an order (offline missions;
     # packages/controllers/mission/order_policy.py). Unset keys take the module's defaults.
     environment:
+      # The dispatcher stores naive datetime.now() timestamps and labels naive ones as UTC (utc_timestamp):
+      # correct only while the container clock is UTC (AUDIT_BACKLOG.md H(g)).
+      - TZ=UTC
       - ROUTE_DEVIATION_XY_PASS_M=${ROUTE_DEVIATION_XY_PASS_M:-0.35}
       - ROUTE_DEVIATION_XY_FINAL_M=${ROUTE_DEVIATION_XY_FINAL_M:-0.35}
       - ROUTE_START_DEVIATION_XY_M=${ROUTE_START_DEVIATION_XY_M:-0.35}

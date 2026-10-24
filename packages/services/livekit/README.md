@@ -87,14 +87,14 @@ Returns service statistics and configuration.
 ```
 
 ## Configuration
-
+The service is configured via environment variables; the credentials have no defaults and the service fails at startup without them:
 The service is configured via environment variables with defaults from the development configuration:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LIVEKIT_API_KEY` | LiveKit API key | `APItMSWMP3TVdfZ` |
-| `LIVEKIT_API_SECRET` | LiveKit API secret | `5aTOwvNSIY8Jvi5lEeBrffpb7P8n6MchhdysejZ8gcwD` |
-| `LIVEKIT_SERVER_URL` | LiveKit server WebSocket URL | `wss://satinav-b22o2lgk.livekit.cloud` |
+| `LIVEKIT_API_KEY` | LiveKit API key | required (no default) |
+| `LIVEKIT_API_SECRET` | LiveKit API secret | required (no default) |
+| `LIVEKIT_SERVER_URL` | LiveKit server WebSocket URL | required (no default) |
 | `LIVEKIT_TTL` | Default token time-to-live in seconds | 36000 (10 hours) |
 | `LIVEKIT_PORT` | Service port | 8006 |
 

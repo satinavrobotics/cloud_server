@@ -28,8 +28,9 @@ _LOCALIZATION_PATH = re.compile(r"^localization/?$")
 _SERVICE_PATH = re.compile(r"^services/([^/]+)/(start|stop)/?$")
 DEFAULT_TIMEOUT_S = ORCHESTRATOR_PROXY_TIMEOUT_S
 # RFC 7230 6.1: meaningful for one connection only, never forwarded (plus host / content-length,
-# which httpx sets for the new request)
-_HOP_BY_HOP = frozenset({"host", "content-length", "connection", "keep-alive",
+# which httpx sets for the new request). "authorization" is the caller's credential for THIS
+# server, not for the robot: it is not forwarded.
+_HOP_BY_HOP = frozenset({"host", "authorization", "content-length", "connection", "keep-alive",
                          "proxy-authenticate", "proxy-authorization", "te", "trailer",
                          "trailers", "transfer-encoding", "upgrade"})
 

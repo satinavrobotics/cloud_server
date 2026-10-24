@@ -484,6 +484,10 @@ AGENT_MODEL = os.getenv("AGENT_MODEL", "claude-haiku-4-5")
 # local LiteLLM proxy in front of a free model like Gemini) for development.
 # Leave unset to talk to the real Anthropic API. See docker_compose/llm_proxy.yaml.
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL") or None
+# One LLM call is bounded: a hung API call would otherwise hold a to_thread worker for the SDK's
+# default 10 minutes. The retries are the SDK's (connection errors, 429, 5xx).
+AGENT_LLM_TIMEOUT_S = float(os.getenv("AGENT_LLM_TIMEOUT_S", "30"))
+AGENT_LLM_MAX_RETRIES = int(os.getenv("AGENT_LLM_MAX_RETRIES", "2"))
 # Battery state-of-charge (%) at or below which a low-battery event fires. One setting for the
 # fleet recorder (BATTERY.LOW, see DISPATCH_RECORDER below) and the agent; the agent's own env
 # name still overrides it for the agent alone.
