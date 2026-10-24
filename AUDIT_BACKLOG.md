@@ -11,6 +11,11 @@ punch list.
 Open refactors and gaps from the SLAM-toggle / relocalization work (2026-10-04) are
 listed in `docs/RELOC_FOLLOWUPS.md`.
 
+> **2026-10-24: this file is closed as the working list.** What is still open (verified against the code) is in
+> `docs/OPEN_ITEMS.md`. Entries marked "Closed 2026-10-24" below were found fixed, mitigated or dropped; the rest
+> were carried over. Obsolete notes: E `_notify_graph_builder` now has callers; I0's `if service is None` repetition
+> is done (`_require_service()`, 132 uses); I2.3 and I2.6 are fixed in code.
+
 > Status: unit suite **555 passed / 0 failed** (was 537 passed / **18 failed** at the
 > start of the pass). Integration/e2e suites were not run (they need the Docker
 > stack). Line numbers are as of the commits named in each item.
@@ -201,6 +206,8 @@ literals as dead fallbacks in `graph_builder/server.py`, `mission_planner/server
 ## C. Principledness / consistency — deferred
 
 ### C1. Unit tests run on Pydantic 2.12; production pins 1.9.0 — **high** (mitigated 2026-10-09, mission dispatch audit)
+> **Closed 2026-10-24:** mitigated by `scripts/run_unit_tests_pinned.sh` / `tests/Dockerfile.unit`; CLAUDE.md documents it.
+
 **Mitigated:** `scripts/run_unit_tests_pinned.sh` runs the suite in `tests/Dockerfile.unit` (Python 3.10 +
 the mission and API service pins, `httpx<0.28` for the old starlette `TestClient`). The host env stays on
 pydantic 2 (host Python is 3.12, where 1.9.0 does not install), so `tests/requirements-test.txt` is
@@ -298,6 +305,8 @@ tracked is undone within one state message. Decide: fail/cancel the tracked
 mission, or scope the CANCELED reading to cancels whose `actionId` belongs to it.
 
 ### C8. `_wait_mission_timeout` can strand a deleted mission as current — **medium** (fixed in audit round 3)
+> **Closed 2026-10-24:** `PENDING_DELETE` branches in the timeout path (`controllers/mission/server.py`).
+
 *Status:* fixed in audit round 3 (X3: the timeout runs on the robot's message loop and a deleted mission
 releases the queue). Original finding:
 On `PENDING_DELETE` it deletes the row and returns without `get_next_mission()` /
@@ -309,12 +318,16 @@ A lingering FATAL from an unrelated order could fail a fresh mission.
 A FATAL `robotBaseNotReadyError` (no references) now gets a `failure_reason`; the lingering-FATAL attribution issue remains.
 
 ### C10. Unvalidated spec writes — **low/medium**
+> **Closed 2026-10-24:** mission PUT uses an allowlist (`EDITABLE_SPEC_FIELDS`); `PUT /robots/{r}/map` answers 410.
+
 `update_robot` / `update_mission` accept a raw `dict` and `setattr` arbitrary spec
 fields with no `validate_assignment`. `UpdateRobotMapRequest.map_id` is required,
 so the client's `assignRobotMap(name, null)` can only ever 422.
 *Status (2026-10-09):* the second half is moot: `UpdateRobotMapRequest` is gone and `PUT /robots/{r}/map` answers 410 (maps U6, `tests/unit/test_maps_u6.py`). The first half (raw dict + `setattr`, no field allowlist) is being fixed in the 2026-10-09 round 2; see I below.
 
 ### C11. FATAL-error references parsed as node indexes, action ids included — **medium** (mostly fixed)
+> **Closed 2026-10-24:** node references use `_NODE_REFERENCE_KEYS`. A failed-instant-action test is still missing (low value).
+
 *Status (2026-10-09, verified in code only):* `get_mission_errors` now maps a nodePolicy `actionId` to its node (`order_ids.node_of_reference`/`node_index`) and skips references of another order (`order_ids.is_reference_of(...) is False`). Not verified: a `…-instantaction-n{headerId}` id that `order_ids` cannot attribute to an order (`is_reference_of` returns None) still goes through `node_index`; no test covers a failed instant action. Original finding:
 `get_mission_errors()` (`controllers/mission/server.py`, see also C9) parses
 `rsplit("-n")[-1].rsplit("-s")[0]` for `referenceKey in node_id/nodeId/action_id/
@@ -325,6 +338,8 @@ Fix: only parse `nodeId` references (`order_ids.node_index`), and match `actionI
 references against the tracked actions instead.
 
 ### C12. Instant-action ids are inconsistently scoped — **low/medium** (restart repeat fixed: mission dispatch audit 2026-10-09)
+> **Closed 2026-10-24:** header ids are clock-seeded (`HEADER_ID_EPOCH`); the restart repeat was the part that mattered.
+
 Outgoing `headerId`s (and so the `instantaction-n{headerId}` ids) are now seeded from the clock
 (`HEADER_ID_EPOCH`/`HEADER_ID_RATE`, W13) and no longer restart at 0 after a dispatcher restart; the
 ids still carry no mission/run token. Original finding:
@@ -336,6 +351,8 @@ unless a robot dedupes on `actionId`; if it does (unverified), give them a per-p
 token like the run id.
 
 ### C13. Order revision is bumped after the robot confirms the cancel — **low, design**
+> **Closed 2026-10-24:** dropped: none found in normal operation.
+
 A15 bumps `order_rev` when the robot reports the node cancelled, but the route change
 is applied when the API update arrives. Anything that sends an order inside that window
 (none found in normal operation) would put new content under the old id. Whether a
@@ -345,6 +362,8 @@ onto the order-mismatch path (budget `MAX_ORDER_MISMATCHES` = 40 state messages)
 skips the explicit "canceled" branch — a flow change, not a tweak.
 
 ### C14. `bearing_deg` is documented one way and implemented another — **medium**
+> **Closed 2026-10-24:** convention decided and docstring fixed (`packages/utils/geo.py`). Re-setting old `enu` datums is an operator action.
+
 `utils/geo.py` and `RobotDatumV1` / `MapObjectV1.datum_bearing_deg` describe it as the
 "angle from +X to true north", but `gps_to_local` computes `x = east·cos b + north·sin b`,
 i.e. with b = 0 the local +X axis points *east* (the doc's wording would give 90°). The
@@ -374,6 +393,8 @@ orchestrator forwards it). Make the field tolerant (unknown → keep the message
 once) rather than fatal, and agree the value a teleoperated robot reports.
 
 ### C16. `pause_order` detection reads only `actionStates[0]` — **low/medium**
+> **Closed 2026-10-24:** action states are scanned newest-first and matched by `actionId`.
+
 `update_mission_node_state` (`controllers/mission/server.py`, `# TODO(Nico): fix the
 action states index`) looks at the first action state only: a pause action that is not
 first is missed, and an ACTION node whose `actionStates` is empty raises `IndexError`
@@ -412,6 +433,8 @@ in `async /health`. Planner: sync python-arango in `find_closest_node_*`,
 `FILTER node._key IN @keys`).
 
 ### D2. Fire-and-forget status writes — **medium** (mission controller fixed: W7)
+> **Closed 2026-10-24:** no fire-and-forget status writes left; the mission controller uses `_status_write_loop`.
+
 *Status:* the mission controller's robot and mission status writes go through a per-row serialized queue
 (`_queue_status_write`): retried, tracked, throttled and flushed at shutdown (W7, W9). Open only outside the
 mission controller, if any `ensure_future(update_status(...))` is left. Original finding:
@@ -434,6 +457,8 @@ a *geo* index on Cartesian metres in an unused collection and no query uses it �
 replace with a persistent index + bounding-box prefilter and delete the manager.
 
 ### D5. graph-builder memory/lifecycle — **medium**
+> **Closed 2026-10-24:** `mqtt_connected` is a property, the image buffer uses its timeout, map part fixed.
+
 The cleanup loop has no try/except and iterates dicts that the paho thread and
 worker threads mutate (one "dictionary changed size" kills it permanently, after
 which both maps grow unbounded); buffered base64 images for nodes that never
@@ -444,6 +469,8 @@ image can land in a different bucket than its node. *(Map part fixed in maps M2:
 nodes both go to the robot's open session; `robot.current_map` itself was removed in U6.)*
 
 ### D6. Postgres watcher hygiene — **low/medium** (watcher part fixed: W1)
+> **Closed 2026-10-24:** connection leak fixed (`_close_connection()`). WebSocket receive-error leak not traced; see `docs/OPEN_ITEMS.md`.
+
 *Status:* W1 made the watcher/handlers resilient (no silent broad `except`, the per-object resync warning
 is gone). Open: the leaked `self._connection` per idle timeout (check) and the WebSocket handlers in
 `api/main.py`. Original finding:
@@ -490,9 +517,9 @@ flags); `packages/controllers/mission/tests/client.py` (the robot simulator) is 
 Fixed: C12 (restart repeat, W13), `failure_category` now set by the dispatcher (TIMEOUT, ROBOT_APP, CANCELED),
 factsheet `custom_actions` cleared by an empty list, edge ids carry the node index, stale tests
 (run-change confirmation, watcher retry, recorder) brought in line, `_pre_drop_pose` aliasing. Open:
-- (a) Robot status whole-row writes between the API and the dispatcher: a factsheet / `PUT status` change
+- (a) ✅ closed 2026-10-24 (`update_status_fields` exists and the API uses it). Robot status whole-row writes between the API and the dispatcher: a factsheet / `PUT status` change
   can be reverted by the dispatcher's next write. Proposed `update_status_fields` (jsonb merge) in `postgres.py`.
-- (b) `connection` OFFLINE/CONNECTIONBROKEN does not mark the robot offline at once; the heartbeat timeout is
+- (b) ✅ closed 2026-10-24 (`_connection_down` is set on OFFLINE/CONNECTIONBROKEN). `connection` OFFLINE/CONNECTIONBROKEN does not mark the robot offline at once; the heartbeat timeout is
   the only source.
 - (c) A mission that was started and then cancelled while its robot is offline blocks that robot's queue
   until the robot returns (workaround: operator force-cancel).
@@ -508,6 +535,8 @@ factsheet `custom_actions` cleared by an empty list, edge ids carry the node ind
   `timezone=UTC`); the python base image defaults to UTC, but nothing enforces it.
 
 ### C18. No robot publishes `heightMax` — **low**
+> **Closed 2026-10-24:** cloud side done (`heightMax` is in the VDA5050 type); the publishing side belongs to the robot team.
+
 mission-dispatch now keeps VDA5050 `physicalParameters.heightMax` as `factsheet.height` (`da91987`,
 -1 until sent) and the client raises the robot by it (2.5D map view), but the ROS client only
 sends length and width, so every robot is drawn 0.35 m tall. Add `heightMax` to the factsheet the
@@ -548,6 +577,8 @@ the datum only, Q-U8). Options: accept manual / reloc placement on geo maps too,
 back to local" as the answer.
 
 ### G3. Limits — **low**
+> **Closed 2026-10-24:** informational; the `PUT datum` bearing part is done.
+
 - The georeference is as good as the user's anchor; nothing checks it against GNSS. A robot
   placed by hand and later by its datum shows the anchor error as a jump at its next restart.
 - `POST .../place {"source": "datum"}` trusts the robot's stored datum; when
@@ -670,9 +701,11 @@ SLAM rules, `/api/createToken` grants, config centralisation, healthchecks / `.d
 7. [low] Client deletes one robot's bags on one map by listing all + filtering + deleting one by one (mapApi.ts ~1089, 1121) — server lacks map filter.
 
 ### I6. Observations from the 2026-10-09 deploy
+> **Closed 2026-10-24:** `mqtt_connected` fixed in code (property).
+
 - graph-builder `/health` reports `mqtt_connected: false` although it is subscribed (see D5).
 
-### I7. Frame witness (2026-10-11, formidable-peacock incident): deferred
+### I7. Frame witness (2026-10-11, formidable-peacock incident): implemented in `dedfd54`; sub-items I7.1-4 remain
 1. [low] Adopt the orchestrator's `frame_id` / `frame_changed_at` (GET /localization) in `map_sessions.frame_reading()` once it ships; today the witness is verified from the VDA state only.
 2. [low] A replace by a new SLAM mapping session still does the `then=stay` switch (about 10 s) before the new SLAM start; no known `then` value avoids it.
 3. [low] A SLAM start that failed leaves a session witnessed `cloud-<map>` while the robot reports "map": it is unplaced `frame_changed` after the 30 s debounce (the start failure is also reported).
