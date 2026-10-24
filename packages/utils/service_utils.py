@@ -104,20 +104,21 @@ class DependencyHealthChecker:
         check_func = config["check_func"]
         timeout = config["timeout"]
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            for attempt in range(self.max_retries + 1):
-                try:
-                    future = executor.submit(check_func)
-                    result = future.result(timeout=timeout)
-                    return bool(result)
-                except FuturesTimeoutError:
-                    self.logger.warning(f"Health check timeout for {name} (attempt {attempt + 1}/{self.max_retries + 1})")
-                    if attempt == self.max_retries:
-                        return False
-                except Exception as e:
-                    self.logger.warning(f"Health check failed for {name} (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
-                    if attempt == self.max_retries:
-                        return False
+        for attempt in range(self.max_retries + 1):
+            # A fresh executor per attempt, left with shutdown(wait=False): leaving a `with`
+            # block would wait for a hung check and make the timeout ineffective, and a hung
+            # worker would also block the next attempt on the same single-worker executor.
+            executor = ThreadPoolExecutor(max_workers=1)
+            try:
+                future = executor.submit(check_func)
+                result = future.result(timeout=timeout)
+                return bool(result)
+            except FuturesTimeoutError:
+                self.logger.warning(f"Health check timeout for {name} (attempt {attempt + 1}/{self.max_retries + 1})")
+            except Exception as e:
+                self.logger.warning(f"Health check failed for {name} (attempt {attempt + 1}/{self.max_retries + 1}): {e}")
+            finally:
+                executor.shutdown(wait=False)
 
         return False
 

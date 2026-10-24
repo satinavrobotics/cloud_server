@@ -424,7 +424,8 @@ async def health_check():
     """Health check endpoint."""
     _require_service()
 
-    dependencies = health_checker.check_all() if health_checker else {}
+    # The checks block (up to timeout x attempts per dependency): not on the event loop
+    dependencies = await asyncio.to_thread(health_checker.check_all) if health_checker else {}
     return create_health_response(
         service_name="api_delegation",
         dependencies=dependencies
