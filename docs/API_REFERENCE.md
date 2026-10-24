@@ -95,7 +95,6 @@ Get service information and available endpoints.
     "load_map": "POST /api/v1/map/load",
     "get_image": "GET /api/v1/images/{image_id}",
     "navigate": "POST /api/v1/navigate",
-    "explore": "POST /api/v1/explore",
     "robots": { ... },
     "missions": { ... },
     "websockets": { ... }
@@ -569,34 +568,6 @@ legacy planner.
 6. Client monitors progress via WebSocket (`/ws/mission/{mission_name}`)
 
 **Backend Services:** Mission Planner → Mission Dispatcher → Robot (MQTT)
-
----
-
-#### `POST /api/v1/explore`
-
-Request exploration action for a robot.
-
-**Request Body:**
-```json
-{
-  "robot_name": "carter01",
-  "timeout_seconds": 600
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "mission_name": "explore_carter01_20240115_103000",
-  "robot_name": "carter01",
-  "timeout_seconds": 600
-}
-```
-
-**Use Case:** Robot explores the environment, building the topological map by capturing images and creating nodes.
-
-**Backend Services:** Mission Dispatcher
 
 ---
 
