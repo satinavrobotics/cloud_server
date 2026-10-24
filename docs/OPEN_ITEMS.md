@@ -12,7 +12,22 @@ Client-side items (`../sati-client/docs/AUDIT_BACKLOG.md`) are not covered here.
 
 ---
 
-## 1. Pick up now (small, mechanical)
+## Status 2026-10-24
+
+Sections 1 and 2 are **done** (traced, fixed, tested on the production pins, merged to `main`, `f46d4a4`),
+except what is listed here. Everything else open is section 3 (owner decisions) and section 4 (later).
+
+- Still open from section 1: B1 key rotation (operator; the old values stay in git history) and confirming
+  the `anthropic==1.6.0` pin (taken from the local `agent_orchestrator_service:latest` image). I0 was judged
+  outdated; B2 target validation was already true, only `Authorization` stripping was added.
+- Still open from section 2: `_iso()`/`_parse_iso()` unification (only the `reconstruction` and
+  `map_view_settings` copies of `_iso` are true duplicates; the rest differ in behaviour, so it needs a
+  behaviour decision), and whether `SPLAT_MESH_NOTES.md` stays at the repo root.
+- Parked branches, deliberately not rebased: `feat/dynamic-regime` (contains `feat/dynamic-posterior`) and
+  `feat/viewer-dynamic-channels`; each has one conflict with `main` (`scene_graph/engine.py`,
+  `branch_viewer/worker.py`). Deleted after merge/backup: `feat/mesh-service` (already in `main`).
+
+## 1. Pick up now (small, mechanical) — DONE
 
 | ID | What | Effort | Where |
 |---|---|---|---|
@@ -38,9 +53,9 @@ Client-side items (`../sati-client/docs/AUDIT_BACKLOG.md`) are not covered here.
 | E | Delete the empty shell `packages/api/client.py` (no importers). | S | |
 | E | Delete `plan_mission` / `_call_mission_planner` (definitions only, no callers; check tests first). | S | `api/server.py:1745,1780` |
 
-## 2. Code cleanups (scan of 2026-10-24)
+## 2. Code cleanups (scan of 2026-10-24) — DONE
 
-All verified by pyflakes or grep; nothing changed yet.
+Scan results as found; fixed on 2026-10-24 apart from the leftovers in the status block.
 
 1. **Unused imports and locals, about 30 spots.** Mechanical, safe. Run `python -m pyflakes packages cloud_common` for the exact list. Main files: `api/server.py` (`threading`, `time`, `GraphDatabaseService`, `_uuid`, unused locals at 258 and 1400), `api/main.py` (`os`, `DISPATCHER_OWNED_STATUS_FIELDS`), `api/maps.py`, `api/semantic.py`, `api/map_events.py`, `api/mapping_stats.py`, `api/mesh.py` and `api/semantic.py` (imported but unused `_utcnow`), `services/livekit/main.py`, `services/server_diagnostics/operations.py`, `services/graph_builder/{scene_adapter,server,scene_memory}.py`, `utils/{mqtt_client,service_utils,fastapi_helpers}.py`, `database/postgres.py`, `topomap_dbs/*/server.py`, `scene_graph/{store,engine,morse}.py`, `telemetry_ingest/writer.py`, `controllers/mission/{server.py:4817,fleet_recorder.py}`, `api/reconstruction.py:1503`.
 2. **Duplicated helpers.** `_utcnow()` is copied into 9 modules (`api/{mapping_switch,recorder_health,telemetry,map_delete,reconstruction,recording,maps}.py`, `telemetry_ingest/policy.py`, `controllers/mission/fleet_recorder.py` as `utcnow`). `_iso()`/`_parse_iso()` near-duplicates in about 8 `api` modules (bodies not yet compared). One shared helper in `packages/utils`.
