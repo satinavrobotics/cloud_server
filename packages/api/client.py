@@ -5,10 +5,6 @@ API Delegation Service Client
 Client library for interacting with the API Delegation Service.
 """
 
-import logging
-from typing import Optional, Dict, Any
-
-import requests
 
 
 

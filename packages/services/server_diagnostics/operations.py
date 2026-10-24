@@ -22,7 +22,7 @@ from typing import Callable, Dict, List, Optional
 from . import robot_config
 from .docker_api import DockerActor, DockerUnavailable
 from .redact import redact_line
-from .service import COMPOSE_SERVICE_LABEL, DiagnosticsService, UnknownService
+from .service import DiagnosticsService, UnknownService
 
 log = logging.getLogger(__name__)
 

@@ -36,7 +36,7 @@ from . import morse
 from .place import place_regions
 from . import turn as turn_search
 from . import weights
-from .chart_keys import assign_A, overlaps, overlaps_cells
+from .chart_keys import assign_A, overlaps_cells
 from .leafcover import View as CamView
 from .leafcover import select_views
 from .state import EngineState, LeafRecord, StateMismatch, TimePlane, widen_time

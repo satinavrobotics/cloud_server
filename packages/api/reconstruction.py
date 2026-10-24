@@ -1500,7 +1500,6 @@ class ReconstructionGateway:
 
     async def _dispatch(self, job: Job) -> bool:
         """Build a fresh manifest for `job` and POST it. True when the service took it."""
-        cfg = self.config
         row = await self.repo.map_row(job.map_name)
         if row is None or row[0] == "DELETING":
             await self._end(job, CANCELLED, _error("map_deleting", "the map is being deleted"),

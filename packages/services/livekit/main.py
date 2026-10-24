@@ -9,12 +9,11 @@ SFU has its own role-scoped counterpart, packages/services/livekit_sfu_tokens.
 import argparse
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .server import LiveKitService

@@ -71,7 +71,7 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 from typing import Callable, Dict, Any, Optional, List, Union, Set, Tuple
 from datetime import datetime, timezone as _dt_timezone
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 
 import math
 

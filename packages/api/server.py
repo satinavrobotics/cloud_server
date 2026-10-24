@@ -11,8 +11,6 @@ import json
 from typing import Dict, Any, Optional, List, Set, Tuple
 from datetime import datetime, timezone
 import asyncio
-import threading
-import time
 
 from fastapi import WebSocket, WebSocketDisconnect, HTTPException
 
@@ -22,7 +20,6 @@ from packages.api.mission_index import RobotMissionIndex
 from packages.services.livekit.client import LiveKitClient
 from packages.database.postgres import PostgresDatabase
 from packages.api.diagnostics import DiagnosticsService
-from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from cloud_common.objects.robot import RobotObjectV1
 from cloud_common.objects.map import (
     ApproxLocationV1, MapGeoV1, MapObjectV1, MapSpecV1, MapStatusV1, effective_state,
@@ -255,7 +252,7 @@ class WebSocketProxyManager:
             while True:
                 try:
                     # Receive messages from client (if any)
-                    data = await client_ws.receive_text()
+                    await client_ws.receive_text()
                     # For now, just acknowledge (can be extended for client commands)
                     await client_ws.send_json({
                         "type": "ack",
@@ -1161,7 +1158,6 @@ class ApiDelegationService:
 
     async def get_map(self, map_id: str) -> Dict[str, Any]:
         """Get a single map from Postgres, enriched with live ArangoDB node/edge counts."""
-        import uuid as _uuid
         try:
             map_obj = await self.database.get_object(MapObjectV1, map_id)
         except Exception:
@@ -1397,12 +1393,6 @@ class ApiDelegationService:
         """
         try:
             # Broadcast to all connected graph builder WebSocket clients
-            message = {
-                "map_id": map_id,
-                "event_type": event_type,
-                "timestamp": str(datetime.now())
-            }
-
             # Note: In a real async context, this would be awaited
             # For now, we just log the notification
             self.logger.debug(f"Notified graph builder: {event_type} for map {map_id}")

@@ -46,7 +46,7 @@ import logging
 import math
 import re
 import uuid
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from packages import config
 from packages.controllers.mission import battery, leg_tracker

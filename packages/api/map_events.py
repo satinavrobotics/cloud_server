@@ -24,7 +24,6 @@ import datetime
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import HTTPException
 
 from packages import config
 from packages.api import fleet_reads

@@ -12,7 +12,6 @@ import uuid
 import argparse
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List, Literal, Tuple
-import os
 from datetime import datetime
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
@@ -52,7 +51,7 @@ from cloud_common.objects.robot import (
     EDITABLE_ROBOT_SPEC_FIELDS, FACTSHEET_PHYSICAL_FIELDS, ROBOT_SERVER_OWNED_SPEC_FIELDS, CustomActionV1,
     RobotObjectV1, RobotSpecV1, RobotStateV1, RobotStatusV1)
 from cloud_common.objects.mission import (
-    DISPATCHER_OWNED_STATUS_FIELDS, EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
+    EDITABLE_SPEC_FIELDS, MissionNodeStatusV1, MissionObjectV1, MissionSpecV1, MissionStateV1,
     MissionStatusV1)
 from cloud_common.objects.detection_results import DetectionResultsObjectV1
 from cloud_common.objects import common as common_objects
