@@ -551,3 +551,22 @@ class TestReplace:
         assert ss.call_args_list[0].kwargs["force"] is True
         assert ss.call_args_list[1].kwargs["force"] is False
         assert ss.call_args.kwargs["backlog_fetch"] is ib.fetch_backlog
+
+
+class TestUploadBacklogRoute:
+    """GET /api/v1/robots/{robot}/upload-backlog: the snapshot with available true, or an explicit unavailable."""
+
+    @pytest.mark.asyncio
+    async def test_snapshot_is_marked_available_and_a_miss_says_nothing_about_the_hold(self, monkeypatch):
+        from packages.api import main, ingest_backlog
+
+        async def ok(robot):
+            return {"robot_name": robot, "hold": True, "leftovers": 3}
+
+        async def down(robot):
+            return None
+
+        monkeypatch.setattr(ingest_backlog, "fetch_backlog", ok)
+        assert await main.robot_upload_backlog("r1") == {"robot_name": "r1", "hold": True, "leftovers": 3, "available": True}
+        monkeypatch.setattr(ingest_backlog, "fetch_backlog", down)
+        assert await main.robot_upload_backlog("r1") == {"available": False, "known": False}

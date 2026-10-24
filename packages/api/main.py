@@ -1266,6 +1266,16 @@ async def map_reloc(map_id: str, robot: str):
         switch=service.mapping_switch, reloc_jobs=service.reloc_jobs))
 
 
+@app.get("/api/v1/robots/{robot_name}/upload-backlog")
+async def robot_upload_backlog(robot_name: str):
+    """What the robot still has to upload and why it may be held (graph-builder's snapshot of its
+    retained spool_state): {known, pending, depth, hold, latched, leftovers, latch_reason,
+    progress_age_s, spool_age_s, robot_report, ...}. `{available: false, known: false}` when
+    graph-builder does not answer. Read-only; the Finish gate uses the same snapshot."""
+    snap = await ingest_backlog.fetch_backlog(robot_name)
+    return {**snap, "available": True} if snap is not None else {"available": False, "known": False}
+
+
 @app.get("/api/v1/robots/{robot_name}/stored-maps")
 async def robot_stored_maps(robot_name: str):
     """The cloud maps the robot holds onboard as stored SLAM maps (it can relocalize on them):
