@@ -131,41 +131,6 @@ class TestAPIDelegationIntegration:
         assert result["edge_count"] == 4  # Bidirectional edges: node_1<->node_2, node_2<->node_3
         assert result["status"] == "ready"
     
-    @pytest.mark.asyncio
-    async def test_proxy_mission_planner_request(self, graph_db_client, sample_map_simple):
-        """Test proxying request to mission planner."""
-        from packages.api.server import ApiDelegationService
-        
-        self._load_map(graph_db_client, sample_map_simple)
-        
-        api_service = ApiDelegationService(
-            arango_host="localhost",
-
-            mission_planner_url="http://localhost:8005",
-            default_map_id=sample_map_simple["map_id"]
-        )
-        
-        api_service.graph_db = graph_db_client
-        
-        # Mock mission planner response
-        mock_mission_response = {
-            "success": True,
-            "mission_id": "mission_123",
-            "path": ["node_1", "node_2", "node_3"]
-        }
-        
-        with patch.object(api_service, '_call_mission_planner', return_value=mock_mission_response):
-            result = await api_service.plan_mission(
-                robot_id="robot_1",
-                goal_x=10.0,
-                goal_y=10.0,
-                map_id=sample_map_simple["map_id"]
-            )
-            
-            assert result["success"] is True
-            assert result["mission_id"] == "mission_123"
-            assert len(result["path"]) == 3
-    
     def test_robot_crud_workflow(self, mission_database_service, api_delegation_service):
         """Test complete Robot CRUD workflow through API delegation."""
         import requests

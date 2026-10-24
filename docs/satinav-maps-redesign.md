@@ -459,7 +459,7 @@ counts per session. `since`: when `enabled` last flipped.
 - **Planner without `map_id`** *(since U2 the session's map; since U6 only the session's map, §14.14)*: the robot's `current_map` (a real map, not `GEO`/`LOCAL`); with no
   robot or no usable current map: 400 (`POST /api/v1/navigate`, `GET /missions/{id}/plan`; the
   API passes the 400 on). The implicit `default` map is gone (`default_map_id` is an opt-in
-  constructor argument, unset in production). The API's `plan_mission` passes `map_id` on.
+  constructor argument, unset in production).
 - **`PUT /maps/{id}/datum`** on a geo map: 409 when the map has nodes or sessions (its origin is
   the first session's datum and fixed); on an empty geo map with an origin, `spec.geo` follows
   the new datum. Local maps unchanged.

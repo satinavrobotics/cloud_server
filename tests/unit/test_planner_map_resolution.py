@@ -167,14 +167,6 @@ class TestStatsRoute:
 
 
 class TestApiPassThrough:
-    async def test_call_mission_planner_passes_map_id(self):
-        from packages.api.server import ApiDelegationService
-        svc = ApiDelegationService.__new__(ApiDelegationService)
-        svc.logger = MagicMock()
-        svc.mission_planner = MagicMock(navigate=AsyncMock(return_value={"success": True}))
-        await svc._call_mission_planner("r1", 1.0, 2.0, "yard")
-        assert svc.mission_planner.navigate.await_args.kwargs["map_id"] == "yard"
-
     async def test_navigate_turns_a_planner_400_into_400(self):
         from packages.api.server import ApiDelegationService
         err = Exception("bad request")
