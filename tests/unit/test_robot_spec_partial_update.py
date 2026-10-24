@@ -232,3 +232,15 @@ def test_datum_and_approx_stamps_are_utc():
         assert offset.stamp == datetime.datetime(2026, 10, 3, 10, tzinfo=datetime.timezone.utc)
         assert offset.stamp.utcoffset() == datetime.timedelta(0)
         assert cls(**kw, stamp="garbage").stamp is None
+
+
+async def test_datum_message_before_the_robot_object_is_loaded_is_ignored():
+    r = _robot(StoreDB(api_objects.RobotObjectV1(name="r1", status={})))
+    r._robot_object = None
+    await r._process_datum_message(types.RobotDatum(latitude=47.5, longitude=19.0))
+
+
+def test_conninfo_quotes_a_password_with_spaces_and_quotes():
+    from psycopg.conninfo import conninfo_to_dict
+    db = PostgresDatabase(dbname="t", user="u", password="p w'd\\", host="h", port=5432)
+    assert conninfo_to_dict(db._auth)["password"] == "p w'd\\"
