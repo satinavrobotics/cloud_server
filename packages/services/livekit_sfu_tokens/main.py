@@ -3,7 +3,7 @@
 LiveKit SFU Token Service - FastAPI Application
 
 Role-scoped token endpoint for the self-hosted LiveKit SFU. Reachable only
-over Tailscale (host firewall + ACL); it is deliberately not routed through
+over Tailscale or, when the robot gateway has a LAN door, the LAN; it is deliberately not routed through
 the api-delegation-service. Only /api/operator/createToken is exposed to the
 dashboard's gateway nginx; /api/createToken (robots) is not.
 
@@ -91,7 +91,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="LiveKit SFU Token Service",
-    description="Role-scoped token service for the self-hosted, Tailscale-only LiveKit server",
+    description="Role-scoped token service for the self-hosted LiveKit server",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -106,12 +106,19 @@ async def health():
 
 
 @app.post("/api/createToken", response_model=CreateTokenResponse)
-async def create_token(request: CreateTokenRequest, background: BackgroundTasks):
-    """Create a token whose permissions are decided by the requested role."""
+async def create_token(request: CreateTokenRequest, background: BackgroundTasks, http_request: Request):
+    """Create a token whose permissions are decided by the requested role.
+
+    A caller that reached this service on the LAN address (Host header) is told the LAN SFU
+    address, so a robot without Tailscale can connect. TODO(security): the route is open to the
+    LAN with no authentication; anyone on the LAN can mint a robot token. Needs a per-robot
+    secret or an allow-list before this goes beyond a trusted LAN."""
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     try:
-        result = service.create_token(request.participantName, request.roomName, request.role)
+        via_lan = is_lan_request(http_request.headers.get("host"), service.lan_host)
+        result = service.create_token(request.participantName, request.roomName, request.role,
+                                      via_lan=via_lan)
     except (UnknownRoleError, InvalidIdentityError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     # After the answer, best effort: the API records TELEOP.SESSION_STARTED (no token is sent).
@@ -146,7 +153,7 @@ async def root():
     return create_root_response(
         service_name="LiveKit SFU Token Service",
         version="1.0.0",
-        description="Role-scoped token service for the self-hosted, Tailscale-only LiveKit server",
+        description="Role-scoped token service for the self-hosted LiveKit server",
         endpoints={
             "create_token": "POST /api/createToken",
             "create_operator_token": "POST /api/operator/createToken",

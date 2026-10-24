@@ -33,7 +33,7 @@ ROLE_GRANTS: Dict[str, Dict[str, bool]] = {
 
 # LiveKit disconnects an existing participant when another joins its room under
 # the same identity. The dashboard route is reachable without any authentication
-# beyond the tailnet, so it must not be able to claim a robot's identity: the
+# beyond the tailnet or LAN, so it must not be able to claim a robot's identity: the
 # dashboard's identities all start with this prefix (sati-client
 # PARTICIPANT_ID_PREFIX) and robot tokens may not use it.
 DASHBOARD_IDENTITY_PREFIX = "WEB-"
@@ -67,7 +67,8 @@ def notify_token_issued(role: str, participant_name: str, room_name: str,
 
 
 def is_lan_request(host_header: Optional[str], lan_host: Optional[str]) -> bool:
-    """True when the Host header (the gateway forwards the client's) names the LAN address."""
+    """True when the Host header (the gateway forwards the client's) names the LAN address.
+    The client sets the header, but it only picks which SFU URL is returned; it grants nothing."""
     if not host_header or not lan_host:
         return False
     return urlparse("//" + host_header).hostname == lan_host
@@ -126,7 +127,7 @@ class LiveKitSfuTokenService:
         Create a token for one participant in one room.
 
         Returns:
-            Dictionary with token, ttl and server_url (the LAN URL for an operator with
+            Dictionary with token, ttl and server_url (the LAN URL for any role with
             via_lan when one is configured)
 
         Raises:
@@ -157,6 +158,6 @@ class LiveKitSfuTokenService:
             **grants,
         )
         server_url = self.operator_server_url if role == "operator" else self.server_url
-        if role == "operator" and via_lan and self.lan_server_url:
+        if via_lan and self.lan_server_url:
             server_url = self.lan_server_url
         return {"token": token, "ttl": ttl, "server_url": server_url}

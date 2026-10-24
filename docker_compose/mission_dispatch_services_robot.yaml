@@ -231,7 +231,10 @@ services:
       retries: 3
       start_period: 20s
 
-  # Role-scoped tokens for the SFU. Robots call /api/createToken on the tailnet IP; the gateway forwards the operator route.
+  # Role-scoped tokens for the SFU. Robots call /api/createToken on the tailnet IP, or on the LAN IP when ROBOT_LAN_IP is set
+  # (the gateway's nginx has a :8008 door there, so a robot works with either connection). The gateway's own
+  # routes forward the operator route only.
+  # TODO(security): robot tokens are open to the LAN with no authentication (decided 2026-10-24: acceptable for now).
   livekit-sfu-tokens:
     build: !reset null
     image: ${IMAGE_REGISTRY:-100.85.3.47:5050/sati}/livekit_sfu_tokens:${IMAGE_TAG:-latest}

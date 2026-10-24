@@ -33,6 +33,7 @@ That includes after a restart of tailscaled or a reboot.
 | `tailscale set --auto-update=false` | script `apply` | None. Stops self-updates restarting tailscaled at a random time. |
 | Second DNS server (default 1.1.1.1) | script `apply`: NetworkManager default-route profile if it runs, else a systemd-resolved `FallbackDNS` drop-in | Indirect. Name resolution survives a router DNS failure. |
 | systemd-timesyncd drop-in, `PollIntervalMaxSec` 600 | script `apply`, `/etc/systemd/timesyncd.conf.d/50-satinav-poll.conf` | Indirect. After an offline boot the clock syncs soon after the link returns. Wrong clocks hurt key and TLS checks. A Pi has no RTC, so this matters more here. |
+| chrony NTP server for the LAN (`NTP_ALLOW`, default 192.168.1.0/24, `local stratum 10`); replaces timesyncd | script `apply`, `/etc/chrony/conf.d/50-satinav-server.conf` | Indirect. The robot's Jetson takes its time from this Pi, so check the Pi's clock and RTC battery first. |
 | Docker starts after tailscaled | script `apply`, `/etc/systemd/system/docker.service.d/10-after-tailscaled.conf` | Mosquitto and the other containers come up with the tailnet address present (see `docs/robot_deploy.md`). |
 
 Only the version, the node attribute and the key expiry decide offline operation. The rest is hygiene.

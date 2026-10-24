@@ -8,12 +8,13 @@
 #   sudo scripts/configure_pi_network.sh offline-test   # section 6 test (WAN must be unplugged)
 #
 # Env: TAILSCALE_VERSION (default 1.104.1), EXTRA_DNS (default 1.1.1.1),
-#      TIMESYNC_POLL_MAX (default 600), PEER (100.x address, for offline-test).
+#      TIMESYNC_POLL_MAX (default 600), NTP_ALLOW (LAN served by chrony, default 192.168.1.0/24), PEER (100.x address, for offline-test).
 set -uo pipefail
 
 TS_VERSION="${TAILSCALE_VERSION:-1.104.1}"
 EXTRA_DNS="${EXTRA_DNS:-1.1.1.1}"
 POLL_MAX="${TIMESYNC_POLL_MAX:-600}"
+NTP_ALLOW="${NTP_ALLOW:-192.168.1.0/24}"   # LAN served by this Pi's NTP server (chrony)
 MIN_MAJOR_MINOR="1.104"
 
 ok()   { printf '  ok    %s\n' "$*"; }
@@ -70,8 +71,12 @@ check_system() {
      tailscale debug prefs 2>/dev/null | python3 -c 'import sys,json;sys.exit(0 if not json.load(sys.stdin).get("AutoUpdate",{}).get("Apply") else 1)' 2>/dev/null
   then ok "auto-update off"; else warn "auto-update on or unreadable"; fi
 
-  if [ -f /etc/systemd/timesyncd.conf.d/50-satinav-poll.conf ]; then ok "timesyncd PollIntervalMaxSec drop-in present"
+  if [ -f /etc/chrony/conf.d/50-satinav-server.conf ]; then
+    ok "chrony serves the LAN ($(grep -h '^allow' /etc/chrony/conf.d/50-satinav-server.conf | tr '\n' ' '))"
+    chronyc tracking 2>/dev/null | grep -E 'Reference ID|Leap status|System time' | sed 's/^/        /'
+  elif [ -f /etc/systemd/timesyncd.conf.d/50-satinav-poll.conf ]; then ok "timesyncd PollIntervalMaxSec drop-in present"
   else warn "timesyncd drop-in missing"; fi
+  have timedatectl && timedatectl 2>/dev/null | grep -E 'RTC time|Local time' | sed 's/^ */        /'
   if [ -f /etc/systemd/system/docker.service.d/10-after-tailscaled.conf ]; then ok "docker starts after tailscaled"
   else warn "docker.service has no After=tailscaled drop-in"; fi
   if have timedatectl; then
@@ -134,7 +139,27 @@ apply_timesyncd() {
   step "Clock sync after an offline boot"
   install -d /etc/systemd/timesyncd.conf.d
   printf '[Time]\nPollIntervalMaxSec=%s\n' "$POLL_MAX" > /etc/systemd/timesyncd.conf.d/50-satinav-poll.conf
-  systemctl restart systemd-timesyncd 2>/dev/null && ok "PollIntervalMaxSec=$POLL_MAX" || warn "systemd-timesyncd not available (chrony in use?)"
+  if systemctl is-active --quiet chrony; then ok "chrony is the clock client, timesyncd drop-in not needed"; return; fi
+  systemctl restart systemd-timesyncd 2>/dev/null && ok "PollIntervalMaxSec=$POLL_MAX" || warn "systemd-timesyncd not available"
+}
+
+# NTP server for the LAN: the Jetson trusts whatever this Pi serves. Keeps serving while unsynchronised
+# (local stratum 10) so a Pi that lost its time and has no internet is still the one clock on the LAN.
+# Replaces systemd-timesyncd (chrony conflicts with it). Check the Pi's clock and RTC battery first.
+apply_chrony() {
+  step "NTP server for the LAN (chrony)"
+  if ! have chronyd; then
+    have apt-get || { warn "chrony not installed and no apt-get; install it by hand"; return; }
+    DEBIAN_FRONTEND=noninteractive apt-get install -y chrony >/dev/null 2>&1 || { warn "apt-get install chrony failed (no internet?)"; return; }
+  fi
+  local dir=/etc/chrony/conf.d
+  if ! grep -qs '^confdir /etc/chrony/conf.d' /etc/chrony/chrony.conf; then
+    printf '\nconfdir /etc/chrony/conf.d\n' >> /etc/chrony/chrony.conf
+  fi
+  install -d "$dir"
+  printf 'allow %s\nlocal stratum 10\n' "$NTP_ALLOW" > "$dir/50-satinav-server.conf"
+  systemctl disable --now systemd-timesyncd >/dev/null 2>&1   # one clock client only
+  systemctl enable chrony >/dev/null 2>&1; systemctl restart chrony && ok "chrony serves $NTP_ALLOW (local stratum 10)" || warn "chrony did not start"
 }
 
 apply_docker_order() {
@@ -176,7 +201,7 @@ case "${1:-check}" in
   check) check_tailscale; check_system; summary ;;
   apply)
     need_root
-    apply_tailscale; apply_dns; apply_timesyncd; apply_docker_order
+    apply_tailscale; apply_dns; apply_chrony; apply_timesyncd; apply_docker_order
     TODOS=0; WARNINGS=0
     step "Re-check"; check_tailscale; check_system
     echo

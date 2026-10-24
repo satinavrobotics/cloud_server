@@ -25,7 +25,7 @@ upstream agent_api {
     server 127.0.0.1:8007;
 }
 
-# The robot's own token service listens on the tailnet IP (robots call it there), not on loopback.
+# The robot's own token service listens on the tailnet IP, not on loopback. Robots call it there, or through the LAN door below.
 # Server diagnostics (container status and logs), loopback only.
 upstream diagnostics_api {
     server 127.0.0.1:8011;
@@ -49,4 +49,25 @@ server {
     error_log /dev/stderr warn;     # also in `docker logs`, so server diagnostics can read it
 
     include /etc/nginx/sati/routes.conf;
+}
+
+# LAN door for robot tokens (ROBOT_LAN_IP:8008, same gate as the gateway's LAN door; off when unset). Only /api/createToken
+# is forwarded, with the client's Host kept so the token service answers with the LAN SFU address. Cannot be combined with
+# ROBOT_LAN_IP=0.0.0.0: that would collide with the token service's own bind on the tailnet IP and port.
+# TODO(security): no authentication; anyone on the LAN can mint a robot token (accepted 2026-10-24).
+server {
+    listen ${ROBOT_LAN_IP}:8008;
+    server_name _;
+
+    location = /api/createToken {
+        limit_except POST { deny all; }
+        proxy_pass http://livekit_selfhost_api;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 10s;
+        proxy_read_timeout 10s;
+    }
+
+    location / { return 404; }
 }

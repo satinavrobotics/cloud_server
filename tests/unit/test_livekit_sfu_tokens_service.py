@@ -276,9 +276,15 @@ class TestLanUrl:
         assert client.post("/api/operator/createToken", json=body,
                            headers={"host": "100.64.0.1"}).json()["server_url"] == OPERATOR_URL
 
-    def test_robots_never_get_the_lan_url(self):
-        svc = LiveKitSfuTokenService(API_KEY, API_SECRET, SERVER_URL, lan_server_url=LAN_URL)
-        assert svc.create_token("jetson", "fleet", "robot", via_lan=True)["server_url"] == SERVER_URL
+    def test_robots_on_the_lan_get_the_lan_url(self, monkeypatch, client):
+        """A robot without Tailscale reaches this service on the LAN address and must be told the LAN SFU."""
+        monkeypatch.setattr(sfu_tokens_main.service, "lan_server_url", LAN_URL)
+        monkeypatch.setattr(sfu_tokens_main.service, "lan_host", "192.168.1.70")
+        body = {"participantName": "jetson", "roomName": "fleet", "role": "robot"}
+        assert client.post("/api/createToken", json=body,
+                           headers={"host": "192.168.1.70:8008"}).json()["server_url"] == LAN_URL
+        assert client.post("/api/createToken", json=body,
+                           headers={"host": "100.64.0.1:8008"}).json()["server_url"] == SERVER_URL
 
     def test_without_a_lan_url_nothing_changes(self, service):
         assert service.create_token("WEB-x", "fleet", "operator", via_lan=True)["server_url"] == SERVER_URL
