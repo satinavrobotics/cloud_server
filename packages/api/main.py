@@ -128,6 +128,7 @@ class NavigationResponse(BaseModel):
                           "status 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings) | 'exceeds_chart' (refused, failed_at 'footprint')")
     goal_far: Optional[Dict[str, Any]] = Field(
         None, description="Goal-far notice, present when the route's goal is far from verified space: {goal_xy [x, y] as asked, free_xy [x, y] the nearest free cell the route ends at, distance_from_free_m, limit_m (the map's close-evidence range), unverified_length_m (metres of the route not validated by close evidence; null = unknown, the store has no validity plane; never 0 for unknown)}; null otherwise")
+    keepout: Optional[Dict[str, Any]] = Field(None, description="Keep-out zones (manually switched-off regions/edges): {applied, unresolved, detour, forced_by, extra_length_m}; failed_at 'keepout' adds unreachable true and reason. Absent when the map has none")
     trajectory: Optional[List[Dict[str, Any]]] = Field(
         None, description="The planner's dense path per leg between the go-to route's consecutive waypoints: "
                           "[{from_index, to_index, points: [[x, y], ...]}], map frame. Display data; a leg may be "
@@ -996,6 +997,37 @@ async def list_blocked_nodes(map_id: str, with_chart_keys: bool = False):
         tagged = await blocked_chart_tags.add_chart_keys(rows, map_id, _scene_graph_reads)
         return {"map_id": map_id, "blocked_nodes": rows, **tagged.fields()}
     return {"map_id": map_id, "blocked_nodes": rows}
+
+
+# ==================== Keep-out zones ====================
+# packages/api/keepouts.py, docs/keepout_zones.md: regions and edges of the map's scene graph switched off by hand; the mission
+# planner never routes through an enabled one. Persistent (no expiry), separate from the robot-reported blocked nodes above.
+
+@app.get("/api/v1/maps/{map_id}/keepouts")
+async def list_keepouts(map_id: str):
+    _require_service()
+    return await _site_call("list keep-outs", service.keepouts.list_all(map_id))
+
+
+@app.post("/api/v1/maps/{map_id}/keepouts", status_code=201)
+async def create_keepout(map_id: str, body: Dict[str, Any]):
+    """{kind: "region"|"edge", label?, region: {chart_key} | {polygon: [[x, y], ...]}, edge: {from, to}} (a chart key or [x, y] each)."""
+    _require_service()
+    return await _site_call("create keep-out", service.keepouts.create(map_id, body))
+
+
+@app.patch("/api/v1/maps/{map_id}/keepouts/{keepout_id}")
+async def patch_keepout(map_id: str, keepout_id: str, body: Dict[str, Any]):
+    """{enabled?: bool, label?: str|null}: switch a zone on or off (the planner follows within seconds) or rename it."""
+    _require_service()
+    return await _site_call("update keep-out", service.keepouts.patch(map_id, keepout_id, body))
+
+
+@app.delete("/api/v1/maps/{map_id}/keepouts/{keepout_id}", status_code=204)
+async def delete_keepout(map_id: str, keepout_id: str):
+    _require_service()
+    await _site_call("delete keep-out", service.keepouts.delete(map_id, keepout_id))
+    return Response(status_code=204)
 
 
 @app.delete("/api/v1/maps/{map_id}/blocked-nodes/{graph_node_id}")

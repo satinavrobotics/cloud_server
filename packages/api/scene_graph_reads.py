@@ -192,7 +192,8 @@ class SceneGraphReads:
                  open_view: Optional[Callable[[str, Optional[int], Any], Any]] = None,
                  epoch: Optional[Callable[[str, Optional[int]], Any]] = None,
                  tile_m: float = TILE_M,
-                 epoch_of_meta: Optional[Callable[[str, int, Dict[str, Any]], Any]] = None) -> None:
+                 epoch_of_meta: Optional[Callable[[str, int, Dict[str, Any]], Any]] = None,
+                 manifest: Optional[Callable[[str, Optional[int]], Dict[str, Any]]] = None) -> None:
         """`whole_graph`: `load` ignores the bbox, so one loaded graph serves every bbox of a
         (map, version); without it each bbox is loaded by itself."""
         self._meta, self._load, self._lineage, self._epoch = meta, load, lineage, epoch
@@ -204,6 +205,8 @@ class SceneGraphReads:
         self._graphs = _Cache(CACHE_GRAPHS)
         self._results = _Cache(CACHE_RESULTS, CACHE_RESULT_BYTES, _result_bytes)
         self._lineages = _Cache(CACHE_LINEAGE)
+        self._manifest = manifest               # (map, version) -> the stored manifest: charts [{key, ...}], links [{a, b, ...}]
+        self._topologies: Dict[str, Tuple[Any, Dict[str, Any]]] = {}
 
     # -- version, epoch, bbox
     async def _version(self, map_id: str, version: Optional[int],
@@ -398,6 +401,22 @@ class SceneGraphReads:
                              "origin": [r.origin[0], r.origin[1]], "step": r.step}
         return out, headers
 
+    async def topology(self, map_id: str) -> Optional[Dict[str, Any]]:
+        """{version, keys: set of chart keys, links: set of frozenset({a, b})} of the map's current version, from the stored
+        manifest (no tile is read; cached per (map, epoch, version)). None: no graph, or a store without manifests."""
+        version, _, ep = await self._version(map_id, None)
+        if version is None or self._manifest is None:
+            return None
+        key = (_tag(ep), version)
+        hit = self._topologies.get(map_id)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        man = await asyncio.to_thread(self._manifest, map_id, version)
+        out = {"version": version, "keys": {c["key"] for c in man.get("charts", [])},
+               "links": {frozenset((l["a"], l["b"])) for l in man.get("links", [])}}
+        self._topologies[map_id] = (key, out)
+        return out
+
     async def owner_plane(self, map_id: str, bbox: BBox, level: int = 0) -> Optional[Dict[str, Any]]:
         """The owner plane of the current version over the snapped bbox, in ONE request (one meta read, one
         query, no hierarchy): {version, epoch, bbox, origin, step, shape, keys, index (u16 ndarray)}; None
@@ -515,6 +534,7 @@ def from_store(store: Any) -> SceneGraphReads:
     A store without `view` / `tiles_in` falls back to the whole graph per (map, version)."""
     lineage = getattr(store, "lineage", None)
     epoch = _store_epoch(store)
+    manifest = store.manifest if callable(getattr(store, "manifest", None)) else None
     if callable(getattr(store, "view", None)) and callable(getattr(store, "tiles_in", None)):
         return SceneGraphReads(
             meta=store.meta,
@@ -522,11 +542,11 @@ def from_store(store: Any) -> SceneGraphReads:
             lineage=lineage,
             tiles_in=lambda map_id, bbox, version: store.tiles_in(map_id, bbox, version),
             open_view=lambda map_id, version, tiles: store.view(map_id, version, tiles),
-            epoch_of_meta=epoch)
+            epoch_of_meta=epoch, manifest=manifest)
     return SceneGraphReads(
         meta=store.meta,
         load=lambda map_id, version, bbox: store.load(map_id, version),
-        lineage=lineage, whole_graph=True, epoch_of_meta=epoch)
+        lineage=lineage, whole_graph=True, epoch_of_meta=epoch, manifest=manifest)
 
 
 def build(enabled: bool, client: Any = None) -> SceneGraphReads:

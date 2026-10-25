@@ -94,6 +94,8 @@ MESH_SQL = "DELETE FROM map_meshes WHERE map_name = %s"
 VIEW_SETTINGS_SQL = "DELETE FROM map_view_settings WHERE map_name = %s"
 # Its person removal setting (migration 20261023_01_map_person_removal) too; the masks go with the bucket and nodes.
 PERSON_REMOVAL_SQL = "DELETE FROM map_person_removal WHERE map_name = %s"
+# Its keep-out zones (migration 20261025_01_map_keepouts) too.
+KEEPOUTS_SQL = "DELETE FROM map_keepouts WHERE map_name = %s"
 # Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
 EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
 # Its blocked-node exclusions (migration 20261008_01_blocked_graph_nodes) too.
@@ -447,6 +449,7 @@ class MapDeleter:
                     await cursor.execute(MESH_SQL, (map_id,))
                     await cursor.execute(VIEW_SETTINGS_SQL, (map_id,))
                     await cursor.execute(PERSON_REMOVAL_SQL, (map_id,))
+                    await cursor.execute(KEEPOUTS_SQL, (map_id,))
                     await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
                     await cursor.execute(BLOCKED_NODES_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,

@@ -38,7 +38,7 @@ from packages.config import (
     SCENE_GRAPH_WORKER_ENABLED,
 )
 from packages.api.map_delete import MapDeleter
-from packages.api import localization_view, map_view_settings, maps, mesh, reconstruction, semantic
+from packages.api import keepouts as keepouts_api, localization_view, map_view_settings, maps, mesh, reconstruction, semantic
 from packages.api.mapping_switch import MappingSwitch
 from packages.api.slam_save_state import PgSlamStateStore
 from packages.api.orchestrator_maps import OrchestratorMaps
@@ -766,6 +766,12 @@ class ApiDelegationService:
 
         # Per-map view settings of the map window (docs/semantic/design.md §10.4): a small table of its own.
         self.view_settings = map_view_settings.ViewSettingsStore(self.database)
+
+        # Keep-out zones of the scene graph (docs/keepout_zones.md); the scene-graph reads are looked up at call time (main.py builds them)
+        def _reads():
+            from packages.api import main as _api_main      # not at the top: main imports this module
+            return _api_main._scene_graph_reads()
+        self.keepouts = keepouts_api.KeepoutStore(self.database, _reads)
 
         async def mark_jobs_deleting(cursor, map_id):
             return {"reconstruction": await reconstruction.mark_map_deleting(cursor, map_id),
