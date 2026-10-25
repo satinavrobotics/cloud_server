@@ -710,3 +710,63 @@ SLAM rules, `/api/createToken` grants, config centralisation, healthchecks / `.d
 2. [low] A replace by a new SLAM mapping session still does the `then=stay` switch (about 10 s) before the new SLAM start; no known `then` value avoids it.
 3. [low] A SLAM start that failed leaves a session witnessed `cloud-<map>` while the robot reports "map": it is unplaced `frame_changed` after the 30 s debounce (the start failure is also reported).
 4. [low] tests/integration/maps/checks_use.py / checks_reuse.py were not re-run (need the real-Postgres rig).
+
+## J. nodePolicy v2 review 2026-10-25 — deferred
+
+Review of the changes since the 2026-10-21 deploy against `docs/node_policies_v2_plan.md` (read-only Haiku review, then
+fixed in the same commit where noted). Each point is referenced as `J.<n>`. Fixed then: the corridor cap at storage and in
+`is_passed`, dead `leg_widths` / `UNAVAILABLE_LEGACY` removed, the warning separates narrow from unknown, the
+planner's unused `NODE_POLICY_SKIP_ENABLED` removed from compose, docs for waypoint 0, last-node tolerance and the
+reason list corrected. The 0-versus-None check in `route_preview.py` and the planner's `unchanged()` was re-read and is
+value-correct (no change; see J.6).
+
+### J.1 Mode default has two sources — **decision needed**
+`VDA5050_NODE_POLICY_MODE` defaults to `factsheet` in compose (`docker_compose/mission_dispatch_services.yaml`) and in
+`order_policy.py`, but to `on` in `.env.example` and the Pi profiles (`profiles/pi4.env`, `pi5.env`, `server.env`). Docs
+`docs/vda5050_offline_missions_plan.md` say `factsheet`. Pick the authoritative value and state it in all four places.
+
+### J.2 Mission event for an unannotated go-to — **not built**
+Plan 2.3 asks for a `node_policy_unannotated` mission event; the dispatcher only logs a warning
+(`controllers/mission/server.py`, `_check_goto_annotated`). The condition is also coarser than the plan's (any origin
+None, or all corridors None). Needs the event plumbing and the exact condition agreed first.
+
+### J.3 Planner margin not in the contract — **decision needed**
+`corridor_per_side` subtracts `SCENE_GRAPH_WIDTH_MARGIN_M` (default 0.05 m) on top of the robot's own ~0.10 m margin. The
+contract says the robot does its own margin and "nothing for us to do". Either write the planner margin into the contract,
+or remove it.
+
+### J.4 `total` means different things — **decision needed**
+Normal planner path: `total = len(wanted)` (all candidates). Unchanged path (`server.py` `unchanged()`) and
+`route_preview.py`: `total` = skippable waypoints without a corridor width. Pick one meaning; it changes the numbers the
+API reports.
+
+### J.5 Plan and doc text to correct (no code change)
+- `docs/node_policies_v2_plan.md` step 1.2 says an explicit `actions: []` overwrites the stored list; the plan's status line
+  and the code (`api/main.py`, registration keeps the list) say it does not. Make the plan match the code.
+- Step 1.5 says lateral distance `<= corridor`; the code uses `corridor - 0.10` (`order_start.py`, `NODE_POLICY_LOCALISATION_MARGIN_M`),
+  which is the intent. Update the plan.
+- Section 1 contract: "operator waypoints are non-skippable" is no longer literally true: an operator's explicit
+  `skippable=true` is kept (`keep_intent`, D1). Reword the contract.
+- `docs/node_policies_2026-10-13.md` line 39 still lists `legacy_planner`; the file is a superseded design note. Leave it, or
+  add a superseded banner.
+
+### J.6 Redundancy (C2, C4, C5, C6, C7, C8)
+- C2: the "corridor > 0 means skippable" rule is written in five places (wire, planner, dispatcher log, route preview,
+  dispatcher reasons). A shared `usable_corridor` / `skip_allowed` helper in `order_policy.py` would remove the drift risk.
+  Not done: the planner cannot import the controller module, so the helper needs a home both can import.
+- C4: `node_policy_plan._between` repeats `_leg_width`'s snap + route + min_width logic. Extract one `_route_leg`.
+- C5: `api/route_preview.measure_reroute` calls the planner serially, once per route, each with a 5 s timeout. A reroute
+  with several routes can block `PUT /missions` for tens of seconds. `asyncio.gather` with one overall deadline.
+- C6: the "already annotated?" test is in the dispatcher's enrich path (`_enrich_routes`) and again in `_check_goto_annotated`; factor it out with J.2.
+- C7: the sent-order decision record is `Dict[str, Any]` (`cloud_common/objects/mission.py`). A small model would validate
+  `reason`, which the API summary keys on.
+- C8: model the factsheet `agvActions` field (plan 1.2) instead of reading it from `.dict()` extras.
+
+### J.7 Outside the node-policy area, skimmed only (unverified)
+- `packages/api/orchestrator_proxy.py` (5aabf80) no longer forwards the caller's Authorization header. Confirm the robot's
+  orchestrator does not depend on it.
+- `GET /api/v1/robots/{robot}/upload-backlog` (8e61129): auth beyond the route group's middleware not checked.
+- `docker_compose/mission_dispatch_services.yaml` (523fa1e): mosquitto gets a data volume; `packages/utils/mosquitto.sh`
+  argument handling not checked.
+- `tests/unit/test_api_delegation.py` lost 75 lines and `api/client.py` was deleted (cd52ae6, cda58b1): coverage not compared.
+- Settings and map PUT now write only their own spec fields (b5118bb): not examined.

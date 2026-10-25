@@ -1821,9 +1821,12 @@ class Robot:
             return
         bare = [j for j in asked if not (route.waypoints[j].corridor_width_m or 0) > 0]
         if bare:
+            # a measured 0 (no room for the robot) is not an unknown width: say which it is
+            unknown = [j for j in bare if route.waypoints[j].corridor_width_m is None]
             self.warning(f"[{self._current_mission.name}] Route {mission_node.name}: "
-                         f"{len(bare)} of {len(asked)} skippable waypoints have no corridor "
-                         f"width (no scene graph or width unknown); sent not skippable: "
+                         f"{len(bare)} of {len(asked)} skippable waypoints have no usable corridor "
+                         f"({len(unknown)} width unknown: no scene graph or unmeasured; "
+                         f"{len(bare) - len(unknown)} measured no room); sent not skippable: "
                          f"{bare[:10]}")
 
     def _passed_at_start(self, route: mission_object.MissionRouteNodeV1) -> int:

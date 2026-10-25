@@ -1059,8 +1059,8 @@ each route's first waypoint (where the robot starts) is never blocked; a waypoin
 that radius of where the row's node was reported.
 
 Waypoint tolerances: `allowedDeviationXY` / `allowedDeviationTheta` left out (or 0) mean the
-dispatcher's policy: 0.35 m / heading free on nodes the robot drives through, 0.1 m / 0.785 rad
-on the last node and on nodes with actions. A positive value is sent as given. A waypoint may
+dispatcher's policy: 0.35 m / heading free on nodes the robot drives through, 0.35 m / 0.785 rad
+on the last node. A positive value is sent as given. A waypoint may
 carry `node_id`, the graph node it was taken from (the planner sets it).
 
 Waypoint skip policy (all optional; left out = the old behaviour, a waypoint is not skippable):
@@ -1073,7 +1073,7 @@ after the waypoint that a skip may use), `origin` (`"user"` or `"planned"`). `ma
 map's scene graph when the mission starts (the operator may also give one). Without a scene
 graph, or where the width is unknown, the waypoint is sent not skippable (logged, never an
 error); the last waypoint of a route is never skippable. Go-to missions (`POST /navigate`) get
-every waypoint but the first and the last skippable by the planner.
+every waypoint but the last skippable by the planner.
 
 Planned waypoints: when a mission starts and the map has a scene graph, the planner inserts
 waypoints with `origin: "planned"` (and `skippable: true`, a `corridor_width_m`) between two of

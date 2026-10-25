@@ -1,6 +1,6 @@
 """What the planner decides for the robot's nodePolicy (docs/node_policies_2026-10-13.md).
 
-* `corridor_per_side` / `leg_widths` / `annotate_corridors`: the clear width around the edges
+* `corridor_per_side` / `annotate_corridors`: the clear width around the edges
   N-1 -> N -> N+1 of a waypoint, from the scene graph, as the `corridorWidth` of a skippable node.
 * `insert_planned`: waypoints the planner adds between two of the operator's waypoints that are not
   in the same or neighbouring chart, so the robot always has a clear waypoint route.
@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from cloud_common.objects import common
+from packages import config
 
 Pt = Tuple[float, float]
 
@@ -20,7 +21,6 @@ UNAVAILABLE_ROBOT_WIDTH = "robot_width_unknown"
 UNAVAILABLE_WIDTH = "width_unknown"
 UNAVAILABLE_BUDGET = "width_budget"
 UNAVAILABLE_NO_GRAPH = "no_scene_graph"
-UNAVAILABLE_LEGACY = "legacy_planner"
 
 
 class LegRoutes:
@@ -49,23 +49,6 @@ def corridor_per_side(width: Optional[float], robot_width: Optional[float],
     if not math.isfinite(room) or room <= 0:
         return 0.0
     return max(0.0, math.floor(room * 100.0 + 1e-9) / 100.0)
-
-
-def leg_widths(graph: Any, pts: Sequence[Pt], snap_m: float, budget_s: float = 0.0,
-               clock: Callable[[], float] = time.monotonic, safety: Any = None) -> List[Optional[float]]:
-    """The passage width of each leg pts[i] -> pts[i+1] (len(pts) - 1 entries): `Route.min_width`
-    of the engine's route between the two snapped points, None when a point does not snap, there
-    is no route, the graph cannot answer, or the time budget (`budget_s` > 0) ran out. Each leg
-    is routed once. `safety` (api.Safety or None) is the clearance pricing of the planner's route, so the
-    width is that of the route the planner takes."""
-    out: List[Optional[float]] = []
-    end = clock() + budget_s if budget_s > 0 else None
-    for a, b in zip(pts[:-1], pts[1:]):
-        if end is not None and clock() > end:
-            out.append(None)
-            continue
-        out.append(_leg_width(graph, a, b, snap_m, safety))
-    return out
 
 
 def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None,
@@ -158,7 +141,7 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
         corridor: Optional[float] = pose.corridor_width_m if operator else None
         if not operator:
             if robot_width is None or not robot_width > 0:
-                reason = UNAVAILABLE_ROBOT_WIDTH if i in wanted or reason is None else reason
+                reason = reason or UNAVAILABLE_ROBOT_WIDTH
             else:
                 legs = [widths.get(leg) for leg in (i - 1, i) if 0 <= leg < last]
                 if legs and all(w is not None for w in legs):
@@ -177,7 +160,8 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
             if usable or not keep_intent or pose.origin == common.WAYPOINT_ORIGIN_PLANNED:
                 pose.skippable = usable
             done += usable
-        pose.corridor_width_m = corridor
+        # stored capped, as the wire carries it: every reader of the stored width sees the same value
+        pose.corridor_width_m = None if corridor is None else min(corridor, config.NODE_POLICY_CORRIDOR_CAP_M)
         pose.corridor_source = common.CORRIDOR_SOURCE_OPERATOR if operator else \
             common.CORRIDOR_SOURCE_MEASURED if corridor is not None else None
     return {"total": len(wanted), "skippable": done, "unavailable": reason, "corridor": counts}

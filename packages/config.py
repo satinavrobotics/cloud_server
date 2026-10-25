@@ -767,6 +767,8 @@ SCENE_GRAPH_WIDTH_CHECK_ENABLED = _env_bool("SCENE_GRAPH_WIDTH_CHECK_ENABLED", "
 NODE_POLICY_GAP_FILL_ENABLED = _env_bool("NODE_POLICY_GAP_FILL_ENABLED", "true")
 NODE_POLICY_WIDTH_BUDGET_S = float(os.getenv("NODE_POLICY_WIDTH_BUDGET_S", "1.0"))
 NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "5.0"))
+# The widest corridorWidth (per side, m) sent to the robot, and stored by the planner: the robot team's contract (2026-10-23).
+NODE_POLICY_CORRIDOR_CAP_M = 1.5
 # Most waypoints one POST /api/v1/route/preview accepts (docs/route_preview_2026-10-14.md); over it: 413.
 ROUTE_PREVIEW_MAX_WAYPOINTS = int(os.getenv("ROUTE_PREVIEW_MAX_WAYPOINTS", "100"))
 # The planner's dense lattice path per leg between the waypoints (docs/plan_trajectory_2026-10-14.md), returned with a plan

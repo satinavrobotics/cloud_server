@@ -14,6 +14,8 @@ from typing import Optional
 
 import pydantic
 
+from packages import config
+
 
 _log = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ NODE_POLICY_MAX_WAIT_DEFAULT_S = 10.0
 # The robot team's contract (2026-10-23), numbers the robot owns: the widest corridorWidth (per
 # side, m) we send; the corridor the robot assumes when an order gives none; what it subtracts
 # from a corridor for its own pose error.
-NODE_POLICY_CORRIDOR_CAP_M = 1.5
+NODE_POLICY_CORRIDOR_CAP_M = config.NODE_POLICY_CORRIDOR_CAP_M
 NODE_POLICY_CORRIDOR_DEFAULT_M = 0.75
 NODE_POLICY_LOCALISATION_MARGIN_M = 0.10
 

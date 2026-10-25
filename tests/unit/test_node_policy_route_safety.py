@@ -37,8 +37,8 @@ class PricedStrip(StripGraph):
 def test_corridor_widths_route_with_the_given_safety_and_without_it_pass_nothing():
     g = PricedStrip()
     pts = [(0.05, 0.05), (3.05, 0.05), (6.05, 0.05)]
-    npp.leg_widths(g, pts, 0.5, safety=SAFETY)
-    assert g.seen == [SAFETY, SAFETY]
+    npp._leg_width(g, pts[0], pts[1], 0.5, safety=SAFETY)
+    assert g.seen == [SAFETY]
     g.seen.clear()
     poses = _poses(0.05, 3.05, 6.05)
     npp.annotate_corridors(g, poses, [1], 0.4, 0.05, 0.5, safety=SAFETY)
@@ -47,7 +47,7 @@ def test_corridor_widths_route_with_the_given_safety_and_without_it_pass_nothing
     class Legacy(StripGraph):                          # a graph whose route() has no `safety` parameter
         pass
     legacy = Legacy()
-    npp.leg_widths(legacy, pts, 0.5)
+    npp._leg_width(legacy, pts[0], pts[1], 0.5)
     npp.annotate_corridors(legacy, _poses(0.05, 3.05, 6.05), [1], 0.4, 0.05, 0.5)
     ins, _ = npp.insert_planned(legacy, _poses(0.05, 10.05), lambda a, b: True, 20.0, 0.5, sr.simplify)
     assert legacy.routes >= 2 and ins

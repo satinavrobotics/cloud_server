@@ -9,7 +9,7 @@ from typing import Optional, Sequence, Tuple
 
 from cloud_common.objects import common
 from packages.controllers.mission.order_policy import NODE_POLICY_CORRIDOR_DEFAULT_M, \
-    NODE_POLICY_LOCALISATION_MARGIN_M
+    NODE_POLICY_LOCALISATION_MARGIN_M, clamp_corridor_m
 
 
 def _unit(dx: float, dy: float) -> Optional[Tuple[float, float]]:
@@ -39,7 +39,7 @@ def is_passed(waypoints: Sequence[common.Pose2D], j: int, x: float, y: float,
     here = waypoints[j]
     if math.hypot(x - here.x, y - here.y) <= deviation_xy_m:
         return True
-    corridor = here.corridor_width_m
+    corridor = clamp_corridor_m(here.corridor_width_m)     # the value the robot is sent, capped the same way
     corridor = NODE_POLICY_CORRIDOR_DEFAULT_M if corridor is None else corridor
     room = corridor - NODE_POLICY_LOCALISATION_MARGIN_M
     if not math.isfinite(room) or room <= 0:

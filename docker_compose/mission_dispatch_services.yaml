@@ -352,7 +352,6 @@ services:
       - SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD=${SCENE_GRAPH_TURN_LAMBDA_M_PER_RAD:-}
       # the commit this image was built from (scripts/deploy.sh exports GIT_SHA); shown by /stats as build_sha
       - BUILD_SHA=${GIT_SHA:-unknown}
-      - NODE_POLICY_SKIP_ENABLED=${NODE_POLICY_SKIP_ENABLED:-true}
       - NODE_POLICY_GAP_FILL_ENABLED=${NODE_POLICY_GAP_FILL_ENABLED:-true}
       - NODE_POLICY_WIDTH_BUDGET_S=${NODE_POLICY_WIDTH_BUDGET_S:-1.0}
       - SCENE_GRAPH_PREWARM_MAPS=${SCENE_GRAPH_PREWARM_MAPS:-}

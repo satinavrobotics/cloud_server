@@ -71,21 +71,24 @@ def test_corridor_per_side_is_the_room_of_the_centre_line():
 
 
 @pytest.mark.unit
-def test_leg_widths_are_the_route_width_of_each_leg_and_none_on_failure():
+def test_leg_width_is_the_route_width_of_the_leg_and_none_on_failure():
     g = StripGraph(width_at=lambda x: 0.9 if 4.0 <= x < 6.0 else 2.0)
-    pts = [(0.05, 0.05), (3.0, 0.05), (5.0, 0.05), (9.0, 0.05)]
-    assert npp.leg_widths(g, pts, 0.5) == pytest.approx([2.0, 0.9, 0.9])
-    assert npp.leg_widths(StripGraph(fail_routes=True), pts, 0.5) == [None, None, None]
+    leg = lambda graph, a, b: npp._leg_width(graph, a, b, 0.5)
+    assert leg(g, (0.05, 0.05), (3.0, 0.05)) == pytest.approx(2.0)
+    assert leg(g, (5.0, 0.05), (9.0, 0.05)) == pytest.approx(0.9)
+    assert leg(StripGraph(fail_routes=True), (0.05, 0.05), (3.0, 0.05)) is None
     # out of the strip: the snap is refused
-    assert npp.leg_widths(g, [(0.05, 5.0), (3.0, 0.05)], 0.5) == [None]
+    assert leg(g, (0.05, 5.0), (3.0, 0.05)) is None
 
 
 @pytest.mark.unit
-def test_leg_widths_stop_at_the_budget():
-    ticks = iter([0.0, 0.5, 2.0, 3.0, 4.0])
-    out = npp.leg_widths(StripGraph(), [(0.05, 0.05), (1.0, 0.05), (2.0, 0.05), (3.0, 0.05)],
-                         0.5, budget_s=1.0, clock=lambda: next(ticks))
-    assert out[0] is not None and out[1:] == [None, None]
+def test_leg_routing_stops_at_the_budget(monkeypatch):
+    ticks = iter([0.0, 0.5, 2.0, 3.0])                # the deadline is 1.0: leg 0 is routed, legs 1 and 2 are cut
+    monkeypatch.setattr(npp.time, "monotonic", lambda: next(ticks))
+    poses = _poses(0.05, 1.0, 2.0, 3.0)
+    report = npp.annotate_corridors(StripGraph(), poses, range(0, 3), 0.6, 0.05, 0.5, budget_s=1.0)
+    assert report["unavailable"] == npp.UNAVAILABLE_BUDGET
+    assert poses[0].corridor_width_m is not None and poses[1].corridor_width_m is None
 
 
 # ---- marking ---------------------------------------------------------------------------------
