@@ -132,6 +132,7 @@ def collapse_repeated_leaf_ids(points: Sequence[Pt], ids: Sequence[Optional[str]
 SNAP_NO_SPACE = "no_navigable_space"
 SNAP_TOO_FAR = "too_far"
 SNAP_CROSSES_BLOCKED = "crosses_blocked"
+BLOCKED_BY_KEEPOUT = "blocked_by_keepout"   # ChartFallback reason: only the operator's keep-out zones cut the goal off (never fallen back on)
 
 
 def unverified_length_m(graph: Any, nodes: List[Pt]) -> Optional[float]:
@@ -181,9 +182,10 @@ TURN_IN_PLACE_RAD = math.radians(30.0)
 class ChartFallback(Exception):
     """The chart route cannot serve this request; `reason` is a short machine-readable text."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, info: Optional[Dict[str, Any]] = None):
         super().__init__(reason)
         self.reason = reason
+        self.info = info          # what the reason carries for the caller (blocked_by_keepout: the zones)
 
 
 @dataclass
@@ -209,6 +211,9 @@ class ChartPlan:
     # unverified_length_m (metres of the route not validated by close evidence, PlanGraph.unverified_length; None when the store
     # has no validity plane), limit_m}; None when within
     goal_far: Optional[Dict[str, Any]] = None
+    # the map has keep-out zones: {applied: [ids], unresolved: [{id, reason}], detour (a zone forced a longer route), forced_by:
+    # [ids of the zones the unconstrained route would cross], extra_length_m}; None when the map has none
+    keepout: Optional[Dict[str, Any]] = None
 
 
 class BoundedPool:
@@ -624,24 +629,31 @@ def version_lag_s(graph_db: Any, map_id: str, cursor: Any,
     return max(0.0, (now - stored) / 1000.0)
 
 
-def blocked_free_los(graph: Any, overlay: Tuple[list, list]) -> Callable[[Pt, Pt], bool]:
+def blocked_free_los(graph: Any, overlay: Tuple[list, list], keepout_keys: Any = None) -> Callable[[Pt, Pt], bool]:
     """Line-of-sight test for `simplify` using only the public API: the straight segment is sampled
     every quarter lattice step, every sample's lattice cell must be navigable (its centre is the
     centre of a free cell: `snap` distance <= half a step; memoised per cell), a step that changes
     both cell indices (a corner crossing) needs both orthogonal neighbours free too (a diagonal
     squeeze between two blocked cells is not a passage), and the segment must clear the transient
-    blocked overlay."""
+    blocked overlay. `keepout_keys` (a set of `scene_graph.api.cell_keys` ints, the keep-out zones' cells): a cell in it is not
+    free."""
     from packages.utils import blocked_geometry as bg
     h = float(graph.params.lattice)
     discs, segments = overlay
     cells: Dict[Tuple[int, int], bool] = {}
+    if keepout_keys:
+        from packages.scene_graph.api import CELL_OFF, CELL_W
+    else:
+        keepout_keys = None
 
     cell_free = getattr(graph, "free_cell", None)        # the lazy graph answers from its owner tile, no snap
 
     def free(i: int, j: int) -> bool:
         v = cells.get((i, j))
         if v is None:
-            if cell_free is not None:
+            if keepout_keys is not None and (j + CELL_OFF) * CELL_W + (i + CELL_OFF) in keepout_keys:
+                v = False
+            elif cell_free is not None:
                 v = bool(cell_free(i, j))
             else:
                 s = graph.snap((i + 0.5) * h, (j + 0.5) * h, 0.5 * h)
@@ -931,6 +943,39 @@ def waypoints_below_floor(graph: Any, poses: Sequence[Any], safety: Any, floor: 
     return n
 
 
+def _keepout_detour(graph: Any, keep: Any, transient: Any, snap_a: Any, snap_b: Any, route: Any,
+                    report: Dict[str, Any]) -> None:
+    """Fill `report` (detour, forced_by, extra_length_m) when the route found WITH the keep-out zones is not the one WITHOUT them:
+    the zones are only asked about when one can lie on a route no longer than ours (a zone farther from the start plus the goal
+    than that is not on any such route), so a plan far from every zone costs no second search. Best effort: a failed second
+    search leaves the report as it is."""
+    from packages.scene_graph.api import MissingTiles
+    from packages.services.mission_planner.lazy_plan import CorridorTooLarge
+    a, b = (snap_a.x, snap_a.y), (snap_b.x, snap_b.y)
+    limit = float(route.length) * 1.25 + 2.0
+
+    def near(box: Any) -> bool:
+        if box is None:
+            return False
+        dx = lambda p: max(box[0] - p[0], 0.0, p[0] - box[2])      # noqa: E731
+        dy = lambda p: max(box[1] - p[1], 0.0, p[1] - box[3])      # noqa: E731
+        return math.hypot(dx(a), dy(a)) + math.hypot(dx(b), dy(b)) <= limit
+    if not any(near(z.box) for z in keep.applied):
+        return
+    try:
+        free = graph.route(snap_a.key, snap_b.key, transient, start=a, goal=b)
+    except (MissingTiles, CorridorTooLarge):
+        return
+    if free is None or not free.nodes:
+        return
+    from packages.services.mission_planner import keepout_overlay as kov
+    hit = keep.zones_hit(kov.cells_of_points([tuple(p) for p in free.nodes], float(graph.params.lattice)))
+    if hit:
+        report["detour"] = True
+        report["forced_by"] = [z.id for z in hit]
+        report["extra_length_m"] = round(max(0.0, float(route.length) - float(free.length)), 3)
+
+
 def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   overlay: Tuple[list, list], node_of: Callable[[float, float], Optional[str]],
                   start_snap_m: float, goal_snap_m: float, max_gap_m: float,
@@ -938,7 +983,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   robot_length_m: Optional[float] = None,
                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                   width_check: bool = True, trajectory_max_points: int = 0,
-                  turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0) -> ChartPlan:
+                  turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0,
+                  keepout_for: Optional[Callable[[Any], Any]] = None) -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
@@ -946,7 +992,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
                               node_policy_cfg, safety_kappa, width_check, trajectory_max_points, turn,
-                              waypoint_budget_m)
+                              waypoint_budget_m, keepout_for)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -959,7 +1005,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    robot_length_m: Optional[float] = None,
                    node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                    width_check: bool = True, trajectory_max_points: int = 0,
-                   turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0) -> ChartPlan:
+                   turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0,
+                  keepout_for: Optional[Callable[[Any], Any]] = None) -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -978,7 +1025,10 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     `turn_record` (None: no turn cost): its lambda goes into the route's `Safety` and the record into `ChartPlan.pricing`; the
     string pull has no turn term (a shortcut is judged by visibility and the priced cost only). `waypoint_budget_m` > 0 replaces
     the string pull by `fewest_waypoints` with that slack budget (the line of sight is then the plain one, the price is in
-    the budget); 0 = the string pull, unchanged."""
+    the budget); 0 = the string pull, unchanged. `keepout_for(graph)` (blocking; None: the map has none) is the operator's
+    keep-out zones resolved on this graph (keepout_overlay.Resolution): their cells are removed from the route search and the line
+    of sight like the overlay, `ChartPlan.keepout` says what they did, and a goal only they cut off is
+    ChartFallback(BLOCKED_BY_KEEPOUT, info) which the caller must report, not hand to the legacy planner."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -998,7 +1048,10 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                     "distance_from_free_m": float(snap_b.distance), "unverified_length_m": None,
                     "limit_m": float(goal_snap_m)}
     discs, segments = overlay
-    blocked = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
+    keep = keepout_for(graph) if keepout_for is not None else None
+    kcells = keep.cells if keep is not None and len(keep.cells) else None
+    transient = Blocked(discs=list(discs), segments=list(segments)) if (discs or segments) else None
+    blocked = Blocked(discs=list(discs), segments=list(segments), cells=kcells) if (discs or segments or kcells is not None) else None
     turn = dict(TURN_NOT_GIVEN) if turn is None else dict(turn)
     safety = safety_for(graph, robot_width_m, robot_length_m, safety_kappa, turn["lambda_m_per_rad"])
     try:
@@ -1009,6 +1062,21 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     except CorridorTooLarge as err:
         raise ChartFallback("corridor_too_large") from err
     if route is None or not route.nodes:
+        if kcells is not None:
+            # cut off by the keep-out zones alone? (the transient overlay and the zones are told apart by routing without the zones)
+            try:
+                without = graph.route(snap_a.key, snap_b.key, transient, start=(snap_a.x, snap_a.y),
+                                      goal=(snap_b.x, snap_b.y))
+            except (MissingTiles, CorridorTooLarge):
+                without = None
+            if without is not None and without.nodes:
+                h = float(graph.params.lattice)
+                from packages.services.mission_planner import keepout_overlay as kov
+                hit = keep.zones_hit(kov.cells_of_points([(snap_a.x, snap_a.y), (snap_b.x, snap_b.y)] + [tuple(p) for p in without.nodes], h))
+                raise ChartFallback(BLOCKED_BY_KEEPOUT, {
+                    **keep.summary(), "forced_by": [z.id for z in hit],
+                    "start_in_zone": bool(keep.zones_hit(kov.cells_of_points([(snap_a.x, snap_a.y)], h))),
+                    "goal_in_zone": bool(keep.zones_hit(kov.cells_of_points([(snap_b.x, snap_b.y)], h)))})
         if blocked is not None:
             # unreachable only because of the overlay? say so (the legacy planner then reports the
             # blocking rows as failed_at "blocked_nodes").
@@ -1029,7 +1097,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     # prepend/append only matters when an end falls back to its chart anchor.
     pts = [(snap_a.x, snap_a.y)] + [tuple(p) for p in route.nodes] + [(snap_b.x, snap_b.y)]
     lattice = list(pts)                    # the dense path, before the waypoints are picked from it
-    visible = blocked_free_los(graph, overlay)
+    visible = blocked_free_los(graph, overlay, keep.keyset if kcells is not None else None)
     plain = visible
     if safety is not None and safety.rate > 0.0:
         visible = priced_visible(visible, graph, pts, safety)
@@ -1106,9 +1174,14 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    "profile": "exp" if exp else "hinge", "k": safety.k, "origin": safety.origin, "reach": safety.margin,
                    "floor": floor,
                    "waypoints_below_floor": waypoints_below_floor(graph, poses, safety, floor), "turn": turn}
+    keepout_report = None
+    if keep is not None and keep.zones:
+        keepout_report = {**keep.summary(), "detour": False, "forced_by": [], "extra_length_m": None}
+        if kcells is not None:
+            _keepout_detour(graph, keep, transient, snap_a, snap_b, route, keepout_report)
     if goal_far is not None:
         goal_far["unverified_length_m"] = unverified_length_m(graph, route.nodes)
     return ChartPlan(waypoints=poses, planned_path=planned, charts=list(route.charts),
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=planned is not None and len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
-                     trajectory=legs, waypoint_budget=budget_record, goal_far=goal_far)
+                     trajectory=legs, waypoint_budget=budget_record, goal_far=goal_far, keepout=keepout_report)

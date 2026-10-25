@@ -15,6 +15,19 @@ def _mock_minio_services():
 
 
 @pytest.fixture(autouse=True)
+def _no_keepout_zones(request):
+    """The mission planner reads the map's keep-out zones (packages/utils/keepouts.fetch) on every plan and refuses to plan when
+    it cannot: tests that give the service a mocked database mean "a map without zones". A test of the zones themselves sets
+    `service._keepouts` / calls the real `fetch` and says so with `@pytest.mark.real_keepouts`."""
+    if request.node.get_closest_marker("real_keepouts"):
+        yield
+        return
+    from unittest.mock import AsyncMock
+    with patch('packages.utils.keepouts.fetch', AsyncMock(return_value=[])):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _current_event_loop_for_sync_tests(request):
     """Sync tests that build a mission-dispatch `Robot` need a current event loop:
     Robot.__init__ schedules its run() task with asyncio.get_event_loop(). pytest-asyncio

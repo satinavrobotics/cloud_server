@@ -13,13 +13,14 @@ import asyncio
 import logging
 import datetime
 import math
+import time
 from typing import Optional, Dict, Any, List, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
-from packages.utils import blocked_geometry, blocked_nodes
+from packages.utils import blocked_geometry, blocked_nodes, keepouts
 from packages import config
-from packages.services.mission_planner import footprint_check, node_policy_plan, scene_route, trajectory
+from packages.services.mission_planner import footprint_check, keepout_overlay, node_policy_plan, scene_route, trajectory
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -45,6 +46,12 @@ class RobotNotPlacedError(ValueError):
 NOT_PLACED_PREFIX = "not placed: "
 # _chart_route's reason for a robot larger than the map's chart radius: plan_route refuses instead of falling back
 REASON_FOOTPRINT = "footprint_exceeds_chart"
+# Reasons the chart planner gives that are ANSWERS, not fallbacks: the legacy planner knows no keep-out zone and would route
+# through one (blocked_by_keepout: they alone cut the goal off; the others: the zones could not be applied, so no plan)
+REASON_KEEPOUT_BLOCKED = scene_route.BLOCKED_BY_KEEPOUT
+REASON_KEEPOUT_UNREADABLE = "keepout_unreadable"
+REASON_KEEPOUT_TOO_LARGE = "keepout_too_large"
+KEEPOUT_REFUSALS = (REASON_KEEPOUT_BLOCKED, REASON_KEEPOUT_UNREADABLE, REASON_KEEPOUT_TOO_LARGE)
 
 
 def _is_real_map(map_id: Optional[str]) -> bool:
@@ -222,6 +229,8 @@ class MissionPlannerService:
         except asyncio.TimeoutError:
             return None, "budget_exhausted"
         except scene_route.ChartFallback as fb:
+            if ctx is not None and fb.info is not None:
+                ctx["fallback_info"] = fb.info
             return None, fb.reason
         except Exception as err:  # pylint: disable=broad-except
             self.logger.warning(f"Chart route failed ({err!r}); using the legacy planner")
@@ -284,6 +293,19 @@ class MissionPlannerService:
         lag, rows = await asyncio.gather(lag_of(), rows_of())
         if lag is not None and lag > config.SCENE_GRAPH_MAX_VERSION_LAG_S:
             return None, "stale_graph"
+        # Keep-out zones are not "exclusions" a caller may ignore. A table that cannot be read is a refusal, never "no zones".
+        try:
+            keep_rows, keep_rev = await self.keepout_overlays().rows(map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Keep-out zones of map {map_id} not readable ({err!r}); not planning without them")
+            return None, REASON_KEEPOUT_UNREADABLE
+        keepout_for = None
+        if keep_rows:
+            def keepout_for(g: Any) -> Any:                # runs in the plan thread (tile reads)
+                try:
+                    return self.keepout_overlays().resolve(map_id, version, keep_rev, keep_rows, g)
+                except keepout_overlay.KeepoutTooLarge as err:
+                    raise scene_route.ChartFallback(REASON_KEEPOUT_TOO_LARGE) from err
         overlay = blocked_geometry.overlay(
             rows, blocked_nodes.MATCH_RADIUS_M,
             self._overlay_half_width(robot)) if rows else ([], [])
@@ -309,7 +331,7 @@ class MissionPlannerService:
                 self._robot_length(robot),
                 self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width,
                 config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0, turn=turn,
-                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0))
+                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0, keepout_for=keepout_for))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -371,6 +393,7 @@ class MissionPlannerService:
             **({"node_policy": plan.node_policy} if plan.node_policy is not None else {}),
             **({"trajectory": plan.trajectory} if plan.trajectory else {}),
             **({"goal_far": plan.goal_far} if plan.goal_far is not None else {}),
+            **({"keepout": plan.keepout} if plan.keepout is not None else {}),
         }, None
 
     @staticmethod
@@ -430,21 +453,45 @@ class MissionPlannerService:
 
         max_points = config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0
         routes = node_policy_plan.LegRoutes() if max_points > 0 else None
+        # keep-out zones: the planned waypoints go around them, and the legs of the final route that still enter one are listed
+        keep_info: Dict[str, Any] = {}
+        try:
+            keep_rows, keep_rev = await self.keepout_overlays().rows(map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Route enrich: keep-out zones of {map_id} not readable ({err!r})")
+            keep_rows, keep_rev = [], ""
+            keep_info["keepout"] = {"applied": [], "unresolved": [], "unavailable": "unreadable", "crossed": []}
 
         def work() -> Tuple[List[common.Pose2D], int, Dict[str, Any]]:
             poses, inserted = base, 0
+            res = None
+            if keep_rows:
+                try:
+                    res = self.keepout_overlays().resolve(map_id, version, keep_rev, keep_rows, graph)
+                except keepout_overlay.KeepoutTooLarge:
+                    keep_info["keepout"] = {"applied": [], "unresolved": [], "unavailable": "too_large", "crossed": []}
             if gap_fill:
-                visible = scene_route.blocked_free_los(graph, ([], []))
+                from packages.scene_graph.api import Blocked
+                blocked = Blocked(cells=res.cells) if res is not None and len(res.cells) else None
+                visible = scene_route.blocked_free_los(graph, ([], []), res.keyset if blocked is not None else None)
                 pull = (scene_route.budget_pull(graph, safety, config.SCENE_GRAPH_WAYPOINT_BUDGET_M)
                         if config.SCENE_GRAPH_WAYPOINT_BUDGET_M else scene_route.simplify)
                 poses, inserted = node_policy_plan.insert_planned(
                     graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
-                    pull, safety, routes)
+                    pull, safety, routes, blocked)
             wanted = [i for i, w in enumerate(poses[:-1])
                       if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
             rep = node_policy_plan.annotate_corridors(
                 graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
                 config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes)
+            if res is not None and res.zones:
+                h = float(graph.params.lattice)
+                crossed = []
+                for k in range(len(poses) - 1):
+                    hit = keepout_overlay.legs_cross(res, (poses[k].x, poses[k].y), (poses[k + 1].x, poses[k + 1].y), h)
+                    if hit:
+                        crossed.append({"from_index": k, "to_index": k + 1, "zones": [z.id for z in hit]})
+                keep_info["keepout"] = {**res.summary(), "crossed": crossed}
             return poses, inserted, rep
 
         try:
@@ -473,7 +520,8 @@ class MissionPlannerService:
                 "changed": [w.dict() for w in poses] != [w.dict() for w in original],
                 "node_policy": report, "graph_version": version,
                 **({"issues": issues} if routes is not None else {}),
-                **({"trajectory": trajectory_legs} if trajectory_legs else {})}
+                **({"trajectory": trajectory_legs} if trajectory_legs else {}),
+                **keep_info}
 
     def _node_policy_cfg(self, robot: Optional[robot_object.RobotObjectV1]
                          ) -> Optional[Dict[str, Any]]:
@@ -1158,6 +1206,72 @@ class MissionPlannerService:
                           "plan with ignore_exclusions"), on_path
         return path, None, []
 
+    def keepout_overlays(self) -> "keepout_overlay.KeepoutOverlays":
+        """The operator's keep-out zones (packages/utils/keepouts.py) of this process: rows re-read every few seconds, resolved
+        per graph version. Made on first use."""
+        overlays = self.__dict__.get("_keepouts")
+        if overlays is None:
+            overlays = self._keepouts = keepout_overlay.KeepoutOverlays(
+                lambda map_id: keepouts.fetch(self.database, map_id, enabled_only=True), time.monotonic)
+        return overlays
+
+    @staticmethod
+    def _keepout_refusal(result: Dict[str, Any], reason: str, info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The plan result for a goal the keep-out zones make unreachable (or that could not be planned around them): an
+        error with failed_at "keepout" and the zones in `keepout`; never a route."""
+        info = dict(info or {})
+        if reason == REASON_KEEPOUT_BLOCKED:
+            where = ("The robot is inside a keep-out zone. " if info.get("start_in_zone") else
+                     "The goal is inside a keep-out zone. " if info.get("goal_in_zone") else "")
+            result["error"] = (where + "Every route to the goal goes through a keep-out zone (manually switched off "
+                               "regions or edges of the map): " + ", ".join(info.get("forced_by") or ["?"]) +
+                               ". Choose another goal or turn the zone off.")
+        elif reason == REASON_KEEPOUT_UNREADABLE:
+            result["error"] = "The map's keep-out zones could not be read, so no route is planned (it could go through one)."
+        else:
+            result["error"] = "The map's keep-out zones are too large to plan around; remove or shrink one."
+        result["failed_at"] = "keepout"
+        result["keepout"] = {**info, "unreachable": True, "reason": reason}
+        return result
+
+    async def _legacy_keepouts(self, map_id: str, path: List[str], start: Any, end: Any, result: Dict[str, Any]
+                               ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+        """The legacy (graph node) planner's keep-out gate: (path, None) when it may go on, else (path, the refusal result).
+        It can place only polygon zones (a chart key or an edge needs the scene graph, which is why this planner runs): any
+        other enabled zone refuses the plan; polygon zones exclude the graph nodes inside them and the edges that cross them
+        (the path is replanned around them, or refused)."""
+        try:
+            rows, _ = await self.keepout_overlays().rows(map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Keep-out zones of map {map_id} not readable ({err!r})")
+            return path, self._keepout_refusal(result, REASON_KEEPOUT_UNREADABLE, None)
+        if not rows:
+            return path, None
+        if any("polygon" not in r["spec"] for r in rows):
+            ids = [r["id"] for r in rows if "polygon" not in r["spec"]]
+            result["error"] = ("The map has keep-out zones set by chart or edge, and the scene-graph planner that can "
+                               "apply them is not available" + (f" ({result.get('planner_fallback')})"
+                                                                 if result.get("planner_fallback") else "") +
+                               ": no route is planned. Zones: " + ", ".join(ids))
+            result["failed_at"] = "keepout"
+            result["keepout"] = {"applied": [], "unresolved": [], "unreachable": True, "reason": "keepout_unverifiable",
+                                 "forced_by": ids}
+            return path, result
+        try:
+            nodes = self.graph_db.get_all_nodes(map_id)
+            edges = self.graph_db.get_edges(map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Graph of map {map_id} not readable for the keep-out check ({err!r})")
+            return path, self._keepout_refusal(result, REASON_KEEPOUT_UNREADABLE, None)
+        outcome = keepout_overlay.legacy_polygon_path(rows, nodes, edges, path, str(start), str(end))
+        if outcome.error:
+            result["error"] = outcome.error
+            result["failed_at"] = "keepout"
+            result["keepout"] = {**outcome.report, "unreachable": True, "reason": REASON_KEEPOUT_BLOCKED}
+            return path, result
+        result["keepout"] = outcome.report
+        return outcome.path, None
+
     async def plan_route(self, robot_name: str, **kwargs: Any) -> Dict[str, Any]:
         """A go-to route (see `_plan_route`), finished the same way whichever planner made it
         (`_finalize_goto`)."""
@@ -1279,6 +1393,9 @@ class MissionPlannerService:
                 return result
             if ctx.get("footprint") is not None:
                 result["footprint"] = ctx["footprint"]
+            if reason in KEEPOUT_REFUSALS:
+                self._chart_outcomes[reason] = self._chart_outcomes.get(reason, 0) + 1
+                return self._keepout_refusal(result, reason, ctx.get("fallback_info"))
             self._chart_outcomes[reason or "served"] = \
                 self._chart_outcomes.get(reason or "served", 0) + 1
             if chart is not None:
@@ -1345,6 +1462,9 @@ class MissionPlannerService:
             result["error"] = error
             result["failed_at"] = "find_path"
             return result
+        path, refusal = await self._legacy_keepouts(map_id, path, start_node['node_id'], end_node['node_id'], result)
+        if refusal is not None:
+            return refusal
 
         result["path"] = path
         result["path_length"] = len(path)

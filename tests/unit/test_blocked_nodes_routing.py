@@ -18,6 +18,7 @@ import pytest  # noqa: E402
 import packages.api.main as api_main  # noqa: E402
 from cloud_common.objects import mission as mission_object  # noqa: E402
 from cloud_common.objects.common import Pose2D  # noqa: E402
+from packages.services.mission_planner.keepout_overlay import KeepoutOverlays
 from packages.services.mission_planner.server import MissionPlannerService  # noqa: E402
 from packages.utils import blocked_nodes  # noqa: E402
 
@@ -187,6 +188,8 @@ def _planning(rows, plain=("1", "2", "3")):
     svc.get_node_poses = MagicMock(side_effect=lambda path, _m: (
         [Pose2D(x=NODES[n][0], y=NODES[n][1], map_id="M", node_id=n) for n in path], None))
     svc.get_robot_status = AsyncMock(return_value=None)
+    # no keep-out zones; the test database below answers every SELECT with blocked-node rows and may be made to fail
+    svc._keepouts = KeepoutOverlays(AsyncMock(return_value=[]), lambda: 0.0)
     return svc
 
 

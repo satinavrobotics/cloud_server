@@ -83,6 +83,7 @@ class PlanResponse(BaseModel):
     planner_fallback: Optional[str] = Field(None, description="Why the legacy planner was used while the scene-graph planner is enabled (e.g. 'no_graph', 'load_timeout'); null otherwise")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total: waypoints that should be skippable, skippable: how many got a corridor width, unavailable: why the others did not (e.g. 'width_unknown', 'width_budget'), else null}")
     footprint: Optional[Dict[str, Any]] = Field(None, description="Robot-vs-map footprint check: {robot_half_side_m (null while the robot's footprint is unknown), map_half_side_m, chart_radius_m, status: 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings; the plan proceeds) | 'exceeds_chart' (plan refused, failed_at 'footprint'), message}; null for a legacy planner or a map without scene-graph parameters")
+    keepout: Optional[Dict[str, Any]] = Field(None, description="Keep-out zones (manually switched-off regions/edges of the map). Plans: {applied: [ids], unresolved: [{id, reason}], detour, forced_by: [ids], extra_length_m}; failed_at 'keepout': also unreachable true and reason. Route enrich: {applied, unresolved, crossed: [{from_index, to_index, zones}]}. Absent when the map has none")
     goal_far: Optional[Dict[str, Any]] = Field(None, description="Goal-far notice, present when the route's goal is far from verified space: {goal_xy [x, y] as asked, free_xy [x, y] the nearest free cell the route ends at, distance_from_free_m, limit_m (the map's close-evidence range), unverified_length_m (metres of the route not validated by close evidence; null = unknown, the store has no validity plane; never 0 for unknown)}; null otherwise")
     trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
@@ -102,6 +103,7 @@ class EnrichResponse(BaseModel):
     changed: bool = Field(False, description="Whether the route differs from the request's")
     node_policy: Optional[Dict[str, Any]] = Field(None, description="{total, skippable, unavailable}; see POST /api/v1/plan")
     graph_version: Optional[int] = None
+    keepout: Optional[Dict[str, Any]] = Field(None, description="Keep-out zones (manually switched-off regions/edges of the map). Plans: {applied: [ids], unresolved: [{id, reason}], detour, forced_by: [ids], extra_length_m}; failed_at 'keepout': also unreachable true and reason. Route enrich: {applied, unresolved, crossed: [{from_index, to_index, zones}]}. Absent when the map has none")
     issues: Optional[list] = Field(None, description="Legs of `waypoints` the planner could not route: [{from_index, to_index, reason}], reason 'outside_graph' | 'unreachable' | 'error'. Null when not computed (no scene graph, trajectory off)")
     trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
@@ -130,6 +132,7 @@ class NavigationResponse(BaseModel):
     node_policy: Optional[Dict[str, Any]] = Field(None, description="nodePolicy skip data of the route: {total, skippable, unavailable}; see POST /api/v1/plan")
     footprint: Optional[Dict[str, Any]] = Field(None, description="Robot-vs-map footprint check: {robot_half_side_m (null while the robot's footprint is unknown), map_half_side_m, chart_radius_m, status: 'ok' | 'larger_than_map' | 'unknown_footprint' (warnings; the plan proceeds) | 'exceeds_chart' (plan refused, failed_at 'footprint'), message}; null for a legacy planner or a map without scene-graph parameters")
     goal_far: Optional[Dict[str, Any]] = Field(None, description="Goal-far notice, present when the route's goal is far from verified space: {goal_xy [x, y] as asked, free_xy [x, y] the nearest free cell the route ends at, distance_from_free_m, limit_m (the map's close-evidence range), unverified_length_m (metres of the route not validated by close evidence; null = unknown, the store has no validity plane; never 0 for unknown)}; null otherwise")
+    keepout: Optional[Dict[str, Any]] = Field(None, description="Keep-out zones (manually switched-off regions/edges): {applied, unresolved, detour, forced_by, extra_length_m}; failed_at 'keepout' adds unreachable true and reason. Absent when the map has none")
     trajectory: Optional[list] = Field(None, description="The planner's dense path per leg between consecutive waypoints: [{from_index, to_index, points: [[x, y], ...]}] in the map frame (cm, direction changes only; first/last point = the waypoints). Display data; a leg may be missing (draw it straight); null when off, over the size cap or not a scene-graph plan")
 
 
@@ -348,6 +351,7 @@ async def plan_only(request: PlanRequest):
             trajectory=result.get("trajectory"),
             footprint=result.get("footprint"),
             goal_far=result.get("goal_far"),
+            keepout=result.get("keepout"),
         )
     except HTTPException:
         raise
@@ -379,7 +383,7 @@ async def enrich_route(request: EnrichRequest):
         success=True, waypoints=[w.dict() for w in result["waypoints"]],
         inserted=result["inserted"], changed=result["changed"],
         node_policy=result.get("node_policy"), graph_version=result.get("graph_version"),
-        trajectory=result.get("trajectory"), issues=result.get("issues"))
+        trajectory=result.get("trajectory"), issues=result.get("issues"), keepout=result.get("keepout"))
 
 
 @app.get("/api/v1/missions/{mission_id}/plan", response_model=NavigationPlanResponse)

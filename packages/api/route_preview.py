@@ -83,7 +83,9 @@ async def preview(planner: Any, map_id: str, raw: List[Dict[str, Any]], return_l
         return {**none, "waypoints": returned or waypoints, "node_policy": policy, "reason": reason}
     return {"waypoints": returned, "trajectory": list(result.get("trajectory") or []),
             "issues": list(result.get("issues") or []), "node_policy": policy,
-            "planner": PLANNER_SCENE_GRAPH, "reason": None, "graph_version": result.get("graph_version")}
+            "planner": PLANNER_SCENE_GRAPH, "reason": None, "graph_version": result.get("graph_version"),
+            # additive: the map's keep-out zones {applied, unresolved, crossed: [{from_index, to_index, zones}]}; absent without any
+            **({"keepout": result["keepout"]} if result.get("keepout") is not None else {})}
 
 
 async def measure_reroute(planner: Any, robot_name: str, reroute: Dict[str, Any]) -> Dict[str, Any]:

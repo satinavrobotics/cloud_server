@@ -3,6 +3,13 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Keep-out zones: open (2026-10-25)
+
+Built and unit-tested on synthetic maps (`docs/keepout_zones.md`); not planned against a real map or a real Postgres.
+- A running mission's reroute and operator-drawn waypoints are not checked against zones (preview lists crossed legs only).
+- A zone whose chart was retired turns `unresolved` and is ignored; no re-attachment by cell overlap (`lineage`).
+- A robot standing inside a zone has no route out until the zone is disabled.
+
 ## Done after the 2026-10-22 demo, with what is still open (2026-10-23)
 
 Pi 5 (`rasp`) runs tag `7dd955e869b5`; desktop 0.3.15 is packaged (not published).

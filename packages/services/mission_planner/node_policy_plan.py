@@ -173,7 +173,7 @@ def _bearing(a: Pt, b: Pt) -> float:
 
 def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt, Pt], bool],
                    max_gap: float, snap_m: float, simplify: Callable[..., List[Pt]],
-                   safety: Any = None, routes: Optional[LegRoutes] = None) -> Tuple[List[common.Pose2D], int]:
+                   safety: Any = None, routes: Optional[LegRoutes] = None, blocked: Any = None) -> Tuple[List[common.Pose2D], int]:
     """`poses` with planned waypoints between every two consecutive ones that are not in the same
     or a neighbouring chart. The planned points come from the engine's route between the two, cut
     (line of sight, gap cap) so that each consecutive pair touches at most two charts; they are
@@ -181,14 +181,15 @@ def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt
     the operator's waypoints. Pairs that do not snap or route are left as they are. Returns
     (new list, number inserted); the input is not modified. With `safety` the route and the cut use the
     planner's clearance pricing (the cut accepts a shortcut only if it costs no more than the lattice path).
-    With `routes` the lattice path of every pair routed here is recorded, cut at the planned points."""
+    With `routes` the lattice path of every pair routed here is recorded, cut at the planned points. `blocked` (a scene_graph
+    `Blocked`, the keep-out zones) is passed to every route search; `visible` must honour it as well."""
     out: List[common.Pose2D] = []
     inserted = 0
     for k, pose in enumerate(poses):
         out.append(pose)
         if k + 1 >= len(poses):
             break
-        extra = _between(graph, pose, poses[k + 1], visible, max_gap, snap_m, simplify, safety, routes)
+        extra = _between(graph, pose, poses[k + 1], visible, max_gap, snap_m, simplify, safety, routes, blocked)
         for j, (x, y) in enumerate(extra):
             nxt = extra[j + 1] if j + 1 < len(extra) else (poses[k + 1].x, poses[k + 1].y)
             out.append(common.Pose2D(
@@ -201,7 +202,7 @@ def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt
 def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
              visible: Callable[[Pt, Pt], bool], max_gap: float, snap_m: float,
              simplify: Callable[..., List[Pt]], safety: Any = None,
-             routes: Optional[LegRoutes] = None) -> List[Pt]:
+             routes: Optional[LegRoutes] = None, blocked: Any = None) -> List[Pt]:
     try:
         sa = graph.snap(a.x, a.y, snap_m)
         sb = graph.snap(b.x, b.y, snap_m)
@@ -214,11 +215,15 @@ def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
             return []
         if sa.key == sb.key and routes is None:
             return []
-        route = graph.route(sa.key, sb.key, None, start=(sa.x, sa.y), goal=(sb.x, sb.y),
+        route = graph.route(sa.key, sb.key, blocked or None, start=(sa.x, sa.y), goal=(sb.x, sb.y),
                             **({} if safety is None else {"safety": safety}))
         if route is None:
             if routes is not None:
                 routes.failed[whole] = "unreachable"
+                if blocked:                       # cut off by the keep-out zones alone?
+                    free = graph.route(sa.key, sb.key, None, start=(sa.x, sa.y), goal=(sb.x, sb.y))
+                    if free is not None and free.nodes:
+                        routes.failed[whole] = "blocked_by_keepout"
             return []
         nodes = [tuple(p) for p in route.nodes]
         if routes is not None and nodes:
