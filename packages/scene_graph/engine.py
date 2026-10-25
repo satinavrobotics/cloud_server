@@ -30,7 +30,7 @@ from scipy import ndimage
 from scipy.sparse import coo_matrix, csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from .api import (BBox, Blocked, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
+from .api import (BBox, Blocked, cell_keys, Chart, Dirty, EngineFaulted, Key, Leaf, LeafError, Link, OwnerRaster, Route, Safety, SceneGraph,
                   SceneParams, Snap, ViewResult)
 from . import morse
 from .place import place_regions
@@ -1525,6 +1525,8 @@ class ChartGraph(SceneGraph):
             dx, dy = x1 - x0, y1 - y0; L2 = dx * dx + dy * dy
             t = np.clip(((cx - x0) * dx + (cy - y0) * dy) / L2, 0, 1) if L2 > 0 else np.zeros_like(cx)
             m |= (cx - (x0 + t * dx)) ** 2 + (cy - (y0 + t * dy)) ** 2 <= hw * hw
+        if blocked.cells is not None and len(blocked.cells):
+            m |= np.isin(cell_keys((self._cx0 + 2 * xx) // 2, (self._cy0 + 2 * yy) // 2), blocked.cells)
         return m
 
     def _cell_at(self, p: Optional[Tuple[float, float]]) -> Optional[int]:
@@ -1564,7 +1566,7 @@ class ChartGraph(SceneGraph):
         R, C, Ln = s.edges
         N = sp.N
         alive = np.ones(N, bool)
-        if blocked is not None and (blocked.discs or blocked.segments):
+        if blocked:
             bm = self._blocked_mask(blocked)
             alive = ~bm[sp.ys, sp.xs]
         if not alive[src] or not alive[dst]: return None
@@ -1966,6 +1968,37 @@ class ChartGraph(SceneGraph):
         s = self._solved
         pu = self._cell_xy(int(s.sp.ys[l["u"]]), int(s.sp.xs[l["u"]])); pv = self._cell_xy(int(s.sp.ys[l["v"]]), int(s.sp.xs[l["v"]]))
         return Link(a=ka, b=kb, length=l["length"], width=l["width"], portal=(pu, pv), channels=dict(l["integ"]), saddle=l["saddle"])
+
+    # ---- keep-out zones (services/mission_planner/keepout_overlay.py): the same three reads PlanGraph has ----
+    def chart_anchors(self) -> Dict[Key, Tuple[float, float]]:
+        """chart key -> anchor (map frame), every chart."""
+        res = self.query(BBox(-1e7, -1e7, 1e7, 1e7), raster=False, parents=False)
+        return {c.key: (float(c.anchor[0]), float(c.anchor[1])) for c in res.charts}
+
+    def chart_links(self) -> set:
+        """The chart pairs joined by a link, as frozenset({key_a, key_b})."""
+        res = self.query(BBox(-1e7, -1e7, 1e7, 1e7), raster=False, parents=False)
+        return {frozenset((l.a, l.b)) for l in res.links}
+
+    def owner_window(self, x0: float, y0: float, x1: float, y1: float):
+        """(ix0, iy0, idx, keys): `idx[row, col]` indexes `keys` (-1: not a chart cell) for the lattice cells of the box."""
+        h = self._h
+        ix0, ix1 = int(math.floor(x0 / h)), int(math.floor(x1 / h))
+        iy0, iy1 = int(math.floor(y0 / h)), int(math.floor(y1 / h))
+        out = np.full((iy1 - iy0 + 1, ix1 - ix0 + 1), -1, np.int32)
+        res = self.query(BBox(ix0 * h, iy0 * h, (ix1 + 1) * h, (iy1 + 1) * h), raster=True, parents=False)
+        r = res.raster
+        if r is None:
+            return ix0, iy0, out, []
+        rx0, ry0 = int(round(r.origin[0] / h)), int(round(r.origin[1] / h))
+        rows, cols = r.index.shape
+        for dy in range(rows):
+            y = ry0 + dy - iy0
+            if 0 <= y < out.shape[0]:
+                xa, xb = max(rx0, ix0), min(rx0 + cols - 1, ix1)
+                if xa <= xb:
+                    out[y, xa - ix0:xb - ix0 + 1] = r.index[dy, xa - rx0:xb - rx0 + 1].astype(np.int32) - 1
+        return ix0, iy0, out, list(r.keys)
 
     def cover(self, keys: Sequence[Key], k: int = 2) -> Tuple[List[str], float, bool]:
         """Minimal set of leaf keys whose camera views k-cover the given charts and the blocked cells bounding them."""

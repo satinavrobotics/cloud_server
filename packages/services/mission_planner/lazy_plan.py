@@ -52,7 +52,7 @@ from scipy.sparse.csgraph import dijkstra
 
 from packages.scene_graph import turn as turn_search
 from packages.scene_graph import weights
-from packages.scene_graph.api import Blocked, Route, Safety, Snap
+from packages.scene_graph.api import Blocked, Route, Safety, Snap, cell_keys
 from packages.scene_graph.store_codec import read_planes
 
 ROUTE_UNIT_M = weights.ROUTE_UNIT_M  # route cost unit (packages/scene_graph/weights.py)
@@ -231,6 +231,37 @@ class PlanGraph:
             return False
         return bool(t["own"][iy % TILE_L, ix % TILE_L] > 0)
 
+    # ---- keep-out zones (keepout_overlay.py): which cells a chart owns, which charts touch ----------------------------------
+    def chart_anchors(self) -> Dict[str, Tuple[float, float]]:
+        """chart key -> anchor (map frame), every chart of the version (the manifest, no tile is read)."""
+        return {k: (float(a[0]), float(a[1])) for k, a in zip(self.keys, self._anchor)}
+
+    def chart_links(self) -> Set[frozenset]:
+        """The chart pairs joined by a link, as frozenset({key_a, key_b})."""
+        return {frozenset((self.keys[a], self.keys[b])) for a, b in self._width}
+
+    def owner_window(self, x0: float, y0: float, x1: float, y1: float) -> Tuple[int, int, np.ndarray, List[str]]:
+        """(ix0, iy0, idx, keys): the owner of every lattice cell of the box, `idx[row, col]` an index into `keys` (-1: not a
+        chart cell), cell (ix0 + col, iy0 + row). Reads the box's tiles (TileUnavailable as everywhere)."""
+        h = float(self.params.lattice)
+        ix0, ix1 = int(math.floor(x0 / h)), int(math.floor(x1 / h))
+        iy0, iy1 = int(math.floor(y0 / h)), int(math.floor(y1 / h))
+        out = np.full((iy1 - iy0 + 1, ix1 - ix0 + 1), -1, np.int32)
+        for ty in range(iy0 // TILE_L, iy1 // TILE_L + 1):
+            for tx in range(ix0 // TILE_L, ix1 // TILE_L + 1):
+                t = self._tile(tx, ty)
+                if t is None or "own" not in t:
+                    continue
+                own = np.asarray(t["own"])
+                ok = (own > 0) & (own < len(self._lut))
+                chart = np.where(ok, self._lut[np.where(ok, own, 0)], -1).astype(np.int32)
+                gx0, gy0 = tx * TILE_L, ty * TILE_L
+                xa, xb = max(ix0, gx0), min(ix1, gx0 + TILE_L - 1)
+                ya, yb = max(iy0, gy0), min(iy1, gy0 + TILE_L - 1)
+                if xa <= xb and ya <= yb:
+                    out[ya - iy0:yb - iy0 + 1, xa - ix0:xb - ix0 + 1] = chart[ya - gy0:yb - gy0 + 1, xa - gx0:xb - gx0 + 1]
+        return ix0, iy0, out, list(self.keys)
+
     def valid_cell(self, ix: int, iy: int) -> bool:
         """Whether lattice cell (ix, iy) (global) is VALID: seen free from within the close-evidence range and not held, or driven
         (the stored `val` plane, which the engine computes as `ChartGraph._val_h`). An absent tile is not valid. Rule stores only."""
@@ -399,7 +430,7 @@ class PlanGraph:
     @staticmethod
     def _alive(blocked: Optional[Blocked], ys: np.ndarray, xs: np.ndarray) -> np.ndarray:
         m = np.zeros(len(ys), bool)
-        if blocked is None or not (blocked.discs or blocked.segments):
+        if not blocked:
             return ~m
         cx = (2 * xs + 1) * RES
         cy = (2 * ys + 1) * RES
@@ -410,6 +441,8 @@ class PlanGraph:
             L2 = dx * dx + dy * dy
             t = np.clip(((cx - x0) * dx + (cy - y0) * dy) / L2, 0, 1) if L2 > 0 else np.zeros_like(cx)
             m |= (cx - (x0 + t * dx)) ** 2 + (cy - (y0 + t * dy)) ** 2 <= hw * hw
+        if blocked.cells is not None and len(blocked.cells):
+            m |= np.isin(cell_keys(xs, ys), blocked.cells)
         return ~m
 
     @staticmethod
@@ -570,7 +603,7 @@ class PlanGraph:
         src, dst = tuple(int(v) for v in self._cell[ja]), tuple(int(v) for v in self._cell[jb])
         c0, c1 = self._cell_at(start, ja), self._cell_at(goal, jb)
         src, dst = c0 or src, c1 or dst
-        overlay = blocked is not None and bool(blocked.discs or blocked.segments)
+        overlay = bool(blocked)
         path = self._path(ja, jb)
         found, rings, whole, exact, tiles = None, 0, path is None, True, 0
         if path is not None:

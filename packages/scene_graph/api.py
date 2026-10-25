@@ -220,10 +220,23 @@ class Safety:
         return np.where(g < self.margin, np.exp(-self.k * (g - self.origin)), 0.0)
 
 
+CELL_OFF = 1 << 20             # `Blocked.cells` keys: (iy + CELL_OFF) * CELL_W + (ix + CELL_OFF), ix / iy the global lattice indices
+CELL_W = 1 << 21
+
+
+def cell_keys(ix, iy) -> np.ndarray:
+    """The int64 keys of global lattice cells (ix, iy) (arrays or numbers), the encoding of `Blocked.cells`."""
+    return (np.asarray(iy, np.int64) + CELL_OFF) * CELL_W + (np.asarray(ix, np.int64) + CELL_OFF)
+
+
 @dataclass
 class Blocked:
     discs: List[Tuple[float, float, float]] = field(default_factory=list)            # x, y, radius
     segments: List[Tuple[Pt, Pt, float]] = field(default_factory=list)               # a, b, half width
+    cells: Optional[np.ndarray] = None                                               # `cell_keys` of whole lattice cells (keep-out zones)
+
+    def __bool__(self) -> bool:
+        return bool(self.discs or self.segments or (self.cells is not None and len(self.cells)))
 
 
 class MissingTiles(Exception):
