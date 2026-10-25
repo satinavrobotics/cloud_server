@@ -228,7 +228,7 @@ class FakeObjects:
         return sorted({(b, k.split("/")[1]) for b, k in self.objects
                        if k.startswith(rc.RESULT_PREFIX)})
 
-    def stream(self, bucket, key):
+    def stream(self, bucket, key, chunk=0):
         yield self.objects[(bucket, key)]
 
 

@@ -3,6 +3,13 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Bounded reconstruction cloud: open (2026-10-25)
+
+`cloud.ply?max_points=N` is built and unit-tested (`docs/reconstruction/point_budget.md`); not run on a Pi, against a real MinIO or behind the new nginx location.
+- The first request per (cloud, bucket) sends no byte until the decimated file is built (a full read of the source); no pre-building when a job finishes, and no tee-while-streaming.
+- Uniform stride keeps the writer's order: if the service ever writes clouds sorted by one axis, the thinning is still uniform, but not a spatial (voxel) thinning.
+- Cache lives in the API container's temp dir by default: lost on a container recreate (rebuilt on demand); set `RECONSTRUCTION_LOD_CACHE_DIR` to a volume to keep it.
+
 ## Keep-out zones: open (2026-10-25)
 
 Built and unit-tested on synthetic maps (`docs/keepout_zones.md`); not planned against a real map or a real Postgres.

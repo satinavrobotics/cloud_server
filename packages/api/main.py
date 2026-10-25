@@ -1639,24 +1639,67 @@ async def delete_map_reconstruction(map_id: str):
     return Response(status_code=204)
 
 
+_lod_cache = None
+
+
+def _get_lod_cache():
+    global _lod_cache
+    if _lod_cache is None:
+        from packages import config as _cfg
+        from packages.api.reconstruction_lod import LodCache
+        _lod_cache = LodCache(_cfg.RECONSTRUCTION_LOD_CACHE_DIR,
+                              _cfg.RECONSTRUCTION_LOD_CACHE_MAX_FILES,
+                              _cfg.RECONSTRUCTION_LOD_CACHE_MAX_MB * 1024 * 1024)
+    return _lod_cache
+
+
 @app.get("/api/v1/maps/{map_id}/reconstruction/files/{name}")
 async def get_map_reconstruction_file(map_id: str, name: str, v: Optional[str] = None,
+                                      max_points: Optional[int] = Query(None, ge=1000,
+                                                                        le=20_000_000),
                                       if_none_match: Optional[str] = Header(None)):
     """cloud.ply | ortho.png | height.png | meta.json of the current result, streamed from the
-    map bucket. ETag = the job id; with `?v=<job id>` the response is cached forever."""
+    map bucket. ETag = the job id; with `?v=<job id>` the response is cached forever.
+
+    `cloud.ply?max_points=N` (1000..20 000 000; ignored for the other files): a bounded cloud.
+    N is rounded up to a bucket (1k 2k 5k 10k 25k 50k 100k 250k 500k 1M 2M 3M 5M 10M 20M); a
+    binary PLY with more vertices than that bucket comes back with every k-th vertex,
+    k = ceil(total / bucket), so with at most `bucket` vertices (the bucket is at most
+    2.5 x N, exactly N when N is a bucket). `X-Total-Points` and `X-Returned-Points` say what the
+    file has and what was sent. A PLY that is small enough, or not a binary_little_endian
+    vertex-only PLY, is sent whole (the headers are then absent for the latter). The first
+    request for a bucket reads the whole source and builds the file (seconds to a minute on a
+    big cloud, no bytes before it is done); later ones are plain file responses. The ETag is
+    `"<job id>-lod<bucket>"`. See docs/reconstruction/point_budget.md."""
     _require_service()
     info = await _site_call("read reconstruction file",
                             service.reconstruction.open_file(map_id, name))
-    etag = f'"{info["job_id"]}"'
+    lod_wanted = max_points is not None and name == "cloud.ply"
+    if lod_wanted:
+        from packages.api import reconstruction_lod as lod
+        etag = lod.etag_for(info["job_id"], max_points)
+    else:
+        etag = f'"{info["job_id"]}"'
     cache = ("public, max-age=31536000, immutable" if v == info["job_id"] else "no-cache")
     headers = {"ETag": etag, "Cache-Control": cache}
     if if_none_match and etag in [t.strip() for t in if_none_match.split(",")]:
         return Response(status_code=304, headers=headers)
-    if info.get("bytes") is not None:
-        headers["Content-Length"] = str(info["bytes"])
     if name == "cloud.ply":
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in map_id)
         headers["Content-Disposition"] = f'attachment; filename="{safe}-reconstruction.ply"'
+    if lod_wanted:
+        headers["Access-Control-Expose-Headers"] = "X-Total-Points, X-Returned-Points"
+        result = await asyncio.to_thread(lod.plan, service.reconstruction.objects, info,
+                                         max_points, _get_lod_cache())
+        if result is not None:
+            headers["X-Total-Points"] = str(result.total)
+            headers["X-Returned-Points"] = str(result.returned)
+            if result.path:
+                from fastapi.responses import FileResponse
+                return FileResponse(result.path, media_type=info["content_type"],
+                                    headers=headers)
+    if info.get("bytes") is not None:
+        headers["Content-Length"] = str(info["bytes"])
     stream = service.reconstruction.objects.stream(info["bucket"], info["key"])
     return StreamingResponse(stream, media_type=info["content_type"], headers=headers)
 

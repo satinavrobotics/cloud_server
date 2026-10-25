@@ -514,6 +514,8 @@ def reconstruction_view(job: Job, stale: Optional[bool],
         file = FILES.get(name, (name, None))[0]
         files[name] = {"name": file, "bytes": info.get("bytes"),
                        "url": file_url(job.map_name, file, job.job_id)}
+        if name == "cloud" and result.get("points") is not None:
+            files[name]["points"] = result["points"]  # for the client's max_points choice
     return {"job_id": job.job_id, "finished_at": _iso(job.finished_at),
             "params": {k: job.params.get(k) for k in ("voxel_m", "max_depth_m", "clip_z")},
             "points": result.get("points"),

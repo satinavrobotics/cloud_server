@@ -387,6 +387,11 @@ RECONSTRUCTION_RELIEF_MAX_CELLS = int(os.getenv("RECONSTRUCTION_RELIEF_MAX_CELLS
 RECONSTRUCTION_TOPVIEW_MEM_MB = int(os.getenv("RECONSTRUCTION_TOPVIEW_MEM_MB", "1024"))
 RECONSTRUCTION_TOPVIEW_TIMEOUT_S = int(os.getenv("RECONSTRUCTION_TOPVIEW_TIMEOUT_S", "600"))
 RECONSTRUCTION_WORK_DIR = _env_or_none("RECONSTRUCTION_WORK_DIR")
+# Decimated copies of cloud.ply for `?max_points=N` (packages/api/reconstruction_lod.py): where
+# they are cached (empty = <system temp dir>/satinav-recon-lod), at most how many files and MB.
+RECONSTRUCTION_LOD_CACHE_DIR = _env_or_none("RECONSTRUCTION_LOD_CACHE_DIR")
+RECONSTRUCTION_LOD_CACHE_MAX_FILES = int(os.getenv("RECONSTRUCTION_LOD_CACHE_MAX_FILES", "6"))
+RECONSTRUCTION_LOD_CACHE_MAX_MB = int(os.getenv("RECONSTRUCTION_LOD_CACHE_MAX_MB", "1536"))
 
 # ==================== Semantic layer gateway (API) ====================
 # docs/semantic/design.md (packages/api/semantic.py). Same shape as the reconstruction gateway above: the
