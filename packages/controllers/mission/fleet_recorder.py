@@ -180,17 +180,27 @@ INSERT_LEG_SQL = (
 )
 LEG_BASE_SQL = "SELECT COALESCE(max(seq), 0) FROM run_legs WHERE run_id = %s"
 # Fill recoveries / recovery time / blocks of a run's legs from the events that carry the leg.
+# `recoveries` counts EPISODES, the rule of packages/api/map_events.py: a NAV.RECOVERY_ENTERED is a
+# new recovery unless the run's previous recovery event (ENTERED or EXITED, whatever leg it is tagged
+# with, or none) was also an ENTERED -- a repeated ENTERED without an EXITED in between is the same
+# episode. The lag runs over all of the run's recovery events (a run has one robot) before the
+# leg_seq filter, so an EXITED tagged with another leg still closes the episode. recovery_s (sum of
+# the EXITED durations) and blocks (every event) are not episodes.
 LEG_EVENTS_SQL = (
     "UPDATE run_legs l SET recoveries = e.recoveries, recovery_s = e.recovery_s, "
     "blocks = e.blocks FROM ("
-    "SELECT (payload->>'leg_seq')::int AS leg_seq, "
-    "count(*) FILTER (WHERE code = 'NAV.RECOVERY_ENTERED') AS recoveries, "
+    "SELECT leg_seq, "
+    "count(*) FILTER (WHERE code = 'NAV.RECOVERY_ENTERED' "
+    "AND prev IS DISTINCT FROM 'NAV.RECOVERY_ENTERED') AS recoveries, "
     "COALESCE(sum((payload->>'duration_s')::float8) "
     "FILTER (WHERE code = 'NAV.RECOVERY_EXITED'), 0) AS recovery_s, "
     "count(*) FILTER (WHERE code IN ('NAV.GOAL_BLOCKED', 'MISSION.EDGE_BLOCKED')) AS blocks "
-    "FROM fleet_events WHERE run_id = %s AND payload->>'leg_seq' IS NOT NULL "
-    "AND code IN ('NAV.RECOVERY_ENTERED', 'NAV.RECOVERY_EXITED', 'NAV.GOAL_BLOCKED', "
-    "'MISSION.EDGE_BLOCKED') GROUP BY 1) e "
+    "FROM (SELECT (payload->>'leg_seq')::int AS leg_seq, code, payload, "
+    "lag(code) OVER (PARTITION BY code IN ('NAV.RECOVERY_ENTERED', 'NAV.RECOVERY_EXITED') "
+    "ORDER BY ts, event_id) AS prev "
+    "FROM fleet_events WHERE run_id = %s AND code IN ('NAV.RECOVERY_ENTERED', "
+    "'NAV.RECOVERY_EXITED', 'NAV.GOAL_BLOCKED', 'MISSION.EDGE_BLOCKED')) ev "
+    "WHERE leg_seq IS NOT NULL GROUP BY leg_seq) e "
     "WHERE l.run_id = %s AND l.seq = e.leg_seq"
 )
 RUN_LEGS_SQL = (

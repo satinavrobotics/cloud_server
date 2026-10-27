@@ -177,7 +177,16 @@ class FakeDB:
                     continue
                 mine = [e for e in self.events.values() if e["run_id"] == run_id
                         and e["payload"].get("leg_seq") == seq]
-                leg["recoveries"] = sum(e["code"] == "NAV.RECOVERY_ENTERED" for e in mine)
+                # recoveries are EPISODES (see LEG_EVENTS_SQL): an ENTERED right after another
+                # ENTERED of the run's recovery events (any leg) is the same episode
+                recovery = [(ts, e["code"], e["payload"].get("leg_seq")) for (_, ts), e
+                            in self.events.items() if e["run_id"] == run_id
+                            and e["code"] in ("NAV.RECOVERY_ENTERED", "NAV.RECOVERY_EXITED")]
+                recovery.sort(key=lambda r: r[0])
+                leg["recoveries"] = sum(
+                    code == "NAV.RECOVERY_ENTERED" and leg_seq == seq
+                    and (i == 0 or recovery[i - 1][1] != "NAV.RECOVERY_ENTERED")
+                    for i, (_, code, leg_seq) in enumerate(recovery))
                 leg["recovery_s"] = sum(e["payload"].get("duration_s") or 0.0 for e in mine
                                         if e["code"] == "NAV.RECOVERY_EXITED")
                 leg["blocks"] = sum(e["code"] in ("NAV.GOAL_BLOCKED", "MISSION.EDGE_BLOCKED")
@@ -193,12 +202,15 @@ class FakeDB:
                 tuple(leg[f] for f in fr.EDGE_LEG_FIELDS) for leg in self.legs_of(params[0])
                 if leg["from_topomap_node"] and leg["to_topomap_node"]]
         elif sql == edge_stats_db.INSERT_SQL:
-            row = dict(zip(edge_stats_db.COLUMNS, params))
-            assert row["observed_at"].tzinfo is not None and row["duration_s"] > 0
-            key = tuple(row[c] for c in edge_stats_db.COLUMNS[:6])
-            if key not in self.edge_obs:
-                self.edge_obs[key] = row
-                cursor.rowcount = 1
+            assert len(params) == len(edge_stats_db.COLUMNS)            # one parallel array per column
+            assert len({len(a) for a in params}) == 1
+            for values in zip(*params):
+                row = dict(zip(edge_stats_db.COLUMNS, values))
+                assert row["observed_at"].tzinfo is not None and row["duration_s"] > 0
+                key = tuple(row[c] for c in edge_stats_db.COLUMNS[:6])
+                if key not in self.edge_obs:
+                    self.edge_obs[key] = row
+                    cursor.rowcount += 1
         elif sql == edge_stats_db.PRUNE_SQL:
             map_id, robot, froms, tos, _, _, window = params
             touched = set(zip(froms, tos))

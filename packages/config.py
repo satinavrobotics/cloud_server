@@ -683,8 +683,16 @@ EFFICIENCY_CACHE_ENTRIES = int(os.getenv("EFFICIENCY_CACHE_ENTRIES", "32"))
 # is not attributed to space (the robot stood, the uploads stalled); it still counts in the active time.
 MAPPING_STATS_MAX_GAP_S = float(os.getenv("MAPPING_STATS_MAX_GAP_S", "60.0"))
 EDGE_STATS_MAX_DURATION_S = float(os.getenv("EDGE_STATS_MAX_DURATION_S", "3600.0"))
-EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", "5.0"))
-EDGE_STATS_MIN_SPEED_MPS = float(os.getenv("EDGE_STATS_MIN_SPEED_MPS", "0.02"))
+# The edge-stats speed rules are deliberately the SAME movement rules as drive-stats / mapping-stats /
+# path efficiency: they default to DRIVE_STATS_MAX_SPEED_MS / DRIVE_STATS_MIN_SPEED_MS (an env var still
+# overrides each). Changing a default only affects observations written from now on: stored ones were
+# judged by the thresholds of their time (5.0 / 0.02 m/s before) and are not re-judged.
+EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", str(DRIVE_STATS_MAX_SPEED_MS)))
+EDGE_STATS_MIN_SPEED_MPS = float(os.getenv("EDGE_STATS_MIN_SPEED_MPS", str(DRIVE_STATS_MIN_SPEED_MS)))
+# GET /api/v1/maps/{id}/edge-stats: the grouped list of a (map, robot, pooled) is cached this long (the
+# client pages through it; each page would otherwise re-read all observations and all edges).
+EDGE_STATS_CACHE_TTL_S = float(os.getenv("EDGE_STATS_CACHE_TTL_S", "120.0"))
+EDGE_STATS_CACHE_ENTRIES = int(os.getenv("EDGE_STATS_CACHE_ENTRIES", "16"))
 
 # ==================== Pre-mission go-to (API) ====================
 # packages/api/pre_goto.py: before a MAPPED mission is queued (POST /api/v1/missions) the server

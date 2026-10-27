@@ -312,6 +312,27 @@ class TestEventsAndSummary:
         assert event["payload"]["leg_seq"] == 2
         assert str(event["run_id"]) == str(fr.run_uuid("m1", RUN))
 
+    async def test_recoveries_count_episodes_not_repeated_entered_events(self, tmp_path):
+        # same rule as map_events: ENTERED, ENTERED (no EXITED between) is ONE recovery; an EXITED
+        # tagged with another leg (or none) still closes the episode. The real SQL is only
+        # exercised against Postgres (tests/integration); this checks the fake's reading of it.
+        rec, db, mission, robot = await start(tmp_path)
+        await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3),
+                   msg(mission, 4, 11), msg(mission, 6, 21))
+        run_id = fr.run_uuid("m1", RUN)
+        for code, payload, ts in (
+                ("NAV.RECOVERY_ENTERED", {"leg_seq": 3}, 12),
+                ("NAV.RECOVERY_ENTERED", {"leg_seq": 3}, 13),      # repeat: same episode
+                ("NAV.RECOVERY_EXITED", {"duration_s": 2.0}, 14),   # untagged: closes it
+                ("NAV.RECOVERY_ENTERED", {"leg_seq": 3}, 15)):      # a second episode
+            db.events[(uuid.uuid4(), at(ts))] = {"code": code, "run_id": run_id, "payload": payload}
+        mission.status.state = State.COMPLETED
+        mission.status.passes_completed = 1
+        rec._clock.now = at(30)
+        rec.run_finished("r1", mission, robot)
+        await rec.run_pending_ops()
+        assert db.legs_of()[2]["recoveries"] == 2
+
     async def test_summary_metrics_and_leg_event_counts_on_run_end(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path)
         await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3),

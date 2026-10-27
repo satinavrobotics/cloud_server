@@ -18,7 +18,8 @@ EDGE_STATS_MAX_DURATION_S, a non-finite distance / duration, or a speed over
 EDGE_STATS_MAX_SPEED_MPS, are dropped (`reject_reason`). A mapping step slower than
 EDGE_STATS_MIN_SPEED_MPS (a session paused or the robot standing still between two nodes) is
 dropped too: its time is not a traversal time (legs are not filtered this way). The statistics (`group_stats`) are
-computed from the newest EDGE_STATS_WINDOW observations of each (map, edge, robot).
+computed from the newest EDGE_STATS_WINDOW observations of each (map, edge, robot), or, pooled, of each
+(map, edge) across all robots.
 Nothing here touches a database; see packages/utils/run_legs.py for the same structure.
 """
 import datetime
@@ -151,14 +152,18 @@ def stats(observations: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def group_stats(observations: Iterable[Mapping[str, Any]], window: Optional[int] = None
-                ) -> List[Dict[str, Any]]:
+def group_stats(observations: Iterable[Mapping[str, Any]], window: Optional[int] = None,
+                pooled: bool = False) -> List[Dict[str, Any]]:
     """Per (map, from, to, robot): the stats of its newest `window` observations, sorted by
-    (map, from, to, robot). Each item: map_id, from_node_id, to_node_id, robot + `stats`."""
-    groups: Dict[Tuple[str, str, str, str], List[Mapping[str, Any]]] = {}
+    (map, from, to, robot). Each item: map_id, from_node_id, to_node_id, robot + `stats`.
+
+    `pooled`: per (map, from, to) across the robots instead, from the newest `window`
+    observations of the edge of ALL robots together (the stored rows are already at most `window`
+    per robot); every item then has `robot: None` and its `sources` / counts are the pool's."""
+    groups: Dict[Tuple[str, str, str, Optional[str]], List[Mapping[str, Any]]] = {}
     for o in observations:
-        groups.setdefault((o["map_id"], o["from_node"], o["to_node"], o["robot_name"]),
-                          []).append(o)
+        groups.setdefault((o["map_id"], o["from_node"], o["to_node"],
+                           None if pooled else o["robot_name"]), []).append(o)
     items = []
     for (map_id, src, dst, robot), group in sorted(groups.items()):
         items.append({"map_id": map_id, "from_node_id": src, "to_node_id": dst, "robot": robot,

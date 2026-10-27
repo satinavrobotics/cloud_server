@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from packages import config
 from packages.api import fleet_reads, map_events, path_efficiency, run_stats, series_axis as ax
-from packages.api.drive_stats import ResultCache
+from packages.api.result_cache import ResultCache
 from packages.events.codes import EventCode
 
 logger = logging.getLogger("ApiDelegationService.map_series")

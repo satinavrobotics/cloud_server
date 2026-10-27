@@ -15,6 +15,7 @@ from fastapi import HTTPException  # noqa: E402
 pytest.importorskip("psycopg")
 
 from packages.api import drive_stats as ds  # noqa: E402
+from packages.api.result_cache import ResultCache  # noqa: E402
 from packages.api import mapping_stats as mst  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -210,7 +211,7 @@ def patched(monkeypatch):
 
 
 def call(graph, reads, occ, robot=None, now=700, map_id="m"):
-    raw, etag = asyncio.run(mst.mapping_stats(None, graph, reads, occ, map_id, robot, cache=ds.ResultCache(4, 60.0),
+    raw, etag = asyncio.run(mst.mapping_stats(None, graph, reads, occ, map_id, robot, cache=ResultCache(4, 60.0),
                                               now=at(now)))
     return json.loads(raw), etag
 
@@ -280,7 +281,7 @@ class TestEndpoint:
 
     def test_cache(self, patched):
         patched([session()])
-        cache = ds.ResultCache(4, 60.0)
+        cache = ResultCache(4, 60.0)
 
         class Counting(FakeGraph):
             n = 0
@@ -302,7 +303,7 @@ class TestRoute:
         monkeypatch.setattr(main, "service", SimpleNamespace(database=None, graph_db=FakeGraph({})))
         monkeypatch.setattr(main, "_scene_graph_reads", lambda: FakeReads())
         monkeypatch.setattr(main, "_occupancy_reads", lambda: FakeOcc())
-        monkeypatch.setattr(mst, "CACHE", ds.ResultCache(4, 60.0))
+        monkeypatch.setattr(mst, "CACHE", ResultCache(4, 60.0))
 
         def get(inm=None):
             req = SimpleNamespace(headers={"if-none-match": inm} if inm else {})
@@ -322,6 +323,6 @@ class TestRoute:
         monkeypatch.setattr(main, "service", SimpleNamespace(database=None, graph_db=FakeGraph({})))
         monkeypatch.setattr(main, "_scene_graph_reads", boom)
         monkeypatch.setattr(main, "_occupancy_reads", boom)
-        monkeypatch.setattr(mst, "CACHE", ds.ResultCache(4, 60.0))
+        monkeypatch.setattr(mst, "CACHE", ResultCache(4, 60.0))
         r = asyncio.run(main.map_mapping_stats("m", SimpleNamespace(headers={}), None))
         assert r.status_code == 200

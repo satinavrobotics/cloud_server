@@ -23,6 +23,7 @@ from fastapi import HTTPException
 
 from packages import config
 from packages.api import maps, session_trace
+from packages.api.result_cache import ResultCache
 from packages.api.session_trace import page_args
 from packages.utils import edge_stats as es
 from packages.utils import edge_stats_db
@@ -47,18 +48,18 @@ def _edges_of(graph: Any, map_id: str) -> List[Dict[str, Any]]:
     return graph.get_edges_strict(map_id)
 
 
-async def edge_stats(db: Any, graph: Any, map_id: str, robot: Optional[str] = None,
-                     min_count: Optional[int] = None, limit: Optional[int] = None,
-                     offset: Optional[int] = None) -> Dict[str, Any]:
-    """The response of GET /api/v1/maps/{map_id}/edge-stats. 404 unknown map; 422 bad
-    limit / offset / min_count."""
-    limit, offset = page_args(limit, offset)
-    min_count = _min_count(min_count)
+# The grouped, filtered-by-edge list per (map, robot or None, pooled) -- before min_count and paging.
+# Keys start with the map id (ResultCache.discard_map). Fresh observations show up after the TTL.
+CACHE = ResultCache(config.EDGE_STATS_CACHE_ENTRIES, config.EDGE_STATS_CACHE_TTL_S)
+
+
+async def _grouped(db: Any, graph: Any, map_id: str, robot: Optional[str], pooled: bool
+                   ) -> List[Dict[str, Any]]:
+    """Every item (all counts) of the map, read from Postgres + ArangoDB. 503 when ArangoDB
+    cannot be read (not cached: the cache keeps successes only)."""
     try:
         async with maps.open_store(db, uuid.uuid4()) as store:
-            if await store.get_map(map_id) is None:
-                raise HTTPException(404, f"Did not find \"map\" with name \"{map_id}\"")
-            observations = await edge_stats_db.fetch(store.cursor, map_id, robot or None)
+            observations = await edge_stats_db.fetch(store.cursor, map_id, robot)
     except maps._SCHEMA_ERRORS as exc:
         raise maps._undefined_table(exc) from exc
     try:
@@ -67,12 +68,36 @@ async def edge_stats(db: Any, graph: Any, map_id: str, robot: Optional[str] = No
         logger.warning("Edge statistics of map %s: could not read its edges: %s", map_id, exc)
         raise HTTPException(503, f"The edges of map \"{map_id}\" could not be read from "
                                  "ArangoDB; try again shortly") from exc
-    items = [i for i in es.group_stats(es.on_edges(observations, edges)) if i["count"] >= min_count]
+    return es.group_stats(es.on_edges(observations, edges), pooled=pooled)
+
+
+async def edge_stats(db: Any, graph: Any, map_id: str, robot: Optional[str] = None,
+                     min_count: Optional[int] = None, limit: Optional[int] = None,
+                     offset: Optional[int] = None, pooled: bool = False,
+                     cache: Optional[ResultCache] = None) -> Dict[str, Any]:
+    """The response of GET /api/v1/maps/{map_id}/edge-stats. 404 unknown map (checked on every
+    request, also when the list is cached); 422 bad limit / offset / min_count. `pooled` (ignored
+    when `robot` is given, then echoed false) groups per edge across robots, `robot: null`. The
+    list is cached per (map, robot, pooled); min_count and paging apply to the cached list."""
+    limit, offset = page_args(limit, offset)
+    min_count = _min_count(min_count)
+    robot = robot or None
+    pooled = bool(pooled) and robot is None
+    try:
+        async with maps.open_store(db, uuid.uuid4()) as store:
+            if await store.get_map(map_id) is None:
+                raise HTTPException(404, f"Did not find \"map\" with name \"{map_id}\"")
+    except maps._SCHEMA_ERRORS as exc:
+        raise maps._undefined_table(exc) from exc
+    grouped = await (CACHE if cache is None else cache).get(
+        (map_id, robot, pooled), lambda: _grouped(db, graph, map_id, robot, pooled))
+    items = [i for i in grouped if i["count"] >= min_count]
     page = items[offset:offset + limit]
     end = offset + len(page)
     return {
         "map_id": map_id,
-        "robot": robot or None,
+        "robot": robot,
+        "pooled": pooled,
         "min_count": min_count,
         "window": config.EDGE_STATS_WINDOW,
         "total": len(items),
