@@ -3464,6 +3464,13 @@ async def update_mission(mission_name: str, mission_data: dict):
                 edited = MissionSpecV1(**{**mission.spec.dict(), **edits})
             except ValidationError as e:
                 raise HTTPException(status_code=400, detail=f"Invalid mission spec: {e}")
+            if "mission_tree" in edits:
+                # operator-supplied routes: no stale chart_key on a waypoint that moved (the planner's own
+                # waypoints are unchanged and keep theirs)
+                before = {str(n.name): n.route for n in mission.mission_tree if n.route is not None}
+                for node in edited.mission_tree:
+                    if node.route is not None:
+                        node.route.clear_stale_charts(before.get(str(node.name)))
             for key in edits:
                 setattr(mission, key, getattr(edited, key))
             touched.update(edits)

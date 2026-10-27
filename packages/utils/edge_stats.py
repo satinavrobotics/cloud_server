@@ -17,9 +17,11 @@ Observations with a duration <= 0 (after rounding to milliseconds, as stored) or
 EDGE_STATS_MAX_DURATION_S, a non-finite distance / duration, or a speed over
 EDGE_STATS_MAX_SPEED_MPS, are dropped (`reject_reason`). A mapping step slower than
 EDGE_STATS_MIN_SPEED_MPS (a session paused or the robot standing still between two nodes) is
-dropped too: its time is not a traversal time (legs are not filtered this way). The statistics (`group_stats`) are
-computed from the newest EDGE_STATS_WINDOW observations of each (map, edge, robot), or, pooled, of each
-(map, edge) across all robots.
+dropped too: its time is not a traversal time (legs are not filtered this way). Raw observations are
+all kept (up to EDGE_STATS_RETENTION_DAYS, packages/utils/edge_stats_db.py); the window is applied on
+read: the statistics (`group_stats`) are computed from the newest EDGE_STATS_WINDOW observations of each
+(map, edge, robot), or, pooled, of each (map, edge) across all robots (the database read already cuts
+to that window, `group_stats` applies it again so it is right for any caller).
 Nothing here touches a database; see packages/utils/run_legs.py for the same structure.
 """
 import datetime
@@ -57,32 +59,44 @@ def reject_reason(duration_s: Optional[float], distance_m: Optional[float]) -> O
 
 def _observation(map_id: str, src: str, dst: str, robot: str, source: str, source_key: str,
                  observed_at: datetime.datetime, duration_s: float,
-                 distance_m: Optional[float], recoveries: int = 0, blocks: int = 0
-                 ) -> Dict[str, Any]:
+                 distance_m: Optional[float], recoveries: int = 0, blocks: int = 0,
+                 moving_s: Optional[float] = None, stopped_s: Optional[float] = None,
+                 recovery_s: Optional[float] = None) -> Dict[str, Any]:
     duration_s = round(duration_s, 3)
     return {"map_id": map_id, "from_node": src, "to_node": dst, "robot_name": robot,
             "source": source, "source_key": source_key, "observed_at": observed_at,
             "duration_s": duration_s,
             "distance_m": None if distance_m is None else round(distance_m, 4),
             "speed_mps": (round(distance_m / duration_s, 4) if distance_m is not None else None),
-            "recoveries": int(recoveries), "blocks": int(blocks)}
+            "recoveries": int(recoveries), "blocks": int(blocks),
+            "moving_s": _ms(moving_s), "stopped_s": _ms(stopped_s), "recovery_s": _ms(recovery_s)}
+
+
+def _ms(value: Optional[float]) -> Optional[float]:
+    """A time rounded to milliseconds as stored; None (unknown) and non-finite values stay None."""
+    return round(float(value), 3) if value is not None and math.isfinite(float(value)) else None
 
 
 def leg_observation(leg: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """The observation of a run_legs row (run_id, seq, robot_name, map_id, from_topomap_node,
-    to_topomap_node, ended_at, duration_s, straight_m, recoveries, blocks); None for a leg
-    without both topomap nodes (or on one node) or a map, or an unusable one. The distance is the
-    straight line between the leg's waypoints (the leg follows planned_path)."""
+    to_topomap_node, ended_at, duration_s, straight_m, planned_m, recoveries, blocks, and optionally moving_s,
+    stopped_s, recovery_s: copied as they are, None = unknown, e.g. a leg recorded before stage C); None for a
+    leg without both topomap nodes (or on one node) or a map, or an unusable one. The distance is
+    the length of the plan between the leg's waypoints (planned_m: the plan trajectory's polyline
+    when the leg had one, else the straight line; a leg recorded before stage B of the edge
+    statistics has planned_m == straight_m). straight_m is the fallback where planned_m is None."""
     src, dst = leg.get("from_topomap_node"), leg.get("to_topomap_node")
     if not src or not dst or src == dst or not leg.get("map_id") or not leg.get("robot_name"):
         return None
-    duration, distance = leg.get("duration_s"), leg.get("straight_m")
+    duration = leg.get("duration_s")
+    distance = leg.get("planned_m") if leg.get("planned_m") is not None else leg.get("straight_m")
     if reject_reason(duration, distance) is not None:
         return None
     return _observation(str(leg["map_id"]), str(src), str(dst), str(leg["robot_name"]),
                         SOURCE_LEG, f"{leg['run_id']}:{leg['seq']}", leg["ended_at"],
                         float(duration), None if distance is None else float(distance),
-                        leg.get("recoveries") or 0, leg.get("blocks") or 0)
+                        leg.get("recoveries") or 0, leg.get("blocks") or 0, leg.get("moving_s"),
+                        leg.get("stopped_s"), leg.get("recovery_s"))
 
 
 def session_observations(map_id: str, session_id: str, robot_name: str,
@@ -135,9 +149,19 @@ def _round(value: Optional[float], digits: int = 3) -> Optional[float]:
 def stats(observations: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
     """The statistics of one (map, edge, robot)'s observations (already the window): count,
     median_s / p90_s of the duration, median_speed_mps (null when none has a speed),
-    last_observed_at, the recoveries / blocks seen (mission legs only) and the count per source."""
+    last_observed_at, the recoveries / blocks seen (mission legs only) and the count per source.
+
+    Stage C (driving time apart from waiting time): `median_moving_s` is the median moving_s of the observations
+    with moving_s > 0 and `moving_count` their number (null / 0 when none: mapping observations and legs recorded
+    before stage C have no moving_s); `moving_speed_mps` the median of distance_m / moving_s over the observations
+    that have both (null when none); `recovery_s` the sum of recovery_s (legs only; it overlaps the stopped time)."""
     durations = [float(o["duration_s"]) for o in observations]
     speeds = [float(o["speed_mps"]) for o in observations if o.get("speed_mps") is not None]
+    moving = [float(o["moving_s"]) for o in observations
+              if o.get("moving_s") is not None and o["moving_s"] > 0]
+    moving_speeds = [float(o["distance_m"]) / float(o["moving_s"]) for o in observations
+                     if o.get("moving_s") is not None and o["moving_s"] > 0
+                     and o.get("distance_m") is not None]
     return {
         "count": len(observations),
         "median_s": _round(statistics.median(durations)) if durations else None,
@@ -147,6 +171,10 @@ def stats(observations: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
                              if observations else None),
         "recoveries": sum(int(o.get("recoveries") or 0) for o in observations),
         "blocks": sum(int(o.get("blocks") or 0) for o in observations),
+        "median_moving_s": _round(statistics.median(moving)) if moving else None,
+        "moving_speed_mps": _round(statistics.median(moving_speeds), 4) if moving_speeds else None,
+        "recovery_s": _round(sum(float(o.get("recovery_s") or 0.0) for o in observations)),
+        "moving_count": len(moving),
         "sources": {s: sum(1 for o in observations if o["source"] == s)
                     for s in (SOURCE_LEG, SOURCE_MAPPING)},
     }
@@ -158,8 +186,8 @@ def group_stats(observations: Iterable[Mapping[str, Any]], window: Optional[int]
     (map, from, to, robot). Each item: map_id, from_node_id, to_node_id, robot + `stats`.
 
     `pooled`: per (map, from, to) across the robots instead, from the newest `window`
-    observations of the edge of ALL robots together (the stored rows are already at most `window`
-    per robot); every item then has `robot: None` and its `sources` / counts are the pool's."""
+    observations of the edge of ALL robots together; every item then has `robot: None` and its
+    `sources` / counts are the pool's."""
     groups: Dict[Tuple[str, str, str, Optional[str]], List[Mapping[str, Any]]] = {}
     for o in observations:
         groups.setdefault((o["map_id"], o["from_node"], o["to_node"],

@@ -41,7 +41,7 @@ leg tracker (controllers/mission/leg_tracker.py)
                         len(planned_path) == total waypoints, else None (silently: legs get VDA ids only)
   observe (:112-170):   Reach(topomap = planned[offset + wp]) at :163-164; a Leg per consecutive pair of reaches
   Leg (:56-72, :172-195): from_topomap_node / to_topomap_node = leaf ids, straight_m = |waypoint_i - waypoint_{i+1}|
-                          (NOT the driven length), planned_m = straight_m, expected_s, duration_s, stopped_s
+                          (NOT the driven length), planned_m = straight_m [until stage B, 2026-10-27; now the plan trajectory's length when the leg has one, with plan_source / from_chart / to_chart / graph_version recorded], expected_s, duration_s, stopped_s
         |
         v  (run end, fleet_recorder.py)
   run_legs table  (INSERT :168-185; migration 20261004_01_run_legs)         key (run_id, seq)

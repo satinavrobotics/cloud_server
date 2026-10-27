@@ -8,6 +8,10 @@ already rely on (docs/scene_graph/integration.md, "Planner contract"):
   repeats the previous bearing (the request carries no goal heading; the robot's final heading is
   the controller's business);
 * `node_id` = the nearest leaf within a threshold, else None;
+* `chart_key` = the chart that owns the waypoint's place on the graph the plan was made on (the plan only
+  knows the ordered list of charts it crosses, not which waypoint is in which, so `chart_of` asks the
+  graph: `graph.snap` of the waypoint, an array lookup per waypoint); None where the graph has no chart
+  within reach. Recording data (run_legs.from_chart / to_chart), never sent to the robot;
 * `planned_path` is returned only when every waypoint has a leaf id, because the leg tracker pairs
   `waypoints[i]` with `planned_path[i]` and drops topomap ids on any length mismatch.
 """
@@ -34,9 +38,11 @@ PLANNER_LEGACY = "legacy"
 
 def build_waypoints(points: Sequence[Pt], map_id: str,
                     node_of: Callable[[float, float], Optional[str]],
-                    allow_repeats: bool = False
+                    allow_repeats: bool = False,
+                    chart_of: Optional[Callable[[float, float], Optional[str]]] = None
                     ) -> Tuple[List[common.Pose2D], Optional[List[str]]]:
-    """(waypoints, planned_path or None) for an already simplified point list.
+    """(waypoints, planned_path or None) for an already simplified point list. `chart_of` (optional) gives each
+    waypoint its `chart_key`.
     `planned_path` is None unless every waypoint has a leaf id, and (unless `allow_repeats`) a
     distinct one. The last waypoint repeats the previous bearing (a one-point route has theta 0)."""
     pts = list(points)
@@ -49,7 +55,8 @@ def build_waypoints(points: Sequence[Pt], map_id: str,
             theta = poses[-1].theta
         else:
             theta = 0.0
-        poses.append(common.Pose2D(x=x, y=y, theta=theta, map_id=map_id, node_id=node_of(x, y)))
+        poses.append(common.Pose2D(x=x, y=y, theta=theta, map_id=map_id, node_id=node_of(x, y),
+                                   chart_key=chart_of(x, y) if chart_of is not None else None))
     ids = [p.node_id for p in poses]
     # one id per waypoint, no repeats: two waypoints snapped to the same leaf would be a zero-length
     # leg for the leg tracker, so such a route carries no planned_path (its legs are VDA-id only).
@@ -57,6 +64,22 @@ def build_waypoints(points: Sequence[Pt], map_id: str,
                if poses and all(n is not None for n in ids)
                and (allow_repeats or len(set(ids)) == len(ids)) else None)
     return poses, planned
+
+
+def chart_key_at(graph: Any, x: float, y: float) -> Optional[str]:
+    """The chart owning the navigable cell nearest (x, y) on `graph` (`graph.snap`, up to the chart diameter), as a
+    string; None when there is none or the graph cannot say. A waypoint of a route that was just planned lies on a
+    navigable cell, so this is its own chart. Never raises, except TileUnavailable (a lazy graph's tile that cannot
+    be read: the caller's fallback handles it)."""
+    from packages.services.mission_planner.lazy_plan import TileUnavailable
+    try:
+        key = graph.snap(x, y).key
+    except TileUnavailable:
+        raise
+    except Exception as err:  # pylint: disable=broad-except
+        _log.warning("chart lookup failed at (%.2f, %.2f): %s", x, y, err)
+        return None
+    return None if key is None else str(key)
 
 
 def repair_leaf_ids(points: Sequence[Pt], ids: Sequence[Optional[str]],
@@ -1143,7 +1166,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     # back: planned_path needs one id per waypoint).
     pts, ids = collapse_repeated_leaf_ids(pts, ids, visible, max_gap_m)
     by_pt = dict(zip(pts, ids))
-    poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)], allow_repeats=True)
+    poses, planned = build_waypoints(pts, map_id, lambda x, y: by_pt[(x, y)], allow_repeats=True,
+                                     chart_of=lambda x, y: chart_key_at(graph, x, y))
     # An END without a leaf within reach is not a reason to give the plan up either (and lose its
     # corridors to the legacy planner): it is served with planned_path None, a route of legs known
     # by their VDA ids only (docs/node_policies_v2_plan.md, step 2.1).

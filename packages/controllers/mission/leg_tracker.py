@@ -22,14 +22,36 @@ Topomap node ids: planner go-tos have exactly one waypoint per planned_path node
 is planned_path[i] when the two have the same length. Any other mission, or a mission whose
 route was rewritten (planned_path cleared), has no topomap ids: its legs are recorded with VDA
 ids only.
+
+Plan of a leg (utils/plan_length.py): the leg between waypoints k-1 and k of ONE route node has the planner's
+trajectory entry (k-1, k) of that node when it has one; `planned_m` is its polyline length when the entry's ends are
+the two poses the robot was sent to (within EFFICIENCY_STALE_TOL_M; `plan_source` "trajectory"), the straight line
+when they are not (a reroute: the leg starts at a waypoint of the old route; "stale") and the straight line when
+there is no entry (first leg of an order, across route nodes, no trajectory; "straight"). A leg without a straight
+line (it starts at the robot's own position) has no plan: both NULL. `from_chart` / `to_chart` are the
+`Pose2D.chart_key` of the two waypoints and `graph_version` the route node's (None for a base node, a route
+without them).
+
+Time of a leg (stage C of the edge statistics). `duration_s` is end.ts - start.ts, split by the robot's own reports:
+
+- `stopped_s`: the intervals between two state messages that follow a message with `driving` false; one interval
+  counts at most MAX_INTERVAL_S (a silent robot is not "stopped"). `driving` missing (None) counts as driving.
+- `silent_s`: the part of every interval (whatever the previous message said about driving) above MAX_INTERVAL_S,
+  i.e. the time the tracker knows nothing about (no messages: a link or dispatcher gap). max(0, dt - MAX_INTERVAL_S)
+  per interval, so an interval is split into at most MAX_INTERVAL_S of stopped (if not driving) and the rest silent.
+- `moving_s` = max(0, duration_s - stopped_s - silent_s): the time with messages that said the robot was driving.
+- Recovery time (run_legs.recovery_s, from the NAV.RECOVERY_EXITED events, filled at run end) is NOT subtracted: it
+  overlaps stopped time and a recovery maneuver may report driving true, so subtracting it would count it twice.
+Both stopped_s and silent_s restart with the leg (the anchor moving to the next route node of the tree resets them).
 """
 import dataclasses
 import datetime
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
+from packages import config
 from packages.controllers.mission import order_ids
-from packages.utils import run_legs
+from packages.utils import plan_length, run_legs
 
 # One state message interval is only counted as stopped time up to this long (a silent robot
 # is not "stopped").
@@ -48,7 +70,9 @@ class Reach:
     pose: Optional[Any] = None           # waypoint Pose2D, map frame; None for a base node
     wp: Optional[int] = None             # waypoint index inside its route node
     topomap: Optional[str] = None
+    chart: Optional[str] = None          # the waypoint's chart_key (None for a base node)
     stopped_s: float = 0.0               # non-driving time since this node was reached
+    silent_s: float = 0.0                # time in gaps above MAX_INTERVAL_S since this node was reached
     virtual: bool = False
 
 
@@ -71,21 +95,37 @@ class Leg:
     straight_m: Optional[float]
     planned_m: Optional[float]
     expected_s: Optional[float]
+    plan_source: Optional[str] = None    # plan_length.SOURCES; None: no straight line, so no plan
+    from_chart: Optional[str] = None
+    to_chart: Optional[str] = None
+    graph_version: Optional[int] = None
+    silent_s: float = 0.0                # see the module docstring: moving_s = duration - stopped - silent
+    moving_s: Optional[float] = None
 
 
 def _dist(a: Any, b: Any) -> float:
     return math.hypot(b.x - a.x, b.y - a.y)
 
 
-def route_table(mission: Any) -> Tuple[Dict[int, Tuple[int, List[Any]]], Optional[List[str]]]:
-    """({tree index: (offset into the concatenated route, waypoints)}, planned_path or None
-    when it does not line up with the waypoints)."""
-    table: Dict[int, Tuple[int, List[Any]]] = {}
+@dataclasses.dataclass
+class RouteInfo:
+    """One route node of the mission's tree, as the tracker needs it."""
+    offset: int                                         # of its first waypoint in the concatenated route
+    waypoints: List[Any]
+    legs: Dict[Tuple[int, int], List[List[float]]]      # plan trajectory entries by (from, to) waypoint index
+    graph_version: Optional[int] = None
+
+
+def route_table(mission: Any) -> Tuple[Dict[int, RouteInfo], Optional[List[str]]]:
+    """({tree index: RouteInfo}, planned_path or None when it does not line up with the waypoints)."""
+    table: Dict[int, RouteInfo] = {}
     offset = 0
     for idx, node in enumerate(mission.mission_tree):
         route = getattr(node, "route", None)
         if route is not None:       # (node.type rebuilds a dict on every call)
-            table[idx] = (offset, list(route.waypoints))
+            legs = {(t.from_index, t.to_index): t.points for t in route.trajectory or []}
+            table[idx] = RouteInfo(offset, list(route.waypoints), legs,
+                                   getattr(route, "graph_version", None))
             offset += len(route.waypoints)
     planned = list(mission.planned_path or [])
     return table, (planned if planned and len(planned) == offset else None)
@@ -122,8 +162,10 @@ class LegTracker:
         # Time the robot spent not driving since the previous message, on the open leg.
         if self._prev is not None and self.anchor is not None:
             dt = (ts - self._prev[0]).total_seconds()
-            if 0 < dt and not self._prev[1]:
-                self.anchor.stopped_s += min(dt, MAX_INTERVAL_S)
+            if 0 < dt:
+                if not self._prev[1]:
+                    self.anchor.stopped_s += min(dt, MAX_INTERVAL_S)
+                self.anchor.silent_s += max(0.0, dt - MAX_INTERVAL_S)
         driving = getattr(message, "driving", None)
         self._prev = (ts, True if driving is None else bool(driving))
 
@@ -155,39 +197,59 @@ class LegTracker:
             elif anchor.node_idx != idx:
                 # The next route node of the tree: the robot is at the node it just reached.
                 self.anchor = dataclasses.replace(anchor, ts=ts, received=received,
-                                                  stopped_s=0.0, node_idx=idx)
+                                                  stopped_s=0.0, silent_s=0.0, node_idx=idx)
             return []
 
-        offset, waypoints = table[idx]
+        info = table[idx]
+        offset, waypoints = info.offset, info.waypoints
         wp = seq // 2 - 1
         if not 0 <= wp < len(waypoints):
             return []
         reach = Reach(node_id, seq, idx, ts, received, status.order_rev, pose=waypoints[wp],
-                      wp=wp, topomap=planned[offset + wp] if planned else None)
+                      wp=wp, topomap=planned[offset + wp] if planned else None,
+                      chart=getattr(waypoints[wp], "chart_key", None))
         anchor, self.anchor = self.anchor, reach
         if anchor is None:
             return []
-        return [self._leg(anchor, reach, limits, default_map or waypoints[wp].map_id or None)]
+        return [self._leg(anchor, reach, limits, default_map or waypoints[wp].map_id or None, info)]
 
-    def _leg(self, start: Reach, end: Reach, limits: Any, map_id: Optional[str]) -> Leg:
+    @staticmethod
+    def _plan(start: Reach, end: Reach, straight: Optional[float], route: Optional[RouteInfo]
+              ) -> Tuple[Optional[float], Optional[str]]:
+        """(planned_m, plan_source) of a leg: see the module docstring."""
+        points, matches = None, False
+        if (route is not None and start.pose is not None and end.pose is not None and start.wp is not None
+                and end.wp == start.wp + 1 and order_ids.node_index(start.vda_node) == end.node_idx):
+            points = route.legs.get((start.wp, end.wp))
+            if points is not None:
+                matches = plan_length.ends_match(points, (start.pose.x, start.pose.y),
+                                                 (end.pose.x, end.pose.y), config.EFFICIENCY_STALE_TOL_M)
+        return plan_length.resolve(points, straight, matches)
+
+    def _leg(self, start: Reach, end: Reach, limits: Any, map_id: Optional[str],
+             route: Optional[RouteInfo] = None) -> Leg:
         self.n_legs += 1
-        straight = planned = heading = None
+        straight = heading = None
         if start.pose is not None and end.pose is not None:
             straight = _dist(start.pose, end.pose)
-            planned = straight
             heading = end.pose.theta - start.pose.theta
+        planned, source = self._plan(start, end, straight, route)
         expected = run_legs.expected_seconds(
             planned, heading, getattr(limits, "speed_max", None),
             getattr(limits, "acceleration_max", None),
             getattr(limits, "angular_speed_max", None)) if planned is not None else None
         duration = max(0.0, (end.ts - start.ts).total_seconds())
+        stopped = min(start.stopped_s, duration)
+        silent = min(start.silent_s, duration)
         return Leg(
             seq=self.n_legs, pass_index=self.pass_index or 0, order_rev=end.order_rev,
             from_vda_node=start.vda_node, to_vda_node=end.vda_node,
             from_topomap_node=start.topomap, to_topomap_node=end.topomap, map_id=map_id,
             started_at=start.ts, ended_at=end.ts, received_started_at=start.received,
             received_ended_at=end.received, duration_s=round(duration, 3),
-            stopped_s=round(min(start.stopped_s + 0.0, duration), 3),
+            stopped_s=round(stopped, 3), silent_s=round(silent, 3),
+            moving_s=round(max(0.0, duration - stopped - silent), 3),
             straight_m=None if straight is None else round(straight, 3),
             planned_m=None if planned is None else round(planned, 3),
-            expected_s=expected)
+            expected_s=expected, plan_source=source, from_chart=start.chart, to_chart=end.chart,
+            graph_version=route.graph_version if route is not None else None)

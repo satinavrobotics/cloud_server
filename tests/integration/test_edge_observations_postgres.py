@@ -1,4 +1,4 @@
-"""edge_observations (migration 20261011_01) and packages/utils/edge_stats_db.py on a real Postgres.
+"""edge_observations (migrations 20261011_01, 20261027_02, 20261027_04) and packages/utils/edge_stats_db.py on a real Postgres.
 
 Opt-in: set EDGE_STATS_TEST_DSN to a THROWAWAY database, e.g.
 
@@ -23,8 +23,11 @@ from packages.utils import edge_stats_db as store
 
 pytestmark = [pytest.mark.integration, pytest.mark.requires_docker]
 
-MIGRATION = (pathlib.Path(__file__).resolve().parents[2] / "packages" / "api" / "migrations"
-             / "versions" / "20261011_01_edge_observations.py")
+VERSIONS = (pathlib.Path(__file__).resolve().parents[2] / "packages" / "api" / "migrations"
+            / "versions")
+MIGRATIONS = (VERSIONS / "20261011_01_edge_observations.py",
+              VERSIONS / "20261027_02_edge_obs_history.py",
+              VERSIONS / "20261027_04_leg_moving.py")
 UTC = datetime.timezone.utc
 T0 = datetime.datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -44,11 +47,18 @@ skip = pytest.mark.skipif(not DSN, reason="set EDGE_STATS_TEST_DSN to a throwawa
                                           "(never the production port 5432)")
 
 
-def migration_sql(direction):
-    spec = importlib.util.spec_from_file_location("edge_observations_migration", MIGRATION)
+def migration_sql(direction, path=MIGRATIONS[0]):
+    spec = importlib.util.spec_from_file_location("edge_observations_migration", path)
     module = importlib.util.module_from_spec(spec)
     statements = []
-    import alembic  # noqa: F401  (the module imports `op` from it)
+    try:
+        import alembic  # noqa: F401  (the module imports `op` from it)
+    except ImportError:  # only `op` is needed, and it is replaced below
+        import sys
+        import types
+        stub = types.ModuleType("alembic")
+        stub.op = None
+        sys.modules["alembic"] = stub
     spec.loader.exec_module(module)
     module.op = SimpleNamespace(execute=statements.append)
     getattr(module, direction)()
@@ -64,7 +74,10 @@ def obs(i, src="A", dst="B", robot="r1", map_id="yard", source="leg"):
 async def cursor():
     import psycopg
     async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as conn:
-        for sql in migration_sql("downgrade") + migration_sql("upgrade"):
+        # migration 04 also adds two columns to run_legs: a stand-in table (the run_legs DDL is not this test's)
+        await conn.execute("DROP TABLE IF EXISTS run_legs; CREATE TABLE run_legs (run_id uuid)")
+        for sql in (migration_sql("downgrade", MIGRATIONS[0]) + migration_sql("upgrade", MIGRATIONS[0])
+                    + migration_sql("upgrade", MIGRATIONS[1]) + migration_sql("upgrade", MIGRATIONS[2])):
             await conn.execute(sql)
         async with conn.cursor() as cur:
             yield cur
@@ -77,28 +90,46 @@ async def keys(cur, src="A", dst="B", robot="r1"):
 
 
 @skip
-async def test_migration_store_window_idempotency_and_prune_scope(cursor):
-    rows = [obs(i) for i in range(25)]
-    assert await store.store(cursor, rows) == 25
-    assert await keys(cursor) == [f"k{i:03d}" for i in range(5, 25)]       # newest 20 of 25
-    # a repeat: the 5 pruned rows are INSERTed again (store() counts inserts) and pruned again
-    assert await store.store(cursor, rows) == 5
-    assert await keys(cursor) == [f"k{i:03d}" for i in range(5, 25)]       # nothing changed
+async def test_store_keeps_everything_fetch_cuts_the_window_purge_removes_old_rows(cursor):
+    rows = [obs(i) for i in range(25)] + [obs(i, robot="r2") for i in range(25, 50)]
+    assert await store.store(cursor, rows) == 50
+    assert await store.store(cursor, rows) == 0                            # idempotent
+    assert len(await keys(cursor)) == 25 and len(await keys(cursor, robot="r2")) == 25  # no prune
 
-    # the prune only touches the edges just written: put A->C over the window by hand
-    await cursor.execute(store.INSERT_SQL, store.insert_params(obs(i, dst="C") for i in range(23)))
-    await store.store(cursor, [obs(100, src="X", dst="Y")])
-    assert len(await keys(cursor, dst="C")) == 23                           # untouched edge
-    await store.store(cursor, [obs(101, dst="C")])
-    assert len(await keys(cursor, dst="C")) == 20                           # now pruned
-    assert len(await keys(cursor)) == 20                                    # A->B unaffected
+    fetched = await store.fetch(cursor, "yard")
+    for robot, expect in (("r1", range(5, 25)), ("r2", range(30, 50))):
+        mine = sorted(r["source_key"] for r in fetched if r["robot_name"] == robot)
+        assert mine == [f"k{i:03d}" for i in expect]                       # the newest 20 each
+    pooled = await store.fetch(cursor, "yard", pooled=True)
+    assert sorted(r["source_key"] for r in pooled) == [f"k{i:03d}" for i in range(30, 50)]
+    assert len(await store.fetch(cursor, "yard", "r1", window=3)) == 3
+    # the same choice as the pure function, ties included
+    tied = [dict(obs(i, dst="T"), observed_at=T0) for i in range(30)]
+    await store.store(cursor, tied)
+    got = [r for r in await store.fetch(cursor, "yard") if r["to_node"] == "T"]
+    assert sorted(r["source_key"] for r in got) == sorted(o["source_key"] for o in es.newest(tied))
 
-    # robots and maps are separate windows; the CHECK refuses a zero duration
-    await store.store(cursor, [obs(i, robot="r2") for i in range(3)])
-    assert len(await keys(cursor, robot="r2")) == 3
+
+@skip
+async def test_purge_old_removes_only_rows_older_than_the_retention_in_batches(cursor):
+    now = datetime.datetime.now(UTC)
+    old = [dict(obs(i), observed_at=now - datetime.timedelta(days=400 + i)) for i in range(7)]
+    young = [dict(obs(10 + i), observed_at=now - datetime.timedelta(days=364, hours=i))
+             for i in range(3)]
+    await store.store(cursor, old + young)
+    conn = cursor.connection
+    assert await store.purge_old(conn, days=0) == 0                        # 0 = keep forever
+    assert await store.purge_old(conn, days=365, batch=3) == 7             # batches of 3, 3, 1
+    assert await keys(cursor) == ["k010", "k011", "k012"]
+    assert await store.purge_old(conn, days=365) == 0
+
+
+@skip
+async def test_check_constraint_and_history_index_exist(cursor):
     import psycopg
     with pytest.raises(psycopg.errors.CheckViolation):
         await cursor.execute(store.INSERT_SQL,
                              store.insert_params([dict(obs(0, dst="Z"), duration_s=0.0)]))
-    fetched = await store.fetch(cursor, "yard", "r2")
-    assert len(fetched) == 3 and fetched[0]["map_id"] == "yard"
+    await cursor.execute("SELECT indexdef FROM pg_indexes WHERE indexname = "
+                         "'edge_observations_history_idx'")
+    assert "observed_at DESC" in (await cursor.fetchone())[0]

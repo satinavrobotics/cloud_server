@@ -43,6 +43,16 @@ async def test_enrich_gives_a_user_skippable_waypoint_its_corridor_and_is_idempo
 
 
 @pytest.mark.unit
+async def test_enrich_sets_the_chart_of_every_waypoint_without_calling_the_route_changed(on):
+    svc = _service(FakeStore(FakeGraph(), version=9))
+    out = await svc.enrich_route("r1", "m", _wps(1.0, 6.0))
+    assert [w.chart_key for w in out["waypoints"]] == ["c0", "c0"]
+    assert out["graph_version"] == 9 and not out["changed"]      # a chart key alone is not a change of route
+    again = await svc.enrich_route("r1", "m", out["waypoints"])
+    assert not again["changed"]
+
+
+@pytest.mark.unit
 async def test_enrich_drops_old_planned_waypoints_and_replans_them(on):
     from cloud_common.objects import common
     svc = _service(FakeStore(FakeGraph()))

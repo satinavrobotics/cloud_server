@@ -106,6 +106,25 @@ class TestExpectedSeconds:
         assert run_legs.expected_seconds(None, None, 1.0, -1, -1) is None
 
 
+class TestSummaryPlanSources:
+    def leg(self, seq, **extra):
+        base = {"seq": seq, "pass_index": 0, "started_at": at(seq), "ended_at": at(seq + 1),
+                "duration_s": 1.0, "straight_m": 3.0, "planned_m": 3.0, "plan_source": None}
+        base.update(extra)
+        return base
+
+    def test_plan_sources_tell_new_and_old_legs_apart_and_distance_prefers_planned_m(self):
+        legs = [self.leg(1, planned_m=5.0, plan_source="trajectory"), self.leg(2, plan_source="straight"),
+                self.leg(3, plan_source="stale"), self.leg(4), self.leg(5),
+                self.leg(6, straight_m=None, planned_m=None)]
+        out = run_legs.summarize(legs, 10.0)
+        assert out["plan_sources"] == {"trajectory": 1, "straight": 1, "stale": 1, "unrecorded": 2, "none": 1}
+        assert out["distance_m"] == pytest.approx(5.0 + 3.0 * 4)
+
+    def test_no_legs_no_sources(self):
+        assert run_legs.summarize([], 5.0)["plan_sources"] == {}
+
+
 class TestAggregate:
     def legs(self, durations, src="A", dst="B", **extra):
         return [{"run_id": i, "from_topomap_node": src, "to_topomap_node": dst,
@@ -333,6 +352,38 @@ class TestEventsAndSummary:
         await rec.run_pending_ops()
         assert db.legs_of()[2]["recoveries"] == 2
 
+    async def test_plan_charts_and_distance_reach_the_rows_the_summary_and_the_edge_observations(self, tmp_path):
+        """Stage B end to end: the row has plan_source / charts / graph_version, the summary counts the sources and
+        its distance and the edge observation's distance are the plan trajectory's, not the straight line."""
+        mission = api_objects.MissionObjectV1(
+            name="m1", robot="r1", status={}, timeout=600, planned_path=["A", "B", "C"],
+            mission_tree=[{"name": "go", "route": {
+                "waypoints": [{"x": 0, "y": 0, "theta": 0.0, "map_id": "map1", "chart_key": "k0"},
+                              {"x": 3, "y": 0, "theta": 0.0, "map_id": "map1", "chart_key": "k0"},
+                              {"x": 3, "y": 4, "theta": 0.0, "map_id": "map1", "chart_key": "k1"}],
+                "trajectory": [{"from_index": 0, "to_index": 1, "points": [[0, 0], [0, 1], [3, 1], [3, 0]]}],
+                "graph_version": 12}}])
+        mission.status.run_id = RUN
+        rec, db, mission, robot = await start(tmp_path, mission)
+        await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3), msg(mission, 4, 11),
+                   msg(mission, 6, 21))
+        rows = db.legs_of()
+        assert [r["plan_source"] for r in rows] == [None, "trajectory", "straight"]
+        assert [(r["from_chart"], r["to_chart"], r["graph_version"]) for r in rows] == \
+            [(None, "k0", 12), ("k0", "k0", 12), ("k0", "k1", 12)]
+        assert (rows[1]["straight_m"], rows[1]["planned_m"]) == (3.0, 5.0)
+        assert rows[1]["expected_s"] == pytest.approx(5.0 + 2.0)
+        mission.status.state = State.COMPLETED
+        mission.status.passes_completed = 1
+        rec._clock.now = at(30)
+        rec.run_finished("r1", mission, robot)
+        await rec.run_pending_ops()
+        summary = db.runs[fr.run_uuid("m1", RUN)]["summary_metrics"]
+        assert summary["plan_sources"] == {"trajectory": 1, "straight": 1, "none": 1}
+        assert summary["distance_m"] == pytest.approx(5.0 + 4.0)
+        [obs] = [o for o in db.edge_obs.values() if o["from_node"] == "A"]
+        assert obs["distance_m"] == 5.0 and obs["speed_mps"] == pytest.approx(5.0 / 8.0, abs=1e-3)
+
     async def test_summary_metrics_and_leg_event_counts_on_run_end(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path)
         await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3),
@@ -407,7 +458,9 @@ def leg_row(run_id, seq, src, dst, duration, expected=4.0, recoveries=0, recover
             "to_topomap_node": dst, "map_id": "map1", "started_at": at(0), "ended_at": at(1),
             "received_started_at": at(0), "received_ended_at": at(1), "duration_s": duration,
             "stopped_s": 0.0, "straight_m": 3.0, "planned_m": 3.0, "expected_s": expected,
-            "recoveries": recoveries, "recovery_s": recovery_s, "blocks": blocks}
+            "recoveries": recoveries, "recovery_s": recovery_s, "blocks": blocks,
+            "plan_source": "straight", "from_chart": None, "to_chart": None, "graph_version": None,
+            "moving_s": None, "silent_s": None}
     return tuple(base[c] for c in fleet_reads.LEG_COLUMNS)
 
 

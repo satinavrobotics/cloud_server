@@ -1210,8 +1210,9 @@ and the top level has `efficiency` (the run's block, same shape as run-stats' be
 | `from_topomap_node`, `to_topomap_node` | Topomap node ids, or `null`: only a mission whose `planned_path` lines up one-to-one with its route waypoints (planner go-tos) has them; a rerouted or hand-made route has none. The first leg of a pass has no `from_topomap_node` |
 | `map_id` | Map of the route |
 | `started_at`, `ended_at` | Robot clock (VDA5050 header time). `received_started_at`, `received_ended_at`: dispatcher clock |
-| `duration_s`, `stopped_s` | Leg time; part of it the robot reported `driving: false` |
-| `straight_m`, `planned_m` | Map-frame distance between the two waypoints (`null` for a leg that starts at the robot's own position) |
+| `duration_s`, `stopped_s`, `silent_s`, `moving_s` | Leg time, split by the robot's state messages (additive, stage C of the edge statistics). `stopped_s`: time after a message with `driving: false` (a missing `driving` counts as driving), at most 30 s per interval between two messages. `silent_s`: the part of every interval above 30 s (no messages: a link or dispatcher gap), whatever `driving` said. `moving_s` = max(0, `duration_s` - `stopped_s` - `silent_s`). Recovery time is not subtracted (it overlaps `stopped_s`, and a recovery maneuver may report driving). `silent_s` and `moving_s` are `null` on a leg recorded before 2026-10-27 (the silent time is unknown) |
+| `straight_m`, `planned_m` | `straight_m`: map-frame straight-line distance between the two waypoints (`null` for a leg that starts at the robot's own position). `planned_m`: the length of the plan between them: the polyline of the route node's plan trajectory when the leg is two adjacent waypoints of one route node whose trajectory entry ends where the leg ends (`plan_source` `trajectory`), else `straight_m` (`straight`: no trajectory entry; `stale`: an entry whose ends are not the leg's, after a reroute). Legs recorded before 2026-10-27 have `planned_m` = `straight_m` and `plan_source` `null` |
+| `plan_source`, `from_chart`, `to_chart`, `graph_version` | `plan_source`: `trajectory` \| `straight` \| `stale` \| `null` (recorded before 2026-10-27, or no plan: `straight_m` is `null`). `from_chart`, `to_chart`: the scene-graph chart key of the leg's start and end waypoint as the planner stored them with the route (`null` for the robot's own position, a hand-made route or a route without them); `graph_version`: the scene-graph version those keys were made on. The edge statistics use `planned_m` as the leg's distance |
 | `expected_s` | `d / speed_max + speed_max / acceleration_max + abs(delta heading) / angular_speed_max` from the robot's factsheet; a term whose limit is unknown (-1) is dropped, `null` when nothing is known or the start has no pose |
 | `recoveries`, `recovery_s`, `blocks` | `recoveries` counts recovery EPISODES (as `map_events`: a `NAV.RECOVERY_ENTERED` right after another ENTERED of the run, without an EXITED in between, is the same recovery); `recovery_s` sums the `NAV.RECOVERY_EXITED` durations; `blocks` counts `NAV.GOAL_BLOCKED` + `MISSION.EDGE_BLOCKED`; events tagged with the leg, filled when the run ends (events arriving later are not counted; runs ended before this rule counted every ENTERED) |
 
@@ -1224,8 +1225,8 @@ expected_s`; `p90_s` is linearly interpolated. 404 when the mission has no run.
 
 `GET /api/v1/runs/{run_id}` also returns `run.planned_path` (the mission's planned path when the
 run started) and, once the run has ended, `run.summary_metrics`: `leg_count`, `duration_s`,
-`distance_m`, `time_moving_s`, `time_stopped_s` (rest of the run: non-driving time and time
-outside any leg), `time_recovery_s` (overlaps stopped time), `recovery_count`, `block_count`,
+`distance_m`, `time_moving_s` (the legs' `moving_s`; `duration_s - stopped_s` for a leg without it), `time_stopped_s` (rest of the run: everything that is not moving, incl. time
+outside any leg), `time_silent_s` (the legs' `silent_s`, part of `time_stopped_s`), `time_recovery_s` (overlaps stopped time), `recovery_count`, `block_count`,
 `expected_s`, `actual_vs_expected` (time of the legs that have an expected time over their
 expected sum), `pass_durations_s` (`[{pass, legs, duration_s}]`).
 

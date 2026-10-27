@@ -1,8 +1,10 @@
 """Per-edge traversal statistics of the topomap: GET /api/v1/maps/{map_id}/edge-stats and the
 writer for finished mapping sessions.
 
-Observations live in `edge_observations` (migration 20261011_01_edge_observations, newest 20 per
-map / edge / robot, packages/utils/edge_stats_db.py). Mission legs are written by mission-dispatch
+Observations live in `edge_observations` (migration 20261011_01_edge_observations, history index
+20261027_02_edge_obs_history, packages/utils/edge_stats_db.py). Every raw observation is
+kept (up to EDGE_STATS_RETENTION_DAYS); the window (the newest 20 per map / edge / robot, or per
+edge across robots when pooled) is applied on read, in SQL. Mission legs are written by mission-dispatch
 when a run ends (packages/controllers/mission/fleet_recorder.py); mapping sessions are written
 here, when the session is finished (`record_session`, called after the finishing transaction
 committed and the robot-side actions are done, as a background task: it never delays them, holds
@@ -55,11 +57,12 @@ CACHE = ResultCache(config.EDGE_STATS_CACHE_ENTRIES, config.EDGE_STATS_CACHE_TTL
 
 async def _grouped(db: Any, graph: Any, map_id: str, robot: Optional[str], pooled: bool
                    ) -> List[Dict[str, Any]]:
-    """Every item (all counts) of the map, read from Postgres + ArangoDB. 503 when ArangoDB
+    """Every item (all counts) of the map, read from Postgres (only the window of each edge) +
+    ArangoDB. 503 when ArangoDB
     cannot be read (not cached: the cache keeps successes only)."""
     try:
         async with maps.open_store(db, uuid.uuid4()) as store:
-            observations = await edge_stats_db.fetch(store.cursor, map_id, robot)
+            observations = await edge_stats_db.fetch(store.cursor, map_id, robot, pooled)
     except maps._SCHEMA_ERRORS as exc:
         raise maps._undefined_table(exc) from exc
     try:

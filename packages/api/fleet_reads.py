@@ -427,7 +427,8 @@ LEG_COLUMNS = ("run_id", "seq", "mission_name", "robot_name", "pass_index", "ord
                "from_vda_node", "to_vda_node", "from_topomap_node", "to_topomap_node", "map_id",
                "started_at", "ended_at", "received_started_at", "received_ended_at",
                "duration_s", "stopped_s", "straight_m", "planned_m", "expected_s",
-               "recoveries", "recovery_s", "blocks")
+               "recoveries", "recovery_s", "blocks", "plan_source", "from_chart", "to_chart",
+               "graph_version", "moving_s", "silent_s")
 _LEG_SELECT = ", ".join(LEG_COLUMNS)
 # The legs a mission aggregate looks at: every run of the mission and of its reruns.
 MISSION_LEGS_MAX = 200000

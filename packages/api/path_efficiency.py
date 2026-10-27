@@ -8,8 +8,12 @@ A LEG is one `run_legs` row: the move between two consecutive reached waypoints 
 * planned_m  the length of the lattice plan path between those two waypoints: the polyline of
              `mission_tree[i].route.trajectory` (plan trajectory work, docs/plan_trajectory_2026-10-14.md) leg
              `from_index = k-1, to_index = k`, found from the leg's VDA node ids (`...-n{i}-s{2k+2}`). A leg
-             without a (valid) trajectory falls back to `run_legs.straight_m` (= `planned_m`, the straight line
-             between the two waypoints: a LOWER bound of the plan, so those legs are reported separately).
+             without a (valid) trajectory falls back to the straight line between the two waypoints (a LOWER bound
+             of the plan, so those legs are reported separately). Legs recorded since stage B of the edge
+             statistics carry the answer (`run_legs.plan_source`, `planned_m`: dispatch compared the live route's
+             trajectory with the leg when it ended, docs/path_efficiency_2026-10-15.md) and are read as recorded;
+             older legs (plan_source NULL, `planned_m` = `straight_m`) are worked out here from the run's stored
+             route snapshot. The rules are packages/utils/plan_length.py.
 * driven_m   the path length of the robot's map-frame track (`robot_track_ts.x_map/y_map`) while the leg was in
              progress (`leg_seq`), with the drive_stats movement rules: a pair of consecutive rows of one run
              (same session and run epoch) farther apart than DRIVE_STATS_MAX_GAP_S or faster than
@@ -24,6 +28,7 @@ import dataclasses
 import datetime
 import json
 import logging
+import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -31,6 +36,7 @@ import numpy as np
 from packages import config
 from packages.api import drive_stats, fleet_reads
 from packages.api.result_cache import ResultCache
+from packages.utils import plan_length as plan_length_mod
 from packages.utils import run_legs
 
 logger = logging.getLogger("ApiDelegationService.path_efficiency")
@@ -43,48 +49,34 @@ UTC = datetime.timezone.utc
 parse_node = run_legs.parse_node     # (tree index, sequence) of "{prefix}-n{i}-s{seq}", else None
 
 
-def polyline_m(points: Sequence[Sequence[float]]) -> float:
-    if len(points) < 2:
-        return 0.0
-    a = np.asarray(points, float)
-    return float(np.hypot(*np.diff(a, axis=0).T).sum())
-
-
-@dataclasses.dataclass
-class Trajectory:
-    """The stored plan of one route node: waypoints (x, y) and the trajectory legs by (from, to) index."""
-    waypoints: List[Tuple[float, float]]
-    legs: Dict[Tuple[int, int], List[List[float]]]
-
-
-def parse_trajectory(waypoints: Any, trajectory: Any) -> Optional[Trajectory]:
-    try:
-        wps = [(float(w[0]), float(w[1])) for w in waypoints or []]
-        legs = {(int(t["from_index"]), int(t["to_index"])): t["points"] for t in trajectory or []
-                if len(t["points"]) >= 2}
-    except (TypeError, ValueError, KeyError, IndexError):
-        return None
-    return Trajectory(wps, legs) if legs else None
+polyline_m = plan_length_mod.polyline_m
+Trajectory = plan_length_mod.Trajectory
+parse_trajectory = plan_length_mod.parse_trajectory
 
 
 def plan_length(leg: Dict[str, Any], trajs: Dict[Tuple[Any, int], Trajectory]) -> Tuple[Optional[float], Optional[str]]:
     """(planned metres, source) of a leg: "trajectory" | "straight" | "stale" (a trajectory exists but does not
     match the leg: the route was replanned after the run's snapshot, straight is used) | None without any plan
-    (the first leg of an order starts at the robot, not at a waypoint)."""
+    (the first leg of an order starts at the robot, not at a waypoint). A leg recorded with `plan_source`
+    (stage B, dispatch worked it out from the live route) is read as recorded: "trajectory" with its stored
+    `planned_m`; any other recorded source is "straight" / "stale" with the straight line, whatever the snapshot
+    holds now. A leg recorded before (plan_source NULL) is worked out here from the run's stored snapshot
+    (`mission_runs.mission_tree`), whose waypoints are compared with the leg's recorded `straight_m`."""
     straight = leg.get("straight_m")
+    recorded = leg.get("plan_source")
+    if recorded is not None:
+        planned = leg.get("planned_m") if recorded == plan_length_mod.SOURCE_TRAJECTORY else straight
+        return (None if planned is None else float(planned)), (recorded if planned is not None else None)
     src, dst = parse_node(leg.get("from_vda_node")), parse_node(leg.get("to_vda_node"))
-    traj = None
+    points, matches = None, False
     if src and dst and src[0] == dst[0] and dst[1] >= 4 and dst[1] % 2 == 0 and src[1] == dst[1] - 2:
         traj = trajs.get((leg["run_id"], dst[0]))
         k = dst[1] // 2 - 1
         points = traj.legs.get((k - 1, k)) if traj else None
-        if points is not None:
-            if straight is not None and k < len(traj.waypoints):
-                a, b = traj.waypoints[k - 1], traj.waypoints[k]
-                if abs(float(np.hypot(b[0] - a[0], b[1] - a[1])) - straight) <= config.EFFICIENCY_STALE_TOL_M:
-                    return polyline_m(points), "trajectory"
-            return (None if straight is None else float(straight)), ("stale" if straight is not None else None)
-    return (None if straight is None else float(straight)), ("straight" if straight is not None else None)
+        if points is not None and straight is not None and k < len(traj.waypoints):
+            a, b = traj.waypoints[k - 1], traj.waypoints[k]
+            matches = abs(math.hypot(b[0] - a[0], b[1] - a[1]) - straight) <= config.EFFICIENCY_STALE_TOL_M
+    return plan_length_mod.resolve(points, straight, matches)
 
 
 @dataclasses.dataclass
@@ -239,8 +231,8 @@ TRACK_SQL = (
     "coalesce(sum(dist * least(1, rec_s / dt)) FILTER (WHERE good AND dist >= %s * dt), 0) "
     "FROM ok GROUP BY run_id, seq")
 
-LEGS_SQL = ("SELECT l.run_id, l.seq, l.from_vda_node, l.to_vda_node, l.duration_s, l.straight_m, l.expected_s, "
-            "l.recovery_s FROM run_legs l "
+LEGS_SQL = ("SELECT l.run_id, l.seq, l.from_vda_node, l.to_vda_node, l.duration_s, l.straight_m, l.planned_m, "
+            "l.plan_source, l.expected_s, l.recovery_s FROM run_legs l "
             "WHERE l.run_id IN (SELECT run_id FROM mission_runs WHERE {where}) ORDER BY l.run_id, l.seq LIMIT %s")
 
 TRAJ_SQL = ("SELECT r.run_id, (t.i - 1)::int, "
@@ -250,8 +242,8 @@ TRAJ_SQL = ("SELECT r.run_id, (t.i - 1)::int, "
             "WHERE r.run_id IN (SELECT run_id FROM mission_runs WHERE {where}) "
             "AND jsonb_typeof(t.n->'route'->'trajectory') = 'array'")
 
-LEG_COLUMNS = ("run_id", "seq", "from_vda_node", "to_vda_node", "duration_s", "straight_m", "expected_s",
-               "recovery_s")
+LEG_COLUMNS = ("run_id", "seq", "from_vda_node", "to_vda_node", "duration_s", "straight_m", "planned_m",
+               "plan_source", "expected_s", "recovery_s")
 
 
 @dataclasses.dataclass

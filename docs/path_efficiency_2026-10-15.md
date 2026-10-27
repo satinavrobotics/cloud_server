@@ -17,9 +17,13 @@ are `...-n{i}-s{seq}` with `seq = 2k + 2` for waypoint `k` of tree node `i`; `se
 
 * **trajectory** (the headline): the polyline of `mission_runs.mission_tree[i].route.trajectory` leg `(k-1 -> k)` (docs/plan_trajectory_2026-10-14.md),
   the lattice path the planner priced. Used only when the leg is two adjacent waypoints of one route node.
-* **straight** (fallback, reported apart): `run_legs.planned_m` = `straight_m` = the distance between the two reached waypoints. This is
-  what `run_legs` always meant by `planned_m`: it is NOT the lattice path, it is a lower bound of it, so a ratio against it reads as detour
-  even for a perfect drive. Used for runs before 2026-10-14, for route nodes without a trajectory, for legs between route nodes.
+* **straight** (fallback, reported apart): the distance between the two reached waypoints (`straight_m`). Until 2026-10-27 `run_legs.planned_m`
+  was always this: it is NOT the lattice path, it is a lower bound of it, so a ratio against it reads as detour even for a perfect drive. Used
+  for runs before 2026-10-14, for route nodes without a trajectory, for legs between route nodes.
+* **Recorded plan (stage B, 2026-10-27)**: dispatch now compares the live route's trajectory with the leg when the leg ends and stores the answer in
+  `run_legs.plan_source` (`trajectory` | `straight` | `stale`) with `planned_m` = the polyline length for `trajectory` (packages/utils/plan_length.py,
+  the same rules as below, the ends compared with the poses the robot was sent to). Such legs are read as recorded. Legs with `plan_source` NULL
+  (older, `planned_m` = `straight_m`) are classified at read time from the run's stored route snapshot as before.
 * **stale**: a trajectory exists but does not match the leg (see Replans). The straight line is used, and the leg is counted as `straight`.
 * The first leg of an order (`from seq 0`: the robot's own pose, not a waypoint) has `straight_m` null: no plan, excluded (`no_plan`).
 

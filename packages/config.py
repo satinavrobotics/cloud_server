@@ -644,14 +644,18 @@ RECORDER_RECONCILE_MIN_AGE_S = float(os.getenv("RECORDER_RECONCILE_MIN_AGE_S", "
 # Trajectory rows logged this long after the run ended still belong to it.
 RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
 
-# Per-edge traversal statistics of the topomap (packages/utils/edge_stats.py): the newest
-# EDGE_STATS_WINDOW observations of each (map, edge, robot) are kept and summarised. An observation
+# Per-edge traversal statistics of the topomap (packages/utils/edge_stats.py): every raw observation
+# is kept (append-only, up to EDGE_STATS_RETENTION_DAYS); the newest EDGE_STATS_WINDOW observations
+# of each (map, edge, robot) are read and summarised (the window is applied on read). An observation
 # with a duration over EDGE_STATS_MAX_DURATION_S (a paused session, a stuck robot) or a speed over
 # EDGE_STATS_MAX_SPEED_MPS (bursty MQTT delivery, a wrong clock) is dropped, as is a duration <= 0.
 # A MAPPING step (two consecutive session nodes) slower than EDGE_STATS_MIN_SPEED_MPS is dropped
 # too: the session was paused or the robot stood still, so its time is no traversal time (legs are
 # not filtered by a minimum speed).
 EDGE_STATS_WINDOW = int(os.getenv("EDGE_STATS_WINDOW", "20"))
+# Observations older than this many days (by observed_at) are deleted, in bounded batches, by the
+# mission-dispatch recorder (hourly). 0 = keep forever.
+EDGE_STATS_RETENTION_DAYS = int(os.getenv("EDGE_STATS_RETENTION_DAYS", "365"))
 
 # GET /api/v1/maps/{id}/drive-stats (docs/drive_stats_2026-10-14.md): per-tile / per-region driving
 # statistics from the recorded map-frame track. A consecutive pair of track rows further apart than

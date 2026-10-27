@@ -32,7 +32,7 @@ import signal
 import time
 import time as _wall_time
 import uuid
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 from collections import OrderedDict, deque
 
 import fastapi
@@ -529,8 +529,17 @@ def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
     # change the digest of a route stored before it existed (a mission in flight at
     # deploy would otherwise read as rerouted and its progress be ignored).
     # `trajectory` is display data (the planner's dense path): adding or refreshing it must not read as a reroute.
-    return hashlib.sha1(
-        route.json(sort_keys=True, exclude_none=True, exclude={"trajectory"}).encode()).hexdigest()[:16]
+    # Likewise the recording data `graph_version` and each waypoint's `chart_key` (nothing the robot drives).
+    return hashlib.sha1(route.json(
+        sort_keys=True, exclude_none=True,
+        exclude={"trajectory": True, "graph_version": True, "waypoints": {"__all__": {"chart_key"}}}
+    ).encode()).hexdigest()[:16]
+
+
+def _same_waypoints(a: Sequence[Any], b: Sequence[Any]) -> bool:
+    """Whether two waypoint lists drive the same route (the recording field `chart_key` is not compared)."""
+    return len(a) == len(b) and all(
+        x.dict(exclude={"chart_key"}) == y.dict(exclude={"chart_key"}) for x, y in zip(a, b))
 
 
 # Precomputed once: handle_instant_action() and _order_action_state() test every action
@@ -1006,7 +1015,8 @@ class Robot:
             if not plan.get("success") or not plan.get("waypoints"):
                 raise RuntimeError(plan.get("error") or "the planner returned no route")
             route = mission_object.MissionRouteNodeV1(waypoints=plan["waypoints"],
-                                                      trajectory=plan.get("trajectory"))
+                                                      trajectory=plan.get("trajectory"),
+                                                      graph_version=plan.get("graph_version"))
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not replan the go-to ({err}); "
                          "using the route stored when it was submitted")
@@ -1072,7 +1082,8 @@ class Robot:
                     self._name, next(iter(maps)), [w.dict() for w in waypoints],
                     insert_planned=insert, timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
                 route = mission_object.MissionRouteNodeV1(waypoints=result["waypoints"],
-                                                          trajectory=result.get("trajectory"))
+                                                          trajectory=result.get("trajectory"),
+                                                          graph_version=result.get("graph_version"))
                 report = result.get("node_policy") or {}
                 inserted = int(result.get("inserted") or 0)
             except Exception as err:  # pylint: disable=broad-except
@@ -2020,7 +2031,7 @@ class Robot:
                     # waypoints only: the trajectory is display data (a client that does not know it
                     # sends the route without it)
                     if n.name == new_node.name and new_node.route is not None and \
-                            n.route.waypoints != new_node.route.waypoints:
+                            not _same_waypoints(n.route.waypoints, new_node.route.waypoints):
                         self._note_replaced_route(n)
                         n.route = new_node.route
                         changed.append(str(n.name))

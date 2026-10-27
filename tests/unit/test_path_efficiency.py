@@ -173,9 +173,10 @@ class FakeDb:
 
 def respond_ok(sql, params):
     if "FROM run_legs l" in sql:
-        return [(RUN, 2, node(1, 2), node(1, 4), 10.0, 2 ** 0.5, 5.0, 0.0),
-                (RUN, 3, node(1, 4), node(1, 6), 10.0, 1.0, 5.0, 0.0),
-                (RUN, 4, node(1, 6), node(1, 8), 10.0, 2 ** 0.5, 5.0, 0.0)]
+        # legs recorded before stage B: planned_m == straight_m, plan_source NULL
+        return [(RUN, 2, node(1, 2), node(1, 4), 10.0, 2 ** 0.5, 2 ** 0.5, None, 5.0, 0.0),
+                (RUN, 3, node(1, 4), node(1, 6), 10.0, 1.0, 1.0, None, 5.0, 0.0),
+                (RUN, 4, node(1, 6), node(1, 8), 10.0, 2 ** 0.5, 2 ** 0.5, None, 5.0, 0.0)]
     if "FROM robot_track_ts" in sql:
         return [(RUN, 2, 10, 0, 2.2, 2.2, 0.2), (RUN, 3, 10, 0, 1.0, 1.0, 0.0), (RUN, 4, 10, 0, 2.0, 2.0, 0.0)]
     if "jsonb_array_elements(r.mission_tree)" in sql:
@@ -219,3 +220,16 @@ async def test_annotate_legs_per_leg_fields():
     assert items[0]["path_ratio"] == round(2.0 / 2.2, 4) and items[0]["efficiency_excluded"] is None
     assert items[2]["plan_m"] is None and items[2]["path_ratio"] is None
     assert top["efficiency"]["legs"] == 3
+
+
+def test_recorded_plan_source_is_read_as_recorded():
+    """Legs recorded by stage B carry plan_source and planned_m: no snapshot is needed, and a stale or straight
+    leg stays so whatever trajectory the run's snapshot holds now."""
+    legs = [{**leg(1, 1, 1.0), "planned_m": 1.4, "plan_source": "trajectory"},
+            {**leg(2, 2, 1.0), "planned_m": 1.0, "plan_source": "stale"},
+            {**leg(3, 3, 1.0), "planned_m": 1.0, "plan_source": "straight"},
+            {**leg(4, 4, None, first=True), "planned_m": None, "plan_source": None}]
+    assert pe.plan_length(legs[0], {}) == (1.4, "trajectory")
+    assert pe.plan_length(legs[1], {(RUN, 1): traj(WPS)}) == (1.0, "stale")
+    assert pe.plan_length(legs[2], {(RUN, 1): traj(WPS)}) == (1.0, "straight")
+    assert pe.plan_length(legs[3], {}) == (None, None)

@@ -62,6 +62,7 @@ class TestRules:
     def test_thresholds_are_the_config(self):
         assert (config.EDGE_STATS_WINDOW, config.EDGE_STATS_MAX_SPEED_MPS,
                 config.EDGE_STATS_MAX_DURATION_S) == (20, 2.0, 3600.0)
+        assert config.EDGE_STATS_RETENTION_DAYS == 365
 
     def test_speed_rules_default_to_the_drive_stats_ones(self):
         # deliberately the same movement rules as drive-stats / path efficiency (env vars may override)
@@ -90,6 +91,17 @@ class TestRules:
     def test_a_duration_that_rounds_to_zero_is_rejected_not_stored_as_zero(self):
         assert es.leg_observation(self.leg(duration_s=0.0004, straight_m=0.0)) is None
         assert es.leg_observation(self.leg(duration_s=0.0006, straight_m=0.0))["duration_s"] == 0.001
+
+    def test_the_distance_is_the_plan_length_when_the_leg_has_one(self):
+        o = es.leg_observation(self.leg(straight_m=2.0, planned_m=3.0))
+        assert (o["distance_m"], o["speed_mps"]) == (3.0, 0.75)
+        o = es.leg_observation(self.leg(straight_m=2.0, planned_m=None))      # no plan length: the straight line
+        assert (o["distance_m"], o["speed_mps"]) == (2.0, 0.5)
+        o = es.leg_observation(self.leg(straight_m=2.0))                      # a row without the field (older caller)
+        assert o["distance_m"] == 2.0
+
+    def test_a_plan_length_that_makes_the_speed_impossible_is_rejected(self):
+        assert es.leg_observation(self.leg(duration_s=0.1, straight_m=0.1, planned_m=3.0)) is None
 
     def test_a_leg_without_a_distance_keeps_its_time(self):
         o = es.leg_observation(self.leg(straight_m=None))
@@ -201,34 +213,71 @@ class TestStore:
         assert params[store.COLUMNS.index("to_node")] == ["B", "C"]
         assert store.INSERT_SQL.count("::") == len(store.COLUMNS) and "unnest" in store.INSERT_SQL
 
-    async def test_prunes_to_the_newest_20_per_edge_and_robot(self):
+    async def test_store_keeps_every_raw_observation(self):
         db = FakeDB()
         cur = await cursor_of(db)
-        await store.store(cur, [obs(i) for i in range(25)] + [obs(i, robot="r2") for i in range(2)])
-        mine = sorted(k[5] for k in db.edge_obs if k[3] == "r1")
-        assert mine == [f"k{i:03d}" for i in range(5, 25)]              # the oldest 5 are gone
-        assert len([k for k in db.edge_obs if k[3] == "r2"]) == 2
-        # an older observation written later (a backfill) is pruned at once, not double counted
-        # (store() returns the rows INSERTED, so it counts the one pruned at once)
-        assert await store.store(cur, [obs(0)]) == 1
-        assert sorted(k[5] for k in db.edge_obs if k[3] == "r1") == mine
+        assert await store.store(cur, [obs(i) for i in range(25)]
+                                 + [obs(i, robot="r2") for i in range(2)]) == 27
+        assert len(db.edge_obs) == 27                                  # nothing pruned
+        assert await store.store(cur, [obs(0)]) == 0                   # a repeat: still idempotent
+        assert store.INSERT_SQL in db.statements and len(db.statements) == 2   # no prune statement
 
-    async def test_prune_is_limited_to_the_touched_edges(self):
+    async def test_fetch_cuts_the_window_per_edge_and_robot(self):
         db = FakeDB()
         cur = await cursor_of(db)
-        for r in [obs(i, src="A", dst="B") for i in range(25)]:     # as stored: over the window
-            db.edge_obs[tuple(r[c] for c in store.COLUMNS[:6])] = r
-        await store.store(cur, [obs(0, src="A", dst="C")])          # touches A->C only
-        assert len([k for k in db.edge_obs if k[2] == "B"]) == 25   # A->B left alone
-        await store.store(cur, [obs(30, src="A", dst="B")])
-        assert len([k for k in db.edge_obs if k[2] == "B"]) == 20
+        await store.store(cur, [obs(i) for i in range(25)] + [obs(i, robot="r2") for i in range(2)]
+                          + [obs(0, dst="C")])
+        rows = await store.fetch(cur, "yard")
+        mine = sorted(r["source_key"] for r in rows if r["robot_name"] == "r1"
+                      and r["to_node"] == "B")
+        assert mine == [f"k{i:03d}" for i in range(5, 25)]             # the newest 20
+        assert len([r for r in rows if r["robot_name"] == "r2"]) == 2
+        assert len([r for r in rows if r["to_node"] == "C"]) == 1
+        assert len(await store.fetch(cur, "yard", "r2")) == 2
+        assert len(await store.fetch(cur, "yard", window=3)) == 3 + 2 + 1
 
-    def test_prune_params_are_the_touched_pairs_per_map_and_robot(self):
-        rows = [obs(0, src="A", dst="B"), obs(1, src="A", dst="B"), obs(2, src="C", dst="D"),
-                obs(3, robot="r2")]
-        assert store.prune_params(rows) == [
-            ("yard", "r1", ["A", "C"], ["B", "D"], "yard", "r1", 20),
-            ("yard", "r2", ["A"], ["B"], "yard", "r2", 20)]
+    async def test_fetch_pooled_cuts_per_edge_across_robots(self):
+        db = FakeDB()
+        cur = await cursor_of(db)
+        # r1 on the even seconds, r2 on the odd ones: the newest 20 of the pool are 30..49
+        await store.store(cur, [obs(i, robot="r1" if i % 2 == 0 else "r2") for i in range(50)])
+        rows = await store.fetch(cur, "yard", pooled=True)
+        assert sorted(r["observed_at"] for r in rows) == [secs(i) for i in range(30, 50)]
+        assert db.statements[-1] == store.SELECT_POOLED_SQL
+
+    def test_select_sql_orders_like_newest(self):
+        for sql in (store.SELECT_SQL, store.SELECT_POOLED_SQL):
+            assert 'ORDER BY observed_at DESC, source COLLATE "C" DESC, ' \
+                   'source_key COLLATE "C" DESC' in sql
+        assert "PARTITION BY from_node, to_node, robot_name " in store.SELECT_SQL
+        assert "PARTITION BY from_node, to_node " in store.SELECT_POOLED_SQL
+
+    async def test_purge_old_deletes_only_rows_older_than_the_retention_in_batches(self):
+        db = FakeDB()
+        cur = await cursor_of(db)
+        now = datetime.datetime.now(UTC)
+        old = [dict(obs(i), observed_at=now - datetime.timedelta(days=400, seconds=i))
+               for i in range(7)]
+        young = [dict(obs(10 + i), observed_at=now - datetime.timedelta(days=364, hours=i))
+                 for i in range(3)]
+        await store.store(cur, old + young)
+        conn = FakeConnection(db)
+        assert await store.purge_old(conn, days=0) == 0                 # 0 = keep forever
+        assert await store.purge_old(conn, batch=3) == 7                # batches of 3, 3, 1
+        assert db.statements.count(store.PURGE_SQL) == 3
+        assert sorted(k[5] for k in db.edge_obs) == ["k010", "k011", "k012"]
+
+class TestRetentionPass:
+    async def test_the_recorder_purges_old_observations_on_its_pool(self, tmp_path):
+        db = FakeDB()
+        rec = fr.FleetRecorder.__new__(fr.FleetRecorder)
+        rec._pool = FakePool(db)
+        old = dict(obs(0), observed_at=datetime.datetime.now(UTC) - datetime.timedelta(days=500))
+        await store.store(await cursor_of(db), [old, obs(1, observed_at=datetime.datetime.now(UTC))])
+        assert await rec.purge_edge_observations() == 1
+        assert [k[5] for k in db.edge_obs] == ["k001"]
+        db.unavailable = True
+        assert await rec.purge_edge_observations() == 0                # logged, never raises
 
 
 # --- writer 1: mission-dispatch at run end -----------------------------------------------------
@@ -265,6 +314,10 @@ class TestRunEndWriter:
         assert [r["duration_s"] for r in rows] == [8.0, 10.0]
         # recoveries / blocks come from the events tagged with the leg
         assert [(r["recoveries"], r["blocks"]) for r in rows] == [(0, 0), (1, 1)]
+        # stage C: the legs reported driving the whole time, so moving == duration (nothing stopped, no gap above
+        # 30 s); the recovery seconds are the EXITED durations (none here), and neither is subtracted from moving
+        assert [(r["moving_s"], r["stopped_s"], r["recovery_s"]) for r in rows] == [
+            (8.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
 
     async def test_recording_twice_does_not_double_count(self, tmp_path):
         rec, db, run_id = await self.run(tmp_path)
@@ -472,7 +525,8 @@ class TestRoute:
         first, second = out["items"]
         assert set(first) == {"from_node_id", "to_node_id", "robot", "count", "median_s", "p90_s",
                               "median_speed_mps", "last_observed_at", "recoveries", "blocks",
-                              "sources"}
+                              "sources", "median_moving_s", "moving_speed_mps", "recovery_s",
+                              "moving_count"}
         assert (first["from_node_id"], first["to_node_id"], first["robot"]) == ("A", "B", "r1")
         assert first["count"] == 20 and first["median_s"] == 12.5     # durations 3..22
         assert second["sources"] == {"leg": 0, "mapping": 3} and second["robot"] == "r2"
@@ -529,9 +583,9 @@ class TestRoute:
         reads = []
         real = store.fetch
 
-        async def counting(cursor, map_id, robot=None):
-            reads.append((map_id, robot))
-            return await real(cursor, map_id, robot)
+        async def counting(cursor, map_id, robot=None, pooled=False):
+            reads.append((map_id, robot, pooled))
+            return await real(cursor, map_id, robot, pooled)
         monkeypatch.setattr(store, "fetch", counting)
         await api.edge_stats(None, graph, "yard", limit=1)
         page2 = await api.edge_stats(None, graph, "yard", limit=1, offset=1)
@@ -540,7 +594,7 @@ class TestRoute:
         assert page2["items"][0]["robot"] == "r2" and thin["total"] == 1
         await api.edge_stats(None, graph, "yard", pooled=True)  # another key
         await api.edge_stats(None, graph, "yard", robot="r1")
-        assert len(reads) == 3
+        assert len(reads) == 3 and reads[1:] == [("yard", None, True), ("yard", "r1", False)]
         with pytest.raises(HTTPException) as exc:               # 404 on every request
             await api.edge_stats(None, graph, "nope")
         assert exc.value.status_code == 404 and len(reads) == 3
@@ -585,6 +639,9 @@ class FakeSources:
     def sessions(self):
         return list(self.session_list)
 
+    def count_fill(self):
+        return 7
+
     def session_rows(self, map_id, session_id):
         return self.graph.session_trace_nodes(map_id, session_id)
 
@@ -623,7 +680,7 @@ class SyncCursor:
 
 class TestBackfill:
     def test_collects_legs_and_sessions_on_edges_only(self):
-        rows, counts = bf.collect(FakeSources())
+        rows, counts = bf.collect(FakeSources(), now=secs(1000))
         assert sorted((o["source"], o["from_node"], o["to_node"]) for o in rows) == [
             ("leg", "n0", "n1"), ("mapping", "n0", "n1"), ("mapping", "n1", "n2")]
         assert counts["legs"] == 3 and counts["leg_unusable"] == 1       # the zero-time leg
@@ -632,23 +689,56 @@ class TestBackfill:
 
     def test_dry_run_is_the_default_and_writes_nothing(self):
         db, write = FakeDB(), FakeWrite(FakeDB())
-        out = bf.run(FakeSources(), write)
+        out = bf.run(FakeSources(), write, now=secs(1000))
         assert out["apply"] is False and write.opened == 0 and db.edge_obs == {}
 
     def test_apply_is_idempotent_and_matches_the_live_writers(self):
         db = FakeDB()
         sources = FakeSources()
-        out = bf.run(sources, FakeWrite(db), apply=True)
+        out = bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
         assert out["inserted"] == 3 and len(db.edge_obs) == 3
-        assert bf.run(sources, FakeWrite(db), apply=True)["inserted"] == 0
+        assert bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))["inserted"] == 0
         assert len(db.edge_obs) == 3
         leg = db.edge_obs[("yard", "n0", "n1", "r1", "leg", "run1:2")]
         assert leg["recoveries"] == 1
 
-    def test_keeps_only_the_newest_window_per_edge(self):
+    def test_fill_new_columns_only_fills_null_columns_of_leg_rows_and_is_idempotent(self):
+        db = FakeDB()
+        sources = FakeSources()
+        bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
+        key = ("yard", "n0", "n1", "r1", "leg", "run1:2")
+        mapping = [k for k in db.edge_obs if k[4] == "mapping"][0]
+        assert db.edge_obs[key]["stopped_s"] is None and db.edge_obs[key]["recovery_s"] is None
+        # run_legs has stopped / recovery for the old leg (since 20261004) and no moving_s (recorded before stage C)
+        db.legs[("run1", 2)] = {"stopped_s": 1.5, "recovery_s": 2.5, "moving_s": None}
+        db.edge_obs[mapping]["stopped_s"] = None
+        out = bf.run(sources, FakeWrite(db), apply=True, fill=True, now=secs(1000))
+        assert out["inserted"] == 0 and out["filled"] == 1
+        row = db.edge_obs[key]
+        assert (row["stopped_s"], row["recovery_s"], row["moving_s"]) == (1.5, 2.5, None)
+        assert db.edge_obs[mapping]["stopped_s"] is None                  # a mapping row is never touched
+        # a value that is already there is not overwritten, and a second run changes nothing
+        row["stopped_s"] = 9.0
+        assert bf.run(sources, FakeWrite(db), apply=True, fill=True, now=secs(1000))["filled"] == 0
+        assert row["stopped_s"] == 9.0
+
+    def test_without_the_flag_nothing_is_filled_and_the_dry_run_only_counts(self):
+        db = FakeDB()
+        sources = FakeSources()
+        bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
+        db.legs[("run1", 2)] = {"stopped_s": 1.5, "recovery_s": 2.5, "moving_s": None}
+        assert "filled" not in bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
+        assert db.edge_obs[("yard", "n0", "n1", "r1", "leg", "run1:2")]["stopped_s"] is None
+        dry = bf.run(sources, FakeWrite(db), fill=True, now=secs(1000))
+        assert dry["to_fill"] == 7 and "filled" not in dry
+        assert "UPDATE" in bf.FILL_SQL and bf.FILL_COUNT_SQL.startswith("SELECT count(*)")
+
+    def test_keeps_every_observation_within_the_retention(self):
         sources = FakeSources()
         sources.leg_rows = [dict(sources.leg_rows[0], seq=i, ended_at=secs(i), duration_s=1.0 + i)
                             for i in range(1, 31)]
         sources.session_list = []
-        rows, counts = bf.collect(sources)
-        assert len(rows) == 20 and min(o["duration_s"] for o in rows) == 12.0
+        rows, counts = bf.collect(sources, now=secs(1000))
+        assert len(rows) == 30 and counts["to_store"] == 30 and counts["too_old"] == 0
+        rows, counts = bf.collect(sources, now=T0 + datetime.timedelta(days=366))
+        assert rows == [] and counts["too_old"] == 30                   # past EDGE_STATS_RETENTION_DAYS

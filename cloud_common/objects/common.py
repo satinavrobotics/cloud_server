@@ -150,6 +150,12 @@ class Pose2D(pydantic.BaseModel):
                     "(set by the planner). Lets a node the robot reports blocked be kept "
                     "out of new routes.",
         default=None)
+    chart_key: Optional[str] = pydantic.Field(
+        description="The scene-graph chart this waypoint lies in, on the graph version the "
+                    "route was planned on (MissionRouteNodeV1.graph_version); set by the planner, "
+                    "None for a legacy or operator-drawn route. Recording data for the leg "
+                    "statistics (run_legs.from_chart / to_chart): never sent to the robot.",
+        default=None)
     skippable: Optional[bool] = pydantic.Field(
         description="May the robot skip this waypoint when it is blocked (nodePolicy "
                     "skippable)? Unset: no. Sent as skippable only together with a "
