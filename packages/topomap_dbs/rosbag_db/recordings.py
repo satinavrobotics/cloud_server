@@ -138,12 +138,23 @@ def sidecar_start(recorded_at: Optional[str]) -> Optional[datetime.datetime]:
     return (t.replace(tzinfo=ROBOT_TZ) if t.tzinfo is None else t).astimezone(datetime.timezone.utc)
 
 
+# A bag "starting" before this has a clock problem, not a 2019 recording (see interval).
+PLAUSIBLE_START = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+
+
 def interval(sidecar: Mapping[str, Any], metadata: Optional[Mapping[str, Any]]
              ) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], str]:
-    """(start, end, interval_source): 'metadata' | 'sidecar_start_only' (end == start) | 'none'."""
+    """(start, end, interval_source): 'metadata' | 'metadata_end_only' (end == start) |
+    'sidecar_start_only' (end == start) | 'none'."""
     if metadata:
         start = _utc(metadata["start_ns"])
-        return start, _utc(metadata["start_ns"] + metadata["duration_ns"]), "metadata"
+        end = _utc(metadata["start_ns"] + metadata["duration_ns"])
+        if start < PLAUSIBLE_START:
+            # One topic stamped with a sensor's time since boot (two July 2026 bags start at
+            # 1970-01-01 00:01:21): rosbag2's start is the earliest stamp, so the range would span
+            # decades and overlap every run. The end is still the real last message.
+            return end, end, "metadata_end_only"
+        return start, end, "metadata"
     start = sidecar_start(sidecar.get("recorded_at"))
     if start is not None:
         return start, start, "sidecar_start_only"
@@ -215,7 +226,7 @@ def _rank(row: Mapping[str, Any]) -> Tuple:
     """Which upload of a duplicated (robot, group_key, part) wins: has its object, then has the
     metadata interval, then the newest upload, then bag_id (deterministic)."""
     src = row["source"]
-    return (src["object_present"], src["interval_source"] == "metadata",
+    return (src["object_present"], src["interval_source"].startswith("metadata"),
             src["uploaded_at"] or "", src["sidecar"]["bag_id"])
 
 
@@ -243,7 +254,8 @@ def collect(sources: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """(rows to upsert, counts). `sources`: sidecars() -> sidecar dicts; stat(robot, bag_id) -> the
     bag object's {key, size, etag, last_modified} or None; read_range(key) -> a ReadRange."""
     counts: Dict[str, Any] = {"sidecars": 0, "bag_missing": 0, "metadata_missing": 0,
-                              "interval_source": {"metadata": 0, "sidecar_start_only": 0, "none": 0}}
+                              "interval_source": {"metadata": 0, "metadata_end_only": 0, "sidecar_start_only": 0,
+                                                  "none": 0}}
     rows = []
     for sidecar in sources.sidecars():
         counts["sidecars"] += 1

@@ -85,6 +85,14 @@ def test_metadata_interval_is_utc():
         rec.parse_bag_metadata(b"rosbag2_bagfile_information: {}")
 
 
+def test_a_start_stamped_from_boot_keeps_only_the_end():
+    # Seen on two July 2026 bags: starting_time 81 s after the epoch, end in 2026.
+    boot = {"start_ns": 81_031_301_000, "duration_ns": 1_783_437_543_000_000_000 - 81_031_301_000}
+    start, end, how = rec.interval({"recorded_at": "2026-07-08T15:19:00"}, boot)
+    assert how == "metadata_end_only" and start == end
+    assert end.year == 2026
+
+
 def test_sidecar_fallback_is_budapest_local_time_and_zero_length():
     start, end, how = rec.interval({"recorded_at": "2026-10-03T22:28:54"}, None)   # CEST, UTC+2
     assert (how, start, end) == ("sidecar_start_only", datetime.datetime(2026, 10, 3, 20, 28, 54, tzinfo=UTC),
@@ -151,7 +159,8 @@ def test_collect_dedupes_reuploads_and_uses_every_fallback():
     assert win["source"]["duplicates"] == ["u1", "u3"] and win["content_hash"] == "e-formidable-peacock/u2"
     assert by[(run, "raw")]["source"]["interval_source"] == "metadata"
     assert by[("x1", "bag")]["start"] is None and by[("x1", "bag")]["source"]["interval_source"] == "none"
-    assert counts["interval_source"] == {"metadata": 2, "sidecar_start_only": 0, "none": 1}
+    assert counts["interval_source"] == {"metadata": 2, "metadata_end_only": 0,
+                                         "sidecar_start_only": 0, "none": 1}
     assert counts["bag_missing"] == 2 and counts["metadata_missing"] == 1
 
 
