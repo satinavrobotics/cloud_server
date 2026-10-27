@@ -271,7 +271,8 @@ def build_snapshot(map_id: str, graph_version: int, robot_class: str, keys: Sequ
     `speed_max` / `speed_basis` the planning robot's (robot_class.speed_basis): anything but a real factsheet speed
     switches the term off. Status, in this order: "no_speed_max"; "no_build_for_version" (no stats object or a version
     never built); "version_mismatch" (the stats are of another graph version); "stamp_mismatch" (the two loads
-    straddled a rebuild); "no_stats" (a build that is not usable, or no row for the class or the pool)."""
+    straddled a rebuild, or a load's rows are of another build than its build row); "no_stats" (a build that is not
+    usable, or no row for the class or the pool)."""
     def neutral_with(status: str, stamp: Optional[str] = None) -> RegionPricing:
         return neutral(map_id, graph_version, robot_class, keys, model, status, stamp)
 
@@ -283,6 +284,10 @@ def build_snapshot(map_id: str, graph_version: int, robot_class: str, keys: Sequ
     if any(s.graph_version != graph_version for s in present):
         return neutral_with("version_mismatch")
     if len({s.stamp for s in present}) > 1:
+        return neutral_with("stamp_mismatch")
+    # rows and build row are two statements (region_stats_load.aload, READ COMMITTED): a rebuild committed between them
+    # gives the rows of one build under the stamp of the next. Every row carries its own build's stamp: check it.
+    if any(c.stamp != s.stamp for s in present for c in s.charts.values()):
         return neutral_with("stamp_mismatch")
     stamp = present[0].stamp
     if any(s.status not in USABLE_BUILDS for s in present):

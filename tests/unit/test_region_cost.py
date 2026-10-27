@@ -27,7 +27,9 @@ def stat(key, runs, len_m, moving_m, stopped_m=0.0, cls=CLS, norm_runs=None):
 
 
 def stats(rows, cls=CLS, version=3, stamp="st", status="ok"):
-    return RegionStats("m", version, cls, {r.chart_key: r for r in rows}, stamp, status, None)
+    """A load of one build: its rows carry the build's stamp, as region_stats.build_map writes them."""
+    return RegionStats("m", version, cls, {r.chart_key: dataclasses.replace(r, stamp=stamp) for r in rows}, stamp, status,
+                       None)
 
 
 def snap(class_rows, pooled_rows=None, model=None, keys=KEYS, version=3, speed_max=0.24, basis="factsheet", **kw):
@@ -249,6 +251,13 @@ class TestStatus:
         p = rc.build_snapshot("m", 3, CLS, KEYS, stats([A, B], stamp="one"), stats([A, B], cls="*", stamp="two"),
                               rc.CostModel(), 0.24)
         assert p.status == "stamp_mismatch"
+
+    def test_rows_of_another_build_than_the_build_row_are_refused(self):
+        # a rebuild committed between a load's two statements: old rows, the new build's stamp
+        old_rows = stats([A, B], stamp="old")
+        mixed = RegionStats("m", 3, CLS, old_rows.charts, "new", "ok", None)
+        p = rc.build_snapshot("m", 3, CLS, KEYS, mixed, stats([A, B], cls="*", stamp="new"), rc.CostModel(), 0.24)
+        assert p.status == "stamp_mismatch" and p.rho.tolist() == [0, 0, 0]
 
     def test_a_build_without_a_scene_graph_or_without_rows_has_no_stats(self):
         assert snap([A, B], status="no_scene_graph").status == "no_stats"
