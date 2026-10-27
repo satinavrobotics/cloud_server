@@ -95,9 +95,9 @@ def write(cursor: Any, observations: Iterable[Mapping[str, Any]],
     """The synchronous twin of edge_stats_db.store (same SQL). Returns the rows inserted."""
     observations = list(observations)
     inserted = 0
-    for obs in observations:
-        cursor.execute(db.INSERT_SQL, tuple(obs[c] for c in db.COLUMNS))
-        inserted += max(0, cursor.rowcount)
+    if observations:
+        cursor.execute(db.INSERT_SQL, db.insert_params(observations))
+        inserted = max(0, cursor.rowcount)
     for params in db.prune_params(observations, window):
         cursor.execute(db.PRUNE_SQL, params)
     return inserted

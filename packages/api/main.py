@@ -1200,16 +1200,17 @@ async def map_session_trajectory(map_id: str, session_id: str, from_index: Optio
 @app.get("/api/v1/maps/{map_id}/edge-stats")
 async def map_edge_stats(map_id: str, robot: Optional[str] = None,
                          min_count: Optional[int] = None, limit: Optional[int] = None,
-                         offset: Optional[int] = None):
+                         offset: Optional[int] = None, pooled: bool = False):
     """Per-edge traversal statistics of the map's topomap (read-only; groundwork for edge
     weights): for each (edge, robot) the count, median / p90 traversal time and median speed of
     the newest 20 observations (mission legs and mapping sessions), `last_observed_at` and the
-    recoveries / blocks seen on legs. `robot` filters, `min_count` (default 1) drops thin
+    recoveries / blocks seen on legs. `robot` filters, `pooled=true` (no `robot`) gives one item
+    per edge over the newest 20 observations of all robots (`robot: null`), `min_count` (default 1) drops thin
     edges, `limit` (1-200, default 100) / `offset` page ({total, next_offset}). 404 unknown map;
     422 bad query. Contract: packages/api/README.md."""
     _require_service()
     return await _site_call("map edge stats", edge_stats.edge_stats(
-        service.database, service.graph_db, map_id, robot, min_count, limit, offset))
+        service.database, service.graph_db, map_id, robot, min_count, limit, offset, pooled))
 
 
 @app.get("/api/v1/maps/{map_id}/drive-stats")

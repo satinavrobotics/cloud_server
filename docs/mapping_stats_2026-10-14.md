@@ -55,7 +55,7 @@ time). Looked up at read time, so figures survive chart splits and merges.
 
 ## Limits, cache, quality
 
-* Cache: `drive_stats.ResultCache` (16 entries, 120 s, single flight) per (map, robot); ETag + `Cache-Control: private,
+* Cache: `result_cache.ResultCache` (16 entries, 120 s, single flight) per (map, robot); ETag + `Cache-Control: private,
   max-age=60`. Open sessions advance with `now` (`window.now`), so a cached answer is up to 120 s behind.
 * Cost: one sessions query, one events query, one track query (bounded by the sessions' time span), one ArangoDB node query
   per session, one pass over the occupancy tiles (cached), chart views in 160 m chunks.

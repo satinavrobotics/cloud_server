@@ -18,6 +18,7 @@ import packages.api.main as main  # noqa: E402
 from packages import config  # noqa: E402
 from packages.api import edge_stats as api  # noqa: E402
 from packages.api import maps  # noqa: E402
+from packages.api.result_cache import ResultCache  # noqa: E402
 from packages.controllers.mission import fleet_recorder as fr  # noqa: E402
 from packages.utils import edge_stats as es  # noqa: E402
 from packages.utils import edge_stats_db as store  # noqa: E402
@@ -51,8 +52,8 @@ def obs(i, duration=2.0, src="A", dst="B", robot="r1", map_id="yard", source="le
 class TestRules:
     @pytest.mark.parametrize("duration, distance, reason", [
         (2.0, 1.0, None), (2.0, None, None), (0.0, 1.0, "duration"), (-1.0, 1.0, "duration"),
-        (None, 1.0, "duration"), (3601.0, 1.0, "too_long"), (1.0, 6.0, "too_fast"),
-        (1.0, 5.0, None), (0.0004, 1.0, "duration"), (0.0006, 0.0, None),
+        (None, 1.0, "duration"), (3601.0, 1.0, "too_long"), (1.0, 2.5, "too_fast"),
+        (1.0, 2.0, None), (0.0004, 1.0, "duration"), (0.0006, 0.0, None),
         (float("nan"), 1.0, "duration"), (float("inf"), 1.0, "duration"),
         (2.0, float("nan"), "distance"), (2.0, float("inf"), "distance")])
     def test_reject_reason(self, duration, distance, reason):
@@ -60,7 +61,12 @@ class TestRules:
 
     def test_thresholds_are_the_config(self):
         assert (config.EDGE_STATS_WINDOW, config.EDGE_STATS_MAX_SPEED_MPS,
-                config.EDGE_STATS_MAX_DURATION_S) == (20, 5.0, 3600.0)
+                config.EDGE_STATS_MAX_DURATION_S) == (20, 2.0, 3600.0)
+
+    def test_speed_rules_default_to_the_drive_stats_ones(self):
+        # deliberately the same movement rules as drive-stats / path efficiency (env vars may override)
+        assert config.EDGE_STATS_MAX_SPEED_MPS == config.DRIVE_STATS_MAX_SPEED_MS
+        assert config.EDGE_STATS_MIN_SPEED_MPS == config.DRIVE_STATS_MIN_SPEED_MS
 
     def leg(self, **extra):
         leg = {"run_id": "run", "seq": 3, "robot_name": "r1", "map_id": "yard",
@@ -113,8 +119,8 @@ class TestRules:
         assert es.session_observations("yard", "s", "r1", nodes) == out        # stable
 
     def test_a_slow_mapping_step_is_not_a_traversal_but_a_slow_leg_is(self):
-        # 1 m in 600 s = 0.0017 m/s (a paused session): dropped; 1 m in 40 s = 0.025 m/s: kept
-        nodes = [self.node(0, 0.0, 0), self.node(1, 1.0, 600), self.node(2, 2.0, 640)]
+        # 1 m in 600 s = 0.0017 m/s (a paused session): dropped; 1 m in 10 s = 0.1 m/s: kept
+        nodes = [self.node(0, 0.0, 0), self.node(1, 1.0, 600), self.node(2, 2.0, 610)]
         out = es.session_observations("yard", "s", "r1", nodes)
         assert [(o["from_node"], o["to_node"]) for o in out] == [("n1", "n2")]
         assert es.leg_observation(self.leg(duration_s=600.0, straight_m=1.0)) is not None
@@ -151,6 +157,14 @@ class TestStats:
                   for i in es.group_stats(rows)}
         assert counts == {("A", "B", "r1"): 20, ("A", "B", "r2"): 3, ("A", "C", "r1"): 2}
 
+    def test_pooled_groups_per_edge_over_all_robots(self):
+        rows = ([obs(i, robot="r1", duration=1.0) for i in range(15)]
+                + [obs(20 + i, robot="r2", duration=3.0) for i in range(10)])
+        [item] = es.group_stats(rows, pooled=True)
+        assert item["robot"] is None and item["count"] == 20             # the newest 20 of 25
+        assert item["median_s"] == 2.0 and item["sources"] == {"leg": 20, "mapping": 0}
+        assert len(es.group_stats(rows)) == 2                            # not pooled: per robot
+
     def test_observations_on_non_edges_are_ignored(self):
         edges = es.edge_set([{"from_node_id": "A", "to_node_id": "B"}])
         rows = [obs(0), obs(1, src="B", dst="A"), obs(2, dst="C")]     # B->A: the other direction
@@ -171,6 +185,21 @@ class TestStore:
         assert await store.store(cur, rows) == 3
         assert await store.store(cur, rows) == 0
         assert len(db.edge_obs) == 3
+
+    async def test_a_batch_is_one_insert_statement(self):
+        db = FakeDB()
+        cur = await cursor_of(db)
+        rows = [obs(i) for i in range(5)] + [obs(0)]                  # a repeat inside the batch
+        assert await store.store(cur, rows) == 5
+        assert db.statements.count(store.INSERT_SQL) == 1 and len(db.edge_obs) == 5
+        assert await store.store(cur, []) == 0                        # nothing: no statement at all
+        assert db.statements.count(store.INSERT_SQL) == 1
+
+    def test_insert_params_are_one_array_per_column(self):
+        params = store.insert_params([obs(0), obs(1, dst="C")])
+        assert len(params) == len(store.COLUMNS) == len(store.COLUMN_TYPES)
+        assert params[store.COLUMNS.index("to_node")] == ["B", "C"]
+        assert store.INSERT_SQL.count("::") == len(store.COLUMNS) and "unnest" in store.INSERT_SQL
 
     async def test_prunes_to_the_newest_20_per_edge_and_robot(self):
         db = FakeDB()
@@ -422,8 +451,14 @@ def seeded(monkeypatch):
     for r in rows:                                       # as stored: no prune here
         db.edge_obs[tuple(r[c] for c in store.COLUMNS[:6])] = r
     monkeypatch.setattr(maps, "open_store", FakeMaps(db))
+    monkeypatch.setattr(api, "CACHE", ResultCache(4, 60.0))
     graph = FakeGraph([], [("A", "B"), ("B", "C"), ("C", "D")])
     return db, graph
+
+
+def put(db, *rows):
+    for r in rows:
+        db.edge_obs[tuple(r[c] for c in store.COLUMNS[:6])] = r
 
 
 class TestRoute:
@@ -470,10 +505,61 @@ class TestRoute:
             await api.edge_stats(None, seeded[1], "nope")
         assert exc.value.status_code == 404
 
+    async def test_pooled_groups_across_robots_and_echoes_the_flag(self, seeded):
+        db, graph = seeded
+        # r2 drove A->B too: 3 newer, slower observations (durations 100 s)
+        put(db, *[obs(30 + i, duration=100.0, src="A", dst="B", robot="r2") for i in range(3)])
+        out = await api.edge_stats(None, graph, "yard", pooled=True)
+        assert out["pooled"] is True and out["robot"] is None and out["total"] == 2
+        ab, bc = out["items"]
+        assert (ab["from_node_id"], ab["to_node_id"], ab["robot"]) == ("A", "B", None)
+        # the newest 20 of all 25 rows: the 3 r2 rows + r1's newest 17 (durations 6..22, median of the 20 = 15.5)
+        assert ab["count"] == 20 and ab["median_s"] == 15.5 and ab["sources"] == {"leg": 20, "mapping": 0}
+        assert bc["robot"] is None and bc["count"] == 3
+        per_robot = await api.edge_stats(None, graph, "yard")
+        assert per_robot["pooled"] is False and per_robot["total"] == 3
+        assert [i["robot"] for i in per_robot["items"]] == ["r1", "r2", "r2"]
+
+    async def test_pooled_is_ignored_when_a_robot_is_given(self, seeded):
+        out = await api.edge_stats(None, seeded[1], "yard", robot="r2", pooled=True)
+        assert out["pooled"] is False and out["robot"] == "r2" and out["items"][0]["robot"] == "r2"
+
+    async def test_the_grouped_list_is_cached_but_the_map_check_and_filters_are_not(self, seeded, monkeypatch):
+        db, graph = seeded
+        reads = []
+        real = store.fetch
+
+        async def counting(cursor, map_id, robot=None):
+            reads.append((map_id, robot))
+            return await real(cursor, map_id, robot)
+        monkeypatch.setattr(store, "fetch", counting)
+        await api.edge_stats(None, graph, "yard", limit=1)
+        page2 = await api.edge_stats(None, graph, "yard", limit=1, offset=1)
+        thin = await api.edge_stats(None, graph, "yard", min_count=4)
+        assert len(reads) == 1                                  # one read for three requests
+        assert page2["items"][0]["robot"] == "r2" and thin["total"] == 1
+        await api.edge_stats(None, graph, "yard", pooled=True)  # another key
+        await api.edge_stats(None, graph, "yard", robot="r1")
+        assert len(reads) == 3
+        with pytest.raises(HTTPException) as exc:               # 404 on every request
+            await api.edge_stats(None, graph, "nope")
+        assert exc.value.status_code == 404 and len(reads) == 3
+
+    async def test_a_503_is_not_cached(self, seeded):
+        db, graph = seeded
+        graph.edges_fail = True
+        with pytest.raises(HTTPException):
+            await api.edge_stats(None, graph, "yard")
+        graph.edges_fail = False
+        assert (await api.edge_stats(None, graph, "yard"))["total"] == 2
+
     async def test_the_route_passes_through(self, seeded, monkeypatch):
         monkeypatch.setattr(main, "service", SimpleNamespace(database=None, graph_db=seeded[1]))
         out = await main.map_edge_stats("yard", robot="r1", min_count=1, limit=5, offset=0)
         assert out["total"] == 1 and out["limit"] == 5 and out["robot"] == "r1"
+        pooled = await main.map_edge_stats("yard", robot=None, min_count=1, limit=5, offset=0,
+                                           pooled=True)
+        assert pooled["pooled"] is True and {i["robot"] for i in pooled["items"]} == {None}
 
 
 # --- the backfill ------------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import pytest  # noqa: E402
 
 import packages.api.main as main  # noqa: E402
 from packages.api import drive_stats as ds  # noqa: E402
+from packages.api.result_cache import ResultCache  # noqa: E402
 from packages.api import map_events, map_series, mapping_stats as mst, run_stats, series_axis as ax  # noqa: E402
 
 pytestmark = pytest.mark.unit
@@ -126,7 +127,7 @@ def eff(monkeypatch):
 async def test_run_stats_series_day(eff):
     db = FakeDb(rs_respond)
     out = {"window": {"from": START.isoformat(), "to": END.isoformat()}}
-    out = await map_series.attach_run_stats(out, db, "office7", None, None, None, "day", cache=ds.ResultCache(4, 60))
+    out = await map_series.attach_run_stats(out, db, "office7", None, None, None, "day", cache=ResultCache(4, 60))
     s = out["series"]
     assert s["bucket"] == "day" and s["t"] == ["2026-10-10T00:00:00+00:00", "2026-10-11T00:00:00+00:00",
                                                "2026-10-12T00:00:00+00:00"]
@@ -163,7 +164,7 @@ async def test_run_stats_series_run(eff):
             return [("ra",)]
         raise AssertionError(sql)
     out = await map_series.attach_run_stats({"window": {"from": START.isoformat(), "to": END.isoformat()}},
-                                            FakeDb(respond), "m", None, None, None, "run", cache=ds.ResultCache(4, 60))
+                                            FakeDb(respond), "m", None, None, None, "run", cache=ResultCache(4, 60))
     s = out["series"]
     assert s["bucket"] == "run" and s["run_id"] == ["ra", "rb"]                   # oldest first
     assert s["outcome"] == ["canceled", "completed"] and s["duration_s"] == [30.0, 90.0]
@@ -175,12 +176,12 @@ async def test_series_failure_degrades_but_422_propagates(monkeypatch):
     def boom(sql, params):
         raise RuntimeError("db down")
     out = await map_series.attach_run_stats({"window": {"from": START.isoformat(), "to": END.isoformat()}},
-                                            FakeDb(boom), "m", None, None, None, "run", cache=ds.ResultCache(4, 60))
+                                            FakeDb(boom), "m", None, None, None, "run", cache=ResultCache(4, 60))
     assert out["series"] is None and "series unavailable" in out["data_quality"]["notes"][0]
     with pytest.raises(Exception) as err:
         await map_series.attach_run_stats({"window": {"from": START.isoformat(),
                                                       "to": (START + datetime.timedelta(days=200)).isoformat()}},
-                                          FakeDb(boom), "m", None, None, None, "day", cache=ds.ResultCache(4, 60))
+                                          FakeDb(boom), "m", None, None, None, "day", cache=ResultCache(4, 60))
     assert err.value.status_code == 422
 
 
@@ -190,7 +191,7 @@ async def test_series_is_cached():
     def respond(sql, params):
         calls.append(sql)
         return []
-    cache = ds.ResultCache(4, 60)
+    cache = ResultCache(4, 60)
     db = FakeDb(respond)
     for _ in range(2):
         await map_series.attach_run_stats({"window": {"from": START.isoformat(), "to": END.isoformat()}},
@@ -218,7 +219,7 @@ async def test_events_series():
         assert sql.startswith("WITH raw") and "GROUP BY 1, 2, 3" in sql
         return rows
     out = {"window": {"from": START.isoformat(), "to": END.isoformat()}, "total_episodes": 1}
-    got = await map_series.attach_events(out, FakeDb(respond), "m", None, None, None, cache=ds.ResultCache(4, 60))
+    got = await map_series.attach_events(out, FakeDb(respond), "m", None, None, None, cache=ResultCache(4, 60))
     s = got["series"]
     assert "series" not in out                                       # the cached summary is not mutated
     assert s["total"] == [6, 0, 4] and s["safety"] == [2, 0, 1]

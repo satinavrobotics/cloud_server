@@ -86,8 +86,7 @@ async def test_migration_store_window_idempotency_and_prune_scope(cursor):
     assert await keys(cursor) == [f"k{i:03d}" for i in range(5, 25)]       # nothing changed
 
     # the prune only touches the edges just written: put A->C over the window by hand
-    await cursor.executemany(store.INSERT_SQL, [tuple(o[c] for c in store.COLUMNS)
-                                                for o in (obs(i, dst="C") for i in range(23))])
+    await cursor.execute(store.INSERT_SQL, store.insert_params(obs(i, dst="C") for i in range(23)))
     await store.store(cursor, [obs(100, src="X", dst="Y")])
     assert len(await keys(cursor, dst="C")) == 23                           # untouched edge
     await store.store(cursor, [obs(101, dst="C")])
@@ -99,7 +98,7 @@ async def test_migration_store_window_idempotency_and_prune_scope(cursor):
     assert len(await keys(cursor, robot="r2")) == 3
     import psycopg
     with pytest.raises(psycopg.errors.CheckViolation):
-        await cursor.execute(store.INSERT_SQL, tuple(dict(obs(0, dst="Z"), duration_s=0.0)[c]
-                                                     for c in store.COLUMNS))
+        await cursor.execute(store.INSERT_SQL,
+                             store.insert_params([dict(obs(0, dst="Z"), duration_s=0.0)]))
     fetched = await store.fetch(cursor, "yard", "r2")
     assert len(fetched) == 3 and fetched[0]["map_id"] == "yard"

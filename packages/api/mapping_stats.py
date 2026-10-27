@@ -32,6 +32,7 @@ from fastapi import HTTPException
 from packages import config
 from packages.api import drive_stats as ds
 from packages.api import fleet_reads, maps
+from packages.api.result_cache import ResultCache
 from packages.api import session_trace as st_api
 from packages.events.codes import EventCode
 from packages.utils import map_sessions as ms
@@ -41,7 +42,7 @@ logger = logging.getLogger("ApiDelegationService.mapping_stats")
 
 CELL_M = ds.CELL_M
 OCC_CELL_M = 0.05
-CACHE = ds.ResultCache(config.DRIVE_STATS_CACHE_ENTRIES, config.DRIVE_STATS_CACHE_TTL_S)
+CACHE = ResultCache(config.DRIVE_STATS_CACHE_ENTRIES, config.DRIVE_STATS_CACHE_TTL_S)
 GAP_CHUNK_M = ds.REGION_CHUNK_CELLS * CELL_M
 
 
@@ -430,7 +431,7 @@ def session_series(per: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 # --- the endpoint --------------------------------------------------------------------------------
 
 async def mapping_stats(db: Any, graph: Any, reads: Any, occupancy: Any, map_id: str, robot: Optional[str] = None,
-                        cache: Optional[ds.ResultCache] = None, now: Optional[datetime.datetime] = None,
+                        cache: Optional[ResultCache] = None, now: Optional[datetime.datetime] = None,
                         series: Optional[str] = None) -> Tuple[bytes, str]:
     """(JSON body, ETag) of GET /api/v1/maps/{map_id}/mapping-stats. 404 unknown map.
     `series="session"` adds the per-session `series` block (the newest SERIES_SESSIONS sessions)."""

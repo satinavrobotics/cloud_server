@@ -14,6 +14,7 @@ from fastapi import HTTPException  # noqa: E402
 pytest.importorskip("psycopg")
 
 from packages.api import drive_stats as ds  # noqa: E402
+from packages.api.result_cache import ResultCache  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -217,7 +218,7 @@ def patched(monkeypatch):
 
 
 def call(reads, graph=None, cache=None, **kw):
-    cache = cache or ds.ResultCache(4, 60.0)
+    cache = cache or ResultCache(4, 60.0)
     raw, etag = asyncio.run(ds.drive_stats(None, graph or FakeGraph({}), reads, kw.pop("map_id", "m"),
                                            cache=cache, **kw))
     return json.loads(raw), etag
@@ -323,7 +324,7 @@ class TestEndpoint:
 class TestCache:
     def test_ttl_and_single_flight(self):
         now = [0.0]
-        cache = ds.ResultCache(2, 10.0, clock=lambda: now[0])
+        cache = ResultCache(2, 10.0, clock=lambda: now[0])
         runs = []
 
         async def compute():
@@ -345,7 +346,7 @@ class TestCache:
         asyncio.run(go())
 
     def test_error_is_not_cached(self):
-        cache = ds.ResultCache(2, 10.0)
+        cache = ResultCache(2, 10.0)
         n = []
 
         async def bad():
@@ -367,7 +368,7 @@ class TestRoute:
         patched(track=track_run("a", [0.05, 0.8]))
         monkeypatch.setattr(main, "service", SimpleNamespace(database=None, graph_db=FakeGraph({})))
         monkeypatch.setattr(main, "_scene_graph_reads", lambda: FakeReads())
-        monkeypatch.setattr(ds, "CACHE", ds.ResultCache(4, 60.0))
+        monkeypatch.setattr(ds, "CACHE", ResultCache(4, 60.0))
 
         def get(inm=None):
             req = SimpleNamespace(headers={"if-none-match": inm} if inm else {})

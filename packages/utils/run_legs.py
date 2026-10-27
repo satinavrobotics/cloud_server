@@ -23,6 +23,14 @@ def known(limit: Any) -> bool:
         and math.isfinite(limit) and limit > 0
 
 
+def parse_node(vda_node: Optional[str]) -> Optional[Tuple[int, int]]:
+    """(tree node index, sequence) of a VDA node id "{prefix}-n{i}-s{seq}" we generate, else None
+    (also for an order id, which has no sequence). The same grammar as packages/controllers/mission/
+    order_ids.py (_NODE_SUFFIX), which the API image does not carry."""
+    match = _VDA_TAIL.search(vda_node or "")
+    return (int(match.group(1)), int(match.group(2))) if match and match.group(2) else None
+
+
 def wrap_angle(angle: float) -> float:
     return (angle + math.pi) % (2 * math.pi) - math.pi
 

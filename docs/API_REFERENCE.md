@@ -1213,7 +1213,7 @@ and the top level has `efficiency` (the run's block, same shape as run-stats' be
 | `duration_s`, `stopped_s` | Leg time; part of it the robot reported `driving: false` |
 | `straight_m`, `planned_m` | Map-frame distance between the two waypoints (`null` for a leg that starts at the robot's own position) |
 | `expected_s` | `d / speed_max + speed_max / acceleration_max + abs(delta heading) / angular_speed_max` from the robot's factsheet; a term whose limit is unknown (-1) is dropped, `null` when nothing is known or the start has no pose |
-| `recoveries`, `recovery_s`, `blocks` | Counts from `NAV.RECOVERY_ENTERED/EXITED`, `NAV.GOAL_BLOCKED`, `MISSION.EDGE_BLOCKED` events tagged with the leg; filled when the run ends (events arriving later are not counted) |
+| `recoveries`, `recovery_s`, `blocks` | `recoveries` counts recovery EPISODES (as `map_events`: a `NAV.RECOVERY_ENTERED` right after another ENTERED of the run, without an EXITED in between, is the same recovery); `recovery_s` sums the `NAV.RECOVERY_EXITED` durations; `blocks` counts `NAV.GOAL_BLOCKED` + `MISSION.EDGE_BLOCKED`; events tagged with the leg, filled when the run ends (events arriving later are not counted; runs ended before this rule counted every ENTERED) |
 
 **`GET /api/v1/missions/{name}/legs`** -- legs of all non-archived runs of the mission and its
 `-rerun-<n>` reruns grouped by leg identity (`from` -> `to`: the topomap node ids, else the

@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from packages import config
 from packages.api import fleet_reads
-from packages.api.drive_stats import ResultCache
+from packages.api.result_cache import ResultCache
 from packages.events.codes import EventCode
 
 UTC = datetime.timezone.utc

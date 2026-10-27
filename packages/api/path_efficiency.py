@@ -24,26 +24,23 @@ import dataclasses
 import datetime
 import json
 import logging
-import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from packages import config
 from packages.api import drive_stats, fleet_reads
+from packages.api.result_cache import ResultCache
+from packages.utils import run_legs
 
 logger = logging.getLogger("ApiDelegationService.path_efficiency")
 
 UTC = datetime.timezone.utc
-_NODE = re.compile(r"-n(\d+)-s(\d+)$")
 
 
 # --- pure core -----------------------------------------------------------------------------------
 
-def parse_node(vda_node: Optional[str]) -> Optional[Tuple[int, int]]:
-    """(tree index, sequence) of "{prefix}-n{i}-s{seq}", else None."""
-    m = _NODE.search(vda_node or "")
-    return (int(m.group(1)), int(m.group(2))) if m else None
+parse_node = run_legs.parse_node     # (tree index, sequence) of "{prefix}-n{i}-s{seq}", else None
 
 
 def polyline_m(points: Sequence[Sequence[float]]) -> float:
@@ -311,11 +308,11 @@ def compute(loaded: Loaded) -> Optional[Dict[str, Any]]:
     return summarize(leg_records(loaded.legs, loaded.tracks, loaded.trajs), loaded.truncated)
 
 
-CACHE = drive_stats.ResultCache(config.EFFICIENCY_CACHE_ENTRIES, config.EFFICIENCY_CACHE_TTL_S)
+CACHE = ResultCache(config.EFFICIENCY_CACHE_ENTRIES, config.EFFICIENCY_CACHE_TTL_S)
 
 
 async def map_efficiency(db: Any, map_id: str, start: datetime.datetime, end: datetime.datetime,
-                         robot: Optional[str], key: Any = None, cache: Optional[drive_stats.ResultCache] = None
+                         robot: Optional[str], key: Any = None, cache: Optional[ResultCache] = None
                          ) -> Optional[Dict[str, Any]]:
     """The `efficiency` block of a map window (cached; the SQL and numpy work do not block the event loop)."""
     cache = CACHE if cache is None else cache

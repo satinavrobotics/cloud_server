@@ -12,6 +12,7 @@ for _k in ("ARANGO_PASSWORD", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY", "POSTGRES_
 import pytest  # noqa: E402
 
 from packages.api import drive_stats, path_efficiency as pe  # noqa: E402
+from packages.api.result_cache import ResultCache  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -48,6 +49,7 @@ def test_parse_node_and_polyline():
     assert pe.parse_node("loop3-rerun-17-ra9-n1-s14") == (1, 14)
     assert pe.parse_node("x-n2-s0") == (2, 0)
     assert pe.parse_node(None) is None and pe.parse_node("nothing") is None
+    assert pe.parse_node("m-n3") is None and pe.parse_node("a-n1-s2-n5") is None   # an order id, a node reference
     assert pe.polyline_m([[0, 0], [3, 0], [3, 4]]) == pytest.approx(7.0)
     assert pe.polyline_m([[0, 0]]) == 0.0
 
@@ -185,7 +187,7 @@ def respond_ok(sql, params):
 
 async def test_map_block_through_the_loader_and_cache():
     db = FakeDb(respond_ok)
-    cache = drive_stats.ResultCache(4, 60.0)
+    cache = ResultCache(4, 60.0)
     end = T0 + datetime.timedelta(days=1)
     out = await pe.map_efficiency(db, "office7", T0, end, None, cache=cache)
     assert out["legs"] == 3 and out["driven_m"] == 5.2 and out["planned_m"] == 5.0

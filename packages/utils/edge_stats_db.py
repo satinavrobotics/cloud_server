@@ -8,9 +8,16 @@ from packages import config
 
 COLUMNS = ("map_id", "from_node", "to_node", "robot_name", "source", "source_key", "observed_at",
            "duration_s", "distance_m", "speed_mps", "recoveries", "blocks")
+# Column types of edge_observations, for the unnest of INSERT_SQL.
+COLUMN_TYPES = ("text", "text", "text", "text", "text", "text", "timestamptz", "float8", "float8",
+                "float8", "int", "int")
+# ONE statement inserts the whole batch: every column is a parallel array (insert_params), so the
+# round trips do not grow with the batch and the cursor's rowcount is the number of rows inserted
+# (executemany would give a per-statement count). A row that already exists, also one repeated in
+# the batch, is skipped.
 INSERT_SQL = (
     f"INSERT INTO edge_observations ({', '.join(COLUMNS)}) "
-    f"VALUES ({', '.join(['%s'] * len(COLUMNS))}) "
+    f"SELECT * FROM unnest({', '.join(f'%s::{t}[]' for t in COLUMN_TYPES)}) "
     "ON CONFLICT (map_id, from_node, to_node, robot_name, source, source_key) DO NOTHING"
 )
 # Delete all but the newest %s observations of every edge of one map and robot that is in the
@@ -30,6 +37,12 @@ SELECT_SQL = (
     f"SELECT {', '.join(COLUMNS)} FROM edge_observations WHERE map_id = %s "
     "AND (%s::text IS NULL OR robot_name = %s)"
 )
+
+
+def insert_params(observations: Iterable[Dict[str, Any]]) -> Tuple[List[Any], ...]:
+    """The INSERT_SQL parameters: one list per column of COLUMNS, one entry per observation."""
+    rows = list(observations)
+    return tuple([o[c] for o in rows] for c in COLUMNS)
 
 
 def prune_params(observations: Iterable[Dict[str, Any]], window: Optional[int] = None
@@ -55,9 +68,9 @@ async def store(cursor: Any, observations: Sequence[Dict[str, Any]],
     the number of rows INSERTED, which counts a new row that the prune removed at once (one
     older than the window of its edge) -- it is not the number of rows that remain."""
     inserted = 0
-    for obs in observations:
-        await cursor.execute(INSERT_SQL, tuple(obs[c] for c in COLUMNS))
-        inserted += max(0, cursor.rowcount)
+    if observations:
+        await cursor.execute(INSERT_SQL, insert_params(observations))
+        inserted = max(0, cursor.rowcount)
     for params in prune_params(observations, window):
         await cursor.execute(PRUNE_SQL, params)
     return inserted
