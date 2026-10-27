@@ -260,7 +260,17 @@ class MissionPlannerService:
             start_xy = await self._robot_xy_in_map(robot, map_id, robot_pose)
         except RobotNotPlacedError:
             return None, "robot_not_placed"       # the legacy path reports it to the caller
-        graph, version = await self._scene_cache.get(map_id, deadline)
+        # Keep-out zones are not "exclusions" a caller may ignore. A table that cannot be read is a refusal, never "no zones".
+        try:
+            keep_rows, keep_rev = await self.keepout_overlays().rows(map_id)
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Keep-out zones of map {map_id} not readable ({err!r}); not planning without them")
+            return None, REASON_KEEPOUT_UNREADABLE
+        # Chart / edge zones exist only on the scene graph: the legacy planner can neither place nor honour them and refuses, so
+        # for such a map an older graph beats no plan (a route stays on cells that graph knows are free; newly mapped areas are unknown
+        # to it, so it never uses them). The answer says so (`graph_stale`).
+        graph_zoned = any("polygon" not in r["spec"] for r in keep_rows)
+        graph, version = await self._scene_cache.get(map_id, deadline, tolerate_stale=graph_zoned)
         footprint = footprint_check.footprint_check(graph, self._robot_width(robot), self._robot_length(robot))
         if ctx is not None and footprint is not None:
             ctx["footprint"] = footprint
@@ -292,13 +302,11 @@ class MissionPlannerService:
 
         lag, rows = await asyncio.gather(lag_of(), rows_of())
         if lag is not None and lag > config.SCENE_GRAPH_MAX_VERSION_LAG_S:
-            return None, "stale_graph"
-        # Keep-out zones are not "exclusions" a caller may ignore. A table that cannot be read is a refusal, never "no zones".
-        try:
-            keep_rows, keep_rev = await self.keepout_overlays().rows(map_id)
-        except Exception as err:  # pylint: disable=broad-except
-            self.logger.warning(f"Keep-out zones of map {map_id} not readable ({err!r}); not planning without them")
-            return None, REASON_KEEPOUT_UNREADABLE
+            if not graph_zoned:
+                return None, "stale_graph"
+            if ctx is not None:
+                ctx["graph_stale"] = {"lag_s": round(float(lag), 1), "limit_s": config.SCENE_GRAPH_MAX_VERSION_LAG_S,
+                                      "graph_version": version, "reason": "keepout_zones_need_the_scene_graph"}
         keepout_for = None
         if keep_rows:
             def keepout_for(g: Any) -> Any:                # runs in the plan thread (tile reads)
@@ -440,7 +448,12 @@ class MissionPlannerService:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + float(config.SCENE_GRAPH_TOTAL_BUDGET_S)
         try:
-            graph, version = await self._scene_cache.get(map_id, deadline)
+            try:
+                zoned_rows, _ = await self.keepout_overlays().rows(map_id)
+            except Exception:  # pylint: disable=broad-except
+                zoned_rows = []
+            graph, version = await self._scene_cache.get(
+                map_id, deadline, tolerate_stale=any("polygon" not in r["spec"] for r in zoned_rows))
         except scene_route.ChartFallback as fb:
             self.logger.info(f"Route enrich: no scene graph for {map_id} ({fb.reason})")
             return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
@@ -1250,13 +1263,13 @@ class MissionPlannerService:
             return path, None
         if any("polygon" not in r["spec"] for r in rows):
             ids = [r["id"] for r in rows if "polygon" not in r["spec"]]
+            why = result.get("planner_fallback")
             result["error"] = ("The map has keep-out zones set by chart or edge, and the scene-graph planner that can "
-                               "apply them is not available" + (f" ({result.get('planner_fallback')})"
-                                                                 if result.get("planner_fallback") else "") +
+                               "apply them is not available" + (f" ({why})" if why else "") +
                                ": no route is planned. Zones: " + ", ".join(ids))
             result["failed_at"] = "keepout"
             result["keepout"] = {"applied": [], "unresolved": [], "unreachable": True, "reason": "keepout_unverifiable",
-                                 "forced_by": ids}
+                                 "forced_by": ids, "planner_fallback": why}
             return path, result
         try:
             nodes = self.graph_db.get_all_nodes(map_id)
@@ -1401,6 +1414,8 @@ class MissionPlannerService:
                 self._chart_outcomes.get(reason or "served", 0) + 1
             if chart is not None:
                 result.update(chart)
+                if ctx.get("graph_stale"):
+                    result["keepout"] = {**(result.get("keepout") or {}), "graph_stale": ctx["graph_stale"]}
                 result["map_id"] = map_id
                 result["goal"] = {"x": target_x, "y": target_y, "map_id": map_id,
                                   "node_id": chart["end_node_id"]}

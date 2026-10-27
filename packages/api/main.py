@@ -361,6 +361,9 @@ async def lifespan(app: FastAPI):
     health_checker.add_dependency("database", lambda: service.database.is_running(), critical=True)
 
     app.state.service = service
+    # the keep-out store reads the scene graph through THIS module's reader: `python -m packages.api.main` runs this file as
+    # __main__, and importing `packages.api.main` from server.py would build a second copy whose `service` is None (503 forever)
+    service.keepouts.set_reads(_scene_graph_reads)
     from packages.api.data_transfer import start_autosync, stop_autosync
     start_autosync(app)                 # idles until automatic sync is switched on (Servers page)
 

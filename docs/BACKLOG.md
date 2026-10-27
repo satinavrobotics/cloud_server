@@ -3,6 +3,13 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Keep-out zones on a stale graph, and the topology 503 (2026-10-27)
+
+Fixed on `fix/keepout-reroute` (`docs/keepout_zones.md` "Live findings"): the API's keep-out store imported `packages.api.main` (a second copy under `python -m`), so topology reads 503'd and zones showed `no_scene_graph`; the planner now plans on a stale graph when the map has chart/edge zones.
+- Not deployed. Needs api-delegation-service and mission-planner-service rebuilt.
+- The route preview does not yet report `graph_stale`; the client does not show `keepout.graph_stale` or `planner_fallback`.
+- A route on an older graph can miss an obstacle that appeared since (the same risk as any stale plan, bounded before by 120 s).
+
 ## Keep-out reroute: a detour the lazy reader could not read, root cause of the user's report not reproduced (2026-10-27)
 
 Branch `fix/keepout-reroute` (`docs/keepout_zones.md` "Reroute"). Fixed: the lazy reader's overlay search jumped from 3 rings of charts to every

@@ -768,10 +768,8 @@ class ApiDelegationService:
         self.view_settings = map_view_settings.ViewSettingsStore(self.database)
 
         # Keep-out zones of the scene graph (docs/keepout_zones.md); the scene-graph reads are looked up at call time (main.py builds them)
-        def _reads():
-            from packages.api import main as _api_main      # not at the top: main imports this module
-            return _api_main._scene_graph_reads()
-        self.keepouts = keepouts_api.KeepoutStore(self.database, _reads)
+        # (main.py hands the reader over with `keepouts.set_reads`: a module cannot import it back, see there)
+        self.keepouts = keepouts_api.KeepoutStore(self.database)
 
         async def mark_jobs_deleting(cursor, map_id):
             return {"reconstruction": await reconstruction.mark_map_deleting(cursor, map_id),
