@@ -57,6 +57,10 @@ from packages.scene_graph.store_codec import read_planes
 
 ROUTE_UNIT_M = weights.ROUTE_UNIT_M  # route cost unit (packages/scene_graph/weights.py)
 RES = 0.05                      # costmap cell; the lattice is 2 x RES (store.py)
+# Under an overlay (blocked cells: robot-reported blocks, keep-out zones) the corridor of the chart path may hold no route (a detour
+# leaves it): its rings widen by these hops (charts around the path) until a route is found or the ring holds every chart. A jump
+# from 3 hops straight to the whole graph needed every tile of the map (CorridorTooLarge on a big map) for a detour of 4 charts.
+RING_HOPS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024)
 TILE_L = 64                     # lattice cells per tile side (store.py)
 TILE_F = 2 * TILE_L             # costmap cells per tile side
 _CLR_CAP_M = 1.0                # clearance is computed exactly up to this (S9 of docs/scene_graph/route_safety.md), capped here;
@@ -607,9 +611,13 @@ class PlanGraph:
         path = self._path(ja, jb)
         found, rings, whole, exact, tiles = None, 0, path is None, True, 0
         if path is not None:
-            for hops in ((1, 2, 3) if overlay else (1,)):     # the engine's corridor; under an overlay widen until one exists
-                rings, found = hops, self._search(self._rings(path, hops), src, dst, blocked, safety=safety)
+            for hops in (RING_HOPS if overlay else (1,)):     # the engine's corridor; under an overlay widen until one exists
+                keep = self._rings(path, hops)
+                rings, found = hops, self._search(keep, src, dst, blocked, safety=safety)
                 if found is not None or not overlay:
+                    break
+                if len(keep) >= len(self.keys):
+                    whole = True                              # the ring held every chart: no route (nothing left to widen to)
                     break
             if (overlay or safety is not None) and found is not None:
                 # The engine searches every chart. Any route of length <= L lies in the charts whose anchors are within
@@ -627,7 +635,7 @@ class PlanGraph:
                                          jlimit=jlimit) or found
                 except CorridorTooLarge:
                     exact = False                              # the corridor's route stands: valid, maybe longer
-        if found is None:
+        if found is None and not (whole and path is not None):
             whole = True                                       # nothing in the corridor: the engine searches every chart
             found = self._search(set(range(len(self.keys))), src, dst, blocked, safety=safety)
         if found is not None and turn > 0.0:

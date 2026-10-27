@@ -1158,7 +1158,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         report = node_policy_plan.annotate_corridors(
             graph, poses, range(0, len(poses) - 1), node_policy_cfg.get("robot_width"),
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
-            node_policy_cfg.get("budget_s", 0.0), safety=safety)
+            node_policy_cfg.get("budget_s", 0.0), safety=safety,
+            blocked=Blocked(cells=kcells) if kcells is not None else None)
     pricing = None
     if safety is not None and safety.rate == 0.0:            # a turn cost alone: no clearance fields
         pricing = {"kappa": 0.0, "margin": None, "rate": 0.0, "margin_source": None, "cost": int(route.cost),

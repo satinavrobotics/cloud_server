@@ -3,6 +3,15 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Keep-out reroute: a detour the lazy reader could not read, root cause of the user's report not reproduced (2026-10-27)
+
+Branch `fix/keepout-reroute` (`docs/keepout_zones.md` "Reroute"). Fixed: the lazy reader's overlay search jumped from 3 rings of charts to every
+chart (`CorridorTooLarge` on a big map), and `plan_on_graph` measured corridor widths without the zones. Every other path was tested
+and routes around a zone when a way exists; the report itself is not reproduced on synthetic worlds.
+- Needs a look on the real map: the planner log line "Chart planner not used (reason)", `scene_graph.outcomes`, and the `issues[].reason` of the preview.
+- The client prints "No route between" for any unroutable leg; it does not show `blocked_by_keepout` (sati-client `utils/routePreview.ts` `describeIssues`).
+- A start/goal within the 0.2 m edge seal or inside a region has no route (by design); the editor does not say it is the zone.
+
 ## Bounded reconstruction cloud: open (2026-10-25)
 
 `cloud.ply?max_points=N` is built and unit-tested (`docs/reconstruction/point_budget.md`); not run on a Pi, against a real MinIO or behind the new nginx location.
