@@ -459,7 +459,8 @@ def leg_row(run_id, seq, src, dst, duration, expected=4.0, recoveries=0, recover
             "received_started_at": at(0), "received_ended_at": at(1), "duration_s": duration,
             "stopped_s": 0.0, "straight_m": 3.0, "planned_m": 3.0, "expected_s": expected,
             "recoveries": recoveries, "recovery_s": recovery_s, "blocks": blocks,
-            "plan_source": "straight", "from_chart": None, "to_chart": None, "graph_version": None}
+            "plan_source": "straight", "from_chart": None, "to_chart": None, "graph_version": None,
+            "moving_s": None, "silent_s": None}
     return tuple(base[c] for c in fleet_reads.LEG_COLUMNS)
 
 

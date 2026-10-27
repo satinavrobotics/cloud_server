@@ -203,6 +203,24 @@ class MissionRouteNodeV1(pydantic.BaseModel):
         values["trajectory"] = kept or None
         return values
 
+    def clear_stale_charts(self, previous: Optional["MissionRouteNodeV1"]) -> bool:
+        """For a route an operator supplied (a reroute, an edit of a PENDING mission) instead of the planner: clear
+        the recording data of the waypoints that are no longer where the planner put them. A waypoint keeps its
+        `chart_key` only if the route it replaces had a waypoint at the same index with the same x / y; if the
+        count changed (or there is no previous route) none does. Anything cleared also sets `graph_version` to None
+        (the keys that stay were made on a version this route no longer claims). Returns whether anything changed."""
+        old = list(previous.waypoints) if previous is not None else []
+        same_count = len(old) == len(self.waypoints)
+        cleared = False
+        for index, waypoint in enumerate(self.waypoints):
+            if waypoint.chart_key is not None and not (
+                    same_count and (old[index].x, old[index].y) == (waypoint.x, waypoint.y)):
+                waypoint.chart_key = None
+                cleared = True
+        if cleared:
+            self.graph_version = None
+        return cleared
+
     @pydantic.validator("waypoints")
     def _validate_at_least_one_waypoint(cls, value):
         if len(value) < 1:
@@ -704,6 +722,8 @@ class MissionObjectV1(MissionSpecV1, object.ApiObject):
         for node_name, route in update_nodes.items():
             for node in self.mission_tree:
                 if node.name == node_name:
+                    # not produced by the planner in this update: no stale chart on a waypoint that moved
+                    route.clear_stale_charts(node.route)
                     node.route = route
         self.planned_path = None
         self.route_rev += 1

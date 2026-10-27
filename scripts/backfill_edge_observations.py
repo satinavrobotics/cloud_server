@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fill edge_observations (per-edge traversal statistics) from data that already exists.
 
-    python scripts/backfill_edge_observations.py [--apply] [--compose-env docker_compose/.env]
+    python scripts/backfill_edge_observations.py [--apply | --fill-new-columns] [--compose-env docker_compose/.env]
     docker compose ... exec api-delegation-service python scripts/backfill_edge_observations.py
 
 Sources, both READ-ONLY: `run_legs` of finished runs (not RUNNING ones: dispatch writes those at
@@ -15,6 +15,15 @@ mission-dispatch would delete it at once.
 The default is a DRY RUN: it counts and prints, writes nothing (the Postgres session is READ ONLY).
 `--apply` writes `edge_observations`; it is idempotent (the primary key is the source's own id:
 run_id:seq, session_id:step), so running it again, or after the live writers ran, adds nothing.
+`--fill-new-columns` (instead of `--apply`; dry run unless combined with `--apply`) is the opt-in UPDATE mode for
+observations that already exist: for each leg observation (source 'leg', key `run_id:seq`) of a finished run it
+sets `stopped_s`, `recovery_s` and `moving_s` from the leg's `run_legs` row, ONLY where the observation's column is
+NULL (never overwrites, so it too is idempotent and does nothing to a row recorded after stage C). `stopped_s` and
+`recovery_s` exist on old legs (run_legs since 20261004). `moving_s` stays NULL for a leg recorded before stage C:
+the silent time inside it is unknown, so driving time cannot be told from silence (it is copied only from a leg
+that has it). Mapping rows are never touched. Without `--fill-new-columns` nothing is updated (INSERT ... DO
+NOTHING).
+
 Environment as scripts/export_map.py (the services' names; `--compose-env FILE` reads
 docker_compose/.env for a run on the cloud host against localhost).
 """
@@ -105,15 +114,45 @@ def write(cursor: Any, observations: Iterable[Mapping[str, Any]]) -> int:
     return max(0, cursor.rowcount)
 
 
+# Fill the NULL stage C columns of the leg observations of finished runs from their run_legs row
+# (`--fill-new-columns`). COALESCE keeps a value already there; moving_s is only copied from a leg that has it.
+_FILL_FROM = (
+    "FROM run_legs l JOIN mission_runs r USING (run_id) "
+    "WHERE o.source = 'leg' AND o.source_key = l.run_id::text || ':' || l.seq::text "
+    "AND r.state <> 'RUNNING' "
+    "AND ((o.stopped_s IS NULL AND l.stopped_s IS NOT NULL) "
+    "OR (o.recovery_s IS NULL AND l.recovery_s IS NOT NULL) "
+    "OR (o.moving_s IS NULL AND l.moving_s IS NOT NULL))"
+)
+FILL_SQL = ("UPDATE edge_observations o SET "
+            "stopped_s = COALESCE(o.stopped_s, l.stopped_s), "
+            "recovery_s = COALESCE(o.recovery_s, l.recovery_s), "
+            "moving_s = COALESCE(o.moving_s, l.moving_s) " + _FILL_FROM)
+# What FILL_SQL would change (the dry run's count).
+FILL_COUNT_SQL = "SELECT count(*) FROM edge_observations o, " + _FILL_FROM.replace("FROM ", "", 1)
+
+
+def fill_new_columns(cursor: Any) -> int:
+    """UPDATE the NULL stopped_s / recovery_s / moving_s of the leg observations from run_legs (FILL_SQL).
+    Returns the rows updated."""
+    cursor.execute(FILL_SQL)
+    return max(0, cursor.rowcount)
+
+
 def run(sources: Any, connect_write: Any = None, apply: bool = False,
-        now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
+        now: Optional[datetime.datetime] = None, fill: bool = False) -> Dict[str, Any]:
     """Collect, and with `apply` write through `connect_write()` (a context manager yielding a
-    cursor in a committing transaction). Returns the counts."""
+    cursor in a committing transaction). With `fill` (--fill-new-columns) the NULL stage C columns of
+    the existing leg observations are filled from run_legs too (counted when not `apply`). Returns the counts."""
     observations, counts = collect(sources, now)
     counts["apply"] = apply
     if apply:
         with connect_write() as cursor:
             counts["inserted"] = write(cursor, observations)
+            if fill:
+                counts["filled"] = fill_new_columns(cursor)
+    elif fill:
+        counts["to_fill"] = sources.count_fill()
     return counts
 
 
@@ -151,6 +190,11 @@ class Sources:
             cur.execute(LEGS_SQL)
             for row in cur:
                 yield dict(zip(LEG_FIELDS, row))
+
+    def count_fill(self) -> int:
+        with self.read.cursor() as cur:
+            cur.execute(FILL_COUNT_SQL)
+            return int(cur.fetchone()[0])
 
     def sessions(self):
         with self.read.cursor() as cur:
@@ -194,6 +238,9 @@ class _Writer:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--apply", action="store_true", help="write (default: dry run)")
+    p.add_argument("--fill-new-columns", action="store_true",
+                   help="also fill the NULL stopped_s / recovery_s / moving_s of existing leg "
+                        "observations from run_legs (with --apply; else only counted)")
     p.add_argument("--compose-env", help="read credentials from docker_compose/.env")
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -202,7 +249,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         from scripts import export_map
         env.update(export_map.compose_env(args.compose_env))
     sources = Sources(env)
-    summary = run(sources, sources.connect_write, apply=args.apply)
+    summary = run(sources, sources.connect_write, apply=args.apply, fill=args.fill_new_columns)
     print(json.dumps(summary, indent=1))
     if not args.apply:
         print("dry run: nothing written (pass --apply)")

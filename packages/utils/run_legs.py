@@ -139,8 +139,10 @@ def summarize(legs: Sequence[Mapping[str, Any]], run_duration_s: Optional[float]
       says which, and `plan_sources` counts them: "trajectory" | "straight" | "stale", "unrecorded" (a leg
       recorded before stage B: its planned_m is the straight line) and "none" (no straight line, no plan);
       only the keys that occur.
-    - time_moving_s: leg time while the robot reported driving; time_stopped_s: the rest of
-      the run (non-driving time inside legs, plus time outside any leg).
+    - time_moving_s: leg time while the robot reported driving: the legs' `moving_s` (duration - stopped - silent,
+      stage C) where recorded, else duration - stopped for a leg recorded before it (NULL moving_s). time_silent_s:
+      the legs' `silent_s` (gaps without state messages above 30 s; 0 for an older leg); it is part of
+      time_stopped_s (the rest of the run: everything that is not moving, plus time outside any leg).
     - time_recovery_s / recovery_count / block_count: from the events tagged with the legs.
       Recovery time overlaps stopped time, it is not a third share of the run.
     - expected_s: sum of the legs' expected_s; actual_vs_expected: actual time of those same
@@ -148,9 +150,11 @@ def summarize(legs: Sequence[Mapping[str, Any]], run_duration_s: Optional[float]
     - pass_durations_s: per pass, first leg start to last leg end."""
     ordered = sorted(legs, key=lambda l: l.get("seq") or 0)
     leg_time = sum(float(l.get("duration_s") or 0.0) for l in ordered)
-    leg_stopped = sum(min(float(l.get("stopped_s") or 0.0), float(l.get("duration_s") or 0.0))
-                      for l in ordered)
-    moving = leg_time - leg_stopped
+    moving = sum(float(l["moving_s"]) if l.get("moving_s") is not None else
+                 max(0.0, float(l.get("duration_s") or 0.0) - min(float(l.get("stopped_s") or 0.0),
+                                                                  float(l.get("duration_s") or 0.0)))
+                 for l in ordered)
+    silent = sum(float(l.get("silent_s") or 0.0) for l in ordered)
     distance = sum(float(l["planned_m"] if l.get("planned_m") is not None else l["straight_m"])
                    for l in ordered if l.get("planned_m") is not None
                    or l.get("straight_m") is not None)
@@ -183,6 +187,7 @@ def summarize(legs: Sequence[Mapping[str, Any]], run_duration_s: Optional[float]
         "plan_sources": plan_sources,
         "time_moving_s": _round(moving),
         "time_stopped_s": _round(stopped),
+        "time_silent_s": _round(silent),
         "time_recovery_s": _round(sum(float(l.get("recovery_s") or 0.0) for l in ordered)),
         "recovery_count": sum(int(l.get("recoveries") or 0) for l in ordered),
         "block_count": sum(int(l.get("blocks") or 0) for l in ordered),

@@ -211,6 +211,19 @@ class FakeDB:
                 if key not in self.edge_obs:
                     self.edge_obs[key] = row
                     cursor.rowcount += 1
+        elif sql.startswith("UPDATE edge_observations o SET"):
+            # scripts/backfill_edge_observations.py FILL_SQL: only the NULL columns of leg rows, from run_legs
+            for key, row in self.edge_obs.items():
+                if row["source"] != "leg":
+                    continue
+                for (run_id, seq), leg in self.legs.items():
+                    if f"{run_id}:{seq}" != row["source_key"]:
+                        continue
+                    changed = False
+                    for col in ("stopped_s", "recovery_s", "moving_s"):
+                        if row.get(col) is None and leg.get(col) is not None:
+                            row[col], changed = leg[col], True
+                    cursor.rowcount += int(changed)
         elif sql in (edge_stats_db.SELECT_SQL, edge_stats_db.SELECT_POOLED_SQL):
             # the window cut of the SQL: newest `window` per (edge, robot) or, pooled, per edge
             map_id, robot, _, window = params

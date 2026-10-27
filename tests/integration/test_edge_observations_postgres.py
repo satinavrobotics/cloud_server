@@ -1,4 +1,4 @@
-"""edge_observations (migrations 20261011_01, 20261027_02) and packages/utils/edge_stats_db.py on a real Postgres.
+"""edge_observations (migrations 20261011_01, 20261027_02, 20261027_04) and packages/utils/edge_stats_db.py on a real Postgres.
 
 Opt-in: set EDGE_STATS_TEST_DSN to a THROWAWAY database, e.g.
 
@@ -26,7 +26,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.requires_docker]
 VERSIONS = (pathlib.Path(__file__).resolve().parents[2] / "packages" / "api" / "migrations"
             / "versions")
 MIGRATIONS = (VERSIONS / "20261011_01_edge_observations.py",
-              VERSIONS / "20261027_02_edge_obs_history.py")
+              VERSIONS / "20261027_02_edge_obs_history.py",
+              VERSIONS / "20261027_04_leg_moving.py")
 UTC = datetime.timezone.utc
 T0 = datetime.datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -73,8 +74,10 @@ def obs(i, src="A", dst="B", robot="r1", map_id="yard", source="leg"):
 async def cursor():
     import psycopg
     async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as conn:
+        # migration 04 also adds two columns to run_legs: a stand-in table (the run_legs DDL is not this test's)
+        await conn.execute("DROP TABLE IF EXISTS run_legs; CREATE TABLE run_legs (run_id uuid)")
         for sql in (migration_sql("downgrade", MIGRATIONS[0]) + migration_sql("upgrade", MIGRATIONS[0])
-                    + migration_sql("upgrade", MIGRATIONS[1])):
+                    + migration_sql("upgrade", MIGRATIONS[1]) + migration_sql("upgrade", MIGRATIONS[2])):
             await conn.execute(sql)
         async with conn.cursor() as cur:
             yield cur

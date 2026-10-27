@@ -314,6 +314,10 @@ class TestRunEndWriter:
         assert [r["duration_s"] for r in rows] == [8.0, 10.0]
         # recoveries / blocks come from the events tagged with the leg
         assert [(r["recoveries"], r["blocks"]) for r in rows] == [(0, 0), (1, 1)]
+        # stage C: the legs reported driving the whole time, so moving == duration (nothing stopped, no gap above
+        # 30 s); the recovery seconds are the EXITED durations (none here), and neither is subtracted from moving
+        assert [(r["moving_s"], r["stopped_s"], r["recovery_s"]) for r in rows] == [
+            (8.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
 
     async def test_recording_twice_does_not_double_count(self, tmp_path):
         rec, db, run_id = await self.run(tmp_path)
@@ -521,7 +525,8 @@ class TestRoute:
         first, second = out["items"]
         assert set(first) == {"from_node_id", "to_node_id", "robot", "count", "median_s", "p90_s",
                               "median_speed_mps", "last_observed_at", "recoveries", "blocks",
-                              "sources"}
+                              "sources", "median_moving_s", "moving_speed_mps", "recovery_s",
+                              "moving_count"}
         assert (first["from_node_id"], first["to_node_id"], first["robot"]) == ("A", "B", "r1")
         assert first["count"] == 20 and first["median_s"] == 12.5     # durations 3..22
         assert second["sources"] == {"leg": 0, "mapping": 3} and second["robot"] == "r2"
@@ -634,6 +639,9 @@ class FakeSources:
     def sessions(self):
         return list(self.session_list)
 
+    def count_fill(self):
+        return 7
+
     def session_rows(self, map_id, session_id):
         return self.graph.session_trace_nodes(map_id, session_id)
 
@@ -693,6 +701,37 @@ class TestBackfill:
         assert len(db.edge_obs) == 3
         leg = db.edge_obs[("yard", "n0", "n1", "r1", "leg", "run1:2")]
         assert leg["recoveries"] == 1
+
+    def test_fill_new_columns_only_fills_null_columns_of_leg_rows_and_is_idempotent(self):
+        db = FakeDB()
+        sources = FakeSources()
+        bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
+        key = ("yard", "n0", "n1", "r1", "leg", "run1:2")
+        mapping = [k for k in db.edge_obs if k[4] == "mapping"][0]
+        assert db.edge_obs[key]["stopped_s"] is None and db.edge_obs[key]["recovery_s"] is None
+        # run_legs has stopped / recovery for the old leg (since 20261004) and no moving_s (recorded before stage C)
+        db.legs[("run1", 2)] = {"stopped_s": 1.5, "recovery_s": 2.5, "moving_s": None}
+        db.edge_obs[mapping]["stopped_s"] = None
+        out = bf.run(sources, FakeWrite(db), apply=True, fill=True, now=secs(1000))
+        assert out["inserted"] == 0 and out["filled"] == 1
+        row = db.edge_obs[key]
+        assert (row["stopped_s"], row["recovery_s"], row["moving_s"]) == (1.5, 2.5, None)
+        assert db.edge_obs[mapping]["stopped_s"] is None                  # a mapping row is never touched
+        # a value that is already there is not overwritten, and a second run changes nothing
+        row["stopped_s"] = 9.0
+        assert bf.run(sources, FakeWrite(db), apply=True, fill=True, now=secs(1000))["filled"] == 0
+        assert row["stopped_s"] == 9.0
+
+    def test_without_the_flag_nothing_is_filled_and_the_dry_run_only_counts(self):
+        db = FakeDB()
+        sources = FakeSources()
+        bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
+        db.legs[("run1", 2)] = {"stopped_s": 1.5, "recovery_s": 2.5, "moving_s": None}
+        assert "filled" not in bf.run(sources, FakeWrite(db), apply=True, now=secs(1000))
+        assert db.edge_obs[("yard", "n0", "n1", "r1", "leg", "run1:2")]["stopped_s"] is None
+        dry = bf.run(sources, FakeWrite(db), fill=True, now=secs(1000))
+        assert dry["to_fill"] == 7 and "filled" not in dry
+        assert "UPDATE" in bf.FILL_SQL and bf.FILL_COUNT_SQL.startswith("SELECT count(*)")
 
     def test_keeps_every_observation_within_the_retention(self):
         sources = FakeSources()

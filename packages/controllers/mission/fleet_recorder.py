@@ -168,12 +168,13 @@ ORPHAN_CANDIDATES_SQL = (
     "WHERE state = 'RUNNING' AND started_at < %s ORDER BY started_at"
 )
 SET_PLANNED_PATH_SQL = "UPDATE mission_runs SET planned_path = %s::jsonb WHERE run_id = %s"
-# Legs (run_legs, migrations 20261004_01_run_legs, 20261027_03_run_legs_plan).
+# Legs (run_legs, migrations 20261004_01_run_legs, 20261027_03_run_legs_plan, 20261027_04_leg_moving).
 LEG_COLUMNS = (
     "run_id", "seq", "mission_name", "robot_name", "pass_index", "order_rev", "from_vda_node",
     "to_vda_node", "from_topomap_node", "to_topomap_node", "map_id", "started_at", "ended_at",
     "received_started_at", "received_ended_at", "duration_s", "stopped_s", "straight_m",
-    "planned_m", "expected_s", "plan_source", "from_chart", "to_chart", "graph_version",
+    "planned_m", "expected_s", "plan_source", "from_chart", "to_chart", "graph_version", "moving_s",
+    "silent_s",
 )
 INSERT_LEG_SQL = (
     f"INSERT INTO run_legs ({', '.join(LEG_COLUMNS)}) "
@@ -207,22 +208,24 @@ LEG_EVENTS_SQL = (
 )
 RUN_LEGS_SQL = (
     "SELECT seq, pass_index, started_at, ended_at, duration_s, stopped_s, straight_m, "
-    "planned_m, expected_s, recoveries, recovery_s, blocks, plan_source FROM run_legs "
+    "planned_m, expected_s, recoveries, recovery_s, blocks, plan_source, moving_s, silent_s "
+    "FROM run_legs "
     "WHERE run_id = %s ORDER BY seq"
 )
 RUN_LEG_FIELDS = ("seq", "pass_index", "started_at", "ended_at", "duration_s", "stopped_s",
                   "straight_m", "planned_m", "expected_s", "recoveries", "recovery_s", "blocks",
-                  "plan_source")
+                  "plan_source", "moving_s", "silent_s")
 SET_SUMMARY_SQL = "UPDATE mission_runs SET summary_metrics = %s::jsonb WHERE run_id = %s"
 # The legs that become per-edge observations (utils/edge_stats.py), after the events filled their
 # recoveries / blocks. Their distance is planned_m (the plan's length) where there is one, else straight_m.
 EDGE_LEGS_SQL = (
     "SELECT run_id, seq, map_id, from_topomap_node, to_topomap_node, ended_at, duration_s, "
-    "straight_m, planned_m, recoveries, blocks FROM run_legs WHERE run_id = %s "
-    "AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL ORDER BY seq"
+    "straight_m, planned_m, recoveries, blocks, moving_s, stopped_s, recovery_s FROM run_legs "
+    "WHERE run_id = %s AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL ORDER BY seq"
 )
 EDGE_LEG_FIELDS = ("run_id", "seq", "map_id", "from_topomap_node", "to_topomap_node", "ended_at",
-                   "duration_s", "straight_m", "planned_m", "recoveries", "blocks")
+                   "duration_s", "straight_m", "planned_m", "recoveries", "blocks", "moving_s", "stopped_s",
+                   "recovery_s")
 
 MISSION_SQL = f"SELECT lifecycle, spec->>'robot', status FROM {MISSION_TABLE} WHERE name = %s"
 TRAJECTORY_SQL = (
@@ -582,7 +585,8 @@ class _WriteLeg(_Op):
                         leg.map_id or info.map_id, leg.started_at, leg.ended_at,
                         leg.received_started_at, leg.received_ended_at, leg.duration_s,
                         leg.stopped_s, leg.straight_m, leg.planned_m, leg.expected_s,
-                        leg.plan_source, leg.from_chart, leg.to_chart, leg.graph_version))
+                        leg.plan_source, leg.from_chart, leg.to_chart, leg.graph_version,
+                        leg.moving_s, leg.silent_s))
 
 
 class _MarkLevel(_Op):

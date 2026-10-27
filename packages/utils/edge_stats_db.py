@@ -1,6 +1,6 @@
 """SQL of the edge_observations table (migration 20261011_01_edge_observations, history index
-20261027_02_edge_obs_history), shared by mission-dispatch (leg observations at run end,
-the retention purge), the API (mapping sessions, the read route) and
+20261027_02_edge_obs_history, moving / stopped / recovery columns 20261027_04_leg_moving), shared by
+mission-dispatch (leg observations at run end, the retention purge), the API (mapping sessions, the read route) and
 scripts/backfill_edge_observations.py.
 
 Every raw observation is kept: store() only inserts. The window (newest EDGE_STATS_WINDOW per edge
@@ -13,10 +13,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from packages import config
 
 COLUMNS = ("map_id", "from_node", "to_node", "robot_name", "source", "source_key", "observed_at",
-           "duration_s", "distance_m", "speed_mps", "recoveries", "blocks")
+           "duration_s", "distance_m", "speed_mps", "recoveries", "blocks", "moving_s", "stopped_s",
+           "recovery_s")
 # Column types of edge_observations, for the unnest of INSERT_SQL.
 COLUMN_TYPES = ("text", "text", "text", "text", "text", "text", "timestamptz", "float8", "float8",
-                "float8", "int", "int")
+                "float8", "int", "int", "float8", "float8", "float8")
 # ONE statement inserts the whole batch: every column is a parallel array (insert_params), so the
 # round trips do not grow with the batch and the cursor's rowcount is the number of rows inserted
 # (executemany would give a per-statement count). A row that already exists, also one repeated in

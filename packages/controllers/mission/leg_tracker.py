@@ -31,6 +31,18 @@ there is no entry (first leg of an order, across route nodes, no trajectory; "st
 line (it starts at the robot's own position) has no plan: both NULL. `from_chart` / `to_chart` are the
 `Pose2D.chart_key` of the two waypoints and `graph_version` the route node's (None for a base node, a route
 without them).
+
+Time of a leg (stage C of the edge statistics). `duration_s` is end.ts - start.ts, split by the robot's own reports:
+
+- `stopped_s`: the intervals between two state messages that follow a message with `driving` false; one interval
+  counts at most MAX_INTERVAL_S (a silent robot is not "stopped"). `driving` missing (None) counts as driving.
+- `silent_s`: the part of every interval (whatever the previous message said about driving) above MAX_INTERVAL_S,
+  i.e. the time the tracker knows nothing about (no messages: a link or dispatcher gap). max(0, dt - MAX_INTERVAL_S)
+  per interval, so an interval is split into at most MAX_INTERVAL_S of stopped (if not driving) and the rest silent.
+- `moving_s` = max(0, duration_s - stopped_s - silent_s): the time with messages that said the robot was driving.
+- Recovery time (run_legs.recovery_s, from the NAV.RECOVERY_EXITED events, filled at run end) is NOT subtracted: it
+  overlaps stopped time and a recovery maneuver may report driving true, so subtracting it would count it twice.
+Both stopped_s and silent_s restart with the leg (the anchor moving to the next route node of the tree resets them).
 """
 import dataclasses
 import datetime
@@ -60,6 +72,7 @@ class Reach:
     topomap: Optional[str] = None
     chart: Optional[str] = None          # the waypoint's chart_key (None for a base node)
     stopped_s: float = 0.0               # non-driving time since this node was reached
+    silent_s: float = 0.0                # time in gaps above MAX_INTERVAL_S since this node was reached
     virtual: bool = False
 
 
@@ -86,6 +99,8 @@ class Leg:
     from_chart: Optional[str] = None
     to_chart: Optional[str] = None
     graph_version: Optional[int] = None
+    silent_s: float = 0.0                # see the module docstring: moving_s = duration - stopped - silent
+    moving_s: Optional[float] = None
 
 
 def _dist(a: Any, b: Any) -> float:
@@ -147,8 +162,10 @@ class LegTracker:
         # Time the robot spent not driving since the previous message, on the open leg.
         if self._prev is not None and self.anchor is not None:
             dt = (ts - self._prev[0]).total_seconds()
-            if 0 < dt and not self._prev[1]:
-                self.anchor.stopped_s += min(dt, MAX_INTERVAL_S)
+            if 0 < dt:
+                if not self._prev[1]:
+                    self.anchor.stopped_s += min(dt, MAX_INTERVAL_S)
+                self.anchor.silent_s += max(0.0, dt - MAX_INTERVAL_S)
         driving = getattr(message, "driving", None)
         self._prev = (ts, True if driving is None else bool(driving))
 
@@ -180,7 +197,7 @@ class LegTracker:
             elif anchor.node_idx != idx:
                 # The next route node of the tree: the robot is at the node it just reached.
                 self.anchor = dataclasses.replace(anchor, ts=ts, received=received,
-                                                  stopped_s=0.0, node_idx=idx)
+                                                  stopped_s=0.0, silent_s=0.0, node_idx=idx)
             return []
 
         info = table[idx]
@@ -222,13 +239,16 @@ class LegTracker:
             getattr(limits, "acceleration_max", None),
             getattr(limits, "angular_speed_max", None)) if planned is not None else None
         duration = max(0.0, (end.ts - start.ts).total_seconds())
+        stopped = min(start.stopped_s, duration)
+        silent = min(start.silent_s, duration)
         return Leg(
             seq=self.n_legs, pass_index=self.pass_index or 0, order_rev=end.order_rev,
             from_vda_node=start.vda_node, to_vda_node=end.vda_node,
             from_topomap_node=start.topomap, to_topomap_node=end.topomap, map_id=map_id,
             started_at=start.ts, ended_at=end.ts, received_started_at=start.received,
             received_ended_at=end.received, duration_s=round(duration, 3),
-            stopped_s=round(min(start.stopped_s + 0.0, duration), 3),
+            stopped_s=round(stopped, 3), silent_s=round(silent, 3),
+            moving_s=round(max(0.0, duration - stopped - silent), 3),
             straight_m=None if straight is None else round(straight, 3),
             planned_m=None if planned is None else round(planned, 3),
             expected_s=expected, plan_source=source, from_chart=start.chart, to_chart=end.chart,
