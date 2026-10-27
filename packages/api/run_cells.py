@@ -13,6 +13,11 @@ packages/utils/run_cells_db.py.
 * Legs source (a run with NO map-frame track row): its `run_legs` with both topomap ids and a positive duration,
   node positions from the topomap graph, `leg_movements`.
 * Neither: a row with no cells and source 'empty' (so the worker does not retry the run forever).
+* Dwell (algo_version 2): the seconds a track segment stood still (`stopped`) with its midpoint within
+  RUN_CELLS_DWELL_RADIUS_M of the run's start (its first track position), of its goal (the last waypoint of the last
+  route node of the mission tree) or of an action node (the last waypoint of the route before an action node of the
+  tree, `dwell_anchors`) are the cell's `dwell_s` and NOT its `stopped_s`; time_s still holds them, so
+  time = moving + stopped + dwell. The legs source has no positions in time and no dwell.
 * Blocks (NAV.GOAL_BLOCKED, MISSION.EDGE_BLOCKED; one per event) are placed on the segment containing their time
   (`cell_raster.block_cells`) or, for legs, at the leg's end node / along the leg (`leg_block_cells`); an event
   that cannot be placed is counted in `totals.blocks_unattributed`. A run on several maps gives each event to the
@@ -27,7 +32,9 @@ import asyncio
 import collections
 import dataclasses
 import datetime
+import json
 import logging
+import math
 import time
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -48,7 +55,7 @@ BLOCK_CODES = ("NAV.GOAL_BLOCKED", "MISSION.EDGE_BLOCKED")
 ROW_WINDOW_BEFORE_S = 60.0           # track / event rows of a run are read from started_at - this ...
 ROW_WINDOW_AFTER_S = 3600.0          # ... to ended_at + this (bounds the hypertable scan; rows lie inside)
 
-RUN_SQL = "SELECT run_id, robot_name, map_id, started_at, ended_at FROM mission_runs WHERE run_id = %s"
+RUN_SQL = "SELECT run_id, robot_name, map_id, started_at, ended_at, mission_tree FROM mission_runs WHERE run_id = %s"
 TRACK_SQL = (
     "SELECT extract(epoch FROM t.ts)::float8, t.x_map, t.y_map, t.map_session_id, t.run_epoch, "
     "COALESCE(s.map_name, %s) FROM robot_track_ts t LEFT JOIN map_sessions s ON s.session_id = t.map_session_id "
@@ -77,6 +84,7 @@ class RunData:
     recoveries: List[Tuple[float, float]] = dataclasses.field(default_factory=list)   # (exit ts, duration_s)
     blocks: List[Tuple[float, Optional[int]]] = dataclasses.field(default_factory=list)  # (ts, leg_seq)
     legs: List[tuple] = dataclasses.field(default_factory=list)        # LEGS_SQL rows
+    tree: Any = None                                                    # mission_runs.mission_tree (nodes as dicts / JSON)
 
 
 async def load_run(cur: Any, run_id: Any) -> Optional[RunData]:
@@ -85,7 +93,8 @@ async def load_run(cur: Any, run_id: Any) -> Optional[RunData]:
     head = await cur.fetchone()
     if head is None:
         return None
-    data = RunData(*head)
+    data = RunData(*head[:5])
+    data.tree = head[5]
     lo = data.started_at - datetime.timedelta(seconds=ROW_WINDOW_BEFORE_S)
     hi = (data.ended_at or utcnow()) + datetime.timedelta(seconds=ROW_WINDOW_AFTER_S)
     await cur.execute(TRACK_SQL, (data.map_id, run_id, data.robot_name, lo, hi))
@@ -103,31 +112,88 @@ async def load_run(cur: Any, run_id: Any) -> Optional[RunData]:
     return data
 
 
+# --- dwell anchors ---------------------------------------------------------------------------------
+
+def _point(wp: Any, run_map: Optional[str]) -> Optional[Tuple[str, float, float]]:
+    try:
+        x, y = float(wp["x"]), float(wp["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    return (wp.get("map_id") or run_map or "", x, y)
+
+
+def dwell_anchors(tree: Any, run_map: Optional[str]) -> List[Tuple[str, float, float]]:
+    """(map, x, y) of the places where a run waits on purpose: the goal (the last waypoint of the last route node of the
+    mission tree) and every action node (the last waypoint of the route node before it; the robot does the action
+    where the route ended). The run's start is not in the tree (the robot is wherever it was) and is added by the
+    summary from its first track position. `tree` is the stored node list (dicts), a JSON string of it, or None."""
+    if isinstance(tree, (str, bytes)):
+        try:
+            tree = json.loads(tree)
+        except ValueError:
+            return []
+    out: List[Tuple[str, float, float]] = []
+    last: Optional[Tuple[str, float, float]] = None
+    for node in tree if isinstance(tree, list) else []:
+        if not isinstance(node, dict):
+            continue
+        waypoints = (node.get("route") or {}).get("waypoints") or []
+        if waypoints:
+            last = _point(waypoints[-1], run_map)
+        elif node.get("action") is not None and last is not None:
+            out.append(last)
+    if last is not None:
+        out.append(last)
+    return sorted(set(out))
+
+
+def near_any(x: np.ndarray, y: np.ndarray, anchors: Sequence[Tuple[float, float]], radius: float) -> np.ndarray:
+    """Whether each point is within `radius` of any anchor."""
+    if not len(anchors) or not x.size:
+        return np.zeros(x.size, bool)
+    ax = np.array([a[0] for a in anchors])
+    ay = np.array([a[1] for a in anchors])
+    return (np.hypot(x[:, None] - ax[None, :], y[:, None] - ay[None, :]) <= radius).any(axis=1)
+
+
 # --- the pure summary ----------------------------------------------------------------------------
 
-def _pack(keys: np.ndarray, sums: np.ndarray, block_keys: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(sorted union of the cells, the 4 sums (len, time, recovery, stopped) on it, blocks per cell)."""
+def _pack(keys: np.ndarray, sums: np.ndarray, block_keys: np.ndarray, dwell: Optional[Tuple[np.ndarray, np.ndarray]] = None
+          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(sorted union of the cells, the 4 sums (len, time, recovery, stopped) on it, blocks per cell, dwell seconds
+    per cell). `dwell` is (cell keys, seconds), its cells a subset of the movement's."""
     bk, bn = np.unique(block_keys, return_counts=True)
-    key = np.union1d(keys, bk)
+    dk, dv = dwell if dwell is not None else (np.empty(0, np.int64), np.empty(0))
+    key = np.union1d(np.union1d(keys, bk), dk)
     full = np.zeros((4, key.size))
     full[:, np.searchsorted(key, keys)] = sums
     blocks = np.zeros(key.size, np.int64)
     blocks[np.searchsorted(key, bk)] = bn
-    return key, full, blocks
+    dwell_s = np.zeros(key.size)
+    dwell_s[np.searchsorted(key, dk)] = dv
+    return key, full, blocks, dwell_s
 
 
 def _params_json(p: cr.Params) -> Dict[str, float]:
-    return {"min_speed": p.min_speed, "max_gap_s": p.max_gap_s, "max_speed": p.max_speed, "leg_max_m": p.leg_max_m}
+    return {"min_speed": p.min_speed, "max_gap_s": p.max_gap_s, "max_speed": p.max_speed, "leg_max_m": p.leg_max_m,
+            "dwell_radius_m": config.RUN_CELLS_DWELL_RADIUS_M}
 
 
 def _empty_totals() -> Dict[str, Any]:
     return {"len_m": 0.0, "time_s": 0.0, "stopped_s": 0.0, "recovery_s": 0.0, "blocks": 0, "segments": 0,
-            "rejected": 0, "recovery_unattributed_s": 0.0, "blocks_unattributed": 0, "legs_skipped": 0}
+            "rejected": 0, "recovery_unattributed_s": 0.0, "blocks_unattributed": 0, "legs_skipped": 0,
+            "dwell_s": 0.0, "dwell_anchors": 0}
 
 
 def _track_map(rows: List[tuple], events_rec: Sequence[Tuple[float, float]], blocks: Sequence[Tuple[float, Any]],
-               p: cr.Params) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray, List[bool]]:
-    """One map's track rows -> (totals, keys, sums, block keys, placed flag per block event)."""
+               p: cr.Params, anchors: Sequence[Tuple[float, float]] = ()
+               ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray, List[bool], Tuple[np.ndarray, np.ndarray]]:
+    """One map's track rows -> (totals, keys, sums, block keys, placed flag per block event, (dwell keys, dwell
+    seconds)). `anchors` are the goal / action positions on this map; the run's start (its first track position) is
+    added here. A stopped segment whose midpoint lies within RUN_CELLS_DWELL_RADIUS_M of an anchor is dwell: its
+    seconds go to the dwell figures and not to `stopped`."""
     grp_codes: Dict[Any, int] = {}
     grp = np.array([grp_codes.setdefault((r[3], r[4]), len(grp_codes)) for r in rows], np.int64)
     run = np.zeros(len(rows), np.int64)
@@ -140,10 +206,24 @@ def _track_map(rows: List[tuple], events_rec: Sequence[Tuple[float, float]], blo
     rec, lost = cr.recovery_overlap(seg, intervals)
     dt = seg.t1 - seg.t0
     dist = np.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0)
-    stopped = np.where(dist < p.min_speed * dt, dt, 0.0)
+    still = np.where(dist < p.min_speed * dt, dt, 0.0)
+    places = list(anchors)
+    if len(order):
+        places.append((float(x[order][0]), float(y[order][0])))             # the start
+    at_place = near_any((seg.x0 + seg.x1) / 2.0, (seg.y0 + seg.y1) / 2.0, places, config.RUN_CELLS_DWELL_RADIUS_M)
+    dwell = np.where(at_place, still, 0.0)
+    stopped = still - dwell
     acc = cr.Accumulator(1)
     acc.add(seg.run, seg.x0, seg.y0, seg.x1, seg.y1, dt, rec, stopped)
     tiles = acc.tiles()
+    dwell_cells = (np.empty(0, np.int64), np.empty(0))
+    if dwell.any():
+        sel = dwell > 0
+        acc_d = cr.Accumulator(1)
+        zeros = np.zeros(int(sel.sum()))
+        acc_d.add(seg.run[sel], seg.x0[sel], seg.y0[sel], seg.x1[sel], seg.y1[sel], dwell[sel], zeros, zeros)
+        td = acc_d.tiles()
+        dwell_cells = (td.key, td.sums[1])
     placed: List[bool] = []
     bkeys: List[np.ndarray] = []
     for bt, _seq in blocks:       # one at a time: block_cells says only how many were unplaced
@@ -154,13 +234,15 @@ def _track_map(rows: List[tuple], events_rec: Sequence[Tuple[float, float]], blo
     totals = _empty_totals()
     totals.update(len_m=float(dist.sum()), time_s=float(dt.sum()), stopped_s=float(stopped.sum()),
                   recovery_s=float(rec.sum()), segments=len(seg), rejected=rejected,
-                  recovery_unattributed_s=float(lost))
-    return totals, tiles.key, tiles.sums, (np.concatenate(bkeys) if bkeys else np.empty(0, np.int64)), placed
+                  recovery_unattributed_s=float(lost), dwell_s=float(dwell.sum()), dwell_anchors=len(places))
+    return (totals, tiles.key, tiles.sums, (np.concatenate(bkeys) if bkeys else np.empty(0, np.int64)), placed,
+            dwell_cells)
 
 
 def _legs_map(legs: List[tuple], blocks: Sequence[Tuple[float, Optional[int]]],
               pos: Callable[[str], Optional[Tuple[float, float]]], p: cr.Params
-              ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray, List[bool]]:
+              ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray, List[bool], None]:
+    """The legs source: no dwell (a leg's stopped seconds have no position in time)."""
     used, parts, skipped = [], [], 0
     for seq, a_id, b_id, dur, stopped, rec, t0, t1, _map in legs:
         mv, sk = cr.leg_movements([{"run": 0, "from": str(a_id), "to": str(b_id), "duration_s": dur,
@@ -187,40 +269,44 @@ def _legs_map(legs: List[tuple], blocks: Sequence[Tuple[float, Optional[int]]],
         placed.append(not lost_one)
         if k.size:
             bkeys.append(k)
-    return totals, tiles.key, tiles.sums, (np.concatenate(bkeys) if bkeys else np.empty(0, np.int64)), placed
+    return totals, tiles.key, tiles.sums, (np.concatenate(bkeys) if bkeys else np.empty(0, np.int64)), placed, None
 
 
 def summarise_rows(data: RunData, node_xy: Callable[[str], Dict[str, Tuple[float, float]]], factsheet: Any,
-                   p: Optional[cr.Params] = None) -> List[rdb.CellRow]:
+                   p: Optional[cr.Params] = None, class_basis: str = "current") -> List[rdb.CellRow]:
     """One CellRow per map of the run (pure; `node_xy(map_id)` -> {topomap node: (x, y)} is called only for the
-    legs source). A run on no map gives no row."""
+    legs source). A run on no map gives no row. `factsheet` labels the run (class, speed_max, speed_basis);
+    `class_basis` says whose it is: "current" (the robot's factsheet at summary time: no factsheet history exists
+    anywhere in the database, 2026-10-27) or "run" (the one in force when the run happened)."""
     p = p or cr.Params()
-    cls, vmax = rclass.robot_class(factsheet), rclass.speed_max_of(factsheet)
+    cls, vmax, vbasis = rclass.robot_class(factsheet), rclass.speed_max_of(factsheet), rclass.speed_basis(factsheet)
     rows: List[rdb.CellRow] = []
 
-    def make(map_id: str, source: str, totals: Dict[str, Any], keys, sums, bkeys, frames) -> rdb.CellRow:
-        key, full, blocks = _pack(keys, sums, bkeys)
+    def make(map_id: str, source: str, totals: Dict[str, Any], keys, sums, bkeys, frames, dwell=None) -> rdb.CellRow:
+        key, full, blocks, dwell_s = _pack(keys, sums, bkeys, dwell)
         totals["blocks"] = int(blocks.sum())
         return rdb.CellRow(
             run_id=data.run_id, map_id=map_id, robot_name=data.robot_name, robot_class=cls, speed_max=vmax,
-            started_at=data.started_at, ended_at=data.ended_at, source=source,
+            speed_basis=vbasis, class_basis=class_basis, started_at=data.started_at, ended_at=data.ended_at, source=source,
             algo_version=config.RUN_CELLS_ALGO_VERSION, cell_m=cr.CELL_M, params=_params_json(p), frames=frames,
             key=key, len_m=full[0], time_s=full[1], stopped_s=full[3], recovery_s=full[2], blocks=blocks,
-            totals=totals)
+            totals=totals, dwell_s=dwell_s)
 
     remaining = list(data.blocks)
+    anchors = dwell_anchors(data.tree, data.map_id)
     if data.track:
         by_map: Dict[str, List[tuple]] = collections.OrderedDict()
         for r in sorted(data.track, key=lambda r: r[0]):
             by_map.setdefault(r[5], []).append(r)
         for map_id, mrows in by_map.items():
-            totals, keys, sums, bkeys, placed = _track_map(mrows, data.recoveries, remaining, p)
+            here = [(x, y) for m, x, y in anchors if m == map_id]
+            totals, keys, sums, bkeys, placed, dwell = _track_map(mrows, data.recoveries, remaining, p, here)
             unplaced = [b for b, ok in zip(remaining, placed) if not ok]
             totals["blocks_unattributed"] = len(unplaced) if len(by_map) == 1 else 0
             remaining = unplaced
             frames = sorted({(str(r[3]) if r[3] is not None else None, str(r[4]) if r[4] is not None else None)
                              for r in mrows}, key=str)
-            rows.append(make(map_id, "track", totals, keys, sums, bkeys, [list(f) for f in frames]))
+            rows.append(make(map_id, "track", totals, keys, sums, bkeys, [list(f) for f in frames], dwell))
         if len(by_map) > 1:           # events no map placed
             rows[-1].totals["blocks_unattributed"] = len(remaining)
         return rows
@@ -230,7 +316,7 @@ def summarise_rows(data: RunData, node_xy: Callable[[str], Dict[str, Tuple[float
             by_map_legs.setdefault(leg[8], []).append(leg)
         for map_id, legs in by_map_legs.items():
             nodes = node_xy(map_id)
-            totals, keys, sums, bkeys, placed = _legs_map(legs, remaining, nodes.get, p)
+            totals, keys, sums, bkeys, placed, _ = _legs_map(legs, remaining, nodes.get, p)
             unplaced = [b for b, ok in zip(remaining, placed) if not ok]
             totals["blocks_unattributed"] = len(unplaced) if len(by_map_legs) == 1 else 0
             remaining = unplaced

@@ -36,6 +36,19 @@ def data(track_rows=(), legs=(), recoveries=(), blocks=(), map_id="m1"):
                       list(track_rows), list(recoveries), list(blocks), list(legs))
 
 
+def wp(x, y=0.05, map_id="m1"):
+    return {"x": x, "y": y, "theta": 0.0, "map_id": map_id}
+
+
+def route(*points, map_id="m1"):
+    return {"name": "navigate", "route": {"waypoints": [wp(x, y, map_id) for x, y in points]}}
+
+
+def wait():
+    return {"name": "w", "action": {"action_type": "wait", "action_parameters": {"seconds": 3}}}
+
+
+TREE = [{"name": "root", "sequence": {}}, route((0.0, 0.05), (2.0, 0.05))]
 NODES = {"m1": {"a": (0.0, 0.05), "b": (4.0, 0.05)}}
 
 
@@ -54,7 +67,7 @@ class TestSummariseRows:
         xs = [0.0, 0.5, 1.0, 1.0, 1.0, 1.5, 2.0]          # two good moves, a stop, two more
         d = data(track(xs), recoveries=[(E0 + 6.0, 3.0)])
         [row] = rc.summarise_rows(d, nodes, FS)
-        assert row.source == "track" and row.map_id == "m1" and row.robot_class == "AMR|0.80x0.50|1.20"
+        assert row.source == "track" and row.map_id == "m1" and row.robot_class == "AMR|0.80x0.50"
         assert row.speed_max == pytest.approx(1.2) and row.algo_version == config.RUN_CELLS_ALGO_VERSION
         got = cell_totals(row)
         assert got["len_m"] == pytest.approx(row.totals["len_m"]) == pytest.approx(2.0)
@@ -65,6 +78,22 @@ class TestSummariseRows:
         assert np.all(np.diff(row.key) > 0)                # sorted, distinct
         assert row.frames == [["s1", "e1"]]
 
+    def test_the_row_records_the_speed_basis_and_whose_factsheet_labelled_it(self):
+        d = data(track([0.0, 0.5, 1.0]))
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert (row.speed_basis, row.class_basis) == ("factsheet", "current")
+        [row] = rc.summarise_rows(d, nodes, FS, class_basis="run")
+        assert row.class_basis == "run"
+
+    def test_a_placeholder_robot_is_marked_and_keeps_its_class_without_speed(self):
+        fs = RobotTypeIdentifierV1(agv_class="CARRIER", length=-1, width=-1, speed_max=1.0)
+        [row] = rc.summarise_rows(data(track([0.0, 0.5, 1.0])), nodes, fs)
+        assert row.robot_class == "CARRIER|?x?" and row.speed_basis == "placeholder" and row.speed_max == 1.0
+
+    def test_a_robot_without_a_factsheet_has_an_unknown_speed(self):
+        [row] = rc.summarise_rows(data(track([0.0, 0.5, 1.0])), nodes, None)
+        assert row.robot_class == "" and row.speed_basis == "unknown" and row.speed_max is None
+
     def test_matches_the_raw_drive_stats_tiles(self):
         from packages.api import drive_stats as ds
         rows = track([0.0, 0.4, 0.8, 0.8, 1.2, 1.2, 1.6])
@@ -74,7 +103,7 @@ class TestSummariseRows:
         tiles, _, _, _ = ds.compute(loaded, lambda: {}, ds.Params())
         assert np.array_equal(tiles.key, row.key)
         assert np.allclose(tiles.sums[0], row.len_m) and np.allclose(tiles.sums[1], row.time_s)
-        assert np.allclose(tiles.sums[2], row.recovery_s) and np.allclose(tiles.sums[3], row.stopped_s)
+        assert np.allclose(tiles.sums[2], row.recovery_s) and np.allclose(tiles.sums[3], row.stopped_all_s)
 
     def test_two_frame_groups_do_not_join(self):
         rows = track([0.0, 0.5, 1.0]) + track([5.0, 5.5, 6.0], t0=E0 + 4.0, session="s2", epoch="e2")
@@ -142,7 +171,7 @@ class Cur:
 
 def a_row(**kw):
     key = cr.cell_key(np.array([3, 4, 4]), np.array([1, 1, 2]))
-    base = dict(run_id=uuid.UUID(int=1), map_id="m1", robot_name="r1", robot_class="AMR|0.80x0.50|1.20", speed_max=1.2,
+    base = dict(run_id=uuid.UUID(int=1), map_id="m1", robot_name="r1", robot_class="AMR|0.80x0.50", speed_max=1.2,
                 started_at=T0, ended_at=T0, source="track", algo_version=1, cell_m=0.1,
                 params={"min_speed": 0.05}, frames=[["s", "e"]], key=key, len_m=np.array([0.1, 0.2, 0.3]),
                 time_s=np.array([1.0, 2.0, 3.0]), stopped_s=np.zeros(3), recovery_s=np.array([0.0, 0.5, 0.0]),
@@ -151,16 +180,143 @@ def a_row(**kw):
     return rdb.CellRow(**base)
 
 
+class TestDwellAnchors:
+    def test_goal_is_the_last_waypoint_of_the_last_route(self):
+        tree = [{"name": "root", "sequence": {}}, route((0.0, 0.0), (1.0, 0.0)), route((3.0, 0.0), (5.0, 1.0))]
+        assert rc.dwell_anchors(tree, "m1") == [("m1", 5.0, 1.0)]
+
+    def test_an_action_node_waits_where_the_route_before_it_ended(self):
+        tree = [route((0.0, 0.0), (1.0, 0.0)), wait(), route((2.0, 0.0), (4.0, 0.0))]
+        assert rc.dwell_anchors(tree, "m1") == [("m1", 1.0, 0.0), ("m1", 4.0, 0.0)]
+
+    def test_an_action_before_any_route_has_no_place_and_duplicates_collapse(self):
+        tree = [wait(), route((0.0, 0.0), (1.0, 0.0)), wait(), wait()]
+        assert rc.dwell_anchors(tree, "m1") == [("m1", 1.0, 0.0)]
+
+    def test_the_map_of_a_waypoint_defaults_to_the_runs_map(self):
+        tree = [{"route": {"waypoints": [{"x": 1.0, "y": 2.0, "map_id": None}]}}]
+        assert rc.dwell_anchors(tree, "run_map") == [("run_map", 1.0, 2.0)]
+
+    def test_json_string_none_and_garbage(self):
+        assert rc.dwell_anchors(json.dumps([route((0.0, 0.0), (1.0, 0.0))]), "m1") == [("m1", 1.0, 0.0)]
+        assert rc.dwell_anchors(None, "m1") == [] and rc.dwell_anchors("{not json", "m1") == []
+        assert rc.dwell_anchors([None, 3, {"route": {"waypoints": [{"x": "a", "y": None}]}}], "m1") == []
+        assert rc.dwell_anchors([{"route": {"waypoints": [{"x": float("nan"), "y": 0.0}]}}], "m1") == []
+
+
+class TestDwell:
+    """Waiting within RUN_CELLS_DWELL_RADIUS_M of the start, goal and action nodes is dwell, not a transit stop."""
+
+    @staticmethod
+    def cells_x(row, field):
+        ax, _ = cr.key_cells(row.key)
+        return sorted(set(ax[getattr(row, field) > 0].tolist()))
+
+    def test_waiting_at_the_start_is_dwell(self):
+        d = data(track([0.0, 0.0, 0.0, 0.5, 1.0, 1.5]))
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == pytest.approx(3.0) and row.stopped_s.sum() == 0.0
+        assert row.totals["dwell_s"] == pytest.approx(3.0) and row.totals["stopped_s"] == 0.0
+        assert self.cells_x(row, "dwell_s") == [0]
+
+    def test_a_stop_in_transit_stays_a_stop(self):
+        d = data(track([0.0, 0.5, 1.0, 1.0, 1.0, 1.5, 2.0]))
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.stopped_s.sum() == pytest.approx(3.0) and row.dwell_s.sum() == 0.0
+        assert self.cells_x(row, "stopped_s") == [10]
+
+    def test_waiting_at_the_goal_of_the_mission_is_dwell(self):
+        d = data(track([0.0, 0.5, 1.0, 1.5, 2.0, 2.0, 2.0]))
+        d.tree = [route((0.0, 0.05), (2.0, 0.05))]
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == pytest.approx(3.0) and row.stopped_s.sum() == 0.0
+        assert row.totals["dwell_anchors"] == 2                       # the goal and the start
+
+    def test_waiting_at_an_action_node_is_dwell_and_a_stop_elsewhere_is_not(self):
+        d = data(track([0.0, 0.5, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.5]))        # waits at 1.0 (action) and 2.0 (not a node)
+        d.tree = [route((0.0, 0.05), (1.0, 0.05)), wait(), route((2.5, 0.05), (3.0, 0.05))]
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == pytest.approx(3.0) and row.stopped_s.sum() == pytest.approx(3.0)
+        assert self.cells_x(row, "dwell_s") == [10] and self.cells_x(row, "stopped_s") == [20]
+
+    def test_the_radius_decides(self, monkeypatch):
+        d = data(track([0.0, 0.5, 1.0, 1.4, 1.4, 1.4, 2.0]))                        # waits 0.4 m past the action node at 1.0
+        d.tree = [route((0.0, 0.05), (1.0, 0.05)), wait()]
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == pytest.approx(3.0)
+        monkeypatch.setattr(config, "RUN_CELLS_DWELL_RADIUS_M", 0.3)
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == 0.0 and row.stopped_s.sum() == pytest.approx(3.0)
+        assert row.params["dwell_radius_m"] == 0.3
+
+    def test_anchors_of_another_map_do_not_count(self):
+        d = data(track([0.0, 0.5, 1.0, 1.5, 2.0, 2.0, 2.0]))
+        d.tree = [route((0.0, 0.05), (2.0, 0.05), map_id="other")]
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == 0.0 and row.stopped_s.sum() == pytest.approx(3.0)
+
+    def test_time_is_moving_plus_stopped_plus_dwell(self):
+        d = data(track([0.0, 0.0, 0.5, 1.0, 1.0, 1.5, 2.0, 2.0]))
+        d.tree = [route((0.0, 0.05), (2.0, 0.05))]
+        [row] = rc.summarise_rows(d, nodes, FS)
+        moving = row.totals["time_s"] - row.totals["stopped_s"] - row.totals["dwell_s"]
+        assert row.dwell_s.sum() == pytest.approx(3.0) and row.stopped_s.sum() == pytest.approx(1.5)
+        assert moving == pytest.approx(4 * 1.5) and row.time_s.sum() == pytest.approx(row.totals["time_s"])
+        assert np.allclose(row.stopped_all_s, row.stopped_s + row.dwell_s)
+
+    def test_drive_stats_still_sees_every_stop(self):
+        from packages.api import drive_stats as ds
+        rows = track([0.0, 0.0, 0.5, 1.0, 1.0, 1.5, 2.0, 2.0])
+        d = data(rows)
+        d.tree = [route((0.0, 0.05), (2.0, 0.05))]
+        [row] = rc.summarise_rows(d, nodes, FS)
+        loaded = ds.Loaded()
+        loaded.track_rows = [("run", r[0], r[1], r[2], r[3], r[4]) for r in rows]
+        raw, _, _, _ = ds.compute(loaded, lambda: {}, ds.Params())
+        loaded = ds.Loaded()
+        loaded.summaries = [row]
+        stored, _, _, _ = ds.compute(loaded, lambda: {}, ds.Params())
+        assert np.array_equal(raw.key, stored.key) and np.allclose(raw.sums, stored.sums)
+        assert stored.sums[3].sum() == pytest.approx(4.5)
+
+    def test_the_legs_source_has_no_dwell(self):
+        legs = [(1, "a", "b", 10.0, 4.0, 0.0, E0, E0 + 10, "m1")]
+        [row] = rc.summarise_rows(data(legs=legs), nodes, FS)
+        assert row.source == "legs" and row.dwell_s.sum() == 0.0 and row.stopped_s.sum() == pytest.approx(4.0)
+
+    def test_a_run_without_a_tree_has_only_its_start(self):
+        d = data(track([0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 2.0]))
+        d.tree = None
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert row.dwell_s.sum() == pytest.approx(1.5) and row.stopped_s.sum() == pytest.approx(1.5)
+
+
 class TestRunCellsDb:
     async def test_encode_decode_round_trip(self):
         row = a_row()
         params = rdb.encode(row)
-        assert params[12] == [3, 4, 4] and params[13] == [1, 1, 2] and params[-1] == "m1"
+        assert params[14] == [3, 4, 4] and params[15] == [1, 1, 2] and params[-1] == "m1"
         stored = [params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0]
         back = rdb.decode(stored)
         assert np.array_equal(back.key, row.key) and np.allclose(back.len_m, row.len_m)
         assert np.array_equal(back.blocks, row.blocks) and back.totals == row.totals and back.frames == row.frames
         assert back.speed_max == 1.2 and back.created_at == T0
+        assert (back.speed_basis, back.class_basis) == ("factsheet", "current") and not back.dwell_s.any()
+
+    async def test_dwell_and_bases_round_trip(self):
+        row = a_row(dwell_s=np.array([0.0, 1.5, 0.25]), speed_basis="placeholder", class_basis="run")
+        params = rdb.encode(row)
+        back = rdb.decode([params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0])
+        assert np.allclose(back.dwell_s, [0.0, 1.5, 0.25])
+        assert (back.speed_basis, back.class_basis) == ("placeholder", "run")
+        assert np.allclose(row.stopped_all_s, row.stopped_s + row.dwell_s)
+
+    async def test_a_row_stored_before_dwell_existed_decodes_with_zero_dwell(self):
+        row = a_row()
+        params = list(rdb.encode(row))
+        params[rdb.COLUMNS.index("dwell_s")] = []             # the migration's default for old rows
+        back = rdb.decode([params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0])
+        assert back.dwell_s.shape == (3,) and not back.dwell_s.any()
 
     async def test_insert_is_an_upsert_guarded_by_the_map(self):
         cur = Cur()
@@ -185,6 +341,45 @@ class FakeClock:
 
     def __call__(self):
         return self.now
+
+
+class TestOlderAlgoVersionIsSummarisedAgain:
+    """A run whose summary is of an older algo_version has no CURRENT summary: the worker and the backfill pick it up."""
+
+    async def test_the_worker_selects_runs_without_a_summary_of_the_current_algo_version(self):
+        seen = []
+
+        class Cur:
+            async def execute(self, sql, params=None):
+                seen.append((sql, params))
+
+            async def fetchall(self):
+                return [(uuid.UUID(int=3), "m1")]
+
+        @contextlib.asynccontextmanager
+        async def read_cursor(_db):
+            yield Cur()
+        w = rc.RunCellsWorker(object(), object())
+        real = rc.fleet_reads.read_cursor
+        rc.fleet_reads.read_cursor = read_cursor
+        try:
+            assert await w.pending(5) == [(uuid.UUID(int=3), "m1")]
+        finally:
+            rc.fleet_reads.read_cursor = real
+        sql, params = seen[0]
+        assert "c.algo_version = %s" in sql and "NOT EXISTS" in sql and params[1] == config.RUN_CELLS_ALGO_VERSION
+        assert config.RUN_CELLS_ALGO_VERSION >= 2
+
+    def test_the_backfill_skips_only_runs_with_a_current_summary(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "backfill_run_cells", os.path.join(os.path.dirname(__file__), "..", "..", "scripts", "backfill_run_cells.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sql, args = mod.select_sql(None, None, False, None)
+        assert "c.algo_version = %s" in sql and config.RUN_CELLS_ALGO_VERSION in args
+        sql, args = mod.select_sql(None, None, True, None)
+        assert "algo_version" not in sql
 
 
 class TestWorker:
@@ -338,7 +533,7 @@ class TestLoadRun:
         async def execute(self, sql, params=None):
             self.sql.append(sql)
             if sql == rc.RUN_SQL:
-                self.rows = [(uuid.UUID(int=1), "r1", "m1", T0, T0 + datetime.timedelta(minutes=1))]
+                self.rows = [(uuid.UUID(int=1), "r1", "m1", T0, T0 + datetime.timedelta(minutes=1), TREE)]
             elif sql == rc.TRACK_SQL:
                 self.rows = self.track_rows
             elif sql == rc.EVENTS_SQL:
@@ -358,6 +553,7 @@ class TestLoadRun:
         d = await rc.load_run(cur, uuid.UUID(int=1))
         assert rc.LEGS_SQL not in cur.sql and len(d.track) == 1
         assert d.recoveries == [(E0 + 5, 2.0)] and d.blocks == [(E0 + 3, None), (E0 + 4, 2)]
+        assert d.tree == TREE
         cur = self.Cursor([])
         await rc.load_run(cur, uuid.UUID(int=1))
         assert rc.LEGS_SQL in cur.sql

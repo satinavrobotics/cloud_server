@@ -32,6 +32,9 @@ Differences from `ChartGraph.route`, all measured by `tests/unit/test_lazy_plan.
   incumbent J_inc is P0 with its turn cost or the expanded optimum on a band of 3 cells around P0 (tiles of the band only), and the
   exact (cell, heading) search runs on the cells of the ellipse |c - a| + |c - b| <= J_inc * 1e-4 m that also satisfy
   d(a, c) + d(c, b) <= J_inc (`packages/scene_graph/turn.py`); over the tile cap the incumbent is returned and `exact` is False;
+* with `region` (docs/planner_region_stats_2026-10-27.md 5, a `RegionPricing`) every edge costs `weights.region_costs` more, from the
+  chart of its two end cells (the `ch` array of the search, no extra read); all bounds above hold, they only rest on cost >= length
+  (`rho_min` makes them tighter), and the turn search takes the term through its edge weights;
 * `max_tiles` caps a request: a bigger corridor raises `CorridorTooLarge` (the planner falls back to the legacy one).
 
 It reads `StoredView` internals (`_own`, `_cache`, `_idx`); that is the cost of a LACI-only phase. Phase 1 gives these
@@ -234,6 +237,37 @@ class PlanGraph:
         if t is None or "own" not in t:
             return False
         return bool(t["own"][iy % TILE_L, ix % TILE_L] > 0)
+
+    def chart_index_cell(self, ix: int, iy: int) -> int:
+        """Index into `keys` of the chart that owns lattice cell (ix, iy) (global), -1 when no chart does (a twin of `free_cell`)."""
+        t = self._tile(ix // TILE_L, iy // TILE_L)
+        if t is None or "own" not in t:
+            return -1
+        o = int(t["own"][iy % TILE_L, ix % TILE_L])
+        return int(self._lut[o]) if 0 < o < len(self._lut) else -1
+
+    def region_arg(self, region: Any) -> Optional[Tuple[np.ndarray, int, int]]:
+        """(rho per chart index, scale, rho_min) of a `RegionPricing` that prices this graph, else None: nothing to price (no snapshot, not
+        `active`, every rho 0) or a snapshot that is not of this version's charts (`region_why`)."""
+        return None if self.region_why(region) != "priced" else (
+            np.asarray(region.rho, np.int64), int(region.scale), int(region.rho_min))
+
+    def region_why(self, region: Any) -> str:
+        """Whether `region` prices this graph: "priced", "neutral" (nothing to price), "version_mismatch" (another graph version) or
+        "keys_mismatch" (not this version's charts)."""
+        if region is None or not region.active or region.rho_max <= 0:
+            return "neutral"
+        if int(region.graph_version) != int(self.version):
+            return "version_mismatch"
+        return "priced" if tuple(region.keys) == tuple(self.keys) else "keys_mismatch"
+
+    @staticmethod
+    def _geo_bound(j: float, reg: Optional[Tuple[np.ndarray, int, int]]) -> float:
+        """The length (m) a route of cost `j` can have at most: every edge costs at least its length, and at least (1 + rho_min / scale) times
+        it under a region term (a relative 1e-6 covers the ceil tolerance of the integer costs); `j` * ROUTE_UNIT_M without one."""
+        if reg is None or reg[2] <= 0:
+            return j * ROUTE_UNIT_M
+        return j * ROUTE_UNIT_M / (1.0 + reg[2] / reg[1]) * (1.0 + 1e-6)
 
     # ---- keep-out zones (keepout_overlay.py): which cells a chart owns, which charts touch ----------------------------------
     def chart_anchors(self) -> Dict[str, Tuple[float, float]]:
@@ -467,7 +501,8 @@ class PlanGraph:
         return out
 
     def _search(self, keep: Set[int], src_cell, dst_cell, blocked: Optional[Blocked], limit: Optional[float] = None,
-                safety: Optional[Safety] = None, jlimit: Optional[float] = None, turn: Optional[tuple] = None):
+                safety: Optional[Safety] = None, jlimit: Optional[float] = None, turn: Optional[tuple] = None,
+                reg: Optional[Tuple[np.ndarray, int, int]] = None):
         """(length, path as (chart, y, x) rows, tiles, cost) of the lattice route inside `keep`, or None. `limit`, when given,
         is a proved upper bound of the answer (a route of that length exists in `keep`): cells and tiles that no route
         of that length can use are left out and Dijkstra stops there; the answer, and its tie-breaks, are unchanged.
@@ -477,6 +512,8 @@ class PlanGraph:
         only, `keep` ignored); (table, "exact", J_inc): the turn-cost optimum, exact when a route of total cost J_inc exists in
         `keep` and `limit` is J_inc * 1e-4 (`turn_search.Graph.restricted`); (table, "full", None): the engine's sequence on the graph
         of `keep` (the plain optimum P0, then `turn_search.route`). The cost is then the total J.
+        `reg` (`region_arg`) adds the region term to every edge cost, from the charts of its end cells (`limit` is then the geometric
+        bound for a cost-J route: `_geo_bound`).
         """
         band = None
         if turn is not None and turn[1] == "band":
@@ -543,6 +580,9 @@ class PlanGraph:
             dn = safety.price(self._clearance(ys[mi], xs[mi]))
             dsum = dn[R] + dn[C]
         Ln = weights.edge_costs(np.concatenate(Lm), dsum, rate)
+        if reg is not None:
+            rn = reg[0][ch[mi]]                            # rho of every member cell's chart (members have ch >= 0)
+            Ln = Ln + weights.region_costs(np.concatenate(Lm), rn[R], rn[C], reg[1])
 
         def find(cell):
             p = int(at(np.array([(cell[0] + _OFF) * _KW + (cell[1] + _OFF)], np.int64))[0])
@@ -593,14 +633,19 @@ class PlanGraph:
 
     # ---- route -------------------------------------------------------------------------------
     def route(self, a: str, b: str, blocked: Optional[Blocked] = None, start: Optional[Tuple[float, float]] = None,
-              goal: Optional[Tuple[float, float]] = None, safety: Optional[Safety] = None) -> Optional[Route]:
+              goal: Optional[Tuple[float, float]] = None, safety: Optional[Safety] = None,
+              region: Any = None) -> Optional[Route]:
         """`ChartGraph.route` from the stored tiles it needs (see the module docstring for the differences). With `safety`
         the objective is the priced cost J (`Route.cost`): the corridor route is the seed, the answer the search of the
         charts that can hold a path of cost <= J_corridor (length <= J_corridor * 1e-4 m, S10), like an overlay. With
-        `safety.turn` > 0 that answer is P0 of the turn-cost search (`_turn`)."""
+        `safety.turn` > 0 that answer is P0 of the turn-cost search (`_turn`). `region` (a `RegionPricing` of this version) adds the
+        region term to every edge: it is a price like `safety`, so the cost J is the objective and the corridor only a seed;
+        a snapshot that prices nothing (none, inactive, every rho 0, other charts) is today's route."""
         turn = 0.0 if safety is None else float(safety.turn)
         if safety is not None and safety.rate == 0.0 and turn == 0.0:
             safety = None                                        # no price: today's route, the corridor included (S8)
+        reg = self.region_arg(region)
+        priced = safety is not None or reg is not None
         ja, jb = self._index.get(a), self._index.get(b)
         if ja is None or jb is None:
             return None
@@ -613,36 +658,39 @@ class PlanGraph:
         if path is not None:
             for hops in (RING_HOPS if overlay else (1,)):     # the engine's corridor; under an overlay widen until one exists
                 keep = self._rings(path, hops)
-                rings, found = hops, self._search(keep, src, dst, blocked, safety=safety)
+                rings, found = hops, self._search(keep, src, dst, blocked, safety=safety, reg=reg)
                 if found is not None or not overlay:
                     break
                 if len(keep) >= len(self.keys):
                     whole = True                              # the ring held every chart: no route (nothing left to widen to)
                     break
-            if (overlay or safety is not None) and found is not None:
+            if (overlay or priced) and found is not None:
                 # The engine searches every chart. Any route of length <= L lies in the charts whose anchors are within
                 # |a - p| + |p - b| <= L + 2 (chart radius + lattice) (a lattice step is at least the Euclidean one):
-                # search those, the answer is the engine's. Under `safety` L is J_corridor * 1e-4 (J >= length / 1e-4, S7).
-                if safety is None:
+                # search those, the answer is the engine's. Under `safety` or `region` L is J_corridor * 1e-4 (J >= length / 1e-4, S7;
+                # / (1 + rho_min) with a region term).
+                if not priced:
                     slack = 1 + ROUTE_UNIT_M / float(self.params.lattice)   # a min-cost path may be this much longer than found
                     bound, jlimit = found[0] * slack, None
                 else:
-                    bound, jlimit = found[3] * ROUTE_UNIT_M, found[3] * (1 + 1e-9) + 1e-9
+                    bound, jlimit = self._geo_bound(found[3], reg), found[3] * (1 + 1e-9) + 1e-9
                 keep = self._ellipse(src, dst, bound) | self._rings(path, rings)
                 try:
                     # the corridor's own route is in `keep`: it bounds the optimum from above
                     found = self._search(keep, src, dst, blocked, limit=bound * (1 + 1e-9) + 1e-9, safety=safety,
-                                         jlimit=jlimit) or found
+                                         jlimit=jlimit, reg=reg) or found
                 except CorridorTooLarge:
                     exact = False                              # the corridor's route stands: valid, maybe longer
         if found is None and not (whole and path is not None):
             whole = True                                       # nothing in the corridor: the engine searches every chart
-            found = self._search(set(range(len(self.keys))), src, dst, blocked, safety=safety)
+            found = self._search(set(range(len(self.keys))), src, dst, blocked, safety=safety, reg=reg)
         if found is not None and turn > 0.0:
-            found, exact = self._turn(found, src, dst, blocked, safety, path, rings, exact)
+            found, exact = self._turn(found, src, dst, blocked, safety, path, rings, exact, reg)
         if found is not None:
             tiles = found[2]
         self.last = dict(rings=rings, whole=whole, exact=exact, tiles=tiles)
+        if region is not None:
+            self.last["region"] = self.region_why(region)
         if found is None:
             return None
         length, rows, _, cost = found
@@ -655,7 +703,7 @@ class PlanGraph:
         return Route(charts=charts, length=length, min_width=self._route_width(rows), nodes=nodes, cost=cost, exact=exact)
 
     def _turn(self, found, src, dst, blocked: Optional[Blocked], safety: Safety, path: Optional[List[int]], rings: int,
-              exact: bool):
+              exact: bool, reg: Optional[Tuple[np.ndarray, int, int]] = None):
         """(found, exact) of the turn-cost route, given the plain answer `found` (P0; the whole graph's optimum when `exact`).
         Incumbent: P0 with its turn cost, or the turn optimum on the band around P0 when cheaper (a band over the cap is skipped).
         Then the exact search of the charts and cells that can hold a route of total cost <= J_inc (length <= J_inc * 1e-4 m, as
@@ -667,18 +715,18 @@ class PlanGraph:
         if j0 == cost0:
             return best, exact                                # no turn on the plain optimum: it is the answer (turn.py)
         try:
-            band = self._search(set(), src, dst, blocked, safety=safety, turn=(tab, "band", rows0))
+            band = self._search(set(), src, dst, blocked, safety=safety, turn=(tab, "band", rows0), reg=reg)
             if band is not None and band[3] < j0:
                 best = band
         except CorridorTooLarge:
             pass
         if not exact:
             return best, False                                # P0 is not proved optimal: the incumbent, flagged
-        bound = best[3] * ROUTE_UNIT_M
+        bound = self._geo_bound(best[3], reg)
         keep = self._ellipse(src, dst, bound) | (self._rings(path, rings) if path is not None else set())
         try:
             got = self._search(keep, src, dst, blocked, limit=bound * (1 + 1e-9) + 1e-9, safety=safety,
-                               turn=(tab, "exact", best[3]))
+                               turn=(tab, "exact", best[3]), reg=reg)
         except CorridorTooLarge:
             return best, False                                # the incumbent stands: valid, maybe costlier
         return (got or best), True

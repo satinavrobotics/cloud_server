@@ -147,12 +147,24 @@ class RouteTrajectoryLegV1(pydantic.BaseModel):
     from_index: int
     to_index: int
     points: List[List[float]]
+    predicted_s: Optional[float] = pydantic.Field(
+        default=None,
+        description="Recording data: the seconds the planner's region cost model predicted for this leg (docs/planner_region_stats_2026-10-27.md 7); "
+                    "None when no model was in use. Display and recording only, never sent to the robot.")
 
     @pydantic.validator("points")
     def _points_are_pairs(cls, value):
         if len(value) < 2 or any(len(p) != 2 for p in value):
             raise ValueError("a trajectory leg needs >= 2 [x, y] points")
         return value
+
+    def dict(self, *args, **kwargs):
+        """As the base class, but without `predicted_s` while it is None: a leg planned without a cost model serializes (stored, sent to the
+        clients) exactly as it did before the field existed."""
+        out = super().dict(*args, **kwargs)
+        if out.get("predicted_s", 0) is None:
+            del out["predicted_s"]
+        return out
 
 
 class MissionRouteNodeV1(pydantic.BaseModel):
@@ -176,6 +188,11 @@ class MissionRouteNodeV1(pydantic.BaseModel):
         description="Scene-graph version the planner made this route (and its waypoints' "
                     "chart_key) on; None for a legacy or operator-drawn route. Recording data, "
                     "never sent to the robot: not part of the route digest.")
+    cost_model: Optional[str] = pydantic.Field(
+        default=None,
+        description="`model_hash:stamp` of the region cost snapshot behind the trajectory's `predicted_s` (and, in mode 'on', the "
+                    "route's shape); None for a route planned without one. Recording data, never sent to the robot: not part of "
+                    "the route digest.")
 
     @property
     def size(self):
@@ -219,6 +236,7 @@ class MissionRouteNodeV1(pydantic.BaseModel):
                 cleared = True
         if cleared:
             self.graph_version = None
+            self.cost_model = None
         return cleared
 
     @pydantic.validator("waypoints")

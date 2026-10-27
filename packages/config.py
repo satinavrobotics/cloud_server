@@ -681,11 +681,19 @@ DRIVE_STATS_SOURCE = os.getenv("DRIVE_STATS_SOURCE", "summaries")
 # REGION_STATS_MIN_LEN_M in the chart; a map is rebuilt REGION_STATS_DEBOUNCE_S after its first change, the
 # newest REGION_STATS_KEEP_VERSIONS graph versions are kept.
 RUN_CELLS_ENABLED = _env_bool("RUN_CELLS_ENABLED", "true")
-RUN_CELLS_ALGO_VERSION = int(os.getenv("RUN_CELLS_ALGO_VERSION", "1"))
+RUN_CELLS_ALGO_VERSION = int(os.getenv("RUN_CELLS_ALGO_VERSION", "2"))
 RUN_CELLS_POLL_S = float(os.getenv("RUN_CELLS_POLL_S", "30.0"))
 RUN_CELLS_BATCH = int(os.getenv("RUN_CELLS_BATCH", "20"))
 RUN_CELLS_EXTRA_GRACE_S = float(os.getenv("RUN_CELLS_EXTRA_GRACE_S", "30.0"))
 RUN_CELLS_RETRY_S = float(os.getenv("RUN_CELLS_RETRY_S", "600.0"))
+# algo_version 2: seconds a robot stood still within RUN_CELLS_DWELL_RADIUS_M of the run's start, of its goal (the last
+# waypoint of the mission) or of an action node (where the mission performs an action) are the run's DWELL, kept apart
+# from the stops in transit (docs/planner_region_stats_2026-10-27.md 10, decision 3).
+RUN_CELLS_DWELL_RADIUS_M = float(os.getenv("RUN_CELLS_DWELL_RADIUS_M", "0.5"))
+# A factsheet speed_max of exactly ROBOT_PLACEHOLDER_SPEED_MAX with no footprint (length and width unknown) is the default a
+# robot reports before it is configured, not a measured limit: its runs do not enter the speed-normalised sums of
+# region_stats and the planner's region term is off for it (packages/utils/robot_class.py:speed_basis).
+ROBOT_PLACEHOLDER_SPEED_MAX = float(os.getenv("ROBOT_PLACEHOLDER_SPEED_MAX", "1.0"))
 REGION_STATS_WINDOW_DAYS = int(os.getenv("REGION_STATS_WINDOW_DAYS", "90"))
 REGION_STATS_MIN_LEN_M = float(os.getenv("REGION_STATS_MIN_LEN_M", "1.0"))
 REGION_STATS_MAX_RUNS = int(os.getenv("REGION_STATS_MAX_RUNS", "50"))
@@ -693,6 +701,22 @@ REGION_STATS_DEBOUNCE_S = float(os.getenv("REGION_STATS_DEBOUNCE_S", "30.0"))
 REGION_STATS_KEEP_VERSIONS = int(os.getenv("REGION_STATS_KEEP_VERSIONS", "3"))
 REGION_STATS_CACHE_TTL_S = float(os.getenv("REGION_STATS_CACHE_TTL_S", "120.0"))
 REGION_STATS_CACHE_ENTRIES = int(os.getenv("REGION_STATS_CACHE_ENTRIES", "16"))
+# Region pricing in the mission planner (docs/planner_region_stats_2026-10-27.md, packages/utils/region_cost.py).
+# REGION_COST_MODE: "off" (no snapshot is loaded or used), "shadow" (the snapshot is computed and the difference logged, the
+# served route is unchanged) or "on"; any other value is "off". Only maps named in REGION_COST_MAPS (comma separated, "*" = all)
+# get the mode; empty = none. REGION_COST_TERMS "name:weight,..." (terms: moving, stop); N0 the shrinkage strength (samples of
+# prior), RHO_CAP the largest excess per chart (x the factsheet speed time), QUANTUM the rounding of rho (1 / an integer).
+# SNAPSHOT_TTL_S: how long the planner trusts a loaded snapshot before looking at region_stats_builds.stamp again.
+REGION_COST_MODE = os.getenv("REGION_COST_MODE", "off").strip().lower()
+if REGION_COST_MODE not in ("off", "shadow", "on"):
+    REGION_COST_MODE = "off"
+REGION_COST_MAPS = tuple(m.strip() for m in os.getenv("REGION_COST_MAPS", "").split(",") if m.strip())
+REGION_COST_TERMS = os.getenv("REGION_COST_TERMS", "moving:1.0")
+REGION_COST_N0 = float(os.getenv("REGION_COST_N0", "5.0"))
+REGION_COST_RHO_CAP = float(os.getenv("REGION_COST_RHO_CAP", "3.0"))
+REGION_COST_QUANTUM = float(os.getenv("REGION_COST_QUANTUM", "0.001"))
+REGION_COST_SNAPSHOT_TTL_S = float(os.getenv("REGION_COST_SNAPSHOT_TTL_S", "30.0"))
+REGION_COST_SNAPSHOT_ENTRIES = int(os.getenv("REGION_COST_SNAPSHOT_ENTRIES", "16"))
 # Robot path efficiency (packages/api/path_efficiency.py, docs/path_efficiency_2026-10-15.md): a leg shorter
 # than EFFICIENCY_MIN_LEG_M of plan is left out of the ratios (too noisy); a leg whose track covers less than
 # EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory whose waypoint

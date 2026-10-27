@@ -529,10 +529,10 @@ def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
     # change the digest of a route stored before it existed (a mission in flight at
     # deploy would otherwise read as rerouted and its progress be ignored).
     # `trajectory` is display data (the planner's dense path): adding or refreshing it must not read as a reroute.
-    # Likewise the recording data `graph_version` and each waypoint's `chart_key` (nothing the robot drives).
+    # Likewise the recording data `graph_version`, `cost_model` and each waypoint's `chart_key` (nothing the robot drives).
     return hashlib.sha1(route.json(
         sort_keys=True, exclude_none=True,
-        exclude={"trajectory": True, "graph_version": True, "waypoints": {"__all__": {"chart_key"}}}
+        exclude={"trajectory": True, "graph_version": True, "cost_model": True, "waypoints": {"__all__": {"chart_key"}}}
     ).encode()).hexdigest()[:16]
 
 
@@ -1016,7 +1016,8 @@ class Robot:
                 raise RuntimeError(plan.get("error") or "the planner returned no route")
             route = mission_object.MissionRouteNodeV1(waypoints=plan["waypoints"],
                                                       trajectory=plan.get("trajectory"),
-                                                      graph_version=plan.get("graph_version"))
+                                                      graph_version=plan.get("graph_version"),
+                                                      cost_model=plan.get("cost_model"))
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not replan the go-to ({err}); "
                          "using the route stored when it was submitted")
@@ -1083,7 +1084,8 @@ class Robot:
                     insert_planned=insert, timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
                 route = mission_object.MissionRouteNodeV1(waypoints=result["waypoints"],
                                                           trajectory=result.get("trajectory"),
-                                                          graph_version=result.get("graph_version"))
+                                                          graph_version=result.get("graph_version"),
+                                                          cost_model=result.get("cost_model"))
                 report = result.get("node_policy") or {}
                 inserted = int(result.get("inserted") or 0)
             except Exception as err:  # pylint: disable=broad-except

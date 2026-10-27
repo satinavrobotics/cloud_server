@@ -25,11 +25,11 @@ from packages.utils import run_cells_db as rdb  # noqa: E402
 pytestmark = pytest.mark.unit
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
-CLASS_A, CLASS_B = "AMR|0.80x0.50|1.20", "AMR|1.00x0.60|1.50"
+CLASS_A, CLASS_B = "AMR|0.80x0.50", "AMR|1.00x0.60"
 
 
 def make_run(i, cells_x, cls=CLASS_A, len_per_cell=0.12, pace=2.0, stopped_per_cell=0.0, age_h=0, blocks_at=(),
-             speed_max=1.2):
+             speed_max=1.2, dwell_per_cell=0.0, speed_basis="factsheet"):
     """A run driving along y = 0 over the given cell columns."""
     n = len(cells_x)
     key = cr.cell_key(np.array(cells_x), np.zeros(n, np.int64))
@@ -43,7 +43,7 @@ def make_run(i, cells_x, cls=CLASS_A, len_per_cell=0.12, pace=2.0, stopped_per_c
         started_at=t, ended_at=t, source="track", algo_version=config.RUN_CELLS_ALGO_VERSION, cell_m=0.1, params={},
         frames=[], key=key[order], len_m=np.full(n, len_per_cell)[order], time_s=np.full(n, len_per_cell * pace)[order],
         stopped_s=np.full(n, stopped_per_cell)[order], recovery_s=np.zeros(n)[order], blocks=blocks[order],
-        totals={}, created_at=t)
+        totals={}, created_at=t, dwell_s=np.full(n, dwell_per_cell)[order], speed_basis=speed_basis)
 
 
 def stored(row):
@@ -230,6 +230,44 @@ class TestAggregate:
         assert {k[1] for k in s} == {CLASS_A, CLASS_B, "", "*"}
         assert s[("A", "*")]["runs"] == 3 and s[("A", CLASS_B)]["runs"] == 1
         assert s[("A", CLASS_B)]["speed_max"] == 1.5 and s[("A", "")]["speed_max"] == 1.2
+
+    def test_sums_are_normalised_by_each_runs_own_speed_max(self, patched):
+        """One class, two speed_max values (a speed change): the history pools, the pace is relative to each run's speed."""
+        # run 1: speed_max 1.0, pace 2 s/m -> 2.0 x ideal; run 2: speed_max 2.0, pace 1 s/m -> 2.0 x ideal as well
+        db = patched(Db([make_run(1, range(0, 20), pace=2.0, speed_max=1.0),
+                         make_run(2, range(0, 20), pace=1.0, speed_max=2.0, age_h=1)]))
+        a = by_key(collect(db, Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
+        assert a["runs"] == 2 and a["norm_runs"] == 2 and a["speed_max"] is None          # mixed speeds: no single one
+        assert a["norm_len_m"] == pytest.approx(4.8)
+        assert a["norm_moving_m"] / a["norm_len_m"] == pytest.approx(2.0)
+        assert a["norm_stopped_m"] == 0.0
+
+    def test_normalised_stopped_time_scales_with_speed(self, patched):
+        run = make_run(1, range(0, 20), pace=2.0, speed_max=0.5, stopped_per_cell=0.12)     # 0.12 s stopped per 0.12 m
+        a = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
+        assert a["norm_stopped_m"] == pytest.approx(20 * 0.12 * 0.5)
+        assert a["norm_moving_m"] == pytest.approx(20 * (0.24 - 0.12) * 0.5)
+
+    def test_placeholder_and_unknown_speed_runs_stay_out_of_the_normalised_sums(self, patched):
+        db = patched(Db([make_run(1, range(0, 20), speed_max=0.24),
+                         make_run(2, range(0, 20), speed_max=1.0, speed_basis="placeholder", age_h=1),
+                         make_run(3, range(0, 20), speed_max=None, speed_basis="unknown", age_h=2)]))
+        a = by_key(collect(db, Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
+        assert a["runs"] == 3 and a["len_m"] == pytest.approx(3 * 2.4)                      # raw sums keep every run
+        assert a["norm_runs"] == 1 and a["norm_len_m"] == pytest.approx(2.4)
+
+    def test_a_placeholder_class_has_no_normalised_sums(self, patched):
+        run = make_run(1, range(0, 20), cls="CARRIER|?x?", speed_max=1.0, speed_basis="placeholder")
+        got = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)
+        assert got[("A", "CARRIER|?x?")]["norm_runs"] == 0 and got[("A", "*")]["norm_len_m"] == 0.0
+
+    def test_dwell_is_kept_out_of_stopped_and_out_of_moving(self, patched):
+        run = make_run(1, range(0, 20), stopped_per_cell=0.02, dwell_per_cell=0.04)
+        a = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
+        assert a["stopped_s"] == pytest.approx(0.4) and a["dwell_s"] == pytest.approx(0.8)
+        assert a["stopped_share"] == pytest.approx(0.4 / 4.8)
+        assert a["moving_speed_mps"] == pytest.approx(2.4 / (4.8 - 0.4 - 0.8))
+        assert a["norm_moving_m"] == pytest.approx((4.8 - 0.4 - 0.8) * 1.2)
 
     def test_zero_denominators_are_null(self, patched):
         run = make_run(1, range(0, 20), stopped_per_cell=0.24)               # all time stopped

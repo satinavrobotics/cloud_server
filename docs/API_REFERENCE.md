@@ -287,7 +287,7 @@ robot class. Read only; the planner will load the same table (`packages/utils/re
 definitions: `docs/region_stats_2026-10-27.md`.
 
 Query (all optional): `robot_class` (default `*` = all classes pooled; a class is
-`<agv_class>|<length>x<width>|<speed_max>` of the factsheet, `packages/utils/robot_class.py`), `version` (a stored scene-graph
+`<agv_class>|<length>x<width>` of the factsheet, without speed_max; `packages/utils/robot_class.py`), `version` (a stored scene-graph
 version; default the newest built), `robot` (one robot, display only: computed on read from its runs, cached).
 
 Response:
@@ -301,13 +301,16 @@ Response:
                "len_m": 212.4, "time_s": 640.2, "stopped_s": 51.0, "recovery_s": 12.5, "blocks": 3,
                "pace_median_s_per_m": 2.9, "pace_p90_s_per_m": 4.1, "moving_pace_median_s_per_m": 2.6,
                "moving_speed_mps": 0.36, "stopped_share": 0.08, "recovery_s_per_100m": 5.9, "blocks_per_run": 0.1,
-               "speed_max": null, "cells": 366, "visited": 233, "first_at": "...", "last_at": "...", "stamp": "..."}]
+               "speed_max": null, "cells": 366, "visited": 233, "first_at": "...", "last_at": "...", "stamp": "...",
+               "dwell_s": 22.0, "norm_runs": 31, "norm_len_m": 212.4, "norm_moving_m": 215.0, "norm_stopped_m": 12.2}]
 }
 ```
 
 * Field names of `regions` are the columns of `region_stats`. A **sample** is one run's drive in one chart of at least
   `min_len_m`; `runs` is the number of samples kept (the newest `max_runs` per chart and class); sums are over them;
-  `pace_*` are `time_s / len_m` per sample (median, p90), `moving_*` leave out `stopped_s`; ratios are null on a zero
+  `pace_*` are `time_s / len_m` per sample (median, p90), `moving_*` leave out `stopped_s` and `dwell_s` (waiting within 0.5 m of
+  the run's start, goal and action nodes, which `stopped_s` does not hold); `norm_*` are sums over the samples whose run had a
+  factsheet speed_max, each time multiplied by that run's own speed_max (`norm_moving_m / norm_len_m` = 1 at speed_max); ratios are null on a zero
   denominator; `visited` counts the chart's 0.1 m cells with movement; `speed_max` is the class's factsheet speed (null for `*`).
 * `stale` is true while the stored build is of an older graph version than `current_graph_version`, or a run was deleted
   since; the next build (the API worker, a debounce after a change) replaces it. `status` `no_scene_graph`: the map has no graph,

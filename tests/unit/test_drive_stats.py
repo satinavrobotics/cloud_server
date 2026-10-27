@@ -565,3 +565,81 @@ class TestSeriesFromSummaries:
         patched(summaries=[row])
         body, _ = call(FakeReads(), start=DAY0, end=DAY0 + _dt.timedelta(days=1), series="day")
         assert body["series"]["len_m"] == [0.0] and body["series"]["source"]["leg_only_runs_not_in_series"] == 1
+
+
+class TestRegionsOfPinsOneVersion:
+    """`regions_of` reads a map over 160 m in several chunks; every chunk must come from the same graph version."""
+
+    # three cells in three different 160 m chunks (which start at cell 0, 1600, 3200)
+    AX, AY = np.array([2, 1602, 3202], np.int64), np.zeros(3, np.int64)
+
+    class Reads:
+        """The owner plane has key `v<version>` (so a chart of another version is recognisable); `versions` is the
+        version each successive owner_plane call sees, the last one repeated."""
+
+        def __init__(self, versions, view_versions=None):
+            self.versions, self.calls, self.views = list(versions), 0, []
+            self.view_versions = view_versions
+
+        async def owner_plane(self, map_id, bbox, level=0):
+            v = self.versions[min(self.calls, len(self.versions) - 1)]
+            self.calls += 1
+            idx = np.ones((4, 4), np.uint16)
+            return {"version": v, "origin": (bbox.x0, bbox.y0), "step": 0.1, "shape": (4, 4), "keys": [f"v{v}"],
+                    "index": idx, "bbox": [bbox.x0, bbox.y0, bbox.x1, bbox.y1]}
+
+        async def view(self, map_id, bbox, level=0, version=None, raster=False, epoch=None, parents=True):
+            self.views.append(version)
+            if self.view_versions is not None:
+                v = self.view_versions(version)
+                if v is None:
+                    raise HTTPException(404, "version gone")
+                version = v
+            return {"version": version, "charts": [{"key": f"v{version}", "cells": 7}]}
+
+    def run(self, reads):
+        return asyncio.run(ds.regions_of(reads, "m", self.AX, self.AY))
+
+    def test_one_version_across_all_chunks(self):
+        reads = self.Reads([4])
+        ids, names, cells, version, status = self.run(reads)
+        assert status == "ok" and version == 4 and names == ["v4"] and cells == {"v4": 7}
+        assert ids.tolist() == [1, 1, 1] and reads.calls == 3 and set(reads.views) == {4}
+
+    def test_a_version_change_after_the_first_chunk_reads_again_on_the_new_version(self):
+        reads = self.Reads([4, 5, 5, 5, 5])             # chunk 1 sees v4, chunk 2 v5: start over, all v5
+        ids, names, cells, version, status = self.run(reads)
+        assert status == "ok" and version == 5 and names == ["v5"] and ids.tolist() == [1, 1, 1]
+        assert cells == {"v5": 7} and reads.calls == 5
+
+    def test_a_version_that_keeps_changing_is_an_error_not_a_mixture(self):
+        reads = self.Reads([1, 2, 3, 4, 5, 6, 7, 8, 9])
+        ids, names, cells, version, status = self.run(reads)
+        assert status == "error" and ids is None and names == [] and cells == {} and version is None
+
+    def test_the_chart_cell_views_are_asked_for_the_pinned_version(self):
+        reads = self.Reads([6])
+        self.run(reads)
+        assert reads.views == [6, 6, 6]
+
+    def test_a_pinned_version_that_is_gone_makes_the_read_start_over(self):
+        gone = {"once": True}
+
+        def view_versions(version):
+            if gone["once"]:
+                gone["once"] = False
+                return None                              # 404 on the first view
+            return version
+        reads = self.Reads([4], view_versions)
+        ids, names, cells, version, status = self.run(reads)
+        assert status == "ok" and version == 4 and ids.tolist() == [1, 1, 1]
+
+    def test_a_view_of_another_version_makes_the_read_start_over(self):
+        reads = self.Reads([4, 4, 4, 4, 4, 4], lambda v: 5 if reads.calls < 2 else v)
+        ids, names, cells, version, status = self.run(reads)
+        assert status == "ok" and ids.tolist() == [1, 1, 1] and cells == {"v4": 7}
+
+    def test_a_single_chunk_needs_no_retry(self):
+        reads = self.Reads([9])
+        out = asyncio.run(ds.regions_of(reads, "m", np.array([1, 2], np.int64), np.array([0, 0], np.int64)))
+        assert out[3] == 9 and reads.calls == 1

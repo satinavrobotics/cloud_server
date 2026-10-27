@@ -168,13 +168,13 @@ ORPHAN_CANDIDATES_SQL = (
     "WHERE state = 'RUNNING' AND started_at < %s ORDER BY started_at"
 )
 SET_PLANNED_PATH_SQL = "UPDATE mission_runs SET planned_path = %s::jsonb WHERE run_id = %s"
-# Legs (run_legs, migrations 20261004_01_run_legs, 20261027_03_run_legs_plan, 20261027_04_leg_moving).
+# Legs (run_legs, migrations 20261004_01_run_legs, 20261027_03_run_legs_plan, 20261027_04_leg_moving, 20261028_03_run_legs_predicted).
 LEG_COLUMNS = (
     "run_id", "seq", "mission_name", "robot_name", "pass_index", "order_rev", "from_vda_node",
     "to_vda_node", "from_topomap_node", "to_topomap_node", "map_id", "started_at", "ended_at",
     "received_started_at", "received_ended_at", "duration_s", "stopped_s", "straight_m",
     "planned_m", "expected_s", "plan_source", "from_chart", "to_chart", "graph_version", "moving_s",
-    "silent_s",
+    "silent_s", "predicted_s", "cost_model",
 )
 INSERT_LEG_SQL = (
     f"INSERT INTO run_legs ({', '.join(LEG_COLUMNS)}) "
@@ -586,7 +586,7 @@ class _WriteLeg(_Op):
                         leg.received_started_at, leg.received_ended_at, leg.duration_s,
                         leg.stopped_s, leg.straight_m, leg.planned_m, leg.expected_s,
                         leg.plan_source, leg.from_chart, leg.to_chart, leg.graph_version,
-                        leg.moving_s, leg.silent_s))
+                        leg.moving_s, leg.silent_s, leg.predicted_s, leg.cost_model))
 
 
 class _MarkLevel(_Op):

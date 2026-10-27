@@ -21,10 +21,11 @@ from packages.utils import cell_raster as cr
 
 MAP_TABLE = MapObjectV1.table_name()
 SOURCES = ("track", "legs", "empty")
-ARRAYS = ("len_m", "time_s", "stopped_s", "recovery_s", "blocks")
-COLUMNS = ("run_id", "map_id", "robot_name", "robot_class", "speed_max", "started_at", "ended_at", "source",
-           "algo_version", "cell_m", "params", "frames", "ix", "iy", "len_m", "time_s", "stopped_s", "recovery_s",
-           "blocks", "totals", "created_at")
+ARRAYS = ("len_m", "time_s", "stopped_s", "recovery_s", "blocks", "dwell_s")
+CLASS_BASES = ("current", "run")        # whose factsheet labelled the run: today's, or the one in force when it ran
+COLUMNS = ("run_id", "map_id", "robot_name", "robot_class", "speed_max", "speed_basis", "class_basis", "started_at",
+           "ended_at", "source", "algo_version", "cell_m", "params", "frames", "ix", "iy", "len_m", "time_s",
+           "stopped_s", "recovery_s", "blocks", "dwell_s", "totals", "created_at")
 
 
 @dataclasses.dataclass
@@ -49,18 +50,30 @@ class CellRow:
     blocks: np.ndarray
     totals: Dict[str, Any]
     created_at: Optional[datetime.datetime] = None
+    dwell_s: Optional[np.ndarray] = None   # waiting near the run's start, goal and action nodes (algo_version 2); not in stopped_s
+    speed_basis: str = "factsheet"         # robot_class.speed_basis: "factsheet" | "placeholder" | "unknown"
+    class_basis: str = "current"           # CLASS_BASES
+
+    def __post_init__(self) -> None:
+        if self.dwell_s is None:
+            self.dwell_s = np.zeros(self.key.size)
 
     def __len__(self) -> int:
         return int(self.key.size)
+
+    @property
+    def stopped_all_s(self) -> np.ndarray:
+        """Every second spent stopped, the dwell included (what drive-stats shows as stopped)."""
+        return self.stopped_s + self.dwell_s
 
 
 # The insert is skipped (rowcount 0) while the map is gone or being deleted, so a run that ends during a map
 # delete cannot bring rows back (packages/api/map_delete.py). The run row must exist (foreign key).
 INSERT_SQL = (
     f"INSERT INTO run_cells ({', '.join(COLUMNS[:-1])}) "
-    "SELECT %s::uuid, %s::text, %s::text, %s::text, %s::float4, %s::timestamptz, %s::timestamptz, %s::text, "
-    "%s::int2, %s::float4, %s::jsonb, %s::jsonb, %s::int4[], %s::int4[], "
-    "%s::float4[], %s::float4[], %s::float4[], %s::float4[], %s::int2[], %s::jsonb "
+    "SELECT %s::uuid, %s::text, %s::text, %s::text, %s::float4, %s::text, %s::text, %s::timestamptz, "
+    "%s::timestamptz, %s::text, %s::int2, %s::float4, %s::jsonb, %s::jsonb, %s::int4[], %s::int4[], "
+    "%s::float4[], %s::float4[], %s::float4[], %s::float4[], %s::int2[], %s::float4[], %s::jsonb "
     f"WHERE EXISTS (SELECT 1 FROM {MAP_TABLE} WHERE name = %s::text AND lifecycle NOT IN ('DELETING', 'DELETED')) "
     "ON CONFLICT (run_id, map_id) DO UPDATE SET "
     + ", ".join(f"{c} = EXCLUDED.{c}" for c in COLUMNS[2:-1]) + ", created_at = now()"
@@ -70,12 +83,13 @@ INSERT_SQL = (
 def encode(row: CellRow) -> tuple:
     """The INSERT_SQL parameters of a row."""
     ax, ay = cr.key_cells(row.key)
-    return (row.run_id, row.map_id, row.robot_name, row.robot_class, row.speed_max, row.started_at, row.ended_at,
-            row.source, row.algo_version, row.cell_m, json.dumps(row.params), json.dumps(row.frames),
-            ax.astype(np.int64).tolist(), ay.astype(np.int64).tolist(),
+    return (row.run_id, row.map_id, row.robot_name, row.robot_class, row.speed_max, row.speed_basis, row.class_basis,
+            row.started_at, row.ended_at, row.source, row.algo_version, row.cell_m, json.dumps(row.params),
+            json.dumps(row.frames), ax.astype(np.int64).tolist(), ay.astype(np.int64).tolist(),
             np.asarray(row.len_m, float).tolist(), np.asarray(row.time_s, float).tolist(),
             np.asarray(row.stopped_s, float).tolist(), np.asarray(row.recovery_s, float).tolist(),
-            np.asarray(row.blocks, np.int64).tolist(), json.dumps(row.totals), row.map_id)
+            np.asarray(row.blocks, np.int64).tolist(), np.asarray(row.dwell_s, float).tolist(),
+            json.dumps(row.totals), row.map_id)
 
 
 def decode(values: Sequence[Any]) -> CellRow:
@@ -90,7 +104,9 @@ def decode(values: Sequence[Any]) -> CellRow:
         params=_json(d["params"]), frames=_json(d["frames"]), key=cr.cell_key(ix, iy),
         len_m=np.asarray(d["len_m"], float), time_s=np.asarray(d["time_s"], float),
         stopped_s=np.asarray(d["stopped_s"], float), recovery_s=np.asarray(d["recovery_s"], float),
-        blocks=np.asarray(d["blocks"], np.int64), totals=_json(d["totals"]), created_at=d["created_at"])
+        blocks=np.asarray(d["blocks"], np.int64), totals=_json(d["totals"]), created_at=d["created_at"],
+        dwell_s=np.asarray(d["dwell_s"], float) if d["dwell_s"] is not None and len(d["dwell_s"]) == ix.size else None,
+        speed_basis=d["speed_basis"], class_basis=d["class_basis"])
 
 
 def _json(value: Any) -> Any:
