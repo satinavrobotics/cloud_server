@@ -87,6 +87,24 @@ What the code does, per path (all pinned by `tests/unit/test_keepout_reroute.py`
   chart boundary, or a planner that timed out (`SCENE_GRAPH_PLAN_BUDGET_S`, answers "none", no issues) can look the same in the
   editor; look at the planner log ("Chart planner not used (...)"), `GET /stats` `scene_graph.outcomes` and the `issues[].reason`.
 
+## Live findings on the dev box, map office9 (2026-10-27)
+
+* **Zones shown `unresolved: no_scene_graph` although the graph is there.** `python -m packages.api.main` runs main.py as `__main__`;
+  `ApiDelegationService` built the keep-out store's reader with `from packages.api import main`, a SECOND copy of the module whose
+  `service` is None, so `_scene_graph_reads()` raised its 503 `scene_graph_unavailable` for ever (logged only at INFO as "topology not
+  readable"). main.py now hands its own reader over (`keepouts.set_reads`). Effect before: the list/create routes could not place
+  points or tell which zones apply (the planner itself, a separate service, was not affected).
+* **`Chart planner not used (stale_graph)`** (15:23:49): the planner's cached graph was from before a live mapping run (versions 158 ->
+  216 between 15:13 and 15:26); the first request after the idle hours found its ingest cursor older than
+  `SCENE_GRAPH_MAX_VERSION_LAG_S` (120 s) and fell back; ten seconds later the new version was loaded (plans at graph_version 209/210
+  served). Transient, lag 0 since. The fallback then hit the legacy planner, which refuses chart/edge zones, so the go-to failed.
+* **Behaviour now**: on a map with a chart or edge zone a stale graph (lag over the limit, or an older cached version kept past
+  `max_stale_s`) is planned on anyway; `plan_route` answers `keepout.graph_stale: {lag_s, limit_s, graph_version, reason}`. Such a
+  route only uses cells the older graph knows are free (newly mapped areas are unknown to it), and zones resolve on that version. Maps
+  without chart/edge zones keep the old behaviour (`stale_graph` -> legacy planner). The route preview (`enrich_route`) tolerates an
+  older cached graph for such maps too, without a notice yet. When the legacy planner still refuses, `keepout.planner_fallback` and
+  the error text name why the scene planner was skipped.
+
 ## Not covered
 
 * **Missions already running keep their route**; a reroute (`PUT /missions/{name}` with `update_nodes`) and operator-drawn

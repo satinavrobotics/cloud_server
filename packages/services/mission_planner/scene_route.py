@@ -478,14 +478,14 @@ class GraphCache:
         fut.add_done_callback(done)
         return fut
 
-    def _serve_older(self, map_id: str, version: int):
+    def _serve_older(self, map_id: str, version: int, tolerate_stale: bool = False):
         """(graph, version) of the newest cached version below `version`, None when there is none;
-        ChartFallback("stale_graph") when a newer one has been known for more than `max_stale_s`."""
+        ChartFallback("stale_graph") when a newer one has been known for more than `max_stale_s` (unless `tolerate_stale`)."""
         older = [k for k in self._graphs if k[0] == map_id and k[1] < version]
         if not older:
             return None
         prev = max(older, key=lambda k: k[1])
-        if self._max_stale > 0:
+        if self._max_stale > 0 and not tolerate_stale:
             since = [t for (m, v), t in self._first_seen.items() if m == map_id and v > prev[1]]
             if since and self._clock() - min(since) > self._max_stale:
                 raise ChartFallback("stale_graph")
@@ -515,8 +515,9 @@ class GraphCache:
         returned for the map (None when unknown)."""
         return self._cursors.get((map_id, self._served.get(map_id, -1)))
 
-    async def get(self, map_id: str, deadline: Optional[float] = None) -> Tuple[Any, int]:
-        """(graph, version) of the map's current version; ChartFallback otherwise. `deadline` is an
+    async def get(self, map_id: str, deadline: Optional[float] = None, tolerate_stale: bool = False) -> Tuple[Any, int]:
+        """(graph, version) of the map's current version; ChartFallback otherwise. `tolerate_stale`: an older cached version is
+        served however long the newer one has been known (the caller says so in its answer; docs/keepout_zones.md). `deadline` is an
         absolute event-loop time (the request's budget end): no wait goes past it, and a timeout
         caused by it is reported `budget_exhausted`, not the stage's own reason."""
         loop = asyncio.get_running_loop()
@@ -557,7 +558,7 @@ class GraphCache:
             return self._graphs[key], key[1]
         if key not in self._loading and self._backed_off(map_id):
             # the last load of this map failed a moment ago: do not start another per request
-            served = self._serve_older(map_id, key[1])
+            served = self._serve_older(map_id, key[1], tolerate_stale)
             if served is None:
                 raise ChartFallback("load_error")
             return served
@@ -566,7 +567,7 @@ class GraphCache:
         # flight per key) and keep serving the newest older version meanwhile, for at most
         # `max_stale_s`; the caller also bounds its age by the ingest lag of THAT version's cursor
         # (`cursor(map)`). A big map takes seconds to load, the worker publishes every few.
-        served = self._serve_older(map_id, key[1])
+        served = self._serve_older(map_id, key[1], tolerate_stale)
         if served is not None:
             return served
         try:

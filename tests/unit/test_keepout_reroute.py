@@ -168,3 +168,53 @@ class TestTheLazyCorridorWidensBeforeItReadsTheWholeMap:
 
 def PlanGraphCap(store, max_tiles):
     return lazy_plan.PlanGraph(store.view("m"), max_tiles=max_tiles)
+
+
+# --- a stale scene graph: chart/edge zones plan on the older graph instead of the legacy planner's refusal --------------------------
+
+async def test_a_stale_graph_still_plans_around_chart_and_edge_zones(on, ring, monkeypatch):
+    svc = svc_on(ring[2], START)
+    monkeypatch.setattr(config, "SCENE_GRAPH_MAX_VERSION_LAG_S", 120.0)
+    monkeypatch.setattr(svc._scene_cache, "cursor", lambda m: [0, "k"])
+    monkeypatch.setattr(scene_route, "version_lag_s", lambda *a, **k: 500.0)
+    with with_rows([ZONES["edge"]()]):
+        out = await svc.plan_route("r1", target_x=GOAL[0], target_y=GOAL[1], map_id="m")
+    assert out["success"] and out["planner"] == scene_route.PLANNER_SCENE_GRAPH
+    assert out["keepout"]["detour"] is True
+    assert out["keepout"]["graph_stale"]["lag_s"] == 500.0 and out["keepout"]["graph_stale"]["limit_s"] == 120.0
+
+
+async def test_a_stale_graph_without_chart_or_edge_zones_still_falls_back(on, ring, monkeypatch):
+    svc = svc_on(ring[2], START)
+    monkeypatch.setattr(svc._scene_cache, "cursor", lambda m: [0, "k"])
+    monkeypatch.setattr(scene_route, "version_lag_s", lambda *a, **k: 500.0)
+    with with_rows([]):
+        chart, reason = await svc._try_chart_route("r1", "m", GOAL[0], GOAL[1], None, False)
+    assert chart is None and reason == "stale_graph"
+
+
+async def test_the_legacy_refusal_names_the_reason_the_scene_planner_was_skipped(on, ring, monkeypatch):
+    svc = svc_on(ring[2], START)
+    monkeypatch.setattr(svc, "_try_chart_route", lambda *a, **k: _ret(None, "load_error"))
+    with with_rows([ZONES["edge"]()]):
+        out = await svc.plan_route("r1", target_x=GOAL[0], target_y=GOAL[1], map_id="m")
+    assert out["failed_at"] == "keepout" and out["keepout"]["reason"] == "keepout_unverifiable"
+    assert out["keepout"]["planner_fallback"] == "load_error" and "(load_error)" in out["error"]
+
+
+async def _ret(*v):
+    return v
+
+
+async def test_the_keepout_store_reads_the_graph_through_the_reader_main_hands_it():
+    """`python -m packages.api.main` runs main.py as __main__; importing packages.api.main from the store built a second copy whose
+    service is None (503 for ever, every edge/chart zone "unresolved: no_scene_graph")"""
+    from packages.api import keepouts as api
+
+    class Reads:
+        async def topology(self, m):
+            return {"keys": {"a"}, "links": set()}
+    store = api.KeepoutStore(None)
+    assert await store._topology("m") is None
+    store.set_reads(lambda: Reads())
+    assert (await store._topology("m"))["keys"] == {"a"}

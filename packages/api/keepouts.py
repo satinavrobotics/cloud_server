@@ -69,6 +69,9 @@ class KeepoutStore:
         self._reads = reads
 
     # -- scene graph (best effort: a graph that cannot be read leaves zones "unresolved", never fails a read)
+    def set_reads(self, reads: Callable[[], Any]) -> None:
+        self._reads = reads
+
     async def _topology(self, map_id: str) -> Optional[Dict[str, Any]]:
         if self._reads is None:
             return None
