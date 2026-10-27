@@ -701,6 +701,22 @@ REGION_STATS_DEBOUNCE_S = float(os.getenv("REGION_STATS_DEBOUNCE_S", "30.0"))
 REGION_STATS_KEEP_VERSIONS = int(os.getenv("REGION_STATS_KEEP_VERSIONS", "3"))
 REGION_STATS_CACHE_TTL_S = float(os.getenv("REGION_STATS_CACHE_TTL_S", "120.0"))
 REGION_STATS_CACHE_ENTRIES = int(os.getenv("REGION_STATS_CACHE_ENTRIES", "16"))
+# Region pricing in the mission planner (docs/planner_region_stats_2026-10-27.md, packages/utils/region_cost.py).
+# REGION_COST_MODE: "off" (no snapshot is loaded or used), "shadow" (the snapshot is computed and the difference logged, the
+# served route is unchanged) or "on"; any other value is "off". Only maps named in REGION_COST_MAPS (comma separated, "*" = all)
+# get the mode; empty = none. REGION_COST_TERMS "name:weight,..." (terms: moving, stop); N0 the shrinkage strength (samples of
+# prior), RHO_CAP the largest excess per chart (x the factsheet speed time), QUANTUM the rounding of rho (1 / an integer).
+# SNAPSHOT_TTL_S: how long the planner trusts a loaded snapshot before looking at region_stats_builds.stamp again.
+REGION_COST_MODE = os.getenv("REGION_COST_MODE", "off").strip().lower()
+if REGION_COST_MODE not in ("off", "shadow", "on"):
+    REGION_COST_MODE = "off"
+REGION_COST_MAPS = tuple(m.strip() for m in os.getenv("REGION_COST_MAPS", "").split(",") if m.strip())
+REGION_COST_TERMS = os.getenv("REGION_COST_TERMS", "moving:1.0")
+REGION_COST_N0 = float(os.getenv("REGION_COST_N0", "5.0"))
+REGION_COST_RHO_CAP = float(os.getenv("REGION_COST_RHO_CAP", "3.0"))
+REGION_COST_QUANTUM = float(os.getenv("REGION_COST_QUANTUM", "0.001"))
+REGION_COST_SNAPSHOT_TTL_S = float(os.getenv("REGION_COST_SNAPSHOT_TTL_S", "30.0"))
+REGION_COST_SNAPSHOT_ENTRIES = int(os.getenv("REGION_COST_SNAPSHOT_ENTRIES", "16"))
 # Robot path efficiency (packages/api/path_efficiency.py, docs/path_efficiency_2026-10-15.md): a leg shorter
 # than EFFICIENCY_MIN_LEG_M of plan is left out of the ratios (too noisy); a leg whose track covers less than
 # EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory whose waypoint
