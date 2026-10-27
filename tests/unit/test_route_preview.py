@@ -157,7 +157,8 @@ async def test_a_reroute_gets_its_corridors_measured_without_replanning():
 
 @pytest.mark.unit
 async def test_a_reroute_is_stored_as_given_when_nothing_can_be_measured():
-    given = {"n1": _route(0, 3, 6, corridor_width_m=0.9, corridor_source="measured")}
+    # an operator's corridor and a measured 0 stay; a positive measured one may be stale and goes (test_corridor_width_review)
+    given = {"n1": _route(0, 3, 6, corridor_width_m=0.9, corridor_source="operator")}
     down = SimpleNamespace(enrich_route=AsyncMock(side_effect=RuntimeError("down")))
     assert await route_preview.measure_reroute(down, "r1", given) == given
     assert await route_preview.measure_reroute(None, "r1", given) == given

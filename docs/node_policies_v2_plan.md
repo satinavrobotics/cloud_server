@@ -20,8 +20,8 @@ clears the stored list (only a factsheet message does).
 | `corridorWidth` | Per side, the room for the robot's centre line. Sent on every pass-through node where known, independent of `skippable`. Capped at 1.5 m. |
 | `corridorWidth: 0` | Measured, no room: distance rule only, never skippable, no gate, and the robot default is never used. |
 | `corridorWidth` missing | Unknown: the robot default of 0.75 m applies (gate only, never a skip). |
-| Robot-side margin | The robot subtracts ~0.10 m for its pose error. A width ≤ 0.10 acts like 0. Nothing for us to do. |
-| `skippable: true` | Only with `corridorWidth > 0`. Guide (planner) nodes only. Operator waypoints are non-skippable (see D1). |
+| Robot-side margin | The robot subtracts ~0.10 m for its pose error. A width ≤ 0.10 acts like 0: its gate has no room. The `0.05 m` `SCENE_GRAPH_WIDTH_MARGIN_M` is the planner's own lattice margin (Route.min_width is +-lattice/2 = 0.05 m), a different thing; the robot team confirmed on 2026-10-27 it stays. |
+| `skippable: true` | Only with `corridorWidth > 0.10` (strictly above `NODE_POLICY_SKIP_MIN_CORRIDOR_M`, default = the robot's 0.10 m localisation margin; **agreed with the robot team 2026-10-27**: `corridorWidth <= 0.10` means `skippable=false`, the `corridorWidth` is still sent, 0 still means measured / no room). One helper, `cloud_common.node_policy.skip_allowed`, is used by the planner, the wire, the dispatcher log and the preview. Guide (planner) nodes only. Operator waypoints are non-skippable (see D1). |
 | Last node | nodePolicy with `maxWaitS` only: `skippable: false`, no `corridorWidth`. The robot holds up to maxWaitS (capped at 120 s), then reports edgeBlocked. |
 | Node without nodePolicy | No hold: blocked at once. |
 | Start node (seq 0, the robot's pose) | Stays as it is and never carries a nodePolicy. |
@@ -60,13 +60,15 @@ Facts from reading the code on `main` @ 38aa447. Each one points at the step tha
   - Tests: standard-only, legacy-only and both placements; registration without `actions` keeps the stored list.
 - **1.3 Order wire.**
   - `VDA5050Action.node_policy(skippable, max_wait_s, corridor_width_m)`: `corridorWidth` is sent whenever the value is not None. It is clamped to [0, `NODE_POLICY_CORRIDOR_CAP_M` = 1.5] (new order-policy key), and a non-finite value counts as None.
-  - `skippable` is true only if asked AND `corridorWidth > 0` AND the skip kill switch is on.
+  - `skippable` is true only if asked AND `corridorWidth > 0.10` (`skip_allowed`) AND the skip kill switch is on.
   - The kill switch off no longer strips the corridor; it only forces `skippable=false`.
   - Last node: nodePolicy with `maxWaitS` only.
   - Tests: wire snapshots for guide / guide-narrow / guide-unknown / operator / operator-unknown / last; the cap; NaN.
 - **1.4 Annotation: tri-state and all interior waypoints** (`node_policy_plan.py`).
   - `corridor_per_side` returns `0.0` when it measured no room and `None` when the width is unknown.
-  - `annotate_corridors` computes `corridor_width_m` for every waypoint except the last, operator waypoints included. `skippable` is set only on candidates (guide nodes), and only when the corridor is > 0.
+  - `annotate_corridors` computes `corridor_width_m` for every waypoint except the last, operator waypoints included. `skippable` is set only on candidates (guide nodes), and only when `skip_allowed(corridor)` (corridor above `NODE_POLICY_SKIP_MIN_CORRIDOR_M`, 0.10 m). A measured `Route.min_width` of exactly 0 is corridor 0 (no room), not unknown; only a non-finite or negative width is unknown. Where the planner did not measure (no graph, timeout, error, a reroute it could not reach), a positive *measured* corridor is cleared (it may be for a place the waypoint left); a measured 0 and the operator's values stay. An operator corridor above the 1.5 m cap is capped silently when stored. Keep-out zones (`blocked`) are applied to every leg's width as they are to the planned route.
+  - `total` of the report is one count everywhere (`cloud_common.node_policy.skippable_candidates`): the waypoints but the last that are planned or ask to be skippable, whether or not they have a corridor.
+  - The sent-order record has a reason `corridor_below_margin`: asked skippable, `0 < corridor <= 0.10`, sent as a gate only.
   - Waypoint 0 uses its one known leg (0→1), since the leg before it starts at the robot. The robot's costmap remains the safety layer; the corridor is only permission.
   - An operator's own `corridor_width_m` still wins.
   - The report gains per-reason counts: `{total, skippable, corridor: {measured, narrow, unknown}, unavailable}`.

@@ -759,6 +759,8 @@ SCENE_GRAPH_MAX_VERSION_LAG_S = float(os.getenv("SCENE_GRAPH_MAX_VERSION_LAG_S",
 # turn in place, hypot(length, width) + margin when it does. The margin is the lattice error:
 # lattice / 2 = 0.05 m for the default 0.1 m lattice.
 SCENE_GRAPH_WIDTH_MARGIN_M = float(os.getenv("SCENE_GRAPH_WIDTH_MARGIN_M", "0.05"))
+# The same margin is subtracted once more in the nodePolicy corridor (node_policy_plan.corridor_per_side), as the planner's lattice
+# allowance; it is not the robot's 0.10 m pose-error margin (NODE_POLICY_LOCALISATION_MARGIN_M), which the robot applies itself.
 # Gate of the `too_narrow` comparison above. OFF by default until it is validated on real maps.
 SCENE_GRAPH_WIDTH_CHECK_ENABLED = _env_bool("SCENE_GRAPH_WIDTH_CHECK_ENABLED", "false")
 # nodePolicy skip data (docs/node_policies_2026-10-13.md). The planner always marks go-here
@@ -774,6 +776,13 @@ NODE_POLICY_WIDTH_BUDGET_S = float(os.getenv("NODE_POLICY_WIDTH_BUDGET_S", "1.0"
 NODE_POLICY_ENRICH_TIMEOUT_S = float(os.getenv("NODE_POLICY_ENRICH_TIMEOUT_S", "5.0"))
 # The widest corridorWidth (per side, m) sent to the robot, and stored by the planner: the robot team's contract (2026-10-23).
 NODE_POLICY_CORRIDOR_CAP_M = 1.5
+# What the robot subtracts from a corridor for its own pose error (order_start.is_passed): a gate with
+# corridor <= this has no usable width, so such a waypoint can never be skipped.
+NODE_POLICY_LOCALISATION_MARGIN_M = 0.10
+# skippable=true is sent only for a corridorWidth STRICTLY above this (m). Default: the robot's localisation margin. Agreed with the
+# robot team on 2026-10-27: corridorWidth <= 0.10 m means skippable=false; corridorWidth itself is still sent (it is the gate), and
+# 0 still means "measured, no room". The 0.05 m SCENE_GRAPH_WIDTH_MARGIN_M above is the planner's own lattice margin, unchanged.
+NODE_POLICY_SKIP_MIN_CORRIDOR_M = float(os.getenv("NODE_POLICY_SKIP_MIN_CORRIDOR_M", str(NODE_POLICY_LOCALISATION_MARGIN_M)))
 # Most waypoints one POST /api/v1/route/preview accepts (docs/route_preview_2026-10-14.md); over it: 413.
 ROUTE_PREVIEW_MAX_WAYPOINTS = int(os.getenv("ROUTE_PREVIEW_MAX_WAYPOINTS", "100"))
 # The planner's dense lattice path per leg between the waypoints (docs/plan_trajectory_2026-10-14.md), returned with a plan

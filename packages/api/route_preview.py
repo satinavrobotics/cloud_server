@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from cloud_common.objects import common
 from packages import config
+from cloud_common import node_policy as node_policy_rules
 
 _log = logging.getLogger("RoutePreview")
 
@@ -61,9 +62,11 @@ async def preview(planner: Any, map_id: str, raw: List[Dict[str, Any]], return_l
     """The response of POST /api/v1/route/preview. Raises PreviewError for a refused request; a planner that is
     down, slow or without a scene graph is an answer (planner "none" with a reason), never an exception."""
     poses = build_route(map_id, raw, return_leg)
+    asked = len(node_policy_rules.skippable_candidates(poses))
     waypoints = [p.dict() for p in poses]
-    asked = sum(1 for p in poses[:-1] if p.skippable and not p.corridor_width_m)
-    none = {"waypoints": waypoints, "trajectory": [], "issues": [],
+    unmeasured = [dict(w) for w in waypoints]          # the answer where nothing is measured: no stale measured corridor
+    node_policy_rules.clear_stale_measured(unmeasured)
+    none = {"waypoints": unmeasured, "trajectory": [], "issues": [],
             "node_policy": {"total": asked, "skippable": 0, "unavailable": None},
             "planner": PLANNER_NONE, "reason": REASON_PLANNER_UNAVAILABLE, "graph_version": None}
     if planner is None:
@@ -80,7 +83,7 @@ async def preview(planner: Any, map_id: str, raw: List[Dict[str, Any]], return_l
     if result.get("graph_version") is None:
         # the planner answered without a scene graph (or gave up): the route came back as it was
         reason = policy.get("unavailable") or REASON_NO_SCENE_GRAPH
-        return {**none, "waypoints": returned or waypoints, "node_policy": policy, "reason": reason}
+        return {**none, "waypoints": returned or unmeasured, "node_policy": policy, "reason": reason}
     return {"waypoints": returned, "trajectory": list(result.get("trajectory") or []),
             "issues": list(result.get("issues") or []), "node_policy": policy,
             "planner": PLANNER_SCENE_GRAPH, "reason": None, "graph_version": result.get("graph_version"),
@@ -98,7 +101,7 @@ async def measure_reroute(planner: Any, robot_name: str, reroute: Dict[str, Any]
     out: Dict[str, Any] = {}
     for name, route in reroute.items():
         route = route.dict() if hasattr(route, "dict") else dict(route or {})
-        waypoints = [w if isinstance(w, dict) else w.dict() for w in route.get("waypoints") or []]
+        waypoints = [dict(w) if isinstance(w, dict) else w.dict() for w in route.get("waypoints") or []]
         maps = {w.get("map_id") or "" for w in waypoints}
         if planner is not None and len(waypoints) >= 2 and len(maps) == 1 and "" not in maps:
             try:
@@ -108,8 +111,13 @@ async def measure_reroute(planner: Any, robot_name: str, reroute: Dict[str, Any]
                 measured = [w if isinstance(w, dict) else w.dict() for w in result["waypoints"]]
                 if len(measured) == len(waypoints):
                     waypoints = measured
+                else:
+                    node_policy_rules.clear_stale_measured(waypoints)
             except Exception as err:  # pylint: disable=broad-except
                 _log.warning("Reroute of %s: corridors not measured (%r); route stored as given",
                              name, err)
+                node_policy_rules.clear_stale_measured(waypoints)
+        else:
+            node_policy_rules.clear_stale_measured(waypoints)       # nothing to measure it against
         out[name] = {**route, "waypoints": waypoints}
     return out

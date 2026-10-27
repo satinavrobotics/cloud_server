@@ -27,6 +27,7 @@ from typing import Any, List, Optional, Set, Union
 
 import pydantic
 
+from cloud_common.node_policy import skip_allowed
 from cloud_common.objects import mission, robot, common
 from packages.controllers.mission import order_ids
 from packages.controllers.mission.order_policy import OrderPolicy, \
@@ -148,14 +149,15 @@ class VDA5050Action(pydantic.BaseModel):
         through it. corridorWidth (per side, the robot's gate) is sent whenever it is known,
         also with skippable=false; 0 means measured, no room, and a missing key means
         unknown (the robot default applies). It is clamped to the contract's cap.
-        skippable is true only with a corridor > 0. The last node carries maxWaitS only
+        skippable is true only with a corridor above NODE_POLICY_SKIP_MIN_CORRIDOR_M (`skip_allowed`; the robot cannot
+        use a gate of 0.10 m or less). The last node carries maxWaitS only
         (skippable false, no corridor). maxWaitS is clamped to what the robot accepts."""
         params = []
         corridor = None if last else clamp_corridor_m(corridor_width_m)
         # Robot team: skippable needs a usable corridorWidth, so never claim it without.
         params.append(VDA5050ActionParameter(
             key="skippable",
-            value=bool(skippable) and corridor is not None and corridor > 0))
+            value=bool(skippable) and skip_allowed(corridor)))
         params.append(VDA5050ActionParameter(key="maxWaitS",
                                              value=clamp_max_wait_s(max_wait_s)))
         if corridor is not None:
@@ -190,6 +192,7 @@ def describe_node_policies(order: "VDA5050Order", waypoints, policy: OrderPolicy
     actions themselves, so the record cannot drift from the wire. `waypoints` are the
     route's waypoints the order was built from, `offset` the index of the first in the
     stored route. Reasons: structural_last, ok (skippable), narrow (measured, no room),
+    corridor_below_margin (asked skippable, 0 < corridor <= NODE_POLICY_SKIP_MIN_CORRIDOR_M: gate only),
     unknown:no_corridor (nothing known, the robot default applies), operator, skip_disabled,
     gate_only (guide node with room, not skippable)."""
     out = []
@@ -207,6 +210,9 @@ def describe_node_policies(order: "VDA5050Order", waypoints, policy: OrderPolicy
             reason = "ok"
         elif corridor == 0:
             reason = "narrow"
+        elif (corridor is not None and getattr(pose2d, "skippable", None) and policy.node_policy_skip_enabled
+              and not skip_allowed(corridor)):
+            reason = "corridor_below_margin"      # asked, has a gate, but 0 < corridor <= the robot's margin
         elif corridor is None:
             reason = "unknown:no_corridor"
         elif getattr(pose2d, "origin", None) != "planned":

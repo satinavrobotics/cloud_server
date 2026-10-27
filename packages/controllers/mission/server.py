@@ -58,6 +58,7 @@ from packages.events.emit import Event, emit as emit_event
 import packages.controllers.mission.vda5050_types as types
 from packages.database.postgres import PostgresDatabase
 from packages.utils import blocked_nodes, map_geo, map_sessions, metrics
+from cloud_common.node_policy import skip_allowed
 import cloud_common.objects as api_objects
 import cloud_common.objects.common as common_objects
 import cloud_common.objects.mission as mission_object
@@ -1819,14 +1820,17 @@ class Robot:
             self.mission_info(f"Route {mission_node.name}: {len(asked)} waypoints ask to be "
                               "skippable; NODE_POLICY_SKIP_ENABLED is off, none is")
             return
-        bare = [j for j in asked if not (route.waypoints[j].corridor_width_m or 0) > 0]
+        bare = [j for j in asked if not skip_allowed(route.waypoints[j].corridor_width_m)]
         if bare:
-            # a measured 0 (no room for the robot) is not an unknown width: say which it is
+            # a measured 0 (no room for the robot) is not an unknown width, and a corridor of 0 < c <= the skip threshold
+            # (the robot cannot use such a gate) is neither: say which it is
             unknown = [j for j in bare if route.waypoints[j].corridor_width_m is None]
+            narrow = [j for j in bare if (route.waypoints[j].corridor_width_m or 0) > 0]
             self.warning(f"[{self._current_mission.name}] Route {mission_node.name}: "
                          f"{len(bare)} of {len(asked)} skippable waypoints have no usable corridor "
                          f"({len(unknown)} width unknown: no scene graph or unmeasured; "
-                         f"{len(bare) - len(unknown)} measured no room); sent not skippable: "
+                         f"{len(narrow)} corridor not above {config.NODE_POLICY_SKIP_MIN_CORRIDOR_M} m; "
+                         f"{len(bare) - len(unknown) - len(narrow)} measured no room); sent not skippable: "
                          f"{bare[:10]}")
 
     def _passed_at_start(self, route: mission_object.MissionRouteNodeV1) -> int:

@@ -587,7 +587,7 @@ call the dispatcher makes before a mission's first start) and returns the result
 ```
 `map_id` and `waypoints` are required (map frame; every waypoint gets `map_id`). `return: true` appends the way back (the
 waypoints in reverse order, heading + pi, the last waypoint not repeated). `robot_name` (optional) gives the robot footprint width for
-corridor widths. Waypoints with `origin: "planned"` are dropped and re-planned.
+corridor widths. Waypoints with `origin: "planned"` are dropped and re-planned. `node_policy.total` is the number of waypoints but the last that are planned or ask to be skippable (the same count whether or not the planner answered); where nothing could be measured, positive measured corridors are cleared. An operator corridor above 1.5 m is capped silently.
 
 **Response (200):**
 ```json
@@ -1069,7 +1069,7 @@ the robot holds at the waypoint before it counts as blocked; default `NODE_POLIC
 capped at 120), `corridor_width_m` (metres of free ground on each side of the edges before and
 after the waypoint that a skip may use), `origin` (`"user"` or `"planned"`). `max_wait_s` and
 `corridor_width_m` must be finite and >= 0, else 422/400. A skip is sent to the robot only when
-`skippable` is true AND a corridor width is known: the planner fills `corridor_width_m` from the
+`skippable` is true AND the corridor width is above `NODE_POLICY_SKIP_MIN_CORRIDOR_M` (0.10 m, the robot's own margin; agreed with the robot team 2026-10-27): a corridor of 0.10 m or less is still sent as `corridorWidth` (the gate) but with `skippable=false`, and 0 means measured, no room. The planner fills `corridor_width_m` from the
 map's scene graph when the mission starts (the operator may also give one). Without a scene
 graph, or where the width is unknown, the waypoint is sent not skippable (logged, never an
 error); the last waypoint of a route is never skippable. Go-to missions (`POST /navigate`) get

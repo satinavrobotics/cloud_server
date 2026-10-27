@@ -429,9 +429,11 @@ class MissionPlannerService:
         report: Dict[str, Any] = {"total": 0, "skippable": 0, "unavailable": None}
 
         def unchanged(reason: str) -> Dict[str, Any]:
-            asked = sum(1 for w in original[:-1] if w.skippable and not w.corridor_width_m)
+            # nothing was measured: a positive measured corridor may be for a place the waypoint has left
+            node_policy_plan.clear_stale_measured(original)
             return {"waypoints": original, "inserted": 0, "changed": False,
-                    "node_policy": {"total": asked, "skippable": 0, "unavailable": reason}}
+                    "node_policy": {"total": len(node_policy_plan.skippable_candidates(original)),
+                                    "skippable": 0, "unavailable": reason}}
 
         if not config.SCENE_GRAPH_PLANNER_ENABLED:
             return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
@@ -470,20 +472,19 @@ class MissionPlannerService:
                     res = self.keepout_overlays().resolve(map_id, version, keep_rev, keep_rows, graph)
                 except keepout_overlay.KeepoutTooLarge:
                     keep_info["keepout"] = {"applied": [], "unresolved": [], "unavailable": "too_large", "crossed": []}
+            from packages.scene_graph.api import Blocked
+            blocked = Blocked(cells=res.cells) if res is not None and len(res.cells) else None
             if gap_fill:
-                from packages.scene_graph.api import Blocked
-                blocked = Blocked(cells=res.cells) if res is not None and len(res.cells) else None
                 visible = scene_route.blocked_free_los(graph, ([], []), res.keyset if blocked is not None else None)
                 pull = (scene_route.budget_pull(graph, safety, config.SCENE_GRAPH_WAYPOINT_BUDGET_M)
                         if config.SCENE_GRAPH_WAYPOINT_BUDGET_M else scene_route.simplify)
                 poses, inserted = node_policy_plan.insert_planned(
                     graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
                     pull, safety, routes, blocked)
-            wanted = [i for i, w in enumerate(poses[:-1])
-                      if w.origin == common.WAYPOINT_ORIGIN_PLANNED or w.skippable]
+            wanted = node_policy_plan.skippable_candidates(poses)
             rep = node_policy_plan.annotate_corridors(
                 graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
-                config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes)
+                config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes, blocked=blocked)
             if res is not None and res.zones:
                 h = float(graph.params.lattice)
                 crossed = []

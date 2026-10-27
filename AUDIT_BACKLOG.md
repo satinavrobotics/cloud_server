@@ -762,6 +762,14 @@ API reports.
   `reason`, which the API summary keys on.
 - C8: model the factsheet `agvActions` field (plan 1.2) instead of reading it from `.dict()` extras.
 
+### J.8 Corridor width review 2026-10-27 — fixed (branch `fix/corridor-width-review`)
+A model review of the corridorWidth computation was checked against the code; all four code items reproduced on main and are fixed with tests (`tests/unit/test_corridor_width_review.py`).
+- Skip threshold: `skippable` needs corridor > `NODE_POLICY_SKIP_MIN_CORRIDOR_M` (default 0.10 = the robot's localisation margin; agreed with the robot team 2026-10-27, the 0.05 m planner margin and centre-point semantics stay). One helper `cloud_common.node_policy.skip_allowed` for the planner, wire, dispatcher log, reason chain (`corridor_below_margin`). The corridor itself is still sent. This closes J.6 C2.
+- A measured `min_width` of 0 gives corridor 0 (one `sanitize_width`); stale positive measured corridors are cleared on the unchanged paths and in `measure_reroute`; `blocked` is passed to every leg width through one `_route_leg` (closes J.6 C4); the operator test runs once.
+- J.4 decided: `total` = waypoints but the last that are planned or ask to be skippable (`skippable_candidates`). The unchanged path and the preview now report that count (before: those without a corridor). `measure_reroute` reports no total.
+- Not changed: operator corridors above 1.5 m are capped silently (documented). Still open: J.6 C5 (serial `measure_reroute`), failure caching, budget redesign.
+- `SCENE_GRAPH_WIDTH_MARGIN_M` comments (config.py, scene_route.required_width) do say lattice error +-0.05 m (lattice/2), distinct from the robot's 0.10 m; the config comment did not say it is also subtracted in `corridor_per_side`, now added. J.3 stands answered by the robot team: it stays.
+
 ### J.7 Outside the node-policy area, skimmed only (unverified)
 - `packages/api/orchestrator_proxy.py` (5aabf80) no longer forwards the caller's Authorization header. Confirm the robot's
   orchestrator does not depend on it.
