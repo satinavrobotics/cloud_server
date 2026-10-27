@@ -62,6 +62,31 @@ when the graph can be read; without it chart keys and points are accepted unchec
 * Robot-reported blocks live in `blocked_graph_nodes` and expire/purge there; keep-outs are another table, so no cleanup of the
   former can touch them (pinned by a test).
 
+## Reroute (2026-10-27)
+
+Reported: adding a node to a mission whose route would use a kept-out edge showed "No route between ..." instead of a way around.
+What the code does, per path (all pinned by `tests/unit/test_keepout_reroute.py`):
+
+* **The editor's call** is `POST /api/v1/route/preview` -> `enrich_route` (never `plan_route`): each leg is routed over the zone cells
+  (`node_policy_plan._route_leg`); a leg that fails is an `issues` entry, which the client prints as "No route between a and b"
+  whatever the reason (`reason` is `blocked_by_keepout` when the zones alone cut it, `unreachable`, `outside_graph`, `error`).
+* With a way around, both planners (engine and lazy reader) return it, for region and edge zones, with a robot footprint and the
+  trajectory on, for a third waypoint added to the route, and for the go-to plan (`keepout.detour`). Not reproduced on the synthetic
+  worlds (ring, room loop, pillar room, 12-room grid: every link as an edge zone, point to point and anchor to anchor).
+* **Fixed, a way around the lazy reader could not find**: under an overlay (zones, robot-reported blocks) it searched 3 rings of charts
+  around the chart path and then every chart, so a detour of more than 3 charts read every tile of the map; over
+  `SCENE_GRAPH_LAZY_MAX_TILES` that is `CorridorTooLarge` -> an `error` leg in the editor ("No route"), and in a go-to the fallback
+  `corridor_too_large` -> the legacy planner -> `failed_at: "keepout"`, `reason: "keepout_unverifiable"` (it cannot place chart/edge
+  zones). The rings now widen 1, 2, 3, 4, 6, 8, 12 ... hops until a route is found (`lazy_plan.RING_HOPS`) and then refine inside the
+  length ellipse as before, so only a detour that really needs more than the cap still raises. The result is the engine's.
+* **Fixed**: `plan_on_graph` measured the corridor widths of its legs without the zones (`annotate_corridors` got no `blocked`), so a
+  detour's widths came from a route through the zone. The route preview already passed them.
+* **Unchanged, by design**: a start or goal inside a zone (a chart zone's cells, or the 2-cell edge seal along the chart boundary)
+  has no route; the preview says `blocked_by_keepout`, a go-to `failed_at: "keepout"` with `start_in_zone` / `goal_in_zone`.
+* **Not verified**: the user's own map. A real map with a kept-out edge whose detour is long, a node placed within 0.2 m of the
+  chart boundary, or a planner that timed out (`SCENE_GRAPH_PLAN_BUDGET_S`, answers "none", no issues) can look the same in the
+  editor; look at the planner log ("Chart planner not used (...)"), `GET /stats` `scene_graph.outcomes` and the `issues[].reason`.
+
 ## Not covered
 
 * **Missions already running keep their route**; a reroute (`PUT /missions/{name}` with `update_nodes`) and operator-drawn
