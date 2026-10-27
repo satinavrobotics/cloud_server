@@ -15,6 +15,7 @@ pytest.importorskip("psycopg")
 
 from packages.api import drive_stats as ds  # noqa: E402
 from packages.api.result_cache import ResultCache  # noqa: E402
+from packages.utils import run_cells_db as rdb  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -140,26 +141,54 @@ class TestLegs:
 
 
 class FakeCursor:
-    def __init__(self, track, legs, recoveries, track_runs=()):
+    """The queries of drive_stats. `summaries`: stored CellRows (rdb.fetch answers them by the window / robot);
+    the raw queries leave out the runs the summaries part takes, as their NOT EXISTS clause does."""
+
+    def __init__(self, track, legs, recoveries, track_runs=(), summaries=()):
         self.track, self.legs, self.recoveries, self.track_runs = track, legs, recoveries, set(track_runs)
+        self.summaries = list(summaries)
         self.sql = []
         self._rows = []
+
+    def _taken(self, sql, args):
+        """Run ids of the summaries part, from the window arguments of the NOT EXISTS clause (algo, [from], [to],
+        [robot])."""
+        if "NOT EXISTS (SELECT 1 FROM run_cells c" not in sql:
+            return set()
+        tail = list(args[-1 - sql.count("c.started_at") - ("c.robot_name" in sql) - 1:-1])
+        algo, rest = tail[0], tail[1:]
+        lo = rest.pop(0) if "c.started_at >= %s" in sql else None
+        hi = rest.pop(0) if "c.started_at < %s" in sql else None
+        robot = rest.pop(0) if "c.robot_name = %s" in sql else None
+        return {s.run_id for s in self.summaries if s.algo_version == algo and (lo is None or s.started_at >= lo)
+                and (hi is None or s.started_at < hi) and (robot is None or s.robot_name == robot)}
 
     async def execute(self, sql, args=()):
         self.sql.append((sql, args))
         if "FROM robot_track_ts t JOIN" in sql:
-            self._rows = sorted(self.track, key=lambda r: -r[1])[:args[-1]]
+            taken = self._taken(sql, args)
+            self._rows = sorted((r for r in self.track if r[0] not in taken), key=lambda r: -r[1])[:args[-1]]
         elif "NAV.RECOVERY_EXITED" in sql:
             self._rows = self.recoveries
         elif "FROM run_legs" in sql:
-            self._rows = self.legs
+            taken = self._taken(sql, args)
+            self._rows = [r for r in self.legs if r[0] not in taken]
         elif "SELECT DISTINCT run_id" in sql:
             self._rows = [(r,) for r in self.track_runs if r in args[0]]
+        elif "FROM run_cells WHERE map_id" in sql:
+            lo = args[2] if "started_at >= %s" in sql else None
+            self._rows = [rdb_stored(s) for s in self.summaries if lo is None or s.started_at >= lo]
         else:
             raise AssertionError(sql)
 
     async def fetchall(self):
         return list(self._rows)
+
+
+def rdb_stored(row):
+    """A CellRow as the SELECT of run_cells_db.COLUMNS returns it."""
+    p = rdb.encode(row)
+    return tuple(p[:len(rdb.COLUMNS) - 1]) + (row.created_at,)
 
 
 class FakeStore:
@@ -201,8 +230,8 @@ class FakeReads:
 
 @pytest.fixture
 def patched(monkeypatch):
-    def install(track=(), legs=(), recoveries=(), track_runs=(), known=("m",)):
-        cursor = FakeCursor(list(track), list(legs), list(recoveries), track_runs)
+    def install(track=(), legs=(), recoveries=(), track_runs=(), known=("m",), summaries=()):
+        cursor = FakeCursor(list(track), list(legs), list(recoveries), track_runs, summaries)
 
         @contextlib.asynccontextmanager
         async def read_cursor(db):
@@ -314,9 +343,12 @@ class TestEndpoint:
         cur = patched()
         a = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
         call(FakeReads(), start=a, end=a + datetime.timedelta(days=1), robot="r1")
-        sql, args = cur.sql[0]
+        sql, args = next(c for c in cur.sql if "FROM robot_track_ts" in c[0])
         assert "t.ts >= %s" in sql and "t.ts < %s" in sql and "t.robot_name = %s" in sql
-        assert args[0] == "m" and args[-2] == a + datetime.timedelta(days=1) or "r1" in args
+        assert args[0] == "m" and "r1" in args
+        sql, args = next(c for c in cur.sql if "FROM run_cells" in c[0])           # the summaries part, same window
+        assert "started_at >= %s" in sql and "started_at < %s" in sql and "robot_name = %s" in sql
+        assert a in args and "r1" in args
         with pytest.raises(HTTPException):
             call(FakeReads(), start=a, end=a)
 
@@ -378,3 +410,158 @@ class TestRoute:
         assert json.loads(r.body)["map_id"] == "m"
         assert get(r.headers["etag"]).status_code == 304
         assert get('"other"').status_code == 200
+
+
+# --- stored per-run summaries (docs/region_stats_2026-10-27.md 6.5) --------------------------------
+
+import datetime as _dt  # noqa: E402
+
+from packages.api import run_cells as rcells  # noqa: E402
+
+DAY0 = _dt.datetime(2026, 10, 14, 0, 0, tzinfo=_dt.timezone.utc)
+
+
+def summarise(run, rows, recoveries=(), started=None, map_id="m"):
+    """The stored summary of one fixture run (rows as track_run builds them)."""
+    started = started or _dt.datetime.fromtimestamp(rows[0][1], _dt.timezone.utc)
+    data = rcells.RunData(run, "r1", map_id, started, started + _dt.timedelta(minutes=5),
+                          [(r[1], r[2], r[3], r[4], r[5], map_id) for r in rows],
+                          [(t, d) for rid, t, d in recoveries if rid == run], [], [])
+    [row] = rcells.summarise_rows(data, lambda m: {}, None)
+    return row
+
+
+def two_runs():
+    a = track_run("a", [0.05, 0.4, 0.8, 0.8, 1.2, 1.9], t0=DAY0.timestamp() + 3600)
+    b = track_run("b", [0.5, 0.9, 1.3, 1.3, 1.3, 2.0, 2.4], y=0.35, t0=DAY0.timestamp() + 7200)
+    rec = [("a", a[3][1] + 2.0, 1.2), ("b", b[4][1] + 0.5, 0.8)]
+    return a, b, rec
+
+
+def tile_dict(body):
+    return {(t[0], t[1]): t[2:] for t in body["tiles"]}
+
+
+class TestSummaries:
+    def both(self, patched, monkeypatch, summarised=("a", "b"), **kw):
+        a, b, rec = two_runs()
+        track = a + b
+        sums = [summarise(r, rows, rec) for r, rows in (("a", a), ("b", b)) if r in summarised]
+        patched(track=track, recoveries=rec, summaries=sums)
+        mixed, _ = call(FakeReads(), **kw)
+        monkeypatch.setattr(ds.config, "DRIVE_STATS_SOURCE", "raw")
+        raw, _ = call(FakeReads(), cache=ResultCache(4, 60.0), **kw)
+        monkeypatch.undo()
+        return mixed, raw
+
+    def test_every_run_summarised_equals_the_raw_answer(self, patched, monkeypatch):
+        mixed, raw = self.both(patched, monkeypatch)
+        assert mixed["source"]["basis"] == "summaries" and raw["source"]["basis"] == "raw"
+        assert mixed["source"]["summary_runs"] == 2 and mixed["source"]["raw_runs"] == 0
+        assert raw["source"]["summary_runs"] == 0 and raw["source"]["raw_runs"] == 2
+        assert tile_dict(mixed).keys() == tile_dict(raw).keys()
+        for cell, vals in tile_dict(raw).items():
+            assert tile_dict(mixed)[cell] == pytest.approx(vals, abs=1e-6)
+        assert len(mixed["regions"]) == len(raw["regions"]) == 2
+        for rm, rr in zip(mixed["regions"], raw["regions"]):
+            assert rm.keys() == rr.keys()
+            for k, v in rr.items():
+                assert rm[k] == pytest.approx(v, abs=0.06), k           # the regions round to 0.01 m / 0.1 s
+        for k in ("track_runs", "track_segments", "track_pairs_rejected", "recovery_unattributed_s", "tiles_track"):
+            assert mixed["source"][k] == pytest.approx(raw["source"][k])
+        assert mixed["source"]["partial"] is False
+
+    def test_a_run_not_summarised_yet_comes_from_the_raw_rows_once(self, patched, monkeypatch):
+        mixed, raw = self.both(patched, monkeypatch, summarised=("a",))
+        assert mixed["source"]["summary_runs"] == 1 and mixed["source"]["raw_runs"] == 1
+        assert mixed["source"]["track_runs"] == 2
+        assert tile_dict(mixed).keys() == tile_dict(raw).keys()
+        for cell, vals in tile_dict(raw).items():
+            assert tile_dict(mixed)[cell] == pytest.approx(vals, abs=1e-6)       # nothing missing, nothing doubled
+        for rm, rr in zip(mixed["regions"], raw["regions"]):
+            assert rm["n"] == rr["n"] and rm["len_m"] == pytest.approx(rr["len_m"], abs=0.01)
+
+    def test_other_min_speed_reads_raw_and_says_so(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec), summarise("b", b, rec)])
+        body, _ = call(FakeReads(), min_speed=0.2)
+        assert body["source"]["basis"] == "raw" and body["source"]["basis_reason"] == "min_speed"
+        assert body["source"]["summary_runs"] == 0 and body["source"]["raw_runs"] == 2
+
+    def test_config_raw_never_reads_the_summaries(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        cur = patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec)])
+        monkeypatch.setattr(ds.config, "DRIVE_STATS_SOURCE", "raw")
+        body, _ = call(FakeReads())
+        assert body["source"]["basis_reason"] == "config" and not any("run_cells" in s for s, _ in cur.sql)
+
+    def test_runs_started_outside_the_window_are_not_summed_from_summaries(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        old = summarise("a", a, rec, started=DAY0 - _dt.timedelta(days=3))
+        patched(track=a + b, recoveries=rec, summaries=[old, summarise("b", b, rec)])
+        body, _ = call(FakeReads(), start=DAY0, end=DAY0 + _dt.timedelta(days=1))
+        # b from its summary; a started before the window, so its rows inside the window come raw (the old rule)
+        assert body["source"]["summary_runs"] == 1 and body["source"]["raw_runs"] == 1
+
+    def test_partial_is_only_the_raw_part_hitting_the_cap(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec)])
+        monkeypatch.setattr(ds.config, "DRIVE_STATS_MAX_ROWS", 3)
+        body, _ = call(FakeReads())
+        assert body["source"]["partial"] is True and body["source"]["track_rows"] == 3
+        patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec), summarise("b", b, rec)])
+        body, _ = call(FakeReads(), cache=ResultCache(4, 60.0))
+        assert body["source"]["partial"] is False and body["source"]["track_rows"] == 0
+
+    def test_the_client_keys_survive(self, patched):
+        a, b, rec = two_runs()
+        patched(track=a, summaries=[summarise("a", a, rec)])
+        body, _ = call(FakeReads())
+        for k in ("track_runs", "track_rows", "track_segments", "track_pairs_rejected", "leg_runs", "leg_rows",
+                  "legs_skipped", "legs_dropped_run_has_track", "recovery_unattributed_s", "partial",
+                  "tiles_track", "tiles_leg_only"):
+            assert k in body["source"]
+        assert body["tile_fields"] == ["ix", "iy", "n", "len_m", "time_s", "recovery_s", "stopped_s"]
+
+    def test_legs_summaries_count_as_leg_runs(self, patched):
+        leg = (1, "n1", "n2", 10.0, 2.0, 1.0, DAY0.timestamp(), DAY0.timestamp() + 10, "m")
+        data = rcells.RunData("L", "r1", "m", DAY0, DAY0 + _dt.timedelta(minutes=1), [], [], [], [leg])
+        [row] = rcells.summarise_rows(data, lambda m: {"n1": (0.05, 5.05), "n2": (2.05, 5.05)}, None)
+        patched(summaries=[row])
+        body, _ = call(FakeReads())
+        assert body["source"]["leg_runs"] == 1 and body["source"]["track_runs"] == 0
+        assert body["source"]["leg_rows"] == 1 and {t[1] for t in body["tiles"]} == {50}
+
+
+class TestSeriesFromSummaries:
+    def test_equals_the_raw_series_when_no_run_crosses_midnight(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        sums = [summarise("a", a, rec), summarise("b", b, rec)]
+        patched(track=a + b, recoveries=rec, summaries=sums)
+        kw = dict(start=DAY0, end=DAY0 + _dt.timedelta(days=2), series="day")
+        mixed, _ = call(FakeReads(), **kw)
+        monkeypatch.setattr(ds.config, "DRIVE_STATS_SOURCE", "raw")
+        raw, _ = call(FakeReads(), cache=ResultCache(4, 60.0), **kw)
+        sm, sr = mixed["series"], raw["series"]
+        for k in ("len_m", "time_s", "recovery_share", "stopped_share", "new_tiles", "cumulative_tiles"):
+            assert sm[k] == pytest.approx(sr[k], abs=1e-3), k
+        # the moving speed uses len / (time - stopped): within the stopped segments' own length (<= 0.05 m/s)
+        assert sm["moving_speed_mps"][0] == pytest.approx(sr["moving_speed_mps"][0], abs=0.05)
+        assert sm["source"]["summary_runs"] == 2 and sr["source"]["summary_runs"] == 0
+
+    def test_a_run_over_midnight_belongs_to_the_day_it_started(self, patched):
+        rows = track_run("x", [0.05, 0.5, 0.95, 1.4], t0=DAY0.timestamp() + 86400 - 2.0)      # crosses the midnight
+        row = summarise("x", rows)
+        patched(summaries=[row])
+        body, _ = call(FakeReads(), start=DAY0, end=DAY0 + _dt.timedelta(days=3), series="day")
+        s = body["series"]
+        assert s["len_m"][0] > 0 and s["len_m"][1] == 0.0
+        assert s["new_tiles"][0] == s["cumulative_tiles"][2] > 0
+
+    def test_legs_summaries_are_not_in_the_series(self, patched):
+        leg = (1, "n1", "n2", 10.0, 0.0, 0.0, DAY0.timestamp(), DAY0.timestamp() + 10, "m")
+        data = rcells.RunData("L", "r1", "m", DAY0, DAY0 + _dt.timedelta(minutes=1), [], [], [], [leg])
+        [row] = rcells.summarise_rows(data, lambda m: {"n1": (0.05, 5.05), "n2": (2.05, 5.05)}, None)
+        patched(summaries=[row])
+        body, _ = call(FakeReads(), start=DAY0, end=DAY0 + _dt.timedelta(days=1), series="day")
+        assert body["series"]["len_m"] == [0.0] and body["series"]["source"]["leg_only_runs_not_in_series"] == 1
