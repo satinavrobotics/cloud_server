@@ -732,6 +732,9 @@ class VDA5050Factsheet(pydantic.BaseModel):
     localizationParameters: Optional[VDA5050LocalizationParameters]
     actions: Optional[List[VDA5050ActionDefinition]] = pydantic.Field(
         None, description="List of custom actions available on this robot")
+    # Not in the VDA5050 factsheet schema: the robot's build id (infoType swVersion), read by
+    # fleet_recorder.sw_version_from_message. Without the field pydantic drops the entry.
+    information: Optional[List[VDA5050Info]] = None
     # Set by the dispatcher on arrival (never part of the robot's message).
     received_topic: Optional[str] = None
     received_retained: Optional[bool] = None
