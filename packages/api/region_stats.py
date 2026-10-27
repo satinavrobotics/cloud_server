@@ -14,7 +14,12 @@ rows:
 * Per (chart, class): sums over the kept samples; pace = time_s / len_m PER SAMPLE and its median / p90 (linear
   percentile) over the samples; moving pace the same with time_s - stopped_s; ratios from the sums (NULL on a zero
   denominator); `runs` = the kept samples; `visited` = distinct 0.1 m cells of the chart with movement in them;
-  `speed_max` = the class's factsheet speed_max when all its samples agree (NULL for '*' or unknown).
+  `speed_max` = the class's factsheet speed_max when all its samples agree (NULL for '*' or unknown). Moving time is
+  time - stopped (transit) - dwell (waiting at the start, goal and action nodes, algo_version 2).
+* `norm_*` (docs/planner_region_stats_2026-10-27.md 10, decision 2): the class key has no speed_max, so pace is
+  normalised by each run's own speed_max: over the kept samples whose run has a factsheet speed (`speed_basis`
+  "factsheet", not a placeholder) `norm_len_m` = metres, `norm_moving_m` = moving seconds x speed_max, `norm_stopped_m` =
+  stopped seconds x speed_max, `norm_runs` = those samples. See region_stats_load.
 * `stamp` = sha1 (16 hex) of (algo_version, window, min length, max runs, sorted (run_id, created_at) of the inputs).
   Day decay, priors and shrinkage are the planner's job (it has `runs`).
 
@@ -40,6 +45,7 @@ from packages import config
 from packages.api import drive_stats, fleet_reads, maps
 from packages.api.result_cache import ResultCache
 from packages.utils import cell_raster as cr
+from packages.utils import robot_class as rclass
 from packages.utils import run_cells_db as rdb
 from packages.utils.timeutil import utcnow
 
@@ -50,7 +56,8 @@ NO_GRAPH_VERSION = 0                     # graph_version of the build row of a m
 COLUMNS = ("map_id", "graph_version", "chart_key", "robot_class", "runs", "len_m", "time_s", "stopped_s",
            "recovery_s", "blocks", "pace_median_s_per_m", "pace_p90_s_per_m", "moving_pace_median_s_per_m",
            "moving_speed_mps", "stopped_share", "recovery_s_per_100m", "blocks_per_run", "speed_max", "cells",
-           "visited", "first_at", "last_at", "stamp")
+           "visited", "first_at", "last_at", "stamp", "dwell_s", "norm_runs", "norm_len_m", "norm_moving_m",
+           "norm_stopped_m")
 INSERT_SQL = (f"INSERT INTO region_stats ({', '.join(COLUMNS)}) VALUES ({', '.join(['%s'] * len(COLUMNS))})")
 LIVE_MAP_SQL = (f"SELECT 1 FROM {MapObjectV1.table_name()} WHERE name = %s "
                 "AND lifecycle NOT IN ('DELETING', 'DELETED') FOR SHARE")
@@ -81,6 +88,11 @@ def _percentiles(values: np.ndarray) -> Tuple[Optional[float], Optional[float]]:
     return float(p50), float(p90)
 
 
+def _moving(sample: Dict[str, Any]) -> float:
+    """Seconds a sample was moving: its time less the transit stops and the dwell (never negative)."""
+    return max(0.0, sample["time_s"] - sample["stopped_s"] - sample["dwell_s"])
+
+
 def _ratio(num: float, den: float) -> Optional[float]:
     return float(num / den) if den > 0 else None
 
@@ -96,12 +108,12 @@ def aggregate(map_id: str, version: int, rows: Sequence[rdb.CellRow], ids_per_ro
             continue
         n = len(names) + 1
         sums = {f: np.bincount(ids, weights=getattr(row, f), minlength=n)
-                for f in ("len_m", "time_s", "stopped_s", "recovery_s", "blocks")}
+                for f in ("len_m", "time_s", "stopped_s", "recovery_s", "blocks", "dwell_s")}
         for k in np.nonzero(sums["len_m"][1:] >= config.REGION_STATS_MIN_LEN_M)[0] + 1:
             samples.setdefault(names[k - 1], []).append({
                 "row": row, "len_m": float(sums["len_m"][k]), "time_s": float(sums["time_s"][k]),
                 "stopped_s": float(sums["stopped_s"][k]), "recovery_s": float(sums["recovery_s"][k]),
-                "blocks": int(round(sums["blocks"][k])), "i": i, "k": int(k)})
+                "blocks": int(round(sums["blocks"][k])), "dwell_s": float(sums["dwell_s"][k]), "i": i, "k": int(k)})
     out: List[Dict[str, Any]] = []
     for chart in sorted(samples):
         pool = sorted(samples[chart], key=lambda s: (s["row"].started_at, str(s["row"].run_id)), reverse=True)
@@ -120,9 +132,12 @@ def _stat_row(map_id: str, version: int, chart: str, cls: str, kept: List[Dict[s
               ) -> Dict[str, Any]:
     len_m, time_s = sum(s["len_m"] for s in kept), sum(s["time_s"] for s in kept)
     stopped, rec = sum(s["stopped_s"] for s in kept), sum(s["recovery_s"] for s in kept)
-    blocks = sum(s["blocks"] for s in kept)
+    blocks, dwell = sum(s["blocks"] for s in kept), sum(s["dwell_s"] for s in kept)
     pace = np.array([s["time_s"] / s["len_m"] for s in kept])
-    moving = np.array([(s["time_s"] - s["stopped_s"]) / s["len_m"] for s in kept if s["time_s"] - s["stopped_s"] > 0])
+    moving = np.array([_moving(s) / s["len_m"] for s in kept if _moving(s) > 0])
+    # the speed-normalised sums: only runs with a factsheet speed_max (a placeholder says nothing), each time x its own
+    norm = [(s, float(s["row"].speed_max)) for s in kept
+            if s["row"].speed_basis == rclass.SPEED_FACTSHEET and (s["row"].speed_max or 0) > 0]
     p50, p90 = _percentiles(pace)
     m50, _ = _percentiles(moving)
     cell_keys = [rows[s["i"]].key[(ids_per_row[s["i"]] == s["k"]) & ((rows[s["i"]].len_m > 0) | (rows[s["i"]].time_s > 0))]
@@ -131,12 +146,13 @@ def _stat_row(map_id: str, version: int, chart: str, cls: str, kept: List[Dict[s
     return {"map_id": map_id, "graph_version": version, "chart_key": chart, "robot_class": cls, "runs": len(kept),
             "len_m": len_m, "time_s": time_s, "stopped_s": stopped, "recovery_s": rec, "blocks": blocks,
             "pace_median_s_per_m": p50, "pace_p90_s_per_m": p90, "moving_pace_median_s_per_m": m50,
-            "moving_speed_mps": _ratio(len_m, time_s - stopped), "stopped_share": _ratio(stopped, time_s),
+            "moving_speed_mps": _ratio(len_m, time_s - stopped - dwell), "stopped_share": _ratio(stopped, time_s),
             "recovery_s_per_100m": _ratio(rec * 100.0, len_m), "blocks_per_run": blocks / len(kept),
             "speed_max": (None if cls == POOLED or len(speeds) != 1 or None in speeds else float(speeds.pop())),
             "cells": int(chart_cells), "visited": int(np.unique(np.concatenate(cell_keys)).size),
             "first_at": min(s["row"].started_at for s in kept), "last_at": max(s["row"].started_at for s in kept),
-            "stamp": stamp}
+            "stamp": stamp, "dwell_s": dwell, "norm_runs": len(norm), "norm_len_m": sum(s["len_m"] for s, _ in norm),
+            "norm_moving_m": sum(_moving(s) * v for s, v in norm), "norm_stopped_m": sum(s["stopped_s"] * v for s, v in norm)}
 
 
 async def current_version(reads: Any, map_id: str) -> Optional[int]:

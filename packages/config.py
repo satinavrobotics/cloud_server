@@ -681,11 +681,15 @@ DRIVE_STATS_SOURCE = os.getenv("DRIVE_STATS_SOURCE", "summaries")
 # REGION_STATS_MIN_LEN_M in the chart; a map is rebuilt REGION_STATS_DEBOUNCE_S after its first change, the
 # newest REGION_STATS_KEEP_VERSIONS graph versions are kept.
 RUN_CELLS_ENABLED = _env_bool("RUN_CELLS_ENABLED", "true")
-RUN_CELLS_ALGO_VERSION = int(os.getenv("RUN_CELLS_ALGO_VERSION", "1"))
+RUN_CELLS_ALGO_VERSION = int(os.getenv("RUN_CELLS_ALGO_VERSION", "2"))
 RUN_CELLS_POLL_S = float(os.getenv("RUN_CELLS_POLL_S", "30.0"))
 RUN_CELLS_BATCH = int(os.getenv("RUN_CELLS_BATCH", "20"))
 RUN_CELLS_EXTRA_GRACE_S = float(os.getenv("RUN_CELLS_EXTRA_GRACE_S", "30.0"))
 RUN_CELLS_RETRY_S = float(os.getenv("RUN_CELLS_RETRY_S", "600.0"))
+# A factsheet speed_max of exactly ROBOT_PLACEHOLDER_SPEED_MAX with no footprint (length and width unknown) is the default a
+# robot reports before it is configured, not a measured limit: its runs do not enter the speed-normalised sums of
+# region_stats and the planner's region term is off for it (packages/utils/robot_class.py:speed_basis).
+ROBOT_PLACEHOLDER_SPEED_MAX = float(os.getenv("ROBOT_PLACEHOLDER_SPEED_MAX", "1.0"))
 REGION_STATS_WINDOW_DAYS = int(os.getenv("REGION_STATS_WINDOW_DAYS", "90"))
 REGION_STATS_MIN_LEN_M = float(os.getenv("REGION_STATS_MIN_LEN_M", "1.0"))
 REGION_STATS_MAX_RUNS = int(os.getenv("REGION_STATS_MAX_RUNS", "50"))

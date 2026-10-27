@@ -1037,7 +1037,7 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
         assert col in up
     assert "DROP VIEW robot_software_periods" in m.DOWNGRADE_SQL and "DROP TABLE navstack_deployments" in m.DOWNGRADE_SQL
     # exactly one head: nothing else descends from the migration it follows; only the edge-stats
-    # index migration (20261027_02) descends from ours, and the run_legs plan migration (20261027_03) is followed by leg moving time (20261027_04), then the head, the run cell summaries (20261028_01)
+    # index migration (20261027_02) descends from ours, and the run_legs plan migration (20261027_03) is followed by leg moving time (20261027_04), then the run cell summaries (20261028_01) and the head, the region cost columns (20261028_02)
     downs = {}
     for f in versions.glob("2026*.py"):
         text = f.read_text()
@@ -1052,7 +1052,8 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
     assert downs["20261027_03_run_legs_plan"] == "20261027_02_edge_obs_history"
     assert downs["20261027_04_leg_moving"] == "20261027_03_run_legs_plan"
     assert downs["20261028_01_run_cells"] == "20261027_04_leg_moving"
-    assert heads == {"20261028_01_run_cells"}
+    assert downs["20261028_02_region_cost"] == "20261028_01_run_cells"
+    assert heads == {"20261028_02_region_cost"}
 
 
 # ---- PgFacts over the mapping-session store ---------------------------------------------------------------

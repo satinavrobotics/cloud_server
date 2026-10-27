@@ -191,11 +191,13 @@ def _legs_map(legs: List[tuple], blocks: Sequence[Tuple[float, Optional[int]]],
 
 
 def summarise_rows(data: RunData, node_xy: Callable[[str], Dict[str, Tuple[float, float]]], factsheet: Any,
-                   p: Optional[cr.Params] = None) -> List[rdb.CellRow]:
+                   p: Optional[cr.Params] = None, class_basis: str = "current") -> List[rdb.CellRow]:
     """One CellRow per map of the run (pure; `node_xy(map_id)` -> {topomap node: (x, y)} is called only for the
-    legs source). A run on no map gives no row."""
+    legs source). A run on no map gives no row. `factsheet` labels the run (class, speed_max, speed_basis);
+    `class_basis` says whose it is: "current" (the robot's factsheet at summary time: no factsheet history exists
+    anywhere in the database, 2026-10-27) or "run" (the one in force when the run happened)."""
     p = p or cr.Params()
-    cls, vmax = rclass.robot_class(factsheet), rclass.speed_max_of(factsheet)
+    cls, vmax, vbasis = rclass.robot_class(factsheet), rclass.speed_max_of(factsheet), rclass.speed_basis(factsheet)
     rows: List[rdb.CellRow] = []
 
     def make(map_id: str, source: str, totals: Dict[str, Any], keys, sums, bkeys, frames) -> rdb.CellRow:
@@ -203,7 +205,7 @@ def summarise_rows(data: RunData, node_xy: Callable[[str], Dict[str, Tuple[float
         totals["blocks"] = int(blocks.sum())
         return rdb.CellRow(
             run_id=data.run_id, map_id=map_id, robot_name=data.robot_name, robot_class=cls, speed_max=vmax,
-            started_at=data.started_at, ended_at=data.ended_at, source=source,
+            speed_basis=vbasis, class_basis=class_basis, started_at=data.started_at, ended_at=data.ended_at, source=source,
             algo_version=config.RUN_CELLS_ALGO_VERSION, cell_m=cr.CELL_M, params=_params_json(p), frames=frames,
             key=key, len_m=full[0], time_s=full[1], stopped_s=full[3], recovery_s=full[2], blocks=blocks,
             totals=totals)

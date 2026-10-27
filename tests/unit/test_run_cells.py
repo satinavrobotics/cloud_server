@@ -54,7 +54,7 @@ class TestSummariseRows:
         xs = [0.0, 0.5, 1.0, 1.0, 1.0, 1.5, 2.0]          # two good moves, a stop, two more
         d = data(track(xs), recoveries=[(E0 + 6.0, 3.0)])
         [row] = rc.summarise_rows(d, nodes, FS)
-        assert row.source == "track" and row.map_id == "m1" and row.robot_class == "AMR|0.80x0.50|1.20"
+        assert row.source == "track" and row.map_id == "m1" and row.robot_class == "AMR|0.80x0.50"
         assert row.speed_max == pytest.approx(1.2) and row.algo_version == config.RUN_CELLS_ALGO_VERSION
         got = cell_totals(row)
         assert got["len_m"] == pytest.approx(row.totals["len_m"]) == pytest.approx(2.0)
@@ -64,6 +64,22 @@ class TestSummariseRows:
         assert row.totals["segments"] == 6 and row.totals["rejected"] == 0
         assert np.all(np.diff(row.key) > 0)                # sorted, distinct
         assert row.frames == [["s1", "e1"]]
+
+    def test_the_row_records_the_speed_basis_and_whose_factsheet_labelled_it(self):
+        d = data(track([0.0, 0.5, 1.0]))
+        [row] = rc.summarise_rows(d, nodes, FS)
+        assert (row.speed_basis, row.class_basis) == ("factsheet", "current")
+        [row] = rc.summarise_rows(d, nodes, FS, class_basis="run")
+        assert row.class_basis == "run"
+
+    def test_a_placeholder_robot_is_marked_and_keeps_its_class_without_speed(self):
+        fs = RobotTypeIdentifierV1(agv_class="CARRIER", length=-1, width=-1, speed_max=1.0)
+        [row] = rc.summarise_rows(data(track([0.0, 0.5, 1.0])), nodes, fs)
+        assert row.robot_class == "CARRIER|?x?" and row.speed_basis == "placeholder" and row.speed_max == 1.0
+
+    def test_a_robot_without_a_factsheet_has_an_unknown_speed(self):
+        [row] = rc.summarise_rows(data(track([0.0, 0.5, 1.0])), nodes, None)
+        assert row.robot_class == "" and row.speed_basis == "unknown" and row.speed_max is None
 
     def test_matches_the_raw_drive_stats_tiles(self):
         from packages.api import drive_stats as ds
@@ -142,7 +158,7 @@ class Cur:
 
 def a_row(**kw):
     key = cr.cell_key(np.array([3, 4, 4]), np.array([1, 1, 2]))
-    base = dict(run_id=uuid.UUID(int=1), map_id="m1", robot_name="r1", robot_class="AMR|0.80x0.50|1.20", speed_max=1.2,
+    base = dict(run_id=uuid.UUID(int=1), map_id="m1", robot_name="r1", robot_class="AMR|0.80x0.50", speed_max=1.2,
                 started_at=T0, ended_at=T0, source="track", algo_version=1, cell_m=0.1,
                 params={"min_speed": 0.05}, frames=[["s", "e"]], key=key, len_m=np.array([0.1, 0.2, 0.3]),
                 time_s=np.array([1.0, 2.0, 3.0]), stopped_s=np.zeros(3), recovery_s=np.array([0.0, 0.5, 0.0]),
@@ -155,12 +171,28 @@ class TestRunCellsDb:
     async def test_encode_decode_round_trip(self):
         row = a_row()
         params = rdb.encode(row)
-        assert params[12] == [3, 4, 4] and params[13] == [1, 1, 2] and params[-1] == "m1"
+        assert params[14] == [3, 4, 4] and params[15] == [1, 1, 2] and params[-1] == "m1"
         stored = [params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0]
         back = rdb.decode(stored)
         assert np.array_equal(back.key, row.key) and np.allclose(back.len_m, row.len_m)
         assert np.array_equal(back.blocks, row.blocks) and back.totals == row.totals and back.frames == row.frames
         assert back.speed_max == 1.2 and back.created_at == T0
+        assert (back.speed_basis, back.class_basis) == ("factsheet", "current") and not back.dwell_s.any()
+
+    async def test_dwell_and_bases_round_trip(self):
+        row = a_row(dwell_s=np.array([0.0, 1.5, 0.25]), speed_basis="placeholder", class_basis="run")
+        params = rdb.encode(row)
+        back = rdb.decode([params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0])
+        assert np.allclose(back.dwell_s, [0.0, 1.5, 0.25])
+        assert (back.speed_basis, back.class_basis) == ("placeholder", "run")
+        assert np.allclose(row.stopped_all_s, row.stopped_s + row.dwell_s)
+
+    async def test_a_row_stored_before_dwell_existed_decodes_with_zero_dwell(self):
+        row = a_row()
+        params = list(rdb.encode(row))
+        params[rdb.COLUMNS.index("dwell_s")] = []             # the migration's default for old rows
+        back = rdb.decode([params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0])
+        assert back.dwell_s.shape == (3,) and not back.dwell_s.any()
 
     async def test_insert_is_an_upsert_guarded_by_the_map(self):
         cur = Cur()

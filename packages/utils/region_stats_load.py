@@ -10,6 +10,13 @@ per chart. `robot_class` comes from packages.utils.robot_class.robot_class(facts
 (the default) pools all classes. A chart without a row has no statistics for that class (fall back to '*' or a
 prior: the planner's choice). `stamp` and `built_at` identify the build; `runs` is the number of samples behind a
 chart's figures so the planner can shrink thin ones. Day decay, priors and shrinkage are not stored.
+
+The `norm_*` figures are what the planner prices with (packages/utils/region_cost.py): sums over the samples whose run
+had a factsheet `speed_max` (speed_basis "factsheet"), each time multiplied by that run's OWN speed_max, so runs of
+different speeds add up: `norm_len_m` the metres, `norm_moving_m` the moving seconds x speed_max (moving = time - stopped
+- dwell), `norm_stopped_m` the stopped seconds x speed_max, `norm_runs` the samples. norm_moving_m / norm_len_m is 1 for a
+robot that drives at its speed_max throughout; the moving excess of a chart is that ratio minus 1. A pooled ('*') row
+holds the same sums over all classes.
 """
 import dataclasses
 import datetime
@@ -19,7 +26,7 @@ POOLED = "*"
 FIELDS = ("chart_key", "robot_class", "runs", "len_m", "time_s", "stopped_s", "recovery_s", "blocks",
           "pace_median_s_per_m", "pace_p90_s_per_m", "moving_pace_median_s_per_m", "moving_speed_mps",
           "stopped_share", "recovery_s_per_100m", "blocks_per_run", "speed_max", "cells", "visited", "first_at",
-          "last_at", "stamp")
+          "last_at", "stamp", "dwell_s", "norm_runs", "norm_len_m", "norm_moving_m", "norm_stopped_m")
 SQL = (f"SELECT {', '.join(FIELDS)} FROM region_stats WHERE map_id = %s AND graph_version = %s AND robot_class = %s")
 BUILD_SQL = "SELECT stamp, status, built_at FROM region_stats_builds WHERE map_id = %s AND graph_version = %s"
 
@@ -47,6 +54,12 @@ class RegionStat:
     first_at: Optional[datetime.datetime]
     last_at: Optional[datetime.datetime]
     stamp: str
+    # waiting near the start, goal and action nodes (not in stopped_s) and the speed-normalised sums (below)
+    dwell_s: float = 0.0
+    norm_runs: int = 0
+    norm_len_m: float = 0.0
+    norm_moving_m: float = 0.0
+    norm_stopped_m: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True)
