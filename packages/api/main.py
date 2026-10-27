@@ -22,7 +22,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService, build_mission_update
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, run_cells, session_trace, session_trajectory, sites
+from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, region_stats, run_cells, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
 from packages.api import navstack_deploy, navstack_images
 from packages.api import route_preview as route_preview_module
@@ -313,6 +313,20 @@ service: Optional[ApiDelegationService] = None
 health_checker: Optional[DependencyHealthChecker] = None
 
 
+async def _build_region_stats(map_id: str) -> None:
+    """Rebuild a map's region statistics (the run_cells worker's builder); a scene graph read that is not up yet
+    raises (503), so the worker tries again instead of storing "no scene graph"."""
+    await region_stats.build_map(service.database, _scene_graph_reads(), map_id)
+
+
+async def _region_stats_stale_maps() -> List[str]:
+    try:
+        reads = _scene_graph_reads()
+    except HTTPException:
+        return []
+    return await region_stats.maps_needing_build(service.database, reads)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import asyncio
@@ -357,7 +371,8 @@ async def lifespan(app: FastAPI):
     # Navstack deploys left non-final by a previous run (docs/navstack_deploy.md); one runner per row across workers.
     service.navstack_deployments.start_resume()
     # Per-run cell summaries (docs/region_stats_2026-10-27.md); one worker per cluster (advisory lock).
-    run_cells_worker = run_cells.RunCellsWorker(service.database, service.graph_db)
+    run_cells_worker = run_cells.RunCellsWorker(service.database, service.graph_db,
+                                                build=_build_region_stats, stale_maps=_region_stats_stale_maps)
     run_cells_worker.start()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
@@ -1242,6 +1257,30 @@ async def map_drive_stats(map_id: str, request: Request, robot: Optional[str] = 
         service.database, service.graph_db, reads, map_id, fleet_reads.parse_ts(from_, "from"),
         fleet_reads.parse_ts(to, "to"), robot, min_speed, series=series))
     headers = {"ETag": etag, "Cache-Control": "private, max-age=60"}
+    if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
+
+
+@app.get("/api/v1/maps/{map_id}/region-stats")
+async def map_region_stats(map_id: str, request: Request, robot_class: Optional[str] = None,
+                           version: Optional[int] = None, robot: Optional[str] = None):
+    """Per-chart driving statistics from the stored per-run cell summaries (what the planner will price a route
+    with): `{map_id, graph_version, stamp, built_at, window_days, min_len_m, max_runs, current_graph_version, stale,
+    status, robot_class, robot, source, runs, regions: [{chart_key, robot_class, runs, len_m, time_s, stopped_s,
+    recovery_s, blocks, pace_median_s_per_m, pace_p90_s_per_m, moving_pace_median_s_per_m, moving_speed_mps,
+    stopped_share, recovery_s_per_100m, blocks_per_run, speed_max, cells, visited, first_at, last_at, stamp}]}`.
+    `robot_class` (default `*`, all classes pooled) selects the rows; `version` a stored graph version (default the
+    newest built); `robot` computes the figures of that one robot on read (display only, cached). ETag + 304.
+    404 unknown map or a version not stored. Contract: docs/region_stats_2026-10-27.md."""
+    _require_service()
+    try:
+        reads = _scene_graph_reads()
+    except HTTPException:
+        reads = None
+    body, etag = await _site_call("map region stats", region_stats.region_stats(
+        service.database, reads, map_id, robot_class, version, robot))
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=30"}
     if etag in [t.strip() for t in (request.headers.get("if-none-match") or "").split(",")]:
         return Response(status_code=304, headers=headers)
     return Response(content=body, media_type="application/json", headers=headers)
