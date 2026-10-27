@@ -28,7 +28,9 @@ trajectory entry (k-1, k) of that node when it has one; `planned_m` is its polyl
 the two poses the robot was sent to (within EFFICIENCY_STALE_TOL_M; `plan_source` "trajectory"), the straight line
 when they are not (a reroute: the leg starts at a waypoint of the old route; "stale") and the straight line when
 there is no entry (first leg of an order, across route nodes, no trajectory; "straight"). A leg without a straight
-line (it starts at the robot's own position) has no plan: both NULL. `from_chart` / `to_chart` are the
+line (it starts at the robot's own position) has no plan: both NULL. `predicted_s` is the trajectory entry's own (the planner's
+region cost model, docs/planner_region_stats_2026-10-27.md 7), copied the way `planned_m` is: only from an entry that matches
+(`plan_source` "trajectory"); `cost_model` is then the route node's. Both NULL otherwise. `from_chart` / `to_chart` are the
 `Pose2D.chart_key` of the two waypoints and `graph_version` the route node's (None for a base node, a route
 without them).
 
@@ -99,6 +101,8 @@ class Leg:
     from_chart: Optional[str] = None
     to_chart: Optional[str] = None
     graph_version: Optional[int] = None
+    predicted_s: Optional[float] = None  # the plan's region-cost prediction for the leg (trajectory entry, plan_source "trajectory")
+    cost_model: Optional[str] = None     # `model_hash:stamp` behind predicted_s
     silent_s: float = 0.0                # see the module docstring: moving_s = duration - stopped - silent
     moving_s: Optional[float] = None
 
@@ -114,6 +118,8 @@ class RouteInfo:
     waypoints: List[Any]
     legs: Dict[Tuple[int, int], List[List[float]]]      # plan trajectory entries by (from, to) waypoint index
     graph_version: Optional[int] = None
+    predicted: Dict[Tuple[int, int], float] = dataclasses.field(default_factory=dict)   # trajectory entries' predicted_s
+    cost_model: Optional[str] = None
 
 
 def route_table(mission: Any) -> Tuple[Dict[int, RouteInfo], Optional[List[str]]]:
@@ -124,8 +130,10 @@ def route_table(mission: Any) -> Tuple[Dict[int, RouteInfo], Optional[List[str]]
         route = getattr(node, "route", None)
         if route is not None:       # (node.type rebuilds a dict on every call)
             legs = {(t.from_index, t.to_index): t.points for t in route.trajectory or []}
+            predicted = {(t.from_index, t.to_index): t.predicted_s for t in route.trajectory or []
+                         if getattr(t, "predicted_s", None) is not None}
             table[idx] = RouteInfo(offset, list(route.waypoints), legs,
-                                   getattr(route, "graph_version", None))
+                                   getattr(route, "graph_version", None), predicted, getattr(route, "cost_model", None))
             offset += len(route.waypoints)
     planned = list(mission.planned_path or [])
     return table, (planned if planned and len(planned) == offset else None)
@@ -234,6 +242,7 @@ class LegTracker:
             straight = _dist(start.pose, end.pose)
             heading = end.pose.theta - start.pose.theta
         planned, source = self._plan(start, end, straight, route)
+        predicted = route.predicted.get((start.wp, end.wp)) if route is not None and source == plan_length.SOURCE_TRAJECTORY else None
         expected = run_legs.expected_seconds(
             planned, heading, getattr(limits, "speed_max", None),
             getattr(limits, "acceleration_max", None),
@@ -252,4 +261,6 @@ class LegTracker:
             straight_m=None if straight is None else round(straight, 3),
             planned_m=None if planned is None else round(planned, 3),
             expected_s=expected, plan_source=source, from_chart=start.chart, to_chart=end.chart,
-            graph_version=route.graph_version if route is not None else None)
+            graph_version=route.graph_version if route is not None else None,
+            predicted_s=None if predicted is None else round(float(predicted), 3),
+            cost_model=route.cost_model if predicted is not None else None)

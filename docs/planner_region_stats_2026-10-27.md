@@ -1,6 +1,6 @@
 # Region statistics in the mission planner (design, 2026-10-27)
 
-Status: **design; the statistics side (S0 code, S1, S2) is implemented on branch `stats/planner-region-cost`, the planner side (S3, S4) is not** (section 11). Builds on `docs/region_stats_2026-10-27.md` (merged to local `main` 0c16088,
+Status: **design; the statistics side (S0 code, S1, S2) and the planner side (S3, S4) are implemented on branch `stats/planner-region-cost`** (sections 11, 12). Builds on `docs/region_stats_2026-10-27.md` (merged to local `main` 0c16088,
 not deployed). Line numbers are of `main` at 0c16088. "Measured" means a read-only query or a read-only run on the cloud box
 on 2026-10-27 (nothing written, nothing deployed).
 
@@ -470,4 +470,79 @@ samples hold 16 and 13 crossings.
 * Deploy and backfill (P1), then shadow evidence (P5): the replay is on history assigned to today's charts, not on shadow plans.
 * The recorder does not stamp the factsheet into the run (`class_basis` stays `current`).
 * Whether to price the dwell/recovery time of a leg (an ETA term per node, not per metre) is not designed.
+
+## 12. Implementation status of the planner side (2026-10-28, branch `stats/planner-region-cost`)
+
+Not merged, not deployed, `REGION_COST_MODE` defaults to `off`. Tests: `test_lazy_region_cost.py`, `test_scene_route_region.py`,
+`test_region_snapshots.py` (S3), `test_region_record.py` and additions to `test_run_legs.py`, `test_navstack_deploy.py` (S4).
+
+**S3 (plumbing, mode off = today)**
+
+| What | Where |
+|---|---|
+| `PlanGraph.route(..., region=)`; the term is added to the integer edge costs in `_search` from the chart index of the two end cells (`ch[mi]`, no extra read) with `weights.region_costs`; `reg = region_arg(region)` is None unless the snapshot is `active`, has a non-zero rho, is of this graph version and has this version's keys | `lazy_plan.py` |
+| A priced region counts as a price: the "no price" shortcut, the ellipse refinement and the Dijkstra `jlimit` are conditioned on `safety is not None or reg is not None`; the turn search takes the term through its edge weights (`_turn` passes `reg` to the band and exact searches) | `lazy_plan.py` |
+| Optional tighter bound: `_geo_bound(J, reg)` = J x 1e-4 / (1 + rho_min / scale) x (1 + 1e-6) (the 1e-6 covers the ceil tolerance of two integer terms); without a floor it is exactly `J x 1e-4`, as before | `lazy_plan.py` |
+| `chord_cost(graph, safety, region)`, `priced_visible(..., region)`, `budget_pull(..., region)`: the sample factor is `1 + rate x deficit + rho / scale` (`PlanGraph.chart_index_cell` is the twin of `free_cell`); the string pull is cost-aware when a clearance price OR a region term is active | `scene_route.py`, `lazy_plan.py` |
+| `plan_on_graph(..., region=, region_mode=)`; the region prices the served route only in mode `on` (and only for a graph that has `region_arg`: the engine graph does not) | `scene_route.py` |
+| nodePolicy legs: `_route_leg`, `_leg_width`, `annotate_corridors`, `insert_planned`, `_between` take `region` next to `safety`; `server.enrich_route` passes it in mode `on` | `node_policy_plan.py`, `server.py` |
+| Snapshot cache: `RegionSnapshots` (new module `region_snapshots.py`, owned by the service), key (map, graph_version, class, stamp, model_hash), read with `region_stats_load.aload` (class and `*`) and `build_snapshot`; a (map, version, class, model) is re-read at most every `REGION_COST_SNAPSHOT_TTL_S` and the snapshot of the stamp that comes back is reused; LRU of `REGION_COST_SNAPSHOT_ENTRIES`; a straddled rebuild (`stamp_mismatch`) is read once more; a read that fails or exceeds 2 s is the neutral `load_error`; a placeholder or missing `speed_max` reads nothing (`no_speed_max`). The planning robot's class is `robot_class(factsheet)` | `region_snapshots.py`, `server.py` |
+| `MissionPlannerService._region_for(map, version, graph, robot)` is the only entry: `mode_for(map)` off (or a graph without `region_arg`) returns `(None, "off")` before any database access | `server.py` |
+
+**S4 (observability and shadow)**
+
+* `ChartPlan.pricing["region"]` (also in shadow): the snapshot's `record()` (`status`, `model_hash`, `stamp`, `graph_version`, `robot_class`,
+  `rho_min`, `rho_max`, `levels` = the fallback counts per level) plus `mode`, `served` (priced | unpriced), and with a usable snapshot and
+  a factsheet `speed_max`: `predicted_s`, `predicted_free_s` (the served lattice path: length / speed_max, plus the excess `rho x length /
+  speed_max` along it, plus turn radians / `angular_speed_max` when the factsheet has it), `cost_model` = `model_hash:stamp`. Shadow adds
+  `alt_route_changed`, `alt_extra_m`, `alt_predicted_s`, `alt_cost` (best effort: `alt_error` on a failure). `status` is the graph's verdict
+  (`version_mismatch`, `keys_mismatch`) when the snapshot is not of the graph planned on. When there is no clearance price the record
+  sits in a pricing dict with the clearance fields 0 / None (profile `none`), as for a turn cost alone; the service logs a `Region cost
+  plan` line and counts plans by status (`get_stats()["scene_graph"]["region_plans"]`, `region_shadow_changed`, `region_snapshots`).
+* `RouteTrajectoryLegV1.predicted_s` (from the leg's own polyline, same sampling as the string pull) and `MissionRouteNodeV1.cost_model`;
+  both travel through `PlanResponse` / `EnrichResponse` / `NavigationResponse` (`cost_model`), `create_mission` and the dispatch-time replan. The
+  route digest is unchanged: `trajectory` was excluded already, `cost_model` is added to the exclusion (and `None` is dropped by
+  `exclude_none`), so the json hashed for a route without the field is byte-for-byte the old one. `clear_stale_charts` clears
+  `cost_model` with `graph_version`.
+* Migration `20261028_03_run_legs_predicted` (head, after `20261028_02_region_cost`): `run_legs.predicted_s float4`, `run_legs.cost_model text`,
+  nullable, no backfill. `leg_tracker` copies the entry's `predicted_s` and the node's `cost_model` the way it copies `planned_m` (only from a
+  matching entry, `plan_source` `trajectory`); `fleet_recorder` writes them (`LEG_COLUMNS`). The read API (`fleet_reads.LEG_COLUMNS`) is not changed.
+* Shadow: the served route, waypoints, trajectory points and corridors are those of mode off (tested); the priced route is a second
+  `route()` call whose `graph.last` is restored afterwards. `on` serves the priced route for the maps in `REGION_COST_MAPS` only; `off` does no work.
+
+**Deviations**
+
+* The snapshot cache lives in its own module (`region_snapshots.py`), instantiated by `server.py`, so it can be tested without the service.
+* The cache key's stamp is only known after reading the build, so a TTL (the existing knob) bounds how often a (map, version, class,
+  model) is re-read; the full key still identifies the stored snapshot.
+* Extra snapshot statuses of the planner side: `load_error` (read failed / timed out), `version_mismatch` and `keys_mismatch` from the graph's check (the first
+  also from `build_snapshot`).
+* `predicted_s` for a trajectory leg uses the leg's compressed polyline (cm-rounded) with the string-pull sampler, not the integer
+  search costs, so it differs from `cost` by the sampling of a cell pair (a few percent); turn time is predicted from the headings of the
+  polyline even when the search prices no turn (lambda 0).
+* `ChartGraph.route` (the engine) has no region term, as designed; a graph without `region_arg` plans unpriced even in mode `on`.
+* The ellipse refinement now also runs for a region-only price (it did not for an unpriced search): that costs about 2 x a plain route on
+  a big world (below), nothing visible on office9.
+* Stage 1 (`_path`, the chart-link seed) is not weighted by rho (optional in 5.3, not needed for optimality).
+
+**Plan time** (`PlanGraph.route`, warm tiles, mean ms per route over 30 pairs, best of 5; random rho on every chart, 30 % zero)
+
+| world (charts) | unpriced | + region 0-0.3 | clearance | + region 0-0.3 | clearance + turn | + region 0-0.3 | + region 0.5-3 (clearance) |
+|---|---|---|---|---|---|---|---|
+| grid (83) | 2.1 | 4.0 | 4.1 | 4.6 | 16.2 | 18.0 | 9.2 |
+| ring (8) | 0.5 | 1.0 | 1.0 | 1.2 | 2.9 | 2.8 | 1.2 |
+| room_loop (8) | 0.5 | 1.1 | 1.1 | 1.0 | 2.9 | 3.1 | 1.1 |
+| pillar_room (4) | 0.8 | 1.1 | 1.1 | 1.2 | 2.5 | 2.7 | 1.4 |
+
+office9 (22 charts, version 216, planner image with this tree mounted read-only, live store read-only, synthetic rho because the live DB
+has no `region_stats` yet; 40 random chart pairs, ms mean / p90 / max): unpriced 0.8 / 0.9 / 1.0, clearance 1.0 / 1.2 / 2.0, region 0-0.3
+1.1 / 1.5 / 4.1, clearance + region 0-0.3 1.4 / 1.8 / 3.5, clearance + region 0-3 1.0 / 1.1 / 2.3, with `rho_min` 0.3-3 1.0 / 1.1 / 2.2; all
+exact, no tile over the cap. Shadow mode is two `route()` calls, so about the sum of the unpriced and the priced figure per plan.
+
+**Open**
+
+* The migration must be applied before mission-dispatch with this code is deployed (the leg insert names the new columns).
+* No `region_stats` on the live DB yet (P1): shadow plans will record `no_build_for_version` until the backfill and a build.
+* `fleet_reads.LEG_COLUMNS` / the legs API do not return `predicted_s` / `cost_model` yet.
+* The cost of the ellipse refinement on a large map under `on` (the 83-chart grid doubles) has not been seen on a map with thousands of charts.
 

@@ -384,6 +384,27 @@ class TestEventsAndSummary:
         [obs] = [o for o in db.edge_obs.values() if o["from_node"] == "A"]
         assert obs["distance_m"] == 5.0 and obs["speed_mps"] == pytest.approx(5.0 / 8.0, abs=1e-3)
 
+    async def test_predicted_seconds_and_the_cost_model_reach_the_rows_like_planned_m(self, tmp_path):
+        """S4: the trajectory entry's predicted_s and the route node's cost_model are copied to the leg row, only for a leg whose entry
+        matches (plan_source "trajectory"); every other leg, and a route planned without a model, has NULL."""
+        mission = api_objects.MissionObjectV1(
+            name="m1", robot="r1", status={}, timeout=600, planned_path=["A", "B", "C"],
+            mission_tree=[{"name": "go", "route": {
+                "waypoints": [{"x": 0, "y": 0, "theta": 0.0, "map_id": "map1", "chart_key": "k0"},
+                              {"x": 3, "y": 0, "theta": 0.0, "map_id": "map1", "chart_key": "k0"},
+                              {"x": 3, "y": 4, "theta": 0.0, "map_id": "map1", "chart_key": "k1"}],
+                "trajectory": [{"from_index": 0, "to_index": 1, "points": [[0, 0], [0, 1], [3, 1], [3, 0]], "predicted_s": 31.4159},
+                               {"from_index": 1, "to_index": 2, "points": [[3, 0], [3, 4]]}],
+                "graph_version": 12, "cost_model": "0123456789abcdef:st1"}}])
+        mission.status.run_id = RUN
+        rec, db, mission, robot = await start(tmp_path, mission)
+        await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3), msg(mission, 4, 11),
+                   msg(mission, 6, 21))
+        rows = db.legs_of()
+        assert [r["plan_source"] for r in rows] == [None, "trajectory", "trajectory"]
+        assert [r["predicted_s"] for r in rows] == [None, 31.416, None]            # an entry without a prediction: NULL
+        assert [r["cost_model"] for r in rows] == [None, "0123456789abcdef:st1", None]
+
     async def test_summary_metrics_and_leg_event_counts_on_run_end(self, tmp_path):
         rec, db, mission, robot = await start(tmp_path)
         await feed(rec, mission, robot, msg(mission, 0, 0), msg(mission, 2, 3),
