@@ -3,6 +3,15 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Keep-out zones are geometry, not scene-graph references (2026-10-27)
+
+Branch `feat/keepout-geometry` (`docs/keepout_zones.md` "Geometry zones"). A zone is stored as a map-frame polygon (region) or line (edge); a chart / edge create request is snapshotted from the graph at that moment (`source` keeps the origin). Planner and legacy planner resolve geometry without the graph.
+- Not merged or deployed. Rebuild api-delegation-service and mission-planner-service; no Alembic migration (the spec JSON holds the geometry).
+- Legacy rows (chart key / chart pair only: office9's edge zone, the Pi's) are rewritten as geometry by the first `GET /keepouts` while the graph is readable; until then they resolve at plan time as before (and keep the stale-graph tolerance and the legacy-planner refusal).
+- An edge snapshot is ONE straight segment through the seal cells (principal axis, 0.05 m past each end): a strongly curved chart boundary leaves the ends of the curve open, and a robot can drive around a segment that does not span the passage. Draw a longer `line` when needed.
+- A chart's polygon is the footprint at creation (largest blob, holes filled, at most 48 vertices, about 0.05 m tolerance); later mapping of that space does not grow the zone, by design.
+- Nothing re-snapshots a zone when the map is rebuilt in a way that moves walls; the operator edits or recreates it.
+
 ## Keep-out zones on a stale graph, and the topology 503 (2026-10-27)
 
 Fixed on `fix/keepout-reroute` (`docs/keepout_zones.md` "Live findings"): the API's keep-out store imported `packages.api.main` (a second copy under `python -m`), so topology reads 503'd and zones showed `no_scene_graph`; the planner now plans on a stale graph when the map has chart/edge zones.

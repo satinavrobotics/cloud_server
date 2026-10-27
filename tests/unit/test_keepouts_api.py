@@ -83,6 +83,14 @@ class FakeDb:
                             r.update(enabled=enabled, label=label, updated_at=T0 + datetime.timedelta(seconds=100 + db.tick))
                             return Cursor([db._tuple(r)])
                     return Cursor([])
+                if sql == ko.SPEC_SQL:
+                    new, map_, id_, old = params
+                    for r in db.rows:
+                        if (r["map_name"], r["id"]) == (map_, id_) and r["spec"] == json.loads(old):
+                            db.tick += 1
+                            r.update(spec=json.loads(new), updated_at=T0 + datetime.timedelta(seconds=200 + db.tick))
+                            return Cursor([db._tuple(r)])
+                    return Cursor([])
                 if sql == ko.DELETE_SQL:
                     keep = [r for r in db.rows if (r["map_name"], r["id"]) != tuple(params)]
                     hit = len(keep) != len(db.rows)
@@ -92,12 +100,20 @@ class FakeDb:
         return Ctx()
 
 
-class FakeReads:
-    """What the store asks of the scene-graph read side: the topology and the owner plane."""
+def default_plane():
+    """Three 2 m x 2 m charts side by side (a:0, b:0, c:0), 0.1 m cells, a 1 m margin around them."""
+    idx = np.zeros((40, 80), np.uint16)
+    idx[10:30, 10:30], idx[10:30, 30:50], idx[10:30, 50:70] = 1, 2, 3
+    return {"origin": (-1.0, -1.0), "step": 0.1, "shape": idx.shape, "keys": ["a:0", "b:0", "c:0"], "index": idx}
 
-    def __init__(self, keys=("a:0", "b:0", "c:0"), links=(("a:0", "b:0"),), plane=None, fail=False):
-        self.topo = {"version": 3, "keys": set(keys), "links": {frozenset(x) for x in links}}
-        self.plane, self.fail = plane, fail
+
+class FakeReads:
+    """What the store asks of the scene-graph read side: the topology (with anchors) and the owner plane."""
+
+    def __init__(self, keys=("a:0", "b:0", "c:0"), links=(("a:0", "b:0"),), plane=None, fail=False, anchors=None):
+        self.topo = {"version": 3, "keys": set(keys), "links": {frozenset(x) for x in links},
+                     "anchors": anchors or {"a:0": (1.0, 1.0), "b:0": (3.0, 1.0), "c:0": (5.0, 1.0)}}
+        self.plane, self.fail = plane if plane is not None else default_plane(), fail
 
     async def topology(self, map_id):
         if self.fail:
@@ -126,7 +142,8 @@ class TestStore:
         s, db = store(reads=FakeReads())
         made = await s.create("lab", {"kind": "region", "label": "wet floor", "region": {"chart_key": "a:0"}})
         assert made["kind"] == "region" and made["enabled"] is True and made["label"] == "wet floor"
-        assert made["region"] == {"chart_key": "a:0"} and made["applies"] == "applied" and made["created_at"].endswith("Z")
+        assert made["source"] == {"chart_key": "a:0"} and made["applies"] == "applied" and made["created_at"].endswith("Z")
+        assert len(made["polygon"]) == 4 and made["region"]["chart_key"] == "a:0"          # a snapshot: the chart's footprint
         poly = await s.create("lab", {"kind": "region", "region": {"polygon": SQUARE}})
         edge = await s.create("lab", {"kind": "edge", "edge": {"from": "a:0", "to": "b:0"}})
         listed = await s.list_all("lab")
@@ -202,35 +219,57 @@ class TestStore:
         plane = {"origin": (0.0, 0.0), "step": 0.1, "shape": idx.shape, "keys": ["a:0", "b:0"], "index": idx}
         s, _ = store(reads=FakeReads(plane=plane))
         made = await s.create("lab", {"kind": "edge", "edge": {"from": [0.2, 0.2], "to": [0.8, 0.2]}})
-        assert made["edge"] == {"from": "a:0", "to": "b:0"} and made["applies"] == "applied"
+        assert made["source"] == {"from": "a:0", "to": "b:0"} and made["applies"] == "applied" and len(made["line"]) == 2
 
-    async def test_without_a_graph_points_are_kept_and_chart_zones_are_unresolved(self):
-        s, _ = store(reads=FakeReads(fail=True))
-        made = await s.create("lab", {"kind": "edge", "edge": {"from": [1, 1], "to": [2, 2]}})
-        assert made["edge"] == {"from": [1.0, 1.0], "to": [2.0, 2.0]}
-        region = await s.create("lab", {"kind": "region", "region": {"chart_key": "a:0"}})
-        listed = {k["id"]: k for k in (await s.list_all("lab"))["keepouts"]}
-        assert listed[region["id"]]["applies"] == "unresolved" and listed[region["id"]]["reason"] == "no_scene_graph"
+    async def test_without_a_graph_chart_and_edge_creation_fails_and_stores_nothing(self):
+        s, db = store(reads=FakeReads(fail=True))
+        for body in ({"kind": "edge", "edge": {"from": [1, 1], "to": [2, 2]}}, {"kind": "region", "region": {"chart_key": "a:0"}},
+                     {"kind": "edge", "edge": {"from": "a:0", "to": "b:0"}}):
+            assert await code_of(s.create("lab", body)) == (503, "scene_graph_unavailable")
+        assert db.rows == []
+        s, db = store(reads=None)
+        assert await code_of(s.create("lab", {"kind": "region", "region": {"chart_key": "a:0"}})) == (503, "scene_graph_unavailable")
+        # a polygon and a line need no graph
+        s, db = store(reads=FakeReads(fail=True))
+        assert (await s.create("lab", {"kind": "region", "region": {"polygon": SQUARE}}))["polygon"] == [[float(x), float(y)] for x, y in SQUARE]
+        assert (await s.create("lab", {"kind": "edge", "line": [[0, 0], [2, 0]]}))["line"] == [[0.0, 0.0], [2.0, 0.0]]
 
-    async def test_applies_follows_the_current_graph(self):
+    async def test_a_map_with_no_graph_is_a_409(self):
+        class NoGraph(FakeReads):
+            async def topology(self, map_id):
+                return None
+        s, db = store(reads=NoGraph())
+        assert await code_of(s.create("lab", {"kind": "region", "region": {"chart_key": "a:0"}})) == (409, "no_scene_graph")
+        assert db.rows == []
+
+    async def test_geometry_zones_do_not_depend_on_the_graph_legacy_ones_do(self):
         reads = FakeReads()
-        s, _ = store(reads=reads)
+        s, db = store(reads=reads)
         chart = await s.create("lab", {"kind": "region", "region": {"chart_key": "a:0"}})
         edge = await s.create("lab", {"kind": "edge", "edge": {"from": "a:0", "to": "b:0"}})
-        poly = await s.create("lab", {"kind": "region", "region": {"polygon": SQUARE}})
-        assert all(k["applies"] == "applied" for k in (await s.list_all("lab"))["keepouts"])
-        reads.topo = {"version": 4, "keys": {"b:0"}, "links": set()}               # a:0 retired, no link left
+        reads.topo = {"version": 4, "keys": {"b:0"}, "links": set(), "anchors": {}}               # a:0 retired, no link left
+        listed = {k["id"]: k for k in (await s.list_all("lab"))["keepouts"]}
+        assert listed[chart["id"]]["applies"] == "applied" and listed[edge["id"]]["applies"] == "applied"
+        assert listed[chart["id"]]["polygon"] == chart["polygon"] and listed[edge["id"]]["line"] == edge["line"]
+        # a legacy row (made before the snapshot) follows the graph while it cannot be migrated
+        legacy = await seed_legacy(db, "region", {"chart_key": "a:0"})
         got = {k["id"]: (k["applies"], k.get("reason")) for k in (await s.list_all("lab"))["keepouts"]}
-        assert got[chart["id"]] == ("unresolved", "chart_not_found") and got[edge["id"]] == ("unresolved", "chart_not_found")
-        assert got[poly["id"]] == ("applied", None)
-        reads.topo = {"version": 5, "keys": {"a:0", "b:0"}, "links": set()}
-        assert {k["id"]: k.get("reason") for k in (await s.list_all("lab"))["keepouts"]}[edge["id"]] == "no_link_between_charts"
+        assert got[legacy] == ("unresolved", "chart_not_found")
 
     async def test_a_disabled_zone_keeps_its_applies_and_shows_enabled_false(self):
         s, _ = store(reads=FakeReads())
         made = await s.create("lab", {"kind": "region", "region": {"polygon": SQUARE}})
         off = await s.patch("lab", made["id"], {"enabled": False})
         assert off["enabled"] is False and off["applies"] == "applied"
+
+
+async def seed_legacy(db, kind, spec, label=None):
+    """A row as it was written before the geometry snapshot."""
+    db.tick += 1
+    rid = f"legacy{db.tick}"
+    db.rows.append({"id": rid, "map_name": "lab", "kind": kind, "label": label, "enabled": True, "spec": spec,
+                    "created_at": T0 + datetime.timedelta(seconds=db.tick), "updated_at": T0 + datetime.timedelta(seconds=db.tick)})
+    return rid
 
 
 class TestHttp:
@@ -315,7 +354,7 @@ class TestTopologyRead:
             return {"charts": [{"key": "a:0"}, {"key": "b:0"}], "links": [{"a": "a:0", "b": "b:0"}]}
         reads = SceneGraphReads(lambda m: dict(meta), lambda *a: None, manifest=manifest)
         topo = await reads.topology("m")
-        assert topo == {"version": 2, "keys": {"a:0", "b:0"}, "links": {frozenset(("a:0", "b:0"))}}
+        assert topo == {"version": 2, "keys": {"a:0", "b:0"}, "links": {frozenset(("a:0", "b:0"))}, "anchors": {}}
         await reads.topology("m")
         assert calls == [("m", 2)]
         meta["version"] = 3

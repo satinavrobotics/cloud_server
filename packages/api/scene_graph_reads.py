@@ -402,7 +402,7 @@ class SceneGraphReads:
         return out, headers
 
     async def topology(self, map_id: str) -> Optional[Dict[str, Any]]:
-        """{version, keys: set of chart keys, links: set of frozenset({a, b})} of the map's current version, from the stored
+        """{version, keys: set of chart keys, links: set of frozenset({a, b}), anchors: {key: (x, y)}} of the map's current version, from the stored
         manifest (no tile is read; cached per (map, epoch, version)). None: no graph, or a store without manifests."""
         version, _, ep = await self._version(map_id, None)
         if version is None or self._manifest is None:
@@ -413,7 +413,8 @@ class SceneGraphReads:
             return hit[1]
         man = await asyncio.to_thread(self._manifest, map_id, version)
         out = {"version": version, "keys": {c["key"] for c in man.get("charts", [])},
-               "links": {frozenset((l["a"], l["b"])) for l in man.get("links", [])}}
+               "links": {frozenset((l["a"], l["b"])) for l in man.get("links", [])},
+               "anchors": {c["key"]: (float(c["anchor"][0]), float(c["anchor"][1])) for c in man.get("charts", []) if c.get("anchor")}}
         self._topologies[map_id] = (key, out)
         return out
 

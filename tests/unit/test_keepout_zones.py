@@ -93,9 +93,15 @@ class TestParse:
     def test_keepout_shape(self):
         out = ko.to_keepout(row("a", {"polygon": SQUARE}, label="L"))
         assert out == {"id": "a", "kind": "region", "label": "L", "enabled": True, "created_at": "2026-10-25T10:00:00Z",
-                       "region": {"polygon": SQUARE}, "applies": "applied"}
+                       "polygon": SQUARE, "region": {"polygon": SQUARE}, "applies": "applied"}
         e = ko.to_keepout(row("e", {"from": "a", "to": [1, 2]}, kind="edge"), ko.UNRESOLVED, "chart_not_found")
         assert e["edge"] == {"from": "a", "to": [1, 2]} and e["applies"] == "unresolved" and e["reason"] == "chart_not_found"
+        assert "line" not in e and "polygon" not in e                         # a legacy row has no geometry yet
+        g = ko.to_keepout(row("g", {"line": [[0, 0], [1, 0]], "source": {"from": "a:0", "to": "b:0"}}, kind="edge"))
+        assert g["line"] == [[0, 0], [1, 0]] and g["source"] == {"from": "a:0", "to": "b:0"} and g["applies"] == "applied"
+        assert g["edge"] == {"line": [[0, 0], [1, 0]], "from": "a:0", "to": "b:0"}
+        c = ko.to_keepout(row("c", {"polygon": SQUARE, "source": {"chart_key": "s1:0"}}))
+        assert c["polygon"] == SQUARE and c["source"] == {"chart_key": "s1:0"} and c["region"]["chart_key"] == "s1:0"
 
 
 # --- resolution ------------------------------------------------------------------------------------------------------------
