@@ -10,7 +10,8 @@ ArangoDB/MinIO can still be deleted) and the route returns 202. A background tas
 2. deletes the map's graph from ArangoDB and its image bucket from MinIO. Both deletes are
    idempotent and treat "not there" as success, so a re-run after a partial success is safe;
 3. on success deletes the row (only while it is still DELETING), its `map_sessions` rows and
-   its `map_reconstructions` rows (3D reconstruction R3; `request()` already cancelled the
+   its `map_reconstructions` rows, its per-run cell summaries and region statistics (`run_cells`,
+   `region_stats`, `region_stats_builds`) (3D reconstruction R3; `request()` already cancelled the
    active job in the marking transaction, through the `on_mark` hook),
    NOTIFYs `DELETED` and writes MAP.DELETED, all in one transaction (the event in a savepoint:
    a failing event write never keeps the map);
@@ -98,6 +99,10 @@ PERSON_REMOVAL_SQL = "DELETE FROM map_person_removal WHERE map_name = %s"
 KEEPOUTS_SQL = "DELETE FROM map_keepouts WHERE map_name = %s"
 # Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
 EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
+# Its per-run cell summaries and the region statistics built from them (migration 20261028_01_run_cells) too.
+RUN_CELLS_SQL = "DELETE FROM run_cells WHERE map_id = %s"
+REGION_STATS_SQL = "DELETE FROM region_stats WHERE map_id = %s"
+REGION_STATS_BUILDS_SQL = "DELETE FROM region_stats_builds WHERE map_id = %s"
 # Its blocked-node exclusions (migration 20261008_01_blocked_graph_nodes) too.
 BLOCKED_NODES_SQL = "DELETE FROM blocked_graph_nodes WHERE map_name = %s"
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
@@ -451,6 +456,9 @@ class MapDeleter:
                     await cursor.execute(PERSON_REMOVAL_SQL, (map_id,))
                     await cursor.execute(KEEPOUTS_SQL, (map_id,))
                     await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
+                    await cursor.execute(RUN_CELLS_SQL, (map_id,))
+                    await cursor.execute(REGION_STATS_SQL, (map_id,))
+                    await cursor.execute(REGION_STATS_BUILDS_SQL, (map_id,))
                     await cursor.execute(BLOCKED_NODES_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))

@@ -22,7 +22,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService, build_mission_update
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, session_trajectory, sites
+from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, run_cells, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
 from packages.api import navstack_deploy, navstack_images
 from packages.api import route_preview as route_preview_module
@@ -356,6 +356,9 @@ async def lifespan(app: FastAPI):
     service.mesh.start_dispatcher()
     # Navstack deploys left non-final by a previous run (docs/navstack_deploy.md); one runner per row across workers.
     service.navstack_deployments.start_resume()
+    # Per-run cell summaries (docs/region_stats_2026-10-27.md); one worker per cluster (advisory lock).
+    run_cells_worker = run_cells.RunCellsWorker(service.database, service.graph_db)
+    run_cells_worker.start()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -382,6 +385,7 @@ async def lifespan(app: FastAPI):
         await service.semantic.stop()
         await service.mesh.stop()
         await service.navstack_deployments.stop()
+        await run_cells_worker.stop()
         if getattr(service, "person_removal", None) is not None:
             await service.person_removal.stop()
         await service.stop_telemetry()
