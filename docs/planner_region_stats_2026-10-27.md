@@ -1,6 +1,6 @@
 # Region statistics in the mission planner (design, 2026-10-27)
 
-Status: **design only**, nothing implemented. Builds on `docs/region_stats_2026-10-27.md` (merged to local `main` 0c16088,
+Status: **design; the statistics side (S0 code, S1, S2) is implemented on branch `stats/planner-region-cost`, the planner side (S3, S4) is not** (section 11). Builds on `docs/region_stats_2026-10-27.md` (merged to local `main` 0c16088,
 not deployed). Line numbers are of `main` at 0c16088. "Measured" means a read-only query or a read-only run on the cloud box
 on 2026-10-27 (nothing written, nothing deployed).
 
@@ -390,3 +390,84 @@ rules of `link_cost_estimation_2026-10-13.md` section 7:
 7. First milestone: calibrated predicted time in shadow mode (S1-S4); route steering only after that.
 8. The cost-term formula lives in `packages/scene_graph/weights.py` next to `edge_costs` (small pure function;
    tell CIMBI). Region pricing data handling stays outside `packages/scene_graph`.
+
+## 11. Implementation status of the statistics side (2026-10-28, branch `stats/planner-region-cost`)
+
+Not merged, not deployed; the `run_cells` / `region_stats` tables are still not on the live DB.
+
+**Done**
+
+| Stage | What | Where |
+|---|---|---|
+| S0.1 | Class key `<agv_class>|<LxW>` without speed_max; `run_cells.speed_max` + `speed_basis` (factsheet / placeholder / unknown) per run; `region_stats.norm_*` = sums normalised by each run's own speed_max | `robot_class.py`, `run_cells.py`, `region_stats.py`, migration `20261028_02_region_cost` |
+| S0.2 | `class_basis` per run: `current` (no factsheet history exists, below) | `run_cells.py` |
+| S0.3 | `algo_version` 2: `dwell_s` within `RUN_CELLS_DWELL_RADIUS_M` (0.5) of start, goal, action nodes; older summaries are re-summarised by the worker and the backfill | `run_cells.py`, `config.py` |
+| S0.4 | `regions_of` pins one graph version for all chunks (restart on a change, then `error`) | `drive_stats.py` |
+| S0.5 | Agreement test builder vs planner `ch` array | `tests/unit/test_region_chart_agreement.py` |
+| S2 | `Term`, `CostModel`, `build_snapshot`, `RegionPricing`, `mode_for`; `weights.region_costs`; config knobs | `packages/utils/region_cost.py`, `scene_graph/weights.py`, `config.py` |
+| S1 | Replay harness | `scripts/analysis/region_cost_replay.py` |
+
+**Findings**
+
+* *Factsheet history:* none (P4/Q2). `robotobjectv1.status` and `robot_latest.state_msg` hold the latest factsheet only;
+  `mission_runs` has no factsheet figures (only `sw_version`); `fleet_events`, `robot_state_ts`, `audit_log` hold none; the
+  retained MQTT factsheet is the latest. Every run is therefore labelled with the current factsheet (`class_basis = 'current'`).
+  To get `'run'` the recorder would have to stamp the factsheet figures into the run at its start (dispatcher side, not done).
+* *Placeholder robots:* confirmed on the live factsheets. masked-frigatebird (19 runs, all on Hospital and LOCAL) and
+  subtle-pelican (no runs): `agv_class` CARRIER, `length` = `width` = -1, `speed_max` 1.0. formidable-peacock (all of
+  office7 / office9): CARRIER 0.5 x 0.5, `speed_max` 0.24. Classes now: `CARRIER|0.50x0.50` and `CARRIER|?x?`.
+
+**Deviations from sections 3 and 4**
+
+* The term values are `rho` directly (excess pace over the ideal at the run's own speed): `region_stats` stores sums already
+  multiplied by each run's `speed_max` (`norm_*`), so `build_snapshot` does not multiply by the planning robot's `speed_max`;
+  its `speed_max` and `speed_basis` only gate the term (`status` `no_speed_max` for a placeholder, missing or non-positive speed).
+* `moving` shrinks the normalised pace ratio (1 at `speed_max`) and subtracts 1 at the end; `stop` shrinks the normalised
+  stopped time per metre. Moving time is `time - stopped - dwell`; `dwell_s` is not priced (waiting at the nodes is not a
+  per-metre cost).
+* Fallback chain as built: a chart with samples of the class shrinks toward the class map-wide figure (level `class`); a chart
+  without them takes the pooled chart figure relative to the pooled map figure, scaled by the class map-wide figure (level
+  `pooled`; the pooled figure itself if the class has no data on the map), else the class map-wide figure (`map`), else
+  rho 0 (`prior`). Using the pooled figure for a chart that has class samples would cancel the shrinkage with a single class.
+* Snapshot `status`: `ok`, `no_speed_max`, `no_build_for_version`, `version_mismatch`, `stamp_mismatch` (the class and the
+  pool were loaded from different builds), `no_stats`. A `stale` build is used. `REGION_COST_MAPS` empty means no map.
+* The additive edge cost lives in `weights.region_costs(length_m, rho_a, rho_b, scale)` (decision 8; tell CIMBI); the planner
+  adds it to `edge_costs`. `scale` = `CostModel.scale` (1000 for the default quantum).
+* `RegionPricing.rho` is int32 in units of the quantum, aligned to the keys passed in (the `PlanGraph.keys` of the version).
+
+**Replay numbers (S1, 2026-10-28, live rows read-only; graph office9 v216, office7 v87; history assigned to today's charts)**
+
+Per run, on the cells inside a chart, from at least 10 earlier runs (112 office9 runs, 85 office7 runs; 356 / 298 chart
+crossings). `n0` = 5, cap 3. Full tables: `region_cost_replay.py replay`. All runs are formidable-peacock (speed_max 0.24).
+
+| | office9 moving | office7 moving | office9 vs baseline |
+|---|---|---|---|
+| model `moving`, median abs error | 4.4 s (13.8 %) | 7.2 s (17.0 %) | |
+| model `moving`, p90 abs error | 19.3 s (32 %) | 17.9 s (51 %) | |
+| model `moving`, actual / predicted, median / sum | 0.95 / 1.05 | 0.87 / 0.93 | |
+| `length / speed_max`, median abs error | 3.6 s (11.7 %) | 6.4 s (20.5 %) | |
+| `length / speed_max`, p90 abs error | 24.4 s (29 %) | 25.8 s (36 %) | |
+| `length / speed_max`, actual / predicted, median / sum | 1.02 / 1.12 | 1.17 / 1.25 | |
+| pace x length vs total time, median abs error | 20.7 s (51 %) | 45.4 s (89 %) | |
+| moving + stop + median dwell vs total time, median | 17.6 s (41 %) | 28.3 s (52 %) | |
+| `expected_s` vs leg `duration_s`, median abs error | 8.7 s (32 %), 97 runs | 10.3 s (28 %), 79 runs | |
+| `expected_s` vs leg `duration_s`, p90 | 64 s (76 %) | 120 s (72 %) | |
+| `expected_s` actual / predicted, median / sum | 1.06 / 1.50 | 1.31 / 1.76 | |
+
+What it says: the `moving` term is calibrated in aggregate (sum of actual / predicted 1.05 and 0.93, against 1.12 and 1.25 for
+length / speed_max) and cuts the p90 error by 21 % and 31 %, but it does **not** beat length / speed_max on the median in
+seconds (4.4 vs 3.6 s on office9, 7.2 vs 6.4 s on office7; in relative terms better on office7): the robot drives close to its
+speed_max on most runs, so the region term has little left to explain. The criterion of section 7 ("beats both baselines") is
+therefore not shown for the moving time. Predicting the whole leg duration is a different task: waiting, recovery and
+dwell dominate it, the region terms do not model them, and `expected_s` (which underpredicts by 1.5x / 1.8x in total but has the
+smaller median error) is not beaten on that scope. `n0` between 0 and 30 changes the medians by under 0.7 s: the charts that
+matter have 20+ samples. No per-chart shrinkage evidence can come from these two maps; the buckets with fewer than 5 earlier
+samples hold 16 and 13 crossings.
+
+**Open**
+
+* The planner side (S3, S4) and the plan record are not started; `REGION_COST_MODE` defaults to `off` and nothing reads it yet.
+* Deploy and backfill (P1), then shadow evidence (P5): the replay is on history assigned to today's charts, not on shadow plans.
+* The recorder does not stamp the factsheet into the run (`class_basis` stays `current`).
+* Whether to price the dwell/recovery time of a leg (an ETA term per node, not per metre) is not designed.
+

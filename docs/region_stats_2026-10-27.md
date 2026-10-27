@@ -1,6 +1,6 @@
 # Region statistics from stored per-run cell summaries (implementation scope, 2026-10-27)
 
-Status: **implemented on branch `stats/region-stats` (off `main` b6dc517), not merged or deployed**; see section 11 for what differs from this text.
+Status: **implemented on branch `stats/region-stats` (off `main` b6dc517), not merged or deployed**; see section 11 for what differs from this text, and section 12 for the changes of 2026-10-28 for the planner (branch `stats/planner-region-cost`).
 Supersedes, for statistics, the "chart transits / link-stats" stage of `docs/tracking_redesign_2026-10-13.md` and
 `docs/scene_graph/edge_stats_on_charts_design.md`. Line numbers below are of `main` at b6dc517; re-check before relying on them.
 
@@ -139,9 +139,10 @@ its `run_cells` rows there too, and mark the map's region stats stale (6.3).
 
 ### 4.3 Robot class
 
-`robot_class = f"{agv_class or '-'}|{length:.2f}x{width:.2f}|{speed_max:.2f}"` from the robot's current factsheet at
-summary time, with any field that is -1 written as `?`. `''` when the robot or factsheet is not found. One pure function
-`packages/utils/robot_class.py:robot_class(factsheet) -> str` with tests. (The planner will use the same function on the
+**Changed 2026-10-28 (section 12):** `robot_class = f"{agv_class or '-'}|{length:.2f}x{width:.2f}"` from the robot's factsheet, with
+any field that is -1 written as `?`; `''` when the robot or factsheet is not found (or none of the three was sent). `speed_max` is
+no longer part of the class; it is stored per run with a `speed_basis`. One pure function
+`packages/utils/robot_class.py:robot_class(factsheet) -> str` with tests. (The planner uses the same function on the
 planning robot's factsheet, so it must be importable without the API.)
 
 ## 5. Code layout
@@ -333,3 +334,41 @@ Measurements (6.6), read-only on the cloud box DB (342 runs, 25 k map-frame trac
   owner-raster read was not measured (it needs the topomap store); `build_map` is that plus one transaction of a few rows.
 * drive-stats on office9: raw 124-170 ms DB + 19-24 ms compute (13.8 k rows, 1516 tiles); from summaries about 4 ms decode
   + 4 ms compute for the 135 runs (table read not measured: the table is not deployed). Tiles equal (1516 = 1516).
+
+## 12. Changes for the planner region cost (2026-10-28, branch `stats/planner-region-cost`)
+
+Decisions 2, 3 and 5 of `docs/planner_region_stats_2026-10-27.md` section 10. New migration `20261028_02_region_cost` (the
+`20261028_01` file is unchanged); `RUN_CELLS_ALGO_VERSION` is 2.
+
+* **Class key without speed.** `robot_class` = `<agv_class>|<L>x<W>` (section 4.3). A speed change no longer splits the history.
+  The live robots: formidable-peacock `CARRIER|0.50x0.50` (speed_max 0.24); masked-frigatebird and subtle-pelican `CARRIER|?x?`
+  (length = width = -1, speed_max 1.0). The 19 runs of masked-frigatebird are on Hospital and LOCAL, none on office7/office9.
+* **Speed per run, with its basis.** `run_cells.speed_max` is the factsheet value at summary time and `run_cells.speed_basis`
+  says how far it can be used: `factsheet`, `placeholder` (a speed_max equal to `ROBOT_PLACEHOLDER_SPEED_MAX` = 1.0 with no
+  footprint, length and width both unknown) or `unknown` (missing, negative, zero). The rule is `robot_class.speed_basis`.
+* **Factsheet at run time.** There is no factsheet history anywhere in the database (2026-10-27, checked): `robotobjectv1.status`
+  and `robot_latest.state_msg` hold the latest only; `mission_runs` has `sw_version` but no factsheet figures; `fleet_events`,
+  `robot_state_ts` and `audit_log` carry none (no `speed_max` / `factsheet` text in any of them); the retained MQTT factsheet is also
+  the latest only. So every run is labelled with the factsheet current at summary time and `run_cells.class_basis = 'current'`
+  (`'run'` is reserved for a source that does not exist yet; `summarise_rows(..., class_basis=)`). Runs summarised by the worker
+  a minute after they end are as good as `'run'`; a backfill labels old runs with today's factsheet.
+* **Normalised sums in `region_stats`.** Per row: `norm_runs`, `norm_len_m`, `norm_moving_m`, `norm_stopped_m`, over the kept
+  samples whose run has `speed_basis = 'factsheet'`: metres, moving seconds x the run's own speed_max and stopped seconds x
+  speed_max (so runs of different speeds add up). `norm_moving_m / norm_len_m` is 1 for a robot driving at its speed_max; the
+  moving excess is that ratio minus 1. Placeholder and unknown-speed runs stay in the raw sums and out of the normalised ones.
+* **Dwell (algo_version 2).** A track segment that stood still (`dist < min_speed * dt`) with its midpoint within
+  `RUN_CELLS_DWELL_RADIUS_M` (0.5 m) of the run's start (its first track position), its goal (the last waypoint of the last route
+  node of `mission_runs.mission_tree`) or an action node (the last waypoint of the route node before an action node of the tree)
+  is `run_cells.dwell_s` (per cell) and not `stopped_s`; `time_s` still holds it: time = moving + stopped + dwell. Waypoints are
+  in the map frame of their `map_id`; anchors of another map are ignored. The legs source has no positions in time, no dwell.
+  `region_stats.dwell_s` sums it; `stopped_s` / `stopped_share` are transit stops only; moving time, `moving_speed_mps` and the
+  moving pace are taken after dwell as well. drive-stats from the summaries adds the dwell back to `stopped` (its figures are
+  unchanged). Runs whose summary is of an older algo_version have no current summary, so the worker and
+  `scripts/backfill_run_cells.py` pick them up (the migration also deletes the algo 1 rows and the stats built from them).
+* **`regions_of` pins one graph version.** The first 160 m chunk fixes the version, the chart-cell views are asked for it, and a
+  chunk or view of another version restarts the read (`REGION_VERSION_TRIES` = 3), then status `error`.
+* **Agreement test** `tests/unit/test_region_chart_agreement.py`: `regions_of` and `PlanGraph._cells` / `owner_window` give every
+  cell the same chart on the lazy-plan fixture worlds.
+* Deviations from the text above: `region_stats.moving_*` now subtract dwell; the class strings of section 4.3 changed; rows
+  have the five new columns of the migration; `run_cells` the three (`speed_basis`, `class_basis`, `dwell_s`).
+
