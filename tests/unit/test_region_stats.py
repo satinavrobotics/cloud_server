@@ -87,6 +87,8 @@ class Cur:
         if s.startswith("SELECT run_id, map_id") or "FROM run_cells WHERE map_id" in s and "SELECT run_id," in s and "map_id, robot_name" in s:
             rows = list(self.db.runs)
             self.rows = [stored(r) for r in rows if (not self.db.robot or r.robot_name == self.db.robot)]
+        elif s.startswith("SELECT 1 FROM") and "FOR SHARE" in s:
+            self.rows = [(1,)] if self.db.map_live else []
         elif s.startswith("SELECT run_id, created_at FROM run_cells"):
             self.rows = [(r.run_id, r.created_at) for r in self.db.runs]
         elif s.startswith("SELECT DISTINCT map_id FROM run_cells"):
@@ -117,6 +119,7 @@ class Db:
     def __init__(self, runs=(), robot=None):
         self.runs, self.robot, self.executed, self.inserted = list(runs), robot, [], []
         self.builds, self.build_rows, self.stat_rows = [], [], []
+        self.map_live = True
 
     @contextlib.asynccontextmanager
     async def connection(self):
@@ -270,6 +273,13 @@ class TestBuildMap:
         out = asyncio.run(rs.build_map(db, Reads(3, [(0, "A")], graph=False), "m"))
         assert out["status"] == "no_scene_graph" and out["graph_version"] == rs.NO_GRAPH_VERSION and db.inserted == []
 
+    def test_a_deleted_map_gets_no_rows(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        db.map_live = False
+        out = asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        assert out["status"] == "map_gone" and db.inserted == []
+        assert not any(s.startswith("DELETE") or "INSERT" in s for s, _ in db.executed)
+
     def test_only_the_current_version_can_be_built(self, patched):
         db = patched(Db([make_run(1, range(0, 30))]))
         with pytest.raises(LookupError):
@@ -297,6 +307,9 @@ class TestMapsNeedingBuild:
         assert self.need(db, Reads(4, [(0, "A")])) == ["m"]                    # a new graph version
         db.builds = [("m", 3, "stale")]
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # a run was deleted
+        db.runs = []
+        assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... even when its last run is gone
+        db.runs = [make_run(1, range(0, 20))]
         db.builds = [("m", 0, "no_scene_graph")]
         assert self.need(db, Reads(3, [(0, "A")], graph=False)) == []          # nothing to build without a graph
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... until the graph appears

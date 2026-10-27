@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from fastapi import HTTPException
 
+from cloud_common.objects.map import MapObjectV1
 from packages import config
 from packages.api import drive_stats, fleet_reads, maps
 from packages.api.result_cache import ResultCache
@@ -51,6 +52,8 @@ COLUMNS = ("map_id", "graph_version", "chart_key", "robot_class", "runs", "len_m
            "moving_speed_mps", "stopped_share", "recovery_s_per_100m", "blocks_per_run", "speed_max", "cells",
            "visited", "first_at", "last_at", "stamp")
 INSERT_SQL = (f"INSERT INTO region_stats ({', '.join(COLUMNS)}) VALUES ({', '.join(['%s'] * len(COLUMNS))})")
+LIVE_MAP_SQL = (f"SELECT 1 FROM {MapObjectV1.table_name()} WHERE name = %s "
+                "AND lifecycle NOT IN ('DELETING', 'DELETED') FOR SHARE")
 CACHE = ResultCache(config.REGION_STATS_CACHE_ENTRIES, config.REGION_STATS_CACHE_TTL_S)
 
 
@@ -192,6 +195,12 @@ async def build_map(db: Any, reads: Any, map_id: str, version: Optional[int] = N
     runs = len({str(r.run_id) for r in got.rows})
     async with db.connection() as conn:
         async with conn.cursor() as cur:
+            # A map deleted (or being deleted) while the build ran must not get rows back: map_delete removes them
+            # once it holds the row; FOR SHARE makes a marking that starts now wait for this transaction.
+            await cur.execute(LIVE_MAP_SQL, (map_id,))
+            if await cur.fetchone() is None:
+                logger.info("Region stats of %s: map is gone or being deleted, nothing stored", map_id)
+                return {"graph_version": ver, "status": "map_gone", "runs": runs, "charts": 0, "stamp": got.stamp}
             await cur.execute("DELETE FROM region_stats WHERE map_id = %s AND graph_version = %s", (map_id, ver))
             if got.stats:
                 await cur.executemany(INSERT_SQL, [_params(s) for s in got.stats])
@@ -219,11 +228,14 @@ async def maps_needing_build(db: Any, reads: Any) -> List[str]:
     async with fleet_reads.read_cursor(db) as cur:
         await cur.execute("SELECT DISTINCT map_id FROM run_cells WHERE started_at >= %s AND algo_version = %s",
                           (start, config.RUN_CELLS_ALGO_VERSION))
-        wanted = sorted(r[0] for r in await cur.fetchall())
+        wanted = {r[0] for r in await cur.fetchall()}
         await cur.execute("SELECT map_id, graph_version, status FROM region_stats_builds")
         builds: Dict[str, Dict[int, str]] = {}
         for map_id, ver, status in await cur.fetchall():
             builds.setdefault(map_id, {})[int(ver)] = status
+            if status == "stale":           # its last runs may be deleted: the rebuild empties the stored rows
+                wanted.add(map_id)
+    wanted = sorted(wanted)
     out = []
     for map_id in wanted:
         have = builds.get(map_id, {})
