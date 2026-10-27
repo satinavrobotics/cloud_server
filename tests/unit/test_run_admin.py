@@ -49,6 +49,7 @@ class Store:
         self.events = []        # dicts (EVENT_COLUMNS)
         self.trajectory = []    # dicts: mission_id, run_id
         self.track_delete_calls = []  # (sql, params) of the same
+        self.stale_marks = []  # run id sets whose maps' region statistics were marked stale
         self.track_deletes = []  # run id sets of the DELETE FROM robot_track_ts calls
         self.notifies = []
         self.executed = []
@@ -115,6 +116,8 @@ class Store:
             keep = [e for e in self.events if e["run_id"] not in ids]
             cur.rowcount = len(self.events) - len(keep)
             self.events = keep
+        elif sql.startswith("UPDATE region_stats_builds SET status = 'stale'"):
+            self.stale_marks.append(set(params[0]))
         elif sql.startswith("DELETE FROM mission_runs"):
             for k in params[0]:
                 cur.rowcount += self.runs.pop(k, None) is not None
@@ -355,6 +358,7 @@ class TestMissionDelete:
                             "deleted_runs": 2, "deleted_events": 4, "deleted_trajectory": 3}
         assert set(s.missions) == {"m-rerun-1", "m-rerun-2", "my"}
         assert set(s.runs) == {rid(3), rid(4), rid(5)}
+        assert s.stale_marks == [{rid(1), rid(2)}]   # the maps' region statistics are marked stale before the runs go
         assert {e["run_id"] for e in s.events if "event_id" not in e} == {
             rid(3), rid(4), rid(5), None}
         assert {(t["mission_id"], t["run_id"]) for t in s.trajectory} == {

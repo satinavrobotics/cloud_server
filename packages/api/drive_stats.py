@@ -14,6 +14,13 @@ Source: the robots' RECORDED trajectories on the map, in the map frame.
   over the segments they overlap.
 * Regions: the scene graph's owner raster of the current version looked up per tile (one cell = one tile).
 
+Summaries (docs/region_stats_2026-10-27.md 6.5): with DRIVE_STATS_SOURCE = "summaries" (default) and the default
+`min_speed`, the runs that STARTED in the window and have a current stored cell summary (`run_cells`, written once per
+finished run by packages/api/run_cells.py: exactly the computation above) are summed from it; every other run
+(still running, finished but not summarised yet, or started before the window) comes from the raw rows as before, so
+a run is never missing and never counted twice. Another `min_speed`, or DRIVE_STATS_SOURCE = "raw", reads the raw
+rows only. `source.basis` says which. The day series attributes a summarised run to the UTC day of its start.
+
 The numpy work runs in a thread; the answer is cached (map, window, robot, min_speed) for
 DRIVE_STATS_CACHE_TTL_S and carries an ETag.
 """
@@ -33,197 +40,19 @@ from fastapi import HTTPException
 from packages import config
 from packages.api import fleet_reads, maps, series_axis
 from packages.api.result_cache import ResultCache
+from packages.utils import run_cells_db
 
 logger = logging.getLogger("ApiDelegationService.drive_stats")
 
-CELL_M = 0.1                  # = the scene graph's lattice step (the owner raster cell)
 TILE_GRID_M = 6.4             # scene-graph store tile: raster origins lie on this grid
-SAMPLE_DIV = 4                # samples per cell along a segment
-MAX_SAMPLES_PER_SEGMENT = 4000
-CHUNK_SEGMENTS = 40_000       # segments rasterised per numpy round (bounds memory)
 REGION_CHUNK_CELLS = 1600     # 160 m = 25 store tiles: one owner-plane request per chunk (4M-cell cap is 2000)
-_OFF = 1 << 30                # cell keys: (ix + _OFF) << 32 | (iy + _OFF)
 
 
-# --- pure core -----------------------------------------------------------------------------------
-
-class Params:
-    """The movement rules of one request."""
-
-    def __init__(self, min_speed: Optional[float] = None, max_gap_s: Optional[float] = None,
-                 max_speed: Optional[float] = None, leg_max_m: Optional[float] = None) -> None:
-        self.min_speed = config.DRIVE_STATS_MIN_SPEED_MS if min_speed is None else float(min_speed)
-        self.max_gap_s = config.DRIVE_STATS_MAX_GAP_S if max_gap_s is None else float(max_gap_s)
-        self.max_speed = config.DRIVE_STATS_MAX_SPEED_MS if max_speed is None else float(max_speed)
-        self.leg_max_m = config.DRIVE_STATS_LEG_MAX_M if leg_max_m is None else float(leg_max_m)
-
-
-def cell_key(ix: np.ndarray, iy: np.ndarray) -> np.ndarray:
-    return ((ix.astype(np.int64) + _OFF) << 32) | (iy.astype(np.int64) + _OFF)
-
-
-def key_cells(key: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    return (key >> 32) - _OFF, (key & 0xFFFFFFFF) - _OFF
-
-
-class Segments:
-    """Movements: run code, start/end time (epoch s), start/end position (m, map frame)."""
-
-    def __init__(self, run, t0, t1, x0, y0, x1, y1):
-        self.run, self.t0, self.t1 = run, t0, t1
-        self.x0, self.y0, self.x1, self.y1 = x0, y0, x1, y1
-
-    def __len__(self) -> int:
-        return int(self.run.size)
-
-
-def track_segments(run: np.ndarray, group: np.ndarray, ts: np.ndarray, x: np.ndarray, y: np.ndarray,
-                   p: Params) -> Tuple[Segments, int]:
-    """Segments between consecutive rows of the same run and group (session + run epoch), the rows sorted by
-    (run, ts). Returns (segments, rejected pairs): a pair is rejected for dt <= 0, dt > max_gap_s or a speed
-    above max_speed (a pose jump)."""
-    if run.size < 2:
-        e = np.empty(0)
-        return Segments(np.empty(0, np.int64), e, e, e, e, e, e), 0
-    same = (run[:-1] == run[1:]) & (group[:-1] == group[1:])
-    dt = ts[1:] - ts[:-1]
-    dx, dy = x[1:] - x[:-1], y[1:] - y[:-1]
-    dist = np.hypot(dx, dy)
-    finite = np.isfinite(dist)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        fast = dist / dt > p.max_speed
-    ok = same & finite & (dt > 0) & (dt <= p.max_gap_s) & ~fast
-    rejected = int(np.count_nonzero(same)) - int(np.count_nonzero(ok))
-    i = np.nonzero(ok)[0]
-    return Segments(run[i], ts[i], ts[i + 1], x[i], y[i], x[i + 1], y[i + 1]), rejected
-
-
-def recovery_overlap(seg: Segments, intervals: Dict[int, List[Tuple[float, float]]]) -> Tuple[np.ndarray, float]:
-    """Seconds of each segment inside its run's recovery intervals, and the recovery seconds of the intervals
-    that overlapped no segment (a pose gap)."""
-    rec = np.zeros(len(seg))
-    attributed = 0.0
-    total = 0.0
-    for run, spans in intervals.items():
-        merged: List[List[float]] = []
-        for s, e in sorted(spans):
-            if e <= s:
-                continue
-            if merged and s <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], e)
-            else:
-                merged.append([s, e])
-        if not merged:
-            continue
-        total += sum(e - s for s, e in merged)
-        sel = np.nonzero(seg.run == run)[0]
-        if not sel.size:
-            continue
-        pts = np.array([v for s, e in merged for v in (s, e)])
-        # the value at s_i is the recovery time before the interval, at e_i the time after it
-        before = np.cumsum([0.0] + [e - s for s, e in merged[:-1]])
-        vals = np.empty(pts.size)
-        vals[0::2], vals[1::2] = before, before + np.array([e - s for s, e in merged])
-        over = np.interp(seg.t1[sel], pts, vals) - np.interp(seg.t0[sel], pts, vals)
-        rec[sel] = np.clip(over, 0.0, seg.t1[sel] - seg.t0[sel])
-        attributed += float(rec[sel].sum())
-    return rec, max(0.0, total - attributed)
-
-
-class Accumulator:
-    """Sums per cell and the distinct (cell, run) pairs, built chunk by chunk."""
-
-    def __init__(self, n_runs: int) -> None:
-        self.n_runs = max(1, n_runs)
-        self.keys: List[np.ndarray] = []
-        self.sums: List[np.ndarray] = []         # rows: len, time, recovery, stopped
-        self.pair_cell: List[np.ndarray] = []
-        self.pair_run: List[np.ndarray] = []
-
-    def add(self, run: np.ndarray, x0, y0, x1, y1, time_s: np.ndarray, rec_s: np.ndarray,
-            stopped_s: np.ndarray, step: float = CELL_M) -> None:
-        """One movement per element; its length is |p1 - p0|, spread evenly along the segment."""
-        for lo in range(0, run.size, CHUNK_SEGMENTS):
-            sl = slice(lo, lo + CHUNK_SEGMENTS)
-            self._add_chunk(run[sl], x0[sl], y0[sl], x1[sl], y1[sl], time_s[sl], rec_s[sl], stopped_s[sl], step)
-
-    def _add_chunk(self, run, x0, y0, x1, y1, time_s, rec_s, stopped_s, step) -> None:
-        if not run.size:
-            return
-        length = np.hypot(x1 - x0, y1 - y0)
-        nsub = np.clip(np.ceil(length / (step / SAMPLE_DIV)), 1, MAX_SAMPLES_PER_SEGMENT).astype(np.int64)
-        total = int(nsub.sum())
-        idx = np.repeat(np.arange(run.size), nsub)
-        first = np.cumsum(nsub) - nsub
-        k = np.arange(total) - np.repeat(first, nsub)
-        frac = (k + 0.5) / nsub[idx]
-        px = x0[idx] + frac * (x1 - x0)[idx]
-        py = y0[idx] + frac * (y1 - y0)[idx]
-        key = cell_key(np.floor(px / step), np.floor(py / step))
-        uniq, inv = np.unique(key, return_inverse=True)
-        w = 1.0 / nsub[idx]
-        sums = np.stack([np.bincount(inv, weights=(w * length[idx]), minlength=uniq.size),
-                         np.bincount(inv, weights=(w * time_s[idx]), minlength=uniq.size),
-                         np.bincount(inv, weights=(w * rec_s[idx]), minlength=uniq.size),
-                         np.bincount(inv, weights=(w * stopped_s[idx]), minlength=uniq.size)])
-        self.keys.append(uniq)
-        self.sums.append(sums)
-        pk = np.unique(inv.astype(np.int64) * self.n_runs + run[idx].astype(np.int64))
-        self.pair_cell.append(uniq[pk // self.n_runs])
-        self.pair_run.append(pk % self.n_runs)
-
-    def merged_with(self, other: "Accumulator") -> "Accumulator":
-        """Both accumulators over disjoint runs (a run is never in both): sums and run counts add."""
-        out = Accumulator(max(self.n_runs, other.n_runs))
-        for name in ("keys", "sums", "pair_cell", "pair_run"):
-            setattr(out, name, getattr(self, name) + getattr(other, name))
-        return out
-
-    def tiles(self) -> "Tiles":
-        if not self.keys:
-            return Tiles(np.empty(0, np.int64), np.empty((4, 0)), np.empty(0, np.int64),
-                         np.empty(0, np.int64), np.empty(0, np.int64))
-        key = np.concatenate(self.keys)
-        uniq, inv = np.unique(key, return_inverse=True)
-        sums = np.stack([np.bincount(inv, weights=np.concatenate([s[r] for s in self.sums]), minlength=uniq.size)
-                         for r in range(4)])
-        pc, pr = np.concatenate(self.pair_cell), np.concatenate(self.pair_run)
-        pi = np.searchsorted(uniq, pc)
-        pair = np.unique(pi.astype(np.int64) * self.n_runs + pr)
-        n = np.bincount(pair // self.n_runs, minlength=uniq.size)
-        return Tiles(uniq, sums, n, (pair // self.n_runs), (pair % self.n_runs))
-
-
-class Tiles:
-    """Sorted cell keys, the 4 x N sums (len, time, recovery, stopped), N run counts, and the distinct
-    (tile index, run) pairs."""
-
-    def __init__(self, key, sums, n, pair_tile, pair_run) -> None:
-        self.key, self.sums, self.n, self.pair_tile, self.pair_run = key, sums, n, pair_tile, pair_run
-
-    def __len__(self) -> int:
-        return int(self.key.size)
-
-
-def leg_movements(legs: Sequence[Dict[str, Any]], pos: Callable[[str], Optional[Tuple[float, float]]],
-                  p: Params) -> Tuple[Dict[str, np.ndarray], int]:
-    """Legs as movements; a leg whose node positions are unknown, whose duration is not positive or whose
-    straight length exceeds leg_max_m is skipped (returned count)."""
-    rows, skipped = [], 0
-    for leg in legs:
-        a, b = pos(leg["from"]), pos(leg["to"])
-        dur = leg["duration_s"]
-        if a is None or b is None or not (dur and dur > 0) or math.hypot(b[0] - a[0], b[1] - a[1]) > p.leg_max_m:
-            skipped += 1
-            continue
-        stopped = min(max(float(leg.get("stopped_s") or 0.0), 0.0), dur)
-        rec = min(max(float(leg.get("recovery_s") or 0.0), 0.0), dur)
-        rows.append((leg["run"], a[0], a[1], b[0], b[1], float(dur), rec, stopped))
-    if not rows:
-        return {}, skipped
-    arr = np.array(rows, dtype=float)
-    return {"run": arr[:, 0].astype(np.int64), "x0": arr[:, 1], "y0": arr[:, 2], "x1": arr[:, 3], "y1": arr[:, 4],
-            "time": arr[:, 5], "rec": arr[:, 6], "stopped": arr[:, 7]}, skipped
+# --- pure core: moved to packages/utils/cell_raster.py, re-exported here --------------------------
+# (the rasteriser is shared with the per-run cell summaries, packages/api/run_cells.py)
+from packages.utils.cell_raster import (  # noqa: E402,F401  pylint: disable=unused-import
+    CELL_M, CHUNK_SEGMENTS, MAX_SAMPLES_PER_SEGMENT, SAMPLE_DIV, _OFF, Accumulator, Params, Segments, Tiles,
+    cell_key, key_cells, leg_movements, recovery_overlap, track_segments)
 
 
 # --- regions -------------------------------------------------------------------------------------
@@ -334,14 +163,25 @@ def _window_sql(column: str, start: Optional[datetime.datetime], end: Optional[d
     return sql
 
 
-async def fetch_track(cur: Any, map_id: str, start, end, robot, limit: int) -> Tuple[List[tuple], bool]:
+def _not_summarised(table_run: str, table_map: str, start, end, robot, args: List[Any]) -> str:
+    """AND NOT EXISTS (a current summary of this run and map that the summaries part takes: it started in the
+    window and is of the robot): those runs are not read raw."""
+    args.append(config.RUN_CELLS_ALGO_VERSION)
+    return (f" AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = {table_run} AND c.map_id = {table_map} "
+            "AND c.algo_version = %s" + run_cells_db.window_sql(start, end, robot, None, args, alias="c") + ")")
+
+
+async def fetch_track(cur: Any, map_id: str, start, end, robot, limit: int,
+                      skip_summarised: bool = False) -> Tuple[List[tuple], bool]:
     """Newest `limit` rows (run_id, epoch s, x_map, y_map, session, run_epoch) of the runs on `map_id` with a
-    stored map pose, and whether the cap cut older rows."""
+    stored map pose, and whether the cap cut older rows. `skip_summarised`: leave out the runs the summaries part
+    takes (see the module docstring)."""
     args: List[Any] = [map_id]
     sql = ("SELECT t.run_id, extract(epoch FROM t.ts)::float8, t.x_map, t.y_map, t.map_session_id, t.run_epoch "
            "FROM robot_track_ts t JOIN mission_runs r ON r.run_id = t.run_id "
            "WHERE r.map_id = %s AND t.x_map IS NOT NULL AND t.y_map IS NOT NULL"
            + _window_sql("t.ts", start, end, robot, "t.robot_name", args)
+           + (_not_summarised("r.run_id", "r.map_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY t.ts DESC LIMIT %s")
     args.append(limit + 1)
     await cur.execute(sql, tuple(args))
@@ -362,11 +202,12 @@ async def fetch_recoveries(cur: Any, run_ids: Sequence[Any], t_min: float, t_max
     return list(await cur.fetchall())
 
 
-async def fetch_legs(cur: Any, map_id: str, start, end, robot) -> List[tuple]:
+async def fetch_legs(cur: Any, map_id: str, start, end, robot, skip_summarised: bool = False) -> List[tuple]:
     args: List[Any] = [map_id]
     sql = ("SELECT run_id, from_topomap_node, to_topomap_node, duration_s, stopped_s, recovery_s "
            "FROM run_legs WHERE map_id = %s AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL "
            "AND duration_s > 0" + _window_sql("started_at", start, end, robot, "robot_name", args)
+           + (_not_summarised("run_legs.run_id", "run_legs.map_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY started_at DESC LIMIT %s")
     args.append(config.DRIVE_STATS_MAX_ROWS)
     await cur.execute(sql, tuple(args))
@@ -393,17 +234,35 @@ class Loaded:
         self.recoveries: List[tuple] = []
         self.legs: List[tuple] = []
         self.legs_dropped_for_track = 0
+        self.summaries: List[run_cells_db.CellRow] = []    # stored per-run cell summaries (the summaries part)
+        self.basis = "raw"                                 # "summaries" | "raw"
+        self.basis_reason: Optional[str] = None            # why raw: "min_speed" | "config"
 
 
-async def load(db: Any, map_id: str, start, end, robot) -> Loaded:
+def summaries_wanted(p: Params) -> Tuple[bool, Optional[str]]:
+    """(read the stored summaries?, why not): the summaries froze the default min_speed."""
+    if config.DRIVE_STATS_SOURCE != "summaries":
+        return False, "config"
+    if p.min_speed != config.DRIVE_STATS_MIN_SPEED_MS:
+        return False, "min_speed"
+    return True, None
+
+
+async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = False,
+               reason: Optional[str] = None) -> Loaded:
     out = Loaded()
+    out.basis, out.basis_reason = ("summaries" if use_summaries else "raw"), reason
     async with fleet_reads.read_cursor(db) as cur:
-        out.track_rows, out.partial = await fetch_track(cur, map_id, start, end, robot, config.DRIVE_STATS_MAX_ROWS)
+        if use_summaries:
+            out.summaries = await run_cells_db.fetch(cur, map_id, start, end, robot,
+                                                     algo_version=config.RUN_CELLS_ALGO_VERSION)
+        out.track_rows, out.partial = await fetch_track(cur, map_id, start, end, robot, config.DRIVE_STATS_MAX_ROWS,
+                                                        skip_summarised=use_summaries)
         track_runs = {r[0] for r in out.track_rows}
         if track_runs:
             ts = [r[1] for r in out.track_rows]
             out.recoveries = await fetch_recoveries(cur, sorted(track_runs, key=str), min(ts), max(ts))
-        legs = await fetch_legs(cur, map_id, start, end, robot)
+        legs = await fetch_legs(cur, map_id, start, end, robot, skip_summarised=use_summaries)
         leg_runs = {l[0] for l in legs} - track_runs
         has_track = await runs_with_track(cur, sorted(leg_runs, key=str))
         out.legs = [l for l in legs if l[0] not in track_runs and l[0] not in has_track]
@@ -411,9 +270,22 @@ async def load(db: Any, map_id: str, start, end, robot) -> Loaded:
     return out
 
 
+def add_summary(acc: Accumulator, code: int, row: run_cells_db.CellRow) -> None:
+    """One stored run summary into an accumulator as run `code`: its cells with movement (a cell that only holds a
+    block event is not a driven tile)."""
+    keep = (row.len_m > 0) | (row.time_s > 0) | (row.recovery_s > 0) | (row.stopped_s > 0)
+    if not keep.any():
+        return
+    acc.keys.append(row.key[keep])
+    acc.sums.append(np.stack([row.len_m[keep], row.time_s[keep], row.recovery_s[keep], row.stopped_s[keep]]))
+    acc.pair_cell.append(row.key[keep])
+    acc.pair_run.append(np.full(int(keep.sum()), code, np.int64))
+
+
 def compute(loaded: Loaded, node_xy: Callable[[], Dict[str, Tuple[float, float]]], p: Params
             ) -> Tuple[Tiles, Dict[str, Any], Tiles, Tiles]:
-    """Tiles of both sources merged, the source counts, and the two sources' tiles (for the cell shares)."""
+    """Tiles of both sources merged, the source counts, and the two sources' tiles (for the cell shares).
+    The stored summaries (`loaded.summaries`) and the raw rows are disjoint sets of runs."""
     codes: Dict[Any, int] = {}
 
     def code(run: Any) -> int:
@@ -423,12 +295,25 @@ def compute(loaded: Loaded, node_xy: Callable[[], Dict[str, Tuple[float, float]]
     track_run_codes = [code(r[0]) for r in rows]
     for leg in loaded.legs:
         code(leg[0])
-    n_runs = len(codes)
-    src: Dict[str, Any] = {"track_runs": len({r[0] for r in rows}), "track_rows": len(rows), "track_segments": 0,
-                           "track_pairs_rejected": 0, "leg_runs": 0, "leg_rows": 0, "legs_skipped": 0,
+    n_raw = len(codes)
+    n_runs = n_raw + len(loaded.summaries)
+    summary_track = [s for s in loaded.summaries if s.source == "track"]
+    summary_legs = [s for s in loaded.summaries if s.source == "legs"]
+    def total(group: Sequence[run_cells_db.CellRow], key: str) -> float:
+        return sum(float(s.totals.get(key) or 0) for s in group)
+
+    src: Dict[str, Any] = {"track_runs": len({r[0] for r in rows}) + len(summary_track), "track_rows": len(rows),
+                           "track_segments": int(total(summary_track, "segments")),
+                           "track_pairs_rejected": int(total(summary_track, "rejected")),
+                           "leg_runs": len(summary_legs), "leg_rows": int(total(summary_legs, "segments")),
+                           "legs_skipped": int(total(summary_legs, "legs_skipped")),
                            "legs_dropped_run_has_track": loaded.legs_dropped_for_track,
-                           "recovery_unattributed_s": 0.0, "partial": loaded.partial}
+                           "recovery_unattributed_s": round(total(loaded.summaries, "recovery_unattributed_s"), 1),
+                           "partial": loaded.partial, "basis": loaded.basis, "basis_reason": loaded.basis_reason,
+                           "summary_runs": len(loaded.summaries), "raw_runs": n_raw}
     acc_t, acc_l = Accumulator(n_runs), Accumulator(n_runs)
+    for j, s in enumerate(loaded.summaries):
+        add_summary(acc_t if s.source == "track" else acc_l, n_raw + j, s)
     if rows:
         run = np.array(track_run_codes, np.int64)
         grp_codes: Dict[Any, int] = {}
@@ -447,13 +332,16 @@ def compute(loaded: Loaded, node_xy: Callable[[], Dict[str, Tuple[float, float]]
         dist = np.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0)
         stopped = np.where(dist < p.min_speed * dt, dt, 0.0)
         acc_t.add(seg.run, seg.x0, seg.y0, seg.x1, seg.y1, dt, rec, stopped)
-        src.update(track_segments=len(seg), track_pairs_rejected=rejected, recovery_unattributed_s=round(lost, 1))
+        src["track_segments"] += len(seg)
+        src["track_pairs_rejected"] += rejected
+        src["recovery_unattributed_s"] = round(src["recovery_unattributed_s"] + lost, 1)
     if loaded.legs:
         xy = node_xy()
         mv, skipped = leg_movements(
             [{"run": codes[l[0]], "from": str(l[1]), "to": str(l[2]), "duration_s": l[3], "stopped_s": l[4],
               "recovery_s": l[5]} for l in loaded.legs], xy.get, p)
-        src.update(leg_rows=len(loaded.legs) - skipped, legs_skipped=skipped, leg_runs=len({l[0] for l in loaded.legs}))
+        src.update(leg_rows=src["leg_rows"] + len(loaded.legs) - skipped, legs_skipped=src["legs_skipped"] + skipped,
+                   leg_runs=src["leg_runs"] + len({l[0] for l in loaded.legs}))
         if mv:
             acc_l.add(mv["run"], mv["x0"], mv["y0"], mv["x1"], mv["y1"], mv["time"], mv["rec"], mv["stopped"])
     tt, tl = acc_t.tiles(), acc_l.tiles()
@@ -465,17 +353,39 @@ def compute(loaded: Loaded, node_xy: Callable[[], Dict[str, Tuple[float, float]]
 
 def series_day(loaded: Loaded, p: Params, axis: Sequence[datetime.datetime]) -> Dict[str, Any]:
     """The `series` block (docs/map_series_2026-10-15.md): per UTC day of `axis`, from the stored map-frame tracks
-    only (legs of runs without a track carry no timestamps). A movement belongs to the day it STARTED.
+    only (legs of runs without a track carry no timestamps). A raw movement belongs to the day it STARTED; a run
+    from the stored summaries (`loaded.summaries`, source track) belongs to the UTC day its run STARTED (a run over
+    midnight is not split), and its moving speed is len_m / (time_s - stopped_s) (the summary has no length of the
+    stopped segments themselves: at most min_speed * stopped_s metres, 0.05 m/s by default).
     `new_tiles` = 0.1 m cells visited that day and on no earlier day OF THE SERIES WINDOW ("first visited" is
     relative to the window, not to all time); `cumulative_tiles` is their running sum (cells visited so far in the
     window). Days without movement: 0 for len_m / time_s / new_tiles, null for the speed and the shares."""
     n = len(axis)
+    sums = {k: np.zeros(n) for k in ("len", "time", "mov_len", "mov_time", "rec", "stopped")}
+    day_keys: List[List[np.ndarray]] = [[] for _ in range(n)]
+    t_axis = axis[0].timestamp()
+    summary_track = [s for s in loaded.summaries if s.source == "track"]
     out: Dict[str, Any] = {"bucket": "day", "t": [t.isoformat() for t in axis], "len_m": [0.0] * n,
                            "time_s": [0.0] * n, "moving_speed_mps": [None] * n, "recovery_share": [None] * n,
                            "stopped_share": [None] * n, "new_tiles": [0] * n, "cumulative_tiles": [0] * n,
                            "source": {"basis": "track", "track_rows": len(loaded.track_rows),
-                                      "partial": loaded.partial,
-                                      "leg_only_runs_not_in_series": len({l[0] for l in loaded.legs})}}
+                                      "partial": loaded.partial, "summary_runs": len(summary_track),
+                                      "leg_only_runs_not_in_series":
+                                          len({l[0] for l in loaded.legs}) + len(loaded.summaries) - len(summary_track)}}
+    for s in summary_track:
+        i = int(np.floor((s.started_at.timestamp() - t_axis) / 86400.0))
+        if not 0 <= i < n:
+            continue
+        time_s, stopped_s = float(s.time_s.sum()), float(s.stopped_s.sum())
+        sums["len"][i] += float(s.len_m.sum())
+        sums["time"][i] += time_s
+        sums["mov_len"][i] += float(s.len_m.sum())
+        sums["mov_time"][i] += max(time_s - stopped_s, 0.0)
+        sums["rec"][i] += float(s.recovery_s.sum())
+        sums["stopped"][i] += stopped_s
+        moved = (s.len_m > 0) | (s.time_s > 0) | (s.recovery_s > 0) | (s.stopped_s > 0)
+        if moved.any():
+            day_keys[i].append(s.key[moved])
     rows = loaded.track_rows
     if rows:
         codes: Dict[Any, int] = {}
@@ -496,30 +406,39 @@ def series_day(loaded: Loaded, p: Params, axis: Sequence[datetime.datetime]) -> 
         dist = np.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0)
         moving = dist >= p.min_speed * dt
         stopped = np.where(moving, 0.0, dt)
-        idx = np.floor((seg.t0 - axis[0].timestamp()) / 86400.0).astype(np.int64)
+        idx = np.floor((seg.t0 - t_axis) / 86400.0).astype(np.int64)
         ok = (idx >= 0) & (idx < n)
-        seen = np.empty(0, np.int64)
         for i in range(n):
             sel = np.nonzero(ok & (idx == i))[0]
             if not sel.size:
-                out["cumulative_tiles"][i] = int(seen.size)
                 continue
-            time_s = float(dt[sel].sum())
             mov = sel[moving[sel]]
-            out["len_m"][i] = round(float(dist[sel].sum()), 2)
-            out["time_s"][i] = round(time_s, 1)
-            if mov.size and dt[mov].sum() > 0:
-                out["moving_speed_mps"][i] = round(float(dist[mov].sum() / dt[mov].sum()), 3)
-            if time_s > 0:
-                out["recovery_share"][i] = round(float(rec[sel].sum()) / time_s, 4)
-                out["stopped_share"][i] = round(float(stopped[sel].sum()) / time_s, 4)
+            sums["len"][i] += float(dist[sel].sum())
+            sums["time"][i] += float(dt[sel].sum())
+            sums["mov_len"][i] += float(dist[mov].sum())
+            sums["mov_time"][i] += float(dt[mov].sum())
+            sums["rec"][i] += float(rec[sel].sum())
+            sums["stopped"][i] += float(stopped[sel].sum())
             acc = Accumulator(1)
             z = np.zeros(sel.size)
             acc.add(np.zeros(sel.size, np.int64), seg.x0[sel], seg.y0[sel], seg.x1[sel], seg.y1[sel], dt[sel], z, z)
-            day_keys = acc.tiles().key
-            out["new_tiles"][i] = int(np.setdiff1d(day_keys, seen, assume_unique=True).size)
-            seen = np.union1d(seen, day_keys)
-            out["cumulative_tiles"][i] = int(seen.size)
+            day_keys[i].append(acc.tiles().key)
+    seen = np.empty(0, np.int64)
+    for i in range(n):
+        time_s = float(sums["time"][i])
+        if time_s > 0 or sums["len"][i] > 0:
+            out["len_m"][i] = round(float(sums["len"][i]), 2)
+            out["time_s"][i] = round(time_s, 1)
+            if sums["mov_time"][i] > 0:
+                out["moving_speed_mps"][i] = round(float(sums["mov_len"][i] / sums["mov_time"][i]), 3)
+            if time_s > 0:
+                out["recovery_share"][i] = round(float(sums["rec"][i]) / time_s, 4)
+                out["stopped_share"][i] = round(float(sums["stopped"][i]) / time_s, 4)
+        if day_keys[i]:
+            keys = np.unique(np.concatenate(day_keys[i]))
+            out["new_tiles"][i] = int(np.setdiff1d(keys, seen, assume_unique=True).size)
+            seen = np.union1d(seen, keys)
+        out["cumulative_tiles"][i] = int(seen.size)
     return out
 
 
@@ -567,6 +486,7 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
     """(JSON body, ETag) of GET /api/v1/maps/{map_id}/drive-stats. 404 unknown map; 422 bad query.
     `series="day"` adds the per-day `series` block over the window (default the last RUN_STATS_DEFAULT_DAYS days)."""
     p = Params(min_speed=parse_min_speed(min_speed))
+    use_summaries, reason = summaries_wanted(p)
     if start is not None and end is not None and end <= start:
         raise HTTPException(422, "to must be after from")
     cache = CACHE if cache is None else cache
@@ -584,7 +504,7 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
                     raise HTTPException(404, f"Did not find \"map\" with name \"{map_id}\"")
         except maps._SCHEMA_ERRORS as exc:
             raise maps._undefined_table(exc) from exc
-        loaded = await load(db, map_id, start, end, robot)
+        loaded = await load(db, map_id, start, end, robot, use_summaries, reason)
 
         def nodes() -> Dict[str, Tuple[float, float]]:
             out = {}
@@ -609,7 +529,7 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
                   "max_speed": p.max_speed}
         body = build_body(map_id, tiles, src, regions, origin, version, window)
         if series:
-            sloaded = loaded if (s_start, s_end) == (start, end) else await load(db, map_id, s_start, s_end, robot)
+            sloaded = loaded if (s_start, s_end) == (start, end) else await load(db, map_id, s_start, s_end, robot, use_summaries, reason)
             body["series"] = await asyncio.to_thread(series_day, sloaded, p, axis)
             body["series"]["window"] = {"from": s_start.isoformat(), "to": s_end.isoformat()}
         raw = json.dumps(body, separators=(",", ":")).encode()

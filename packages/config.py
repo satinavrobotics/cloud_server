@@ -669,6 +669,30 @@ DRIVE_STATS_MIN_SPEED_MS = float(os.getenv("DRIVE_STATS_MIN_SPEED_MS", "0.05"))
 DRIVE_STATS_LEG_MAX_M = float(os.getenv("DRIVE_STATS_LEG_MAX_M", "10.0"))
 DRIVE_STATS_CACHE_TTL_S = float(os.getenv("DRIVE_STATS_CACHE_TTL_S", "120.0"))
 DRIVE_STATS_CACHE_ENTRIES = int(os.getenv("DRIVE_STATS_CACHE_ENTRIES", "16"))
+# Where drive-stats / its day series read their cells: "summaries" = the stored per-run cell summaries
+# (run_cells, below) plus the raw track for runs not summarised yet; "raw" = the raw track only (the original behaviour).
+DRIVE_STATS_SOURCE = os.getenv("DRIVE_STATS_SOURCE", "summaries")
+# Per-run cell summaries and the per-region statistics built from them (docs/region_stats_2026-10-27.md).
+# The API's worker (one per deployment, advisory-lock election) summarises every finished run once, RUN_CELLS_POLL_S
+# apart, up to RUN_CELLS_BATCH runs per pass, a run's rows being final RECORDER_TRAJECTORY_GRACE_S +
+# RUN_CELLS_EXTRA_GRACE_S after it ended; a run that fails is not retried for RUN_CELLS_RETRY_S. A bump of
+# RUN_CELLS_ALGO_VERSION recomputes every run. region_stats keeps, per (map, graph version, chart, robot class),
+# the newest REGION_STATS_MAX_RUNS runs (of the last REGION_STATS_WINDOW_DAYS days) that drove at least
+# REGION_STATS_MIN_LEN_M in the chart; a map is rebuilt REGION_STATS_DEBOUNCE_S after its first change, the
+# newest REGION_STATS_KEEP_VERSIONS graph versions are kept.
+RUN_CELLS_ENABLED = _env_bool("RUN_CELLS_ENABLED", "true")
+RUN_CELLS_ALGO_VERSION = int(os.getenv("RUN_CELLS_ALGO_VERSION", "1"))
+RUN_CELLS_POLL_S = float(os.getenv("RUN_CELLS_POLL_S", "30.0"))
+RUN_CELLS_BATCH = int(os.getenv("RUN_CELLS_BATCH", "20"))
+RUN_CELLS_EXTRA_GRACE_S = float(os.getenv("RUN_CELLS_EXTRA_GRACE_S", "30.0"))
+RUN_CELLS_RETRY_S = float(os.getenv("RUN_CELLS_RETRY_S", "600.0"))
+REGION_STATS_WINDOW_DAYS = int(os.getenv("REGION_STATS_WINDOW_DAYS", "90"))
+REGION_STATS_MIN_LEN_M = float(os.getenv("REGION_STATS_MIN_LEN_M", "1.0"))
+REGION_STATS_MAX_RUNS = int(os.getenv("REGION_STATS_MAX_RUNS", "50"))
+REGION_STATS_DEBOUNCE_S = float(os.getenv("REGION_STATS_DEBOUNCE_S", "30.0"))
+REGION_STATS_KEEP_VERSIONS = int(os.getenv("REGION_STATS_KEEP_VERSIONS", "3"))
+REGION_STATS_CACHE_TTL_S = float(os.getenv("REGION_STATS_CACHE_TTL_S", "120.0"))
+REGION_STATS_CACHE_ENTRIES = int(os.getenv("REGION_STATS_CACHE_ENTRIES", "16"))
 # Robot path efficiency (packages/api/path_efficiency.py, docs/path_efficiency_2026-10-15.md): a leg shorter
 # than EFFICIENCY_MIN_LEG_M of plan is left out of the ratios (too noisy); a leg whose track covers less than
 # EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory whose waypoint

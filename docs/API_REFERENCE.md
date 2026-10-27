@@ -264,10 +264,56 @@ Response:
   `min_speed`. Mean speed of a tile = `len_m / time_s`; time lost = `recovery_s` + `stopped_s` (they can overlap).
 * **Regions:** per chart key of the current graph version: `n` distinct runs, the summed fields, `cells` the chart's size
   in 0.1 m cells, `visited` how many of them have drive data.
-* `source.partial` true: more than `DRIVE_STATS_MAX_ROWS` (2,000,000) track rows matched, the newest were used.
+* `source.partial` true: more than `DRIVE_STATS_MAX_ROWS` (2,000,000) raw track rows matched, the newest were used (the
+  stored summaries are never cut).
+* **Summaries:** by default (`DRIVE_STATS_SOURCE=summaries`, the default `min_speed`) a run that started in the window and
+  has a stored cell summary (`run_cells`) is summed from it; all other runs (still running, not summarised yet, started
+  before the window) come from the raw rows, so none is missing or counted twice. `source.basis` is `summaries` or `raw`
+  (`basis_reason` `min_speed` or `config` says why raw), `source.summary_runs` / `raw_runs` count the runs of each part
+  (the other `source` keys keep their meaning and cover both). `series=day` puts a summarised run on the UTC day it started
+  (a raw movement keeps the day it started).
 * Headers: `ETag`, `Cache-Control: private, max-age=60`; 304 on a matching `If-None-Match`. Results are cached
   server-side for 120 s per (map, window, robot, min_speed).
 * Errors: 404 unknown map, 422 bad `from`/`to`/`min_speed`, 503 when the database cannot be read in time.
+
+---
+
+### Map Region Statistics
+
+#### `GET /api/v1/maps/{map_id}/region-stats`
+
+Per-chart driving statistics of a map from the stored per-run cell summaries: what a route through a chart costs, per
+robot class. Read only; the planner will load the same table (`packages/utils/region_stats_load.py`). Rules, tables and
+definitions: `docs/region_stats_2026-10-27.md`.
+
+Query (all optional): `robot_class` (default `*` = all classes pooled; a class is
+`<agv_class>|<length>x<width>|<speed_max>` of the factsheet, `packages/utils/robot_class.py`), `version` (a stored scene-graph
+version; default the newest built), `robot` (one robot, display only: computed on read from its runs, cached).
+
+Response:
+
+```json
+{
+  "map_id": "office9", "graph_version": 5, "stamp": "3f2a9c0d41b7e8aa", "built_at": "2026-10-28T09:12:00+00:00",
+  "window_days": 90, "min_len_m": 1.0, "max_runs": 50, "current_graph_version": 5, "stale": false,
+  "status": "ok", "robot_class": "*", "robot": null, "source": "stored", "runs": 135,
+  "regions": [{"map_id": "office9", "graph_version": 5, "chart_key": "b63f0f5e-...:0", "robot_class": "*", "runs": 31,
+               "len_m": 212.4, "time_s": 640.2, "stopped_s": 51.0, "recovery_s": 12.5, "blocks": 3,
+               "pace_median_s_per_m": 2.9, "pace_p90_s_per_m": 4.1, "moving_pace_median_s_per_m": 2.6,
+               "moving_speed_mps": 0.36, "stopped_share": 0.08, "recovery_s_per_100m": 5.9, "blocks_per_run": 0.1,
+               "speed_max": null, "cells": 366, "visited": 233, "first_at": "...", "last_at": "...", "stamp": "..."}]
+}
+```
+
+* Field names of `regions` are the columns of `region_stats`. A **sample** is one run's drive in one chart of at least
+  `min_len_m`; `runs` is the number of samples kept (the newest `max_runs` per chart and class); sums are over them;
+  `pace_*` are `time_s / len_m` per sample (median, p90), `moving_*` leave out `stopped_s`; ratios are null on a zero
+  denominator; `visited` counts the chart's 0.1 m cells with movement; `speed_max` is the class's factsheet speed (null for `*`).
+* `stale` is true while the stored build is of an older graph version than `current_graph_version`, or a run was deleted
+  since; the next build (the API worker, a debounce after a change) replaces it. `status` `no_scene_graph`: the map has no graph,
+  `regions` is `[]`. `source` is `stored` or `computed`.
+* Only the current graph version can be computed on read. Headers `ETag`, `Cache-Control: private, max-age=30`; 304 on a
+  matching `If-None-Match`. Errors: 404 unknown map or a version that is neither stored nor current.
 
 ---
 

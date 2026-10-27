@@ -247,6 +247,11 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
                         "AND robot_name = ANY(%s::text[]) AND ts BETWEEN %s AND %s",
                         (run_ids, sorted({r[2] for r in runs}), min(r[4] for r in runs),
                          max(r[5] or now for r in runs) + TRAJECTORY_GRACE))
+                # The runs' cell summaries go with them (run_cells has ON DELETE CASCADE); the region statistics
+                # built from them are stale until the next build (docs/region_stats_2026-10-27.md 4.2).
+                await cur.execute(
+                    "UPDATE region_stats_builds SET status = 'stale' WHERE status = 'ok' AND map_id IN "
+                    "(SELECT map_id FROM run_cells WHERE run_id = ANY(%s::uuid[]))", (run_ids,))
                 await cur.execute("DELETE FROM mission_runs WHERE run_id = ANY(%s::uuid[])",
                                   (run_ids,))
                 deleted_runs = cur.rowcount
