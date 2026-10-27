@@ -56,11 +56,12 @@ SAME_CHART = "same_chart"
 
 
 def _route_leg(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None, blocked: Any = None,
-               skip_same_chart: bool = False) -> Tuple[Any, Any, Any, Optional[str]]:
+               skip_same_chart: bool = False, region: Any = None) -> Tuple[Any, Any, Any, Optional[str]]:
     """The one place a leg is snapped and routed: (snap a, snap b, Route or None, failure). failure is None for a route,
     "outside_graph" (a point does not snap), "unreachable" (no route), "blocked_by_keepout" (no route with the keep-out
     zones `blocked`, one without them), or SAME_CHART (only with `skip_same_chart`: both ends in one chart, not routed).
-    `blocked` (a scene_graph `Blocked`) goes to the route search, so a leg is measured and planned over the same cells.
+    `blocked` (a scene_graph `Blocked`) goes to the route search, so a leg is measured and planned over the same cells; so does
+    `region` (a `RegionPricing`, the planner's region cost term), for a graph that takes one.
     Raises what the graph raises; the callers record that as "error"."""
     sa = graph.snap(a[0], a[1], snap_m)
     sb = graph.snap(b[0], b[1], snap_m)
@@ -69,6 +70,8 @@ def _route_leg(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None, bloc
     if skip_same_chart and sa.key == sb.key:
         return sa, sb, None, SAME_CHART
     extra = {} if safety is None else {"safety": safety}
+    if region is not None:
+        extra["region"] = region
     route = graph.route(sa.key, sb.key, blocked or None, start=(sa.x, sa.y), goal=(sb.x, sb.y), **extra)
     if route is not None:
         return sa, sb, route, None
@@ -80,12 +83,12 @@ def _route_leg(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None, bloc
 
 
 def _leg_width(graph: Any, a: Pt, b: Pt, snap_m: float, safety: Any = None,
-               routes: Optional[LegRoutes] = None, blocked: Any = None) -> Optional[float]:
+               routes: Optional[LegRoutes] = None, blocked: Any = None, region: Any = None) -> Optional[float]:
     key = ((float(a[0]), float(a[1])), (float(b[0]), float(b[1])))
     if routes is not None and key in routes.widths:
         return routes.widths[key]
     try:
-        _, _, route, failure = _route_leg(graph, a, b, snap_m, safety, blocked)
+        _, _, route, failure = _route_leg(graph, a, b, snap_m, safety, blocked, region=region)
         if route is None:
             if routes is not None:
                 routes.failed.setdefault(key, failure or "unreachable")
@@ -114,7 +117,7 @@ def _operator_corridor(pose: common.Pose2D) -> bool:
 def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Iterable[int],
                        robot_width: Optional[float], margin: float, snap_m: float,
                        budget_s: float = 0.0, keep_intent: bool = False, safety: Any = None,
-                       routes: Optional[LegRoutes] = None, blocked: Any = None) -> Dict[str, Any]:
+                       routes: Optional[LegRoutes] = None, blocked: Any = None, region: Any = None) -> Dict[str, Any]:
     """Give every waypoint the robot drives through (all but the last) its `corridor_width_m`
     from the scene graph, and make the `candidates` (waypoint indexes that should be skippable)
     skippable where there is room. The corridor is the gate the robot may cross, so operator
@@ -133,7 +136,7 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
     "unavailable": reason a width could not be known or None, "corridor": {"measured": n > 0,
     "narrow": n at 0, "unknown": n None} over all annotated waypoints}. With `routes`, a leg
     already routed is not routed again, and the legs routed here are added to it. `blocked` (keep-out zones) goes to
-    every leg's route search, as in `insert_planned`. `skippable` needs `skip_allowed(corridor)`: a corridor of
+    every leg's route search, as in `insert_planned`, and so does `region`. `skippable` needs `skip_allowed(corridor)`: a corridor of
     0 < c <= NODE_POLICY_SKIP_MIN_CORRIDOR_M is kept as the gate but not skippable. An operator's corridor above
     NODE_POLICY_CORRIDOR_CAP_M is capped silently when stored."""
     last = len(poses) - 1
@@ -155,7 +158,7 @@ def annotate_corridors(graph: Any, poses: List[common.Pose2D], candidates: Itera
                 cut.add(leg)
                 continue
             widths[leg] = _leg_width(graph, (poses[leg].x, poses[leg].y),
-                                     (poses[leg + 1].x, poses[leg + 1].y), snap_m, safety, routes, blocked)
+                                     (poses[leg + 1].x, poses[leg + 1].y), snap_m, safety, routes, blocked, region)
     reason: Optional[str] = None
     done = 0
     counts = {"measured": 0, "narrow": 0, "unknown": 0}
@@ -197,7 +200,8 @@ def _bearing(a: Pt, b: Pt) -> float:
 
 def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt, Pt], bool],
                    max_gap: float, snap_m: float, simplify: Callable[..., List[Pt]],
-                   safety: Any = None, routes: Optional[LegRoutes] = None, blocked: Any = None) -> Tuple[List[common.Pose2D], int]:
+                   safety: Any = None, routes: Optional[LegRoutes] = None, blocked: Any = None,
+                   region: Any = None) -> Tuple[List[common.Pose2D], int]:
     """`poses` with planned waypoints between every two consecutive ones that are not in the same
     or a neighbouring chart. The planned points come from the engine's route between the two, cut
     (line of sight, gap cap) so that each consecutive pair touches at most two charts; they are
@@ -206,14 +210,15 @@ def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt
     (new list, number inserted); the input is not modified. With `safety` the route and the cut use the
     planner's clearance pricing (the cut accepts a shortcut only if it costs no more than the lattice path).
     With `routes` the lattice path of every pair routed here is recorded, cut at the planned points. `blocked` (a scene_graph
-    `Blocked`, the keep-out zones) is passed to every route search; `visible` must honour it as well."""
+    `Blocked`, the keep-out zones) is passed to every route search; `visible` must honour it as well. `region` (the planner's region cost
+    term) prices the route and the cut like `safety` does."""
     out: List[common.Pose2D] = []
     inserted = 0
     for k, pose in enumerate(poses):
         out.append(pose)
         if k + 1 >= len(poses):
             break
-        extra = _between(graph, pose, poses[k + 1], visible, max_gap, snap_m, simplify, safety, routes, blocked)
+        extra = _between(graph, pose, poses[k + 1], visible, max_gap, snap_m, simplify, safety, routes, blocked, region)
         for j, (x, y) in enumerate(extra):
             nxt = extra[j + 1] if j + 1 < len(extra) else (poses[k + 1].x, poses[k + 1].y)
             out.append(common.Pose2D(
@@ -226,13 +231,13 @@ def insert_planned(graph: Any, poses: List[common.Pose2D], visible: Callable[[Pt
 def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
              visible: Callable[[Pt, Pt], bool], max_gap: float, snap_m: float,
              simplify: Callable[..., List[Pt]], safety: Any = None,
-             routes: Optional[LegRoutes] = None, blocked: Any = None) -> List[Pt]:
+             routes: Optional[LegRoutes] = None, blocked: Any = None, region: Any = None) -> List[Pt]:
     whole = ((a.x, a.y), (b.x, b.y))
     try:
         # a pair in one chart gets no planned waypoint, but with `routes` it is routed once for its trajectory
         # (the width of its leg needs the same route)
         sa, sb, route, failure = _route_leg(graph, (a.x, a.y), (b.x, b.y), snap_m, safety, blocked,
-                                            skip_same_chart=routes is None)
+                                            skip_same_chart=routes is None, region=region)
         if route is None:
             if routes is not None and failure != SAME_CHART:
                 routes.failed[whole] = failure
@@ -259,9 +264,11 @@ def _between(graph: Any, a: common.Pose2D, b: common.Pose2D,
         lo, hi = (i, k) if i <= k else (k, i)
         return len(set(owners[lo:hi + 1])) <= 2
 
-    if safety is not None and safety.rate > 0.0 and not getattr(simplify, "unpriced_visible", False):   # a turn cost alone leaves the cut as it is
-        from packages.services.mission_planner import scene_route    # not at module level: scene_route imports this module
-        visible = scene_route.priced_visible(visible, graph, nodes, safety)
+    # a turn cost alone leaves the cut as it is; a clearance price or a region term makes the line of sight cost-aware
+    from packages.services.mission_planner import scene_route    # not at module level: scene_route imports this module
+    if not getattr(simplify, "unpriced_visible", False) and (
+            (safety is not None and safety.rate > 0.0) or scene_route.region_arg(graph, region) is not None):
+        visible = scene_route.priced_visible(visible, graph, nodes, safety, region)
     kept = simplify(nodes, lambda p, q: window_ok(p, q) and visible(p, q), max_gap)
     if routes is not None and len(kept) > 2:
         # the whole-route entry is replaced by its pieces; the widths of the pieces are not known

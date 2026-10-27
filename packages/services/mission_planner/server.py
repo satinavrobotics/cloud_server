@@ -18,9 +18,9 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
-from packages.utils import blocked_geometry, blocked_nodes, keepouts
+from packages.utils import blocked_geometry, blocked_nodes, keepouts, region_cost
 from packages import config
-from packages.services.mission_planner import footprint_check, keepout_overlay, node_policy_plan, scene_route, trajectory
+from packages.services.mission_planner import footprint_check, keepout_overlay, node_policy_plan, region_snapshots, scene_route, trajectory
 from packages.utils import map_geo
 from packages.utils import map_sessions
 from packages.utils.geo import gps_to_local
@@ -146,6 +146,8 @@ class MissionPlannerService:
         self._waypoints_removed = 0           # waypoints the budgeted pull saved against the greedy pull (SCENE_GRAPH_WAYPOINT_BUDGET_M)
         # served chart plans by the source of their turn-cost lambda (scene_route.turn_lambda: factsheet | config | off)
         self._turn_sources: Dict[str, int] = {}
+        # region cost (docs/planner_region_stats_2026-10-27.md): snapshots of the statistics
+        self._region_snaps = region_snapshots.RegionSnapshots(lambda: self.database.connection())
 
         self._prewarm_task: Optional["asyncio.Task"] = None
 
@@ -329,6 +331,7 @@ class MissionPlannerService:
 
         check_width = config.SCENE_GRAPH_WIDTH_CHECK_ENABLED
         turn = self._robot_turn(robot)
+        region, region_mode = await self._region_for(map_id, version, graph, robot)
         plan_wait, budget_bound = stage(config.SCENE_GRAPH_PLAN_BUDGET_S)
         plan_fut = self._plan_pool.submit(
             lambda: scene_route.plan_on_graph(
@@ -340,7 +343,8 @@ class MissionPlannerService:
                 self._robot_length(robot),
                 self._node_policy_cfg(robot), config.SCENE_GRAPH_SAFETY_KAPPA, check_width,
                 config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0, turn=turn,
-                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0, keepout_for=keepout_for))
+                waypoint_budget_m=config.SCENE_GRAPH_WAYPOINT_BUDGET_M or 0.0, keepout_for=keepout_for,
+                region=region, region_mode=region_mode))
         try:
             plan = await asyncio.wait_for(plan_fut, plan_wait)
         except asyncio.TimeoutError:
@@ -405,6 +409,21 @@ class MissionPlannerService:
             **({"keepout": plan.keepout} if plan.keepout is not None else {}),
         }, None
 
+    async def _region_for(self, map_id: str, version: int, graph: Any, robot: Any) -> Tuple[Any, str]:
+        """(snapshot, mode) of the region cost term for a plan on `graph`: mode `region_cost.mode_for(map_id)`; off (or a graph that cannot take
+        a snapshot) is (None, "off") and does no work at all, not even a database read. Never raises."""
+        mode = region_cost.mode_for(map_id)
+        if mode == "off" or not callable(getattr(graph, "region_arg", None)):
+            return None, "off"
+        try:
+            return await self._region_snaps.get(map_id, version, graph.keys,
+                                                getattr(getattr(robot, "status", None), "factsheet", None)), mode
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # pylint: disable=broad-except
+            self.logger.warning(f"Region cost snapshot of {map_id} v{version} failed ({err!r}); planning without it")
+            return None, "off"
+
     @staticmethod
     def _goal_snap_m(graph: Any) -> float:
         """The goal's acceptance distance from free space: the map's close-evidence range (set at map creation, fixed for
@@ -466,6 +485,9 @@ class MissionPlannerService:
         snap_m = config.SCENE_GRAPH_START_SNAP_M
         safety = scene_route.safety_for(graph, robot_width, self._robot_length(robot), config.SCENE_GRAPH_SAFETY_KAPPA,
                                         self._robot_turn(robot)["lambda_m_per_rad"])   # the planner's pricing and turn cost
+        # the region term prices the legs only in mode "on" (and where it prices something); "shadow" and "off" leave them as they are
+        region, region_mode = await self._region_for(map_id, version, graph, robot)
+        serve = region if region_mode == "on" and scene_route.region_arg(graph, region) is not None else None
 
         max_points = config.PLAN_TRAJECTORY_MAX_POINTS if config.PLAN_TRAJECTORY_ENABLED else 0
         routes = node_policy_plan.LegRoutes() if max_points > 0 else None
@@ -490,15 +512,16 @@ class MissionPlannerService:
             blocked = Blocked(cells=res.cells) if res is not None and len(res.cells) else None
             if gap_fill:
                 visible = scene_route.blocked_free_los(graph, ([], []), res.keyset if blocked is not None else None)
-                pull = (scene_route.budget_pull(graph, safety, config.SCENE_GRAPH_WAYPOINT_BUDGET_M)
+                pull = (scene_route.budget_pull(graph, safety, config.SCENE_GRAPH_WAYPOINT_BUDGET_M, serve)
                         if config.SCENE_GRAPH_WAYPOINT_BUDGET_M else scene_route.simplify)
                 poses, inserted = node_policy_plan.insert_planned(
                     graph, base, visible, config.SCENE_GRAPH_MAX_WAYPOINT_GAP_M, snap_m,
-                    pull, safety, routes, blocked)
+                    pull, safety, routes, blocked, serve)
             wanted = node_policy_plan.skippable_candidates(poses)
             rep = node_policy_plan.annotate_corridors(
                 graph, poses, wanted, robot_width, config.SCENE_GRAPH_WIDTH_MARGIN_M, snap_m,
-                config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes, blocked=blocked)
+                config.NODE_POLICY_WIDTH_BUDGET_S, keep_intent=True, safety=safety, routes=routes, blocked=blocked,
+                region=serve)
             if res is not None and res.zones:
                 h = float(graph.params.lattice)
                 crossed = []

@@ -868,29 +868,15 @@ def _pricing_for(graph: Any, robot_width_m: Optional[float], robot_length_m: Opt
 PRICE_SAMPLE_M = 0.025          # spacing of the samples that measure the priced cost of a straight segment
 
 
-def chord_cost(graph: Any, safety: Any) -> Callable[[Pt, Pt], float]:
-    """The priced cost of a straight piece (a, b): its length times the mean of 1 + rate * deficit over samples every
-    `PRICE_SAMPLE_M` (at the middle of equal sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell
-    counts as clearance 0); the plain length when no clearance price is active (`safety` None or rate 0)."""
-    if safety is None or float(safety.rate) <= 0.0:
-        return math.dist
-    h = float(graph.params.lattice)
-    mu = float(safety.rate)
-    price_cell = getattr(graph, "price_cell", None)
-    memo: Dict[Tuple[int, int], float] = {}
+def region_arg(graph: Any, region: Any) -> Optional[tuple]:
+    """`graph.region_arg(region)` (rho per chart, scale, rho_min) when the graph can price a region snapshot and this one prices it, else None."""
+    fn = getattr(graph, "region_arg", None)
+    return fn(region) if callable(fn) and region is not None else None
 
-    def factor(x: float, y: float) -> float:
-        c = (int(math.floor(x / h)), int(math.floor(y / h)))
-        f = memo.get(c)
-        if f is None:
-            if callable(price_cell):
-                d = price_cell(c[0], c[1], safety)
-            else:                                    # a graph that only has the hinge's deficit_cell
-                d = graph.deficit_cell(c[0], c[1], float(safety.margin))
-            # a non-navigable cell counts as clearance 0
-            f = memo[c] = 1.0 + mu * (float(safety.price(0.0)) if d is None else d)
-        return f
 
+def _sampled(factor: Callable[[float, float], float]) -> Callable[[Pt, Pt], float]:
+    """The cost of a straight piece (a, b): its length times the mean of `factor` over samples every `PRICE_SAMPLE_M` (at the
+    middle of equal sub-pieces)."""
     def cost(a: Pt, b: Pt) -> float:
         length = math.dist(a, b)
         if length == 0.0:
@@ -905,15 +891,67 @@ def chord_cost(graph: Any, safety: Any) -> Callable[[Pt, Pt], float]:
     return cost
 
 
+def chord_cost(graph: Any, safety: Any, region: Any = None) -> Callable[[Pt, Pt], float]:
+    """The priced cost of a straight piece (a, b): its length times the mean of 1 + rate * deficit + rho over samples every
+    `PRICE_SAMPLE_M` (at the middle of equal sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell
+    counts as clearance 0) and rho (excess time per metre x speed_max, `region`: a `RegionPricing`) from the chart that owns it
+    (0 where none does); the plain length when no clearance price and no region term is active (`safety` None or rate 0)."""
+    reg = region_arg(graph, region)
+    if (safety is None or float(safety.rate) <= 0.0) and reg is None:
+        return math.dist
+    h = float(graph.params.lattice)
+    priced = safety is not None and float(safety.rate) > 0.0
+    mu = float(safety.rate) if priced else 0.0
+    price_cell = getattr(graph, "price_cell", None)
+    memo: Dict[Tuple[int, int], float] = {}
+
+    def factor(x: float, y: float) -> float:
+        c = (int(math.floor(x / h)), int(math.floor(y / h)))
+        f = memo.get(c)
+        if f is None:
+            f = 1.0
+            if priced:
+                if callable(price_cell):
+                    d = price_cell(c[0], c[1], safety)
+                else:                                    # a graph that only has the hinge's deficit_cell
+                    d = graph.deficit_cell(c[0], c[1], float(safety.margin))
+                # a non-navigable cell counts as clearance 0
+                f = 1.0 + mu * (float(safety.price(0.0)) if d is None else d)
+            if reg is not None:
+                j = graph.chart_index_cell(c[0], c[1])
+                if j >= 0:
+                    f += float(reg[0][j]) / reg[1]       # the lattice edge's (rho_a + rho_b) / (2 scale), per sample
+            memo[c] = f
+        return f
+
+    return _sampled(factor)
+
+
+def chord_excess(graph: Any, region: Any) -> Callable[[Pt, Pt], float]:
+    """The metres-at-speed_max of excess time of a straight piece (a, b): its length times the mean of rho / scale (`chord_cost`'s
+    sampling), 0 when `region` prices nothing on this graph."""
+    reg = region_arg(graph, region)
+    if reg is None:
+        return lambda a, b: 0.0
+    h = float(graph.params.lattice)
+
+    def factor(x: float, y: float) -> float:
+        j = graph.chart_index_cell(int(math.floor(x / h)), int(math.floor(y / h)))
+        return float(reg[0][j]) / reg[1] if j >= 0 else 0.0
+
+    return _sampled(factor)
+
+
 def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: Sequence[Pt],
-                   safety: Any) -> Callable[[Pt, Pt], bool]:
+                   safety: Any, region: Any = None) -> Callable[[Pt, Pt], bool]:
     """Cost-aware line of sight (S11): `visible(a, b)` AND the priced cost of the segment (a, b) is at most that of the
     lattice sub-path between the two points (both found in `lattice_pts`, the route's points). The cost of a straight
     piece is its length times the mean of 1 + rate * deficit over samples every `PRICE_SAMPLE_M` (at the middle of equal
     sub-pieces), the deficit read from the sample's lattice cell (a non-navigable cell counts as clearance 0); the
     sub-path is measured the same way between its consecutive points. Then the final polyline costs no more than the
-    lattice path. A point that is not on the route is judged by `visible` alone."""
-    cost = chord_cost(graph, safety)
+    lattice path. A point that is not on the route is judged by `visible` alone. With `region` the cost also holds the chart's
+    rho (`chord_cost`), so a shortcut never cuts across a slow chart that the lattice path avoided."""
+    cost = chord_cost(graph, safety, region)
     pts: List[Pt] = []
     for p in lattice_pts:
         if not pts or p != pts[-1]:
@@ -938,10 +976,10 @@ def priced_visible(visible: Callable[[Pt, Pt], bool], graph: Any, lattice_pts: S
     return priced
 
 
-def budget_pull(graph: Any, safety: Any, budget_m: float) -> Callable[..., List[Pt]]:
+def budget_pull(graph: Any, safety: Any, budget_m: float, region: Any = None) -> Callable[..., List[Pt]]:
     """A `simplify` replacement for the gap fill (`node_policy_plan.insert_planned`): `fewest_waypoints` with this budget.
     It takes the plain line of sight (`unpriced_visible`): the price is in the budget."""
-    cost = chord_cost(graph, safety)
+    cost = chord_cost(graph, safety, region)
 
     def pull(points: Sequence[Pt], visible: Callable[[Pt, Pt], bool], max_gap: float) -> List[Pt]:
         return fewest_waypoints(points, visible, max_gap, cost, budget_m, thin_eps=thin_eps(graph))
@@ -1008,7 +1046,8 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                   node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                   width_check: bool = True, trajectory_max_points: int = 0,
                   turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0,
-                  keepout_for: Optional[Callable[[Any], Any]] = None) -> ChartPlan:
+                  keepout_for: Optional[Callable[[Any], Any]] = None, region: Any = None,
+                  region_mode: str = "off") -> ChartPlan:
     """`_plan_on_graph`; a tile of a lazy graph that cannot be read (a garbage-collected version, a backend error)
     is ChartFallback("tile_unavailable"), and the graph is flagged so `GraphCache` drops it."""
     from packages.services.mission_planner.lazy_plan import TileUnavailable
@@ -1016,7 +1055,7 @@ def plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         return _plan_on_graph(graph, map_id, start_xy, goal_xy, overlay, node_of, start_snap_m, goal_snap_m,
                               max_gap_m, robot_width_m, width_margin_m, robot_length_m,
                               node_policy_cfg, safety_kappa, width_check, trajectory_max_points, turn,
-                              waypoint_budget_m, keepout_for)
+                              waypoint_budget_m, keepout_for, region, region_mode)
     except TileUnavailable as err:
         _log.warning("scene graph tile unavailable (%s); the graph is dropped", err)
         raise ChartFallback("tile_unavailable") from err
@@ -1030,7 +1069,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    node_policy_cfg: Optional[Dict[str, Any]] = None, safety_kappa: float = 0.0,
                    width_check: bool = True, trajectory_max_points: int = 0,
                    turn: Optional[Dict[str, Any]] = None, waypoint_budget_m: float = 0.0,
-                  keepout_for: Optional[Callable[[Any], Any]] = None) -> ChartPlan:
+                  keepout_for: Optional[Callable[[Any], Any]] = None, region: Any = None,
+                   region_mode: str = "off") -> ChartPlan:
     """Snap, route around the overlay, simplify, convert to poses. Blocking (run it in a thread).
     Raises ChartFallback for every case the legacy planner must take over. `robot_width_m` is the
     planning robot's footprint width (None / <= 0: unknown, never rejects; `robot_length_m` likewise
@@ -1052,7 +1092,9 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     the budget); 0 = the string pull, unchanged. `keepout_for(graph)` (blocking; None: the map has none) is the operator's
     keep-out zones resolved on this graph (keepout_overlay.Resolution): their cells are removed from the route search and the line
     of sight like the overlay, `ChartPlan.keepout` says what they did, and a goal only they cut off is
-    ChartFallback(BLOCKED_BY_KEEPOUT, info) which the caller must report, not hand to the legacy planner."""
+    ChartFallback(BLOCKED_BY_KEEPOUT, info) which the caller must report, not hand to the legacy planner. `region` is the planning robot's
+    `RegionPricing` and `region_mode` "off" | "shadow" | "on" (`region_cost.mode_for`; docs/planner_region_stats_2026-10-27.md 5, 7):
+    "on" prices the route (search, string pull, corridor legs) with the region term; "shadow" and "off" (or no snapshot) serve today's."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -1078,9 +1120,14 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     blocked = Blocked(discs=list(discs), segments=list(segments), cells=kcells) if (discs or segments or kcells is not None) else None
     turn = dict(TURN_NOT_GIVEN) if turn is None else dict(turn)
     safety = safety_for(graph, robot_width_m, robot_length_m, safety_kappa, turn["lambda_m_per_rad"])
+    # the region term prices the served route only in mode "on" (and only when it prices something on this graph); "shadow" and "off" serve today's
+    serve = region if region_mode == "on" and region_arg(graph, region) is not None else None
+    extra = {} if safety is None else {"safety": safety}
+    if serve is not None:
+        extra["region"] = serve
     try:
         route = graph.route(snap_a.key, snap_b.key, blocked, start=(snap_a.x, snap_a.y),
-                            goal=(snap_b.x, snap_b.y), **({} if safety is None else {"safety": safety}))
+                            goal=(snap_b.x, snap_b.y), **extra)
     except MissingTiles as err:
         raise ChartFallback("missing_tiles") from err
     except CorridorTooLarge as err:
@@ -1123,11 +1170,11 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     lattice = list(pts)                    # the dense path, before the waypoints are picked from it
     visible = blocked_free_los(graph, overlay, keep.keyset if kcells is not None else None)
     plain = visible
-    if safety is not None and safety.rate > 0.0:
-        visible = priced_visible(visible, graph, pts, safety)
+    if (safety is not None and safety.rate > 0.0) or serve is not None:
+        visible = priced_visible(visible, graph, pts, safety, serve)
     budget_record = None
     if waypoint_budget_m > 0.0:
-        pulled = fewest_waypoints(pts, plain, max_gap_m, chord_cost(graph, safety), waypoint_budget_m, MIN_END_STUB_M,
+        pulled = fewest_waypoints(pts, plain, max_gap_m, chord_cost(graph, safety, serve), waypoint_budget_m, MIN_END_STUB_M,
                                   thin_eps(graph))
         budget_record = {"waypoint_budget_m": waypoint_budget_m,
                          "waypoints_removed": max(0, len(simplify(pts, visible, max_gap_m)) - len(pulled))}
@@ -1139,7 +1186,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     # With the waypoint budget the merge is judged against the budget instead: visible, and the polyline stays within
     # J(lattice) + budget.
     if budget_record is not None:
-        cost = chord_cost(graph, safety)
+        cost = chord_cost(graph, safety, serve)
         j_limit = sum(cost(p, q) for p, q in zip(lattice[:-1], lattice[1:])) + waypoint_budget_m
 
         def stub_ok(k: int) -> bool:
@@ -1184,7 +1231,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
             graph, poses, range(0, len(poses) - 1), node_policy_cfg.get("robot_width"),
             node_policy_cfg.get("margin", 0.0), node_policy_cfg.get("snap_m", start_snap_m),
             node_policy_cfg.get("budget_s", 0.0), safety=safety,
-            blocked=Blocked(cells=kcells) if kcells is not None else None)
+            blocked=Blocked(cells=kcells) if kcells is not None else None, region=serve)
     pricing = None
     if safety is not None and safety.rate == 0.0:            # a turn cost alone: no clearance fields
         pricing = {"kappa": 0.0, "margin": None, "rate": 0.0, "margin_source": None, "cost": int(route.cost),
