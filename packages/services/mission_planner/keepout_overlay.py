@@ -2,9 +2,12 @@
 scene-graph version, to the lattice cells the route search must not use (`Blocked.cells`), the same overlay machinery the
 robot-reported blocks use.
 
+GEOMETRY zones (what the API stores since 2026-10-27; they need no graph and survive any graph rebuild or merge):
+* region `polygon`: the lattice cells whose centre is inside the polygon;
+* edge `line`: the cells whose centre is within one lattice step of the segment (a seal two cells thick, like the chart seal below);
+LEGACY zones (rows not yet migrated to geometry by the API, resolved against the graph being planned on):
 * region by chart key: the cells the chart owns (the engine's owner plane around its anchor);
-* region by polygon: the lattice cells whose centre is inside the polygon (needs no graph);
-* edge: the cells of the two charts that touch the other chart (8-neighbourhood), a two-cell-thick seal along their whole shared
+* edge by chart pair: the cells of the two charts that touch the other chart (8-neighbourhood), a two-cell-thick seal along their whole shared
   boundary, so no crossing between exactly those two charts is left (their other neighbours stay open, except where a cell of the
   seal also touches one).
 
@@ -120,6 +123,26 @@ def polygon_cells(poly: Sequence[Sequence[float]], h: float) -> np.ndarray:
     return _keys_of_mask(inside, ix0, iy0)
 
 
+LINE_HALF_WIDTH_CELLS = 1.0     # a line zone seals the cells whose centre is within this many lattice steps of the segment
+
+
+def line_cells(line: Sequence[Sequence[float]], h: float) -> np.ndarray:
+    """Keys of the lattice cells whose centre is within LINE_HALF_WIDTH_CELLS * h of the segment: a barrier two cells thick, with
+    no diagonal gap (the same thickness as the chart-pair seal)."""
+    (xa, ya), (xb, yb) = line[0], line[1]
+    r = LINE_HALF_WIDTH_CELLS * h
+    ix0, ix1 = int(math.floor((min(xa, xb) - r) / h)), int(math.floor((max(xa, xb) + r) / h))
+    iy0, iy1 = int(math.floor((min(ya, yb) - r) / h)), int(math.floor((max(ya, yb) + r) / h))
+    if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > MAX_CELLS:
+        raise KeepoutTooLarge("line")
+    gx, gy = np.meshgrid((np.arange(ix0, ix1 + 1) + 0.5) * h, (np.arange(iy0, iy1 + 1) + 0.5) * h)
+    dx, dy = xb - xa, yb - ya
+    L2 = dx * dx + dy * dy
+    t = np.clip(((gx - xa) * dx + (gy - ya) * dy) / L2, 0.0, 1.0) if L2 > 0 else np.zeros(gx.shape)
+    near = np.hypot(gx - xa - t * dx, gy - ya - t * dy) <= r + 1e-9
+    return _keys_of_mask(near, ix0, iy0)
+
+
 def _box_around(points: Sequence[Pt], pad: float) -> Tuple[float, float, float, float]:
     return (min(p[0] for p in points) - pad, min(p[1] for p in points) - pad,
             max(p[0] for p in points) + pad, max(p[1] for p in points) + pad)
@@ -169,6 +192,9 @@ def resolve(graph: Optional[Any], rows: Sequence[Mapping[str, Any]], version: Op
         spec, cells, reason = row["spec"], np.zeros(0, np.int64), None
         if "polygon" in spec:
             cells = polygon_cells(spec["polygon"], h)
+            reason = None if len(cells) else R_EMPTY
+        elif "line" in spec:
+            cells = line_cells(spec["line"], h)
             reason = None if len(cells) else R_EMPTY
         elif graph is None:
             reason = R_NO_GRAPH
@@ -273,7 +299,7 @@ class KeepoutOverlays:
         return res
 
 
-# --- the legacy (graph node) planner: polygon zones only ---------------------------------------------------------------------
+# --- the legacy (graph node) planner: polygon and line zones ---------------------------------------------------------------------
 
 @dataclass
 class LegacyOutcome:
@@ -302,15 +328,28 @@ def leg_crosses_polygon(a: Pt, b: Pt, poly: Sequence[Sequence[float]]) -> bool:
     return any(bg.segments_intersect(a, b, tuple(poly[i]), tuple(poly[(i + 1) % n])) for i in range(n))
 
 
+def leg_crosses_line(a: Pt, b: Pt, line: Sequence[Sequence[float]], h: float = 0.1) -> bool:
+    """Whether the straight leg a -> b crosses the barrier segment or passes within its half width (LINE_HALF_WIDTH_CELLS * h)."""
+    from packages.utils import blocked_geometry as bg
+    p, q = tuple(line[0]), tuple(line[1])
+    if bg.segments_intersect(a, b, p, q):
+        return True
+    from packages.utils.keepout_geometry import _seg_dist
+    r = LINE_HALF_WIDTH_CELLS * h
+    return min(_seg_dist(a, p, q), _seg_dist(b, p, q), _seg_dist(p, a, b), _seg_dist(q, a, b)) <= r
+
+
 def legacy_polygon_path(rows: Sequence[Mapping[str, Any]], nodes: Sequence[Mapping[str, Any]],
                         edges: Sequence[Mapping[str, Any]], path: Sequence[str], start: str, end: str) -> LegacyOutcome:
     """Keep the legacy planner's graph-node `path` out of the polygon zones in `rows`: the path itself if it clears them,
     else the fewest-hops path that passes no node inside a zone and no edge that enters one (the robot's own start node, and
-    the legs that leave it, are exempt: a robot inside a zone may drive out), else an error. Chart and edge zones are not
-    handled here (the caller refuses those)."""
+    the legs that leave it, are exempt: a robot inside a zone may drive out), else an error. Unmigrated chart / chart-pair rows are
+    not handled here (the caller refuses those). Line (edge) zones are barriers: no node lies in one, but a leg that crosses or touches it
+    is excluded like a leg that enters a polygon."""
     from packages.utils import blocked_nodes
     polys = [(str(r["id"]), r["spec"]["polygon"]) for r in rows if "polygon" in r["spec"]]
-    ids = [i for i, _ in polys]
+    lines = [(str(r["id"]), r["spec"]["line"]) for r in rows if "line" in r["spec"]]
+    ids = [i for i, _ in polys] + [i for i, _ in lines]
     xy = {str(n.get("node_id", n.get("_key"))): blocked_nodes.node_xy(n) for n in nodes}
     report: Dict[str, Any] = {"applied": ids, "unresolved": [], "detour": False, "forced_by": [], "extra_length_m": None}
 
@@ -325,6 +364,8 @@ def legacy_polygon_path(rows: Sequence[Mapping[str, Any]], nodes: Sequence[Mappi
                 hit = pa is not None and pb is not None and a != start and leg_crosses_polygon(pa, pb, poly)
             if hit:
                 out.append(zid)
+        if b is not None and pa is not None and pb is not None and a != start:
+            out += [zid for zid, ln in lines if leg_crosses_line(pa, pb, ln)]
         return out
 
     def path_hits(p: Sequence[str]) -> List[str]:

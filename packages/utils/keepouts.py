@@ -6,12 +6,13 @@ touches `blocked_graph_nodes`, whose expiry purge (blocked_nodes.PURGE_SQL) cann
 planner turns the enabled rows into the same `Blocked` overlay segments the robot-reported blocks use
 (packages/services/mission_planner/keepout_overlay.py).
 
-A row's `spec` (jsonb) is one of
-    region by chart  {"chart_key": "<scene-graph chart key>"}          stable across scene-graph versions (rule A)
-    region by shape  {"polygon": [[x, y], ...]}                          map frame, metres
-    edge             {"from": <chart key | [x, y]>, "to": <chart key | [x, y]>}   the link between two charts
-Chart keys are the stable identifier the engine has; polygons are for what has no chart yet. A point in an
-edge is a convenience: the API replaces it by the chart key at that point when the graph can be read.
+A row's `spec` (jsonb) is GEOMETRY in the map frame (metres), independent of the scene graph (a graph rebuild or a chart
+merge cannot change or lose the zone):
+    region  {"polygon": [[x, y], ...], "source"?: {"chart_key": k}}          closed implicitly
+    edge    {"line": [[x, y], [x, y]], "source"?: {"from": a, "to": b}}      the barrier across the passage
+`source` is informational: which chart / chart pair the geometry was snapshotted from at creation.
+Rows made before 2026-10-27 hold only a chart key {"chart_key"} or {"from", "to"} (the "legacy" form): they are resolved
+against the graph at plan time until the API rewrites them as geometry (KeepoutStore.migrate, on a list read).
 
 This module is pure (validation, JSON shape, revision) plus the SQL the API and the planner share.
 """
@@ -31,6 +32,7 @@ MAX_LABEL = 120
 MAX_KEY = 200
 MAX_COORD = 1.0e6            # metres; anything beyond is a typo, and keeps the lattice arithmetic exact
 MIN_POLYGON_AREA_M2 = 1.0e-4
+MIN_LINE_M = 0.05              # an edge barrier shorter than this is a typo
 MAX_POLYGON_SIDE_M = 200.0     # bounding box side: at 0.1 m cells a zone stays within the planner's cell budget
 
 APPLIED, UNRESOLVED = "applied", "unresolved"
@@ -38,6 +40,9 @@ APPLIED, UNRESOLVED = "applied", "unresolved"
 COLUMNS = ("id", "kind", "label", "enabled", "spec", "created_at", "updated_at")
 LIST_SQL = (f"SELECT {', '.join(COLUMNS)} FROM {TABLE} WHERE map_name = %s ORDER BY created_at, id")
 ENABLED_SQL = (f"SELECT {', '.join(COLUMNS)} FROM {TABLE} WHERE map_name = %s AND enabled ORDER BY created_at, id")
+# compare-and-set of the spec (the lazy migration of a legacy row): params (new spec, map, id, old spec); no row back = it changed meanwhile
+SPEC_SQL = (f"UPDATE {TABLE} SET spec = %s::jsonb, updated_at = now() WHERE map_name = %s AND id = %s AND spec = %s::jsonb "
+            f"RETURNING {', '.join(COLUMNS)}")
 # params: (id, map, kind, label, spec json, map, MAX_PER_MAP); no row back = the map is at its cap
 INSERT_SQL = (f"INSERT INTO {TABLE} (id, map_name, kind, label, enabled, spec) "
               f"SELECT %s, %s, %s, %s, true, %s::jsonb WHERE (SELECT count(*) FROM {TABLE} WHERE map_name = %s) < %s "
@@ -101,6 +106,35 @@ def _polygon(value: Any) -> List[List[float]]:
     return poly
 
 
+def is_geometry(spec: Mapping[str, Any]) -> bool:
+    """A spec that holds its own geometry (a polygon or a line): needs no scene graph to be placed."""
+    return "polygon" in spec or "line" in spec
+
+
+def is_legacy(spec: Mapping[str, Any]) -> bool:
+    """A spec that names only a chart / chart pair (made before the geometry snapshot, not migrated yet)."""
+    return not is_geometry(spec)
+
+
+def _line(value: Any, what: str = "edge.line") -> List[List[float]]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise _bad("invalid_line", f"{what} must be two points [[x, y], [x, y]]")
+    line = [_point(p, f"{what}[{i}]") for i, p in enumerate(value)]
+    if math.dist(line[0], line[1]) < MIN_LINE_M:
+        raise _bad("invalid_line", f"{what} must be at least {MIN_LINE_M:g} m long")
+    if abs(line[0][0] - line[1][0]) > MAX_POLYGON_SIDE_M or abs(line[0][1] - line[1][1]) > MAX_POLYGON_SIDE_M:
+        raise _bad("invalid_line", f"{what} must fit in a {MAX_POLYGON_SIDE_M:g} m square")
+    return line
+
+
+def normalise_polygon(value: Any) -> List[List[float]]:
+    return _polygon(value)
+
+
+def normalise_line(value: Any) -> List[List[float]]:
+    return _line(value)
+
+
 def _chart_key(value: Any, what: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > MAX_KEY:
         raise _bad("invalid_keepout", f"{what} must be a non-empty string of at most {MAX_KEY} characters")
@@ -135,10 +169,12 @@ def parse_create(body: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
     label = _label(body.get("label"))
     if kind == "region":
         region = body.get("region")
+        if region is None and body.get("polygon") is not None:
+            region = {"polygon": body["polygon"]}          # shorthand: {kind: region, polygon: [...]}
         if not isinstance(region, Mapping):
             raise _bad("invalid_keepout", "a region keep-out needs a `region` object")
-        if body.get("edge") is not None:
-            raise _bad("invalid_keepout", "a region keep-out must not carry an `edge`")
+        if body.get("edge") is not None or body.get("line") is not None:
+            raise _bad("invalid_keepout", "a region keep-out must not carry an `edge` or a `line`")
         has_key, has_poly = region.get("chart_key") is not None, region.get("polygon") is not None
         if has_key == has_poly:
             raise _bad("invalid_keepout", "region needs exactly one of chart_key or polygon")
@@ -146,10 +182,16 @@ def parse_create(body: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
             return kind, label, {"chart_key": _chart_key(region["chart_key"], "region.chart_key")}
         return kind, label, {"polygon": _polygon(region["polygon"])}
     edge = body.get("edge")
+    if edge is None and body.get("line") is not None:
+        edge = {"line": body["line"]}                      # shorthand: {kind: edge, line: [[x, y], [x, y]]}
     if not isinstance(edge, Mapping):
-        raise _bad("invalid_keepout", "an edge keep-out needs an `edge` object")
-    if body.get("region") is not None:
-        raise _bad("invalid_keepout", "an edge keep-out must not carry a `region`")
+        raise _bad("invalid_keepout", "an edge keep-out needs an `edge` object or a `line`")
+    if body.get("region") is not None or body.get("polygon") is not None:
+        raise _bad("invalid_keepout", "an edge keep-out must not carry a `region` or a `polygon`")
+    if edge.get("line") is not None:
+        if edge.get("from") is not None or edge.get("to") is not None:
+            raise _bad("invalid_keepout", "an edge needs either from/to or a line, not both")
+        return kind, label, {"line": _line(edge["line"])}
     a, b = _endpoint(edge.get("from"), "edge.from"), _endpoint(edge.get("to"), "edge.to")
     if a == b:
         raise _bad("invalid_keepout", "edge.from and edge.to must differ")
@@ -201,11 +243,24 @@ def to_keepout(row: Mapping[str, Any], applies: str = APPLIED, reason: Optional[
     out: Dict[str, Any] = {"id": row["id"], "kind": row["kind"], "label": row.get("label"),
                            "enabled": bool(row["enabled"]), "created_at": row.get("created_at"),
                            "applies": applies}
+    source = spec.get("source")
     if row["kind"] == "region":
-        out["region"] = ({"chart_key": spec["chart_key"]} if "chart_key" in spec
-                         else {"polygon": [list(p) for p in spec["polygon"]]})
+        if "polygon" in spec:
+            out["polygon"] = [list(p) for p in spec["polygon"]]
+            # back-compat: the old `region` object, now with the geometry (and the chart it was made from)
+            out["region"] = {"polygon": out["polygon"], **({"chart_key": source["chart_key"]} if source and "chart_key" in source else {})}
+        else:
+            out["region"] = {"chart_key": spec["chart_key"]}          # legacy, not migrated yet: no geometry
     else:
-        out["edge"] = {"from": spec["from"], "to": spec["to"]}
+        if "line" in spec:
+            out["line"] = [list(p) for p in spec["line"]]
+            out["edge"] = {"line": out["line"], **({"from": source["from"], "to": source["to"]} if source and "from" in source else {})}
+        else:
+            out["edge"] = {"from": spec["from"], "to": spec["to"]}   # legacy, not migrated yet: no geometry
+    if source is None and is_legacy(spec):
+        source = ({"chart_key": spec["chart_key"]} if "chart_key" in spec else {"from": spec["from"], "to": spec["to"]})
+    if source:
+        out["source"] = source
     if reason:
         out["reason"] = reason
     return out

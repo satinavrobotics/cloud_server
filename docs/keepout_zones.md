@@ -1,14 +1,54 @@
-# Keep-out zones (2026-10-25)
+# Keep-out zones (2026-10-25, geometry 2026-10-27)
 
-Operators switch off **regions** and **edges** of a map's scene graph by hand; the mission planner then never routes through them.
+Operators switch off **regions** and **passages (edges)** of a map by hand; the mission planner then never routes through them.
 Persistent per map (no expiry) until an operator disables or deletes them. Code: `packages/utils/keepouts.py` (model, validation,
 SQL), `packages/api/keepouts.py` (routes), `packages/services/mission_planner/keepout_overlay.py` (zone -> cells, cache, legacy
 gate). Table `map_keepouts` (migration `20261025_01_map_keepouts`, idempotent); the map delete removes the rows.
 
-## Model
+## Geometry zones (2026-10-27)
 
-The engine routes on a lattice (0.1 m) and can only block by geometry (`Blocked`), but it has stable identifiers: **chart keys**
-(rule A, `chart_keys.py`) and the **links** between charts. So a zone is stored by identifier where there is one:
+A zone is the SPACE the operator selected, not a reference into the scene graph: "if a region gets deleted or merged there it
+doesn't affect keeping out the space there". Every zone is stored as geometry in the map frame (metres) in `map_keepouts.spec`
+(no new column, no Alembic migration):
+
+| kind | `spec` | resolves to |
+|---|---|---|
+| region | `{"polygon": [[x, y], ...], "source"?: {"chart_key"}}` | the lattice cells whose centre is inside the polygon (closed implicitly; 3..200 points, finite, fits 200 m) |
+| edge | `{"line": [[x, y], [x, y]], "source"?: {"from", "to"}}` | the barrier across a passage: the cells whose centre is within one lattice step of the segment (2 cells thick, like the old chart seal) |
+
+Both resolve from the geometry alone (`keepout_overlay.polygon_cells` / `line_cells`), so a graph rebuild, a chart merge or a retired
+chart key cannot change or lose a zone, and a geometry zone never needs the scene-graph planner: it no longer forces it, no
+longer triggers the legacy planner's refusal, and no longer triggers the stale-graph tolerance.
+
+**Snapshot.** A create request may still name a chart (`region: {chart_key}`) or an edge (`edge: {from, to}`, ends are chart keys or
+`[x, y]` points). The API (`KeepoutStore.snapshot`) reads the graph once and stores geometry:
+
+* chart -> its footprint on the owner plane (largest blob, holes filled) traced along cell edges and simplified (Douglas-Peucker, tolerance
+  from 0.5 cell up) to at most 48 vertices; the read window grows (4, 8, 16 m around the anchor) until the chart does not touch it;
+* edge -> the seal between the two charts as in `keepout_overlay.edge_cells` (cells of each chart touching the other), reduced to
+  one segment along the seal's principal axis, 0.05 m past each end (a single-cell seal: across the line between the two anchors);
+* `source` keeps the chart key / chart pair for the UI ("made from chart X"); nothing resolves it again.
+
+If the graph cannot be read the request FAILS and nothing is stored: 503 `scene_graph_unavailable` (store down, retry), 409
+`no_scene_graph` (the map has none), 503 `chart_geometry_unavailable` (chart position / footprint not readable), 422 `chart_not_found` /
+`no_link_between_charts` / `point_off_graph` (as before). A polygon or a `line` needs no graph.
+
+**Existing rows** (chart key / chart pair only, made before this change) are **legacy**. `KeepoutStore.migrate`, run by every
+`GET /keepouts` while the graph is readable, snapshots each once and writes the geometry into the row (`UPDATE ... WHERE spec = <old
+spec>`: compare-and-set, so a concurrent edit or migration wins cleanly) which bumps `updated_at` and so the `revision`. Idempotent
+(geometry rows are never touched); a row the graph cannot place (chart gone, graph unreadable) is left as it is with no data lost, and
+keeps the old path: resolved against the graph at plan time (`chart_cells` / `edge_cells`), `applies: "unresolved"` with a reason when
+it cannot be, the stale-graph tolerance and `graph_stale` notice (commit 62ffef2) and the legacy-planner refusal (`keepout_unverifiable`)
+- all only while such a row exists (`keepouts.is_legacy`).
+
+**Legacy planner** (graph-node path, used when the scene planner is off or unavailable): honours polygon AND line zones. Nodes inside
+a polygon and legs that enter a polygon are excluded; a leg that crosses a line (or passes within 0.1 m of it) is excluded; the leg out of
+the robot's own start node is exempt as before; no way around is an error.
+
+## Legacy model (rows not yet migrated)
+
+Before the geometry snapshot a zone was stored by identifier (chart keys, rule A, `chart_keys.py`, and the links between charts) and
+resolved at plan time. Rows of that form still work until the first list read migrates them:
 
 | kind | `spec` | resolves to |
 |---|---|---|
@@ -29,16 +69,32 @@ unresolved zone and reports it; the UI should say so. Polygons never go unresolv
 
 ```
 GET    /api/v1/maps/{map}/keepouts        -> {"map_id", "keepouts": [Keepout], "revision"}
-POST   /api/v1/maps/{map}/keepouts        {kind, label?, region | edge} -> 201 Keepout
+POST   /api/v1/maps/{map}/keepouts        {kind, label?, region: {polygon} | {chart_key} | edge: {from, to} | {line}} -> 201 Keepout
+                                           (shorthand: top-level `polygon` / `line`)
 PATCH  /api/v1/maps/{map}/keepouts/{id}   {enabled?, label?} -> Keepout
 DELETE /api/v1/maps/{map}/keepouts/{id}   -> 204
-Keepout = {id, kind, label, enabled, created_at, region | edge, applies: "applied"|"unresolved", reason?}
+Keepout = {id, kind, label, enabled, created_at, polygon (region) | line (edge), source?, region | edge (compat), applies: "applied"|"unresolved", reason?}
 ```
+
+Response items (`polygon` / `line` are always present on geometry rows; `region` / `edge` repeat them for older clients, with
+the chart key / chart pair when known):
+
+```json
+{"id": "9f2c...", "kind": "region", "label": "wet floor", "enabled": true, "created_at": "2026-10-27T12:00:00Z",
+ "polygon": [[1.2, 0.4], [3.2, 0.4], [3.2, 2.4], [1.2, 2.4]], "source": {"chart_key": "s008:1"},
+ "region": {"polygon": [[1.2, 0.4], [3.2, 0.4], [3.2, 2.4], [1.2, 2.4]], "chart_key": "s008:1"}, "applies": "applied"}
+{"id": "a31d...", "kind": "edge", "label": null, "enabled": true, "created_at": "2026-10-27T12:01:00Z",
+ "line": [[3.15, 0.6], [3.15, 2.2]], "source": {"from": "s008:4", "to": "s008:1"},
+ "edge": {"line": [[3.15, 0.6], [3.15, 2.2]], "from": "s008:4", "to": "s008:1"}, "applies": "applied"}
+```
+
+A legacy row not migrated yet has no `polygon` / `line` (only `region.chart_key` / `edge.{from,to}`, `source` mirroring them) and may be
+`applies: "unresolved"` with a `reason`; geometry rows are always `applied` (`reason` kept for the unresolved legacy case).
 
 `revision` changes whenever a zone is added, removed, enabled/disabled or relabelled. Errors are `{"detail": {"code", "message"}}`:
 404 `map_not_found` / `keepout_not_found`; 409 `map_deleting` / `keepout_limit` (200 per map) / `keepout_exists` (same spec);
-422 `invalid_keepout` / `invalid_polygon` / `chart_not_found` / `no_link_between_charts` / `point_off_graph` (the last three only
-when the graph can be read; without it chart keys and points are accepted unchecked).
+422 `invalid_keepout` / `invalid_polygon` / `invalid_line` / `chart_not_found` / `no_link_between_charts` / `point_off_graph`;
+409 `no_scene_graph` and 503 `scene_graph_unavailable` / `chart_geometry_unavailable` when a chart / edge create cannot read the graph (nothing is stored).
 
 ## Planner behaviour
 
@@ -52,9 +108,9 @@ when the graph can be read; without it chart keys and points are accepted unchec
   `keepout: {unreachable: true, reason: "blocked_by_keepout", forced_by, start_in_zone, goal_in_zone}`. It does **not** fall back to
   the legacy planner (which knows no zones). Same for an unreadable table (`keepout_unreadable`) or zones over the cell budget
   (`keepout_too_large`, 2M cells).
-* **Other fallbacks** (scene-graph planner off or unavailable): the legacy planner applies polygon zones to its graph-node path
-  (nodes inside, edges that enter a polygon are excluded; refused if no way around). With a chart or edge zone enabled it refuses
-  (`reason: "keepout_unverifiable"`): it cannot place them, and silently ignoring them is not an option.
+* **Other fallbacks** (scene-graph planner off or unavailable): the legacy planner applies polygon and line zones to its graph-node path
+  (nodes inside, edges that enter a polygon or cross a line are excluded; refused if no way around). Only an unmigrated legacy row
+  (chart key / chart pair) makes it refuse (`reason: "keepout_unverifiable"`): it cannot place those.
 * **Route preview** (`POST /api/v1/route/preview`, `enrich`): planned waypoints inserted between the operator's waypoints go
   around zones; the response gets `keepout: {applied, unresolved, crossed: [{from_index, to_index, zones}]}` listing the final
   legs that still enter a zone (the operator's own waypoints are never moved). With trajectory on, a gap cut off only by a zone is
@@ -112,7 +168,8 @@ What the code does, per path (all pinned by `tests/unit/test_keepout_reroute.py`
   dispatcher goes through the planner and is covered.
 * A robot **inside** a zone, or a goal inside one, gets no route (the zone's cells are not drivable); `start_in_zone` /
   `goal_in_zone` in the error say so. Disable the zone to let the robot out.
+* An edge zone is one straight segment: a strongly curved boundary leaves the curve's ends open (see BACKLOG).
 * Zones are not shown to the robot; the robot's own safety layers know nothing of them.
-* Chart keys are stable (rule A) but a chart can still be retired when the map changes a lot: the zone then turns `unresolved`.
-  Nothing re-attaches it by overlap.
+* A geometry zone never turns unresolved for want of a chart; only an unmigrated legacy row can (chart retired before it was
+  migrated). The geometry is the footprint at creation: later mapping of that space does not grow it.
 * Not run against a real map or real Postgres: tested on the synthetic chart worlds with in-memory fakes of the table.

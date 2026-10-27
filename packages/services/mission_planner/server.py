@@ -266,10 +266,11 @@ class MissionPlannerService:
         except Exception as err:  # pylint: disable=broad-except
             self.logger.warning(f"Keep-out zones of map {map_id} not readable ({err!r}); not planning without them")
             return None, REASON_KEEPOUT_UNREADABLE
-        # Chart / edge zones exist only on the scene graph: the legacy planner can neither place nor honour them and refuses, so
+        # Zones are geometry (polygon / line), planned without the graph's charts. Only a LEGACY row (a chart key or chart pair the API has
+        # not rewritten as geometry yet) exists only on the scene graph: the legacy planner can neither place nor honour it and refuses, so
         # for such a map an older graph beats no plan (a route stays on cells that graph knows are free; newly mapped areas are unknown
         # to it, so it never uses them). The answer says so (`graph_stale`).
-        graph_zoned = any("polygon" not in r["spec"] for r in keep_rows)
+        graph_zoned = any(keepouts.is_legacy(r["spec"]) for r in keep_rows)
         graph, version = await self._scene_cache.get(map_id, deadline, tolerate_stale=graph_zoned)
         footprint = footprint_check.footprint_check(graph, self._robot_width(robot), self._robot_length(robot))
         if ctx is not None and footprint is not None:
@@ -453,7 +454,7 @@ class MissionPlannerService:
             except Exception:  # pylint: disable=broad-except
                 zoned_rows = []
             graph, version = await self._scene_cache.get(
-                map_id, deadline, tolerate_stale=any("polygon" not in r["spec"] for r in zoned_rows))
+                map_id, deadline, tolerate_stale=any(keepouts.is_legacy(r["spec"]) for r in zoned_rows))
         except scene_route.ChartFallback as fb:
             self.logger.info(f"Route enrich: no scene graph for {map_id} ({fb.reason})")
             return unchanged(node_policy_plan.UNAVAILABLE_NO_GRAPH)
@@ -1251,9 +1252,9 @@ class MissionPlannerService:
     async def _legacy_keepouts(self, map_id: str, path: List[str], start: Any, end: Any, result: Dict[str, Any]
                                ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
         """The legacy (graph node) planner's keep-out gate: (path, None) when it may go on, else (path, the refusal result).
-        It can place only polygon zones (a chart key or an edge needs the scene graph, which is why this planner runs): any
-        other enabled zone refuses the plan; polygon zones exclude the graph nodes inside them and the edges that cross them
-        (the path is replanned around them, or refused)."""
+        It places geometry zones (polygon, line): they exclude the graph nodes inside them and the edges that cross them (the path
+        is replanned around them, or refused). A legacy row (chart key / chart pair not yet rewritten as geometry) needs the scene
+        graph, which is not what runs here: it refuses the plan."""
         try:
             rows, _ = await self.keepout_overlays().rows(map_id)
         except Exception as err:  # pylint: disable=broad-except
@@ -1261,10 +1262,10 @@ class MissionPlannerService:
             return path, self._keepout_refusal(result, REASON_KEEPOUT_UNREADABLE, None)
         if not rows:
             return path, None
-        if any("polygon" not in r["spec"] for r in rows):
-            ids = [r["id"] for r in rows if "polygon" not in r["spec"]]
+        if any(keepouts.is_legacy(r["spec"]) for r in rows):
+            ids = [r["id"] for r in rows if keepouts.is_legacy(r["spec"])]
             why = result.get("planner_fallback")
-            result["error"] = ("The map has keep-out zones set by chart or edge, and the scene-graph planner that can "
+            result["error"] = ("The map has keep-out zones not yet stored as geometry (set by chart or edge), and the scene-graph planner that can "
                                "apply them is not available" + (f" ({why})" if why else "") +
                                ": no route is planned. Zones: " + ", ".join(ids))
             result["failed_at"] = "keepout"
