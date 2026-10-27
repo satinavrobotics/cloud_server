@@ -507,6 +507,9 @@ class MissionPlannerService:
                     if hit:
                         crossed.append({"from_index": k, "to_index": k + 1, "zones": [z.id for z in hit]})
                 keep_info["keepout"] = {**res.summary(), "crossed": crossed}
+            # every waypoint of the answer (operator's, inserted) gets the chart it lies in on THIS graph version
+            for pose in poses:
+                pose.chart_key = scene_route.chart_key_at(graph, pose.x, pose.y)
             return poses, inserted, rep
 
         try:
@@ -532,7 +535,8 @@ class MissionPlannerService:
                 if reason:
                     issues.append({"from_index": k, "to_index": k + 1, "reason": reason})
         return {"waypoints": poses, "inserted": inserted,
-                "changed": [w.dict() for w in poses] != [w.dict() for w in original],
+                "changed": [w.dict(exclude={"chart_key"}) for w in poses]
+                           != [w.dict(exclude={"chart_key"}) for w in original],
                 "node_policy": report, "graph_version": version,
                 **({"issues": issues} if routes is not None else {}),
                 **({"trajectory": trajectory_legs} if trajectory_legs else {}),
@@ -1040,6 +1044,7 @@ class MissionPlannerService:
         register_map: bool = True,
         goal: Optional[Dict[str, Any]] = None,
         trajectory: Optional[List[Dict[str, Any]]] = None,
+        graph_version: Optional[int] = None,
     ) -> Tuple[Optional[mission_object.MissionObjectV1], Optional[str]]:
         """
         Create a mission object with waypoints.
@@ -1053,6 +1058,7 @@ class MissionPlannerService:
             mission_name: Optional mission name (auto-generated if not provided)
             timeout_seconds: Optional time limit in seconds; None = no limit
             planned_path: Optional list of node IDs forming the path
+            graph_version: scene-graph version the waypoints' chart keys were made on (the route's)
 
         Returns:
             Tuple of (mission_object, error_message)
@@ -1074,7 +1080,7 @@ class MissionPlannerService:
                     name="navigate_to_target",
                     parent="root",
                     route=mission_object.MissionRouteNodeV1(
-                        waypoints=waypoints, trajectory=trajectory
+                        waypoints=waypoints, trajectory=trajectory, graph_version=graph_version
                     )
                 )
             ]
@@ -1569,6 +1575,7 @@ class MissionPlannerService:
             register_map=register_map,
             goal=goal,
             trajectory=result.get("trajectory"),
+            graph_version=result.get("graph_version"),
         )
         if error:
             result["error"] = error

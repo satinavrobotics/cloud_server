@@ -37,7 +37,7 @@ from packages.utils import map_sessions as ms  # noqa: E402
 logger = logging.getLogger("backfill_edge_observations")
 
 LEG_FIELDS = ("run_id", "seq", "robot_name", "map_id", "from_topomap_node", "to_topomap_node",
-              "ended_at", "duration_s", "straight_m", "recoveries", "blocks")
+              "ended_at", "duration_s", "straight_m", "planned_m", "recoveries", "blocks")
 LEGS_SQL = (f"SELECT {', '.join('l.' + f for f in LEG_FIELDS)} FROM run_legs l "
             "JOIN mission_runs r USING (run_id) WHERE r.state <> 'RUNNING' "
             "AND l.from_topomap_node IS NOT NULL AND l.to_topomap_node IS NOT NULL "

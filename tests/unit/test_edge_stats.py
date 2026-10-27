@@ -92,6 +92,17 @@ class TestRules:
         assert es.leg_observation(self.leg(duration_s=0.0004, straight_m=0.0)) is None
         assert es.leg_observation(self.leg(duration_s=0.0006, straight_m=0.0))["duration_s"] == 0.001
 
+    def test_the_distance_is_the_plan_length_when_the_leg_has_one(self):
+        o = es.leg_observation(self.leg(straight_m=2.0, planned_m=3.0))
+        assert (o["distance_m"], o["speed_mps"]) == (3.0, 0.75)
+        o = es.leg_observation(self.leg(straight_m=2.0, planned_m=None))      # no plan length: the straight line
+        assert (o["distance_m"], o["speed_mps"]) == (2.0, 0.5)
+        o = es.leg_observation(self.leg(straight_m=2.0))                      # a row without the field (older caller)
+        assert o["distance_m"] == 2.0
+
+    def test_a_plan_length_that_makes_the_speed_impossible_is_rejected(self):
+        assert es.leg_observation(self.leg(duration_s=0.1, straight_m=0.1, planned_m=3.0)) is None
+
     def test_a_leg_without_a_distance_keeps_its_time(self):
         o = es.leg_observation(self.leg(straight_m=None))
         assert o["duration_s"] == 4.0 and o["speed_mps"] is None

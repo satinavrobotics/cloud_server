@@ -171,6 +171,11 @@ class MissionRouteNodeV1(pydantic.BaseModel):
         description="Display data, never sent to the robot: the planner's dense path between "
                     "consecutive waypoints, one entry per leg it knows (docs/plan_trajectory_2026-10-14.md). "
                     "Legs whose ends no longer match their waypoints are dropped on load.")
+    graph_version: Optional[int] = pydantic.Field(
+        default=None,
+        description="Scene-graph version the planner made this route (and its waypoints' "
+                    "chart_key) on; None for a legacy or operator-drawn route. Recording data, "
+                    "never sent to the robot: not part of the route digest.")
 
     @property
     def size(self):

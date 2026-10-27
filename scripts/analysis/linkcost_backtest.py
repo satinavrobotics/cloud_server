@@ -22,6 +22,8 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 
+# straight_m is the chord between the waypoints; from 2026-10-27 planned_m is the plan trajectory length where the leg
+# had one (plan_source). This backtest keeps using the chord (the history before has nothing else).
 SQL = """
 COPY (
   SELECT run_id, seq, robot_name,

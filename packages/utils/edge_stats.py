@@ -72,13 +72,16 @@ def _observation(map_id: str, src: str, dst: str, robot: str, source: str, sourc
 
 def leg_observation(leg: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     """The observation of a run_legs row (run_id, seq, robot_name, map_id, from_topomap_node,
-    to_topomap_node, ended_at, duration_s, straight_m, recoveries, blocks); None for a leg
-    without both topomap nodes (or on one node) or a map, or an unusable one. The distance is the
-    straight line between the leg's waypoints (the leg follows planned_path)."""
+    to_topomap_node, ended_at, duration_s, straight_m, planned_m, recoveries, blocks); None for a
+    leg without both topomap nodes (or on one node) or a map, or an unusable one. The distance is
+    the length of the plan between the leg's waypoints (planned_m: the plan trajectory's polyline
+    when the leg had one, else the straight line; a leg recorded before stage B of the edge
+    statistics has planned_m == straight_m). straight_m is the fallback where planned_m is None."""
     src, dst = leg.get("from_topomap_node"), leg.get("to_topomap_node")
     if not src or not dst or src == dst or not leg.get("map_id") or not leg.get("robot_name"):
         return None
-    duration, distance = leg.get("duration_s"), leg.get("straight_m")
+    duration = leg.get("duration_s")
+    distance = leg.get("planned_m") if leg.get("planned_m") is not None else leg.get("straight_m")
     if reject_reason(duration, distance) is not None:
         return None
     return _observation(str(leg["map_id"]), str(src), str(dst), str(leg["robot_name"]),

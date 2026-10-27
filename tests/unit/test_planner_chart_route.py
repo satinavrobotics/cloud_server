@@ -149,6 +149,46 @@ async def test_success_returns_pose_waypoints_with_distinct_leaf_ids(on):
 
 
 @pytest.mark.unit
+async def test_every_waypoint_carries_the_chart_it_lies_in(on):
+    """The plan knows only the ordered charts it crosses; each waypoint's chart is asked of the graph it was planned on."""
+    graph = FakeGraph()
+    asked = []
+    snap = graph.snap
+
+    def owner(x, y, max_dist=None):
+        s = snap(x, y, max_dist)
+        asked.append((x, y))
+        return Snap("c0" if x < 5.0 else "c1", s.x, s.y, s.distance)
+    graph.snap = owner
+    svc = _service(FakeStore(graph, version=7))
+    out = await _plan(svc)
+    wps = out["waypoints"]
+    assert [w.chart_key for w in wps] == ["c0" if w.x < 5.0 else "c1" for w in wps]
+    assert {w.chart_key for w in wps} <= set(out["chart_keys"]) and wps[0].chart_key == "c0" and wps[-1].chart_key == "c1"
+    assert all((w.x, w.y) in asked for w in wps)
+
+
+@pytest.mark.unit
+def test_build_waypoints_chart_of_is_optional_and_a_missing_chart_is_none():
+    poses, _ = scene_route.build_waypoints([(0.0, 0.0), (1.0, 0.0)], "m", lambda x, y: None)
+    assert [p.chart_key for p in poses] == [None, None]
+    poses, _ = scene_route.build_waypoints([(0.0, 0.0), (1.0, 0.0)], "m", lambda x, y: None,
+                                           chart_of=lambda x, y: "k" if x == 0.0 else None)
+    assert [p.chart_key for p in poses] == ["k", None]
+
+
+@pytest.mark.unit
+def test_chart_key_at_never_raises_for_a_graph_that_cannot_say():
+    class Broken:
+        def snap(self, x, y, max_dist=None):
+            raise RuntimeError("no plane")
+    assert scene_route.chart_key_at(Broken(), 0.0, 0.0) is None
+    assert scene_route.chart_key_at(FakeGraph(), 1.0, 0.0) == "c0"
+    none = SimpleNamespace(snap=lambda x, y, max_dist=None: Snap(None, x, y, 99.0))
+    assert scene_route.chart_key_at(none, 1.0, 9.0) is None            # no chart in reach: the engine's None
+
+
+@pytest.mark.unit
 async def test_blocked_rows_become_the_route_overlay_and_limit_simplification(on):
     graph = FakeGraph()
     svc = _service(FakeStore(graph))

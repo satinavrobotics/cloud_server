@@ -133,7 +133,12 @@ def summarize(legs: Sequence[Mapping[str, Any]], run_duration_s: Optional[float]
               passes_completed: int = 0) -> Dict[str, Any]:
     """mission_runs.summary_metrics from the run's legs (any order).
 
-    - distance_m: sum of planned_m (straight_m where a leg has no planned distance).
+    - distance_m: sum of planned_m (straight_m where a leg has no planned distance). planned_m is the plan
+      trajectory's length where the leg had one (stage B of the edge statistics), else the straight line;
+      a leg's `plan_source` (trajectory | straight | stale, None: recorded before stage B or no plan)
+      says which, and `plan_sources` counts them: "trajectory" | "straight" | "stale", "unrecorded" (a leg
+      recorded before stage B: its planned_m is the straight line) and "none" (no straight line, no plan);
+      only the keys that occur.
     - time_moving_s: leg time while the robot reported driving; time_stopped_s: the rest of
       the run (non-driving time inside legs, plus time outside any leg).
     - time_recovery_s / recovery_count / block_count: from the events tagged with the legs.
@@ -149,6 +154,11 @@ def summarize(legs: Sequence[Mapping[str, Any]], run_duration_s: Optional[float]
     distance = sum(float(l["planned_m"] if l.get("planned_m") is not None else l["straight_m"])
                    for l in ordered if l.get("planned_m") is not None
                    or l.get("straight_m") is not None)
+    plan_sources: Dict[str, int] = {}
+    for l in ordered:
+        key = l.get("plan_source") or (
+            "unrecorded" if l.get("straight_m") is not None else "none")
+        plan_sources[key] = plan_sources.get(key, 0) + 1
     with_expected = [l for l in ordered if l.get("expected_s") is not None]
     expected = sum(float(l["expected_s"]) for l in with_expected)
     actual_of_expected = sum(float(l.get("duration_s") or 0.0) for l in with_expected)
@@ -170,6 +180,7 @@ def summarize(legs: Sequence[Mapping[str, Any]], run_duration_s: Optional[float]
         "passes_completed": passes_completed,
         "duration_s": _round(run_duration_s),
         "distance_m": _round(distance),
+        "plan_sources": plan_sources,
         "time_moving_s": _round(moving),
         "time_stopped_s": _round(stopped),
         "time_recovery_s": _round(sum(float(l.get("recovery_s") or 0.0) for l in ordered)),
