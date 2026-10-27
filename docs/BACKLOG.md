@@ -3,6 +3,16 @@
 Known issues and follow-ups that are understood but not (fully) resolved, or
 resolved with a narrow fix that leaves a related risk in place. Newest first.
 
+## Navstack deploy, server side: built, not deployed, never run against a real robot (2026-10-27)
+
+Branch `feat/navstack-deploy` (`docs/navstack_deploy.md`): registry reads, fleet software view, the server-driven deploy job with its migration, the proxy guard; the retention script is in `sati_docker_registry` (branch `feat/prune-navstack`).
+- Not merged or deployed. Needs api-delegation-service rebuilt (migration `20261027_01_navstack_deployments`); the robot needs the orchestrator J0-J4 (switch / rollback / `capabilities.switch` / `previous_mode` / `active_operation` / op `steps`) and mission-dispatch rebuilt with the factsheet `information` fix, or every deploy ends `failed_verify`.
+- Not done: plan 4.5's move of the registry data to `/media/satiadmin/data0/docker_registry` (live host, done by hand), and running `prune_navstack.py --apply` + garbage collection (registry stopped) for the first time.
+- No auth: `requested_by` is the unverified `X-Sati-Operator` header; anyone who reaches the API can deploy or roll back (plan risk 1).
+- The server does not refuse starting a mapping session while a deployment runs, and cancelling during a pull does not stop the pull on the robot.
+- The field names read from the orchestrator (`active_operation`, `result.error`, `previous_mode`, op states) follow the Jetson document and are unchecked against a real one.
+- The sati-client side (5.x) does not exist; `fleet/software` has an extra `registry_error` key, and the proxy lets `switch?check=true` through for the confirm dialog.
+
 ## Keep-out zones are geometry, not scene-graph references (2026-10-27)
 
 Branch `feat/keepout-geometry` (`docs/keepout_zones.md` "Geometry zones"). A zone is stored as a map-frame polygon (region) or line (edge); a chart / edge create request is snapshotted from the graph at that moment (`source` keeps the origin). Planner and legacy planner resolve geometry without the graph.

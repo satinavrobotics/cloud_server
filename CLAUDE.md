@@ -99,6 +99,7 @@ Self-hosted LiveKit is part of the main compose file (`docker_compose/mission_di
 - `packages/api/server.py` — `ApiDelegationService` (the logic the routes call), plus `WebSocketManager` / `WebSocketProxyManager`. No routes here.
 - `packages/api/orchestrator_proxy.py` — reverse proxy to the per-robot orchestrator.
 - `packages/api/orchestrator_client.py`, `mapping_switch.py` — the API's own calls to a robot's orchestrator (start/stop/status of a session's mapping services).
+- `packages/api/navstack_images.py`, `navstack_deploy.py` — navstack images in the private registry, the fleet software view, and the server-driven deploy/rollback job (table `navstack_deployments`; the proxy refuses `system/image/switch|rollback`). See `docs/navstack_deploy.md`.
 - `packages/controllers/mission/server.py` — VDA5050 mission dispatcher; watches PostgreSQL, publishes to MQTT.
 - `packages/controllers/mission/behavior_tree.py` — py_trees behavior tree that drives mission step execution.
 - `packages/controllers/mission/vda5050_types/` — VDA5050 protocol type definitions (Pydantic v1).

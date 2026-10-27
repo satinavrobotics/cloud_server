@@ -38,7 +38,8 @@ from packages.config import (
     SCENE_GRAPH_WORKER_ENABLED,
 )
 from packages.api.map_delete import MapDeleter
-from packages.api import keepouts as keepouts_api, localization_view, map_view_settings, maps, mesh, reconstruction, semantic
+from packages.api import (keepouts as keepouts_api, localization_view, map_view_settings, maps, mesh,
+                          navstack_deploy, navstack_images, reconstruction, semantic)
 from packages.api.mapping_switch import MappingSwitch
 from packages.api.slam_save_state import PgSlamStateStore
 from packages.api.orchestrator_maps import OrchestratorMaps
@@ -826,6 +827,14 @@ class ApiDelegationService:
 
         # a reloc job's PUT /localization / init_pos change: as through the orchestrator proxy
         self.reloc_jobs.on_robot_changed = self.robot_changed
+
+        # Navstack images in the registry and the deploy jobs (docs/navstack_deploy.md). The jobs are
+        # rows in navstack_deployments, resumed at startup (main.py lifespan).
+        self.navstack_registry = navstack_images.NavstackRegistry()
+        self.navstack_deployments = navstack_deploy.NavstackDeployments(
+            navstack_deploy.DeploymentStore(self.database),
+            navstack_deploy.PgFacts(self.database, self.mapping_switch),
+            self.navstack_registry, on_robot_changed=self.robot_changed)
         # Maps §14: every robot's open session (the robot's derived `session` key), cached 1 s
         # for the robot WebSocket (one robot_update per robot state message).
         self.session_cache = maps.OpenSessionCache(self.database)

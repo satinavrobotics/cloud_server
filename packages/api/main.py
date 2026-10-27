@@ -24,6 +24,7 @@ from packages.api.server import ApiDelegationService, build_mission_update
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
 from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
+from packages.api import navstack_deploy, navstack_images
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -353,6 +354,8 @@ async def lifespan(app: FastAPI):
     service.reconstruction.start_dispatcher()
     service.semantic.start_dispatcher()
     service.mesh.start_dispatcher()
+    # Navstack deploys left non-final by a previous run (docs/navstack_deploy.md); one runner per row across workers.
+    service.navstack_deployments.start_resume()
 
     health_checker = DependencyHealthChecker(timeout=5.0)
     health_checker.add_dependency("graph_db", lambda: service.graph_db.is_healthy(), critical=True)
@@ -378,6 +381,7 @@ async def lifespan(app: FastAPI):
         await service.reconstruction.stop()
         await service.semantic.stop()
         await service.mesh.stop()
+        await service.navstack_deployments.stop()
         if getattr(service, "person_removal", None) is not None:
             await service.person_removal.stop()
         await service.stop_telemetry()
@@ -3067,6 +3071,78 @@ async def list_robot_site_assignments(robot_name: str):
     _require_service()
     return await _site_call("list site assignments",
                             sites.list_assignments(service.database, robot_name))
+
+
+# ==================== Navstack images and deploys ====================
+# packages/api/navstack_images.py (registry + fleet view), packages/api/navstack_deploy.py (the deploy job),
+# docs/navstack_deploy.md. The generic orchestrator proxy refuses image switch / rollback: use these.
+
+@app.get("/api/v1/navstack/images")
+async def list_navstack_images(branch: Optional[str] = Query(None, description="Branch; default humble")):
+    """The navstack builds of a branch in the image registry, newest first: `{"branch", "latest_tag",
+    "images": [{tag, digest, git_sha, created, commit_subject, size_bytes, aliases, build_info}],
+    "fetched_at"}`. 502 (`detail`) when the registry cannot be read: never an empty list for that."""
+    _require_service()
+    branch = navstack_images.check_branch(branch)
+    try:
+        return await service.navstack_registry.list_images(branch)
+    except navstack_images.RegistryError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail)
+
+
+@app.get("/api/v1/fleet/software")
+async def fleet_software(branch: Optional[str] = Query(None, description="Branch for behind_latest; default humble")):
+    """What each robot runs: `{"branch", "latest_tag", "robots": [{robot_name, sw_version, mode:
+    image|dev|null, tag, sha, last_seen, behind_latest}], "registry_error"}` (`registry_error` is null, or
+    the reason `latest_tag` is null and nothing is behind)."""
+    _require_service()
+    branch = navstack_images.check_branch(branch)
+    return await _site_call("read the fleet software", navstack_images.fleet_software(
+        service.database, service.navstack_registry, branch))
+
+
+@app.post("/api/v1/robots/{robot_name}/deploy", status_code=202)
+async def deploy_navstack(robot_name: str, body: navstack_deploy.DeployRequest,
+                          x_sati_operator: Optional[str] = Header(None, alias="X-Sati-Operator")):
+    """Deploy (or, with `pull_only`, just pull) a navstack image on the robot: `{"tag", "mode": "image" |
+    "dev", "pull_only"}` -> 202 `{"deployment_id"}`; follow it with GET /api/v1/deployments/{id}. 409 with a
+    readable `detail` when refused. `X-Sati-Operator` is stored as `requested_by` (unverified: no auth)."""
+    _require_service()
+    dep_id = await _site_call("deploy navstack", service.navstack_deployments.request_deploy(
+        robot_name, body, x_sati_operator))
+    return {"deployment_id": dep_id}
+
+
+@app.post("/api/v1/robots/{robot_name}/deploy/rollback", status_code=202)
+async def rollback_navstack(robot_name: str,
+                            x_sati_operator: Optional[str] = Header(None, alias="X-Sati-Operator")):
+    """Switch the robot back to its previous build (the orchestrator's `previous_tag` / `previous_mode`)."""
+    _require_service()
+    dep_id = await _site_call("roll back navstack", service.navstack_deployments.request_rollback(
+        robot_name, x_sati_operator))
+    return {"deployment_id": dep_id}
+
+
+@app.get("/api/v1/robots/{robot_name}/deployments")
+async def list_navstack_deployments(robot_name: str, limit: int = Query(
+        navstack_deploy.DEFAULT_LIST_LIMIT, ge=1, le=navstack_deploy.MAX_LIST_LIMIT)):
+    """The robot's deployments, newest first (a JSON list)."""
+    _require_service()
+    return await _site_call("list deployments", service.navstack_deployments.list_for(robot_name, limit))
+
+
+@app.get("/api/v1/deployments/{deployment_id}")
+async def get_navstack_deployment(deployment_id: uuid.UUID):
+    """One deployment with its steps. 404 if unknown."""
+    _require_service()
+    return await _site_call("get deployment", service.navstack_deployments.get(deployment_id))
+
+
+@app.post("/api/v1/deployments/{deployment_id}/cancel")
+async def cancel_navstack_deployment(deployment_id: uuid.UUID):
+    """Cancel a deployment before its switch step starts. 409 after that or when it is already over."""
+    _require_service()
+    return await _site_call("cancel deployment", service.navstack_deployments.cancel(deployment_id))
 
 
 # ==================== Runs, events, timeline (Phase 0 WP10) ====================
