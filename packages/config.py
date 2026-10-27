@@ -686,6 +686,10 @@ RUN_CELLS_POLL_S = float(os.getenv("RUN_CELLS_POLL_S", "30.0"))
 RUN_CELLS_BATCH = int(os.getenv("RUN_CELLS_BATCH", "20"))
 RUN_CELLS_EXTRA_GRACE_S = float(os.getenv("RUN_CELLS_EXTRA_GRACE_S", "30.0"))
 RUN_CELLS_RETRY_S = float(os.getenv("RUN_CELLS_RETRY_S", "600.0"))
+# algo_version 2: seconds a robot stood still within RUN_CELLS_DWELL_RADIUS_M of the run's start, of its goal (the last
+# waypoint of the mission) or of an action node (where the mission performs an action) are the run's DWELL, kept apart
+# from the stops in transit (docs/planner_region_stats_2026-10-27.md 10, decision 3).
+RUN_CELLS_DWELL_RADIUS_M = float(os.getenv("RUN_CELLS_DWELL_RADIUS_M", "0.5"))
 # A factsheet speed_max of exactly ROBOT_PLACEHOLDER_SPEED_MAX with no footprint (length and width unknown) is the default a
 # robot reports before it is configured, not a measured limit: its runs do not enter the speed-normalised sums of
 # region_stats and the planner's region term is off for it (packages/utils/robot_class.py:speed_basis).

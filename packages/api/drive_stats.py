@@ -273,11 +273,12 @@ async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = Fa
 def add_summary(acc: Accumulator, code: int, row: run_cells_db.CellRow) -> None:
     """One stored run summary into an accumulator as run `code`: its cells with movement (a cell that only holds a
     block event is not a driven tile)."""
-    keep = (row.len_m > 0) | (row.time_s > 0) | (row.recovery_s > 0) | (row.stopped_s > 0)
+    stopped = row.stopped_all_s          # drive-stats shows every stop; the summary keeps the dwell apart
+    keep = (row.len_m > 0) | (row.time_s > 0) | (row.recovery_s > 0) | (stopped > 0)
     if not keep.any():
         return
     acc.keys.append(row.key[keep])
-    acc.sums.append(np.stack([row.len_m[keep], row.time_s[keep], row.recovery_s[keep], row.stopped_s[keep]]))
+    acc.sums.append(np.stack([row.len_m[keep], row.time_s[keep], row.recovery_s[keep], stopped[keep]]))
     acc.pair_cell.append(row.key[keep])
     acc.pair_run.append(np.full(int(keep.sum()), code, np.int64))
 
@@ -376,14 +377,14 @@ def series_day(loaded: Loaded, p: Params, axis: Sequence[datetime.datetime]) -> 
         i = int(np.floor((s.started_at.timestamp() - t_axis) / 86400.0))
         if not 0 <= i < n:
             continue
-        time_s, stopped_s = float(s.time_s.sum()), float(s.stopped_s.sum())
+        time_s, stopped_s = float(s.time_s.sum()), float(s.stopped_all_s.sum())
         sums["len"][i] += float(s.len_m.sum())
         sums["time"][i] += time_s
         sums["mov_len"][i] += float(s.len_m.sum())
         sums["mov_time"][i] += max(time_s - stopped_s, 0.0)
         sums["rec"][i] += float(s.recovery_s.sum())
         sums["stopped"][i] += stopped_s
-        moved = (s.len_m > 0) | (s.time_s > 0) | (s.recovery_s > 0) | (s.stopped_s > 0)
+        moved = (s.len_m > 0) | (s.time_s > 0) | (s.recovery_s > 0) | (s.stopped_all_s > 0)
         if moved.any():
             day_keys[i].append(s.key[moved])
     rows = loaded.track_rows
