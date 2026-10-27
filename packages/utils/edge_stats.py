@@ -17,9 +17,11 @@ Observations with a duration <= 0 (after rounding to milliseconds, as stored) or
 EDGE_STATS_MAX_DURATION_S, a non-finite distance / duration, or a speed over
 EDGE_STATS_MAX_SPEED_MPS, are dropped (`reject_reason`). A mapping step slower than
 EDGE_STATS_MIN_SPEED_MPS (a session paused or the robot standing still between two nodes) is
-dropped too: its time is not a traversal time (legs are not filtered this way). The statistics (`group_stats`) are
-computed from the newest EDGE_STATS_WINDOW observations of each (map, edge, robot), or, pooled, of each
-(map, edge) across all robots.
+dropped too: its time is not a traversal time (legs are not filtered this way). Raw observations are
+all kept (up to EDGE_STATS_RETENTION_DAYS, packages/utils/edge_stats_db.py); the window is applied on
+read: the statistics (`group_stats`) are computed from the newest EDGE_STATS_WINDOW observations of each
+(map, edge, robot), or, pooled, of each (map, edge) across all robots (the database read already cuts
+to that window, `group_stats` applies it again so it is right for any caller).
 Nothing here touches a database; see packages/utils/run_legs.py for the same structure.
 """
 import datetime
@@ -158,8 +160,8 @@ def group_stats(observations: Iterable[Mapping[str, Any]], window: Optional[int]
     (map, from, to, robot). Each item: map_id, from_node_id, to_node_id, robot + `stats`.
 
     `pooled`: per (map, from, to) across the robots instead, from the newest `window`
-    observations of the edge of ALL robots together (the stored rows are already at most `window`
-    per robot); every item then has `robot: None` and its `sources` / counts are the pool's."""
+    observations of the edge of ALL robots together; every item then has `robot: None` and its
+    `sources` / counts are the pool's."""
     groups: Dict[Tuple[str, str, str, Optional[str]], List[Mapping[str, Any]]] = {}
     for o in observations:
         groups.setdefault((o["map_id"], o["from_node"], o["to_node"],

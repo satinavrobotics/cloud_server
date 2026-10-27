@@ -109,6 +109,8 @@ MAX_PENDING_OPS = config.RECORDER_MAX_PENDING_OPS
 # mission_runs RUNNING and the mission undeletable.
 # Orphaned RUNNING runs are also settled periodically, not only at startup.
 RECONCILE_PERIOD_S = config.RECORDER_RECONCILE_PERIOD_S
+# How often old edge observations are purged (EDGE_STATS_RETENTION_DAYS).
+EDGE_PURGE_EVERY_S = edge_stats_db.PURGE_EVERY_S
 # Runs younger than this are left alone by the periodic reconcile.
 RECONCILE_MIN_AGE_S = config.RECORDER_RECONCILE_MIN_AGE_S
 # Trajectory rows logged this long after the run ended still belong to it (graph-builder
@@ -723,6 +725,8 @@ class FleetRecorder:
             self._writer.start()
         self._spawn(self._run_worker(), "runs")
         self._spawn(self._reconcile_loop(), "reconcile")
+        if config.EDGE_STATS_RETENTION_DAYS > 0:
+            self._spawn(self._edge_retention_loop(), "edge_retention")
         self._spawn(self._sweep_loop(), "heartbeat_sweep")
         self._spawn(self._health_loop(), "health_report")
 
@@ -763,6 +767,28 @@ class FleetRecorder:
         while True:
             await self._sleep(RECONCILE_PERIOD_S)
             self.queue_reconcile()
+
+    async def _edge_retention_loop(self) -> None:
+        """Every EDGE_PURGE_EVERY_S delete the edge observations older than
+        EDGE_STATS_RETENTION_DAYS (edge_stats_db.purge_old: bounded batches, own connection).
+        Optional housekeeping: a failure is logged and the next pass tries again."""
+        while True:
+            await self._sleep(EDGE_PURGE_EVERY_S)
+            await self.purge_edge_observations()
+
+    async def purge_edge_observations(self) -> int:
+        """One retention pass; returns the rows deleted (0 on a failure, which is logged)."""
+        if self._pool is None:
+            return 0
+        try:
+            async with self._pool.connection() as conn:
+                return await edge_stats_db.purge_old(conn)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not purge old edge observations: %s",
+                           str(exc).strip() or type(exc).__name__)
+            return 0
 
     def queue_reconcile(self) -> None:
         if any(isinstance(op, _Reconcile) for op in self._ops):

@@ -8,8 +8,9 @@ Sources, both READ-ONLY: `run_legs` of finished runs (not RUNNING ones: dispatch
 run end) and the finished MAPPING sessions of `map_sessions` with their nodes in ArangoDB. An
 observation counts only on a pair that is an edge of its map in ArangoDB now (the rules of
 packages/utils/edge_stats.py: no topomap ids, duration <= 0 or too long, speed too high, or no
-such edge: dropped). Per (map, edge, robot) only the newest EDGE_STATS_WINDOW observations are
-kept, as the live writers do.
+such edge: dropped). Every raw observation is stored, as the live writers do (the window is applied
+on read); one older than EDGE_STATS_RETENTION_DAYS (when > 0) is skipped, the retention purge of
+mission-dispatch would delete it at once.
 
 The default is a DRY RUN: it counts and prints, writes nothing (the Postgres session is READ ONLY).
 `--apply` writes `edge_observations`; it is idempotent (the primary key is the source's own id:
@@ -18,6 +19,7 @@ Environment as scripts/export_map.py (the services' names; `--compose-env FILE` 
 docker_compose/.env for a run on the cloud host against localhost).
 """
 import argparse
+import datetime
 import json
 import logging
 import os
@@ -44,13 +46,14 @@ SESSIONS_SQL = ("SELECT session_id, map_name, robot_name, purpose FROM map_sessi
                 "WHERE ended_at IS NOT NULL AND purpose = 'mapping' ORDER BY started_at, session_id")
 
 
-def collect(sources: Any) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+def collect(sources: Any, now: Optional[datetime.datetime] = None
+            ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """(the observations to store, counts). `sources`: legs() -> run_legs row dicts (LEG_FIELDS),
     sessions() -> {session_id, map_name, robot_name, purpose} dicts, session_rows(map, sid) ->
-    GraphDatabaseService.session_trace_nodes rows, edges(map) -> get_edges rows. Pure apart from
-    those reads."""
+    GraphDatabaseService.session_trace_nodes rows, edges(map) -> get_edges rows. `now` (default the
+    current time) dates the retention. Pure apart from those reads."""
     counts = {"legs": 0, "leg_unusable": 0, "sessions": 0, "mapping_candidates": 0,
-              "non_edge": 0, "stored_after_window": 0}
+              "non_edge": 0, "too_old": 0, "to_store": 0}
     edge_cache: Dict[str, Any] = {}
 
     def edges_of(map_id: str):
@@ -81,32 +84,32 @@ def collect(sources: Any) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         kept = es.on_edges(candidates, edges_of(session["map_name"]))
         counts["non_edge"] += len(candidates) - len(kept)
         found.extend(kept)
-    groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
-    for obs in found:
-        groups.setdefault((obs["map_id"], obs["from_node"], obs["to_node"], obs["robot_name"]),
-                          []).append(obs)
-    out = [dict(o) for g in groups.values() for o in es.newest(g)]
-    counts["stored_after_window"] = len(out)
+    retention = config.EDGE_STATS_RETENTION_DAYS
+    if retention > 0:
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        cutoff = now - datetime.timedelta(days=retention)
+        kept_found = [o for o in found if o["observed_at"] >= cutoff]
+        counts["too_old"] = len(found) - len(kept_found)
+        found = kept_found
+    out = [dict(o) for o in found]
+    counts["to_store"] = len(out)
     return out, counts
 
 
-def write(cursor: Any, observations: Iterable[Mapping[str, Any]],
-          window: Optional[int] = None) -> int:
+def write(cursor: Any, observations: Iterable[Mapping[str, Any]]) -> int:
     """The synchronous twin of edge_stats_db.store (same SQL). Returns the rows inserted."""
     observations = list(observations)
-    inserted = 0
-    if observations:
-        cursor.execute(db.INSERT_SQL, db.insert_params(observations))
-        inserted = max(0, cursor.rowcount)
-    for params in db.prune_params(observations, window):
-        cursor.execute(db.PRUNE_SQL, params)
-    return inserted
+    if not observations:
+        return 0
+    cursor.execute(db.INSERT_SQL, db.insert_params(observations))
+    return max(0, cursor.rowcount)
 
 
-def run(sources: Any, connect_write: Any = None, apply: bool = False) -> Dict[str, Any]:
+def run(sources: Any, connect_write: Any = None, apply: bool = False,
+        now: Optional[datetime.datetime] = None) -> Dict[str, Any]:
     """Collect, and with `apply` write through `connect_write()` (a context manager yielding a
     cursor in a committing transaction). Returns the counts."""
-    observations, counts = collect(sources)
+    observations, counts = collect(sources, now)
     counts["apply"] = apply
     if apply:
         with connect_write() as cursor:

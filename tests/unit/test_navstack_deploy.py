@@ -1036,7 +1036,8 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
     for col in nd.COLUMNS:
         assert col in up
     assert "DROP VIEW robot_software_periods" in m.DOWNGRADE_SQL and "DROP TABLE navstack_deployments" in m.DOWNGRADE_SQL
-    # exactly one head: nothing else descends from the migration it follows, and nothing descends from ours
+    # exactly one head: nothing else descends from the migration it follows; only the edge-stats
+    # index migration (20261027_02) descends from ours, and it is the head
     downs = {}
     for f in versions.glob("2026*.py"):
         text = f.read_text()
@@ -1044,9 +1045,10 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
         down = [l for l in text.splitlines() if l.startswith("down_revision = ")][0]
         downs[rev] = down.split('"')[1] if '"' in down else None
     assert downs["20261027_01_navstack_deployments"] == "20261027_01_recordings"
-    assert [r for r, d in downs.items() if d == "20261027_01_navstack_deployments"] == []
+    assert [r for r, d in downs.items() if d == "20261027_01_navstack_deployments"] == [
+        "20261027_02_edge_obs_history"]
     heads = set(downs) - set(downs.values())
-    assert heads == {"20261027_01_navstack_deployments"}
+    assert heads == {"20261027_02_edge_obs_history"}
 
 
 # ---- PgFacts over the mapping-session store ---------------------------------------------------------------

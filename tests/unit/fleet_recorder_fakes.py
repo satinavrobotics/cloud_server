@@ -211,25 +211,27 @@ class FakeDB:
                 if key not in self.edge_obs:
                     self.edge_obs[key] = row
                     cursor.rowcount += 1
-        elif sql == edge_stats_db.PRUNE_SQL:
-            map_id, robot, froms, tos, _, _, window = params
-            touched = set(zip(froms, tos))
-            by_edge = {}
-            for key, row in self.edge_obs.items():
-                pair = (row["from_node"], row["to_node"])
-                if row["map_id"] == map_id and row["robot_name"] == robot and pair in touched:
-                    by_edge.setdefault(pair, []).append(key)
-            for keys in by_edge.values():
-                keys.sort(key=lambda k: (self.edge_obs[k]["observed_at"], k[4], k[5]),
-                          reverse=True)
-                for key in keys[window:]:
-                    del self.edge_obs[key]
-        elif sql == edge_stats_db.SELECT_SQL:
-            map_id, robot, _ = params
-            cursor.results = [tuple(r[c] for c in edge_stats_db.COLUMNS)
-                              for r in self.edge_obs.values()
-                              if r["map_id"] == map_id and (robot is None
-                                                            or r["robot_name"] == robot)]
+        elif sql in (edge_stats_db.SELECT_SQL, edge_stats_db.SELECT_POOLED_SQL):
+            # the window cut of the SQL: newest `window` per (edge, robot) or, pooled, per edge
+            map_id, robot, _, window = params
+            pooled = sql == edge_stats_db.SELECT_POOLED_SQL
+            groups = {}
+            for key, r in self.edge_obs.items():
+                if r["map_id"] == map_id and (robot is None or r["robot_name"] == robot):
+                    groups.setdefault((r["from_node"], r["to_node"],
+                                       None if pooled else r["robot_name"]), []).append(r)
+            cursor.results = [
+                tuple(r[c] for c in edge_stats_db.COLUMNS)
+                for rows in groups.values()
+                for r in sorted(rows, key=lambda r: (r["observed_at"], r["source"],
+                                                     r["source_key"]), reverse=True)[:window]]
+        elif sql == edge_stats_db.PURGE_SQL:
+            days, batch = params
+            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
+            old = [k for k, r in self.edge_obs.items() if r["observed_at"] < cutoff][:batch]
+            for key in old:
+                del self.edge_obs[key]
+            cursor.rowcount = len(old)
         elif sql == EVENT_INSERT_SQL:
             row = dict(zip(EVENT_COLUMNS, params))
             assert row["ts"].tzinfo is not None
