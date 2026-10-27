@@ -9,9 +9,11 @@ port are retrieved from the fleet database (stored during robot registration).
 import contextlib
 import json
 import logging
+import posixpath
 import re
 import uuid
 from typing import Any, Mapping, Optional
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 _SAVE_PATH = re.compile(r"^localization/save/?$")
 _LOCALIZATION_PATH = re.compile(r"^localization/?$")
 _SERVICE_PATH = re.compile(r"^services/([^/]+)/(start|stop)/?$")
+_IMAGE_SWITCH_PATH = re.compile(r"^system/image/(switch|rollback)/?$")
 DEFAULT_TIMEOUT_S = ORCHESTRATOR_PROXY_TIMEOUT_S
 # RFC 7230 6.1: meaningful for one connection only, never forwarded (plus host / content-length,
 # which httpx sets for the new request). "authorization" is the caller's credential for THIS
@@ -105,6 +108,21 @@ def slam_conflict(method: str, path: str, state: Optional[str], robot_name: str)
             f"Use the server: {use}.")
 
 
+def image_switch_conflict(method: str, path: str, robot_name: str, query: str = "") -> Optional[str]:
+    """Why a proxied call must be refused (409 detail), or None: `POST system/image/switch|rollback`
+    changes what the robot runs and goes through the server's deploy job, which logs it (the deploy
+    log, docs/navstack_deploy.md) and verifies the result. Pull and prune (and every read) pass, and so
+    does the side-effect-free preflight `switch?check=true` the client shows in its confirm dialog,
+    but only with exactly that query (anything else, such as a repeated `check`, is refused)."""
+    # dot segments and doubled slashes are resolved by the receiving server: match what it will route
+    match = _IMAGE_SWITCH_PATH.match(posixpath.normpath("/" + path).lstrip("/"))
+    if method != "POST" or not match:
+        return None
+    if match.group(1) == "switch" and parse_qs(query, keep_blank_values=True) == {"check": ["true"]}:
+        return None
+    return f"use POST /api/v1/robots/{robot_name}/deploy"
+
+
 router = APIRouter(prefix="/api/v1/orchestration", tags=["orchestration-proxy"])
 
 
@@ -115,6 +133,10 @@ async def proxy_to_orchestrator(robot_name: str, path: str, request: Request):
 
     if service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+
+    image_conflict = image_switch_conflict(request.method, path, robot_name, request.url.query)
+    if image_conflict is not None:
+        raise HTTPException(status_code=409, detail=image_conflict)
 
     try:
         robot = await service.database.get_object(RobotObjectV1, robot_name)

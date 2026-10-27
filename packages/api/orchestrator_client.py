@@ -41,6 +41,11 @@ other route to change it (the deprecated /maps/mapping, /maps/{n}/mapping/start,
                                    ?background=true: 202; starts and stops nothing
   GET  /localization/save          -> {map, status: saving|done|failed, error, meta, ...}; 404 none
 
+NAVSTACK IMAGE MODE (image_status / image_pull / image_switch / image_rollback / image_operation, used only by
+packages/api/navstack_deploy.py; contract: satibot_orchestrator docs/navstack-deploy-jetson-scope.md section 4,
+docs/navstack_deploy.md): GET /system/image, POST /system/image/pull|switch|rollback, GET /system/image/operations/{id};
+404 on every route = image mode is off on this robot.
+
 SLAM maps (docs/satinav-maps-redesign.md 14.15): a local map with `slam_map` is recorded on the
 robot under onboard_map_name(map); the orchestrator reserves some names, so the server's maps
 get a prefix. Every call raises OrchestratorError; packages/api/mapping_switch.py and
@@ -242,6 +247,45 @@ class OrchestratorClient:
         is over."""
         body = await self._call("GET", "/localization/save", ORCHESTRATOR_QUERY_TIMEOUT_S)
         return body if isinstance(body, dict) else {}
+
+    # --- navstack image mode (docs/navstack_deploy.md; contract: satibot_orchestrator
+    # docs/navstack-deploy-jetson-scope.md section 4). 404 on every route = image mode is not enabled
+    # on this robot (OrchestratorError kind HTTP, status 404). -----------------------------------
+
+    async def image_status(self) -> Dict[str, Any]:
+        """GET /system/image -> {running: {mode, tag, git_sha, ...}, previous_tag, previous_mode,
+        local_images: [{tag, ...}], disk, capabilities: {pull, switch}, active_operation}."""
+        body = await self._call("GET", "/system/image", ORCHESTRATOR_QUERY_TIMEOUT_S)
+        return body if isinstance(body, dict) else {}
+
+    async def image_pull(self, tag: str) -> Dict[str, Any]:
+        """POST /system/image/pull {tag} -> 202 op {id, kind: pull, state, ...}; 409 busy / low
+        disk / active order, 400 bad tag."""
+        return await self._call("POST", "/system/image/pull", ORCHESTRATOR_START_TIMEOUT_S,
+                                json_body={"tag": tag})
+
+    async def image_switch(self, mode: str, tag: Optional[str] = None,
+                           check: bool = False) -> Dict[str, Any]:
+        """POST /system/image/switch {mode, tag}[?check=true]: check -> 200 {ok: true} or a 409
+        {detail}, no side effects; otherwise 202 op, or 200 {noop: true}."""
+        body: Dict[str, Any] = {"mode": mode}
+        if tag is not None:
+            body["tag"] = tag
+        params = {"check": "true"} if check else None
+        return await self._call("POST", "/system/image/switch", ORCHESTRATOR_START_TIMEOUT_S,
+                                params=params, json_body=body)
+
+    async def image_rollback(self) -> Dict[str, Any]:
+        """POST /system/image/rollback -> 202 op; 409 no previous / preflight refusal."""
+        return await self._call("POST", "/system/image/rollback", ORCHESTRATOR_START_TIMEOUT_S)
+
+    async def image_operation(self, op_id: str) -> Dict[str, Any]:
+        """GET /system/image/operations/{id} -> {id, kind, state: running|done|failed|rolled_back|
+        interrupted, tag, mode, steps: [...], result}; 404 unknown id."""
+        body = await self._call("GET", f"/system/image/operations/{_seg(op_id)}",
+                                ORCHESTRATOR_QUERY_TIMEOUT_S)
+        return body if isinstance(body, dict) else {}
+
 
 def problem_of(answer: Any) -> Optional[str]:
     """The `problem` of a partial=ok answer ("{status}: {detail}"): the request changed something

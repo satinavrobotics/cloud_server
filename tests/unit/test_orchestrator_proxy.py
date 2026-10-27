@@ -228,3 +228,58 @@ async def test_a_mutation_waits_for_a_session_operation_holding_the_lock():
     assert not task.done()
     lock.release()
     assert (await task).status_code == 200
+
+
+# ---- navstack image guard (docs/navstack_deploy.md): switch / rollback only through the deploy job ----
+
+class QReq(Req):
+    def __init__(self, service, method="POST", query=""):
+        super().__init__(service, method)
+        self.url = SimpleNamespace(query=query)
+
+
+@pytest.mark.parametrize("path", [
+    "system/image/switch", "system/image/rollback", "system/image/switch/", "system/image/rollback/",
+    "system//image/switch", "system/image/../image/switch", "./system/image/rollback"])
+async def test_image_switch_and_rollback_are_refused_with_the_deploy_route(path):
+    FakeClient.seen = {}
+    with pytest.raises(HTTPException) as err:
+        await proxy.proxy_to_orchestrator("r1", path, Req(_service()))
+    assert err.value.status_code == 409
+    assert err.value.detail == "use POST /api/v1/robots/r1/deploy"
+    assert FakeClient.seen == {}, "nothing reached the robot"
+
+
+@pytest.mark.parametrize("query", ["force=true", "check=false", "check=true&force=true",
+                                   "check=true&check=false", "check=false&check=true", "check="])
+async def test_switch_is_refused_with_any_query_but_exactly_check_true(query):
+    with pytest.raises(HTTPException) as err:
+        await proxy.proxy_to_orchestrator("r1", "system/image/switch", QReq(_service(), query=query))
+    assert err.value.status_code == 409
+
+
+async def test_the_side_effect_free_switch_check_passes():
+    resp = await proxy.proxy_to_orchestrator("r1", "system/image/switch",
+                                             QReq(_service(), query="check=true"))
+    assert resp.status_code == 200 and FakeClient.seen["url"].endswith("system/image/switch?check=true")
+
+
+async def test_rollback_check_is_not_passed():
+    with pytest.raises(HTTPException) as err:
+        await proxy.proxy_to_orchestrator("r1", "system/image/rollback", QReq(_service(), query="check=true"))
+    assert err.value.status_code == 409
+
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", "system/image/pull"), ("POST", "system/image/prune"), ("GET", "system/image"),
+    ("GET", "system/image/tags"), ("GET", "system/image/operations/abc"),
+    ("GET", "system/image/switch"), ("POST", "system/image/switchboard")])
+async def test_pull_prune_and_reads_stay_proxied(method, path):
+    resp = await proxy.proxy_to_orchestrator("r1", path, Req(_service(), method=method))
+    assert resp.status_code == 200 and FakeClient.seen["url"].endswith("/" + path)
+
+
+def test_image_switch_conflict_is_pure():
+    assert proxy.image_switch_conflict("POST", "system/image/switch", "x") == "use POST /api/v1/robots/x/deploy"
+    assert proxy.image_switch_conflict("GET", "system/image/switch", "x") is None
+    assert proxy.image_switch_conflict("POST", "services/topomap/start", "x") is None

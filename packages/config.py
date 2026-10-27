@@ -1041,3 +1041,27 @@ def _validate_scene_graph_worker_scale() -> None:
 
 
 _validate_scene_graph_worker_scale()
+
+# ==================== Navstack images and deploys (docs/navstack_deploy.md) ====================
+# The private registry the navstack images are pushed to (sati_docker_registry, Tailscale-only,
+# plain HTTP). The server reads it directly (packages/api/navstack_images.py), so the build list
+# works while a robot is offline. `NAVSTACK_IMAGE` is the repository inside it.
+NAVSTACK_REGISTRY_URL = os.getenv("NAVSTACK_REGISTRY_URL", "http://100.85.3.47:5050").rstrip("/")
+NAVSTACK_IMAGE = os.getenv("NAVSTACK_IMAGE", "sati/navstack")
+NAVSTACK_ARCH = os.getenv("NAVSTACK_ARCH", "arm64")
+NAVSTACK_DEFAULT_BRANCH = os.getenv("NAVSTACK_DEFAULT_BRANCH", "humble")
+NAVSTACK_REGISTRY_TIMEOUT_S = float(os.getenv("NAVSTACK_REGISTRY_TIMEOUT_S", "15.0"))
+# The tag list and `<branch>-latest` are refetched at most this often; per-tag rows (tags are
+# immutable) are cached for the life of the process.
+NAVSTACK_IMAGES_CACHE_TTL_S = float(os.getenv("NAVSTACK_IMAGES_CACHE_TTL_S", "60.0"))
+# Deploy job (packages/api/navstack_deploy.py). Defaults are the plan's: a robot is online when
+# its robot_latest.last_seen is younger than ONLINE_MAX_AGE; the pull is polled every 3 s for up
+# to 45 min; the switch every 3 s for up to 10 min (a dropped connection in between is not a
+# failure); the robot's reported build id must match within VERIFY_TIMEOUT.
+NAVSTACK_ONLINE_MAX_AGE_S = float(os.getenv("NAVSTACK_ONLINE_MAX_AGE_S", "30.0"))
+NAVSTACK_PULL_POLL_S = float(os.getenv("NAVSTACK_PULL_POLL_S", "3.0"))
+NAVSTACK_PULL_TIMEOUT_S = float(os.getenv("NAVSTACK_PULL_TIMEOUT_S", str(45 * 60)))
+NAVSTACK_SWITCH_POLL_S = float(os.getenv("NAVSTACK_SWITCH_POLL_S", "3.0"))
+NAVSTACK_SWITCH_TIMEOUT_S = float(os.getenv("NAVSTACK_SWITCH_TIMEOUT_S", str(10 * 60)))
+NAVSTACK_VERIFY_POLL_S = float(os.getenv("NAVSTACK_VERIFY_POLL_S", "2.0"))
+NAVSTACK_VERIFY_TIMEOUT_S = float(os.getenv("NAVSTACK_VERIFY_TIMEOUT_S", "120.0"))

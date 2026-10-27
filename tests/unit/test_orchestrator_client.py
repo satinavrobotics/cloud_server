@@ -137,3 +137,34 @@ async def test_unreachable_timeout_and_no_address():
     with pytest.raises(oc.OrchestratorError) as err:
         await oc.OrchestratorClient(SimpleNamespace(name="r")).get_localization()
     assert err.value.kind == oc.NO_ADDRESS
+
+
+async def test_image_mode_calls_follow_the_orchestrator_contract():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, dict(request.url.params),
+                     json.loads(request.content) if request.content else None))
+        if request.url.raw_path.endswith(b"/operations/a%2Fb"):
+            return httpx.Response(404, json={"detail": "unknown operation"})
+        return httpx.Response(200, json={"id": "op1", "ok": True})
+
+    c = client_for(handler)
+    await c.image_status()
+    await c.image_pull("humble-1-abcdef0")
+    await c.image_switch("image", "humble-1-abcdef0")
+    await c.image_switch("image", "humble-1-abcdef0", check=True)
+    await c.image_switch("dev")
+    await c.image_rollback()
+    await c.image_operation("op1")
+    assert seen == [
+        ("GET", "/system/image", {}, None),
+        ("POST", "/system/image/pull", {}, {"tag": "humble-1-abcdef0"}),
+        ("POST", "/system/image/switch", {}, {"mode": "image", "tag": "humble-1-abcdef0"}),
+        ("POST", "/system/image/switch", {"check": "true"}, {"mode": "image", "tag": "humble-1-abcdef0"}),
+        ("POST", "/system/image/switch", {}, {"mode": "dev"}),
+        ("POST", "/system/image/rollback", {}, None),
+        ("GET", "/system/image/operations/op1", {}, None)]
+    with pytest.raises(oc.OrchestratorError) as err:     # ids are one quoted path segment
+        await c.image_operation("a/b")
+    assert err.value.status == 404 and err.value.detail == "unknown operation"
