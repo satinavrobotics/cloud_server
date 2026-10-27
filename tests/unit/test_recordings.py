@@ -170,6 +170,15 @@ def test_sidecar_only_row_uses_the_intended_key_and_no_size():
     assert row["start"] == row["end"] and row["source"]["object_present"] is False
 
 
+def test_former_robot_names_are_stored_under_the_fleet_name():
+    old = dict(car("p1", "20261005_210517_navstack_sati_odin"), robot_name="Pincer01")
+    row = rec.build_row(old, None, None)
+    assert row["robot_name"] == "formidable-peacock"
+    assert row["storage_key"] == "Pincer01/p1"                    # where the upload really is
+    assert row["source"]["uploaded_as"] == "Pincer01"
+    assert rec.build_row(car("f1", "x"), None, None)["source"]["uploaded_as"] is None
+
+
 def test_overlap_counts_use_the_skew_tolerance():
     t = datetime.datetime(2026, 10, 18, 17, 0, tzinfo=UTC)
     run = {"robot_name": "r", "started_at": t, "ended_at": t + datetime.timedelta(minutes=5)}

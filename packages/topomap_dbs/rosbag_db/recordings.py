@@ -176,6 +176,11 @@ def mission_context(mission: Optional[Mapping[str, Any]]) -> Tuple[Optional[str]
     return run_id, str(order_id) if order_id else None
 
 
+# Former names of fleet robots (user, 2026-10-27): their uploads are stored under the fleet
+# name so they join mission_runs; the MinIO key keeps the name they were uploaded under.
+ROBOT_ALIASES = {"Pincer01": "formidable-peacock", "odin1": "formidable-peacock"}
+
+
 def build_row(sidecar: Mapping[str, Any], obj: Optional[Mapping[str, Any]],
               metadata: Optional[Mapping[str, Any]],
               mission: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
@@ -184,18 +189,20 @@ def build_row(sidecar: Mapping[str, Any], obj: Optional[Mapping[str, Any]],
     robot-recorded mission block (see mission_context); no recording has one yet."""
     kind, group_key, part = classify(sidecar)
     start, end, how = interval(sidecar, metadata)
-    robot = sidecar["robot_name"]
+    uploaded_as = sidecar["robot_name"]
+    robot = ROBOT_ALIASES.get(uploaded_as, uploaded_as)
     run_id, order_id = mission_context(mission)
     return {
         "id": str(uuid.uuid5(NAMESPACE, f"{robot}/{group_key}/{part}")),
         "kind": kind, "robot_name": robot, "start": start, "end": end,
         "group_key": group_key, "part": part,
         "storage_bucket": BUCKET,
-        "storage_key": obj["key"] if obj else f"{robot}/{sidecar['bag_id']}",
+        "storage_key": obj["key"] if obj else f"{uploaded_as}/{sidecar['bag_id']}",
         "size_bytes": obj["size"] if obj else None,
         "content_hash": (obj.get("etag") or "").strip('"') or None if obj else None,
         "map_id": sidecar.get("map_id"), "run_id": run_id, "order_id": order_id,
         "source": {"sidecar": dict(sidecar), "interval_source": how,
+                   "uploaded_as": uploaded_as if uploaded_as != robot else None,
                    "object_present": obj is not None,
                    "uploaded_at": obj["last_modified"].isoformat() if obj and obj.get("last_modified") else None,
                    "bag_metadata": dict(metadata) if metadata else None,
