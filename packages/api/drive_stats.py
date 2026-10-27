@@ -70,10 +70,29 @@ def plane_lookup(plane: Dict[str, Any], ax: np.ndarray, ay: np.ndarray) -> np.nd
     return out
 
 
+_CHANGED = object()       # a graph version change seen between two chunks of one read
+REGION_VERSION_TRIES = 3  # reads started over after a version change before giving up
+
+
 async def regions_of(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray
                      ) -> Tuple[Optional[np.ndarray], List[str], Dict[str, int], Optional[int], str]:
     """Chart of every tile. Returns (region id per tile (0 = none, i = names[i-1]), names, cells per chart key,
-    graph version, status "ok" | "none" | "error"). Never raises: a missing graph or a failing read is a status."""
+    graph version, status "ok" | "none" | "error"). Never raises: a missing graph or a failing read is a status.
+
+    ONE graph version answers the whole call: the first chunk's owner plane fixes it, the chart-cell views are asked
+    for that version, and a later chunk whose owner plane is of another version (the graph was rebuilt during a read
+    of a map over 160 m) makes the read start over on the new version, REGION_VERSION_TRIES times, then it is
+    status "error" (a mixture of two versions would assign cells to charts that do not belong together)."""
+    for _ in range(REGION_VERSION_TRIES):
+        out = await _regions_pass(reads, map_id, ax, ay)
+        if out is not _CHANGED:
+            return out
+        logger.info("Drive stats of %s: the graph version changed during the read; reading again", map_id)
+    logger.warning("Drive stats of %s: the graph version kept changing; no regions", map_id)
+    return None, [], {}, None, "error"
+
+
+async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray):
     names: List[str] = []
     cells: Dict[str, int] = {}
     ids = np.zeros(ax.size, np.int64)
@@ -95,8 +114,18 @@ async def regions_of(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray
             if abs(float(plane["step"]) - CELL_M) > 1e-9:
                 logger.warning("Drive stats: owner raster step %s is not %s; no regions", plane["step"], CELL_M)
                 return None, [], {}, None, "error"
-            version = plane["version"] if version is None else version
-            view = await reads.view(map_id, box, 0, raster=False, parents=False)
+            if version is None:
+                version = plane["version"]
+            elif plane["version"] != version:
+                return _CHANGED
+            try:
+                view = await reads.view(map_id, box, 0, version=version, raster=False, parents=False)
+            except HTTPException as exc:
+                if exc.status_code in (404, 409, 410):        # the pinned version is gone: the graph moved on
+                    return _CHANGED
+                raise
+            if view.get("version", version) != version:
+                return _CHANGED
             for ch in view.get("charts", []):
                 cells[ch["key"]] = int(ch.get("cells") or 0)
             vals = await asyncio.to_thread(plane_lookup, plane, ax[sel], ay[sel])
