@@ -296,7 +296,7 @@ def test_the_migration_follows_the_newest_one_and_is_idempotent(monkeypatch):
         down = [l for l in text.splitlines() if l.startswith("down_revision = ")]
         downs[rev[0].split('"')[1]] = down[0].split('"')[1] if '"' in down[0] else None
     heads = set(downs) - set(downs.values())
-    assert heads == {"20261025_01_map_keepouts"}                  # one head, ours
+    assert len(heads) == 1 and "20261025_01_map_keepouts" in downs   # one head (newer migrations may follow ours)
 
 
 def test_the_map_delete_removes_the_zones():
