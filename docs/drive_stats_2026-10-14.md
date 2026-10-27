@@ -52,6 +52,29 @@ the number of distinct runs through the chart, `cells` the chart's size from the
 its tiles with drive data. Tiles on no chart are in no region. No engine is loaded; when the scene graph is off, has no
 graph or a read fails, `regions` is `[]`, `source.scene_graph` is `none` / `error` and tiles use absolute indices.
 
+## Source: stored run summaries (2026-10-27)
+
+Since `docs/region_stats_2026-10-27.md` the tiles of a FINISHED run are not recomputed on every read: the API worker
+(`packages/api/run_cells.py`) stores them once per run in `run_cells` (arrays of absolute 0.1 m cells with length, time,
+stopped, recovery seconds and blocks), computed by the same code (`packages/utils/cell_raster.py`, moved out of
+`drive_stats.py`, which re-exports it) with the default `Params`. With `DRIVE_STATS_SOURCE=summaries` (default) and the
+default `min_speed`:
+
+* runs that STARTED in the window and have a current summary (`algo_version` = `RUN_CELLS_ALGO_VERSION`) are summed from it
+  (same tiles, same `n` = distinct runs per cell, same regions: the unit tests assert equality with the raw computation);
+* every other run -- still running, finished but not summarised yet (the worker waits `RECORDER_TRAJECTORY_GRACE_S` +
+  `RUN_CELLS_EXTRA_GRACE_S` after the end), or started before the window -- is read raw as described above; the raw queries
+  leave out the runs of the first part (`NOT EXISTS` on `run_cells`), so no run is counted twice or missing;
+* another `min_speed` (the summaries froze the default) or `DRIVE_STATS_SOURCE=raw` reads everything raw: today's behaviour
+  exactly. `source.basis` / `basis_reason` / `summary_runs` / `raw_runs` say what happened; `source.partial` is true only
+  when the RAW part hit `DRIVE_STATS_MAX_ROWS`.
+
+Documented differences: (1) a summarised run is taken whole when it STARTED in the window (the raw rule cuts by row time),
+so a run that straddles the window edge is counted fully inside or outside; (2) in the `series=day` block a summarised run is
+attributed to the UTC day of its start (a raw movement to the day it started: a run over midnight shifts), and its
+moving speed is `len_m / (time_s - stopped_s)` (the stopped segments' own length, at most `min_speed` x `stopped_s`, is
+inside `len_m`); (3) the summaries keep float4 per cell (about 1e-7 relative).
+
 ## Limits and caching
 
 * At most `DRIVE_STATS_MAX_ROWS` (2,000,000) track rows are read, newest first; more sets `source.partial` (no 413: a
