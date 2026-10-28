@@ -35,10 +35,11 @@ run_analysis.py --bag DIR --out DIR --bag-id ID
 ```
 
 - `--list` prints the manifests found (json) and exits; the server learns what an image offers from this, nothing is configured server-side.
-- It extracts into `OUT/x/` once (skipped when `OUT/x/meta.json` already carries the current `extractor_version`), then runs each applicable
+- It extracts into `OUT/x/` (the server always re-extracts; a skip when `OUT/x/meta.json` carries the current `extractor_version` is optional and
+  only possible once the extractor writes that version, which it does not yet), then runs each applicable
   analyzer profile into `OUT/<id>/<profile>/`, and writes `OUT/run.json` (extractor version, per analyzer: status, duration, exit code) and `OUT/run.log`.
 - It reads the bag only (mount it read-only), writes only under `--out`, and passes every path to the analyzers itself. No analyzer may fall
-  back to a robot path such as `/mnt/ssd/...` (the lost-time tool's `--episodes` and `--clearance-dir` defaults do today); a missing
+  back to a robot path such as `/mnt/ssd/...` (the lost-time tool's `--episodes` default does today: `$EPISODE_FILE` or `/mnt/ssd/recordings/EPISODES.log`; `--clearance-dir` is a `score_confirmation_run.py` default, not the ledger's); a missing
   *required* input is an error, a missing *optional* one is a note.
 - Exit codes: 0 = every analyzer ended ok / warn / n/a; 1 = at least one analyzer ended `error`; 2 = bad arguments or missing required input;
   3 = extraction failed. One analyzer's failure never stops the others.
@@ -60,7 +61,8 @@ One per analyzer, next to its code. Fields:
 | `metrics` | every metric the result may carry, declared once: `unit`, `direction` (lower / higher / neutral is better), `description`, optional `headline` |
 
 Why profiles: the lost-time tool has many behaviour flags and flipped defaults (decisions 214, 330, 334). A named profile such as
-`legacy_rules` lets us run one bag under an older reading next to the current default; the profile is part of the result key.
+`legacy_rules` would let us run one bag under an older reading next to the current default; the profile is part of the result key. **The robot team
+asked not to ship a legacy profile for lost time in v1** (see section 8); the mechanism stays in the contract for later analyzers, and `lost_time` ships `default` only.
 Phase 0 found that a stored baseline cannot be reproduced exactly this way: on `live_20261004_200002` goal time, ideal and lost time match,
 but `unjustified_s` is 218.8 with current defaults and 252.1 with all legacy flags, against 234.8 in the baseline, because that run's rule
 combination no longer exists behind any flags. So profiles give comparable side-by-side readings, not a time machine; every result carries the tool git sha.
@@ -107,8 +109,10 @@ checked against the baseline file `behaviour/tools/baseline/live_20261004_200002
 | `status` | `n/a` when there are no goals; `warn` when `tick_identity_max_residual_s` > 1e-6, or the tool printed a fallback note (`o2_fallbacks`, a missing params dump), or `abs(unassigned_share_signed)` > 0.05 (that last threshold is my suggestion, the owners should set it); else `ok` |
 
 The identity check is why `warn` exists: the ledger's exact tick identity holds to ~1e-12 s on the bags tried in phase 0 (2.2e-12 and 2.5e-12), so a breach means a real defect.
-Read it from `totals.tick_identity_max_residual_s` (and `ad10_split.identity`); the ledger json has no top-level `identity` key.
-A missing params dump is a `warn` with code `input.params_missing`: the ledger then silently uses default nominal speeds, footprint and maneuver
+Read it from `totals.tick_identity_max_residual_s` only. `ad10_split` (non-legacy mode only) and `o2_fallbacks` (only when a flipped O2 default fell back on that
+bag) are OPTIONAL in the tool's output and the 2026-10-04 baseline has neither: the adapter must treat both as absent-able, and there is no top-level `identity` key.
+A missing params dump is a `warn` with code `input.params_missing`, **set by the adapter when the runner did not pass `--params`** (`inputs.present.params` is false);
+the tool has no structured flag for it and parsing its stdout WARNING is a brittle fallback. The ledger then silently uses default nominal speeds, footprint and maneuver
 speeds and prints only a WARNING, which makes it the most result-affecting missing input.
 The example result (`lost_time.result.example.json`) is the stored baseline turned into an envelope, for illustration only (not output of the
 current tool): 24 goals, 22 reached, 1009.5 s goal time, 590.8 s lost, 234.8 s unjustified (23.3% of goal time). It carries `warn` because the
@@ -120,14 +124,26 @@ Validates against the schemas, stores the envelope as-is plus the metrics in que
 from the manifest's declarations. It treats everything in a result as untrusted text (escapes notes and table cells, resolves artifact paths
 inside the analyzer's directory only, enforces the size caps). A result that fails validation is stored as `error` with the validation message.
 
-## 8. Open questions for the robot team
+## 8. Decisions (robot team reply 2026-10-28; "confirm" = needs the owners' sign-off)
 
-1. Is `analyzer.yaml` next to each tool (my proposal), or one registry file in `behaviour/tools/`? Next to the tool keeps ownership clear.
-2. Where does the contract live? I suggest `sati_benchmark/analysis/` (package already exists); this document and the schemas would move there.
-3. `warn` thresholds for the lost-time adapter: tick residual 1e-6 s (the ledger header states the identity holds to 1e-6 s) and `unassigned_share` 0.05: right?
-4. Which of the 24 totals and which `q_rows` belong in `metrics`? I mapped the ten that read as headline or integrity numbers; the rest stay in the artifact.
-5. Phase 0 could not reproduce the 2026-10-04 baseline's `unjustified_s` (234.8) with any flag set (218.8 default, 252.1 all legacy). Do you want a `legacy_rules` profile at all, or is the git sha in each result enough? Should the stored baselines in `baseline/` be regenerated with the current tool and marked as such?
-6. Who owns `extractor_version`? It must change whenever `bag_to_jsonl.py` changes what it writes, so it sits naturally with that script.
-7. Can the runner assume `OUT/x/` from the robot's own earlier run is reusable, or must the server always re-extract? (Re-extract is the safe default.)
-9. The extractor imports every message type it keeps and crashes on one it cannot import, so a bag from another robot fails whole. It needs a try/except per topic type (skip with a `not decodable` note) before any backfill of the 91 old bags. Yours to change in `bag_to_jsonl.py`.
-10. Metrics that are per-goal (24 rows here) fit `tables` up to 200 rows; if a later analyzer needs per-tick series it must use an artifact. OK?
+Checked by the robot team against `lost_time_ledger.py` and the baseline: baseline numbers match, tick residual 2.16e-12 in the baseline, the mapped tables exist,
+the tool writes `<label>_ledger.json` / `<label>_ledger.md` into `--out`. They did not reproduce our 218.8 / 252.1 numbers themselves.
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Manifest next to each tool or one registry | next to each tool |
+| 2 | Where the contract lives | `sati_benchmark/analysis/` (confirm); the ledger stays in `behaviour/tools/` |
+| 3 | `warn` thresholds | tick residual 1e-6 s fine (2e-12 observed); `unassigned_share` 0.05 fine (0.0024 observed); both a policy choice for the owners (confirm) |
+| 4 | Which metrics | the ten mapped are fine for v1; `q_rows` not reviewed yet |
+| 5 | Legacy profile / baselines | no `legacy_rules` profile in v1; the tool git sha in each result is enough; keep old baselines as history, add new ones from the current tool marked with their build |
+| 6 | `extractor_version` | robot team owns it, a constant in `bag_to_jsonl.py`, bumped on any output change; NOT added yet (meta.json carries no version today) |
+| 7 | Reuse `x/` | always re-extract on the server |
+| 8 | (numbering gap in the earlier text) | none |
+| 9 | Extractor skips undecodable types | done in the working tree: skipped topics listed in `meta.json` `not_decodable` and on stderr; unit-tested, not run on a real bag; deserialisation errors on an importable type are not covered |
+| 10 | Per-goal tables up to 200 rows, per-tick series as artifacts | OK |
+| 11 | Finalize call after upload | the robot team would skip it while the server polls |
+
+Robot-side changes already made (not committed or built yet):
+- **Params dump:** the upload tar keeps the single top-level `<bag>/` and now also holds `<bag>/params/` (YAMLs, `config_hash.txt`, `bt_trees/`, `RUN.txt`). Older bags and bags without a params dir have no `params/`: keep accepting that. The upload-url request body is unchanged.
+- **Build tag:** `params/RUN.txt` carries `git_describe`, `git_dirty_patch`, `build_image` and per-package build times, so no new field is needed. The runner passes `--params <bag>/params` when it exists and fills `producer.stack_build` from `RUN.txt`.
+- **After a verified upload the bag and its `_params` dir are deleted on the robot.**

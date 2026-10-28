@@ -26,12 +26,6 @@ profiles:
       vda_log: ["--vda-log", "{vda_log}"]
     timeout_s: 3600
     memory_mb: 6144
-  legacy_rules:
-    description: "Older readings of the rules (legacy flags). Does NOT reproduce the stored 2026-10-04 baseline exactly (phase 0 found unjustified_s 252.1 vs 234.8); a comparison profile, not a replay."
-    argv: ["python3", "{tools}/lost_time_ledger.py", "--bag", "{bag}", "--x", "{x}", "--goals", "auto", "--legacy-reasons", "--goal-starts", "begin", "--ntp-waypoints", "proxies", "--ntp-leg-fallback", "whole-goal", "--out", "{out}/ledger", "--label", "{bag_id}"]
-    optional_argv:
-      params: ["--params", "{params}"]
-    timeout_s: 3600
 adapter: lost_time_adapter.py
 metrics:
   goal_time_s:               {unit: s,     direction: neutral,         description: "Sum of all goal windows."}
