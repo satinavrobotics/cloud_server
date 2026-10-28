@@ -15,6 +15,17 @@ profile in use. Contract: `docs/bag_analysis_contract_2026-10-28.md`. Plan: `web
   gains a server note `extract.not_decodable` when the extractor reported undecodable topics.
 - view `analysis_latest`: per (recording, analyzer, profile) the highest analyzer_version, then extractor_version, then newest.
 
+## Declared catalog (migration `20261028_05_analysis_catalog`)
+
+`analysis_catalog(analyzer, analyzer_version, decl_hash, title, owner, description, profiles text[], metrics jsonb, extractor_version, analysis_image, tool_git_sha, first_seen_at, last_seen_at)`,
+PK `(analyzer, analyzer_version, decl_hash)`; `decl_hash` = sha256 of the canonical JSON of the normalised metrics declaration
+(`{name: {unit, direction, description, headline}}`, headline defaults false). The worker (`catalog.py`, wrapped around the executor in `main.build_worker`) stores the
+`run_analysis.py --list` manifests at startup (also without auto mode) and whenever a later `list_analyzers()` returns a different catalog. Same key seen again: `last_seen_at`
+moves and title / owner / description / profiles / extractor_version / analysis_image / tool_git_sha are refreshed. A changed metrics declaration for the same analyzer + version is a
+NEW row (the old one stays). Manifest text is untrusted: names re-checked against the schema patterns, unit / direction enums, strings bounded (title/owner 200, description 2000, metric
+description 1000, 200 metrics, 50 profiles, 100 analyzers) and stripped of control characters; a manifest that fails is skipped whole and logged. A store failure is logged and
+swallowed (retried at the next listing), a failing startup listing is logged and the loop goes on. `--list` may carry a top-level `tool_git_sha` (stored if hex). Downgrade drops the table.
+
 ## Configuration (`packages/config.py`, section "Bag analysis"; all defaults safe)
 
 `BAG_ANALYSIS_ENABLED` (false: the service idles), `BAG_ANALYSIS_AUTO` (false: the scheduler enqueues nothing), `BAG_ANALYSIS_SCRATCH_DIR` (/scratch),
@@ -78,7 +89,7 @@ the recording must exist, be a run of part `nav` with a stored object (else 409)
 
 | Method | Path | Request | Response | Errors |
 |---|---|---|---|---|
-| GET | `/api/v1/analyses/catalog` | none | `Catalog` | 503 |
+| GET | `/api/v1/analyses/catalog` | none | `Catalog` (stored results merged with stored declarations) | 503 |
 | GET | `/api/v1/analyses/recordings` | query `robot`, `metrics` (comma list), `cursor`, `limit` (1-200, default 50) | `RecordingPage` | 422 (cursor, limit), 503 |
 | GET | `/api/v1/recordings/{id}/analyses` | query `history` (bool, default false) | `RecordingAnalyses` | 404 unknown recording, 422 id not a UUID, 503 |
 | GET | `/api/v1/recordings/{id}/analyses/{analyzer}/{profile}/{analyzer_version}/{extractor_version}/artifacts/{path}` | none | the file (attachment) | 404 (unknown recording / result / path not in the stored list / object gone), 503 object store |
@@ -100,10 +111,18 @@ AnalysisResult    { recording_id, analyzer, analyzer_version:int, profile, extra
                     producer: {...}, inputs: {...},               # as stored (tool_git_sha, stack_build, present, server_passed ...)
                     artifacts: [{name, path, media_type, size?, sha256?, download_url|null}],
                     created_at, latest: bool }                    # latest: newest row of its (analyzer, profile)
-Catalog           { source: "derived", declared: false,
+Catalog           { source: "declared"|"derived", declared: bool,   # source "declared" when any stored declaration is used; declared true when EVERY analyzer row has one
                     analyzers: [{analyzer, profile, analyzer_version, analyzer_versions:[int], extractor_version,
-                                 recordings:int, last_result_at, title: null,
-                                 metrics: [{name, unit: null, direction: null, headline: null, description: null}]}] }
+                                 recordings:int, last_result_at|null, title|null, owner|null, description|null,
+                                 declared: bool, declared_version:int|null, declared_last_seen_at|null, profiles:[str],
+                                 metrics: [{name, unit|null, direction|null, headline|null, description|null, declared: bool}]}] }
+```
+Catalog rules: rows are (analyzer, profile) from stored results; the declaration used is the one of the row's `analyzer_version`, else the newest declared version of that analyzer
+(newest-seen declaration per version); it applies only when the manifest has that profile. `metrics` = stored names UNION declared names; a declared metric carries `unit` (s m rad share count ratio m/s none),
+`direction` (`lower_is_better` | `higher_is_better` | `neutral`, as in the manifest), `headline`, `description`, `declared: true`; others stay null / `declared: false`. Analyzer profiles that are declared but
+have no stored result are listed with `recordings: 0`, empty `analyzer_versions`, `last_result_at: null`, and can be named in the POST `analyzers`. Fields added in this change: `owner`, `description`, `declared`,
+`declared_version`, `declared_last_seen_at`, `profiles`, metric `declared`; the previously null fields are only filled, never changed otherwise.
+```
 Job               { id, recording_id, analyzer_ids: [str]|null, trigger: "auto"|"request", requested_by|null,
                     status: "queued"|"running"|"done"|"failed"|"cancelled", attempts:int,
                     created_at, started_at|null, finished_at|null, error|null, log_tail|null /* only with ?log=1 */ }
@@ -136,8 +155,8 @@ Streamed through the API (64 KiB chunks, no presigned URL, so MinIO need not be 
 
 ### Open points of the API
 
-- **The catalog is derived, not declared.** The worker does not store the runner's `--list` manifests, so unit / direction / headline / title are not available server side. Follow-up (needs a migration and a worker change, not done here): the worker upserts the manifests it reads at startup into a table, and `Catalog` switches to `source: "declared"` (the model already has the fields).
-  Until then an analyzer must have at least one stored result to appear in the catalog and to be nameable in `analyzers` of the POST.
+- **The catalog is declared once the worker has run.** Until a worker has listed the runner at least once (table empty) the catalog is derived from stored results as before. Analyzers and profiles from a declaration
+  can be named in the POST even without a stored result.
 - `force` (re-run an existing key) is not supported: results are insert-only and the worker drops entries that already have a result for the current key. A re-run happens when the analyzer or extractor version changes, or when the stored result is an `error`.
 - The POST cannot tell "no analyzer applies" (the applicability rules live in the manifests); such a job ends `done` with nothing run.
 - No authentication (see above). `requested_by` is unverified.
