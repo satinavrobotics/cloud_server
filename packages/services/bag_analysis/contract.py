@@ -89,6 +89,14 @@ def _no_constant(name: str) -> None:
     raise ValueError(f"non-finite number {name} is not allowed")
 
 
+def read_capped(path: Path, max_bytes: int) -> bytes:
+    """At most `max_bytes + 1` bytes of a regular file (never a symlink): a result longer than the cap is detectable
+    (len > max_bytes) without reading it all into memory."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as f:
+        return f.read(max_bytes + 1)
+
+
 def parse_envelope_bytes(raw: bytes, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES) -> Tuple[Optional[Any], List[str]]:
     """(parsed json, errors). Size cap first; NaN/Infinity and invalid UTF-8 are errors."""
     if len(raw) > max_bytes:
@@ -157,7 +165,7 @@ def check_result(raw: bytes, manifest: Dict[str, Any], analyzer_dir: Path, *, ba
     if envelope["bag_id"] != bag_id:
         errors.append(f"bag_id is {envelope['bag_id']!r}, expected {bag_id!r}")
     if extractor_version is not None and envelope["extractor_version"] != extractor_version:
-        errors.append(f"extractor_version is {envelope['extractor_version']}, the runner reports {extractor_version}")
+        errors.append(f"extractor_version is {envelope['extractor_version']}, the analysis image's catalog reports {extractor_version}")
     declared = manifest.get("metrics", {})
     undeclared = sorted(set(envelope["metrics"]) - set(declared))
     if undeclared:

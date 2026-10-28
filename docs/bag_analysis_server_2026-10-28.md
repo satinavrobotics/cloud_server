@@ -31,7 +31,7 @@ swallowed (retried at the next listing), a failing startup listing is logged and
 `BAG_ANALYSIS_RUN_ANALYSIS` (/opt/navstack/sati_benchmark/analysis/run_analysis.py), `BAG_ANALYSIS_BUCKET` (analysis), `BAG_ANALYSIS_POLL_S` (30), `BAG_ANALYSIS_SCHEDULE_EVERY_S` (300),
 `BAG_ANALYSIS_JOB_TIMEOUT_S` (7200), `BAG_ANALYSIS_MEMORY_MB` (0 = no RLIMIT_AS), `BAG_ANALYSIS_STUCK_AFTER_S` (10800), `BAG_ANALYSIS_MAX_ATTEMPTS` (3),
 `BAG_ANALYSIS_FAILED_RETRY_AFTER_S` (86400), `BAG_ANALYSIS_DISK_MARGIN_BYTES` (2 GiB), `BAG_ANALYSIS_MAX_OBJECT_BYTES` (30 GiB), `BAG_ANALYSIS_MAX_UNTAR_BYTES` (40 GiB),
-`BAG_ANALYSIS_MAX_TAR_MEMBERS` (2000), `BAG_ANALYSIS_MAX_ENVELOPE_BYTES` (256 KiB), `BAG_ANALYSIS_MAX_ARTIFACT_BYTES` (200 MiB).
+`BAG_ANALYSIS_MAX_TAR_MEMBERS` (2000), `BAG_ANALYSIS_MAX_ENVELOPE_BYTES` (256 KiB), `BAG_ANALYSIS_MAX_ARTIFACT_BYTES` (200 MiB), `BAG_ANALYSIS_RUNNER_MAX_FILE_BYTES` (20 GiB, RLIMIT_FSIZE of the runner, 0 = none).
 Compose only: `BAG_ANALYSIS_IMAGE`, `BAG_ANALYSIS_BASE_IMAGE`, `BAG_ANALYSIS_SCRATCH_VOLUME`, `MEM_BAG_ANALYSIS` (8g), `CPUS_BAG_ANALYSIS` (2).
 
 ## Job lifecycle
@@ -45,9 +45,26 @@ Compose only: `BAG_ANALYSIS_IMAGE`, `BAG_ANALYSIS_BASE_IMAGE`, `BAG_ANALYSIS_SCR
    `<bag>/params` is passed as `--params` when it exists (old bags have none: normal).
 4. Runner (`run_analysis.py --bag --out --bag-id --only id:profile,... [--params]`) writes `OUT/<analyzer>/<profile>/result.json` (+ artifacts). Assumption to confirm: that location.
 5. Ingest per entry: `contract.check_result`; failure, a missing result.json or unreadable output is stored as an `error` result carrying the reason (never dropped). Valid results: artifacts uploaded, row inserted.
-   The runner's own `extractor_version` is accepted as reported.
+   The envelope's `extractor_version` must equal the image catalog's (`--list`), because results are keyed on it; a different value is an analyzer-level problem, stored as an `error` result saying so.
+   result.json is read with a cap (at most max+1 bytes, symlinks refused); over the cap is an `error` result. `--list` stdout is capped too (4 MiB).
 6. Job `done` (an analyzer `error` is a result, the job is still done) or `failed` (timeout, runner exit not 0/1, extraction failed (3), unsafe tar, upload error, crash) with error and the last 8000 characters of the runner log.
-   Scratch is removed in `finally`. SIGTERM kills the runner and releases the job to the queue (attempt not counted, the error text is cleared). Startup sweep: removes `job-*` scratch dirs, re-queues jobs running longer than the limit, fails them once attempts are exhausted.
+   Scratch is removed in `finally`. SIGTERM kills the runner and releases the job to the queue (attempt not counted, the error text is cleared).
+   The final state write (done / failed / released) is retried 4 times with backoff (1, 2, 4 s); if it still fails the loop hands the claimed job back to the queue (a stored result makes the rerun a no-op).
+   A failed `--list` is an infrastructure problem: no job is claimed while it fails, and a job already claimed is released (not failed).
+   Extraction is bounded by `min(MAX_UNTAR, free scratch - margin)` (the guard above only knew the compressed size); the runner has RLIMIT_FSIZE (per file; the total of its output is not capped).
+
+### Single worker, orphaned jobs
+
+The documented deployment is ONE worker (one container, concurrency 1). So at startup every job still `running` is an orphan of a dead process: the startup sweep re-queues ALL of them (jobs with
+attempts exhausted are failed), whatever their age, and removes the `job-*` scratch dirs. A periodic sweep between jobs (every 10 minutes) keeps the age rule (`BAG_ANALYSIS_STUCK_AFTER_S`) as a safety net.
+Two workers on one database would break this (the second one's startup would requeue the first one's live job): add a heartbeat/owner column before running more than one.
+
+## Trust model of the analyzers
+
+The runner is trusted code: it runs as the worker's uid (10001) in the worker's network namespace (`network_mode: host`). The environment allow-list (`executor.scrub_env`) keeps credentials out of the
+runner's own environment, but a same-uid process can read `/proc/<ppid>/environ`, which Linux serves from the ORIGINAL environment block (`os.environ.pop` does not change it). So after the clients exist,
+`secrets_scrub.scrub_environ` pops the credentials AND blanks their values in that block (best effort, Linux). It cannot hide what the worker still holds in memory, and does nothing about the host network
+(the runner can reach Postgres and MinIO ports). Untrusted analyzers would need a separate uid (and a network restriction); not built.
 
 ## Storage layout
 
@@ -76,7 +93,7 @@ a health endpoint / heartbeat for the service, retention of artifacts, `parts` s
 ## Tests
 
 ```
-python -m pytest tests/unit/bag_analysis -q -o addopts=""        # 93 tests, no Docker (needs jsonschema; skipped without it)
+python -m pytest tests/unit/bag_analysis -q -o addopts=""        # no Docker (needs jsonschema; skipped without it)
 docker run -d --name ba-test -p 127.0.0.1:55455:5432 -e POSTGRES_PASSWORD=t -e POSTGRES_DB=mission timescale/timescaledb-ha:pg17.11-ts2.30.1
 BAG_ANALYSIS_TEST_DSN="host=127.0.0.1 port=55455 dbname=mission user=postgres password=t" \
   python -m pytest tests/integration/test_bag_analysis_postgres.py -q -o addopts=""   # migration up/down/up, store SQL, concurrent claim

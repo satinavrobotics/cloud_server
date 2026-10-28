@@ -15,7 +15,12 @@ Lifecycle of `process_job` (docs/bag_analysis_server_2026-10-28.md):
 A job-level failure (object missing, disk guard, unsafe tar, runner timeout / crash / extraction failure, upload
 error) marks the job `failed` with the error and the tail of the runner log; it is not retried by the scheduler
 for BAG_ANALYSIS_FAILED_RETRY_AFTER_S. An analyzer that ran and said `error` is a RESULT, and the job is `done`.
-`startup_sweep` removes leftover scratch directories of a dead process and puts jobs stuck in `running` back.
+`startup_sweep` removes leftover scratch directories of a dead process and puts EVERY job still `running` back
+(the documented deployment is ONE worker: at startup nothing of this service can legitimately be running);
+`sweep_stuck` is the periodic safety net (age rule, BAG_ANALYSIS_STUCK_AFTER_S).
+A failed `--list` (infrastructure, not the job's fault) hands the job back to the queue instead of failing it.
+The finalizing write (complete / fail / release) is retried with backoff so a database blip does not leave a job
+`running`.
 """
 import hashlib
 import logging
@@ -42,6 +47,10 @@ class JobFailed(Exception):
     def __init__(self, message: str, log_tail: str = ""):
         super().__init__(message)
         self.log_tail = log_tail
+
+
+class _NothingToRun(Exception):
+    """Internal: every applicable analyzer already has a current result."""
 
 
 class MinioObjects:
@@ -105,7 +114,10 @@ class Worker:
                  max_envelope_bytes: int = contract.DEFAULT_MAX_ENVELOPE_BYTES,
                  max_artifact_bytes: int = contract.DEFAULT_MAX_ARTIFACT_BYTES,
                  stuck_after_s: float = 10800.0, max_attempts: int = 3,
-                 disk_free: Optional[Callable[[str], int]] = None):
+                 disk_free: Optional[Callable[[str], int]] = None, finalize_retries: int = 4,
+                 finalize_backoff_s: float = 1.0, sleep: Callable[[float], None] = time.sleep):
+        self.finalize_retries, self.finalize_backoff_s, self._sleep = finalize_retries, finalize_backoff_s, sleep
+        self.claimed_id: Optional[str] = None
         self.store, self.executor, self.objects = store, executor, objects
         self.scratch = Path(scratch_dir)
         self.bucket = bucket
@@ -123,36 +135,82 @@ class Worker:
             for d in self.scratch.glob(SCRATCH_PREFIX + "*"):
                 safe_tar.remove_tree(d)
                 removed += 1
-        requeued, failed = self.store.requeue_stuck(self.stuck_after_s, self.max_attempts)
+        # Single-worker assumption: at startup every 'running' job is an orphan of a dead process (age 0).
+        requeued, failed = self.store.requeue_stuck(0, self.max_attempts)
         if removed or requeued or failed:
-            logger.warning("startup sweep: removed %d scratch dirs, re-queued %d, failed %d stuck jobs",
+            logger.warning("startup sweep: removed %d scratch dirs, re-queued %d, failed %d orphaned running jobs",
                            removed, requeued, failed)
         return {"scratch_removed": removed, "requeued": requeued, "failed": failed}
+
+    def sweep_stuck(self) -> Tuple[int, int]:
+        """Periodic safety net: 'running' jobs older than stuck_after_s (e.g. whose final write was lost)."""
+        requeued, failed = self.store.requeue_stuck(self.stuck_after_s, self.max_attempts)
+        if requeued or failed:
+            logger.warning("sweep: re-queued %d, failed %d stuck jobs", requeued, failed)
+        return requeued, failed
+
+    def _finalize(self, fn: Callable[..., None], *args: Any) -> None:
+        """Run a final job-state write; retried with exponential backoff, the last error propagates."""
+        for attempt in range(self.finalize_retries):
+            try:
+                fn(*args)
+                return
+            except Exception:  # noqa: BLE001
+                if attempt == self.finalize_retries - 1:
+                    raise
+                delay = self.finalize_backoff_s * 2 ** attempt
+                logger.warning("job state write %s failed, retry in %.1fs", getattr(fn, "__name__", fn), delay,
+                               exc_info=True)
+                self._sleep(delay)
+
+    def abandon_claimed(self) -> None:
+        """Last resort after an unexpected error escaped `process_job`: hand the claimed job back to the queue
+        (it is re-checked, and a stored result makes it a no-op). Best effort; the sweeps cover the rest."""
+        job_id, self.claimed_id = self.claimed_id, None
+        if job_id is None:
+            return
+        try:
+            self._finalize(self.store.release, job_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not release job %s; the sweep will", job_id)
 
     # ---- one job ----
 
     def process_one(self) -> Optional[str]:
         """Claim and process the next job; its id, or None when the queue is empty."""
+        try:  # an unusable analysis image is an infrastructure problem: claim nothing, wait for the next poll
+            catalog = self.executor.list_analyzers()
+        except Exception:  # noqa: BLE001
+            logger.exception("cannot list the analyzers; not claiming a job")
+            return None
         job = self.store.claim_next()
         if job is None:
             return None
-        self.process_job(job)
+        self.claimed_id = job["id"]
+        self.process_job(job, catalog)
+        self.claimed_id = None
         return job["id"]
 
-    def process_job(self, job: Mapping[str, Any]) -> str:
+    def process_job(self, job: Mapping[str, Any], catalog: Optional[Catalog] = None) -> str:
         """Run `job` (already claimed). Always leaves the job done / failed / queued again, never 'running'.
         Returns the final status."""
         job_id, tail = job["id"], ""
         work: Optional[Path] = None
-        try:
+        done_note: Optional[str] = None     # set when the job succeeded; completed AFTER the scratch cleanup, outside
+        try:                                # the try, so a failing final write is never turned into 'failed'.
             rec = self.store.get_recording(job["recording_id"])
             if rec is None:
                 raise JobFailed("recording not found (deleted?)")
-            catalog = self.executor.list_analyzers()
+            if catalog is None:
+                try:
+                    catalog = self.executor.list_analyzers()
+                except Exception:  # noqa: BLE001 - not the job's fault: give it back, do not fail it
+                    logger.exception("job %s: cannot list the analyzers; handing the job back", job_id)
+                    self._finalize(self.store.release, job_id)
+                    return "queued"
             entries = self._entries(job, rec, catalog)
             if not entries:
-                self.store.complete(job_id, "nothing to run: no applicable analyzer lacks a current result")
-                return "done"
+                raise _NothingToRun()
             self.scratch.mkdir(parents=True, exist_ok=True)
             self._check_object(rec)
             work = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=str(self.scratch)))
@@ -163,23 +221,24 @@ class Worker:
                                     [f"{a}:{p}" for a, p in entries], passed)
             tail = _tail(run.log_tail)
             if run.cancelled:
-                self.store.release(job_id)
+                self._finalize(self.store.release, job_id)
                 return "queued"
             self._check_run(run)
             self._ingest(rec, catalog, entries, run, passed, work / "out")
-            self.store.complete(job_id, tail)
-            return "done"
+            done_note = tail
+        except _NothingToRun:
+            done_note = "nothing to run: no applicable analyzer lacks a current result"
         except JobFailed as e:
             logger.error("job %s failed: %s", job_id, e)
-            self.store.fail(job_id, str(e)[:2000], _tail(e.log_tail) or tail)
+            self._finalize(self.store.fail, job_id, str(e)[:2000], _tail(e.log_tail) or tail)
             return "failed"
         except safe_tar.UnsafeArchive as e:
             logger.error("job %s: unsafe archive: %s", job_id, e)
-            self.store.fail(job_id, f"unsafe or unreadable archive: {e}"[:2000], tail)
+            self._finalize(self.store.fail, job_id, f"unsafe or unreadable archive: {e}"[:2000], tail)
             return "failed"
         except Exception as e:  # noqa: BLE001 - a job must never stay 'running'
             logger.exception("job %s crashed", job_id)
-            self.store.fail(job_id, f"{type(e).__name__}: {e}"[:2000], tail)
+            self._finalize(self.store.fail, job_id, f"{type(e).__name__}: {e}"[:2000], tail)
             return "failed"
         finally:
             if work is not None:
@@ -187,6 +246,11 @@ class Worker:
                     safe_tar.remove_tree(work)
                 except Exception:  # noqa: BLE001
                     logger.exception("could not remove scratch dir %s", work)
+        return self._complete(job_id, done_note or "")
+
+    def _complete(self, job_id: str, note: str) -> str:
+        self._finalize(self.store.complete, job_id, note)
+        return "done"
 
     # ---- steps ----
 
@@ -224,9 +288,11 @@ class Worker:
     def _fetch(self, rec: Mapping[str, Any], work: Path) -> Path:
         dest = work / "bag"
         dest.mkdir()
+        # The guard in _check_object looked at the COMPRESSED size; bound the extraction by what is really free.
+        budget = min(self.max_untar, max(self.disk_free(str(self.scratch)) - self.disk_margin, 0))
         stream = self.objects.open_stream(rec["storage_bucket"], rec["storage_key"])
         try:
-            info = safe_tar.extract_stream(stream, dest, max_members=self.max_members, max_bytes=self.max_untar,
+            info = safe_tar.extract_stream(stream, dest, max_members=self.max_members, max_bytes=budget,
                                            max_stream_bytes=self.max_object)
         finally:
             stream.close()
@@ -257,10 +323,16 @@ class Worker:
                                 f"(exit code {run.exit_code})"], "result.missing"
             else:
                 try:
-                    raw = (adir / "result.json").read_bytes() if not (adir / "result.json").is_symlink() else b""
-                    envelope, errors = contract.check_result(
-                        raw, manifest, adir, bag_id=bag_id, profile=profile, extractor_version=None,  # the runner's own value is accepted (meta.json carries none yet)
-                        max_envelope_bytes=self.max_envelope, max_artifact_bytes=self.max_artifact)
+                    # at most max+1 bytes are read (never the whole file); a symlink is not followed
+                    raw = contract.read_capped(adir / "result.json", self.max_envelope)
+                    if len(raw) > self.max_envelope:
+                        errors = [f"result.json is over the {self.max_envelope} byte cap"]
+                    else:
+                        # the key of a result carries extractor_version: it must be the one the image's catalog reports
+                        envelope, errors = contract.check_result(
+                            raw, manifest, adir, bag_id=bag_id, profile=profile,
+                            extractor_version=catalog.extractor_version,
+                            max_envelope_bytes=self.max_envelope, max_artifact_bytes=self.max_artifact)
                 except OSError as e:
                     errors = [f"result.json unreadable: {e}"]
             if errors:

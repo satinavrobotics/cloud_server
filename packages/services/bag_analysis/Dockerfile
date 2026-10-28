@@ -25,7 +25,8 @@ RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin baga
     && mkdir -p /scratch && chown 10001:10001 /scratch
 USER 10001
 
-ENV PYTHONPATH=/app
+# keep what the base image sets (the runner inherits PYTHONPATH through the env allow-list)
+ENV PYTHONPATH=/app${PYTHONPATH:+:$PYTHONPATH}
 ENV PYTHONDONTWRITEBYTECODE=1
 
 CMD ["python3", "-m", "packages.services.bag_analysis.main"]

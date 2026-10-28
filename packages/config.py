@@ -1156,6 +1156,8 @@ BAG_ANALYSIS_DISK_MARGIN_BYTES = int(os.getenv("BAG_ANALYSIS_DISK_MARGIN_BYTES",
 # Hard limits: the object itself, the bytes and the number of members the tar may expand to.
 BAG_ANALYSIS_MAX_OBJECT_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_OBJECT_BYTES", str(30 * 1024 ** 3)))
 BAG_ANALYSIS_MAX_UNTAR_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_UNTAR_BYTES", str(40 * 1024 ** 3)))
+# RLIMIT_FSIZE of the runner: no single file it writes may be larger (0 = no limit).
+BAG_ANALYSIS_RUNNER_MAX_FILE_BYTES = int(os.getenv("BAG_ANALYSIS_RUNNER_MAX_FILE_BYTES", str(20 * 1024 ** 3)))
 BAG_ANALYSIS_MAX_TAR_MEMBERS = int(os.getenv("BAG_ANALYSIS_MAX_TAR_MEMBERS", "2000"))
 # Result limits (server-side checks the schema cannot express).
 BAG_ANALYSIS_MAX_ENVELOPE_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_ENVELOPE_BYTES", str(256 * 1024)))
