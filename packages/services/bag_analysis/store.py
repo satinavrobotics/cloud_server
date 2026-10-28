@@ -103,6 +103,43 @@ BUSY_SQL = "SELECT DISTINCT recording_id::text FROM analysis_jobs WHERE status I
 FAILED_RECENT_SQL = ("SELECT DISTINCT recording_id::text FROM analysis_jobs WHERE "
                      "status = 'failed' AND finished_at > now() - make_interval(secs => %(since_s)s)")
 
+# ---- reads for the API (packages/api/bag_analysis.py) ----
+
+_JOB_COLUMNS = ("SELECT id::text AS id, recording_id::text AS recording_id, analyzer_ids, scope, trigger, "
+                "requested_by, status, attempts, created_at, started_at, finished_at, error, log_tail "
+                "FROM analysis_jobs ")
+JOBS_FOR_RECORDING_SQL = (_JOB_COLUMNS + "WHERE recording_id = %(recording_id)s::uuid "
+                          "ORDER BY created_at DESC, id DESC LIMIT %(limit)s")
+ACTIVE_JOB_SQL = (_JOB_COLUMNS + "WHERE recording_id = %(recording_id)s::uuid AND trigger = %(trigger)s "
+                  "AND scope = %(scope)s AND status IN ('queued', 'running') LIMIT 1")
+
+CATALOG_SQL = """
+SELECT analyzer, profile, max(analyzer_version) AS analyzer_version, max(extractor_version) AS extractor_version,
+       array_agg(DISTINCT analyzer_version ORDER BY analyzer_version) AS analyzer_versions,
+       count(DISTINCT recording_id) AS recordings, max(created_at) AS last_result_at
+FROM analysis_results GROUP BY analyzer, profile ORDER BY analyzer, profile
+"""
+CATALOG_METRICS_SQL = """
+SELECT analyzer, profile, array_agg(DISTINCT k ORDER BY k) AS metrics
+FROM analysis_latest, jsonb_object_keys(metrics) AS k GROUP BY analyzer, profile
+"""
+
+_REC_LIST_COLUMNS = """
+SELECT id::text AS id, robot_name, group_key, part, storage_key, size_bytes, map_id, created_at,
+       source #>> '{sidecar,description}' AS description, source #>> '{sidecar,bag_id}' AS bag_id,
+       COALESCE((source ->> 'object_present')::boolean, false) AS object_present
+FROM recordings
+WHERE kind = 'run' AND part = 'nav' AND (%(robot)s::text IS NULL OR robot_name = %(robot)s)
+  AND (%(after_ts)s::timestamptz IS NULL OR (created_at, id) < (%(after_ts)s::timestamptz, %(after_id)s::uuid))
+ORDER BY created_at DESC, id DESC LIMIT %(limit)s
+"""
+LATEST_FOR_IDS_SQL = ("SELECT recording_id::text AS recording_id, analyzer, analyzer_version, profile, "
+                      "extractor_version, status, metrics, created_at FROM analysis_latest "
+                      "WHERE recording_id = ANY(%(ids)s::uuid[]) ORDER BY recording_id, analyzer, profile")
+LAST_JOB_FOR_IDS_SQL = ("SELECT DISTINCT ON (recording_id) recording_id::text AS recording_id, id::text AS id, "
+                        "trigger, status, created_at, finished_at, error FROM analysis_jobs "
+                        "WHERE recording_id = ANY(%(ids)s::uuid[]) ORDER BY recording_id, created_at DESC, id DESC")
+
 
 def scope_of(analyzer_ids: Optional[Sequence[str]]) -> str:
     """Canonical text of an analyzer selection: '*' (all applicable) or the sorted, de-duplicated entries."""
@@ -111,11 +148,13 @@ def scope_of(analyzer_ids: Optional[Sequence[str]]) -> str:
     return ",".join(sorted(set(analyzer_ids)))
 
 
-def connect_from_config() -> Any:
-    """A psycopg connection to the mission database, from packages/config.py (never at import time)."""
+def connect_from_config(statement_timeout_ms: Optional[int] = None) -> Any:
+    """A psycopg connection to the mission database, from packages/config.py (never at import time).
+    `statement_timeout_ms` (the API passes its read timeout) is set for the session."""
     import psycopg
     from packages import config
-    return psycopg.connect(
+    extra = {"options": f"-c statement_timeout={int(statement_timeout_ms)}"} if statement_timeout_ms else {}
+    return psycopg.connect(**extra,
         host=config.POSTGRES_DATABASE_HOST, port=int(config.POSTGRES_DATABASE_PORT),
         dbname=config.POSTGRES_DATABASE_NAME, user=config.POSTGRES_DATABASE_USERNAME,
         password=config.postgres_database_password(), connect_timeout=5)
@@ -245,6 +284,62 @@ class PgStore:
         def go(cur):
             cur.execute(FAILED_RECENT_SQL, {"since_s": float(since_s)})
             return {r["recording_id"] for r in cur.fetchall()}
+        return self._run(go)
+
+    # ---- reads for the API ----
+
+    def jobs_for_recording(self, recording_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Newest first (all statuses, both triggers)."""
+        def go(cur):
+            cur.execute(JOBS_FOR_RECORDING_SQL, {"recording_id": recording_id, "limit": int(limit)})
+            return cur.fetchall()
+        return self._run(go)
+
+    def active_job(self, recording_id: str, analyzer_ids: Optional[Sequence[str]],
+                   trigger: str) -> Optional[Dict[str, Any]]:
+        """The queued/running job of (recording, trigger, selection), i.e. what a refused enqueue collided with."""
+        def go(cur):
+            cur.execute(ACTIVE_JOB_SQL, {"recording_id": recording_id, "trigger": trigger,
+                                         "scope": scope_of(analyzer_ids)})
+            return cur.fetchone()
+        return self._run(go)
+
+    def catalog_summary(self) -> List[Dict[str, Any]]:
+        """What the stored results say about the analyzers: per (analyzer, profile) the newest versions, the
+        versions seen, the number of recordings, the last result time and the metric names of the newest rows."""
+        def go(cur):
+            cur.execute(CATALOG_SQL)
+            rows = cur.fetchall()
+            cur.execute(CATALOG_METRICS_SQL)
+            names = {(r["analyzer"], r["profile"]): list(r["metrics"]) for r in cur.fetchall()}
+            for r in rows:
+                r["metrics"] = names.get((r["analyzer"], r["profile"]), [])
+            return rows
+        return self._run(go)
+
+    def recordings_page(self, limit: int, robot: Optional[str] = None,
+                        after: Optional[Tuple[Any, str]] = None) -> List[Dict[str, Any]]:
+        """Analysable recordings (run, part nav), newest first by (created_at, id), each with `latest` (the
+        analysis_latest rows, metrics included, no tables / artifacts) and `last_job`. `after` = (created_at, id)
+        of the last row of the previous page."""
+        params = {"limit": int(limit), "robot": robot, "after_ts": after[0] if after else None,
+                  "after_id": after[1] if after else None}
+
+        def go(cur):
+            cur.execute(_REC_LIST_COLUMNS, params)
+            recs = cur.fetchall()
+            ids = [r["id"] for r in recs]
+            latest: Dict[str, List[Dict[str, Any]]] = {i: [] for i in ids}
+            jobs: Dict[str, Dict[str, Any]] = {}
+            if ids:
+                cur.execute(LATEST_FOR_IDS_SQL, {"ids": ids})
+                for r in cur.fetchall():
+                    latest[r["recording_id"]].append(r)
+                cur.execute(LAST_JOB_FOR_IDS_SQL, {"ids": ids})
+                jobs = {r["recording_id"]: r for r in cur.fetchall()}
+            for r in recs:
+                r["latest"], r["last_job"] = latest[r["id"]], jobs.get(r["id"])
+            return recs
         return self._run(go)
 
 

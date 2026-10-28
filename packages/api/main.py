@@ -25,6 +25,7 @@ from packages.api import fleet_reads, maps, recorder_health, recording, run_admi
 from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, region_stats, run_cells, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
 from packages.api import navstack_deploy, navstack_images
+from packages.api import bag_analysis as bag_analysis_api
 from packages.api import route_preview as route_preview_module
 from packages.api import localization_view as lv
 from packages.api.idempotency import IdempotencyMiddleware, IdempotencyStore
@@ -3187,6 +3188,80 @@ async def cancel_navstack_deployment(deployment_id: uuid.UUID):
     """Cancel a deployment before its switch step starts. 409 after that or when it is already over."""
     _require_service()
     return await _site_call("cancel deployment", service.navstack_deployments.cancel(deployment_id))
+
+
+# ==================== Bag analysis (docs/bag_analysis_server_2026-10-28.md) ====================
+# Results and on-request jobs of packages/services/bag_analysis. No auth, like the other routes (see
+# packages/api/bag_analysis.py). The analysis API is built on first use.
+
+def _analysis() -> "bag_analysis_api.AnalysisApi":
+    _require_service()
+    api = getattr(service, "bag_analysis", None)
+    if api is None:
+        api = service.bag_analysis = bag_analysis_api.AnalysisApi()
+    return api
+
+
+@app.get("/api/v1/analyses/catalog", response_model=bag_analysis_api.Catalog)
+async def analysis_catalog():
+    """The analyzers known from stored results (`source: derived`): per analyzer + profile the newest versions and
+    the metric names. unit / direction / headline are null until the manifests are stored (`declared: false`)."""
+    return await _site_call("read the analysis catalog", _analysis().catalog())
+
+
+@app.get("/api/v1/analyses/recordings", response_model=bag_analysis_api.RecordingPage)
+async def analysis_recordings(
+    robot: Optional[str] = Query(None, description="Robot name"),
+    metrics: Optional[str] = Query(None, description="Comma-separated metric names to keep in `latest[].metrics` "
+                                                     "(default: all)"),
+    cursor: Optional[str] = Query(None, description="`next_cursor` of the previous page"),
+    limit: int = Query(bag_analysis_api.DEFAULT_LIST_LIMIT, ge=1, le=bag_analysis_api.MAX_LIST_LIMIT),
+):
+    """Analysable recordings (run, part nav), newest first, each with its latest results' status and metrics and
+    its last job: `{"items": [...], "next_cursor": str | null}`."""
+    names = [m.strip() for m in metrics.split(",") if m.strip()][:50] if metrics else None
+    return await _site_call("list recordings with analyses", _analysis().recordings(robot, names, cursor, limit))
+
+
+@app.get("/api/v1/recordings/{recording_id}/analyses", response_model=bag_analysis_api.RecordingAnalyses)
+async def recording_analyses(recording_id: str, history: bool = Query(
+        False, description="true: every stored version (`latest` marks the newest per analyzer + profile)")):
+    """The analysis results of one recording (latest per analyzer + profile; `history=1`: all versions). 404 if
+    the recording is unknown. All text in the answer is untrusted: render it as plain text."""
+    return await _site_call("get recording analyses", _analysis().results(recording_id, history))
+
+
+@app.get("/api/v1/recordings/{recording_id}/analyses/{analyzer}/{profile}/{analyzer_version}/"
+         "{extractor_version}/artifacts/{artifact_path:path}")
+async def recording_analysis_artifact(recording_id: str, analyzer: str, profile: str, analyzer_version: int,
+                                      extractor_version: int, artifact_path: str):
+    """Download one artifact of a stored result as an attachment. `artifact_path` must be the `path` of an entry
+    in that result's artifact list (404 otherwise); the object key is never taken from the request."""
+    return await _site_call("download analysis artifact", _analysis().open_artifact(
+        recording_id, analyzer, profile, analyzer_version, extractor_version, artifact_path))
+
+
+@app.post("/api/v1/recordings/{recording_id}/analyses", response_model=bag_analysis_api.RequestOutcome)
+async def request_recording_analysis(
+        recording_id: str, response: Response, body: Optional[bag_analysis_api.AnalysisRequest] = None,
+        x_sati_operator: Optional[str] = Header(None, alias="X-Sati-Operator")):
+    """Queue an on-request analysis: `{"analyzers": ["id" | "id:profile", ...]}` (optional; default every
+    analyzer that applies). 202 `{"created": true, "job"}` for a new job, 200 `{"created": false, "job"}` when an
+    identical job is already queued or running. Analyzers whose results exist are skipped by the worker, so a
+    repeat of a finished request ends as a no-op job. `force` is not supported (422). 404 unknown recording, 409
+    not analysable. `X-Sati-Operator` is stored as `requested_by` (unverified: no auth)."""
+    out = await _site_call("request recording analysis", _analysis().request(
+        recording_id, body or bag_analysis_api.AnalysisRequest(), x_sati_operator))
+    response.status_code = 202 if out.created else 200
+    return out
+
+
+@app.get("/api/v1/recordings/{recording_id}/analysis-jobs", response_model=bag_analysis_api.JobList)
+async def recording_analysis_jobs(
+        recording_id: str, limit: int = Query(20, ge=1, le=bag_analysis_api.MAX_JOBS),
+        log: bool = Query(False, description="include `log_tail` (untrusted text)")):
+    """The analysis jobs of one recording, newest first (both triggers, every status)."""
+    return await _site_call("get analysis jobs", _analysis().jobs(recording_id, limit, log))
 
 
 # ==================== Runs, events, timeline (Phase 0 WP10) ====================

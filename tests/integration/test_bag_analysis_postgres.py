@@ -208,3 +208,41 @@ def test_migration_store_jobs_and_results():
         assert conn.execute("SELECT status, error FROM analysis_jobs WHERE id = %s", (jid,)).fetchone() == ("queued", None)
     again = store.claim_next()
     assert again["id"] == jid and again["attempts"] == 1
+
+    # ---- reads the API uses (packages/api/bag_analysis.py) ----
+    # jobs of a recording, newest first, with the error / log columns
+    jobs = store.jobs_for_recording(rids[1], 50)
+    assert jobs and jobs == sorted(jobs, key=lambda j: (j["created_at"], j["id"]), reverse=True)
+    assert {"id", "recording_id", "analyzer_ids", "scope", "trigger", "requested_by", "status", "attempts",
+            "created_at", "started_at", "finished_at", "error", "log_tail"} <= set(jobs[0])
+    assert any(j["error"] == "boom" and j["log_tail"] == "last lines" for j in jobs)
+    assert store.jobs_for_recording(rids[1], 1) == jobs[:1]
+
+    # the active job an enqueue collided with
+    with _connect() as conn:
+        fresh = _recording(conn, 20)
+    first = store.enqueue(fresh, ["a", "b"], "request", "op")
+    assert store.enqueue(fresh, ["b", "a"], "request") is None
+    act = store.active_job(fresh, ["b", "a"], "request")
+    assert act["id"] == first and act["requested_by"] == "op" and act["analyzer_ids"] == ["a", "b"]
+    assert store.active_job(fresh, None, "request") is None and store.active_job(fresh, ["a", "b"], "auto") is None
+
+    # catalog derived from the results: versions, recordings, metric names of the newest rows
+    cat = {(c["analyzer"], c["profile"]): c for c in store.catalog_summary()}
+    lt = cat[("lost_time", "default")]
+    assert lt["analyzer_version"] == 2 and lt["analyzer_versions"] == [1, 2] and lt["recordings"] == 1
+    assert lt["metrics"] == ["m"] and cat[("lost_time", "legacy")]["analyzer_version"] == 1
+
+    # recordings page: only run/nav, newest first, keyset cursor, latest rows without tables, last job
+    page = store.recordings_page(100)
+    assert len(page) == 5 and all(p["part"] == "nav" for p in page)
+    stamps = [(p["created_at"], p["id"]) for p in page]
+    assert stamps == sorted(stamps, reverse=True)
+    by_id = {p["id"]: p for p in page}
+    assert {x["analyzer"] for x in by_id[r]["latest"]} == {"lost_time"} and len(by_id[r]["latest"]) == 2
+    assert "tables" not in by_id[r]["latest"][0] and by_id[r]["last_job"]["status"] in ("queued", "running", "done", "failed")
+    assert by_id[fresh]["latest"] == [] and by_id[fresh]["last_job"]["id"] == first
+    first_two = store.recordings_page(2)
+    rest = store.recordings_page(100, after=(first_two[-1]["created_at"], first_two[-1]["id"]))
+    assert [p["id"] for p in first_two + rest] == [p["id"] for p in page]
+    assert store.recordings_page(10, robot="nobody") == [] and len(store.recordings_page(10, robot="r")) == 5
