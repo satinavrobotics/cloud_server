@@ -33,6 +33,7 @@ from . import contract
 logger = logging.getLogger("bag_analysis.executor")
 
 LOG_TAIL_BYTES = 8000
+LIST_MAX_BYTES = 4 * 1024 * 1024               # `--list` stdout cap (a catalog of a few dozen manifests is far smaller)
 ENV_ALLOW_EXACT = ("PATH", "LANG", "TZ", "LD_LIBRARY_PATH", "PYTHONPATH", "CMAKE_PREFIX_PATH", "PKG_CONFIG_PATH",
                    "PYTHONHASHSEED", "SATI_ANALYSIS_IMAGE")
 ENV_ALLOW_PREFIX = ("LC_", "ROS_", "AMENT_", "COLCON_", "RMW_", "RCUTILS_", "BAG_ANALYSIS_TOOLS")
@@ -136,7 +137,8 @@ class SubprocessExecutor(Executor):
     def __init__(self, run_analysis: str, python: str = "python3", timeout_s: float = 7200.0, memory_mb: int = 0,
                  list_timeout_s: float = 120.0, env_source: Optional[Mapping[str, str]] = None,
                  extra_env_allow: Sequence[str] = (), should_stop: Callable[[], bool] = lambda: False,
-                 nice: int = 10):
+                 nice: int = 10, max_file_bytes: int = 0, list_max_bytes: int = LIST_MAX_BYTES):
+        self.max_file_bytes, self.list_max_bytes = max_file_bytes, list_max_bytes
         self.run_analysis, self.python = run_analysis, python
         self.timeout_s, self.memory_mb, self.list_timeout_s = timeout_s, memory_mb, list_timeout_s
         self.env_source = os.environ if env_source is None else env_source
@@ -145,15 +147,18 @@ class SubprocessExecutor(Executor):
     def _env(self, home: Optional[str]) -> Dict[str, str]:
         return scrub_env(self.env_source, self.extra_env_allow, home)
 
-    def _preexec(self) -> Optional[Callable[[], None]]:
+    def _preexec(self, fsize: Optional[int] = None) -> Optional[Callable[[], None]]:
         if resource is None:
             return None
         memory_bytes, nice = self.memory_mb * 1024 * 1024, self.nice
+        fsize = self.max_file_bytes if fsize is None else fsize
 
         def limits() -> None:  # runs in the child between fork and exec
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             if memory_bytes:
                 resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+            if fsize:  # no single file the runner writes may exceed this (SIGXFSZ / EFBIG)
+                resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
             if nice:
                 os.nice(nice)
         return limits
@@ -162,18 +167,24 @@ class SubprocessExecutor(Executor):
         return [self.python, self.run_analysis, "--list"]
 
     def list_analyzers(self) -> Catalog:
+        # stdout/stderr go to files in the throwaway cwd and are read with a cap, so a runner that prints without
+        # end can neither fill this process's memory nor pass an oversized catalog on.
         with tempfile.TemporaryDirectory(prefix="ba-list-") as cwd:
-            proc = subprocess.run(self.argv_list(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
-                                  env=self._env(cwd), timeout=self.list_timeout_s, preexec_fn=self._preexec(),
-                                  start_new_session=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"run_analysis.py --list exited {proc.returncode}: "
-                               f"{proc.stderr.decode('utf-8', 'replace')[-500:]}")
-        return parse_catalog(proc.stdout.decode("utf-8"))
+            out_path, err_path = Path(cwd) / "stdout", Path(cwd) / "stderr"
+            with open(out_path, "wb") as out, open(err_path, "wb") as err:
+                proc = subprocess.run(self.argv_list(), stdout=out, stderr=err, stdin=subprocess.DEVNULL, cwd=cwd,
+                                      env=self._env(cwd), timeout=self.list_timeout_s,
+                                      preexec_fn=self._preexec(self.list_max_bytes + 1), start_new_session=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"run_analysis.py --list exited {proc.returncode}: {_tail(err_path, 500)}")
+            raw = contract.read_capped(out_path, self.list_max_bytes)
+        if len(raw) > self.list_max_bytes:
+            raise ValueError(f"--list printed more than {self.list_max_bytes} bytes")
+        return parse_catalog(raw.decode("utf-8"))
 
     def run_argv(self, bag_dir: Path, out_dir: Path, bag_id: str, only: Sequence[str],
                  optional_inputs: Mapping[str, Path]) -> List[str]:
-        argv = [self.python, self.run_analysis, "--bag", str(bag_dir), "--out", str(out_dir), "--bag-id", bag_id]
+        argv = [self.python, self.run_analysis, "--bag", str(bag_dir), "--out", str(out_dir), f"--bag-id={bag_id}"]  # `=` form: an id starting with '-' is a value, not a flag
         if only:
             argv += ["--only", ",".join(only)]
         flags = {"params": "--params", "episodes": "--episodes", "vda_log": "--vda-log"}

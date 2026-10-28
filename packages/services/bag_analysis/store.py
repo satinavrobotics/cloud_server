@@ -166,16 +166,17 @@ def scope_of(analyzer_ids: Optional[Sequence[str]]) -> str:
     return ",".join(sorted(set(analyzer_ids)))
 
 
-def connect_from_config(statement_timeout_ms: Optional[int] = None) -> Any:
+def connect_from_config(statement_timeout_ms: Optional[int] = None, password: Optional[str] = None) -> Any:
     """A psycopg connection to the mission database, from packages/config.py (never at import time).
-    `statement_timeout_ms` (the API passes its read timeout) is set for the session."""
+    `statement_timeout_ms` (the API passes its read timeout) is set for the session. `password` overrides the
+    environment lookup (the worker captures it at startup and then scrubs its environment)."""
     import psycopg
     from packages import config
     extra = {"options": f"-c statement_timeout={int(statement_timeout_ms)}"} if statement_timeout_ms else {}
     return psycopg.connect(**extra,
         host=config.POSTGRES_DATABASE_HOST, port=int(config.POSTGRES_DATABASE_PORT),
         dbname=config.POSTGRES_DATABASE_NAME, user=config.POSTGRES_DATABASE_USERNAME,
-        password=config.postgres_database_password(), connect_timeout=5)
+        password=password if password is not None else config.postgres_database_password(), connect_timeout=5)
 
 
 def _dict_cursor(conn: Any) -> Any:

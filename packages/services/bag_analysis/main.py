@@ -16,7 +16,7 @@ import time
 from typing import Any, Callable, Optional
 
 from packages import config
-from packages.services.bag_analysis import scheduler
+from packages.services.bag_analysis import scheduler, secrets_scrub
 from packages.services.bag_analysis.catalog import CatalogRecorder, RecordingExecutor
 from packages.services.bag_analysis.executor import SubprocessExecutor
 from packages.services.bag_analysis.store import PgStore, connect_from_config
@@ -27,11 +27,13 @@ logger = logging.getLogger("bag_analysis")
 
 def build_worker(stop: threading.Event) -> tuple:
     from minio import Minio
-    store = PgStore(connect_from_config)
+    pg_password = config.postgres_database_password()   # captured: the environment is scrubbed below
+    store = PgStore(lambda: connect_from_config(password=pg_password))
     # every catalog the runner lists is also stored (analysis_catalog), so the API can serve declared metadata
     executor = RecordingExecutor(SubprocessExecutor(config.BAG_ANALYSIS_RUN_ANALYSIS,
                                                     timeout_s=config.BAG_ANALYSIS_JOB_TIMEOUT_S,
-                                                    memory_mb=config.BAG_ANALYSIS_MEMORY_MB, should_stop=stop.is_set),
+                                                    memory_mb=config.BAG_ANALYSIS_MEMORY_MB, should_stop=stop.is_set,
+                                                    max_file_bytes=config.BAG_ANALYSIS_RUNNER_MAX_FILE_BYTES),
                                  CatalogRecorder(store))
     client = Minio(f"{config.MINIO_HOST}:{config.MINIO_PORT}", access_key=config.require_secret("MINIO_ACCESS_KEY"),
                    secret_key=config.require_secret("MINIO_SECRET_KEY"), secure=config.MINIO_SECURE)
@@ -42,22 +44,27 @@ def build_worker(stop: threading.Event) -> tuple:
                     max_envelope_bytes=config.BAG_ANALYSIS_MAX_ENVELOPE_BYTES,
                     max_artifact_bytes=config.BAG_ANALYSIS_MAX_ARTIFACT_BYTES,
                     stuck_after_s=config.BAG_ANALYSIS_STUCK_AFTER_S, max_attempts=config.BAG_ANALYSIS_MAX_ATTEMPTS)
+    # The runner is a child of this process under the same uid and could read /proc/<ppid>/environ.
+    secrets_scrub.scrub_environ()
     return store, executor, worker
 
 
 def run_loop(store: Any, executor: Any, worker: Worker, stop: threading.Event, *, auto: bool, poll_s: float,
              schedule_every_s: float, retry_failed_after_s: float, clock: Callable[[], float] = time.monotonic,
-             max_iterations: Optional[int] = None) -> int:
+             max_iterations: Optional[int] = None, sweep_every_s: float = 600.0) -> int:
     """The service loop; returns the number of jobs processed. `max_iterations` is for tests."""
     worker.startup_sweep()
     try:  # learn (and, through RecordingExecutor, store) the declared catalog at startup, also when not auto
         executor.list_analyzers()
     except Exception:  # noqa: BLE001 - the runner may be unavailable now; every job asks again
         logger.exception("startup: could not list the analyzers (continuing)")
-    processed, next_schedule, iterations = 0, 0.0, 0
+    processed, next_schedule, next_sweep, iterations = 0, 0.0, clock() + sweep_every_s, 0
     while not stop.is_set() and (max_iterations is None or iterations < max_iterations):
         iterations += 1
         try:
+            if clock() >= next_sweep:   # safety net: 'running' jobs older than the stuck limit (single worker)
+                next_sweep = clock() + sweep_every_s
+                worker.sweep_stuck()
             if auto and clock() >= next_schedule:
                 next_schedule = clock() + schedule_every_s
                 counts = scheduler.schedule_once(store, executor.list_analyzers(), auto=True,
@@ -69,6 +76,7 @@ def run_loop(store: Any, executor: Any, worker: Worker, stop: threading.Event, *
                 continue
         except Exception:  # noqa: BLE001 - keep the service alive; the next pass retries
             logger.exception("loop error")
+            worker.abandon_claimed()   # a job claimed when the error hit goes back to the queue, never stays 'running'
         stop.wait(poll_s)
     return processed
 
