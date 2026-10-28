@@ -18,7 +18,7 @@ profile in use. Contract: `docs/bag_analysis_contract_2026-10-28.md`. Plan: `web
 ## Configuration (`packages/config.py`, section "Bag analysis"; all defaults safe)
 
 `BAG_ANALYSIS_ENABLED` (false: the service idles), `BAG_ANALYSIS_AUTO` (false: the scheduler enqueues nothing), `BAG_ANALYSIS_SCRATCH_DIR` (/scratch),
-`BAG_ANALYSIS_RUN_ANALYSIS` (/opt/analysis/run_analysis.py), `BAG_ANALYSIS_BUCKET` (analysis), `BAG_ANALYSIS_POLL_S` (30), `BAG_ANALYSIS_SCHEDULE_EVERY_S` (300),
+`BAG_ANALYSIS_RUN_ANALYSIS` (/opt/navstack/sati_benchmark/analysis/run_analysis.py), `BAG_ANALYSIS_BUCKET` (analysis), `BAG_ANALYSIS_POLL_S` (30), `BAG_ANALYSIS_SCHEDULE_EVERY_S` (300),
 `BAG_ANALYSIS_JOB_TIMEOUT_S` (7200), `BAG_ANALYSIS_MEMORY_MB` (0 = no RLIMIT_AS), `BAG_ANALYSIS_STUCK_AFTER_S` (10800), `BAG_ANALYSIS_MAX_ATTEMPTS` (3),
 `BAG_ANALYSIS_FAILED_RETRY_AFTER_S` (86400), `BAG_ANALYSIS_DISK_MARGIN_BYTES` (2 GiB), `BAG_ANALYSIS_MAX_OBJECT_BYTES` (30 GiB), `BAG_ANALYSIS_MAX_UNTAR_BYTES` (40 GiB),
 `BAG_ANALYSIS_MAX_TAR_MEMBERS` (2000), `BAG_ANALYSIS_MAX_ENVELOPE_BYTES` (256 KiB), `BAG_ANALYSIS_MAX_ARTIFACT_BYTES` (200 MiB).

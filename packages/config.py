@@ -1136,7 +1136,7 @@ BAG_ANALYSIS_AUTO = _env_bool("BAG_ANALYSIS_AUTO", "false")
 # Dedicated scratch directory (its own volume): the bag tar is streamed and extracted here, deleted after each job.
 BAG_ANALYSIS_SCRATCH_DIR = os.getenv("BAG_ANALYSIS_SCRATCH_DIR", "/scratch")
 # The analysis image's entry point (argv[0] of the executor is python3, argv[1] is this path).
-BAG_ANALYSIS_RUN_ANALYSIS = os.getenv("BAG_ANALYSIS_RUN_ANALYSIS", "/opt/analysis/run_analysis.py")
+BAG_ANALYSIS_RUN_ANALYSIS = os.getenv("BAG_ANALYSIS_RUN_ANALYSIS", "/opt/navstack/sati_benchmark/analysis/run_analysis.py")
 # Object store bucket for result artifacts: <robot>/<bag_id>/<analyzer>/<profile>/v<analyzer_version>_x<extractor_version>/<path>
 BAG_ANALYSIS_BUCKET = os.getenv("BAG_ANALYSIS_BUCKET", "analysis")
 BAG_ANALYSIS_POLL_S = float(os.getenv("BAG_ANALYSIS_POLL_S", "30"))
