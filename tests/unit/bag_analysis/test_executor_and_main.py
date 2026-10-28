@@ -43,8 +43,9 @@ def runner(tmp_path):
 def test_scrub_env_drops_secrets_keeps_ros():
     env = ex.scrub_env({"PATH": "/x", "POSTGRES_PASSWORD": "s", "MINIO_SECRET_KEY": "s", "ARANGO_PASSWORD": "s",
                         "ROS_DISTRO": "humble", "AMENT_PREFIX_PATH": "/opt", "LD_LIBRARY_PATH": "/l", "HOME": "/root",
-                        "RANDOM_THING": "1"}, home="/h")
-    assert set(env) == {"PATH", "ROS_DISTRO", "AMENT_PREFIX_PATH", "LD_LIBRARY_PATH", "PYTHONDONTWRITEBYTECODE", "HOME"}
+                        "RANDOM_THING": "1", "SATI_ANALYSIS_IMAGE": "sati/navstack-analysis:runner-humble-x86"}, home="/h")
+    assert set(env) == {"PATH", "ROS_DISTRO", "AMENT_PREFIX_PATH", "LD_LIBRARY_PATH", "PYTHONDONTWRITEBYTECODE", "HOME",
+                        "SATI_ANALYSIS_IMAGE"}
     assert env["HOME"] == "/h"
 
 

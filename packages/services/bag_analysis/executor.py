@@ -34,7 +34,7 @@ logger = logging.getLogger("bag_analysis.executor")
 
 LOG_TAIL_BYTES = 8000
 ENV_ALLOW_EXACT = ("PATH", "LANG", "TZ", "LD_LIBRARY_PATH", "PYTHONPATH", "CMAKE_PREFIX_PATH", "PKG_CONFIG_PATH",
-                   "PYTHONHASHSEED")
+                   "PYTHONHASHSEED", "SATI_ANALYSIS_IMAGE")
 ENV_ALLOW_PREFIX = ("LC_", "ROS_", "AMENT_", "COLCON_", "RMW_", "RCUTILS_", "BAG_ANALYSIS_TOOLS")
 
 
