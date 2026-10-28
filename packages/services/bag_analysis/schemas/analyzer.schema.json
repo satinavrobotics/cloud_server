@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://satinavrobotics.com/schemas/bag-analysis/analyzer/1",
+  "title": "Analyzer manifest (analyzer.yaml), contract 1 (PROPOSAL 2026-10-28)",
+  "type": "object",
+  "required": ["contract", "id", "version", "title", "owner", "applies_to", "inputs", "profiles", "adapter", "metrics"],
+  "additionalProperties": false,
+  "properties": {
+    "contract": {"const": 1},
+    "id": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,39}$"},
+    "version": {"type": "integer", "minimum": 1, "description": "Bump when any metric's meaning or value for the same input changes."},
+    "title": {"type": "string"},
+    "description": {"type": "string"},
+    "owner": {"type": "string", "description": "Team that answers for what the numbers mean."},
+    "requires": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"extractor": {"type": "integer", "minimum": 1, "description": "Minimum extractor_version."}}
+    },
+    "applies_to": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A bag that does not match ends as status n/a, never as error.",
+      "properties": {
+        "description_regex": {"type": "string"},
+        "bag_id_regex": {"type": "string"},
+        "topics_all": {"type": "array", "items": {"type": "string"}, "description": "Topics that must exist in metadata.yaml."}
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["x"],
+      "additionalProperties": false,
+      "description": "required | optional | none, per input. x = extractor output dir, bag = rosbag2 dir (read-only).",
+      "properties": {
+        "x": {"enum": ["required"]},
+        "bag": {"enum": ["required", "optional", "none"]},
+        "params": {"enum": ["required", "optional", "none"]},
+        "episodes": {"enum": ["required", "optional", "none"]},
+        "vda_log": {"enum": ["required", "optional", "none"]}
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{0,39}$"},
+      "description": "Named run configurations. 'default' is required. A profile is part of the result key, so legacy flag sets stay reproducible next to the current one.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["argv"],
+        "additionalProperties": false,
+        "properties": {
+          "description": {"type": "string"},
+          "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Placeholders: {tools} {bag} {x} {out} {bag_id}. Never a shell string."},
+          "optional_argv": {
+            "type": "object",
+            "description": "Appended only when that input is present: input name -> argv fragment with placeholders {params} {episodes} {vda_log}.",
+            "additionalProperties": {"type": "array", "items": {"type": "string"}}
+          },
+          "timeout_s": {"type": "integer", "minimum": 1},
+          "memory_mb": {"type": "integer", "minimum": 64}
+        }
+      }
+    },
+    "adapter": {
+      "type": "string",
+      "description": "Module (relative to the manifest) with build_result(ctx) -> dict (status, notes, metrics, tables, artifacts). Python stdlib only."
+    },
+    "metrics": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{1,59}$"},
+      "description": "Every metric the result may carry, declared once here, not in each result.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["unit", "direction", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "unit": {"enum": ["s", "m", "rad", "share", "count", "ratio", "m/s", "none"]},
+          "direction": {"enum": ["lower_is_better", "higher_is_better", "neutral"]},
+          "description": {"type": "string"},
+          "headline": {"type": "boolean", "description": "Show as a tile by default."}
+        }
+      }
+    }
+  }
+}

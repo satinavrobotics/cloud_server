@@ -1125,3 +1125,38 @@ NAVSTACK_SWITCH_POLL_S = float(os.getenv("NAVSTACK_SWITCH_POLL_S", "3.0"))
 NAVSTACK_SWITCH_TIMEOUT_S = float(os.getenv("NAVSTACK_SWITCH_TIMEOUT_S", str(10 * 60)))
 NAVSTACK_VERIFY_POLL_S = float(os.getenv("NAVSTACK_VERIFY_POLL_S", "2.0"))
 NAVSTACK_VERIFY_TIMEOUT_S = float(os.getenv("NAVSTACK_VERIFY_TIMEOUT_S", "120.0"))
+
+# ==================== Bag analysis (packages/services/bag_analysis, docs/bag_analysis_server_2026-10-28.md) ====================
+# The service is OFF unless BAG_ANALYSIS_ENABLED is set AND the compose profile `analysis` is selected. It never
+# starts from any profile in docker_compose/profiles/*.env.
+BAG_ANALYSIS_ENABLED = _env_bool("BAG_ANALYSIS_ENABLED", "false")
+# Scheduler: enqueue jobs by itself for run recordings (part nav) that lack a result for the current
+# (analyzer, version, profile, extractor_version). OFF until the owner decides; jobs can still be requested.
+BAG_ANALYSIS_AUTO = _env_bool("BAG_ANALYSIS_AUTO", "false")
+# Dedicated scratch directory (its own volume): the bag tar is streamed and extracted here, deleted after each job.
+BAG_ANALYSIS_SCRATCH_DIR = os.getenv("BAG_ANALYSIS_SCRATCH_DIR", "/scratch")
+# The analysis image's entry point (argv[0] of the executor is python3, argv[1] is this path).
+BAG_ANALYSIS_RUN_ANALYSIS = os.getenv("BAG_ANALYSIS_RUN_ANALYSIS", "/opt/analysis/run_analysis.py")
+# Object store bucket for result artifacts: <robot>/<bag_id>/<analyzer>/<profile>/v<analyzer_version>_x<extractor_version>/<path>
+BAG_ANALYSIS_BUCKET = os.getenv("BAG_ANALYSIS_BUCKET", "analysis")
+BAG_ANALYSIS_POLL_S = float(os.getenv("BAG_ANALYSIS_POLL_S", "30"))
+# Scheduler pass interval (only used with BAG_ANALYSIS_AUTO).
+BAG_ANALYSIS_SCHEDULE_EVERY_S = float(os.getenv("BAG_ANALYSIS_SCHEDULE_EVERY_S", "300"))
+# One runner invocation (extraction + all analyzers of the job) is killed after this.
+BAG_ANALYSIS_JOB_TIMEOUT_S = float(os.getenv("BAG_ANALYSIS_JOB_TIMEOUT_S", "7200"))
+# Address-space limit (RLIMIT_AS) of the runner process in MB; 0 = none (the container memory cap still applies).
+BAG_ANALYSIS_MEMORY_MB = int(os.getenv("BAG_ANALYSIS_MEMORY_MB", "0"))
+# A job 'running' longer than this is put back in the queue at startup (a crashed worker); at MAX_ATTEMPTS it fails.
+BAG_ANALYSIS_STUCK_AFTER_S = float(os.getenv("BAG_ANALYSIS_STUCK_AFTER_S", "10800"))
+BAG_ANALYSIS_MAX_ATTEMPTS = int(os.getenv("BAG_ANALYSIS_MAX_ATTEMPTS", "3"))
+# The scheduler does not re-enqueue a recording whose auto job failed within this window.
+BAG_ANALYSIS_FAILED_RETRY_AFTER_S = float(os.getenv("BAG_ANALYSIS_FAILED_RETRY_AFTER_S", "86400"))
+# Disk guard: refuse a bag when free space on the scratch volume < 2 x object size + this margin.
+BAG_ANALYSIS_DISK_MARGIN_BYTES = int(os.getenv("BAG_ANALYSIS_DISK_MARGIN_BYTES", str(2 * 1024 ** 3)))
+# Hard limits: the object itself, the bytes and the number of members the tar may expand to.
+BAG_ANALYSIS_MAX_OBJECT_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_OBJECT_BYTES", str(30 * 1024 ** 3)))
+BAG_ANALYSIS_MAX_UNTAR_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_UNTAR_BYTES", str(40 * 1024 ** 3)))
+BAG_ANALYSIS_MAX_TAR_MEMBERS = int(os.getenv("BAG_ANALYSIS_MAX_TAR_MEMBERS", "2000"))
+# Result limits (server-side checks the schema cannot express).
+BAG_ANALYSIS_MAX_ENVELOPE_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_ENVELOPE_BYTES", str(256 * 1024)))
+BAG_ANALYSIS_MAX_ARTIFACT_BYTES = int(os.getenv("BAG_ANALYSIS_MAX_ARTIFACT_BYTES", str(200 * 1024 ** 2)))
