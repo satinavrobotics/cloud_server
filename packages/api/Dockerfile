@@ -26,6 +26,9 @@ COPY packages/topomap_dbs/ /app/packages/topomap_dbs/
 COPY packages/services/mission_planner/client.py /app/packages/services/mission_planner/
 COPY packages/services/mission_planner/__init__.py /app/packages/services/mission_planner/
 
+# Bag analysis store (packages/api/bag_analysis.py imports packages.services.bag_analysis.store; the worker itself is its own image)
+COPY packages/services/bag_analysis/ /app/packages/services/bag_analysis/
+
 # Copy livekit client library (not the full service)
 COPY packages/services/livekit/client.py /app/packages/services/livekit/
 COPY packages/services/livekit/__init__.py /app/packages/services/livekit/
