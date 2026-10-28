@@ -282,6 +282,63 @@ services:
       minio:
         condition: service_healthy
 
+  # Bag analysis worker (docs/bag_analysis_server_2026-10-28.md). NOT part of any COMPOSE_PROFILES in use
+  # (docker_compose/profiles/*.env): it starts only with COMPOSE_PROFILES=analysis (or --profile analysis), and even
+  # then idles unless BAG_ANALYSIS_ENABLED=true. No Docker socket, no ports, no host mounts except the scratch volume.
+  # BAG_ANALYSIS_IMAGE should be a worker built FROM the analysis image (Dockerfile header); the default image has
+  # no runner and can only fail jobs. BAG_ANALYSIS_SCRATCH_VOLUME: a named volume (default) or an absolute host
+  # directory owned by uid 10001.
+  bag-analysis-service:
+    profiles: ["analysis"]
+    build:
+      context: ..
+      dockerfile: packages/services/bag_analysis/Dockerfile
+      args:
+        BASE_IMAGE: ${BAG_ANALYSIS_BASE_IMAGE:-python:3.10-slim}
+    image: ${BAG_ANALYSIS_IMAGE:-bag_analysis_service:latest}
+    command: ["python", "-m", "packages.services.bag_analysis.main"]
+    environment:
+      - MINIO_HOST=localhost
+      - MINIO_PORT=${MINIO_PORT:-9000}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - MINIO_SECURE=false
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DATABASE_PORT=${POSTGRES_DATABASE_PORT}
+      - POSTGRES_DATABASE_NAME=${POSTGRES_DATABASE_NAME}
+      - POSTGRES_DATABASE_USERNAME=${POSTGRES_DATABASE_USERNAME}
+      - POSTGRES_DATABASE_PASSWORD=${POSTGRES_DATABASE_PASSWORD}
+      - BAG_ANALYSIS_ENABLED=${BAG_ANALYSIS_ENABLED:-false}
+      - BAG_ANALYSIS_AUTO=${BAG_ANALYSIS_AUTO:-false}
+      - BAG_ANALYSIS_SCRATCH_DIR=/scratch
+      - BAG_ANALYSIS_RUN_ANALYSIS=${BAG_ANALYSIS_RUN_ANALYSIS:-/opt/analysis/run_analysis.py}
+      - BAG_ANALYSIS_BUCKET=${BAG_ANALYSIS_BUCKET:-analysis}
+      - BAG_ANALYSIS_POLL_S=${BAG_ANALYSIS_POLL_S:-30}
+      - BAG_ANALYSIS_JOB_TIMEOUT_S=${BAG_ANALYSIS_JOB_TIMEOUT_S:-7200}
+      - BAG_ANALYSIS_DISK_MARGIN_BYTES=${BAG_ANALYSIS_DISK_MARGIN_BYTES:-2147483648}
+      - BAG_ANALYSIS_MAX_OBJECT_BYTES=${BAG_ANALYSIS_MAX_OBJECT_BYTES:-32212254720}
+    network_mode: "host"
+    restart: unless-stopped
+    mem_limit: ${MEM_BAG_ANALYSIS:-8g}
+    memswap_limit: ${MEM_BAG_ANALYSIS:-8g}
+    cpus: ${CPUS_BAG_ANALYSIS:-2}
+    pids_limit: 512
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${BAG_ANALYSIS_SCRATCH_VOLUME:-bag_analysis_scratch}:/scratch
+    # A running runner is killed and its job handed back to the queue on SIGTERM (up to one poll of the process).
+    stop_grace_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
   # Create Mission Planner Service
   mission-planner-service:
     build:
@@ -626,6 +683,8 @@ services:
         condition: service_started
 
 volumes:
+  # Scratch of the optional bag-analysis worker (profile `analysis`); empty between jobs.
+  bag_analysis_scratch:
   arango_data:
   mission_dispatch_spill:
   mosquitto_data:
