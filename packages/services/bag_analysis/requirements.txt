@@ -1,0 +1,4 @@
+# Bag analysis worker. Same driver pins as graph_builder / mission-dispatch (psycopg 3.0.15, minio); jsonschema only here.
+psycopg[binary]==3.0.15
+minio>=7.2.0
+jsonschema==4.17.3

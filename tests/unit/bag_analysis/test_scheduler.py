@@ -16,6 +16,7 @@ def catalog(version=1, ext=1, **applies_to):
     m["version"] = version
     if applies_to:
         m["applies_to"] = applies_to
+    m["profiles"]["alt"] = copy.deepcopy(m["profiles"]["default"])  # generic mechanism; lost_time ships only default
     other = copy.deepcopy(m)
     other.update(id="other_tool", applies_to={"description_regex": "calibration"})
     return Catalog(ext, [m, other])
@@ -94,7 +95,7 @@ def test_request_validates_and_is_idempotent():
     store, cat = FakeStore([rec, recording(2, object_present=False), recording(3, part="raw")]), catalog()
     jid = scheduler.request(store, cat, rec["id"], None, "me")
     assert jid and scheduler.request(store, cat, rec["id"], None, "me") is None
-    assert scheduler.request(store, cat, rec["id"], ["lost_time:legacy_rules"], "me")
+    assert scheduler.request(store, cat, rec["id"], ["lost_time:alt"], "me")
     for args in (("nope",), (recording(2)["id"],), (recording(3)["id"],), (rec["id"], ["ghost"]),
                  (rec["id"], ["lost_time:nope"])):
         with pytest.raises(ValueError):

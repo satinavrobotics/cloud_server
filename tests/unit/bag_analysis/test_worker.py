@@ -238,3 +238,27 @@ def test_startup_sweep_requeues_stuck_and_removes_stale_scratch(tmp_path):
 
 def test_artifact_key_layout():
     assert artifact_key("odin1/b", "lt", "default", 3, 2, "x/y.md") == "odin1/b/lt/default/v3_x2/x/y.md"
+
+
+def test_params_dir_is_passed_when_present_and_absence_is_normal(tmp_path):
+    e = Env(tmp_path, tar=bag_tar(params=True))
+    assert e.go()[0] == "done"
+    assert list(e.executor.calls[0]["optional_inputs"]) == ["params"]
+    assert e.executor.calls[0]["optional_inputs"]["params"].name == "params"
+    assert list(e.store.results.values())[0]["inputs"]["server_passed"] == {"params": True}
+    e2 = Env(tmp_path / "old")
+    assert e2.go()[0] == "done" and e2.executor.calls[0]["optional_inputs"] == {}
+    assert list(e2.store.results.values())[0]["inputs"]["server_passed"] == {}
+
+
+def test_not_decodable_topics_become_a_note_and_runner_extractor_version_is_accepted(tmp_path):
+    def writer(adir):
+        (adir.parent.parent / "x").mkdir(exist_ok=True)
+        (adir.parent.parent / "x" / "meta.json").write_text(json.dumps({"not_decodable": ["/a", {"topic": "/b"}]}))
+        write_result(adir, lost_time_envelope(extractor_version=7))
+    e = Env(tmp_path, results={KEY: writer})
+    assert e.go()[0] == "done"
+    [row] = e.store.results.values()
+    assert row["extractor_version"] == 7 and row["status"] == "warn"   # not an error; catalog said 1
+    assert row["notes"][-1]["code"] == "extract.not_decodable" and "/a, /b" in row["notes"][-1]["text"]
+    assert all(n["code"] != "extract.not_decodable" for n in row["envelope"]["notes"])

@@ -157,14 +157,16 @@ class Worker:
             self._check_object(rec)
             work = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=str(self.scratch)))
             bag_dir = self._fetch(rec, work)
+            # Optional inputs the tar may carry: <bag>/params/ (newer bags; older ones have none, which is normal).
+            passed = {"params": bag_dir / "params"} if (bag_dir / "params").is_dir() else {}
             run = self.executor.run(bag_dir, work / "out", rec["bag_id"] or rec["storage_key"].split("/", 1)[-1],
-                                    [f"{a}:{p}" for a, p in entries], {})
+                                    [f"{a}:{p}" for a, p in entries], passed)
             tail = _tail(run.log_tail)
             if run.cancelled:
                 self.store.release(job_id)
                 return "queued"
             self._check_run(run)
-            self._ingest(rec, catalog, entries, run)
+            self._ingest(rec, catalog, entries, run, passed, work / "out")
             self.store.complete(job_id, tail)
             return "done"
         except JobFailed as e:
@@ -242,8 +244,9 @@ class Worker:
             raise JobFailed(f"the runner exited with {run.exit_code}", run.log_tail)
 
     def _ingest(self, rec: Mapping[str, Any], catalog: Catalog, entries: Sequence[Tuple[str, str]],
-                run: RunResult) -> None:
+                run: RunResult, passed: Mapping[str, Path], out_dir: Path) -> None:
         by_id = catalog.by_id()
+        extra_notes = self._not_decodable_note(out_dir)
         bag_id = rec["bag_id"] or rec["storage_key"].split("/", 1)[-1]
         for analyzer, profile in entries:
             manifest = by_id[analyzer]
@@ -256,7 +259,7 @@ class Worker:
                 try:
                     raw = (adir / "result.json").read_bytes() if not (adir / "result.json").is_symlink() else b""
                     envelope, errors = contract.check_result(
-                        raw, manifest, adir, bag_id=bag_id, profile=profile, extractor_version=catalog.extractor_version,
+                        raw, manifest, adir, bag_id=bag_id, profile=profile, extractor_version=None,  # the runner's own value is accepted (meta.json carries none yet)
                         max_envelope_bytes=self.max_envelope, max_artifact_bytes=self.max_artifact)
                 except OSError as e:
                     errors = [f"result.json unreadable: {e}"]
@@ -268,7 +271,26 @@ class Worker:
                 artifacts: List[Dict[str, Any]] = []
             else:
                 artifacts = self._upload(rec, envelope, adir)
-            self.store.insert_result(result_row(envelope, artifacts, rec["id"]))
+            row = result_row(envelope, artifacts, rec["id"])
+            # What the SERVER handed the runner, next to what the envelope claims in inputs.present.
+            row["inputs"] = dict(row["inputs"], server_passed={k: True for k in passed})
+            row["notes"] = list(row["notes"]) + extra_notes
+            self.store.insert_result(row)
+
+    @staticmethod
+    def _not_decodable_note(out_dir: Path) -> List[Dict[str, Any]]:
+        """Topics the extractor could not decode (x/meta.json `not_decodable`) are a note, never an error."""
+        try:
+            import json
+            topics = json.loads((out_dir / "x" / "meta.json").read_text()).get("not_decodable")
+        except (OSError, ValueError, AttributeError):
+            return []
+        if not topics:
+            return []
+        names = ", ".join(str(t.get("topic", t) if isinstance(t, dict) else t) for t in
+                          (topics if isinstance(topics, list) else [topics]))
+        return [{"code": "extract.not_decodable", "level": "info",
+                 "text": f"topics the extractor could not decode: {names}"[:500]}]
 
     def _upload(self, rec: Mapping[str, Any], envelope: Mapping[str, Any], adir: Path) -> List[Dict[str, Any]]:
         out = []

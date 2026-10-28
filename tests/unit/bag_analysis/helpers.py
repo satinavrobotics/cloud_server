@@ -66,6 +66,9 @@ def make_tar(members, path=None) -> bytes:
     return data
 
 
-def bag_tar(bag_name="20261004_200002_navstack_sati_odin", db3=b"x" * 100) -> bytes:
-    return make_tar([(bag_name, ("dir",)), (f"{bag_name}/metadata.yaml", b"rosbag2_bagfile_information: {}\n"),
-                     (f"{bag_name}/{bag_name}_0.db3", db3)])
+def bag_tar(bag_name="20261004_200002_navstack_sati_odin", db3=b"x" * 100, params=False) -> bytes:
+    members = [(bag_name, ("dir",)), (f"{bag_name}/metadata.yaml", b"rosbag2_bagfile_information: {}\n"),
+               (f"{bag_name}/{bag_name}_0.db3", db3)]
+    if params:
+        members += [(f"{bag_name}/params", ("dir",)), (f"{bag_name}/params/RUN.txt", b"git_describe: v1\n")]
+    return make_tar(members)
