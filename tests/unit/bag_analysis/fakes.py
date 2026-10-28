@@ -50,7 +50,7 @@ class FakeStore:
 
     def release(self, job_id):
         j = self.jobs[job_id]
-        j.update(status="queued", started_at=None, attempts=max(j["attempts"] - 1, 0))
+        j.update(status="queued", started_at=None, attempts=max(j["attempts"] - 1, 0), error=None)
 
     def requeue_stuck(self, older_than_s, max_attempts):
         requeued = failed = 0
@@ -105,7 +105,7 @@ class FakeStore:
 
     def recently_failed_recordings(self, since_s):
         return {j["recording_id"] for j in self.jobs.values()
-                if j["trigger"] == "auto" and j["status"] == "failed" and j["finished_at"] > self.now - since_s}
+                if j["status"] == "failed" and j["finished_at"] > self.now - since_s}
 
 
 class FakeObjects:

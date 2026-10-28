@@ -46,7 +46,7 @@ WHERE id = %(id)s::uuid AND status IN ('running', 'queued')
 
 RELEASE_SQL = """
 UPDATE analysis_jobs SET status = 'queued', started_at = NULL, attempts = GREATEST(attempts - 1, 0),
-       error = 'released: the worker was stopped while the job ran'
+       error = NULL
 WHERE id = %(id)s::uuid AND status = 'running'
 """
 
@@ -99,7 +99,8 @@ CANDIDATES_SQL = RECORDING_COLUMNS + "WHERE kind = 'run' AND part = 'nav' ORDER 
 RESULT_KEYS_SQL = ("SELECT recording_id::text, analyzer, analyzer_version, profile, extractor_version "
                    "FROM analysis_results")
 BUSY_SQL = "SELECT DISTINCT recording_id::text FROM analysis_jobs WHERE status IN ('queued', 'running')"
-FAILED_RECENT_SQL = ("SELECT DISTINCT recording_id::text FROM analysis_jobs WHERE trigger = 'auto' AND "
+# Any trigger: a failed on-request job must not be re-enqueued by the next auto pass (same bag, same failure).
+FAILED_RECENT_SQL = ("SELECT DISTINCT recording_id::text FROM analysis_jobs WHERE "
                      "status = 'failed' AND finished_at > now() - make_interval(secs => %(since_s)s)")
 
 
@@ -240,7 +241,7 @@ class PgStore:
         return self._run(go)
 
     def recently_failed_recordings(self, since_s: float) -> Set[str]:
-        """Recordings whose auto job failed in the last `since_s` seconds (not retried by the scheduler)."""
+        """Recordings with a failed job (auto or on request) in the last `since_s` seconds (not retried by the scheduler)."""
         def go(cur):
             cur.execute(FAILED_RECENT_SQL, {"since_s": float(since_s)})
             return {r["recording_id"] for r in cur.fetchall()}

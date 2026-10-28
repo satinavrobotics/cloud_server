@@ -168,7 +168,8 @@ def test_migration_store_jobs_and_results():
     with _connect() as conn:
         assert conn.execute("SELECT status FROM analysis_jobs WHERE id = ANY(%s::uuid[]) ORDER BY status",
                             ([got[0], got[1]],)).fetchall() == [("failed",), ("queued",)]
-    assert store.recently_failed_recordings(60) == set()
+    # the failed job above was an on-request one: it counts for the retry window too (any trigger)
+    assert rids[1] in store.recently_failed_recordings(60) and store.recently_failed_recordings(0) == set()
 
     # results: insert only; same key kept; error superseded; latest view picks the newest version
     r = rids[2]
@@ -203,5 +204,7 @@ def test_migration_store_jobs_and_results():
     job = store.claim_next()
     assert job["id"] == jid and job["attempts"] == 1
     store.release(jid)
+    with _connect() as conn:
+        assert conn.execute("SELECT status, error FROM analysis_jobs WHERE id = %s", (jid,)).fetchone() == ("queued", None)
     again = store.claim_next()
     assert again["id"] == jid and again["attempts"] == 1

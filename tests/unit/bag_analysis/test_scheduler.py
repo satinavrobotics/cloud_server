@@ -90,6 +90,16 @@ def test_recently_failed_not_retried_until_window_passes():
     assert run(store, catalog())["enqueued"] == 1
 
 
+def test_failed_on_request_job_also_suppresses_auto_pass():
+    store = FakeStore([recording(1)])
+    jid = store.enqueue(recording(1)["id"], None, "request")
+    store.claim_next()
+    store.fail(jid, "extraction failed")
+    assert run(store, catalog())["recently_failed"] == 1 and len(store.jobs) == 1
+    store.now += 4000
+    assert run(store, catalog())["enqueued"] == 1
+
+
 def test_request_validates_and_is_idempotent():
     rec = recording(1)
     store, cat = FakeStore([rec, recording(2, object_present=False), recording(3, part="raw")]), catalog()

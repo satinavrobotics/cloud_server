@@ -173,6 +173,13 @@ def test_cancel_releases_job_without_counting_attempt(tmp_path):
     e.executor.cancelled = True
     status, job = e.go()
     assert status == "queued" and job["status"] == "queued" and job["attempts"] == 0 and e.leftovers() == []
+    assert job["error"] is None
+
+
+def test_release_sql_clears_error_and_failed_sql_covers_any_trigger():
+    from packages.services.bag_analysis import store as st
+    assert "error = NULL" in st.RELEASE_SQL and "released:" not in st.RELEASE_SQL
+    assert "trigger" not in st.FAILED_RECENT_SQL
 
 
 def test_already_analysed_job_is_a_noop_and_error_result_is_rerun(tmp_path):
