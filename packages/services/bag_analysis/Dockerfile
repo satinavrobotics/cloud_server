@@ -28,4 +28,4 @@ USER 10001
 ENV PYTHONPATH=/app
 ENV PYTHONDONTWRITEBYTECODE=1
 
-CMD ["python", "-m", "packages.services.bag_analysis.main"]
+CMD ["python3", "-m", "packages.services.bag_analysis.main"]
