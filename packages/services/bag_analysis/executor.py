@@ -44,6 +44,7 @@ class Catalog:
     extractor_version: int
     analyzers: List[Dict[str, Any]]
     analysis_image: Optional[str] = None
+    tool_git_sha: Optional[str] = None             # the runner's `--list` reports it; stored with the declaration
     rejected: List[str] = field(default_factory=list)  # one line per manifest that failed validation
 
     def by_id(self) -> Dict[str, Dict[str, Any]]:
@@ -101,7 +102,9 @@ def parse_catalog(text: str) -> Catalog:
         else:
             seen.add(m["id"])
             good.append(m)
-    return Catalog(data["extractor_version"], good, data.get("analysis_image"), rejected)
+    sha = data.get("tool_git_sha")
+    return Catalog(data["extractor_version"], good, data.get("analysis_image"),
+                   sha if isinstance(sha, str) else None, rejected)
 
 
 def discover_dirs(out_dir: Path, only: Sequence[str] = ()) -> Dict[Tuple[str, str], Path]:

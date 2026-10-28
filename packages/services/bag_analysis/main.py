@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from packages import config
 from packages.services.bag_analysis import scheduler
+from packages.services.bag_analysis.catalog import CatalogRecorder, RecordingExecutor
 from packages.services.bag_analysis.executor import SubprocessExecutor
 from packages.services.bag_analysis.store import PgStore, connect_from_config
 from packages.services.bag_analysis.worker import MinioObjects, Worker
@@ -26,9 +27,12 @@ logger = logging.getLogger("bag_analysis")
 
 def build_worker(stop: threading.Event) -> tuple:
     from minio import Minio
-    executor = SubprocessExecutor(config.BAG_ANALYSIS_RUN_ANALYSIS, timeout_s=config.BAG_ANALYSIS_JOB_TIMEOUT_S,
-                                  memory_mb=config.BAG_ANALYSIS_MEMORY_MB, should_stop=stop.is_set)
     store = PgStore(connect_from_config)
+    # every catalog the runner lists is also stored (analysis_catalog), so the API can serve declared metadata
+    executor = RecordingExecutor(SubprocessExecutor(config.BAG_ANALYSIS_RUN_ANALYSIS,
+                                                    timeout_s=config.BAG_ANALYSIS_JOB_TIMEOUT_S,
+                                                    memory_mb=config.BAG_ANALYSIS_MEMORY_MB, should_stop=stop.is_set),
+                                 CatalogRecorder(store))
     client = Minio(f"{config.MINIO_HOST}:{config.MINIO_PORT}", access_key=config.require_secret("MINIO_ACCESS_KEY"),
                    secret_key=config.require_secret("MINIO_SECRET_KEY"), secure=config.MINIO_SECURE)
     worker = Worker(store, executor, MinioObjects(client), scratch_dir=config.BAG_ANALYSIS_SCRATCH_DIR,
@@ -46,6 +50,10 @@ def run_loop(store: Any, executor: Any, worker: Worker, stop: threading.Event, *
              max_iterations: Optional[int] = None) -> int:
     """The service loop; returns the number of jobs processed. `max_iterations` is for tests."""
     worker.startup_sweep()
+    try:  # learn (and, through RecordingExecutor, store) the declared catalog at startup, also when not auto
+        executor.list_analyzers()
+    except Exception:  # noqa: BLE001 - the runner may be unavailable now; every job asks again
+        logger.exception("startup: could not list the analyzers (continuing)")
     processed, next_schedule, iterations = 0, 0.0, 0
     while not stop.is_set() and (max_iterations is None or iterations < max_iterations):
         iterations += 1

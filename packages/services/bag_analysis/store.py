@@ -124,6 +124,24 @@ SELECT analyzer, profile, array_agg(DISTINCT k ORDER BY k) AS metrics
 FROM analysis_latest, jsonb_object_keys(metrics) AS k GROUP BY analyzer, profile
 """
 
+UPSERT_CATALOG_SQL = """
+INSERT INTO analysis_catalog (analyzer, analyzer_version, decl_hash, title, owner, description, profiles, metrics,
+                              extractor_version, analysis_image, tool_git_sha)
+VALUES (%(analyzer)s, %(analyzer_version)s, %(decl_hash)s, %(title)s, %(owner)s, %(description)s, %(profiles)s,
+        %(metrics)s, %(extractor_version)s, %(analysis_image)s, %(tool_git_sha)s)
+ON CONFLICT (analyzer, analyzer_version, decl_hash) DO UPDATE SET
+  last_seen_at = now(), title = EXCLUDED.title, owner = EXCLUDED.owner, description = EXCLUDED.description,
+  profiles = EXCLUDED.profiles, extractor_version = EXCLUDED.extractor_version,
+  analysis_image = EXCLUDED.analysis_image, tool_git_sha = EXCLUDED.tool_git_sha
+RETURNING (xmax = 0) AS inserted
+"""
+# newest-seen declaration per (analyzer, analyzer_version)
+DECLARATIONS_SQL = """
+SELECT DISTINCT ON (analyzer, analyzer_version) analyzer, analyzer_version, decl_hash, title, owner, description,
+       profiles, metrics, extractor_version, analysis_image, tool_git_sha, first_seen_at, last_seen_at
+FROM analysis_catalog ORDER BY analyzer, analyzer_version DESC, last_seen_at DESC, first_seen_at DESC
+"""
+
 _REC_LIST_COLUMNS = """
 SELECT id::text AS id, robot_name, group_key, part, storage_key, size_bytes, map_id, created_at,
        source #>> '{sidecar,description}' AS description, source #>> '{sidecar,bag_id}' AS bag_id,
@@ -236,6 +254,30 @@ class PgStore:
         def go(cur):
             cur.execute(INSERT_RESULT_SQL, params)
             return cur.fetchone() is not None
+        return self._run(go)
+
+    # ---- declared catalog ----
+
+    def upsert_catalog(self, entries: Sequence[Dict[str, Any]]) -> Tuple[int, int]:
+        """Store validated catalog entries (packages/services/bag_analysis/catalog.py). A known (analyzer,
+        version, declaration hash) only moves last_seen_at; a changed declaration is a new row. Returns
+        (inserted, seen_again)."""
+        from psycopg.types.json import Jsonb
+        rows = [dict(e, metrics=Jsonb(e["metrics"]), profiles=list(e["profiles"])) for e in entries]
+
+        def go(cur):
+            fresh = 0
+            for params in rows:
+                cur.execute(UPSERT_CATALOG_SQL, params)
+                fresh += 1 if cur.fetchone()["inserted"] else 0
+            return fresh, len(rows) - fresh
+        return self._run(go)
+
+    def declarations(self) -> List[Dict[str, Any]]:
+        """The newest-seen declaration per (analyzer, analyzer_version)."""
+        def go(cur):
+            cur.execute(DECLARATIONS_SQL)
+            return cur.fetchall()
         return self._run(go)
 
     def latest_results(self, recording_id: Optional[str] = None) -> List[Dict[str, Any]]:

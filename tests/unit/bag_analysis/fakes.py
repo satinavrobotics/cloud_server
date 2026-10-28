@@ -64,6 +64,30 @@ class FakeStore:
                     failed += 1
         return requeued, failed
 
+    # declared catalog (same semantics as the SQL: key (analyzer, version, decl_hash))
+    def upsert_catalog(self, entries):
+        if getattr(self, "fail_catalog", False):
+            raise OSError("database down")
+        self.catalog_rows = getattr(self, "catalog_rows", {})
+        fresh = 0
+        for e in entries:
+            key = (e["analyzer"], e["analyzer_version"], e["decl_hash"])
+            old = self.catalog_rows.get(key)
+            self.now += 1
+            if old is None:
+                self.catalog_rows[key] = dict(e, first_seen_at=self.now, last_seen_at=self.now)
+                fresh += 1
+            else:
+                old.update(e, last_seen_at=self.now)
+        return fresh, len(entries) - fresh
+
+    def declarations(self):
+        best = {}
+        for (a, v, _h), r in getattr(self, "catalog_rows", {}).items():
+            if (a, v) not in best or r["last_seen_at"] >= best[(a, v)]["last_seen_at"]:
+                best[(a, v)] = r
+        return [best[k] for k in sorted(best, key=lambda k: (k[0], -k[1]))]
+
     # results
     @staticmethod
     def _key(row):

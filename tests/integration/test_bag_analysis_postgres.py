@@ -1,4 +1,4 @@
-"""Migration 20261028_04 (analysis_jobs / analysis_results / analysis_latest) and the store SQL on a real PostgreSQL.
+"""Migrations 20261028_04 (analysis_jobs / analysis_results / analysis_latest) and 20261028_05 (analysis_catalog) and the store SQL on a real PostgreSQL.
 
 Opt-in: set BAG_ANALYSIS_TEST_DSN to a THROWAWAY database (never port 5432), e.g.
 
@@ -41,7 +41,7 @@ skip = pytest.mark.skipif(not DSN, reason="set BAG_ANALYSIS_TEST_DSN to a throwa
 
 SCHEMA = """
 DROP VIEW IF EXISTS analysis_latest, recording_events, recording_legs, recording_runs;
-DROP TABLE IF EXISTS analysis_results, analysis_jobs, recordings, run_legs, fleet_events, mission_runs CASCADE;
+DROP TABLE IF EXISTS analysis_catalog, analysis_results, analysis_jobs, recordings, run_legs, fleet_events, mission_runs CASCADE;
 CREATE TABLE mission_runs (run_id uuid PRIMARY KEY, mission_name text, robot_name text NOT NULL,
   started_at timestamptz NOT NULL, ended_at timestamptz);
 CREATE TABLE run_legs (run_id uuid REFERENCES mission_runs(run_id), seq int, robot_name text NOT NULL,
@@ -87,6 +87,11 @@ def _setup():
             present = conn.execute("SELECT to_regclass('analysis_results') IS NOT NULL, "
                                    "to_regclass('analysis_latest') IS NOT NULL").fetchone()
             assert present == (direction == "upgrade",) * 2
+        for direction in ("upgrade", "downgrade", "upgrade"):
+            for sql in migration_sql("20261028_05_analysis_catalog", direction):
+                conn.execute(sql)
+            present = conn.execute("SELECT to_regclass('analysis_catalog') IS NOT NULL").fetchone()
+            assert present == (direction == "upgrade",)
 
 
 def _recording(conn, n, part='nav'):
@@ -246,3 +251,62 @@ def test_migration_store_jobs_and_results():
     rest = store.recordings_page(100, after=(first_two[-1]["created_at"], first_two[-1]["id"]))
     assert [p["id"] for p in first_two + rest] == [p["id"] for p in page]
     assert store.recordings_page(10, robot="nobody") == [] and len(store.recordings_page(10, robot="r")) == 5
+
+
+def _entry(**over):
+    from packages.services.bag_analysis import catalog as cat
+    metrics = {"lost_s": {"unit": "s", "direction": "lower_is_better", "description": "d", "headline": True},
+               "goals_n": {"unit": "count", "direction": "neutral", "description": "n", "headline": False}}
+    e = {"analyzer": "lost_time", "analyzer_version": 1, "decl_hash": cat.declaration_hash(metrics),
+         "title": "Lost time ledger", "owner": "navstack-behaviour", "description": "x", "profiles": ["default"],
+         "metrics": metrics, "extractor_version": 1, "analysis_image": "img:1", "tool_git_sha": "5e06719f"}
+    e.update(over)
+    return e
+
+
+@skip
+def test_catalog_upsert_and_changed_declaration():
+    from packages.services.bag_analysis import catalog as cat
+    from packages.services.bag_analysis.store import PgStore
+    _setup()
+    store = PgStore(_connect)
+    assert store.declarations() == []
+
+    # first sight inserts; the same key again only moves last_seen_at (and refreshes the descriptive columns)
+    assert store.upsert_catalog([_entry()]) == (1, 0)
+    with _connect() as conn:
+        first, last = conn.execute("SELECT first_seen_at, last_seen_at FROM analysis_catalog").fetchone()
+    assert first == last
+    assert store.upsert_catalog([_entry(title="Renamed", analysis_image="img:2")]) == (0, 1)
+    with _connect() as conn:
+        rows = conn.execute("SELECT title, analysis_image, first_seen_at, last_seen_at FROM analysis_catalog").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "Renamed" and rows[0][1] == "img:2"
+    assert rows[0][2] == first and rows[0][3] > first
+
+    # a changed metric declaration under the same analyzer + version is a NEW row; the old one is kept
+    changed = _entry()["metrics"] | {"lost_s": {"unit": "m", "direction": "lower_is_better", "description": "d",
+                                                 "headline": True}}
+    assert store.upsert_catalog([_entry(metrics=changed, decl_hash=cat.declaration_hash(changed))]) == (1, 0)
+    with _connect() as conn:
+        assert conn.execute("SELECT count(*) FROM analysis_catalog").fetchone() == (2,)
+        assert conn.execute("SELECT count(*) FROM analysis_catalog WHERE metrics -> 'lost_s' ->> 'unit' = 's'").fetchone() == (1,)
+
+    # another version is another row; declarations() = newest-seen row per (analyzer, version)
+    assert store.upsert_catalog([_entry(analyzer_version=2)]) == (1, 0)
+    decls = store.declarations()
+    assert [(d["analyzer"], d["analyzer_version"]) for d in decls] == [("lost_time", 2), ("lost_time", 1)]
+    v1 = decls[1]
+    assert v1["metrics"]["lost_s"]["unit"] == "m"          # the changed declaration was seen last
+    assert v1["profiles"] == ["default"] and v1["tool_git_sha"] == "5e06719f" and v1["extractor_version"] == 1
+    # seeing the original declaration again makes it the newest-seen one, no third row
+    store.upsert_catalog([_entry()])
+    assert store.declarations()[1]["metrics"]["lost_s"]["unit"] == "s"
+    with _connect() as conn:
+        assert conn.execute("SELECT count(*) FROM analysis_catalog WHERE analyzer_version = 1").fetchone() == (2,)
+
+    # the table refuses a malformed hash / version
+    import psycopg
+    with pytest.raises(psycopg.errors.CheckViolation):
+        store.upsert_catalog([_entry(decl_hash="nothex")])
+    with pytest.raises(psycopg.errors.CheckViolation):
+        store.upsert_catalog([_entry(analyzer_version=0)])
