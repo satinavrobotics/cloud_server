@@ -116,7 +116,9 @@ class OrderPolicy(pydantic.BaseModel):
     deviation_xy_pass_m: float = 0.35
     deviation_xy_final_m: float = 0.35
     deviation_xy_start_m: float = 0.35
-    # allowedDeviationTheta (rad): heading is free on a pass-through node.
+    # allowedDeviationTheta (rad): heading is free on every route node (pass-through and
+    # last). The final value applies only where a heading is the point: a rotation move
+    # and an action order's start node.
     deviation_theta_pass_rad: float = 3.1416
     deviation_theta_final_rad: float = 0.785
     # A waypoint value of 0 means "not set" (sati-client used to send 0 explicitly);

@@ -74,7 +74,7 @@ File:line references are against the tree on 2026-10-08. "Unverified" marks clai
   - `resolve_deviation(value, is_final, has_actions, cfg)` returns `value` if it is > 0.
   - Otherwise it returns 0.1 when the node is final or carries actions, and 0.35 for a pass-through node.
   - The start node (robot pose, sequence 0) gets `ROUTE_START_DEVIATION_XY_M` (0.35), so the robot does not try to re-reach its own pose. If the start node carries actions, it gets 0.1.
-  - Theta: pass-through gets π (heading free), final gets 0.785. Confirm with the robot team.
+  - Theta: pass-through gets π (heading free); since 2026-10-28 so does the last node of a route order (a dead-end final heading forced a turn with no room). 0.785 (`..._FINAL_RAD`) now applies only to a rotation move and an action order's start node. A waypoint's own theta is still honoured.
 - **Planner** (`mission_planner/server.py:507-514`): drop the hardcoded 0.2 / 0.785 and set `node_id`.
 - **Client** (`missionApi.ts:240-254`): stop sending the deviation fields; update `__tests__/services/missionApi.test.ts`.
 - **Config:** `ROUTE_DEVIATION_XY_PASS_M=0.35`, `ROUTE_DEVIATION_XY_FINAL_M=0.35` (was 0.1 until 2026-10-09), `ROUTE_START_DEVIATION_XY_M=0.35`, `ROUTE_DEVIATION_THETA_PASS_RAD=3.1416`, `ROUTE_DEVIATION_THETA_FINAL_RAD=0.785`, `ROUTE_DEVIATION_ZERO_IS_UNSET=true`.
