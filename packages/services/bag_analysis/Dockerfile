@@ -10,6 +10,9 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
+# The analysis image ends as USER analyst: install into the system site as root (a user install would land in
+# analyst's home, which the unprivileged runtime user cannot read).
+USER root
 COPY packages/services/bag_analysis/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
