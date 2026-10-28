@@ -89,11 +89,11 @@ def _setup():
             assert present == (direction == "upgrade",) * 2
 
 
-def _recording(conn, n):
+def _recording(conn, n, part='nav'):
     rid = str(uuid.uuid4())
     conn.execute("INSERT INTO recordings (id, kind, robot_name, during, group_key, part, storage_bucket, storage_key, "
-                 "size_bytes, source) VALUES (%s, 'run', 'r', 'empty', %s, 'nav', 'rosbags', %s, 10, %s)",
-                 (rid, f"g{n}", f"r/b{n}", json.dumps({"object_present": True, "sidecar": {"bag_id": f"b{n}",
+                 "size_bytes, source) VALUES (%s, 'run', 'r', 'empty', %s, %s, 'rosbags', %s, 10, %s)",
+                 (rid, f"g{n}", part, f"r/b{n}", json.dumps({"object_present": True, "sidecar": {"bag_id": f"b{n}",
                                                                                           "description": "x"}})))
     conn.commit()
     return rid
@@ -192,4 +192,16 @@ def test_migration_store_jobs_and_results():
     # candidates and get_recording read the registry's sidecar fields
     rec = store.get_recording(r)
     assert rec["bag_id"] == "b2" and rec["object_present"] is True and rec["storage_key"] == "r/b2"
-    assert len(store.candidate_recordings()) == 4
+    with _connect() as conn:
+        _recording(conn, 9, part="raw")
+    assert len(store.candidate_recordings()) == 4  # the raw part is not a candidate
+
+    # release hands a running job back without counting the attempt
+    while store.claim_next():
+        pass
+    jid = store.enqueue(rids[3], ["rel"], "request")
+    job = store.claim_next()
+    assert job["id"] == jid and job["attempts"] == 1
+    store.release(jid)
+    again = store.claim_next()
+    assert again["id"] == jid and again["attempts"] == 1

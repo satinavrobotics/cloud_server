@@ -44,6 +44,12 @@ UPDATE analysis_jobs SET status = 'failed', finished_at = now(), error = %(error
 WHERE id = %(id)s::uuid AND status IN ('running', 'queued')
 """
 
+RELEASE_SQL = """
+UPDATE analysis_jobs SET status = 'queued', started_at = NULL, attempts = GREATEST(attempts - 1, 0),
+       error = 'released: the worker was stopped while the job ran'
+WHERE id = %(id)s::uuid AND status = 'running'
+"""
+
 REQUEUE_STUCK_SQL = """
 UPDATE analysis_jobs SET status = 'queued', started_at = NULL,
        error = 'requeued: stuck in running past the limit (worker died?)'
@@ -161,6 +167,10 @@ class PgStore:
 
     def fail(self, job_id: str, error: str, log_tail: Optional[str] = None) -> None:
         self._run(lambda cur: cur.execute(FAIL_SQL, {"id": job_id, "error": error, "log_tail": log_tail}))
+
+    def release(self, job_id: str) -> None:
+        """Give a running job back to the queue without counting the attempt (graceful shutdown)."""
+        self._run(lambda cur: cur.execute(RELEASE_SQL, {"id": job_id}))
 
     def requeue_stuck(self, older_than_s: float, max_attempts: int) -> Tuple[int, int]:
         """(requeued, failed): jobs 'running' for longer than `older_than_s`."""
