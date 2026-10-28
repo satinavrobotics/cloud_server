@@ -22,9 +22,10 @@ Everything in a result (notes, table cells, metric names, job errors and log tai
 returned as JSON data only; artifacts are served as attachments with a fixed content type, `nosniff` and a
 sandbox CSP, never as HTML.
 
-Catalog limits: the worker does not persist the runner's `--list` manifests, so the catalog is DERIVED from stored
-results: analyzers, profiles, versions, metric names. `unit`, `direction`, `headline`, `title` are declared in the
-manifest only and are `null` here until the worker stores its catalog (see the doc, "Open points").
+Catalog: stored results say which analyzers / profiles / versions / metric names exist; the declarations the worker
+stored from the runner's `--list` manifests (table analysis_catalog) add title, owner, description, profiles and per
+metric unit / direction / headline / description. A metric (or analyzer) without a stored declaration keeps null
+fields and `declared: false`. Analyzers that are declared but have no stored result yet are listed too.
 """
 import logging
 import re
@@ -142,27 +143,35 @@ class RequestOutcome(BaseModel):
 
 class CatalogMetric(BaseModel):
     name: str
-    unit: Optional[str] = Field(None, description="Manifest field; null while the catalog is derived")
-    direction: Optional[str] = Field(None, description="lower | higher | neutral; null while derived")
-    headline: Optional[bool] = Field(None, description="null while derived")
+    unit: Optional[str] = Field(None, description="Manifest enum: s m rad share count ratio m/s none; null when undeclared")
+    direction: Optional[str] = Field(None, description="Manifest enum: lower_is_better | higher_is_better | neutral; null when undeclared")
+    headline: Optional[bool] = Field(None, description="Show as a tile by default; null when undeclared")
     description: Optional[str] = None
+    declared: bool = Field(False, description="True when a stored manifest declaration supplied the fields above")
 
 
 class CatalogAnalyzer(BaseModel):
     analyzer: str
     profile: str
-    analyzer_version: int = Field(..., description="Highest stored")
+    analyzer_version: int = Field(..., description="Highest stored result version, else the declared one")
     analyzer_versions: List[int]
-    extractor_version: int = Field(..., description="Highest stored")
+    extractor_version: int = Field(..., description="Highest stored result version, else the declared one")
     recordings: int
     last_result_at: Optional[str] = None
-    title: Optional[str] = Field(None, description="Manifest field; null while the catalog is derived")
+    title: Optional[str] = Field(None, description="Manifest field; null when undeclared")
+    owner: Optional[str] = None
+    description: Optional[str] = None
+    declared: bool = Field(False, description="True when a stored manifest declaration matched this analyzer")
+    declared_version: Optional[int] = Field(None, description="analyzer_version of the declaration used")
+    declared_last_seen_at: Optional[str] = Field(None, description="When the worker last saw that declaration")
+    profiles: List[str] = Field(default_factory=list, description="Profile names the manifest declares")
     metrics: List[CatalogMetric]
 
 
 class Catalog(BaseModel):
-    source: str = Field(..., description="'derived': from stored results. 'declared' is reserved for a stored manifest catalog.")
-    declared: bool
+    source: str = Field(..., description="'declared' when any stored manifest declaration was used, else 'derived' "
+                                         "(from stored results only)")
+    declared: bool = Field(..., description="True when every analyzer listed has a declaration (and there is one)")
     analyzers: List[CatalogAnalyzer]
 
 
@@ -294,13 +303,66 @@ class AnalysisApi:
 
     # -- reads --
 
-    async def catalog(self) -> Catalog:
+    async def _catalog_rows(self):
+        """(summary rows from results, declarations by analyzer -> {version: row}); a store without declarations
+        (or a failing declarations read on an older schema) yields none."""
         rows = await _db(self.store.catalog_summary)
-        return Catalog(source="derived", declared=False, analyzers=[
-            CatalogAnalyzer(analyzer=r["analyzer"], profile=r["profile"], analyzer_version=r["analyzer_version"],
-                            analyzer_versions=list(r["analyzer_versions"]), extractor_version=r["extractor_version"],
-                            recordings=r["recordings"], last_result_at=_iso(r.get("last_result_at")),
-                            metrics=[CatalogMetric(name=m) for m in r["metrics"]]) for r in rows])
+        decls: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        for d in await _db(self.store.declarations):
+            decls.setdefault(d["analyzer"], {})[d["analyzer_version"]] = d
+        return rows, decls
+
+    @staticmethod
+    def _pick(decls: Dict[str, Dict[int, Dict[str, Any]]], analyzer: str, version: int) -> Optional[Dict[str, Any]]:
+        """The declaration of exactly this analyzer version, else the newest declared version."""
+        by_version = decls.get(analyzer)
+        if not by_version:
+            return None
+        return by_version.get(version) or by_version[max(by_version)]
+
+    async def catalog(self) -> Catalog:
+        rows, decls = await self._catalog_rows()
+        out: List[CatalogAnalyzer] = []
+        seen = set()
+        for r in rows:
+            seen.add((r["analyzer"], r["profile"]))
+            d = self._pick(decls, r["analyzer"], r["analyzer_version"])
+            if d is not None and r["profile"] not in (d.get("profiles") or []):
+                d = None  # the manifest has no such profile (any more): nothing is declared for this row
+            out.append(self._analyzer(r, d))
+        for analyzer, by_version in sorted(decls.items()):
+            d = by_version[max(by_version)]
+            for profile in d.get("profiles") or []:
+                if (analyzer, profile) not in seen:
+                    out.append(self._analyzer({"analyzer": analyzer, "profile": profile,
+                                               "analyzer_version": d["analyzer_version"],
+                                               "analyzer_versions": [], "extractor_version": d.get("extractor_version") or 0,
+                                               "recordings": 0, "last_result_at": None, "metrics": []}, d))
+        out.sort(key=lambda a: (a.analyzer, a.profile))
+        used = any(a.declared for a in out)
+        return Catalog(source="declared" if used else "derived",
+                       declared=bool(out) and all(a.declared for a in out), analyzers=out)
+
+    @staticmethod
+    def _analyzer(r: Dict[str, Any], d: Optional[Dict[str, Any]]) -> CatalogAnalyzer:
+        declared_metrics = (d or {}).get("metrics") or {}
+        metrics = []
+        for name in sorted(set(r["metrics"]) | set(declared_metrics)):
+            m = declared_metrics.get(name)
+            if isinstance(m, dict):
+                metrics.append(CatalogMetric(name=name, unit=m.get("unit"), direction=m.get("direction"),
+                                             headline=bool(m.get("headline", False)), description=m.get("description"),
+                                             declared=True))
+            else:
+                metrics.append(CatalogMetric(name=name))
+        return CatalogAnalyzer(
+            analyzer=r["analyzer"], profile=r["profile"], analyzer_version=r["analyzer_version"],
+            analyzer_versions=list(r["analyzer_versions"]), extractor_version=r["extractor_version"],
+            recordings=r["recordings"], last_result_at=_iso(r.get("last_result_at")),
+            title=(d or {}).get("title"), owner=(d or {}).get("owner"), description=(d or {}).get("description"),
+            declared=d is not None, declared_version=d["analyzer_version"] if d else None,
+            declared_last_seen_at=_iso(d.get("last_seen_at")) if d else None,
+            profiles=list((d or {}).get("profiles") or []), metrics=metrics)
 
     async def results(self, recording_id: str, history: bool) -> RecordingAnalyses:
         rid = (await self._recording(recording_id))["id"]
@@ -362,14 +424,14 @@ class AnalysisApi:
         entries = sorted(set(body.analyzers)) if body.analyzers else None
         if entries:
             known: Dict[str, set] = {}
-            for r in await _db(self.store.catalog_summary):
-                known.setdefault(r["analyzer"], set()).add(r["profile"])
+            for a in (await self.catalog()).analyzers:  # stored results and declared manifests
+                known.setdefault(a.analyzer, set()).add(a.profile)
             for entry in entries:
                 aid, _, profile = entry.partition(":")
                 if aid not in known or (profile and profile not in known[aid]):
                     raise HTTPException(422, [{"loc": ["body", "analyzers"], "type": "value_error",
-                                               "msg": f"unknown analyzer or profile {entry!r} (no stored result "
-                                                      "for it); omit `analyzers` to run everything that applies"}])
+                                               "msg": f"unknown analyzer or profile {entry!r} (not in the catalog: no stored "
+                                                      "result or declaration); omit `analyzers` to run everything that applies"}])
         by = (operator or "").strip()[:MAX_OPERATOR_LEN] or None
         job_id = await _db(self.store.enqueue, rec["id"], entries, "request", by)
         if job_id is not None:

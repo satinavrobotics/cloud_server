@@ -149,6 +149,76 @@ async def test_catalog_is_derived_from_stored_results():
     assert len(body["analyzers"]) == 2
 
 
+def declaration(analyzer="lost_time", av=1, profiles=("default",), **over):
+    d = {"analyzer": analyzer, "analyzer_version": av, "decl_hash": "0" * 64, "title": "Lost time ledger",
+         "owner": "navstack-behaviour", "description": "Per goal ...", "profiles": list(profiles),
+         "metrics": {"lost_s": {"unit": "s", "direction": "lower_is_better", "description": "goal_time_s - ideal_s.",
+                                "headline": True},
+                     "goals_n": {"unit": "count", "direction": "neutral", "description": "Goals scored.",
+                                 "headline": False},
+                     "never_seen": {"unit": "none", "direction": "neutral", "description": "", "headline": False}},
+         "extractor_version": 1, "analysis_image": "img", "tool_git_sha": "abc1234",
+         "first_seen_at": 1.0, "last_seen_at": T0}
+    d.update(over)
+    return d
+
+
+def declare(store, *decls):
+    store.catalog_rows = {(d["analyzer"], d["analyzer_version"], d["decl_hash"]): d for d in decls}
+
+
+async def test_catalog_serves_declared_metadata_and_keeps_undeclared_null():
+    store, api = make(results=[result(), result(analyzer="other", profile="fast", metrics={"x": 1})])
+    declare(store, declaration())
+    body = (await call(api, "GET", "/api/v1/analyses/catalog")).json()
+    assert body["source"] == "declared" and body["declared"] is False      # "other" has no declaration
+    lt = next(a for a in body["analyzers"] if a["analyzer"] == "lost_time")
+    assert lt["declared"] is True and lt["title"] == "Lost time ledger" and lt["owner"] == "navstack-behaviour"
+    assert lt["profiles"] == ["default"] and lt["declared_version"] == 1
+    m = {x["name"]: x for x in lt["metrics"]}
+    assert m["lost_s"] == {"name": "lost_s", "unit": "s", "direction": "lower_is_better", "headline": True,
+                           "description": "goal_time_s - ideal_s.", "declared": True}
+    assert m["goals_n"]["headline"] is False and m["never_seen"]["declared"] is True   # declared, no result yet
+    assert m["bad"]["declared"] is False and m["bad"]["unit"] is None and m["bad"]["headline"] is None
+    other = next(a for a in body["analyzers"] if a["analyzer"] == "other")
+    assert other["declared"] is False and other["title"] is None and other["metrics"][0]["unit"] is None
+
+
+async def test_catalog_fully_declared_flag_and_declared_only_analyzer():
+    store, api = make(results=[result(metrics={"lost_s": 1})])
+    declare(store, declaration(profiles=("default", "legacy")))
+    body = (await call(api, "GET", "/api/v1/analyses/catalog")).json()
+    assert body["declared"] is True
+    legacy = next(a for a in body["analyzers"] if a["profile"] == "legacy")
+    assert legacy["recordings"] == 0 and legacy["last_result_at"] is None and legacy["analyzer_versions"] == []
+    assert legacy["analyzer_version"] == 1 and legacy["declared"] is True
+
+
+async def test_catalog_picks_declaration_of_the_result_version_else_newest():
+    store, api = make(results=[result(av=1), result(av=2)])
+    declare(store, declaration(av=1, title="v1"), declaration(av=3, title="v3"))
+    lt = (await call(api, "GET", "/api/v1/analyses/catalog")).json()["analyzers"][0]
+    assert lt["analyzer_version"] == 2 and lt["title"] == "v3" and lt["declared_version"] == 3
+    store2, api2 = make(results=[result(av=1)])
+    declare(store2, declaration(av=1, title="v1"), declaration(av=3, title="v3"))
+    assert (await call(api2, "GET", "/api/v1/analyses/catalog")).json()["analyzers"][0]["title"] == "v1"
+
+
+async def test_catalog_profile_missing_from_manifest_stays_undeclared():
+    store, api = make(results=[result(profile="gone")])
+    declare(store, declaration())
+    row = next(a for a in (await call(api, "GET", "/api/v1/analyses/catalog")).json()["analyzers"] if a["profile"] == "gone")
+    assert row["declared"] is False and row["title"] is None
+
+
+async def test_declared_analyzer_without_results_can_be_requested():
+    store, api = make()
+    declare(store, declaration())
+    r = await call(api, "POST", BASE + "/analyses", json={"analyzers": ["lost_time:default"]})
+    assert r.status_code == 202, r.text
+    assert (await call(api, "POST", BASE + "/analyses", json={"analyzers": ["nope"]})).status_code == 422
+
+
 async def test_empty_catalog():
     _, api = make()
     assert (await call(api, "GET", "/api/v1/analyses/catalog")).json()["analyzers"] == []
