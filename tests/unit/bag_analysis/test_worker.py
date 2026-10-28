@@ -258,14 +258,131 @@ def test_params_dir_is_passed_when_present_and_absence_is_normal(tmp_path):
     assert list(e2.store.results.values())[0]["inputs"]["server_passed"] == {}
 
 
-def test_not_decodable_topics_become_a_note_and_runner_extractor_version_is_accepted(tmp_path):
+def test_not_decodable_topics_become_a_note(tmp_path):
     def writer(adir):
         (adir.parent.parent / "x").mkdir(exist_ok=True)
         (adir.parent.parent / "x" / "meta.json").write_text(json.dumps({"not_decodable": ["/a", {"topic": "/b"}]}))
-        write_result(adir, lost_time_envelope(extractor_version=7))
+        write_result(adir, lost_time_envelope())
     e = Env(tmp_path, results={KEY: writer})
     assert e.go()[0] == "done"
     [row] = e.store.results.values()
-    assert row["extractor_version"] == 7 and row["status"] == "warn"   # not an error; catalog said 1
+    assert row["extractor_version"] == 1 and row["status"] == "warn"   # not an error
     assert row["notes"][-1]["code"] == "extract.not_decodable" and "/a, /b" in row["notes"][-1]["text"]
     assert all(n["code"] != "extract.not_decodable" for n in row["envelope"]["notes"])
+
+
+def test_envelope_extractor_version_must_match_the_catalog(tmp_path):
+    e = Env(tmp_path, results={KEY: lambda adir: write_result(adir, lost_time_envelope(extractor_version=7))})
+    status, job = e.go()
+    [row] = e.store.results.values()
+    assert status == "done" and row["status"] == "error" and row["extractor_version"] == 1   # keyed on the catalog's
+    assert "extractor_version is 7" in json.dumps(row["notes"]) and "catalog reports 1" in json.dumps(row["notes"])
+
+
+def test_oversized_result_json_is_an_error_result_and_read_is_capped(tmp_path, monkeypatch):
+    def writer(adir):
+        (adir / "result.json").write_bytes(b"[" + b" " * 5000 + b"]")
+    reads = []
+    real = contract.read_capped
+    monkeypatch.setattr(contract, "read_capped", lambda p, n: reads.append(n) or real(p, n))
+    e = Env(tmp_path, results={KEY: writer}, max_envelope_bytes=1000)
+    status, _ = e.go()
+    [row] = e.store.results.values()
+    assert status == "done" and row["status"] == "error" and "over the 1000 byte cap" in json.dumps(row["notes"])
+    assert reads == [1000]
+
+
+def test_read_capped_reads_at_most_max_plus_one_and_refuses_symlinks(tmp_path):
+    f = tmp_path / "f"
+    f.write_bytes(b"x" * 100)
+    assert len(contract.read_capped(f, 10)) == 11 and contract.read_capped(f, 100) == b"x" * 100
+    (tmp_path / "l").symlink_to(f)
+    with pytest.raises(OSError):
+        contract.read_capped(tmp_path / "l", 10)
+
+
+def test_extraction_budget_is_free_space_minus_margin(tmp_path, monkeypatch):
+    seen = {}
+    real = safe_tar.extract_stream
+    monkeypatch.setattr(safe_tar, "extract_stream", lambda stream, dest, **kw: seen.update(kw) or real(stream, dest, **kw))
+    e = Env(tmp_path, disk_margin_bytes=1000, max_untar_bytes=10 ** 12)
+    e.worker.disk_free = lambda p: 100_000
+    e.go()
+    assert seen["max_bytes"] == 99_000
+    e2 = Env(tmp_path / "b", disk_margin_bytes=1000, max_untar_bytes=5000)   # the fixed cap still applies when lower
+    e2.go()
+    assert seen["max_bytes"] == 5000
+
+
+def test_extraction_over_free_space_fails_job(tmp_path):
+    e = Env(tmp_path, tar=bag_tar(db3=b"0" * 50_000), disk_margin_bytes=0)
+    free = iter([10_000_000, 10_000])        # the guard sees plenty, the extraction budget sees little
+    e.worker.disk_free = lambda p: next(free)
+    status, job = e.go()
+    assert status == "failed" and "unsafe or unreadable archive" in job["error"] and e.leftovers() == []
+
+
+def test_startup_sweep_requeues_every_running_job_whatever_its_age(tmp_path):
+    e = Env(tmp_path)
+    job = e.store.claim_next()                     # claimed a moment ago, the worker "dies"
+    assert e.worker.startup_sweep()["requeued"] == 1 and e.store.jobs[job["id"]]["status"] == "queued"
+
+
+def test_sweep_stuck_keeps_the_age_rule(tmp_path):
+    e = Env(tmp_path)
+    job = e.store.claim_next()
+    assert e.worker.sweep_stuck() == (0, 0) and e.store.jobs[job["id"]]["status"] == "running"
+    e.store.now += 20000
+    assert e.worker.sweep_stuck() == (1, 0) and e.store.jobs[job["id"]]["status"] == "queued"
+
+
+class Flaky:
+    """Wraps a store; the named methods raise `times` times first."""
+
+    def __init__(self, store, **times):
+        self._s, self.left = store, dict(times)
+
+    def __getattr__(self, name):
+        real = getattr(self._s, name)
+        if name not in self.left:
+            return real
+
+        def call(*a, **k):
+            if self.left[name] > 0:
+                self.left[name] -= 1
+                raise OSError("db blip")
+            return real(*a, **k)
+        return call
+
+
+def test_final_write_is_retried_with_backoff(tmp_path):
+    e = Env(tmp_path)
+    sleeps = []
+    e.worker.store = Flaky(e.store, complete=2)
+    e.worker._sleep = sleeps.append
+    status, job = e.go()
+    assert status == "done" and job["status"] == "done" and sleeps == [1.0, 2.0]
+
+
+def test_final_write_gives_up_after_the_retries_and_abandon_releases(tmp_path):
+    e = Env(tmp_path)
+    e.worker._sleep = lambda s: None
+    e.worker.store = Flaky(e.store, complete=99)
+    job = e.store.claim_next()
+    e.worker.claimed_id = job["id"]
+    with pytest.raises(OSError):
+        e.worker.process_job(job)
+    assert e.store.jobs[job["id"]]["status"] == "running"
+    e.worker.store = e.store                        # the database is back
+    e.worker.abandon_claimed()
+    assert e.store.jobs[job["id"]]["status"] == "queued" and e.worker.claimed_id is None
+
+
+def test_list_failure_hands_the_job_back_instead_of_failing_it(tmp_path):
+    e = Env(tmp_path)
+    e.executor.list_analyzers = lambda: (_ for _ in ()).throw(RuntimeError("image broken"))
+    job = e.store.claim_next()
+    assert e.worker.process_job(job) == "queued"
+    assert e.store.jobs[job["id"]]["status"] == "queued" and e.store.jobs[job["id"]]["attempts"] == 0
+    assert e.executor.calls == [] and e.worker.process_one() is None      # process_one claims nothing meanwhile
+    assert e.store.jobs[job["id"]]["status"] == "queued"

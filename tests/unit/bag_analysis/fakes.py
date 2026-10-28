@@ -55,7 +55,7 @@ class FakeStore:
     def requeue_stuck(self, older_than_s, max_attempts):
         requeued = failed = 0
         for j in self.jobs.values():
-            if j["status"] == "running" and j["started_at"] < self.now - older_than_s:
+            if j["status"] == "running" and j["started_at"] <= self.now - older_than_s:
                 if j["attempts"] < max_attempts:
                     j.update(status="queued", started_at=None)
                     requeued += 1

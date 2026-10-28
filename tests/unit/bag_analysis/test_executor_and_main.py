@@ -61,7 +61,7 @@ def test_parse_catalog_validates_and_rejects():
 def test_run_argv_is_a_list_and_rejects_unknown_inputs(tmp_path):
     e = ex.SubprocessExecutor("/opt/run_analysis.py")
     argv = e.run_argv(Path("/b"), Path("/o"), "id; rm -rf /", ["lost_time:default"], {"params": Path("/p")})
-    assert argv == ["python3", "/opt/run_analysis.py", "--bag", "/b", "--out", "/o", "--bag-id", "id; rm -rf /",
+    assert argv == ["python3", "/opt/run_analysis.py", "--bag", "/b", "--out", "/o", "--bag-id=id; rm -rf /",
                     "--only", "lost_time:default", "--params", "/p"]
     with pytest.raises(ValueError):
         e.run_argv(Path("/b"), Path("/o"), "x", [], {"evil": Path("/p")})
@@ -153,3 +153,61 @@ def test_loop_survives_errors_and_stops_on_event(tmp_path):
     stop = threading.Event()
     threading.Timer(0.3, stop.set).start()
     assert run_loop(store, execu, worker, stop, auto=False, poll_s=0.05, schedule_every_s=1, retry_failed_after_s=1) == 0
+
+
+# ---- review fixes: capped --list, RLIMIT_FSIZE, scrubbed environment block, sweeps in the loop ----
+
+def _script(tmp_path, body):
+    p = tmp_path / "r.py"
+    p.write_text(body)
+    return str(p)
+
+
+def test_list_output_over_the_cap_is_rejected_without_being_read_whole(tmp_path):
+    p = _script(tmp_path, "import sys\nsys.stdout.write('[' + ' ' * 5000 + ']')")
+    e = ex.SubprocessExecutor(p, python=sys.executable, env_source={"PATH": "/usr/bin:/bin"}, list_max_bytes=1000)
+    with pytest.raises((ValueError, RuntimeError)):      # RLIMIT_FSIZE stops the writer (exit by signal) or the cap trips
+        e.list_analyzers()
+
+
+def test_runner_file_size_limit_stops_a_runaway_writer(tmp_path):
+    p = _script(tmp_path, "import sys\nwith open('big', 'wb') as f:\n    f.write(b'x' * 100000)\n")
+    e = ex.SubprocessExecutor(p, python=sys.executable, env_source={"PATH": "/usr/bin:/bin"}, max_file_bytes=4096)
+    work = tmp_path / "w"
+    (work / "bag").mkdir(parents=True)
+    res = e.run(work / "bag", work / "out", "b", [], {})
+    assert res.exit_code not in (0, None)
+    assert (work / "out" / "big").stat().st_size <= 4096
+
+
+def test_scrub_environ_blanks_the_initial_environment_block(tmp_path):
+    import os
+    import subprocess
+    code = ("import os\nfrom packages.services.bag_analysis import secrets_scrub as s\n"
+            "s.scrub_environ(['SATI_SECRET_TEST'])\n"
+            "print(repr(os.environ.get('SATI_SECRET_TEST')), 'hunter2' in open('/proc/self/environ').read())")
+    if not os.path.exists("/proc/self/environ"):
+        pytest.skip("no /proc")
+    root = Path(__file__).resolve().parents[3]
+    out = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, timeout=60,
+                         env={"PATH": "/usr/bin:/bin", "SATI_SECRET_TEST": "hunter2", "PYTHONPATH": str(root)})
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["None", "False"]
+
+
+def test_loop_runs_the_periodic_sweep_and_releases_a_job_after_an_error(tmp_path):
+    rec = recording(1)
+    store = FakeStore([rec])
+    execu = ex.FakeExecutor(ex.Catalog(1, [lost_time_manifest()]), {("lost_time", "default"): lost_time_envelope()})
+    worker = Worker(store, execu, FakeObjects({("rosbags", "odin1/bag1"): bag_tar()}), scratch_dir=str(tmp_path / "s"),
+                    disk_free=lambda p: 10 ** 12, finalize_retries=1)
+    swept = []
+    worker.sweep_stuck = lambda: swept.append(1) or (0, 0)
+    jid = store.enqueue(rec["id"], None, "request")
+    real_complete = store.complete
+    store.complete = lambda *a, **k: (_ for _ in ()).throw(OSError("db blip"))   # the final write keeps failing
+    stop = threading.Event()
+    run_loop(store, execu, worker, stop, auto=False, poll_s=0.0, schedule_every_s=1, retry_failed_after_s=60,
+             max_iterations=1, sweep_every_s=-1)
+    assert swept and store.jobs[jid]["status"] == "queued"     # handed back, not left 'running'
+    store.complete = real_complete
