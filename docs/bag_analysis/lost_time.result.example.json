@@ -1,0 +1,159 @@
+{
+ "schema": 1,
+ "analyzer": "lost_time",
+ "analyzer_version": 1,
+ "profile": "default",
+ "extractor_version": 1,
+ "bag_id": "6ae7c4cf-89c6-4ce9-83d5-b1f9b9226378",
+ "status": "warn",
+ "notes": [
+  {
+   "code": "input.params_missing",
+   "level": "warn",
+   "text": "No params dump in the bag: nominal speeds taken from the tool defaults."
+  },
+  {
+   "code": "stack_build.unknown",
+   "level": "info",
+   "text": "The bag does not say which build recorded it; analysed with the newest analysis image."
+  }
+ ],
+ "producer": {
+  "tool_git_sha": "0000000",
+  "analysis_image": "sati/navstack-analysis:example",
+  "stack_build": null,
+  "command": [
+   "python3",
+   "lost_time_ledger.py",
+   "--bag",
+   "...",
+   "--goals",
+   "auto"
+  ],
+  "started_at": "2026-10-28T12:00:00Z",
+  "duration_s": 0
+ },
+ "inputs": {
+  "bag_dir": "20261004_200002_navstack_sati_odin",
+  "present": {
+   "params": false,
+   "episodes": false,
+   "vda_log": false
+  }
+ },
+ "metrics": {
+  "goal_time_s": 1009.4999999999999,
+  "ideal_s": 418.70000000000005,
+  "lost_s": 590.8123387870202,
+  "unjustified_s": 234.78906175722614,
+  "unjustified_share": 0.2325795559754593,
+  "detour_s": 154.1738963773393,
+  "unassigned_s": -1.4275980671779886,
+  "tick_identity_max_residual_s": 2.1600499167107046e-12,
+  "goals_n": 24,
+  "goals_reached_n": 22
+ },
+ "tables": {
+  "by_state": {
+   "title": "Lost seconds by state",
+   "columns": [
+    "state",
+    "justified_s",
+    "unjustified_s",
+    "unjudged_s",
+    "total_s"
+   ],
+   "rows": [
+    [
+     "safety_hold",
+     0.0,
+     0.7000000000000001,
+     0.0,
+     0.7000000000000001
+    ],
+    [
+     "look",
+     45.19999999999992,
+     16.44999999999998,
+     0.0,
+     61.64999999999996
+    ],
+    [
+     "maneuver",
+     66.35000000000015,
+     81.79999999999882,
+     0.0,
+     148.14999999999807
+    ],
+    [
+     "recovery_rung",
+     39.60000000000003,
+     19.24999999999998,
+     0.0,
+     58.85000000000013
+    ],
+    [
+     "standing",
+     47.249999999999865,
+     3.4500000000000006,
+     0.0,
+     50.69999999999988
+    ],
+    [
+     "slow_motion",
+     25.05299888245698,
+     31.858416631270075,
+     0.0,
+     56.91141551372708
+    ],
+    [
+     "segment_boundary",
+     24.061520749464858,
+     5.03280411823294,
+     0.0,
+     29.094324867697797
+    ],
+    [
+     "detour",
+     77.92605536961493,
+     76.24784100772435,
+     0.0,
+     154.1738963773393
+    ]
+   ]
+  },
+  "unjustified_by_owner": {
+   "title": "Unjustified seconds by owner",
+   "columns": [
+    "owner",
+    "unjustified_s"
+   ],
+   "rows": [
+    [
+     "A",
+     118.61610837441046
+    ],
+    [
+     "B",
+     90.58280411823216
+    ],
+    [
+     "C",
+     25.59014926458395
+    ]
+   ]
+  }
+ },
+ "artifacts": [
+  {
+   "name": "Ledger (markdown)",
+   "path": "ledger/20261004_200002_ledger.md",
+   "media_type": "text/markdown"
+  },
+  {
+   "name": "Ledger (json)",
+   "path": "ledger/20261004_200002_ledger.json",
+   "media_type": "application/json"
+  }
+ ]
+}

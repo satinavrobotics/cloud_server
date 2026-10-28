@@ -1,0 +1,46 @@
+# Example manifest for the lost-time analyzer (PROPOSAL 2026-10-28). Would live next to lost_time_ledger.py in the navstack repo:
+#   sati_nav2_behaviour_plugin/behaviour/tools/lost_time/analyzer.yaml
+# Command lines follow post_run_readout.sh; the ledger's output file names are to be confirmed in phase 0.
+contract: 1
+id: lost_time
+version: 1
+title: Lost time ledger
+description: Per goal, how much of the goal time was not driving at nominal speed, split by state and owner, each second judged justified / unjustified.
+owner: navstack-behaviour
+requires: {extractor: 1}
+applies_to:
+  description_regex: "navstack_sati_odin"
+inputs:
+  x: required
+  bag: required          # costmap frames are read from the db3
+  params: optional       # nominal speeds / footprint / twist_mux; without it the tool falls back and says so
+  episodes: optional     # operator-assist windows
+  vda_log: optional      # external-window detection; falls back to /rosout
+profiles:
+  default:
+    description: Current defaults of the tool.
+    argv: ["python3", "{tools}/lost_time_ledger.py", "--bag", "{bag}", "--x", "{x}", "--goals", "auto", "--out", "{out}/ledger", "--label", "{bag_id}"]
+    optional_argv:
+      params: ["--params", "{params}"]
+      episodes: ["--episodes", "{episodes}"]
+      vda_log: ["--vda-log", "{vda_log}"]
+    timeout_s: 3600
+    memory_mb: 6144
+  legacy_rules:
+    description: "Older readings of the rules (legacy flags). Does NOT reproduce the stored 2026-10-04 baseline exactly (phase 0 found unjustified_s 252.1 vs 234.8); a comparison profile, not a replay."
+    argv: ["python3", "{tools}/lost_time_ledger.py", "--bag", "{bag}", "--x", "{x}", "--goals", "auto", "--legacy-reasons", "--goal-starts", "begin", "--ntp-waypoints", "proxies", "--ntp-leg-fallback", "whole-goal", "--out", "{out}/ledger", "--label", "{bag_id}"]
+    optional_argv:
+      params: ["--params", "{params}"]
+    timeout_s: 3600
+adapter: lost_time_adapter.py
+metrics:
+  goal_time_s:               {unit: s,     direction: neutral,         description: "Sum of all goal windows."}
+  ideal_s:                   {unit: s,     direction: neutral,         description: "Sum of ideal times (shortest feasible path at nominal speeds)."}
+  lost_s:                    {unit: s,     direction: lower_is_better, description: "goal_time_s - ideal_s.", headline: true}
+  unjustified_s:             {unit: s,     direction: lower_is_better, description: "Lost seconds the evidence rules did not justify.", headline: true}
+  unjustified_share:         {unit: share, direction: lower_is_better, description: "unjustified_s / goal_time_s.", headline: true}
+  detour_s:                  {unit: s,     direction: lower_is_better, description: "Time lost to a longer / more turning path than the ideal."}
+  unassigned_s:              {unit: s,     direction: neutral,         description: "Remainder of the ledger identity (signed). Large magnitude = the speed model or ideal estimate fits badly."}
+  tick_identity_max_residual_s: {unit: s,  direction: lower_is_better, description: "Worst residual of the exact tick identity; must be ~0."}
+  goals_n:                   {unit: count, direction: neutral,         description: "Goals scored."}
+  goals_reached_n:           {unit: count, direction: higher_is_better, description: "Goals that reached their target."}

@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://satinavrobotics.com/schemas/bag-analysis/result/1",
+  "title": "Bag analysis result envelope, schema 1 (PROPOSAL 2026-10-28)",
+  "type": "object",
+  "required": ["schema", "analyzer", "analyzer_version", "profile", "extractor_version", "bag_id", "status", "producer", "inputs", "metrics"],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {"const": 1},
+    "analyzer": {"type": "string", "pattern": "^[a-z][a-z0-9_]{1,39}$"},
+    "analyzer_version": {"type": "integer", "minimum": 1},
+    "profile": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,39}$"},
+    "extractor_version": {"type": "integer", "minimum": 1},
+    "bag_id": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": ["ok", "warn", "n/a", "error"],
+      "description": "State of the ANALYSIS, not a verdict on the robot. ok: computed, trustworthy. warn: computed with caveats listed in notes. n/a: does not apply to this bag. error: the analyzer failed or produced invalid output."
+    },
+    "notes": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "required": ["code", "text"],
+        "properties": {
+          "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{1,59}$"},
+          "level": {"enum": ["info", "warn", "error"], "default": "info"},
+          "text": {"type": "string", "maxLength": 500}
+        }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "required": ["tool_git_sha"],
+      "properties": {
+        "tool_git_sha": {"type": "string"},
+        "analysis_image": {"type": ["string", "null"]},
+        "stack_build": {"type": ["string", "null"], "description": "Image tag / sha that recorded the bag, null when unknown."},
+        "command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "started_at": {"type": "string", "format": "date-time"},
+        "duration_s": {"type": "number", "minimum": 0}
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "required": ["bag_dir", "present"],
+      "properties": {
+        "bag_dir": {"type": "string"},
+        "present": {
+          "type": "object",
+          "description": "Which optional inputs were available: params, episodes, vda_log, ...",
+          "additionalProperties": {"type": "boolean"}
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Flat map metric name -> number or null (null = not computable for this bag). Names must be declared in the manifest.",
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{1,59}$"},
+      "additionalProperties": {"type": ["number", "null"]},
+      "maxProperties": 200
+    },
+    "tables": {
+      "type": "object",
+      "maxProperties": 20,
+      "propertyNames": {"pattern": "^[a-z][a-z0-9_]{1,39}$"},
+      "additionalProperties": {
+        "type": "object",
+        "required": ["columns", "rows"],
+        "properties": {
+          "title": {"type": "string"},
+          "columns": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 30},
+          "rows": {"type": "array", "maxItems": 200, "items": {"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}}}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "media_type"],
+        "properties": {
+          "name": {"type": "string"},
+          "path": {"type": "string", "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$", "description": "Relative to the analyzer's output directory; no absolute paths, no '..'."},
+          "media_type": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}
