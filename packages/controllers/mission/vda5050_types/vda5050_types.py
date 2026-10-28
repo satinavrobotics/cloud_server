@@ -271,7 +271,10 @@ class VDA5050Node(pydantic.BaseModel):
                     mission_node_id: int, final: bool = False,
                     policy: Optional[OrderPolicy] = None) -> "VDA5050Node":
         """A route node. Its allowed deviation is the waypoint's own when set, else the
-        order policy's: tight on the last node, wider on a node the robot drives through."""
+        order policy's: tight position on the last node, wider on a node the robot drives through.
+        Heading is free on every route node: the final theta is only the last leg's bearing,
+        and nothing in a route order needs it (docking and loading are action orders), so
+        demanding it can force a turn the robot has no room for (a dead end)."""
         policy = policy or current_order_policy()
         return VDA5050Node(
             nodeId=order_ids.node_id(mission_id, mission_node_id, sequence),
@@ -280,7 +283,7 @@ class VDA5050Node(pydantic.BaseModel):
                 x=pose.x, y=pose.y, theta=pose.theta, mapId=pose.map_id,
                 allowedDeviationXY=policy.deviation_xy(pose.allowedDeviationXY, final),
                 allowedDeviationTheta=policy.deviation_theta(pose.allowedDeviationTheta,
-                                                             final)))
+                                                             False)))
 
     @classmethod
     def from_robot(cls, robot_object: robot.RobotObjectV1, mission_id: str,

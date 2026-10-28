@@ -267,8 +267,19 @@ def test_pass_through_nodes_are_wide_and_the_last_node_is_tight():
     xy = [p.allowedDeviationXY for p in _positions(order)]
     theta = [p.allowedDeviationTheta for p in _positions(order)]
     assert xy == [POLICY.deviation_xy_start_m, 0.35, 0.35, 0.35]
-    assert theta == [POLICY.deviation_theta_pass_rad, POLICY.deviation_theta_pass_rad,
-                     POLICY.deviation_theta_pass_rad, POLICY.deviation_theta_final_rad]
+    # heading is free on every route node, the last included (dead-end ends: no forced turn)
+    assert theta == [POLICY.deviation_theta_pass_rad] * 4
+
+
+@pytest.mark.unit
+def test_final_heading_stays_tight_on_a_move_and_an_operator_theta_is_kept():
+    move = types.VDA5050Order.from_move(
+        mission_object.MissionMoveNodeV1(rotation=1.0), _robot_obj(), "m1", 1)
+    assert _positions(move)[-1].allowedDeviationTheta == POLICY.deviation_theta_final_rad
+    order = types.VDA5050Order.from_route(
+        _route_of({"x": 1}, {"x": 2, "allowedDeviationTheta": 0.2}), _robot_obj(), "m1", 1,
+        policy=POLICY)
+    assert _positions(order)[-1].allowedDeviationTheta == 0.2
 
 
 @pytest.mark.unit
