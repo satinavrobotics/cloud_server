@@ -1,7 +1,6 @@
 # Bag analysis, server side: groundwork (2026-10-28)
 
-Status: built and tested without the real analysis image; nothing deployed, no migration run on production, the compose service is not in any
-profile in use. Contract: `docs/bag_analysis_contract_2026-10-28.md`. Plan: `web_stack/BAG_ANALYSIS_PIPELINE_PLAN_20261028.md`.
+Status: deployed on the dev box 2026-10-28 (worker on request only, no automatic analysis; see "Deploy and switch" below). The compose service is in no robot profile. Contract: `docs/bag_analysis_contract_2026-10-28.md`. Plan: `web_stack/BAG_ANALYSIS_PIPELINE_PLAN_20261028.md`.
 
 ## Tables (migration `20261028_04_bag_analysis`)
 
@@ -54,6 +53,20 @@ Compose only: `BAG_ANALYSIS_IMAGE`, `BAG_ANALYSIS_BASE_IMAGE`, `BAG_ANALYSIS_SCR
 
 Bucket `analysis` (created on first upload), key `<robot>/<bag_id>/<analyzer>/<profile>/v<analyzer_version>_x<extractor_version>/<path>`; `<robot>/<bag_id>` is the recording's `storage_key`.
 The version segment is an addition to the plan's layout: results are never overwritten, so their files must not be either.
+
+## Deploy and switch (dev box, profile `server`)
+
+The settings live in `docker_compose/profiles/server.env` (tracked), so `scripts/render_env.sh server` keeps the worker; nothing is passed inline:
+`COMPOSE_PROFILES=analysis`, `BAG_ANALYSIS_ENABLED=true`, `BAG_ANALYSIS_AUTO=false`, `BAG_ANALYSIS_IMAGE` (worker built FROM the analysis image, see the Dockerfile header)
+and `BAG_ANALYSIS_BASE_IMAGE`. Jobs run only when requested (`POST .../analyses`); the scheduler enqueues nothing while AUTO is false.
+
+- Check without writing: `scripts/render_env.sh server --check` (or `--out <dir>/.env` to render elsewhere).
+- Apply: edit the profile, `scripts/render_env.sh server`, then from `docker_compose/`:
+  `docker compose -f mission_dispatch_services.yaml up -d --no-deps --no-build bag-analysis-service` (never recreate the gateway or other shared services for this).
+- Idle the worker (keep the container): `BAG_ANALYSIS_ENABLED=false`, render, recreate the worker.
+- Remove it: empty `COMPOSE_PROFILES` (the profile list in `server.env`), render, then `docker compose ... rm -sf bag-analysis-service`.
+- Automatic analysis: `BAG_ANALYSIS_AUTO=true` is a separate decision, off until the user says so.
+- New analysis image: build the worker with the new tag, change `BAG_ANALYSIS_IMAGE` / `BAG_ANALYSIS_BASE_IMAGE` in the profile, render, recreate the worker.
 
 ## Deliberately not built
 
