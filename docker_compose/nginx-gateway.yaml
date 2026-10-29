@@ -10,8 +10,13 @@ services:
     image: nginx:alpine
     container_name: sati_nginx_gateway
     network_mode: "host"
+    environment:
+      # The read-only API door (nginx/readonly-cloud.conf.template) listens on this address, port 8090. MINIO_TAILNET_IP
+      # is the cloud's tailnet address (profiles/server.env); unset, the door is on loopback only.
+      - CLOUD_TAILNET_IP=${MINIO_TAILNET_IP:-127.0.0.1}
     volumes:
       - ./nginx/nginx-http.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/readonly-cloud.conf.template:/etc/nginx/templates/readonly.conf.template:ro
       - ./nginx:/etc/nginx/sati:ro      # routes.conf, web-routes.conf (cloud) and the CORS files are included from here
       - ./downloads:/srv/sati-downloads:ro   # the desktop app's installers and latest.json (nginx/downloads.conf)
       # HTTPS: swap the first line for ./nginx/nginx.conf and uncomment

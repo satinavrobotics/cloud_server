@@ -51,6 +51,16 @@ server {
     include /etc/nginx/sati/routes.conf;
 }
 
+# Read-only API door (GET only) for offline analysis tools: tailnet address, port 8090, never the LAN (readonly-routes.conf).
+server {
+    listen ${ROBOT_TAILNET_IP}:8090;
+    server_name _;
+
+    add_header X-Content-Type-Options "nosniff" always;
+
+    include /etc/nginx/sati/readonly-routes.conf;
+}
+
 # LAN door for robot tokens (ROBOT_LAN_IP:8008, same gate as the gateway's LAN door; off when unset). Only /api/createToken
 # is forwarded, with the client's Host kept so the token service answers with the LAN SFU address. Cannot be combined with
 # ROBOT_LAN_IP=0.0.0.0: that would collide with the token service's own bind on the tailnet IP and port.

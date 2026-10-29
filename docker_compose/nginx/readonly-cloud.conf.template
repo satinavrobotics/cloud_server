@@ -1,0 +1,11 @@
+# Cloud read-only API door: nginx/readonly-routes.conf on the cloud's tailnet address, port 8090. Rendered by the nginx
+# image's envsubst (only ${CLOUD_TAILNET_IP} is defined, set by nginx-gateway.yaml). Not on 0.0.0.0: the door is for the
+# tailnet only. The upstreams backend_api and diagnostics_api come from nginx-http.conf (same http context).
+server {
+    listen ${CLOUD_TAILNET_IP}:8090;
+    server_name _;
+
+    add_header X-Content-Type-Options "nosniff" always;
+
+    include /etc/nginx/sati/readonly-routes.conf;
+}
