@@ -96,7 +96,7 @@ class Cur:
             self.rows = [(r.run_id, r.created_at) for r in self.db.runs]
         elif s.startswith("SELECT DISTINCT map_id FROM run_cells"):
             self.rows = [(m,) for m in sorted({r.map_id for r in self.db.runs})]
-        elif s.startswith("SELECT map_id, graph_version, status, detail FROM region_stats_builds"):
+        elif s.startswith("SELECT map_id, graph_version, status, detail, built_at, runs FROM region_stats_builds"):
             self.rows = list(self.db.builds)
         elif s.startswith("SELECT graph_version, stamp, built_at, status, runs FROM region_stats_builds"):
             rows = [b for b in self.db.build_rows if args[0] == b[0] and (len(args) < 2 or args[1] == b[1])]
@@ -389,26 +389,55 @@ class TestMapsNeedingBuild:
     def test_cases(self, patched):
         db = patched(Db([make_run(1, range(0, 20))]))
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # never built
-        db.builds = [("m", 3, "ok", BUILT)]
+        db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == []                       # up to date
         assert self.need(db, Reads(4, [(0, "A")])) == ["m"]                    # a new graph version
-        db.builds = [("m", 3, "stale", BUILT)]
+        db.builds = [("m", 3, "stale", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # a run was deleted
         db.runs = []
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... even when its last run is gone
         db.runs = [make_run(1, range(0, 20))]
-        db.builds = [("m", 0, "no_scene_graph", BUILT)]
+        db.builds = [("m", 0, "no_scene_graph", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")], graph=False)) == []          # nothing to build without a graph
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... until the graph appears
 
     def test_a_build_of_another_builder_version_is_redone(self, patched):
         db = patched(Db([make_run(1, range(0, 20))]))
-        db.builds = [("m", 3, "ok", None)]                                     # a legacy build has no detail
+        db.builds = [("m", 3, "ok", None, NOW, 1)]                                     # a legacy build has no detail
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]
-        db.builds = [("m", 3, "ok", json.dumps({"builder": rs.BUILDER_VERSION - 1}))]
+        db.builds = [("m", 3, "ok", json.dumps({"builder": rs.BUILDER_VERSION - 1}), NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]
-        db.builds = [("m", 3, "ok", BUILT)]
+        db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == []
+
+    def test_old_builds_and_expired_inputs_are_redone(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        reads = Reads(3, [(0, "A")])
+        day = datetime.timedelta(seconds=config.REGION_STATS_MAX_AGE_S)
+        db.builds = [("m", 3, "ok", BUILT, NOW - day - datetime.timedelta(minutes=1), 1)]
+        assert self.need(db, reads) == ["m"]                                   # built too long ago
+        db.builds = [("m", 3, "ok", BUILT, NOW - day / 2, 1)]
+        assert self.need(db, reads) == []
+        db.runs = []                                                           # an idle map with an old build ...
+        db.builds = [("m", 3, "ok", BUILT, NOW - 2 * day, 1)]
+        assert self.need(db, reads) == ["m"]                                   # ... is judged without run rows
+        db.builds = [("m", 3, "ok", BUILT, NOW - 2 * day, 0)]
+        assert self.need(db, reads) == []                                      # an empty build has nothing to expire
+        old = (NOW - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS + 1)).isoformat()
+        left = json.dumps({"builder": rs.BUILDER_VERSION, "oldest_at": old})
+        db.builds = [("m", 3, "ok", left, NOW, 5)]
+        assert self.need(db, reads) == ["m"]                                   # its oldest input left the window
+        inside = json.dumps({"builder": rs.BUILDER_VERSION, "oldest_at": NOW.isoformat()})
+        db.builds = [("m", 3, "ok", inside, NOW, 5)]
+        assert self.need(db, reads) == []
+
+    def test_the_build_records_its_oldest_input(self, patched):
+        db = patched(Db([make_run(1, range(0, 30)), make_run(2, range(0, 30), age_h=5)]))
+        asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        args = [a for s, a in db.executed if s.startswith("INSERT INTO region_stats_builds")][0]
+        detail = json.loads(args[5])
+        assert detail["builder"] == rs.BUILDER_VERSION
+        assert detail["oldest_at"] == min(r.started_at for r in db.runs).isoformat()
 
 
 class TestRoute:

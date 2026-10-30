@@ -220,9 +220,12 @@ async def collect(db: Any, reads: Any, map_id: str, robot: Optional[str] = None)
 
 def detail_of(got: Collected) -> str:
     """region_stats_builds.detail (text): the builder version and the sample gate the rows were built with, so old and
-    new builds can be told apart; maps_needing_build rebuilds a build of another builder version."""
+    new builds can be told apart (maps_needing_build rebuilds a build of another builder version), and the start of
+    the oldest input (a build whose oldest input left the window is rebuilt)."""
+    oldest = min((r.started_at for r in got.rows), default=None)
     return json.dumps({"builder": BUILDER_VERSION, "min_len_m": config.REGION_STATS_MIN_LEN_M,
-                       "min_event_s": config.REGION_STATS_MIN_EVENT_S}, separators=(",", ":"))
+                       "min_event_s": config.REGION_STATS_MIN_EVENT_S,
+                       "oldest_at": None if oldest is None else oldest.isoformat()}, separators=(",", ":"))
 
 
 def _params(stat: Dict[str, Any]) -> tuple:
@@ -289,30 +292,45 @@ def _detail(text: Any) -> Dict[str, Any]:
 
 
 async def maps_needing_build(db: Any, reads: Any) -> List[str]:
-    """Maps with summaries in the window whose newest build is not of the current graph version, is stale, or was
-    built by another builder version (a legacy build has no detail)."""
-    start = utcnow() - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
+    """Maps with summaries in the window whose newest build is not of the current graph version, is stale, was built by
+    another builder version (a legacy build has no detail), is older than REGION_STATS_MAX_AGE_S, or kept an input
+    that has since left the window (an idle map would otherwise keep samples older than the window forever)."""
+    now = utcnow()
+    start = now - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
     async with fleet_reads.read_cursor(db) as cur:
         await cur.execute("SELECT DISTINCT map_id FROM run_cells WHERE started_at >= %s AND algo_version = %s",
                           (start, config.RUN_CELLS_ALGO_VERSION))
         wanted = {r[0] for r in await cur.fetchall()}
-        await cur.execute("SELECT map_id, graph_version, status, detail FROM region_stats_builds")
-        builds: Dict[str, Dict[int, Tuple[str, Dict[str, Any]]]] = {}
-        for map_id, ver, status, detail in await cur.fetchall():
-            builds.setdefault(map_id, {})[int(ver)] = (status, _detail(detail))
-            if status == "stale":           # its last runs may be deleted: the rebuild empties the stored rows
-                wanted.add(map_id)
-    wanted = sorted(wanted)
+        await cur.execute("SELECT map_id, graph_version, status, detail, built_at, runs FROM region_stats_builds")
+        builds: Dict[str, Dict[int, Tuple[str, Dict[str, Any], Any, int]]] = {}
+        for map_id, ver, status, detail, built_at, runs in await cur.fetchall():
+            builds.setdefault(map_id, {})[int(ver)] = (status, _detail(detail), built_at, int(runs or 0))
+            wanted.add(map_id)              # a build of a map with no runs left is judged too (stale, expired)
     out = []
-    for map_id in wanted:
+    for map_id in sorted(wanted):
         have = builds.get(map_id, {})
         ver = await current_version(reads, map_id)
         if ver is None:
             if not have or any(b[0] == "stale" for b in have.values()):
                 out.append(map_id)
-        elif ver not in have or have[ver][0] != "ok" or have[ver][1].get("builder") != BUILDER_VERSION:
+        elif ver not in have or _outdated(have[ver], now, start):
             out.append(map_id)
     return out
+
+
+def _outdated(build: Tuple[str, Dict[str, Any], Any, int], now: datetime.datetime, start: datetime.datetime) -> bool:
+    """Whether the build of the current graph version must be redone: not ok, another builder, too old, or its oldest
+    input has left the window."""
+    status, detail, built_at, runs = build
+    if status != "ok" or detail.get("builder") != BUILDER_VERSION:
+        return True
+    if runs > 0 and built_at is not None and (now - built_at).total_seconds() >= config.REGION_STATS_MAX_AGE_S:
+        return True
+    oldest = detail.get("oldest_at")
+    try:
+        return bool(oldest) and datetime.datetime.fromisoformat(oldest) < start
+    except ValueError:
+        return True
 
 
 # --- read route ----------------------------------------------------------------------------------
