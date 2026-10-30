@@ -225,14 +225,12 @@ class LegTracker:
     def _plan(start: Reach, end: Reach, straight: Optional[float], route: Optional[RouteInfo]
               ) -> Tuple[Optional[float], Optional[str]]:
         """(planned_m, plan_source) of a leg: see the module docstring."""
-        points, matches = None, False
+        points, a, b = None, None, None
         if (route is not None and start.pose is not None and end.pose is not None and start.wp is not None
                 and end.wp == start.wp + 1 and order_ids.node_index(start.vda_node) == end.node_idx):
             points = route.legs.get((start.wp, end.wp))
-            if points is not None:
-                matches = plan_length.ends_match(points, (start.pose.x, start.pose.y),
-                                                 (end.pose.x, end.pose.y), config.EFFICIENCY_STALE_TOL_M)
-        return plan_length.resolve(points, straight, matches)
+            a, b = (start.pose.x, start.pose.y), (end.pose.x, end.pose.y)
+        return plan_length.plan_of(points, a, b, straight, config.EFFICIENCY_STALE_TOL_M)
 
     def _leg(self, start: Reach, end: Reach, limits: Any, map_id: Optional[str],
              route: Optional[RouteInfo] = None) -> Leg:
