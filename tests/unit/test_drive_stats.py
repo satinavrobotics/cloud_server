@@ -541,7 +541,7 @@ class TestSummaries:
         cur = patched(track=a, summaries=[summarise("a", a, rec)])
         call(FakeReads())
         for sql, _ in cur.sql:
-            if "NOT EXISTS" in sql:
+            if "NOT EXISTS (SELECT 1 FROM run_cells c" in sql:      # the raw part's check (not fetch's archive filter)
                 assert "c.run_id = " in sql and "c.map_id" not in sql
 
     def test_config_raw_never_reads_the_summaries(self, patched, monkeypatch):
