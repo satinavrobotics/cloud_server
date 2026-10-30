@@ -374,3 +374,37 @@ Decisions 2, 3 and 5 of `docs/planner_region_stats_2026-10-27.md` section 10. Ne
 * Deviations from the text above: `region_stats.moving_*` now subtract dwell; the class strings of section 4.3 changed; rows
   have the five new columns of the migration; `run_cells` the three (`speed_basis`, `class_basis`, `dwell_s`).
 
+
+## 13. Changes 2026-10-30 (builder; branch `stats/wp-c`, review ids from `stats_review_2026-10-30.md`)
+
+Sections 1-12 stay as written; where they differ, this section wins.
+
+* **Sample gate (D4, I4).** A (run, chart) is a sample when `len_m >= REGION_STATS_MIN_LEN_M` (1 m) **or** `blocks > 0` **or**
+  `stopped_s + recovery_s >= REGION_STATS_MIN_EVENT_S` (new, 10 s). A robot that waits 120 s, drives 0.6 m and reroutes now
+  shows up in `blocks_per_run` / `stopped_share` / `norm_stopped_m`. `pace_median`, `pace_p90` and `moving_pace_median` use only
+  the samples that pass the length gate (NULL when none does); `runs` and the sums count every sample.
+* **Builder version.** `region_stats.BUILDER_VERSION` = 2 (1 = length gate only). It is part of `stamp`, and
+  `region_stats_builds.detail` (text, previously always NULL) now holds JSON `{"builder", "min_len_m", "min_event_s",
+  "oldest_at"}`. `maps_needing_build` rebuilds any build whose detail lacks `builder == BUILDER_VERSION`, so the first poll
+  after deploy rebuilds every map. The read route's meta has `min_event_s` and `builder`. The planner sees a new `stamp` and
+  reloads; `region_cost.model_hash` describes the cost model only and is unchanged.
+* **Pace and share fields (I5).** `pace_*` is the gross pace (time incl. stopped and dwell). `moving_pace_median_s_per_m` and
+  `moving_speed_mps` are dwell-free (time - stopped - dwell), as section 11 says; the module docstring said otherwise.
+  `stopped_share` is now `stopped_s / (time_s - dwell_s)` (was over `time_s`). No field was added, removed or renamed.
+* **Inputs generation (C4).** `collect` reads `region_stats_inputs.gen` (missing row = 0) before the rows; `build_map` inserts
+  the row if missing, re-reads it `FOR UPDATE` in the write transaction and, if it moved, stores nothing and returns status
+  `inputs_changed` (the build row is left as it was, stale after `mark_stale`; the next poll rebuilds). The gen built from is
+  stored in `region_stats_builds.inputs_gen`.
+* **Rebuild by age (I8).** `maps_needing_build` also rebuilds a build with `runs > 0` older than `REGION_STATS_MAX_AGE_S`
+  (86400 s) and a build whose oldest input (`detail.oldest_at`) is older than the window. Builds of maps with no runs left in
+  the window are judged too.
+* **Archived runs (D2, I3).** The maps-with-runs scan and the computed-on-read key read skip runs with
+  `mission_runs.archived_at` set; `collect` relies on `run_cells_db.fetch(exclude_archived=True)`.
+* **Poll cost (P6).** `maps_needing_build` gets the graph version through a per-map cache (`REGION_STATS_VERSION_TTL_S`,
+  120 s); `build_map` drops the entry. The newest-`REGION_STATS_MAX_RUNS` cut stays in `aggregate`, because the chart of a cell
+  is known only after the owner-raster lookup, so it cannot be a SQL limit.
+* **Stale means "an input changed".** `region_builds.mark_stale` also runs on every new or recomputed `run_cells` row, so `stale`
+  is no longer only "a run was deleted". `maps_needing_build` feeds the run_cells worker's `dirty` map (`setdefault`, so the
+  first change keeps its time), and `build_due` builds a map once `REGION_STATS_DEBOUNCE_S` has passed: one build per window
+  of a burst. A build that loses the generation race returns `inputs_changed`, writes nothing and is picked up again by the
+  next debounced pass. The planner loader reads `stale` builds as usable (`region_cost.USABLE_BUILDS`).

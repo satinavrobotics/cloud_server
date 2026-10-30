@@ -678,7 +678,8 @@ DRIVE_STATS_SOURCE = os.getenv("DRIVE_STATS_SOURCE", "summaries")
 # RUN_CELLS_EXTRA_GRACE_S after it ended; a run that fails is not retried for RUN_CELLS_RETRY_S. A bump of
 # RUN_CELLS_ALGO_VERSION recomputes every run. region_stats keeps, per (map, graph version, chart, robot class),
 # the newest REGION_STATS_MAX_RUNS runs (of the last REGION_STATS_WINDOW_DAYS days) that drove at least
-# REGION_STATS_MIN_LEN_M in the chart; a map is rebuilt REGION_STATS_DEBOUNCE_S after its first change, the
+# REGION_STATS_MIN_LEN_M in the chart, or were obstructed there (a block, or REGION_STATS_MIN_EVENT_S of stopped plus
+# recovery time); a build older than REGION_STATS_MAX_AGE_S is redone; a map is rebuilt REGION_STATS_DEBOUNCE_S after its first change, the
 # newest REGION_STATS_KEEP_VERSIONS graph versions are kept.
 RUN_CELLS_ENABLED = _env_bool("RUN_CELLS_ENABLED", "true")
 RUN_CELLS_ALGO_VERSION = int(os.getenv("RUN_CELLS_ALGO_VERSION", "2"))
@@ -703,6 +704,9 @@ ROBOT_PLACEHOLDER_SPEED_MAX = float(os.getenv("ROBOT_PLACEHOLDER_SPEED_MAX", "1.
 REGION_STATS_WINDOW_DAYS = int(os.getenv("REGION_STATS_WINDOW_DAYS", "90"))
 REGION_STATS_MIN_LEN_M = float(os.getenv("REGION_STATS_MIN_LEN_M", "1.0"))
 REGION_STATS_MAX_RUNS = int(os.getenv("REGION_STATS_MAX_RUNS", "50"))
+REGION_STATS_MIN_EVENT_S = float(os.getenv("REGION_STATS_MIN_EVENT_S", "10.0"))
+REGION_STATS_MAX_AGE_S = float(os.getenv("REGION_STATS_MAX_AGE_S", "86400.0"))
+REGION_STATS_VERSION_TTL_S = float(os.getenv("REGION_STATS_VERSION_TTL_S", "120.0"))   # maps_needing_build: graph version cache
 REGION_STATS_DEBOUNCE_S = float(os.getenv("REGION_STATS_DEBOUNCE_S", "30.0"))
 REGION_STATS_KEEP_VERSIONS = int(os.getenv("REGION_STATS_KEEP_VERSIONS", "3"))
 REGION_STATS_CACHE_TTL_S = float(os.getenv("REGION_STATS_CACHE_TTL_S", "120.0"))

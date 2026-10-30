@@ -8,24 +8,30 @@ version's rows are a rebuildable cache, dropped and recomputed from `run_cells` 
 `collect` (read side, also used by the route for a robot filter) maps every summarised cell of a map to its chart
 with the same owner-raster lookup drive-stats uses (`drive_stats.regions_of`), and `aggregate` (pure) turns that into
 rows:
-* A (run, chart) pair is a SAMPLE when the run drove at least REGION_STATS_MIN_LEN_M in the chart (drops boundary
-  clips). Per (chart, robot_class) the newest REGION_STATS_MAX_RUNS samples by the run's start are kept; the
-  robot_class '*' pools all classes and keeps the newest MAX_RUNS samples of the chart over all of them.
-* Per (chart, class): sums over the kept samples; pace = time_s / len_m PER SAMPLE and its median / p90 (linear
-  percentile) over the samples; moving pace the same with time_s - stopped_s; ratios from the sums (NULL on a zero
-  denominator); `runs` = the kept samples; `visited` = distinct 0.1 m cells of the chart with movement in them;
-  `speed_max` = the class's factsheet speed_max when all its samples agree (NULL for '*' or unknown). Moving time is
-  time - stopped (transit) - dwell (waiting at the start, goal and action nodes, algo_version 2).
+* A (run, chart) pair is a SAMPLE (is_sample) when the run drove at least REGION_STATS_MIN_LEN_M in the chart (drops
+  boundary clips) or was obstructed there (a block, or stopped + recovery >= REGION_STATS_MIN_EVENT_S); the obstructed
+  short passes are the ones that matter for cost. Per (chart, robot_class) the newest REGION_STATS_MAX_RUNS samples by
+  the run's start are kept; the robot_class '*' pools all classes and keeps the newest MAX_RUNS samples of the chart
+  over all of them.
+* Per (chart, class): sums over the kept samples; `pace_*` = GROSS pace, time_s / len_m PER SAMPLE (stopped seconds and
+  dwell included) and its median / p90 (linear percentile) over the samples that pass the length gate (a pace needs a
+  length); `moving_pace_median_s_per_m` the same with the moving time, time_s - stopped_s - dwell_s (transit stops and
+  the waits at the start, goal and action nodes both out; algo_version 2); `moving_speed_mps` = len_m over the summed
+  moving time; `stopped_share` = stopped_s / (time_s - dwell_s) (the dwell is neither moving nor a stop in transit);
+  other ratios from the sums (NULL on a zero denominator); `runs` = the kept samples; `visited` = distinct 0.1 m
+  cells of the chart with movement in them; `speed_max` = the class's factsheet speed_max when all its samples agree
+  (NULL for '*' or unknown).
 * `norm_*` (docs/planner_region_stats_2026-10-27.md 10, decision 2): the class key has no speed_max, so pace is
   normalised by each run's own speed_max: over the kept samples whose run has a factsheet speed (`speed_basis`
   "factsheet", not a placeholder) `norm_len_m` = metres, `norm_moving_m` = moving seconds x speed_max, `norm_stopped_m` =
   stopped seconds x speed_max, `norm_runs` = those samples. See region_stats_load.
-* `stamp` = sha1 (16 hex) of (algo_version, window, min length, max runs, sorted (run_id, created_at) of the inputs).
+* `stamp` = sha1 (16 hex) of (algo_version, BUILDER_VERSION, window, min length, min event, max runs, sorted (run_id, created_at) of the inputs).
   Day decay, priors and shrinkage are the planner's job (it has `runs`).
 
 `build_map` writes one (map, graph version) in one transaction (delete + insert + its region_stats_builds row) and
 keeps the newest REGION_STATS_KEEP_VERSIONS versions. `maps_needing_build` names the maps whose newest build is not
-of the current graph version, or is marked stale (a run was deleted); the run_cells worker rebuilds them.
+of the current graph version, or is marked stale (an input changed: a run summarised, replaced, deleted or archived); the run_cells
+worker rebuilds them, putting them through its dirty / REGION_STATS_DEBOUNCE_S path (one build per window of a burst).
 Only the CURRENT graph version can be built: the owner raster of an older one is not served.
 """
 import asyncio
@@ -34,6 +40,7 @@ import datetime
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -51,6 +58,7 @@ from packages.utils.timeutil import utcnow
 
 logger = logging.getLogger("ApiDelegationService.region_stats")
 
+BUILDER_VERSION = 2          # 1: samples = runs with len >= MIN_LEN_M; 2: also blocked / stopped >= MIN_EVENT_S samples (docs 13)
 POOLED = "*"
 NO_GRAPH_VERSION = 0                     # graph_version of the build row of a map without a scene graph
 COLUMNS = ("map_id", "graph_version", "chart_key", "robot_class", "runs", "len_m", "time_s", "stopped_s",
@@ -61,6 +69,10 @@ COLUMNS = ("map_id", "graph_version", "chart_key", "robot_class", "runs", "len_m
 INSERT_SQL = (f"INSERT INTO region_stats ({', '.join(COLUMNS)}) VALUES ({', '.join(['%s'] * len(COLUMNS))})")
 LIVE_MAP_SQL = (f"SELECT 1 FROM {MapObjectV1.table_name()} WHERE name = %s "
                 "AND lifecycle NOT IN ('DELETING', 'DELETED') FOR SHARE")
+# archived runs are in no statistic (docs 13); mission_runs.archived_at is set by the archive endpoint (run_admin.py)
+NOT_ARCHIVED = ("NOT EXISTS (SELECT 1 FROM mission_runs mr WHERE mr.run_id = run_cells.run_id "
+                "AND mr.archived_at IS NOT NULL)")
+GEN_SQL = "SELECT gen FROM region_stats_inputs WHERE map_id = %s"
 CACHE = ResultCache(config.REGION_STATS_CACHE_ENTRIES, config.REGION_STATS_CACHE_TTL_S)
 
 
@@ -72,11 +84,12 @@ class Collected:
     rows: List[rdb.CellRow]
     stamp: str
     stats: List[Dict[str, Any]]
+    gen: int = 0                        # region_stats_inputs.gen read before the rows (docs 13): see build_map
 
 
 def stamp_of(rows: Sequence[rdb.CellRow]) -> str:
-    ident = [config.RUN_CELLS_ALGO_VERSION, config.REGION_STATS_WINDOW_DAYS, config.REGION_STATS_MIN_LEN_M,
-             config.REGION_STATS_MAX_RUNS, sorted((str(r.run_id), r.created_at.isoformat() if r.created_at else "")
+    ident = [config.RUN_CELLS_ALGO_VERSION, BUILDER_VERSION, config.REGION_STATS_WINDOW_DAYS,
+             config.REGION_STATS_MIN_LEN_M, config.REGION_STATS_MIN_EVENT_S, config.REGION_STATS_MAX_RUNS, sorted((str(r.run_id), r.created_at.isoformat() if r.created_at else "")
                                                   for r in rows)]
     return hashlib.sha1(json.dumps(ident, separators=(",", ":")).encode()).hexdigest()[:16]
 
@@ -97,6 +110,14 @@ def _ratio(num: float, den: float) -> Optional[float]:
     return float(num / den) if den > 0 else None
 
 
+def is_sample(len_m: Any, blocks: Any, stopped_s: Any, recovery_s: Any) -> Any:
+    """Which (run, chart) pairs are samples (docs 13): the run drove REGION_STATS_MIN_LEN_M in the chart, or was obstructed
+    there (a block, or REGION_STATS_MIN_EVENT_S of stopped plus recovery time): a robot that waits 120 s and reroutes
+    after 0.6 m is exactly the pass the statistics are for. Works on scalars and numpy arrays."""
+    return ((len_m >= config.REGION_STATS_MIN_LEN_M) | (blocks > 0)
+            | (stopped_s + recovery_s >= config.REGION_STATS_MIN_EVENT_S))
+
+
 def aggregate(map_id: str, version: int, rows: Sequence[rdb.CellRow], ids_per_row: Sequence[np.ndarray],
               names: Sequence[str], cells: Dict[str, int], stamp: str) -> List[Dict[str, Any]]:
     """The region_stats rows (dicts of COLUMNS) of `rows`; `ids_per_row[i]` = the chart id (0 = none, k =
@@ -109,7 +130,8 @@ def aggregate(map_id: str, version: int, rows: Sequence[rdb.CellRow], ids_per_ro
         n = len(names) + 1
         sums = {f: np.bincount(ids, weights=getattr(row, f), minlength=n)
                 for f in ("len_m", "time_s", "stopped_s", "recovery_s", "blocks", "dwell_s")}
-        for k in np.nonzero(sums["len_m"][1:] >= config.REGION_STATS_MIN_LEN_M)[0] + 1:
+        for k in np.nonzero(is_sample(sums["len_m"][1:], sums["blocks"][1:], sums["stopped_s"][1:],
+                                      sums["recovery_s"][1:]))[0] + 1:
             samples.setdefault(names[k - 1], []).append({
                 "row": row, "len_m": float(sums["len_m"][k]), "time_s": float(sums["time_s"][k]),
                 "stopped_s": float(sums["stopped_s"][k]), "recovery_s": float(sums["recovery_s"][k]),
@@ -133,8 +155,10 @@ def _stat_row(map_id: str, version: int, chart: str, cls: str, kept: List[Dict[s
     len_m, time_s = sum(s["len_m"] for s in kept), sum(s["time_s"] for s in kept)
     stopped, rec = sum(s["stopped_s"] for s in kept), sum(s["recovery_s"] for s in kept)
     blocks, dwell = sum(s["blocks"] for s in kept), sum(s["dwell_s"] for s in kept)
-    pace = np.array([s["time_s"] / s["len_m"] for s in kept])
-    moving = np.array([_moving(s) / s["len_m"] for s in kept if _moving(s) > 0])
+    # a pace needs a length: the samples that count by an event only (docs 13) stay out of the percentiles
+    long = [s for s in kept if s["len_m"] >= config.REGION_STATS_MIN_LEN_M]
+    pace = np.array([s["time_s"] / s["len_m"] for s in long])
+    moving = np.array([_moving(s) / s["len_m"] for s in long if _moving(s) > 0])
     # the speed-normalised sums: only runs with a factsheet speed_max (a placeholder says nothing), each time x its own
     norm = [(s, float(s["row"].speed_max)) for s in kept
             if s["row"].speed_basis == rclass.SPEED_FACTSHEET and (s["row"].speed_max or 0) > 0]
@@ -146,7 +170,7 @@ def _stat_row(map_id: str, version: int, chart: str, cls: str, kept: List[Dict[s
     return {"map_id": map_id, "graph_version": version, "chart_key": chart, "robot_class": cls, "runs": len(kept),
             "len_m": len_m, "time_s": time_s, "stopped_s": stopped, "recovery_s": rec, "blocks": blocks,
             "pace_median_s_per_m": p50, "pace_p90_s_per_m": p90, "moving_pace_median_s_per_m": m50,
-            "moving_speed_mps": _ratio(len_m, time_s - stopped - dwell), "stopped_share": _ratio(stopped, time_s),
+            "moving_speed_mps": _ratio(len_m, time_s - stopped - dwell), "stopped_share": _ratio(stopped, time_s - dwell),
             "recovery_s_per_100m": _ratio(rec * 100.0, len_m), "blocks_per_run": blocks / len(kept),
             "speed_max": (None if cls == POOLED or len(speeds) != 1 or None in speeds else float(speeds.pop())),
             "cells": int(chart_cells), "visited": int(np.unique(np.concatenate(cell_keys)).size),
@@ -168,15 +192,37 @@ async def current_version(reads: Any, map_id: str) -> Optional[int]:
     return None if topo is None else int(topo["version"])
 
 
+_VERSIONS: Dict[str, Tuple[float, int]] = {}      # map_id -> (monotonic time, graph version) for maps_needing_build
+
+
+async def cached_version(reads: Any, map_id: str) -> Optional[int]:
+    """`current_version` for the poll: the answer is kept REGION_STATS_VERSION_TTL_S (a graph version found is
+    cached, a missing one is asked again) so an idle map costs no topology read per poll."""
+    now = time.monotonic()
+    hit = _VERSIONS.get(map_id)
+    if hit is not None and now - hit[0] < config.REGION_STATS_VERSION_TTL_S:
+        return hit[1]
+    ver = await current_version(reads, map_id)
+    if ver is None:
+        _VERSIONS.pop(map_id, None)
+    else:
+        _VERSIONS[map_id] = (now, ver)
+    return ver
+
+
 async def collect(db: Any, reads: Any, map_id: str, robot: Optional[str] = None) -> Collected:
     """Read the map's summaries of the window and group them by the current owner raster. Raises when the
     scene-graph read fails (a build must not store a wrong version)."""
     start = utcnow() - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
     async with fleet_reads.read_cursor(db) as cur:
+        # the generation first: a writer that changes the inputs after this read bumps it, so build_map sees a change
+        await cur.execute(GEN_SQL, (map_id,))
+        found = await cur.fetchone()
+        gen = int(found[0]) if found else 0
         rows = await rdb.fetch(cur, map_id, start=start, robot=robot, algo_version=config.RUN_CELLS_ALGO_VERSION)
     stamp = stamp_of(rows)
     if reads is None:
-        return Collected("none", None, rows, stamp, [])
+        return Collected("none", None, rows, stamp, [], gen)
     keys = [r.key for r in rows if len(r)]
     uniq = np.unique(np.concatenate(keys)) if keys else np.empty(0, np.int64)
     if uniq.size:
@@ -184,15 +230,25 @@ async def collect(db: Any, reads: Any, map_id: str, robot: Optional[str] = None)
         if status == "error":
             raise RuntimeError(f"scene graph read of {map_id} failed")
         if status == "none" or ids is None:
-            return Collected("none", None, rows, stamp, [])
+            return Collected("none", None, rows, stamp, [], gen)
     else:
         version = await current_version(reads, map_id)
         if version is None:
-            return Collected("none", None, rows, stamp, [])
+            return Collected("none", None, rows, stamp, [], gen)
         ids, names, cells = np.empty(0, np.int64), [], {}
     per_row = [ids[np.searchsorted(uniq, r.key)] if len(r) else np.empty(0, np.int64) for r in rows]
     stats = await asyncio.to_thread(aggregate, map_id, int(version), rows, per_row, names, cells, stamp)
-    return Collected("ok", int(version), rows, stamp, stats)
+    return Collected("ok", int(version), rows, stamp, stats, gen)
+
+
+def detail_of(got: Collected) -> str:
+    """region_stats_builds.detail (text): the builder version and the sample gate the rows were built with, so old and
+    new builds can be told apart (maps_needing_build rebuilds a build of another builder version), and the start of
+    the oldest input (a build whose oldest input left the window is rebuilt)."""
+    oldest = min((r.started_at for r in got.rows), default=None)
+    return json.dumps({"builder": BUILDER_VERSION, "min_len_m": config.REGION_STATS_MIN_LEN_M,
+                       "min_event_s": config.REGION_STATS_MIN_EVENT_S,
+                       "oldest_at": None if oldest is None else oldest.isoformat()}, separators=(",", ":"))
 
 
 def _params(stat: Dict[str, Any]) -> tuple:
@@ -217,14 +273,26 @@ async def build_map(db: Any, reads: Any, map_id: str, version: Optional[int] = N
             if await cur.fetchone() is None:
                 logger.info("Region stats of %s: map is gone or being deleted, nothing stored", map_id)
                 return {"graph_version": ver, "status": "map_gone", "runs": runs, "charts": 0, "stamp": got.stamp}
+            # The inputs may have changed since collect (a run summarised, replaced, deleted or archived): every writer bumps
+            # region_stats_inputs.gen (packages/utils/region_builds.mark_stale) before it changes them. Lock the row so a
+            # writer that comes now waits for this commit (and then marks the fresh build stale), and store nothing
+            # when the generation moved: the build row stays stale / missing; the worker's next debounced pass rebuilds (no retry loop here).
+            await cur.execute("INSERT INTO region_stats_inputs (map_id) VALUES (%s) ON CONFLICT DO NOTHING", (map_id,))
+            await cur.execute(GEN_SQL + " FOR UPDATE", (map_id,))
+            gen_now = int((await cur.fetchone())[0])
+            if gen_now != got.gen:
+                logger.info("Region stats of %s: inputs changed during the build (gen %s -> %s), retry next poll",
+                            map_id, got.gen, gen_now)
+                return {"graph_version": ver, "status": "inputs_changed", "runs": runs, "charts": 0, "stamp": got.stamp}
             await cur.execute("DELETE FROM region_stats WHERE map_id = %s AND graph_version = %s", (map_id, ver))
             if got.stats:
                 await cur.executemany(INSERT_SQL, [_params(s) for s in got.stats])
             await cur.execute(
-                "INSERT INTO region_stats_builds (map_id, graph_version, stamp, runs, status, detail, built_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, now()) ON CONFLICT (map_id, graph_version) DO UPDATE SET "
+                "INSERT INTO region_stats_builds (map_id, graph_version, stamp, runs, status, detail, built_at, inputs_gen) "
+                "VALUES (%s, %s, %s, %s, %s, %s, now(), %s) ON CONFLICT (map_id, graph_version) DO UPDATE SET "
                 "stamp = EXCLUDED.stamp, runs = EXCLUDED.runs, status = EXCLUDED.status, detail = EXCLUDED.detail, "
-                "built_at = now()", (map_id, ver, got.stamp, runs, status, None))
+                "built_at = now(), inputs_gen = EXCLUDED.inputs_gen", (map_id, ver, got.stamp, runs, status,
+                                                                         detail_of(got), got.gen))
             await cur.execute(
                 "DELETE FROM region_stats WHERE map_id = %s AND graph_version NOT IN "
                 "(SELECT graph_version FROM region_stats_builds WHERE map_id = %s "
@@ -234,34 +302,59 @@ async def build_map(db: Any, reads: Any, map_id: str, version: Optional[int] = N
                 "(SELECT graph_version FROM region_stats_builds WHERE map_id = %s "
                 "ORDER BY graph_version DESC LIMIT %s)", (map_id, map_id, config.REGION_STATS_KEEP_VERSIONS))
     CACHE.discard_map(map_id)
+    _VERSIONS.pop(map_id, None)
     logger.info("Region stats of %s: version %s, %d runs, %d rows (%s)", map_id, ver, runs, len(got.stats), status)
     return {"graph_version": ver, "status": status, "runs": runs, "charts": len(got.stats), "stamp": got.stamp}
 
 
+def _detail(text: Any) -> Dict[str, Any]:
+    try:
+        d = json.loads(text) if text else {}
+    except ValueError:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
 async def maps_needing_build(db: Any, reads: Any) -> List[str]:
-    """Maps with summaries in the window whose newest build is not of the current graph version or is stale."""
-    start = utcnow() - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
+    """Maps with summaries in the window whose newest build is not of the current graph version, is stale, was built by
+    another builder version (a legacy build has no detail), is older than REGION_STATS_MAX_AGE_S, or kept an input
+    that has since left the window (an idle map would otherwise keep samples older than the window forever)."""
+    now = utcnow()
+    start = now - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
     async with fleet_reads.read_cursor(db) as cur:
-        await cur.execute("SELECT DISTINCT map_id FROM run_cells WHERE started_at >= %s AND algo_version = %s",
-                          (start, config.RUN_CELLS_ALGO_VERSION))
+        await cur.execute("SELECT DISTINCT map_id FROM run_cells WHERE started_at >= %s AND algo_version = %s AND "
+                          + NOT_ARCHIVED, (start, config.RUN_CELLS_ALGO_VERSION))
         wanted = {r[0] for r in await cur.fetchall()}
-        await cur.execute("SELECT map_id, graph_version, status FROM region_stats_builds")
-        builds: Dict[str, Dict[int, str]] = {}
-        for map_id, ver, status in await cur.fetchall():
-            builds.setdefault(map_id, {})[int(ver)] = status
-            if status == "stale":           # its last runs may be deleted: the rebuild empties the stored rows
-                wanted.add(map_id)
-    wanted = sorted(wanted)
+        await cur.execute("SELECT map_id, graph_version, status, detail, built_at, runs FROM region_stats_builds")
+        builds: Dict[str, Dict[int, Tuple[str, Dict[str, Any], Any, int]]] = {}
+        for map_id, ver, status, detail, built_at, runs in await cur.fetchall():
+            builds.setdefault(map_id, {})[int(ver)] = (status, _detail(detail), built_at, int(runs or 0))
+            wanted.add(map_id)              # a build of a map with no runs left is judged too (stale, expired)
     out = []
-    for map_id in wanted:
+    for map_id in sorted(wanted):
         have = builds.get(map_id, {})
-        ver = await current_version(reads, map_id)
+        ver = await cached_version(reads, map_id)
         if ver is None:
-            if not have or "stale" in have.values():
+            if not have or any(b[0] == "stale" for b in have.values()):
                 out.append(map_id)
-        elif have.get(ver) != "ok":
+        elif ver not in have or _outdated(have[ver], now, start):
             out.append(map_id)
     return out
+
+
+def _outdated(build: Tuple[str, Dict[str, Any], Any, int], now: datetime.datetime, start: datetime.datetime) -> bool:
+    """Whether the build of the current graph version must be redone: not ok, another builder, too old, or its oldest
+    input has left the window."""
+    status, detail, built_at, runs = build
+    if status != "ok" or detail.get("builder") != BUILDER_VERSION:
+        return True
+    if runs > 0 and built_at is not None and (now - built_at).total_seconds() >= config.REGION_STATS_MAX_AGE_S:
+        return True
+    oldest = detail.get("oldest_at")
+    try:
+        return bool(oldest) and datetime.datetime.fromisoformat(oldest) < start
+    except ValueError:
+        return True
 
 
 # --- read route ----------------------------------------------------------------------------------
@@ -292,7 +385,8 @@ async def region_stats(db: Any, reads: Any, map_id: str, robot_class: Optional[s
         raise maps._undefined_table(exc) from exc
     current = await current_version(reads, map_id)
     meta = {"window_days": config.REGION_STATS_WINDOW_DAYS, "min_len_m": config.REGION_STATS_MIN_LEN_M,
-            "max_runs": config.REGION_STATS_MAX_RUNS, "current_graph_version": current}
+            "max_runs": config.REGION_STATS_MAX_RUNS,
+            "min_event_s": config.REGION_STATS_MIN_EVENT_S, "builder": BUILDER_VERSION, "current_graph_version": current}
     stored: Optional[tuple] = None
     if robot is None:
         async with fleet_reads.read_cursor(db) as cur:
@@ -331,7 +425,8 @@ async def region_stats(db: Any, reads: Any, map_id: str, robot_class: Optional[s
     async with fleet_reads.read_cursor(db) as cur:
         start = utcnow() - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
         args2: List[Any] = [map_id, config.RUN_CELLS_ALGO_VERSION, start]
-        sql2 = ("SELECT run_id, created_at FROM run_cells WHERE map_id = %s AND algo_version = %s AND started_at >= %s")
+        sql2 = ("SELECT run_id, created_at FROM run_cells WHERE map_id = %s AND algo_version = %s AND started_at >= %s AND "
+                + NOT_ARCHIVED)
         if robot:
             sql2 += " AND robot_name = %s"
             args2.append(robot)

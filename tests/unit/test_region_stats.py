@@ -25,6 +25,7 @@ from packages.utils import run_cells_db as rdb  # noqa: E402
 pytestmark = pytest.mark.unit
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
+BUILT = json.dumps({"builder": rs.BUILDER_VERSION})
 CLASS_A, CLASS_B = "AMR|0.80x0.50", "AMR|1.00x0.60"
 
 
@@ -87,13 +88,15 @@ class Cur:
         if s.startswith("SELECT run_id, map_id") or "FROM run_cells WHERE map_id" in s and "SELECT run_id," in s and "map_id, robot_name" in s:
             rows = list(self.db.runs)
             self.rows = [stored(r) for r in rows if (not self.db.robot or r.robot_name == self.db.robot)]
+        elif s.startswith("SELECT gen FROM region_stats_inputs"):
+            self.rows = [(self.db.gen_locked if "FOR UPDATE" in s and self.db.gen_locked is not None else self.db.gen,)]
         elif s.startswith("SELECT 1 FROM") and "FOR SHARE" in s:
             self.rows = [(1,)] if self.db.map_live else []
         elif s.startswith("SELECT run_id, created_at FROM run_cells"):
             self.rows = [(r.run_id, r.created_at) for r in self.db.runs]
         elif s.startswith("SELECT DISTINCT map_id FROM run_cells"):
             self.rows = [(m,) for m in sorted({r.map_id for r in self.db.runs})]
-        elif s.startswith("SELECT map_id, graph_version, status FROM region_stats_builds"):
+        elif s.startswith("SELECT map_id, graph_version, status, detail, built_at, runs FROM region_stats_builds"):
             self.rows = list(self.db.builds)
         elif s.startswith("SELECT graph_version, stamp, built_at, status, runs FROM region_stats_builds"):
             rows = [b for b in self.db.build_rows if args[0] == b[0] and (len(args) < 2 or args[1] == b[1])]
@@ -120,6 +123,7 @@ class Db:
         self.runs, self.robot, self.executed, self.inserted = list(runs), robot, [], []
         self.builds, self.build_rows, self.stat_rows = [], [], []
         self.map_live = True
+        self.gen, self.gen_locked = 0, None       # region_stats_inputs.gen; gen_locked = what a writer made it meanwhile
 
     @contextlib.asynccontextmanager
     async def connection(self):
@@ -184,6 +188,36 @@ class TestAggregate:
         assert a["first_at"] == a["last_at"] == db.runs[0].started_at and a["stamp"] == got.stamp
         assert s[("A", "*")]["runs"] == 1 and s[("A", "*")]["speed_max"] is None
         assert s[("A", "*")]["len_m"] == a["len_m"]
+
+    def test_the_sample_gate_keeps_obstructed_short_passes(self, patched):
+        reads = Reads(1, [(-10_000, "A")])
+        # 0.6 m driven (below REGION_STATS_MIN_LEN_M) in each case
+        plain = make_run(1, range(0, 5))
+        blocked = make_run(2, range(0, 5), blocks_at=(2,))
+        waited = make_run(3, range(0, 5), stopped_per_cell=2.5)              # 12.5 s stopped
+        brief = make_run(4, range(0, 5), stopped_per_cell=1.0)               # 5 s: not enough
+        got = collect(patched(Db([plain, blocked, waited, brief])), reads)
+        a = by_key(got.stats)[("A", CLASS_A)]
+        assert a["runs"] == 2 and a["blocks"] == 1 and a["stopped_s"] == pytest.approx(12.5)
+        # no sample reached the length gate: no pace, but the event figures are there
+        assert a["pace_median_s_per_m"] is None and a["pace_p90_s_per_m"] is None
+        assert a["moving_pace_median_s_per_m"] is None and a["stopped_share"] is not None
+
+    def test_pace_percentiles_use_only_the_long_samples(self, patched):
+        long_run = make_run(1, range(0, 30), pace=2.0)
+        short_blocked = make_run(2, range(0, 5), pace=50.0, blocks_at=(1,), age_h=1)
+        got = collect(patched(Db([long_run, short_blocked])), Reads(1, [(-10_000, "A")]))
+        a = by_key(got.stats)[("A", CLASS_A)]
+        assert a["runs"] == 2 and a["blocks"] == 1
+        assert a["pace_median_s_per_m"] == pytest.approx(2.0) and a["pace_p90_s_per_m"] == pytest.approx(2.0)
+
+    def test_dwell_is_out_of_the_stopped_share_and_the_moving_pace(self, patched):
+        run = make_run(1, range(0, 30), stopped_per_cell=0.02, dwell_per_cell=0.1)
+        a = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
+        time_s, stopped, dwell = 30 * 0.24, 30 * 0.02, 30 * 0.1
+        assert a["pace_median_s_per_m"] == pytest.approx(2.0)                    # gross: dwell and stops included
+        assert a["stopped_share"] == pytest.approx(stopped / (time_s - dwell))
+        assert a["moving_pace_median_s_per_m"] == pytest.approx((time_s - stopped - dwell) / 3.6)
 
     def test_totals_are_conserved(self, patched):
         run = make_run(1, range(0, 30))
@@ -265,7 +299,7 @@ class TestAggregate:
         run = make_run(1, range(0, 20), stopped_per_cell=0.02, dwell_per_cell=0.04)
         a = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
         assert a["stopped_s"] == pytest.approx(0.4) and a["dwell_s"] == pytest.approx(0.8)
-        assert a["stopped_share"] == pytest.approx(0.4 / 4.8)
+        assert a["stopped_share"] == pytest.approx(0.4 / (4.8 - 0.8))             # builder 2: the dwell is not in the denominator
         assert a["moving_speed_mps"] == pytest.approx(2.4 / (4.8 - 0.4 - 0.8))
         assert a["norm_moving_m"] == pytest.approx((4.8 - 0.4 - 0.8) * 1.2)
 
@@ -299,7 +333,7 @@ class TestBuildMap:
         db = patched(Db([make_run(1, range(0, 30))]))
         out = asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A"), (10, "B")]), "m"))
         assert out["graph_version"] == 3 and out["status"] == "ok" and out["runs"] == 1 and out["charts"] == 4
-        sqls = [" ".join(s.split())[:50] for s, _ in db.executed if "region_stats" in s]
+        sqls = [" ".join(s.split())[:50] for s, _ in db.executed if "region_stats" in s and "region_stats_inputs" not in s]
         assert sqls[0].startswith("DELETE FROM region_stats WHERE map_id")
         assert any("many" == a for _, a in db.executed) and len(db.inserted) == 4
         assert any(s.startswith("INSERT INTO region_stats_builds") for s in sqls)
@@ -310,6 +344,21 @@ class TestBuildMap:
         db = patched(Db([make_run(1, range(0, 30))]))
         out = asyncio.run(rs.build_map(db, Reads(3, [(0, "A")], graph=False), "m"))
         assert out["status"] == "no_scene_graph" and out["graph_version"] == rs.NO_GRAPH_VERSION and db.inserted == []
+
+    def test_inputs_changed_during_the_build_stores_nothing(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        db.gen, db.gen_locked = 4, 5
+        out = asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        assert out["status"] == "inputs_changed" and db.inserted == []
+        assert not any(s.startswith("DELETE") or "INSERT INTO region_stats_builds" in s for s, _ in db.executed)
+
+    def test_the_generation_built_from_is_stored(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        db.gen = 4
+        asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        sql, args = [e for e in db.executed if e[0].startswith("INSERT INTO region_stats_builds")][0]
+        assert "inputs_gen" in sql and args[-1] == 4
+        assert any(s.startswith("INSERT INTO region_stats_inputs") for s, _ in db.executed)
 
     def test_a_deleted_map_gets_no_rows(self, patched):
         db = patched(Db([make_run(1, range(0, 30))]))
@@ -334,23 +383,86 @@ class TestBuildMap:
 
 
 class TestMapsNeedingBuild:
-    def need(self, db, reads):
+    def need(self, db, reads, fresh=True):
+        if fresh:
+            rs._VERSIONS.clear()
         return asyncio.run(rs.maps_needing_build(db, reads))
+
+    def test_the_graph_version_is_cached_between_polls(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
+
+        class Counting(Reads):
+            calls = 0
+
+            async def topology(self, map_id):
+                Counting.calls += 1
+                return await super().topology(map_id)
+        reads = Counting(3, [(0, "A")])
+        assert self.need(db, reads) == [] and self.need(db, reads, fresh=False) == []
+        assert Counting.calls == 1
+        assert self.need(db, Reads(4, [(0, "A")]), fresh=False) == []          # still the cached version 3 ...
+        rs._VERSIONS["m"] = (rs._VERSIONS["m"][0] - config.REGION_STATS_VERSION_TTL_S - 1, 3)
+        assert self.need(db, Reads(4, [(0, "A")]), fresh=False) == ["m"]       # ... until the TTL has passed
 
     def test_cases(self, patched):
         db = patched(Db([make_run(1, range(0, 20))]))
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # never built
-        db.builds = [("m", 3, "ok")]
+        db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == []                       # up to date
         assert self.need(db, Reads(4, [(0, "A")])) == ["m"]                    # a new graph version
-        db.builds = [("m", 3, "stale")]
+        db.builds = [("m", 3, "stale", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # a run was deleted
         db.runs = []
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... even when its last run is gone
         db.runs = [make_run(1, range(0, 20))]
-        db.builds = [("m", 0, "no_scene_graph")]
+        db.builds = [("m", 0, "no_scene_graph", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")], graph=False)) == []          # nothing to build without a graph
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... until the graph appears
+
+    def test_a_build_of_another_builder_version_is_redone(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        db.builds = [("m", 3, "ok", None, NOW, 1)]                                     # a legacy build has no detail
+        assert self.need(db, Reads(3, [(0, "A")])) == ["m"]
+        db.builds = [("m", 3, "ok", json.dumps({"builder": rs.BUILDER_VERSION - 1}), NOW, 1)]
+        assert self.need(db, Reads(3, [(0, "A")])) == ["m"]
+        db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
+        assert self.need(db, Reads(3, [(0, "A")])) == []
+
+    def test_archived_runs_do_not_make_a_map_wanted(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        self.need(db, Reads(3, [(0, "A")]))
+        sql = [s for s, _ in db.executed if s.startswith("SELECT DISTINCT map_id FROM run_cells")][0]
+        assert "mr.archived_at IS NOT NULL" in sql and "NOT EXISTS" in sql
+
+    def test_old_builds_and_expired_inputs_are_redone(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        reads = Reads(3, [(0, "A")])
+        day = datetime.timedelta(seconds=config.REGION_STATS_MAX_AGE_S)
+        db.builds = [("m", 3, "ok", BUILT, NOW - day - datetime.timedelta(minutes=1), 1)]
+        assert self.need(db, reads) == ["m"]                                   # built too long ago
+        db.builds = [("m", 3, "ok", BUILT, NOW - day / 2, 1)]
+        assert self.need(db, reads) == []
+        db.runs = []                                                           # an idle map with an old build ...
+        db.builds = [("m", 3, "ok", BUILT, NOW - 2 * day, 1)]
+        assert self.need(db, reads) == ["m"]                                   # ... is judged without run rows
+        db.builds = [("m", 3, "ok", BUILT, NOW - 2 * day, 0)]
+        assert self.need(db, reads) == []                                      # an empty build has nothing to expire
+        old = (NOW - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS + 1)).isoformat()
+        left = json.dumps({"builder": rs.BUILDER_VERSION, "oldest_at": old})
+        db.builds = [("m", 3, "ok", left, NOW, 5)]
+        assert self.need(db, reads) == ["m"]                                   # its oldest input left the window
+        inside = json.dumps({"builder": rs.BUILDER_VERSION, "oldest_at": NOW.isoformat()})
+        db.builds = [("m", 3, "ok", inside, NOW, 5)]
+        assert self.need(db, reads) == []
+
+    def test_the_build_records_its_oldest_input(self, patched):
+        db = patched(Db([make_run(1, range(0, 30)), make_run(2, range(0, 30), age_h=5)]))
+        asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        args = [a for s, a in db.executed if s.startswith("INSERT INTO region_stats_builds")][0]
+        detail = json.loads(args[5])
+        assert detail["builder"] == rs.BUILDER_VERSION
+        assert detail["oldest_at"] == min(r.started_at for r in db.runs).isoformat()
 
 
 class TestRoute:
@@ -397,6 +509,14 @@ class TestRoute:
         with pytest.raises(HTTPException) as e:
             self.call(db, Reads(3, [(0, "A")]), version=2)
         assert e.value.status_code == 404
+
+
+class TestRouteArchived:
+    def test_the_computed_cache_key_read_skips_archived_runs(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        asyncio.run(rs.region_stats(db, Reads(3, [(-10_000, "A")]), "m", robot="r1"))
+        sql = [s for s, _ in db.executed if s.startswith("SELECT run_id, created_at FROM run_cells")][0]
+        assert "mr.archived_at IS NOT NULL" in sql
 
 
 class TestLoader:
