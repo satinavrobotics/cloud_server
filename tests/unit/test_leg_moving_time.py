@@ -146,3 +146,63 @@ async def test_the_api_clears_the_chart_of_a_waypoint_the_operator_moved(state, 
     route_node = got.mission_tree[1].route
     assert [w.chart_key for w in route_node.waypoints] == ["c0", None, "c2"], json.dumps(request)[:80]
     assert route_node.graph_version is None
+
+
+# --- headerId gaps (W2-1 / W2-2) ----------------------------------------------------------------------------
+
+def feed_hdr(tracker, mission, *steps):
+    """steps: (seq, t, driving, headerId); the legs completed by the last step."""
+    legs = []
+    for seq, t, driving, hid in steps:
+        legs = tracker.observe(
+            message=SimpleNamespace(lastNodeId=vda(mission, 0, seq), orderId="m1-rabcd1234-n0",
+                                    driving=driving, headerId=hid),
+            mission=mission, ts=at(t), received=at(t), limits=None)
+    return legs
+
+
+class TestHeaderIdGaps:
+    def run(self, *steps):
+        mission = make_mission(route(WPS))
+        tr = leg_tracker.LegTracker()
+        [leg] = feed_hdr(tr, mission, (0, 0, True, 1), (2, 2, True, 2), *steps)
+        assert leg.stopped_s + leg.silent_s + leg.moving_s == pytest.approx(leg.duration_s)
+        return leg, tr
+
+    def test_consecutive_ids_keep_the_normal_rules(self):
+        leg, tr = self.run((2, 3, False, 3), (2, 4, False, 4), (4, 5, True, 5))
+        assert (leg.stopped_s, leg.silent_s, leg.moving_s) == (2.0, 0.0, 1.0)
+        assert tr.header_gaps == 0
+
+    def test_a_gap_of_three_ids_is_silent_not_stopped(self):
+        leg, tr = self.run((2, 3, False, 3), (2, 8, False, 6), (4, 9, True, 7))
+        assert (leg.stopped_s, leg.silent_s, leg.moving_s) == (1.0, 5.0, 1.0)
+        assert tr.header_gaps == 1
+
+    def test_a_gap_is_silent_even_after_a_driving_message(self):
+        leg, _ = self.run((2, 10, True, 4), (4, 12, True, 5))      # id 3 lost: 8 s silent, not moving
+        assert (leg.stopped_s, leg.silent_s, leg.moving_s) == (0.0, 8.0, 2.0)
+
+    def test_a_coalesced_pair_shows_as_a_gap_of_one_missing_id(self):
+        leg, tr = self.run((2, 3, False, 3), (2, 5, False, 5), (4, 6, True, 6))     # id 4 never processed
+        assert (leg.stopped_s, leg.silent_s) == (1.0, 2.0)
+        assert tr.header_gaps == 1
+
+    def test_a_restart_counts_silent_and_resets_the_reference(self):
+        leg, tr = self.run((2, 10, False, 900), (2, 20, False, 3), (2, 21, False, 4), (4, 22, True, 5))
+        assert (leg.stopped_s, leg.silent_s, leg.moving_s) == (2.0, 18.0, 0.0)
+        assert tr.header_gaps == 2
+
+    def test_a_new_pass_has_no_reference(self):
+        mission = make_mission(route(WPS))
+        tr = leg_tracker.LegTracker()
+        feed_hdr(tr, mission, (0, 0, True, 50), (2, 2, True, 51))
+        mission.status.passes_completed += 1
+        [leg] = feed_hdr(tr, mission, (0, 100, True, 7), (2, 101, True, 8), (4, 103, True, 9))
+        assert leg.silent_s == 0.0 and tr.header_gaps == 0
+
+    def test_missing_ids_fall_back_to_the_30_second_rule(self):
+        mission = make_mission(route(WPS))
+        [leg] = feed_hdr(leg_tracker.LegTracker(), mission,
+                         (0, 0, False, None), (2, 1, False, None), (4, 101, True, None))
+        assert (leg.stopped_s, leg.silent_s, leg.moving_s) == (30.0, 70.0, 0.0)
