@@ -151,6 +151,8 @@ class PlanGraph:
         charts = [by_id[i] for i in order] if order and len(order) == len(by_id) and set(order) == set(by_id) \
             else list(man["charts"])
         self.keys: List[str] = [c["key"] for c in charts]
+        self.keys_t: Tuple[str, ...] = tuple(self.keys)       # the same, immutable: what a region snapshot is built from (`is` test in `region_why`)
+        self._region_memo: Optional[Tuple[Any, Optional[Tuple[np.ndarray, int, int]]]] = None   # (snapshot, its `region_arg`): the last one asked
         k = len(self.keys)
         self._index = {key: j for j, key in enumerate(self.keys)}
         self._cell = np.array([c["cell"] for c in charts], np.int64).reshape(-1, 2)      # global lattice (y, x)
@@ -248,18 +250,28 @@ class PlanGraph:
 
     def region_arg(self, region: Any) -> Optional[Tuple[np.ndarray, int, int]]:
         """(rho per chart index, scale, rho_min) of a `RegionPricing` that prices this graph, else None: nothing to price (no snapshot, not
-        `active`, every rho 0) or a snapshot that is not of this version's charts (`region_why`)."""
-        return None if self.region_why(region) != "priced" else (
+        `active`, every rho 0) or a snapshot that is not of this version's charts (`region_why`). Memoised on the snapshot object (a
+        plan asks once per leg), so the int64 copy is made once per snapshot."""
+        memo = self._region_memo
+        if memo is not None and memo[0] is region:
+            return memo[1]
+        got = None if self.region_why(region) != "priced" else (
             np.asarray(region.rho, np.int64), int(region.scale), int(region.rho_min))
+        if region is not None:
+            self._region_memo = (region, got)
+        return got
 
     def region_why(self, region: Any) -> str:
-        """Whether `region` prices this graph: "priced", "neutral" (nothing to price), "version_mismatch" (another graph version) or
-        "keys_mismatch" (not this version's charts)."""
-        if region is None or not region.active or region.rho_max <= 0:
+        """Whether `region` prices this graph: "neutral" (no snapshot, or one that is not `active`), "version_mismatch" (another graph
+        version), "keys_mismatch" (not this version's charts), then "neutral" again when every rho is 0 and "priced" otherwise: the
+        version and the charts are judged before rho_max, so an all-zero snapshot of another version is not read as neutral."""
+        if region is None or not region.active:
             return "neutral"
         if int(region.graph_version) != int(self.version):
             return "version_mismatch"
-        return "priced" if tuple(region.keys) == tuple(self.keys) else "keys_mismatch"
+        if region.keys is not self.keys_t and tuple(region.keys) != self.keys_t:
+            return "keys_mismatch"
+        return "priced" if region.rho_max > 0 else "neutral"
 
     @staticmethod
     def _geo_bound(j: float, reg: Optional[Tuple[np.ndarray, int, int]]) -> float:

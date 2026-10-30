@@ -220,8 +220,10 @@ class RegionPricing:
 
     @property
     def key(self) -> Tuple[str, int, str, Optional[str], str]:
-        """The cache key of the snapshot."""
-        return (self.map_id, self.graph_version, self.robot_class, self.stamp, self.model_hash)
+        """The cache key of the snapshot. A neutral snapshot carries its status in the stamp slot: the neutral statuses
+        (stamp_mismatch, version_mismatch, no_build_for_version, load_error) have no stamp or share one, and must not stand for each other."""
+        return (self.map_id, self.graph_version, self.robot_class,
+                self.stamp if self.status == "ok" else "%s:%s" % (self.stamp, self.status), self.model_hash)
 
     @property
     def active(self) -> bool:

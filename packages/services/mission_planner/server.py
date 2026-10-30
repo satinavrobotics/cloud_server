@@ -471,7 +471,7 @@ class MissionPlannerService:
         if mode == "off" or not callable(getattr(graph, "region_arg", None)):
             return None, "off"
         try:
-            return await self._region_snaps.get(map_id, version, graph.keys,
+            return await self._region_snaps.get(map_id, version, getattr(graph, "keys_t", graph.keys),
                                                 getattr(getattr(robot, "status", None), "factsheet", None)), mode
         except asyncio.CancelledError:
             raise
