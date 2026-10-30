@@ -233,7 +233,7 @@ async def fetch_track(cur: Any, map_id: str, start, end, robot, limit: int,
     args: List[Any] = [map_id]
     sql = ("SELECT t.run_id, extract(epoch FROM t.ts)::float8, t.x_map, t.y_map, t.map_session_id, t.run_epoch "
            "FROM robot_track_ts t JOIN mission_runs r ON r.run_id = t.run_id "
-           "WHERE r.map_id = %s AND t.x_map IS NOT NULL AND t.y_map IS NOT NULL"
+           "WHERE r.map_id = %s AND r.archived_at IS NULL AND t.x_map IS NOT NULL AND t.y_map IS NOT NULL"
            + _window_sql("t.ts", start, end, robot, "t.robot_name", args)
            + (_not_summarised("r.run_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY t.ts DESC LIMIT %s")
@@ -260,7 +260,8 @@ async def fetch_legs(cur: Any, map_id: str, start, end, robot, skip_summarised: 
     args: List[Any] = [map_id]
     sql = ("SELECT run_id, from_topomap_node, to_topomap_node, duration_s, stopped_s, recovery_s "
            "FROM run_legs WHERE map_id = %s AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL "
-           "AND duration_s > 0" + _window_sql("started_at", start, end, robot, "robot_name", args)
+           "AND duration_s > 0 AND EXISTS (SELECT 1 FROM mission_runs a WHERE a.run_id = run_legs.run_id "
+           "AND a.archived_at IS NULL)" + _window_sql("started_at", start, end, robot, "robot_name", args)
            + (_not_summarised("run_legs.run_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY started_at DESC LIMIT %s")
     args.append(config.DRIVE_STATS_MAX_ROWS)
@@ -268,12 +269,18 @@ async def fetch_legs(cur: Any, map_id: str, start, end, robot, skip_summarised: 
     return list(await cur.fetchall())
 
 
-async def runs_with_track(cur: Any, run_ids: Sequence[Any]) -> set:
-    """Runs (of `run_ids`) that have ANY stored map-frame track row, in or out of the window."""
+async def runs_with_track(cur: Any, run_ids: Sequence[Any], start: Optional[datetime.datetime] = None) -> set:
+    """Runs (of `run_ids`, which fetch_legs already took from non-archived runs) that have ANY stored map-frame track row, in or out of the window.
+    `start`: the window start. The runs started at or after it, so no row of theirs is older (an hour of slack for
+    the clock difference between a run's start and its first row): the scan of the hypertable is bounded."""
     if not run_ids:
         return set()
-    await cur.execute("SELECT DISTINCT run_id FROM robot_track_ts WHERE run_id = ANY(%s) AND x_map IS NOT NULL",
-                      (list(run_ids),))
+    sql = ("SELECT DISTINCT run_id FROM robot_track_ts WHERE run_id = ANY(%s) AND x_map IS NOT NULL")
+    args: List[Any] = [list(run_ids)]
+    if start is not None:
+        sql += " AND ts >= %s"
+        args.append(start - datetime.timedelta(hours=1))
+    await cur.execute(sql, tuple(args))
     return {r[0] for r in await cur.fetchall()}
 
 
@@ -330,7 +337,7 @@ async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = Fa
             out.recoveries = await fetch_recoveries(cur, sorted(track_runs, key=str), min(ts), max(ts))
         legs = await fetch_legs(cur, map_id, start, end, robot, skip_summarised=use_summaries)
         leg_runs = {l[0] for l in legs} - track_runs
-        has_track = await runs_with_track(cur, sorted(leg_runs, key=str))
+        has_track = await runs_with_track(cur, sorted(leg_runs, key=str), start)
         out.legs = [l for l in legs if l[0] not in track_runs and l[0] not in has_track]
         out.legs_dropped_for_track = len(legs) - len(out.legs)
     return out

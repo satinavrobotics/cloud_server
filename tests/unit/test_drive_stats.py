@@ -363,6 +363,18 @@ class TestEndpoint:
         with pytest.raises(HTTPException):
             call(FakeReads(), start=a, end=a)
 
+    def test_archived_runs_are_left_out_and_the_track_probe_is_bounded(self, patched):
+        import datetime
+        cur = patched(legs=[("legrun", "n1", "n2", 10.0, 0.0, 0.0)])
+        a = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
+        call(FakeReads(), start=a)
+        sql = next(s for s, _ in cur.sql if "FROM robot_track_ts t JOIN" in s)
+        assert "r.archived_at IS NULL" in sql
+        sql = next(s for s, _ in cur.sql if "FROM run_legs" in s)
+        assert "a.archived_at IS NULL" in sql
+        sql, args = next(c for c in cur.sql if c[0].startswith("SELECT DISTINCT run_id"))
+        assert "ts >= %s" in sql and args[1] == a - datetime.timedelta(hours=1)
+
 
 class TestCache:
     def test_ttl_and_single_flight(self):

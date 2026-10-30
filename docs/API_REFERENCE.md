@@ -266,6 +266,7 @@ Response:
   in 0.1 m cells, `visited` how many of them have drive data. `stopped_s` is every stop; `dwell_s` is the part of it spent
   waiting near the run's start, goal and action nodes and `transit_stopped_s` = `stopped_s - dwell_s` the rest. The latter
   is the region-stats `stopped_s`. Runs read raw (no stored summary) carry no dwell split: `dwell_s` 0 for them.
+* **Archived runs** (`mission_runs.archived_at`) are left out of the raw part (tracks and legs), as they are of run-stats.
 * `source.partial` true: more than `DRIVE_STATS_MAX_ROWS` (2,000,000) raw track rows matched, the newest were used (the
   stored summaries are never cut).
 * **Summaries:** by default (`DRIVE_STATS_SOURCE=summaries`, the default `min_speed`) a run that started in the window and
