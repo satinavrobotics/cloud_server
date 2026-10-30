@@ -28,7 +28,6 @@ import dataclasses
 import datetime
 import json
 import logging
-import math
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -61,22 +60,22 @@ def plan_length(leg: Dict[str, Any], trajs: Dict[Tuple[Any, int], Trajectory]) -
     (stage B, dispatch worked it out from the live route) is read as recorded: "trajectory" with its stored
     `planned_m`; any other recorded source is "straight" / "stale" with the straight line, whatever the snapshot
     holds now. A leg recorded before (plan_source NULL) is worked out here from the run's stored snapshot
-    (`mission_runs.mission_tree`), whose waypoints are compared with the leg's recorded `straight_m`."""
+    (`mission_runs.mission_tree`) by the writer's endpoint rule as far as the stored data allows
+    (plan_length.plan_of_snapshot: the leg's poses were not stored, only its `straight_m`)."""
     straight = leg.get("straight_m")
     recorded = leg.get("plan_source")
     if recorded is not None:
         planned = leg.get("planned_m") if recorded == plan_length_mod.SOURCE_TRAJECTORY else straight
         return (None if planned is None else float(planned)), (recorded if planned is not None else None)
     src, dst = parse_node(leg.get("from_vda_node")), parse_node(leg.get("to_vda_node"))
-    points, matches = None, False
+    points, a, b = None, None, None
     if src and dst and src[0] == dst[0] and dst[1] >= 4 and dst[1] % 2 == 0 and src[1] == dst[1] - 2:
         traj = trajs.get((leg["run_id"], dst[0]))
         k = dst[1] // 2 - 1
         points = traj.legs.get((k - 1, k)) if traj else None
-        if points is not None and straight is not None and k < len(traj.waypoints):
+        if points is not None and k < len(traj.waypoints):
             a, b = traj.waypoints[k - 1], traj.waypoints[k]
-            matches = abs(math.hypot(b[0] - a[0], b[1] - a[1]) - straight) <= config.EFFICIENCY_STALE_TOL_M
-    return plan_length_mod.resolve(points, straight, matches)
+    return plan_length_mod.plan_of_snapshot(points, a, b, straight, config.EFFICIENCY_STALE_TOL_M)
 
 
 @dataclasses.dataclass

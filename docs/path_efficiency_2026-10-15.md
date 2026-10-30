@@ -44,9 +44,12 @@ are `...-n{i}-s{seq}` with `seq = 2k + 2` for waypoint `k` of tree node `i`; `se
 ## Decisions
 
 * **Replans / reroutes mid-run.** `mission_runs.mission_tree` is the snapshot at the run's start; a replan (`_replan_goto`) or reroute (`order_rev` > 0)
-  changes the waypoints afterwards. The leg's recorded `straight_m` is compared with the distance of the snapshot's two waypoints; a difference above
-  `EFFICIENCY_STALE_TOL_M` (3 cm) marks the trajectory stale. On office7 the one rerouted run has 37 of 60 legs stale, caught this way.
-  Stale legs are not in the headline (`source.stale_trajectory_legs`). Not detected: a replan that kept the same waypoints and only changed the
+  changes the waypoints afterwards. A trajectory entry is stale unless BOTH its ends are within
+  `EFFICIENCY_STALE_TOL_M` (3 cm) of the leg's two waypoints (`plan_length.plan_of`; the rule dispatch applies when it records the leg, with the
+  poses it sent the robot to). A leg recorded before `plan_source` existed has no stored poses, only `straight_m`, so it is judged by
+  `plan_length.plan_of_snapshot`: the snapshot's waypoint distance must be within 2 x the tolerance of `straight_m` (necessary for both ends to match),
+  and the entry's ends must sit at the snapshot's waypoints. On office7 the one rerouted run has 37 of 60 legs stale, caught this way.
+  Stale legs are not in the headline (`source.stale_trajectory_legs`). Not detected on legs without `plan_source`: a reroute that moved both waypoints and kept their spacing (the writer sees it), and a replan that kept the same waypoints and only changed the
   path between them (cannot be seen from the stored data; the snapshot trajectory is then compared with the real drive).
 * **Recovery.** The driven path includes recovery spins and back-ups. `excluding_recovery` removes, per track pair, the share of its distance that
   falls in the `NAV.RECOVERY_EXITED` interval (`ts - duration_s .. ts`) of the run (time-proportional). `time.ratio_excl_recovery` removes
