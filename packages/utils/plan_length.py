@@ -66,3 +66,14 @@ def resolve(points: Optional[Sequence[Sequence[float]]], straight_m: Optional[fl
     if matches:
         return polyline_m(points), SOURCE_TRAJECTORY
     return float(straight_m), SOURCE_STALE
+
+
+def plan_of(points: Optional[Sequence[Sequence[float]]], start: Optional[Tuple[float, float]],
+            end: Optional[Tuple[float, float]], straight_m: Optional[float], tol_m: float
+            ) -> Tuple[Optional[float], Optional[str]]:
+    """`resolve` with the stale rule applied: THE endpoint rule (the entry's first point within `tol_m` of the
+    leg's start AND its last of the leg's end, `ends_match`). `start` / `end` are the (x, y) the leg runs
+    between, None when the leg has no waypoint pose there (then an entry cannot match)."""
+    matches = (points is not None and start is not None and end is not None
+               and ends_match(points, start, end, tol_m))
+    return resolve(points, straight_m, matches)

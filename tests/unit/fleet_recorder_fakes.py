@@ -16,7 +16,6 @@ from packages.events.emit import COLUMNS as EVENT_COLUMNS, INSERT_SQL as EVENT_I
 from packages.telemetry_ingest import IngestQueue, RecordingPolicy, SpillFile, health, tables
 from packages.telemetry_ingest.policy import PolicySources
 from packages.telemetry_ingest.rehydrate import SELECT_SQL as LATEST_SELECT_SQL
-from packages.utils import edge_stats_db
 
 UTC = datetime.timezone.utc
 T0 = datetime.datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
@@ -44,7 +43,6 @@ class FakeDB:
         self.events = {}        # (event_id, ts) -> row dict
         self.trajectory = []    # dicts: mission_id, robot_name, ts, run_id
         self.legs = {}          # (run_id, seq) -> row dict (run_legs)
-        self.edge_obs = {}      # primary key tuple -> row dict (edge_observations)
         self.missions = {}      # name -> (lifecycle, robot, status dict)
         self.next_run = {}      # mission name -> pending one-off recording level
         self.latest = []        # tuples in rehydrate SELECT_SQL column order
@@ -55,12 +53,10 @@ class FakeDB:
 
     # --- state helpers -------------------------------------------------------------------
     def snapshot(self):
-        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run,
-                              self.edge_obs))
+        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run))
 
     def restore(self, snap):
-        (self.runs, self.events, self.trajectory, self.legs, self.next_run,
-         self.edge_obs) = snap
+        (self.runs, self.events, self.trajectory, self.legs, self.next_run) = snap
 
     def legs_of(self, run_id=None):
         return [r for _, r in sorted(self.legs.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
@@ -197,54 +193,6 @@ class FakeDB:
         elif sql == fr.SET_SUMMARY_SQL:
             summary, run_id = params
             self.runs[run_id]["summary_metrics"] = json.loads(summary)
-        elif sql == fr.EDGE_LEGS_SQL:
-            cursor.results = [
-                tuple(leg[f] for f in fr.EDGE_LEG_FIELDS) for leg in self.legs_of(params[0])
-                if leg["from_topomap_node"] and leg["to_topomap_node"]]
-        elif sql == edge_stats_db.INSERT_SQL:
-            assert len(params) == len(edge_stats_db.COLUMNS)            # one parallel array per column
-            assert len({len(a) for a in params}) == 1
-            for values in zip(*params):
-                row = dict(zip(edge_stats_db.COLUMNS, values))
-                assert row["observed_at"].tzinfo is not None and row["duration_s"] > 0
-                key = tuple(row[c] for c in edge_stats_db.COLUMNS[:6])
-                if key not in self.edge_obs:
-                    self.edge_obs[key] = row
-                    cursor.rowcount += 1
-        elif sql.startswith("UPDATE edge_observations o SET"):
-            # scripts/backfill_edge_observations.py FILL_SQL: only the NULL columns of leg rows, from run_legs
-            for key, row in self.edge_obs.items():
-                if row["source"] != "leg":
-                    continue
-                for (run_id, seq), leg in self.legs.items():
-                    if f"{run_id}:{seq}" != row["source_key"]:
-                        continue
-                    changed = False
-                    for col in ("stopped_s", "recovery_s", "moving_s"):
-                        if row.get(col) is None and leg.get(col) is not None:
-                            row[col], changed = leg[col], True
-                    cursor.rowcount += int(changed)
-        elif sql in (edge_stats_db.SELECT_SQL, edge_stats_db.SELECT_POOLED_SQL):
-            # the window cut of the SQL: newest `window` per (edge, robot) or, pooled, per edge
-            map_id, robot, _, window = params
-            pooled = sql == edge_stats_db.SELECT_POOLED_SQL
-            groups = {}
-            for key, r in self.edge_obs.items():
-                if r["map_id"] == map_id and (robot is None or r["robot_name"] == robot):
-                    groups.setdefault((r["from_node"], r["to_node"],
-                                       None if pooled else r["robot_name"]), []).append(r)
-            cursor.results = [
-                tuple(r[c] for c in edge_stats_db.COLUMNS)
-                for rows in groups.values()
-                for r in sorted(rows, key=lambda r: (r["observed_at"], r["source"],
-                                                     r["source_key"]), reverse=True)[:window]]
-        elif sql == edge_stats_db.PURGE_SQL:
-            days, batch = params
-            cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-            old = [k for k, r in self.edge_obs.items() if r["observed_at"] < cutoff][:batch]
-            for key in old:
-                del self.edge_obs[key]
-            cursor.rowcount = len(old)
         elif sql == EVENT_INSERT_SQL:
             row = dict(zip(EVENT_COLUMNS, params))
             assert row["ts"].tzinfo is not None

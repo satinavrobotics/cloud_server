@@ -146,6 +146,14 @@ class LegTracker:
         self.anchor: Optional[Reach] = None
         self.last_node: Optional[str] = None
         self._prev: Optional[Tuple[datetime.datetime, bool]] = None   # (ts, driving)
+        self._routes: Optional[Tuple[Tuple[int, int], Tuple[Dict[int, RouteInfo], Optional[List[str]]]]] = None
+
+    def _route_table(self, mission: Any, order_rev: int) -> Tuple[Dict[int, RouteInfo], Optional[List[str]]]:
+        """route_table(mission), rebuilt only when the order or the route revision changed."""
+        key = (order_rev, int(getattr(mission, "route_rev", 0) or 0))
+        if self._routes is None or self._routes[0] != key:
+            self._routes = (key, route_table(mission))
+        return self._routes[1]
 
     @property
     def current_seq(self) -> Optional[int]:
@@ -183,7 +191,7 @@ class LegTracker:
             order_id = message.orderId or ""
             if self.anchor is None and order_ids.is_order_of(prefix, order_id):
                 idx = order_ids.order_node_index(order_id)
-                if idx in route_table(mission)[0]:
+                if idx in self._route_table(mission, status.order_rev)[0]:
                     self.anchor = Reach(f"{prefix}-n{idx}-s0", 0, idx, ts, received,
                                         status.order_rev, virtual=True)
             return []
@@ -191,7 +199,7 @@ class LegTracker:
             return []
         self.last_node = node_id
 
-        table, planned = route_table(mission)
+        table, planned = self._route_table(mission, status.order_rev)
         idx, seq = order_ids.node_index(node_id), order_ids.node_sequence(node_id)
         if idx not in table:
             self.anchor = None         # an action or a move: the next route starts afresh
@@ -219,20 +227,18 @@ class LegTracker:
         anchor, self.anchor = self.anchor, reach
         if anchor is None:
             return []
-        return [self._leg(anchor, reach, limits, default_map or waypoints[wp].map_id or None, info)]
+        return [self._leg(anchor, reach, limits, run_legs.leg_map_id(waypoints[wp].map_id, default_map), info)]
 
     @staticmethod
     def _plan(start: Reach, end: Reach, straight: Optional[float], route: Optional[RouteInfo]
               ) -> Tuple[Optional[float], Optional[str]]:
         """(planned_m, plan_source) of a leg: see the module docstring."""
-        points, matches = None, False
+        points, a, b = None, None, None
         if (route is not None and start.pose is not None and end.pose is not None and start.wp is not None
                 and end.wp == start.wp + 1 and order_ids.node_index(start.vda_node) == end.node_idx):
             points = route.legs.get((start.wp, end.wp))
-            if points is not None:
-                matches = plan_length.ends_match(points, (start.pose.x, start.pose.y),
-                                                 (end.pose.x, end.pose.y), config.EFFICIENCY_STALE_TOL_M)
-        return plan_length.resolve(points, straight, matches)
+            a, b = (start.pose.x, start.pose.y), (end.pose.x, end.pose.y)
+        return plan_length.plan_of(points, a, b, straight, config.EFFICIENCY_STALE_TOL_M)
 
     def _leg(self, start: Reach, end: Reach, limits: Any, map_id: Optional[str],
              route: Optional[RouteInfo] = None) -> Leg:

@@ -128,7 +128,7 @@ class TestSummaryPlanSources:
 class TestAggregate:
     def legs(self, durations, src="A", dst="B", **extra):
         return [{"run_id": i, "from_topomap_node": src, "to_topomap_node": dst,
-                 "duration_s": d, "expected_s": 4.0, "recoveries": 0, **extra}
+                 "duration_s": d, "expected_s": 4.0, "plan_source": "straight", "recoveries": 0, **extra}
                 for i, d in enumerate(durations)]
 
     def test_median_p90_ratio(self):
@@ -352,9 +352,9 @@ class TestEventsAndSummary:
         await rec.run_pending_ops()
         assert db.legs_of()[2]["recoveries"] == 2
 
-    async def test_plan_charts_and_distance_reach_the_rows_the_summary_and_the_edge_observations(self, tmp_path):
+    async def test_plan_charts_and_distance_reach_the_rows_and_the_summary(self, tmp_path):
         """Stage B end to end: the row has plan_source / charts / graph_version, the summary counts the sources and
-        its distance and the edge observation's distance are the plan trajectory's, not the straight line."""
+        its distance is the plan trajectory's, not the straight line."""
         mission = api_objects.MissionObjectV1(
             name="m1", robot="r1", status={}, timeout=600, planned_path=["A", "B", "C"],
             mission_tree=[{"name": "go", "route": {
@@ -381,8 +381,6 @@ class TestEventsAndSummary:
         summary = db.runs[fr.run_uuid("m1", RUN)]["summary_metrics"]
         assert summary["plan_sources"] == {"trajectory": 1, "straight": 1, "none": 1}
         assert summary["distance_m"] == pytest.approx(5.0 + 4.0)
-        [obs] = [o for o in db.edge_obs.values() if o["from_node"] == "A"]
-        assert obs["distance_m"] == 5.0 and obs["speed_mps"] == pytest.approx(5.0 / 8.0, abs=1e-3)
 
     async def test_predicted_seconds_and_the_cost_model_reach_the_rows_like_planned_m(self, tmp_path):
         """S4: the trajectory entry's predicted_s and the route node's cost_model are copied to the leg row, only for a leg whose entry
@@ -905,3 +903,26 @@ class TestEndpoints:
 
     async def test_mission_without_runs_is_404(self):
         assert (await get(FakeDb(), "/api/v1/missions/nope/legs")).status_code == 404
+
+
+def test_expected_s_medians_skip_legs_recorded_before_the_plan_source():
+    """I11: expected_s of a plan_source NULL leg is a straight-line figure: it does not feed the median."""
+    legs = [{"from_topomap_node": "A", "to_topomap_node": "B", "run_id": "r", "duration_s": 10.0,
+             "expected_s": 4.0, "plan_source": None},
+            {"from_topomap_node": "A", "to_topomap_node": "B", "run_id": "r", "duration_s": 10.0,
+             "expected_s": 8.0, "plan_source": "trajectory"}]
+    [item] = run_legs.aggregate(legs)
+    assert item["expected_s"] == 8.0 and item["ratio"] == 1.25
+    assert run_legs.leg_map_id("w", "r") == "w" and run_legs.leg_map_id(None, "r") == "r" \
+        and run_legs.leg_map_id("", None) is None
+
+
+def test_events_are_not_tagged_with_a_leg_while_an_adopted_run_is_unresolved(tmp_path):
+    """C9: before leg_base is known, seq 1, 2, ... would collide with the legs stored before the restart."""
+    from types import SimpleNamespace
+    rec = make_recorder(tmp_path)[0]
+    tracker = SimpleNamespace(current_seq=2)
+    rec._runs["r1"] = SimpleNamespace(tracker=tracker, resolved=False, leg_base=5)
+    assert rec.leg_seq("r1") is None
+    rec._runs["r1"].resolved = True
+    assert rec.leg_seq("r1") == 7

@@ -87,6 +87,11 @@ def percentile(values: Sequence[float], q: float) -> Optional[float]:
     return float(ordered[low] + (ordered[high] - ordered[low]) * (pos - low))
 
 
+def leg_map_id(waypoint_map: Optional[str], run_map: Optional[str]) -> Optional[str]:
+    """The map a leg belongs to: its waypoint's own map, else the run's (the one rule for every writer)."""
+    return waypoint_map or run_map or None
+
+
 def _round(value: Optional[float], digits: int = 3) -> Optional[float]:
     return None if value is None else round(value, digits)
 
@@ -104,7 +109,9 @@ def aggregate(legs: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         group["topomap"] = group["topomap"] and topomap
         if leg.get("duration_s") is not None:
             group["durations"].append(float(leg["duration_s"]))
-        if leg.get("expected_s") is not None:
+        # expected_s was a straight-line figure before stage B (plan_source NULL) and a polyline one after:
+        # only the legs that say which plan they used feed the median, so the ratio does not shift by era
+        if leg.get("expected_s") is not None and leg.get("plan_source") is not None:
             group["expected"].append(float(leg["expected_s"]))
         group["recoveries"] += int(leg.get("recoveries") or 0)
         group["recovery_s"] += float(leg.get("recovery_s") or 0.0)

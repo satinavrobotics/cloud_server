@@ -644,19 +644,6 @@ RECORDER_RECONCILE_MIN_AGE_S = float(os.getenv("RECORDER_RECONCILE_MIN_AGE_S", "
 # Trajectory rows logged this long after the run ended still belong to it.
 RECORDER_TRAJECTORY_GRACE_S = int(os.getenv("RECORDER_TRAJECTORY_GRACE_S", "5"))
 
-# Per-edge traversal statistics of the topomap (packages/utils/edge_stats.py): every raw observation
-# is kept (append-only, up to EDGE_STATS_RETENTION_DAYS); the newest EDGE_STATS_WINDOW observations
-# of each (map, edge, robot) are read and summarised (the window is applied on read). An observation
-# with a duration over EDGE_STATS_MAX_DURATION_S (a paused session, a stuck robot) or a speed over
-# EDGE_STATS_MAX_SPEED_MPS (bursty MQTT delivery, a wrong clock) is dropped, as is a duration <= 0.
-# A MAPPING step (two consecutive session nodes) slower than EDGE_STATS_MIN_SPEED_MPS is dropped
-# too: the session was paused or the robot stood still, so its time is no traversal time (legs are
-# not filtered by a minimum speed).
-EDGE_STATS_WINDOW = int(os.getenv("EDGE_STATS_WINDOW", "20"))
-# Observations older than this many days (by observed_at) are deleted, in bounded batches, by the
-# mission-dispatch recorder (hourly). 0 = keep forever.
-EDGE_STATS_RETENTION_DAYS = int(os.getenv("EDGE_STATS_RETENTION_DAYS", "365"))
-
 # GET /api/v1/maps/{id}/drive-stats (docs/drive_stats_2026-10-14.md): per-tile / per-region driving
 # statistics from the recorded map-frame track. A consecutive pair of track rows further apart than
 # DRIVE_STATS_MAX_GAP_S, faster than DRIVE_STATS_MAX_SPEED_MS (a pose jump) or not moving forward in
@@ -744,17 +731,6 @@ EFFICIENCY_CACHE_ENTRIES = int(os.getenv("EFFICIENCY_CACHE_ENTRIES", "32"))
 # nodes of a mapping session longer than MAPPING_STATS_MAX_GAP_S (after the paused seconds are taken out)
 # is not attributed to space (the robot stood, the uploads stalled); it still counts in the active time.
 MAPPING_STATS_MAX_GAP_S = float(os.getenv("MAPPING_STATS_MAX_GAP_S", "60.0"))
-EDGE_STATS_MAX_DURATION_S = float(os.getenv("EDGE_STATS_MAX_DURATION_S", "3600.0"))
-# The edge-stats speed rules are deliberately the SAME movement rules as drive-stats / mapping-stats /
-# path efficiency: they default to DRIVE_STATS_MAX_SPEED_MS / DRIVE_STATS_MIN_SPEED_MS (an env var still
-# overrides each). Changing a default only affects observations written from now on: stored ones were
-# judged by the thresholds of their time (5.0 / 0.02 m/s before) and are not re-judged.
-EDGE_STATS_MAX_SPEED_MPS = float(os.getenv("EDGE_STATS_MAX_SPEED_MPS", str(DRIVE_STATS_MAX_SPEED_MS)))
-EDGE_STATS_MIN_SPEED_MPS = float(os.getenv("EDGE_STATS_MIN_SPEED_MPS", str(DRIVE_STATS_MIN_SPEED_MS)))
-# GET /api/v1/maps/{id}/edge-stats: the grouped list of a (map, robot, pooled) is cached this long (the
-# client pages through it; each page would otherwise re-read all observations and all edges).
-EDGE_STATS_CACHE_TTL_S = float(os.getenv("EDGE_STATS_CACHE_TTL_S", "120.0"))
-EDGE_STATS_CACHE_ENTRIES = int(os.getenv("EDGE_STATS_CACHE_ENTRIES", "16"))
 
 # ==================== Pre-mission go-to (API) ====================
 # packages/api/pre_goto.py: before a MAPPED mission is queued (POST /api/v1/missions) the server

@@ -22,7 +22,7 @@ import uvicorn
 
 from packages.api.server import ApiDelegationService, build_mission_update
 from packages.api import fleet_reads, maps, recorder_health, recording, run_admin, run_stats, teleop
-from packages.api import drive_stats, edge_stats, map_events, mapping_stats, path_efficiency, region_stats, run_cells, session_trace, session_trajectory, sites
+from packages.api import drive_stats, map_events, mapping_stats, path_efficiency, region_stats, run_cells, session_trace, session_trajectory, sites
 from packages.api import map_series, series_axis, ingest_backlog
 from packages.api import navstack_deploy, navstack_images
 from packages.api import bag_analysis as bag_analysis_api
@@ -1135,12 +1135,6 @@ def _arango_node_count(name: str) -> int:
     return int(stats.get("node_count") or 0)
 
 
-async def _record_session_edges(session: Dict[str, Any]) -> None:
-    """A finished mapping session's per-edge observations (packages/api/edge_stats.py), as a
-    background task: returns at once, never raises."""
-    edge_stats.schedule_record_session(service.database, service.graph_db, session)
-
-
 @app.post("/api/v1/maps/{map_id}/sessions", status_code=201)
 async def start_map_session(map_id: str, body: Dict[str, Any], force: bool = False):
     """Start a session `{robot, purpose?, services?, placement?, replace?}` on the map (maps
@@ -1167,7 +1161,7 @@ async def start_map_session(map_id: str, body: Dict[str, Any], force: bool = Fal
     return await _site_call("start map session", maps.start_session(
         service.database, map_id, body, uuid.uuid4(), recording.request_actor(),
         switch=service.mapping_switch, arango_node_count=_arango_node_count,
-        reloc_jobs=service.reloc_jobs, on_finished=_record_session_edges,
+        reloc_jobs=service.reloc_jobs,
         backlog_fetch=ingest_backlog.fetch_backlog, force=force))
 
 
@@ -1215,22 +1209,6 @@ async def map_session_trajectory(map_id: str, session_id: str, from_index: Optio
     return StreamingResponse(pack.stream(), media_type="application/x-tar", headers={
         "Content-Disposition": f'attachment; filename="{pack.filename}"',
         "X-Accel-Buffering": "no", "Cache-Control": "no-store"})
-
-
-@app.get("/api/v1/maps/{map_id}/edge-stats")
-async def map_edge_stats(map_id: str, robot: Optional[str] = None,
-                         min_count: Optional[int] = None, limit: Optional[int] = None,
-                         offset: Optional[int] = None, pooled: bool = False):
-    """Per-edge traversal statistics of the map's topomap (read-only; groundwork for edge
-    weights): for each (edge, robot) the count, median / p90 traversal time and median speed of
-    the newest 20 observations (mission legs and mapping sessions), `last_observed_at` and the
-    recoveries / blocks seen on legs. `robot` filters, `pooled=true` (no `robot`) gives one item
-    per edge over the newest 20 observations of all robots (`robot: null`), `min_count` (default 1) drops thin
-    edges, `limit` (1-200, default 100) / `offset` page ({total, next_offset}). 404 unknown map;
-    422 bad query. Contract: packages/api/README.md."""
-    _require_service()
-    return await _site_call("map edge stats", edge_stats.edge_stats(
-        service.database, service.graph_db, map_id, robot, min_count, limit, offset, pooled))
 
 
 @app.get("/api/v1/maps/{map_id}/drive-stats")
@@ -1491,7 +1469,7 @@ async def map_session_action(map_id: str, session_id: str, action: str, force: b
         service.database, map_id, session_id, action, uuid.uuid4(),
         recording.request_actor(), switch=service.mapping_switch,
         arango_node_count=_arango_node_count, reloc_jobs=service.reloc_jobs,
-        on_finished=_record_session_edges, backlog_fetch=ingest_backlog.fetch_backlog,
+        backlog_fetch=ingest_backlog.fetch_backlog,
         force=force))
 
 
