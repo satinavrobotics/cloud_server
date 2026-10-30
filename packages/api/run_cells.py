@@ -44,6 +44,7 @@ from packages import config
 from packages.api import fleet_reads
 from packages.api.entrypoint import advisory_lock_key
 from packages.utils import cell_raster as cr
+from packages.utils import factsheet_periods
 from packages.utils import region_builds
 from packages.utils import robot_class as rclass
 from packages.utils import run_cells_db as rdb
@@ -277,8 +278,8 @@ def summarise_rows(data: RunData, node_xy: Callable[[str], Dict[str, Tuple[float
                    p: Optional[cr.Params] = None, class_basis: str = "current") -> List[rdb.CellRow]:
     """One CellRow per map of the run (pure; `node_xy(map_id)` -> {topomap node: (x, y)} is called only for the
     legs source). A run on no map gives no row. `factsheet` labels the run (class, speed_max, speed_basis);
-    `class_basis` says whose it is: "current" (the robot's factsheet at summary time: no factsheet history exists
-    anywhere in the database, 2026-10-27) or "run" (the one in force when the run happened)."""
+    `class_basis` says whose it is: "current" (the robot's factsheet at summary time: the run started before the first
+    robot_factsheet_periods row of the robot, or the robot has none) or "period" (the factsheet period the run started in)."""
     p = p or cr.Params()
     cls, vmax, vbasis = rclass.robot_class(factsheet), rclass.speed_max_of(factsheet), rclass.speed_basis(factsheet)
     rows: List[rdb.CellRow] = []
@@ -366,13 +367,19 @@ def keep_labels(rows: Sequence[rdb.CellRow], labels: Mapping[str, tuple]) -> Non
 async def summarise_run(db: Any, graph: Any, robots: Mapping[str, Any], run_id: Any,
                         relabel: Optional[bool] = None) -> List[rdb.CellRow]:
     """The run's summaries (one per map). `robots` maps a robot name to its factsheet (unknown robot: class '').
-    The labels of a stored summary are kept unless `relabel` (default config.RUN_CELLS_RELABEL)."""
+    A run is labelled from the factsheet period it started in (class_basis 'period'), which overrides any stored label.
+    With no period, the labels of a stored summary are kept unless `relabel` (default config.RUN_CELLS_RELABEL), else
+    the robot's current factsheet labels the run (class_basis 'current')."""
     async with fleet_reads.read_cursor(db) as cur:
         data = await load_run(cur, run_id)
-        labels = {} if (config.RUN_CELLS_RELABEL if relabel is None else relabel) else await rdb.fetch_labels(cur, run_id)
-    if data is None:
-        return []
-    rows = await asyncio.to_thread(summarise_rows, data, node_lookup(graph), robots.get(data.robot_name))
+        if data is None:
+            return []
+        period = await factsheet_periods.period_at(cur, data.robot_name, data.started_at)
+        keep = period is None and not (config.RUN_CELLS_RELABEL if relabel is None else relabel)
+        labels = await rdb.fetch_labels(cur, run_id) if keep else {}
+    rows = await asyncio.to_thread(summarise_rows, data, node_lookup(graph),
+                                   period if period is not None else robots.get(data.robot_name),
+                                   class_basis="current" if period is None else "period")
     keep_labels(rows, labels)
     return rows
 

@@ -408,3 +408,41 @@ Sections 1-12 stay as written; where they differ, this section wins.
   first change keeps its time), and `build_due` builds a map once `REGION_STATS_DEBOUNCE_S` has passed: one build per window
   of a burst. A build that loses the generation race returns `inputs_changed`, writes nothing and is picked up again by the
   next debounced pass. The planner loader reads `stale` builds as usable (`region_cost.USABLE_BUILDS`).
+
+## 14. Factsheet periods (2026-10-30, branch `stats/w2-factsheet-periods`)
+
+Decision (owner, 2026-10-30): a speed-profile change on the same robot is not a different robot. Identity is `robot_name`, the class is the
+physical body (`agv_class` + footprint) and the speed limits are a per-run condition. So a run is labelled from the factsheet that was in
+force when it started, not from the robot's current one.
+
+* **Table** `robot_factsheet_periods` (migration `20261030_05`): `(robot_name, valid_from)` with `agv_class`, `speed_max`,
+  `angular_speed_max`, `acceleration_max`, `length`, `width` (unknown / -1 is NULL), `source` (`factsheet` | `seed`).
+  `FleetRecorder.on_factsheet` inserts a row only when those figures differ from the robot's latest row (after the dispatcher's validity
+  rules: a missing or nonsense figure keeps the stored one). `valid_from` is the factsheet's header timestamp, or the received time
+  when it is absent, in the future (+60 s) or not after the latest period. A retained factsheet re-delivered on reconnect writes nothing.
+  Robot delete removes the robot's periods. There is no robot rename path.
+* **Labelling** (`run_cells.summarise_run`, `scripts/backfill_run_cells.py`): the period with the latest `valid_from <= started_at` gives
+  `robot_class`, `speed_max`, `speed_basis` and `class_basis = 'period'`. A run that started before the robot's first period (or a robot
+  with none) is labelled as before: current factsheet, `class_basis 'current'`. The D5 carry-over of stored labels on a recompute now applies
+  only to runs without a period; a period overrides a stored `current` label. `RUN_CELLS_RELABEL` / `--relabel` keep their meaning for
+  runs without a period. The planner (`region_cost`) still uses the planning robot's current factsheet.
+* **Not automatic:** a new period does not relabel runs already summarised. Relabel with the backfill; it marks the region builds of the
+  touched maps stale in the same transaction.
+
+Procedure to record a known change (dry run first; `--apply` writes; add `--compose-env docker_compose/.env` on the cloud host):
+
+```
+# 1. seed the figures before and after the change (the robot team gives the date)
+python scripts/seed_factsheet_periods.py --robot formidable-peacock --from 2026-10-01T00:00:00Z \
+    --speed-max 0.24 --length L --width W --agv-class C                  # the old profile, from the start of its history
+python scripts/seed_factsheet_periods.py --robot formidable-peacock --from <DATE-OF-CHANGE> \
+    --speed-max 0.36 --length L --width W --agv-class C                  # the new one
+# 2. relabel that robot's runs (dry run, then --apply)
+python scripts/backfill_run_cells.py --recompute --relabel --robot formidable-peacock
+```
+
+Example: `formidable-peacock` went from 0.24 to 0.36 m/s. After the seed, runs that started before the change are `speed_max 0.24,
+class_basis period`, later ones 0.36; the class is unchanged, so its history stays in one class. `--file periods.json` takes several
+entries at once. Seeding an existing `(robot, from)` is refused unless `--replace`. Seed the period that starts the history first: the
+recorder's own first row for the robot would otherwise start at the header time of its next factsheet, and the runs before it stay
+`current`.

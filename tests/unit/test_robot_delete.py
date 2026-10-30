@@ -108,7 +108,7 @@ async def test_idle_delete_defaults_keep_history(monkeypatch):
     assert db.lifecycle_calls == [(RobotObjectV1, "r1", ObjectLifecycleV1.DELETED)]
     tables = set(db.deleted_tables())
     assert tables == set(robot_delete.STATE_TABLES)
-    assert {"robot_site_assignments", "robot_run_epochs"} <= tables
+    assert {"robot_site_assignments", "robot_run_epochs", "robot_factsheet_periods"} <= tables
     assert not tables & set(robot_delete.TELEMETRY_TABLES)
 
 

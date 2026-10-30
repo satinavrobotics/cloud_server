@@ -13,6 +13,7 @@ import uuid
 from packages.controllers.mission import fleet_recorder as fr
 from packages.controllers.mission.vda5050_types import vda5050_types as types
 from packages.events.emit import COLUMNS as EVENT_COLUMNS, INSERT_SQL as EVENT_INSERT_SQL
+from packages.utils import factsheet_periods as fp
 from packages.telemetry_ingest import IngestQueue, RecordingPolicy, SpillFile, health, tables
 from packages.telemetry_ingest.policy import PolicySources
 from packages.telemetry_ingest.rehydrate import SELECT_SQL as LATEST_SELECT_SQL
@@ -47,16 +48,17 @@ class FakeDB:
         self.next_run = {}      # mission name -> pending one-off recording level
         self.latest = []        # tuples in rehydrate SELECT_SQL column order
         self.health = {}        # recorder_health: process -> row dict
+        self.periods = {}       # (robot_name, valid_from) -> row dict (robot_factsheet_periods)
         self.unavailable = False
         self.fail = None        # fail(sql, params) -> exception or None
         self.statements = []
 
     # --- state helpers -------------------------------------------------------------------
     def snapshot(self):
-        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run))
+        return copy.deepcopy((self.runs, self.events, self.trajectory, self.legs, self.next_run, self.periods))
 
     def restore(self, snap):
-        (self.runs, self.events, self.trajectory, self.legs, self.next_run) = snap
+        (self.runs, self.events, self.trajectory, self.legs, self.next_run, self.periods) = snap
 
     def legs_of(self, run_id=None):
         return [r for _, r in sorted(self.legs.items(), key=lambda kv: (str(kv[0][0]), kv[0][1]))
@@ -203,6 +205,14 @@ class FakeDB:
                 cursor.rowcount = 1
         elif sql.startswith(LATEST_SELECT_SQL):
             cursor.results = list(self.latest)
+        elif sql == fp.LATEST_SQL:
+            rows = sorted((k for k in self.periods if k[0] == params[0]), key=lambda k: k[1], reverse=True)
+            cursor.results = [(rows[0][1],) + tuple(self.periods[rows[0]][f] for f in fp.FIELDS)] if rows else []
+        elif sql == fp.INSERT_SQL:
+            row = dict(zip(fp.COLUMNS, params))
+            if (row["robot_name"], row["valid_from"]) not in self.periods:
+                self.periods[(row["robot_name"], row["valid_from"])] = row
+                cursor.rowcount = 1
         elif sql == health.UPSERT_SQL:
             process, pid, host, role, started_at, report = params
             self.health[process] = {"pid": pid, "hostname": host, "role": role,

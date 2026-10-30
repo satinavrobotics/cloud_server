@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fill run_cells (the per-run cell summaries) for finished runs that have none (or an old algo_version).
 
-    python scripts/backfill_run_cells.py [--apply] [--map M] [--since ISO] [--limit N] [--recompute] [--relabel]
+    python scripts/backfill_run_cells.py [--apply] [--map M] [--robot NAME] [--since ISO] [--limit N] [--recompute] [--relabel]
                                          [--compose-env docker_compose/.env]
     docker compose ... exec api-delegation-service python scripts/backfill_run_cells.py --apply
 
@@ -10,11 +10,13 @@ runs that ended before it existed (and, with --recompute, for a changed rule). I
 (`run_cells.load_run`, `summarise_rows`, `run_cells_db.insert`), so the rows are identical to the worker's.
 
 Selection: runs with `ended_at` older than the trajectory grace, on a map that exists (not DELETING), `--map` /
-`--since` (started_at) narrowing it; without `--recompute` only runs with no row of the current
+`--robot` / `--since` (started_at) narrowing it; without `--recompute` only runs with no row of the current
 RUN_CELLS_ALGO_VERSION; with it every selected run is summarised again and its rows replaced.
 
-A recompute keeps each run's stored robot_class / speed_max / speed_basis / class_basis (the label it was summarised
-with, decision D5); --relabel labels it again with the robot's current factsheet. A run that yields no row (its run or
+A run that started in a factsheet period (robot_factsheet_periods, docs/region_stats_2026-10-27.md) is always labelled from
+that period (class_basis 'period'), which overrides a stored label. Otherwise a recompute keeps each run's stored
+robot_class / speed_max / speed_basis / class_basis (the label it was summarised with, decision D5); --relabel labels it
+again with the robot's current factsheet. A run that yields no row (its run or
 map vanished meanwhile) is counted in `no_rows` and written nothing.
 
 The default is a DRY RUN: it summarises in memory, prints the counts and the size of the rows, and writes nothing
@@ -37,6 +39,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from packages import config  # noqa: E402
 from packages.api import run_cells as rc  # noqa: E402
+from packages.utils import factsheet_periods  # noqa: E402
 from packages.utils import region_builds  # noqa: E402
 from packages.utils import run_cells_db as rdb  # noqa: E402
 
@@ -49,12 +52,16 @@ SELECT_SQL = (
 SKIP_DONE = " AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = r.run_id AND c.algo_version = %s)"
 
 
-def select_sql(map_id: Optional[str], since: Optional[datetime.datetime], recompute: bool, limit: Optional[int]):
+def select_sql(map_id: Optional[str], since: Optional[datetime.datetime], recompute: bool, limit: Optional[int],
+               robot: Optional[str] = None):
     args: List[Any] = [config.RECORDER_TRAJECTORY_GRACE_S + config.RUN_CELLS_EXTRA_GRACE_S]
     sql = SELECT_SQL
     if map_id:
         sql += " AND r.map_id = %s"
         args.append(map_id)
+    if robot:
+        sql += " AND r.robot_name = %s"
+        args.append(robot)
     if since is not None:
         sql += " AND r.started_at >= %s"
         args.append(since)
@@ -96,15 +103,17 @@ async def run(env: Mapping[str, str], args: argparse.Namespace) -> Dict[str, Any
     async with await psycopg.AsyncConnection.connect(conninfo, autocommit=True) as read, \
             await psycopg.AsyncConnection.connect(conninfo) as write:
         await read.execute("SET default_transaction_read_only = on")
-        sql, params = select_sql(args.map, since, args.recompute, args.limit)
+        sql, params = select_sql(args.map, since, args.recompute, args.limit, args.robot)
         run_ids = [r[0] for r in await (await read.execute(sql, params)).fetchall()]
         robots = await _factsheets(read)
         for run_id in run_ids:
             try:
                 async with read.cursor() as cur:
                     data = await rc.load_run(cur, run_id)
-                    labels = {} if args.relabel else await rdb.fetch_labels(cur, run_id)
-                rows = rc.summarise_rows(data, nodes, robots.get(data.robot_name)) if data else []
+                    period = await factsheet_periods.period_at(cur, data.robot_name, data.started_at) if data else None
+                    labels = {} if (args.relabel or period is not None) else await rdb.fetch_labels(cur, run_id)
+                rows = rc.summarise_rows(data, nodes, period if period is not None else robots.get(data.robot_name),
+                                         class_basis="current" if period is None else "period") if data else []
                 rc.keep_labels(rows, labels)
             except Exception as exc:  # pylint: disable=broad-except
                 counts["failed"] += 1
@@ -150,6 +159,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--apply", action="store_true", help="write (default: dry run)")
     p.add_argument("--map", help="only runs on this map")
+    p.add_argument("--robot", help="only runs of this robot (e.g. to relabel after seeding its factsheet periods)")
     p.add_argument("--since", help="only runs started at or after this ISO-8601 time")
     p.add_argument("--limit", type=int, help="at most this many runs (oldest ended first)")
     p.add_argument("--recompute", action="store_true", help="also runs that already have a current summary")
