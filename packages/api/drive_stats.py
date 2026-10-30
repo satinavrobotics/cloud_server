@@ -571,8 +571,7 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
     key = (map_id, start, end, robot or None, p.min_speed) + ((series,) if series else ())
     s_start, s_end = start, end
     if series:
-        s_end = end or datetime.datetime.now(datetime.timezone.utc)
-        s_start = start or s_end - datetime.timedelta(days=config.RUN_STATS_DEFAULT_DAYS)
+        s_start, s_end = fleet_reads.default_window(start, end, config.RUN_STATS_DEFAULT_DAYS)
         axis = series_axis.day_axis(s_start, s_end)     # 422 for a window over 120 days, before any query
 
     async def run() -> Tuple[bytes, str]:

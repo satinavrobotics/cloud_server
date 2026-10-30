@@ -233,7 +233,7 @@ map-frame trajectories. Read only. Full rules, limits and the live cross-check: 
 
 Query (all optional): `from`, `to` (ISO-8601 with time zone; rows with `from <= ts < to`), `robot` (exact name),
 `min_speed` (m/s, 0..1, default 0.05: a movement slower than this counts as stopped time),
-`series=day` (opt-in; adds a per-UTC-day `series` block over `from`/`to`, default the last 30 days, at most 120 days:
+`series=day` (opt-in; adds a per-UTC-day `series` block over `from`/`to`, default as run-stats (next UTC hour, 30 days back to a day start), at most 120 days:
 `docs/map_series_2026-10-15.md`).
 
 Response:
@@ -1290,8 +1290,8 @@ expected sum), `pass_durations_s` (`[{pass, legs, duration_s}]`).
 session at the run's start) is that map.
 
 **`GET /api/v1/maps/{map_id}/run-stats?from=&to=&robot=`** -- operating metrics of the map's
-non-archived runs that started in `[from, to)` (ISO-8601 with time zone; default: the last 30
-days), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls. The headline, `efficiency` and
+non-archived runs that started in `[from, to)` (ISO-8601 with time zone; default: `to` = the start of the next UTC hour,
+`from` = the start of the UTC day 30 days before `to`, so the window and the answer are stable within the hour), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls. The headline, `efficiency` and
 `series` are all cached 120 s (`EFFICIENCY_CACHE_TTL_S`; the headline used to be uncached).
 
 ```
@@ -1335,7 +1335,7 @@ Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-1
 
 **`GET /api/v1/maps/{map_id}/events-summary?from=&to=&robot=&limit=10`** -- the most usual events
 of the map and its safety events, as episodes (a repeated error counts once). Window `[from, to)`,
-default the last 30 days; `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
+default as run-stats (next UTC hour, 30 days back to a day start); `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
 an unknown map answers zeros. Cached 30 s, `series` included (it was 120 s). Opt-in `series=day` adds `series: {bucket, t, total, safety,
 by_code}` per UTC day (`docs/map_series_2026-10-15.md`).
 

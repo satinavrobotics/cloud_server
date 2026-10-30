@@ -247,8 +247,7 @@ def event_detail(code: str, payload: Any) -> Optional[str]:
 
 def resolve_window(start: Optional[datetime.datetime], end: Optional[datetime.datetime]
                    ) -> Tuple[datetime.datetime, datetime.datetime]:
-    end = end or datetime.datetime.now(UTC)
-    start = start or end - datetime.timedelta(days=config.RUN_STATS_DEFAULT_DAYS)
+    start, end = fleet_reads.default_window(start, end, config.RUN_STATS_DEFAULT_DAYS)
     fleet_reads.check_window(start, end)
     return start, end
 

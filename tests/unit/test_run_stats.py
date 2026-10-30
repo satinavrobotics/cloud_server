@@ -150,7 +150,10 @@ async def test_robot_filter_is_a_bound_parameter():
 
 def test_window_defaults_and_validation():
     start, end = run_stats.resolve_window(None, None)
-    assert end - start == datetime.timedelta(days=30)
+    # stable within the hour: `to` is the next UTC hour start, `from` the UTC day start 30 days before it
+    assert end.minute == end.second == end.microsecond == 0 and end > datetime.datetime.now(UTC)
+    assert (start.hour, start.minute) == (0, 0) and datetime.timedelta(days=30) <= end - start < datetime.timedelta(days=31)
+    assert run_stats.resolve_window(None, None) == (start, end)
     with pytest.raises(Exception) as exc:
         run_stats.resolve_window(T0, T0)
     assert exc.value.status_code == 422
@@ -371,3 +374,15 @@ async def test_duration_percentiles_apply_the_hung_run_cap():
     await run_stats.run_stats(db, "office7", T0, T0 + datetime.timedelta(days=10))
     sql, params = next(e for e in db.executed if "percentile_cont(0.95)" in e[0])
     assert sql.count("secs <= %s") == 2 and params[-3:] == (run_stats.config.RUN_STATS_MAX_RUN_S,) * 3
+
+
+def test_default_window_is_stable_within_the_hour():
+    from packages.api import fleet_reads
+    a = datetime.datetime(2026, 10, 30, 14, 5, 7, 123, tzinfo=datetime.timezone.utc)
+    b = a.replace(minute=59, second=59)
+    assert fleet_reads.default_window(None, None, 30, now=a) == fleet_reads.default_window(None, None, 30, now=b)
+    assert fleet_reads.default_window(None, None, 30, now=a) == (
+        datetime.datetime(2026, 9, 30, tzinfo=datetime.timezone.utc),
+        datetime.datetime(2026, 10, 30, 15, tzinfo=datetime.timezone.utc))
+    given = (T0, T0 + datetime.timedelta(days=1))
+    assert fleet_reads.default_window(*given, 30, now=a) == given
