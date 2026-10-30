@@ -87,6 +87,11 @@ def percentile(values: Sequence[float], q: float) -> Optional[float]:
     return float(ordered[low] + (ordered[high] - ordered[low]) * (pos - low))
 
 
+def leg_map_id(waypoint_map: Optional[str], run_map: Optional[str]) -> Optional[str]:
+    """The map a leg belongs to: its waypoint's own map, else the run's (the one rule for every writer)."""
+    return waypoint_map or run_map or None
+
+
 def _round(value: Optional[float], digits: int = 3) -> Optional[float]:
     return None if value is None else round(value, digits)
 

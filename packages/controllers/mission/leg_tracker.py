@@ -219,7 +219,7 @@ class LegTracker:
         anchor, self.anchor = self.anchor, reach
         if anchor is None:
             return []
-        return [self._leg(anchor, reach, limits, default_map or waypoints[wp].map_id or None, info)]
+        return [self._leg(anchor, reach, limits, run_legs.leg_map_id(waypoints[wp].map_id, default_map), info)]
 
     @staticmethod
     def _plan(start: Reach, end: Reach, straight: Optional[float], route: Optional[RouteInfo]

@@ -582,7 +582,7 @@ class _WriteLeg(_Op):
                         info.run_id, info.leg_base + leg.seq, info.mission_name,
                         info.robot_name, leg.pass_index, leg.order_rev, leg.from_vda_node,
                         leg.to_vda_node, leg.from_topomap_node, leg.to_topomap_node,
-                        leg.map_id or info.map_id, leg.started_at, leg.ended_at,
+                        run_legs.leg_map_id(leg.map_id, info.map_id), leg.started_at, leg.ended_at,
                         leg.received_started_at, leg.received_ended_at, leg.duration_s,
                         leg.stopped_s, leg.straight_m, leg.planned_m, leg.expected_s,
                         leg.plan_source, leg.from_chart, leg.to_chart, leg.graph_version,
