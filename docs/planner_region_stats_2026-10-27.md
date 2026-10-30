@@ -494,7 +494,7 @@ Not merged, not deployed, `REGION_COST_MODE` defaults to `off`. Tests: `test_laz
 * `ChartPlan.pricing["region"]` (also in shadow): the snapshot's `record()` (`status`, `model_hash`, `stamp`, `graph_version`, `robot_class`,
   `rho_min`, `rho_max`, `levels` = the fallback counts per level) plus `mode`, `served` (priced | unpriced), and with a usable snapshot and
   a factsheet `speed_max`: `predicted_s`, `predicted_free_s` (the served lattice path: length / speed_max, plus the excess `rho x length /
-  speed_max` along it, plus turn radians / `angular_speed_max` when the factsheet has it), `cost_model` = `model_hash:stamp`. Shadow adds
+  speed_max` along it; no turn time since 2026-10-30), `cost_model` = `model_hash:stamp`. Shadow adds
   `alt_route_changed`, `alt_extra_m`, `alt_predicted_s`, `alt_cost` (best effort: `alt_error` on a failure). `status` is the graph's verdict
   (`version_mismatch`, `keys_mismatch`) when the snapshot is not of the graph planned on. When there is no clearance price the record
   sits in a pricing dict with the clearance fields 0 / None (profile `none`), as for a turn cost alone; the service logs a `Region cost

@@ -48,7 +48,7 @@ def without_predictions(legs):
 
 
 # ---- predicted time (pure) ---------------------------------------------------------------------------------------
-def test_region_times_is_length_over_speed_plus_excess_plus_turns(graphs):
+def test_region_times_is_length_over_speed_plus_excess(graphs):
     name, eng, lazy = graphs
     reg = pricing(lazy, [500] * len(lazy.keys))
     route = lazy.route(lazy.keys[0], lazy.keys[-1])
@@ -56,23 +56,17 @@ def test_region_times_is_length_over_speed_plus_excess_plus_turns(graphs):
     times = sr.region_times(lazy, reg, TURN)
     got, free = times(pts)
     length = sum(math.dist(a, b) for a, b in zip(pts[:-1], pts[1:]))
-    spin = sr._turn_rad(pts) / OMEGA
-    assert free == pytest.approx(length / SPEED + spin)
-    assert got == pytest.approx(length * 1.5 / SPEED + spin)                 # rho 0.5 everywhere: a metre takes 1.5 x as long
-    # no angular_speed_max: no turn time; an unknown speed: nothing to predict
-    assert sr.region_times(lazy, reg, {**TURN, "angular_speed_max": None})(pts)[1] == pytest.approx(length / SPEED)
+    assert free == pytest.approx(length / SPEED)
+    assert got == pytest.approx(length * 1.5 / SPEED)                        # rho 0.5 everywhere: a metre takes 1.5 x as long
+    # length-based (D3): no turn time, with or without angular_speed_max; an unknown speed: nothing to predict
+    assert sr.region_times(lazy, reg, {**TURN, "angular_speed_max": None})(pts) == (got, free)
+    stair = [(0.0, 0.0), (0.05, 0.0), (0.05, 0.05), (0.1, 0.05), (0.1, 0.1)]   # a lattice staircase counts its length only
+    assert times(stair)[1] == pytest.approx(0.2 / SPEED)
     for bad in (None, -1, 0, float("nan")):
         assert sr.region_times(lazy, reg, {**TURN, "speed_max": bad}) is None
     assert sr.region_times(lazy, None, TURN) is None
     assert sr.region_times(lazy, pricing(lazy, [500] * len(lazy.keys), status="no_stats"), TURN) is None
     assert sr.region_times(lazy, pricing(lazy, [500] * len(lazy.keys), version=lazy.version + 1), TURN) is None
-
-
-def test_turn_radians_of_a_polyline():
-    assert sr._turn_rad([(0, 0), (1, 0), (1, 1), (0, 1)]) == pytest.approx(math.pi)
-    assert sr._turn_rad([(0, 0), (1, 0), (1, 0), (2, 0)]) == 0.0              # a repeated point is not a corner
-    assert sr._turn_rad([(0, 0), (1, 0)]) == 0.0 and sr._turn_rad([]) == 0.0
-    assert sr._turn_rad([(0, 0), (1, 0), (0, 0.01)]) == pytest.approx(math.pi - math.atan2(0.01, 1.0), rel=1e-6)   # wrapped to [0, pi]
 
 
 # ---- the plan record ---------------------------------------------------------------------------------------------

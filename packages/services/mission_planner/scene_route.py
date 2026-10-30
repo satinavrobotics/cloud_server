@@ -990,38 +990,24 @@ def budget_pull(graph: Any, safety: Any, budget_m: float, region: Any = None) ->
     return pull
 
 
-def _turn_rad(pts: Sequence[Pt]) -> float:
-    """The sum of the absolute heading changes along a polyline (rad); zero-length pieces are skipped."""
-    total, prev = 0.0, None
-    for p, q in zip(pts[:-1], pts[1:]):
-        if p == q:
-            continue
-        ang = math.atan2(q[1] - p[1], q[0] - p[0])
-        if prev is not None:
-            total += abs((ang - prev + math.pi) % (2.0 * math.pi) - math.pi)
-        prev = ang
-    return total
-
-
 def region_times(graph: Any, region: Any, turn: Optional[Dict[str, Any]]) -> Optional[Callable[[Sequence[Pt]], Tuple[float, float]]]:
     """`times(points) -> (predicted_s, predicted_free_s)` of a polyline for the planning robot, or None when there is nothing to predict
     with: no snapshot, one that is not `active`, of another version / charts than the graph's, or a robot without a real speed_max.
-    predicted_free_s = length / speed_max (+ turn time with the factsheet's angular_speed_max); predicted_s adds the excess time of
-    the charts the polyline runs through (rho x length / speed_max, `chord_excess`)."""
+    predicted_free_s = length / speed_max; predicted_s adds the excess time of the charts the polyline runs through (rho x length /
+    speed_max, `chord_excess`). Length-based like the replay that calibrated the model (scripts/analysis/region_cost_replay.py): no
+    turn time (the moving figures already hold the turning slowness; counting the heading changes of the dense lattice path would
+    add about 0.8 rad per step of a staircase)."""
     why = getattr(graph, "region_why", None)
     if region is None or not callable(why) or not region.active or why(region) not in ("priced", "neutral"):
         return None
     speed = _number((turn or {}).get("speed_max"))
-    omega = _number((turn or {}).get("angular_speed_max"))
     if speed is None or not (math.isfinite(speed) and speed > 0.0):
         return None
-    omega = omega if omega is not None and math.isfinite(omega) and omega > 0.0 else None
     excess = chord_excess(graph, region)
 
     def times(pts: Sequence[Pt]) -> Tuple[float, float]:
         length = sum(math.dist(p, q) for p, q in zip(pts[:-1], pts[1:]))
-        spin = _turn_rad(pts) / omega if omega is not None else 0.0
-        return ((length + sum(excess(p, q) for p, q in zip(pts[:-1], pts[1:]))) / speed + spin, length / speed + spin)
+        return (length + sum(excess(p, q) for p, q in zip(pts[:-1], pts[1:]))) / speed, length / speed
 
     return times
 
