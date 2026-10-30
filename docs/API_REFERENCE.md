@@ -269,7 +269,8 @@ Response:
 * **Summaries:** by default (`DRIVE_STATS_SOURCE=summaries`, the default `min_speed`) a run that started in the window and
   has a stored cell summary (`run_cells`) is summed from it; all other runs (still running, not summarised yet, started
   before the window) come from the raw rows, so none is missing or counted twice. `source.basis` is `summaries` or `raw`
-  (`basis_reason` `min_speed` or `config` says why raw), `source.summary_runs` / `raw_runs` count the runs of each part
+  (`basis_reason` `min_speed`, `config` or `params` says why raw; `params`: a stored summary was written with other rules than
+  today's `DRIVE_STATS_*` / `RUN_CELLS_DWELL_RADIUS_M`, so the whole read is raw until the runs are recomputed), `source.summary_runs` / `raw_runs` count the runs of each part
   (the other `source` keys keep their meaning and cover both). `series=day` puts a summarised run on the UTC day it started
   (a raw movement keeps the day it started).
 * Headers: `ETag`, `Cache-Control: private, max-age=60`; 304 on a matching `If-None-Match`. Results are cached

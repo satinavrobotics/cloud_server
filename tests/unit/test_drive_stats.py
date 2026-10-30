@@ -499,6 +499,16 @@ class TestSummaries:
         assert body["source"]["basis"] == "raw" and body["source"]["basis_reason"] == "min_speed"
         assert body["source"]["summary_runs"] == 0 and body["source"]["raw_runs"] == 2
 
+    def test_summaries_written_with_other_rules_read_raw_and_say_so(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec), summarise("b", b, rec)])
+        body, _ = call(FakeReads())
+        assert body["source"]["basis"] == "summaries"                       # the stored params are today's
+        monkeypatch.setattr(ds.config, "RUN_CELLS_DWELL_RADIUS_M", 0.9)
+        body, _ = call(FakeReads(), cache=ResultCache(4, 60.0))
+        assert body["source"]["basis"] == "raw" and body["source"]["basis_reason"] == "params"
+        assert body["source"]["summary_runs"] == 0 and body["source"]["raw_runs"] == 2
+
     def test_config_raw_never_reads_the_summaries(self, patched, monkeypatch):
         a, b, rec = two_runs()
         cur = patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec)])

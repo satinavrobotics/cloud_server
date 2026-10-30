@@ -269,7 +269,7 @@ class Loaded:
         self.legs_dropped_for_track = 0
         self.summaries: List[run_cells_db.CellRow] = []    # stored per-run cell summaries (the summaries part)
         self.basis = "raw"                                 # "summaries" | "raw"
-        self.basis_reason: Optional[str] = None            # why raw: "min_speed" | "config"
+        self.basis_reason: Optional[str] = None            # why raw: "min_speed" | "config" | "params"
 
 
 def summaries_wanted(p: Params) -> Tuple[bool, Optional[str]]:
@@ -281,6 +281,15 @@ def summaries_wanted(p: Params) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def stored_params_current(summaries: Sequence[run_cells_db.CellRow]) -> bool:
+    """Were all these summaries written with today's rules (`run_cells._params_json(Params())`: min_speed, max_gap_s,
+    max_speed, leg_max_m, dwell radius)? Only the keys a summary stores are compared."""
+    from packages.api import run_cells       # late: run_cells is a sibling that must not be needed to import this
+    want = run_cells._params_json(Params())  # pylint: disable=protected-access
+    return all(math.isclose(float(row.params[k]), v, abs_tol=1e-9)
+               for row in summaries for k, v in want.items() if row.params.get(k) is not None)
+
+
 async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = False,
                reason: Optional[str] = None) -> Loaded:
     out = Loaded()
@@ -289,6 +298,9 @@ async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = Fa
         if use_summaries:
             out.summaries = await run_cells_db.fetch(cur, map_id, start, end, robot,
                                                      algo_version=config.RUN_CELLS_ALGO_VERSION)
+            if not stored_params_current(out.summaries):    # the rules changed since they were written: mixed
+                out.summaries, out.basis, out.basis_reason = [], "raw", "params"
+                use_summaries = False
         out.track_rows, out.partial = await fetch_track(cur, map_id, start, end, robot, config.DRIVE_STATS_MAX_ROWS,
                                                         skip_summarised=use_summaries)
         track_runs = {r[0] for r in out.track_rows}
