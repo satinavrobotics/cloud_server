@@ -509,6 +509,21 @@ class TestSummaries:
         assert body["source"]["basis"] == "raw" and body["source"]["basis_reason"] == "params"
         assert body["source"]["summary_runs"] == 0 and body["source"]["raw_runs"] == 2
 
+    def test_regions_split_dwell_from_transit_stops(self, patched):
+        a, _, rec = two_runs()
+        row = summarise("a", a, rec)
+        row.dwell_s = np.zeros(row.key.size)
+        row.dwell_s[0] = 4.0
+        patched(track=a, summaries=[row])
+        body, _ = call(FakeReads())
+        assert body["source"]["basis"] == "summaries"
+        assert sum(r["dwell_s"] for r in body["regions"]) == pytest.approx(4.0, abs=0.06)
+        for r in body["regions"]:                                  # stopped_s stays every stop
+            assert r["stopped_s"] == pytest.approx(r["dwell_s"] + r["transit_stopped_s"], abs=0.06)
+        patched(track=a)                                            # raw rows carry no dwell
+        raw, _ = call(FakeReads(), cache=ResultCache(4, 60.0), min_speed=0.06)
+        assert all(r["dwell_s"] == 0.0 and r["transit_stopped_s"] == r["stopped_s"] for r in raw["regions"])
+
     def test_config_raw_never_reads_the_summaries(self, patched, monkeypatch):
         a, b, rec = two_runs()
         cur = patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec)])

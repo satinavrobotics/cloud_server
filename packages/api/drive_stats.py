@@ -150,9 +150,26 @@ async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray)
     return ids, names, cells, version, "ok"
 
 
-def region_rows(tiles: Tiles, ids: np.ndarray, names: List[str], cells: Dict[str, int]) -> List[Dict[str, Any]]:
+def dwell_on(tiles: Tiles, summaries: Sequence[run_cells_db.CellRow]) -> np.ndarray:
+    """Dwell seconds (waiting near a run's start, goal and action nodes) per tile of `tiles`, from the stored
+    summaries; zero for raw rows, which carry no dwell split."""
+    out = np.zeros(len(tiles))
+    keys = [s.key for s in summaries if s.dwell_s.size]
+    if not keys or not len(tiles):
+        return out
+    key, dwell = np.concatenate(keys), np.concatenate([s.dwell_s for s in summaries if s.dwell_s.size])
+    pos = np.searchsorted(tiles.key, key)
+    ok = (pos < tiles.key.size) & (tiles.key[np.minimum(pos, tiles.key.size - 1)] == key)
+    np.add.at(out, pos[ok], dwell[ok])
+    return out
+
+
+def region_rows(tiles: Tiles, ids: np.ndarray, names: List[str], cells: Dict[str, int],
+                dwell: Optional[np.ndarray] = None) -> List[Dict[str, Any]]:
     """Per chart: distinct runs through it, summed length / time / recovery / stopped, the chart's cells and
-    how many of its 0.1 m cells were driven (`visited`)."""
+    how many of its 0.1 m cells were driven (`visited`). `stopped_s` is every stop; `dwell_s` (`dwell`: per tile,
+    see dwell_on) is the part spent waiting near start / goal / action nodes and `transit_stopped_s` the rest, the
+    two region-stats fields."""
     sel = np.nonzero(ids > 0)[0]
     if not sel.size:
         return []
@@ -167,10 +184,12 @@ def region_rows(tiles: Tiles, ids: np.ndarray, names: List[str], cells: Dict[str
     for r in order:
         m = rid == r
         s = tiles.sums[:, sel[m]].sum(axis=1)
+        d = 0.0 if dwell is None else min(float(dwell[sel[m]].sum()), float(s[3]))
         name = names[int(r) - 1]
         out.append({"key": name, "n": int(n_by_region[r]), "len_m": round(float(s[0]), 2),
                     "time_s": round(float(s[1]), 1), "recovery_s": round(float(s[2]), 1),
-                    "stopped_s": round(float(s[3]), 1), "cells": cells.get(name, 0), "visited": int(m.sum())})
+                    "stopped_s": round(float(s[3]), 1), "dwell_s": round(d, 1),
+                    "transit_stopped_s": round(float(s[3]) - d, 1), "cells": cells.get(name, 0), "visited": int(m.sum())})
     out.sort(key=lambda d: d["key"])
     return out
 
@@ -568,7 +587,8 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
         else:
             ids, names, cells, version, status = await regions_of(reads, map_id, *key_cells(tiles.key))
         src["scene_graph"] = status
-        regions = region_rows(tiles, ids, names, cells) if ids is not None else []
+        regions = (region_rows(tiles, ids, names, cells, dwell_on(tiles, loaded.summaries))
+                   if ids is not None else [])
         origin = origin_cells(tiles.key, status == "ok" and version is not None)
         window = {"from": start.isoformat() if start else None, "to": end.isoformat() if end else None,
                   "robot": robot or None, "min_speed": p.min_speed, "max_gap_s": p.max_gap_s,

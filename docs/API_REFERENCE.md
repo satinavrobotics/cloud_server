@@ -244,7 +244,7 @@ Response:
   "tile_fields": ["ix", "iy", "n", "len_m", "time_s", "recovery_s", "stopped_s"],
   "tiles": [[64, 64, 3, 0.412, 2.35, 0.0, 1.5]],
   "regions": [{"key": "b63f0f5e-...:0", "n": 57, "len_m": 178.04, "time_s": 1455.6, "recovery_s": 119.8,
-               "stopped_s": 400.1, "cells": 366, "visited": 233}],
+               "stopped_s": 400.1, "dwell_s": 60.0, "transit_stopped_s": 340.1, "cells": 366, "visited": 233}],
   "source": {"track_runs": 48, "track_rows": 7516, "track_segments": 7464, "track_pairs_rejected": 4,
              "leg_runs": 31, "leg_rows": 61, "legs_skipped": 0, "legs_dropped_run_has_track": 94,
              "recovery_unattributed_s": 3.1, "partial": false, "tiles_track": 939, "tiles_leg_only": 94,
@@ -263,7 +263,9 @@ Response:
   (including stopped and recovery time), `recovery_s` time inside NAV recoveries, `stopped_s` time in movements slower than
   `min_speed`. Mean speed of a tile = `len_m / time_s`; time lost = `recovery_s` + `stopped_s` (they can overlap).
 * **Regions:** per chart key of the current graph version: `n` distinct runs, the summed fields, `cells` the chart's size
-  in 0.1 m cells, `visited` how many of them have drive data.
+  in 0.1 m cells, `visited` how many of them have drive data. `stopped_s` is every stop; `dwell_s` is the part of it spent
+  waiting near the run's start, goal and action nodes and `transit_stopped_s` = `stopped_s - dwell_s` the rest. The latter
+  is the region-stats `stopped_s`. Runs read raw (no stored summary) carry no dwell split: `dwell_s` 0 for them.
 * `source.partial` true: more than `DRIVE_STATS_MAX_ROWS` (2,000,000) raw track rows matched, the newest were used (the
   stored summaries are never cut).
 * **Summaries:** by default (`DRIVE_STATS_SOURCE=summaries`, the default `min_speed`) a run that started in the window and
