@@ -25,6 +25,7 @@ import pytest  # noqa: E402
 
 import packages.api.main as main  # noqa: E402
 from packages.api import fleet_reads, run_admin  # noqa: E402
+from packages.utils import region_builds  # noqa: E402
 from packages.api.idempotency import GUARDED_ROUTES  # noqa: E402
 from packages.events.emit import (  # noqa: E402
     COLUMNS as EVENT_COLUMNS, INSERT_SQL as EVENT_INSERT_SQL)
@@ -49,6 +50,7 @@ class Store:
         self.events = []        # dicts (EVENT_COLUMNS)
         self.trajectory = []    # dicts: mission_id, run_id
         self.track_delete_calls = []  # (sql, params) of the same
+        self.lookups = []      # run id sets whose maps were looked up (before the delete)
         self.stale_marks = []  # run id sets whose maps' region statistics were marked stale
         self.track_deletes = []  # run id sets of the DELETE FROM robot_track_ts calls
         self.notifies = []
@@ -116,7 +118,12 @@ class Store:
             keep = [e for e in self.events if e["run_id"] not in ids]
             cur.rowcount = len(self.events) - len(keep)
             self.events = keep
-        elif sql.startswith("UPDATE region_stats_builds SET status = 'stale'"):
+        elif sql == region_builds.MAPS_OF_RUNS_SQL:
+            self.lookups.append(set(params[0]))
+            cur.rows = [("m1",)] if params[0] else []
+        elif sql == region_builds.BUMP_SQL:
+            pass
+        elif sql == region_builds.STALE_SQL:
             self.stale_marks.append(set(params[0]))
         elif sql.startswith("DELETE FROM mission_runs"):
             for k in params[0]:
@@ -358,7 +365,7 @@ class TestMissionDelete:
                             "deleted_runs": 2, "deleted_events": 4, "deleted_trajectory": 3}
         assert set(s.missions) == {"m-rerun-1", "m-rerun-2", "my"}
         assert set(s.runs) == {rid(3), rid(4), rid(5)}
-        assert s.stale_marks == [{rid(1), rid(2)}]   # the maps' region statistics are marked stale before the runs go
+        assert s.lookups == [{rid(1), rid(2)}] and s.stale_marks == [{"m1"}]   # the maps' region statistics are marked stale before the runs go
         assert {e["run_id"] for e in s.events if "event_id" not in e} == {
             rid(3), rid(4), rid(5), None}
         assert {(t["mission_id"], t["run_id"]) for t in s.trajectory} == {
