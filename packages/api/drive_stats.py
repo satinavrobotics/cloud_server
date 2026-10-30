@@ -482,17 +482,21 @@ def series_day(loaded: Loaded, p: Params, axis: Sequence[datetime.datetime]) -> 
         stopped = np.where(moving, 0.0, dt)
         idx = np.floor((seg.t0 - t_axis) / 86400.0).astype(np.int64)
         ok = (idx >= 0) & (idx < n)
+        day = idx[ok]
+        mv = moving[ok]
+        for name, vals in (("len", dist), ("time", dt), ("rec", rec)):
+            sums[name] += np.bincount(day, weights=vals[ok], minlength=n)
+        sums["mov_len"] += np.bincount(day, weights=np.where(mv, dist[ok], 0.0), minlength=n)
+        sums["mov_time"] += np.bincount(day, weights=np.where(mv, dt[ok], 0.0), minlength=n)
+        sums["stopped"] += np.bincount(day, weights=np.where(mv, 0.0, dt[ok]), minlength=n)
+        # tiles per day: the segments grouped by day with one sort (not one scan of all segments per day)
+        by_day = np.argsort(day, kind="stable")
+        order = np.nonzero(ok)[0][by_day]
+        bounds = np.searchsorted(day[by_day], np.arange(n + 1))
         for i in range(n):
-            sel = np.nonzero(ok & (idx == i))[0]
+            sel = order[bounds[i]:bounds[i + 1]]
             if not sel.size:
                 continue
-            mov = sel[moving[sel]]
-            sums["len"][i] += float(dist[sel].sum())
-            sums["time"][i] += float(dt[sel].sum())
-            sums["mov_len"][i] += float(dist[mov].sum())
-            sums["mov_time"][i] += float(dt[mov].sum())
-            sums["rec"][i] += float(rec[sel].sum())
-            sums["stopped"][i] += float(stopped[sel].sum())
             acc = Accumulator(1)
             z = np.zeros(sel.size)
             acc.add(np.zeros(sel.size, np.int64), seg.x0[sel], seg.y0[sel], seg.x1[sel], seg.y1[sel], dt[sel], z, z)

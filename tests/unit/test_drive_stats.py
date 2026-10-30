@@ -602,6 +602,23 @@ class TestSeriesReusesTheLoad:
         assert sum("FROM robot_track_ts t JOIN" in sql for sql, _ in cur.sql) == 2
 
 
+class TestSeriesDayRaw:
+    def test_sums_per_day_from_raw_rows(self):
+        """Two runs on two of three days: the per-day sums of the vectorised path."""
+        d1, d3 = DAY0.timestamp() + 3600, DAY0.timestamp() + 2 * 86400 + 3600
+        rows = track_run("a", [0.05, 0.4, 0.8, 0.8, 1.2], t0=d1) + track_run("b", [0.5, 0.9, 0.9], y=0.35, t0=d3)
+        loaded = ds.Loaded()
+        loaded.track_rows = rows
+        axis = [DAY0 + _dt.timedelta(days=i) for i in range(3)]
+        out = ds.series_day(loaded, P, axis)
+        # run a: 4 pairs, 0.35 + 0.4 + 0.0 + 0.4 m over 6 s (the 0-length pair is a stop); run b: 0.4 + 0.0 m
+        assert out["len_m"] == [pytest.approx(1.15, abs=0.01), 0.0, pytest.approx(0.4, abs=0.01)]
+        assert out["time_s"] == [6.0, 0.0, 3.0]
+        assert out["stopped_share"] == [pytest.approx(0.25), None, pytest.approx(0.5)]
+        assert out["moving_speed_mps"][1] is None and out["new_tiles"][1] == 0
+        assert out["cumulative_tiles"][2] >= out["cumulative_tiles"][0] > 0
+
+
 class TestSeriesFromSummaries:
     def test_equals_the_raw_series_when_no_run_crosses_midnight(self, patched, monkeypatch):
         a, b, rec = two_runs()
