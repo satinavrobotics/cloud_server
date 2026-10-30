@@ -1102,7 +1102,9 @@ class FleetRecorder:
     def leg_seq(self, robot_name: str) -> Optional[int]:
         """run_legs.seq of the leg the robot's run is on (what events are tagged with)."""
         run = self._runs.get(robot_name)
-        current = run.tracker.current_seq if run is not None else None
+        if run is None or not run.resolved:
+            return None     # an adopted run's leg_base is not known yet: its legs would collide with the stored ones
+        current = run.tracker.current_seq
         return None if current is None else run.leg_base + current
 
     @_guarded
