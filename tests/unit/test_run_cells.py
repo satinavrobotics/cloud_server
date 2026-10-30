@@ -82,8 +82,8 @@ class TestSummariseRows:
         d = data(track([0.0, 0.5, 1.0]))
         [row] = rc.summarise_rows(d, nodes, FS)
         assert (row.speed_basis, row.class_basis) == ("factsheet", "current")
-        [row] = rc.summarise_rows(d, nodes, FS, class_basis="run")
-        assert row.class_basis == "run"
+        [row] = rc.summarise_rows(d, nodes, FS, class_basis="period")
+        assert row.class_basis == "period"
 
     def test_a_placeholder_robot_is_marked_and_keeps_its_class_without_speed(self):
         fs = RobotTypeIdentifierV1(agv_class="CARRIER", length=-1, width=-1, speed_max=1.0)
@@ -304,11 +304,11 @@ class TestRunCellsDb:
         assert (back.speed_basis, back.class_basis) == ("factsheet", "current") and not back.dwell_s.any()
 
     async def test_dwell_and_bases_round_trip(self):
-        row = a_row(dwell_s=np.array([0.0, 1.5, 0.25]), speed_basis="placeholder", class_basis="run")
+        row = a_row(dwell_s=np.array([0.0, 1.5, 0.25]), speed_basis="placeholder", class_basis="period")
         params = rdb.encode(row)
         back = rdb.decode([params[i] for i in range(len(rdb.COLUMNS) - 1)] + [T0])
         assert np.allclose(back.dwell_s, [0.0, 1.5, 0.25])
-        assert (back.speed_basis, back.class_basis) == ("placeholder", "run")
+        assert (back.speed_basis, back.class_basis) == ("placeholder", "period")
         assert np.allclose(row.stopped_all_s, row.stopped_s + row.dwell_s)
 
     async def test_a_row_stored_before_dwell_existed_decodes_with_zero_dwell(self):
@@ -571,10 +571,10 @@ class TestWpD:
 
     def test_keep_labels_overrides_only_maps_with_a_stored_row(self):
         rows = rc.summarise_rows(data(track([0.0, 1.0, 2.0])), nodes, FS)
-        rc.keep_labels(rows, {"m1": ("AMR|0.80x0.50", 0.24, "factsheet", "run")})
-        assert (rows[0].speed_max, rows[0].class_basis) == (0.24, "run")
+        rc.keep_labels(rows, {"m1": ("AMR|0.80x0.50", 0.24, "factsheet", "period")})
+        assert (rows[0].speed_max, rows[0].class_basis) == (0.24, "period")
         rows = rc.summarise_rows(data(track([0.0, 1.0, 2.0])), nodes, FS)
-        rc.keep_labels(rows, {"other": ("x", 0.1, "unknown", "run")})
+        rc.keep_labels(rows, {"other": ("x", 0.1, "unknown", "period")})
         assert rows[0].speed_max == pytest.approx(1.2)
 
     async def test_fetch_excludes_archived_by_default(self):
@@ -665,3 +665,16 @@ class TestWpD:
         assert out["failed"] == 0 and "r1" in w.terminal and "r1" not in w.failed
         await w.step()
         assert calls == ["r1"]
+
+
+def test_class_bases_match_the_run_cells_check():
+    # The unit tests' fake DB has no constraints: the last migration that sets run_cells_class_basis_check must allow
+    # every CLASS_BASES value (20261030_05 wrote 'period' while the CHECK still said ('current', 'run')).
+    import pathlib
+    import re
+    versions = pathlib.Path(__file__).resolve().parents[2] / "packages/api/migrations/versions"
+    setters = sorted(f for f in versions.glob("2026*.py")
+                     if "ADD CONSTRAINT run_cells_class_basis_check" in f.read_text())
+    upgrade = setters[-1].read_text().split("def downgrade")[0]
+    allowed = re.search(r"run_cells_class_basis_check CHECK \(class_basis IN \(([^)]*)\)\)", upgrade).group(1)
+    assert {v.strip(" '") for v in allowed.split(",")} == set(rdb.CLASS_BASES)

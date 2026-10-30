@@ -91,6 +91,7 @@ async def test_a_run_is_labelled_from_the_period_it_started_in(run_env):
     run_env.periods = [period(T0 - 5 * DAY, 0.24), period(T0 + DAY, 0.36)]      # the speed change is after the run
     [row] = await run_env.run()
     assert (row.speed_max, row.speed_basis, row.class_basis, row.robot_class) == (0.24, "factsheet", "period", "AMR|0.80x0.50")
+    assert row.class_basis in rdb.CLASS_BASES  # the run_cells CHECK allows exactly these (test_run_cells)
 
 
 async def test_no_period_before_the_run_labels_it_from_the_current_factsheet(run_env):
