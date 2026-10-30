@@ -97,8 +97,6 @@ class FakeCursor:
             db.person_removal_deleted.append(params[0])
         elif sql == map_delete.KEEPOUTS_SQL:
             db.keepouts_deleted.append(params[0])
-        elif sql == map_delete.EDGE_OBSERVATIONS_SQL:
-            db.edge_observations_deleted.append(params[0])
         elif sql == map_delete.BLOCKED_NODES_SQL:
             db.blocked_deleted.append(params[0])
         elif sql in (map_delete.RUN_CELLS_SQL, map_delete.REGION_STATS_SQL, map_delete.REGION_STATS_BUILDS_SQL,
@@ -171,7 +169,6 @@ class FakeDb:
         self.view_settings_deleted = []
         self.person_removal_deleted = []
         self.keepouts_deleted = []
-        self.edge_observations_deleted = []
         self.region_stats_deleted = []
         self.blocked_deleted = []
         self.robots = {}
@@ -254,7 +251,6 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     assert db.view_settings_deleted == ["site_a"]  # and its view settings
     assert db.person_removal_deleted == ["site_a"]  # and its person removal setting
     assert db.keepouts_deleted == ["site_a"]  # and its keep-out zones
-    assert db.edge_observations_deleted == ["site_a"]  # and its edge statistics
     assert db.region_stats_deleted == [("run_cells", "site_a"), ("region_stats", "site_a"), ("region_stats_builds", "site_a"),
                                         ("region_stats_inputs", "site_a")]
     assert db.blocked_deleted == ["site_a"]  # and its blocked-node exclusions

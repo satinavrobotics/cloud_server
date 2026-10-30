@@ -1037,7 +1037,7 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
         assert col in up
     assert "DROP VIEW robot_software_periods" in m.DOWNGRADE_SQL and "DROP TABLE navstack_deployments" in m.DOWNGRADE_SQL
     # exactly one head: nothing else descends from the migration it follows; only the edge-stats
-    # index migration (20261027_02) descends from ours, and the run_legs plan migration (20261027_03) is followed by leg moving time (20261027_04), then the run cell summaries (20261028_01), the region cost columns (20261028_02) the leg predictions (20261028_03), the bag analysis tables (20261028_04), the analysis catalog (20261028_05), the stats indexes and cleanup (20261030_01-03) the region build inputs generation (20261030_04) and the head, the factsheet periods (20261030_05)
+    # index migration (20261027_02) descends from ours, and the run_legs plan migration (20261027_03) is followed by leg moving time (20261027_04), then the run cell summaries (20261028_01), the region cost columns (20261028_02) the leg predictions (20261028_03), the bag analysis tables (20261028_04), the analysis catalog (20261028_05), the stats indexes and cleanup (20261030_01-03) the region build inputs generation (20261030_04), the factsheet periods (20261030_05), the class_basis 'period' check (20261030_06) and the head, the edge_observations drop (20261030_07)
     downs = {}
     for f in versions.glob("2026*.py"):
         text = f.read_text()
@@ -1061,7 +1061,9 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
     assert downs["20261030_03_stats_cleanup"] == "20261030_02_track_run_idx"
     assert downs["20261030_04_region_inputs_gen"] == "20261030_03_stats_cleanup"
     assert downs["20261030_05_factsheet_periods"] == "20261030_04_region_inputs_gen"
-    assert heads == {"20261030_05_factsheet_periods"}
+    assert downs["20261030_06_class_basis_period"] == "20261030_05_factsheet_periods"
+    assert downs["20261030_07_drop_edge_obs"] == "20261030_06_class_basis_period"
+    assert heads == {"20261030_07_drop_edge_obs"}
 
 
 # ---- PgFacts over the mapping-session store ---------------------------------------------------------------

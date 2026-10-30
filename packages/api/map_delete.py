@@ -98,8 +98,6 @@ VIEW_SETTINGS_SQL = "DELETE FROM map_view_settings WHERE map_name = %s"
 PERSON_REMOVAL_SQL = "DELETE FROM map_person_removal WHERE map_name = %s"
 # Its keep-out zones (migration 20261025_01_map_keepouts) too.
 KEEPOUTS_SQL = "DELETE FROM map_keepouts WHERE map_name = %s"
-# Its per-edge traversal statistics (migration 20261011_01_edge_observations) too.
-EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
 # Its per-run cell summaries and the region statistics built from them (migration 20261028_01_run_cells) too.
 RUN_CELLS_SQL = "DELETE FROM run_cells WHERE map_id = %s"
 REGION_STATS_SQL = "DELETE FROM region_stats WHERE map_id = %s"
@@ -457,7 +455,6 @@ class MapDeleter:
                     await cursor.execute(VIEW_SETTINGS_SQL, (map_id,))
                     await cursor.execute(PERSON_REMOVAL_SQL, (map_id,))
                     await cursor.execute(KEEPOUTS_SQL, (map_id,))
-                    await cursor.execute(EDGE_OBSERVATIONS_SQL, (map_id,))
                     await cursor.execute(RUN_CELLS_SQL, (map_id,))
                     await cursor.execute(REGION_STATS_SQL, (map_id,))
                     await cursor.execute(REGION_STATS_BUILDS_SQL, (map_id,))

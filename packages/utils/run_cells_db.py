@@ -22,7 +22,7 @@ from packages.utils import cell_raster as cr
 MAP_TABLE = MapObjectV1.table_name()
 SOURCES = ("track", "legs", "empty")
 ARRAYS = ("len_m", "time_s", "stopped_s", "recovery_s", "blocks", "dwell_s")
-CLASS_BASES = ("current", "run")        # whose factsheet labelled the run: today's, or the one in force when it ran
+CLASS_BASES = ("current", "period")     # whose factsheet labelled the run: today's, or the period in force when it ran
 COLUMNS = ("run_id", "map_id", "robot_name", "robot_class", "speed_max", "speed_basis", "class_basis", "started_at",
            "ended_at", "source", "algo_version", "cell_m", "params", "frames", "ix", "iy", "len_m", "time_s",
            "stopped_s", "recovery_s", "blocks", "dwell_s", "totals", "created_at")
