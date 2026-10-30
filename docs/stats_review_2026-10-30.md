@@ -313,3 +313,24 @@ Wave 2 (not started):
 * W2-1..3 (§4.1).
 * WP-H end-to-end check on a dump.
 * Add a "retired" note to the edge-stats design docs (`link_cost_estimation`, `scene_graph/edge_stats_on_charts_design.md`).
+
+## 6. Wave 2 status (2026-10-30)
+
+Merged to local `main` through `stats/wave2`: unit suite 67 failed / 7808 passed / 40 errors, the same failing set as baseline. Not pushed, not deployed.
+
+* **Check on a copy of the live data: GO for deploy.**
+  * The migrations take under 0.4 s each; the track index covers about 1.6k uncompressed rows.
+  * The new indexes are used, cache hits run 0 queries, and ETags are stable.
+  * Region rebuilds give plausible numbers.
+  * On office9, planning takes 3.6 ms median with the cost off and 4.4 ms in shadow, and the served routes are identical.
+  * Open: shadow's region-cost route differs from the served one in 16 of 30 pairs (`alt_route_changed`). Review this before shadow goes live.
+  * Open: the path-efficiency `TRACK_SQL` takes about 440 ms, from a correlated `rec_s` sub-select (pre-existing).
+* **W2-1/W2-2:** a `headerId` jump or a restart counts the interval as `silent_s` (`stats/w2-gaps`).
+* **I10:** one stale-plan rule (`plan_length.plan_of` / `plan_of_snapshot`). Legs recorded before the plan marker cannot see a reroute that keeps the waypoint spacing (documented). 3 of 1,794 historical legs change from stale to trajectory.
+* **Factsheet periods (owner decision: a speed-profile change is the same robot):**
+  * `robot_factsheet_periods` (migration `20261030_05`), written by the recorder when the limits or footprint change.
+  * `run_cells` labels from the period valid at the run's start (`class_basis = 'period'`).
+  * `scripts/seed_factsheet_periods.py` plus `backfill_run_cells.py --relabel --robot`; procedure in region stats spec §14.
+  * Seed and re-label once the robot team sends the values and the date.
+  * `formidable-peacock`: if the change date falls between 2026-10-28 16:20 and 2026-10-29 18:54 UTC, the existing labels are already right.
+* **With the deploy:** drop `edge_observations` (WP-G2).
