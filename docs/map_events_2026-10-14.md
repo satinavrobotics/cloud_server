@@ -47,6 +47,7 @@ is counted once per recovery: the previous NAV.RECOVERY_* event of the robot mus
 (skipped); `ROBOT.HEARTBEAT_LOST` (link_loss); `ROBOT.OFFLINE`, `MISSION.REROUTED` (a reroute the dispatcher applied, one per applied `route_rev` that replaced at least one route; before 2026-10-30 it was also recorded when an edge block cleared, now `MISSION.BLOCK_CLEARED`, not counted),
 `MISSION.CANCEL_REQUESTED`, `TELEOP.SESSION_STARTED` (other). Not counted: battery, node up/down, state
 changes, run start/finish, map administration, the cleared/exited/restored halves.
+`MISSION.REROUTED` is emitted only for a reroute the dispatcher applies to a dispatched mission (`_update_mission_from_api`). A reroute of a not-yet-dispatched (queued) mission goes through `_apply_spec_edit` instead and emits no `MISSION.REROUTED`. `MISSION.REROUTED` rows recorded before 2026-10-30 are block clears (they have `blocked_edges` and no `route_rev`), not reroutes.
 **Safety** = the first five classes of `SAFETY_CLASSES` (safety_reflex, blocked, skipped, link_loss); recovery is
 reported but is not a safety event. Rules: `CLASS_RULES` (one table; the `class` filter SQL is derived from it).
 

@@ -51,10 +51,20 @@ class _Db:
         return cls(name=name, lifecycle=self.row.lifecycle, status=self.row.status.dict(),
                    **json.loads(self.row.spec.json()))
 
-    async def update_spec_fields(self, cls, name, fields, publisher_id):
+    async def update_spec_fields(self, cls, name, fields, publisher_id, bump_route_rev=False,
+                                 **_):
+        """The jsonb semantics of PostgresDatabase.update_spec_fields: `||`, and route_rev
+        either GREATEST(stored, value) or, bumped, stored + 1."""
         self.spec_writes.append(fields)
+        stored = self.row.route_rev
+        merged = {**json.loads(self.row.spec.json()), **fields}
+        if bump_route_rev:
+            merged["route_rev"] = stored + 1
+        elif "route_rev" in fields:
+            merged["route_rev"] = max(stored, fields["route_rev"])
         self.row = cls(name=name, lifecycle=self.row.lifecycle, status=self.row.status.dict(),
-                       **{**json.loads(self.row.spec.json()), **fields})
+                       **merged)
+        return merged["route_rev"] if ("route_rev" in fields or bump_route_rev) else None
 
     async def update_status(self, *a, **k):
         pass
@@ -104,7 +114,7 @@ async def test_force_must_be_a_real_bool(force):
     db = _Db(_mission())
     with pytest.raises(HTTPException) as exc:
         await _put(db, {"update_nodes": {"a": {"waypoints": [_wp(5.0)]}}, "force": force})
-    assert exc.value.status_code == 422 and db.row.route_rev == 0
+    assert exc.value.status_code == 400 and db.row.route_rev == 0
 
 
 async def test_an_unknown_node_is_refused_before_the_planner_is_asked():
@@ -161,14 +171,17 @@ async def test_routes_are_measured_concurrently():
 
     planner = SimpleNamespace(enrich_route=AsyncMock(side_effect=enrich))
     reroute = {n: {"waypoints": [_wp(0.0), _wp(3.0)]} for n in ("a", "b", "c")}
-    out = await route_preview.measure_reroute(planner, "r1", reroute)
+    out = (await route_preview.measure_reroute_detailed(planner, "r1", reroute))[0]
     assert peak == 3 and list(out) == ["a", "b", "c"]
     assert planner.enrich_route.await_args.kwargs["timeout"] > 0
     # one failing route does not take the others down
     planner = SimpleNamespace(enrich_route=AsyncMock(side_effect=[RuntimeError("x"),
                               {"waypoints": [_wp(0.0), _wp(3.0)]}]))
-    out = await route_preview.measure_reroute(planner, "r1", {n: reroute[n] for n in "ab"})
+    out = (await route_preview.measure_reroute_detailed(planner, "r1", {n: reroute[n] for n in "ab"}))[0]
     assert list(out) == ["a", "b"]
+    # the other route was still measured (one planner call each) and the failed one kept as given
+    assert planner.enrich_route.await_count == 2
+    assert out["a"] == reroute["a"] or out["a"]["waypoints"] == reroute["a"]["waypoints"]
 
 
 async def test_crossed_keepout_zones_come_back_as_warnings_not_a_409():
@@ -209,3 +222,64 @@ async def test_update_returns_the_routes_now_in_the_tree_and_refuses_a_finished_
     done = _mission(state=State.COMPLETED)
     with pytest.raises(common.ICSUsageError):
         await done.update({"a": {"waypoints": [_wp(5.0)]}})
+
+
+# ---- route_rev: a PUT's bump is above whatever is stored when it writes -------------------------
+async def test_a_put_that_races_a_dispatcher_bump_does_not_tie():
+    db = _Db(_mission())
+    planner_calls = []
+
+    async def enrich(robot, map_id, wps, **kw):
+        # the dispatcher's replan / enrich commits revision 1 while the PUT awaits the planner
+        planner_calls.append(1)
+        await db.update_spec_fields(mission_object.MissionObjectV1, "m1", {}, None,
+                                    bump_route_rev=True)
+        return {"waypoints": wps}
+
+    planner = SimpleNamespace(enrich_route=AsyncMock(side_effect=enrich))
+    out = await _put(db, {"update_nodes": {"a": {"waypoints": [_wp(5.0), _wp(6.0)]}}}, planner)
+    assert planner_calls and out["route_rev"] == 2      # not 1: the PUT read 0, stored is 1
+
+
+async def test_two_sequential_puts_raise_the_revision_each_time():
+    db = _Db(_mission())
+    first = await _put(db, {"update_nodes": {"a": {"waypoints": [_wp(5.0), _wp(6.0)]}}})
+    second = await _put(db, {"update_nodes": {"a": {"waypoints": [_wp(7.0), _wp(8.0)]}}})
+    assert (first["route_rev"], second["route_rev"]) == (1, 2)
+    assert all("route_rev" not in w for w in db.spec_writes)   # bumped in SQL, never sent
+
+
+# ---- the pose exemption is the footprint, not widened (amendment) -------------------------------
+def _blocked_row(node="2", x=1.0, y=0.0):
+    return {"graph_node_id": node, "x": x, "y": y, "robot_x": None, "robot_y": None}
+
+
+async def _hits_with_pose(monkeypatch, rows, pose, half_width):
+    monkeypatch.setattr(api_main, "service", SimpleNamespace(database=SimpleNamespace()))
+    monkeypatch.setattr(api_main.blocked_nodes, "fetch_active", AsyncMock(return_value=rows))
+    wps = [{"x": 1.0, "y": 0.0, "map_id": "M", "node_id": "2"},
+           {"x": 3.0, "y": 0.0, "map_id": "M", "node_id": "3"}]
+    return await api_main._reroute_through_blocked({"a": {"waypoints": wps}}, half_width, pose)
+
+
+async def test_a_blocked_waypoint_0_4_m_from_the_robot_is_still_refused(monkeypatch):
+    rows = [_blocked_row()]
+    hits = await _hits_with_pose(monkeypatch, rows, (1.0 - 0.4, 0.0, "M"), 0.3)
+    assert [r["graph_node_id"] for r in hits] == ["2"]          # stopped short of it: 409
+    # the same waypoint when it is not blocked: nothing to refuse
+    assert await _hits_with_pose(monkeypatch, [], (0.6, 0.0, "M"), 0.3) == []
+    # standing on it (within the footprint) is exempt, as before
+    assert await _hits_with_pose(monkeypatch, rows, (1.0 - 0.2, 0.0, "M"), 0.3) == []
+
+
+async def test_robot_is_read_once_per_reroute():
+    db = _Db(_mission(), robot=_robot())
+    reads = []
+    orig = db.get_object
+
+    async def counting(cls, name):
+        reads.append(cls)
+        return await orig(cls, name)
+    db.get_object = counting
+    await _put(db, {"update_nodes": {"a": {"waypoints": [_wp(5.0), _wp(6.0)]}}})
+    assert reads.count(RobotObjectV1) == 1

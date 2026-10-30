@@ -71,7 +71,8 @@ async def _replan_with(edit, stored_rev=None):
 async def test_replan_without_an_edit_bumps_the_revision():
     m, db = await _replan_with(lambda r: None)
     assert m.route_rev == m.status.applied_route_rev == 1
-    assert db.update_spec_fields.await_args.args[2]["route_rev"] == 1
+    assert "route_rev" not in db.update_spec_fields.await_args.args[2]
+    assert db.update_spec_fields.await_args.kwargs["bump_route_rev"] is True
 
 
 @pytest.mark.unit
@@ -166,3 +167,33 @@ def test_rerouted_event_id_includes_the_revision_and_block_cleared_is_its_own_co
     assert e2.code.value == "MISSION.REROUTED" and e2.payload["route_rev"] == 2
     assert e2.discriminator != e3.discriminator and e2.discriminator.endswith("|2")
     assert bc.code.value == "MISSION.BLOCK_CLEARED" and bc.payload["blocked_edges"] == ["e1"]
+
+
+# --- route_rev: the dispatcher's bump is the stored value + 1, never a tie ------------------------
+@pytest.mark.unit
+async def test_replan_takes_the_revision_the_write_stored():
+    # An operator's PUT stored revision 4 meanwhile (not seen in memory): the bump lands on 5 and
+    # the dispatcher's in-memory revision and applied revision follow the stored one.
+    async def plan(**_):
+        return _plan(51.0)
+    planner = SimpleNamespace(plan=AsyncMock(side_effect=plan))
+    r, db = goto_tests._make_robot(planner)
+    db.update_spec_fields = AsyncMock(return_value=5)
+    m = goto_tests._goto()
+    r._current_mission = m
+    await r._replan_goto()
+    assert m.route_rev == m.status.applied_route_rev == 5
+    assert db.update_spec_fields.await_args.kwargs["bump_route_rev"] is True
+
+
+@pytest.mark.unit
+async def test_enrich_takes_the_revision_the_write_stored():
+    planned = enrich_tests._wp(5.0, origin="planned", skippable=True, corridor_width_m=0.4)
+    planner = SimpleNamespace(enrich_route=AsyncMock(return_value=enrich_tests._enriched(
+        enrich_tests._wp(0.0), planned, enrich_tests._wp(10.0))))
+    r, db = goto_tests._make_robot(planner)
+    db.update_spec_fields = AsyncMock(return_value=7)
+    m = enrich_tests._mission([enrich_tests._wp(0.0), enrich_tests._wp(10.0)])
+    r._current_mission = m
+    await r._enrich_routes()
+    assert m.route_rev == m.status.applied_route_rev == 7

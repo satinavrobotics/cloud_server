@@ -549,8 +549,8 @@ async def test_api_reroute_of_a_running_mission_is_not_treated_as_an_edit():
 
     db.update_spec_fields.assert_awaited_once()
     fields = db.update_spec_fields.await_args.args[2]
-    assert set(fields) == {"mission_tree", "planned_path", "route_rev"}  # nothing else
-    assert fields["route_rev"] == 1
+    assert set(fields) == {"mission_tree", "planned_path"}  # nothing else; route_rev is bumped in SQL
+    assert db.update_spec_fields.await_args.kwargs == {"bump_route_rev": True}
     assert [(w["x"], w["y"]) for w in fields["mission_tree"][1]["route"]["waypoints"]] == [(1.0, 1.0)]
 
 

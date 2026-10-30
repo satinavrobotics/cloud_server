@@ -243,10 +243,10 @@ def test_the_route_digest_ignores_cost_model_and_predicted_s():
     traj = mission_object.MissionRouteNodeV1(waypoints=poses(), trajectory=[leg])
     modelled = mission_object.MissionRouteNodeV1(waypoints=poses(), trajectory=[{**leg, "predicted_s": 4.5}],
                                                  graph_version=3, cost_model="0123456789abcdef:st1")
-    digest = mission_server._route_digest(bare)
-    assert digest == mission_server._route_digest(traj) == mission_server._route_digest(modelled)
+    digest = mission_object.route_digest(bare)
+    assert digest == mission_object.route_digest(traj) == mission_object.route_digest(modelled)
     moved = mission_object.MissionRouteNodeV1(waypoints=poses()[:2], cost_model="0123456789abcdef:st1")
-    assert mission_server._route_digest(moved) != digest
+    assert mission_object.route_digest(moved) != digest
 
 
 def test_the_route_digest_is_the_one_computed_before_the_fields_existed():
@@ -257,9 +257,9 @@ def test_the_route_digest_is_the_one_computed_before_the_fields_existed():
     text = route.json(sort_keys=True, exclude_none=True,
                       exclude={"trajectory": True, "graph_version": True, "waypoints": {"__all__": {"chart_key"}}})
     assert "cost_model" not in text and "predicted" not in text
-    assert mission_server._route_digest(route) == hashlib.sha1(text.encode()).hexdigest()[:16]
+    assert mission_object.route_digest(route) == hashlib.sha1(text.encode()).hexdigest()[:16]
     with_model = mission_object.MissionRouteNodeV1(waypoints=poses(), graph_version=4, cost_model="a:b")
-    assert mission_server._route_digest(with_model) == mission_server._route_digest(route)
+    assert mission_object.route_digest(with_model) == mission_object.route_digest(route)
 
 
 def test_the_new_fields_round_trip():

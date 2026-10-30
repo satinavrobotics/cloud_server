@@ -149,7 +149,7 @@ def _route(*xs, **kw):
 async def test_a_reroute_gets_its_corridors_measured_without_replanning():
     planner = SimpleNamespace(enrich_route=AsyncMock(side_effect=lambda r, m, wps, **kw: {
         "waypoints": [{**w, "corridor_width_m": 0.4, "corridor_source": "measured"} for w in wps]}))
-    out = await route_preview.measure_reroute(planner, "r1", {"n1": _route(0, 3, 6)})
+    out = (await route_preview.measure_reroute_detailed(planner, "r1", {"n1": _route(0, 3, 6)}))[0]
     assert [w["corridor_width_m"] for w in out["n1"]["waypoints"]] == [0.4] * 3
     args, kwargs = planner.enrich_route.call_args
     assert args[0] == "r1" and args[1] == "m" and kwargs["insert_planned"] is False
@@ -160,10 +160,10 @@ async def test_a_reroute_is_stored_as_given_when_nothing_can_be_measured():
     # an operator's corridor and a measured 0 stay; a positive measured one may be stale and goes (test_corridor_width_review)
     given = {"n1": _route(0, 3, 6, corridor_width_m=0.9, corridor_source="operator")}
     down = SimpleNamespace(enrich_route=AsyncMock(side_effect=RuntimeError("down")))
-    assert await route_preview.measure_reroute(down, "r1", given) == given
-    assert await route_preview.measure_reroute(None, "r1", given) == given
+    assert (await route_preview.measure_reroute_detailed(down, "r1", given))[0] == given
+    assert (await route_preview.measure_reroute_detailed(None, "r1", given))[0] == given
     wrong_count = SimpleNamespace(enrich_route=AsyncMock(return_value={"waypoints": []}))
-    assert await route_preview.measure_reroute(wrong_count, "r1", given) == given
+    assert (await route_preview.measure_reroute_detailed(wrong_count, "r1", given))[0] == given
 
 
 @pytest.mark.unit
@@ -172,6 +172,6 @@ async def test_a_reroute_without_one_map_is_not_sent_to_the_planner():
     mixed = _route(0, 3)
     mixed["waypoints"][1]["map_id"] = "other"
     mapless = _route(0, 3, map_id="")
-    out = await route_preview.measure_reroute(planner, "r1", {"a": mixed, "b": mapless})
+    out = (await route_preview.measure_reroute_detailed(planner, "r1", {"a": mixed, "b": mapless}))[0]
     planner.enrich_route.assert_not_called()
     assert out["a"] == mixed and out["b"] == mapless

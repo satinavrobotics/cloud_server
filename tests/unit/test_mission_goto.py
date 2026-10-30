@@ -200,7 +200,8 @@ async def test_a_queued_go_to_is_replanned_from_the_pose_at_dispatch():
     assert goto.planned_path == ["7", "8"]
     # stored, and not mistaken for a reroute when the row comes back
     fields = db.update_spec_fields.await_args.args[2]
-    assert fields["planned_path"] == ["7", "8"] and fields["route_rev"] == 1
+    assert fields["planned_path"] == ["7", "8"] and "route_rev" not in fields
+    assert db.update_spec_fields.await_args.kwargs["bump_route_rev"] is True
     assert goto.route_rev == goto.status.applied_route_rev == 1
     await r._on_mission_change(_echo_of(goto, fields))
     assert not [c for c in r._mqtt_client.publish.call_args_list
@@ -212,7 +213,7 @@ def _echo_of(goto, fields):
     echo = _goto()
     echo.mission_tree = [mission_object.MissionNodeV1(**n) for n in fields["mission_tree"]]
     echo.planned_path = fields["planned_path"]
-    echo.route_rev = fields["route_rev"]
+    echo.route_rev = goto.route_rev    # what the bumped write stored
     return echo
 
 

@@ -146,7 +146,7 @@ async def test_a_rejection_from_a_robot_that_runs_someone_elses_order_still_fail
 
 
 # ---- adopting the order the robot is already running (instead of cancelling it and sending the same route again)
-from packages.controllers.mission.server import _route_digest  # noqa: E402
+from cloud_common.objects.mission import route_digest  # noqa: E402
 import cloud_common.objects.mission as _mission_objects  # noqa: E402
 
 
@@ -162,7 +162,7 @@ def _revisions_setup(r, route_changed=False, known=True):
     r._current_leaf_node = MagicMock(return_value=node)
     r._cancel_order = AsyncMock(return_value=True)
     r._persist_current_mission_status = AsyncMock()
-    digest = _route_digest(node.route)
+    digest = route_digest(node.route)
     if known:
         r._order_records[old] = _mission_objects.MissionSentOrderV1(
             order_id=old, route_digest=("0" * len(digest)) if route_changed else digest, waypoint_offset=0)

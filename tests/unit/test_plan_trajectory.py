@@ -185,4 +185,4 @@ def test_stale_legs_are_dropped_not_an_error():
 
 @pytest.mark.unit
 def test_the_route_digest_ignores_the_trajectory():
-    assert dispatch_server._route_digest(_route(trajectory=LEGS)) == dispatch_server._route_digest(_route())
+    assert mission_object.route_digest(_route(trajectory=LEGS)) == mission_object.route_digest(_route())

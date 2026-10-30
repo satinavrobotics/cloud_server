@@ -49,9 +49,9 @@ def test_the_order_sent_to_the_robot_never_carries_chart_keys_or_the_graph_versi
 def test_the_route_digest_ignores_the_recording_fields():
     base = mission_object.MissionRouteNodeV1(waypoints=_poses(False))
     charted = mission_object.MissionRouteNodeV1(waypoints=_poses(True), graph_version=5)
-    assert mission_server._route_digest(base) == mission_server._route_digest(charted)
+    assert mission_object.route_digest(base) == mission_object.route_digest(charted)
     moved = mission_object.MissionRouteNodeV1(waypoints=_poses(False)[:2])
-    assert mission_server._route_digest(base) != mission_server._route_digest(moved)
+    assert mission_object.route_digest(base) != mission_object.route_digest(moved)
     assert mission_object.same_route(base, charted)
     assert not mission_object.same_route(base, moved)
 

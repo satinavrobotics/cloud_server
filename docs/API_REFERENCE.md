@@ -1108,12 +1108,21 @@ A reroute whose waypoints go through a graph node a robot reported blocked recen
 [Blocked graph nodes](#blocked-graph-nodes)) is refused with `409`
 `{"error": "HTTP Error", "detail": {"code": "ROUTE_THROUGH_BLOCKED_NODES", "message": ...,
 "blocked_nodes": [...]}, "status_code": 409, "path": ...}`; add `"force": true` to the body to
-reroute anyway. The check uses the planner's rule, and is pose-based: a waypoint within the
-robot's footprint (its half width) of the robot's own pose is where it already stands and is exempt
-(not simply the route's first waypoint, which the editor seeds from the stored route); a waypoint with a
+reroute anyway. The check uses the planner's rule, and is pose-based: a waypoint near the
+robot's own pose (its footprint half width) is where it already stands and is exempt (not simply
+the route's first waypoint, which the editor seeds from the stored route). The exemption is not widened: a robot that
+reported `edgeBlocked` stops just short of the blocked node, so a waypoint farther than the footprint from the robot
+that matches an active block (e.g. the blocked node 0.4 m ahead) is still refused with `409`; a waypoint that is not
+blocked is never refused, near the robot or not. Without a trusted pose (no robot, robot unreadable or offline)
+every waypoint is checked; the route's legs are always checked as segments; `force` overrides. A waypoint with a
 `node_id` matches a row of that graph node, or a position row (`"@x,y"`) within
 `BLOCKED_NODE_MATCH_RADIUS_M` (0.5 m); a waypoint without `node_id` matches by lying within
 that radius of where the row's node was reported.
+
+Reroute request errors: a malformed `update_nodes` (not an object of `{node name: {waypoints: [...]}}`, or a route
+that does not validate) is `400`; a non-boolean `force` is `400`; `{}` or `null` for `update_nodes` is no reroute (a
+no-op: nothing is bumped or stored). The new `route_rev` is stored as the stored value plus one, in one SQL
+statement, so it is always above whatever the dispatcher or another PUT stored meanwhile.
 
 Waypoint tolerances: `allowedDeviationXY` / `allowedDeviationTheta` left out (or 0) mean the
 dispatcher's policy: 0.35 m / heading free on nodes the robot drives through, 0.35 m / 0.785 rad

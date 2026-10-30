@@ -188,7 +188,9 @@ def same_route(a: Any, b: Any) -> bool:
 
 def route_digest(route: "MissionRouteNodeV1") -> str:
     """A stable 16-hex hash of the same canonical form `same_route` compares (waypoints without `chart_key`), for
-    records that outlive the object (sent-order records): `route_digest(a) == route_digest(b)` iff `same_route(a, b)`.
+    records that outlive the object (sent-order records). Equal digests iff `same_route(a, b)`, up to float signed zero
+    (-0.0 and 0.0 compare equal but serialise differently); the hash is truncated to 16 hex, so a collision is
+    possible in principle, not in practice.
     Unset optional waypoint fields are left out, so adding one to Pose2D does not change the digest of a route
     stored before it existed (a mission in flight at deploy would otherwise read as rerouted)."""
     return hashlib.sha1(route.json(

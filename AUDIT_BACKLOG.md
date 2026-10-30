@@ -756,8 +756,8 @@ API reports.
   Not done: the planner cannot import the controller module, so the helper needs a home both can import.
 - C4: `node_policy_plan._between` repeats `_leg_width`'s snap + route + min_width logic. Extract one `_route_leg`.
 - C5: fixed 2026-10-30: `route_preview.measure_reroute_detailed` (used by `PUT /missions`) measures the routes concurrently with
-  `asyncio.gather`, each with its own `NODE_POLICY_ENRICH_TIMEOUT_S` (no single overall deadline). `measure_reroute` remains as a
-  routes-only wrapper (tests).
+  `asyncio.gather`, each with its own `NODE_POLICY_ENRICH_TIMEOUT_S` (no single overall deadline). The routes-only wrapper `measure_reroute` was
+  removed (2026-10-30): `measure_reroute_detailed` is the only entry (tests use `[0]`).
 - C6: the "already annotated?" test is in the dispatcher's enrich path (`_enrich_routes`) and again in `_check_goto_annotated`; factor it out with J.2.
 - C7: the sent-order decision record is `Dict[str, Any]` (`cloud_common/objects/mission.py`). A small model would validate
   `reason`, which the API summary keys on.
@@ -766,9 +766,9 @@ API reports.
 ### J.8 Corridor width review 2026-10-27 — fixed (branch `fix/corridor-width-review`)
 A model review of the corridorWidth computation was checked against the code; all four code items reproduced on main and are fixed with tests (`tests/unit/test_corridor_width_review.py`).
 - Skip threshold: `skippable` needs corridor > `NODE_POLICY_SKIP_MIN_CORRIDOR_M` (default 0.10 = the robot's localisation margin; agreed with the robot team 2026-10-27, the 0.05 m planner margin and centre-point semantics stay). One helper `cloud_common.node_policy.skip_allowed` for the planner, wire, dispatcher log, reason chain (`corridor_below_margin`). The corridor itself is still sent. This closes J.6 C2.
-- A measured `min_width` of 0 gives corridor 0 (one `sanitize_width`); stale positive measured corridors are cleared on the unchanged paths and in `measure_reroute`; `blocked` is passed to every leg width through one `_route_leg` (closes J.6 C4); the operator test runs once.
-- J.4 decided: `total` = waypoints but the last that are planned or ask to be skippable (`skippable_candidates`). The unchanged path and the preview now report that count (before: those without a corridor). `measure_reroute` reports no total.
-- Not changed: operator corridors above 1.5 m are capped silently (documented). Still open: J.6 C5 (serial `measure_reroute`), failure caching, budget redesign.
+- A measured `min_width` of 0 gives corridor 0 (one `sanitize_width`); stale positive measured corridors are cleared on the unchanged paths and in `measure_reroute_detailed`; `blocked` is passed to every leg width through one `_route_leg` (closes J.6 C4); the operator test runs once.
+- J.4 decided: `total` = waypoints but the last that are planned or ask to be skippable (`skippable_candidates`). The unchanged path and the preview now report that count (before: those without a corridor). `measure_reroute_detailed` reports no total.
+- Not changed: operator corridors above 1.5 m are capped silently (documented). Still open: J.6 C5 (serial measure; now concurrent), failure caching, budget redesign.
 - `SCENE_GRAPH_WIDTH_MARGIN_M` comments (config.py, scene_route.required_width) do say lattice error +-0.05 m (lattice/2), distinct from the robot's 0.10 m; the config comment did not say it is also subtracted in `corridor_per_side`, now added. J.3 stands answered by the robot team: it stays.
 
 ### J.7 Outside the node-policy area, skimmed only (unverified)

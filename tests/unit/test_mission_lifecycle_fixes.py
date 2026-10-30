@@ -239,9 +239,14 @@ class _FakeMissionDb:
         self.row = cls(name=name, lifecycle=self.row.lifecycle, status=self.row.status.dict(),
                        **json.loads(spec.json()))
 
-    async def update_spec_fields(self, cls, name, fields, publisher_id):
+    async def update_spec_fields(self, cls, name, fields, publisher_id, bump_route_rev=False,
+                                 **_):
+        merged = {**json.loads(self.row.spec.json()), **fields}
+        if bump_route_rev:      # stored + 1, as PostgresDatabase does in SQL
+            merged["route_rev"] = self.row.route_rev + 1
         self.row = cls(name=name, lifecycle=self.row.lifecycle, status=self.row.status.dict(),
-                       **{**json.loads(self.row.spec.json()), **fields})
+                       **merged)
+        return merged["route_rev"] if bump_route_rev or "route_rev" in fields else None
 
     async def update_status(self, cls, name, status, publisher_id):
         self.row.status = status

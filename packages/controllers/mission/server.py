@@ -22,7 +22,6 @@ SPDX-License-Identifier: Apache-2.0
 import asyncio
 import datetime
 import enum
-import hashlib
 import json
 import logging
 import math
@@ -525,7 +524,6 @@ NEW_REVISION = "revision"
 
 
 # The one definition of route sameness lives in cloud_common (same_route / route_digest).
-_route_digest = mission_object.route_digest   # alias: kept for the tests that import it from here
 
 
 # Precomputed once: handle_instant_action() and _order_action_state() test every action
@@ -1044,13 +1042,26 @@ class Robot:
         self.mission_info(f"Replanned the go-to from the robot's pose "
                           f"({pose.x:.2f}, {pose.y:.2f}): {len(route.waypoints)} waypoints")
         try:
-            await self._database.update_spec_fields(
-                api_objects.MissionObjectV1, mission.name,
-                {"mission_tree": json.loads(mission.spec.json())["mission_tree"],
-                 "planned_path": mission.planned_path, "route_rev": mission.route_rev},
-                self._mission_writer_id())
+            await self._store_route_change(
+                mission, {"mission_tree": json.loads(mission.spec.json())["mission_tree"],
+                          "planned_path": mission.planned_path})
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not store the replanned route ({err})")
+
+    async def _store_route_change(self, mission: api_objects.MissionObjectV1,
+                                  fields: Dict[str, Any]) -> None:
+        """Write a route change of the dispatcher's own (replan, enrich) with a route_rev bumped
+        in SQL (stored + 1): strictly above whatever an operator's PUT stored meanwhile, so
+        the revision can never tie with theirs and be ignored. The in-memory route_rev and
+        applied_route_rev take the revision actually stored (this change is already applied:
+        the row coming back must not reroute again). A failed write raises; the in-memory
+        revision then stays the provisional one the caller set."""
+        stored = await self._database.update_spec_fields(
+            api_objects.MissionObjectV1, mission.name, fields, self._mission_writer_id(),
+            bump_route_rev=True)
+        if isinstance(stored, int) and not isinstance(stored, bool):
+            mission.route_rev = stored
+            mission.status.applied_route_rev = stored
 
     async def _enrich_routes(self):
         """Complete the route nodes of a mission that has not started with their nodePolicy
@@ -1137,11 +1148,8 @@ class Robot:
         mission.route_rev = rev_before + 1
         mission.status.applied_route_rev = mission.route_rev
         try:
-            await self._database.update_spec_fields(
-                api_objects.MissionObjectV1, mission.name,
-                {"mission_tree": json.loads(mission.spec.json())["mission_tree"],
-                 "route_rev": mission.route_rev},
-                self._mission_writer_id())
+            await self._store_route_change(
+                mission, {"mission_tree": json.loads(mission.spec.json())["mission_tree"]})
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"[{mission.name}] Could not store the enriched route ({err})")
 
@@ -1907,7 +1915,7 @@ class Robot:
             route = mission_node.route
             offset = min(max(waypoint_offset, 0), len(route.waypoints) - 1)
             record = mission_object.MissionSentOrderV1(
-                order_id=order_id, route_digest=_route_digest(route), waypoint_offset=offset)
+                order_id=order_id, route_digest=mission_object.route_digest(route), waypoint_offset=offset)
             if offset:
                 route = route.copy(update={"waypoints": route.waypoints[offset:]})
             try:
@@ -2001,7 +2009,7 @@ class Robot:
         record = self._sent_order_record(order_id)
         if record is None or record.route_digest is None or node.route is None:
             return True
-        return record.route_digest == _route_digest(node.route)
+        return record.route_digest == mission_object.route_digest(node.route)
 
     def _current_order_id(self) -> Optional[str]:
         """The orderId of the current behavior-tree node, if it is a leaf."""
@@ -2020,7 +2028,7 @@ class Robot:
                 self._sent_order_record(current) is not None or node.route is None:
             return
         self._current_mission.status.sent_order = mission_object.MissionSentOrderV1(
-            order_id=current, route_digest=_route_digest(node.route))
+            order_id=current, route_digest=mission_object.route_digest(node.route))
 
     def _resend_due(self) -> bool:
         """Whether an order the robot has not adopted may be sent again: after
@@ -3446,7 +3454,7 @@ class Robot:
         node = self._current_leaf_node()
         record = self._order_records.get(order_id)
         if node is None or node.route is None or record is None or record.route_digest is None \
-                or record.route_digest != _route_digest(node.route):
+                or record.route_digest != mission_object.route_digest(node.route):
             return False
         self._adopted_prefix = order_ids.order_prefix(order_id)
         mission.status.sent_order = record

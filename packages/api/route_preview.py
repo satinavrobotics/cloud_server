@@ -138,7 +138,12 @@ def keepout_warnings(keepout_by_node: Dict[str, Optional[Dict[str, Any]]]) -> Li
 
 async def measure_reroute_detailed(planner: Any, robot_name: str, reroute: Dict[str, Any]
                                    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """measure_reroute plus what the planner said besides the corridors: (routes, info) with
+    """A reroute's routes with their corridors measured again for the waypoints where they are now
+    (`update_nodes` of PUT /missions/{name}): the editor seeds a reroute with the stored route, so
+    a waypoint the operator moved still carries the corridor measured for its old place. The
+    waypoints are not re-planned or moved (`insert_planned` off); an operator's own corridor is
+    kept. A planner that is down, slow or without a scene graph leaves the route as it was given,
+    like a route with nothing to measure. Returns (routes, info): the routes as dicts, and
     info = {"measured": [node names measured on a scene graph (their chart_key / graph_version
     are fresh)], "warnings": keepout_warnings}. The routes are measured concurrently, each with
     its own NODE_POLICY_ENRICH_TIMEOUT_S, so a reroute of N routes costs one call, not N."""
@@ -149,15 +154,3 @@ async def measure_reroute_detailed(planner: Any, robot_name: str, reroute: Dict[
     info = {"measured": [n for n, r in zip(names, results) if r[1]],
             "warnings": keepout_warnings({n: r[2] for n, r in zip(names, results)})}
     return routes, info
-
-
-async def measure_reroute(planner: Any, robot_name: str, reroute: Dict[str, Any]) -> Dict[str, Any]:
-    """A reroute's routes with their corridors measured again for the waypoints where they are now
-    (`update_nodes` of PUT /missions/{name}): the editor seeds a reroute with the stored route, so
-    a waypoint the operator moved still carries the corridor measured for its old place. The
-    waypoints are not re-planned or moved (`insert_planned` off); an operator's own corridor is
-    kept. A planner that is down, slow or without a scene graph leaves the route as it was given,
-    like a route with nothing to measure. Returns the routes as dicts. Routes only: PUT /missions
-    uses `measure_reroute_detailed` (it needs the measured names and keep-out warnings too); this
-    wrapper is for callers that want just the routes."""
-    return (await measure_reroute_detailed(planner, robot_name, reroute))[0]

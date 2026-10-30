@@ -435,6 +435,7 @@ class PostgresDatabase:
 
     async def _commit_update(self, cursor, table_name: str, name: str,
                              publisher_id: uuid.UUID):
+        """Notify subscribers of the written row; returns the row (None after a DELETE)."""
         if cursor.rowcount == 0:
             raise fastapi.HTTPException(404,
                                         f"Could not find object {name}")
@@ -442,13 +443,14 @@ class PostgresDatabase:
             values = await cursor.fetchone()
         except psycopg.ProgrammingError:
             # Result set has no data (e.g. after a DELETE operation)
-            return
+            return None
 
         if values is None:
             raise fastapi.HTTPException(400,
                                         f"Could not find object {name}")
         name, lifecycle, _, _ = values
         await self._notify(cursor, table_name, name, lifecycle, publisher_id)
+        return values
 
     @staticmethod
     def _query_value(value):
@@ -592,7 +594,8 @@ class PostgresDatabase:
 
     async def update_spec_fields(self, object_class: objects.ApiObjectType, name: str,
                                  fields: Dict[str, Any], publisher_id: uuid.UUID,
-                                 before_commit: Optional[SpecHook] = None):
+                                 before_commit: Optional[SpecHook] = None,
+                                 bump_route_rev: bool = False) -> Optional[int]:
         """Set only the given top-level spec keys, leaving every other key as stored.
 
         For writers that hold a cached copy of the object (mission-dispatch): writing their
@@ -601,12 +604,23 @@ class PostgresDatabase:
         just before a datum message). One statement (`spec || patch`), so it is atomic and
         takes the same row lock as update_spec; NOTIFY and 404 behave like update_spec.
         `fields` must be JSON-serialisable (use json.loads(model.json()) for sub-models).
-        `before_commit` is as in update_spec(): it sees the locked old spec and the merged one."""
-        if not fields:
-            return
+        `before_commit` is as in update_spec(): it sees the locked old spec and the merged one.
+
+        `route_rev` (a monotonic counter, several writers): an absolute value in `fields` is
+        applied as GREATEST(stored, value); `bump_route_rev=True` instead sets it to
+        stored + 1 in the same statement (so two writers can never both land on the same
+        revision) and is exclusive with a `route_rev` in `fields`. Returns the route_rev as
+        stored by this write (None when the write did not touch it)."""
+        if bump_route_rev and "route_rev" in fields:
+            raise ValueError("pass either a route_rev value or bump_route_rev, not both")
+        if not fields and not bump_route_rev:
+            return None
         unknown = set(fields) - set(object_class.get_spec_class().__fields__)
         if unknown:
             raise ValueError(f"unknown {object_class.get_alias()} spec fields: {sorted(unknown)}")
+        if bump_route_rev and "route_rev" not in object_class.get_spec_class().__fields__:
+            raise ValueError(f"{object_class.get_alias()} has no route_rev to bump")
+        stored_rev: Optional[int] = None
         try:
             async with self._pool.connection() as conn:
                 async with conn.cursor() as cursor:
@@ -617,29 +631,57 @@ class PostgresDatabase:
                             "WHERE name = %s FOR UPDATE;", [name])
                         row = await cursor.fetchone()
                         old_spec = row[0] if row is not None else None
-                    query, params = self._spec_fields_query(object_class.table_name(), name,
-                                                            fields)
+                    query, params = self._spec_fields_query(
+                        object_class.table_name(), name, fields, bump_route_rev)
                     await cursor.execute(query, params)
-                    await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
+                    row = await self._commit_update(cursor, object_class.table_name(), name,
+                                                    publisher_id)
+                if "route_rev" in fields or bump_route_rev:
+                    stored_rev = self._stored_route_rev(row, old_spec, fields, bump_route_rev)
                 if before_commit is not None:
                     merged = {**(old_spec or {}), **fields}
-                    if "route_rev" in fields:
-                        merged["route_rev"] = max(int(fields["route_rev"]),
-                                                  int((old_spec or {}).get("route_rev") or 0))
+                    if stored_rev is not None:
+                        merged["route_rev"] = stored_rev
                     await self._run_hook(before_commit, conn, old_spec, json.dumps(merged))
         except Exception as err:
             self._logger.error("Database error: %s", err, exc_info=True)
             raise
+        return stored_rev
 
     @staticmethod
-    def _spec_fields_query(table: str, name: str, fields: Dict[str, Any]):
+    def _stored_route_rev(row: Any, old_spec: Optional[Dict[str, Any]],
+                          fields: Dict[str, Any], bump: bool) -> Optional[int]:
+        """The route_rev the write left stored: read from the RETURNING row (spec is its third
+        column); failing that, derived from the locked old spec the way the SQL computes it."""
+        try:
+            spec = row[2]
+            if isinstance(spec, str):
+                spec = json.loads(spec)
+            return int(spec["route_rev"])
+        except (TypeError, KeyError, IndexError, ValueError):
+            pass
+        stored = int((old_spec or {}).get("route_rev") or 0)
+        if bump:
+            return stored + 1 if old_spec is not None else None
+        return max(int(fields["route_rev"]), stored)
+
+    @staticmethod
+    def _spec_fields_query(table: str, name: str, fields: Dict[str, Any],
+                           bump_route_rev: bool = False):
         """Build the (query, params) for update_spec_fields.
 
         `route_rev` is a monotonic counter with several concurrent writers (API PUT, dispatcher
-        replan/enrich), so it is never overwritten by `||`: it is set to
+        replan/enrich), so it is never overwritten by `||`: an incoming value is set to
         GREATEST(stored, incoming) in the same statement, so a lower value can never replace
-        a higher one. Everything is parameterised; only the table name is interpolated."""
+        a higher one; `bump_route_rev` sets it to coalesce(stored, 0) + 1, strictly above
+        whatever is stored when the statement runs. Everything is parameterised; only the
+        table name is interpolated."""
         patch = dict(fields)
+        if bump_route_rev:
+            query = (f"UPDATE {table} SET spec = (spec || %s::jsonb) || jsonb_build_object("
+                     "'route_rev', coalesce((spec->>'route_rev')::int, 0) + 1) "
+                     "WHERE name = %s RETURNING *;")
+            return query, [json.dumps(patch), name]
         if "route_rev" not in patch:
             return (f"UPDATE {table} SET spec = spec || %s::jsonb WHERE name = %s RETURNING *;",
                     [json.dumps(patch), name])

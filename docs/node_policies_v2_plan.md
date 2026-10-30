@@ -155,7 +155,7 @@ which also covers routes stored before this existed).
 - `annotate_corridors` keeps only an operator's corridor (any value, 0 included) and measures the rest
   again; a failed re-measure keeps a measured 0.0 (no gate is the safe side) but never a positive one.
 - `PUT /missions/{name}` with `update_nodes` measures the new routes' corridors before storing them
-  (`route_preview.measure_reroute`: no re-planning, no moving; planner down or no graph: stored as given).
+  (`route_preview.measure_reroute_detailed`: no re-planning, no moving; planner down or no graph: stored as given).
 - sati-client (`feature/corridor-source`): the editor round-trips `corridor_source`; typing a corridor
   makes it the operator's, clearing it hands it back to the server.
 - Not covered: a robot-frame (mapless) or mixed-map reroute is not measured (no scene graph to ask).

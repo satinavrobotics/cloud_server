@@ -61,7 +61,8 @@ async def test_planned_waypoints_are_stored_and_sent_with_their_policy():
     assert args.args[:2] == ("r1", "m") and args.kwargs["insert_planned"] is True
     assert [w.origin for w in m.mission_tree[0].route.waypoints] == [None, "planned", None]
     fields = db.update_spec_fields.await_args.args[2]
-    assert fields["route_rev"] == 1 and m.status.applied_route_rev == 1
+    assert "route_rev" not in fields and db.update_spec_fields.await_args.kwargs["bump_route_rev"] is True
+    assert m.route_rev == m.status.applied_route_rev == 1
     stored = fields["mission_tree"][0]["route"]["waypoints"]
     assert [w["origin"] for w in stored] == [None, "planned", None]
     order = _orders(r)[0]

@@ -38,7 +38,7 @@ not derivable.
 
 ## Resume digest and rerouting
 
-`_route_digest` excludes `trajectory` (`route.json(..., exclude={"trajectory"})`): a route stored before this change, or the same route
+`route_digest` (cloud_common.objects.mission) excludes `trajectory` (`route.json(..., exclude={"trajectory"})`): a route stored before this change, or the same route
 with a refreshed trajectory, has one digest. The dispatcher's reroute detection (route_rev handling of a changed spec) compares `route.waypoints`, not the whole route, so
 a client that sends a route back without its trajectory (or with another) is not a reroute and cannot cancel a running node. Such a PUT
 with changed waypoints stores the client's route as sent.

@@ -73,7 +73,7 @@ def test_a_stored_routes_digest_is_unchanged_by_the_new_waypoint_fields():
         {"allowedDeviationTheta": 0.0, "allowedDeviationXY": 0.1, "map_id": "",
          "theta": 0.0, "x": 3.0, "y": 4.0}]}
     route = mission_object.MissionRouteNodeV1(**stored)
-    assert server_module._route_digest(route) == "1375510c23c826f4"
+    assert mission_object.route_digest(route) == "1375510c23c826f4"
 
 
 # ---------------------------------------------------------------------------

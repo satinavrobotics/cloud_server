@@ -154,7 +154,7 @@ def test_measure_reroute_clears_stale_corridors_on_every_unmeasured_path():
     wrong = SimpleNamespace(enrich_route=AsyncMock(return_value={"waypoints": []}))
     import asyncio
     for planner in (down, wrong, None):
-        out = asyncio.run(route_preview.measure_reroute(planner, "r1", {"n": route}))
+        out = asyncio.run(route_preview.measure_reroute_detailed(planner, "r1", {"n": route}))[0]
         got = [w.get("corridor_width_m") for w in out["n"]["waypoints"]]
         assert got == [None, 0.0, 0.7, 0.4, None]
     assert route["waypoints"][0]["corridor_width_m"] == 0.9            # the caller's input is not changed

@@ -1073,32 +1073,42 @@ async def clear_blocked_node(map_id: str, graph_node_id: str):
     return {"map_id": map_id, "graph_node_id": graph_node_id, "cleared": True}
 
 
-async def _mission_half_width(robot_name: Optional[str]) -> Optional[float]:
-    """The overlay half width of the mission's robot (blocked_geometry.half_width_for of its
-    factsheet, as the planner's overlay uses); None when the robot cannot be read, which keeps
-    the BLOCKED_SEGMENT_HALF_WIDTH_M constant."""
+async def _read_mission_robot(robot_name: Optional[str]) -> Any:
+    """The mission's RobotObjectV1 (one read), or None: no robot name or unreadable."""
     if not robot_name:
         return None
     try:
-        robot = await service.database.get_object(RobotObjectV1, str(robot_name))
+        return await service.database.get_object(RobotObjectV1, str(robot_name))
+    except Exception as err:  # pylint: disable=broad-except
+        logging.info("Robot %s not readable (%s); reroute check uses the constant half "
+                     "width and checks every waypoint", robot_name, err)
+        return None
+
+
+def _robot_half_width(robot: Any) -> Optional[float]:
+    """The overlay half width of a robot (blocked_geometry.half_width_for of its factsheet, as
+    the planner's overlay uses); None when there is no robot, which keeps the
+    BLOCKED_SEGMENT_HALF_WIDTH_M constant."""
+    if robot is None:
+        return None
+    try:
         factsheet = robot.status.factsheet
         from packages.utils import blocked_geometry
         return blocked_geometry.half_width_for(getattr(factsheet, "length", None),
                                                getattr(factsheet, "width", None))
     except Exception as err:  # pylint: disable=broad-except
-        logging.info("Robot %s footprint not readable (%s); reroute check uses the constant "
-                     "half width", robot_name, err)
+        logging.info("Robot footprint not readable (%s); reroute check uses the constant "
+                     "half width", err)
         return None
 
 
-async def _mission_robot_pose(robot_name: Optional[str]) -> Optional[Tuple[float, float, str]]:
-    """(x, y, map_id) of the mission's robot as the cloud last stored it, or None when it cannot
-    be trusted: no robot, unreadable, or offline (its stored pose is then stale). map_id may be
+def _robot_pose(robot: Any) -> Optional[Tuple[float, float, str]]:
+    """(x, y, map_id) of a robot as the cloud last stored it, or None when it cannot be
+    trusted: no robot, unreadable, or offline (its stored pose is then stale). map_id may be
     "" (not reported)."""
-    if not robot_name:
+    if robot is None:
         return None
     try:
-        robot = await service.database.get_object(RobotObjectV1, str(robot_name))
         status = robot.status
         if not getattr(status, "online", False):
             return None
@@ -1108,9 +1118,18 @@ async def _mission_robot_pose(robot_name: Optional[str]) -> Optional[Tuple[float
             return None
         return x, y, str(getattr(pose, "map_id", "") or "")
     except Exception as err:  # pylint: disable=broad-except
-        logging.info("Robot %s pose not readable (%s); reroute checks every waypoint",
-                     robot_name, err)
+        logging.info("Robot pose not readable (%s); reroute checks every waypoint", err)
         return None
+
+
+async def _mission_half_width(robot_name: Optional[str]) -> Optional[float]:
+    """`_robot_half_width` of the mission's robot (one read)."""
+    return _robot_half_width(await _read_mission_robot(robot_name))
+
+
+async def _mission_robot_pose(robot_name: Optional[str]) -> Optional[Tuple[float, float, str]]:
+    """`_robot_pose` of the mission's robot (one read)."""
+    return _robot_pose(await _read_mission_robot(robot_name))
 
 
 async def _reroute_through_blocked(reroute: Dict[str, Any],
@@ -1118,10 +1137,13 @@ async def _reroute_through_blocked(reroute: Dict[str, Any],
                                    robot_pose: Optional[Tuple[float, float, str]] = None
                                    ) -> List[Dict[str, Any]]:
     """The active blocked-node rows a reroute's waypoints go through, by the planner's rule
-    (blocked_nodes.row_blocks). `robot_pose` (`_mission_robot_pose`): a waypoint within the
-    robot's footprint of it is where the robot already stands and is never blocked; without a
-    pose (None) every waypoint is checked. The route's legs are checked as a segment either way.
-    `half_width_m`: the rerouted robot's half width (`_mission_half_width`); None keeps the
+    (blocked_nodes.row_blocks). `robot_pose` (`_robot_pose`): a waypoint within the
+    robot's half width of it is where the robot already stands and is never blocked; a
+    waypoint beyond that is checked even when it is near the pose: a robot that reported
+    edgeBlocked stops just short of the blocked node, which must not pass as "where it
+    stands". A waypoint that is not blocked passes at any distance, so no wider radius is
+    needed. Without a pose (None: no robot, unreadable, offline) every waypoint is checked. The route's legs are checked as a segment either way.
+    `half_width_m`: the rerouted robot's half width (`_robot_half_width`); None keeps the
     constant."""
     from packages.utils import blocked_geometry
     footprint = half_width_m if half_width_m is not None else blocked_geometry.HALF_WIDTH_M
@@ -3582,7 +3604,7 @@ async def update_mission(mission_name: str, mission_data: dict):
     if force is None:
         force = False
     if not isinstance(force, bool):
-        raise HTTPException(status_code=422, detail="force must be a boolean (true or false)")
+        raise HTTPException(status_code=400, detail="force must be a boolean (true or false)")
     warnings: List[Dict[str, Any]] = []
 
     # Update spec if provided
@@ -3641,11 +3663,10 @@ async def update_mission(mission_name: str, mission_data: dict):
             # straight back to it (2026-10-08); the operator can force it. The robot's own
             # pose (not the route's first waypoint, which the client seeds from the stored
             # route) says which node it already stands at.
-            robot_name = getattr(mission, "robot", None)
             try:
+                robot = await _read_mission_robot(getattr(mission, "robot", None))
                 through = await _reroute_through_blocked(
-                    reroute, await _mission_half_width(robot_name),
-                    await _mission_robot_pose(robot_name))
+                    reroute, _robot_half_width(robot), _robot_pose(robot))
             except Exception as err:  # pylint: disable=broad-except
                 logging.warning("Blocked graph nodes not readable (%s); reroute not "
                                 "checked against them", err)
@@ -3667,14 +3688,18 @@ async def update_mission(mission_name: str, mission_data: dict):
             # dispatcher resumes from, and a stored request would be re-applied on
             # every delivery of the row. The dispatcher acts once per route_rev.
             await mission.update(measured_routes, measured=info["measured"])
-            touched.update(("mission_tree", "planned_path", "route_rev"))
+            touched.update(("mission_tree", "planned_path"))
         # Only the keys this request changed: writing the whole spec read above back would
         # revert what the dispatcher patched since (a replan's mission_tree / planned_path).
+        # A reroute's route_rev is bumped in SQL (stored + 1, not the value read at the top of
+        # this request): the dispatcher acts only on a revision above the one it applied, and
+        # a replan / enrich of its own, or a second PUT, may have raised it meanwhile.
         spec_json = json.loads(mission.spec.json())
-        if touched:
+        if touched or reroute:
             await service.database.update_spec_fields(
                 MissionObjectV1, mission.name,
-                {k: spec_json[k] for k in touched if k in spec_json}, publisher_id)
+                {k: spec_json[k] for k in touched if k in spec_json}, publisher_id,
+                **({"bump_route_rev": True} if reroute else {}))
         if "mission_tree" in edits:
             await service.database.update_status(
                 MissionObjectV1, mission.name, mission.status, publisher_id)

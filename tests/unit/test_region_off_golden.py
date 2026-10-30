@@ -360,7 +360,7 @@ def _plan(graph, p, q, kappa, turn):
 
 
 def digest(plan) -> dict:
-    """Route nodes, cost and a digest of everything the route node carries (like the dispatcher's `_route_digest`: no
+    """Route nodes, cost and a digest of everything the route node carries (like `route_digest`: no
     recording data)."""
     if isinstance(plan, str):
         return {"fallback": plan}

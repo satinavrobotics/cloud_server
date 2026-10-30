@@ -80,7 +80,7 @@ def _sent(order_id, route_node):
     """The record an earlier process stored before sending `order_id` for `route_node`."""
     route = mission_object.MissionRouteNodeV1(**route_node["route"])
     return mission_object.MissionSentOrderV1(order_id=order_id,
-                                             route_digest=server_module._route_digest(route))
+                                             route_digest=mission_object.route_digest(route))
 
 
 def _info(state, mission_status):
