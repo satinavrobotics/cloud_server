@@ -233,3 +233,38 @@ def test_recorded_plan_source_is_read_as_recorded():
     assert pe.plan_length(legs[1], {(RUN, 1): traj(WPS)}) == (1.0, "stale")
     assert pe.plan_length(legs[2], {(RUN, 1): traj(WPS)}) == (1.0, "straight")
     assert pe.plan_length(legs[3], {}) == (None, None)
+
+
+def test_snapshot_stale_rule_tolerates_twice_the_endpoint_tolerance():
+    """Legs without plan_source: the leg's poses are unknown, only straight_m. Both ends within tol of the waypoints
+    allows the spacing to differ by up to 2 tol, so that is the read side's stale threshold."""
+    tr = {(RUN, 1): traj(WPS)}
+    tol = pe.config.EFFICIENCY_STALE_TOL_M
+    d = 2 ** 0.5
+    assert pe.plan_length(leg(2, 1, d + 1.9 * tol), tr)[1] == "trajectory"
+    assert pe.plan_length(leg(2, 1, d + 2.1 * tol), tr)[1] == "stale"
+    assert pe.plan_length(leg(2, 1, d - 2.1 * tol), tr)[1] == "stale"
+
+
+def test_reroute_keeping_spacing_is_stale_on_both_sides_and_matching_is_trajectory_on_both():
+    """The writer (plan_of, with the poses) and a recorded leg read back (plan_source) agree; a match is
+    trajectory on both."""
+    from packages.utils import plan_length as pl
+    tol = pe.config.EFFICIENCY_STALE_TOL_M
+    pts = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]               # entry (0 -> 1), polyline 2.0, line sqrt2
+    d = 2 ** 0.5
+    # rerouted: both waypoints moved 1 m sideways, spacing kept
+    moved = pl.plan_of(pts, (0.0, 1.0), (1.0, 2.0), d, tol)
+    assert moved == (pytest.approx(d), "stale")
+    row = {**leg(2, 1, d), "planned_m": moved[0], "plan_source": moved[1]}
+    assert pe.plan_length(row, {(RUN, 1): traj(WPS)}) == (pytest.approx(d), "stale")
+    # matching ends
+    same = pl.plan_of(pts, (0.0, 0.01), (1.0, 1.0), d, tol)
+    assert same == (pytest.approx(2.0), "trajectory")
+    row = {**leg(2, 1, d), "planned_m": same[0], "plan_source": same[1]}
+    assert pe.plan_length(row, {}) == (pytest.approx(2.0), "trajectory")
+
+
+def test_snapshot_entry_not_at_snapshot_waypoints_is_stale():
+    t = pe.Trajectory(list(WPS), {(0, 1): [[5.0, 5.0], [6.0, 6.0]]})     # entry far from the waypoints
+    assert pe.plan_length(leg(2, 1, 2 ** 0.5), {(RUN, 1): t})[1] == "stale"

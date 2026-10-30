@@ -77,3 +77,18 @@ def plan_of(points: Optional[Sequence[Sequence[float]]], start: Optional[Tuple[f
     matches = (points is not None and start is not None and end is not None
                and ends_match(points, start, end, tol_m))
     return resolve(points, straight_m, matches)
+
+
+def plan_of_snapshot(points: Optional[Sequence[Sequence[float]]], start: Optional[Tuple[float, float]],
+                     end: Optional[Tuple[float, float]], straight_m: Optional[float], tol_m: float
+                     ) -> Tuple[Optional[float], Optional[str]]:
+    """`plan_of` for a leg recorded before `plan_source` existed, worked out at read time. The leg's own poses were
+    not stored, only `straight_m`, so `start` / `end` are the run SNAPSHOT's waypoints, and the endpoint rule can
+    only be checked against those. The leg's ends are within `tol_m` of the poses it ran between, so a snapshot
+    whose waypoint distance differs from `straight_m` by more than 2 * `tol_m` cannot hold the leg's waypoints:
+    stale. Within that the leg is called as the writer would have, except for a reroute that moved both waypoints
+    and kept their spacing, which only the writer (it has the poses) can see."""
+    if (points is not None and start is not None and end is not None and straight_m is not None
+            and abs(math.hypot(end[0] - start[0], end[1] - start[1]) - straight_m) > 2.0 * tol_m):
+        return resolve(points, straight_m, False)
+    return plan_of(points, start, end, straight_m, tol_m)

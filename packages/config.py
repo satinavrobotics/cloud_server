@@ -720,9 +720,9 @@ REGION_COST_ALT_TIMEOUT_S = float(os.getenv("REGION_COST_ALT_TIMEOUT_S", "5.0"))
 REGION_COST_ALT_MAX_INFLIGHT = int(os.getenv("REGION_COST_ALT_MAX_INFLIGHT", "2"))
 # Robot path efficiency (packages/api/path_efficiency.py, docs/path_efficiency_2026-10-15.md): a leg shorter
 # than EFFICIENCY_MIN_LEG_M of plan is left out of the ratios (too noisy); a leg whose track covers less than
-# EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory whose waypoint
-# distance differs from the leg's recorded straight_m by more than EFFICIENCY_STALE_TOL_M is stale (the route was
-# replanned); ratios need EFFICIENCY_MIN_LEGS legs; at most EFFICIENCY_MAX_LEGS legs are read (the answer says
+# EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory entry is stale (the route was
+# replanned) unless BOTH its ends are within EFFICIENCY_STALE_TOL_M of the leg's two waypoints (utils/plan_length.py;
+# for a leg recorded before plan_source existed only the waypoint spacing is known, see plan_of_snapshot); ratios need EFFICIENCY_MIN_LEGS legs; at most EFFICIENCY_MAX_LEGS legs are read (the answer says
 # so); answers are cached EFFICIENCY_CACHE_TTL_S seconds.
 EFFICIENCY_MIN_LEG_M = float(os.getenv("EFFICIENCY_MIN_LEG_M", "0.2"))
 EFFICIENCY_MIN_COVERAGE = float(os.getenv("EFFICIENCY_MIN_COVERAGE", "0.8"))
