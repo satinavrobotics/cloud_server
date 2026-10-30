@@ -67,6 +67,9 @@ COLUMNS = ("map_id", "graph_version", "chart_key", "robot_class", "runs", "len_m
 INSERT_SQL = (f"INSERT INTO region_stats ({', '.join(COLUMNS)}) VALUES ({', '.join(['%s'] * len(COLUMNS))})")
 LIVE_MAP_SQL = (f"SELECT 1 FROM {MapObjectV1.table_name()} WHERE name = %s "
                 "AND lifecycle NOT IN ('DELETING', 'DELETED') FOR SHARE")
+# archived runs are in no statistic (docs 13); mission_runs.archived_at is set by the archive endpoint (run_admin.py)
+NOT_ARCHIVED = ("NOT EXISTS (SELECT 1 FROM mission_runs mr WHERE mr.run_id = run_cells.run_id "
+                "AND mr.archived_at IS NOT NULL)")
 GEN_SQL = "SELECT gen FROM region_stats_inputs WHERE map_id = %s"
 CACHE = ResultCache(config.REGION_STATS_CACHE_ENTRIES, config.REGION_STATS_CACHE_TTL_S)
 
@@ -298,8 +301,8 @@ async def maps_needing_build(db: Any, reads: Any) -> List[str]:
     now = utcnow()
     start = now - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
     async with fleet_reads.read_cursor(db) as cur:
-        await cur.execute("SELECT DISTINCT map_id FROM run_cells WHERE started_at >= %s AND algo_version = %s",
-                          (start, config.RUN_CELLS_ALGO_VERSION))
+        await cur.execute("SELECT DISTINCT map_id FROM run_cells WHERE started_at >= %s AND algo_version = %s AND "
+                          + NOT_ARCHIVED, (start, config.RUN_CELLS_ALGO_VERSION))
         wanted = {r[0] for r in await cur.fetchall()}
         await cur.execute("SELECT map_id, graph_version, status, detail, built_at, runs FROM region_stats_builds")
         builds: Dict[str, Dict[int, Tuple[str, Dict[str, Any], Any, int]]] = {}
@@ -401,7 +404,8 @@ async def region_stats(db: Any, reads: Any, map_id: str, robot_class: Optional[s
     async with fleet_reads.read_cursor(db) as cur:
         start = utcnow() - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
         args2: List[Any] = [map_id, config.RUN_CELLS_ALGO_VERSION, start]
-        sql2 = ("SELECT run_id, created_at FROM run_cells WHERE map_id = %s AND algo_version = %s AND started_at >= %s")
+        sql2 = ("SELECT run_id, created_at FROM run_cells WHERE map_id = %s AND algo_version = %s AND started_at >= %s AND "
+                + NOT_ARCHIVED)
         if robot:
             sql2 += " AND robot_name = %s"
             args2.append(robot)

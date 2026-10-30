@@ -410,6 +410,12 @@ class TestMapsNeedingBuild:
         db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
         assert self.need(db, Reads(3, [(0, "A")])) == []
 
+    def test_archived_runs_do_not_make_a_map_wanted(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        self.need(db, Reads(3, [(0, "A")]))
+        sql = [s for s, _ in db.executed if s.startswith("SELECT DISTINCT map_id FROM run_cells")][0]
+        assert "mr.archived_at IS NOT NULL" in sql and "NOT EXISTS" in sql
+
     def test_old_builds_and_expired_inputs_are_redone(self, patched):
         db = patched(Db([make_run(1, range(0, 20))]))
         reads = Reads(3, [(0, "A")])
@@ -484,6 +490,14 @@ class TestRoute:
         with pytest.raises(HTTPException) as e:
             self.call(db, Reads(3, [(0, "A")]), version=2)
         assert e.value.status_code == 404
+
+
+class TestRouteArchived:
+    def test_the_computed_cache_key_read_skips_archived_runs(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        asyncio.run(rs.region_stats(db, Reads(3, [(-10_000, "A")]), "m", robot="r1"))
+        sql = [s for s, _ in db.executed if s.startswith("SELECT run_id, created_at FROM run_cells")][0]
+        assert "mr.archived_at IS NOT NULL" in sql
 
 
 class TestLoader:
