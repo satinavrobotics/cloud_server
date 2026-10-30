@@ -1300,7 +1300,7 @@ days), optionally of one robot. 422 for `from >= to`; an unknown map answers zer
  "intervention": {"count", "cancels", "teleop", "takeovers", "rate_per_hour": float|null,
                   "free_success_rate": float|null, "free_runs"},
  "hours": float,                    // operating time, see docs/map_run_stats_2026-10-14.md
- "duration_s": {"median", "p95", "n"},   // COMPLETED runs
+ "duration_s": {"median", "p95", "n"},   // COMPLETED runs; median/p95 without runs over max_run_s (hung), n counts all
  "timeout": {"count", "median_s"},
  "abort_rate": float|null,          // (failed+timeout+aborted) / finished
  "recovery": {"legs", "legs_with_recovery", "median_s", "p95_s", "total_s",

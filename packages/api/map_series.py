@@ -86,7 +86,8 @@ async def _run_stats_day(db: Any, map_id: str, start, end, robot, ekey: Any = No
         for d, state, count, med in await _rows(cur, scope + (
                 f" SELECT {_DAY}, state, count(*), percentile_cont(0.5) WITHIN GROUP (ORDER BY "
                 "extract(epoch FROM ended_at - started_at)) FILTER (WHERE state = 'COMPLETED' "
-                "AND ended_at IS NOT NULL) FROM scope GROUP BY 1, 2"), sp):
+                "AND ended_at IS NOT NULL AND extract(epoch FROM ended_at - started_at) <= %s) "
+                "FROM scope GROUP BY 1, 2"), sp + (cap,)):
             i = pos.get(d)
             if i is None:
                 continue

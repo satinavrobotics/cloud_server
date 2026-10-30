@@ -76,7 +76,7 @@ def stats_respond(sql, params):
                 ("ROBOT.HEARTBEAT_LOST", "", "error", 1, T, 0, ["r1"])]
     if "GROUP BY state" in sql:
         return [("COMPLETED", 73), ("FAILED", 5), ("CANCELED", 10)]
-    if "FILTER (WHERE state = 'COMPLETED')" in sql:
+    if "FILTER (WHERE state = 'COMPLETED' AND secs" in sql:
         return [(57.6, 948.3, None, 0)]
     if "GROUP BY 1 ORDER BY 2 DESC" in sql:
         return [("OPERATOR.CANCELED", 10), ("UNKNOWN", 5)]
@@ -124,7 +124,7 @@ async def test_no_runs_gives_nulls_not_errors():
     def respond(sql, params):
         if "GROUP BY state" in sql or "GROUP BY 1" in sql:
             return []
-        if "FILTER (WHERE state = 'COMPLETED')" in sql:
+        if "FILTER (WHERE state = 'COMPLETED' AND secs" in sql:
             return [(None, None, None, 0)]
         if "FROM run_legs" in sql:
             return [(0, 0, None, None, 0, 0)]
@@ -364,3 +364,10 @@ async def test_cached_headline_is_one_query_set_and_a_private_copy():
     second = await run_stats.run_stats_cached(db, "office7", T0, end, cache=cache)
     assert len(db.executed) == n and "efficiency" not in second and "x" not in second["data_quality"]["notes"]
     assert all(k[0] == "office7" for k in cache._done)          # discard_map contract
+
+
+async def test_duration_percentiles_apply_the_hung_run_cap():
+    db = FakeDb(stats_respond)
+    await run_stats.run_stats(db, "office7", T0, T0 + datetime.timedelta(days=10))
+    sql, params = next(e for e in db.executed if "percentile_cont(0.95)" in e[0])
+    assert sql.count("secs <= %s") == 2 and params[-3:] == (run_stats.config.RUN_STATS_MAX_RUN_S,) * 3
