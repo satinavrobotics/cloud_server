@@ -35,6 +35,9 @@ class FakeCursor:
     async def fetchone(self):
         return self.db.pending
 
+    async def fetchall(self):
+        return []           # run_cells maps of the robot (region_builds.mark_stale)
+
     async def __aenter__(self):
         return self
 

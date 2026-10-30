@@ -70,6 +70,7 @@ from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
 from packages.telemetry_ingest import tables
 from packages.telemetry_ingest.policy import RecordingLevel, allows, load_sources
+from packages.utils import region_builds
 
 logger = logging.getLogger("ApiDelegationService.run_admin")
 
@@ -145,6 +146,7 @@ async def archive_runs(db: Any, request: ArchiveRequest) -> Dict[str, int]:
         selector, params = "run_id = ANY(%s::uuid[])", (sorted(set(request.run_ids)),)
     else:
         selector, params = family_filter("mission_name"), (request.mission,) * 3
+    touched: List[str] = []
     try:
         async with db.connection() as conn:
             async with conn.cursor() as cur:
@@ -165,6 +167,8 @@ async def archive_runs(db: Any, request: ArchiveRequest) -> Dict[str, int]:
                         "AND archived_at IS NOT NULL RETURNING run_id", params)
                     changed = [row[0] for row in await cur.fetchall()]
                     skipped = 0
+                # archived runs leave every statistic and restored ones come back (decision D2)
+                touched = await region_builds.mark_stale(cur, run_ids=changed)
             if changed:
                 changed.sort(key=str)
                 code = EventCode.RUN_ARCHIVED if request.archived else EventCode.RUN_UNARCHIVED
@@ -175,6 +179,7 @@ async def archive_runs(db: Any, request: ArchiveRequest) -> Dict[str, int]:
                              **_run_id_payload(changed)}))
     except psycopg.errors.UndefinedTable as exc:
         raise _unavailable(exc) from exc
+    region_builds.discard_caches(touched)
     return {"updated": len(changed), "skipped_running": int(skipped)}
 
 
@@ -248,10 +253,9 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
                         (run_ids, sorted({r[2] for r in runs}), min(r[4] for r in runs),
                          max(r[5] or now for r in runs) + TRAJECTORY_GRACE))
                 # The runs' cell summaries go with them (run_cells has ON DELETE CASCADE); the region statistics
-                # built from them are stale until the next build (docs/region_stats_2026-10-27.md 4.2).
-                await cur.execute(
-                    "UPDATE region_stats_builds SET status = 'stale' WHERE status = 'ok' AND map_id IN "
-                    "(SELECT map_id FROM run_cells WHERE run_id = ANY(%s::uuid[]))", (run_ids,))
+                # built from them are stale until the next build (docs/region_stats_2026-10-27.md 4.2), so the maps
+                # are looked up and marked before the rows go.
+                touched = await region_builds.mark_stale(cur, run_ids=run_ids)
                 await cur.execute("DELETE FROM mission_runs WHERE run_id = ANY(%s::uuid[])",
                                   (run_ids,))
                 deleted_runs = cur.rowcount
@@ -273,6 +277,7 @@ async def delete_mission(db: Any, name: str, *, with_reruns: bool = False,
                          **_run_id_payload(run_ids)}))
     except psycopg.errors.UndefinedTable as exc:
         raise _unavailable(exc) from exc
+    region_builds.discard_caches(touched)
     result: Dict[str, Any] = {
         "success": True,
         "message": (f"Mission {name} and its reruns deleted" if with_reruns

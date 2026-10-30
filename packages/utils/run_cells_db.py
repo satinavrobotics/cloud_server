@@ -142,11 +142,14 @@ def window_sql(start: Optional[datetime.datetime], end: Optional[datetime.dateti
 async def fetch(cursor: Any, map_id: str, start: Optional[datetime.datetime] = None,
                 end: Optional[datetime.datetime] = None, robot: Optional[str] = None,
                 robot_class: Optional[str] = None, limit: Optional[int] = None,
-                algo_version: Optional[int] = None) -> List[CellRow]:
+                algo_version: Optional[int] = None, exclude_archived: bool = True) -> List[CellRow]:
     """The map's summaries with `start <= started_at < end` (open ends allowed), optionally of one robot / one
-    class / one algo version, newest first, at most `limit`."""
+    class / one algo version, newest first, at most `limit`. Archived runs are left out (decision D2: archiving
+    removes a run from every statistic) unless `exclude_archived` is False."""
     args: List[Any] = [map_id]
     sql = f"SELECT {', '.join(COLUMNS)} FROM run_cells WHERE map_id = %s"
+    if exclude_archived:
+        sql += " AND NOT EXISTS (SELECT 1 FROM mission_runs mr WHERE mr.run_id = run_cells.run_id AND mr.archived_at IS NOT NULL)"
     if algo_version is not None:
         sql += " AND algo_version = %s"
         args.append(algo_version)
@@ -156,3 +159,12 @@ async def fetch(cursor: Any, map_id: str, start: Optional[datetime.datetime] = N
         args.append(limit)
     await cursor.execute(sql, tuple(args))
     return [decode(r) for r in await cursor.fetchall()]
+
+
+LABEL_SQL = "SELECT map_id, robot_class, speed_max, speed_basis, class_basis FROM run_cells WHERE run_id = %s"
+
+
+async def fetch_labels(cursor: Any, run_id: Any) -> Dict[str, tuple]:
+    """map_id -> (robot_class, speed_max, speed_basis, class_basis) of the run's stored rows (a recompute keeps them)."""
+    await cursor.execute(LABEL_SQL, (run_id,))
+    return {r[0]: (r[1], None if r[2] is None else float(r[2]), r[3], r[4]) for r in await cursor.fetchall()}

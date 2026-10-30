@@ -101,7 +101,8 @@ class FakeCursor:
             db.edge_observations_deleted.append(params[0])
         elif sql == map_delete.BLOCKED_NODES_SQL:
             db.blocked_deleted.append(params[0])
-        elif sql in (map_delete.RUN_CELLS_SQL, map_delete.REGION_STATS_SQL, map_delete.REGION_STATS_BUILDS_SQL):
+        elif sql in (map_delete.RUN_CELLS_SQL, map_delete.REGION_STATS_SQL, map_delete.REGION_STATS_BUILDS_SQL,
+                     map_delete.REGION_STATS_INPUTS_SQL):
             db.region_stats_deleted.append((sql.split()[2], params[0]))
         elif sql == emit_mod.INSERT_SQL:
             if db.fail_events:
@@ -254,7 +255,8 @@ async def test_request_marks_deleting_then_cleans_up_and_removes_the_row():
     assert db.person_removal_deleted == ["site_a"]  # and its person removal setting
     assert db.keepouts_deleted == ["site_a"]  # and its keep-out zones
     assert db.edge_observations_deleted == ["site_a"]  # and its edge statistics
-    assert db.region_stats_deleted == [("run_cells", "site_a"), ("region_stats", "site_a"), ("region_stats_builds", "site_a")]
+    assert db.region_stats_deleted == [("run_cells", "site_a"), ("region_stats", "site_a"), ("region_stats_builds", "site_a"),
+                                        ("region_stats_inputs", "site_a")]
     assert db.blocked_deleted == ["site_a"]  # and its blocked-node exclusions
     assert graph.calls == ["site_a"] and images.calls == ["site_a"]
     assert [p[1].split(" ", 1)[1] for p in db.notifies] == ["site_a DELETING", "site_a DELETED"]

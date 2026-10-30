@@ -21,6 +21,7 @@ from psycopg.types.json import Jsonb
 from packages.api.entrypoint import advisory_lock_key
 from packages.api.fleet_reads import TRAJECTORY_GRACE
 from packages.migration.apply import ImportRefused
+from packages.utils import region_builds
 
 logger = logging.getLogger(__name__)
 
@@ -521,6 +522,7 @@ class ServiceTarget:
     async def remove_imported(self, import_id: str) -> Dict[str, int]:
         """Undo for runs and recordings: delete exactly what `import_id` inserted (a run's legs go with it), then forget the rows."""
         removed = {"runs": 0, "rosbags": 0}
+        touched: List[str] = []
         async with self.db.connection() as conn:
             cur = await conn.execute("SELECT kind, key FROM import_items WHERE import_id = %s", (import_id,))
             items = await cur.fetchall()
@@ -530,8 +532,11 @@ class ServiceTarget:
                     await conn.execute(f"DELETE FROM {HISTORY_TABLES[kind]} WHERE run_id = ANY(%s::uuid[])", (ids,))
             run_ids = [k for kind, k in items if kind == "run"]
             if run_ids:
+                async with conn.cursor() as mcur:       # before the rows go: the maps come from run_cells
+                    touched = await region_builds.mark_stale(mcur, run_ids=run_ids)
                 cur = await conn.execute("DELETE FROM mission_runs WHERE run_id = ANY(%s::uuid[])", (run_ids,))
                 removed["runs"] = max(cur.rowcount, 0)
+        region_builds.discard_caches(touched)
         for kind, key in items:
             if kind == "rosbag":
                 robot, bag_id = key.split("/", 1)

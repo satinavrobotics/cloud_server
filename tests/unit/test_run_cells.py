@@ -557,3 +557,111 @@ class TestLoadRun:
         cur = self.Cursor([])
         await rc.load_run(cur, uuid.UUID(int=1))
         assert rc.LEGS_SQL in cur.sql
+
+
+class TestWpD:
+    def test_only_the_first_map_has_the_start_dwell_anchor(self):
+        # the robot waits 3 s where it changed map: dwell on the first map's start only
+        a = track([0.0, 1.0, 2.0], map_id="m1")
+        b = track([5.0, 5.0, 5.0, 6.0], t0=E0 + 10.0, map_id="m2", session="s2")
+        rows = rc.summarise_rows(data(a + b), nodes, FS)
+        assert [r.map_id for r in rows] == ["m1", "m2"]
+        assert rows[0].totals["dwell_anchors"] == 1 and rows[1].totals["dwell_anchors"] == 0
+        assert rows[1].totals["dwell_s"] == 0 and rows[1].totals["stopped_s"] == pytest.approx(3.0)
+
+    def test_keep_labels_overrides_only_maps_with_a_stored_row(self):
+        rows = rc.summarise_rows(data(track([0.0, 1.0, 2.0])), nodes, FS)
+        rc.keep_labels(rows, {"m1": ("AMR|0.80x0.50", 0.24, "factsheet", "run")})
+        assert (rows[0].speed_max, rows[0].class_basis) == (0.24, "run")
+        rows = rc.summarise_rows(data(track([0.0, 1.0, 2.0])), nodes, FS)
+        rc.keep_labels(rows, {"other": ("x", 0.1, "unknown", "run")})
+        assert rows[0].speed_max == pytest.approx(1.2)
+
+    async def test_fetch_excludes_archived_by_default(self):
+        seen = []
+
+        class Cur:
+            async def execute(self, sql, params=None):
+                seen.append(sql)
+
+            async def fetchall(self):
+                return []
+        await rdb.fetch(Cur(), "m1")
+        await rdb.fetch(Cur(), "m1", exclude_archived=False)
+        assert "archived_at IS NOT NULL" in seen[0] and "archived_at" not in seen[1]
+
+    async def test_store_marks_the_written_maps_stale(self, monkeypatch):
+        calls = []
+
+        async def fake_insert(cur, row):
+            return row.map_id != "gone"
+
+        async def fake_mark(cur, **kw):
+            calls.append(kw)
+        monkeypatch.setattr(rdb, "insert", fake_insert)
+        monkeypatch.setattr(rc.region_builds, "mark_stale", fake_mark)
+
+        class Conn:
+            def cursor(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *e):
+                return False
+
+        class Db:
+            def connection(self):
+                return Conn()
+        assert await rc.store(Db(), [a_row(map_id="m1"), a_row(map_id="gone")]) == 1
+        assert calls == [{"map_ids": ["m1"]}]
+
+    async def test_pending_uses_the_high_water_mark_between_sweeps(self, monkeypatch):
+        seen = []
+
+        class Cur:
+            async def execute(self, sql, params=None):
+                seen.append(params)
+
+            async def fetchall(self):
+                return []
+
+        @contextlib.asynccontextmanager
+        async def read_cursor(_db):
+            yield Cur()
+        monkeypatch.setattr(rc.fleet_reads, "read_cursor", read_cursor)
+        clock = FakeClock()
+        w = rc.RunCellsWorker(object(), object(), clock=clock)
+        await w.pending(5)                       # first pass: a sweep
+        assert seen[-1][3] is None and w.hwm is not None and not w.sweeping
+        await w.pending(5)
+        assert seen[-1][3] == seen[-1][4] == w.hwm or seen[-1][3] is not None
+        clock.now += config.RUN_CELLS_FULL_SWEEP_S
+        await w.pending(5)
+        assert seen[-1][3] is None               # the periodic full sweep
+
+    async def test_a_run_whose_map_is_gone_is_terminal_not_retried(self, monkeypatch):
+        w = rc.RunCellsWorker(object(), object(), clock=FakeClock())
+        calls = []
+
+        async def fake_pending(limit):
+            return [("r1", "m1")] if "r1" not in w.retry_blocked() else []
+
+        async def fake_factsheets(db):
+            return {}
+
+        async def fake_summarise(db, graph, robots, run_id):
+            calls.append(run_id)
+            return [a_row(map_id="m1")]
+
+        async def fake_store(db, rows):
+            return 0
+        w.pending = fake_pending
+        monkeypatch.setattr(rc, "factsheets", fake_factsheets)
+        monkeypatch.setattr(rc, "summarise_run", fake_summarise)
+        monkeypatch.setattr(rc, "store", fake_store)
+        out = await w.step()
+        assert out["failed"] == 0 and "r1" in w.terminal and "r1" not in w.failed
+        await w.step()
+        assert calls == ["r1"]

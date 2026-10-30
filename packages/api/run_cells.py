@@ -44,6 +44,7 @@ from packages import config
 from packages.api import fleet_reads
 from packages.api.entrypoint import advisory_lock_key
 from packages.utils import cell_raster as cr
+from packages.utils import region_builds
 from packages.utils import robot_class as rclass
 from packages.utils import run_cells_db as rdb
 from packages.utils.timeutil import utcnow
@@ -188,11 +189,11 @@ def _empty_totals() -> Dict[str, Any]:
 
 
 def _track_map(rows: List[tuple], events_rec: Sequence[Tuple[float, float]], blocks: Sequence[Tuple[float, Any]],
-               p: cr.Params, anchors: Sequence[Tuple[float, float]] = ()
+               p: cr.Params, anchors: Sequence[Tuple[float, float]] = (), start_anchor: bool = True
                ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray, List[bool], Tuple[np.ndarray, np.ndarray]]:
     """One map's track rows -> (totals, keys, sums, block keys, placed flag per block event, (dwell keys, dwell
     seconds)). `anchors` are the goal / action positions on this map; the run's start (its first track position) is
-    added here. A stopped segment whose midpoint lies within RUN_CELLS_DWELL_RADIUS_M of an anchor is dwell: its
+    added here when `start_anchor` (only the run's first map has it). A stopped segment whose midpoint lies within RUN_CELLS_DWELL_RADIUS_M of an anchor is dwell: its
     seconds go to the dwell figures and not to `stopped`."""
     grp_codes: Dict[Any, int] = {}
     grp = np.array([grp_codes.setdefault((r[3], r[4]), len(grp_codes)) for r in rows], np.int64)
@@ -208,7 +209,7 @@ def _track_map(rows: List[tuple], events_rec: Sequence[Tuple[float, float]], blo
     dist = np.hypot(seg.x1 - seg.x0, seg.y1 - seg.y0)
     still = np.where(dist < p.min_speed * dt, dt, 0.0)
     places = list(anchors)
-    if len(order):
+    if len(order) and start_anchor:
         places.append((float(x[order][0]), float(y[order][0])))             # the start
     at_place = near_any((seg.x0 + seg.x1) / 2.0, (seg.y0 + seg.y1) / 2.0, places, config.RUN_CELLS_DWELL_RADIUS_M)
     dwell = np.where(at_place, still, 0.0)
@@ -298,9 +299,11 @@ def summarise_rows(data: RunData, node_xy: Callable[[str], Dict[str, Tuple[float
         by_map: Dict[str, List[tuple]] = collections.OrderedDict()
         for r in sorted(data.track, key=lambda r: r[0]):
             by_map.setdefault(r[5], []).append(r)
-        for map_id, mrows in by_map.items():
+        for n, (map_id, mrows) in enumerate(by_map.items()):
             here = [(x, y) for m, x, y in anchors if m == map_id]
-            totals, keys, sums, bkeys, placed, dwell = _track_map(mrows, data.recoveries, remaining, p, here)
+            # the run's start is its first position: a later map's first position is where the robot changed map
+            totals, keys, sums, bkeys, placed, dwell = _track_map(mrows, data.recoveries, remaining, p, here,
+                                                                  start_anchor=n == 0)
             unplaced = [b for b, ok in zip(remaining, placed) if not ok]
             totals["blocks_unattributed"] = len(unplaced) if len(by_map) == 1 else 0
             remaining = unplaced
@@ -350,31 +353,54 @@ def node_lookup(graph: Any) -> Callable[[str], Dict[str, Tuple[float, float]]]:
     return nodes
 
 
-async def summarise_run(db: Any, graph: Any, robots: Mapping[str, Any], run_id: Any) -> List[rdb.CellRow]:
-    """The run's summaries (one per map). `robots` maps a robot name to its factsheet (unknown robot: class '')."""
+def keep_labels(rows: Sequence[rdb.CellRow], labels: Mapping[str, tuple]) -> None:
+    """A recompute keeps what the run was labelled with (decision D5): robot_class, speed_max, speed_basis and
+    class_basis of the stored row of the same map replace the current factsheet's, so an algo_version bump does not
+    undo the per-run speed normalisation. A map with no stored row keeps the label it was just given."""
+    for row in rows:
+        old = labels.get(row.map_id)
+        if old is not None:
+            row.robot_class, row.speed_max, row.speed_basis, row.class_basis = old
+
+
+async def summarise_run(db: Any, graph: Any, robots: Mapping[str, Any], run_id: Any,
+                        relabel: Optional[bool] = None) -> List[rdb.CellRow]:
+    """The run's summaries (one per map). `robots` maps a robot name to its factsheet (unknown robot: class '').
+    The labels of a stored summary are kept unless `relabel` (default config.RUN_CELLS_RELABEL)."""
     async with fleet_reads.read_cursor(db) as cur:
         data = await load_run(cur, run_id)
+        labels = {} if (config.RUN_CELLS_RELABEL if relabel is None else relabel) else await rdb.fetch_labels(cur, run_id)
     if data is None:
         return []
-    return await asyncio.to_thread(summarise_rows, data, node_lookup(graph), robots.get(data.robot_name))
+    rows = await asyncio.to_thread(summarise_rows, data, node_lookup(graph), robots.get(data.robot_name))
+    keep_labels(rows, labels)
+    return rows
 
 
 async def store(db: Any, rows: Sequence[rdb.CellRow]) -> int:
-    """Insert the rows of one run in one transaction; the number actually written."""
-    written = 0
+    """Insert the rows of one run in one transaction; the number actually written. The maps written are marked
+    stale (region_builds.mark_stale) in the same transaction: a new or recomputed summary changes a build's inputs."""
+    written: List[str] = []
     async with db.connection() as conn:
         async with conn.cursor() as cur:
             for row in rows:
-                written += 1 if await rdb.insert(cur, row) else 0
-    return written
+                if await rdb.insert(cur, row):
+                    written.append(row.map_id)
+            await region_builds.mark_stale(cur, map_ids=written)
+    return len(written)
 
 
+# `since` (the worker's high-water mark on ended_at, NULL = every finished run) bounds the anti-join; `due` are runs whose
+# retry time has come, wherever they ended.
 PENDING_SQL = (
-    "SELECT r.run_id, r.map_id FROM mission_runs r "
+    "SELECT r.run_id, r.map_id, r.ended_at FROM mission_runs r "
     f"JOIN {rdb.MAP_TABLE} m ON m.name = r.map_id AND m.lifecycle NOT IN ('DELETING', 'DELETED') "
     "WHERE r.ended_at IS NOT NULL AND r.map_id IS NOT NULL AND r.ended_at < now() - make_interval(secs => %s) "
     "AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = r.run_id AND c.algo_version = %s) "
-    "AND r.run_id <> ALL(%s::uuid[]) ORDER BY r.ended_at LIMIT %s")
+    "AND r.run_id <> ALL(%s::uuid[]) "
+    "AND (%s::timestamptz IS NULL OR r.ended_at >= %s OR r.run_id = ANY(%s::uuid[])) ORDER BY r.ended_at LIMIT %s")
+HWM_SLACK_S = 60.0          # the mark trails the grace cutoff by this much (clock skew between this process and the database)
+TERMINAL_MAX = 10000
 
 
 async def factsheets(db: Any) -> Dict[str, Any]:
@@ -396,6 +422,11 @@ class RunCellsWorker:
                  clock: Callable[[], float] = time.monotonic) -> None:
         self.db, self.graph, self.build, self.stale_maps, self.clock = db, graph, build, stale_maps, clock
         self.failed: Dict[Any, float] = {}              # run_id -> retry not before (clock)
+        self.due: set = set()                           # failed runs whose retry time has come (selected wherever they ended)
+        self.terminal: set = set()                      # runs with nothing to summarise (gone, or their map is): not selected again
+        self.hwm: Optional[datetime.datetime] = None    # runs ended before this were all seen by an earlier pass
+        self.sweeping = True                            # a full sweep is under way (it takes several passes when the backlog is big)
+        self.last_sweep = 0.0
         self.dirty: Dict[str, float] = {}               # map_id -> clock of the first change since its last build
         self.summarised = 0
         self.errors = 0
@@ -424,40 +455,64 @@ class RunCellsWorker:
 
     # -- one pass
     def retry_blocked(self) -> List[Any]:
-        """Runs that failed and are not due for another try yet."""
+        """Runs that failed and are not due for another try yet, and the terminal ones."""
         now = self.clock()
+        self.due.update(k for k, v in self.failed.items() if v <= now)
         self.failed = {k: v for k, v in self.failed.items() if v > now}
-        return list(self.failed)
+        return list(self.failed) + list(self.terminal)
 
     async def pending(self, limit: int) -> List[Tuple[Any, str]]:
+        """Unsummarised finished runs, oldest first. Between sweeps only those that ended since the high-water mark
+        (plus the failed ones whose retry is due) are looked at; a sweep (the first pass, then every
+        RUN_CELLS_FULL_SWEEP_S, over as many passes as the backlog needs) looks at all of them."""
         blocked = self.retry_blocked()
         grace = config.RECORDER_TRAJECTORY_GRACE_S + config.RUN_CELLS_EXTRA_GRACE_S
+        if not self.sweeping and self.clock() - self.last_sweep >= config.RUN_CELLS_FULL_SWEEP_S:
+            self.sweeping = True
+        since = None if self.sweeping else self.hwm
+        cutoff = utcnow() - datetime.timedelta(seconds=grace + HWM_SLACK_S)
         async with fleet_reads.read_cursor(self.db) as cur:
-            await cur.execute(PENDING_SQL, (grace, config.RUN_CELLS_ALGO_VERSION, blocked, limit))
-            return [(r[0], r[1]) for r in await cur.fetchall()]
+            await cur.execute(PENDING_SQL, (grace, config.RUN_CELLS_ALGO_VERSION, blocked, since, since,
+                                            [k for k in self.due if k not in blocked], limit))
+            found = list(await cur.fetchall())
+        if len(found) >= limit:               # more waiting: the mark stops at the last run seen
+            if not self.sweeping and len(found[-1]) > 2 and found[-1][2] is not None:
+                self.hwm = found[-1][2]
+        else:
+            if self.sweeping:
+                self.sweeping, self.last_sweep = False, self.clock()
+            self.hwm = cutoff
+        return [(r[0], r[1]) for r in found]
 
     async def step(self) -> Dict[str, int]:
         """Summarise up to RUN_CELLS_BATCH runs, then rebuild the due maps. Never raises."""
-        done = failed = built = 0
+        done = failed = built = skipped = 0
         try:
             todo = await self.pending(config.RUN_CELLS_BATCH)
             robots = await factsheets(self.db) if todo else {}
             for run_id, map_id in todo:
                 try:
                     rows = await summarise_run(self.db, self.graph, robots, run_id)
-                    if not rows:
-                        raise LookupError("run has no summary rows (gone, or no map)")
-                    if not await store(self.db, rows):
-                        raise LookupError("map is gone or being deleted")
+                    if not rows or not await store(self.db, rows):
+                        # the run or its only map is gone (or being deleted): nothing to summarise, nothing to retry
+                        self.due.discard(run_id)
+                        if len(self.terminal) >= TERMINAL_MAX:
+                            self.terminal.clear()
+                        self.terminal.add(run_id)
+                        skipped += 1
+                        logger.info("Run %s: nothing to summarise (run or map gone)", run_id)
+                        continue
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # pylint: disable=broad-except
+                    self.due.discard(run_id)
                     failed += 1
                     self.errors += 1
                     self.failed[run_id] = self.clock() + config.RUN_CELLS_RETRY_S
                     logger.warning("Run %s: no cell summary (%s: %s); retry in %.0f s", run_id,
                                    type(exc).__name__, exc, config.RUN_CELLS_RETRY_S)
                     continue
+                self.due.discard(run_id)
                 done += 1
                 self.summarised += 1
                 for row in rows:
@@ -472,8 +527,8 @@ class RunCellsWorker:
             logger.exception("Run cells pass failed")
         if self.build is not None:
             built = await self.build_due()
-        if done or failed or built:
-            logger.info("Run cells: %d summarised, %d failed, %d maps rebuilt", done, failed, built)
+        if done or failed or built or skipped:
+            logger.info("Run cells: %d summarised, %d failed, %d skipped, %d maps rebuilt", done, failed, skipped, built)
         return {"summarised": done, "failed": failed, "built": built}
 
     async def build_due(self) -> int:

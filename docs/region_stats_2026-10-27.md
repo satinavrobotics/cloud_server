@@ -302,8 +302,10 @@ the live DB is needed, do NOT; compute in memory and report.
 Where the code differs from, or fills in, the text above:
 
 * `run_cells.run_id` has a foreign key to `mission_runs(run_id) ON DELETE CASCADE` (like `run_legs`): deleting a run or a
-  mission deletes its summaries, and an insert for a vanished run fails instead of resurrecting it. `run_admin` only marks the
-  maps' builds `stale` before the delete; `packages/migration/stores.py` needs nothing. `run_cells.source` has a CHECK.
+  mission deletes its summaries, and an insert for a vanished run fails instead of resurrecting it. Every writer that changes a build's inputs (run delete, archive / restore, import undo in
+  `packages/migration/stores.py`, robot delete, a new or recomputed summary) calls `region_builds.mark_stale` (bumps
+  `region_stats_inputs.gen`, marks the maps' builds `stale`) in its own transaction before the rows go, and drops the maps'
+  stats read caches after the commit (corrected 2026-10-30: this note used to say stores.py needs nothing, which was wrong). `run_cells.source` has a CHECK.
 * "No window" for the track read of one run is a time bound for chunk pruning only: `started_at - 60 s .. ended_at + 1 h`
   (`run_cells.ROW_WINDOW_*`); rows of a run lie inside.
 * A track row belongs to the map of its session (`map_sessions.map_name`, else the run's map); a run therefore gets one row

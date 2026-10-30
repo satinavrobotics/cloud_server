@@ -686,6 +686,12 @@ RUN_CELLS_POLL_S = float(os.getenv("RUN_CELLS_POLL_S", "30.0"))
 RUN_CELLS_BATCH = int(os.getenv("RUN_CELLS_BATCH", "20"))
 RUN_CELLS_EXTRA_GRACE_S = float(os.getenv("RUN_CELLS_EXTRA_GRACE_S", "30.0"))
 RUN_CELLS_RETRY_S = float(os.getenv("RUN_CELLS_RETRY_S", "600.0"))
+# The worker looks for unsummarised runs only among those that ended since its last pass (a high-water mark on ended_at),
+# plus a full sweep over all finished runs every RUN_CELLS_FULL_SWEEP_S (an algo_version bump, or a run the mark missed).
+RUN_CELLS_FULL_SWEEP_S = float(os.getenv("RUN_CELLS_FULL_SWEEP_S", "3600.0"))
+# A recompute keeps the run's robot_class / speed_max / speed_basis / class_basis (the label it was summarised with);
+# true labels it again with the robot's current factsheet (the backfill's --relabel).
+RUN_CELLS_RELABEL = _env_bool("RUN_CELLS_RELABEL", "false")
 # algo_version 2: seconds a robot stood still within RUN_CELLS_DWELL_RADIUS_M of the run's start, of its goal (the last
 # waypoint of the mission) or of an action node (where the mission performs an action) are the run's DWELL, kept apart
 # from the stops in transit (docs/planner_region_stats_2026-10-27.md 10, decision 3).

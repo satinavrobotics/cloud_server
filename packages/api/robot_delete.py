@@ -43,6 +43,7 @@ from packages.api import maps
 from packages.api.livekit_admin import LiveKitAdmin
 from packages.telemetry_ingest.policy import ASSIGNMENTS_TABLE
 from packages.utils import map_sessions as ms
+from packages.utils import region_builds
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +87,20 @@ class RobotDeleter:
         self.arango_node_count = arango_node_count
         self.livekit_remover = livekit_remover or LiveKitAdmin().remove_robot_participants
 
-    async def _purge(self, robot_name: str, telemetry: bool) -> None:
+    async def _purge(self, robot_name: str, telemetry: bool, touched: Optional[list] = None) -> None:
         async with self.db.connection() as conn:
             async with conn.cursor() as cursor:
                 await _delete_rows(cursor, STATE_TABLES, robot_name)
                 if telemetry:
+                    # the robot's runs (and their run_cells, by cascade) go: mark the region builds first
+                    hit = await region_builds.mark_stale(cursor, robot_name=robot_name)
+                    if touched is not None:
+                        touched.extend(hit)
                     await _delete_rows(cursor, TELEMETRY_TABLES, robot_name)
 
     async def _close_and_clear(self, robot_name: str, telemetry: bool,
-                               actor: Optional[str]) -> Tuple[RobotObjectV1, list]:
+                               actor: Optional[str],
+                               touched: Optional[list] = None) -> Tuple[RobotObjectV1, list]:
         """Step 1. (the robot, the sessions it closed)."""
         closed = []
         counts = await maps._node_counts(self.arango_node_count,
@@ -118,6 +124,9 @@ class RobotDeleter:
                     closed.append(current)
             await _delete_rows(store.cursor, STATE_TABLES, robot_name)
             if telemetry:
+                hit = await region_builds.mark_stale(store.cursor, robot_name=robot_name)
+                if touched is not None:
+                    touched.extend(hit)
                 await _delete_rows(store.cursor, TELEMETRY_TABLES, robot_name)
         return robot, closed
 
@@ -135,7 +144,8 @@ class RobotDeleter:
                       actor: Optional[str],
                       rosbag_deleter: Optional[Callable[[str], Awaitable[Dict[str, Any]]]]
                       ) -> Dict[str, Any]:
-        robot, closed = await self._close_and_clear(robot_name, delete_telemetry, actor)
+        touched: list = []
+        robot, closed = await self._close_and_clear(robot_name, delete_telemetry, actor, touched)
         actions: list = []
         for session in closed:  # best effort, never blocks the delete
             actions += await maps.stop_services(self.db, self.switch, robot, session)
@@ -158,10 +168,11 @@ class RobotDeleter:
             logger.warning("LiveKit participant removal for robot %s failed (ignored)",
                            robot_name, exc_info=True)
         try:
-            await self._purge(robot_name, delete_telemetry)
+            await self._purge(robot_name, delete_telemetry, touched)
         except Exception:  # noqa: BLE001
             logger.exception("Late cleanup of robot %s failed (the robot itself is deleted)",
                              robot_name)
+        region_builds.discard_caches(touched)
         out = {"success": True, "message": f"Robot {robot_name} deleted",
                "deleted": {"telemetry": bool(delete_telemetry),
                            "rosbags": bool(delete_rosbags),

@@ -11,7 +11,7 @@ ArangoDB/MinIO can still be deleted) and the route returns 202. A background tas
    idempotent and treat "not there" as success, so a re-run after a partial success is safe;
 3. on success deletes the row (only while it is still DELETING), its `map_sessions` rows and
    its `map_reconstructions` rows, its per-run cell summaries and region statistics (`run_cells`,
-   `region_stats`, `region_stats_builds`) (3D reconstruction R3; `request()` already cancelled the
+   `region_stats`, `region_stats_builds`, `region_stats_inputs`) (3D reconstruction R3; `request()` already cancelled the
    active job in the marking transaction, through the `on_mark` hook),
    NOTIFYs `DELETED` and writes MAP.DELETED, all in one transaction (the event in a savepoint:
    a failing event write never keeps the map);
@@ -63,6 +63,7 @@ from packages.utils.timeutil import utcnow as _utcnow
 from packages.api.entrypoint import advisory_lock_key
 from packages.events.codes import EventCode, Source
 from packages.events.emit import Event, emit
+from packages.utils import region_builds
 
 logger = logging.getLogger("ApiDelegationService.map_delete")
 
@@ -103,6 +104,7 @@ EDGE_OBSERVATIONS_SQL = "DELETE FROM edge_observations WHERE map_id = %s"
 RUN_CELLS_SQL = "DELETE FROM run_cells WHERE map_id = %s"
 REGION_STATS_SQL = "DELETE FROM region_stats WHERE map_id = %s"
 REGION_STATS_BUILDS_SQL = "DELETE FROM region_stats_builds WHERE map_id = %s"
+REGION_STATS_INPUTS_SQL = "DELETE FROM region_stats_inputs WHERE map_id = %s"      # the inputs generation (region_builds)
 # Its blocked-node exclusions (migration 20261008_01_blocked_graph_nodes) too.
 BLOCKED_NODES_SQL = "DELETE FROM blocked_graph_nodes WHERE map_name = %s"
 NOTIFY_SQL = "SELECT pg_notify(%s, %s)"
@@ -459,11 +461,14 @@ class MapDeleter:
                     await cursor.execute(RUN_CELLS_SQL, (map_id,))
                     await cursor.execute(REGION_STATS_SQL, (map_id,))
                     await cursor.execute(REGION_STATS_BUILDS_SQL, (map_id,))
+                    await cursor.execute(REGION_STATS_INPUTS_SQL, (map_id,))
                     await cursor.execute(BLOCKED_NODES_SQL, (map_id,))
                     await cursor.execute(NOTIFY_SQL, (MAP_TABLE,
                                                       f"{self._publisher_id} {map_id} {DELETED}"))
             if removed:
                 await self._emit_deleted(conn, map_id, status)
+        if removed:
+            region_builds.discard_caches([map_id])       # the stats read caches of the map (TTL otherwise)
         logger.info("Map %s deleted", map_id)
 
     async def _notify_deleted(self, map_id: str) -> None:
