@@ -1,5 +1,5 @@
 """The small LRU + TTL + single-flight cache that the read endpoints share (drive-stats, mapping-stats,
-run-stats series, map events, path efficiency, edge-stats). Keys are tuples whose first element is the
+run-stats and its series, map events, path efficiency, region-stats). Keys are tuples whose first element is the
 map id (`discard_map`)."""
 import asyncio
 import collections

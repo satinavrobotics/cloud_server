@@ -23,7 +23,7 @@ STALE_SQL = "UPDATE region_stats_builds SET status = 'stale' WHERE status = 'ok'
 
 # The modules holding a ResultCache named CACHE keyed by map id (packages/api/result_cache.py: discard_map) whose
 # figures come from runs or their summaries. Imported lazily (they import the API stack); one that is missing is skipped.
-CACHE_MODULES = ("drive_stats", "mapping_stats", "map_series", "map_events", "path_efficiency", "edge_stats",
+CACHE_MODULES = ("drive_stats", "mapping_stats", "map_series", "map_events", "path_efficiency", "run_stats",
                  "region_stats")
 
 
