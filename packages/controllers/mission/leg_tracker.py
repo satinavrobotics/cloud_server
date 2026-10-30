@@ -38,9 +38,14 @@ Time of a leg (stage C of the edge statistics). `duration_s` is end.ts - start.t
 
 - `stopped_s`: the intervals between two state messages that follow a message with `driving` false; one interval
   counts at most MAX_INTERVAL_S (a silent robot is not "stopped"). `driving` missing (None) counts as driving.
-- `silent_s`: the part of every interval (whatever the previous message said about driving) above MAX_INTERVAL_S,
-  i.e. the time the tracker knows nothing about (no messages: a link or dispatcher gap). max(0, dt - MAX_INTERVAL_S)
-  per interval, so an interval is split into at most MAX_INTERVAL_S of stopped (if not driving) and the rest silent.
+- `silent_s`: the time the tracker knows nothing about (a link or dispatcher gap), whatever the previous message said
+  about driving. Two rules. (1) The robot's state headerId goes up by exactly 1 per published message (event-triggered
+  extras included, the robot never merges), so when it jumps by more than 1 since the previous processed message (lost
+  on QoS 0 MQTT, or coalesced by the dispatcher's send_message) the WHOLE interval is silent, not stopped or moving;
+  when it goes down (a robot restart) the interval is silent too and the new id is the reference. (2) Without a
+  headerId (None), or with consecutive ids, max(0, dt - MAX_INTERVAL_S) per interval, so an interval is split into at
+  most MAX_INTERVAL_S of stopped (if not driving) and the rest silent. The first message of a leg or pass has no
+  reference and credits nothing. LegTracker.header_gaps counts the rule-1 intervals (and a debug log line each).
 - `moving_s` = max(0, duration_s - stopped_s - silent_s): the time with messages that said the robot was driving.
 - Recovery time (run_legs.recovery_s, from the NAV.RECOVERY_EXITED events, filled at run end) is NOT subtracted: it
   overlaps stopped time and a recovery maneuver may report driving true, so subtracting it would count it twice.
@@ -48,6 +53,7 @@ Both stopped_s and silent_s restart with the leg (the anchor moving to the next 
 """
 import dataclasses
 import datetime
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,6 +64,8 @@ from packages.utils import plan_length, run_legs
 # One state message interval is only counted as stopped time up to this long (a silent robot
 # is not "stopped").
 MAX_INTERVAL_S = 30.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
@@ -146,6 +154,8 @@ class LegTracker:
         self.anchor: Optional[Reach] = None
         self.last_node: Optional[str] = None
         self._prev: Optional[Tuple[datetime.datetime, bool]] = None   # (ts, driving)
+        self._prev_header: Optional[int] = None    # headerId of the message behind _prev
+        self.header_gaps = 0                       # intervals counted as silent by a headerId jump or reset
         self._routes: Optional[Tuple[Tuple[int, int], Tuple[Dict[int, RouteInfo], Optional[List[str]]]]] = None
 
     def _route_table(self, mission: Any, order_rev: int) -> Tuple[Dict[int, RouteInfo], Optional[List[str]]]:
@@ -164,6 +174,12 @@ class LegTracker:
         self.anchor = None
         self.last_node = None
         self._prev = None
+        self._prev_header = None
+
+    @staticmethod
+    def _header_id(message: Any) -> Optional[int]:
+        value = getattr(message, "headerId", None)
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     def observe(self, *, message: Any, mission: Any, ts: datetime.datetime,
                 received: datetime.datetime, limits: Any = None,
@@ -175,13 +191,25 @@ class LegTracker:
             self.pass_index = status.passes_completed
         prefix = order_ids.run_prefix(str(mission.name), status.run_id, status.order_rev)
 
-        # Time the robot spent not driving since the previous message, on the open leg.
+        # Time the robot spent not driving since the previous message, on the open leg. A headerId that jumps by
+        # more than 1 (lost or coalesced messages) or goes down (a robot restart) makes the whole interval silent.
+        header = self._header_id(message)
+        lost = (header is not None and self._prev_header is not None and
+                (header > self._prev_header + 1 or header < self._prev_header))
         if self._prev is not None and self.anchor is not None:
             dt = (ts - self._prev[0]).total_seconds()
             if 0 < dt:
-                if not self._prev[1]:
-                    self.anchor.stopped_s += min(dt, MAX_INTERVAL_S)
-                self.anchor.silent_s += max(0.0, dt - MAX_INTERVAL_S)
+                if lost:
+                    self.anchor.silent_s += dt
+                else:
+                    if not self._prev[1]:
+                        self.anchor.stopped_s += min(dt, MAX_INTERVAL_S)
+                    self.anchor.silent_s += max(0.0, dt - MAX_INTERVAL_S)
+        if lost:
+            self.header_gaps += 1
+            logger.debug("state headerId %s after %s: interval counted as silent (%d so far)",
+                         header, self._prev_header, self.header_gaps)
+        self._prev_header = header
         driving = getattr(message, "driving", None)
         self._prev = (ts, True if driving is None else bool(driving))
 
