@@ -106,6 +106,7 @@ def test_reroute_start_from_the_old_route_is_stale():
     moved = [wp(1, 0, "c9"), wp(3, 0, "c1"), wp(3, 4, "c2")]
     mission.mission_tree[0].route = mission_object.MissionRouteNodeV1(
         **route(moved, [entry(0, 1, (1, 0), (1, 1), (3, 1), (3, 0))], graph_version=8))
+    mission.route_rev += 1          # every real route rewrite bumps it (the tracker caches the table per revision)
     [leg] = feed(tr, mission, (0, 4, 5))
     assert leg.straight_m == 3.0 and leg.planned_m == 3.0 and leg.plan_source == "stale"
     assert leg.expected_s == pytest.approx(3.0 + 2.0)
@@ -163,3 +164,40 @@ def test_plan_length_helper_rules():
     assert plan_length.parse_trajectory([[0, 0]], [{"from_index": 0}]) is None      # malformed
     assert plan_length.parse_trajectory([[0, 0]], []) is None
     assert math.isclose(plan_length.polyline_m([[0, 0], [3, 4]]), 5.0)
+
+
+# --- review 2026-10-30 (WP-F) ------------------------------------------------------------------------------
+
+def test_plan_of_applies_the_endpoint_rule_both_ends_within_tolerance():
+    """I10: a trajectory entry is "trajectory" only when BOTH its ends are within the tolerance of the leg's ends."""
+    pts = [[0, 0], [0, 4], [3, 4]]
+    assert plan_length.plan_of(pts, (0, 0), (3, 4), 5.0, 0.03) == (7.0, plan_length.SOURCE_TRAJECTORY)
+    # the length of the straight line is the same, but the end moved: stale
+    assert plan_length.plan_of(pts, (0, 0), (4, 3), 5.0, 0.03) == (5.0, plan_length.SOURCE_STALE)
+    assert plan_length.plan_of(None, (0, 0), (3, 4), 5.0, 0.03) == (5.0, plan_length.SOURCE_STRAIGHT)
+    assert plan_length.plan_of(pts, None, None, None, 0.03) == (None, None)
+
+
+def test_the_route_table_is_built_once_per_order_and_route_revision(monkeypatch):
+    """R6."""
+    calls = []
+    real = leg_tracker.route_table
+    monkeypatch.setattr(leg_tracker, "route_table", lambda m: calls.append(1) or real(m))
+    mission = make_mission(route(WPS))
+    tr = leg_tracker.LegTracker()
+    feed(tr, mission, (0, 0, 0), (0, 2, 2), (0, 4, 10), (0, 6, 20))
+    assert len(calls) == 1
+    mission.route_rev += 1                      # an edited route: rebuilt
+    feed(tr, mission, (0, 2, 30))
+    assert len(calls) == 2
+
+
+def test_a_leg_takes_its_waypoint_map_before_the_run_map():
+    """R5."""
+    mission = make_mission(route(WPS))
+    tr = leg_tracker.LegTracker()
+    legs = []
+    for idx, seq, t in [(0, 0, 0), (0, 2, 2), (0, 4, 10)]:
+        legs = tr.observe(message=SimpleNamespace(lastNodeId=vda(mission, idx, seq), orderId=f"m1-r{RUN}-n0", driving=True),
+                           mission=mission, ts=at(t), received=at(t), default_map="run_map")
+    assert legs[0].map_id == "map1"             # the waypoint's (WPS are on map1), not the run's

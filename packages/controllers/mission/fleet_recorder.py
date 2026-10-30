@@ -63,7 +63,7 @@ from packages.telemetry_ingest.policy import (
     ASSIGNMENTS_CHANNEL, allows as policy_allows, parse_assignment_payload, parse_level,
 )
 from packages.telemetry_ingest.rehydrate import LatestRow
-from packages.utils import edge_stats, edge_stats_db, map_geo, map_sessions, run_legs
+from packages.utils import map_geo, map_sessions, run_legs
 
 logger = logging.getLogger("Isaac Mission Dispatch.fleet_recorder")
 
@@ -109,8 +109,6 @@ MAX_PENDING_OPS = config.RECORDER_MAX_PENDING_OPS
 # mission_runs RUNNING and the mission undeletable.
 # Orphaned RUNNING runs are also settled periodically, not only at startup.
 RECONCILE_PERIOD_S = config.RECORDER_RECONCILE_PERIOD_S
-# How often old edge observations are purged (EDGE_STATS_RETENTION_DAYS).
-EDGE_PURGE_EVERY_S = edge_stats_db.PURGE_EVERY_S
 # Runs younger than this are left alone by the periodic reconcile.
 RECONCILE_MIN_AGE_S = config.RECORDER_RECONCILE_MIN_AGE_S
 # Trajectory rows logged this long after the run ended still belong to it (graph-builder
@@ -216,17 +214,6 @@ RUN_LEG_FIELDS = ("seq", "pass_index", "started_at", "ended_at", "duration_s", "
                   "straight_m", "planned_m", "expected_s", "recoveries", "recovery_s", "blocks",
                   "plan_source", "moving_s", "silent_s")
 SET_SUMMARY_SQL = "UPDATE mission_runs SET summary_metrics = %s::jsonb WHERE run_id = %s"
-# The legs that become per-edge observations (utils/edge_stats.py), after the events filled their
-# recoveries / blocks. Their distance is planned_m (the plan's length) where there is one, else straight_m.
-EDGE_LEGS_SQL = (
-    "SELECT run_id, seq, map_id, from_topomap_node, to_topomap_node, ended_at, duration_s, "
-    "straight_m, planned_m, recoveries, blocks, moving_s, stopped_s, recovery_s FROM run_legs "
-    "WHERE run_id = %s AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL ORDER BY seq"
-)
-EDGE_LEG_FIELDS = ("run_id", "seq", "map_id", "from_topomap_node", "to_topomap_node", "ended_at",
-                   "duration_s", "straight_m", "planned_m", "recoveries", "blocks", "moving_s", "stopped_s",
-                   "recovery_s")
-
 MISSION_SQL = f"SELECT lifecycle, spec->>'robot', status FROM {MISSION_TABLE} WHERE name = %s"
 TRAJECTORY_SQL = (
     "UPDATE mission_trajectory SET run_id = %s "
@@ -305,20 +292,6 @@ def _is_transient(exc: BaseException) -> bool:
     except ImportError:  # pragma: no cover - the dispatcher always has them
         return False
     return isinstance(exc, (psycopg.OperationalError, psycopg_pool.PoolTimeout))
-
-
-def _is_lock_or_cancel(exc: BaseException) -> bool:
-    """A deadlock / serialization failure, lock timeout or cancelled statement: the database
-    refused THIS statement (psycopg raises them as OperationalError subclasses, which
-    _is_transient counts as connection-level)."""
-    try:
-        from psycopg import errors
-    except ImportError:  # pragma: no cover - the dispatcher always has it
-        return False
-    # DeadlockDetected / SerializationFailure are not subclasses of TransactionRollback here
-    return isinstance(exc, (errors.TransactionRollback, errors.DeadlockDetected,
-                            errors.SerializationFailure, errors.LockNotAvailable,
-                            errors.QueryCanceled))
 
 
 def _guarded(fn):
@@ -731,8 +704,6 @@ class FleetRecorder:
             self._writer.start()
         self._spawn(self._run_worker(), "runs")
         self._spawn(self._reconcile_loop(), "reconcile")
-        if config.EDGE_STATS_RETENTION_DAYS > 0:
-            self._spawn(self._edge_retention_loop(), "edge_retention")
         self._spawn(self._sweep_loop(), "heartbeat_sweep")
         self._spawn(self._health_loop(), "health_report")
 
@@ -773,28 +744,6 @@ class FleetRecorder:
         while True:
             await self._sleep(RECONCILE_PERIOD_S)
             self.queue_reconcile()
-
-    async def _edge_retention_loop(self) -> None:
-        """Every EDGE_PURGE_EVERY_S delete the edge observations older than
-        EDGE_STATS_RETENTION_DAYS (edge_stats_db.purge_old: bounded batches, own connection).
-        Optional housekeeping: a failure is logged and the next pass tries again."""
-        while True:
-            await self._sleep(EDGE_PURGE_EVERY_S)
-            await self.purge_edge_observations()
-
-    async def purge_edge_observations(self) -> int:
-        """One retention pass; returns the rows deleted (0 on a failure, which is logged)."""
-        if self._pool is None:
-            return 0
-        try:
-            async with self._pool.connection() as conn:
-                return await edge_stats_db.purge_old(conn)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not purge old edge observations: %s",
-                           str(exc).strip() or type(exc).__name__)
-            return 0
 
     def queue_reconcile(self) -> None:
         if any(isinstance(op, _Reconcile) for op in self._ops):
@@ -1627,38 +1576,6 @@ class FleetRecorder:
                 raise
             logger.exception("Could not write the summary of run %s", info.run_id)
 
-    async def _record_edge_observations(self, conn: Any, info: RunInfo) -> None:
-        """The run's legs between topomap nodes as per-edge observations (edge_observations;
-        a repeat changes nothing). Whether a leg is a real topomap edge is decided by the API
-        when it reads: dispatch has no ArangoDB access. A savepoint, so a problem here never
-        costs the run."""
-        try:
-            async with conn.transaction():
-                async with conn.cursor() as cursor:
-                    await cursor.execute(EDGE_LEGS_SQL, (info.run_id,))
-                    rows = await cursor.fetchall()
-                    observations = []
-                    for row in rows:
-                        leg = dict(zip(EDGE_LEG_FIELDS, row), robot_name=info.robot_name)
-                        leg["map_id"] = leg["map_id"] or info.map_id
-                        obs = edge_stats.leg_observation(leg)
-                        if obs is not None:
-                            observations.append(obs)
-                    if observations:
-                        await edge_stats_db.store(cursor, observations)
-        except Exception as exc:  # noqa: BLE001
-            if getattr(conn, "broken", False):
-                raise
-            if _is_lock_or_cancel(exc):
-                # a deadlock / lock timeout / cancelled statement of this OPTIONAL writer: the
-                # savepoint is rolled back and the run end goes on (the legs stay in run_legs)
-                logger.warning("Could not record the edge observations of run %s: %s",
-                               info.run_id, exc)
-                return
-            if _is_transient(exc):
-                raise
-            logger.exception("Could not record the edge observations of run %s", info.run_id)
-
     async def _emit_run_started(self, conn: Any, info: RunInfo) -> None:
         if self._events_allowed(info.robot_name, EventCode.MISSION_RUN_STARTED, info):
             await emit(conn, Event(
@@ -1710,7 +1627,6 @@ class FleetRecorder:
                          "duration_s": max(0.0, (finish.ended_at - info.started_at)
                                            .total_seconds())}))
         await self._summarize_run(conn, info, finish)
-        await self._record_edge_observations(conn, info)
         # mission_trajectory is written by graph-builder, keyed by mission name; tag this
         # run's rows. A savepoint, so a problem here never costs the run row.
         try:

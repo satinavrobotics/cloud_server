@@ -1,5 +1,5 @@
 """Stage C of the edge statistics: driving time apart from waiting time (leg_tracker.py module docstring):
-stopped_s / silent_s / moving_s of a leg, the run summary, the per-edge statistics and the route-edit chart rule."""
+stopped_s / silent_s / moving_s of a leg, the run summary and the route-edit chart rule."""
 from types import SimpleNamespace
 
 import pytest
@@ -7,10 +7,8 @@ import pytest
 from cloud_common.objects import common
 from cloud_common.objects import mission as mission_object
 from packages.controllers.mission import leg_tracker
-from packages.utils import edge_stats as es
 from packages.utils import run_legs
 from tests.unit.test_leg_tracker_plan import WPS, at, make_mission, route, vda, wp
-from tests.unit.test_edge_stats import obs
 
 pytestmark = pytest.mark.unit
 
@@ -78,40 +76,6 @@ class TestSummary:
     def test_old_legs_only_keep_the_old_figures(self):
         out = run_legs.summarize([self.leg(1)], 150.0)
         assert out["time_moving_s"] == 80.0 and out["time_silent_s"] == 0.0 and out["time_stopped_s"] == 70.0
-
-
-class TestEdgeStats:
-    def leg(self, **extra):
-        base = {"run_id": "run1", "seq": 1, "robot_name": "r1", "map_id": "yard", "from_topomap_node": "A",
-                "to_topomap_node": "B", "ended_at": at(100), "duration_s": 20.0, "straight_m": 4.0,
-                "planned_m": 4.0, "recoveries": 1, "blocks": 0}
-        base.update(extra)
-        return base
-
-    def test_leg_observation_carries_the_times_and_mapping_rows_have_none(self):
-        o = es.leg_observation(self.leg(moving_s=8.0, stopped_s=10.0, recovery_s=5.0))
-        assert (o["moving_s"], o["stopped_s"], o["recovery_s"]) == (8.0, 10.0, 5.0)
-        assert o["speed_mps"] == pytest.approx(0.2)                    # distance / total duration, as before
-        old = es.leg_observation(self.leg())
-        assert (old["moving_s"], old["stopped_s"], old["recovery_s"]) == (None, None, None)
-        mapping = es._observation("yard", "A", "B", "r1", "mapping", "s:1", at(1), 2.0, 1.0)
-        assert (mapping["moving_s"], mapping["stopped_s"], mapping["recovery_s"]) == (None, None, None)
-
-    def test_stats_moving_figures_use_only_observations_with_moving_time(self):
-        rows = [obs(0, duration=20.0, distance=4.0, moving_s=8.0, recovery_s=5.0),
-                obs(1, duration=20.0, distance=4.0, moving_s=4.0, recovery_s=1.5),
-                obs(2, duration=20.0, distance=4.0),                       # older: no moving_s
-                obs(3, duration=20.0, distance=4.0, moving_s=0.0)]         # nothing known to be moving
-        [item] = es.group_stats(rows)
-        assert item["moving_count"] == 2 and item["median_moving_s"] == 6.0
-        assert item["moving_speed_mps"] == pytest.approx(0.75)            # median of 4/8, 4/4
-        assert item["recovery_s"] == pytest.approx(6.5)
-        assert item["median_s"] == 20.0 and item["median_speed_mps"] == pytest.approx(0.2)   # unchanged
-
-    def test_stats_without_moving_data_are_null(self):
-        [item] = es.group_stats([obs(0)])
-        assert (item["median_moving_s"], item["moving_speed_mps"], item["moving_count"],
-                item["recovery_s"]) == (None, None, 0, 0.0)
 
 
 # --- operator-supplied routes: no stale chart keys --------------------------------------------------------
