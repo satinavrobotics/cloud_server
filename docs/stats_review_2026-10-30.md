@@ -334,3 +334,26 @@ Merged to local `main` through `stats/wave2`: unit suite 67 failed / 7808 passed
   * Seed and re-label once the robot team sends the values and the date.
   * `formidable-peacock`: if the change date falls between 2026-10-28 16:20 and 2026-10-29 18:54 UTC, the existing labels are already right.
 * **With the deploy:** drop `edge_observations` (WP-G2).
+
+## 7. Deploy (2026-10-30, cloud only; the Pis untouched)
+
+* **Step 1, `main` 295c2e7:** all 8 service images, API first. Migrations 20261030_01..05 ran in about 1 s. Rollback tags `:before-stats-2026-10-30`.
+  * No errors in the logs. `/edge-stats` returns 404. `REGION_COST_MODE` is `off` in the planner.
+* **Factsheet periods seeded from our own data**, so the robot team's date is not needed.
+  * `formidable-peacock`: CARRIER 0.50×0.50, `speed_max` 0.24 from 2026-09-30, and 0.36 (angular 0.54) from 2026-10-29 18:54 UTC.
+  * No run started in the gap between 2026-10-28 16:20 and 2026-10-29 18:54, so any change date in it gives the same labels.
+  * The recorder wrote the first periods for `robot` and `subtle-pelican` itself.
+* **Bug found by the relabel:** the `run_cells.class_basis` CHECK still allowed only `('current', 'run')`, so every `'period'` row was refused.
+  * Per-run commits: nothing was lost, and no live run ended in between.
+  * Fixed in migration `20261030_06_class_basis_period`, which allows `('current', 'period')`.
+  * Two tests now tie the written value, `CLASS_BASES` and the latest CHECK together.
+* **Step 2, `20261030_07_drop_edge_obs` (WP-G2):** 1,723 rows dropped; map and robot delete no longer touch the table.
+  * Backup: `/home/satiadmin/satinavrobotics/backups/edge_observations_2026-10-30.sql`.
+* **Deploy slip:** the first ID for migration 07 (`20261030_07_drop_edge_observations`) was 34 characters long, and `alembic_version.version_num` is `varchar(32)`. The API crash-looped for about 3 minutes (no missions active) until it was renamed `20261030_07_drop_edge_obs`.
+  * Migration 06 had already committed. Keep revision IDs at 32 characters or fewer.
+* **Peacock relabel after the fix:** 318 runs written, 0 failed. The values are unchanged, now with `class_basis = 'period'`, and the 6 builds are stale and rebuilding.
+* **Client:** the dev box's Expo server serves the `sati-client` working tree, which is on another branch (`feat/ios-ble`) without WP-A.
+  * Its Overview "Average speed" tile shows a dash (the edge-stats call now 404s) until that branch takes `main`.
+  * Published desktop builds also show a dash.
+* **New finding for the robot team:** `formidable-peacock` drove p95 0.40 m/s while its factsheet said 0.24 (p95 0.38 at 0.36). So `speedMax` is not the drive cap.
+  * Region pace is normalised by `speed_max` (§4.3 of the region stats spec), so this needs an answer before region cost goes beyond shadow.

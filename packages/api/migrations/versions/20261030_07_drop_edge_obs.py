@@ -1,6 +1,6 @@
 """Drop edge_observations (edge statistics are retired)
 
-Revision ID: 20261030_07_drop_edge_observations
+Revision ID: 20261030_07_drop_edge_obs
 Revises: 20261030_06_class_basis_period
 Create Date: 2026-10-30
 
@@ -10,7 +10,7 @@ commit. downgrade() recreates the table empty (20261011_01_edge_observations + 2
 """
 from alembic import op
 
-revision = "20261030_07_drop_edge_observations"
+revision = "20261030_07_drop_edge_obs"
 down_revision = "20261030_06_class_basis_period"
 branch_labels = None
 depends_on = None

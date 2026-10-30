@@ -1062,8 +1062,8 @@ def test_the_migration_chains_from_the_single_head_and_defines_the_plans_objects
     assert downs["20261030_04_region_inputs_gen"] == "20261030_03_stats_cleanup"
     assert downs["20261030_05_factsheet_periods"] == "20261030_04_region_inputs_gen"
     assert downs["20261030_06_class_basis_period"] == "20261030_05_factsheet_periods"
-    assert downs["20261030_07_drop_edge_observations"] == "20261030_06_class_basis_period"
-    assert heads == {"20261030_07_drop_edge_observations"}
+    assert downs["20261030_07_drop_edge_obs"] == "20261030_06_class_basis_period"
+    assert heads == {"20261030_07_drop_edge_obs"}
 
 
 # ---- PgFacts over the mapping-session store ---------------------------------------------------------------
