@@ -118,8 +118,8 @@ def test_weights_region_costs_formula():
     length = np.array([0.1, 0.1 * math.sqrt(2), 0.1])
     got = region_costs(length, [0, 1000, 3000], [0, 1000, 0], SCALE)
     assert got.tolist() == [0.0, math.ceil(length[1] / ROUTE_UNIT_M * 1.0 - 1e-6), math.ceil(1000 * 1.5 - 1e-6)]
-    assert (region_costs(length, [0, 0, 0], [0, 0, 0]) == 0).all()
-    assert (edge_costs(length, None, 0.0) + region_costs(length, [5, 5, 5], [7, 7, 7]) >= length / ROUTE_UNIT_M - 1e-6).all()
+    assert (region_costs(length, [0, 0, 0], [0, 0, 0], SCALE) == 0).all()
+    assert (edge_costs(length, None, 0.0) + region_costs(length, [5, 5, 5], [7, 7, 7], SCALE) >= length / ROUTE_UNIT_M - 1e-6).all()
 
 
 # ---- region None is today's route ------------------------------------------------------------------------
@@ -349,3 +349,20 @@ def test_turn_search_with_rho_has_a_cold_and_overlay_answer(built):
                 assert warm.exact
         n += 1
     assert n
+
+
+def test_region_why_judges_version_and_charts_before_rho_max(built):
+    """I16: an all-zero snapshot of another version or charts is a mismatch, not 'neutral'; `region_arg` is memoised per snapshot (P9)."""
+    name, st, eng, lazy = built
+    n = len(lazy.keys)
+    zero = pricing(lazy, [0] * n)
+    assert lazy.region_why(zero) == "neutral" and lazy.region_arg(zero) is None and lazy.region_why(None) == "neutral"
+    assert lazy.region_why(pricing(lazy, [0] * n, version=lazy.version + 1)) == "version_mismatch"
+    foreign = region_cost._snapshot("m", lazy.version, "c", "s", region_cost.CostModel(), "ok", ["x"] * n, [0] * n, ["class"] * n)
+    assert lazy.region_why(foreign) == "keys_mismatch"
+    assert lazy.region_why(pricing(lazy, [500] * n, status="no_stats")) == "neutral"
+    live = pricing(lazy, [500] * n)
+    assert lazy.region_why(live) == "priced" and live.keys is not lazy.keys_t and live.keys == lazy.keys_t
+    first = lazy.region_arg(live)
+    assert first is not None and lazy.region_arg(live) is first                  # the int64 copy is made once per snapshot
+    assert lazy.region_arg(zero) is None and lazy.region_arg(live)[1:] == first[1:]

@@ -48,7 +48,7 @@ def without_predictions(legs):
 
 
 # ---- predicted time (pure) ---------------------------------------------------------------------------------------
-def test_region_times_is_length_over_speed_plus_excess_plus_turns(graphs):
+def test_region_times_is_length_over_speed_plus_excess(graphs):
     name, eng, lazy = graphs
     reg = pricing(lazy, [500] * len(lazy.keys))
     route = lazy.route(lazy.keys[0], lazy.keys[-1])
@@ -56,23 +56,17 @@ def test_region_times_is_length_over_speed_plus_excess_plus_turns(graphs):
     times = sr.region_times(lazy, reg, TURN)
     got, free = times(pts)
     length = sum(math.dist(a, b) for a, b in zip(pts[:-1], pts[1:]))
-    spin = sr._turn_rad(pts) / OMEGA
-    assert free == pytest.approx(length / SPEED + spin)
-    assert got == pytest.approx(length * 1.5 / SPEED + spin)                 # rho 0.5 everywhere: a metre takes 1.5 x as long
-    # no angular_speed_max: no turn time; an unknown speed: nothing to predict
-    assert sr.region_times(lazy, reg, {**TURN, "angular_speed_max": None})(pts)[1] == pytest.approx(length / SPEED)
+    assert free == pytest.approx(length / SPEED)
+    assert got == pytest.approx(length * 1.5 / SPEED)                        # rho 0.5 everywhere: a metre takes 1.5 x as long
+    # length-based (D3): no turn time, with or without angular_speed_max; an unknown speed: nothing to predict
+    assert sr.region_times(lazy, reg, {**TURN, "angular_speed_max": None})(pts) == (got, free)
+    stair = [(0.0, 0.0), (0.05, 0.0), (0.05, 0.05), (0.1, 0.05), (0.1, 0.1)]   # a lattice staircase counts its length only
+    assert times(stair)[1] == pytest.approx(0.2 / SPEED)
     for bad in (None, -1, 0, float("nan")):
         assert sr.region_times(lazy, reg, {**TURN, "speed_max": bad}) is None
     assert sr.region_times(lazy, None, TURN) is None
     assert sr.region_times(lazy, pricing(lazy, [500] * len(lazy.keys), status="no_stats"), TURN) is None
     assert sr.region_times(lazy, pricing(lazy, [500] * len(lazy.keys), version=lazy.version + 1), TURN) is None
-
-
-def test_turn_radians_of_a_polyline():
-    assert sr._turn_rad([(0, 0), (1, 0), (1, 1), (0, 1)]) == pytest.approx(math.pi)
-    assert sr._turn_rad([(0, 0), (1, 0), (1, 0), (2, 0)]) == 0.0              # a repeated point is not a corner
-    assert sr._turn_rad([(0, 0), (1, 0)]) == 0.0 and sr._turn_rad([]) == 0.0
-    assert sr._turn_rad([(0, 0), (1, 0), (0, 0.01)]) == pytest.approx(math.pi - math.atan2(0.01, 1.0), rel=1e-6)   # wrapped to [0, pi]
 
 
 # ---- the plan record ---------------------------------------------------------------------------------------------
@@ -99,10 +93,17 @@ def test_shadow_serves_the_unpriced_route_and_records_the_alternative(graphs):
         assert rec["predicted_free_s"] > 0
         assert all(leg["predicted_s"] > 0 for leg in shadow.trajectory)
         assert sum(leg["predicted_s"] for leg in shadow.trajectory) == pytest.approx(rec["predicted_s"], rel=0.1, abs=0.1)
-        changed += rec["alt_route_changed"]
-        assert rec["alt_extra_m"] >= -1e-6                                     # the unpriced route is the shortest one
-        if not rec["alt_route_changed"]:
-            assert rec["alt_extra_m"] == 0.0 and rec["alt_predicted_s"] == pytest.approx(rec["predicted_s"], abs=0.01)
+        assert not [k for k in rec if k.startswith("alt_")]                    # the served record holds no second search (C2)
+        assert rec["tiles"] > 0 and rec["exact"] is True                       # P11: the served search's size
+        alt = shadow.region_alt()
+        changed += alt["alt_route_changed"]
+        assert alt["alt_extra_m"] >= -1e-6                                     # the unpriced route is the shortest one
+        assert alt["alt_tiles"] > 0 and alt["alt_exact"] is True
+        if alt["alt_route_changed"]:
+            assert alt["alt_nodes_differ"] and (alt["alt_extra_m"] > sr.ALT_MIN_EXTRA_M
+                                                or alt["alt_predicted_s"] < rec["predicted_s"] * (1 - sr.ALT_MIN_GAIN))
+        elif not alt["alt_nodes_differ"]:
+            assert alt["alt_extra_m"] == 0.0 and alt["alt_predicted_s"] == pytest.approx(rec["predicted_s"], abs=0.01)
     assert n and (changed or name == "two_rooms")
 
 
@@ -114,23 +115,49 @@ def test_the_priced_alternative_is_faster_on_the_models_account(graphs):
     n = 0
     for p, q in _trial_pairs(eng, 14, 8):
         got = _plan(lazy, p, q, reg, "shadow", trajectory=0, turn=dict(TURN, angular_speed_max=None))
-        if isinstance(got, str) or "alt_predicted_s" not in got.pricing["region"]:
+        if isinstance(got, str) or got.region_alt is None:
             continue
-        rec = got.pricing["region"]
-        assert rec["alt_predicted_s"] <= rec["predicted_s"] * 1.03 + 0.2, rec
+        rec, alt = got.pricing["region"], got.region_alt()
+        assert alt["alt_predicted_s"] <= rec["predicted_s"] * 1.03 + 0.2, (rec, alt)
         n += 1
     assert n
 
 
-def test_shadow_restores_the_graph_search_state(graphs):
-    """`graph.last` (read by the service's log line) is the served route's search, not the alternative's."""
+def test_shadow_plan_does_not_search_the_alternative(graphs):
+    """`graph.last` (read by the service's log line) is the served route's search: the plan runs no second search, it hands out the job."""
     name, eng, lazy = graphs
     reg = pricing(lazy, random_rho(lazy, 9, lo=500, hi=3000))
+    n = 0
     for p, q in _trial_pairs(eng, 4, 3):
         plan(lazy, p, q)
         want = dict(lazy.last)
-        plan(lazy, p, q, reg, "shadow")
+        got = plan(lazy, p, q, reg, "shadow")
         assert lazy.last == want
+        if not isinstance(got, str) and got.region_alt is not None:
+            assert got.pricing["region"]["tiles"] == want["tiles"]
+            n += 1
+    assert n
+
+
+def test_the_alternative_job_is_shadow_only_and_reports_noise_as_unchanged(graphs):
+    name, eng, lazy = graphs
+    reg = pricing(lazy, random_rho(lazy, 9, lo=500, hi=3000, zero_share=0.3))
+    for p, q in _trial_pairs(eng, 6, 8):
+        for mode in ("off", "on"):
+            got = plan(lazy, p, q, reg, mode)
+            assert isinstance(got, str) or got.region_alt is None
+    # equal routes under different node lists, or a gain below the thresholds, are not a change
+    route = lazy.route(lazy.keys[0], lazy.keys[-1])
+    times = lambda pts: (10.0, 9.0)                                         # noqa: E731
+    pts = [tuple(p) for p in route.nodes]
+    same = sr._region_alt(route, [pts[0], pts[-1]], times, 10.0, route, lazy)
+    assert same["alt_route_changed"] is False and same["alt_nodes_differ"] is False and same["alt_extra_m"] == 0.0
+    noisy = dataclasses.replace(route, nodes=list(reversed(route.nodes)))
+    got = sr._region_alt(route, [pts[0], pts[-1]], times, 10.0, noisy, lazy)
+    assert got["alt_nodes_differ"] is True and got["alt_route_changed"] is False
+    got = sr._region_alt(route, [pts[0], pts[-1]], times, 10.1, noisy, lazy)           # 1 % faster: a change
+    assert got["alt_route_changed"] is True
+    assert sr._region_alt(route, [], times, 10.0, None, lazy) == {"alt_error": "no_route"}
 
 
 def test_on_serves_the_priced_route_and_says_so(graphs):
@@ -198,8 +225,11 @@ def test_off_never_calls_the_region_search(graphs, monkeypatch):
     _plan(lazy, p, q, reg, "off")
     assert seen and all("region" not in kw for kw in seen)
     seen.clear()
-    plan(lazy, p, q, reg, "shadow")
-    assert len(seen) == 2 and sorted(kw for kw in seen if "region" in kw) == [["goal", "region", "start"]]   # the served route, then the alternative
+    got = plan(lazy, p, q, reg, "shadow")
+    assert len(seen) == 1 and not any("region" in kw for kw in seen)         # the plan searches the served route only (C2)
+    if not isinstance(got, str) and got.region_alt is not None:
+        got.region_alt()                                                    # the alternative, when the caller runs the job
+        assert len(seen) == 2 and sorted(kw for kw in seen if "region" in kw) == [["goal", "region", "start"]]
 
 
 # ---- the route node ----------------------------------------------------------------------------------------------
@@ -335,7 +365,58 @@ async def test_shadow_through_the_service_serves_the_unchanged_route(monkeypatch
     assert [(w.x, w.y) for w in shadow["waypoints"]] == [(w.x, w.y) for w in off["waypoints"]]
     assert shadow["chart_keys"] == off["chart_keys"] and shadow["path"] == off["path"]
     assert without_predictions(shadow["trajectory"]) == off["trajectory"]
+    await _settle(svc)
     assert svc.get_stats()["scene_graph"]["region_shadow_changed"] in (0, 1)
+    assert svc.get_stats()["scene_graph"]["region_alt"] == {"done": 1}
+
+
+async def _settle(svc):
+    import asyncio
+    while svc._alt_tasks:
+        await asyncio.wait(list(svc._alt_tasks))
+
+
+async def test_a_slow_shadow_alternative_never_delays_or_alters_the_served_plan(monkeypatch):
+    """The alternative is a task after the plan: a job that blocks (past its timeout) leaves the plan, served at once, as it is, and is
+    recorded as skipped."""
+    import threading
+    from packages import config
+    from packages.services.mission_planner import scene_route
+    off, _, _, _ = await _served(monkeypatch, "off")
+    release = threading.Event()
+    real = scene_route._region_alt
+    monkeypatch.setattr(scene_route, "_region_alt", lambda *a, **k: (release.wait(10), real(*a, **k))[1])
+    monkeypatch.setattr(config, "REGION_COST_ALT_TIMEOUT_S", 0.2)
+    try:
+        shadow, svc, _, _ = await _served(monkeypatch, "shadow")
+        assert svc._alt_tasks                                                # still pending when the plan came back
+        assert [(w.x, w.y) for w in shadow["waypoints"]] == [(w.x, w.y) for w in off["waypoints"]] and shadow["path"] == off["path"]
+        assert "alt_timeout" not in svc.get_stats()["scene_graph"]["region_alt"]
+        await _settle(svc)
+        assert svc.get_stats()["scene_graph"]["region_alt"] == {"alt_timeout": 1}
+        assert svc.get_stats()["scene_graph"]["region_shadow_changed"] == 0
+    finally:
+        release.set()
+
+
+async def test_a_busy_alt_pool_skips_the_alternative(monkeypatch):
+    import threading
+    from packages import config
+    from packages.services.mission_planner import scene_route
+    release = threading.Event()
+    real = scene_route._region_alt
+    monkeypatch.setattr(scene_route, "_region_alt", lambda *a, **k: (release.wait(10), real(*a, **k))[1])
+    monkeypatch.setattr(config, "REGION_COST_ALT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(config, "REGION_COST_ALT_MAX_INFLIGHT", 1)
+    try:
+        out, svc, _, _ = await _served(monkeypatch, "shadow")
+        await _settle(svc)
+        assert svc.get_stats()["scene_graph"]["region_alt"] == {"alt_timeout": 1}       # still running: holds the slot
+        svc._start_region_alt("m", 1, lambda: {})
+        await _settle(svc)
+        assert svc.get_stats()["scene_graph"]["region_alt"] == {"alt_timeout": 1, "alt_busy": 1}
+    finally:
+        release.set()
 
 
 async def test_a_map_outside_the_allowlist_is_off_through_the_service(monkeypatch):

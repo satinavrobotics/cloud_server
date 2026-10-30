@@ -494,7 +494,7 @@ Not merged, not deployed, `REGION_COST_MODE` defaults to `off`. Tests: `test_laz
 * `ChartPlan.pricing["region"]` (also in shadow): the snapshot's `record()` (`status`, `model_hash`, `stamp`, `graph_version`, `robot_class`,
   `rho_min`, `rho_max`, `levels` = the fallback counts per level) plus `mode`, `served` (priced | unpriced), and with a usable snapshot and
   a factsheet `speed_max`: `predicted_s`, `predicted_free_s` (the served lattice path: length / speed_max, plus the excess `rho x length /
-  speed_max` along it, plus turn radians / `angular_speed_max` when the factsheet has it), `cost_model` = `model_hash:stamp`. Shadow adds
+  speed_max` along it; no turn time since 2026-10-30), `cost_model` = `model_hash:stamp`. Shadow adds
   `alt_route_changed`, `alt_extra_m`, `alt_predicted_s`, `alt_cost` (best effort: `alt_error` on a failure). `status` is the graph's verdict
   (`version_mismatch`, `keys_mismatch`) when the snapshot is not of the graph planned on. When there is no clearance price the record
   sits in a pricing dict with the clearance fields 0 / None (profile `none`), as for a turn cost alone; the service logs a `Region cost
@@ -546,3 +546,31 @@ exact, no tile over the cap. Shadow mode is two `route()` calls, so about the su
 * `fleet_reads.LEG_COLUMNS` / the legs API do not return `predicted_s` / `cost_model` yet.
 * The cost of the ellipse refinement on a large map under `on` (the 83-chart grid doubles) has not been seen on a map with thousands of charts.
 
+
+**2026-10-30 changes (stats review `stats_review_2026-10-30.md`, work package WP-E; mode default still `off`, mode off is byte-identical:
+`tests/unit/test_region_off_golden.py` holds the route nodes, costs and digests of the code before these changes)**
+
+* **Predicted time is length-based (C1, D3).** `region_times` no longer adds a spin term (heading changes of the dense lattice path over
+  `angular_speed_max`): an off-axis line on the 8-connected lattice is a staircase and counted about 0.785 rad per step. `predicted_free_s` =
+  length / `speed_max`, `predicted_s` adds `rho x length / speed_max`, as in the replay that calibrated the model. This changes `predicted_s`,
+  `predicted_free_s`, `alt_predicted_s` and the leg `predicted_s` (hence `run_legs.predicted_s`) for the same plan.
+* **The shadow alternative runs after the plan is served (C2).** `plan_on_graph` no longer runs the second `graph.route`; `ChartPlan.region_alt`
+  is a job the service runs as a separate task on its own one-thread pool (`sg-alt`) once the served plan is logged. `REGION_COST_ALT_TIMEOUT_S`
+  (5 s) bounds it and `REGION_COST_ALT_MAX_INFLIGHT` (2) caps the queue; a busy pool or a timeout is counted in `get_stats()["scene_graph"]
+  ["region_alt"]` (`alt_busy`, `alt_timeout`, `alt_error`, `done`) and logged as `alt_skipped`. **API shape:** `pricing.region` no longer holds
+  `alt_route_changed`, `alt_extra_m`, `alt_predicted_s`, `alt_cost` or `alt_error`; they are in the `Region cost alt` log line (with
+  `alt_nodes_differ`, `alt_tiles`, `alt_exact`) and `region_shadow_changed` counts them. The alternative never delays or alters the served plan.
+* **`alt_route_changed` is a threshold (P10).** The alternative must be more than 0.05 m longer or predicted more than 0.5 % faster;
+  `alt_nodes_differ` keeps the raw node-list comparison (tie-break noise between equal-cost routes inflated `region_shadow_changed`).
+* **Ellipse growth is measurable (P11).** `pricing.region` and the `Region cost plan` line carry `tiles` and `exact` of the served search; the alt
+  line carries `alt_tiles` and `alt_exact`. Read them in shadow before ever turning `on` (with `rho_cap` 3 and `rho_min` near 0 the admissible
+  ellipse can be up to 4x longer: more tiles, `CorridorTooLarge`, `exact=False`).
+* **Snapshot cache (P8, I16, P9).** `LOAD_TIMEOUT_S` is 0.3 s; a failed or timed-out read is cached as the neutral `load_error` snapshot for
+  `LOAD_ERROR_TTL_S` (5 s). Neutral snapshots carry their status in `RegionPricing.key`, so `stamp_mismatch`, `version_mismatch`,
+  `no_build_for_version` and `load_error` no longer stand for each other. `PlanGraph.region_why` judges the version and the charts before
+  `rho_max`; `region_arg` is memoised per snapshot and the charts are compared by identity with `PlanGraph.keys_t` first; the snapshot cache's
+  latest-index is evicted with its LRU entry.
+* **Levels (I15).** `LEVELS` is `class, pooled, map, prior` (the order the chain prefers them), so provenance ranks `pooled` above `map`.
+* **Cleanup (R4).** Removed `RegionPricing.rho_of` and `.levels` (the per-level counts stay in `provenance`), `Term.kind`, `Contribution.n_eff`,
+  the second `MODES` check, `weights.REGION_RHO_SCALE` (`region_costs` takes the snapshot's scale) and the second speed rule
+  (`region_cost.speed_usable`). The term composer stays (it is the `REGION_COST_TERMS` contract and part of `model_hash`).

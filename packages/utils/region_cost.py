@@ -42,10 +42,9 @@ import numpy as np
 from packages import config
 from packages.utils.region_stats_load import RegionStat, RegionStats
 
-# quality of a chart's figure, best first
-LEVELS = ("class", "map", "pooled", "prior")
+# quality of a chart's figure, best first: a chart without class data prefers the pooled figure to the map-wide one (Term.value)
+LEVELS = ("class", "pooled", "map", "prior")
 USABLE_BUILDS = ("ok", "stale")          # a stale build (a rebuild is pending) is still real data
-MODES = ("off", "shadow", "on")
 
 
 class Sums(NamedTuple):
@@ -78,7 +77,6 @@ class StatChain:
 @dataclasses.dataclass(frozen=True)
 class Contribution:
     rho: float               # >= 0, excess time per metre x speed_max
-    n_eff: float             # samples of the chart behind it (0 = all prior)
     level: str               # one of LEVELS
 
 
@@ -86,12 +84,11 @@ class Contribution:
 class Term:
     """A pure function from a chart's statistics chain to an excess rho. `figure` reads the ratio of sums that is
     shrunk (e.g. normalised moving time per metre); `baseline` is what the figure is at the factsheet speed (1 for a
-    pace, 0 for a stop share); `kind` "excess_s_per_m" terms are additive inside the search."""
+    pace, 0 for a stop share). Terms add up inside the search."""
     name: str
     version: int
     figure: Callable[[Sums], float]
     baseline: float = 0.0
-    kind: str = "excess_s_per_m"
 
     def value(self, chain: StatChain, n0: float) -> Contribution:
         n = chain.chart_class.runs
@@ -111,7 +108,7 @@ class Term:
             x = (n * xbar + n0 * prior) / (n + n0)
         else:
             x = prior
-        return Contribution(max(0.0, x - self.baseline), n, level)
+        return Contribution(max(0.0, x - self.baseline), level)
 
     def _ratio(self, s: Sums) -> Optional[float]:
         return self.figure(s) if s.len_m > 0 else None
@@ -203,7 +200,7 @@ def parse_terms(text: str) -> Tuple[Tuple[str, float], ...]:
 class RegionPricing:
     """Immutable snapshot for one (map, graph version, robot class, build, model). `rho[i]` belongs to `keys[i]` (the
     keys of the SAME graph version, in the planner's order), an int32 in units of 1 / `scale`; all 0 unless `status`
-    is "ok". `levels[i]` is the fallback level of chart i, `provenance` the count per level."""
+    is "ok". `provenance` is the count of charts per fallback level."""
     map_id: str
     graph_version: int
     robot_class: str
@@ -213,25 +210,20 @@ class RegionPricing:
     keys: Tuple[str, ...]
     rho: np.ndarray
     scale: int
-    levels: Tuple[str, ...]
     provenance: Tuple[Tuple[str, int], ...]
     rho_min: int
     rho_max: int
 
     @property
     def key(self) -> Tuple[str, int, str, Optional[str], str]:
-        """The cache key of the snapshot."""
-        return (self.map_id, self.graph_version, self.robot_class, self.stamp, self.model_hash)
+        """The cache key of the snapshot. A neutral snapshot carries its status in the stamp slot: the neutral statuses
+        (stamp_mismatch, version_mismatch, no_build_for_version, load_error) have no stamp or share one, and must not stand for each other."""
+        return (self.map_id, self.graph_version, self.robot_class,
+                self.stamp if self.status == "ok" else "%s:%s" % (self.stamp, self.status), self.model_hash)
 
     @property
     def active(self) -> bool:
         return self.status == "ok"
-
-    def rho_of(self, chart_key: str) -> int:
-        try:
-            return int(self.rho[self.keys.index(chart_key)])
-        except ValueError:
-            return 0
 
     def record(self) -> Dict[str, object]:
         """The part of the plan record that identifies the snapshot (docs/planner_region_stats_2026-10-27.md 7)."""
@@ -251,8 +243,14 @@ def _snapshot(map_id: str, graph_version: int, robot_class: str, stamp: Optional
     arr.setflags(write=False)
     counts = [(lv, sum(1 for x in levels if x == lv)) for lv in LEVELS]
     return RegionPricing(map_id, int(graph_version), robot_class, stamp, model.model_hash, status, tuple(keys), arr,
-                         model.scale, tuple(levels), tuple((lv, n) for lv, n in counts if n),
+                         model.scale, tuple((lv, n) for lv, n in counts if n),
                          int(arr.min()) if arr.size else 0, int(arr.max()) if arr.size else 0)
+
+
+def speed_usable(speed_max: Optional[float], speed_basis: str) -> bool:
+    """Whether a planning robot's speed prices anything: a real factsheet speed_max (a placeholder or missing one switches the term off,
+    decision 5). The one place that decides it (`build_snapshot`, and the snapshot cache before it reads)."""
+    return speed_basis == "factsheet" and speed_max is not None and math.isfinite(speed_max) and speed_max > 0
 
 
 def neutral(map_id: str, graph_version: int, robot_class: str, keys: Sequence[str], model: CostModel,
@@ -276,7 +274,7 @@ def build_snapshot(map_id: str, graph_version: int, robot_class: str, keys: Sequ
     def neutral_with(status: str, stamp: Optional[str] = None) -> RegionPricing:
         return neutral(map_id, graph_version, robot_class, keys, model, status, stamp)
 
-    if speed_basis != "factsheet" or speed_max is None or not (math.isfinite(speed_max) and speed_max > 0):
+    if not speed_usable(speed_max, speed_basis):
         return neutral_with("no_speed_max")
     present = [s for s in (stats_class, stats_pooled) if s is not None]
     if not present or any(s.stamp is None for s in present):
@@ -317,7 +315,7 @@ def _total(charts: Mapping[str, RegionStat]) -> Sums:
 def mode_for(map_id: str) -> str:
     """off | shadow | on for a map: REGION_COST_MODE, and only for the maps in REGION_COST_MAPS ('*' = all)."""
     mode = config.REGION_COST_MODE
-    if mode not in MODES or mode == "off":
+    if mode not in ("shadow", "on"):               # off, and anything else
         return "off"
     allowed = config.REGION_COST_MAPS
     return mode if ("*" in allowed or map_id in allowed) else "off"

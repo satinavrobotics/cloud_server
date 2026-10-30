@@ -9,7 +9,6 @@ import numpy as np
 from packages.scene_graph.api import edge_weight
 
 ROUTE_UNIT_M = 1e-4     # the route cost unit: a path cost is an integer count of these
-REGION_RHO_SCALE = 1000  # region excess rho (time over the ideal time per metre, x speed_max) is an integer count of 1 / this
 
 
 def edge_costs(length_m, deficit_sum, rate):
@@ -21,7 +20,7 @@ def edge_costs(length_m, deficit_sum, rate):
     return np.maximum(np.ceil(units - 1e-6), 1.0)
 
 
-def region_costs(length_m, rho_a, rho_b, scale=REGION_RHO_SCALE):
+def region_costs(length_m, rho_a, rho_b, scale):
     """The integer cost of the time a region statistic says the edges take beyond the ideal, added to `edge_costs`: an edge of
     length l between cells of excess rho_a and rho_b (ints, units of 1 / scale, the chart's excess time per metre x speed_max)
     costs `ceil(l / ROUTE_UNIT_M * (rho_a + rho_b) / (2 * scale) - 1e-6)` more, 0 for rho 0. Never negative, so every edge still

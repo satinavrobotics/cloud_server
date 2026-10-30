@@ -240,6 +240,9 @@ class ChartPlan:
     # `model_hash:stamp` of the region cost snapshot the plan's predicted times come from (pricing["region"]["cost_model"]); None when
     # no snapshot was used (mode off, no usable statistics). Recording data, never part of the route digest
     cost_model: Optional[str] = None
+    # shadow mode: the job that searches the priced alternative (`_region_alt`), for the CALLER to run after the plan is served, off the
+    # request's path (docs/planner_region_stats_2026-10-27.md 12); None in every other mode. Never part of the served plan
+    region_alt: Optional[Callable[[], Dict[str, Any]]] = None
 
 
 class BoundedPool:
@@ -990,38 +993,24 @@ def budget_pull(graph: Any, safety: Any, budget_m: float, region: Any = None) ->
     return pull
 
 
-def _turn_rad(pts: Sequence[Pt]) -> float:
-    """The sum of the absolute heading changes along a polyline (rad); zero-length pieces are skipped."""
-    total, prev = 0.0, None
-    for p, q in zip(pts[:-1], pts[1:]):
-        if p == q:
-            continue
-        ang = math.atan2(q[1] - p[1], q[0] - p[0])
-        if prev is not None:
-            total += abs((ang - prev + math.pi) % (2.0 * math.pi) - math.pi)
-        prev = ang
-    return total
-
-
 def region_times(graph: Any, region: Any, turn: Optional[Dict[str, Any]]) -> Optional[Callable[[Sequence[Pt]], Tuple[float, float]]]:
     """`times(points) -> (predicted_s, predicted_free_s)` of a polyline for the planning robot, or None when there is nothing to predict
     with: no snapshot, one that is not `active`, of another version / charts than the graph's, or a robot without a real speed_max.
-    predicted_free_s = length / speed_max (+ turn time with the factsheet's angular_speed_max); predicted_s adds the excess time of
-    the charts the polyline runs through (rho x length / speed_max, `chord_excess`)."""
+    predicted_free_s = length / speed_max; predicted_s adds the excess time of the charts the polyline runs through (rho x length /
+    speed_max, `chord_excess`). Length-based like the replay that calibrated the model (scripts/analysis/region_cost_replay.py): no
+    turn time (the moving figures already hold the turning slowness; counting the heading changes of the dense lattice path would
+    add about 0.8 rad per step of a staircase)."""
     why = getattr(graph, "region_why", None)
     if region is None or not callable(why) or not region.active or why(region) not in ("priced", "neutral"):
         return None
     speed = _number((turn or {}).get("speed_max"))
-    omega = _number((turn or {}).get("angular_speed_max"))
     if speed is None or not (math.isfinite(speed) and speed > 0.0):
         return None
-    omega = omega if omega is not None and math.isfinite(omega) and omega > 0.0 else None
     excess = chord_excess(graph, region)
 
     def times(pts: Sequence[Pt]) -> Tuple[float, float]:
         length = sum(math.dist(p, q) for p, q in zip(pts[:-1], pts[1:]))
-        spin = _turn_rad(pts) / omega if omega is not None else 0.0
-        return ((length + sum(excess(p, q) for p, q in zip(pts[:-1], pts[1:]))) / speed + spin, length / speed + spin)
+        return (length + sum(excess(p, q) for p, q in zip(pts[:-1], pts[1:]))) / speed, length / speed
 
     return times
 
@@ -1057,38 +1046,56 @@ def waypoints_below_floor(graph: Any, poses: Sequence[Any], safety: Any, floor: 
     return n
 
 
+ALT_MIN_EXTRA_M = 0.05          # a shadow alternative counts as a different route when it is this much longer ...
+ALT_MIN_GAIN = 0.005            # ... or predicted this share faster (tie-break noise between equal-cost routes is neither)
+
+
 def _region_record(graph: Any, region: Any, mode: str, turn: Dict[str, Any], route: Any, lattice: Sequence[Pt],
-                   legs: Optional[List[Dict[str, Any]]], priced: bool, route_with: Callable[..., Any]) -> Dict[str, Any]:
-    """`pricing["region"]` of a plan (docs/planner_region_stats_2026-10-27.md 7): the snapshot's identity and status (`status` is the
-    graph's verdict when the snapshot is not of this version / these charts), `mode`, `served` ("priced" | "unpriced"), the fallback
-    counts per level, and with a usable snapshot and a factsheet speed_max `predicted_s` / `predicted_free_s` of the served lattice
-    path (`region_times`), `cost_model`, and `predicted_s` on the trajectory `legs`. Shadow adds what the priced route would have been
-    (`route_with(region=...)`: best effort): `alt_route_changed`, `alt_extra_m`, `alt_predicted_s`, `alt_cost`."""
+                   legs: Optional[List[Dict[str, Any]]], priced: bool, route_with: Callable[..., Any],
+                   served_last: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], Optional[Callable[[], Dict[str, Any]]]]:
+    """(`pricing["region"]` of a plan, shadow alternative job) (docs/planner_region_stats_2026-10-27.md 7): the snapshot's identity and
+    status (`status` is the graph's verdict when the snapshot is not of this version / these charts), `mode`, `served` ("priced" |
+    "unpriced"), the fallback counts per level, and with a usable snapshot and a factsheet speed_max `predicted_s` / `predicted_free_s`
+    of the served lattice path (`region_times`), `cost_model`, and `predicted_s` on the trajectory `legs`; `tiles` / `exact` of the served
+    search (`served_last`, `route`). Shadow also returns the job that searches what the priced route would have been
+    (`route_with(region=...)`, see `_region_alt`): it is NOT run here, so the served plan never waits for it."""
     why = graph.region_why(region) if callable(getattr(graph, "region_why", None)) else "unsupported_graph"
-    rec: Dict[str, Any] = {**region.record(), "mode": mode, "served": "priced" if priced else "unpriced"}
+    rec: Dict[str, Any] = {**region.record(), "mode": mode, "served": "priced" if priced else "unpriced",
+                           "tiles": (served_last or {}).get("tiles"), "exact": bool(getattr(route, "exact", True))}
     if why in ("version_mismatch", "keys_mismatch", "unsupported_graph"):
         rec["status"] = why
     times = region_times(graph, region, turn)
     if times is None:
-        return rec
+        return rec, None
     rec["predicted_s"], rec["predicted_free_s"] = (round(v, 3) for v in times(lattice))
     rec["cost_model"] = cost_model_of(region)
     annotate_predicted(legs, times)
+    job = None
     if mode == "shadow" and why == "priced":
-        saved = getattr(graph, "last", None)
-        try:
-            alt = route_with(region=region)
-            if alt is not None and alt.nodes:
-                alt_pts = [lattice[0]] + [tuple(p) for p in alt.nodes] + [lattice[-1]]
-                rec.update(alt_route_changed=[tuple(p) for p in alt.nodes] != [tuple(p) for p in route.nodes],
-                           alt_extra_m=round(float(alt.length) - float(route.length), 3),
-                           alt_predicted_s=round(times(alt_pts)[0], 3), alt_cost=int(alt.cost))
-        except Exception as err:  # pylint: disable=broad-except
-            rec["alt_error"] = type(err).__name__
-        finally:
-            if saved is not None:
-                graph.last = saved                           # the served route's search stays what `last` says
-    return rec
+        def job() -> Dict[str, Any]:
+            try:
+                return _region_alt(route, lattice, times, rec["predicted_s"], route_with(region=region), graph)
+            except Exception as err:  # pylint: disable=broad-except
+                return {"alt_error": type(err).__name__}
+    return rec, job
+
+
+def _region_alt(route: Any, lattice: Sequence[Pt], times: Callable[[Sequence[Pt]], Tuple[float, float]], served_s: float,
+                alt: Any, graph: Any) -> Dict[str, Any]:
+    """The shadow comparison of the served `route` with the priced route `alt` (searched just before, by the job):
+    `alt_route_changed` (a real difference: the alternative is longer by more than ALT_MIN_EXTRA_M or predicted more than ALT_MIN_GAIN
+    faster; equal-cost routes that differ in their node lists are tie-break noise), `alt_nodes_differ` (the raw node comparison),
+    `alt_extra_m`, `alt_predicted_s`, `alt_cost`, and the search's `alt_tiles` / `alt_exact`."""
+    if alt is None or not alt.nodes:
+        return {"alt_error": "no_route"}
+    alt_pts = [lattice[0]] + [tuple(p) for p in alt.nodes] + [lattice[-1]]
+    alt_s = round(times(alt_pts)[0], 3)
+    extra = round(float(alt.length) - float(route.length), 3)
+    differ = [tuple(p) for p in alt.nodes] != [tuple(p) for p in route.nodes]
+    gain = (served_s - alt_s) / served_s if served_s > 0 else 0.0
+    return {"alt_route_changed": bool(differ and (extra > ALT_MIN_EXTRA_M or gain > ALT_MIN_GAIN)), "alt_nodes_differ": differ,
+            "alt_extra_m": extra, "alt_predicted_s": alt_s, "alt_cost": int(alt.cost),
+            "alt_tiles": (getattr(graph, "last", None) or {}).get("tiles"), "alt_exact": bool(getattr(alt, "exact", True))}
 
 
 def _keepout_detour(graph: Any, keep: Any, transient: Any, snap_a: Any, snap_b: Any, route: Any,
@@ -1181,7 +1188,8 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
     ChartFallback(BLOCKED_BY_KEEPOUT, info) which the caller must report, not hand to the legacy planner. `region` is the planning robot's
     `RegionPricing` and `region_mode` "off" | "shadow" | "on" (`region_cost.mode_for`; docs/planner_region_stats_2026-10-27.md 5, 7):
     "on" prices the route (search, string pull, corridor legs) with the region term; "shadow" serves today's route and records, in
-    `pricing["region"]`, the predicted time of it and what the priced route would have been; "off" (or no snapshot) does nothing."""
+    `pricing["region"]`, the predicted time of it; what the priced route would have been is the plan's `region_alt` job, which the caller
+    runs after serving (it is a second full search); "off" (or no snapshot) does nothing."""
     from packages.scene_graph.api import Blocked, MissingTiles
     from packages.services.mission_planner.lazy_plan import CorridorTooLarge
     snap_a = graph.snap(start_xy[0], start_xy[1], start_snap_m)
@@ -1220,6 +1228,7 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
         raise ChartFallback("missing_tiles") from err
     except CorridorTooLarge as err:
         raise ChartFallback("corridor_too_large") from err
+    served_last = dict(getattr(graph, "last", None) or {}) if region is not None else None     # the served search, before the legs' own
     if route is None or not route.nodes:
         if kcells is not None:
             # cut off by the keep-out zones alone? (the transient overlay and the zones are told apart by routing without the zones)
@@ -1335,11 +1344,11 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                    "profile": "exp" if exp else "hinge", "k": safety.k, "origin": safety.origin, "reach": safety.margin,
                    "floor": floor,
                    "waypoints_below_floor": waypoints_below_floor(graph, poses, safety, floor), "turn": turn}
-    rec = None
+    rec, alt_job = None, None
     if region is not None:
-        rec = _region_record(graph, region, region_mode, turn, route, lattice, legs, serve is not None,
-                             lambda **kw: graph.route(snap_a.key, snap_b.key, blocked, start=(snap_a.x, snap_a.y),
-                                                      goal=(snap_b.x, snap_b.y), **{**extra, **kw}))
+        rec, alt_job = _region_record(graph, region, region_mode, turn, route, lattice, legs, serve is not None,
+                                      lambda **kw: graph.route(snap_a.key, snap_b.key, blocked, start=(snap_a.x, snap_a.y),
+                                                               goal=(snap_b.x, snap_b.y), **{**extra, **kw}), served_last)
         if pricing is None:                                  # the region record alone: the clearance fields are 0 / None
             pricing = {"kappa": 0.0, "margin": None, "rate": 0.0, "margin_source": None, "cost": int(route.cost),
                        "exact": bool(getattr(route, "exact", True)), "profile": "none", "k": None, "origin": None, "reach": None,
@@ -1356,4 +1365,4 @@ def _plan_on_graph(graph: Any, map_id: str, start_xy: Pt, goal_xy: Pt,
                      min_width=min_width, goal_xy=(snap_b.x, snap_b.y),
                      repeated_leaf_ids=planned is not None and len(set(planned)) != len(planned), node_policy=report, pricing=pricing,
                      trajectory=legs, waypoint_budget=budget_record, goal_far=goal_far, keepout=keepout_report,
-                     cost_model=None if rec is None else rec.get("cost_model"))
+                     cost_model=None if rec is None else rec.get("cost_model"), region_alt=alt_job)
