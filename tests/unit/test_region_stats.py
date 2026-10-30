@@ -25,6 +25,7 @@ from packages.utils import run_cells_db as rdb  # noqa: E402
 pytestmark = pytest.mark.unit
 
 NOW = datetime.datetime.now(datetime.timezone.utc)
+BUILT = json.dumps({"builder": rs.BUILDER_VERSION})
 CLASS_A, CLASS_B = "AMR|0.80x0.50", "AMR|1.00x0.60"
 
 
@@ -95,7 +96,7 @@ class Cur:
             self.rows = [(r.run_id, r.created_at) for r in self.db.runs]
         elif s.startswith("SELECT DISTINCT map_id FROM run_cells"):
             self.rows = [(m,) for m in sorted({r.map_id for r in self.db.runs})]
-        elif s.startswith("SELECT map_id, graph_version, status FROM region_stats_builds"):
+        elif s.startswith("SELECT map_id, graph_version, status, detail FROM region_stats_builds"):
             self.rows = list(self.db.builds)
         elif s.startswith("SELECT graph_version, stamp, built_at, status, runs FROM region_stats_builds"):
             rows = [b for b in self.db.build_rows if args[0] == b[0] and (len(args) < 2 or args[1] == b[1])]
@@ -187,6 +188,28 @@ class TestAggregate:
         assert a["first_at"] == a["last_at"] == db.runs[0].started_at and a["stamp"] == got.stamp
         assert s[("A", "*")]["runs"] == 1 and s[("A", "*")]["speed_max"] is None
         assert s[("A", "*")]["len_m"] == a["len_m"]
+
+    def test_the_sample_gate_keeps_obstructed_short_passes(self, patched):
+        reads = Reads(1, [(-10_000, "A")])
+        # 0.6 m driven (below REGION_STATS_MIN_LEN_M) in each case
+        plain = make_run(1, range(0, 5))
+        blocked = make_run(2, range(0, 5), blocks_at=(2,))
+        waited = make_run(3, range(0, 5), stopped_per_cell=2.5)              # 12.5 s stopped
+        brief = make_run(4, range(0, 5), stopped_per_cell=1.0)               # 5 s: not enough
+        got = collect(patched(Db([plain, blocked, waited, brief])), reads)
+        a = by_key(got.stats)[("A", CLASS_A)]
+        assert a["runs"] == 2 and a["blocks"] == 1 and a["stopped_s"] == pytest.approx(12.5)
+        # no sample reached the length gate: no pace, but the event figures are there
+        assert a["pace_median_s_per_m"] is None and a["pace_p90_s_per_m"] is None
+        assert a["moving_pace_median_s_per_m"] is None and a["stopped_share"] is not None
+
+    def test_pace_percentiles_use_only_the_long_samples(self, patched):
+        long_run = make_run(1, range(0, 30), pace=2.0)
+        short_blocked = make_run(2, range(0, 5), pace=50.0, blocks_at=(1,), age_h=1)
+        got = collect(patched(Db([long_run, short_blocked])), Reads(1, [(-10_000, "A")]))
+        a = by_key(got.stats)[("A", CLASS_A)]
+        assert a["runs"] == 2 and a["blocks"] == 1
+        assert a["pace_median_s_per_m"] == pytest.approx(2.0) and a["pace_p90_s_per_m"] == pytest.approx(2.0)
 
     def test_totals_are_conserved(self, patched):
         run = make_run(1, range(0, 30))
@@ -358,17 +381,26 @@ class TestMapsNeedingBuild:
     def test_cases(self, patched):
         db = patched(Db([make_run(1, range(0, 20))]))
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # never built
-        db.builds = [("m", 3, "ok")]
+        db.builds = [("m", 3, "ok", BUILT)]
         assert self.need(db, Reads(3, [(0, "A")])) == []                       # up to date
         assert self.need(db, Reads(4, [(0, "A")])) == ["m"]                    # a new graph version
-        db.builds = [("m", 3, "stale")]
+        db.builds = [("m", 3, "stale", BUILT)]
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # a run was deleted
         db.runs = []
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... even when its last run is gone
         db.runs = [make_run(1, range(0, 20))]
-        db.builds = [("m", 0, "no_scene_graph")]
+        db.builds = [("m", 0, "no_scene_graph", BUILT)]
         assert self.need(db, Reads(3, [(0, "A")], graph=False)) == []          # nothing to build without a graph
         assert self.need(db, Reads(3, [(0, "A")])) == ["m"]                    # ... until the graph appears
+
+    def test_a_build_of_another_builder_version_is_redone(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        db.builds = [("m", 3, "ok", None)]                                     # a legacy build has no detail
+        assert self.need(db, Reads(3, [(0, "A")])) == ["m"]
+        db.builds = [("m", 3, "ok", json.dumps({"builder": rs.BUILDER_VERSION - 1}))]
+        assert self.need(db, Reads(3, [(0, "A")])) == ["m"]
+        db.builds = [("m", 3, "ok", BUILT)]
+        assert self.need(db, Reads(3, [(0, "A")])) == []
 
 
 class TestRoute:
