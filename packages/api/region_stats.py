@@ -39,6 +39,7 @@ import datetime
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -190,6 +191,24 @@ async def current_version(reads: Any, map_id: str) -> Optional[int]:
     return None if topo is None else int(topo["version"])
 
 
+_VERSIONS: Dict[str, Tuple[float, int]] = {}      # map_id -> (monotonic time, graph version) for maps_needing_build
+
+
+async def cached_version(reads: Any, map_id: str) -> Optional[int]:
+    """`current_version` for the poll: the answer is kept REGION_STATS_VERSION_TTL_S (a graph version found is
+    cached, a missing one is asked again) so an idle map costs no topology read per poll."""
+    now = time.monotonic()
+    hit = _VERSIONS.get(map_id)
+    if hit is not None and now - hit[0] < config.REGION_STATS_VERSION_TTL_S:
+        return hit[1]
+    ver = await current_version(reads, map_id)
+    if ver is None:
+        _VERSIONS.pop(map_id, None)
+    else:
+        _VERSIONS[map_id] = (now, ver)
+    return ver
+
+
 async def collect(db: Any, reads: Any, map_id: str, robot: Optional[str] = None) -> Collected:
     """Read the map's summaries of the window and group them by the current owner raster. Raises when the
     scene-graph read fails (a build must not store a wrong version)."""
@@ -282,6 +301,7 @@ async def build_map(db: Any, reads: Any, map_id: str, version: Optional[int] = N
                 "(SELECT graph_version FROM region_stats_builds WHERE map_id = %s "
                 "ORDER BY graph_version DESC LIMIT %s)", (map_id, map_id, config.REGION_STATS_KEEP_VERSIONS))
     CACHE.discard_map(map_id)
+    _VERSIONS.pop(map_id, None)
     logger.info("Region stats of %s: version %s, %d runs, %d rows (%s)", map_id, ver, runs, len(got.stats), status)
     return {"graph_version": ver, "status": status, "runs": runs, "charts": len(got.stats), "stamp": got.stamp}
 
@@ -312,7 +332,7 @@ async def maps_needing_build(db: Any, reads: Any) -> List[str]:
     out = []
     for map_id in sorted(wanted):
         have = builds.get(map_id, {})
-        ver = await current_version(reads, map_id)
+        ver = await cached_version(reads, map_id)
         if ver is None:
             if not have or any(b[0] == "stale" for b in have.values()):
                 out.append(map_id)

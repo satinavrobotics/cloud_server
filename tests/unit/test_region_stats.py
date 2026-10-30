@@ -383,8 +383,27 @@ class TestBuildMap:
 
 
 class TestMapsNeedingBuild:
-    def need(self, db, reads):
+    def need(self, db, reads, fresh=True):
+        if fresh:
+            rs._VERSIONS.clear()
         return asyncio.run(rs.maps_needing_build(db, reads))
+
+    def test_the_graph_version_is_cached_between_polls(self, patched):
+        db = patched(Db([make_run(1, range(0, 20))]))
+        db.builds = [("m", 3, "ok", BUILT, NOW, 1)]
+
+        class Counting(Reads):
+            calls = 0
+
+            async def topology(self, map_id):
+                Counting.calls += 1
+                return await super().topology(map_id)
+        reads = Counting(3, [(0, "A")])
+        assert self.need(db, reads) == [] and self.need(db, reads, fresh=False) == []
+        assert Counting.calls == 1
+        assert self.need(db, Reads(4, [(0, "A")]), fresh=False) == []          # still the cached version 3 ...
+        rs._VERSIONS["m"] = (rs._VERSIONS["m"][0] - config.REGION_STATS_VERSION_TTL_S - 1, 3)
+        assert self.need(db, Reads(4, [(0, "A")]), fresh=False) == ["m"]       # ... until the TTL has passed
 
     def test_cases(self, patched):
         db = patched(Db([make_run(1, range(0, 20))]))
