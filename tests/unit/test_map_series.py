@@ -119,7 +119,7 @@ def rs_respond(sql, params):
 
 @pytest.fixture
 def eff(monkeypatch):
-    async def fake(db, map_id, start, end, robot):
+    async def fake(db, map_id, start, end, robot, key=None):
         return {"ra": (100.0, 125.0, 3), "rb": (50.0, 50.0, 1), "rc": (10.0, 20.0, 1)}
     monkeypatch.setattr(map_series, "_efficiency", fake)
 
@@ -311,3 +311,19 @@ async def test_routes_without_series_are_unchanged(eff):
     resp = await _get(FakeDb(lambda s, p: []), "/api/v1/maps/m/events-summary?series=day")
     assert resp.status_code == 200 and resp.json()["series"]["bucket"] == "day"
     assert len(resp.json()["series"]["t"]) in (30, 31)
+
+
+async def test_series_efficiency_shares_the_headline_load(monkeypatch):
+    """The headline's efficiency block and the series' per-run figures come from one cached load."""
+    from packages.api import path_efficiency
+    loads = []
+
+    async def fake_load(db, map_id, start, end, robot, run_id=None):
+        loads.append(1)
+        return path_efficiency.Loaded([], {}, {}, False)
+    monkeypatch.setattr(path_efficiency, "load", fake_load)
+    monkeypatch.setattr(path_efficiency, "CACHE", ResultCache(4, 60))
+    out = {"window": {"from": START.isoformat(), "to": END.isoformat()}}
+    await path_efficiency.attach(out, None, "office7", START, END, None)
+    assert await map_series._efficiency(None, "office7", START, END, None, ("office7", START, END, None)) == {}
+    assert len(loads) == 1
