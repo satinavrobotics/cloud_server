@@ -8,19 +8,24 @@ version's rows are a rebuildable cache, dropped and recomputed from `run_cells` 
 `collect` (read side, also used by the route for a robot filter) maps every summarised cell of a map to its chart
 with the same owner-raster lookup drive-stats uses (`drive_stats.regions_of`), and `aggregate` (pure) turns that into
 rows:
-* A (run, chart) pair is a SAMPLE when the run drove at least REGION_STATS_MIN_LEN_M in the chart (drops boundary
-  clips). Per (chart, robot_class) the newest REGION_STATS_MAX_RUNS samples by the run's start are kept; the
-  robot_class '*' pools all classes and keeps the newest MAX_RUNS samples of the chart over all of them.
-* Per (chart, class): sums over the kept samples; pace = time_s / len_m PER SAMPLE and its median / p90 (linear
-  percentile) over the samples; moving pace the same with time_s - stopped_s; ratios from the sums (NULL on a zero
-  denominator); `runs` = the kept samples; `visited` = distinct 0.1 m cells of the chart with movement in them;
-  `speed_max` = the class's factsheet speed_max when all its samples agree (NULL for '*' or unknown). Moving time is
-  time - stopped (transit) - dwell (waiting at the start, goal and action nodes, algo_version 2).
+* A (run, chart) pair is a SAMPLE (is_sample) when the run drove at least REGION_STATS_MIN_LEN_M in the chart (drops
+  boundary clips) or was obstructed there (a block, or stopped + recovery >= REGION_STATS_MIN_EVENT_S); the obstructed
+  short passes are the ones that matter for cost. Per (chart, robot_class) the newest REGION_STATS_MAX_RUNS samples by
+  the run's start are kept; the robot_class '*' pools all classes and keeps the newest MAX_RUNS samples of the chart
+  over all of them.
+* Per (chart, class): sums over the kept samples; `pace_*` = GROSS pace, time_s / len_m PER SAMPLE (stopped seconds and
+  dwell included) and its median / p90 (linear percentile) over the samples that pass the length gate (a pace needs a
+  length); `moving_pace_median_s_per_m` the same with the moving time, time_s - stopped_s - dwell_s (transit stops and
+  the waits at the start, goal and action nodes both out; algo_version 2); `moving_speed_mps` = len_m over the summed
+  moving time; `stopped_share` = stopped_s / (time_s - dwell_s) (the dwell is neither moving nor a stop in transit);
+  other ratios from the sums (NULL on a zero denominator); `runs` = the kept samples; `visited` = distinct 0.1 m
+  cells of the chart with movement in them; `speed_max` = the class's factsheet speed_max when all its samples agree
+  (NULL for '*' or unknown).
 * `norm_*` (docs/planner_region_stats_2026-10-27.md 10, decision 2): the class key has no speed_max, so pace is
   normalised by each run's own speed_max: over the kept samples whose run has a factsheet speed (`speed_basis`
   "factsheet", not a placeholder) `norm_len_m` = metres, `norm_moving_m` = moving seconds x speed_max, `norm_stopped_m` =
   stopped seconds x speed_max, `norm_runs` = those samples. See region_stats_load.
-* `stamp` = sha1 (16 hex) of (algo_version, window, min length, max runs, sorted (run_id, created_at) of the inputs).
+* `stamp` = sha1 (16 hex) of (algo_version, BUILDER_VERSION, window, min length, min event, max runs, sorted (run_id, created_at) of the inputs).
   Day decay, priors and shrinkage are the planner's job (it has `runs`).
 
 `build_map` writes one (map, graph version) in one transaction (delete + insert + its region_stats_builds row) and
@@ -160,7 +165,7 @@ def _stat_row(map_id: str, version: int, chart: str, cls: str, kept: List[Dict[s
     return {"map_id": map_id, "graph_version": version, "chart_key": chart, "robot_class": cls, "runs": len(kept),
             "len_m": len_m, "time_s": time_s, "stopped_s": stopped, "recovery_s": rec, "blocks": blocks,
             "pace_median_s_per_m": p50, "pace_p90_s_per_m": p90, "moving_pace_median_s_per_m": m50,
-            "moving_speed_mps": _ratio(len_m, time_s - stopped - dwell), "stopped_share": _ratio(stopped, time_s),
+            "moving_speed_mps": _ratio(len_m, time_s - stopped - dwell), "stopped_share": _ratio(stopped, time_s - dwell),
             "recovery_s_per_100m": _ratio(rec * 100.0, len_m), "blocks_per_run": blocks / len(kept),
             "speed_max": (None if cls == POOLED or len(speeds) != 1 or None in speeds else float(speeds.pop())),
             "cells": int(chart_cells), "visited": int(np.unique(np.concatenate(cell_keys)).size),

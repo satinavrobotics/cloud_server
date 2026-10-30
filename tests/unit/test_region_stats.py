@@ -211,6 +211,14 @@ class TestAggregate:
         assert a["runs"] == 2 and a["blocks"] == 1
         assert a["pace_median_s_per_m"] == pytest.approx(2.0) and a["pace_p90_s_per_m"] == pytest.approx(2.0)
 
+    def test_dwell_is_out_of_the_stopped_share_and_the_moving_pace(self, patched):
+        run = make_run(1, range(0, 30), stopped_per_cell=0.02, dwell_per_cell=0.1)
+        a = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
+        time_s, stopped, dwell = 30 * 0.24, 30 * 0.02, 30 * 0.1
+        assert a["pace_median_s_per_m"] == pytest.approx(2.0)                    # gross: dwell and stops included
+        assert a["stopped_share"] == pytest.approx(stopped / (time_s - dwell))
+        assert a["moving_pace_median_s_per_m"] == pytest.approx((time_s - stopped - dwell) / 3.6)
+
     def test_totals_are_conserved(self, patched):
         run = make_run(1, range(0, 30))
         got = collect(patched(Db([run])), Reads(1, [(-10_000, "A"), (10, "B")]))
@@ -291,7 +299,7 @@ class TestAggregate:
         run = make_run(1, range(0, 20), stopped_per_cell=0.02, dwell_per_cell=0.04)
         a = by_key(collect(patched(Db([run])), Reads(1, [(-10_000, "A")])).stats)[("A", CLASS_A)]
         assert a["stopped_s"] == pytest.approx(0.4) and a["dwell_s"] == pytest.approx(0.8)
-        assert a["stopped_share"] == pytest.approx(0.4 / 4.8)
+        assert a["stopped_share"] == pytest.approx(0.4 / (4.8 - 0.8))             # builder 2: the dwell is not in the denominator
         assert a["moving_speed_mps"] == pytest.approx(2.4 / (4.8 - 0.4 - 0.8))
         assert a["norm_moving_m"] == pytest.approx((4.8 - 0.4 - 0.8) * 1.2)
 
