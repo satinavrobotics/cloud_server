@@ -915,3 +915,14 @@ def test_expected_s_medians_skip_legs_recorded_before_the_plan_source():
     assert item["expected_s"] == 8.0 and item["ratio"] == 1.25
     assert run_legs.leg_map_id("w", "r") == "w" and run_legs.leg_map_id(None, "r") == "r" \
         and run_legs.leg_map_id("", None) is None
+
+
+def test_events_are_not_tagged_with_a_leg_while_an_adopted_run_is_unresolved(tmp_path):
+    """C9: before leg_base is known, seq 1, 2, ... would collide with the legs stored before the restart."""
+    from types import SimpleNamespace
+    rec = make_recorder(tmp_path)[0]
+    tracker = SimpleNamespace(current_seq=2)
+    rec._runs["r1"] = SimpleNamespace(tracker=tracker, resolved=False, leg_base=5)
+    assert rec.leg_seq("r1") is None
+    rec._runs["r1"].resolved = True
+    assert rec.leg_seq("r1") == 7
