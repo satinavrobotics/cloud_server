@@ -61,6 +61,7 @@ COLUMNS = ("map_id", "graph_version", "chart_key", "robot_class", "runs", "len_m
 INSERT_SQL = (f"INSERT INTO region_stats ({', '.join(COLUMNS)}) VALUES ({', '.join(['%s'] * len(COLUMNS))})")
 LIVE_MAP_SQL = (f"SELECT 1 FROM {MapObjectV1.table_name()} WHERE name = %s "
                 "AND lifecycle NOT IN ('DELETING', 'DELETED') FOR SHARE")
+GEN_SQL = "SELECT gen FROM region_stats_inputs WHERE map_id = %s"
 CACHE = ResultCache(config.REGION_STATS_CACHE_ENTRIES, config.REGION_STATS_CACHE_TTL_S)
 
 
@@ -72,6 +73,7 @@ class Collected:
     rows: List[rdb.CellRow]
     stamp: str
     stats: List[Dict[str, Any]]
+    gen: int = 0                        # region_stats_inputs.gen read before the rows (docs 13): see build_map
 
 
 def stamp_of(rows: Sequence[rdb.CellRow]) -> str:
@@ -173,10 +175,14 @@ async def collect(db: Any, reads: Any, map_id: str, robot: Optional[str] = None)
     scene-graph read fails (a build must not store a wrong version)."""
     start = utcnow() - datetime.timedelta(days=config.REGION_STATS_WINDOW_DAYS)
     async with fleet_reads.read_cursor(db) as cur:
+        # the generation first: a writer that changes the inputs after this read bumps it, so build_map sees a change
+        await cur.execute(GEN_SQL, (map_id,))
+        found = await cur.fetchone()
+        gen = int(found[0]) if found else 0
         rows = await rdb.fetch(cur, map_id, start=start, robot=robot, algo_version=config.RUN_CELLS_ALGO_VERSION)
     stamp = stamp_of(rows)
     if reads is None:
-        return Collected("none", None, rows, stamp, [])
+        return Collected("none", None, rows, stamp, [], gen)
     keys = [r.key for r in rows if len(r)]
     uniq = np.unique(np.concatenate(keys)) if keys else np.empty(0, np.int64)
     if uniq.size:
@@ -184,15 +190,15 @@ async def collect(db: Any, reads: Any, map_id: str, robot: Optional[str] = None)
         if status == "error":
             raise RuntimeError(f"scene graph read of {map_id} failed")
         if status == "none" or ids is None:
-            return Collected("none", None, rows, stamp, [])
+            return Collected("none", None, rows, stamp, [], gen)
     else:
         version = await current_version(reads, map_id)
         if version is None:
-            return Collected("none", None, rows, stamp, [])
+            return Collected("none", None, rows, stamp, [], gen)
         ids, names, cells = np.empty(0, np.int64), [], {}
     per_row = [ids[np.searchsorted(uniq, r.key)] if len(r) else np.empty(0, np.int64) for r in rows]
     stats = await asyncio.to_thread(aggregate, map_id, int(version), rows, per_row, names, cells, stamp)
-    return Collected("ok", int(version), rows, stamp, stats)
+    return Collected("ok", int(version), rows, stamp, stats, gen)
 
 
 def _params(stat: Dict[str, Any]) -> tuple:
@@ -217,14 +223,26 @@ async def build_map(db: Any, reads: Any, map_id: str, version: Optional[int] = N
             if await cur.fetchone() is None:
                 logger.info("Region stats of %s: map is gone or being deleted, nothing stored", map_id)
                 return {"graph_version": ver, "status": "map_gone", "runs": runs, "charts": 0, "stamp": got.stamp}
+            # The inputs may have changed since collect (a run deleted, archived, a summary replaced): every writer bumps
+            # region_stats_inputs.gen (packages/utils/region_builds.mark_stale) before it changes them. Lock the row so a
+            # writer that comes now waits for this commit (and then marks the fresh build stale), and store nothing
+            # when the generation moved: the build row stays stale / missing and the next poll rebuilds.
+            await cur.execute("INSERT INTO region_stats_inputs (map_id) VALUES (%s) ON CONFLICT DO NOTHING", (map_id,))
+            await cur.execute(GEN_SQL + " FOR UPDATE", (map_id,))
+            gen_now = int((await cur.fetchone())[0])
+            if gen_now != got.gen:
+                logger.info("Region stats of %s: inputs changed during the build (gen %s -> %s), retry next poll",
+                            map_id, got.gen, gen_now)
+                return {"graph_version": ver, "status": "inputs_changed", "runs": runs, "charts": 0, "stamp": got.stamp}
             await cur.execute("DELETE FROM region_stats WHERE map_id = %s AND graph_version = %s", (map_id, ver))
             if got.stats:
                 await cur.executemany(INSERT_SQL, [_params(s) for s in got.stats])
             await cur.execute(
-                "INSERT INTO region_stats_builds (map_id, graph_version, stamp, runs, status, detail, built_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, now()) ON CONFLICT (map_id, graph_version) DO UPDATE SET "
+                "INSERT INTO region_stats_builds (map_id, graph_version, stamp, runs, status, detail, built_at, inputs_gen) "
+                "VALUES (%s, %s, %s, %s, %s, %s, now(), %s) ON CONFLICT (map_id, graph_version) DO UPDATE SET "
                 "stamp = EXCLUDED.stamp, runs = EXCLUDED.runs, status = EXCLUDED.status, detail = EXCLUDED.detail, "
-                "built_at = now()", (map_id, ver, got.stamp, runs, status, None))
+                "built_at = now(), inputs_gen = EXCLUDED.inputs_gen", (map_id, ver, got.stamp, runs, status, None,
+                                                                         got.gen))
             await cur.execute(
                 "DELETE FROM region_stats WHERE map_id = %s AND graph_version NOT IN "
                 "(SELECT graph_version FROM region_stats_builds WHERE map_id = %s "

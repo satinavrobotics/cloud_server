@@ -87,6 +87,8 @@ class Cur:
         if s.startswith("SELECT run_id, map_id") or "FROM run_cells WHERE map_id" in s and "SELECT run_id," in s and "map_id, robot_name" in s:
             rows = list(self.db.runs)
             self.rows = [stored(r) for r in rows if (not self.db.robot or r.robot_name == self.db.robot)]
+        elif s.startswith("SELECT gen FROM region_stats_inputs"):
+            self.rows = [(self.db.gen_locked if "FOR UPDATE" in s and self.db.gen_locked is not None else self.db.gen,)]
         elif s.startswith("SELECT 1 FROM") and "FOR SHARE" in s:
             self.rows = [(1,)] if self.db.map_live else []
         elif s.startswith("SELECT run_id, created_at FROM run_cells"):
@@ -120,6 +122,7 @@ class Db:
         self.runs, self.robot, self.executed, self.inserted = list(runs), robot, [], []
         self.builds, self.build_rows, self.stat_rows = [], [], []
         self.map_live = True
+        self.gen, self.gen_locked = 0, None       # region_stats_inputs.gen; gen_locked = what a writer made it meanwhile
 
     @contextlib.asynccontextmanager
     async def connection(self):
@@ -299,7 +302,7 @@ class TestBuildMap:
         db = patched(Db([make_run(1, range(0, 30))]))
         out = asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A"), (10, "B")]), "m"))
         assert out["graph_version"] == 3 and out["status"] == "ok" and out["runs"] == 1 and out["charts"] == 4
-        sqls = [" ".join(s.split())[:50] for s, _ in db.executed if "region_stats" in s]
+        sqls = [" ".join(s.split())[:50] for s, _ in db.executed if "region_stats" in s and "region_stats_inputs" not in s]
         assert sqls[0].startswith("DELETE FROM region_stats WHERE map_id")
         assert any("many" == a for _, a in db.executed) and len(db.inserted) == 4
         assert any(s.startswith("INSERT INTO region_stats_builds") for s in sqls)
@@ -310,6 +313,21 @@ class TestBuildMap:
         db = patched(Db([make_run(1, range(0, 30))]))
         out = asyncio.run(rs.build_map(db, Reads(3, [(0, "A")], graph=False), "m"))
         assert out["status"] == "no_scene_graph" and out["graph_version"] == rs.NO_GRAPH_VERSION and db.inserted == []
+
+    def test_inputs_changed_during_the_build_stores_nothing(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        db.gen, db.gen_locked = 4, 5
+        out = asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        assert out["status"] == "inputs_changed" and db.inserted == []
+        assert not any(s.startswith("DELETE") or "INSERT INTO region_stats_builds" in s for s, _ in db.executed)
+
+    def test_the_generation_built_from_is_stored(self, patched):
+        db = patched(Db([make_run(1, range(0, 30))]))
+        db.gen = 4
+        asyncio.run(rs.build_map(db, Reads(3, [(-10_000, "A")]), "m"))
+        sql, args = [e for e in db.executed if e[0].startswith("INSERT INTO region_stats_builds")][0]
+        assert "inputs_gen" in sql and args[-1] == 4
+        assert any(s.startswith("INSERT INTO region_stats_inputs") for s, _ in db.executed)
 
     def test_a_deleted_map_gets_no_rows(self, patched):
         db = patched(Db([make_run(1, range(0, 30))]))
