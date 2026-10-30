@@ -241,10 +241,10 @@ async def attach_events(out: Dict[str, Any], db: Any, map_id: str, start: Option
                         end: Optional[datetime.datetime], robot: Optional[str],
                         cache: Optional[ResultCache] = None) -> Dict[str, Any]:
     """`out` (a cached events-summary answer, not mutated) plus `series` over the window of that answer."""
-    cache = CACHE if cache is None else cache
+    cache = map_events.CACHE if cache is None else cache      # the summary's cache: one TTL for both blocks
     win = out["window"]
     s, e = datetime.datetime.fromisoformat(win["from"]), datetime.datetime.fromisoformat(win["to"])
 
     async def run() -> Dict[str, Any]:
         return await events_series(db, map_id, s, e, robot)
-    return {**out, "series": await cache.get((map_id, "events-summary", start, end, robot or None, "day"), run)}
+    return {**out, "series": await cache.get((map_id, "events-series", start, end, robot or None, "day"), run)}

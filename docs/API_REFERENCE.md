@@ -1290,7 +1290,8 @@ session at the run's start) is that map.
 
 **`GET /api/v1/maps/{map_id}/run-stats?from=&to=&robot=`** -- operating metrics of the map's
 non-archived runs that started in `[from, to)` (ISO-8601 with time zone; default: the last 30
-days), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls.
+days), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls. The headline, `efficiency` and
+`series` are all cached 120 s (`EFFICIENCY_CACHE_TTL_S`; the headline used to be uncached).
 
 ```
 {"map_id", "window": {"from", "to"}, "robot": null | str,
@@ -1334,7 +1335,7 @@ Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-1
 **`GET /api/v1/maps/{map_id}/events-summary?from=&to=&robot=&limit=10`** -- the most usual events
 of the map and its safety events, as episodes (a repeated error counts once). Window `[from, to)`,
 default the last 30 days; `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
-an unknown map answers zeros. Cached 30 s. Opt-in `series=day` adds `series: {bucket, t, total, safety,
+an unknown map answers zeros. Cached 30 s, `series` included (it was 120 s). Opt-in `series=day` adds `series: {bucket, t, total, safety,
 by_code}` per UTC day (`docs/map_series_2026-10-15.md`).
 
 ```

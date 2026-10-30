@@ -18,6 +18,7 @@ import pytest  # noqa: E402
 
 import packages.api.main as main  # noqa: E402
 from packages.api import run_stats, teleop  # noqa: E402
+from packages.api.result_cache import ResultCache  # noqa: E402
 from packages.events import causes, schemas  # noqa: E402
 from packages.events.codes import EventCode, Severity, meta_for  # noqa: E402
 from packages.events.emit import Event, build_row  # noqa: E402
@@ -350,3 +351,16 @@ def test_migration_seeds_the_new_causes():
         assert (c.category, c.title, c.description) == (category, title, description)
         assert category == code.split(".", 1)[0]
     assert mod.down_revision == "20261012_01_blocked_geometry"
+
+
+async def test_cached_headline_is_one_query_set_and_a_private_copy():
+    db = FakeDb(stats_respond)
+    cache = ResultCache(4, 60)
+    end = T0 + datetime.timedelta(days=10)
+    first = await run_stats.run_stats_cached(db, "office7", T0, end, cache=cache)
+    n = len(db.executed)
+    first["efficiency"] = {"mutated": True}                     # the route adds blocks to what it gets
+    first["data_quality"]["notes"].append("x")
+    second = await run_stats.run_stats_cached(db, "office7", T0, end, cache=cache)
+    assert len(db.executed) == n and "efficiency" not in second and "x" not in second["data_quality"]["notes"]
+    assert all(k[0] == "office7" for k in cache._done)          # discard_map contract

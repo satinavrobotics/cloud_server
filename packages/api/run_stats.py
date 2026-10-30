@@ -31,6 +31,7 @@ Definitions (all counts are runs unless stated):
                   only these recorded events are counted.
 """
 
+import copy
 import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +39,7 @@ from fastapi import HTTPException
 
 from packages import config
 from packages.api import fleet_reads, map_events
+from packages.api.result_cache import ResultCache
 from packages.events.codes import EventCode
 
 UTC = datetime.timezone.utc
@@ -186,6 +188,22 @@ async def run_stats(db: Any, map_id: str, start: Optional[datetime.datetime] = N
                          "hours_excluded_runs": int(dur[3] or 0),
                          "max_run_s": cap, "notes": notes},
     }
+
+
+# The headline is cached with the same TTL as its `efficiency` and `series` blocks (path_efficiency, map_series),
+# so the three agree to within one TTL. Keys start with the map id (ResultCache.discard_map).
+CACHE = ResultCache(config.EFFICIENCY_CACHE_ENTRIES, config.EFFICIENCY_CACHE_TTL_S)
+
+
+async def run_stats_cached(db: Any, map_id: str, start: Optional[datetime.datetime] = None,
+                           end: Optional[datetime.datetime] = None, robot: Optional[str] = None,
+                           cache: Optional[ResultCache] = None) -> Dict[str, Any]:
+    """`run_stats` through the cache (key: the REQUEST window, as the other blocks). Returns a private copy: the
+    caller adds `efficiency` / `series` to it."""
+    cache = CACHE if cache is None else cache
+    out = await cache.get((map_id, "run-stats", start, end, robot or None),
+                          lambda: run_stats(db, map_id, start, end, robot))
+    return copy.deepcopy(out)
 
 
 def require_map_id(map_id: str) -> str:

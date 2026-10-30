@@ -294,3 +294,18 @@ async def test_scope_safety_restricts_codes_and_classes():
 async def test_summary_last_ts_is_iso_utc():
     out = await map_events.events_summary(FakeDb(summary_respond), "m", T0, T1, cache=ResultCache(4, 30))
     assert out["top"][0]["last_ts"] == T0.isoformat() and out["top"][0]["last_ts"].endswith("+00:00")
+
+
+async def test_summary_and_series_share_one_cache_keyed_by_map():
+    """One TTL for the endpoint's blocks (I12): the series block lives in the summary's cache, and every key starts
+    with the map id so ResultCache.discard_map clears both."""
+    from packages.api import map_series
+    db = FakeDb(lambda sql, params: [] if "GROUP BY 1, 2, 3" in sql else summary_respond(sql, params))
+    cache = ResultCache(8, 30)
+    await map_events.events_summary(db, "m", T0, T1, cache=cache)
+    await map_events.events_summary(db, "other", T0, T1, cache=cache)
+    out = {"window": {"from": T0.isoformat(), "to": T1.isoformat()}}
+    await map_series.attach_events(out, db, "m", T0, T1, None, cache=cache)
+    assert len(cache._done) == 3 and all(k[0] in ("m", "other") for k in cache._done)
+    cache.discard_map("m")
+    assert {k[0] for k in cache._done} == {"other"}

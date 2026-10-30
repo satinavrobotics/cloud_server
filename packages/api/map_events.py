@@ -275,6 +275,8 @@ def split_code(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
 
 # --- cache ---------------------------------------------------------------------------------------
 
+# Keys start with the map id (ResultCache.discard_map). One TTL for the whole endpoint: the summary, its
+# `series=day` block (map_series.attach_events) and the list all use this cache.
 CACHE = ResultCache(config.MAP_EVENTS_CACHE_ENTRIES, config.MAP_EVENTS_CACHE_TTL_S)
 
 
@@ -355,7 +357,7 @@ async def events_summary(db: Any, map_id: str, start: Optional[datetime.datetime
             "attribution": att,
             "data_quality": {"notes": notes},
         }
-    return await cache.get(("summary", map_id, start, end, robot, limit), run)
+    return await cache.get((map_id, "summary", start, end, robot, limit), run)
 
 
 # --- GET /api/v1/maps/{map_id}/events ------------------------------------------------------------
@@ -423,4 +425,4 @@ async def list_events(db: Any, map_id: str, start: Optional[datetime.datetime] =
         rows = rows[:limit]
         nxt = fleet_reads.encode_cursor("map_events", rows[-1][0], rows[-1][1]) if more else None
         return {"items": [_item(r) for r in rows], "next": nxt}
-    return await cache.get(("events", map_id, start, end, code, cls, robot, limit, cursor, scope), run)
+    return await cache.get((map_id, "events", start, end, code, cls, robot, limit, cursor, scope), run)
