@@ -118,8 +118,8 @@ def test_weights_region_costs_formula():
     length = np.array([0.1, 0.1 * math.sqrt(2), 0.1])
     got = region_costs(length, [0, 1000, 3000], [0, 1000, 0], SCALE)
     assert got.tolist() == [0.0, math.ceil(length[1] / ROUTE_UNIT_M * 1.0 - 1e-6), math.ceil(1000 * 1.5 - 1e-6)]
-    assert (region_costs(length, [0, 0, 0], [0, 0, 0]) == 0).all()
-    assert (edge_costs(length, None, 0.0) + region_costs(length, [5, 5, 5], [7, 7, 7]) >= length / ROUTE_UNIT_M - 1e-6).all()
+    assert (region_costs(length, [0, 0, 0], [0, 0, 0], SCALE) == 0).all()
+    assert (edge_costs(length, None, 0.0) + region_costs(length, [5, 5, 5], [7, 7, 7], SCALE) >= length / ROUTE_UNIT_M - 1e-6).all()
 
 
 # ---- region None is today's route ------------------------------------------------------------------------

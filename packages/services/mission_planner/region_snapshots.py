@@ -47,7 +47,7 @@ class RegionSnapshots:
         cls = robot_class.robot_class(factsheet)
         speed = robot_class.speed_max_of(factsheet)
         basis = robot_class.speed_basis(factsheet)
-        if basis != robot_class.SPEED_FACTSHEET or speed is None:
+        if not region_cost.speed_usable(speed, basis):
             return region_cost.neutral(map_id, graph_version, cls, keys, model, "no_speed_max")
         short = (map_id, int(graph_version), cls, model.model_hash)
         now = self._clock()

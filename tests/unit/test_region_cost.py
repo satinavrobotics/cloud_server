@@ -16,6 +16,11 @@ CLS = "CARRIER|0.50x0.50"
 KEYS = ["A", "B", "C"]
 
 
+def rho_of(p, key):
+    """The rho of a chart by key (0 for a key the snapshot does not have)."""
+    return int(p.rho[p.keys.index(key)]) if key in p.keys else 0
+
+
 def stat(key, runs, len_m, moving_m, stopped_m=0.0, cls=CLS, norm_runs=None):
     """A region_stats row; `moving_m` / `stopped_m` are the speed-normalised sums (the pace ratio is moving_m / len_m)."""
     return RegionStat(chart_key=key, robot_class=cls, runs=runs, len_m=len_m, time_s=0.0, stopped_s=0.0, recovery_s=0.0,
@@ -38,6 +43,12 @@ def snap(class_rows, pooled_rows=None, model=None, keys=KEYS, version=3, speed_m
                              model or rc.CostModel(), speed_max, basis)
 
 
+def level_of(key, *args, **kw):
+    """The fallback level of one chart: the snapshot of that chart alone has one level in its provenance."""
+    (level, n), = snap(*args, **{**kw, "keys": [key]}).provenance
+    return level
+
+
 A = stat("A", 2, 10.0, 20.0)         # pace 2.0 x the ideal, 2 samples
 B = stat("B", 10, 100.0, 100.0)      # at speed_max, 10 samples
 MAP_P = 120.0 / 110.0                # the class map-wide pace ratio of A + B
@@ -47,32 +58,32 @@ class TestShrinkage:
     def test_a_chart_with_samples_is_pulled_to_the_map_wide_figure(self):
         p = snap([A, B])
         x = (2 * 2.0 + 5 * MAP_P) / 7
-        assert p.rho_of("A") == round((x - 1) * 1000)
-        assert p.levels[0] == "class" and p.status == "ok"
+        assert rho_of(p, "A") == round((x - 1) * 1000)
+        assert level_of("A", [A, B]) == "class" and p.status == "ok"
 
     def test_many_samples_dominate_the_prior(self):
         heavy = stat("A", 500, 1000.0, 2000.0)
         p = snap([heavy, B])
-        assert abs(p.rho_of("A") - 1000) < 15                       # about 2.0 - 1 = 1.0
+        assert abs(rho_of(p, "A") - 1000) < 15                       # about 2.0 - 1 = 1.0
 
     def test_n0_zero_is_the_plain_ratio_of_sums(self):
         p = snap([A, B], model=rc.CostModel(n0=0))
-        assert p.rho_of("A") == 1000
+        assert rho_of(p, "A") == 1000
 
     def test_a_chart_at_or_below_speed_max_costs_nothing(self):
         fast = stat("A", 4, 10.0, 8.0)                               # 0.8 x the ideal time: faster than speed_max
         p = snap([fast], model=rc.CostModel(n0=0))
-        assert p.rho_of("A") == 0
+        assert rho_of(p, "A") == 0
 
     def test_shrinkage_is_in_pace_space_so_a_fast_run_offsets_a_slow_one(self):
         p = snap([stat("A", 2, 20.0, 20.0), stat("B", 2, 20.0, 60.0)], model=rc.CostModel(n0=0))
-        assert p.rho_of("A") == 0 and p.rho_of("B") == 2000
+        assert rho_of(p, "A") == 0 and rho_of(p, "B") == 2000
 
 
 class TestFallbackLevels:
     def test_a_chart_nobody_drove_gets_the_class_map_wide_figure(self):
         p = snap([A, B])
-        assert p.levels[2] == "map" and p.rho_of("C") == round((MAP_P - 1) * 1000)
+        assert level_of("C", [A, B]) == "map" and rho_of(p, "C") == round((MAP_P - 1) * 1000)
 
     def test_a_chart_only_another_class_drove_gets_the_pooled_figure_relative_to_the_map(self):
         other = "TRUCK|1.00x1.00"
@@ -81,7 +92,7 @@ class TestFallbackLevels:
         p = snap([A, B], pooled)
         pool_map = (20.0 + 100.0 + 30.0) / 120.0
         expect = MAP_P * (3.0 / pool_map) - 1
-        assert p.levels[2] == "pooled" and p.rho_of("C") == round(expect * 1000)
+        assert level_of("C", [A, B], pooled) == "pooled" and rho_of(p, "C") == round(expect * 1000)
         assert other                                                  # (the other class is only in the pooled rows)
 
     def test_levels_rank_best_first_in_the_order_the_chain_prefers_them(self):
@@ -89,33 +100,31 @@ class TestFallbackLevels:
         assert rc.LEVELS == ("class", "pooled", "map", "prior")
         pooled = [stat("A", 2, 10.0, 20.0, cls="*"), stat("B", 10, 100.0, 100.0, cls="*"), stat("C", 3, 10.0, 30.0, cls="*")]
         p = snap([A, B], pooled, keys=["A", "B", "C", "D"])
-        assert p.levels == ("class", "class", "pooled", "map")
+        assert [level_of(k, [A, B], pooled) for k in "ABCD"] == ["class", "class", "pooled", "map"]
         assert [lv for lv, _ in p.provenance] == ["class", "pooled", "map"]
 
     def test_pooled_figures_are_used_as_is_when_the_class_has_no_data_on_the_map(self):
         pooled = [stat("A", 2, 10.0, 20.0, cls="*")]
         p = snap([], pooled)
-        assert p.levels[0] == "pooled" and p.rho_of("A") == 1000
-        assert p.levels[1] == "prior" and p.rho_of("B") == 0
+        assert level_of("A", [], pooled) == "pooled" and rho_of(p, "A") == 1000
+        assert level_of("B", [], pooled) == "prior" and rho_of(p, "B") == 0
 
     def test_no_data_anywhere_is_the_factsheet_rho_zero(self):
         p = snap([stat("X", 1, 10.0, 10.0)], [stat("X", 1, 10.0, 10.0, cls="*")], keys=["A"])
-        assert p.status == "ok" and p.levels == ("map",) and p.rho_of("A") == 0       # the class map-wide figure is 1.0
+        assert p.status == "ok" and p.provenance == (("map", 1),) and rho_of(p, "A") == 0       # the class map-wide figure is 1.0
         q = snap([], [stat("X", 1, 10.0, 30.0, cls="*")], keys=["A"])
-        assert q.status == "ok" and q.levels == ("prior",) and q.rho_of("A") == 0     # nothing on the chart or the class
+        assert q.status == "ok" and q.provenance == (("prior", 1),) and rho_of(q, "A") == 0     # nothing on the chart or the class
 
     def test_a_chart_with_class_data_does_not_borrow_the_pool_even_if_it_is_thin(self):
         pooled = [stat("A", 20, 100.0, 400.0, cls="*"), B_pool()]
         p = snap([stat("A", 1, 5.0, 5.0), B], pooled, model=rc.CostModel(n0=1))
-        assert p.levels[0] == "class" and p.rho_of("A") < 100
+        assert level_of("A", [stat("A", 1, 5.0, 5.0), B], pooled, model=rc.CostModel(n0=1)) == "class" and rho_of(p, "A") < 100
 
     def test_zero_length_samples_are_no_data(self):
-        p = snap([stat("A", 3, 0.0, 0.0), B])
-        assert p.levels[0] == "map"
+        assert level_of("A", [stat("A", 3, 0.0, 0.0), B]) == "map"
 
     def test_runs_without_a_real_speed_are_no_data(self):
-        p = snap([stat("A", 3, 10.0, 30.0, norm_runs=0), B])
-        assert p.levels[0] == "map"
+        assert level_of("A", [stat("A", 3, 10.0, 30.0, norm_runs=0), B]) == "map"
 
 
 def B_pool():
@@ -125,21 +134,21 @@ def B_pool():
 class TestCapAndQuantum:
     def test_rho_is_capped(self):
         p = snap([stat("A", 50, 10.0, 1000.0)], model=rc.CostModel(n0=0, rho_cap=3.0), keys=["A"])
-        assert p.rho_of("A") == 3000 and p.rho_max == 3000
+        assert rho_of(p, "A") == 3000 and p.rho_max == 3000
 
     def test_the_cap_is_a_model_setting(self):
         p = snap([stat("A", 50, 10.0, 1000.0)], model=rc.CostModel(n0=0, rho_cap=0.5), keys=["A"])
-        assert p.rho_of("A") == 500
+        assert rho_of(p, "A") == 500
 
     def test_rho_is_rounded_half_up_to_the_quantum(self):
         for ratio, expect in ((1.0004, 0), (1.00051, 1), (1.0006, 1), (1.00149, 1), (1.00151, 2), (1.1234, 123)):
             p = snap([stat("A", 5, 1000.0, 1000.0 * ratio)], model=rc.CostModel(n0=0), keys=["A"])
-            assert p.rho_of("A") == expect, ratio
+            assert rho_of(p, "A") == expect, ratio
 
     def test_a_coarser_quantum(self):
         m = rc.CostModel(n0=0, quantum=0.01)
         p = snap([stat("A", 5, 1000.0, 1237.0)], model=m, keys=["A"])
-        assert p.rho_of("A") == 24 and p.scale == 100
+        assert rho_of(p, "A") == 24 and p.scale == 100
 
     def test_the_array_is_int32_and_read_only(self):
         p = snap([A, B])
@@ -160,17 +169,17 @@ class TestTerms:
     def test_the_stop_term_is_the_normalised_stopped_time_per_metre(self):
         rows = [stat("A", 5, 100.0, 100.0, stopped_m=25.0)]
         p = snap(rows, model=rc.CostModel(terms=(("stop", 1.0),), n0=0), keys=["A"])
-        assert p.rho_of("A") == 250
+        assert rho_of(p, "A") == 250
 
     def test_terms_add_with_their_weights(self):
         rows = [stat("A", 5, 100.0, 150.0, stopped_m=20.0)]
         m = rc.CostModel(terms=(("moving", 1.0), ("stop", 0.5)), n0=0)
-        assert snap(rows, model=m, keys=["A"]).rho_of("A") == 500 + 100
+        assert rho_of(snap(rows, model=m, keys=["A"]), "A") == 500 + 100
 
     def test_a_zero_weight_term_is_off(self):
         rows = [stat("A", 5, 100.0, 150.0, stopped_m=20.0)]
         m = rc.CostModel(terms=(("moving", 1.0), ("stop", 0.0)), n0=0)
-        assert snap(rows, model=m, keys=["A"]).rho_of("A") == 500
+        assert rho_of(snap(rows, model=m, keys=["A"]), "A") == 500
 
     def test_no_terms_prices_nothing(self):
         assert snap([A, B], model=rc.CostModel(terms=())).rho.tolist() == [0, 0, 0]
@@ -196,8 +205,8 @@ class TestTerms:
 
     def test_the_level_of_a_chart_is_the_worst_of_its_terms(self):
         # both terms read the same sums here, so the levels agree; with weights 0 the term is not consulted
-        p = snap([A, B], model=rc.CostModel(terms=(("moving", 1.0), ("stop", 1.0))))
-        assert p.levels[0] == "class" and p.levels[2] == "map"
+        p_model = rc.CostModel(terms=(("moving", 1.0), ("stop", 1.0)))
+        assert [level_of(k, [A, B], model=p_model) for k in "AC"] == ["class", "map"]
 
 
 class TestModelHash:
@@ -276,7 +285,7 @@ class TestStatus:
 
     def test_the_class_load_may_be_missing_when_the_pool_is_there(self):
         p = rc.build_snapshot("m", 3, CLS, KEYS, None, stats([A, B], cls="*"), rc.CostModel(), 0.24)
-        assert p.status == "ok" and p.levels[0] == "pooled" and p.rho_of("A") == 1000
+        assert p.status == "ok" and p.provenance[0] == ("pooled", 2) and rho_of(p, "A") == 1000
 
     def test_a_neutral_snapshot_still_aligns_with_the_keys(self):
         p = snap([A, B], speed_max=None)
@@ -286,11 +295,11 @@ class TestStatus:
 class TestSnapshotShape:
     def test_rho_follows_the_order_of_the_keys(self):
         p = snap([A, B], keys=["C", "B", "A"])
-        assert p.rho_of("A") == snap([A, B]).rho_of("A") and p.rho[2] == p.rho_of("A") and p.rho[1] == p.rho_of("B")
+        assert rho_of(p, "A") == rho_of(snap([A, B]), "A") and p.rho[2] == rho_of(p, "A") and p.rho[1] == rho_of(p, "B")
 
     def test_a_key_the_stats_do_not_know_is_priced_and_a_stat_without_a_key_is_ignored(self):
         p = snap([A, B, stat("Z", 5, 10.0, 40.0)], keys=["A", "B"])
-        assert p.keys == ("A", "B") and p.rho_of("Z") == 0
+        assert p.keys == ("A", "B") and rho_of(p, "Z") == 0
 
     def test_provenance_counts_the_levels_and_min_max(self):
         p = snap([A, B])
@@ -334,18 +343,18 @@ class TestMode:
 
 class TestEdgeCost:
     def test_zero_rho_adds_nothing(self):
-        assert weights.region_costs([0.1, 0.1414], [0, 0], [0, 0]).tolist() == [0.0, 0.0]
+        assert weights.region_costs([0.1, 0.1414], [0, 0], [0, 0], 1000).tolist() == [0.0, 0.0]
 
     def test_the_additive_formula(self):
         """A 1000 unit edge between rho 0.5 and 1.0 costs ceil(1000 * 0.75) more."""
-        assert weights.region_costs([0.1], [500], [1000]).tolist() == [750.0]
-        assert weights.region_costs([0.1414], [500], [500]).tolist() == [np.ceil(1414 * 0.5 - 1e-6)]
+        assert weights.region_costs([0.1], [500], [1000], 1000).tolist() == [750.0]
+        assert weights.region_costs([0.1414], [500], [500], 1000).tolist() == [np.ceil(1414 * 0.5 - 1e-6)]
 
     def test_it_is_a_whole_number_never_negative_and_never_below_the_length(self):
         rng = np.random.default_rng(1)
         length = rng.uniform(0.05, 0.2, 200)
         a, b = rng.integers(0, 3000, 200), rng.integers(0, 3000, 200)
-        extra = weights.region_costs(length, a, b)
+        extra = weights.region_costs(length, a, b, 1000)
         assert (extra >= 0).all() and (extra == np.round(extra)).all()
         base = weights.edge_costs(length, np.zeros(200), 0.0)
         assert (base + extra >= base).all() and (base + extra >= np.floor(length / weights.ROUTE_UNIT_M)).all()
@@ -356,7 +365,7 @@ class TestEdgeCost:
         assert weights.region_costs([0.1], [50], [100], scale=m.scale).tolist() == [750.0]
 
     def test_a_tiny_rho_does_not_round_to_a_lower_cost_than_zero(self):
-        assert weights.region_costs([0.0001], [1], [0]).tolist() == [1.0]
+        assert weights.region_costs([0.0001], [1], [0], 1000).tolist() == [1.0]
 
 
 def test_the_module_is_pure_it_imports_no_io_layer():
@@ -368,3 +377,16 @@ def test_the_module_is_pure_it_imports_no_io_layer():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True,
                          cwd=str(__import__("pathlib").Path(__file__).resolve().parents[2])).stdout.strip()
     assert out == ""
+
+
+class TestGates:
+    def test_speed_usable_is_the_one_speed_rule(self):
+        assert rc.speed_usable(0.24, "factsheet")
+        for speed, basis in ((None, "factsheet"), (0.0, "factsheet"), (float("nan"), "factsheet"), (0.24, "placeholder"), (0.24, "unknown")):
+            assert not rc.speed_usable(speed, basis)
+
+    def test_mode_for_is_off_unless_shadow_or_on_for_an_allowed_map(self, monkeypatch):
+        monkeypatch.setattr(config, "REGION_COST_MAPS", ("m",))
+        for mode, want in (("off", "off"), ("shadow", "shadow"), ("on", "on"), ("bogus", "off")):
+            monkeypatch.setattr(config, "REGION_COST_MODE", mode)
+            assert rc.mode_for("m") == want and rc.mode_for("other") == "off"

@@ -11,7 +11,7 @@ from packages.services.mission_planner import region_snapshots as rs
 from packages.utils import region_cost as rc
 from packages.utils import region_stats_load as load
 
-from .test_region_cost import A, B, CLS, KEYS, stat, stats
+from .test_region_cost import A, B, CLS, KEYS, rho_of, stat, stats
 
 pytestmark = pytest.mark.unit
 
@@ -75,7 +75,7 @@ def test_a_snapshot_is_built_from_the_stats_of_the_version(world):
     snaps = rs.RegionSnapshots(Conn(), Clock())
     got = run(snaps.get("m", 3, KEYS, FS))
     assert got.status == "ok" and got.graph_version == 3 and got.robot_class == CLS and got.stamp == "st1"
-    assert got.rho_of("A") > 0 and got.model_hash == rc.CostModel.from_config().model_hash
+    assert rho_of(got, "A") > 0 and got.model_hash == rc.CostModel.from_config().model_hash
     assert world.reads == [("m", 3, CLS), ("m", 3, "*")]
 
 
@@ -107,7 +107,7 @@ def test_a_new_stamp_is_a_new_snapshot_and_the_old_one_stays_cached(world):
     fill(world, stamp="st2", rows=(stat("A", 2, 10.0, 30.0), B))
     clock.t += 31
     second = run(snaps.get("m", 3, KEYS, FS))
-    assert second.stamp == "st2" and second is not first and second.rho_of("A") != first.rho_of("A")
+    assert second.stamp == "st2" and second is not first and rho_of(second, "A") != rho_of(first, "A")
     assert snaps.stats()["entries"] == 2 and first.key != second.key
 
 
