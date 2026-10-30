@@ -14,7 +14,7 @@ import logging
 import datetime
 import math
 import time
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Callable, Optional, Dict, Any, List, Set, Tuple, Union
 
 from packages.topomap_dbs.graph_db.server import GraphDatabaseService
 from packages.database.postgres import PostgresDatabase
@@ -136,6 +136,10 @@ class MissionPlannerService:
                          tile_cache=config.SCENE_GRAPH_LAZY_TILE_CACHE))
         self._plan_pool = scene_route.BoundedPool(
             "sg-plan", 2, config.SCENE_GRAPH_PLAN_MAX_INFLIGHT, busy_reason="planner_busy")
+        # shadow mode's priced alternative runs here, after the plan is served (never on the plan pool's workers, never awaited by a plan)
+        self._alt_pool = scene_route.BoundedPool("sg-alt", 1, config.REGION_COST_ALT_MAX_INFLIGHT, busy_reason="alt_busy")
+        self._alt_tasks: Set[asyncio.Task] = set()
+        self._region_alt_outcomes: Dict[str, int] = {}       # done | alt_busy | alt_timeout | alt_error | alt_closed
         # chart-route outcomes by reason ("served" or the fallback reason), for get_stats()
         self._chart_outcomes: Dict[str, int] = {}
         # plans served with clearance pricing, and those whose search hit the tile cap (route not proved optimal)
@@ -370,6 +374,8 @@ class MissionPlannerService:
         self._turn_sources[turn["source"]] = self._turn_sources.get(turn["source"], 0) + 1
         if plan.pricing is not None and "region" in plan.pricing:
             self._log_region(map_id, version, plan.pricing["region"])
+        if plan.region_alt is not None:
+            self._start_region_alt(map_id, version, plan.region_alt)
         if plan.pricing is not None and plan.pricing["rate"] == 0.0 and turn["lambda_m_per_rad"] > 0.0:
             self.logger.info(
                 "Turn-cost plan map=%s graph_version=%s cost=%d exact=%s turn_lambda=%.3f turn_source=%s turn_reason=%s tiles=%s",
@@ -421,9 +427,42 @@ class MissionPlannerService:
         self._region_shadow_changed += 1 if rec.get("alt_route_changed") else 0
         self.logger.info(
             "Region cost plan map=%s graph_version=%s mode=%s status=%s served=%s model=%s stamp=%s predicted_s=%s predicted_free_s=%s "
-            "levels=%s alt_changed=%s alt_extra_m=%s alt_predicted_s=%s", map_id, version, rec["mode"], rec["status"], rec["served"],
+            "levels=%s tiles=%s exact=%s", map_id, version, rec["mode"], rec["status"], rec["served"],
             rec["model_hash"], rec["stamp"], rec.get("predicted_s"), rec.get("predicted_free_s"), rec.get("levels"),
-            rec.get("alt_route_changed"), rec.get("alt_extra_m"), rec.get("alt_predicted_s"))
+            rec.get("tiles"), rec.get("exact"))
+
+    def _start_region_alt(self, map_id: str, version: int, job: Callable[[], Dict[str, Any]]) -> None:
+        """Run shadow mode's priced alternative as a task of its own, after the served plan is on its way: the plan never awaits it and
+        its result only reaches the log and the counters."""
+        task = asyncio.ensure_future(self._run_region_alt(map_id, version, job))
+        self._alt_tasks.add(task)
+        task.add_done_callback(self._alt_tasks.discard)
+
+    async def _run_region_alt(self, map_id: str, version: int, job: Callable[[], Dict[str, Any]]) -> None:
+        """One shadow alternative on the alt pool under REGION_COST_ALT_TIMEOUT_S. A busy pool or a timeout is recorded as `alt_skipped`
+        (the search of a timed-out job runs on and ends by itself, keeping its slot until then). Never raises."""
+        outcome, res = "done", {}
+        try:
+            res = await asyncio.wait_for(self._alt_pool.submit(job), config.REGION_COST_ALT_TIMEOUT_S)
+            if "alt_error" in res:
+                outcome = "alt_error"
+        except asyncio.CancelledError:
+            raise
+        except scene_route.ChartFallback as err:
+            outcome = err.reason
+        except asyncio.TimeoutError:
+            outcome = "alt_timeout"
+        except Exception as err:  # pylint: disable=broad-except
+            outcome, res = "alt_error", {"alt_error": type(err).__name__}
+        self._region_alt_outcomes[outcome] = self._region_alt_outcomes.get(outcome, 0) + 1
+        if outcome in ("done", "alt_error"):
+            self._region_shadow_changed += 1 if res.get("alt_route_changed") else 0
+            self.logger.info(
+                "Region cost alt map=%s graph_version=%s alt_changed=%s alt_nodes_differ=%s alt_extra_m=%s alt_predicted_s=%s alt_tiles=%s "
+                "alt_exact=%s alt_error=%s", map_id, version, res.get("alt_route_changed"), res.get("alt_nodes_differ"), res.get("alt_extra_m"),
+                res.get("alt_predicted_s"), res.get("alt_tiles"), res.get("alt_exact"), res.get("alt_error"))
+        else:
+            self.logger.info("Region cost alt map=%s graph_version=%s alt_skipped=%s", map_id, version, outcome)
 
     async def _region_for(self, map_id: str, version: int, graph: Any, robot: Any) -> Tuple[Any, str]:
         """(snapshot, mode) of the region cost term for a plan on `graph`: mode `region_cost.mode_for(map_id)`; off (or a graph that cannot take
@@ -1870,6 +1909,7 @@ class MissionPlannerService:
                 "waypoints_removed": self._waypoints_removed,
                 "region_plans": dict(self._region_plans),          # plans with a region record, by snapshot status
                 "region_shadow_changed": self._region_shadow_changed,
+                "region_alt": dict(self._region_alt_outcomes),      # shadow alternatives by outcome (done | alt_busy | alt_timeout | ...)
                 "region_snapshots": self._region_snaps.stats(),
             }
         return stats
@@ -1880,4 +1920,7 @@ class MissionPlannerService:
             self._prewarm_task.cancel()
         self._scene_cache.close()
         self._plan_pool.close()
+        self._alt_pool.close()
+        for task in list(self._alt_tasks):
+            task.cancel()
 

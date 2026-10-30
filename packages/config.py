@@ -717,6 +717,10 @@ REGION_COST_RHO_CAP = float(os.getenv("REGION_COST_RHO_CAP", "3.0"))
 REGION_COST_QUANTUM = float(os.getenv("REGION_COST_QUANTUM", "0.001"))
 REGION_COST_SNAPSHOT_TTL_S = float(os.getenv("REGION_COST_SNAPSHOT_TTL_S", "30.0"))
 REGION_COST_SNAPSHOT_ENTRIES = int(os.getenv("REGION_COST_SNAPSHOT_ENTRIES", "16"))
+# Shadow mode's priced alternative is a second full route search, run on its own one-thread pool after the plan is served: at most
+# ALT_MAX_INFLIGHT searches queued or running (more are skipped, `alt_busy`), each given ALT_TIMEOUT_S before it is recorded as skipped.
+REGION_COST_ALT_TIMEOUT_S = float(os.getenv("REGION_COST_ALT_TIMEOUT_S", "5.0"))
+REGION_COST_ALT_MAX_INFLIGHT = int(os.getenv("REGION_COST_ALT_MAX_INFLIGHT", "2"))
 # Robot path efficiency (packages/api/path_efficiency.py, docs/path_efficiency_2026-10-15.md): a leg shorter
 # than EFFICIENCY_MIN_LEG_M of plan is left out of the ratios (too noisy); a leg whose track covers less than
 # EFFICIENCY_MIN_COVERAGE of its straight line is an incomplete track; a stored trajectory whose waypoint
