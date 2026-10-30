@@ -49,9 +49,9 @@ logger = logging.getLogger(__name__)
 
 # Per-robot state that is always removed (it describes the robot, not its history).
 # edge_observations: the robot's per-edge traversal statistics go with it (so a session it closes
-# here is not recorded either).
+# here is not recorded either). robot_factsheet_periods: what its factsheet said over time.
 STATE_TABLES: Tuple[str, ...] = (ASSIGNMENTS_TABLE, ms.RUN_EPOCH_TABLE, "robot_latest",
-                                 "edge_observations")
+                                 "edge_observations", "robot_factsheet_periods")
 # robot_name-keyed history, removed with delete_telemetry (hypertables: a plain DELETE works,
 # also on compressed chunks).
 TELEMETRY_TABLES: Tuple[str, ...] = ("robot_state_ts", "diagnostics_ts", "robot_track_ts",
