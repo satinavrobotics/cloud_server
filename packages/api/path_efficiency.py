@@ -303,16 +303,42 @@ def compute(loaded: Loaded) -> Optional[Dict[str, Any]]:
 CACHE = ResultCache(config.EFFICIENCY_CACHE_ENTRIES, config.EFFICIENCY_CACHE_TTL_S)
 
 
-async def map_efficiency(db: Any, map_id: str, start: datetime.datetime, end: datetime.datetime,
-                         robot: Optional[str], key: Any = None, cache: Optional[ResultCache] = None
-                         ) -> Optional[Dict[str, Any]]:
-    """The `efficiency` block of a map window (cached; the SQL and numpy work do not block the event loop)."""
+def run_efficiency(records: Sequence[Dict[str, Any]]) -> Dict[Any, Tuple[float, float, int]]:
+    """run_id -> (planned_m, driven_m, legs) over the legs counted in the headline (a stored plan trajectory
+    and a usable track)."""
+    out: Dict[Any, List[float]] = {}
+    for r in records:
+        if r["excluded"] is None and r["plan_source"] == "trajectory":
+            acc = out.setdefault(r["run_id"], [0.0, 0.0, 0])
+            acc[0] += r["plan_m"]
+            acc[1] += r["driven_m"]
+            acc[2] += 1
+    return {k: (v[0], v[1], int(v[2])) for k, v in out.items()}
+
+
+def _analyse(loaded: Loaded) -> Dict[str, Any]:
+    recs = leg_records(loaded.legs, loaded.tracks, loaded.trajs)
+    return {"block": summarize(recs, loaded.truncated), "per_run": run_efficiency(recs)}
+
+
+async def map_analysis(db: Any, map_id: str, start: datetime.datetime, end: datetime.datetime,
+                       robot: Optional[str], key: Any = None, cache: Optional[ResultCache] = None
+                       ) -> Dict[str, Any]:
+    """`{"block": the efficiency block, "per_run": run_efficiency}` of a map window. Cached; the one cached load
+    (TRACK_SQL is the heaviest query of run-stats) serves the headline and the series (map_series)."""
     cache = CACHE if cache is None else cache
 
     async def run() -> Dict[str, Any]:
         loaded = await load(db, map_id, start, end, robot)
-        return {"block": await asyncio.to_thread(compute, loaded)}
-    return (await cache.get(key if key is not None else (map_id, start, end, robot or None), run))["block"]
+        return await asyncio.to_thread(_analyse, loaded)
+    return await cache.get(key if key is not None else (map_id, start, end, robot or None), run)
+
+
+async def map_efficiency(db: Any, map_id: str, start: datetime.datetime, end: datetime.datetime,
+                         robot: Optional[str], key: Any = None, cache: Optional[ResultCache] = None
+                         ) -> Optional[Dict[str, Any]]:
+    """The `efficiency` block of a map window (cached; the SQL and numpy work do not block the event loop)."""
+    return (await map_analysis(db, map_id, start, end, robot, key, cache))["block"]
 
 
 async def attach(out: Dict[str, Any], db: Any, map_id: str, start: Optional[datetime.datetime],

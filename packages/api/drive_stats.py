@@ -77,7 +77,9 @@ REGION_VERSION_TRIES = 3  # reads started over after a version change before giv
 async def regions_of(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray
                      ) -> Tuple[Optional[np.ndarray], List[str], Dict[str, int], Optional[int], str]:
     """Chart of every tile. Returns (region id per tile (0 = none, i = names[i-1]), names, cells per chart key,
-    graph version, status "ok" | "none" | "error"). Never raises: a missing graph or a failing read is a status.
+    graph version, status "ok" | "none" | "error"). Never raises: a missing graph or a failing read is a status. A chunk with no
+    owner raster (outside the graph's extent) leaves its tiles in no chart; "none" is only for a map where NO chunk
+    has one.
 
     ONE graph version answers the whole call: the first chunk's owner plane fixes it, the chart-cell views are asked
     for that version, and a later chunk whose owner plane is of another version (the graph was rebuilt during a read
@@ -109,8 +111,8 @@ async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray)
             span = REGION_CHUNK_CELLS * CELL_M
             box = BBox(round(cx * span, 6), round(cy * span, 6), round((cx + 1) * span, 6), round((cy + 1) * span, 6))
             plane = await reads.owner_plane(map_id, box, 0)
-            if plane is None:
-                return None, [], {}, None, "none"
+            if plane is None:        # no raster for this chunk (outside the graph extent): its tiles stay chart 0
+                continue
             if abs(float(plane["step"]) - CELL_M) > 1e-9:
                 logger.warning("Drive stats: owner raster step %s is not %s; no regions", plane["step"], CELL_M)
                 return None, [], {}, None, "error"
@@ -137,6 +139,8 @@ async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray)
                     index_of[name] = len(names)
                 glob[i] = index_of[name]
             ids[sel] = glob[np.clip(vals, 0, len(keys))]
+        if version is None:          # not one chunk has a raster: there is no scene graph for this map
+            return None, [], {}, None, "none"
     except HTTPException as exc:
         logger.info("Drive stats of %s: no regions (%s %s)", map_id, exc.status_code, exc.detail)
         return None, [], {}, None, "error"
@@ -146,9 +150,26 @@ async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray)
     return ids, names, cells, version, "ok"
 
 
-def region_rows(tiles: Tiles, ids: np.ndarray, names: List[str], cells: Dict[str, int]) -> List[Dict[str, Any]]:
+def dwell_on(tiles: Tiles, summaries: Sequence[run_cells_db.CellRow]) -> np.ndarray:
+    """Dwell seconds (waiting near a run's start, goal and action nodes) per tile of `tiles`, from the stored
+    summaries; zero for raw rows, which carry no dwell split."""
+    out = np.zeros(len(tiles))
+    keys = [s.key for s in summaries if s.dwell_s.size]
+    if not keys or not len(tiles):
+        return out
+    key, dwell = np.concatenate(keys), np.concatenate([s.dwell_s for s in summaries if s.dwell_s.size])
+    pos = np.searchsorted(tiles.key, key)
+    ok = (pos < tiles.key.size) & (tiles.key[np.minimum(pos, tiles.key.size - 1)] == key)
+    np.add.at(out, pos[ok], dwell[ok])
+    return out
+
+
+def region_rows(tiles: Tiles, ids: np.ndarray, names: List[str], cells: Dict[str, int],
+                dwell: Optional[np.ndarray] = None) -> List[Dict[str, Any]]:
     """Per chart: distinct runs through it, summed length / time / recovery / stopped, the chart's cells and
-    how many of its 0.1 m cells were driven (`visited`)."""
+    how many of its 0.1 m cells were driven (`visited`). `stopped_s` is every stop; `dwell_s` (`dwell`: per tile,
+    see dwell_on) is the part spent waiting near start / goal / action nodes and `transit_stopped_s` the rest, the
+    two region-stats fields."""
     sel = np.nonzero(ids > 0)[0]
     if not sel.size:
         return []
@@ -163,10 +184,12 @@ def region_rows(tiles: Tiles, ids: np.ndarray, names: List[str], cells: Dict[str
     for r in order:
         m = rid == r
         s = tiles.sums[:, sel[m]].sum(axis=1)
+        d = 0.0 if dwell is None else min(float(dwell[sel[m]].sum()), float(s[3]))
         name = names[int(r) - 1]
         out.append({"key": name, "n": int(n_by_region[r]), "len_m": round(float(s[0]), 2),
                     "time_s": round(float(s[1]), 1), "recovery_s": round(float(s[2]), 1),
-                    "stopped_s": round(float(s[3]), 1), "cells": cells.get(name, 0), "visited": int(m.sum())})
+                    "stopped_s": round(float(s[3]), 1), "dwell_s": round(d, 1),
+                    "transit_stopped_s": round(float(s[3]) - d, 1), "cells": cells.get(name, 0), "visited": int(m.sum())})
     out.sort(key=lambda d: d["key"])
     return out
 
@@ -192,11 +215,13 @@ def _window_sql(column: str, start: Optional[datetime.datetime], end: Optional[d
     return sql
 
 
-def _not_summarised(table_run: str, table_map: str, start, end, robot, args: List[Any]) -> str:
-    """AND NOT EXISTS (a current summary of this run and map that the summaries part takes: it started in the
-    window and is of the robot): those runs are not read raw."""
+def _not_summarised(table_run: str, start, end, robot, args: List[Any]) -> str:
+    """AND NOT EXISTS (a current summary of this run, on ANY map, that the summaries part takes: it started in the
+    window and is of the robot): those runs are not read raw. Any map: the summariser puts a row on the map of its
+    session, which can differ from `mission_runs.map_id`, so a run summarised only on another map must not also be
+    counted here."""
     args.append(config.RUN_CELLS_ALGO_VERSION)
-    return (f" AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = {table_run} AND c.map_id = {table_map} "
+    return (f" AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = {table_run} "
             "AND c.algo_version = %s" + run_cells_db.window_sql(start, end, robot, None, args, alias="c") + ")")
 
 
@@ -208,9 +233,9 @@ async def fetch_track(cur: Any, map_id: str, start, end, robot, limit: int,
     args: List[Any] = [map_id]
     sql = ("SELECT t.run_id, extract(epoch FROM t.ts)::float8, t.x_map, t.y_map, t.map_session_id, t.run_epoch "
            "FROM robot_track_ts t JOIN mission_runs r ON r.run_id = t.run_id "
-           "WHERE r.map_id = %s AND t.x_map IS NOT NULL AND t.y_map IS NOT NULL"
+           "WHERE r.map_id = %s AND r.archived_at IS NULL AND t.x_map IS NOT NULL AND t.y_map IS NOT NULL"
            + _window_sql("t.ts", start, end, robot, "t.robot_name", args)
-           + (_not_summarised("r.run_id", "r.map_id", start, end, robot, args) if skip_summarised else "")
+           + (_not_summarised("r.run_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY t.ts DESC LIMIT %s")
     args.append(limit + 1)
     await cur.execute(sql, tuple(args))
@@ -235,20 +260,27 @@ async def fetch_legs(cur: Any, map_id: str, start, end, robot, skip_summarised: 
     args: List[Any] = [map_id]
     sql = ("SELECT run_id, from_topomap_node, to_topomap_node, duration_s, stopped_s, recovery_s "
            "FROM run_legs WHERE map_id = %s AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL "
-           "AND duration_s > 0" + _window_sql("started_at", start, end, robot, "robot_name", args)
-           + (_not_summarised("run_legs.run_id", "run_legs.map_id", start, end, robot, args) if skip_summarised else "")
+           "AND duration_s > 0 AND EXISTS (SELECT 1 FROM mission_runs a WHERE a.run_id = run_legs.run_id "
+           "AND a.archived_at IS NULL)" + _window_sql("started_at", start, end, robot, "robot_name", args)
+           + (_not_summarised("run_legs.run_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY started_at DESC LIMIT %s")
     args.append(config.DRIVE_STATS_MAX_ROWS)
     await cur.execute(sql, tuple(args))
     return list(await cur.fetchall())
 
 
-async def runs_with_track(cur: Any, run_ids: Sequence[Any]) -> set:
-    """Runs (of `run_ids`) that have ANY stored map-frame track row, in or out of the window."""
+async def runs_with_track(cur: Any, run_ids: Sequence[Any], start: Optional[datetime.datetime] = None) -> set:
+    """Runs (of `run_ids`, which fetch_legs already took from non-archived runs) that have ANY stored map-frame track row, in or out of the window.
+    `start`: the window start. The runs started at or after it, so no row of theirs is older (an hour of slack for
+    the clock difference between a run's start and its first row): the scan of the hypertable is bounded."""
     if not run_ids:
         return set()
-    await cur.execute("SELECT DISTINCT run_id FROM robot_track_ts WHERE run_id = ANY(%s) AND x_map IS NOT NULL",
-                      (list(run_ids),))
+    sql = ("SELECT DISTINCT run_id FROM robot_track_ts WHERE run_id = ANY(%s) AND x_map IS NOT NULL")
+    args: List[Any] = [list(run_ids)]
+    if start is not None:
+        sql += " AND ts >= %s"
+        args.append(start - datetime.timedelta(hours=1))
+    await cur.execute(sql, tuple(args))
     return {r[0] for r in await cur.fetchall()}
 
 
@@ -265,7 +297,7 @@ class Loaded:
         self.legs_dropped_for_track = 0
         self.summaries: List[run_cells_db.CellRow] = []    # stored per-run cell summaries (the summaries part)
         self.basis = "raw"                                 # "summaries" | "raw"
-        self.basis_reason: Optional[str] = None            # why raw: "min_speed" | "config"
+        self.basis_reason: Optional[str] = None            # why raw: "min_speed" | "config" | "params"
 
 
 def summaries_wanted(p: Params) -> Tuple[bool, Optional[str]]:
@@ -277,6 +309,15 @@ def summaries_wanted(p: Params) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def stored_params_current(summaries: Sequence[run_cells_db.CellRow]) -> bool:
+    """Were all these summaries written with today's rules (`run_cells._params_json(Params())`: min_speed, max_gap_s,
+    max_speed, leg_max_m, dwell radius)? Only the keys a summary stores are compared."""
+    from packages.api import run_cells       # late: run_cells is a sibling that must not be needed to import this
+    want = run_cells._params_json(Params())  # pylint: disable=protected-access
+    return all(math.isclose(float(row.params[k]), v, abs_tol=1e-9)
+               for row in summaries for k, v in want.items() if row.params.get(k) is not None)
+
+
 async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = False,
                reason: Optional[str] = None) -> Loaded:
     out = Loaded()
@@ -285,6 +326,9 @@ async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = Fa
         if use_summaries:
             out.summaries = await run_cells_db.fetch(cur, map_id, start, end, robot,
                                                      algo_version=config.RUN_CELLS_ALGO_VERSION)
+            if not stored_params_current(out.summaries):    # the rules changed since they were written: mixed
+                out.summaries, out.basis, out.basis_reason = [], "raw", "params"
+                use_summaries = False
         out.track_rows, out.partial = await fetch_track(cur, map_id, start, end, robot, config.DRIVE_STATS_MAX_ROWS,
                                                         skip_summarised=use_summaries)
         track_runs = {r[0] for r in out.track_rows}
@@ -293,7 +337,7 @@ async def load(db: Any, map_id: str, start, end, robot, use_summaries: bool = Fa
             out.recoveries = await fetch_recoveries(cur, sorted(track_runs, key=str), min(ts), max(ts))
         legs = await fetch_legs(cur, map_id, start, end, robot, skip_summarised=use_summaries)
         leg_runs = {l[0] for l in legs} - track_runs
-        has_track = await runs_with_track(cur, sorted(leg_runs, key=str))
+        has_track = await runs_with_track(cur, sorted(leg_runs, key=str), start)
         out.legs = [l for l in legs if l[0] not in track_runs and l[0] not in has_track]
         out.legs_dropped_for_track = len(legs) - len(out.legs)
     return out
@@ -438,17 +482,21 @@ def series_day(loaded: Loaded, p: Params, axis: Sequence[datetime.datetime]) -> 
         stopped = np.where(moving, 0.0, dt)
         idx = np.floor((seg.t0 - t_axis) / 86400.0).astype(np.int64)
         ok = (idx >= 0) & (idx < n)
+        day = idx[ok]
+        mv = moving[ok]
+        for name, vals in (("len", dist), ("time", dt), ("rec", rec)):
+            sums[name] += np.bincount(day, weights=vals[ok], minlength=n)
+        sums["mov_len"] += np.bincount(day, weights=np.where(mv, dist[ok], 0.0), minlength=n)
+        sums["mov_time"] += np.bincount(day, weights=np.where(mv, dt[ok], 0.0), minlength=n)
+        sums["stopped"] += np.bincount(day, weights=np.where(mv, 0.0, dt[ok]), minlength=n)
+        # tiles per day: the segments grouped by day with one sort (not one scan of all segments per day)
+        by_day = np.argsort(day, kind="stable")
+        order = np.nonzero(ok)[0][by_day]
+        bounds = np.searchsorted(day[by_day], np.arange(n + 1))
         for i in range(n):
-            sel = np.nonzero(ok & (idx == i))[0]
+            sel = order[bounds[i]:bounds[i + 1]]
             if not sel.size:
                 continue
-            mov = sel[moving[sel]]
-            sums["len"][i] += float(dist[sel].sum())
-            sums["time"][i] += float(dt[sel].sum())
-            sums["mov_len"][i] += float(dist[mov].sum())
-            sums["mov_time"][i] += float(dt[mov].sum())
-            sums["rec"][i] += float(rec[sel].sum())
-            sums["stopped"][i] += float(stopped[sel].sum())
             acc = Accumulator(1)
             z = np.zeros(sel.size)
             acc.add(np.zeros(sel.size, np.int64), seg.x0[sel], seg.y0[sel], seg.x1[sel], seg.y1[sel], dt[sel], z, z)
@@ -523,8 +571,7 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
     key = (map_id, start, end, robot or None, p.min_speed) + ((series,) if series else ())
     s_start, s_end = start, end
     if series:
-        s_end = end or datetime.datetime.now(datetime.timezone.utc)
-        s_start = start or s_end - datetime.timedelta(days=config.RUN_STATS_DEFAULT_DAYS)
+        s_start, s_end = fleet_reads.default_window(start, end, config.RUN_STATS_DEFAULT_DAYS)
         axis = series_axis.day_axis(s_start, s_end)     # 422 for a window over 120 days, before any query
 
     async def run() -> Tuple[bytes, str]:
@@ -552,14 +599,17 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
         else:
             ids, names, cells, version, status = await regions_of(reads, map_id, *key_cells(tiles.key))
         src["scene_graph"] = status
-        regions = region_rows(tiles, ids, names, cells) if ids is not None else []
+        regions = (region_rows(tiles, ids, names, cells, dwell_on(tiles, loaded.summaries))
+                   if ids is not None else [])
         origin = origin_cells(tiles.key, status == "ok" and version is not None)
         window = {"from": start.isoformat() if start else None, "to": end.isoformat() if end else None,
                   "robot": robot or None, "min_speed": p.min_speed, "max_gap_s": p.max_gap_s,
                   "max_speed": p.max_speed}
         body = build_body(map_id, tiles, src, regions, origin, version, window)
         if series:
-            sloaded = loaded if (s_start, s_end) == (start, end) else await load(db, map_id, s_start, s_end, robot, use_summaries, reason)
+            # an open `to` resolves to the same "now" as the series window: reuse what is loaded
+            same = s_start == start and (end is None or s_end == end)
+            sloaded = loaded if same else await load(db, map_id, s_start, s_end, robot, use_summaries, reason)
             body["series"] = await asyncio.to_thread(series_day, sloaded, p, axis)
             body["series"]["window"] = {"from": s_start.isoformat(), "to": s_end.isoformat()}
         raw = json.dumps(body, separators=(",", ":")).encode()

@@ -138,6 +138,19 @@ def check_window(start: Optional[datetime.datetime],
         raise _invalid("to", "`to` must be after `from`")
 
 
+def default_window(start: Optional[datetime.datetime], end: Optional[datetime.datetime], days: int,
+                   now: Optional[datetime.datetime] = None) -> Tuple[datetime.datetime, datetime.datetime]:
+    """(start, end) of a stats window with the defaults filled in, STABLE within the hour so the answers and their
+    caches / ETags can repeat: an open `to` is the start of the next UTC hour, an open `from` the start of the UTC
+    day `days` before `to`. Explicit values are kept as given."""
+    if end is None:
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        end = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+    if start is None:
+        start = (end - datetime.timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, end
+
+
 def check_choice(value: Optional[str], name: str, choices: Sequence[str]) -> Optional[str]:
     if value is not None and value not in choices:
         raise _invalid(name, f"unexpected value {value!r}; permitted: {', '.join(choices)}",
@@ -428,7 +441,7 @@ LEG_COLUMNS = ("run_id", "seq", "mission_name", "robot_name", "pass_index", "ord
                "started_at", "ended_at", "received_started_at", "received_ended_at",
                "duration_s", "stopped_s", "straight_m", "planned_m", "expected_s",
                "recoveries", "recovery_s", "blocks", "plan_source", "from_chart", "to_chart",
-               "graph_version", "moving_s", "silent_s")
+               "graph_version", "moving_s", "silent_s", "predicted_s", "cost_model")
 _LEG_SELECT = ", ".join(LEG_COLUMNS)
 # The legs a mission aggregate looks at: every run of the mission and of its reruns.
 MISSION_LEGS_MAX = 200000

@@ -233,7 +233,7 @@ map-frame trajectories. Read only. Full rules, limits and the live cross-check: 
 
 Query (all optional): `from`, `to` (ISO-8601 with time zone; rows with `from <= ts < to`), `robot` (exact name),
 `min_speed` (m/s, 0..1, default 0.05: a movement slower than this counts as stopped time),
-`series=day` (opt-in; adds a per-UTC-day `series` block over `from`/`to`, default the last 30 days, at most 120 days:
+`series=day` (opt-in; adds a per-UTC-day `series` block over `from`/`to`, default as run-stats (next UTC hour, 30 days back to a day start), at most 120 days:
 `docs/map_series_2026-10-15.md`).
 
 Response:
@@ -244,7 +244,7 @@ Response:
   "tile_fields": ["ix", "iy", "n", "len_m", "time_s", "recovery_s", "stopped_s"],
   "tiles": [[64, 64, 3, 0.412, 2.35, 0.0, 1.5]],
   "regions": [{"key": "b63f0f5e-...:0", "n": 57, "len_m": 178.04, "time_s": 1455.6, "recovery_s": 119.8,
-               "stopped_s": 400.1, "cells": 366, "visited": 233}],
+               "stopped_s": 400.1, "dwell_s": 60.0, "transit_stopped_s": 340.1, "cells": 366, "visited": 233}],
   "source": {"track_runs": 48, "track_rows": 7516, "track_segments": 7464, "track_pairs_rejected": 4,
              "leg_runs": 31, "leg_rows": 61, "legs_skipped": 0, "legs_dropped_run_has_track": 94,
              "recovery_unattributed_s": 3.1, "partial": false, "tiles_track": 939, "tiles_leg_only": 94,
@@ -263,13 +263,17 @@ Response:
   (including stopped and recovery time), `recovery_s` time inside NAV recoveries, `stopped_s` time in movements slower than
   `min_speed`. Mean speed of a tile = `len_m / time_s`; time lost = `recovery_s` + `stopped_s` (they can overlap).
 * **Regions:** per chart key of the current graph version: `n` distinct runs, the summed fields, `cells` the chart's size
-  in 0.1 m cells, `visited` how many of them have drive data.
+  in 0.1 m cells, `visited` how many of them have drive data. `stopped_s` is every stop; `dwell_s` is the part of it spent
+  waiting near the run's start, goal and action nodes and `transit_stopped_s` = `stopped_s - dwell_s` the rest. The latter
+  is the region-stats `stopped_s`. Runs read raw (no stored summary) carry no dwell split: `dwell_s` 0 for them.
+* **Archived runs** (`mission_runs.archived_at`) are left out of the raw part (tracks and legs), as they are of run-stats.
 * `source.partial` true: more than `DRIVE_STATS_MAX_ROWS` (2,000,000) raw track rows matched, the newest were used (the
   stored summaries are never cut).
 * **Summaries:** by default (`DRIVE_STATS_SOURCE=summaries`, the default `min_speed`) a run that started in the window and
   has a stored cell summary (`run_cells`) is summed from it; all other runs (still running, not summarised yet, started
   before the window) come from the raw rows, so none is missing or counted twice. `source.basis` is `summaries` or `raw`
-  (`basis_reason` `min_speed` or `config` says why raw), `source.summary_runs` / `raw_runs` count the runs of each part
+  (`basis_reason` `min_speed`, `config` or `params` says why raw; `params`: a stored summary was written with other rules than
+  today's `DRIVE_STATS_*` / `RUN_CELLS_DWELL_RADIUS_M`, so the whole read is raw until the runs are recomputed), `source.summary_runs` / `raw_runs` count the runs of each part
   (the other `source` keys keep their meaning and cover both). `series=day` puts a summarised run on the UTC day it started
   (a raw movement keeps the day it started).
 * Headers: `ETag`, `Cache-Control: private, max-age=60`; 304 on a matching `If-None-Match`. Results are cached
@@ -1262,6 +1266,7 @@ and the top level has `efficiency` (the run's block, same shape as run-stats' be
 | `duration_s`, `stopped_s`, `silent_s`, `moving_s` | Leg time, split by the robot's state messages (additive, stage C of the edge statistics). `stopped_s`: time after a message with `driving: false` (a missing `driving` counts as driving), at most 30 s per interval between two messages. `silent_s`: the part of every interval above 30 s (no messages: a link or dispatcher gap), whatever `driving` said. `moving_s` = max(0, `duration_s` - `stopped_s` - `silent_s`). Recovery time is not subtracted (it overlaps `stopped_s`, and a recovery maneuver may report driving). `silent_s` and `moving_s` are `null` on a leg recorded before 2026-10-27 (the silent time is unknown) |
 | `straight_m`, `planned_m` | `straight_m`: map-frame straight-line distance between the two waypoints (`null` for a leg that starts at the robot's own position). `planned_m`: the length of the plan between them: the polyline of the route node's plan trajectory when the leg is two adjacent waypoints of one route node whose trajectory entry ends where the leg ends (`plan_source` `trajectory`), else `straight_m` (`straight`: no trajectory entry; `stale`: an entry whose ends are not the leg's, after a reroute). Legs recorded before 2026-10-27 have `planned_m` = `straight_m` and `plan_source` `null` |
 | `plan_source`, `from_chart`, `to_chart`, `graph_version` | `plan_source`: `trajectory` \| `straight` \| `stale` \| `null` (recorded before 2026-10-27, or no plan: `straight_m` is `null`). `from_chart`, `to_chart`: the scene-graph chart key of the leg's start and end waypoint as the planner stored them with the route (`null` for the robot's own position, a hand-made route or a route without them); `graph_version`: the scene-graph version those keys were made on. |
+| `predicted_s`, `cost_model` | Region cost model prediction for the leg (seconds; the shadow go/no-go compares it with `duration_s`) and the `<model_hash>:<stamp>` of the snapshot it came from; `null` when the leg has no prediction (cost model off, or the plan was not a trajectory) |
 | `expected_s` | `d / speed_max + speed_max / acceleration_max + abs(delta heading) / angular_speed_max` from the robot's factsheet; a term whose limit is unknown (-1) is dropped, `null` when nothing is known or the start has no pose |
 | `recoveries`, `recovery_s`, `blocks` | `recoveries` counts recovery EPISODES (as `map_events`: a `NAV.RECOVERY_ENTERED` right after another ENTERED of the run, without an EXITED in between, is the same recovery); `recovery_s` sums the `NAV.RECOVERY_EXITED` durations; `blocks` counts `NAV.GOAL_BLOCKED` + `MISSION.EDGE_BLOCKED`; events tagged with the leg, filled when the run ends (events arriving later are not counted; runs ended before this rule counted every ENTERED) |
 
@@ -1285,8 +1290,9 @@ expected sum), `pass_durations_s` (`[{pass, legs, duration_s}]`).
 session at the run's start) is that map.
 
 **`GET /api/v1/maps/{map_id}/run-stats?from=&to=&robot=`** -- operating metrics of the map's
-non-archived runs that started in `[from, to)` (ISO-8601 with time zone; default: the last 30
-days), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls.
+non-archived runs that started in `[from, to)` (ISO-8601 with time zone; default: `to` = the start of the next UTC hour,
+`from` = the start of the UTC day 30 days before `to`, so the window and the answer are stable within the hour), optionally of one robot. 422 for `from >= to`; an unknown map answers zeros/nulls. The headline, `efficiency` and
+`series` are all cached 120 s (`EFFICIENCY_CACHE_TTL_S`; the headline used to be uncached).
 
 ```
 {"map_id", "window": {"from", "to"}, "robot": null | str,
@@ -1295,7 +1301,7 @@ days), optionally of one robot. 422 for `from >= to`; an unknown map answers zer
  "intervention": {"count", "cancels", "teleop", "takeovers", "rate_per_hour": float|null,
                   "free_success_rate": float|null, "free_runs"},
  "hours": float,                    // operating time, see docs/map_run_stats_2026-10-14.md
- "duration_s": {"median", "p95", "n"},   // COMPLETED runs
+ "duration_s": {"median", "p95", "n"},   // COMPLETED runs; median/p95 without runs over max_run_s (hung), n counts all
  "timeout": {"count", "median_s"},
  "abort_rate": float|null,          // (failed+timeout+aborted) / finished
  "recovery": {"legs", "legs_with_recovery", "median_s", "p95_s", "total_s",
@@ -1329,8 +1335,8 @@ Definitions, the hung-run rule and the teleop signal: `docs/map_run_stats_2026-1
 
 **`GET /api/v1/maps/{map_id}/events-summary?from=&to=&robot=&limit=10`** -- the most usual events
 of the map and its safety events, as episodes (a repeated error counts once). Window `[from, to)`,
-default the last 30 days; `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
-an unknown map answers zeros. Cached 30 s. Opt-in `series=day` adds `series: {bucket, t, total, safety,
+default as run-stats (next UTC hour, 30 days back to a day start); `limit` 1-50 per `top` list. 422 for `from >= to` or a bad `limit`;
+an unknown map answers zeros. Cached 30 s, `series` included (it was 120 s). Opt-in `series=day` adds `series: {bucket, t, total, safety,
 by_code}` per UTC day (`docs/map_series_2026-10-15.md`).
 
 ```

@@ -4,7 +4,6 @@
 Every block is aligned with `t`; SQL does the bucketing (one grouped query per block, in the same read-only
 transaction), Python only places the rows on the axis. Cached per (kind, map, request window, robot, series).
 """
-import asyncio
 import datetime
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,17 +35,7 @@ def _f(value: Any, digits: int) -> Optional[float]:
 
 # --- efficiency per run / per day ----------------------------------------------------------------
 
-def run_efficiency(records: Sequence[Dict[str, Any]]) -> Dict[Any, Tuple[float, float, int]]:
-    """run_id -> (planned_m, driven_m, legs) over the legs counted in the headline (a stored plan trajectory
-    and a usable track)."""
-    out: Dict[Any, List[float]] = {}
-    for r in records:
-        if r["excluded"] is None and r["plan_source"] == "trajectory":
-            acc = out.setdefault(r["run_id"], [0.0, 0.0, 0])
-            acc[0] += r["plan_m"]
-            acc[1] += r["driven_m"]
-            acc[2] += 1
-    return {k: (v[0], v[1], int(v[2])) for k, v in out.items()}
+run_efficiency = path_efficiency.run_efficiency
 
 
 def efficiency_point(planned: float, driven: float) -> Tuple[Optional[float], Optional[float]]:
@@ -56,10 +45,10 @@ def efficiency_point(planned: float, driven: float) -> Tuple[Optional[float], Op
     return round(planned / driven, 4), round((driven / planned - 1.0) * 100.0, 2)
 
 
-async def _efficiency(db: Any, map_id: str, start, end, robot) -> Dict[Any, Tuple[float, float, int]]:
-    loaded = await path_efficiency.load(db, map_id, start, end, robot)
-    recs = await asyncio.to_thread(path_efficiency.leg_records, loaded.legs, loaded.tracks, loaded.trajs)
-    return run_efficiency(recs)
+async def _efficiency(db: Any, map_id: str, start, end, robot, key: Any = None) -> Dict[Any, Tuple[float, float, int]]:
+    """Per-run (planned, driven, legs). Through path_efficiency's cache under the same key as the headline's
+    `efficiency` block, so a cold run-stats?series= runs the track query once."""
+    return (await path_efficiency.map_analysis(db, map_id, start, end, robot, key))["per_run"]
 
 
 def _scope(robot: Optional[str]) -> str:
@@ -77,7 +66,7 @@ async def _safety_days(cur: Any, map_id: str, start, end, robot, pos: Dict[Any, 
     return out
 
 
-async def _run_stats_day(db: Any, map_id: str, start, end, robot) -> Dict[str, Any]:
+async def _run_stats_day(db: Any, map_id: str, start, end, robot, ekey: Any = None) -> Dict[str, Any]:
     axis = ax.day_axis(start, end)
     n = len(axis)
     pos = ax.index_of(axis)
@@ -97,7 +86,8 @@ async def _run_stats_day(db: Any, map_id: str, start, end, robot) -> Dict[str, A
         for d, state, count, med in await _rows(cur, scope + (
                 f" SELECT {_DAY}, state, count(*), percentile_cont(0.5) WITHIN GROUP (ORDER BY "
                 "extract(epoch FROM ended_at - started_at)) FILTER (WHERE state = 'COMPLETED' "
-                "AND ended_at IS NOT NULL) FROM scope GROUP BY 1, 2"), sp):
+                "AND ended_at IS NOT NULL AND extract(epoch FROM ended_at - started_at) <= %s) "
+                "FROM scope GROUP BY 1, 2"), sp + (cap,)):
             i = pos.get(d)
             if i is None:
                 continue
@@ -144,7 +134,7 @@ async def _run_stats_day(db: Any, map_id: str, start, end, robot) -> Dict[str, A
             if d in pos:
                 run_day[rid] = pos[d]
         episodes = await _safety_days(cur, map_id, start, end, robot, pos, n)
-    per_run = await _efficiency(db, map_id, start, end, robot)
+    per_run = await _efficiency(db, map_id, start, end, robot, ekey)
     planned, driven = [0.0] * n, [0.0] * n
     for rid, (pl, dr, _legs) in per_run.items():
         i = run_day.get(rid)
@@ -166,7 +156,7 @@ async def _run_stats_day(db: Any, map_id: str, start, end, robot) -> Dict[str, A
     }
 
 
-async def _run_stats_runs(db: Any, map_id: str, start, end, robot) -> Dict[str, Any]:
+async def _run_stats_runs(db: Any, map_id: str, start, end, robot, ekey: Any = None) -> Dict[str, Any]:
     scope = _scope(robot)
     sp: Tuple[Any, ...] = (map_id, start, end) + ((robot,) if robot else ())
     async with fleet_reads.read_cursor(db) as cur:
@@ -181,7 +171,7 @@ async def _run_stats_runs(db: Any, map_id: str, start, end, robot) -> Dict[str, 
             "(SELECT 1 FROM fleet_events e WHERE e.code = %s AND e.robot_name = r.robot_name "
             "AND e.ts >= r.started_at AND e.ts <= r.ended_at))"),
             (ids, EventCode.TELEOP_SESSION_STARTED.value))} if ids else set()
-    per_run = await _efficiency(db, map_id, start, end, robot) if ids else {}
+    per_run = await _efficiency(db, map_id, start, end, robot, ekey) if ids else {}
     runs = sorted(runs, key=lambda r: (r[2], str(r[0])))        # oldest first: a chart reads left to right
     out: Dict[str, Any] = {"bucket": "run", "t": [], "run_id": [], "outcome": [], "duration_s": [],
                            "recovery_s": [], "efficiency_ratio": [], "intervention": []}
@@ -209,7 +199,8 @@ async def attach_run_stats(out: Dict[str, Any], db: Any, map_id: str, start: Opt
     fn = _run_stats_day if series == "day" else _run_stats_runs
 
     async def run() -> Dict[str, Any]:
-        return await fn(db, map_id, s, e, robot)
+        # the headline's cache key (path_efficiency.attach): the REQUEST window
+        return await fn(db, map_id, s, e, robot, (map_id, start, end, robot or None))
     try:
         out["series"] = await cache.get((map_id, "run-stats", start, end, robot or None, series), run)
     except Exception as exc:  # noqa: BLE001
@@ -251,10 +242,10 @@ async def attach_events(out: Dict[str, Any], db: Any, map_id: str, start: Option
                         end: Optional[datetime.datetime], robot: Optional[str],
                         cache: Optional[ResultCache] = None) -> Dict[str, Any]:
     """`out` (a cached events-summary answer, not mutated) plus `series` over the window of that answer."""
-    cache = CACHE if cache is None else cache
+    cache = map_events.CACHE if cache is None else cache      # the summary's cache: one TTL for both blocks
     win = out["window"]
     s, e = datetime.datetime.fromisoformat(win["from"]), datetime.datetime.fromisoformat(win["to"])
 
     async def run() -> Dict[str, Any]:
         return await events_series(db, map_id, s, e, robot)
-    return {**out, "series": await cache.get((map_id, "events-summary", start, end, robot or None, "day"), run)}
+    return {**out, "series": await cache.get((map_id, "events-series", start, end, robot or None, "day"), run)}

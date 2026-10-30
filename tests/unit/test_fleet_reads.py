@@ -696,3 +696,8 @@ class TestEffectiveLevelAll:
     async def test_timeout_is_503(self):
         db = FakeDb(fail=psycopg.errors.QueryCanceled("timeout"))
         assert (await get(db, "/api/v1/recording")).status_code == 503
+
+
+def test_leg_columns_carry_the_prediction():
+    assert {"predicted_s", "cost_model"} <= set(fr.LEG_COLUMNS)
+    assert fr.leg_dict([None] * len(fr.LEG_COLUMNS))["predicted_s"] is None

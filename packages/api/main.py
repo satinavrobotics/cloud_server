@@ -648,7 +648,7 @@ async def map_run_stats(
     start, end = fleet_reads.parse_ts(from_, "from"), fleet_reads.parse_ts(to, "to")
     if series == "day":
         series_axis.day_axis(*run_stats.resolve_window(start, end))     # 422 before any query
-    out = await _site_call("map run stats", run_stats.run_stats(
+    out = await _site_call("map run stats", run_stats.run_stats_cached(
         service.database, map_id, start, end, robot))
     # + `efficiency`: driven path vs the lattice plan path (path_efficiency.py; cached, never fails run-stats)
     out = await path_efficiency.attach(out, service.database, map_id, start, end, robot)

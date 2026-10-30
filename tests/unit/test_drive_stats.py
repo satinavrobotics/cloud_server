@@ -309,6 +309,17 @@ class TestEndpoint:
         body, _ = call(Off())
         assert body["regions"] == [] and body["source"]["scene_graph"] == "none" and body["origin"] == [0.0, 0.0]
 
+    def test_a_chunk_outside_the_graph_extent_does_not_drop_the_regions(self, patched):
+        """A run crossing a 160 m grid line the graph does not reach: only that chunk has no chart."""
+        patched(track=track_run("a", [0.05, 0.75, 1.45, 2.15]) + track_run("b", [170.05, 170.75], t0=5000.0))
+
+        class Partial(FakeReads):
+            async def owner_plane(self, map_id, bbox, level=0):
+                return None if bbox.x0 > 100 else await super().owner_plane(map_id, bbox, level)
+        body, _ = call(Partial())
+        assert body["source"]["scene_graph"] == "ok" and {r["key"] for r in body["regions"]} == {"A", "B"}
+        assert body["graph_version"] == 7
+
     def test_leg_fallback_excludes_runs_with_track(self, patched):
         legs = [("legrun", "n1", "n2", 10.0, 0.0, 0.0), ("a", "n1", "n2", 10.0, 0.0, 0.0),
                 ("outside", "n1", "n2", 10.0, 0.0, 0.0)]
@@ -351,6 +362,18 @@ class TestEndpoint:
         assert a in args and "r1" in args
         with pytest.raises(HTTPException):
             call(FakeReads(), start=a, end=a)
+
+    def test_archived_runs_are_left_out_and_the_track_probe_is_bounded(self, patched):
+        import datetime
+        cur = patched(legs=[("legrun", "n1", "n2", 10.0, 0.0, 0.0)])
+        a = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
+        call(FakeReads(), start=a)
+        sql = next(s for s, _ in cur.sql if "FROM robot_track_ts t JOIN" in s)
+        assert "r.archived_at IS NULL" in sql
+        sql = next(s for s, _ in cur.sql if "FROM run_legs" in s)
+        assert "a.archived_at IS NULL" in sql
+        sql, args = next(c for c in cur.sql if c[0].startswith("SELECT DISTINCT run_id"))
+        assert "ts >= %s" in sql and args[1] == a - datetime.timedelta(hours=1)
 
 
 class TestCache:
@@ -488,6 +511,39 @@ class TestSummaries:
         assert body["source"]["basis"] == "raw" and body["source"]["basis_reason"] == "min_speed"
         assert body["source"]["summary_runs"] == 0 and body["source"]["raw_runs"] == 2
 
+    def test_summaries_written_with_other_rules_read_raw_and_say_so(self, patched, monkeypatch):
+        a, b, rec = two_runs()
+        patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec), summarise("b", b, rec)])
+        body, _ = call(FakeReads())
+        assert body["source"]["basis"] == "summaries"                       # the stored params are today's
+        monkeypatch.setattr(ds.config, "RUN_CELLS_DWELL_RADIUS_M", 0.9)
+        body, _ = call(FakeReads(), cache=ResultCache(4, 60.0))
+        assert body["source"]["basis"] == "raw" and body["source"]["basis_reason"] == "params"
+        assert body["source"]["summary_runs"] == 0 and body["source"]["raw_runs"] == 2
+
+    def test_regions_split_dwell_from_transit_stops(self, patched):
+        a, _, rec = two_runs()
+        row = summarise("a", a, rec)
+        row.dwell_s = np.zeros(row.key.size)
+        row.dwell_s[0] = 4.0
+        patched(track=a, summaries=[row])
+        body, _ = call(FakeReads())
+        assert body["source"]["basis"] == "summaries"
+        assert sum(r["dwell_s"] for r in body["regions"]) == pytest.approx(4.0, abs=0.06)
+        for r in body["regions"]:                                  # stopped_s stays every stop
+            assert r["stopped_s"] == pytest.approx(r["dwell_s"] + r["transit_stopped_s"], abs=0.06)
+        patched(track=a)                                            # raw rows carry no dwell
+        raw, _ = call(FakeReads(), cache=ResultCache(4, 60.0), min_speed=0.06)
+        assert all(r["dwell_s"] == 0.0 and r["transit_stopped_s"] == r["stopped_s"] for r in raw["regions"])
+
+    def test_the_raw_part_skips_a_run_summarised_on_any_map(self, patched):
+        a, _, rec = two_runs()
+        cur = patched(track=a, summaries=[summarise("a", a, rec)])
+        call(FakeReads())
+        for sql, _ in cur.sql:
+            if "NOT EXISTS" in sql:
+                assert "c.run_id = " in sql and "c.map_id" not in sql
+
     def test_config_raw_never_reads_the_summaries(self, patched, monkeypatch):
         a, b, rec = two_runs()
         cur = patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec)])
@@ -531,6 +587,36 @@ class TestSummaries:
         body, _ = call(FakeReads())
         assert body["source"]["leg_runs"] == 1 and body["source"]["track_runs"] == 0
         assert body["source"]["leg_rows"] == 1 and {t[1] for t in body["tiles"]} == {50}
+
+
+class TestSeriesReusesTheLoad:
+    def test_open_to_loads_once(self, patched):
+        """The client sends `from` only: the series window ends at "now" too, and shares the one load."""
+        cur = patched(track=track_run("a", [0.05, 0.8], t0=DAY0.timestamp() + 60))
+        call(FakeReads(), start=DAY0, series="day")
+        assert sum("FROM robot_track_ts t JOIN" in sql for sql, _ in cur.sql) == 1
+
+    def test_default_window_differs_and_loads_again(self, patched):
+        cur = patched(track=track_run("a", [0.05, 0.8], t0=DAY0.timestamp() + 60))
+        call(FakeReads(), series="day")
+        assert sum("FROM robot_track_ts t JOIN" in sql for sql, _ in cur.sql) == 2
+
+
+class TestSeriesDayRaw:
+    def test_sums_per_day_from_raw_rows(self):
+        """Two runs on two of three days: the per-day sums of the vectorised path."""
+        d1, d3 = DAY0.timestamp() + 3600, DAY0.timestamp() + 2 * 86400 + 3600
+        rows = track_run("a", [0.05, 0.4, 0.8, 0.8, 1.2], t0=d1) + track_run("b", [0.5, 0.9, 0.9], y=0.35, t0=d3)
+        loaded = ds.Loaded()
+        loaded.track_rows = rows
+        axis = [DAY0 + _dt.timedelta(days=i) for i in range(3)]
+        out = ds.series_day(loaded, P, axis)
+        # run a: 4 pairs, 0.35 + 0.4 + 0.0 + 0.4 m over 6 s (the 0-length pair is a stop); run b: 0.4 + 0.0 m
+        assert out["len_m"] == [pytest.approx(1.15, abs=0.01), 0.0, pytest.approx(0.4, abs=0.01)]
+        assert out["time_s"] == [6.0, 0.0, 3.0]
+        assert out["stopped_share"] == [pytest.approx(0.25), None, pytest.approx(0.5)]
+        assert out["moving_speed_mps"][1] is None and out["new_tiles"][1] == 0
+        assert out["cumulative_tiles"][2] >= out["cumulative_tiles"][0] > 0
 
 
 class TestSeriesFromSummaries:

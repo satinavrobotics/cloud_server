@@ -20,8 +20,9 @@ Definitions (all counts are runs unless stated):
                   config.RUN_STATS_MAX_RUN_S (default 2 h: a hung run, not operating time) are
                   left out (their number is `data_quality.hours_excluded_runs`)
   rate_per_hour   interventions / hours (null without hours)
-  duration_s      median and P95 of ended_at - started_at over COMPLETED runs; `timeout` is
-                  reported separately (count, median)
+  duration_s      median and P95 of ended_at - started_at over COMPLETED runs, without the hung runs
+                  over config.RUN_STATS_MAX_RUN_S (as `hours`; `n` still counts them, their number is
+                  `data_quality.hours_excluded_runs`); `timeout` is reported separately (count, median)
   recovery        over the legs (run_legs) of the scope's runs: median / P95 of recovery_s over
                   legs with recoveries > 0; share_of_time = sum(recovery_s) / sum(duration_s)
   safety          safety EPISODES attributed to the map (map_events.py: the event's run, else the
@@ -31,6 +32,7 @@ Definitions (all counts are runs unless stated):
                   only these recorded events are counted.
 """
 
+import copy
 import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,6 +40,7 @@ from fastapi import HTTPException
 
 from packages import config
 from packages.api import fleet_reads, map_events
+from packages.api.result_cache import ResultCache
 from packages.events.codes import EventCode
 
 UTC = datetime.timezone.utc
@@ -61,8 +64,7 @@ def _ratio(num: float, den: float) -> Optional[float]:
 
 def resolve_window(start: Optional[datetime.datetime], end: Optional[datetime.datetime]
                    ) -> Tuple[datetime.datetime, datetime.datetime]:
-    end = end or datetime.datetime.now(UTC)
-    start = start or end - datetime.timedelta(days=config.RUN_STATS_DEFAULT_DAYS)
+    start, end = fleet_reads.default_window(start, end, config.RUN_STATS_DEFAULT_DAYS)
     fleet_reads.check_window(start, end)
     return start, end
 
@@ -92,10 +94,10 @@ async def run_stats(db: Any, map_id: str, start: Optional[datetime.datetime] = N
         (dur,) = await rows(cur, scope + (
             ", d AS (SELECT state, extract(epoch FROM ended_at - started_at) AS secs "
             "FROM scope WHERE ended_at IS NOT NULL) SELECT "
-            "percentile_cont(0.5) WITHIN GROUP (ORDER BY secs) FILTER (WHERE state = 'COMPLETED'), "
-            "percentile_cont(0.95) WITHIN GROUP (ORDER BY secs) FILTER (WHERE state = 'COMPLETED'), "
+            "percentile_cont(0.5) WITHIN GROUP (ORDER BY secs) FILTER (WHERE state = 'COMPLETED' AND secs <= %s), "
+            "percentile_cont(0.95) WITHIN GROUP (ORDER BY secs) FILTER (WHERE state = 'COMPLETED' AND secs <= %s), "
             "percentile_cont(0.5) WITHIN GROUP (ORDER BY secs) FILTER (WHERE state = 'TIMEOUT'), "
-            "count(*) FILTER (WHERE secs > %s) FROM d"), sp + (cap,))
+            "count(*) FILTER (WHERE secs > %s) FROM d"), sp + (cap, cap, cap))
         causes = await rows(cur, scope + (
             " SELECT coalesce(abort_cause, 'UNKNOWN'), count(*) FROM scope "
             "WHERE state NOT IN ('RUNNING', 'COMPLETED') GROUP BY 1 ORDER BY 2 DESC, 1"), sp)
@@ -186,6 +188,22 @@ async def run_stats(db: Any, map_id: str, start: Optional[datetime.datetime] = N
                          "hours_excluded_runs": int(dur[3] or 0),
                          "max_run_s": cap, "notes": notes},
     }
+
+
+# The headline is cached with the same TTL as its `efficiency` and `series` blocks (path_efficiency, map_series),
+# so the three agree to within one TTL. Keys start with the map id (ResultCache.discard_map).
+CACHE = ResultCache(config.EFFICIENCY_CACHE_ENTRIES, config.EFFICIENCY_CACHE_TTL_S)
+
+
+async def run_stats_cached(db: Any, map_id: str, start: Optional[datetime.datetime] = None,
+                           end: Optional[datetime.datetime] = None, robot: Optional[str] = None,
+                           cache: Optional[ResultCache] = None) -> Dict[str, Any]:
+    """`run_stats` through the cache (key: the REQUEST window, as the other blocks). Returns a private copy: the
+    caller adds `efficiency` / `series` to it."""
+    cache = CACHE if cache is None else cache
+    out = await cache.get((map_id, "run-stats", start, end, robot or None),
+                          lambda: run_stats(db, map_id, start, end, robot))
+    return copy.deepcopy(out)
 
 
 def require_map_id(map_id: str) -> str:
