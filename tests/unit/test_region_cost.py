@@ -84,6 +84,14 @@ class TestFallbackLevels:
         assert p.levels[2] == "pooled" and p.rho_of("C") == round(expect * 1000)
         assert other                                                  # (the other class is only in the pooled rows)
 
+    def test_levels_rank_best_first_in_the_order_the_chain_prefers_them(self):
+        """class, then pooled (preferred to the map-wide figure), then map, then prior (I15): provenance lists them that way."""
+        assert rc.LEVELS == ("class", "pooled", "map", "prior")
+        pooled = [stat("A", 2, 10.0, 20.0, cls="*"), stat("B", 10, 100.0, 100.0, cls="*"), stat("C", 3, 10.0, 30.0, cls="*")]
+        p = snap([A, B], pooled, keys=["A", "B", "C", "D"])
+        assert p.levels == ("class", "class", "pooled", "map")
+        assert [lv for lv, _ in p.provenance] == ["class", "pooled", "map"]
+
     def test_pooled_figures_are_used_as_is_when_the_class_has_no_data_on_the_map(self):
         pooled = [stat("A", 2, 10.0, 20.0, cls="*")]
         p = snap([], pooled)

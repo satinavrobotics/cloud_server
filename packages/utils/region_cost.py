@@ -42,8 +42,8 @@ import numpy as np
 from packages import config
 from packages.utils.region_stats_load import RegionStat, RegionStats
 
-# quality of a chart's figure, best first
-LEVELS = ("class", "map", "pooled", "prior")
+# quality of a chart's figure, best first: a chart without class data prefers the pooled figure to the map-wide one (Term.value)
+LEVELS = ("class", "pooled", "map", "prior")
 USABLE_BUILDS = ("ok", "stale")          # a stale build (a rebuild is pending) is still real data
 MODES = ("off", "shadow", "on")
 
