@@ -524,6 +524,14 @@ class TestSummaries:
         raw, _ = call(FakeReads(), cache=ResultCache(4, 60.0), min_speed=0.06)
         assert all(r["dwell_s"] == 0.0 and r["transit_stopped_s"] == r["stopped_s"] for r in raw["regions"])
 
+    def test_the_raw_part_skips_a_run_summarised_on_any_map(self, patched):
+        a, _, rec = two_runs()
+        cur = patched(track=a, summaries=[summarise("a", a, rec)])
+        call(FakeReads())
+        for sql, _ in cur.sql:
+            if "NOT EXISTS" in sql:
+                assert "c.run_id = " in sql and "c.map_id" not in sql
+
     def test_config_raw_never_reads_the_summaries(self, patched, monkeypatch):
         a, b, rec = two_runs()
         cur = patched(track=a + b, recoveries=rec, summaries=[summarise("a", a, rec)])

@@ -215,11 +215,13 @@ def _window_sql(column: str, start: Optional[datetime.datetime], end: Optional[d
     return sql
 
 
-def _not_summarised(table_run: str, table_map: str, start, end, robot, args: List[Any]) -> str:
-    """AND NOT EXISTS (a current summary of this run and map that the summaries part takes: it started in the
-    window and is of the robot): those runs are not read raw."""
+def _not_summarised(table_run: str, start, end, robot, args: List[Any]) -> str:
+    """AND NOT EXISTS (a current summary of this run, on ANY map, that the summaries part takes: it started in the
+    window and is of the robot): those runs are not read raw. Any map: the summariser puts a row on the map of its
+    session, which can differ from `mission_runs.map_id`, so a run summarised only on another map must not also be
+    counted here."""
     args.append(config.RUN_CELLS_ALGO_VERSION)
-    return (f" AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = {table_run} AND c.map_id = {table_map} "
+    return (f" AND NOT EXISTS (SELECT 1 FROM run_cells c WHERE c.run_id = {table_run} "
             "AND c.algo_version = %s" + run_cells_db.window_sql(start, end, robot, None, args, alias="c") + ")")
 
 
@@ -233,7 +235,7 @@ async def fetch_track(cur: Any, map_id: str, start, end, robot, limit: int,
            "FROM robot_track_ts t JOIN mission_runs r ON r.run_id = t.run_id "
            "WHERE r.map_id = %s AND t.x_map IS NOT NULL AND t.y_map IS NOT NULL"
            + _window_sql("t.ts", start, end, robot, "t.robot_name", args)
-           + (_not_summarised("r.run_id", "r.map_id", start, end, robot, args) if skip_summarised else "")
+           + (_not_summarised("r.run_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY t.ts DESC LIMIT %s")
     args.append(limit + 1)
     await cur.execute(sql, tuple(args))
@@ -259,7 +261,7 @@ async def fetch_legs(cur: Any, map_id: str, start, end, robot, skip_summarised: 
     sql = ("SELECT run_id, from_topomap_node, to_topomap_node, duration_s, stopped_s, recovery_s "
            "FROM run_legs WHERE map_id = %s AND from_topomap_node IS NOT NULL AND to_topomap_node IS NOT NULL "
            "AND duration_s > 0" + _window_sql("started_at", start, end, robot, "robot_name", args)
-           + (_not_summarised("run_legs.run_id", "run_legs.map_id", start, end, robot, args) if skip_summarised else "")
+           + (_not_summarised("run_legs.run_id", start, end, robot, args) if skip_summarised else "")
            + " ORDER BY started_at DESC LIMIT %s")
     args.append(config.DRIVE_STATS_MAX_ROWS)
     await cur.execute(sql, tuple(args))
