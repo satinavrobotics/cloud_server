@@ -63,7 +63,7 @@ from packages.telemetry_ingest.policy import (
     ASSIGNMENTS_CHANNEL, allows as policy_allows, parse_assignment_payload, parse_level,
 )
 from packages.telemetry_ingest.rehydrate import LatestRow
-from packages.utils import map_geo, map_sessions, run_legs
+from packages.utils import factsheet_periods, map_geo, map_sessions, run_legs
 
 logger = logging.getLogger("Isaac Mission Dispatch.fleet_recorder")
 
@@ -596,6 +596,36 @@ class _FinishRun(_Op):
                 await recorder._close_run(conn, self.info, self.finish, self.with_events)
 
 
+class _WriteFactsheetPeriod(_Op):
+    """A factsheet was received: a new robot_factsheet_periods row when its figures differ from the robot's latest period
+    (utils/factsheet_periods.py). Decided when it runs, against the stored latest row, so a re-delivered retained factsheet
+    writes nothing."""
+
+    def __init__(self, robot_name: str, message: Any, received_at: datetime.datetime):
+        self.robot_name = robot_name
+        self.message = message
+        self.received_at = received_at
+
+    def describe(self) -> str:
+        return f"factsheet period of {self.robot_name}"
+
+    async def run(self, recorder: "FleetRecorder") -> None:
+        async with recorder._pool.connection(timeout=OP_CONNECT_TIMEOUT_S) as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cursor:
+                    await cursor.execute(factsheet_periods.LATEST_SQL, (self.robot_name,))
+                    row = await cursor.fetchone()
+                    latest = factsheet_periods.row_dict(row) if row is not None else None
+                    values = factsheet_periods.from_message(self.message, latest)
+                    if not factsheet_periods.differs(latest, values):
+                        return
+                    since = factsheet_periods.valid_from(
+                        parse_robot_ts(self.message.timestamp, self.received_at), self.received_at,
+                        latest["valid_from"] if latest else None)
+                    await cursor.execute(factsheet_periods.INSERT_SQL, (
+                        self.robot_name, since, *(values[f] for f in factsheet_periods.FIELDS), "factsheet"))
+
+
 class _Reconcile(_Op):
     """Settle RUNNING runs the dispatcher no longer knows (left by a previous process at
     startup, or by a lost finish, periodically)."""
@@ -943,6 +973,7 @@ class FleetRecorder:
         if self._sw_version(track, sw_version_from_message(message),
                             parse_robot_ts(message.timestamp, now)):
             self._put_latest(track)
+        self._submit(_WriteFactsheetPeriod(robot_name, message, now))
 
     @_guarded
     def on_leg_state(self, robot_name: str, message: Any, mission: Any, robot_object: Any = None,
