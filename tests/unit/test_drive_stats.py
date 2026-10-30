@@ -533,6 +533,19 @@ class TestSummaries:
         assert body["source"]["leg_rows"] == 1 and {t[1] for t in body["tiles"]} == {50}
 
 
+class TestSeriesReusesTheLoad:
+    def test_open_to_loads_once(self, patched):
+        """The client sends `from` only: the series window ends at "now" too, and shares the one load."""
+        cur = patched(track=track_run("a", [0.05, 0.8], t0=DAY0.timestamp() + 60))
+        call(FakeReads(), start=DAY0, series="day")
+        assert sum("FROM robot_track_ts t JOIN" in sql for sql, _ in cur.sql) == 1
+
+    def test_default_window_differs_and_loads_again(self, patched):
+        cur = patched(track=track_run("a", [0.05, 0.8], t0=DAY0.timestamp() + 60))
+        call(FakeReads(), series="day")
+        assert sum("FROM robot_track_ts t JOIN" in sql for sql, _ in cur.sql) == 2
+
+
 class TestSeriesFromSummaries:
     def test_equals_the_raw_series_when_no_run_crosses_midnight(self, patched, monkeypatch):
         a, b, rec = two_runs()

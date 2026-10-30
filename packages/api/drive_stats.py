@@ -559,7 +559,9 @@ async def drive_stats(db: Any, graph: Any, reads: Any, map_id: str, start: Optio
                   "max_speed": p.max_speed}
         body = build_body(map_id, tiles, src, regions, origin, version, window)
         if series:
-            sloaded = loaded if (s_start, s_end) == (start, end) else await load(db, map_id, s_start, s_end, robot, use_summaries, reason)
+            # an open `to` resolves to the same "now" as the series window: reuse what is loaded
+            same = s_start == start and (end is None or s_end == end)
+            sloaded = loaded if same else await load(db, map_id, s_start, s_end, robot, use_summaries, reason)
             body["series"] = await asyncio.to_thread(series_day, sloaded, p, axis)
             body["series"]["window"] = {"from": s_start.isoformat(), "to": s_end.isoformat()}
         raw = json.dumps(body, separators=(",", ":")).encode()
