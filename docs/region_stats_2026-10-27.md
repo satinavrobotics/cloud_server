@@ -401,3 +401,8 @@ Sections 1-12 stay as written; where they differ, this section wins.
 * **Poll cost (P6).** `maps_needing_build` gets the graph version through a per-map cache (`REGION_STATS_VERSION_TTL_S`,
   120 s); `build_map` drops the entry. The newest-`REGION_STATS_MAX_RUNS` cut stays in `aggregate`, because the chart of a cell
   is known only after the owner-raster lookup, so it cannot be a SQL limit.
+* **Stale means "an input changed".** `region_builds.mark_stale` also runs on every new or recomputed `run_cells` row, so `stale`
+  is no longer only "a run was deleted". `maps_needing_build` feeds the run_cells worker's `dirty` map (`setdefault`, so the
+  first change keeps its time), and `build_due` builds a map once `REGION_STATS_DEBOUNCE_S` has passed: one build per window
+  of a burst. A build that loses the generation race returns `inputs_changed`, writes nothing and is picked up again by the
+  next debounced pass. The planner loader reads `stale` builds as usable (`region_cost.USABLE_BUILDS`).

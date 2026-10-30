@@ -30,7 +30,8 @@ rows:
 
 `build_map` writes one (map, graph version) in one transaction (delete + insert + its region_stats_builds row) and
 keeps the newest REGION_STATS_KEEP_VERSIONS versions. `maps_needing_build` names the maps whose newest build is not
-of the current graph version, or is marked stale (a run was deleted); the run_cells worker rebuilds them.
+of the current graph version, or is marked stale (an input changed: a run summarised, replaced, deleted or archived); the run_cells
+worker rebuilds them, putting them through its dirty / REGION_STATS_DEBOUNCE_S path (one build per window of a burst).
 Only the CURRENT graph version can be built: the owner raster of an older one is not served.
 """
 import asyncio
@@ -272,10 +273,10 @@ async def build_map(db: Any, reads: Any, map_id: str, version: Optional[int] = N
             if await cur.fetchone() is None:
                 logger.info("Region stats of %s: map is gone or being deleted, nothing stored", map_id)
                 return {"graph_version": ver, "status": "map_gone", "runs": runs, "charts": 0, "stamp": got.stamp}
-            # The inputs may have changed since collect (a run deleted, archived, a summary replaced): every writer bumps
+            # The inputs may have changed since collect (a run summarised, replaced, deleted or archived): every writer bumps
             # region_stats_inputs.gen (packages/utils/region_builds.mark_stale) before it changes them. Lock the row so a
             # writer that comes now waits for this commit (and then marks the fresh build stale), and store nothing
-            # when the generation moved: the build row stays stale / missing and the next poll rebuilds.
+            # when the generation moved: the build row stays stale / missing; the worker's next debounced pass rebuilds (no retry loop here).
             await cur.execute("INSERT INTO region_stats_inputs (map_id) VALUES (%s) ON CONFLICT DO NOTHING", (map_id,))
             await cur.execute(GEN_SQL + " FOR UPDATE", (map_id,))
             gen_now = int((await cur.fetchone())[0])
