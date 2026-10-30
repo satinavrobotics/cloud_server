@@ -77,7 +77,9 @@ REGION_VERSION_TRIES = 3  # reads started over after a version change before giv
 async def regions_of(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray
                      ) -> Tuple[Optional[np.ndarray], List[str], Dict[str, int], Optional[int], str]:
     """Chart of every tile. Returns (region id per tile (0 = none, i = names[i-1]), names, cells per chart key,
-    graph version, status "ok" | "none" | "error"). Never raises: a missing graph or a failing read is a status.
+    graph version, status "ok" | "none" | "error"). Never raises: a missing graph or a failing read is a status. A chunk with no
+    owner raster (outside the graph's extent) leaves its tiles in no chart; "none" is only for a map where NO chunk
+    has one.
 
     ONE graph version answers the whole call: the first chunk's owner plane fixes it, the chart-cell views are asked
     for that version, and a later chunk whose owner plane is of another version (the graph was rebuilt during a read
@@ -109,8 +111,8 @@ async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray)
             span = REGION_CHUNK_CELLS * CELL_M
             box = BBox(round(cx * span, 6), round(cy * span, 6), round((cx + 1) * span, 6), round((cy + 1) * span, 6))
             plane = await reads.owner_plane(map_id, box, 0)
-            if plane is None:
-                return None, [], {}, None, "none"
+            if plane is None:        # no raster for this chunk (outside the graph extent): its tiles stay chart 0
+                continue
             if abs(float(plane["step"]) - CELL_M) > 1e-9:
                 logger.warning("Drive stats: owner raster step %s is not %s; no regions", plane["step"], CELL_M)
                 return None, [], {}, None, "error"
@@ -137,6 +139,8 @@ async def _regions_pass(reads: Any, map_id: str, ax: np.ndarray, ay: np.ndarray)
                     index_of[name] = len(names)
                 glob[i] = index_of[name]
             ids[sel] = glob[np.clip(vals, 0, len(keys))]
+        if version is None:          # not one chunk has a raster: there is no scene graph for this map
+            return None, [], {}, None, "none"
     except HTTPException as exc:
         logger.info("Drive stats of %s: no regions (%s %s)", map_id, exc.status_code, exc.detail)
         return None, [], {}, None, "error"

@@ -309,6 +309,17 @@ class TestEndpoint:
         body, _ = call(Off())
         assert body["regions"] == [] and body["source"]["scene_graph"] == "none" and body["origin"] == [0.0, 0.0]
 
+    def test_a_chunk_outside_the_graph_extent_does_not_drop_the_regions(self, patched):
+        """A run crossing a 160 m grid line the graph does not reach: only that chunk has no chart."""
+        patched(track=track_run("a", [0.05, 0.75, 1.45, 2.15]) + track_run("b", [170.05, 170.75], t0=5000.0))
+
+        class Partial(FakeReads):
+            async def owner_plane(self, map_id, bbox, level=0):
+                return None if bbox.x0 > 100 else await super().owner_plane(map_id, bbox, level)
+        body, _ = call(Partial())
+        assert body["source"]["scene_graph"] == "ok" and {r["key"] for r in body["regions"]} == {"A", "B"}
+        assert body["graph_version"] == 7
+
     def test_leg_fallback_excludes_runs_with_track(self, patched):
         legs = [("legrun", "n1", "n2", 10.0, 0.0, 0.0), ("a", "n1", "n2", 10.0, 0.0, 0.0),
                 ("outside", "n1", "n2", 10.0, 0.0, 0.0)]
