@@ -8,6 +8,7 @@ Covers:
   clearing the block when the robot resumes.
 """
 import asyncio
+import datetime
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -248,3 +249,26 @@ async def test_blocked_mission_without_cancel_stays_running():
 
     assert mission.status.state == mission_object.MissionStateV1.RUNNING
     assert mission.status.blocked is True
+
+
+@pytest.mark.unit
+async def test_blocked_since_set_once_and_cleared():
+    r, db = _make_robot()
+    mission = _make_mission()
+    mission.status.state = mission_object.MissionStateV1.RUNNING
+    r._current_mission = mission
+    assert mission.status.blocked_since is None   # old rows / not blocked
+
+    r._handle_edge_blocked(_build_state([_edge_blocked_error()]))
+    first = mission.status.blocked_since
+    assert first is not None
+    stamp = datetime.datetime.fromisoformat(first)
+    assert stamp.utcoffset() == datetime.timedelta(0)
+
+    # The same block re-reported does not move it.
+    r._handle_edge_blocked(_build_state([_edge_blocked_error()]))
+    assert mission.status.blocked_since == first
+
+    r._handle_edge_blocked(_build_state([]))
+    assert mission.status.blocked_since is None
+    r._cancel_mission_timeout()

@@ -1233,6 +1233,14 @@ route once the dispatcher enriched it before the first order). A client that edi
 the route back without `trajectory`, or with legs whose ends no longer sit at their waypoints, loses it (stale legs are
 dropped on load, never an error). See `docs/plan_trajectory_2026-10-14.md`.
 
+#### Mission status block fields
+
+While a robot is blocked, the mission status (REST `status` and the `mission_update` WebSocket
+message) carries `blocked` (bool), `blocked_since` (ISO-8601 UTC timestamp of when the block was
+first recorded, e.g. `"2026-10-30T09:15:02.123456+00:00"`; `null` when not blocked and on rows
+from before the field existed; a re-report of the same block does not change it, and it resets when the block target, the node or edge, changes),
+`blocked_node`, `blocked_edge` and `blocked_waypoint_index`.
+
 #### Blocked graph nodes
 
 When a robot reports `edgeBlocked`, the dispatcher keeps the blocked waypoint's graph node out of
@@ -1763,7 +1771,10 @@ interface MissionObject {
   in place: node statuses reset to `PENDING`, `status.run_id` renewed (so the VDA5050
   order/node ids of each pass are unique), `status.passes_completed` incremented, and
   the timeout re-armed per pass. The robot is not idled between passes. A cancel, a
-  failure or a timeout in any pass ends the whole repeat.
+  failure or a timeout in any pass ends the whole repeat. The next pass starts no sooner
+  than `MISSION_PASS_MIN_GAP_S` (default 5 s) after the last one finished, and not at all
+  when that pass reached no waypoint of its route nodes: the mission is then `FAILED`
+  (`failure_reason` "Repeat stopped: ...") and a `MISSION.PASS_NO_PROGRESS` event is recorded.
 - **`then_run`**: when the mission has completed (last pass included) the dispatcher
   creates a new mission named `{then_run}-run-{unix_ms}` as a copy of the named mission
   (same `robot`, `mission_tree`, `timeout`, `mode`, `register_map`, `repeat` and

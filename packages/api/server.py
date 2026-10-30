@@ -559,6 +559,7 @@ def build_mission_update(mission) -> Dict[str, Any]:
             "start_timestamp": st.start_timestamp.isoformat() if st.start_timestamp is not None else None,
             "end_timestamp": st.end_timestamp.isoformat() if st.end_timestamp is not None else None,
             "blocked": st.blocked,
+            "blocked_since": st.blocked_since,
             "blocked_node": st.blocked_node,
             "blocked_edge": st.blocked_edge,
             "blocked_waypoint_index": st.blocked_waypoint_index,

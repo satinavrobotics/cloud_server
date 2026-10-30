@@ -19,6 +19,7 @@ VALID_PAYLOADS = {
     EventCode.MISSION_NODE_FAILED: {"mission_name": "m1", "node_id": "n3"},
     EventCode.MISSION_REROUTED: {"mission_name": "m1", "route_rev": 2, "nodes": ["r"]},
     EventCode.MISSION_BLOCK_CLEARED: {"mission_name": "m1", "blocked_edges": ["e1", "e2"]},
+    EventCode.MISSION_PASS_NO_PROGRESS: {"mission_name": "m1", "passes_completed": 1},
     EventCode.MISSION_EDGE_BLOCKED: {"mission_name": "m1", "edge_id": "e1"},
     EventCode.MISSION_CANCEL_REQUESTED: {"mission_name": "m1", "actor": "alice"},
     EventCode.MISSION_ORDER_CHURN: {"mission_name": "m1", "order_id": "m1-r1v6-n1",

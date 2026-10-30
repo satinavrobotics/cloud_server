@@ -607,6 +607,11 @@ class MissionStatusV1(pydantic.BaseModel):
         False, description="True when the robot reported an impassable edge and is waiting \
                            (IDLE) for the server/operator to send a new route. The mission \
                            remains RUNNING; this is a non-terminal condition.")
+    blocked_since: Optional[str] = pydantic.Field(
+        None, description="ISO-8601 UTC timestamp of when the current block was first \
+                           recorded; null when not blocked (and on rows from before this \
+                           field existed). Not overwritten when the same block is \
+                           re-reported.")
     blocked_node: Optional[str] = pydantic.Field(
         None, description="Name of the mission_tree route node whose edge is blocked.")
     blocked_edge: Optional[str] = pydantic.Field(

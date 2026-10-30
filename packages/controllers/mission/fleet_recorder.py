@@ -1438,6 +1438,15 @@ class FleetRecorder:
         }, discriminator=f"{mission.name}|{mission.status.run_id}")
 
     @_guarded
+    def pass_no_progress(self, robot_name: str, mission: Any, passes: int,
+                         ts: Optional[datetime.datetime] = None) -> None:
+        """A repeating mission's pass reached no waypoint; its next pass was not started."""
+        self._event(EventCode.MISSION_PASS_NO_PROGRESS, robot_name, ts or self._clock(), {
+            "mission_name": mission.name, "passes_completed": passes,
+            "detail": f"pass {passes} reached no waypoint; repeat stopped",
+        }, discriminator=f"{mission.name}|{mission.status.run_id}")
+
+    @_guarded
     def rerouted(self, robot_name: str, mission: Any, route_rev: int, nodes: List[str],
                  ts: Optional[datetime.datetime] = None) -> None:
         """A reroute the dispatcher applied. The route revision is in the discriminator, so

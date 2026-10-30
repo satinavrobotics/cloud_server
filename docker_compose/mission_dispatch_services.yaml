@@ -104,6 +104,7 @@ services:
       - MISSION_TIMEOUT_PAUSE_OFFLINE=${MISSION_TIMEOUT_PAUSE_OFFLINE:-true}
       - BLOCKED_NODE_EXCLUSION_MIN=${BLOCKED_NODE_EXCLUSION_MIN:-10}
       - ORDER_CANCEL_MIN_DWELL_S=${ORDER_CANCEL_MIN_DWELL_S:-2}
+      - MISSION_PASS_MIN_GAP_S=${MISSION_PASS_MIN_GAP_S:-5}
       # Fleet events spilled during a database outage survive a container recreate. A
       # directory of its own: the heartbeat (/tmp/mission_dispatch) must not outlive the container.
       - FLEET_SPILL_PATH=/var/lib/mission_dispatch/spill/fleet_events_spill.jsonl

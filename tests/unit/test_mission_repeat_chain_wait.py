@@ -20,6 +20,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from packages import config
 import cloud_common.objects as api_objects
 import cloud_common.objects.common as common
 import cloud_common.objects.mission as mission_object
@@ -91,8 +92,16 @@ def _published_order_ids(r):
             for c in r._mqtt_client.publish.call_args_list]
 
 
-async def _finish(r):
-    """Complete the current mission's pass the way robot feedback would."""
+@pytest.fixture(autouse=True)
+def _no_pass_gap(monkeypatch):
+    monkeypatch.setattr(config, "MISSION_PASS_MIN_GAP_S", 0.0)
+
+
+async def _finish(r, progress=True):
+    """Complete the current mission's pass the way robot feedback would (having reached
+    a waypoint, unless `progress` is False)."""
+    if progress:
+        r._current_mission.status.task_status = {"a": 1}
     r._set_mission_state(State.COMPLETED)
     await r.post_mission_completion()
 
@@ -623,4 +632,69 @@ async def test_a_reroute_of_a_dispatched_mission_is_not_reported_as_an_ignored_e
     r._apply_spec_edit(m, echo, dispatched=True)
 
     assert "m1" not in r._ignored_spec_edits
+    r._cancel_mission_timeout()
+
+
+# ---------------------------------------------------------------------------
+# Pass guard: minimum gap and progress
+# ---------------------------------------------------------------------------
+@pytest.mark.unit
+async def test_next_pass_waits_out_the_minimum_gap(monkeypatch):
+    monkeypatch.setattr(config, "MISSION_PASS_MIN_GAP_S", 5.0)
+    r, _ = _make_robot()
+    m = await _start(r, _mission(repeat=3))
+    run_id = m.status.run_id
+
+    await _finish(r)
+    # Too soon: still the finished pass, not dropped, no new run id.
+    assert r._current_mission is m and m.status.state == State.COMPLETED
+    assert m.status.run_id == run_id
+
+    r._pass_done_at -= 6.0          # the gap has passed; the next state message retries
+    await r.get_next_mission()
+    assert r._current_mission is m and m.status.run_id != run_id
+    assert m.status.passes_completed == 1
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_pass_without_progress_is_not_repeated():
+    r, _ = _make_robot()
+    r._record = MagicMock()
+    m = await _start(r, _mission(repeat=3))
+    run_id = m.status.run_id
+
+    await _finish(r, progress=False)
+
+    assert r._current_mission is None
+    assert m.status.run_id == run_id
+    assert m.status.state == State.FAILED
+    assert "without reaching any waypoint" in m.status.failure_reason
+    assert any(c.args[0] == "pass_no_progress" for c in r._record.call_args_list)
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_action_only_mission_counts_as_progress():
+    r, _ = _make_robot()
+    m = await _start(r, _mission(tree=_tree(_wait("pause")), repeat=2))
+    run_id = m.status.run_id
+
+    await _finish(r, progress=False)
+
+    assert r._current_mission is m and m.status.run_id != run_id
+    r._cancel_mission_timeout()
+
+
+@pytest.mark.unit
+async def test_robot_already_on_the_goal_counts_as_progress():
+    """An order that leaves out every waypoint (robot already there) still marks them
+    reached, so the repeat is not failed as 'no progress'."""
+    r, _ = _make_robot()
+    m = await _start(r, _mission(repeat=2))
+    m.status.task_status = {}
+    node = m.mission_tree[1]
+    record = SimpleNamespace(waypoint_offset=2)
+    r._mark_skipped_waypoints_reached(node, 0, record)
+    assert r._pass_made_progress()
     r._cancel_mission_timeout()

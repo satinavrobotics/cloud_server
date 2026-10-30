@@ -741,6 +741,10 @@ class Robot:
         # Completion (mission name + run id + pass) whose then_run mission has been
         # created already, so a completion seen twice chains only once.
         self._chained_completion: Optional[str] = None
+        # (mission name, run id) of the pass whose completion is waiting out the minimum
+        # gap before the next pass, and the monotonic time it was first seen completed.
+        self._pass_done_key: Optional[Tuple[str, str]] = None
+        self._pass_done_at: float = 0.0
         # Missions whose spec edit was refused because they were already dispatched,
         # so the log says so once rather than on every status echo.
         self._ignored_spec_edits: Set[str] = set()
@@ -3674,6 +3678,49 @@ class Robot:
             return False
         return mission.repeat == 0 or mission.status.passes_completed + 1 < mission.repeat
 
+    def _pass_made_progress(self) -> bool:
+        """Whether the pass that just completed reached any waypoint. A mission with no
+        route node (only actions) has no waypoints to reach and always counts as progress.
+
+        Not a risk for a robot already standing on the goal: a route only completes on a
+        state whose lastNodeId carries this run's prefix and whose sequence id is the last
+        one, and that report moves task_status (last_node_seq_id restarts at -1 each pass).
+        Waypoints the order left out as already reached are marked by
+        _mark_skipped_waypoints_reached. So a completed pass without task_status really
+        reached nothing."""
+        mission = self._current_mission
+        assert mission is not None
+        has_route = any(n.type is mission_object.MissionNodeType.ROUTE and
+                        n.route is not None and n.route.waypoints
+                        for n in mission.mission_tree)
+        return not has_route or bool(mission.status.task_status)
+
+    def _pass_gap_remaining_s(self) -> float:
+        """Seconds left of config.MISSION_PASS_MIN_GAP_S since this pass was first seen
+        completed (0 when the next pass may start)."""
+        mission = self._current_mission
+        assert mission is not None
+        key = (mission.name, mission.status.run_id or "")
+        now = time.monotonic()
+        if self._pass_done_key != key:
+            self._pass_done_key = key
+            self._pass_done_at = now
+        return max(config.MISSION_PASS_MIN_GAP_S - (now - self._pass_done_at), 0.0)
+
+    def _stop_repeat_without_progress(self) -> None:
+        """End a repeating mission whose finished pass reached no waypoint: it is FAILED
+        with a reason (not re-sent), and the event is recorded."""
+        mission = self._current_mission
+        assert mission is not None
+        passes = mission.status.passes_completed + 1
+        reason = (f"Repeat stopped: pass {passes} completed without reaching any waypoint, "
+                  "so the next pass was not started")
+        self.warning(f"[{mission.name}] {reason}")
+        mission.status.failure_reason = reason
+        self._set_failure_category(mission_object.MissionFailureCategoryV1.ROBOT_APP)
+        self._set_mission_state(mission_object.MissionStateV1.FAILED)
+        self._record("pass_no_progress", self._name, mission, passes, self._event_ts)
+
     async def _start_next_pass(self) -> bool:
         """Run the current (just completed) mission again, in place, as its next pass.
 
@@ -3699,6 +3746,7 @@ class Robot:
         status.failure_reason = None
         status.failure_category = None
         status.blocked = False
+        status.blocked_since = None
         status.blocked_node = None
         status.blocked_edge = None
         status.blocked_waypoint_index = None
@@ -3788,7 +3836,13 @@ class Robot:
                 not self._current_mission.needs_canceled and \
                 self._current_mission.lifecycle is api_objects.object.ObjectLifecycleV1.ALIVE:
             if self._will_run_another_pass():
-                if await self._start_next_pass():
+                if not self._pass_made_progress():
+                    # A pass that reached nothing would only be sent again, and again.
+                    self._stop_repeat_without_progress()
+                elif self._pass_gap_remaining_s() > 0:
+                    # Too soon after the last pass: a later state message comes back here.
+                    return
+                elif await self._start_next_pass():
                     return
                 # No pass follows after all: the robot is not on task any more.
                 self._set_robot_idle_after_mission()
@@ -4477,6 +4531,8 @@ class Robot:
             return True
 
         status.blocked = True
+        # Only here, where a block is new or changed target: a re-report returned above.
+        status.blocked_since = datetime.datetime.now(datetime.timezone.utc).isoformat()
         status.blocked_node = blocked_node_name
         status.blocked_edge = blocked_edge
         status.blocked_waypoint_index = blocked_waypoint_index
@@ -4522,6 +4578,7 @@ class Robot:
         self._record("block_cleared", self._name, mission, blocked_node,
                      mission.status.blocked_edge, self._event_ts)
         mission.status.blocked = False
+        mission.status.blocked_since = None
         mission.status.blocked_node = None
         mission.status.blocked_edge = None
         mission.status.blocked_waypoint_index = None

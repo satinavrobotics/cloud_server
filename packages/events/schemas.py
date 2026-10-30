@@ -94,6 +94,13 @@ class BlockCleared(Payload):
     detail: Optional[str] = None
 
 
+class PassNoProgress(Payload):
+    """A repeating mission's finished pass reached no waypoint, so no next pass was started."""
+    mission_name: Optional[str] = None
+    passes_completed: Optional[int] = None
+    detail: Optional[str] = None
+
+
 class EdgeBlocked(Payload):
     mission_name: Optional[str] = None
     edge_id: Optional[str] = None

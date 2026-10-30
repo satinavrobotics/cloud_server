@@ -575,6 +575,8 @@ DISPATCH_RUN_CHECK_TIMEOUT_S = float(os.getenv("DISPATCH_RUN_CHECK_TIMEOUT_S", "
 # A current mission whose start failed is started again at most every START_RETRY_S, and
 # failed after MAX_START_ATTEMPTS.
 DISPATCH_START_RETRY_S = float(os.getenv("DISPATCH_START_RETRY_S", "5.0"))
+# A repeating mission starts its next pass no sooner than this after the last one finished.
+MISSION_PASS_MIN_GAP_S = max(0.0, float(os.getenv("MISSION_PASS_MIN_GAP_S", "5.0")))
 DISPATCH_MAX_START_ATTEMPTS = int(os.getenv("DISPATCH_MAX_START_ATTEMPTS", "5"))
 # A failed status write is retried with this back-off (doubling, capped); a failure streak is
 # an error from the Nth failure on; a shutdown waits FLUSH_S for the queued writes.

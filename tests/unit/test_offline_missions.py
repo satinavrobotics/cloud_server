@@ -639,7 +639,8 @@ async def test_node_notes_are_capped_newest_first(monkeypatch):
 
 
 @pytest.mark.unit
-async def test_a_new_pass_starts_without_the_last_passes_reports():
+async def test_a_new_pass_starts_without_the_last_passes_reports(monkeypatch):
+    monkeypatch.setattr("packages.config.MISSION_PASS_MIN_GAP_S", 0.0)
     r, _, m = await _start_on_map()
     m.repeat = 2
     order = _order_id(r)
