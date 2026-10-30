@@ -163,8 +163,9 @@ What the code does, per path (all pinned by `tests/unit/test_keepout_reroute.py`
 
 ## Not covered
 
-* **Missions already running keep their route**; a reroute (`PUT /missions/{name}` with `update_nodes`) and operator-drawn
-  waypoints are not checked against zones (the preview lists crossed legs; the mission API does not refuse them). A replan by the
+* **Missions already running keep their route**; a reroute (`PUT /missions/{name}` with `update_nodes`) is not refused for
+  crossing a zone: the response carries a non-blocking `warnings` entry `ROUTE_CROSSES_KEEPOUT` (`node`, `crossed`, `message`) from the
+  planner's `keepout.crossed`. Operator-drawn waypoints are not checked (the preview lists crossed legs; the mission API does not refuse them). A replan by the
   dispatcher goes through the planner and is covered.
 * A robot **inside** a zone, or a goal inside one, gets no route (the zone's cells are not drivable); `start_in_zone` /
   `goal_in_zone` in the error say so. Disable the zone to let the robot out.

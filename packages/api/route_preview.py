@@ -1,9 +1,10 @@
 """Dry-run preview of a route (docs/route_preview_2026-10-14.md): what the mission dispatcher's route enrichment
 would store for these waypoints (planned waypoints, corridor widths, lattice trajectory), computed by the planner's
 `POST /api/v1/route/enrich` and returned without storing anything. No database access, no events."""
+import asyncio
 import logging
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cloud_common.objects import common
 from packages import config
@@ -91,33 +92,72 @@ async def preview(planner: Any, map_id: str, raw: List[Dict[str, Any]], return_l
             **({"keepout": result["keepout"]} if result.get("keepout") is not None else {})}
 
 
+async def _measure_route(planner: Any, robot_name: str, name: str,
+                         route: Any) -> Tuple[Dict[str, Any], bool, Optional[Dict[str, Any]]]:
+    """One route of a reroute: (route dict, measured on a scene graph, the planner's keepout
+    answer or None). Never raises: a planner that fails leaves the route as given."""
+    route = route.dict() if hasattr(route, "dict") else dict(route or {})
+    waypoints = [dict(w) if isinstance(w, dict) else w.dict() for w in route.get("waypoints") or []]
+    maps = {w.get("map_id") or "" for w in waypoints}
+    if planner is not None and len(waypoints) >= 2 and len(maps) == 1 and "" not in maps:
+        try:
+            result = await planner.enrich_route(
+                robot_name, next(iter(maps)), waypoints, insert_planned=False,
+                timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
+            measured = [w if isinstance(w, dict) else w.dict() for w in result["waypoints"]]
+            if len(measured) == len(waypoints):
+                version = result.get("graph_version")
+                out = {**route, "waypoints": measured}
+                if version is not None:
+                    # chart_keys are of THIS graph version: the route now claims it
+                    out["graph_version"] = version
+                return out, version is not None, result.get("keepout")
+            node_policy_rules.clear_stale_measured(waypoints)
+        except Exception as err:  # pylint: disable=broad-except
+            _log.warning("Reroute of %s: corridors not measured (%r); route stored as given",
+                         name, err)
+            node_policy_rules.clear_stale_measured(waypoints)
+    else:
+        node_policy_rules.clear_stale_measured(waypoints)       # nothing to measure it against
+    return {**route, "waypoints": waypoints}, False, None
+
+
+def keepout_warnings(keepout_by_node: Dict[str, Optional[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Non-blocking warnings for the legs of a reroute that still enter a keep-out zone (the
+    planner's `keepout.crossed`); one entry per route that has any."""
+    out = []
+    for name, keepout in keepout_by_node.items():
+        crossed = (keepout or {}).get("crossed") or []
+        if crossed:
+            zones = sorted({z for leg in crossed for z in leg.get("zones") or []})
+            out.append({"code": "ROUTE_CROSSES_KEEPOUT", "node": name, "crossed": crossed,
+                        "message": f"The new route of node {name} crosses keep-out zone(s) "
+                                   f"{', '.join(map(str, zones))}."})
+    return out
+
+
+async def measure_reroute_detailed(planner: Any, robot_name: str, reroute: Dict[str, Any]
+                                   ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """measure_reroute plus what the planner said besides the corridors: (routes, info) with
+    info = {"measured": [node names measured on a scene graph (their chart_key / graph_version
+    are fresh)], "warnings": keepout_warnings}. The routes are measured concurrently, each with
+    its own NODE_POLICY_ENRICH_TIMEOUT_S, so a reroute of N routes costs one call, not N."""
+    names = list(reroute)
+    results = await asyncio.gather(*(_measure_route(planner, robot_name, n, reroute[n])
+                                     for n in names))
+    routes = {n: r[0] for n, r in zip(names, results)}
+    info = {"measured": [n for n, r in zip(names, results) if r[1]],
+            "warnings": keepout_warnings({n: r[2] for n, r in zip(names, results)})}
+    return routes, info
+
+
 async def measure_reroute(planner: Any, robot_name: str, reroute: Dict[str, Any]) -> Dict[str, Any]:
     """A reroute's routes with their corridors measured again for the waypoints where they are now
     (`update_nodes` of PUT /missions/{name}): the editor seeds a reroute with the stored route, so
     a waypoint the operator moved still carries the corridor measured for its old place. The
     waypoints are not re-planned or moved (`insert_planned` off); an operator's own corridor is
     kept. A planner that is down, slow or without a scene graph leaves the route as it was given,
-    like a route with nothing to measure. Returns the routes as dicts."""
-    out: Dict[str, Any] = {}
-    for name, route in reroute.items():
-        route = route.dict() if hasattr(route, "dict") else dict(route or {})
-        waypoints = [dict(w) if isinstance(w, dict) else w.dict() for w in route.get("waypoints") or []]
-        maps = {w.get("map_id") or "" for w in waypoints}
-        if planner is not None and len(waypoints) >= 2 and len(maps) == 1 and "" not in maps:
-            try:
-                result = await planner.enrich_route(
-                    robot_name, next(iter(maps)), waypoints, insert_planned=False,
-                    timeout=config.NODE_POLICY_ENRICH_TIMEOUT_S)
-                measured = [w if isinstance(w, dict) else w.dict() for w in result["waypoints"]]
-                if len(measured) == len(waypoints):
-                    waypoints = measured
-                else:
-                    node_policy_rules.clear_stale_measured(waypoints)
-            except Exception as err:  # pylint: disable=broad-except
-                _log.warning("Reroute of %s: corridors not measured (%r); route stored as given",
-                             name, err)
-                node_policy_rules.clear_stale_measured(waypoints)
-        else:
-            node_policy_rules.clear_stale_measured(waypoints)       # nothing to measure it against
-        out[name] = {**route, "waypoints": waypoints}
-    return out
+    like a route with nothing to measure. Returns the routes as dicts. Routes only: PUT /missions
+    uses `measure_reroute_detailed` (it needs the measured names and keep-out warnings too); this
+    wrapper is for callers that want just the routes."""
+    return (await measure_reroute_detailed(planner, robot_name, reroute))[0]

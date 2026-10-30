@@ -18,7 +18,8 @@ SPDX-License-Identifier: Apache-2.0
 """
 import datetime
 import enum
-from typing import Any, Dict, List, Optional
+import hashlib
+from typing import Any, Dict, Iterable, List, Optional
 
 import pydantic
 
@@ -165,6 +166,35 @@ class RouteTrajectoryLegV1(pydantic.BaseModel):
         if out.get("predicted_s", 0) is None:
             del out["predicted_s"]
         return out
+
+
+def route_waypoints(route: Any) -> List[Any]:
+    """The waypoint list of a route node, or of a bare list of waypoints; empty for None."""
+    if route is None:
+        return []
+    return list(getattr(route, "waypoints", route))
+
+
+def same_route(a: Any, b: Any) -> bool:
+    """THE definition of "these two routes are the same" for reroute purposes: their waypoints are equal, in
+    order, ignoring each waypoint's `chart_key`. `trajectory`, `graph_version`, `cost_model` (and `chart_key`)
+    are planner / recording metadata, not routing intent: refreshing them is never a reroute.
+    Accepts route nodes or plain waypoint lists; None counts as an empty route (None and [] are the same).
+    Not for "is there anything new to store" questions (a trajectory-only refresh is worth storing)."""
+    wa, wb = route_waypoints(a), route_waypoints(b)
+    return len(wa) == len(wb) and all(
+        x.dict(exclude={"chart_key"}) == y.dict(exclude={"chart_key"}) for x, y in zip(wa, wb))
+
+
+def route_digest(route: "MissionRouteNodeV1") -> str:
+    """A stable 16-hex hash of the same canonical form `same_route` compares (waypoints without `chart_key`), for
+    records that outlive the object (sent-order records): `route_digest(a) == route_digest(b)` iff `same_route(a, b)`.
+    Unset optional waypoint fields are left out, so adding one to Pose2D does not change the digest of a route
+    stored before it existed (a mission in flight at deploy would otherwise read as rerouted)."""
+    return hashlib.sha1(route.json(
+        sort_keys=True, exclude_none=True,
+        exclude={"trajectory": True, "graph_version": True, "cost_model": True, "waypoints": {"__all__": {"chart_key"}}}
+    ).encode()).hexdigest()[:16]
 
 
 class MissionRouteNodeV1(pydantic.BaseModel):
@@ -379,7 +409,7 @@ class MissionSpecV1(pydantic.BaseModel):
         False, description="Marker for whether the mission is requested to be canceled"
     )
     update_nodes: Optional[Dict[str, MissionRouteNodeV1]] = pydantic.Field(
-        None, description="Deprecated, accepted for compatibility and never stored: a reroute "
+        None, description="Request-only, never stored (always null on a read): a reroute "
                           "(PUT /missions/{name} with update_nodes) is folded into mission_tree "
                           "and announced by route_rev.")
     route_rev: int = pydantic.Field(
@@ -651,6 +681,30 @@ class MissionQueryParamsV1(pydantic.BaseModel):
     most_recent: Optional[int]
 
 
+def parse_reroute(update_nodes: Any) -> Optional[Dict[str, MissionRouteNodeV1]]:
+    """The one parse of a reroute (`update_nodes` of PUT /missions/{name}): None for no reroute
+    (None or {}), else {node name: MissionRouteNodeV1}. Objects pass through. A body that is not
+    {name: route-object} or a route that does not validate is an ICSUsageError (400) naming the
+    node, never a 500. An empty route (no waypoints) is refused by the model's own validator."""
+    if update_nodes is None or update_nodes == {}:
+        return None
+    if not isinstance(update_nodes, dict):
+        raise common.ICSUsageError("update_nodes must be an object {node name: {waypoints: [...]}}")
+    out: Dict[str, MissionRouteNodeV1] = {}
+    for name, route in update_nodes.items():
+        if isinstance(route, MissionRouteNodeV1):
+            out[name] = route
+            continue
+        if not isinstance(route, dict):
+            raise common.ICSUsageError(
+                f"update_nodes[{name!r}] must be an object {{waypoints: [...]}}")
+        try:
+            out[name] = MissionRouteNodeV1(**route)
+        except pydantic.ValidationError as err:
+            raise common.ICSUsageError(f"update_nodes[{name!r}] is not a valid route: {err}") from err
+    return out
+
+
 class MissionObjectV1(MissionSpecV1, object.ApiObject):
     """Specifies a mission, which is a list of orders, to be completed by a specific robot."""
     status: MissionStatusV1
@@ -712,40 +766,50 @@ class MissionObjectV1(MissionSpecV1, object.ApiObject):
         self.needs_canceled = True
         return {"detail": f"Mission {self.name} will be canceled."}
 
-    async def update(self, update_nodes: Dict[str, MissionRouteNodeV1]):
+    def check_reroute(self, routes: Dict[str, MissionRouteNodeV1]) -> None:
+        """Raise ICSUsageError (400) unless every node of `routes` is a route node of this
+        mission that can still be rerouted. Pure: the API runs it before the planner is asked
+        anything, and update() runs it again before it touches the tree."""
         if self.status.state.done:
             raise common.ICSUsageError(
                 f"Mission {self.name} is finished with status {self.status.state}.")
-        # Parse first: a bad route must not leave the tree half rerouted.
-        update_nodes = {name: route if isinstance(route, MissionRouteNodeV1)
-                        else MissionRouteNodeV1(**route)
-                        for name, route in update_nodes.items()}
-        current_node_names = [n.name for n in self.mission_tree]
-        for node_name, _ in update_nodes.items():
-            if node_name not in current_node_names:
+        by_name = {n.name: n for n in self.mission_tree}
+        for node_name in routes:
+            node = by_name.get(node_name)
+            if node is None:
                 raise common.ICSUsageError(
                     f"Node {node_name} does not exist in mission {self.name}")
             if self.status.state is MissionStateV1.RUNNING and \
                     self.status.node_status[node_name].state.done:
                 raise common.ICSUsageError(
-                    f"Mission node {node_name} is finished with status \
-                        {self.status.node_status[node_name].state}.")
-            node = next(n for n in self.mission_tree if n.name == node_name)
+                    f"Mission node {node_name} is finished with status "
+                    f"{self.status.node_status[node_name].state}.")
             if node.type is not MissionNodeType.ROUTE:
                 raise common.ICSUsageError(
                     f"Mission node {node_name} is not a route node and cannot be rerouted")
-        # Fold the new routes into the tree. The tree is the single source of truth: the
-        # row is what the dispatcher resumes from, and route_rev tells it to act once.
-        # The old planned_path described the old route, so it goes.
-        for node_name, route in update_nodes.items():
+
+    async def update(self, update_nodes: Dict[str, Any],
+                     measured: Optional[Iterable[str]] = None
+                     ) -> Dict[str, MissionRouteNodeV1]:
+        """Fold a reroute into mission_tree and bump route_rev (the dispatcher acts once per
+        revision). `update_nodes`: {node name: route}, MissionRouteNodeV1 or dict (parse_reroute
+        has made them objects already; a dict is parsed here). `measured`: the node names whose
+        route the planner measured in this update on a scene graph (chart_key / graph_version
+        are fresh): those keep them, every other route gets clear_stale_charts against the route
+        it replaces. planned_path (topomap ids paired 1:1 with the old waypoints) cannot be
+        derived for the new ones, so it is cleared. Returns the routes now in the tree."""
+        routes = parse_reroute(update_nodes) or {}   # parse first: a bad route must not leave the tree half rerouted
+        self.check_reroute(routes)
+        trusted = set(measured or ())
+        for node_name, route in routes.items():
             for node in self.mission_tree:
                 if node.name == node_name:
-                    # not produced by the planner in this update: no stale chart on a waypoint that moved
-                    route.clear_stale_charts(node.route)
+                    if node_name not in trusted:
+                        route.clear_stale_charts(node.route)
                     node.route = route
         self.planned_path = None
         self.route_rev += 1
-        return update_nodes
+        return routes
 
     @staticmethod
     def get_query_map() -> Dict:

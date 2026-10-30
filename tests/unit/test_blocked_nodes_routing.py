@@ -143,12 +143,21 @@ async def test_the_robots_start_node_is_never_blocked_in_the_planner_or_the_api(
     svc = _planner(rows)
     assert svc._path_avoiding("1", "3", "M", rows) == (["1", "2", "3"], None, [])
     svc.graph_db.get_edges.assert_not_called()
-    assert await _reroute_hits(rows, _waypoints(["1", "2", "3"]), monkeypatch) == []
-    # Each route of a reroute starts where the robot is when it begins it.
+    # The API exempts a node by the robot's pose (within its footprint), not by being first.
+    at_1 = (*NODES["1"], "M")
     monkeypatch.setattr(api_main, "service", SimpleNamespace(database=_Db(rows)))
     assert await api_main._reroute_through_blocked(
-        {"a": {"waypoints": _waypoints(["1", "2"])},
-         "b": {"waypoints": _waypoints(["2", "1"])}}) == [_row("1", *NODES["1"])]
+        {"go": {"waypoints": _waypoints(["1", "2", "3"])}}, robot_pose=at_1) == []
+    # No pose known: every waypoint is checked, the first one too.
+    assert await _reroute_hits(rows, _waypoints(["1", "2", "3"]), monkeypatch) == rows
+    # A pose elsewhere (the client seeded waypoint 0 at a node the robot is not at): blocked.
+    assert await api_main._reroute_through_blocked(
+        {"go": {"waypoints": _waypoints(["1", "2", "3"])}},
+        robot_pose=(*NODES["3"], "M")) == rows
+    # Pose on another map exempts nothing.
+    assert await api_main._reroute_through_blocked(
+        {"go": {"waypoints": _waypoints(["1", "2", "3"])}},
+        robot_pose=(*NODES["1"], "OTHER")) == rows
 
 
 async def test_waypoints_as_pose2d_objects_are_checked_too(monkeypatch):

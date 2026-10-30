@@ -128,7 +128,8 @@ CREATE INDEX ON fleet_events (run_id) WHERE run_id IS NOT NULL;
 |---|---|---|
 | `MISSION.RUN_STARTED` / `RUN_FINISHED` | dispatch | run lifecycle (payload: outcome, cause) |
 | `MISSION.NODE_FAILED` | dispatch | node status failure |
-| `MISSION.REROUTED` / `EDGE_BLOCKED` | dispatch | `blocked*`/`held*` change |
+| `MISSION.EDGE_BLOCKED` / `BLOCK_CLEARED` | dispatch | `blocked*`/`held*` change (`BLOCK_CLEARED` was `REROUTED` before 2026-10-30; old rows keep that code) |
+| `MISSION.REROUTED` | dispatch | a reroute applied: `route_rev` > `applied_route_rev`, routes replaced (id includes the revision) |
 | `MISSION.CANCEL_REQUESTED` | api | cancel route (payload: actor) |
 | `ROBOT.STATE_CHANGED` | dispatch | `state` diff |
 | `ROBOT.ONLINE` / `OFFLINE` | dispatch | `connection` topic |
@@ -277,7 +278,7 @@ The level is resolved per robot, in this order of precedence:
 
 1. On run start: `INSERT mission_runs` together with `MISSION.RUN_STARTED`, in one transaction.
 2. On a terminal state: update the run and emit `MISSION.RUN_FINISHED`, in one transaction.
-3. Emit `NODE_FAILED`, `REROUTED` and `EDGE_BLOCKED` where the status fields are already updated.
+3. Emit `NODE_FAILED`, `BLOCK_CLEARED` and `EDGE_BLOCKED` where the status fields are already updated.
 4. Write `run_id` into `mission_trajectory`.
 5. The `state`, `connection` and `factsheet` handlers feed the detectors and enqueue `robot_state_ts` rows and `robot_latest` upserts.
 6. Run a 1 Hz heartbeat sweep that emits `HEARTBEAT_LOST`/`RESTORED`.

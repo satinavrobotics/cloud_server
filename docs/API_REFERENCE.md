@@ -1094,19 +1094,23 @@ the edit to a queued (or held, not yet dispatched) mission; once the mission has
 dispatched a late edit is ignored. `update_nodes` (a reroute of a running mission) is not
 an edit and is not restricted this way: `{"update_nodes": {"<route node>": {"waypoints": [...]}}}`
 is validated (the node must exist, be a route node, and not be finished), folded into the
-stored `mission_tree`, clears `planned_path` and bumps the spec's `route_rev`; the request itself
+stored `mission_tree`, clears `planned_path` (it becomes `null`: the planner returns no topomap ids for
+the new waypoints, so the one-to-one pairing cannot be kept) and bumps the spec's `route_rev`; the request itself
 is not stored, and the response is the updated mission. The dispatcher acts on a reroute once per
 `route_rev` (`status.applied_route_rev` is the revision it has acted on), cancelling the running
 order and resending the node with the new route. Other spec fields: `kind` (`"goto"` for a
 planner go-to, else `null`), `goal` (`{x, y, map_id, node_id?}` of a go-to), `created_at`
-(set when the row is created); all server-owned.
+(set when the row is created); all server-owned. A reroute leg that enters a keep-out zone is
+not refused: the response gets `"warnings": [{"code": "ROUTE_CROSSES_KEEPOUT", "node", "crossed",
+"message"}]` (non-blocking).
 
 A reroute whose waypoints go through a graph node a robot reported blocked recently (see
 [Blocked graph nodes](#blocked-graph-nodes)) is refused with `409`
 `{"error": "HTTP Error", "detail": {"code": "ROUTE_THROUGH_BLOCKED_NODES", "message": ...,
 "blocked_nodes": [...]}, "status_code": 409, "path": ...}`; add `"force": true` to the body to
-reroute anyway. The check uses the planner's rule, so a route the planner returned passes it:
-each route's first waypoint (where the robot starts) is never blocked; a waypoint with a
+reroute anyway. The check uses the planner's rule, and is pose-based: a waypoint within the
+robot's footprint (its half width) of the robot's own pose is where it already stands and is exempt
+(not simply the route's first waypoint, which the editor seeds from the stored route); a waypoint with a
 `node_id` matches a row of that graph node, or a position row (`"@x,y"`) within
 `BLOCKED_NODE_MATCH_RADIUS_M` (0.5 m); a waypoint without `node_id` matches by lying within
 that radius of where the row's node was reported.

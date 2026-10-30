@@ -77,6 +77,18 @@ class NodeFailed(Payload):
 
 
 class Rerouted(Payload):
+    """A reroute the dispatcher applied (route_rev raised, routes replaced). Events stored
+    before MISSION.BLOCK_CLEARED existed carry this code for a cleared block instead: they
+    have `blocked_edges` and no `route_rev`."""
+    mission_name: Optional[str] = None
+    route_rev: Optional[int] = None
+    nodes: List[str] = []              # route nodes whose route was replaced
+    blocked_edges: List[str] = []      # legacy (a cleared block)
+    detail: Optional[str] = None
+
+
+class BlockCleared(Payload):
+    """The robot resumed after an edgeBlocked."""
     mission_name: Optional[str] = None
     blocked_edges: List[str] = []
     detail: Optional[str] = None

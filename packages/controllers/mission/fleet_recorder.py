@@ -5,7 +5,7 @@ What dispatch records, on top of what it already does:
 - `mission_runs`: one row per dispatched mission, inserted together with
   MISSION.RUN_STARTED and closed together with MISSION.RUN_FINISHED, each pair in one
   transaction. Repeat passes stay inside the run (`passes_completed`).
-- MISSION.NODE_FAILED / EDGE_BLOCKED / REROUTED where the dispatcher updates those
+- MISSION.NODE_FAILED / EDGE_BLOCKED / BLOCK_CLEARED / REROUTED where the dispatcher updates those
   status fields.
 - From `state`, `connection` and `factsheet`: ROBOT.STATE_CHANGED, ONLINE/OFFLINE,
   ERROR_RAISED/CLEARED, SW_VERSION_CHANGED, BATTERY.LOW/OK, plus `robot_state_ts` rows
@@ -1426,13 +1426,26 @@ class FleetRecorder:
                     }, discriminator=f"{mission.name}|{mission.status.run_id}")
 
     @_guarded
-    def rerouted(self, robot_name: str, mission: Any, blocked_node: Optional[str],
-                 blocked_edge: Optional[str], ts: Optional[datetime.datetime] = None) -> None:
-        self._event(EventCode.MISSION_REROUTED, robot_name, ts or self._clock(), {
+    def block_cleared(self, robot_name: str, mission: Any, blocked_node: Optional[str],
+                      blocked_edge: Optional[str],
+                      ts: Optional[datetime.datetime] = None) -> None:
+        """The robot resumed after an edgeBlocked (before 2026-10-30 recorded as
+        MISSION.REROUTED; those rows stay as they are)."""
+        self._event(EventCode.MISSION_BLOCK_CLEARED, robot_name, ts or self._clock(), {
             "mission_name": mission.name,
             "blocked_edges": [blocked_edge] if blocked_edge else [],
             "detail": f"block on node {blocked_node} cleared; mission resumed",
         }, discriminator=f"{mission.name}|{mission.status.run_id}")
+
+    @_guarded
+    def rerouted(self, robot_name: str, mission: Any, route_rev: int, nodes: List[str],
+                 ts: Optional[datetime.datetime] = None) -> None:
+        """A reroute the dispatcher applied. The route revision is in the discriminator, so
+        each revision is one event however often the row is redelivered."""
+        self._event(EventCode.MISSION_REROUTED, robot_name, ts or self._clock(), {
+            "mission_name": mission.name, "route_rev": route_rev, "nodes": list(nodes),
+            "detail": f"route revision {route_rev}: routes of {', '.join(nodes)} replaced",
+        }, discriminator=f"{mission.name}|{mission.status.run_id}|{route_rev}")
 
     # --- run worker ----------------------------------------------------------------------
     def _submit(self, op: _Op) -> None:

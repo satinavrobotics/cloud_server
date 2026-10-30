@@ -212,7 +212,7 @@ async def test_node_failed_and_edge_block_events_from_the_dispatcher(tmp_path):
     robot._handle_edge_blocked(msg.copy(update={"errors": []}))
     robot.set_mission_node_state("go", State.FAILED)
     assert [e["code"] for e in queued(recorder) if e["code"].startswith("MISSION.")] == [
-        "MISSION.EDGE_BLOCKED", "MISSION.REROUTED", "MISSION.NODE_FAILED"]
+        "MISSION.EDGE_BLOCKED", "MISSION.BLOCK_CLEARED", "MISSION.NODE_FAILED"]
 
 
 class _Exploding:

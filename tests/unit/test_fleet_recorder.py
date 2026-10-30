@@ -288,10 +288,10 @@ def test_node_failed_edge_blocked_and_rerouted_events(tmp_path):
 
     rec.node_failed("r1", mission, "go", T0)
     rec.edge_blocked("r1", mission, T0)
-    rec.rerouted("r1", mission, "go", "e7", T0)
+    rec.block_cleared("r1", mission, "go", "e7", T0)
     rows = queued(rec)
 
-    assert codes(rows) == ["MISSION.NODE_FAILED", "MISSION.EDGE_BLOCKED", "MISSION.REROUTED"]
+    assert codes(rows) == ["MISSION.NODE_FAILED", "MISSION.EDGE_BLOCKED", "MISSION.BLOCK_CLEARED"]
     assert rows[0]["payload"] == {"mission_name": "m1", "node_id": "go", "node_type": "route",
                                   "detail": "lidar down"}
     assert rows[1]["payload"]["edge_id"] == "e7"

@@ -48,7 +48,7 @@ and routes around a zone when a way exists; the report itself is not reproduced 
 ## Keep-out zones: open (2026-10-25)
 
 Built and unit-tested on synthetic maps (`docs/keepout_zones.md`); not planned against a real map or a real Postgres.
-- A running mission's reroute and operator-drawn waypoints are not checked against zones (preview lists crossed legs only).
+- A running mission's reroute is not refused for crossing a zone: `PUT /missions/{name}` answers with a non-blocking `ROUTE_CROSSES_KEEPOUT` entry in `warnings` (the planner's `keepout.crossed`). Operator-drawn waypoints of a new mission are still only listed by the preview.
 - A zone whose chart was retired turns `unresolved` and is ignored; no re-attachment by cell overlap (`lineage`).
 - A robot standing inside a zone has no route out until the zone is disabled.
 

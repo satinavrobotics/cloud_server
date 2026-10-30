@@ -15,6 +15,7 @@ class EventCode(str, enum.Enum):
     MISSION_RUN_FINISHED = "MISSION.RUN_FINISHED"
     MISSION_NODE_FAILED = "MISSION.NODE_FAILED"
     MISSION_REROUTED = "MISSION.REROUTED"
+    MISSION_BLOCK_CLEARED = "MISSION.BLOCK_CLEARED"
     MISSION_EDGE_BLOCKED = "MISSION.EDGE_BLOCKED"
     MISSION_CANCEL_REQUESTED = "MISSION.CANCEL_REQUESTED"
     ROBOT_STATE_CHANGED = "ROBOT.STATE_CHANGED"
@@ -132,6 +133,7 @@ CODES: Dict[EventCode, CodeMeta] = {
     _C.MISSION_RUN_FINISHED: CodeMeta(_S.INFO, True, schemas.RunFinished, _D),
     _C.MISSION_NODE_FAILED: CodeMeta(_S.ERROR, True, schemas.NodeFailed, _D),
     _C.MISSION_REROUTED: CodeMeta(_S.INFO, False, schemas.Rerouted, _D),
+    _C.MISSION_BLOCK_CLEARED: CodeMeta(_S.INFO, False, schemas.BlockCleared, _D),
     _C.MISSION_EDGE_BLOCKED: CodeMeta(_S.WARNING, True, schemas.EdgeBlocked, _D),
     _C.MISSION_CANCEL_REQUESTED: CodeMeta(_S.INFO, True, schemas.CancelRequested, _A),
     _C.ROBOT_STATE_CHANGED: CodeMeta(_S.INFO, False, schemas.StateChanged, _D),

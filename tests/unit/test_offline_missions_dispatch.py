@@ -70,7 +70,7 @@ async def test_canceled_messages_without_the_error_keep_the_block_and_send_nothi
 
     assert m.status.blocked and r._mission_timeout_task is None
     assert len(_orders(r)) == 1 and m.status.order_rev == 0 and r._pending_send is None
-    assert r._robot_server.fleet_recorder.rerouted.call_count == 0
+    assert r._robot_server.fleet_recorder.block_cleared.call_count == 0
 
 
 @pytest.mark.unit

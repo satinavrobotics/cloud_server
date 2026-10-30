@@ -617,16 +617,39 @@ class PostgresDatabase:
                             "WHERE name = %s FOR UPDATE;", [name])
                         row = await cursor.fetchone()
                         old_spec = row[0] if row is not None else None
-                    query = f"UPDATE {object_class.table_name()} " \
-                            "SET spec = spec || %s::jsonb WHERE name = %s RETURNING *;"
-                    await cursor.execute(query, [json.dumps(fields), name])
+                    query, params = self._spec_fields_query(object_class.table_name(), name,
+                                                            fields)
+                    await cursor.execute(query, params)
                     await self._commit_update(cursor, object_class.table_name(), name, publisher_id)
                 if before_commit is not None:
-                    await self._run_hook(before_commit, conn, old_spec,
-                                         json.dumps({**(old_spec or {}), **fields}))
+                    merged = {**(old_spec or {}), **fields}
+                    if "route_rev" in fields:
+                        merged["route_rev"] = max(int(fields["route_rev"]),
+                                                  int((old_spec or {}).get("route_rev") or 0))
+                    await self._run_hook(before_commit, conn, old_spec, json.dumps(merged))
         except Exception as err:
             self._logger.error("Database error: %s", err, exc_info=True)
             raise
+
+    @staticmethod
+    def _spec_fields_query(table: str, name: str, fields: Dict[str, Any]):
+        """Build the (query, params) for update_spec_fields.
+
+        `route_rev` is a monotonic counter with several concurrent writers (API PUT, dispatcher
+        replan/enrich), so it is never overwritten by `||`: it is set to
+        GREATEST(stored, incoming) in the same statement, so a lower value can never replace
+        a higher one. Everything is parameterised; only the table name is interpolated."""
+        patch = dict(fields)
+        if "route_rev" not in patch:
+            return (f"UPDATE {table} SET spec = spec || %s::jsonb WHERE name = %s RETURNING *;",
+                    [json.dumps(patch), name])
+        incoming = patch.pop("route_rev")
+        if isinstance(incoming, bool) or not isinstance(incoming, int):
+            raise ValueError(f"route_rev must be an int, got {incoming!r}")
+        query = (f"UPDATE {table} SET spec = (spec || %s::jsonb) || jsonb_build_object("
+                 "'route_rev', GREATEST(coalesce((spec->>'route_rev')::int, 0), %s::int)) "
+                 "WHERE name = %s RETURNING *;")
+        return query, [json.dumps(patch), incoming, name]
 
     async def _run_hook(self, hook: SpecHook, conn: Any, old_spec: Optional[Dict[str, Any]],
                         new_spec_json: str) -> None:

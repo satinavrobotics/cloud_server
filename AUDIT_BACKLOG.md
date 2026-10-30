@@ -755,8 +755,9 @@ API reports.
   dispatcher reasons). A shared `usable_corridor` / `skip_allowed` helper in `order_policy.py` would remove the drift risk.
   Not done: the planner cannot import the controller module, so the helper needs a home both can import.
 - C4: `node_policy_plan._between` repeats `_leg_width`'s snap + route + min_width logic. Extract one `_route_leg`.
-- C5: `api/route_preview.measure_reroute` calls the planner serially, once per route, each with a 5 s timeout. A reroute
-  with several routes can block `PUT /missions` for tens of seconds. `asyncio.gather` with one overall deadline.
+- C5: fixed 2026-10-30: `route_preview.measure_reroute_detailed` (used by `PUT /missions`) measures the routes concurrently with
+  `asyncio.gather`, each with its own `NODE_POLICY_ENRICH_TIMEOUT_S` (no single overall deadline). `measure_reroute` remains as a
+  routes-only wrapper (tests).
 - C6: the "already annotated?" test is in the dispatcher's enrich path (`_enrich_routes`) and again in `_check_goto_annotated`; factor it out with J.2.
 - C7: the sent-order decision record is `Dict[str, Any]` (`cloud_common/objects/mission.py`). A small model would validate
   `reason`, which the API summary keys on.

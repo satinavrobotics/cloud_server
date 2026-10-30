@@ -524,22 +524,8 @@ SEND_NODE = "send"
 NEW_REVISION = "revision"
 
 
-def _route_digest(route: mission_object.MissionRouteNodeV1) -> str:
-    # Unset optional waypoint fields are left out, so adding one to Pose2D does not
-    # change the digest of a route stored before it existed (a mission in flight at
-    # deploy would otherwise read as rerouted and its progress be ignored).
-    # `trajectory` is display data (the planner's dense path): adding or refreshing it must not read as a reroute.
-    # Likewise the recording data `graph_version`, `cost_model` and each waypoint's `chart_key` (nothing the robot drives).
-    return hashlib.sha1(route.json(
-        sort_keys=True, exclude_none=True,
-        exclude={"trajectory": True, "graph_version": True, "cost_model": True, "waypoints": {"__all__": {"chart_key"}}}
-    ).encode()).hexdigest()[:16]
-
-
-def _same_waypoints(a: Sequence[Any], b: Sequence[Any]) -> bool:
-    """Whether two waypoint lists drive the same route (the recording field `chart_key` is not compared)."""
-    return len(a) == len(b) and all(
-        x.dict(exclude={"chart_key"}) == y.dict(exclude={"chart_key"}) for x, y in zip(a, b))
+# The one definition of route sameness lives in cloud_common (same_route / route_digest).
+_route_digest = mission_object.route_digest   # alias: kept for the tests that import it from here
 
 
 # Precomputed once: handle_instant_action() and _order_action_state() test every action
@@ -987,6 +973,24 @@ class Robot:
                     # The next mission's start failing too is for its own retries.
                     self.warning(f"Could not move on after the failed start: {next_err}")
 
+    async def _plan_superseded(self, mission: api_objects.MissionObjectV1, rev_before: int,
+                               tree_before: Any, routes_before: Sequence[Any]) -> bool:
+        """Whether an operator's edit (PUT /missions: new routes under a higher route_rev)
+        has landed since a planner call began, so its answer would overwrite the operator's
+        routes or lower their route_rev. Checked on the dispatcher's copy (the PUT's echo
+        may have been applied already) and on the stored row (it may not have been yet); a
+        store that cannot be read counts as not superseded. `routes_before` is
+        (route node, its route) pairs as they were when the call began."""
+        if mission.route_rev != rev_before or mission.mission_tree is not tree_before or \
+                any(node.route is not route for node, route in routes_before):
+            return True
+        try:
+            stored = await self._database.get_object(api_objects.MissionObjectV1, mission.name)
+            stored_rev = getattr(stored, "route_rev", None)
+            return isinstance(stored_rev, int) and stored_rev > rev_before
+        except Exception:  # pylint: disable=broad-except
+            return False
+
     async def _replan_goto(self):
         """A go-to was planned when it was submitted, from where the robot stood then; when it
         waited behind another mission the robot is elsewhere by now, and the stored route
@@ -1008,6 +1012,10 @@ class Robot:
                 goal.get("y") is None:
             return
         pose = self._robot_object.status.pose
+        # What the plan is based on: an operator edit (PUT /missions, a reroute) that lands
+        # while the planner works makes the answer stale (see _plan_superseded).
+        rev_before, tree_before, route_before = \
+            mission.route_rev, mission.mission_tree, route_node.route
         try:
             plan = await planner.plan(
                 robot_name=self._name, target_x=goal["x"], target_y=goal["y"],
@@ -1022,11 +1030,16 @@ class Robot:
             self.warning(f"[{mission.name}] Could not replan the go-to ({err}); "
                          "using the route stored when it was submitted")
             return
+        if await self._plan_superseded(mission, rev_before, tree_before,
+                                       [(route_node, route_before)]):
+            self.mission_info(f"[{mission.name}] The route was edited while the go-to was "
+                              "replanned; not applying the planner's answer")
+            return
         route_node.route = route
         mission.planned_path = plan.get("planned_path")
         # The new route is the one being sent: a reroute revision the dispatcher has
         # already applied, so the row coming back does not reroute it again.
-        mission.route_rev += 1
+        mission.route_rev = rev_before + 1
         mission.status.applied_route_rev = mission.route_rev
         self.mission_info(f"Replanned the go-to from the robot's pose "
                           f"({pose.x:.2f}, {pose.y:.2f}): {len(route.waypoints)} waypoints")
@@ -1064,8 +1077,9 @@ class Robot:
             return
         # A route paired with planned_path (topomap ids) must keep its length.
         insert = not mission.planned_path
-        changed = False
+        updates: List[Tuple[Any, Any, Any]] = []     # (route node, its route now, the enriched one)
         tree = mission.mission_tree
+        rev_before = mission.route_rev
         for node in list(tree):
             if node.type != mission_object.MissionNodeType.ROUTE or node.route is None:
                 continue
@@ -1100,18 +1114,27 @@ class Robot:
                 self.mission_info(f"Route {node.name} was edited while it was enriched; "
                                   "not applying the planner's answer")
                 continue
-            # a trajectory alone (waypoints as they were) is also worth storing
+            # Deliberately full equality, not same_route(): a trajectory alone (waypoints as they were) is also
+            # worth storing, though it is not a reroute.
             if (result.get("changed") or route.trajectory) and route != node.route:
-                node.route = route
-                changed = True
+                updates.append((node, before, route))
             self.mission_info(
                 f"Route {node.name}: {inserted} planned waypoints inserted; "
                 f"{report.get('skippable', 0)} of {report.get('total', 0)} skippable"
                 + (f" (not skippable: {report['unavailable']})"
                    if report.get("unavailable") else ""))
-        if not changed:
+        if not updates:
             return
-        mission.route_rev += 1
+        # Applied together, and only if no operator edit landed meanwhile (the per-node
+        # check above sees the dispatcher's copy; this one also the stored row).
+        if await self._plan_superseded(mission, rev_before, tree,
+                                       [(n, before) for n, before, _ in updates]):
+            self.mission_info("The routes were edited while they were enriched; "
+                              "not applying the planner's answer")
+            return
+        for node, _, route in updates:
+            node.route = route
+        mission.route_rev = rev_before + 1
         mission.status.applied_route_rev = mission.route_rev
         try:
             await self._database.update_spec_fields(
@@ -1326,13 +1349,23 @@ class Robot:
 
     def _replace_cancel_must_wait(self) -> bool:
         """Whether a reroute's cancelOrder must wait: the order version just sent has not
-        been reported by the robot yet, and ORDER_CANCEL_MIN_DWELL_S has not passed since it
-        went out (2026-10-08: order versions cancelled right after they were sent)."""
+        been reported by the robot yet, and the dwell (order_policy cancel_min_dwell_s, env
+        ORDER_CANCEL_MIN_DWELL_S) has not passed since its first send (2026-10-08: order
+        versions cancelled right after they were sent)."""
         if self._sent_order is None or self._robot_order_id == self._sent_order.orderId:
             return False
         # From the first send: resends of the same order do not restart the dwell.
         return time.monotonic() - self._order_first_sent_at < \
             order_policy.current().cancel_min_dwell_s
+
+    async def _issue_replace_cancel(self, note: str) -> bool:
+        """The one place a reroute's cancelOrder (CancelPurpose.REPLACE) is issued, now or
+        once its dwell is over. Releases the held-cancel flag whether or not one went out
+        (one already outstanding does the job). Not checked against the robot's state
+        (OURS_ANY): the order may be one it has not reported yet."""
+        self._deferred_replace_cancel = False
+        return await self._cancel_order(CancelPurpose.REPLACE, "replace", note,
+                                        ours=OURS_ANY, current_run_only=True)
 
     async def _send_cancel_order(self, action_id: str,
                                  purpose: Optional[CancelPurpose] = None):
@@ -1752,6 +1785,10 @@ class Robot:
                 self._sent_order = order
                 self._order_resends = 0
                 self._order_first_sent_at = time.monotonic()
+                # A new order (another node, a new revision) is built from the newest
+                # route, so a reroute's cancel held for the previous one has nothing left
+                # to replace and must not cancel this order.
+                self._deferred_replace_cancel = False
 
             order.headerId = self._next_header_id("order")
             order.timestamp = types.utc_timestamp()
@@ -2005,6 +2042,9 @@ class Robot:
 
     def _update_mission_from_api(self, mission: api_objects.MissionObjectV1,
                                  message: api_objects.MissionObjectV1) -> bool:
+        """Apply what the API changed on the stored row to the dispatcher's copy of the running
+        mission: a cancel, a lifecycle change, or a reroute (acted on once per route_rev). Returns
+        whether the node now running lost its route and must be cancelled."""
         cancel_current_node = False
         # From POST /mission/{name}/cancel endpoint
         if mission.needs_canceled != message.needs_canceled:
@@ -2033,7 +2073,7 @@ class Robot:
                     # waypoints only: the trajectory is display data (a client that does not know it
                     # sends the route without it)
                     if n.name == new_node.name and new_node.route is not None and \
-                            not _same_waypoints(n.route.waypoints, new_node.route.waypoints):
+                            not mission_object.same_route(n.route, new_node.route):
                         self._note_replaced_route(n)
                         n.route = new_node.route
                         changed.append(str(n.name))
@@ -2052,10 +2092,17 @@ class Robot:
             mission.planned_path = message.planned_path
             mission.route_rev = message.route_rev
             mission.status.applied_route_rev = message.route_rev
+            if changed:
+                # One event per applied revision (the revision is in its id); a revision
+                # that replaced no route (planned_path only, an echo) is not a reroute.
+                self._record("rerouted", self._name, mission, message.route_rev, changed,
+                             self._event_ts)
             self._queue_status_write(api_objects.MissionObjectV1, mission.name, mission.status, self._mission_writer_id())
         return cancel_current_node
 
     async def _on_mission_change(self, message: api_objects.MissionObjectV1):
+        """A mission row arrived from the API / watcher: queue a new mission, drop a deleted or
+        moved one, or apply an edit, cancel or reroute (`_update_mission_from_api`) to the current one."""
         # A mission being deleted that isn't in our queue is one we already ran (or
         # never had): forget it so its name can be reused by a genuinely new mission,
         # and stop -- a deleted object is not work to queue. Falling through here
@@ -2186,15 +2233,17 @@ class Robot:
                         self.mission_info("Reroute: waiting for the robot to take the order "
                                           "just sent before cancelling it")
                         return
-                    self._deferred_replace_cancel = False
                     self.info("Cancelling current node...")
-                    # Not checked against the robot's state: the order may be one it has
-                    # not reported yet (guarded above by the outstanding cancel).
-                    await self._cancel_order(
-                        CancelPurpose.MISSION if self._current_mission.needs_canceled
-                        else CancelPurpose.REPLACE,
-                        "mission" if self._current_mission.needs_canceled else "replace",
-                        "Send cancel order action", ours=OURS_ANY, current_run_only=True)
+                    if self._current_mission.needs_canceled:
+                        self._deferred_replace_cancel = False
+                        # Not checked against the robot's state (OURS_ANY): the order may
+                        # be one it has not reported yet; one cancel at a time is guarded
+                        # above (and again inside _cancel_order).
+                        await self._cancel_order(
+                            CancelPurpose.MISSION, "mission", "Send cancel order action",
+                            ours=OURS_ANY, current_run_only=True)
+                    else:
+                        await self._issue_replace_cancel("Send cancel order action")
                 return
 
             self.info(f"Update a PENDING mission [{message.name}]")
@@ -3194,12 +3243,11 @@ class Robot:
             return
 
         if self._deferred_replace_cancel and not self._replace_cancel_must_wait():
-            self._deferred_replace_cancel = False
-            if not self._has_outstanding_cancel(current_run_only=True) and \
-                    not self._current_mission.needs_canceled:
-                await self._cancel_order(CancelPurpose.REPLACE, "replace",
-                                         "Reroute: send cancel order action",
-                                         ours=OURS_ANY, current_run_only=True)
+            if self._has_outstanding_cancel(current_run_only=True) or \
+                    self._current_mission.needs_canceled:
+                self._deferred_replace_cancel = False   # nothing left for it to do
+            else:
+                await self._issue_replace_cancel("Reroute: send cancel order action")
                 return
 
         # A send the current node is owed goes out once no cancelOrder of ours is in
@@ -4463,7 +4511,7 @@ class Robot:
             return
         self._blocked_order_id = None
         blocked_node = mission.status.blocked_node
-        self._record("rerouted", self._name, mission, blocked_node,
+        self._record("block_cleared", self._name, mission, blocked_node,
                      mission.status.blocked_edge, self._event_ts)
         mission.status.blocked = False
         mission.status.blocked_node = None

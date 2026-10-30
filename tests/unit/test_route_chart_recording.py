@@ -52,8 +52,8 @@ def test_the_route_digest_ignores_the_recording_fields():
     assert mission_server._route_digest(base) == mission_server._route_digest(charted)
     moved = mission_object.MissionRouteNodeV1(waypoints=_poses(False)[:2])
     assert mission_server._route_digest(base) != mission_server._route_digest(moved)
-    assert mission_server._same_waypoints(base.waypoints, charted.waypoints)
-    assert not mission_server._same_waypoints(base.waypoints, moved.waypoints)
+    assert mission_object.same_route(base, charted)
+    assert not mission_object.same_route(base, moved)
 
 
 @pytest.mark.unit
